@@ -154,7 +154,13 @@ class Qwen3DecoderLayer(nn.Module):
         # Attention with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, **kwargs)
+        # Pass hidden_states as keyword arg for AttnWrapperBase compatibility
+        attn_out = self.self_attn(hidden_states=hidden_states, **kwargs)
+        # Handle tuple return from wrapper (output, attn_weights, kv_cache)
+        if isinstance(attn_out, tuple):
+            hidden_states = attn_out[0]
+        else:
+            hidden_states = attn_out
         hidden_states = residual + hidden_states
 
         # MLP with residual
