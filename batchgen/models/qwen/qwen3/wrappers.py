@@ -39,6 +39,7 @@ from .model import apply_rotary_pos_emb, rotate_half
 
 # Import GQA attention (auto-detects FA2/FA3)
 from batchgen.attention.gqa.gqa_attention import gqa_attention_prefill
+from batchgen.attention.gqa.fa_prefill import gqa_prefill_fa
 from batchgen.attention.gqa.fa_decode import gqa_decode_fa
 
 # GQA decode for paged KV cache
@@ -84,6 +85,148 @@ class Qwen3AttnWrapper(AttnWrapperBase):
     ) -> Dict[str, torch.Tensor]:
         """No-op for BF16 weights."""
         return weights_dict
+
+    def forward(self, hidden_states=None, **kwargs):
+        """Override to route prepacked prefill correctly."""
+        import logging as _log
+
+        if not self.persistent:
+            weights = self.load_weights(self.module_key)
+            dequant_weights = self.dequantize_weights(weights)
+            self.apply_weights(dequant_weights)
+
+        # Extract hidden_states from kwargs if passed as kwarg
+        if hidden_states is None:
+            hidden_states = kwargs.pop("hidden_states", None)
+        else:
+            kwargs.pop("hidden_states", None)
+
+        if self.phase == "prefill" and AttnWrapperBase.prepack_mode:
+            result = self._forward_prefill_prepacked(
+                hidden_states,
+                position_ids=AttnWrapperBase.position_ids,
+            )
+        elif self.phase == "prefill":
+            result = self._forward_prefill(hidden_states, **kwargs)
+        else:
+            result = self._forward_decode(hidden_states, **kwargs)
+
+        if not self.persistent:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
+
+        return result
+
+    def _forward_prefill_prepacked(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Prepacked prefill with KV offloading to host paged KV cache.
+
+        In prepack mode, hidden_states is [1, total_tokens, hidden_dim],
+        with cu_seqlens tracking sequence boundaries.
+        KV is split per-sequence and offloaded to host for later decode.
+        """
+        import logging as _log
+
+        if hidden_states.dim() == 3:
+            hidden_states_2d = hidden_states.squeeze(0)
+            input_was_3d = True
+        else:
+            hidden_states_2d = hidden_states
+            input_was_3d = False
+
+        total_tokens = hidden_states_2d.shape[0]
+
+        cu_seqlens = AttnWrapperBase.prepack_cu_seqlens
+        max_seqlen = AttnWrapperBase.prepack_max_seqlen
+        num_sequences = AttnWrapperBase.prepack_num_sequences
+        seq_lengths = AttnWrapperBase.prepack_seq_lengths
+
+        # Project Q, K, V: [total_tokens, hidden] -> [total_tokens, heads, dim]
+        query = self.module.q_proj(hidden_states_2d)
+        key = self.module.k_proj(hidden_states_2d)
+        value = self.module.v_proj(hidden_states_2d)
+
+        query = query.view(total_tokens, self.num_heads, self.head_dim)
+        key = key.view(total_tokens, self.num_kv_heads, self.head_dim)
+        value = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        # QK-norm (reshape to [..., head_dim] for RMSNorm)
+        q_shape, k_shape = query.shape, key.shape
+        query = self.module.q_norm(query.reshape(-1, self.head_dim)).reshape(q_shape)
+        key = self.module.k_norm(key.reshape(-1, self.head_dim)).reshape(k_shape)
+
+        # RoPE per token using position_ids
+        if position_ids is not None:
+            cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+            cos = cos[position_ids]  # [total_tokens, head_dim]
+            sin = sin[position_ids]
+
+            half_dim = self.head_dim // 2
+            q1, q2 = query[..., :half_dim], query[..., half_dim:]
+            k1, k2 = key[..., :half_dim], key[..., half_dim:]
+
+            cos_half = cos[..., :half_dim].unsqueeze(1)  # [total_tokens, 1, half_dim]
+            sin_half = sin[..., :half_dim].unsqueeze(1)
+
+            query = torch.cat([
+                q1 * cos_half - q2 * sin_half,
+                q2 * cos_half + q1 * sin_half
+            ], dim=-1)
+
+            key = torch.cat([
+                k1 * cos_half - k2 * sin_half,
+                k2 * cos_half + k1 * sin_half
+            ], dim=-1)
+
+        # Varlen flash attention
+        attn_output, lse = gqa_prefill_fa(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
+            cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            sinks=None,
+            softmax_scale=self.scale,
+        )
+
+        # Output projection
+        attn_output = attn_output.view(total_tokens, self.num_heads * self.head_dim)
+        attn_output = self.module.o_proj(attn_output)
+
+        # CRITICAL: Offload KV to host paged KV cache per sequence
+        # Without this, decode reads empty KV and generates gibberish
+        global_sequence_ids = AttnWrapperBase.cur_batch
+        torch.cuda.current_stream().synchronize()
+
+        for seq_idx in range(num_sequences):
+            start_idx = cu_seqlens[seq_idx].item()
+            end_idx = cu_seqlens[seq_idx + 1].item()
+            seq_len = end_idx - start_idx
+
+            seq_key = key[start_idx:end_idx].unsqueeze(0)      # [1, seq_len, kv_heads, dim]
+            seq_value = value[start_idx:end_idx].unsqueeze(0)  # [1, seq_len, kv_heads, dim]
+            seq_global_id = [global_sequence_ids[seq_idx]]
+
+            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+                layer_idx=self.layer_idx,
+                sequence_ids=seq_global_id,
+                k_tensor=seq_key,
+                v_tensor=seq_value,
+                sequence_lengths=[seq_len],
+            )
+
+        if input_was_3d:
+            attn_output = attn_output.unsqueeze(0)
+
+        return attn_output, None, None
 
     def _apply_qk_norm(self, query, key):
         """Apply QK-norm (per-head RMSNorm) to Q and K tensors.
