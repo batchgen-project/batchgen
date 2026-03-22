@@ -105,7 +105,10 @@ class Qwen3ParallelStrategyManager:
         # Step 4: Create RoPE embedding on model
         self._setup_rope()
 
-        # Step 5: Configure attention wrappers (MLP is persistent in skeleton)
+        # Step 5: Load attention weights from core engine (persistent mode)
+        self._load_attn_module()
+
+        # Step 6: Configure attention wrappers (MLP is persistent in skeleton)
         self._config_attn_module()
         self._config_lm_head_hook()
 
@@ -135,6 +138,37 @@ class Qwen3ParallelStrategyManager:
                     loaded_count += 1
 
         logging.info(f"Loaded {loaded_count} skeleton parameters")
+
+    def _load_attn_module(self):
+        """Load attention weights from core_engine for persistent mode."""
+        logging.info("Loading attention module weights...")
+        device = self.engine_config.Basic_Config.device_torch
+
+        for layer_idx in range(self.model_config.num_hidden_layers):
+            attn_module = self.model.model.layers[layer_idx].self_attn
+            module_key = f"attn_{layer_idx}"
+
+            tensors = self.core_engine.get_tensor(module_key)
+
+            for name, tensor in tensors.items():
+                # Navigate to the parameter (e.g., "q_proj.weight" -> attn_module.q_proj.weight)
+                parts = name.split(".")
+                obj = attn_module
+                for part in parts[:-1]:
+                    obj = getattr(obj, part)
+                setattr_name = parts[-1]
+                if hasattr(obj, setattr_name):
+                    param = getattr(obj, setattr_name)
+                    if isinstance(param, torch.nn.Parameter):
+                        param.data = tensor.to(device)
+                    else:
+                        setattr(obj, setattr_name, tensor.to(device))
+                else:
+                    setattr(obj, setattr_name, tensor.to(device))
+
+            logging.debug(f"Loaded attention weights for layer {layer_idx}")
+
+        logging.info(f"Loaded attention weights for {self.model_config.num_hidden_layers} layers")
 
     def _setup_rope(self):
         """Create shared RoPE embedding for all attention layers."""
