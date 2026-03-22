@@ -633,7 +633,7 @@ def parse_args():
 	parser.add_argument("--model", type=str, required=True, help="HuggingFace Model Name")
 	parser.add_argument("--hf-cache-dir", type=str, default=None)
 	parser.add_argument("--cache-dir", type=str, default=None)
-	parser.add_argument("--pt-ckpt-dir", type=str, default=None)
+	parser.add_argument("--pt-ckpt-dir", type=str, default=None, dest="converted_ckpt_dir")
 	parser.add_argument("--enable-hugetlbfs", action='store_false')
 	parser.add_argument("--dist-init-addr", type=str)
 	parser.add_argument("--kv-dtype", type=str, default="bfloat16")
