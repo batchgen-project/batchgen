@@ -3774,7 +3774,16 @@ class BatchGenWorker:
 						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
 			if global_seq_ids:
-				self.gpu_paged_kv_cache_manager.free_pages_for_sequences(global_seq_ids)
+				# Filter to only sequences the GPU manager actually tracks
+				mgr = self.gpu_paged_kv_cache_manager
+				known_ids = [gid for gid in global_seq_ids if gid in mgr._sequences]
+				if known_ids:
+					mgr.free_pages_for_sequences(known_ids)
+				if len(known_ids) < len(global_seq_ids):
+					unknown = len(global_seq_ids) - len(known_ids)
+					logging.debug(
+						f"Rank {self.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
+					)
 				# Also remove from tracking set
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
