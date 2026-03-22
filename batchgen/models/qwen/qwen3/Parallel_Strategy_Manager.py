@@ -78,6 +78,10 @@ class Qwen3ParallelStrategyManager:
             gc.collect()
             torch.cuda.empty_cache()
 
+        # Set phase to prefill for attention wrapper routing
+        Qwen3AttnWrapper.phase = "prefill"
+        Qwen3MLPWrapper.phase = "prefill"
+
         # Step 1: Initialize model
         self.model = Qwen3ForCausalLM(self.loaded_model_config)
 
