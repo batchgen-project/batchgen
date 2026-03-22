@@ -1837,7 +1837,7 @@ class BatchGenWorker:
 		self._kv_fingerprints = {}
 		for uuid in list(self._sequences_with_gpu_kv):
 			seq = self.global_batch.get_sequence(uuid)
-			if not seq or seq.decoded_length < 120:
+			if not seq or seq.decoded_length == 0 or seq.eos_reached:
 				continue
 
 			gidx = seq.global_idx
