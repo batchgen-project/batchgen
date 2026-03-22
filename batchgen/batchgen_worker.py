@@ -4865,8 +4865,13 @@ class BatchGenWorker:
 					# for some sequences (~134-token truncation). The ON_HOLD path
 					# properly syncs metadata, frees GPU pages, and ensures sequences
 					# resume through the standard ON_HOLD→IN_DECODE load path.
-					if decode_uuids:
-						self._put_sequences_on_hold(decode_uuids)
+					# Filter to IN_DECODE only (decode_uuids may contain EVICTED/COMPLETED)
+					in_decode_uuids = [
+						u for u in decode_uuids
+						if self.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
+					]
+					if in_decode_uuids:
+						self._put_sequences_on_hold(in_decode_uuids)
 					break
 		
 		# Log timing stats
