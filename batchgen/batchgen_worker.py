@@ -87,6 +87,9 @@ BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 # Diagnostic logging for 134-token truncation investigation
 BATCHGEN_DIAG_134 = os.environ.get("BATCHGEN_DIAG_134", "0") == "1"
 
+# Force synchronous KV offload (disable deferred flush) for debugging
+BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
+
 # Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
 # Default: enabled (recommended always on). Use --no-prepack to disable.
 BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
@@ -7650,8 +7653,29 @@ class BatchGenWorker:
 					self._deferred_kv_entries = []
 					self._deferred_kv_worker_view = _kv_worker_view
 
-				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-					self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
+				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
+					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
+					_sync_kv_seq_ids = _kv_seq_ids
+					_sync_kv_seq_lengths = _kv_seq_lengths
+					_sync_kv_worker_view = _kv_worker_view
+					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						if k_tensor.dim() == 3:
+							k_tensor = k_tensor.unsqueeze(2)
+						if v_tensor is not None and v_tensor.dim() == 3:
+							v_tensor = v_tensor.unsqueeze(2)
+						torch.cuda.synchronize()
+						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+							layer_idx=layer_idx,
+							sequence_ids=_sync_kv_seq_ids,
+							k_tensor=k_tensor,
+							v_tensor=v_tensor,
+							sequence_lengths=_sync_kv_seq_lengths,
+						)
+						if task is not None:
+							task.wait()
+				else:
+					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
 
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
