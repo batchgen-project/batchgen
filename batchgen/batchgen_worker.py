@@ -4849,7 +4849,16 @@ class BatchGenWorker:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
 						logging.info(f"[DECODE] Breaking for prefill - {num_queued} queued, {num_evicted} evicted")
-					break  # Exit inner decode while loop, outer loop will check has_queueing()/has_evicted()
+					# CRITICAL: Transition IN_DECODE → ON_HOLD before prefill.
+					# Without this, _destroy_gpu_paged_kv_cache in prefill phase destroys
+					# GPU KV under IN_DECODE sequences. The subsequent reload through
+					# _allocate_gpu_kv_two_page_buffer has subtle bugs that corrupt KV
+					# for some sequences (~134-token truncation). The ON_HOLD path
+					# properly syncs metadata, frees GPU pages, and ensures sequences
+					# resume through the standard ON_HOLD→IN_DECODE load path.
+					if decode_uuids:
+						self._put_sequences_on_hold(decode_uuids)
+					break
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
