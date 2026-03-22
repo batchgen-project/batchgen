@@ -153,6 +153,13 @@ class Qwen3Initializer:
         num_kv_heads = self.model_config.num_key_value_heads  # 8
         head_dim = self.model_config.head_dim               # 128
 
+        # Micro-batch sizes for dense model (no planner needed)
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 128
+        self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size = 128
+        self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 1
+        self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 1
+        self.engine_config.Module_Batching_Config.global_batch_size = 128
+
         # Module buffer counts for C++ core engine (must be Dict[str, int])
         self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
             "attn": 1,
