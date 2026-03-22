@@ -403,15 +403,18 @@ def build_gpu_kv_config_fixed_size(
 	else:
 		raise NotImplementedError(f"Model {model_name} not supported")
 	
+	# Use profile's page_size if available (ensures consistency)
+	profile = _resolve_profile(model_name)
+	actual_page_size = profile.page_size  # Use profile's page_size, not parameter
+
 	# Calculate bytes per page per layer
 	bytes_per_token = kv_dim * dtype_bytes
-	bytes_per_page = bytes_per_token * page_size_tokens
+	bytes_per_page = bytes_per_token * actual_page_size
 	bytes_per_page_all_layers = bytes_per_page * num_layers
-	
+
 	# Calculate total pages from memory budget
 	total_bytes = int(gpu_kv_cache_size_gb * (1024 ** 3))
 	num_pages = total_bytes // bytes_per_page_all_layers
-	profile = _resolve_profile(model_name)
 	return GPUPagedKVConfig(
 		num_layers=profile.num_layers,
 		num_pages=num_pages,
