@@ -5,10 +5,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn_interface import flash_attn_varlen_func 
+try:
+	from flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+	flash_attn_varlen_func = None
 from .padding import _upad_input, pad_input
 from .rotary_embedding import mla_rotary_pos_emb, rotary_pos_emb, apply_rotary_pos_emb
-import deep_gemm
+try:
+	import deep_gemm
+except ImportError:
+	deep_gemm = None
 # from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
 from typing import Tuple
