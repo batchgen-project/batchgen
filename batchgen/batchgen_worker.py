@@ -1691,6 +1691,35 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
 
+		# KV SANITY: Log active_page_counts vs needed pages for resuming sequences
+		if BATCHGEN_KV_SANITY:
+			import math as _math
+			page_counts_list = active_sequence_page_counts.tolist()
+			undercopy_count = 0
+			for idx, global_idx in enumerate(global_sequence_ids):
+				for uuid, local_idx in self._uuid_to_local_map.items():
+					seq = self.global_batch.get_sequence(uuid)
+					if seq and seq.global_idx == global_idx and seq.decoded_length >= 120:
+						gpu_pages = page_counts_list[idx] if idx < len(page_counts_list) else -1
+						needed_pages = _math.ceil(seq.current_context_length / self.PAGE_SIZE)
+						is_under = gpu_pages < needed_pages
+						if is_under:
+							undercopy_count += 1
+						logging.warning(
+							f"[KV_SANITY] LOAD_DETAIL rank={self.rank} gidx={global_idx} "
+							f"gpu_pages={gpu_pages} needed={needed_pages} "
+							f"ctx={seq.current_context_length} decoded={seq.decoded_length} "
+							f"prompt={seq.original_prompt_length} "
+							f"host_pages={seq.host_pages_allocated} "
+							f"{'UNDERCOPY!' if is_under else 'OK'}"
+						)
+						break
+			if undercopy_count > 0:
+				logging.error(
+					f"[KV_SANITY] UNDERCOPY DETECTED on rank={self.rank}: "
+					f"{undercopy_count} sequences have gpu_pages < needed_pages!"
+				)
+
 		# DEBUG: Check what's being passed to the host→GPU load
 		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
 			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
