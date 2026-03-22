@@ -96,7 +96,9 @@ class Qwen3Initializer:
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
         engine_config.Basic_Config.num_queries = getattr(args, 'num_queries', 1)
-        engine_config.Basic_Config.module_types = ["attn", "mlp"]
+        # Dense 8B model fits entirely in GPU memory — use only attn module type
+        # MLP weights are persistent in skeleton (no dynamic loading needed)
+        engine_config.Basic_Config.module_types = ["attn"]
         engine_config.Basic_Config.num_threads = 0
         engine_config.Basic_Config.gpu_arch = getattr(args, 'gpu_arch', 'ampere')
 
@@ -151,6 +153,8 @@ class Qwen3Initializer:
         num_kv_heads = self.model_config.num_key_value_heads  # 8
         head_dim = self.model_config.head_dim               # 128
 
+        # Only attn uses dynamic weight loading via core engine
+        # MLP weights are persistent in model skeleton (fits in GPU memory)
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
                 "q_proj.weight": [num_heads * head_dim, hidden_size],
@@ -160,17 +164,10 @@ class Qwen3Initializer:
                 "q_norm.weight": [head_dim],
                 "k_norm.weight": [head_dim],
             },
-            "mlp": {
-                "gate_proj.weight": [intermediate_size, hidden_size],
-                "up_proj.weight": [intermediate_size, hidden_size],
-                "down_proj.weight": [hidden_size, intermediate_size],
-            },
         }
 
-        # All BF16 weights
         self.engine_config.GPU_Buffer_Config.weight_dtypes = {
             "attn": torch.bfloat16,
-            "mlp": torch.bfloat16,
         }
 
     def _parse_model_config(self) -> ModelConfig:
@@ -179,7 +176,7 @@ class Qwen3Initializer:
 
         model_config.model_type = "qwen3"
         model_config.num_hidden_layers = 36
-        model_config.num_local_experts = None  # Dense model
+        model_config.num_local_experts = 0  # Dense model (no MoE)
         model_config.num_attention_heads = 32
         model_config.num_key_value_heads = 8
         model_config.head_dim = 128

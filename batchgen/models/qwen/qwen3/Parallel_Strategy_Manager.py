@@ -82,13 +82,14 @@ class Qwen3ParallelStrategyManager:
         self.model = Qwen3ForCausalLM(self.loaded_model_config)
 
         # Step 2: Build weight mappings
+        # Only attention uses dynamic loading via core engine
+        # MLP weights are persistent in skeleton (8B model fits in GPU memory)
         self.state_dict_name_map = {}
         self.weight_copy_task = {}
         self.weight_copy_task["attn"] = []
-        self.weight_copy_task["mlp"] = []
 
         for layer_idx in range(self.model_config.num_hidden_layers):
-            # Attention weights
+            # Attention weights — dynamic loading via core engine
             for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
                 tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
                 self.state_dict_name_map[tensor_full_name] = {
@@ -96,15 +97,7 @@ class Qwen3ParallelStrategyManager:
                     "tensor_key": name,
                 }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
-
-            # MLP weights (dense, single MLP per layer)
-            for name, _ in self.model.model.layers[layer_idx].mlp.named_parameters():
-                tensor_full_name = f"model.layers.{layer_idx}.mlp.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"mlp_{layer_idx}",
-                    "tensor_key": name,
-                }
-            self.weight_copy_task["mlp"].append(f"mlp_{layer_idx}")
+            # MLP weights NOT registered — go to skeleton (persistent)
 
         # Step 3: Load skeleton weights
         self._load_model_skeleton()
@@ -112,9 +105,8 @@ class Qwen3ParallelStrategyManager:
         # Step 4: Create RoPE embedding on model
         self._setup_rope()
 
-        # Step 5: Configure attention and MLP wrappers
+        # Step 5: Configure attention wrappers (MLP is persistent in skeleton)
         self._config_attn_module()
-        self._config_mlp_module()
         self._config_lm_head_hook()
 
         self.model.eval()

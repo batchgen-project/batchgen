@@ -128,11 +128,13 @@ class Qwen3ParameterServer:
     def _parse_state_dict(self):
         """Parse model state dict to build name mapping.
 
-        Attention and MLP weights go to module_weights_storage_ (dynamic loading).
-        Embeddings, layer norms, lm_head go to skeleton_state_dict_ (persistent).
+        Attention weights go to module_weights_storage_ (dynamic loading via core engine).
+        MLP weights, embeddings, layer norms, lm_head go to skeleton_state_dict_ (persistent).
+
+        For dense 8B model on 96GB GPU, MLP weights are persistent in skeleton
+        since the entire model fits in GPU memory.
         """
         self.weight_copy_task["attn"] = []
-        self.weight_copy_task["mlp"] = []
 
         for layer_idx in range(self.num_layers):
             # Attention weights (separate Q, K, V, O projections + QK-norm)
@@ -152,23 +154,12 @@ class Qwen3ParameterServer:
                 }
             self.weight_copy_task["attn"].append(f"attn_{layer_idx}")
 
-            # MLP weights (gate, up, down projections)
-            mlp_tensor_names = [
-                "gate_proj.weight",
-                "up_proj.weight",
-                "down_proj.weight",
-            ]
-            for name in mlp_tensor_names:
-                tensor_full_name = f"model.layers.{layer_idx}.mlp.{name}"
-                self.state_dict_name_map[tensor_full_name] = {
-                    "module_key": f"mlp_{layer_idx}",
-                    "tensor_key": name,
-                }
-            self.weight_copy_task["mlp"].append(f"mlp_{layer_idx}")
+            # MLP weights are NOT in state_dict_name_map — they go to skeleton
+            # (persistent on GPU, no dynamic loading needed for 8B model)
 
         logging.info(f"State dict name map: {len(self.state_dict_name_map)} entries")
         logging.info(f"  Attention: {len(self.weight_copy_task['attn'])} layers")
-        logging.info(f"  MLP: {len(self.weight_copy_task['mlp'])} layers")
+        logging.info(f"  MLP: persistent in skeleton (not dynamically loaded)")
 
     def _convert_checkpoint(self):
         """Convert HF safetensors to BatchGen format.
