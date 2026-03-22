@@ -3525,6 +3525,7 @@ class BatchGenWorker:
 			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
+			seq.original_prompt_length = actual_prompt_len  # Must match prompt_length at tokenization time
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
