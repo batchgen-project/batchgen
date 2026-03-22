@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
-from .model import apply_rotary_pos_emb
+from .model import apply_rotary_pos_emb, rotate_half
 
 # Import GQA attention (auto-detects FA2/FA3)
 from batchgen.attention.gqa.gqa_attention import gqa_attention_prefill
@@ -188,6 +188,21 @@ class Qwen3AttnWrapper(AttnWrapperBase):
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
         cache_seqlens = AttnWrapperBase.cache_seqlens
 
+        # Micro-batch slicing
+        micro_cache_seqlens = cache_seqlens
+        if batch_slice is not None:
+            start_idx, end_idx = batch_slice
+            micro_cache_seqlens = cache_seqlens[start_idx:end_idx]
+
+        if micro_cache_seqlens is not None and micro_cache_seqlens.numel() == 0:
+            return (
+                torch.empty((0, 1, hidden_states.shape[-1]),
+                            device=hidden_states.device, dtype=hidden_states.dtype),
+                None, None
+            )
+
+        current_token_position = micro_cache_seqlens - 1 if micro_cache_seqlens is not None else None
+
         # Project Q, K, V
         query = self.module.q_proj(hidden_states)
         key = self.module.k_proj(hidden_states)
@@ -201,41 +216,46 @@ class Qwen3AttnWrapper(AttnWrapperBase):
         query, key = self._apply_qk_norm(query, key)
 
         # RoPE
-        max_pos = int(position_ids.max().item()) + 1 if position_ids is not None else 1
-        cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_pos)
-
-        query_t = query.transpose(1, 2)
-        key_t = key.transpose(1, 2)
-        query_t, key_t = apply_rotary_pos_emb(query_t, key_t, cos, sin, position_ids)
-
-        # Write K, V to paged KV cache
-        key_write = key_t.transpose(1, 2).contiguous()   # [B, 1, KV_H, D]
-        value_write = value.contiguous()                   # [B, 1, KV_H, D]
-
-        if gpu_kv_manager is not None:
-            gpu_kv_manager.write_kv(
-                self.layer_idx, key_write, value_write,
-                cache_seqlens, batch_slice=batch_slice
-            )
-
-            # Read full KV cache for attention
-            full_key, full_value = gpu_kv_manager.read_kv(
-                self.layer_idx, cache_seqlens + 1, batch_slice=batch_slice
-            )
-
-            # GQA decode attention
-            attn_output = batchgen_gqa_decode_bf16(
-                query_t, full_key, full_value,
-                cache_seqlens=cache_seqlens + 1,
-                scale=self.scale,
-                num_kv_groups=self.num_groups,
-            )
+        max_seqlen = AttnWrapperBase.max_seqlen or 1
+        cos, sin = self.module.rotary_emb(value.transpose(1, 2), seq_len=max_seqlen)
+        if current_token_position is not None:
+            cos = cos[current_token_position].unsqueeze(1)
+            sin = sin[current_token_position].unsqueeze(1)
         else:
-            # Fallback: use simple attention (no paged KV)
-            attn_output = gqa_attention_prefill(
-                query=query_t, key=key_t, value=value.transpose(1, 2),
-                sinks=None, scale=self.scale, sliding_window=None,
-            )
+            cos = cos[:1]
+            sin = sin[:1]
+
+        query, key = self._apply_rotary(query, key, cos, sin)
+
+        # Write new K, V to paged GPU cache
+        # Shape: [batch, seq_len=1, num_heads, head_dim]
+        gpu_kv_manager.update_layer_decode_new_token(
+            k_tensor=key,
+            v_tensor=value,
+            sequence_lengths=current_token_position if current_token_position is not None else torch.zeros(batch, dtype=torch.int32, device=hidden_states.device),
+            layer_idx=self.layer_idx,
+            batch_slice=batch_slice,
+        )
+
+        # Retrieve paged K, V cache and page table for attention
+        k_cache_layer, v_cache_layer, page_table = gpu_kv_manager.get_layer_kv_with_page_table(
+            self.layer_idx
+        )
+
+        if batch_slice is not None:
+            start_idx, end_idx = batch_slice
+            page_table = page_table[start_idx:end_idx]
+
+        # GQA decode attention with paged KV
+        query_t = query.transpose(1, 2)  # [B, H, 1, D]
+        attn_output = batchgen_gqa_decode_bf16(
+            query_t,
+            k_cache_layer, v_cache_layer,
+            cache_seqlens=micro_cache_seqlens,
+            scale=self.scale,
+            num_kv_groups=self.num_groups,
+            page_table=page_table,
+        )
 
         # Reshape
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -245,6 +265,12 @@ class Qwen3AttnWrapper(AttnWrapperBase):
         attn_output = self.module.o_proj(attn_output)
 
         return attn_output, None, None
+
+    def _apply_rotary(self, query, key, cos, sin):
+        """Apply RoPE to query and key. Handles [B, S, H, D] format."""
+        q_embed = (query * cos) + (rotate_half(query) * sin)
+        k_embed = (key * cos) + (rotate_half(key) * sin)
+        return q_embed, k_embed
 
 
 class Qwen3MLPWrapper(ExpertWrapperBase):
