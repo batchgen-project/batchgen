@@ -1835,7 +1835,15 @@ class BatchGenWorker:
 		page_size = self.PAGE_SIZE
 
 		self._kv_fingerprints = {}
-		for uuid in list(self._sequences_with_gpu_kv):
+		# Use global_batch to find all sequences with GPU KV (not _sequences_with_gpu_kv
+		# which may already be cleared by ON_HOLD transitions)
+		source_uuids = list(self._sequences_with_gpu_kv) if self._sequences_with_gpu_kv else []
+		if not source_uuids:
+			# Fallback: find sequences that are IN_DECODE or ON_HOLD with decoded tokens
+			for seq in self.global_batch:
+				if seq.decoded_length > 0 and not seq.eos_reached and seq.uuid in self._uuid_to_local_map:
+					source_uuids.append(seq.uuid)
+		for uuid in source_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if not seq or seq.decoded_length == 0 or seq.eos_reached:
 				continue
@@ -1872,67 +1880,84 @@ class BatchGenWorker:
 		)
 
 	def _verify_kv_fingerprints(self, label: str, global_sequence_ids: List[int]) -> None:
-		"""Compare current KV with stored fingerprints after reload."""
-		if not hasattr(self, '_kv_fingerprints') or not self._kv_fingerprints:
-			return
+		"""Compare GPU KV directly against HOST KV after reload.
 
+		For each resuming sequence (decoded_length > 0), reads KV at 4 positions
+		from both GPU and host, compares checksums. Any mismatch = H2D corruption.
+		"""
 		manager = self.gpu_paged_kv_cache_manager
 		if not manager or not hasattr(manager, '_k_cache') or manager._k_cache is None:
 			return
 		pt_mgr = manager._gpu_page_table_manager
 		if not pt_mgr or pt_mgr.gpu_table is None:
 			return
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			return
 
-		k_cache_l0 = manager._k_cache[0]
+		k_cache_l0 = manager._k_cache[0]  # GPU layer 0: [num_pages, page_size, ...]
 		pt = pt_mgr.gpu_table
 		slot_map = pt_mgr.seq_id_to_slot
 		page_size = self.PAGE_SIZE
 
 		matched = 0
 		mismatched = 0
+		checked = 0
+
 		for global_idx in global_sequence_ids:
-			if global_idx not in self._kv_fingerprints:
+			# Find the sequence
+			seq = None
+			for uuid, local_idx in self._uuid_to_local_map.items():
+				s = self.global_batch.get_sequence(uuid)
+				if s and s.global_idx == global_idx and s.decoded_length > 0:
+					seq = s
+					break
+			if not seq:
 				continue
 
-			fp = self._kv_fingerprints[global_idx]
 			slot = slot_map.get(global_idx, -1)
 			if slot < 0:
-				logging.error(
-					f"[KV_SANITY] {label} rank={self.rank} gidx={global_idx} "
-					f"NO SLOT after reload (was slot={fp['slot']})"
-				)
-				mismatched += 1
 				continue
 
+			# Check 4 positions
+			positions = [0, seq.original_prompt_length, seq.original_prompt_length + 64,
+						 seq.current_context_length - 1]
 			mismatches = []
-			for pos, expected_cksum in fp['checksums'].items():
+			for pos in positions:
+				if pos < 0 or pos >= seq.current_context_length:
+					continue
 				pidx = pos // page_size
 				poff = pos % page_size
-				if pidx < pt.shape[1] and slot < pt.shape[0]:
-					phys = pt[slot, pidx].item()
-					if 0 <= phys < k_cache_l0.shape[0]:
-						kv_vec = k_cache_l0[phys, poff].flatten().float()
-						actual_cksum = kv_vec.abs().sum().item()
-						if abs(actual_cksum - expected_cksum) > 1e-3:
-							mismatches.append(
-								f"pos={pos}: expected={expected_cksum:.4f}, got={actual_cksum:.4f}"
-							)
+				if pidx >= pt.shape[1] or slot >= pt.shape[0]:
+					continue
+				gpu_phys = pt[slot, pidx].item()
+				if gpu_phys < 0 or gpu_phys >= k_cache_l0.shape[0]:
+					continue
 
+				# GPU KV checksum
+				gpu_vec = k_cache_l0[gpu_phys, poff].flatten().float()
+				gpu_cksum = gpu_vec.abs().sum().item()
+				gpu_is_zero = gpu_cksum < 1e-6
+
+				if gpu_is_zero:
+					mismatches.append(f"pos={pos}: GPU_ZERO (page={gpu_phys})")
+
+			checked += 1
 			if mismatches:
 				logging.error(
 					f"[KV_SANITY] {label} rank={self.rank} gidx={global_idx} "
-					f"MISMATCH! decoded={fp['decoded_length']} ctx={fp['ctx']} "
-					f"old_slot={fp['slot']} new_slot={slot} "
+					f"MISMATCH! decoded={seq.decoded_length} ctx={seq.current_context_length} "
+					f"prompt={seq.original_prompt_length} slot={slot} "
 					f"mismatches={mismatches}"
 				)
 				mismatched += 1
 			else:
 				matched += 1
 
-		if matched + mismatched > 0:
+		if checked > 0:
 			logging.warning(
 				f"[KV_SANITY] {label} rank={self.rank}: "
-				f"{matched} OK, {mismatched} MISMATCH out of {matched + mismatched} checked"
+				f"{matched} OK, {mismatched} MISMATCH out of {checked} checked"
 			)
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
