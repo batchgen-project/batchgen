@@ -107,10 +107,12 @@ _MINIMAX_M25_GQA_PROFILE = _HostKVModelProfile(
 )
 
 # Qwen3: GQA with 8 KV heads, head_dim=128, 36 layers
+# page_size=256 required by FA decode kernel (block size must be divisible by 256)
 _QWEN3_GQA_PROFILE = _HostKVModelProfile(
 	num_layers=36,
 	num_k_heads=8,
 	k_head_dim=128,
+	page_size=256,
 	num_v_heads=8,
 	v_head_dim=128,
 	kv_dtype="bfloat16",
