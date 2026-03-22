@@ -106,11 +106,22 @@ _MINIMAX_M25_GQA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# Qwen3: GQA with 8 KV heads, head_dim=128, 36 layers
+_QWEN3_GQA_PROFILE = _HostKVModelProfile(
+	num_layers=36,
+	num_k_heads=8,
+	k_head_dim=128,
+	num_v_heads=8,
+	v_head_dim=128,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
+	"qwen3_gqa": _QWEN3_GQA_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -139,6 +150,12 @@ for canonical, aliases in {
 		"minimaxai/minimax-m2.5",
 		"minimax-m2.5",
 		"minimax",
+	),
+	"qwen3_gqa": (
+		"qwen/qwen3guard-gen-8b",
+		"qwen3guard-gen-8b",
+		"qwen3guard",
+		"qwen3",
 	),
 }.items():
 	for alias in aliases:
