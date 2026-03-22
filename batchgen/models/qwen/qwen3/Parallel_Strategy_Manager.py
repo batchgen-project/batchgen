@@ -223,8 +223,13 @@ class Qwen3ParallelStrategyManager:
         """Configure for decode phase.
 
         For dense single-device model, decode and prefill share the same model.
+        Set phase to 'decode' so AttnWrapperBase routes to _forward_decode.
         """
-        return self.configure_prefill()
+        result = self.configure_prefill()
+        # CRITICAL: Set phase to decode for attention wrapper routing
+        Qwen3AttnWrapper.phase = "decode"
+        Qwen3MLPWrapper.phase = "decode"
+        return result
 
     def get_weight_copy_task(self) -> Dict[str, List[str]]:
         return self.weight_copy_task
