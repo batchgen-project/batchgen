@@ -1725,33 +1725,42 @@ class BatchGenWorker:
 		# DIAG-134: Verify GPU KV after host→GPU load for sequences near boundary
 		if BATCHGEN_DIAG_134:
 			page_counts_list = active_sequence_page_counts.tolist()
+			k_cache_l0 = manager._k_cache[0] if manager._k_cache is not None else None
+			pt = manager._gpu_page_table_manager.gpu_table if manager._gpu_page_table_manager else None
+			slot_map = manager._gpu_page_table_manager.seq_id_to_slot if manager._gpu_page_table_manager else {}
+			diag_count = 0
 			for idx, global_idx in enumerate(global_sequence_ids):
+				if diag_count >= 3:
+					break
 				for uuid, local_idx in self._uuid_to_local_map.items():
 					seq = self.global_batch.get_sequence(uuid)
 					if seq and seq.global_idx == global_idx and 120 <= seq.decoded_length <= 145:
 						gpu_pages = page_counts_list[idx] if idx < len(page_counts_list) else -1
-						# Read layer-0 KV at last decoded position to verify
-						k_cache_l0 = manager._k_cache[0] if manager._k_cache is not None else None
-						kv_checksum = "N/A"
-						if k_cache_l0 is not None and manager._gpu_page_table_manager.gpu_table is not None:
-							pt = manager._gpu_page_table_manager.gpu_table
-							slot_map = manager._gpu_page_table_manager.seq_id_to_slot
-							slot = slot_map.get(global_idx, -1)
-							if slot >= 0 and slot < pt.shape[0]:
-								last_kv_pos = seq.current_context_length - 2  # -2: last completed KV position
-								page_idx = last_kv_pos // manager.config.page_size_tokens
-								offset = last_kv_pos % manager.config.page_size_tokens
-								if page_idx < pt.shape[1]:
-									phys_page = pt[slot, page_idx].item()
-									if phys_page >= 0 and phys_page < k_cache_l0.shape[0]:
-										kv_slice = k_cache_l0[phys_page, offset, :4].float().flatten()
-										kv_checksum = f"L0_kv[{last_kv_pos}]=[{', '.join(f'{kv_slice[j].item():.4f}' for j in range(min(4, kv_slice.numel())))}]"
+						slot = slot_map.get(global_idx, -1)
+						# Check KV at 3 positions: pos=10 (early prompt), pos=prompt_len (first decode), pos=ctx-2 (last KV)
+						kv_samples = []
+						if k_cache_l0 is not None and pt is not None and slot >= 0:
+							for check_pos in [10, seq.prompt_length, seq.current_context_length - 2]:
+								pidx = check_pos // manager.config.page_size_tokens
+								poff = check_pos % manager.config.page_size_tokens
+								if pidx < pt.shape[1] and slot < pt.shape[0]:
+									phys = pt[slot, pidx].item()
+									if 0 <= phys < k_cache_l0.shape[1]:
+										kv_flat = k_cache_l0[phys, poff].flatten().float()
+										nz = (kv_flat.abs().sum().item() > 1e-6)
+										kv_samples.append(f"p{check_pos}={'OK' if nz else 'ZERO'}")
+									else:
+										kv_samples.append(f"p{check_pos}=BAD({phys})")
+								else:
+									kv_samples.append(f"p{check_pos}=OOB")
 						logging.warning(
 							f"[DIAG-134] KV_LOAD_VERIFY rank={self.rank} gidx={global_idx} "
 							f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
-							f"gpu_pages_loaded={gpu_pages} host_pages={seq.host_pages_allocated} "
-							f"{kv_checksum}"
+							f"prompt={seq.prompt_length} "
+							f"gpu_pages={gpu_pages} host_pages={seq.host_pages_allocated} "
+							f"kv=[{', '.join(kv_samples)}]"
 						)
+						diag_count += 1
 						break
 
 		# DEBUG: Verify KV content is different across sequences after host→GPU load
