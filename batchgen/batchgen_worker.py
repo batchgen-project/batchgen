@@ -5255,10 +5255,11 @@ class BatchGenWorker:
 		# (original prompt + previously decoded tokens) and pre-filled decoded_tokens.
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq.status != SequenceStatus.EVICTED:
-				continue
+			# FIX: Check evicted_token_ids instead of status.
+			# Status was already changed to IN_PREFILL at line 4891 before this runs,
+			# so checking status == EVICTED always fails. evicted_token_ids is the
+			# ground truth for whether a sequence needs re-entry reconstruction.
 			if seq.evicted_token_ids is None:
-				logging.error(f"Rank {self.rank}: EVICTED seq {uuid[:8]} has no evicted_token_ids!")
 				continue
 
 			evicted_ids = seq.evicted_token_ids  # 1D tensor
