@@ -11,105 +11,22 @@ Per-step forward: 2 kernel launches (GEMM + SiLU), zero Python loops or allocati
 """
 
 import logging
-from pathlib import Path
 
 import torch
 
-_module = None
+import batchgen_kernels.moe._C_marlin_grouped_gemm as _module
+
 _warned_m8 = False
 _warned_m16 = False
 
 
 def _load_module():
-    """Load Marlin grouped GEMM kernel (pre-compiled or JIT fallback)."""
-    global _module
-    if _module is not None:
-        return _module
-
-    # Try pre-compiled extension first
-    try:
-        import batchgen_kernels.moe._C_marlin_grouped_gemm as _module
-        logging.info("[Marlin] Loaded pre-compiled marlin_grouped_gemm")
-        return _module
-    except ImportError:
-        logging.warning("[Marlin] batchgen_kernels.moe._C_marlin_grouped_gemm not found, falling back to JIT compile")
-    cu_path = Path(__file__).parent / "marlin_grouped_gemm.cu"
-    cuda_src = cu_path.read_text()
-
-    launcher_code = r"""
-#include <torch/extension.h>
-
-void grouped_marlin_gemm(
-    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
-    torch::Tensor scales_ptrs,
-    torch::Tensor expert_starts, torch::Tensor expert_counts,
-    int num_experts, int prob_n, int prob_k,
-    torch::Tensor workspace, int num_matrices, int n_tiles);
-
-void grouped_marlin_gemm_m16(
-    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
-    torch::Tensor scales_ptrs,
-    torch::Tensor expert_starts, torch::Tensor expert_counts,
-    int num_experts, int prob_n, int prob_k,
-    torch::Tensor workspace, int num_matrices, int n_tiles,
-    int max_m_tiles);
-
-void grouped_marlin_gemm_m16_s1(
-    torch::Tensor A,
-    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
-    torch::Tensor C_ptrs,
-    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
-    torch::Tensor expert_starts, torch::Tensor expert_counts,
-    int num_experts, int prob_n, int prob_k,
-    torch::Tensor workspace, int n_tiles, int max_m_tiles);
-
-void silu_mul(torch::Tensor gate, torch::Tensor up, torch::Tensor out);
-
-void silu_mul_scatter(
-    torch::Tensor gate, torch::Tensor up, torch::Tensor out,
-    torch::Tensor expert_counts,
-    int num_experts, int compact_stride, int output_stride, int N);
-
-void silu_mul_dual_stride(
-    torch::Tensor gate_inplace, torch::Tensor up,
-    torch::Tensor expert_counts,
-    int num_experts, int gate_stride, int up_stride, int N);
-"""
-
-    from torch.utils.cpp_extension import load_inline
-
-    _module = load_inline(
-        name="marlin_grouped_gemm",
-        cpp_sources=[launcher_code],
-        cuda_sources=[cuda_src],
-        functions=[
-            "grouped_marlin_gemm",
-            "grouped_marlin_gemm_m16",
-            "grouped_marlin_gemm_m16_s1",
-            "silu_mul",
-            "silu_mul_scatter",
-            "silu_mul_dual_stride",
-        ],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++17",
-            "-arch=sm_90a",
-            "--use_fast_math",
-            "-lineinfo",
-            "-DUSE_BF16_COMPUTE",
-            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        ],
-        verbose=False,
-    )
+    """Return pre-compiled Marlin grouped GEMM kernel from batchgen_kernels."""
     return _module
 
 
 def is_marlin_available() -> bool:
-    try:
-        _load_module()
-        return True
-    except Exception:
-        return False
+    return _module is not None
 
 
 def marlin_grouped_stage1_3d_inplace(

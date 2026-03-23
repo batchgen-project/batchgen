@@ -100,50 +100,11 @@ def marlin_to_wgmma_cpu(
     return raw_packed, raw_scales
 
 
-_transform_module = None
+import batchgen_kernels.moe._C_marlin_transform as _transform_module
 
 
 def _load_transform_module():
-    """Load Marlin transform kernel (pre-compiled or JIT fallback)."""
-    global _transform_module
-    if _transform_module is not None:
-        return _transform_module
-
-    # Try pre-compiled extension first
-    try:
-        import batchgen_kernels.moe._C_marlin_transform as _transform_module
-        return _transform_module
-    except ImportError:
-        import logging
-        logging.warning("[Marlin] batchgen_kernels.moe._C_marlin_transform not found, falling back to JIT compile")
-    from pathlib import Path
-    cu_path = Path(__file__).parent / "marlin_transform_kernel.cu"
-    cuda_src = cu_path.read_text()
-
-    launcher_code = r"""
-#include <torch/extension.h>
-void marlin_to_wgmma_transform(
-    torch::Tensor marlin_qw, torch::Tensor raw_qw, torch::Tensor perm, int K, int N);
-void marlin_to_wgmma_scale_transform(
-    torch::Tensor marlin_s, torch::Tensor raw_s, torch::Tensor scale_perm, int K_groups, int N);
-void raw_to_marlin_transform(
-    torch::Tensor raw_qw, torch::Tensor marlin_qw, torch::Tensor perm, int K, int N);
-void raw_to_marlin_scale_transform(
-    torch::Tensor raw_s, torch::Tensor marlin_s, torch::Tensor scale_perm, int K_groups, int N);
-"""
-
-    from torch.utils.cpp_extension import load_inline
-    _transform_module = load_inline(
-        name="marlin_transform",
-        cpp_sources=[launcher_code],
-        cuda_sources=[cuda_src],
-        functions=[
-            "marlin_to_wgmma_transform", "marlin_to_wgmma_scale_transform",
-            "raw_to_marlin_transform", "raw_to_marlin_scale_transform",
-        ],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-arch=sm_90a", "--use_fast_math"],
-        verbose=False,
-    )
+    """Return pre-compiled Marlin transform kernel from batchgen_kernels."""
     return _transform_module
 
 
