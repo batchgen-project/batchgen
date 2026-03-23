@@ -108,72 +108,65 @@ def main():
         f"top_p=[{min(sampling_stats['top_ps']):.2f}, {max(sampling_stats['top_ps']):.2f}]"
     )
 
-    # Upload and create batch
-    from batchgen.batchgen_client import BatchGenClient
-    client = BatchGenClient(base_url=args.base_url)
-    file_id = client.upload_batch_file(path)
-    logger.info(f"Uploaded file: {file_id}")
+    # Submit batch via BatchGen HTTP client
+    import sys
+    sys.path.insert(0, _BATCHGEN_ROOT)
+    from batchgen.batchgen_client import BatchGenHttpClient
 
-    batch_id = client.create_batch(
-        file_id, args.timeout, args.max_decoding_length,
-        temperature=None, top_p=None, top_k=None,
+    client = BatchGenHttpClient(base_url=args.base_url)
+    batch = client.submit_batch(
+        input_file_path=path,
+        endpoint="/v1/chat/completions",
+        poll_interval=5.0,
+        timeout=args.timeout,
+        max_decoding_length=args.max_decoding_length,
+        temperature=None,  # Per-request temps already in JSONL body
     )
-    logger.info(f"Created batch: {batch_id}")
 
-    # Poll
-    start = time.time()
-    while True:
-        status = client.get_batch_status(batch_id)
-        if status["status"] in ("completed", "failed", "cancelled"):
-            break
-        elapsed = time.time() - start
-        if elapsed > args.timeout:
-            logger.error(f"Timeout after {elapsed:.0f}s")
-            break
-        logger.info(f"Batch {batch_id} status: {status['status']}, waiting...")
-        time.sleep(5)
+    output_file_id = batch.get("output_file_id")
+    if not output_file_id:
+        logger.error(f"Batch failed: {batch}")
+        return
 
-    logger.info(f"Batch completed: {status}")
+    content = client.download_file_content(output_file_id)
+    result_lines = content.decode("utf-8").strip().split("\n")
+    logger.info(f"Downloaded {len(result_lines)} results")
 
-    # Download results
-    if status.get("output_file_id"):
-        result_path = client.download_batch_results(status["output_file_id"])
-        logger.info(f"Results: {result_path}")
+    # Analyze
+    tokens = []
+    no_think = []
+    short_seqs = []
+    long_seqs = []
+    for line in result_lines:
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        ct = d["response"]["body"]["usage"]["completion_tokens"]
+        c = d["response"]["body"]["choices"][0]["message"]["content"]
+        cid = d["custom_id"]
+        tokens.append(ct)
+        if "</think>" not in c and ct < args.max_decoding_length:
+            no_think.append((cid, ct))
+        if ct < 200:
+            short_seqs.append((cid, ct, c[-60:].replace("\n", " ")))
+        if ct > 50000:
+            long_seqs.append((cid, ct, c[-60:].replace("\n", " ")))
 
-        # Analyze
-        tokens = []
-        no_think = []
-        short_seqs = []
-        long_seqs = []
-        with open(result_path) as f:
-            for line in f:
-                d = json.loads(line)
-                ct = d["response"]["body"]["usage"]["completion_tokens"]
-                c = d["response"]["body"]["choices"][0]["message"]["content"]
-                cid = d["custom_id"]
-                tokens.append(ct)
-                if "</think>" not in c and ct < args.max_decoding_length:
-                    no_think.append((cid, ct))
-                if ct < 200:
-                    short_seqs.append((cid, ct, c[-60:].replace("\n", " ")))
-                if ct > 50000:
-                    long_seqs.append((cid, ct, c[-60:].replace("\n", " ")))
-
-        tokens.sort()
-        n = len(tokens)
-        print(f"\n=== RESULTS ===")
-        print(f"Total: {n}, Mean: {sum(tokens)/n:.1f}, Median: {tokens[n//2]}")
-        print(f"Min: {tokens[0]}, Max: {tokens[-1]}")
-        print(f"P5: {tokens[int(n*0.05)]}, P95: {tokens[int(n*0.95)]}, P99: {tokens[int(n*0.99)]}")
-        print(f"Short (<200 tokens): {len(short_seqs)}")
-        for s in short_seqs:
-            print(f"  {s[0]}: {s[1]} tok — [{s[2]}]")
-        print(f"No </think> (non-maxlen): {len(no_think)}")
-        for t in no_think[:5]:
-            print(f"  {t[0]}: {t[1]} tok")
-        print(f"Very long (>50K tokens): {len(long_seqs)}")
-        for s in long_seqs[:5]:
-            print(f"  {s[0]}: {s[1]} tok — [{s[2]}]")
+    tokens.sort()
+    n = len(tokens)
+    print(f"\n=== RESULTS ===")
+    print(f"Total: {n}, Mean: {sum(tokens)/n:.1f}, Median: {tokens[n//2]}")
+    print(f"Min: {tokens[0]}, Max: {tokens[-1]}")
+    print(f"P5: {tokens[int(n*0.05)]}, P95: {tokens[int(n*0.95)]}, P99: {tokens[int(n*0.99)]}")
+    print(f"Short (<200 tokens): {len(short_seqs)}")
+    for s in short_seqs:
+        print(f"  {s[0]}: {s[1]} tok — [{s[2]}]")
+    print(f"No </think> (non-maxlen): {len(no_think)}")
+    for t in no_think[:5]:
+        print(f"  {t[0]}: {t[1]} tok")
+    print(f"Very long (>50K tokens): {len(long_seqs)}")
+    for s in long_seqs[:5]:
+        print(f"  {s[0]}: {s[1]} tok — [{s[2]}]")
 
 
 if __name__ == "__main__":
