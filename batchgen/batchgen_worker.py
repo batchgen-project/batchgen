@@ -5323,8 +5323,8 @@ class BatchGenWorker:
 					kv_token_budget=seq.kv_token_budget,
 				)
 
-			# Transition: EVICTED → IN_PREFILL
-			self.global_batch.update_status(uuid, SequenceStatus.IN_PREFILL)
+			# Status already set to IN_PREFILL at line 4891 (before _config_prefill_for_batch)
+			# Skip redundant transition that would fail with IN_PREFILL → IN_PREFILL
 
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
