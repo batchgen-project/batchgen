@@ -480,12 +480,13 @@ class KimiK25ParallelStrategyManager:
             layer.mlp.nonpersistent_expert_ids = list(range(routed_expert_gpu_end, routed_expert_host_end))
             layer.mlp.num_persistent_local_experts = self.num_local_expert_per_layer
 
-        logging.info(
-            f"Rank {self.rank}: K2.5 MoE expert split — "
-            f"persistent: {self.num_local_expert_per_layer}, "
-            f"non-persistent: {routed_expert_host_end - routed_expert_gpu_end}, "
-            f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
-        )
+        if self.rank == 0:
+            logging.info(
+                f"K2.5 MoE expert split — "
+                f"persistent: {self.num_local_expert_per_layer}, "
+                f"non-persistent: {routed_expert_host_end - routed_expert_gpu_end}, "
+                f"for layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1}"
+            )
 
         self.model.eval()
 
@@ -501,6 +502,10 @@ class KimiK25ParallelStrategyManager:
         # This avoids ~20 GiB CUDA allocator fragmentation from small scale tensors.
         self._move_int4_to_gpu_contiguous()
         _log_hbm("_move_int4_to_gpu_contiguous")
+
+        # Marlin decode is default for K2.5
+        self._register_marlin_weights()
+        _log_hbm("_register_marlin_weights")
 
         # Initialize grouped WGMMA for persistent experts (after INT4 weights on GPU)
         for layer_idx in range(
@@ -529,6 +534,20 @@ class KimiK25ParallelStrategyManager:
             device=device,
         )
         _log_hbm("MoEBufferManager")
+
+        # Pre-allocate Marlin decode buffers (gate_buf + up_buf) BEFORE KV cache sizing.
+        # This ensures the memory planner accounts for them when sizing KV cache.
+        # Marlin decode is default for K2.5
+        mtp = KimiK25MoE._buf.max_tokens_padded
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            moe = self.model.model.layers[layer_idx].mlp
+            if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
+                moe._init_marlin_buffers(mtp)
+                break  # All layers share the same class-level _buf, init once
+        _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
 
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
@@ -768,12 +787,24 @@ class KimiK25ParallelStrategyManager:
                     attn_module, "decoding_attn",
                     types.MethodType(mla_decoding_flashmla, attn_module),
                 )
-                setattr(
-                    attn_module, "decoding_attn_mode_3_bf16",
-                    types.MethodType(
-                        mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, attn_module
-                    ),
-                )
+                # Use optimized decode path if enabled via env var
+                import os as _os
+                if _os.environ.get("BATCHGEN_OPTIMIZED_DECODE", "0") == "1":
+                    from batchgen.attention.mla.flashmla_backend import mla_decoding_optimized_with_pagekv
+                    setattr(
+                        attn_module, "decoding_attn_mode_3_bf16",
+                        types.MethodType(
+                            mla_decoding_optimized_with_pagekv, attn_module
+                        ),
+                    )
+                    logging.info("[K2.5] Using OPTIMIZED decode path (fused kernels)")
+                else:
+                    setattr(
+                        attn_module, "decoding_attn_mode_3_bf16",
+                        types.MethodType(
+                            mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, attn_module
+                        ),
+                    )
                 setattr(
                     attn_module, "decoding_attn_bf16",
                     types.MethodType(mla_decoding_flashmla, attn_module),
@@ -870,6 +901,7 @@ class KimiK25ParallelStrategyManager:
             expert.int4_down_packed = tensors["down_proj.weight_packed"]
             expert.int4_down_scale = tensors["down_proj.weight_scale"]
 
+
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
 
     def _move_int4_to_gpu_contiguous(self):
@@ -941,6 +973,73 @@ class KimiK25ParallelStrategyManager:
         self._int4_scale_gpu_buf = scale_gpu_buf
 
         logging.debug(f"INT4 weights moved to GPU contiguously for {len(self.local_routed_experts)} experts")
+
+    def _register_marlin_weights(self):
+        """Register Marlin weights for 3-stage decode (gate+up+down).
+
+        If checkpoint was converted with --marlin, int4_*_packed already contains
+        Marlin layout → assign directly as marlin_*_qw (no repack needed).
+        If old checkpoint (raw INT4), repack at runtime via CPU.
+
+        Detection: Marlin layout is [K//16, N*2], raw is [N, K//8].
+        For gate/up: N=2048, K=7168. Marlin=[448, 4096], raw=[2048, 896].
+        """
+        # Marlin decode is default for K2.5
+        device = self.engine_config.Basic_Config.device_torch
+
+        count_marlin = 0
+        count_repack = 0
+        for routed_expert_idx in self.local_routed_experts:
+            layer_idx = int(routed_expert_idx.split("_")[2])
+            global_expert_idx = int(routed_expert_idx.split("_")[3])
+            expert = self.model.model.layers[layer_idx].mlp.experts[global_expert_idx]
+            module = expert.module if hasattr(expert, 'module') else expert
+
+            gate_packed = module.int4_gate_packed
+            # Detect format: Marlin [K//16, N*2] has shape[0] < shape[1] for K>N
+            # Raw [N, K//8] has shape[0] > shape[1] for N<K
+            # For gate/up: raw=[2048, 896], marlin=[448, 4096]
+            is_marlin = gate_packed.shape[0] < gate_packed.shape[1]
+
+            if is_marlin:
+                # Marlin checkpoint: int4_* attrs are already Marlin layout.
+                # Just assign as marlin_* for decode. No transform needed here.
+                # Prefill transform (Marlin→raw) happens on-the-fly in
+                # wrappers.py dequantize_weights() when WGMMA needs raw INT4.
+                for proj in ('gate', 'up', 'down'):
+                    setattr(module, f'marlin_{proj}_qw', getattr(module, f'int4_{proj}_packed'))
+                    setattr(module, f'marlin_{proj}_scale', getattr(module, f'int4_{proj}_scale'))
+                count_marlin += 1
+            else:
+                # Old checkpoint, runtime repack
+                from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
+                K = gate_packed.shape[1] * 8
+                N = gate_packed.shape[0]
+
+                for proj in ('gate', 'up'):
+                    packed = getattr(module, f'int4_{proj}_packed')
+                    scale = getattr(module, f'int4_{proj}_scale')
+                    marlin_qw, marlin_s = repack_int4_to_marlin_gs32(packed, scale, K, N)
+                    setattr(module, f'marlin_{proj}_qw', marlin_qw)
+                    setattr(module, f'marlin_{proj}_scale', marlin_s)
+
+                down_packed = module.int4_down_packed
+                down_scale = module.int4_down_scale
+                down_K_in = down_packed.shape[1] * 8
+                down_N_out = down_packed.shape[0]
+                marlin_dqw, marlin_ds = repack_int4_to_marlin_gs32(
+                    down_packed, down_scale, down_K_in, down_N_out)
+                module.marlin_down_qw = marlin_dqw
+                module.marlin_down_scale = marlin_ds
+                count_repack += 1
+
+        if self.rank == 0:
+            if count_marlin > 0:
+                logging.info(f"[MODEL] Marlin weights: {count_marlin} experts "
+                             f"(pre-converted, no clone, old buf freed)")
+            if count_repack > 0:
+                logging.info(f"[MODEL] Marlin weights: {count_repack} experts "
+                             f"(runtime repack from raw INT4)")
 
     def _load_model_skeleton(self):
         """Load skeleton weights (norms, embeddings, router) to model.

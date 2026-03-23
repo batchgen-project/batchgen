@@ -217,6 +217,7 @@ class KimiK25_Parameter_Server:
 
                 # --- Routed expert weights (INT4 compressed-tensors) ---
                 for expert_idx in range(self.num_experts):
+                    # INT4 raw weights (always present)
                     for name in _INT4_EXPERT_TENSOR_NAMES:
                         tensor_full_name = (
                             f"language_model.model.layers.{layer_idx}.mlp.experts."

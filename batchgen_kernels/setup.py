@@ -92,6 +92,30 @@ setup(
             sources=["src/moe/fused_int4_wgmma_grouped.cu"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
         ),
+        # Marlin W4A16 grouped GEMM (gate+up+SiLU fused + down)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_marlin_grouped_gemm",
+            sources=["src/moe/marlin_grouped_gemm.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "--use_fast_math", "-lineinfo",
+                         "-DUSE_BF16_COMPUTE",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # Marlin <-> WGMMA weight transform
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_marlin_transform",
+            sources=["src/moe/marlin_transform_kernel.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "--use_fast_math",
+                         "--threads", _nvcc_threads],
+            },
+        ),
         # QKV WGMMA fused projection
         CUDAExtension(
             name="batchgen_kernels.attention._C_qkv_wgmma",

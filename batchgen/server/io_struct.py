@@ -29,7 +29,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(
         ..., description="Conversation messages"
     )
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
@@ -72,7 +72,7 @@ class CompletionRequest(BaseModel):
     )
     max_tokens: Optional[int] = Field(default=None, ge=1)
     max_completion_tokens: Optional[int] = Field(default=None, ge=1)
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)

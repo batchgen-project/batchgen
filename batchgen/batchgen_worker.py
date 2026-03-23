@@ -84,6 +84,9 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
+# Force synchronous KV offload (disable deferred flush) for debugging
+BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
+
 # Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
 # Default: enabled (recommended always on). Use --no-prepack to disable.
 BATCHGEN_ENABLE_PREPACK = os.environ.get("BATCHGEN_ENABLE_PREPACK", "1") == "1"
@@ -144,7 +147,11 @@ class QueryBookBufferPool:
 
 	def allocate_slot(self) -> int:
 		if self._free_slots:
-			return self._free_slots.pop()
+			slot = self._free_slots.pop()
+			# Clear stale data from previous occupant to prevent EOS/token contamination
+			self.decoded_tokens_buffer[slot, :] = self.pad_token_id
+			self.input_ids_buffer[slot, :] = 0
+			return slot
 		slot = self._next_slot
 		if slot >= self.num_sequences:
 			raise RuntimeError(f"QueryBookBufferPool exhausted: {self.num_sequences} slots used")
@@ -286,7 +293,7 @@ class BatchGenWorkerArgs:
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
-	disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
+	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
 	# Dynamic host KV reservation
@@ -1147,6 +1154,60 @@ class BatchGenWorker:
 				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
 				manager.rebuild_page_table(remaining_global)
 
+	def _flush_deferred_kv_to_host(self) -> None:
+		"""Flush all deferred KV host offload entries accumulated during forward.
+
+		ONE event.synchronize() covers all layers, then batch-launch D2H copies.
+		This replaces N per-layer syncs with a single post-forward sync.
+		"""
+		entries = getattr(self, '_deferred_kv_entries', [])
+		if not entries:
+			return
+
+		worker_view = getattr(self, '_deferred_kv_worker_view', None)
+		batch_info = getattr(self, '_deferred_kv_batch', None)
+		if worker_view is None or batch_info is None:
+			self._deferred_kv_entries = []
+			return
+
+		sequence_ids, sequence_lengths = batch_info
+
+		# ONE sync for ALL layers — the key optimization
+		if not hasattr(self, '_kv_offload_event'):
+			self._kv_offload_event = torch.cuda.Event()
+		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
+		self._kv_offload_event.synchronize()
+
+		# Fire all D2H copies
+		if not hasattr(self, '_pending_kv_append_tensors'):
+			self._pending_kv_append_tensors = []
+
+		for layer_idx, k_tensor, v_tensor in entries:
+			if k_tensor.dim() == 3:
+				k_tensor = k_tensor.unsqueeze(2)
+			if v_tensor is not None and v_tensor.dim() == 3:
+				v_tensor = v_tensor.unsqueeze(2)
+
+			task = worker_view.async_append_decode_kv_to_host(
+				layer_idx=layer_idx,
+				sequence_ids=sequence_ids,
+				k_tensor=k_tensor,
+				v_tensor=v_tensor,
+				sequence_lengths=sequence_lengths,
+			)
+
+			self._pending_kv_append_tensors.append(k_tensor)
+			if v_tensor is not None:
+				self._pending_kv_append_tensors.append(v_tensor)
+			if task is not None:
+				self._pending_kv_append_tasks.append(task)
+
+		# Throttle: prevent thread exhaustion from std::async
+		if len(self._pending_kv_append_tasks) >= 256:
+			self._wait_pending_kv_append_tasks()
+
+		self._deferred_kv_entries = []
+
 	def _append_decode_kv_to_host_async(
 		self,
 		layer_idx: int,
@@ -1607,20 +1668,6 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
 
-		# DEBUG: Check what's being passed to the host→GPU load
-		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
-			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
-			print(f"[HOST->GPU DEBUG] global_sequence_ids = {global_sequence_ids[:10]}... (total={len(global_sequence_ids)})")
-			print(f"[HOST->GPU DEBUG] sequence_tensor = {sequence_tensor[:10].tolist()}...")
-			print(f"[HOST->GPU DEBUG] active_sequence_page_counts = {active_sequence_page_counts[:10].tolist()}...")
-			print(f"[HOST->GPU DEBUG] k_ptrs.shape = {k_ptrs.shape}")
-			# Check if global_sequence_ids are all the same (BUG)
-			unique_ids = set(global_sequence_ids)
-			if len(unique_ids) < len(global_sequence_ids):
-				print(f"[HOST->GPU DEBUG] *** WARNING: DUPLICATE sequence IDs! Unique: {len(unique_ids)}, Total: {len(global_sequence_ids)} ***")
-			else:
-				print(f"[HOST->GPU DEBUG] OK: All {len(global_sequence_ids)} sequence IDs are unique")
-
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
@@ -1644,54 +1691,7 @@ class BatchGenWorker:
 			self.rank, len(global_sequence_ids), load_duration,
 		)
 
-		# DEBUG: Verify KV content is different across sequences after host→GPU load
-		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
-			k_cache, v_cache = manager.get_kv_tensors()
-			# k_cache shape: [num_layers, num_pages, page_size, num_kv_heads, head_dim]
-			print(f"\n[KV LOAD DEBUG] === After Host→GPU Load ===")
-			print(f"[KV LOAD DEBUG] Loaded {len(global_sequence_ids)} sequences: {global_sequence_ids[:5]}...")
-			print(f"[KV LOAD DEBUG] k_cache.shape={k_cache.shape}")
-
-			# Get page table to find physical pages for each sequence
-			page_table = manager._gpu_page_table_manager.gpu_table
-			print(f"[KV LOAD DEBUG] page_table.shape={page_table.shape}")
-
-			# Compare KV content at position 0 (first token) for first 3 sequences
-			# Layer 0, position 0 should contain different values if prefill worked correctly
-			num_to_check = min(3, len(global_sequence_ids))
-			kv_samples = []
-			for i in range(num_to_check):
-				# Get the GPU page for this sequence's position 0
-				slot_idx = i  # slot_indices are 0, 1, 2, ...
-				page_idx = 0  # position 0
-				gpu_page = int(page_table[slot_idx, page_idx].item())
-				offset = 0  # position 0 within page
-
-				# Read K at layer 0, this page, position 0, head 0, first 4 dims
-				k_sample = k_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
-				v_sample = None
-				if v_cache is not None:
-					v_sample = v_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
-
-				kv_samples.append({
-					'seq': i,
-					'global_idx': global_sequence_ids[i],
-					'slot': slot_idx,
-					'gpu_page': gpu_page,
-					'k_sample': k_sample,
-					'v_sample': v_sample,
-				})
-				print(f"[KV LOAD DEBUG] seq{i} (global={global_sequence_ids[i]}): slot={slot_idx}, gpu_page={gpu_page}, K[0,:4]={k_sample}")
-
-			# Check if all K samples are identical (BAD)
-			all_k_same = all(s['k_sample'] == kv_samples[0]['k_sample'] for s in kv_samples)
-			if all_k_same:
-				print(f"[KV LOAD DEBUG] *** WARNING: ALL {num_to_check} SEQUENCES HAVE IDENTICAL K VALUES! ***")
-				print(f"[KV LOAD DEBUG] This indicates prefill wrote identical KV or host→GPU load is corrupted!")
-			else:
-				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
-
-	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:	
+	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not local_sequence_ids:
@@ -3024,7 +3024,7 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				# CRITICAL: Ensure current_context_length is consistent before sending
 				# The invariant is: current_context_length = prompt_length + decoded_length
-				expected_ctx = seq.prompt_length + seq.decoded_length
+				expected_ctx = seq.original_prompt_length + seq.decoded_length
 				if seq.current_context_length != expected_ctx:
 					logging.warning(
 						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
@@ -3065,7 +3065,7 @@ class BatchGenWorker:
 								seq.host_token_capacity = state['host_token_capacity']
 							
 							# VALIDATION: Ensure received ctx_len is consistent
-							expected_ctx = seq.prompt_length + seq.decoded_length
+							expected_ctx = seq.original_prompt_length + seq.decoded_length
 							if seq.current_context_length != expected_ctx:
 								logging.error(
 									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
@@ -3396,6 +3396,7 @@ class BatchGenWorker:
 			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
+			seq.original_prompt_length = actual_prompt_len  # Must match prompt_length at tokenization time
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
@@ -3655,7 +3656,16 @@ class BatchGenWorker:
 						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
 			if global_seq_ids:
-				self.gpu_paged_kv_cache_manager.free_pages_for_sequences(global_seq_ids)
+				# Filter to only sequences the GPU manager actually tracks
+				mgr = self.gpu_paged_kv_cache_manager
+				known_ids = [gid for gid in global_seq_ids if gid in mgr._sequences]
+				if known_ids:
+					mgr.free_pages_for_sequences(known_ids)
+				if len(known_ids) < len(global_seq_ids):
+					unknown = len(global_seq_ids) - len(known_ids)
+					logging.debug(
+						f"Rank {self.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
+					)
 				# Also remove from tracking set
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
@@ -4149,7 +4159,7 @@ class BatchGenWorker:
 				if seq is not None and local_idx in self.query_book:
 					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens.clone(), finish_reason)
+						(seq.global_idx, self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length].clone(), finish_reason)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -4670,6 +4680,19 @@ class BatchGenWorker:
 					break
 				
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+
+				# ============ CRITICAL: Sync metadata before decode config ============
+				# After decode→prefill→decode transitions, sequence metadata
+				# (decoded_length, current_context_length, host_pages_allocated) may be
+				# stale on non-owning ranks. The last sync was at the previous decode
+				# group's final boundary. Sequences decoded additional tokens after that
+				# boundary without cross-rank sync. Without this sync,
+				# _allocate_gpu_kv_two_page_buffer may allocate too few GPU pages
+				# (capped by stale host_pages_allocated), causing KV corruption at the
+				# DECISION_INTERVAL boundary (~134-token truncation bug).
+				if decode_uuids:
+					self._sync_sequence_metadata(decode_uuids)
+
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 
 				# B. Config Decode
@@ -4710,7 +4733,21 @@ class BatchGenWorker:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
 						logging.info(f"[DECODE] Breaking for prefill - {num_queued} queued, {num_evicted} evicted")
-					break  # Exit inner decode while loop, outer loop will check has_queueing()/has_evicted()
+					# CRITICAL: Transition IN_DECODE → ON_HOLD before prefill.
+					# Without this, _destroy_gpu_paged_kv_cache in prefill phase destroys
+					# GPU KV under IN_DECODE sequences. The subsequent reload through
+					# _allocate_gpu_kv_two_page_buffer has subtle bugs that corrupt KV
+					# for some sequences (~134-token truncation). The ON_HOLD path
+					# properly syncs metadata, frees GPU pages, and ensures sequences
+					# resume through the standard ON_HOLD→IN_DECODE load path.
+					# Filter to IN_DECODE only (decode_uuids may contain EVICTED/COMPLETED)
+					in_decode_uuids = [
+						u for u in decode_uuids
+						if self.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
+					]
+					if in_decode_uuids:
+						self._put_sequences_on_hold(in_decode_uuids)
+					break
 		
 		# Log timing stats
 		generation_time = time.perf_counter() - generation_start_time
@@ -4767,7 +4804,7 @@ class BatchGenWorker:
 			if local_idx not in self.query_book:
 				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
 				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens
+			decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
 			decoded_str = self._decode_tokens_to_string(decoded_tokens)
 			local_results.append((global_idx, decoded_str))
 
@@ -4906,10 +4943,11 @@ class BatchGenWorker:
 		# (original prompt + previously decoded tokens) and pre-filled decoded_tokens.
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq.status != SequenceStatus.EVICTED:
-				continue
+			# FIX: Check evicted_token_ids instead of status.
+			# Status was already changed to IN_PREFILL at line 4891 before this runs,
+			# so checking status == EVICTED always fails. evicted_token_ids is the
+			# ground truth for whether a sequence needs re-entry reconstruction.
 			if seq.evicted_token_ids is None:
-				logging.error(f"Rank {self.rank}: EVICTED seq {uuid[:8]} has no evicted_token_ids!")
 				continue
 
 			evicted_ids = seq.evicted_token_ids  # 1D tensor
@@ -4961,8 +4999,8 @@ class BatchGenWorker:
 					kv_token_budget=seq.kv_token_budget,
 				)
 
-			# Transition: EVICTED → IN_PREFILL
-			self.global_batch.update_status(uuid, SequenceStatus.IN_PREFILL)
+			# Status already set to IN_PREFILL at line 4891 (before _config_prefill_for_batch)
+			# Skip redundant transition that would fail with IN_PREFILL → IN_PREFILL
 
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
@@ -5135,7 +5173,7 @@ class BatchGenWorker:
 		3. GPU KV page allocation
 		"""
 		start_time = time.perf_counter()
-		
+
 		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
 		# This must happen BEFORE any validation or diagnostics that read current_context_length.
 		# The root cause of ctx_len=0 bug is that current_context_length can become stale during
@@ -5151,7 +5189,7 @@ class BatchGenWorker:
 			# Compute the correct context length
 			# For sequences with decoded tokens: ctx_len = prompt_length + decoded_length
 			# For freshly prefilled sequences: ctx_len should equal prompt_length (decoded_length=0)
-			expected_ctx = seq.prompt_length + seq.decoded_length
+			expected_ctx = seq.original_prompt_length + seq.decoded_length
 			
 			# Repair if mismatched
 			if seq.current_context_length != expected_ctx:
@@ -5519,7 +5557,7 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + seq.decoded_length
+			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -5788,7 +5826,7 @@ class BatchGenWorker:
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.prompt_length + seq.decoded_length
+			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 			# Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -6109,12 +6147,13 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
+				is_completed = self._is_sequence_completed(seq)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
-					'completed': self._is_sequence_completed(seq),
+					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
 					# Host KV growth fields
@@ -6621,7 +6660,7 @@ class BatchGenWorker:
 			)
 		
 		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
-		
+
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -6629,7 +6668,15 @@ class BatchGenWorker:
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
-		
+			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
+			if local_idx in self.query_book:
+				self.query_book[local_idx] = query(
+					text=seq.text,
+					encoded={"input_ids": seq.input_ids},
+					decoded_tokens=seq.decoded_tokens,
+					kv_token_budget=seq.kv_token_budget,
+				)
+
 		updated_uuids = current_decode_uuids + valid_pending_uuids
 		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
 		
@@ -6657,7 +6704,7 @@ class BatchGenWorker:
 			return
 
 		# Model guard: only capture for supported models
-		SUPPORTED_MODELS = {"gpt-oss-120b"}
+		SUPPORTED_MODELS = {"gpt-oss-120b", "kimi-k2.5", "kimi_k2.5", "kimi-k25", "kimi_k25"}
 		model_name = getattr(self, 'model_name', '') or ''
 		if not any(s in model_name.lower() for s in SUPPORTED_MODELS):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -6742,6 +6789,9 @@ class BatchGenWorker:
 		)
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
+		# Detect K2.5 model for specialized graph segment
+		_is_k25 = any(s in (self.model_name or '').lower() for s in ('kimi-k2.5', 'kimi_k2.5', 'kimi-k25', 'kimi_k25'))
+
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
 		# Generate exactly num_buckets geometrically-spaced bucket sizes.
@@ -6757,106 +6807,137 @@ class BatchGenWorker:
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 
-		# Pre-warm: initialize sinks and RoPE cache before capture
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			wrapper = decoder_layer.self_attn
-			# Initialize sinks for persistent mode
-			if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
-				wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
-			elif wrapper.sinks is not None:
-				wrapper.sinks = wrapper.sinks.to(self.torch_device)
-			# Pre-warm RoPE cos/sin cache to max position embeddings
-			dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
-			wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
-
-		# Register full attention segments
-		# Use max possible pages based on max sequence length, not current state.
-		# The page_table static buffer column width is baked into the graph —
-		# if sequences grow beyond this during decode, FlashAttention reads
-		# past the buffer causing illegal memory access.
-		page_size_tokens = gpu_manager.config.page_size_tokens
-		max_seq_len = self.model.config.max_position_embeddings
-		max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			attn_wrapper = decoder_layer.self_attn
-			seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
-								  max_pages, page_size_tokens)
-			manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
-
-		# Register MoE segments with shared buffer pool (EP mode)
+		# GPT-OSS-specific pre-warm and per-layer segment registration
+		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
 		has_moe_graph = False
 		moe_pool = None
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			moe_decode = decoder_layer.mlp
-			if (hasattr(moe_decode, 'persistent_expert_indices')
-					and len(moe_decode.persistent_expert_indices) > 0
-					and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-				# Create shared pool once from first MoE layer's params
-				if moe_pool is None:
-					moe_pool = SharedMoEBufferPool(
-						world_size=self.world_size,
-						hidden_size=moe_decode.hidden_size,
-						total_experts=moe_decode.total_experts,
-						num_experts_per_tok=moe_decode.num_experts_per_tok,
-						num_local_experts=len(moe_decode.persistent_expert_indices),
-						N_intermediate=moe_decode.gate_weight_ref.shape[0],
-						device=self.torch_device,
-					)
-					moe_pool.setup(bucketing.bucket_sizes)
-				moe_seg = MoESegment(
-					moe_decode, moe_pool, moe_decode.comm,
-					self.world_size, self.rank, self.torch_device,
-				)
-				decoder_layer._moe_segment = moe_seg
-				decoder_layer._moe_bucketing = bucketing
-				# Register compute segment for graph capture.
-				# All_gather is graph-captured; all_reduce remains eager.
-				if not os.environ.get("BATCHGEN_MOE_EAGER"):
-					moe_compute_seg = MoEComputeSegment(
+		if not _is_k25:
+			# Pre-warm: initialize sinks and RoPE cache before capture
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				wrapper = decoder_layer.self_attn
+				# Initialize sinks for persistent mode
+				if wrapper.sinks is None and wrapper.persistent and hasattr(wrapper.module, 'sinks'):
+					wrapper.sinks = wrapper.module.sinks.data.to(self.torch_device)
+				elif wrapper.sinks is not None:
+					wrapper.sinks = wrapper.sinks.to(self.torch_device)
+				# Pre-warm RoPE cos/sin cache to max position embeddings
+				dummy = torch.zeros(1, 1, wrapper.num_kv_heads, wrapper.head_dim, device=self.torch_device)
+				wrapper.module.rotary_emb(dummy, seq_len=max_rope_len)
+
+			# Register full attention segments
+			# Use max possible pages based on max sequence length, not current state.
+			# The page_table static buffer column width is baked into the graph —
+			# if sequences grow beyond this during decode, FlashAttention reads
+			# past the buffer causing illegal memory access.
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_seq_len = self.model.config.max_position_embeddings
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				attn_wrapper = decoder_layer.self_attn
+				seg = FullAttnSegment(decoder_layer, attn_wrapper, layer_idx, max_rope_len,
+									  max_pages, page_size_tokens)
+				manager.register_segment(f"layer_{layer_idx}_full_attn", seg)
+
+			# Register MoE segments with shared buffer pool (EP mode)
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				moe_decode = decoder_layer.mlp
+				if (hasattr(moe_decode, 'persistent_expert_indices')
+						and len(moe_decode.persistent_expert_indices) > 0
+						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+					# Create shared pool once from first MoE layer's params
+					if moe_pool is None:
+						moe_pool = SharedMoEBufferPool(
+							world_size=self.world_size,
+							hidden_size=moe_decode.hidden_size,
+							total_experts=moe_decode.total_experts,
+							num_experts_per_tok=moe_decode.num_experts_per_tok,
+							num_local_experts=len(moe_decode.persistent_expert_indices),
+							N_intermediate=moe_decode.gate_weight_ref.shape[0],
+							device=self.torch_device,
+						)
+						moe_pool.setup(bucketing.bucket_sizes)
+					moe_seg = MoESegment(
 						moe_decode, moe_pool, moe_decode.comm,
 						self.world_size, self.rank, self.torch_device,
 					)
-					manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
-					has_moe_graph = True
+					decoder_layer._moe_segment = moe_seg
+					decoder_layer._moe_bucketing = bucketing
+					# Register compute segment for graph capture.
+					# All_gather is graph-captured; all_reduce remains eager.
+					if not os.environ.get("BATCHGEN_MOE_EAGER"):
+						moe_compute_seg = MoEComputeSegment(
+							moe_decode, moe_pool, moe_decode.comm,
+							self.world_size, self.rank, self.torch_device,
+						)
+						manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
+						has_moe_graph = True
+		else:
+			# K2.5: Pre-warm RoPE cache (shared instance)
+			rotary_emb = self.model.model._shared_rotary_emb
+			dummy = torch.zeros(1, 1, 1, rotary_emb.dim, device=self.torch_device)
+			rotary_emb(dummy, seq_len=max_rope_len)
+			# Compute max_pages for K2.5
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_seq_len = self.model.config.max_position_embeddings
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
-		# Whole-model graph is the default. Set BATCHGEN_SEGMENTED_GRAPH=1 to use per-layer graphs instead.
-		use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
+		# Whole-model graph is the default for GPT-OSS.
+		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
+		# serializes the shared expert, losing async overlap (~18ms/step regression).
+		if _is_k25:
+			use_whole_model = False
+		else:
+			use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
 
 		if use_whole_model:
 			# Whole-model mode: single graph for entire decode pass.
 			# Discard per-layer segments, register one WholeModelSegment instead.
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 
-			# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
-			# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
-			# inside the graph — required for single-graph whole-model capture.
-			moe_segments = {}
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				moe_decode = decoder_layer.mlp
-				if (hasattr(moe_decode, 'persistent_expert_indices')
-						and len(moe_decode.persistent_expert_indices) > 0
-						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
-					moe_segments[layer_idx] = MoESegment(
-						moe_decode, moe_pool, moe_decode.comm,
-						self.world_size, self.rank, self.torch_device,
-					)
-
-			vocab_size = self.model.vocab_size
+			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
 
-			whole_seg = WholeModelSegment(
-				model=self.model,
-				moe_pool=moe_pool,
-				moe_segments=moe_segments,
-				device=self.torch_device,
-				max_pages_per_seq=max_pages,
-				vocab_size=vocab_size,
-				hidden_size=hidden_size,
-				max_bucket_size=bucketing._max_bucket,
-			)
+			if _is_k25:
+				# K2.5 uses MLA attention + 3D strided MoE — different segment class
+				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25WholeModelSegment
+				whole_seg = K25WholeModelSegment(
+					model=self.model,
+					device=self.torch_device,
+					max_pages_per_seq=max_pages,
+					vocab_size=vocab_size,
+					hidden_size=hidden_size,
+					max_bucket_size=bucketing._max_bucket,
+				)
+			else:
+				# GPT-OSS: GQA attention + SharedMoEBufferPool
+				# Build MoE segments dict (layer_idx → MoESegment) for WholeModelSegment.
+				# Use MoESegment (not MoEComputeSegment) because it includes all_reduce
+				# inside the graph — required for single-graph whole-model capture.
+				moe_segments = {}
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe_decode = decoder_layer.mlp
+					if (hasattr(moe_decode, 'persistent_expert_indices')
+							and len(moe_decode.persistent_expert_indices) > 0
+							and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+						moe_segments[layer_idx] = MoESegment(
+							moe_decode, moe_pool, moe_decode.comm,
+							self.world_size, self.rank, self.torch_device,
+						)
+
+				whole_seg = WholeModelSegment(
+					model=self.model,
+					moe_pool=moe_pool,
+					moe_segments=moe_segments,
+					device=self.torch_device,
+					max_pages_per_seq=max_pages,
+					vocab_size=vocab_size,
+					hidden_size=hidden_size,
+					max_bucket_size=bucketing._max_bucket,
+				)
+
 			manager.register_segment("whole_model", whole_seg)
 
 			if self.rank == 0:
@@ -6885,32 +6966,66 @@ class BatchGenWorker:
 					f"CUDA graphs ready (whole-model): {stats['total_capture_time_ms']:.0f}ms"
 				)
 		else:
-			# Per-layer mode (existing behavior)
+			# Per-layer mode: capture attention graph per layer, MoE stays eager.
 			self._whole_model_graph = False
 
-			if self.rank == 0:
-				num_segs = "attn+moe" if has_moe_graph else "attn"
-				logging.info(
-					f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
-					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
-				)
+			if _is_k25:
+				# K2.5: Register K25AttnSegment per layer (MLA attention only, no MoE graph).
+				# MoE stays eager to preserve async shared expert overlap.
+				# Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
+				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25AttnSegment
 
-			# Sync all ranks before warmup — MoE segments use NCCL collectives
-			# which require all ranks to participate simultaneously.
-			if has_moe_graph:
-				torch.cuda.synchronize(self.torch_device)
-				dist.barrier()
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					attn_wrapper = decoder_layer.self_attn
+					seg = K25AttnSegment(
+						decoder_layer, attn_wrapper, layer_idx,
+						max_seq_len=max_rope_len,
+						max_pages_per_seq=max_pages,
+						page_size_tokens=page_size_tokens,
+					)
+					seg_name = f"layer_{layer_idx}_attn"
+					manager.register_segment(seg_name, seg)
 
-			manager.warmup_and_capture_all()
+				if self.rank == 0:
+					logging.info(
+						f"CUDA graph capture (K2.5 MLA): {len(self.model.model.layers)} layers (attn only) × "
+						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+					)
 
-			# Enable graph mode on each decoder layer
-			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
-				decoder_layer.enable_cuda_graph(
-					manager,
-					full_attn_name=f"layer_{layer_idx}_full_attn",
-					moe_name=moe_name,
-				)
+				manager.warmup_and_capture_all()
+
+				# Enable graph mode on each decoder layer
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					decoder_layer.enable_cuda_graph(
+						manager,
+						attn_name=f"layer_{layer_idx}_attn",
+						max_pages_per_seq=max_pages,
+					)
+			else:
+				# GPT-OSS: per-layer mode (existing behavior)
+				if self.rank == 0:
+					num_segs = "attn+moe" if has_moe_graph else "attn"
+					logging.info(
+						f"CUDA graph capture: {len(self.model.model.layers)} layers ({num_segs}) × "
+						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+					)
+
+				# Sync all ranks before warmup — MoE segments use NCCL collectives
+				# which require all ranks to participate simultaneously.
+				if has_moe_graph:
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
+
+				manager.warmup_and_capture_all()
+
+				# Enable graph mode on each decoder layer
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe_name = f"layer_{layer_idx}_moe" if has_moe_graph else None
+					decoder_layer.enable_cuda_graph(
+						manager,
+						full_attn_name=f"layer_{layer_idx}_full_attn",
+						moe_name=moe_name,
+					)
 
 			self._cuda_graph_manager = manager
 			if self.rank == 0:
@@ -7039,7 +7154,7 @@ class BatchGenWorker:
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
-		
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -7203,7 +7318,7 @@ class BatchGenWorker:
 					for seq in batch_sequences:
 						ctx_len = seq.current_context_length
 						if ctx_len == 0:  # Rare edge case - trust prompt_length + decoded_length
-							ctx_len = seq.prompt_length + seq.decoded_length
+							ctx_len = seq.original_prompt_length + seq.decoded_length
 							if ctx_len > 0:
 								seq.current_context_length = ctx_len
 						cache_seqlens.append(ctx_len)
@@ -7222,13 +7337,6 @@ class BatchGenWorker:
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
-
-					# DEBUG: Print cache_seqlens and input tokens
-					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
-						print(f"\n[DECODE DEBUG] Iteration {local_iteration}")
-						print(f"[DECODE DEBUG] cache_seqlens[:5]: {Attn_Wrapper.cache_seqlens[:5].tolist()}")
-						print(f"[DECODE DEBUG] position_ids[:5]: {Attn_Wrapper.position_ids[:5].flatten().tolist()}")
-						print(f"[DECODE DEBUG] new_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -7268,22 +7376,62 @@ class BatchGenWorker:
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
 
-				# Per-iteration MoE buffer sync: track actual batch size for tight NCCL buffers.
-				# Without this, num_tokens_per_rank stays stale from page boundary, causing
-				# oversized buckets and redundant GEMM compute on padded tokens.
-				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-				dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
-				_max_bs = max(_local_bs.item(), 1)
-				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-						self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+				# MoE buffer sync: only needed at decision boundaries (batch size changes).
+				# Between boundaries, batch size is constant — skip the all_reduce + .item()
+				# CPU-GPU sync that drains the GPU pipeline every step.
+				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
+				if getattr(self, '_whole_model_graph', False):
+					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
+					_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
+					dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
+					_max_bs = max(_local_bs.item(), 1)
+					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+				else:
+					# Per-layer graph or eager: no NCCL in graph, use local batch size
+					_max_bs = max(len(batch), 1)
 
-				# KV append callback
-				# NOTE: v_tensor is optional for backward compatibility with MLA models (DeepSeek)
-				# GPT-OSS uses GQA with separate K and V, so it passes both tensors
+				# KV append callback — deferred: accumulate during forward, single sync after
 				current_batch = list(batch)
-				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-					self._append_decode_kv_to_host_async(layer_idx, current_batch, k_tensor, v_tensor)
+				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+
+				if _kv_worker_view is not None:
+					_kv_seq_ids = []
+					_kv_seq_lengths = []
+					for local_idx in current_batch:
+						uuid = self._local_to_uuid_map[local_idx]
+						seq = self.global_batch.get_sequence(uuid)
+						_kv_seq_ids.append(seq.global_idx)
+						_kv_seq_lengths.append(seq.current_context_length - 1)
+					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
+					self._deferred_kv_entries = []
+					self._deferred_kv_worker_view = _kv_worker_view
+
+				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
+					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
+					_sync_kv_seq_ids = _kv_seq_ids
+					_sync_kv_seq_lengths = _kv_seq_lengths
+					_sync_kv_worker_view = _kv_worker_view
+					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						if k_tensor.dim() == 3:
+							k_tensor = k_tensor.unsqueeze(2)
+						if v_tensor is not None and v_tensor.dim() == 3:
+							v_tensor = v_tensor.unsqueeze(2)
+						torch.cuda.synchronize()
+						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+							layer_idx=layer_idx,
+							sequence_ids=_sync_kv_seq_ids,
+							k_tensor=k_tensor,
+							v_tensor=v_tensor,
+							sequence_lengths=_sync_kv_seq_lengths,
+						)
+						if task is not None:
+							task.wait()
+				else:
+					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
+
 				Attn_Wrapper.kv_append_callback = kv_append_callback
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 				AttnWrapperBase.kv_append_callback = kv_append_callback
@@ -7340,10 +7488,13 @@ class BatchGenWorker:
 					if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
 						for layer_idx in range(wm_seg.num_layers):
 							kv_buf = wm_seg._kv_buffers[layer_idx]
+							# K2.5 MLA has no separate V cache — pass None for v_tensor
+							v_buf = kv_buf.get("value")
+							v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
 							kv_cb(
 								layer_idx,
 								kv_buf["key"][:batch_size].clone(),
-								kv_buf["value"][:batch_size].clone(),
+								v_clone,
 							)
 				else:
 					# Per-layer graph or eager forward
@@ -7360,28 +7511,8 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# DEBUG: Print sampled tokens and logits comparison
-			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
-				print(f"\n[DECODE DEBUG] === Iteration {local_iteration} ===")
-				token_ids = new_tokens[:5].flatten().tolist()
-				print(f"[DECODE DEBUG] sampled_tokens[:5]: {token_ids}")
-				# Decode tokens to show actual text
-				try:
-					decoded_tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
-					print(f"[DECODE DEBUG] decoded_text[:5]: {decoded_tokens}")
-				except Exception as e:
-					print(f"[DECODE DEBUG] decode error: {e}")
-				# Check if all tokens are the same
-				if len(new_tokens) >= 2:
-					all_same = all(new_tokens[i].item() == new_tokens[0].item() for i in range(min(5, len(new_tokens))))
-					if all_same:
-						print(f"[DECODE DEBUG] *** WARNING: All sequences sampled SAME token! ***")
-				# Show logits for first 3 sequences
-				if os.environ.get("BATCHGEN_DEBUG_DECODE_LOGITS", "0") == "1":
-					logits = outputs.logits[:, -1, :]
-					for i in range(min(3, len(logits))):
-						top_vals, top_ids = torch.topk(logits[i], k=5)
-						print(f"[DECODE DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
+			# Flush deferred KV entries — single sync for all layers
+			self._flush_deferred_kv_to_host()
 
 			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
 			# This avoids N GPU synchronizations which cause heavy CPU overhead
@@ -7393,6 +7524,15 @@ class BatchGenWorker:
 					continue
 
 				decode_pos = seq.decoded_length
+				if BATCHGEN_CB_DEBUG:
+					qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
+					seq_ptr = seq.decoded_tokens.data_ptr()
+					if qb_ptr != seq_ptr:
+						logging.error(
+							f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
+							f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
+							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
 
 				seq.decoded_length += 1
@@ -7412,7 +7552,7 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
-		
+
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
 		Attn_Wrapper.past_key_states = None
@@ -8114,7 +8254,7 @@ class BatchGenWorker:
 				continue
 			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
-		
+
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
 		if result.shape[0] != len(batch):
