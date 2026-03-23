@@ -85,6 +85,11 @@ Output Format:
         action='store_true',
         help='Enable verbose debug logging'
     )
+    parser.add_argument(
+        '--no-marlin',
+        action='store_true',
+        help='Skip Marlin INT4 repack (default: Marlin repack enabled for K2.5 decode)'
+    )
 
     parsed_args = parser.parse_args(args)
 
@@ -135,7 +140,8 @@ Output Format:
             result_dir = converter.convert_model_directory(
                 input_dir=input_dir,
                 output_dir=output_dir,
-                force=parsed_args.force
+                force=parsed_args.force,
+                marlin=not parsed_args.no_marlin,
             )
 
             logging.info(f"Conversion completed successfully!")

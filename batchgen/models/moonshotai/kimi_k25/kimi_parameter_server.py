@@ -164,7 +164,8 @@ class KimiK25_Parameter_Server:
         # K2.5 uses HuggingFace safetensors format — no custom conversion needed
         if self.converted_ckpt_dir is None:
             converter = ckpt_converter()
-            self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+            self.converted_ckpt_dir = converter.convert_model_directory(
+                self.cache_dir, marlin=True)  # Marlin layout is default for K2.5 decode
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
