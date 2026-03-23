@@ -84,14 +84,8 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
-# Diagnostic logging for 134-token truncation investigation
-BATCHGEN_DIAG_134 = os.environ.get("BATCHGEN_DIAG_134", "0") == "1"
-
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
-
-# KV cache reload sanity check: compare fingerprints before destroy vs after reload
-BATCHGEN_KV_SANITY = os.environ.get("BATCHGEN_KV_SANITY", "0") == "1"
 
 # Prepack mode for efficient prefill batching (DEPRECATED: use --enable-prepack CLI arg)
 # Default: enabled (recommended always on). Use --no-prepack to disable.
@@ -1178,23 +1172,6 @@ class BatchGenWorker:
 
 		sequence_ids, sequence_lengths = batch_info
 
-		# DIAG-134: Log KV flush positions for sequences near DECISION_INTERVAL boundary
-		if BATCHGEN_DIAG_134 and entries:
-			# Only log layer 0 to avoid spam
-			for i, seq_id in enumerate(sequence_ids):
-				seq_len = sequence_lengths[i] if i < len(sequence_lengths) else -1
-				# Find this sequence to get decoded_length
-				for uuid, local_idx in self._uuid_to_local_map.items():
-					seq = self.global_batch.get_sequence(uuid)
-					if seq and seq.global_idx == seq_id and 120 <= seq.decoded_length <= 140:
-						logging.warning(
-							f"[DIAG-134] KV_FLUSH rank={self.rank} gidx={seq_id} "
-							f"append_pos={seq_len} decoded_len={seq.decoded_length} "
-							f"ctx={seq.current_context_length} prompt={seq.prompt_length} "
-							f"host_pages={seq.host_pages_allocated}"
-						)
-						break
-
 		# ONE sync for ALL layers — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
 			self._kv_offload_event = torch.cuda.Event()
@@ -1691,35 +1668,6 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
 
-		# KV SANITY: Log active_page_counts vs needed pages for resuming sequences
-		if BATCHGEN_KV_SANITY:
-			import math as _math
-			page_counts_list = active_sequence_page_counts.tolist()
-			undercopy_count = 0
-			for idx, global_idx in enumerate(global_sequence_ids):
-				for uuid, local_idx in self._uuid_to_local_map.items():
-					seq = self.global_batch.get_sequence(uuid)
-					if seq and seq.global_idx == global_idx and seq.decoded_length >= 120:
-						gpu_pages = page_counts_list[idx] if idx < len(page_counts_list) else -1
-						needed_pages = _math.ceil(seq.current_context_length / self.PAGE_SIZE)
-						is_under = gpu_pages < needed_pages
-						if is_under:
-							undercopy_count += 1
-						logging.warning(
-							f"[KV_SANITY] LOAD_DETAIL rank={self.rank} gidx={global_idx} "
-							f"gpu_pages={gpu_pages} needed={needed_pages} "
-							f"ctx={seq.current_context_length} decoded={seq.decoded_length} "
-							f"prompt={seq.original_prompt_length} "
-							f"host_pages={seq.host_pages_allocated} "
-							f"{'UNDERCOPY!' if is_under else 'OK'}"
-						)
-						break
-			if undercopy_count > 0:
-				logging.error(
-					f"[KV_SANITY] UNDERCOPY DETECTED on rank={self.rank}: "
-					f"{undercopy_count} sequences have gpu_pages < needed_pages!"
-				)
-
 		# DEBUG: Check what's being passed to the host→GPU load
 		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
 			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
@@ -1751,56 +1699,11 @@ class BatchGenWorker:
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
 
-		# KV sanity check: verify fingerprints AFTER host→GPU reload
-		if BATCHGEN_KV_SANITY:
-			self._verify_kv_fingerprints("POST_RELOAD", global_sequence_ids)
-
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
-
-		# DIAG-134: Verify GPU KV after host→GPU load for sequences near boundary
-		if BATCHGEN_DIAG_134:
-			page_counts_list = active_sequence_page_counts.tolist()
-			k_cache_l0 = manager._k_cache[0] if manager._k_cache is not None else None
-			pt = manager._gpu_page_table_manager.gpu_table if manager._gpu_page_table_manager else None
-			slot_map = manager._gpu_page_table_manager.seq_id_to_slot if manager._gpu_page_table_manager else {}
-			diag_count = 0
-			for idx, global_idx in enumerate(global_sequence_ids):
-				if diag_count >= 3:
-					break
-				for uuid, local_idx in self._uuid_to_local_map.items():
-					seq = self.global_batch.get_sequence(uuid)
-					if seq and seq.global_idx == global_idx and 120 <= seq.decoded_length <= 145:
-						gpu_pages = page_counts_list[idx] if idx < len(page_counts_list) else -1
-						slot = slot_map.get(global_idx, -1)
-						# Check KV at 3 positions: pos=10 (early prompt), pos=prompt_len (first decode), pos=ctx-2 (last KV)
-						kv_samples = []
-						if k_cache_l0 is not None and pt is not None and slot >= 0:
-							for check_pos in [10, seq.prompt_length, seq.current_context_length - 2]:
-								pidx = check_pos // manager.config.page_size_tokens
-								poff = check_pos % manager.config.page_size_tokens
-								if pidx < pt.shape[1] and slot < pt.shape[0]:
-									phys = pt[slot, pidx].item()
-									if 0 <= phys < k_cache_l0.shape[1]:
-										kv_flat = k_cache_l0[phys, poff].flatten().float()
-										nz = (kv_flat.abs().sum().item() > 1e-6)
-										kv_samples.append(f"p{check_pos}={'OK' if nz else 'ZERO'}")
-									else:
-										kv_samples.append(f"p{check_pos}=BAD({phys})")
-								else:
-									kv_samples.append(f"p{check_pos}=OOB")
-						logging.warning(
-							f"[DIAG-134] KV_LOAD_VERIFY rank={self.rank} gidx={global_idx} "
-							f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
-							f"prompt={seq.prompt_length} "
-							f"gpu_pages={gpu_pages} host_pages={seq.host_pages_allocated} "
-							f"kv=[{', '.join(kv_samples)}]"
-						)
-						diag_count += 1
-						break
 
 		# DEBUG: Verify KV content is different across sequences after host→GPU load
 		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
@@ -1848,146 +1751,6 @@ class BatchGenWorker:
 				print(f"[KV LOAD DEBUG] This indicates prefill wrote identical KV or host→GPU load is corrupted!")
 			else:
 				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
-
-	def _capture_kv_fingerprints(self, label: str) -> None:
-		"""Capture KV checksums at key positions for sequences near truncation range."""
-		manager = self.gpu_paged_kv_cache_manager
-		if not manager or not hasattr(manager, '_k_cache') or manager._k_cache is None:
-			return
-		pt_mgr = manager._gpu_page_table_manager
-		if not pt_mgr or pt_mgr.gpu_table is None:
-			return
-
-		k_cache_l0 = manager._k_cache[0]  # layer 0
-		pt = pt_mgr.gpu_table
-		slot_map = pt_mgr.seq_id_to_slot
-		page_size = self.PAGE_SIZE
-
-		self._kv_fingerprints = {}
-		# Use global_batch to find all sequences with GPU KV (not _sequences_with_gpu_kv
-		# which may already be cleared by ON_HOLD transitions)
-		source_uuids = list(self._sequences_with_gpu_kv) if self._sequences_with_gpu_kv else []
-		if not source_uuids:
-			# Fallback: find sequences that are IN_DECODE or ON_HOLD with decoded tokens
-			for seq in self.global_batch:
-				if seq.decoded_length > 0 and not seq.eos_reached and seq.uuid in self._uuid_to_local_map:
-					source_uuids.append(seq.uuid)
-		for uuid in source_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if not seq or seq.decoded_length == 0 or seq.eos_reached:
-				continue
-
-			gidx = seq.global_idx
-			slot = slot_map.get(gidx, -1)
-			if slot < 0:
-				continue
-
-			fingerprint = {}
-			positions = [0, seq.original_prompt_length, seq.original_prompt_length + 64, seq.current_context_length - 1]
-			for pos in positions:
-				if pos < 0 or pos >= seq.current_context_length:
-					continue
-				pidx = pos // page_size
-				poff = pos % page_size
-				if pidx < pt.shape[1] and slot < pt.shape[0]:
-					phys = pt[slot, pidx].item()
-					if 0 <= phys < k_cache_l0.shape[0]:
-						kv_vec = k_cache_l0[phys, poff].flatten().float()
-						fingerprint[pos] = kv_vec.abs().sum().item()
-
-			self._kv_fingerprints[gidx] = {
-				'decoded_length': seq.decoded_length,
-				'ctx': seq.current_context_length,
-				'prompt': seq.original_prompt_length,
-				'slot': slot,
-				'checksums': fingerprint,
-			}
-
-		logging.warning(
-			f"[KV_SANITY] {label} rank={self.rank}: Captured fingerprints for "
-			f"{len(self._kv_fingerprints)} sequences"
-		)
-
-	def _verify_kv_fingerprints(self, label: str, global_sequence_ids: List[int]) -> None:
-		"""Compare GPU KV directly against HOST KV after reload.
-
-		For each resuming sequence (decoded_length > 0), reads KV at 4 positions
-		from both GPU and host, compares checksums. Any mismatch = H2D corruption.
-		"""
-		manager = self.gpu_paged_kv_cache_manager
-		if not manager or not hasattr(manager, '_k_cache') or manager._k_cache is None:
-			return
-		pt_mgr = manager._gpu_page_table_manager
-		if not pt_mgr or pt_mgr.gpu_table is None:
-			return
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return
-
-		k_cache_l0 = manager._k_cache[0]  # GPU layer 0: [num_pages, page_size, ...]
-		pt = pt_mgr.gpu_table
-		slot_map = pt_mgr.seq_id_to_slot
-		page_size = self.PAGE_SIZE
-
-		matched = 0
-		mismatched = 0
-		checked = 0
-
-		for global_idx in global_sequence_ids:
-			# Find the sequence
-			seq = None
-			for uuid, local_idx in self._uuid_to_local_map.items():
-				s = self.global_batch.get_sequence(uuid)
-				if s and s.global_idx == global_idx and s.decoded_length > 0:
-					seq = s
-					break
-			if not seq:
-				continue
-
-			slot = slot_map.get(global_idx, -1)
-			if slot < 0:
-				continue
-
-			# Check 4 positions
-			positions = [0, seq.original_prompt_length, seq.original_prompt_length + 64,
-						 seq.current_context_length - 1]
-			mismatches = []
-			for pos in positions:
-				if pos < 0 or pos >= seq.current_context_length:
-					continue
-				pidx = pos // page_size
-				poff = pos % page_size
-				if pidx >= pt.shape[1] or slot >= pt.shape[0]:
-					continue
-				gpu_phys = pt[slot, pidx].item()
-				if gpu_phys < 0 or gpu_phys >= k_cache_l0.shape[0]:
-					continue
-
-				# GPU KV checksum
-				gpu_vec = k_cache_l0[gpu_phys, poff].flatten().float()
-				gpu_cksum = gpu_vec.abs().sum().item()
-				gpu_is_zero = gpu_cksum < 1e-6
-
-				if gpu_is_zero:
-					mismatches.append(f"pos={pos}: GPU_ZERO (page={gpu_phys})")
-
-			checked += 1
-			if mismatches:
-				logging.error(
-					f"[KV_SANITY] {label} rank={self.rank} gidx={global_idx} "
-					f"MISMATCH! decoded={seq.decoded_length} ctx={seq.current_context_length} "
-					f"prompt={seq.original_prompt_length} slot={slot} "
-					f"mismatches={mismatches}"
-				)
-				mismatched += 1
-			else:
-				matched += 1
-
-		if checked > 0:
-			logging.warning(
-				f"[KV_SANITY] {label} rank={self.rank}: "
-				f"{matched} OK, {mismatched} MISMATCH out of {checked} checked"
-			)
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
@@ -3356,13 +3119,6 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
-							# DIAG-134: Log received metadata for sequences near truncation boundary
-							if BATCHGEN_DIAG_134 and 120 <= state['decoded_length'] <= 145:
-								logging.warning(
-									f"[DIAG-134] SYNC_RECV rank={self.rank} gidx={seq.global_idx} "
-									f"recv_decoded={state['decoded_length']} recv_ctx={state['current_context_length']} "
-									f"recv_eos={state['eos_reached']}"
-								)
 							# Sync host KV fields for consistent migration planning
 							if 'host_pages_allocated' in state:
 								seq.host_pages_allocated = state['host_pages_allocated']
@@ -3983,13 +3739,6 @@ class BatchGenWorker:
 		# get EXTENSION_GPU_PAGE_BUFFER (smaller), not INITIAL_GPU_PAGE_BUFFER.
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			# DIAG-134: Log ON_HOLD with decoded_length for short sequences
-			if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
-				logging.warning(
-					f"[DIAG-134] ON_HOLD rank={self.rank} gidx={seq.global_idx} "
-					f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
-					f"ctx={seq.current_context_length}"
-				)
 			seq.gpu_pages_allocated = 0
 			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
@@ -5295,18 +5044,6 @@ class BatchGenWorker:
 			remaining_decode = max(0, seq.original_max_decode_length - prev_decoded)
 			seq.max_decode_length = remaining_decode
 
-			# DIAG: Log reconstructed state before clearing eviction
-			if BATCHGEN_KV_SANITY and prev_decoded > 0:
-				_n = n_old if prev_decoded > 0 else 0
-				logging.warning(
-					f"[REPREFILL_DIAG] rank={self.rank} gidx={seq.global_idx} "
-					f"new_prompt_len={new_prompt_len} prev_decoded={prev_decoded} "
-					f"n_old={_n} decoded_len={seq.decoded_length} "
-					f"prompt={seq.prompt_length} orig_prompt={seq.original_prompt_length} "
-					f"first_5_decoded={seq.decoded_tokens[0, :min(5,seq.decoded_length)].tolist() if seq.decoded_length > 0 else []} "
-					f"last_5_decoded={seq.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist() if seq.decoded_length > 0 else []}"
-				)
-
 			# Clear eviction state
 			seq.evicted_token_ids = None
 
@@ -5497,26 +5234,6 @@ class BatchGenWorker:
 		3. GPU KV page allocation
 		"""
 		start_time = time.perf_counter()
-
-		# DIAG-134: State dump for resuming sequences near DECISION_INTERVAL boundary
-		if BATCHGEN_DIAG_134:
-			import math as _math
-			for uuid in decode_uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq and 120 <= seq.decoded_length <= 145:
-					expected_ctx = seq.original_prompt_length + seq.decoded_length
-					ctx_ok = seq.current_context_length == expected_ctx
-					host_pages_needed = _math.ceil(expected_ctx / self.PAGE_SIZE) if expected_ctx > 0 else 0
-					host_ok = seq.host_pages_allocated >= host_pages_needed
-					logging.warning(
-						f"[DIAG-134] CONFIG_ENTRY rank={self.rank} gidx={seq.global_idx} "
-						f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
-						f"expected_ctx={expected_ctx} ctx_ok={ctx_ok} "
-						f"prompt={seq.prompt_length} "
-						f"host_pages={seq.host_pages_allocated} host_needed={host_pages_needed} host_ok={host_ok} "
-						f"gpu_pages={seq.gpu_pages_allocated} had_initial={seq.had_initial_gpu_reservation} "
-						f"status={seq.status.name}"
-					)
 
 		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
 		# This must happen BEFORE any validation or diagnostics that read current_context_length.
@@ -5902,16 +5619,6 @@ class BatchGenWorker:
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
 			seq.decoded_length = token_pos + 1
 			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
-
-			# DIAG: Log post-prefill state for re-entered sequences
-			if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0:
-				logging.warning(
-					f"[PREFILL_DONE_DIAG] rank={self.rank} gidx={seq.global_idx} "
-					f"decoded_len={seq.decoded_length} prompt={seq.prompt_length} "
-					f"orig_prompt={seq.original_prompt_length} ctx={seq.current_context_length} "
-					f"new_token={new_tokens_cpu[i].item()} token_pos={token_pos} "
-					f"last_5_decoded={self.query_book[local_idx].decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
-				)
 
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
@@ -6502,17 +6209,6 @@ class BatchGenWorker:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				is_completed = self._is_sequence_completed(seq)
-				# DIAG-134: Log on ANY rank when a short sequence is marked completed at boundary
-				if BATCHGEN_DIAG_134 and is_completed and seq.decoded_length <= 200:
-					local_idx = self._uuid_to_local_map[uuid]
-					raw_toks = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
-					logging.warning(
-						f"[DIAG-134] STATE_GATHER_COMPLETED rank={self.rank} gidx={seq.global_idx} "
-						f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
-						f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
-						f"model_ctx={self.model_context_length} "
-						f"last_30_toks={raw_toks[-30:]} first_5_toks={raw_toks[:5]}"
-					)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
@@ -6646,17 +6342,6 @@ class BatchGenWorker:
 
 		# A. Release completed sequences
 		completed_uuids = decisions.completed_uuids
-		if completed_uuids and BATCHGEN_DIAG_134 and self.rank == 0:
-			for uuid in completed_uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				state = global_seq_state.get(uuid, {})
-				if seq and state.get('decoded_length', 9999) <= 200:
-					logging.warning(
-						f"[DIAG-134] BOUNDARY_COMPLETE gidx={seq.global_idx} "
-						f"decoded={state.get('decoded_length')} eos={state.get('eos_reached')} "
-						f"ctx={state.get('current_context_length')} "
-						f"rank={state.get('owning_rank')}"
-					)
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
@@ -6740,15 +6425,6 @@ class BatchGenWorker:
 					else:
 						seq.evicted_token_ids = prompt_tokens.clone()
 					seq.total_decoded_before_eviction = seq.decoded_length
-					if BATCHGEN_KV_SANITY and seq.decoded_length > 0:
-						logging.warning(
-							f"[EVICT_DIAG] rank={self.rank} gidx={seq.global_idx} "
-							f"decoded_len={seq.decoded_length} prompt={seq.prompt_length} "
-							f"orig_prompt={seq.original_prompt_length} "
-							f"evicted_ids_len={len(seq.evicted_token_ids)} "
-							f"first_5_decoded={seq.decoded_tokens[0, :min(5,seq.decoded_length)].tolist()} "
-							f"last_5_decoded={seq.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
-						)
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
@@ -7049,13 +6725,6 @@ class BatchGenWorker:
 		for local_idx in pending_local_indices:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			# DIAG-134: Log RESUME with decoded_length for short sequences
-			if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
-				logging.warning(
-					f"[DIAG-134] RESUME rank={self.rank} gidx={seq.global_idx} "
-					f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
-					f"ctx={seq.current_context_length} status={seq.status.name}"
-				)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
@@ -7547,46 +7216,6 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# DIAG-134: At decode group entry, verify GPU KV for sequences near boundary
-		if BATCHGEN_DIAG_134 and gpu_manager and gpu_manager._k_cache is not None:
-			k_cache_l0 = gpu_manager._k_cache[0]
-			pt_mgr = gpu_manager._gpu_page_table_manager
-			if pt_mgr and pt_mgr.gpu_table is not None:
-				for local_idx in batch:
-					uuid = self._local_to_uuid_map.get(local_idx)
-					if not uuid:
-						continue
-					seq = self.global_batch.get_sequence(uuid)
-					if seq and 120 <= seq.decoded_length <= 145:
-						slot = pt_mgr.seq_id_to_slot.get(seq.global_idx, -1)
-						if slot >= 0:
-							# Read GPU KV at 3 positions: decoded_len-3, -2, -1
-							kv_samples = []
-							for offset in [-3, -2, -1]:
-								pos = seq.current_context_length + offset - 1
-								if pos < 0:
-									continue
-								page_idx = pos // gpu_manager.config.page_size_tokens
-								page_off = pos % gpu_manager.config.page_size_tokens
-								if page_idx < pt_mgr.gpu_table.shape[1]:
-									phys = pt_mgr.gpu_table[slot, page_idx].item()
-									if 0 <= phys < k_cache_l0.shape[1]:
-										kv_flat = k_cache_l0[phys, page_off].flatten().float()
-										val = kv_flat[0].item() if kv_flat.numel() > 0 else 0.0
-										is_zero = (kv_flat.abs().sum().item() < 1e-6)
-										kv_samples.append(f"pos{pos}={'ZERO' if is_zero else f'{val:.4f}'}")
-									else:
-										kv_samples.append(f"pos{pos}=BAD_PAGE({phys})")
-								else:
-									kv_samples.append(f"pos{pos}=NO_PAGE(pidx={page_idx})")
-							# Also read decoded token at last position
-							last_tok = self.query_book[local_idx].decoded_tokens[0, seq.decoded_length - 1].item()
-							logging.warning(
-								f"[DIAG-134] DECODE_ENTRY_KV rank={self.rank} gidx={seq.global_idx} "
-								f"decoded_len={seq.decoded_length} ctx={seq.current_context_length} "
-								f"slot={slot} last_tok={last_tok} kv=[{', '.join(kv_samples)}]"
-							)
-
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -7599,15 +7228,6 @@ class BatchGenWorker:
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
-				# DIAG-134: Log batch state BEFORE boundary
-				if BATCHGEN_DIAG_134 and self.rank == 0 and local_iteration <= 256:
-					batch_gids = self._local_indices_to_global_seq_ids(batch) if batch else []
-					pt_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager and gpu_manager._gpu_page_table_manager and gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					logging.info(
-						f"[DIAG-134] PRE-BOUNDARY iter={local_iteration} "
-						f"batch_size={len(batch)} batch_gids[:10]={batch_gids[:10]} "
-						f"pt_slots[:10]={pt_order[:10]} match={batch_gids == pt_order}"
-					)
 				last_boundary = local_iteration
 
 				(decode_uuids, batch,
@@ -7632,13 +7252,6 @@ class BatchGenWorker:
 
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
 						# Fix: Rebuild page table to match batch
-						if BATCHGEN_DIAG_134 and self.rank == 0:
-							logging.warning(
-								f"[DIAG-134] POST-BOUNDARY PAGE TABLE REBUILD at iter={local_iteration}: "
-								f"old_slots[:5]={post_boundary_slot_order[:5]}, "
-								f"new_batch[:5]={post_boundary_batch_global_ids[:5]}, "
-								f"len_old={len(post_boundary_slot_order)}, len_new={len(post_boundary_batch_global_ids)}"
-							)
 						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
 
 				# Page table is now verified for this batch
@@ -7771,20 +7384,6 @@ class BatchGenWorker:
 								seq.current_context_length = ctx_len
 						cache_seqlens.append(ctx_len)
 
-					# DIAG-134: Verify cache_seqlens at first forward pass
-					if BATCHGEN_DIAG_134 and local_iteration == 1:
-						for fi, fseq in enumerate(batch_sequences):
-							if 120 <= fseq.decoded_length <= 200:
-								expected = fseq.original_prompt_length + fseq.decoded_length
-								logging.warning(
-									f"[DIAG-134] FIRST_FWD rank={self.rank} gidx={fseq.global_idx} "
-									f"cache_seqlens={cache_seqlens[fi]} expected={expected} "
-									f"match={cache_seqlens[fi]==expected} "
-									f"decoded_len={fseq.decoded_length} prompt={fseq.prompt_length} "
-									f"orig_prompt={fseq.original_prompt_length} "
-									f"ctx={fseq.current_context_length}"
-								)
-
 					max_ctx = max(cache_seqlens)
 					# Build attention metadata directly on GPU
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
@@ -7838,12 +7437,6 @@ class BatchGenWorker:
 							batch_global_order = Attn_Wrapper.cur_batch
 							if slot_order != batch_global_order:
 								# Fix: Rebuild page table to match batch order
-								if BATCHGEN_DIAG_134 and self.rank == 0:
-									logging.warning(
-										f"[DIAG-134] PAGE TABLE MISMATCH at iter={local_iteration}: "
-										f"slot_order[:5]={slot_order[:5]}, batch[:5]={batch_global_order[:5]}, "
-										f"len_slot={len(slot_order)}, len_batch={len(batch_global_order)}"
-									)
 								gpu_manager.rebuild_page_table(batch_global_order)
 						_page_table_verified_this_batch = True
 				
@@ -8019,14 +7612,6 @@ class BatchGenWorker:
 			# Update sequences (reuse batch_sequences from forward pass setup)
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
 				if self._is_sequence_completed(seq):
-					# DIAG-134: Log WHY a short sequence is skipped as completed (ALL ranks)
-					if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
-						logging.warning(
-							f"[DIAG-134] SKIP_COMPLETED rank={self.rank} gidx={seq.global_idx} "
-							f"decoded_len={seq.decoded_length} eos={seq.eos_reached} "
-							f"ctx={seq.current_context_length} max_dec={seq.max_decode_length} "
-							f"model_ctx={self.model_context_length} iter={local_iteration}"
-						)
 					continue
 
 				decode_pos = seq.decoded_length
@@ -8040,22 +7625,6 @@ class BatchGenWorker:
 							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
 						)
 				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
-				# DIAG: Log first 10 token writes for re-entered sequences
-				if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0 and local_iteration <= 10:
-					logging.warning(
-						f"[DECODE_WRITE_DIAG] rank={self.rank} gidx={seq.global_idx} "
-						f"iter={local_iteration} decode_pos={decode_pos} "
-						f"token={new_tokens_cpu[i].item()} "
-						f"decoded_len_before={seq.decoded_length} ctx={seq.current_context_length}"
-					)
-
-				# DIAG-134: Log token writes around boundary (positions 125-140) on ALL ranks
-				if BATCHGEN_DIAG_134 and 125 <= decode_pos <= 140:
-					tok_id = new_tokens_cpu[i].item()
-					logging.info(
-						f"[DIAG-134] TOKEN_WRITE rank={self.rank} gidx={seq.global_idx} pos={decode_pos} "
-						f"tok={tok_id} ctx={seq.current_context_length} iter={local_iteration}"
-					)
 
 				seq.decoded_length += 1
 				seq.current_context_length += 1
@@ -8063,17 +7632,6 @@ class BatchGenWorker:
 				# Use CPU tensor to avoid GPU sync
 				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 					seq.eos_reached = True
-					# DIAG-134: Dump raw token buffer for short sequences on EOS (ALL ranks)
-					if BATCHGEN_DIAG_134 and seq.decoded_length <= 200:
-						raw_toks = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
-						logging.warning(
-							f"[DIAG-134] SHORT_EOS rank={self.rank} gidx={seq.global_idx} decoded_len={seq.decoded_length} "
-							f"iter={local_iteration} eos_tok={new_tokens_cpu[i].item()} "
-							f"was_evicted={seq.total_decoded_before_eviction > 0} "
-							f"orig_prompt={seq.original_prompt_length} prompt={seq.prompt_length} "
-							f"last_30_toks={raw_toks[-30:]} "
-							f"has_163607={'YES' if 163607 in raw_toks else 'NO'}"
-						)
 
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
@@ -8085,10 +7643,6 @@ class BatchGenWorker:
 		if pending_async_task is not None:
 			pending_async_task.wait()
 			torch.cuda.synchronize(self.torch_device)
-
-		# KV sanity check: capture fingerprints BEFORE GPU KV is destroyed
-		if BATCHGEN_KV_SANITY:
-			self._capture_kv_fingerprints("PRE_DESTROY")
 
 		Attn_Wrapper.kv_append_callback = None
 		Attn_Wrapper.scale = None
@@ -8791,14 +8345,6 @@ class BatchGenWorker:
 				continue
 			token = query_entry.decoded_tokens[:, pos:pos+1]
 			tokens.append(token)
-			# DIAG: Log decode input for re-entered sequences
-			if BATCHGEN_KV_SANITY and seq.total_decoded_before_eviction > 0:
-				logging.warning(
-					f"[DECODE_INPUT_DIAG] rank={self.rank} gidx={seq.global_idx} "
-					f"decoded_len={seq.decoded_length} pos={pos} "
-					f"input_token={token[0,0].item()} "
-					f"last_5_decoded={query_entry.decoded_tokens[0, max(0,seq.decoded_length-5):seq.decoded_length].tolist()}"
-				)
 
 		result = torch.cat(tokens, dim=0).to(self.torch_device) if tokens else torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 		
