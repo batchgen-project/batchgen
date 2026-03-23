@@ -1011,27 +1011,11 @@ class KimiK25ParallelStrategyManager:
                     setattr(module, f'marlin_{proj}_scale', getattr(module, f'int4_{proj}_scale'))
                 count_marlin += 1
             else:
-                # Old checkpoint, runtime repack
-                from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
-                K = gate_packed.shape[1] * 8
-                N = gate_packed.shape[0]
-
-                for proj in ('gate', 'up'):
-                    packed = getattr(module, f'int4_{proj}_packed')
-                    scale = getattr(module, f'int4_{proj}_scale')
-                    marlin_qw, marlin_s = repack_int4_to_marlin_gs32(packed, scale, K, N)
-                    setattr(module, f'marlin_{proj}_qw', marlin_qw)
-                    setattr(module, f'marlin_{proj}_scale', marlin_s)
-
-                down_packed = module.int4_down_packed
-                down_scale = module.int4_down_scale
-                down_K_in = down_packed.shape[1] * 8
-                down_N_out = down_packed.shape[0]
-                marlin_dqw, marlin_ds = repack_int4_to_marlin_gs32(
-                    down_packed, down_scale, down_K_in, down_N_out)
-                module.marlin_down_qw = marlin_dqw
-                module.marlin_down_scale = marlin_ds
-                count_repack += 1
+                raise RuntimeError(
+                    f"Checkpoint at layer {layer_idx} contains raw INT4 weights (not Marlin layout). "
+                    f"Please re-convert your checkpoint: "
+                    f"python -m batchgen.tools.convert_checkpoint --input-dir <model_dir> --force"
+                )
 
         if self.rank == 0:
             if count_marlin > 0:
