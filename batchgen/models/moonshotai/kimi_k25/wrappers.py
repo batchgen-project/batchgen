@@ -142,9 +142,8 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_packed": self.module.int4_down_packed,
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
-        # Transform Marlin→raw INT4 on-the-fly for WGMMA prefill
-        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
-            self._transform_marlin_to_raw(weights)
+        # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA prefill
+        self._transform_marlin_to_raw(weights)
         return weights
 
     _transform_logged = False
@@ -261,9 +260,8 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
-            # Non-persistent: transform Marlin→raw INT4 on-the-fly for WGMMA
-            if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
-                self._transform_marlin_to_raw(weights)
+            # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA
+            self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
         if hidden_states.dtype != torch.bfloat16:

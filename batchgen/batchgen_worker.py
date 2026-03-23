@@ -1668,20 +1668,6 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 		active_sequence_page_counts = manager.export_active_sequence_page_counts()
 
-		# DEBUG: Check what's being passed to the host→GPU load
-		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1":
-			print(f"\n[HOST->GPU DEBUG] === Before async_load_layer_paged_kv_to_device ===")
-			print(f"[HOST->GPU DEBUG] global_sequence_ids = {global_sequence_ids[:10]}... (total={len(global_sequence_ids)})")
-			print(f"[HOST->GPU DEBUG] sequence_tensor = {sequence_tensor[:10].tolist()}...")
-			print(f"[HOST->GPU DEBUG] active_sequence_page_counts = {active_sequence_page_counts[:10].tolist()}...")
-			print(f"[HOST->GPU DEBUG] k_ptrs.shape = {k_ptrs.shape}")
-			# Check if global_sequence_ids are all the same (BUG)
-			unique_ids = set(global_sequence_ids)
-			if len(unique_ids) < len(global_sequence_ids):
-				print(f"[HOST->GPU DEBUG] *** WARNING: DUPLICATE sequence IDs! Unique: {len(unique_ids)}, Total: {len(global_sequence_ids)} ***")
-			else:
-				print(f"[HOST->GPU DEBUG] OK: All {len(global_sequence_ids)} sequence IDs are unique")
-
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
@@ -1704,53 +1690,6 @@ class BatchGenWorker:
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
 		)
-
-		# DEBUG: Verify KV content is different across sequences after host→GPU load
-		if os.environ.get("BATCHGEN_DEBUG_KV_LOAD", "0") == "1" and len(global_sequence_ids) >= 2:
-			k_cache, v_cache = manager.get_kv_tensors()
-			# k_cache shape: [num_layers, num_pages, page_size, num_kv_heads, head_dim]
-			print(f"\n[KV LOAD DEBUG] === After Host→GPU Load ===")
-			print(f"[KV LOAD DEBUG] Loaded {len(global_sequence_ids)} sequences: {global_sequence_ids[:5]}...")
-			print(f"[KV LOAD DEBUG] k_cache.shape={k_cache.shape}")
-
-			# Get page table to find physical pages for each sequence
-			page_table = manager._gpu_page_table_manager.gpu_table
-			print(f"[KV LOAD DEBUG] page_table.shape={page_table.shape}")
-
-			# Compare KV content at position 0 (first token) for first 3 sequences
-			# Layer 0, position 0 should contain different values if prefill worked correctly
-			num_to_check = min(3, len(global_sequence_ids))
-			kv_samples = []
-			for i in range(num_to_check):
-				# Get the GPU page for this sequence's position 0
-				slot_idx = i  # slot_indices are 0, 1, 2, ...
-				page_idx = 0  # position 0
-				gpu_page = int(page_table[slot_idx, page_idx].item())
-				offset = 0  # position 0 within page
-
-				# Read K at layer 0, this page, position 0, head 0, first 4 dims
-				k_sample = k_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
-				v_sample = None
-				if v_cache is not None:
-					v_sample = v_cache[0, gpu_page, offset, 0, :4].cpu().tolist()
-
-				kv_samples.append({
-					'seq': i,
-					'global_idx': global_sequence_ids[i],
-					'slot': slot_idx,
-					'gpu_page': gpu_page,
-					'k_sample': k_sample,
-					'v_sample': v_sample,
-				})
-				print(f"[KV LOAD DEBUG] seq{i} (global={global_sequence_ids[i]}): slot={slot_idx}, gpu_page={gpu_page}, K[0,:4]={k_sample}")
-
-			# Check if all K samples are identical (BAD)
-			all_k_same = all(s['k_sample'] == kv_samples[0]['k_sample'] for s in kv_samples)
-			if all_k_same:
-				print(f"[KV LOAD DEBUG] *** WARNING: ALL {num_to_check} SEQUENCES HAVE IDENTICAL K VALUES! ***")
-				print(f"[KV LOAD DEBUG] This indicates prefill wrote identical KV or host→GPU load is corrupted!")
-			else:
-				print(f"[KV LOAD DEBUG] OK: K values differ across sequences (expected for different prompts)")
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
@@ -7399,13 +7338,6 @@ class BatchGenWorker:
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
 
-					# DEBUG: Print cache_seqlens and input tokens
-					if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
-						print(f"\n[DECODE DEBUG] Iteration {local_iteration}")
-						print(f"[DECODE DEBUG] cache_seqlens[:5]: {Attn_Wrapper.cache_seqlens[:5].tolist()}")
-						print(f"[DECODE DEBUG] position_ids[:5]: {Attn_Wrapper.position_ids[:5].flatten().tolist()}")
-						print(f"[DECODE DEBUG] new_tokens[:5]: {new_tokens[:5].flatten().tolist()}")
-
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:
@@ -7581,29 +7513,6 @@ class BatchGenWorker:
 
 			# Flush deferred KV entries — single sync for all layers
 			self._flush_deferred_kv_to_host()
-
-			# DEBUG: Print sampled tokens and logits comparison
-			if os.environ.get("BATCHGEN_DEBUG_DECODE", "0") == "1" and local_iteration <= 5:
-				print(f"\n[DECODE DEBUG] === Iteration {local_iteration} ===")
-				token_ids = new_tokens[:5].flatten().tolist()
-				print(f"[DECODE DEBUG] sampled_tokens[:5]: {token_ids}")
-				# Decode tokens to show actual text
-				try:
-					decoded_tokens = [self.tokenizer.decode([tid]) for tid in token_ids]
-					print(f"[DECODE DEBUG] decoded_text[:5]: {decoded_tokens}")
-				except Exception as e:
-					print(f"[DECODE DEBUG] decode error: {e}")
-				# Check if all tokens are the same
-				if len(new_tokens) >= 2:
-					all_same = all(new_tokens[i].item() == new_tokens[0].item() for i in range(min(5, len(new_tokens))))
-					if all_same:
-						print(f"[DECODE DEBUG] *** WARNING: All sequences sampled SAME token! ***")
-				# Show logits for first 3 sequences
-				if os.environ.get("BATCHGEN_DEBUG_DECODE_LOGITS", "0") == "1":
-					logits = outputs.logits[:, -1, :]
-					for i in range(min(3, len(logits))):
-						top_vals, top_ids = torch.topk(logits[i], k=5)
-						print(f"[DECODE DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
 
 			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
 			# This avoids N GPU synchronizations which cause heavy CPU overhead

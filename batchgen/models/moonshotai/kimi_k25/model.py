@@ -752,47 +752,47 @@ class KimiK25MoE(nn.Module):
             # Marlin W4A16 3-stage decode: weight pointers only (mtp-dependent buffers deferred)
             self._use_marlin_decode = False
             self._marlin_mtp = 0
-            if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
-                try:
-                    N = self.moe_intermediate_size
-                    K = self.config.hidden_size
+            # Marlin decode is default for K2.5
+            try:
+                N = self.moe_intermediate_size
+                K = self.config.hidden_size
 
-                    # Collect weight pointers for all 3 projections
-                    gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    down_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
-                    down_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                # Collect weight pointers for all 3 projections
+                gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
 
-                    for local_e in range(E):
-                        global_e = self.routed_expert_start_idx + local_e
-                        wrapper = self.experts[global_e]
-                        module = wrapper.module if hasattr(wrapper, 'module') else wrapper
-                        gate_w_ptrs[local_e] = module.marlin_gate_qw.data_ptr()
-                        gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
-                        up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
-                        up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
-                        down_w_ptrs[local_e] = module.marlin_down_qw.data_ptr()
-                        down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
+                for local_e in range(E):
+                    global_e = self.routed_expert_start_idx + local_e
+                    wrapper = self.experts[global_e]
+                    module = wrapper.module if hasattr(wrapper, 'module') else wrapper
+                    gate_w_ptrs[local_e] = module.marlin_gate_qw.data_ptr()
+                    gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
+                    up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
+                    up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
+                    down_w_ptrs[local_e] = module.marlin_down_qw.data_ptr()
+                    down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
 
-                    mw = {}
-                    # S1 fused: separate gate/up [E] each
-                    mw['gate_B_ptrs'] = gate_w_ptrs
-                    mw['gate_scales_ptrs'] = gate_s_ptrs
-                    mw['up_B_ptrs'] = up_w_ptrs
-                    mw['up_scales_ptrs'] = up_s_ptrs
-                    # S3: down [E]
-                    mw['s3_B_ptrs'] = down_w_ptrs
-                    mw['s3_scales_ptrs'] = down_s_ptrs
-                    mw['N'] = N
-                    mw['K'] = K
+                mw = {}
+                # S1 fused: separate gate/up [E] each
+                mw['gate_B_ptrs'] = gate_w_ptrs
+                mw['gate_scales_ptrs'] = gate_s_ptrs
+                mw['up_B_ptrs'] = up_w_ptrs
+                mw['up_scales_ptrs'] = up_s_ptrs
+                # S3: down [E]
+                mw['s3_B_ptrs'] = down_w_ptrs
+                mw['s3_scales_ptrs'] = down_s_ptrs
+                mw['N'] = N
+                mw['K'] = K
 
-                    self._marlin_weights = mw
-                    self._use_marlin_decode = True
-                except AttributeError as e:
-                    logging.warning(f"[MoE] Marlin weights not found: {e}")
-                    self._use_marlin_decode = False
+                self._marlin_weights = mw
+                self._use_marlin_decode = True
+            except AttributeError as e:
+                logging.warning(f"[MoE] Marlin weights not found: {e}")
+                self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False

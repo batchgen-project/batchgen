@@ -503,7 +503,7 @@ class KimiK25ParallelStrategyManager:
         self._move_int4_to_gpu_contiguous()
         _log_hbm("_move_int4_to_gpu_contiguous")
 
-        # Optional: convert INT4 → Marlin format for decode S1 (BATCHGEN_MARLIN_DECODE=1)
+        # Marlin decode is default for K2.5
         self._register_marlin_weights()
         _log_hbm("_register_marlin_weights")
 
@@ -537,17 +537,17 @@ class KimiK25ParallelStrategyManager:
 
         # Pre-allocate Marlin decode buffers (gate_buf + up_buf) BEFORE KV cache sizing.
         # This ensures the memory planner accounts for them when sizing KV cache.
-        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") == "1":
-            mtp = KimiK25MoE._buf.max_tokens_padded
-            for layer_idx in range(
-                self.loaded_model_config.first_k_dense_replace,
-                self.model_config.num_hidden_layers,
-            ):
-                moe = self.model.model.layers[layer_idx].mlp
-                if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
-                    moe._init_marlin_buffers(mtp)
-                    break  # All layers share the same class-level _buf, init once
-            _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
+        # Marlin decode is default for K2.5
+        mtp = KimiK25MoE._buf.max_tokens_padded
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            moe = self.model.model.layers[layer_idx].mlp
+            if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
+                moe._init_marlin_buffers(mtp)
+                break  # All layers share the same class-level _buf, init once
+        _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
 
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
@@ -984,10 +984,7 @@ class KimiK25ParallelStrategyManager:
         Detection: Marlin layout is [K//16, N*2], raw is [N, K//8].
         For gate/up: N=2048, K=7168. Marlin=[448, 4096], raw=[2048, 896].
         """
-        import os
-        if os.environ.get("BATCHGEN_MARLIN_DECODE", "0") != "1":
-            return
-
+        # Marlin decode is default for K2.5
         device = self.engine_config.Basic_Config.device_torch
 
         count_marlin = 0
