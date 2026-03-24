@@ -436,17 +436,31 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
         cache_seqlens_for_attn = micro_cache_seqlens
 
-        # Decode attention
-        if not getattr(self.__class__, '_warned_attn', False):
-            logging.warning("[Attn] HOT PATH: gqa_decode_fa (FlashAttention, NOT batchgen_gqa_decode_bf16)")
-            self.__class__._warned_attn = True
-        attn_output, _ = gqa_decode_fa(
-            q=query,
-            k_cache=k_cache_layer,
-            v_cache=v_cache_layer,
-            cache_seqlens=cache_seqlens_for_attn,
-            block_table=page_table,
-        )
+        # Decode attention — use WGMMA kernel if available, else FlashAttention
+        _use_wgmma = os.environ.get("BATCHGEN_USE_WGMMA_DECODE", "0") == "1"
+        if _use_wgmma:
+            from batchgen.attention.gqa import batchgen_gqa_decode_bf16
+            if not getattr(self.__class__, '_warned_attn', False):
+                logging.warning("[Attn] HOT PATH: batchgen_gqa_decode_bf16 (WGMMA)")
+                self.__class__._warned_attn = True
+            attn_output, _ = batchgen_gqa_decode_bf16(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
+        else:
+            if not getattr(self.__class__, '_warned_attn', False):
+                logging.warning("[Attn] HOT PATH: gqa_decode_fa (FlashAttention)")
+                self.__class__._warned_attn = True
+            attn_output, _ = gqa_decode_fa(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
 
         # Output projection via FP8 GEMM
         attn_output = attn_output.view(batch, 1, num_heads * head_dim)

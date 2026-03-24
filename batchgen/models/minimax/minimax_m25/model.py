@@ -67,12 +67,20 @@ except ImportError:
 # FP8 blockwise grouped GEMM (CuTe persistent kernel)
 try:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
+        grouped_fp8_blockwise_gemm,
         grouped_fp8_blockwise_s1_silu,
         grouped_fp8_blockwise_s3,
     )
     _HAS_FP8_BLOCKWISE = True
 except ImportError:
     _HAS_FP8_BLOCKWISE = False
+
+# CUDA FP8 quantization ops (act_quant_3d, fused_silu_quant_3d)
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d, fused_silu_quant_3d
+    _HAS_FP8_OPS = True
+except ImportError:
+    _HAS_FP8_OPS = False
 
 # 3D dispatch scatter + CUDA reduce (K2.5 pattern)
 try:
@@ -1078,9 +1086,13 @@ class MiniMaxM25MoE(nn.Module):
 
         Reads from buf.dispatched_x, writes to buf.expert_out.
         Uses CuTe persistent kernel with uniform cu_seqlens stride.
+        P3a: CUDA act_quant_3d replaces Triton act_quant
+        P3b: CUDA fused_silu_quant_3d replaces SiLU + act_quant
         """
         if not getattr(self.__class__, '_warned_gemm_3d', False):
-            logging.warning("[MoE] HOT PATH: _fp8_blockwise_gemm_3d (CuTe persistent, no scatter/gather)")
+            logging.warning(
+                f"[MoE] HOT PATH: _fp8_blockwise_gemm_3d "
+                f"(act_quant_3d={_HAS_FP8_OPS}, fused_silu_quant={_HAS_FP8_OPS})")
             self.__class__._warned_gemm_3d = True
         E = self.experts_per_rank
         K = self.hidden_size
@@ -1093,22 +1105,49 @@ class MiniMaxM25MoE(nn.Module):
         seqlens = expert_counts[:E]
         avg = max(int(seqlens.float().mean().item()), 1)
 
-        # Quantize input
-        x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
-        x_scale_t = x_scale.t().contiguous()
+        # P3a: Quantize input — CUDA act_quant_3d or Triton fallback
+        if _HAS_FP8_OPS:
+            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+            x_quant = x_quant_3d.view(E * mtp, K)
+            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
+            x_scale_t = x_scale.t().contiguous()
 
-        # S1: gate + up + SiLU
-        intermediate = grouped_fp8_blockwise_s1_silu(
-            x_quant.view(torch.float8_e4m3fn), x_scale_t,
-            self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-            self.fp8_up_w3d.view(torch.float8_e4m3fn),
-            self.fp8_gate_ws3d, self.fp8_up_ws3d,
-            seqlens, cu_seqlens, avg,
-        )
-
-        # Re-quantize intermediate for S3
-        inter_quant, inter_scale = act_quant(intermediate)
-        inter_scale_t = inter_scale.t().contiguous()
+        # P3b: S1 gate + up → fused SiLU + quant (or separate SiLU + quant)
+        if _HAS_FP8_OPS:
+            # Separate gate and up GEMMs (no SiLU fusion in GEMM)
+            gate_result = grouped_fp8_blockwise_gemm(
+                x_quant.view(torch.float8_e4m3fn),
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                seqlens, cu_seqlens,
+                x_scale_t, self.fp8_gate_ws3d, avg,
+            )
+            up_result = grouped_fp8_blockwise_gemm(
+                x_quant.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                seqlens, cu_seqlens,
+                x_scale_t, self.fp8_up_ws3d, avg,
+            )
+            # Fused SiLU + FP8 quantization (eliminates intermediate BF16 buffer)
+            inter_quant_3d, inter_scale_3d = fused_silu_quant_3d(
+                gate_result.view(E, mtp, N),
+                up_result.view(E, mtp, N),
+                seqlens,
+            )
+            inter_quant = inter_quant_3d.view(E * mtp, N)
+            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            intermediate = grouped_fp8_blockwise_s1_silu(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            inter_quant, inter_scale = act_quant(intermediate)
+            inter_scale_t = inter_scale.t().contiguous()
 
         # S3: down projection → writes to expert_out buffer
         result = grouped_fp8_blockwise_s3(
