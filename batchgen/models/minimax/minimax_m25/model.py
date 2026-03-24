@@ -1175,6 +1175,18 @@ class MiniMaxM25MoE(nn.Module):
             # 2) Gate: sigmoid routing
             topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
 
+            # Debug: check allgather output
+            debug_moe = os.environ.get("BATCHGEN_DEBUG_MOE") and self.__class__._debug_count < 3
+            if debug_moe:
+                at_nz = all_tokens.count_nonzero().item()
+                at_max = all_tokens.abs().max().item()
+                nz_per_row = [(all_tokens[i].count_nonzero().item(), all_tokens[i].abs().max().item())
+                              for i in range(min(num_global, 8))]
+                print(f"[DEBUG_ALLGATHER] R{self.rank} all_tokens: shape={list(all_tokens.shape)} "
+                      f"nonzero={at_nz}/{all_tokens.numel()} max={at_max:.4f} "
+                      f"per_row_nz={[r[0] for r in nz_per_row]} "
+                      f"topk_idx[:4]={topk_idx[:4].tolist()}", flush=True)
+
             # 3) 3D dispatch scatter into strided buffer
             buf.dispatched_x.zero_()
             expert_counts, topk_pos = dispatch_scatter_3d(
