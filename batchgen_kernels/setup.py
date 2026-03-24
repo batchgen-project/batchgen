@@ -121,6 +121,17 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
+        # FP8 blockwise MoE pipeline ops (act_quant_3d, silu_mul_3d, fused_silu_quant_3d)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fp8_blockwise_ops",
+            sources=["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "-lineinfo",
+                         "--threads", _nvcc_threads],
+            },
+        ),
         # Marlin <-> WGMMA weight transform
         CUDAExtension(
             name="batchgen_kernels.moe._C_marlin_transform",
