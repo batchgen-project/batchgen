@@ -13,7 +13,9 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
-#include <torch/library.h>
+#include <torch/extension.h>
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
 
 namespace batchgen {
 namespace moe {
@@ -214,14 +216,14 @@ torch::Tensor fp8_blockwise_grouped_gemm(
   return y;
 }
 
-TORCH_LIBRARY_FRAGMENT(batchgen_kernels, m) {
-  m.def(
-      "fp8_blockwise_grouped_gemm(Tensor x, Tensor weight, Tensor seqlens, Tensor cu_seqlens, "
-      "Tensor xscale, Tensor wscale, int num_seq_per_group_avg, Tensor? output, "
-      "Tensor? tma_desc) -> (Tensor)");
-  m.impl("fp8_blockwise_grouped_gemm", torch::kCUDA,
-         &batchgen::moe::fp8_blockwise_grouped_gemm);
-}
+}  // close namespace moe
+}  // close namespace batchgen
 
-}  // namespace moe
-}  // namespace batchgen
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("fp8_blockwise_grouped_gemm",
+        &batchgen::moe::fp8_blockwise_grouped_gemm,
+        "FP8 blockwise grouped GEMM (CuTe persistent 3-WG, adaptive TileM)",
+        py::arg("x"), py::arg("weight"), py::arg("seqlens"), py::arg("cu_seqlens"),
+        py::arg("x_scale"), py::arg("w_scale"), py::arg("num_seq_per_group_avg"),
+        py::arg("output") = py::none(), py::arg("tma_desc") = py::none());
+}
