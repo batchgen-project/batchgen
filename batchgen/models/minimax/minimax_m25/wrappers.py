@@ -36,6 +36,46 @@ from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 from .model import rotate_half
 
+
+# ============================================================================
+# Per-sub-op decode timing (BATCHGEN_DECODE_TIMING=1)
+# ============================================================================
+
+_DECODE_TIMING = os.environ.get("BATCHGEN_DECODE_TIMING", "0") == "1"
+_DECODE_TIMING_INTERVAL = int(os.environ.get("BATCHGEN_DECODE_TIMING_INTERVAL", "50"))
+
+
+class DecodeTimingStats:
+    """Accumulates per-sub-op timing across decode steps. Logs every N steps."""
+    _step = 0
+    _accum = {}  # op_name -> total_us
+
+    @classmethod
+    def _sync_record(cls, op: str, t0: float):
+        torch.cuda.synchronize()
+        elapsed_us = (time.perf_counter() - t0) * 1e6
+        cls._accum[op] = cls._accum.get(op, 0.0) + elapsed_us
+
+    @classmethod
+    def step_done(cls):
+        cls._step += 1
+        if cls._step % _DECODE_TIMING_INTERVAL != 0:
+            return
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            cls._accum.clear()
+            return
+        n = _DECODE_TIMING_INTERVAL
+        lines = [f"\n=== MiniMax Decode Timing (avg over {n} steps, step {cls._step}) ==="]
+        total = sum(cls._accum.values())
+        for op, us in sorted(cls._accum.items(), key=lambda x: -x[1]):
+            pct = 100 * us / max(total, 1)
+            lines.append(f"  {op:20s}: {us/n:8.1f} us/step ({pct:5.1f}%)")
+        lines.append(f"  {'TOTAL':20s}: {total/n:8.1f} us/step")
+        logging.info("\n".join(lines))
+        cls._accum.clear()
+
 try:
     from batchgen.attention.mla.fa3_backend import w8a16_gemm
     _HAS_W8A16 = True
@@ -381,6 +421,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         rotary_dim = self.module.rotary_dim
 
         # Q/K/V projection via FP8 GEMM
+        if _DECODE_TIMING:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         query = _fp8_linear(fp8_q, q_scale, hidden_states)
         key = _fp8_linear(fp8_k, k_scale, hidden_states)
         value = _fp8_linear(fp8_v, v_scale, hidden_states)
@@ -389,12 +433,16 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
         key = cuda_rmsnorm(key, self.module.k_norm.weight, self.module.k_norm.eps)
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_qkv_proj", _t0)
+            _t0 = time.perf_counter()
+
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, num_heads, head_dim)
         key = key.view(batch, seq_len, num_kv_heads, head_dim)
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
-        # Partial RoPE (PyTorch ops — CUDA RoPE kernel needs further debugging for partial rotation)
+        # Partial RoPE (PyTorch ops)
         if not getattr(self.__class__, '_warned_rope', False):
             logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (NOT CUDA rope_forward)")
             self.__class__._warned_rope = True
@@ -417,6 +465,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             k_pass,
         ], dim=-1)
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_rope", _t0)
+            _t0 = time.perf_counter()
+
         # Write new K,V to paged GPU cache
         gpu_kv_manager.update_layer_decode_new_token(
             k_tensor=key,
@@ -433,6 +485,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         if batch_slice is not None:
             start_idx, end_idx = batch_slice
             page_table = page_table[start_idx:end_idx]
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_kv_update", _t0)
+            _t0 = time.perf_counter()
 
         cache_seqlens_for_attn = micro_cache_seqlens
 
@@ -462,9 +518,16 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
                 block_table=page_table,
             )
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_forward", _t0)
+            _t0 = time.perf_counter()
+
         # Output projection via FP8 GEMM
         attn_output = attn_output.view(batch, 1, num_heads * head_dim)
         attn_output = _fp8_linear(fp8_o, o_scale, attn_output)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_output_proj", _t0)
 
         # Append KV to host
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)

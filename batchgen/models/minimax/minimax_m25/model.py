@@ -1615,6 +1615,11 @@ class MiniMaxM25Model(nn.Module):
 
         DecodeLayerTiming.print_summary()
 
+        # Per-sub-op timing (BATCHGEN_DECODE_TIMING=1)
+        from .wrappers import DecodeTimingStats, _DECODE_TIMING
+        if _DECODE_TIMING:
+            DecodeTimingStats.step_done()
+
         return (hidden_states, next_cache, None, None)
 
 
