@@ -1064,6 +1064,8 @@ class MiniMaxM25MoE(nn.Module):
         )
         return res
 
+    _debug_count = 0
+
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
         """FP8 blockwise grouped GEMM on 3D strided buffer (no scatter/gather).
 
@@ -1074,12 +1076,20 @@ class MiniMaxM25MoE(nn.Module):
         K = self.hidden_size
         N = self.config.moe_intermediate_size
         mtp = buf.max_tokens_padded
+        debug = os.environ.get("BATCHGEN_DEBUG_MOE") and self.__class__._debug_count < 3
 
         cu_seqlens = torch.arange(
             0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
 
         seqlens = expert_counts[:E]
         avg = max(int(seqlens.float().mean().item()), 1)
+
+        if debug:
+            dx = buf.dispatched_x[:E * mtp]
+            print(f"[DEBUG_MOE] R{self.rank} dispatched_x: shape={list(dx.shape)} "
+                  f"mean={dx.float().mean().item():.6f} max={dx.abs().max().item():.6f} "
+                  f"nonzero={dx.count_nonzero().item()}/{dx.numel()} "
+                  f"expert_counts={expert_counts[:E].tolist()}", flush=True)
 
         # Quantize input
         x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
@@ -1094,6 +1104,12 @@ class MiniMaxM25MoE(nn.Module):
             seqlens, cu_seqlens, avg,
         )
 
+        if debug:
+            print(f"[DEBUG_MOE] R{self.rank} intermediate: shape={list(intermediate.shape)} "
+                  f"mean={intermediate.float().mean().item():.6f} "
+                  f"max={intermediate.abs().max().item():.6f} "
+                  f"nan={intermediate.isnan().any().item()}", flush=True)
+
         # Re-quantize intermediate for S3
         inter_quant, inter_scale = act_quant(intermediate)
         inter_scale_t = inter_scale.t().contiguous()
@@ -1105,6 +1121,13 @@ class MiniMaxM25MoE(nn.Module):
             self.fp8_down_ws3d,
             seqlens, cu_seqlens, avg,
         )
+
+        if debug:
+            print(f"[DEBUG_MOE] R{self.rank} s3_result: shape={list(result.shape)} "
+                  f"mean={result.float().mean().item():.6f} "
+                  f"max={result.abs().max().item():.6f} "
+                  f"nan={result.isnan().any().item()}", flush=True)
+            self.__class__._debug_count += 1
 
         # Copy result to expert_out buffer for reduce
         buf.expert_out[:E * mtp].copy_(result[:E * mtp])
@@ -1164,6 +1187,16 @@ class MiniMaxM25MoE(nn.Module):
             self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
             # 5) CUDA reduce: weighted scatter from 3D to flat
+            debug = os.environ.get("BATCHGEN_DEBUG_MOE") and self.__class__._debug_count <= 3
+            if debug:
+                eo = buf.expert_out[:self.experts_per_rank * buf.max_tokens_padded]
+                tp_valid = (topk_pos >= 0).sum().item()
+                print(f"[DEBUG_REDUCE] R{self.rank} expert_out: mean={eo.float().mean().item():.6f} "
+                      f"max={eo.abs().max().item():.6f} nonzero={eo.count_nonzero().item()}/{eo.numel()} "
+                      f"topk_pos valid={tp_valid}/{topk_pos.numel()} "
+                      f"topk_weight: mean={topk_weight.mean().item():.4f} "
+                      f"shape={list(topk_weight.shape)}", flush=True)
+
             result_buf = buf.result_buffer[:num_global]
             result_buf.zero_()
             global_results = reduce_weighted_scatter(
@@ -1171,6 +1204,11 @@ class MiniMaxM25MoE(nn.Module):
                 num_global, hidden_size, topk,
                 output=result_buf,
             )
+
+            if debug:
+                print(f"[DEBUG_REDUCE] R{self.rank} global_results: mean={global_results.float().mean().item():.6f} "
+                      f"max={global_results.abs().max().item():.6f} "
+                      f"nan={global_results.isnan().any().item()}", flush=True)
 
             # 6) AllReduce
             with self.comm.change_state(enable=True):
