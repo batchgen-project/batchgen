@@ -354,7 +354,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         """
         from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
         from batchgen.attention.fused_kernels import cuda_rmsnorm
-        from batchgen.attention.fused_kernels.ops import _get_ext as _get_attn_ext
 
         fp8_q, q_scale, fp8_k, k_scale, fp8_v, v_scale, fp8_o, o_scale = self._get_attn_weights()
 
@@ -395,27 +394,25 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         key = key.view(batch, seq_len, num_kv_heads, head_dim)
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
-        # Partial RoPE via CUDA kernel (rope_forward with half_dim=rotary_dim//2)
+        # Partial RoPE (PyTorch ops — CUDA RoPE kernel needs further debugging for partial rotation)
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-        half_dim = rotary_dim // 2  # 32 for rotary_dim=64
+        cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+        sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        # cos/sin: [max_seqlen, rotary_dim] → pad to [batch, 1, head_dim]
-        cos_pos = cos[current_token_position]  # [batch, rotary_dim]
-        sin_pos = sin[current_token_position]
-        cos_padded = torch.zeros(batch, 1, head_dim, dtype=cos_pos.dtype, device=cos_pos.device)
-        sin_padded = torch.zeros(batch, 1, head_dim, dtype=sin_pos.dtype, device=sin_pos.device)
-        cos_padded[:, 0, :rotary_dim] = cos_pos
-        sin_padded[:, 0, :rotary_dim] = sin_pos
+        q_rot = query[..., :rotary_dim]
+        q_pass = query[..., rotary_dim:]
+        k_rot = key[..., :rotary_dim]
+        k_pass = key[..., rotary_dim:]
 
-        # rope_forward with explicit half_dim for partial rotation
-        q_rot, k_rot = _get_attn_ext().rope_forward(
-            query, key, cos_padded, sin_padded, half_dim)
-        # Copy passthrough dims (kernel only writes first rotary_dim=2*half_dim dims)
-        q_rot[..., rotary_dim:] = query[..., rotary_dim:]
-        k_rot[..., rotary_dim:] = key[..., rotary_dim:]
-        query = q_rot
-        key = k_rot
+        query = torch.cat([
+            q_rot * cos + rotate_half(q_rot) * sin,
+            q_pass,
+        ], dim=-1)
+        key = torch.cat([
+            k_rot * cos + rotate_half(k_rot) * sin,
+            k_pass,
+        ], dim=-1)
 
         # Write new K,V to paged GPU cache
         gpu_kv_manager.update_layer_decode_new_token(
