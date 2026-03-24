@@ -321,13 +321,23 @@ class DecodeLayerTiming:
         total_moe = sum(s.moe_ms for s in cls.layer_stats)
         total_time = total_attn + total_moe
         num_layers = len(cls.layer_stats)
-        print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===")
-        print(f"Total: {total_time:.2f} ms ({1000/total_time:.1f} tokens/sec)")
-        print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/total_time:.1f}%)")
-        print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/total_time:.1f}%)")
-        print(f"\nPer-layer (first 3):")
-        for s in cls.layer_stats[:3]:
-            print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms")
+        avg_attn = total_attn / max(num_layers, 1)
+        avg_moe = total_moe / max(num_layers, 1)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===",
+                  flush=True)
+            print(f"Total: {total_time:.2f} ms ({1000/max(total_time, 0.01):.1f} tokens/sec)",
+                  flush=True)
+            print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/max(total_time, 0.01):.1f}%) "
+                  f"avg={avg_attn:.2f}ms/layer", flush=True)
+            print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/max(total_time, 0.01):.1f}%) "
+                  f"avg={avg_moe:.2f}ms/layer", flush=True)
+            print(f"\nPer-layer (first 5):", flush=True)
+            for s in cls.layer_stats[:5]:
+                print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms",
+                      flush=True)
         cls.layer_stats.clear()
 
     @classmethod
@@ -1481,9 +1491,14 @@ class MiniMaxM25DecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        timing_enabled = DecodeLayerTiming.enabled
         DecodeLayerTiming.start_layer(self.layer_idx)
 
         # ========== ATTENTION ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            attn_start = time.perf_counter()
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attn_weights, present_key_value = self.self_attn(
@@ -1503,10 +1518,12 @@ class MiniMaxM25DecoderLayer(nn.Module):
             self.post_attention_layernorm.eps,
         )
 
-        # ========== MoE ==========
-        timing_enabled = DecodeLayerTiming.enabled
         if timing_enabled:
             torch.cuda.synchronize()
+            DecodeLayerTiming.record_attn((time.perf_counter() - attn_start) * 1000)
+
+        # ========== MoE ==========
+        if timing_enabled:
             moe_start = time.perf_counter()
 
         hidden_states = self.mlp(hidden_states)
