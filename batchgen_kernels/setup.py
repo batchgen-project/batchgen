@@ -110,7 +110,7 @@ setup(
             name="batchgen_kernels.moe._C_fp8_blockwise_gemm",
             sources=["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
             include_dirs=[os.path.join(_this_dir, "3rd/cutlass/include"),
-                         os.path.join(_this_dir, "src/moe/fp8_blockwise")],
+                         _this_dir],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
