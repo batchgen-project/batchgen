@@ -1157,8 +1157,11 @@ class MiniMaxM25MoE(nn.Module):
             buf.resize_if_needed(num_global)
 
             # 1) AllGather into pre-allocated buffer
+            #    Slice padded to current num_tokens_per_rank (may differ from
+            #    original allocation if set_num_tokens_per_rank was called)
+            ntr = self.num_tokens_per_rank
             all_tokens = buf.all_tokens[:num_global]
-            padded = buf.padded
+            padded = buf.padded[:ntr]
             padded.zero_()
             if num_tokens > 0:
                 padded[:num_tokens] = x
