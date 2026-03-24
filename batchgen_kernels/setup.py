@@ -105,6 +105,22 @@ setup(
                          "--threads", _nvcc_threads],
             },
         ),
+        # FP8 blockwise grouped GEMM (CuTe persistent, adaptive TileM)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fp8_blockwise_gemm",
+            sources=["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
+            include_dirs=[os.path.join(_this_dir, "3rd/cutlass/include"),
+                         os.path.join(_this_dir, "src/moe/fp8_blockwise")],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "-lineinfo", "--expt-relaxed-constexpr",
+                         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                         "-DNDEBUG",
+                         "-Xptxas=-v",
+                         "--threads", _nvcc_threads],
+            },
+        ),
         # Marlin <-> WGMMA weight transform
         CUDAExtension(
             name="batchgen_kernels.moe._C_marlin_transform",
