@@ -79,6 +79,12 @@ __global__ void rope_kernel(
 
     o_ptr[x_base + tid] = static_cast<T>(static_cast<float>(x1c) - static_cast<float>(x2s));
     o_ptr[x_base + half_dim + tid] = static_cast<T>(static_cast<float>(x2c) + static_cast<float>(x1s));
+
+    // Copy passthrough dimensions (partial rotation: 2*half_dim < head_dim)
+    int rotary_dim = 2 * half_dim;
+    for (int pd = rotary_dim + tid; pd < head_dim; pd += half_dim) {
+        o_ptr[x_base + pd] = x_ptr[x_base + pd];
+    }
 }
 
 // ============================================================================
