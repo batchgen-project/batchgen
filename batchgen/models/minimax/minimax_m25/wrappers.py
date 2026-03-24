@@ -84,7 +84,7 @@ except ImportError:
 
 # CUDA RoPE kernel (partial rotation with passthrough copy)
 try:
-    from batchgen_kernels.attention._C_attention_ext import rope_forward as _rope_forward_cuda
+    from batchgen_kernels.attention._C_fused_ops import rope_forward as _rope_forward_cuda
     _HAS_CUDA_ROPE = True
 except ImportError:
     _HAS_CUDA_ROPE = False
