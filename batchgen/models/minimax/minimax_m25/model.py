@@ -787,6 +787,15 @@ class MiniMaxM25MoE(nn.Module):
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
 
+        # Resize buf.padded to match new num_tokens_per_rank (K2.5 pattern)
+        buf = self.__class__._buf
+        if buf is not None and buf.padded.shape[0] != num_tokens_per_rank:
+            buf.padded = torch.zeros(
+                num_tokens_per_rank, buf.H,
+                dtype=torch.bfloat16, device=buf.device,
+            )
+            buf.num_tokens_per_rank = num_tokens_per_rank
+
     def init(self, micro_batch_size):
         """Build FP8 weight pointer arrays for grouped GEMM.
 
@@ -1157,11 +1166,8 @@ class MiniMaxM25MoE(nn.Module):
             buf.resize_if_needed(num_global)
 
             # 1) AllGather into pre-allocated buffer
-            #    Slice padded to current num_tokens_per_rank (may differ from
-            #    original allocation if set_num_tokens_per_rank was called)
-            ntr = self.num_tokens_per_rank
             all_tokens = buf.all_tokens[:num_global]
-            padded = buf.padded[:ntr]
+            padded = buf.padded
             padded.zero_()
             if num_tokens > 0:
                 padded[:num_tokens] = x
