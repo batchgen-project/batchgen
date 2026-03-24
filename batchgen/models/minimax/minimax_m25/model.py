@@ -715,6 +715,67 @@ class MiniMaxM25MoE(nn.Module):
             [s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device
         )
 
+        # Stack FP8 weights for blockwise grouped GEMM kernel
+        # gate/up: [E_local, N=moe_intermediate_size, K=hidden_size] fp8
+        # down:    [E_local, N=hidden_size, K=moe_intermediate_size] fp8
+        self._init_fp8_blockwise_weights()
+
+    def _init_fp8_blockwise_weights(self):
+        """Stack per-expert FP8 weights into 3D tensors for blockwise GEMM.
+
+        Creates [E_local, out_dim, in_dim] contiguous fp8 weight tensors
+        and [E_local, out_dim/128, (in_dim/128+3)//4*4] padded scale tensors.
+        Called once during init() after pointer arrays are built.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size  # 3072
+        N = self.config.moe_intermediate_size  # 1536
+        scale_block = 128
+
+        k_blocks = K // scale_block
+        n_blocks = N // scale_block
+        k_blocks_pad4 = (k_blocks + 3) // 4 * 4
+        n_blocks_pad4 = (n_blocks + 3) // 4 * 4
+
+        # Gate: [E, N, K] fp8 — gate_proj maps K→N
+        self.fp8_gate_w3d = torch.stack(self.gate_list).contiguous()
+        # Up: [E, N, K] fp8
+        self.fp8_up_w3d = torch.stack(self.up_list).contiguous()
+        # Down: [E, K, N] fp8 — down_proj maps N→K
+        self.fp8_down_w3d = torch.stack(self.down_list).contiguous()
+
+        # Gate weight scales: [E, N/128, (K/128+3)//4*4]
+        self.fp8_gate_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.gate_scale_list):
+            self.fp8_gate_ws3d[i, :, :k_blocks] = s
+
+        # Up weight scales: [E, N/128, (K/128+3)//4*4]
+        self.fp8_up_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.up_scale_list):
+            self.fp8_up_ws3d[i, :, :k_blocks] = s
+
+        # Down weight scales: [E, K/128, (N/128+3)//4*4]
+        self.fp8_down_ws3d = torch.zeros(
+            E, k_blocks, n_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.down_scale_list):
+            self.fp8_down_ws3d[i, :, :n_blocks] = s
+
+        # Pre-computed cu_seqlens for reserved buffer layout
+        # mtp = max_tokens_padded (set later by init_num_tokens)
+        self._fp8_blockwise_ready = True
+
+        logging.info(
+            f"[MoE] FP8 blockwise weights stacked: "
+            f"gate={list(self.fp8_gate_w3d.shape)}, "
+            f"down={list(self.fp8_down_w3d.shape)}, "
+            f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
+        )
+
     def _gate_sigmoid_topk(self, hidden_states_2d):
         """Sigmoid routing with correction bias on 2D input [N, hidden_size].
 
