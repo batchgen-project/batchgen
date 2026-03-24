@@ -1079,6 +1079,9 @@ class MiniMaxM25MoE(nn.Module):
         Reads from buf.dispatched_x, writes to buf.expert_out.
         Uses CuTe persistent kernel with uniform cu_seqlens stride.
         """
+        if not getattr(self.__class__, '_warned_gemm_3d', False):
+            logging.warning("[MoE] HOT PATH: _fp8_blockwise_gemm_3d (CuTe persistent, no scatter/gather)")
+            self.__class__._warned_gemm_3d = True
         E = self.experts_per_rank
         K = self.hidden_size
         N = self.config.moe_intermediate_size
@@ -1140,6 +1143,10 @@ class MiniMaxM25MoE(nn.Module):
         # === K2.5 Pattern: 3D dispatch + CUDA reduce ===
         if buf is not None and _HAS_DISPATCH_3D and _HAS_FP8_BLOCKWISE \
                 and getattr(self, '_fp8_blockwise_ready', False):
+            if not getattr(self.__class__, '_warned_k25_path', False):
+                logging.warning(
+                    "[MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
+                self.__class__._warned_k25_path = True
             buf.resize_if_needed(num_global)
 
             # 1) AllGather into pre-allocated buffer
@@ -1196,6 +1203,12 @@ class MiniMaxM25MoE(nn.Module):
             return global_results[start_token_ids:end_token_ids].to(x.dtype)
 
         # === Fallback: fused_moe_token_dispatch + Triton reduce ===
+        if not getattr(self.__class__, '_warned_fallback', False):
+            logging.warning(
+                "[MoE] FALLBACK: fused_moe_token_dispatch + Triton reduce "
+                f"(dispatch_3d={_HAS_DISPATCH_3D}, blockwise={_HAS_FP8_BLOCKWISE}, "
+                f"ready={getattr(self, '_fp8_blockwise_ready', False)}, buf={buf is not None})")
+            self.__class__._warned_fallback = True
         if num_tokens == 0:
             padded_hidden_states = torch.zeros(
                 (self.num_tokens_per_rank, hidden_size),

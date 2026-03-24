@@ -395,6 +395,9 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
         # Partial RoPE (PyTorch ops — CUDA RoPE kernel needs further debugging for partial rotation)
+        if not getattr(self.__class__, '_warned_rope', False):
+            logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (NOT CUDA rope_forward)")
+            self.__class__._warned_rope = True
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
         cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
@@ -434,6 +437,9 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         cache_seqlens_for_attn = micro_cache_seqlens
 
         # Decode attention
+        if not getattr(self.__class__, '_warned_attn', False):
+            logging.warning("[Attn] HOT PATH: gqa_decode_fa (FlashAttention, NOT batchgen_gqa_decode_bf16)")
+            self.__class__._warned_attn = True
         attn_output, _ = gqa_decode_fa(
             q=query,
             k_cache=k_cache_layer,
