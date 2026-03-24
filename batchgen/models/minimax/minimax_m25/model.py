@@ -74,6 +74,13 @@ try:
 except ImportError:
     _HAS_FP8_BLOCKWISE = False
 
+# 3D dispatch scatter + CUDA reduce (K2.5 pattern)
+try:
+    from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d, reduce_weighted_scatter
+    _HAS_DISPATCH_3D = True
+except ImportError:
+    _HAS_DISPATCH_3D = False
+
 
 # ============================================================================
 # MoE Triton Kernels (self-contained — no cross-model imports)
@@ -569,6 +576,89 @@ class MiniMaxM25Expert(nn.Module):
 
 
 # ============================================================================
+# MoE Buffer Manager (K2.5 pattern: 3D strided layout)
+# ============================================================================
+
+_DEFAULT_MTP = 64  # fixed max_tokens_padded for decode batch sizes
+
+
+class MiniMaxM25MoEBufferManager:
+    """Pre-allocated buffers for MiniMax MoE decode pipeline (3D strided layout).
+
+    One instance per model, shared across all 62 MoE layers via class variable.
+    Follows K2.5 pattern: dispatch_scatter_3d writes tokens directly into
+    fixed-stride slots, GEMM operates inplace, reduce reads via topk_pos.
+
+    Buffer layout: [E_local * max_tokens_padded, dim] (3D strided).
+    Each expert e owns rows [e * mtp, (e+1) * mtp) in the activation buffer.
+    """
+
+    def __init__(
+        self,
+        E_local: int,
+        max_global_bsz: int,
+        H: int,
+        N_inter: int,
+        topk: int,
+        num_tokens_per_rank: int,
+        device: torch.device,
+        max_tokens_padded: int = _DEFAULT_MTP,
+    ):
+        self.E_local = E_local
+        self.H = H
+        self.N_inter = N_inter
+        self.topk = topk
+        self.max_global_bsz = max_global_bsz
+        self.num_tokens_per_rank = num_tokens_per_rank
+        self.device = device
+        self.max_tokens_padded = max_tokens_padded
+
+        NK = max_global_bsz * topk
+        buf_rows = E_local * max_tokens_padded
+
+        # Communication buffers
+        self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
+
+        # Routing metadata
+        self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+
+        # 3D strided GEMM buffers
+        self.dispatched_x = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+
+        # Result buffer
+        self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+
+        logging.info(
+            f"[MoEBufferManager] 3D strided: E_local={E_local}, mtp={max_tokens_padded}, "
+            f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
+            f"total={self._total_bytes() / (1024**3):.2f} GiB"
+        )
+
+    def resize_if_needed(self, global_bsz: int):
+        """Resize communication/routing buffers if global_bsz exceeds capacity."""
+        if global_bsz <= self.max_global_bsz:
+            return
+        logging.info(f"[MoEBufferManager] Resizing: {self.max_global_bsz} -> {global_bsz}")
+        self.max_global_bsz = global_bsz
+        NK = global_bsz * self.topk
+        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
+        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+    def _total_bytes(self):
+        total = 0
+        for attr in ['all_tokens', 'padded', 'expert_counts', 'expert_counters',
+                      'topk_pos', 'dispatched_x', 'expert_out', 'result_buffer']:
+            t = getattr(self, attr)
+            total += t.nelement() * t.element_size()
+        return total
+
+
+# ============================================================================
 # MoE Layer with Sigmoid Routing + Correction Bias
 # ============================================================================
 
@@ -650,18 +740,36 @@ class MiniMaxM25MoE(nn.Module):
         self.token_idx = None
         self.topk_pos = None
 
+    # Class-level shared buffer (one per model, shared across all 62 MoE layers)
+    _buf: Optional[MiniMaxM25MoEBufferManager] = None
+
     def init_num_tokens(self, num_tokens_per_rank):
         """Allocate token dispatch buffers for EP decode."""
         self.num_tokens_per_rank = num_tokens_per_rank
         self.max_num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = self.num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
+
+        # Legacy dispatch buffers (for fused_moe_token_dispatch fallback)
         self.token_idx = torch.arange(
             global_num_tokens, dtype=torch.int32, device=self.device
         ).repeat_interleave(K)
         self.topk_pos = torch.arange(
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
+
+        # 3D buffer manager (K2.5 pattern)
+        if _HAS_DISPATCH_3D and self.__class__._buf is None:
+            self.__class__._buf = MiniMaxM25MoEBufferManager(
+                E_local=self.experts_per_rank,
+                max_global_bsz=global_num_tokens,
+                H=self.hidden_size,
+                N_inter=self.config.moe_intermediate_size,
+                topk=K,
+                num_tokens_per_rank=num_tokens_per_rank,
+                device=self.device,
+                max_tokens_padded=_DEFAULT_MTP,
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         """Dynamically update num_tokens_per_rank for reduced communication."""
@@ -956,16 +1064,63 @@ class MiniMaxM25MoE(nn.Module):
         )
         return res
 
+    def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
+        """FP8 blockwise grouped GEMM on 3D strided buffer (no scatter/gather).
+
+        Reads from buf.dispatched_x, writes to buf.expert_out.
+        Uses CuTe persistent kernel with uniform cu_seqlens stride.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size
+        N = self.config.moe_intermediate_size
+        mtp = buf.max_tokens_padded
+
+        cu_seqlens = torch.arange(
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
+
+        seqlens = expert_counts[:E]
+        avg = max(int(seqlens.float().mean().item()), 1)
+
+        # Quantize input
+        x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
+        x_scale_t = x_scale.t().contiguous()
+
+        # S1: gate + up + SiLU
+        intermediate = grouped_fp8_blockwise_s1_silu(
+            x_quant.view(torch.float8_e4m3fn), x_scale_t,
+            self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+            self.fp8_up_w3d.view(torch.float8_e4m3fn),
+            self.fp8_gate_ws3d, self.fp8_up_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Re-quantize intermediate for S3
+        inter_quant, inter_scale = act_quant(intermediate)
+        inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection → writes to expert_out buffer
+        result = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Copy result to expert_out buffer for reduce
+        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
+
     @torch.inference_mode()
     def moe_infer_allgather_allreduce_bf16_acc(self, x):
-        """EP decode: AllGather → gate → dispatch → grouped FP8 GEMM → reduce → AllReduce.
+        """EP decode: AllGather → gate → 3D dispatch → FP8 GEMM → reduce → AllReduce.
 
-        All-persistent path. No shared experts (unlike DeepSeek-V3).
+        All-persistent path. Uses K2.5 pattern: dispatch_scatter_3d + reduce_weighted_scatter.
+        Falls back to fused_moe_token_dispatch path if dispatch_scatter_3d unavailable.
         """
-        # scatter_weight_reduce_optimized is defined at module level (self-contained)
-
+        buf = self.__class__._buf
         num_tokens, hidden_size = x.shape
         device = x.device
+        topk = self.num_experts_per_tok
+        num_global = self.num_tokens_per_rank * self.world_size
 
         if num_tokens > self.num_tokens_per_rank:
             raise RuntimeError(
@@ -973,7 +1128,65 @@ class MiniMaxM25MoE(nn.Module):
                 f"num_tokens_per_rank={self.num_tokens_per_rank}"
             )
 
-        # Pad local tokens to num_tokens_per_rank
+        # === K2.5 Pattern: 3D dispatch + CUDA reduce ===
+        if buf is not None and _HAS_DISPATCH_3D and _HAS_FP8_BLOCKWISE \
+                and getattr(self, '_fp8_blockwise_ready', False):
+            buf.resize_if_needed(num_global)
+
+            # 1) AllGather into pre-allocated buffer
+            all_tokens = buf.all_tokens[:num_global]
+            padded = buf.padded
+            padded.zero_()
+            if num_tokens > 0:
+                padded[:num_tokens] = x
+
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.default_stream(device),
+                )
+
+            # 2) Gate: sigmoid routing
+            topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
+
+            # 3) 3D dispatch scatter into strided buffer
+            buf.dispatched_x.zero_()
+            expert_counts, topk_pos = dispatch_scatter_3d(
+                all_tokens, topk_idx.to(torch.int32),
+                buf.dispatched_x,
+                self.routed_expert_start_idx, self.experts_per_rank,
+                buf.max_tokens_padded,
+                buf.expert_counts, buf.expert_counters,
+                buf.topk_pos[:num_global * topk],
+            )
+
+            # 4) FP8 blockwise GEMM on 3D buffer
+            self._fp8_blockwise_gemm_3d(buf, expert_counts)
+
+            # 5) CUDA reduce: weighted scatter from 3D to flat
+            result_buf = buf.result_buffer[:num_global]
+            result_buf.zero_()
+            global_results = reduce_weighted_scatter(
+                buf.expert_out, topk_pos, topk_weight,
+                num_global, hidden_size, topk,
+                output=result_buf,
+            )
+
+            # 6) AllReduce
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.default_stream(device),
+                )
+
+            # 7) Slice local tokens
+            if num_tokens == 0:
+                return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
+            start_token_ids = self.rank * self.num_tokens_per_rank
+            end_token_ids = start_token_ids + num_tokens
+            return global_results[start_token_ids:end_token_ids].to(x.dtype)
+
+        # === Fallback: fused_moe_token_dispatch + Triton reduce ===
         if num_tokens == 0:
             padded_hidden_states = torch.zeros(
                 (self.num_tokens_per_rank, hidden_size),
@@ -988,7 +1201,6 @@ class MiniMaxM25MoE(nn.Module):
         else:
             padded_hidden_states = x
 
-        # 1) AllGather: collect tokens from all ranks
         all_tokens = torch.zeros(
             (self.world_size * self.num_tokens_per_rank, hidden_size),
             device=self.device, dtype=torch.bfloat16,
@@ -999,38 +1211,30 @@ class MiniMaxM25MoE(nn.Module):
                 stream=torch.cuda.default_stream(self.device),
             )
 
-        # 2) Gate on global tokens — sigmoid routing
-        global_x = all_tokens
-        topk_idx, topk_weight = self._gate_sigmoid_topk(global_x)
+        topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
 
-        # 3) Dispatch tokens to local experts
         (input_x, input_eids, global_indices, token_topk_pos,
          expert_counts, expert_offsets) = fused_moe_token_dispatch(
-            global_x, topk_idx, self.token_idx, self.topk_pos,
+            all_tokens, topk_idx, self.token_idx, self.topk_pos,
             self.routed_expert_start_idx, self.routed_expert_end_idx,
         )
 
-        # 4) Grouped FP8 expert GEMM
         res = self.grouped_dequant_moe_fp8(
             input_x, input_eids, expert_counts, expert_offsets,
         )
 
-        # 5) Weighted scatter-reduce back to per-token output
-        num_global = self.num_tokens_per_rank * self.world_size
         global_results = scatter_weight_reduce_optimized(
             res, global_indices, token_topk_pos, topk_weight,
             num_global, self.num_experts_per_tok,
         )
         global_results = global_results.to(torch.bfloat16)
 
-        # 6) AllReduce
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.default_stream(self.device),
             )
 
-        # 7) Slice local tokens (no shared experts to add)
         if num_tokens == 0:
             return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
         start_token_ids = self.rank * self.num_tokens_per_rank
