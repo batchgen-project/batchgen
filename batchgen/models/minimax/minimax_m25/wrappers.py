@@ -352,7 +352,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         Uses batchgen WGMMA decode kernel on H20, FlashAttention fallback otherwise.
         Partial RoPE via CUDA rope_forward kernel (half_dim=rotary_dim//2).
         """
-        from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
+        from batchgen.attention.gqa import gqa_decode_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
 
         fp8_q, q_scale, fp8_k, k_scale, fp8_v, v_scale, fp8_o, o_scale = self._get_attn_weights()
@@ -433,8 +433,8 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
         cache_seqlens_for_attn = micro_cache_seqlens
 
-        # Decode attention via CUDA WGMMA kernel (H20) or FA3 fallback
-        attn_output, _ = batchgen_gqa_decode_bf16(
+        # Decode attention
+        attn_output, _ = gqa_decode_fa(
             q=query,
             k_cache=k_cache_layer,
             v_cache=v_cache_layer,
