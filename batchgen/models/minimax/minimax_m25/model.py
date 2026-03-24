@@ -1198,7 +1198,13 @@ class MiniMaxM25MoE(nn.Module):
                 self.__class__._warned_k25_path = True
             buf.resize_if_needed(num_global)
 
+            from .wrappers import DecodeTimingStats, _DECODE_TIMING
+
             # 1) AllGather into pre-allocated buffer
+            if _DECODE_TIMING:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
+
             all_tokens = buf.all_tokens[:num_global]
             padded = buf.padded
             padded.zero_()
@@ -1211,8 +1217,16 @@ class MiniMaxM25MoE(nn.Module):
                     stream=torch.cuda.default_stream(device),
                 )
 
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_allgather", _t0)
+                _t0 = time.perf_counter()
+
             # 2) Gate: sigmoid routing
             topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_gate", _t0)
+                _t0 = time.perf_counter()
 
             # 3) 3D dispatch scatter into strided buffer
             buf.dispatched_x.zero_()
@@ -1225,8 +1239,16 @@ class MiniMaxM25MoE(nn.Module):
                 buf.topk_pos[:num_global * topk],
             )
 
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_dispatch", _t0)
+                _t0 = time.perf_counter()
+
             # 4) FP8 blockwise GEMM on 3D buffer
             self._fp8_blockwise_gemm_3d(buf, expert_counts)
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_gemm", _t0)
+                _t0 = time.perf_counter()
 
             # 5) CUDA reduce: weighted scatter from 3D to flat
             result_buf = buf.result_buffer[:num_global]
@@ -1237,12 +1259,19 @@ class MiniMaxM25MoE(nn.Module):
                 output=result_buf,
             )
 
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_reduce", _t0)
+                _t0 = time.perf_counter()
+
             # 6) AllReduce
             with self.comm.change_state(enable=True):
                 self.comm.all_reduce(
                     global_results, op=dist.ReduceOp.SUM,
                     stream=torch.cuda.default_stream(device),
                 )
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_allreduce", _t0)
 
             # 7) Slice local tokens
             if num_tokens == 0:

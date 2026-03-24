@@ -82,6 +82,29 @@ try:
 except ImportError:
     _HAS_W8A16 = False
 
+# CUDA RoPE kernel (partial rotation with passthrough copy)
+try:
+    from batchgen_kernels.attention._C_attention_ext import rope_forward as _rope_forward_cuda
+    _HAS_CUDA_ROPE = True
+except ImportError:
+    _HAS_CUDA_ROPE = False
+
+
+def _cuda_rope_forward(query, key, cos, sin, half_dim):
+    """CUDA RoPE with partial rotation passthrough.
+
+    Args:
+        query: [B, S=1, num_q_heads, head_dim]
+        key:   [B, S=1, num_kv_heads, head_dim]
+        cos:   [B, S=1, head_dim] (padded to head_dim)
+        sin:   [B, S=1, head_dim]
+        half_dim: rotary_dim // 2
+
+    Returns:
+        (q_rotated, k_rotated) same shapes as input
+    """
+    return _rope_forward_cuda(query, key, cos, sin, half_dim, None)
+
 
 def _fp8_linear(weight_fp8, scale, x):
     """FP8 weight × BF16 activation via w8a16_gemm. Scale factors are F32 (from checkpoint)."""
@@ -442,28 +465,47 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         key = key.view(batch, seq_len, num_kv_heads, head_dim)
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
-        # Partial RoPE (PyTorch ops)
-        if not getattr(self.__class__, '_warned_rope', False):
-            logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (NOT CUDA rope_forward)")
-            self.__class__._warned_rope = True
+        # Partial RoPE — CUDA kernel or PyTorch fallback
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-        cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
-        sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        q_rot = query[..., :rotary_dim]
-        q_pass = query[..., rotary_dim:]
-        k_rot = key[..., :rotary_dim]
-        k_pass = key[..., rotary_dim:]
+        if _HAS_CUDA_ROPE:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: CUDA rope_forward (partial rotation, passthrough copy)")
+                self.__class__._warned_rope = True
+            # cos/sin from rotary_emb: [seq_len, rotary_dim]
+            # Index by position: [batch, rotary_dim]
+            cos_pos = cos[current_token_position]  # [batch, rotary_dim]
+            sin_pos = sin[current_token_position]  # [batch, rotary_dim]
+            # Pad to head_dim for kernel (kernel reads cos[batch_seq_idx * head_dim + tid])
+            cos_padded = torch.nn.functional.pad(cos_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            sin_padded = torch.nn.functional.pad(sin_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            # Reshape for kernel: [B, S=1, head_dim]
+            cos_k = cos_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            sin_k = sin_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            half_dim = rotary_dim // 2  # 32 for MiniMax
+            query, key = _cuda_rope_forward(
+                query, key, cos_k, sin_k, half_dim)
+        else:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (fallback)")
+                self.__class__._warned_rope = True
+            cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+            sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        query = torch.cat([
-            q_rot * cos + rotate_half(q_rot) * sin,
-            q_pass,
-        ], dim=-1)
-        key = torch.cat([
-            k_rot * cos + rotate_half(k_rot) * sin,
-            k_pass,
-        ], dim=-1)
+            q_rot = query[..., :rotary_dim]
+            q_pass = query[..., rotary_dim:]
+            k_rot = key[..., :rotary_dim]
+            k_pass = key[..., rotary_dim:]
+
+            query = torch.cat([
+                q_rot * cos + rotate_half(q_rot) * sin,
+                q_pass,
+            ], dim=-1)
+            key = torch.cat([
+                k_rot * cos + rotate_half(k_rot) * sin,
+                k_pass,
+            ], dim=-1)
 
         if _DECODE_TIMING:
             DecodeTimingStats._sync_record("attn_rope", _t0)
