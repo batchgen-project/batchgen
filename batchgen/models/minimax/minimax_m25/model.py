@@ -64,6 +64,16 @@ try:
 except ImportError:
     _HAS_FP8_GROUPED = False
 
+# FP8 blockwise grouped GEMM (CuTe persistent kernel)
+try:
+    from batchgen.moe.grouped_fp8_blockwise_moe import (
+        grouped_fp8_blockwise_s1_silu,
+        grouped_fp8_blockwise_s3,
+    )
+    _HAS_FP8_BLOCKWISE = True
+except ImportError:
+    _HAS_FP8_BLOCKWISE = False
+
 
 # ============================================================================
 # MoE Triton Kernels (self-contained — no cross-model imports)
@@ -804,9 +814,12 @@ class MiniMaxM25MoE(nn.Module):
     def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
         """Process dispatched tokens through local experts with FP8 grouped GEMM.
 
-        Two-stage TMA pipeline:
-        1. act_quant → fused_fp8_moe_stage_1_tma (gate_proj * up_proj with SwiGLU)
-        2. act_quant → fused_dequant_grouped_gemm_fp8_tma (down_proj)
+        Uses CuTe blockwise kernel when available (2.5× faster decode),
+        falls back to Triton TMA kernel otherwise.
+
+        Input x is in compacted layout from fused_moe_token_dispatch.
+        For blockwise kernel: scatter to uniform [E*mtp, dim] stride, call kernel,
+        gather results back to compacted layout.
         """
         actual_num_tokens = expert_offsets[-1]
         if isinstance(actual_num_tokens, torch.Tensor):
@@ -819,7 +832,92 @@ class MiniMaxM25MoE(nn.Module):
                 (0, self.hidden_size), device=x.device, dtype=torch.bfloat16
             )
 
-        expert_counts = expert_counts.to(torch.int32)
+        expert_counts_i32 = expert_counts.to(torch.int32)
+
+        # ── FP8 Blockwise Kernel Path (CuTe persistent) ──
+        if _HAS_FP8_BLOCKWISE and getattr(self, '_fp8_blockwise_ready', False):
+            return self._grouped_dequant_fp8_blockwise(
+                x, expert_counts_i32, expert_offsets, actual_num_tokens_val)
+
+        # ── Fallback: Triton TMA Kernel ──
+        return self._grouped_dequant_fp8_triton(
+            x, expert_counts_i32, actual_num_tokens_val)
+
+    def _grouped_dequant_fp8_blockwise(self, x, expert_counts, expert_offsets,
+                                        actual_num_tokens_val):
+        """FP8 blockwise grouped GEMM via CuTe persistent kernel.
+
+        Scatters compacted tokens to uniform [E*mtp, dim] layout,
+        runs blockwise GEMM, gathers back.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size
+        N = self.config.moe_intermediate_size
+        device = x.device
+
+        # Determine mtp (max tokens padded to 64)
+        max_tok = int(expert_counts.max().item())
+        mtp = max(((max_tok + 63) // 64) * 64, 64)
+
+        # Build uniform cu_seqlens
+        cu_seqlens = torch.arange(
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=device)
+
+        # Scatter compacted x → uniform [E*mtp, K] layout
+        x_uniform = torch.zeros(E * mtp, K, dtype=x.dtype, device=device)
+        offsets = expert_offsets.cpu().tolist()
+        counts = expert_counts.cpu().tolist()
+        for e in range(E):
+            m_e = counts[e]
+            if m_e > 0:
+                src = offsets[e]
+                dst = e * mtp
+                x_uniform[dst:dst + m_e] = x[src:src + m_e]
+
+        # Quantize to FP8
+        x_quant, x_scale = act_quant(x_uniform)
+
+        # Transpose x_scale: [M, K/128] → [K/128, E*mtp]
+        x_scale_t = x_scale.t().contiguous()
+
+        seqlens = expert_counts[:E]
+        avg = max(int(seqlens.float().mean().item()), 1)
+
+        # S1: gate + up + SiLU
+        intermediate = grouped_fp8_blockwise_s1_silu(
+            x_quant.view(torch.float8_e4m3fn), x_scale_t,
+            self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+            self.fp8_up_w3d.view(torch.float8_e4m3fn),
+            self.fp8_gate_ws3d, self.fp8_up_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Re-quantize intermediate for S3
+        inter_quant, inter_scale = act_quant(intermediate)
+        inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection
+        result_uniform = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Gather back to compacted layout
+        result = torch.empty(
+            actual_num_tokens_val, K, dtype=torch.bfloat16, device=device)
+        for e in range(E):
+            m_e = counts[e]
+            if m_e > 0:
+                src = e * mtp
+                dst = offsets[e]
+                result[dst:dst + m_e] = result_uniform[src:src + m_e]
+
+        return result
+
+    def _grouped_dequant_fp8_triton(self, x, expert_counts, actual_num_tokens_val):
+        """Fallback: Triton TMA kernel for FP8 grouped GEMM."""
         group_size, activated_group_idx, group_start_indices, num_active_experts = (
             compact_expert_data(expert_counts)
         )
@@ -837,7 +935,6 @@ class MiniMaxM25MoE(nn.Module):
         x_sliced = x[:actual_num_tokens_val]
         x_quant, x_scale = act_quant(x_sliced)
 
-        # Stage 1: gate_proj * up_proj (SwiGLU activation)
         intermediate = fused_fp8_moe_stage_1_tma(
             x_quant, x_scale,
             self.gate_list, self.gate_ptrs_ptr,
@@ -848,10 +945,8 @@ class MiniMaxM25MoE(nn.Module):
             num_active_experts, self.experts_per_rank,
         )
 
-        # Re-quantize intermediate for stage 2
         intermediate, intermediate_scale = act_quant(intermediate)
 
-        # Stage 2: down_proj
         res = fused_dequant_grouped_gemm_fp8_tma(
             intermediate, intermediate_scale,
             self.down_list, self.down_ptrs_ptr,
