@@ -88,6 +88,7 @@ try:
     _HAS_CUDA_ROPE = True
 except ImportError:
     _HAS_CUDA_ROPE = False
+    logging.warning("[RoPE] CUDA rope_forward not available — will use PyTorch fallback")
 
 
 def _cuda_rope_forward(query, key, cos, sin, half_dim):

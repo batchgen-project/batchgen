@@ -81,6 +81,7 @@ try:
     _HAS_FP8_OPS = True
 except ImportError:
     _HAS_FP8_OPS = False
+    logging.warning("[MoE] CUDA act_quant_3d/fused_silu_quant_3d not available — will use Triton fallback")
 
 # 3D dispatch scatter + CUDA reduce (K2.5 pattern)
 try:
