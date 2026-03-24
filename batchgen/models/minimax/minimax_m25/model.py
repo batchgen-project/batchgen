@@ -911,20 +911,13 @@ class MiniMaxM25MoE(nn.Module):
         for i, s in enumerate(self.down_scale_list):
             self.fp8_down_ws3d[i, :, :n_blocks] = s
 
-        # Fused gate+up: [E, 2N, K] — single GEMM for S1
-        self.fp8_gate_up_w3d = torch.cat(
-            [self.fp8_gate_w3d, self.fp8_up_w3d], dim=1).contiguous()
-        # Fused gate+up scales: [E, 2N/128, (K/128+3)//4*4]
-        self.fp8_gate_up_ws3d = torch.cat(
-            [self.fp8_gate_ws3d, self.fp8_up_ws3d], dim=1).contiguous()
-
         self._fp8_blockwise_ready = True
 
         logging.info(
             f"[MoE] FP8 blockwise weights stacked: "
-            f"gate_up={list(self.fp8_gate_up_w3d.shape)}, "
+            f"gate={list(self.fp8_gate_w3d.shape)}, "
             f"down={list(self.fp8_down_w3d.shape)}, "
-            f"gate_up_scale={list(self.fp8_gate_up_ws3d.shape)}"
+            f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
         )
 
     def _gate_sigmoid_topk(self, hidden_states_2d):
@@ -1131,21 +1124,25 @@ class MiniMaxM25MoE(nn.Module):
             x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
             x_scale_t = x_scale.t().contiguous()
 
-        # Opt-1: S1 fused gate+up in single GEMM → [E*mtp, 2N], then split + SiLU+quant
+        # S1: gate + up (2 GEMM launches) + fused SiLU+quant
+        # TODO: fuse gate+up into single kernel (like Marlin's MarlinGrouped_M16_S1)
         if _HAS_FP8_OPS:
-            # Single GEMM: x @ gate_up_w^T → [E*mtp, 2N]
-            gate_up_result = grouped_fp8_blockwise_gemm(
+            gate_result = grouped_fp8_blockwise_gemm(
                 x_quant.view(torch.float8_e4m3fn),
-                self.fp8_gate_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
                 seqlens, cu_seqlens,
-                x_scale_t, self.fp8_gate_up_ws3d, avg,
+                x_scale_t, self.fp8_gate_ws3d, avg,
             )
-            # Split into gate [E*mtp, N] and up [E*mtp, N]
-            gate_result, up_result = gate_up_result.chunk(2, dim=-1)
+            up_result = grouped_fp8_blockwise_gemm(
+                x_quant.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                seqlens, cu_seqlens,
+                x_scale_t, self.fp8_up_ws3d, avg,
+            )
             # Fused SiLU + FP8 quantization (eliminates intermediate BF16 buffer)
             inter_quant_3d, inter_scale_3d = fused_silu_quant_3d(
-                gate_result.contiguous().view(E, mtp, N),
-                up_result.contiguous().view(E, mtp, N),
+                gate_result.view(E, mtp, N),
+                up_result.view(E, mtp, N),
                 seqlens,
             )
             inter_quant = inter_quant_3d.view(E * mtp, N)

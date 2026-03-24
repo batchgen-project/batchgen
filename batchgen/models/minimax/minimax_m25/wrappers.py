@@ -108,8 +108,54 @@ def _cuda_rope_forward(query, key, cos, sin, half_dim):
 
 
 def _fp8_linear(weight_fp8, scale, x):
-    """FP8 weight × BF16 activation via w8a16_gemm. Scale factors are F32 (from checkpoint)."""
+    """FP8 weight × BF16 activation. Uses CUDA act_quant_3d(E=1) if available."""
+    if _HAS_CUDA_ACT_QUANT:
+        return _fp8_linear_cuda_quant(weight_fp8, scale, x)
     return w8a16_gemm(weight_fp8, scale, x)
+
+
+# CUDA act_quant for attention path (avoid Triton overhead on small M)
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
+    import deep_gemm
+    _HAS_CUDA_ACT_QUANT = True
+except ImportError:
+    _HAS_CUDA_ACT_QUANT = False
+    logging.warning("[Attn] CUDA act_quant_3d not available — using Triton act_quant in w8a16_gemm")
+
+_warned_cuda_act_quant = False
+
+
+def _fp8_linear_cuda_quant(weight_fp8, scale, x):
+    """FP8 linear with CUDA act_quant_3d(E=1) replacing Triton act_quant."""
+    global _warned_cuda_act_quant
+    if not _warned_cuda_act_quant:
+        logging.warning("[Attn] HOT PATH: _fp8_linear with CUDA act_quant_3d(E=1)")
+        _warned_cuda_act_quant = True
+
+    orig_shape = x.shape
+    x_2d = x.view(-1, x.size(-1))  # [M, K]
+    M, K = x_2d.shape
+    N = weight_fp8.size(0)
+
+    # CUDA act_quant_3d with E=1
+    tokens_per_expert = torch.tensor([M], dtype=torch.int32, device=x.device)
+    x_3d = x_2d.view(1, M, K)
+    x_fp8_3d, x_scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+    x_fp8 = x_fp8_3d.view(M, K)
+    x_scale = x_scale_3d.view(M, -1)
+
+    # DeepGEMM FP8×FP8→BF16
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    deep_gemm.fp8_gemm_nt(
+        (x_fp8.view(torch.float8_e4m3fn), x_scale),
+        (weight_fp8, scale),
+        out, disable_ue8m0_cast=True,
+    )
+
+    if len(orig_shape) == 3:
+        out = out.view(orig_shape[0], orig_shape[1], N)
+    return out
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
