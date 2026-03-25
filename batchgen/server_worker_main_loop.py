@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 import traceback
+from datetime import timedelta
 from typing import Any, List, Optional
 
 import torch
@@ -145,7 +146,7 @@ def _server_worker_main_impl(
 			world_size=args.world_size,
 			rank=args.global_rank,
 			device_id=args.local_rank,
-			timeout=torch.distributed.timedelta(seconds=3600),
+			timeout=timedelta(seconds=3600),
 		)
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
