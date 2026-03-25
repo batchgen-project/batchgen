@@ -824,6 +824,18 @@ class BatchGenWorker:
 		# Step 2: Tokenize new sequences (all ranks, parallel)
 		self._tokenize_admitted_sequences(new_uuids)
 
+		# Step 2.5: Update max_input_length from admitted sequences
+		# This is critical — engine config uses max_input_length for attention mask shape
+		max_prompt = max(
+			(self.global_batch.get_sequence(u).prompt_length
+			 for u in new_uuids if self.global_batch.get_sequence(u) is not None),
+			default=0,
+		)
+		if max_prompt > self.max_input_length:
+			self.max_input_length = max_prompt
+			if self.rank == 0:
+				logging.info(f"[ADMIT] Updated max_input_length to {self.max_input_length}")
+
 		# Step 3: Assign ranks (round-robin, continuing from existing)
 		self._assign_admitted_sequences_to_ranks(new_uuids)
 
