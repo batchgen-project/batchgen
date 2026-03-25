@@ -346,3 +346,25 @@ def _normalize_result_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _normalize_result_value(val) for key, val in value.items()}
     return value
+
+
+# ======================== Model Metadata ========================
+
+
+class ModelObject(BaseModel):
+    """OpenAI-compatible model object with BatchGen extensions."""
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "batchgen"
+    max_context_length: int = Field(
+        description="Maximum context length (prompt + completion tokens)"
+    )
+
+
+class ListModelsResponse(BaseModel):
+    """OpenAI-compatible response for GET /v1/models."""
+
+    object: Literal["list"] = "list"
+    data: List[ModelObject]
