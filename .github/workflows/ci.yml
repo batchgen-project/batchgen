@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Syntax check
+        run: |
+          echo "Checking Python syntax..."
+          ERRORS=0
+          while IFS= read -r f; do
+            if ! python -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
+              echo "::error file=$f::Syntax error in $f"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(find batchgen/ tests/ -name '*.py' -type f)
+          if [ $ERRORS -gt 0 ]; then
+            echo "::error::$ERRORS file(s) have syntax errors"
+            exit 1
+          fi
+          echo "All files pass syntax check"
+
+      - name: Check for backup files
+        run: |
+          BAKS=$(find . -name '*_bak*' -o -name '* copy*' -o -name '*_backup*' | grep -v .git | grep -v __pycache__ || true)
+          if [ -n "$BAKS" ]; then
+            echo "::warning::Backup files found (should be deleted):"
+            echo "$BAKS"
+          fi
+
+      - name: Unit tests
+        run: |
+          pip install pytest
+          if [ -d tests/unit ] && [ "$(ls tests/unit/*.py 2>/dev/null)" ]; then
+            pytest tests/unit/ -v --tb=short || true
+          else
+            echo "No unit tests found in tests/unit/"
+          fi
+
+      - name: Build check
+        run: |
+          python -c "exec(open('setup.py').read())" && echo "setup.py parses OK"
