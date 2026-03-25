@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "batchgen_kernels"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Pre-compiled CUDA kernels for BatchGen inference"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.9.0"]
+
+[tool.setuptools.dynamic]
+version = {attr = "batchgen_kernels._version.__version__"}
