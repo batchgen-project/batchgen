@@ -140,14 +140,18 @@ def _server_worker_main_impl(
 	torch.cuda.set_device(args.local_rank)
 
 	try:
-		dist.init_process_group(
+		pg_kwargs = dict(
 			backend="nccl",
 			init_method="tcp://" + args.dist_init_addr,
 			world_size=args.world_size,
 			rank=args.global_rank,
-			device_id=args.local_rank,
 			timeout=timedelta(seconds=3600),
 		)
+		# device_id requires torch >= 2.8
+		import inspect
+		if 'device_id' in inspect.signature(dist.init_process_group).parameters:
+			pg_kwargs['device_id'] = torch.device(f"cuda:{args.local_rank}")
+		dist.init_process_group(**pg_kwargs)
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
