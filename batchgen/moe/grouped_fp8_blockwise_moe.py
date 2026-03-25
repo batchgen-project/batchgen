@@ -22,6 +22,7 @@ from typing import Optional
 logger = logging.getLogger("batchgen.moe.fp8_blockwise")
 
 _warned_import = False
+_warned_fused_s1 = False
 
 
 def _get_kernel():
@@ -39,6 +40,23 @@ def _get_kernel():
                 "FP8 blockwise grouped GEMM kernel not available "
                 "(batchgen_kernels.moe._C_fp8_blockwise_gemm). "
                 "Falling back to Triton implementation."
+            )
+        return None
+
+
+def _get_fused_s1_kernel():
+    """Load the compiled fused S1 kernel (gate+up+SiLU)."""
+    global _warned_fused_s1
+    try:
+        from batchgen_kernels.moe._C_fp8_blockwise_gemm import (
+            fp8_blockwise_fused_s1,
+        )
+        return fp8_blockwise_fused_s1
+    except ImportError:
+        if not _warned_fused_s1:
+            _warned_fused_s1 = True
+            logger.warning(
+                "FP8 fused S1 kernel not available — falling back to 2× GEMM + SiLU"
             )
         return None
 
@@ -136,6 +154,57 @@ def grouped_fp8_blockwise_s1_silu(
 
     # Fused SiLU: silu(gate) * up
     return torch.nn.functional.silu(gate_result) * up_result
+
+
+def grouped_fp8_blockwise_fused_s1(
+    x_fp8: Tensor,
+    x_scale: Tensor,
+    gate_w3d: Tensor,
+    up_w3d: Tensor,
+    gate_ws3d: Tensor,
+    up_ws3d: Tensor,
+    seqlens: Tensor,
+    cu_seqlens: Tensor,
+    num_seq_per_group_avg: int,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """Fused S1: gate GEMM + up GEMM + SiLU in single kernel launch.
+
+    Two-phase CuTe persistent kernel (v19). Gate result stays in SMEM,
+    SiLU applied in the epilogue. 1.75× faster than 2× GEMM + SiLU at decode.
+
+    Falls back to grouped_fp8_blockwise_s1_silu if fused kernel unavailable.
+
+    Args:
+        x_fp8:      [E*mtp, K] fp8 — quantized activations
+        x_scale:    [K/128, E*mtp] f32 — transposed activation scales
+        gate_w3d:   [E, N, K] fp8 — gate projection weights
+        up_w3d:     [E, N, K] fp8 — up projection weights
+        gate_ws3d:  [E, N/128, K/128_pad4] f32 — gate weight scales
+        up_ws3d:    [E, N/128, K/128_pad4] f32 — up weight scales
+        seqlens:    [E] int32
+        cu_seqlens: [E+1] int32
+        num_seq_per_group_avg: int
+        output:     [E*mtp, N] bf16 — pre-allocated (optional)
+
+    Returns:
+        [E*mtp, N] bf16 — silu(gate) * up
+    """
+    kernel = _get_fused_s1_kernel()
+    if kernel is not None:
+        return kernel(
+            x_fp8, gate_w3d, up_w3d,
+            seqlens, cu_seqlens, x_scale,
+            gate_ws3d, up_ws3d,
+            num_seq_per_group_avg,
+            output,
+        )
+    # Fallback: 2× GEMM + SiLU
+    return grouped_fp8_blockwise_s1_silu(
+        x_fp8, x_scale, gate_w3d, up_w3d,
+        gate_ws3d, up_ws3d, seqlens, cu_seqlens,
+        num_seq_per_group_avg,
+    )
 
 
 def grouped_fp8_blockwise_s3(

@@ -69,6 +69,7 @@ try:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
         grouped_fp8_blockwise_gemm,
         grouped_fp8_blockwise_s1_silu,
+        grouped_fp8_blockwise_fused_s1,
         grouped_fp8_blockwise_s3,
     )
     _HAS_FP8_BLOCKWISE = True
@@ -1134,27 +1135,19 @@ class MiniMaxM25MoE(nn.Module):
             x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
             x_scale_t = x_scale.t().contiguous()
 
-        # S1: gate + up (2 GEMM launches) + fused SiLU+quant
-        # TODO: fuse gate+up into single kernel (like Marlin's MarlinGrouped_M16_S1)
+        # S1: gate + up + SiLU → FP8 quantize for S2 down projection
+        # Fused S1 (v19): single kernel for gate+up+SiLU (1.75× faster at decode)
+        # Output is BF16, then quantized to FP8 via act_quant_3d or fused_silu_quant_3d
         if _HAS_FP8_OPS:
-            gate_result = grouped_fp8_blockwise_gemm(
-                x_quant.view(torch.float8_e4m3fn),
+            s1_result = grouped_fp8_blockwise_fused_s1(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
                 self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                seqlens, cu_seqlens,
-                x_scale_t, self.fp8_gate_ws3d, avg,
-            )
-            up_result = grouped_fp8_blockwise_gemm(
-                x_quant.view(torch.float8_e4m3fn),
                 self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                seqlens, cu_seqlens,
-                x_scale_t, self.fp8_up_ws3d, avg,
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
             )
-            # Fused SiLU + FP8 quantization (eliminates intermediate BF16 buffer)
-            inter_quant_3d, inter_scale_3d = fused_silu_quant_3d(
-                gate_result.view(E, mtp, N),
-                up_result.view(E, mtp, N),
-                seqlens,
-            )
+            inter_quant_3d, inter_scale_3d = act_quant_3d(
+                s1_result.view(E, mtp, N), seqlens)
             inter_quant = inter_quant_3d.view(E * mtp, N)
             inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
         else:
