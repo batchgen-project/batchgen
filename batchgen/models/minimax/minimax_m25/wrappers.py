@@ -41,40 +41,13 @@ from .model import rotate_half
 # Per-sub-op decode timing (BATCHGEN_DECODE_TIMING=1)
 # ============================================================================
 
-_DECODE_TIMING = os.environ.get("BATCHGEN_DECODE_TIMING", "0") == "1"
-_DECODE_TIMING_INTERVAL = int(os.environ.get("BATCHGEN_DECODE_TIMING_INTERVAL", "50"))
+from batchgen.profiling.decode_timing import (
+    DecodeTimingStats,
+    decode_timing_enabled as _decode_timing_enabled,
+)
 
-
-class DecodeTimingStats:
-    """Accumulates per-sub-op timing across decode steps. Logs every N steps."""
-    _step = 0
-    _accum = {}  # op_name -> total_us
-
-    @classmethod
-    def _sync_record(cls, op: str, t0: float):
-        torch.cuda.synchronize()
-        elapsed_us = (time.perf_counter() - t0) * 1e6
-        cls._accum[op] = cls._accum.get(op, 0.0) + elapsed_us
-
-    @classmethod
-    def step_done(cls):
-        cls._step += 1
-        if cls._step % _DECODE_TIMING_INTERVAL != 0:
-            return
-        import torch.distributed as dist
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        if rank != 0:
-            cls._accum.clear()
-            return
-        n = _DECODE_TIMING_INTERVAL
-        lines = [f"\n=== MiniMax Decode Timing (avg over {n} steps, step {cls._step}) ==="]
-        total = sum(cls._accum.values())
-        for op, us in sorted(cls._accum.items(), key=lambda x: -x[1]):
-            pct = 100 * us / max(total, 1)
-            lines.append(f"  {op:20s}: {us/n:8.1f} us/step ({pct:5.1f}%)")
-        lines.append(f"  {'TOTAL':20s}: {total/n:8.1f} us/step")
-        logging.info("\n".join(lines))
-        cls._accum.clear()
+_DECODE_TIMING = _decode_timing_enabled()
+DecodeTimingStats.set_model_name("MiniMax-M25")
 
 try:
     from batchgen.attention.mla.fa3_backend import w8a16_gemm
@@ -618,8 +591,8 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         if _debug_attn and not getattr(self.__class__, '_attn_debug_done', False):
             # P2 debug: run BOTH kernels, compare outputs
             try:
-                from batchgen.attention.gqa import batchgen_gqa_decode_bf16
-                wgmma_out, _ = batchgen_gqa_decode_bf16(
+                from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_decode
+                wgmma_out, _ = _wgmma_decode(
                     q=query.clone(),
                     k_cache=k_cache_layer,
                     v_cache=v_cache_layer,
@@ -654,11 +627,11 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
                 self.__class__._attn_debug_done = True
 
         if _use_wgmma:
-            from batchgen.attention.gqa import batchgen_gqa_decode_bf16
+            from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_fn
             if not getattr(self.__class__, '_warned_attn', False):
                 logging.warning("[Attn] HOT PATH: batchgen_gqa_decode_bf16 (WGMMA)")
                 self.__class__._warned_attn = True
-            attn_output, _ = batchgen_gqa_decode_bf16(
+            attn_output, _ = _wgmma_fn(
                 q=query,
                 k_cache=k_cache_layer,
                 v_cache=v_cache_layer,

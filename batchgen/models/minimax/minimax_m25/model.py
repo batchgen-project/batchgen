@@ -927,7 +927,7 @@ class MiniMaxM25MoE(nn.Module):
             topk_idx: [N, num_experts_per_tok] int32
             topk_weight: [N, num_experts_per_tok] float32
         """
-        # Log gate dtype once to verify no unnecessary FP32 cast
+        # Log gate dtype once — do NOT cast without understanding checkpoint format
         if not getattr(self.__class__, '_warned_gate_dtype', False):
             self.__class__._warned_gate_dtype = True
             logging.warning(
