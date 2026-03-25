@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import uvicorn
@@ -19,6 +20,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from batchgen.server.batch_scheduler import BatchScheduler, parse_batch_file
+from batchgen.config.model_registry import (
+    CONFIG_REGISTRY,
+    _detect_model_type_from_identifier,
+)
 from batchgen.server.io_struct import (
     BatchObject,
     BatchStatus,
@@ -31,6 +36,8 @@ from batchgen.server.io_struct import (
     ListBatchesResponse,
     ListFilesRequest,
     ListFilesResponse,
+    ListModelsResponse,
+    ModelObject,
     RawInferenceRequest,
     normalize_inference_results,
 )
@@ -43,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
-QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /health$")
+QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /v1/models|^GET /health$")
 
 
 class QuietAccessLogMiddleware(BaseHTTPMiddleware):
@@ -101,6 +108,23 @@ def create_app(
         app.state.worker = worker
         app.state.scheduler = scheduler
 
+        # Build model metadata object (cached for lifetime of server)
+        # Only use BatchGen-maintained registered configs — never fall back to HF config.json
+        detected_type = _detect_model_type_from_identifier(server_args.model)
+        if detected_type is None or detected_type not in CONFIG_REGISTRY:
+            raise ValueError(
+                f"Model '{server_args.model}' is not registered in BatchGen CONFIG_REGISTRY. "
+                f"Cannot serve /v1/models metadata. Registered types: {list(CONFIG_REGISTRY.keys())}"
+            )
+        model_config = CONFIG_REGISTRY[detected_type]()
+        model_id = Path(server_args.model).name
+        app.state.model_object = ModelObject(
+            id=model_id,
+            created=int(time.time()),
+            owned_by="batchgen",
+            max_context_length=model_config.max_position_embeddings,
+        )
+
         worker.start()
         await scheduler.start()
         health_state.mark_startup_complete()
@@ -122,6 +146,21 @@ def create_app(
 
     # Add custom access logging middleware (replaces uvicorn's default)
     app.add_middleware(QuietAccessLogMiddleware)
+
+    # ==================== Model Endpoints ====================
+
+    @app.get("/v1/models", response_model=ListModelsResponse)
+    async def list_models(request: Request):
+        return ListModelsResponse(data=[request.app.state.model_object])
+
+    @app.get("/v1/models/{model_id:path}", response_model=ModelObject)
+    async def retrieve_model(request: Request, model_id: str):
+        model_obj: ModelObject = request.app.state.model_object
+        if model_id != model_obj.id:
+            raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+        return model_obj
+
+    # ==================== File Endpoints ====================
 
     @app.post("/v1/files", response_model=FileObject)
     async def upload_file(
