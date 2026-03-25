@@ -835,6 +835,7 @@ class BatchGenWorker:
 			self.max_input_length = max_prompt
 			if self.rank == 0:
 				logging.info(f"[ADMIT] Updated max_input_length to {self.max_input_length}")
+			self._update_config_after_tokenization()
 
 		# Step 3: Assign ranks (round-robin, continuing from existing)
 		self._assign_admitted_sequences_to_ranks(new_uuids)
@@ -934,6 +935,7 @@ class BatchGenWorker:
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
 			seq.prompt_length = actual_prompt_len
+			seq.original_prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
