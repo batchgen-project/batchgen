@@ -30,3 +30,5 @@ from batchgen_kernels.triton.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_cache_update_with_q_return_new_kv,
 )
 from batchgen_kernels.triton.fused_dequant_gemm import fused_fp8_bf16_gemm
+from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
+from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape

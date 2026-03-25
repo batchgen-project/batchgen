@@ -68,6 +68,7 @@ class _CausalLMOutput:
 
 _K25_TIMING_ENABLED = os.environ.get("BATCHGEN_K25_TIMING", "0") == "1"
 _K25_TIMING_LOG_INTERVAL = int(os.environ.get("BATCHGEN_K25_TIMING_INTERVAL", "10"))
+_K25_TIMING_SYNC_EVERY = int(os.environ.get("BATCHGEN_K25_TIMING_SYNC_EVERY", "50"))
 
 # MoE sub-op names (order matters for table output)
 _MOE_OPS = [
@@ -119,10 +120,19 @@ class K25DecodeTimer:
 
     def step_done(self):
         """Called after one full forward pass (all 61 layers).
-        Single sync, then read all deferred events."""
-        torch.cuda.synchronize()
 
-        # Process all deferred events
+        Only sync every _K25_TIMING_SYNC_EVERY steps to avoid serializing
+        the GPU pipeline. On non-sync steps, discard pending events.
+        """
+        self.step_count += 1
+
+        if self.step_count % _K25_TIMING_SYNC_EVERY != 0:
+            # Non-sync step: discard events to avoid memory buildup
+            self._pending_events.clear()
+            return
+
+        # Sync step: read all deferred events
+        torch.cuda.synchronize()
         for layer_idx, events, op_names, kind in self._pending_events:
             accum = self.layer_accum if kind == "layer" else self.moe_accum
             for i, op in enumerate(op_names):
@@ -131,7 +141,6 @@ class K25DecodeTimer:
         self._pending_events.clear()
 
         self.samples += 1
-        self.step_count += 1
         if self.samples >= _K25_TIMING_LOG_INTERVAL:
             self._log_and_reset()
 
@@ -739,9 +748,104 @@ class KimiK25MoE(nn.Module):
             self._moe_weights = weights
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
+
+            # Marlin W4A16 3-stage decode: weight pointers only (mtp-dependent buffers deferred)
+            self._use_marlin_decode = False
+            self._marlin_mtp = 0
+            # Marlin decode is default for K2.5
+            try:
+                N = self.moe_intermediate_size
+                K = self.config.hidden_size
+
+                # Collect weight pointers for all 3 projections
+                gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+
+                for local_e in range(E):
+                    global_e = self.routed_expert_start_idx + local_e
+                    wrapper = self.experts[global_e]
+                    module = wrapper.module if hasattr(wrapper, 'module') else wrapper
+                    gate_w_ptrs[local_e] = module.marlin_gate_qw.data_ptr()
+                    gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
+                    up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
+                    up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
+                    down_w_ptrs[local_e] = module.marlin_down_qw.data_ptr()
+                    down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
+
+                mw = {}
+                # S1 fused: separate gate/up [E] each
+                mw['gate_B_ptrs'] = gate_w_ptrs
+                mw['gate_scales_ptrs'] = gate_s_ptrs
+                mw['up_B_ptrs'] = up_w_ptrs
+                mw['up_scales_ptrs'] = up_s_ptrs
+                # S3: down [E]
+                mw['s3_B_ptrs'] = down_w_ptrs
+                mw['s3_scales_ptrs'] = down_s_ptrs
+                mw['N'] = N
+                mw['K'] = K
+
+                self._marlin_weights = mw
+                self._use_marlin_decode = True
+            except AttributeError as e:
+                logging.warning(f"[MoE] Marlin weights not found: {e}")
+                self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
+
+    # Class-level shared Marlin buffers (like _buf, allocated once for all layers)
+    _marlin_gate_buf = None
+    _marlin_up_buf = None
+
+    def _init_marlin_buffers(self, mtp: int):
+        """Init Marlin 3-stage decode buffers.
+
+        gate_buf and up_buf are class-level (shared across all 60 MoE layers).
+        Called once during model init, before KV cache sizing.
+        Per-instance: expert_starts, C_ptrs, workspaces.
+        """
+        mw = self._marlin_weights
+        E = self.num_persistent_local_experts
+        N = mw['N']  # 2048
+        K = mw['K']  # 7168
+        device = self.device
+
+        # Expert starts: mtp stride for 3D buffer access
+        mw['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
+
+        # S1 fused C_ptrs [E]: output into buf.intermediate at mtp stride
+        buf = self.__class__._buf
+        bpr_N = N * 2  # bytes per row (BF16)
+        mw['s1_fused_C_ptrs'] = torch.tensor(
+            [buf.intermediate.data_ptr() + e * mtp * bpr_N for e in range(E)],
+            dtype=torch.int64, device=device)
+
+        # S1 workspace (E matrices for fused kernel)
+        n_tiles_s1 = N // 256  # 8
+        mw['s1_workspace'] = torch.zeros(
+            E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+
+        # S3 workspace
+        n_tiles_s3 = K // 256  # 28
+        mw['s3_workspace'] = torch.zeros(
+            E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
+
+        # S3 C_ptrs: pre-computed, recomputed only if expert_out moves
+        mw['_s3_expert_out_ptr'] = None
+        mw['s3_C_ptrs'] = None
+
+        # Cache Marlin module to avoid per-step import + function call
+        from batchgen.moe.marlin_grouped_moe import _load_module
+        self._marlin_mod = _load_module()
+
+        self._marlin_mtp = mtp
+        if self.rank == 0:
+            logging.info(f"[MoE] Marlin 3-stage fused buffers initialized "
+                         f"(E={E}, mtp={mtp})")
 
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -782,7 +886,6 @@ class KimiK25MoE(nn.Module):
 
         # Shared expert on its own stream (depends on identity which is ready on compute_stream)
         shared_stream.wait_stream(compute_stream)
-
         with torch.cuda.stream(shared_stream):
             shared_out = self.shared_experts(identity)
 
@@ -835,17 +938,59 @@ class KimiK25MoE(nn.Module):
             ev[3].record()  # after dispatch, before wgmma_s1
 
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        if getattr(self, '_use_grouped_wgmma', False) \
+        mtp = buf.max_tokens_padded if buf is not None else 0
+
+        if getattr(self, '_use_marlin_decode', False) and buf is not None:
+            # === DECODE: Marlin 3-Stage (weight-format-driven, no runtime dispatch) ===
+            # Marlin weights are loaded at init time. Kernel selection follows weight format.
+            if self._marlin_mtp != mtp:
+                self._init_marlin_buffers(mtp)
+
+            # Pigeonhole bound for CTA M-tiling grid size
+            max_possible_m = min(num_global, mtp)
+            max_marlin_m_tiles = (max_possible_m + 15) // 16
+
+            mod_m = self._marlin_mod
+            mw = self._marlin_weights
+            E_local = buf.E_local
+
+            # S3 C_ptrs: recompute only if expert_out buffer moved
+            if mw['_s3_expert_out_ptr'] != buf.expert_out.data_ptr():
+                bpr_K = mw['K'] * 2
+                mw['s3_C_ptrs'] = torch.tensor(
+                    [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
+                    dtype=torch.int64, device=device)
+                mw['_s3_expert_out_ptr'] = buf.expert_out.data_ptr()
+
+            # Stage 1: fused gate+up+SiLU (single kernel, E matrices)
+            n_tiles_s1 = N // 256
+            mod_m.grouped_marlin_gemm_m16_s1(
+                buf.dispatched_x,
+                mw['gate_B_ptrs'], mw['up_B_ptrs'], mw['s1_fused_C_ptrs'],
+                mw['gate_scales_ptrs'], mw['up_scales_ptrs'],
+                mw['expert_starts'], expert_counts,
+                E_local, N, K, mw['s1_workspace'], n_tiles_s1, max_marlin_m_tiles)
+
+            if timer is not None:
+                ev[4].record()  # after fused S1, before S3
+
+            # Stage 3: down GEMM (E matrices)
+            n_tiles_s3 = K // 256
+            mod_m.grouped_marlin_gemm_m16(
+                buf.intermediate, mw['s3_B_ptrs'], mw['s3_C_ptrs'],
+                mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
+                E_local, K, N, mw['s3_workspace'],
+                E_local, n_tiles_s3, max_marlin_m_tiles)
+
+        elif getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
+            # === WGMMA 2-Stage (used when Marlin disabled or prefill mode) ===
             mod = self._wgmma_mod
             w = self._moe_weights
-            mtp = buf.max_tokens_padded
-            # Heuristic grid: assume worst-case ~2x uniform distribution
             avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-            # Stage 1 inplace: dispatched_x → intermediate
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 expert_counts,
@@ -854,13 +999,8 @@ class KimiK25MoE(nn.Module):
                 buf.empty_bias, buf.empty_bias,
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
-
-        if timer is not None:
-            ev[4].record()  # after wgmma_s1, before wgmma_s2
-
-        if getattr(self, '_use_grouped_wgmma', False) \
-                and buf is not None and buf.tma_dispatched is not None:
-            # Stage 2 inplace: intermediate → expert_out
+            if timer is not None:
+                ev[4].record()  # after stage1, before stage2
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
                 expert_counts,
@@ -988,6 +1128,16 @@ class KimiK25DecoderLayer(nn.Module):
         except Exception:
             return None
 
+    def enable_cuda_graph(self, manager, attn_name: str, max_pages_per_seq: int = 0):
+        """Enable per-layer CUDA graph for MLA attention.
+
+        MoE stays eager (preserves async shared expert overlap).
+        Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
+        """
+        self.cuda_graph_manager = manager
+        self._attn_segment_name = attn_name
+        self._graph_max_pages = max_pages_per_seq
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -998,53 +1148,100 @@ class KimiK25DecoderLayer(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+
         timer = _get_k25_timer()
+        layer_idx = kwargs.get("layer_idx", self.layer_idx)
+        batch_size = hidden_states.shape[0]
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
 
         if timer is not None:
-            layer_idx = kwargs.get("layer_idx", -1)
             ev = timer.make_events(len(_LAYER_OPS))
             ev[0].record()
 
-        # Pre-norm attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # ---- MLA Attention: CUDA graph or eager ----
+        use_graph = (hasattr(self, 'cuda_graph_manager')
+                     and self.cuda_graph_manager is not None
+                     and getattr(self, '_attn_segment_name', None) is not None
+                     and batch_size > 0)
+        attn_done = False
+
+        if use_graph:
+            try:
+                gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                _, _, page_table = gpu_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
+                slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
+                cache_seqlens = AttnWrapperBase.cache_seqlens
+
+                pt = page_table[:batch_size]
+                if self._graph_max_pages > 0 and pt.shape[1] < self._graph_max_pages:
+                    pt = torch.nn.functional.pad(
+                        pt, (0, self._graph_max_pages - pt.shape[1]), value=0
+                    )
+                elif self._graph_max_pages > 0 and pt.shape[1] > self._graph_max_pages:
+                    pt = pt[:, :self._graph_max_pages]
+
+                out = self.cuda_graph_manager.replay(
+                    self._attn_segment_name,
+                    batch_size,
+                    hidden_states=hidden_states,
+                    cache_seqlens=cache_seqlens[:batch_size],
+                    page_table=pt,
+                    slot_indices=slot_indices[:batch_size],
+                )
+
+                hidden_states = out["normed"]
+                residual = out["residual"]
+
+                kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+                if kv_cb is not None:
+                    kv_cb(self.layer_idx, out["k_tensor"][:batch_size].clone(), None)
+
+                attn_done = True
+            except (ValueError, RuntimeError) as e:
+                logging.warning(f"Layer {self.layer_idx} graph replay failed: {e}, falling back to eager")
+                attn_done = False
 
         if timer is not None:
-            ev[1].record()
+            ev[1].record()  # input_ln (includes graph setup overhead if graph path)
 
-        attn_out = self.self_attn(hidden_states=hidden_states)
-        hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
-
-        if timer is not None:
-            ev[2].record()
-
-        # Fused: residual += attn_out, then post_attention_layernorm
-        if fused_add_norm is not None:
-            hidden_states, residual = fused_add_norm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        else:
-            hidden_states = residual + hidden_states
+        if not attn_done:
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            if timer is not None:
+                ev[1].record()  # re-record after actual input_ln
+
+            attn_out = self.self_attn(hidden_states=hidden_states)
+            hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+
+            if fused_add_norm is not None:
+                hidden_states, residual = fused_add_norm(
+                    residual, hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
 
         if timer is not None:
-            ev[3].record()
+            ev[2].record()  # after mla
 
-        # MoE/FFN
+        if timer is not None:
+            ev[3].record()  # post_ln_res (fused with mla in eager, part of graph in graph path)
+
+        # ---- MoE/FFN: always eager (preserves async shared expert overlap) ----
         hidden_states = self.mlp(hidden_states)
 
         if timer is not None:
-            ev[4].record()
+            ev[4].record()  # after mlp
 
         # residual += mlp_out
         hidden_states = residual + hidden_states
 
         if timer is not None:
-            ev[5].record()
+            ev[5].record()  # after res_add
             timer.defer_layer_times(layer_idx, ev, _LAYER_OPS)
 
         return (hidden_states, None, None)

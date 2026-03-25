@@ -89,7 +89,7 @@ class ServerArgs:
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
     parse_thinking: bool = False  # Extract reasoning_content from model output
     parse_tool_call: bool = False  # Extract tool_calls from model output
-    disable_cuda_graphs: bool = False  # Disable CUDA graph capture for decode attention
+    disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
     # Dynamic host KV reservation settings

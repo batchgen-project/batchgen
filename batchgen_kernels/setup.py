@@ -92,6 +92,57 @@ setup(
             sources=["src/moe/fused_int4_wgmma_grouped.cu"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": _sm90a_flags},
         ),
+        # Marlin W4A16 grouped GEMM (gate+up+SiLU fused + down)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_marlin_grouped_gemm",
+            sources=["src/moe/marlin_grouped_gemm.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "--use_fast_math", "-lineinfo",
+                         "-DUSE_BF16_COMPUTE",
+                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # FP8 blockwise grouped GEMM (CuTe persistent, adaptive TileM)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fp8_blockwise_gemm",
+            sources=["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
+            include_dirs=[os.path.join(_this_dir, "3rd/cutlass/include"),
+                         _this_dir],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "-lineinfo", "--expt-relaxed-constexpr",
+                         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                         "-DNDEBUG",
+                         "-Xptxas=-v",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # FP8 blockwise MoE pipeline ops (act_quant_3d, silu_mul_3d, fused_silu_quant_3d)
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fp8_blockwise_ops",
+            sources=["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "-lineinfo",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # Marlin <-> WGMMA weight transform
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_marlin_transform",
+            sources=["src/moe/marlin_transform_kernel.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
+                         "--use_fast_math",
+                         "--threads", _nvcc_threads],
+            },
+        ),
         # QKV WGMMA fused projection
         CUDAExtension(
             name="batchgen_kernels.attention._C_qkv_wgmma",
@@ -213,6 +264,53 @@ setup(
                          "-U__CUDA_NO_HALF_OPERATORS__",
                          "-U__CUDA_NO_HALF_CONVERSIONS__",
                          "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                         "--threads", _nvcc_threads] + _sm80_gencode,
+            },
+        ),
+        # ── AOT MLA attention kernels (SM90a, BF16-only) ──
+
+        # Fused RMSNorm + RoPE + cache write (KV + Q)
+        CUDAExtension(
+            name="batchgen_kernels.attention._C_fused_kv_norm_rope",
+            sources=["src/attention/fused_kv_norm_rope_cache.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                         "-gencode", "arch=compute_90a,code=sm_90a",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # Fused q_absorb GEMV + q_pe copy
+        CUDAExtension(
+            name="batchgen_kernels.attention._C_fused_q_absorb",
+            sources=["src/attention/fused_q_absorb.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                         "-gencode", "arch=compute_90a,code=sm_90a",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+        # Fused q_b split into q_nope + q_pe
+        CUDAExtension(
+            name="batchgen_kernels.attention._C_fused_q_split",
+            sources=["src/attention/fused_q_split.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                         "-gencode", "arch=compute_90a,code=sm_90a",
+                         "--threads", _nvcc_threads],
+            },
+        ),
+
+        # ── AOT MoE token permutation (SM80+, multi-dtype) ──
+
+        CUDAExtension(
+            name="batchgen_kernels.moe._C_fused_moe_token_permutation",
+            sources=["src/moe/fused_moe_token_permutation.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
                          "--threads", _nvcc_threads] + _sm80_gencode,
             },
         ),
