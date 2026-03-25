@@ -927,6 +927,13 @@ class MiniMaxM25MoE(nn.Module):
             topk_idx: [N, num_experts_per_tok] int32
             topk_weight: [N, num_experts_per_tok] float32
         """
+        # Log gate dtype once to verify no unnecessary FP32 cast
+        if not getattr(self.__class__, '_warned_gate_dtype', False):
+            self.__class__._warned_gate_dtype = True
+            logging.warning(
+                f"[MoE GATE] gate.weight.dtype={self.gate.weight.dtype}, "
+                f"input.dtype={hidden_states_2d.dtype}, "
+                f"e_score_correction.dtype={self.e_score_correction_bias.dtype}")
         router_logits = self.gate(hidden_states_2d.to(self.gate.weight.dtype)).to(hidden_states_2d.dtype)
 
         if _HAS_CUDA_ROUTING:
@@ -1015,6 +1022,7 @@ class MiniMaxM25MoE(nn.Module):
         x_scale_t = x_scale.t().contiguous()
 
         seqlens = expert_counts[:E]
+        # Old Triton path — .item() sync acceptable (fallback only)
         avg = max(int(seqlens.float().mean().item()), 1)
 
         # S1: gate + up + SiLU
@@ -1112,7 +1120,9 @@ class MiniMaxM25MoE(nn.Module):
             0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
 
         seqlens = expert_counts[:E]
-        avg = max(int(seqlens.float().mean().item()), 1)
+        # Avoid .item() GPU→CPU sync in hot path — use fixed estimate for TileM hint.
+        # For decode, M per expert is small (1-8). Kernel auto-selects TileM regardless.
+        avg = max(mtp // max(E, 1), 1)
 
         # P3a: Quantize input — CUDA act_quant_3d or Triton fallback
         if _HAS_FP8_OPS:

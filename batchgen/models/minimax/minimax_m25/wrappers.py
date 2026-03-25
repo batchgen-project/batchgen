@@ -516,6 +516,11 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
 
+        # Save pre-RoPE for one-time P4 validation (only first call)
+        if _HAS_CUDA_ROPE and not getattr(self.__class__, '_rope_validated', False):
+            query_save = query.clone()
+            key_save = key.clone()
+
         if _HAS_CUDA_ROPE:
             if not getattr(self.__class__, '_warned_rope', False):
                 logging.warning("[Attn] HOT PATH: CUDA rope_forward (partial rotation, passthrough copy)")
@@ -533,6 +538,31 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             half_dim = rotary_dim // 2  # 32 for MiniMax
             query, key = _cuda_rope_forward(
                 query, key, cos_k, sin_k, half_dim)
+
+            # One-time P4 validation: compare CUDA vs PyTorch RoPE
+            if not getattr(self.__class__, '_rope_validated', False):
+                self.__class__._rope_validated = True
+                cos_ref = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+                sin_ref = sin[current_token_position].unsqueeze(1).unsqueeze(2)
+                q_ref_rot = query_save[..., :rotary_dim]
+                q_ref_pass = query_save[..., rotary_dim:]
+                q_ref = torch.cat([
+                    q_ref_rot * cos_ref + rotate_half(q_ref_rot) * sin_ref,
+                    q_ref_pass,
+                ], dim=-1)
+                k_ref_rot = key_save[..., :rotary_dim]
+                k_ref_pass = key_save[..., rotary_dim:]
+                k_ref = torch.cat([
+                    k_ref_rot * cos_ref + rotate_half(k_ref_rot) * sin_ref,
+                    k_ref_pass,
+                ], dim=-1)
+                q_diff = (query - q_ref).abs().max().item()
+                k_diff = (key - k_ref).abs().max().item()
+                q_pass_ok = torch.allclose(query[..., rotary_dim:], query_save[..., rotary_dim:], atol=1e-6)
+                k_pass_ok = torch.allclose(key[..., rotary_dim:], key_save[..., rotary_dim:], atol=1e-6)
+                logging.warning(
+                    f"[P4 VALIDATE] CUDA vs PyTorch RoPE: q_max_diff={q_diff:.2e}, k_max_diff={k_diff:.2e}, "
+                    f"q_pass_preserved={q_pass_ok}, k_pass_preserved={k_pass_ok}")
         else:
             if not getattr(self.__class__, '_warned_rope', False):
                 logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (fallback)")
@@ -583,6 +613,46 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
         # Decode attention — use WGMMA kernel if available, else FlashAttention
         _use_wgmma = os.environ.get("BATCHGEN_USE_WGMMA_DECODE", "0") == "1"
+        _debug_attn = os.environ.get("BATCHGEN_DEBUG_ATTN", "0") == "1"
+
+        if _debug_attn and not getattr(self.__class__, '_attn_debug_done', False):
+            # P2 debug: run BOTH kernels, compare outputs
+            try:
+                from batchgen.attention.gqa import batchgen_gqa_decode_bf16
+                wgmma_out, _ = batchgen_gqa_decode_bf16(
+                    q=query.clone(),
+                    k_cache=k_cache_layer,
+                    v_cache=v_cache_layer,
+                    cache_seqlens=cache_seqlens_for_attn,
+                    block_table=page_table,
+                )
+                fa_out, _ = gqa_decode_fa(
+                    q=query.clone(),
+                    k_cache=k_cache_layer,
+                    v_cache=v_cache_layer,
+                    cache_seqlens=cache_seqlens_for_attn,
+                    block_table=page_table,
+                )
+                diff = (wgmma_out - fa_out).abs()
+                max_diff = diff.max().item()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    wgmma_out.flatten().unsqueeze(0).float(),
+                    fa_out.flatten().unsqueeze(0).float(),
+                ).item()
+                logging.warning(
+                    f"[P2 DEBUG] layer={self.layer_idx} WGMMA vs FA: "
+                    f"max_diff={max_diff:.2e}, cos_sim={cos_sim:.6f}, "
+                    f"seqlens={cache_seqlens_for_attn.tolist()}, "
+                    f"q_shape={list(query.shape)}, "
+                    f"kv_cache_shape={list(k_cache_layer.shape)}, "
+                    f"page_table_shape={list(page_table.shape)}, "
+                    f"page_table_dtype={page_table.dtype}")
+                if self.layer_idx >= 5:  # Stop after 6 layers to avoid log spam
+                    self.__class__._attn_debug_done = True
+            except Exception as e:
+                logging.warning(f"[P2 DEBUG] layer={self.layer_idx} comparison failed: {e}")
+                self.__class__._attn_debug_done = True
+
         if _use_wgmma:
             from batchgen.attention.gqa import batchgen_gqa_decode_bf16
             if not getattr(self.__class__, '_warned_attn', False):
