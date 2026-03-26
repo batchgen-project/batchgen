@@ -353,17 +353,14 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             self.fp8_v.view(torch.uint8),
         ], dim=0).unsqueeze(0).view(torch.float8_e4m3fn)
 
-        # Convert per-row scales [N_i, K/128] → blockwise [N_i/128, K/128]
+        # Checkpoint scales are already blockwise [N_i/128, K/128].
+        # Pack into [1, N_total/128, K/128_pad4] for grouped GEMM API.
         k_blocks = K // _QKV_SCALE_BK
         k_blocks_pad = (k_blocks + 3) // 4 * 4
 
-        def _to_blockwise(scale, n_rows):
-            n_blocks = n_rows // _QKV_SCALE_BK
-            return scale.reshape(n_blocks, _QKV_SCALE_BK, k_blocks).amax(dim=1)
-
-        q_ws = _to_blockwise(self.q_scale, self._qkv_q_size)
-        k_ws = _to_blockwise(self.k_scale, self._qkv_kv_size)
-        v_ws = _to_blockwise(self.v_scale, self._qkv_kv_size)
+        q_ws = self.q_scale.reshape(-1, k_blocks)   # [q_size/128, k_blocks]
+        k_ws = self.k_scale.reshape(-1, k_blocks)   # [kv_size/128, k_blocks]
+        v_ws = self.v_scale.reshape(-1, k_blocks)    # [kv_size/128, k_blocks]
 
         n_blocks = N // _QKV_SCALE_BK
         self.packed_qkv_ws = torch.zeros(
