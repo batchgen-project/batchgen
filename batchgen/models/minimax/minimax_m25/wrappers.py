@@ -36,16 +36,99 @@ from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 from .model import rotate_half
 
+
+# ============================================================================
+# Per-sub-op decode timing (BATCHGEN_DECODE_TIMING=1)
+# ============================================================================
+
+from batchgen.profiling.decode_timing import (
+    DecodeTimingStats,
+    decode_timing_enabled as _decode_timing_enabled,
+)
+
+_DECODE_TIMING = _decode_timing_enabled()
+DecodeTimingStats.set_model_name("MiniMax-M25")
+
 try:
     from batchgen.attention.mla.fa3_backend import w8a16_gemm
     _HAS_W8A16 = True
 except ImportError:
     _HAS_W8A16 = False
 
+# CUDA RoPE kernel (partial rotation with passthrough copy)
+try:
+    from batchgen_kernels.attention._C_fused_ops import rope_forward as _rope_forward_cuda
+    _HAS_CUDA_ROPE = True
+except ImportError:
+    _HAS_CUDA_ROPE = False
+    logging.warning("[RoPE] CUDA rope_forward not available — will use PyTorch fallback")
+
+
+def _cuda_rope_forward(query, key, cos, sin, half_dim):
+    """CUDA RoPE with partial rotation passthrough.
+
+    Args:
+        query: [B, S=1, num_q_heads, head_dim]
+        key:   [B, S=1, num_kv_heads, head_dim]
+        cos:   [B, S=1, head_dim] (padded to head_dim)
+        sin:   [B, S=1, head_dim]
+        half_dim: rotary_dim // 2
+
+    Returns:
+        (q_rotated, k_rotated) same shapes as input
+    """
+    return _rope_forward_cuda(query, key, cos, sin, half_dim, None)
+
 
 def _fp8_linear(weight_fp8, scale, x):
-    """FP8 weight × BF16 activation via w8a16_gemm. Scale factors are F32 (from checkpoint)."""
+    """FP8 weight × BF16 activation. Uses CUDA act_quant_3d(E=1) if available."""
+    if _HAS_CUDA_ACT_QUANT:
+        return _fp8_linear_cuda_quant(weight_fp8, scale, x)
     return w8a16_gemm(weight_fp8, scale, x)
+
+
+# CUDA act_quant for attention path (avoid Triton overhead on small M)
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
+    import deep_gemm
+    _HAS_CUDA_ACT_QUANT = True
+except ImportError:
+    _HAS_CUDA_ACT_QUANT = False
+    logging.warning("[Attn] CUDA act_quant_3d not available — using Triton act_quant in w8a16_gemm")
+
+_warned_cuda_act_quant = False
+
+
+def _fp8_linear_cuda_quant(weight_fp8, scale, x):
+    """FP8 linear with CUDA act_quant_3d(E=1) replacing Triton act_quant."""
+    global _warned_cuda_act_quant
+    if not _warned_cuda_act_quant:
+        logging.warning("[Attn] HOT PATH: _fp8_linear with CUDA act_quant_3d(E=1)")
+        _warned_cuda_act_quant = True
+
+    orig_shape = x.shape
+    x_2d = x.view(-1, x.size(-1))  # [M, K]
+    M, K = x_2d.shape
+    N = weight_fp8.size(0)
+
+    # CUDA act_quant_3d with E=1
+    tokens_per_expert = torch.tensor([M], dtype=torch.int32, device=x.device)
+    x_3d = x_2d.view(1, M, K)
+    x_fp8_3d, x_scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+    x_fp8 = x_fp8_3d.view(M, K)
+    x_scale = x_scale_3d.view(M, -1)
+
+    # DeepGEMM FP8×FP8→BF16
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    deep_gemm.fp8_gemm_nt(
+        (x_fp8.view(torch.float8_e4m3fn), x_scale),
+        (weight_fp8, scale),
+        out, disable_ue8m0_cast=True,
+    )
+
+    if len(orig_shape) == 3:
+        out = out.view(orig_shape[0], orig_shape[1], N)
+    return out
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
@@ -347,7 +430,11 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             )
 
     def _forward_decode(self, hidden_states, **kwargs):
-        """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV FA."""
+        """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV attention.
+
+        Uses batchgen WGMMA decode kernel on H20, FlashAttention fallback otherwise.
+        Partial RoPE via CUDA rope_forward kernel (half_dim=rotary_dim//2).
+        """
         from batchgen.attention.gqa import gqa_decode_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
 
@@ -377,6 +464,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         rotary_dim = self.module.rotary_dim
 
         # Q/K/V projection via FP8 GEMM
+        if _DECODE_TIMING:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
         query = _fp8_linear(fp8_q, q_scale, hidden_states)
         key = _fp8_linear(fp8_k, k_scale, hidden_states)
         value = _fp8_linear(fp8_v, v_scale, hidden_states)
@@ -385,30 +476,90 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
         key = cuda_rmsnorm(key, self.module.k_norm.weight, self.module.k_norm.eps)
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_qkv_proj", _t0)
+            _t0 = time.perf_counter()
+
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, num_heads, head_dim)
         key = key.view(batch, seq_len, num_kv_heads, head_dim)
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
-        # Partial RoPE
+        # Partial RoPE — CUDA kernel or PyTorch fallback
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-        cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, rotary_dim]
-        sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        q_rot = query[..., :rotary_dim]
-        q_pass = query[..., rotary_dim:]
-        k_rot = key[..., :rotary_dim]
-        k_pass = key[..., rotary_dim:]
+        # Save pre-RoPE for one-time P4 validation (only first call)
+        if _HAS_CUDA_ROPE and not getattr(self.__class__, '_rope_validated', False):
+            query_save = query.clone()
+            key_save = key.clone()
 
-        query = torch.cat([
-            q_rot * cos + rotate_half(q_rot) * sin,
-            q_pass,
-        ], dim=-1)
-        key = torch.cat([
-            k_rot * cos + rotate_half(k_rot) * sin,
-            k_pass,
-        ], dim=-1)
+        if _HAS_CUDA_ROPE:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: CUDA rope_forward (partial rotation, passthrough copy)")
+                self.__class__._warned_rope = True
+            # cos/sin from rotary_emb: [seq_len, rotary_dim]
+            # Index by position: [batch, rotary_dim]
+            cos_pos = cos[current_token_position]  # [batch, rotary_dim]
+            sin_pos = sin[current_token_position]  # [batch, rotary_dim]
+            # Pad to head_dim for kernel (kernel reads cos[batch_seq_idx * head_dim + tid])
+            cos_padded = torch.nn.functional.pad(cos_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            sin_padded = torch.nn.functional.pad(sin_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            # Reshape for kernel: [B, S=1, head_dim]
+            cos_k = cos_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            sin_k = sin_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            half_dim = rotary_dim // 2  # 32 for MiniMax
+            query, key = _cuda_rope_forward(
+                query, key, cos_k, sin_k, half_dim)
+
+            # One-time P4 validation: compare CUDA vs PyTorch RoPE
+            if not getattr(self.__class__, '_rope_validated', False):
+                self.__class__._rope_validated = True
+                cos_ref = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+                sin_ref = sin[current_token_position].unsqueeze(1).unsqueeze(2)
+                q_ref_rot = query_save[..., :rotary_dim]
+                q_ref_pass = query_save[..., rotary_dim:]
+                q_ref = torch.cat([
+                    q_ref_rot * cos_ref + rotate_half(q_ref_rot) * sin_ref,
+                    q_ref_pass,
+                ], dim=-1)
+                k_ref_rot = key_save[..., :rotary_dim]
+                k_ref_pass = key_save[..., rotary_dim:]
+                k_ref = torch.cat([
+                    k_ref_rot * cos_ref + rotate_half(k_ref_rot) * sin_ref,
+                    k_ref_pass,
+                ], dim=-1)
+                q_diff = (query - q_ref).abs().max().item()
+                k_diff = (key - k_ref).abs().max().item()
+                q_pass_ok = torch.allclose(query[..., rotary_dim:], query_save[..., rotary_dim:], atol=1e-6)
+                k_pass_ok = torch.allclose(key[..., rotary_dim:], key_save[..., rotary_dim:], atol=1e-6)
+                logging.warning(
+                    f"[P4 VALIDATE] CUDA vs PyTorch RoPE: q_max_diff={q_diff:.2e}, k_max_diff={k_diff:.2e}, "
+                    f"q_pass_preserved={q_pass_ok}, k_pass_preserved={k_pass_ok}")
+        else:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (fallback)")
+                self.__class__._warned_rope = True
+            cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+            sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
+
+            q_rot = query[..., :rotary_dim]
+            q_pass = query[..., rotary_dim:]
+            k_rot = key[..., :rotary_dim]
+            k_pass = key[..., rotary_dim:]
+
+            query = torch.cat([
+                q_rot * cos + rotate_half(q_rot) * sin,
+                q_pass,
+            ], dim=-1)
+            key = torch.cat([
+                k_rot * cos + rotate_half(k_rot) * sin,
+                k_pass,
+            ], dim=-1)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_rope", _t0)
+            _t0 = time.perf_counter()
 
         # Write new K,V to paged GPU cache
         gpu_kv_manager.update_layer_decode_new_token(
@@ -427,20 +578,49 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             start_idx, end_idx = batch_slice
             page_table = page_table[start_idx:end_idx]
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_kv_update", _t0)
+            _t0 = time.perf_counter()
+
         cache_seqlens_for_attn = micro_cache_seqlens
 
-        # FlashAttention decode with paged KV
-        attn_output, _ = gqa_decode_fa(
-            q=query,
-            k_cache=k_cache_layer,
-            v_cache=v_cache_layer,
-            cache_seqlens=cache_seqlens_for_attn,
-            block_table=page_table,
-        )
+        # Decode attention — use WGMMA kernel if available, else FlashAttention
+        _use_wgmma = os.environ.get("BATCHGEN_USE_WGMMA_DECODE", "0") == "1"
+
+        if _use_wgmma:
+            from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_fn
+            if not getattr(self.__class__, '_warned_attn', False):
+                logging.warning("[Attn] HOT PATH: batchgen_gqa_decode_bf16 (WGMMA)")
+                self.__class__._warned_attn = True
+            attn_output, _ = _wgmma_fn(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
+        else:
+            if not getattr(self.__class__, '_warned_attn', False):
+                logging.warning("[Attn] HOT PATH: gqa_decode_fa (FlashAttention)")
+                self.__class__._warned_attn = True
+            attn_output, _ = gqa_decode_fa(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_forward", _t0)
+            _t0 = time.perf_counter()
 
         # Output projection via FP8 GEMM
         attn_output = attn_output.view(batch, 1, num_heads * head_dim)
         attn_output = _fp8_linear(fp8_o, o_scale, attn_output)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_output_proj", _t0)
 
         # Append KV to host
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)

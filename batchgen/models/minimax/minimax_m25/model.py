@@ -64,6 +64,33 @@ try:
 except ImportError:
     _HAS_FP8_GROUPED = False
 
+# FP8 blockwise grouped GEMM (CuTe persistent kernel)
+try:
+    from batchgen.moe.grouped_fp8_blockwise_moe import (
+        grouped_fp8_blockwise_gemm,
+        grouped_fp8_blockwise_s1_silu,
+        grouped_fp8_blockwise_fused_s1,
+        grouped_fp8_blockwise_s3,
+    )
+    _HAS_FP8_BLOCKWISE = True
+except ImportError:
+    _HAS_FP8_BLOCKWISE = False
+
+# CUDA FP8 quantization ops (act_quant_3d, fused_silu_quant_3d)
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d, fused_silu_quant_3d
+    _HAS_FP8_OPS = True
+except ImportError:
+    _HAS_FP8_OPS = False
+    logging.warning("[MoE] CUDA act_quant_3d/fused_silu_quant_3d not available — will use Triton fallback")
+
+# 3D dispatch scatter + CUDA reduce (K2.5 pattern)
+try:
+    from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d, reduce_weighted_scatter
+    _HAS_DISPATCH_3D = True
+except ImportError:
+    _HAS_DISPATCH_3D = False
+
 
 # ============================================================================
 # MoE Triton Kernels (self-contained — no cross-model imports)
@@ -296,13 +323,23 @@ class DecodeLayerTiming:
         total_moe = sum(s.moe_ms for s in cls.layer_stats)
         total_time = total_attn + total_moe
         num_layers = len(cls.layer_stats)
-        print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===")
-        print(f"Total: {total_time:.2f} ms ({1000/total_time:.1f} tokens/sec)")
-        print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/total_time:.1f}%)")
-        print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/total_time:.1f}%)")
-        print(f"\nPer-layer (first 3):")
-        for s in cls.layer_stats[:3]:
-            print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms")
+        avg_attn = total_attn / max(num_layers, 1)
+        avg_moe = total_moe / max(num_layers, 1)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===",
+                  flush=True)
+            print(f"Total: {total_time:.2f} ms ({1000/max(total_time, 0.01):.1f} tokens/sec)",
+                  flush=True)
+            print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/max(total_time, 0.01):.1f}%) "
+                  f"avg={avg_attn:.2f}ms/layer", flush=True)
+            print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/max(total_time, 0.01):.1f}%) "
+                  f"avg={avg_moe:.2f}ms/layer", flush=True)
+            print(f"\nPer-layer (first 5):", flush=True)
+            for s in cls.layer_stats[:5]:
+                print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms",
+                      flush=True)
         cls.layer_stats.clear()
 
     @classmethod
@@ -559,6 +596,89 @@ class MiniMaxM25Expert(nn.Module):
 
 
 # ============================================================================
+# MoE Buffer Manager (K2.5 pattern: 3D strided layout)
+# ============================================================================
+
+_DEFAULT_MTP = 64  # fixed max_tokens_padded for decode batch sizes
+
+
+class MiniMaxM25MoEBufferManager:
+    """Pre-allocated buffers for MiniMax MoE decode pipeline (3D strided layout).
+
+    One instance per model, shared across all 62 MoE layers via class variable.
+    Follows K2.5 pattern: dispatch_scatter_3d writes tokens directly into
+    fixed-stride slots, GEMM operates inplace, reduce reads via topk_pos.
+
+    Buffer layout: [E_local * max_tokens_padded, dim] (3D strided).
+    Each expert e owns rows [e * mtp, (e+1) * mtp) in the activation buffer.
+    """
+
+    def __init__(
+        self,
+        E_local: int,
+        max_global_bsz: int,
+        H: int,
+        N_inter: int,
+        topk: int,
+        num_tokens_per_rank: int,
+        device: torch.device,
+        max_tokens_padded: int = _DEFAULT_MTP,
+    ):
+        self.E_local = E_local
+        self.H = H
+        self.N_inter = N_inter
+        self.topk = topk
+        self.max_global_bsz = max_global_bsz
+        self.num_tokens_per_rank = num_tokens_per_rank
+        self.device = device
+        self.max_tokens_padded = max_tokens_padded
+
+        NK = max_global_bsz * topk
+        buf_rows = E_local * max_tokens_padded
+
+        # Communication buffers
+        self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
+
+        # Routing metadata
+        self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+
+        # 3D strided GEMM buffers
+        self.dispatched_x = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+
+        # Result buffer
+        self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+
+        logging.info(
+            f"[MoEBufferManager] 3D strided: E_local={E_local}, mtp={max_tokens_padded}, "
+            f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
+            f"total={self._total_bytes() / (1024**3):.2f} GiB"
+        )
+
+    def resize_if_needed(self, global_bsz: int):
+        """Resize communication/routing buffers if global_bsz exceeds capacity."""
+        if global_bsz <= self.max_global_bsz:
+            return
+        logging.info(f"[MoEBufferManager] Resizing: {self.max_global_bsz} -> {global_bsz}")
+        self.max_global_bsz = global_bsz
+        NK = global_bsz * self.topk
+        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
+        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+    def _total_bytes(self):
+        total = 0
+        for attr in ['all_tokens', 'padded', 'expert_counts', 'expert_counters',
+                      'topk_pos', 'dispatched_x', 'expert_out', 'result_buffer']:
+            t = getattr(self, attr)
+            total += t.nelement() * t.element_size()
+        return total
+
+
+# ============================================================================
 # MoE Layer with Sigmoid Routing + Correction Bias
 # ============================================================================
 
@@ -640,18 +760,36 @@ class MiniMaxM25MoE(nn.Module):
         self.token_idx = None
         self.topk_pos = None
 
+    # Class-level shared buffer (one per model, shared across all 62 MoE layers)
+    _buf: Optional[MiniMaxM25MoEBufferManager] = None
+
     def init_num_tokens(self, num_tokens_per_rank):
         """Allocate token dispatch buffers for EP decode."""
         self.num_tokens_per_rank = num_tokens_per_rank
         self.max_num_tokens_per_rank = num_tokens_per_rank
         global_num_tokens = self.num_tokens_per_rank * self.world_size
         K = self.num_experts_per_tok
+
+        # Legacy dispatch buffers (for fused_moe_token_dispatch fallback)
         self.token_idx = torch.arange(
             global_num_tokens, dtype=torch.int32, device=self.device
         ).repeat_interleave(K)
         self.topk_pos = torch.arange(
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
+
+        # 3D buffer manager (K2.5 pattern)
+        if _HAS_DISPATCH_3D and self.__class__._buf is None:
+            self.__class__._buf = MiniMaxM25MoEBufferManager(
+                E_local=self.experts_per_rank,
+                max_global_bsz=global_num_tokens,
+                H=self.hidden_size,
+                N_inter=self.config.moe_intermediate_size,
+                topk=K,
+                num_tokens_per_rank=num_tokens_per_rank,
+                device=self.device,
+                max_tokens_padded=_DEFAULT_MTP,
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         """Dynamically update num_tokens_per_rank for reduced communication."""
@@ -668,6 +806,15 @@ class MiniMaxM25MoE(nn.Module):
         self.topk_pos = torch.arange(
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
+
+        # Resize buf.padded to match new num_tokens_per_rank (K2.5 pattern)
+        buf = self.__class__._buf
+        if buf is not None and buf.padded.shape[0] != num_tokens_per_rank:
+            buf.padded = torch.zeros(
+                num_tokens_per_rank, buf.H,
+                dtype=torch.bfloat16, device=buf.device,
+            )
+            buf.num_tokens_per_rank = num_tokens_per_rank
 
     def init(self, micro_batch_size):
         """Build FP8 weight pointer arrays for grouped GEMM.
@@ -715,6 +862,65 @@ class MiniMaxM25MoE(nn.Module):
             [s.data_ptr() for s in self.down_scale_list], dtype=torch.int64, device=self.device
         )
 
+        # Stack FP8 weights for blockwise grouped GEMM kernel
+        # gate/up: [E_local, N=moe_intermediate_size, K=hidden_size] fp8
+        # down:    [E_local, N=hidden_size, K=moe_intermediate_size] fp8
+        self._init_fp8_blockwise_weights()
+
+    def _init_fp8_blockwise_weights(self):
+        """Stack per-expert FP8 weights into 3D tensors for blockwise GEMM.
+
+        Creates [E_local, out_dim, in_dim] contiguous fp8 weight tensors
+        and [E_local, out_dim/128, (in_dim/128+3)//4*4] padded scale tensors.
+        Called once during init() after pointer arrays are built.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size  # 3072
+        N = self.config.moe_intermediate_size  # 1536
+        scale_block = 128
+
+        k_blocks = K // scale_block
+        n_blocks = N // scale_block
+        k_blocks_pad4 = (k_blocks + 3) // 4 * 4
+        n_blocks_pad4 = (n_blocks + 3) // 4 * 4
+
+        # Gate: [E, N, K] fp8 — gate_proj maps K→N
+        self.fp8_gate_w3d = torch.stack(self.gate_list).contiguous()
+        # Up: [E, N, K] fp8
+        self.fp8_up_w3d = torch.stack(self.up_list).contiguous()
+        # Down: [E, K, N] fp8 — down_proj maps N→K
+        self.fp8_down_w3d = torch.stack(self.down_list).contiguous()
+
+        # Gate weight scales: [E, N/128, (K/128+3)//4*4]
+        self.fp8_gate_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.gate_scale_list):
+            self.fp8_gate_ws3d[i, :, :k_blocks] = s
+
+        # Up weight scales: [E, N/128, (K/128+3)//4*4]
+        self.fp8_up_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.up_scale_list):
+            self.fp8_up_ws3d[i, :, :k_blocks] = s
+
+        # Down weight scales: [E, K/128, (N/128+3)//4*4]
+        self.fp8_down_ws3d = torch.zeros(
+            E, k_blocks, n_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.down_scale_list):
+            self.fp8_down_ws3d[i, :, :n_blocks] = s
+
+        self._fp8_blockwise_ready = True
+
+        logging.info(
+            f"[MoE] FP8 blockwise weights stacked: "
+            f"gate={list(self.fp8_gate_w3d.shape)}, "
+            f"down={list(self.fp8_down_w3d.shape)}, "
+            f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
+        )
+
     def _gate_sigmoid_topk(self, hidden_states_2d):
         """Sigmoid routing with correction bias on 2D input [N, hidden_size].
 
@@ -722,6 +928,13 @@ class MiniMaxM25MoE(nn.Module):
             topk_idx: [N, num_experts_per_tok] int32
             topk_weight: [N, num_experts_per_tok] float32
         """
+        # Log gate dtype once — do NOT cast without understanding checkpoint format
+        if not getattr(self.__class__, '_warned_gate_dtype', False):
+            self.__class__._warned_gate_dtype = True
+            logging.warning(
+                f"[MoE GATE] gate.weight.dtype={self.gate.weight.dtype}, "
+                f"input.dtype={hidden_states_2d.dtype}, "
+                f"e_score_correction.dtype={self.e_score_correction_bias.dtype}")
         router_logits = self.gate(hidden_states_2d.to(self.gate.weight.dtype)).to(hidden_states_2d.dtype)
 
         if _HAS_CUDA_ROUTING:
@@ -743,9 +956,12 @@ class MiniMaxM25MoE(nn.Module):
     def grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets):
         """Process dispatched tokens through local experts with FP8 grouped GEMM.
 
-        Two-stage TMA pipeline:
-        1. act_quant → fused_fp8_moe_stage_1_tma (gate_proj * up_proj with SwiGLU)
-        2. act_quant → fused_dequant_grouped_gemm_fp8_tma (down_proj)
+        Uses CuTe blockwise kernel when available (2.5× faster decode),
+        falls back to Triton TMA kernel otherwise.
+
+        Input x is in compacted layout from fused_moe_token_dispatch.
+        For blockwise kernel: scatter to uniform [E*mtp, dim] stride, call kernel,
+        gather results back to compacted layout.
         """
         actual_num_tokens = expert_offsets[-1]
         if isinstance(actual_num_tokens, torch.Tensor):
@@ -758,7 +974,93 @@ class MiniMaxM25MoE(nn.Module):
                 (0, self.hidden_size), device=x.device, dtype=torch.bfloat16
             )
 
-        expert_counts = expert_counts.to(torch.int32)
+        expert_counts_i32 = expert_counts.to(torch.int32)
+
+        # ── FP8 Blockwise Kernel Path (CuTe persistent) ──
+        if _HAS_FP8_BLOCKWISE and getattr(self, '_fp8_blockwise_ready', False):
+            return self._grouped_dequant_fp8_blockwise(
+                x, expert_counts_i32, expert_offsets, actual_num_tokens_val)
+
+        # ── Fallback: Triton TMA Kernel ──
+        return self._grouped_dequant_fp8_triton(
+            x, expert_counts_i32, actual_num_tokens_val)
+
+    def _grouped_dequant_fp8_blockwise(self, x, expert_counts, expert_offsets,
+                                        actual_num_tokens_val):
+        """FP8 blockwise grouped GEMM via CuTe persistent kernel.
+
+        Scatters compacted tokens to uniform [E*mtp, dim] layout,
+        runs blockwise GEMM, gathers back.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size
+        N = self.config.moe_intermediate_size
+        device = x.device
+
+        # Determine mtp (max tokens padded to 64)
+        max_tok = int(expert_counts.max().item())
+        mtp = max(((max_tok + 63) // 64) * 64, 64)
+
+        # Build uniform cu_seqlens
+        cu_seqlens = torch.arange(
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=device)
+
+        # Scatter compacted x → uniform [E*mtp, K] layout
+        x_uniform = torch.zeros(E * mtp, K, dtype=x.dtype, device=device)
+        offsets = expert_offsets.cpu().tolist()
+        counts = expert_counts.cpu().tolist()
+        for e in range(E):
+            m_e = counts[e]
+            if m_e > 0:
+                src = offsets[e]
+                dst = e * mtp
+                x_uniform[dst:dst + m_e] = x[src:src + m_e]
+
+        # Quantize to FP8
+        x_quant, x_scale = act_quant(x_uniform)
+
+        # Transpose x_scale: [M, K/128] → [K/128, E*mtp]
+        x_scale_t = x_scale.t().contiguous()
+
+        seqlens = expert_counts[:E]
+        # Old Triton path — .item() sync acceptable (fallback only)
+        avg = max(int(seqlens.float().mean().item()), 1)
+
+        # S1: gate + up + SiLU
+        intermediate = grouped_fp8_blockwise_s1_silu(
+            x_quant.view(torch.float8_e4m3fn), x_scale_t,
+            self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+            self.fp8_up_w3d.view(torch.float8_e4m3fn),
+            self.fp8_gate_ws3d, self.fp8_up_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Re-quantize intermediate for S3
+        inter_quant, inter_scale = act_quant(intermediate)
+        inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection
+        result_uniform = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Gather back to compacted layout
+        result = torch.empty(
+            actual_num_tokens_val, K, dtype=torch.bfloat16, device=device)
+        for e in range(E):
+            m_e = counts[e]
+            if m_e > 0:
+                src = e * mtp
+                dst = offsets[e]
+                result[dst:dst + m_e] = result_uniform[src:src + m_e]
+
+        return result
+
+    def _grouped_dequant_fp8_triton(self, x, expert_counts, actual_num_tokens_val):
+        """Fallback: Triton TMA kernel for FP8 grouped GEMM."""
         group_size, activated_group_idx, group_start_indices, num_active_experts = (
             compact_expert_data(expert_counts)
         )
@@ -776,7 +1078,6 @@ class MiniMaxM25MoE(nn.Module):
         x_sliced = x[:actual_num_tokens_val]
         x_quant, x_scale = act_quant(x_sliced)
 
-        # Stage 1: gate_proj * up_proj (SwiGLU activation)
         intermediate = fused_fp8_moe_stage_1_tma(
             x_quant, x_scale,
             self.gate_list, self.gate_ptrs_ptr,
@@ -787,10 +1088,8 @@ class MiniMaxM25MoE(nn.Module):
             num_active_experts, self.experts_per_rank,
         )
 
-        # Re-quantize intermediate for stage 2
         intermediate, intermediate_scale = act_quant(intermediate)
 
-        # Stage 2: down_proj
         res = fused_dequant_grouped_gemm_fp8_tma(
             intermediate, intermediate_scale,
             self.down_list, self.down_ptrs_ptr,
@@ -800,16 +1099,91 @@ class MiniMaxM25MoE(nn.Module):
         )
         return res
 
+    def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
+        """FP8 blockwise grouped GEMM on 3D strided buffer (no scatter/gather).
+
+        Reads from buf.dispatched_x, writes to buf.expert_out.
+        Uses CuTe persistent kernel with uniform cu_seqlens stride.
+        P3a: CUDA act_quant_3d replaces Triton act_quant
+        P3b: CUDA fused_silu_quant_3d replaces SiLU + act_quant
+        """
+        if not getattr(self.__class__, '_warned_gemm_3d', False):
+            logging.warning(
+                f"[MoE] HOT PATH: _fp8_blockwise_gemm_3d "
+                f"(act_quant_3d={_HAS_FP8_OPS}, fused_silu_quant={_HAS_FP8_OPS})")
+            self.__class__._warned_gemm_3d = True
+        E = self.experts_per_rank
+        K = self.hidden_size
+        N = self.config.moe_intermediate_size
+        mtp = buf.max_tokens_padded
+
+        cu_seqlens = torch.arange(
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
+
+        seqlens = expert_counts[:E]
+        # Avoid .item() GPU→CPU sync in hot path — use fixed estimate for TileM hint.
+        # For decode, M per expert is small (1-8). Kernel auto-selects TileM regardless.
+        avg = max(mtp // max(E, 1), 1)
+
+        # P3a: Quantize input — CUDA act_quant_3d or Triton fallback
+        if _HAS_FP8_OPS:
+            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+            x_quant = x_quant_3d.view(E * mtp, K)
+            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            x_quant, x_scale = act_quant(buf.dispatched_x[:E * mtp])
+            x_scale_t = x_scale.t().contiguous()
+
+        # S1: gate + up + SiLU → FP8 quantize for S2 down projection
+        # Fused S1 (v19): single kernel for gate+up+SiLU (1.75× faster at decode)
+        # Output is BF16, then quantized to FP8 via act_quant_3d or fused_silu_quant_3d
+        if _HAS_FP8_OPS:
+            s1_result = grouped_fp8_blockwise_fused_s1(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            inter_quant_3d, inter_scale_3d = act_quant_3d(
+                s1_result.view(E, mtp, N), seqlens)
+            inter_quant = inter_quant_3d.view(E * mtp, N)
+            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            intermediate = grouped_fp8_blockwise_s1_silu(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            inter_quant, inter_scale = act_quant(intermediate)
+            inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection → writes to expert_out buffer
+        result = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+
+        # Copy result to expert_out buffer for reduce
+        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
+
     @torch.inference_mode()
     def moe_infer_allgather_allreduce_bf16_acc(self, x):
-        """EP decode: AllGather → gate → dispatch → grouped FP8 GEMM → reduce → AllReduce.
+        """EP decode: AllGather → gate → 3D dispatch → FP8 GEMM → reduce → AllReduce.
 
-        All-persistent path. No shared experts (unlike DeepSeek-V3).
+        All-persistent path. Uses K2.5 pattern: dispatch_scatter_3d + reduce_weighted_scatter.
+        Falls back to fused_moe_token_dispatch path if dispatch_scatter_3d unavailable.
         """
-        # scatter_weight_reduce_optimized is defined at module level (self-contained)
-
+        buf = self.__class__._buf
         num_tokens, hidden_size = x.shape
         device = x.device
+        topk = self.num_experts_per_tok
+        num_global = self.num_tokens_per_rank * self.world_size
 
         if num_tokens > self.num_tokens_per_rank:
             raise RuntimeError(
@@ -817,7 +1191,104 @@ class MiniMaxM25MoE(nn.Module):
                 f"num_tokens_per_rank={self.num_tokens_per_rank}"
             )
 
-        # Pad local tokens to num_tokens_per_rank
+        # === K2.5 Pattern: 3D dispatch + CUDA reduce ===
+        if buf is not None and _HAS_DISPATCH_3D and _HAS_FP8_BLOCKWISE \
+                and getattr(self, '_fp8_blockwise_ready', False):
+            if not getattr(self.__class__, '_warned_k25_path', False):
+                logging.warning(
+                    "[MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
+                self.__class__._warned_k25_path = True
+            buf.resize_if_needed(num_global)
+
+            from .wrappers import DecodeTimingStats, _DECODE_TIMING
+
+            # 1) AllGather into pre-allocated buffer
+            if _DECODE_TIMING:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
+
+            all_tokens = buf.all_tokens[:num_global]
+            padded = buf.padded
+            padded.zero_()
+            if num_tokens > 0:
+                padded[:num_tokens] = x
+
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.default_stream(device),
+                )
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_allgather", _t0)
+                _t0 = time.perf_counter()
+
+            # 2) Gate: sigmoid routing
+            topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_gate", _t0)
+                _t0 = time.perf_counter()
+
+            # 3) 3D dispatch scatter into strided buffer
+            buf.dispatched_x.zero_()
+            expert_counts, topk_pos = dispatch_scatter_3d(
+                all_tokens, topk_idx.to(torch.int32),
+                buf.dispatched_x,
+                self.routed_expert_start_idx, self.experts_per_rank,
+                buf.max_tokens_padded,
+                buf.expert_counts, buf.expert_counters,
+                buf.topk_pos[:num_global * topk],
+            )
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_dispatch", _t0)
+                _t0 = time.perf_counter()
+
+            # 4) FP8 blockwise GEMM on 3D buffer
+            self._fp8_blockwise_gemm_3d(buf, expert_counts)
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_gemm", _t0)
+                _t0 = time.perf_counter()
+
+            # 5) CUDA reduce: weighted scatter from 3D to flat
+            result_buf = buf.result_buffer[:num_global]
+            result_buf.zero_()
+            global_results = reduce_weighted_scatter(
+                buf.expert_out, topk_pos, topk_weight,
+                num_global, hidden_size, topk,
+                output=result_buf,
+            )
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_reduce", _t0)
+                _t0 = time.perf_counter()
+
+            # 6) AllReduce
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.default_stream(device),
+                )
+
+            if _DECODE_TIMING:
+                DecodeTimingStats._sync_record("moe_allreduce", _t0)
+
+            # 7) Slice local tokens
+            if num_tokens == 0:
+                return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
+            start_token_ids = self.rank * self.num_tokens_per_rank
+            end_token_ids = start_token_ids + num_tokens
+            return global_results[start_token_ids:end_token_ids].to(x.dtype)
+
+        # === Fallback: fused_moe_token_dispatch + Triton reduce ===
+        if not getattr(self.__class__, '_warned_fallback', False):
+            logging.warning(
+                "[MoE] FALLBACK: fused_moe_token_dispatch + Triton reduce "
+                f"(dispatch_3d={_HAS_DISPATCH_3D}, blockwise={_HAS_FP8_BLOCKWISE}, "
+                f"ready={getattr(self, '_fp8_blockwise_ready', False)}, buf={buf is not None})")
+            self.__class__._warned_fallback = True
         if num_tokens == 0:
             padded_hidden_states = torch.zeros(
                 (self.num_tokens_per_rank, hidden_size),
@@ -832,7 +1303,6 @@ class MiniMaxM25MoE(nn.Module):
         else:
             padded_hidden_states = x
 
-        # 1) AllGather: collect tokens from all ranks
         all_tokens = torch.zeros(
             (self.world_size * self.num_tokens_per_rank, hidden_size),
             device=self.device, dtype=torch.bfloat16,
@@ -843,38 +1313,30 @@ class MiniMaxM25MoE(nn.Module):
                 stream=torch.cuda.default_stream(self.device),
             )
 
-        # 2) Gate on global tokens — sigmoid routing
-        global_x = all_tokens
-        topk_idx, topk_weight = self._gate_sigmoid_topk(global_x)
+        topk_idx, topk_weight = self._gate_sigmoid_topk(all_tokens)
 
-        # 3) Dispatch tokens to local experts
         (input_x, input_eids, global_indices, token_topk_pos,
          expert_counts, expert_offsets) = fused_moe_token_dispatch(
-            global_x, topk_idx, self.token_idx, self.topk_pos,
+            all_tokens, topk_idx, self.token_idx, self.topk_pos,
             self.routed_expert_start_idx, self.routed_expert_end_idx,
         )
 
-        # 4) Grouped FP8 expert GEMM
         res = self.grouped_dequant_moe_fp8(
             input_x, input_eids, expert_counts, expert_offsets,
         )
 
-        # 5) Weighted scatter-reduce back to per-token output
-        num_global = self.num_tokens_per_rank * self.world_size
         global_results = scatter_weight_reduce_optimized(
             res, global_indices, token_topk_pos, topk_weight,
             num_global, self.num_experts_per_tok,
         )
         global_results = global_results.to(torch.bfloat16)
 
-        # 6) AllReduce
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results, op=dist.ReduceOp.SUM,
                 stream=torch.cuda.default_stream(self.device),
             )
 
-        # 7) Slice local tokens (no shared experts to add)
         if num_tokens == 0:
             return torch.empty((0, hidden_size), device=device, dtype=x.dtype)
         start_token_ids = self.rank * self.num_tokens_per_rank
@@ -1060,9 +1522,14 @@ class MiniMaxM25DecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        timing_enabled = DecodeLayerTiming.enabled
         DecodeLayerTiming.start_layer(self.layer_idx)
 
         # ========== ATTENTION ==========
+        if timing_enabled:
+            torch.cuda.synchronize()
+            attn_start = time.perf_counter()
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attn_weights, present_key_value = self.self_attn(
@@ -1082,10 +1549,12 @@ class MiniMaxM25DecoderLayer(nn.Module):
             self.post_attention_layernorm.eps,
         )
 
-        # ========== MoE ==========
-        timing_enabled = DecodeLayerTiming.enabled
         if timing_enabled:
             torch.cuda.synchronize()
+            DecodeLayerTiming.record_attn((time.perf_counter() - attn_start) * 1000)
+
+        # ========== MoE ==========
+        if timing_enabled:
             moe_start = time.perf_counter()
 
         hidden_states = self.mlp(hidden_states)
@@ -1176,6 +1645,11 @@ class MiniMaxM25Model(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         DecodeLayerTiming.print_summary()
+
+        # Per-sub-op timing (BATCHGEN_DECODE_TIMING=1)
+        from .wrappers import DecodeTimingStats, _DECODE_TIMING
+        if _DECODE_TIMING:
+            DecodeTimingStats.step_done()
 
         return (hidden_states, next_cache, None, None)
 
