@@ -96,8 +96,6 @@ stateDiagram-v2
     validating --> in_progress : Input parsed OK
     in_progress --> completed : All sequences done
     in_progress --> failed : Worker error or timeout
-    in_progress --> cancelling : POST .../cancel
-    cancelling --> cancelled : Worker stopped
     validating --> failed : Invalid input
 ```
 
@@ -107,8 +105,6 @@ stateDiagram-v2
 | `in_progress` | Sequences queued for GPU inference |
 | `completed` | All results ready; `output_file_id` is set |
 | `failed` | Error occurred; check `error` field |
-| `cancelling` | Cancel requested, waiting for worker |
-| `cancelled` | Batch cancelled; partial results discarded |
 
 ## Input JSONL Format
 
@@ -313,9 +309,8 @@ Returns `{"status": "healthy"}` (200) or `{"status": "unhealthy", "reason": "...
 | **503** | Server unhealthy | Wait for recovery |
 
 **Batch-level failures** (status = `"failed"`): Check the `error` field on the batch object for details. Common causes:
-- `capacity_exceeded` — Server had too many requests queued
-- `batch_failed` — Worker process encountered an error
-- `timeout` — Batch did not complete within 24 hours
+- `capacity_exceeded` — Server had too many requests queued. Retry later.
+- `batch_failed` — Worker process encountered an error or batch timed out (24h limit). The error message contains the specific reason.
 
 ## Best Practices
 
@@ -327,7 +322,7 @@ Returns `{"status": "healthy"}` (200) or `{"status": "unhealthy", "reason": "...
 
 4. **Monitor `/v1/pool/status`** for capacity planning. If `scheduling_pool_free` is consistently 0, your server is saturated.
 
-5. **Don't resubmit the same file** while a batch is active. The server rejects duplicate active batches per file (400 error). Wait for the current batch to complete or cancel it first.
+5. **Don't resubmit the same file** while a batch is active. The server rejects duplicate active batches per file (400 error). Wait for the current batch to complete first.
 
 6. **Handle 429 gracefully.** The Python client does this automatically. If using curl or a custom client, implement exponential backoff.
 
@@ -341,6 +336,12 @@ Returns `{"status": "healthy"}` (200) or `{"status": "unhealthy", "reason": "...
 | Concurrent processing slots | 10,240 | `--max-pool-size` |
 | Batch timeout | 24 hours | (completion_window) |
 | Per-request context | Model-dependent | `--max-context-length` |
+
+## Limitations
+
+- **No batch cancellation.** Once a batch is submitted, it runs to completion. If a batch was submitted incorrectly, either wait for it to complete (results can be ignored) or restart the server.
+- **No streaming.** Results are available only after each sequence finishes (via incremental output) or when the entire batch completes.
+- **Single model.** The server loads one model at startup. All batches use that model; the `model` field in request bodies is for validation only.
 
 ## API Reference
 
