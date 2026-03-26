@@ -66,8 +66,8 @@ def main():
         print(f"FAIL: No output. Batch: {batch}")
         return
 
-    content = client.get_file_content(output_id)
-    outputs = [json.loads(l) for l in content.strip().split("\n") if l.strip()]
+    content = client.download_file_content(output_id)
+    outputs = [json.loads(l) for l in content.decode("utf-8").strip().split("\n") if l.strip()]
     print(f"Got {len(outputs)} outputs")
 
     correct = 0
