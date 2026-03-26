@@ -1001,10 +1001,16 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 			)
 
-	def _report_completion(self, uuid: str) -> None:
+	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
 		"""Report a single sequence completion to the response queue.
 
 		Also frees the QueryBook buffer slot so it can be reused by new admissions.
+
+		Args:
+			uuid: Sequence UUID.
+			gathered_text: Pre-gathered decoded text from _gather_completed_tokens.
+				If provided, uses this instead of reading from local decoded_tokens
+				(which may be empty on rank 0 for sequences owned by other ranks).
 		"""
 		seq = self.global_batch.get_sequence(uuid)
 		if seq is None:
@@ -1024,9 +1030,10 @@ class BatchGenWorker:
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
 			return
-		# Gather decoded text
-		text = ""
-		if seq.decoded_tokens is not None and seq.decoded_length > 0:
+
+		# Use gathered text if provided, otherwise read from local buffer
+		text = gathered_text if gathered_text is not None else ""
+		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
 			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
 			try:
 				text = self.tokenizer.decode(token_ids)
@@ -1041,6 +1048,44 @@ class BatchGenWorker:
 			"prompt_length": seq.prompt_length,
 			"decoded_length": seq.decoded_length,
 		})
+
+	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
+		"""Gather decoded tokens from owning ranks for completed sequences.
+
+		Each rank writes decoded tokens only for sequences it owns. This method
+		uses all_gather_object to collect tokens from all ranks so rank 0 can
+		report them correctly.
+
+		Returns:
+			Dict mapping uuid -> decoded text string.
+		"""
+		if not completed_uuids:
+			return {}
+
+		# Each rank provides tokens for its locally-owned completed sequences
+		my_tokens = {}
+		for uuid in completed_uuids:
+			if uuid in self._uuid_to_local_map:
+				local_idx = self._uuid_to_local_map[uuid]
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None and local_idx in self.query_book:
+					token_ids = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
+					try:
+						text = self.tokenizer.decode(token_ids)
+					except Exception:
+						text = ""
+					my_tokens[uuid] = text
+
+		# All ranks participate in gather
+		all_tokens = [None] * self.world_size
+		dist.all_gather_object(all_tokens, my_tokens)
+
+		# Merge: each uuid is owned by exactly one rank
+		merged = {}
+		for rank_tokens in all_tokens:
+			if rank_tokens:
+				merged.update(rank_tokens)
+		return merged
 
 	# ============ End Request Pool Methods ============
 
@@ -4771,6 +4816,17 @@ class BatchGenWorker:
 		self.num_local_queries = 0
 		self._rejected_sequences = []
 
+		# Reset max_input_length from Init's 8192 default to 0.
+		# In legacy mode, _tokenize_global_batch sets max_input_length to the
+		# actual longest prompt, then _update_config_after_tokenization propagates
+		# it to padding_length and engine config BEFORE prefill/decode.
+		# In pool mode, Init(None,...) defaults max_input_length to 8192 for the
+		# initializer, but once core components are ready we must reset it so the
+		# first admission batch correctly sets it from actual prompt lengths.
+		# Without this, padding_length stays at 8192 which causes wrong
+		# KV_Storage_Config.reserved_length and GPU buffer sizing.
+		self.max_input_length = 0
+
 		# Enter the persistent generate loop
 		return self.generate()
 
@@ -5093,9 +5149,12 @@ class BatchGenWorker:
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
 					self._submit_completed_to_incremental_writer(list(global_completed))
+					# Gather decoded tokens from owning ranks before reporting
+					# (each rank only writes decoded tokens for its own sequences)
+					gathered_texts = self._gather_completed_tokens(list(global_completed))
 					# Report completions to response queue (pool mode)
 					for uuid in global_completed:
-						self._report_completion(uuid)
+						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 
 				if not decode_uuids:
 					break
@@ -6180,24 +6239,6 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
-				# DEBUG: Verify per-sequence hidden states after prefill
-				import os
-				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
-					print(f"\n[PREFILL OUTPUT DEBUG] === Micro-batch {batch_idx} ===")
-					print(f"[PREFILL OUTPUT DEBUG] hidden_states.shape = {hidden_states.shape}")
-					print(f"[PREFILL OUTPUT DEBUG] batch_cu_seqlens = {batch_cu_seqlens.tolist()}")
-					print(f"[PREFILL OUTPUT DEBUG] last_token_indices = {last_token_indices.tolist()}")
-					print(f"[PREFILL OUTPUT DEBUG] last_token_hidden.shape = {last_token_hidden.shape}")
-					# Check if hidden states differ across sequences
-					for i in range(min(3, batch_num_seqs)):
-						h = last_token_hidden[i, :8].tolist()
-						print(f"[PREFILL OUTPUT DEBUG] seq{i} (pos={last_token_indices[i].item()}): hidden[:8] = {[f'{v:.4f}' for v in h]}")
-					if batch_num_seqs >= 2:
-						diff = (last_token_hidden[0] - last_token_hidden[1]).abs().max().item()
-						print(f"[PREFILL OUTPUT DEBUG] max_diff seq0-seq1: {diff:.6f}")
-						if diff < 1e-4:
-							print(f"[PREFILL OUTPUT DEBUG] *** CRITICAL: seq0 and seq1 have IDENTICAL hidden states! ***")
-
 				# Call lm_head directly using F.linear to bypass the hook
 				logits = torch.nn.functional.linear(
 					last_token_hidden,
@@ -6207,17 +6248,6 @@ class BatchGenWorker:
 
 				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
-
-				# DEBUG: Show logits and sampled tokens
-				if os.environ.get("BATCHGEN_DEBUG_PREFILL_OUTPUT", "0") == "1":
-					print(f"[PREFILL OUTPUT DEBUG] logits.shape = {logits.shape}")
-					for i in range(min(3, batch_num_seqs)):
-						top_vals, top_ids = torch.topk(logits[i], k=5)
-						print(f"[PREFILL OUTPUT DEBUG] seq{i} top5_ids={top_ids.tolist()}, top5_vals={[f'{v:.2f}' for v in top_vals.tolist()]}")
-					print(f"[PREFILL OUTPUT DEBUG] sampled_tokens[:5] = {batch_new_tokens[:5].flatten().tolist()}")
-					if batch_num_seqs >= 2:
-						if batch_new_tokens[0].item() == batch_new_tokens[1].item():
-							print(f"[PREFILL OUTPUT DEBUG] *** WARNING: seq0 and seq1 sampled SAME token! ***")
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
@@ -6710,9 +6740,11 @@ class BatchGenWorker:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
+			# Gather decoded tokens from owning ranks before reporting
+			gathered_texts = self._gather_completed_tokens(completed_uuids)
 			# Report completions to response queue (pool mode)
 			for uuid in completed_uuids:
-				self._report_completion(uuid)
+				self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
@@ -8758,9 +8790,11 @@ class BatchGenWorker:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 					# Incremental write: gather completed tokens to rank 0
 					self._submit_completed_to_incremental_writer(completed_uuids)
+					# Gather decoded tokens from owning ranks before reporting
+					gathered_texts = self._gather_completed_tokens(completed_uuids)
 					# Report completions to response queue (pool mode)
 					for uuid in completed_uuids:
-						self._report_completion(uuid)
+						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:

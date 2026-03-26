@@ -79,7 +79,7 @@ def main():
         text = choices[0]["message"]["content"][:500] if choices else ""
 
         # Check for garbage: Chinese chars, csharp, README, etc.
-        is_garbage = any(k in text.lower() for k in ["csharp", "readme", "<|channel|>", "\u4e2d\u6587"])
+        is_garbage = any(k in text.lower() for k in ["csharp", "readme", "\u4e2d\u6587"])
         if is_garbage:
             garbage += 1
             print(f"  GARBAGE {cid}: {text[:100]}")
