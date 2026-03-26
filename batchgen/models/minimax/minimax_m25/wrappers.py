@@ -179,11 +179,11 @@ def _packed_qkv_gemm(hidden_states, packed_w, packed_ws, q_size, kv_size):
     # Single FP8 GEMM (production CuTe persistent kernel, E=1)
     output = _qkv_gemm(x_fp8, packed_w, seqlens, cu_seqlens, x_scale_t, packed_ws, M)
 
-    # Zero-copy split
+    # Split output — slices are non-contiguous (stride=N along dim 0), must make contiguous
     out = output[:M]
-    Q = out[:, :q_size].reshape(*orig_shape, q_size)
-    K_out = out[:, q_size:q_size + kv_size].reshape(*orig_shape, kv_size)
-    V = out[:, q_size + kv_size:].reshape(*orig_shape, kv_size)
+    Q = out[:, :q_size].contiguous().reshape(*orig_shape, q_size)
+    K_out = out[:, q_size:q_size + kv_size].contiguous().reshape(*orig_shape, kv_size)
+    V = out[:, q_size + kv_size:].contiguous().reshape(*orig_shape, kv_size)
     return Q, K_out, V
 
 
