@@ -586,45 +586,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
         # Decode attention — use WGMMA kernel if available, else FlashAttention
         _use_wgmma = os.environ.get("BATCHGEN_USE_WGMMA_DECODE", "0") == "1"
-        _debug_attn = os.environ.get("BATCHGEN_DEBUG_ATTN", "0") == "1"
-
-        if _debug_attn and not getattr(self.__class__, '_attn_debug_done', False):
-            # P2 debug: run BOTH kernels, compare outputs
-            try:
-                from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_decode
-                wgmma_out, _ = _wgmma_decode(
-                    q=query.clone(),
-                    k_cache=k_cache_layer,
-                    v_cache=v_cache_layer,
-                    cache_seqlens=cache_seqlens_for_attn,
-                    block_table=page_table,
-                )
-                fa_out, _ = gqa_decode_fa(
-                    q=query.clone(),
-                    k_cache=k_cache_layer,
-                    v_cache=v_cache_layer,
-                    cache_seqlens=cache_seqlens_for_attn,
-                    block_table=page_table,
-                )
-                diff = (wgmma_out - fa_out).abs()
-                max_diff = diff.max().item()
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    wgmma_out.flatten().unsqueeze(0).float(),
-                    fa_out.flatten().unsqueeze(0).float(),
-                ).item()
-                logging.warning(
-                    f"[P2 DEBUG] layer={self.layer_idx} WGMMA vs FA: "
-                    f"max_diff={max_diff:.2e}, cos_sim={cos_sim:.6f}, "
-                    f"seqlens={cache_seqlens_for_attn.tolist()}, "
-                    f"q_shape={list(query.shape)}, "
-                    f"kv_cache_shape={list(k_cache_layer.shape)}, "
-                    f"page_table_shape={list(page_table.shape)}, "
-                    f"page_table_dtype={page_table.dtype}")
-                if self.layer_idx >= 5:  # Stop after 6 layers to avoid log spam
-                    self.__class__._attn_debug_done = True
-            except Exception as e:
-                logging.warning(f"[P2 DEBUG] layer={self.layer_idx} comparison failed: {e}")
-                self.__class__._attn_debug_done = True
 
         if _use_wgmma:
             from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_fn
