@@ -111,6 +111,9 @@ class ServerArgs:
     # Request pool: max QueryBook capacity. Default 10240 enables pool mode.
     # Set to 0 to force legacy batch-FIFO mode.
     max_pool_size: int = 10240
+    # IntakePool capacity: max total requests that can be queued.
+    # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
+    max_intake_capacity: int = 1_000_000
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -247,6 +250,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=10240,
         help="Max QueryBook pool capacity for persistent request scheduling. "
              "Default: 10240 (pool mode enabled). Set to 0 for legacy batch-FIFO mode.",
+    )
+    parser.add_argument(
+        "--max-intake-capacity",
+        type=int,
+        default=1_000_000,
+        help="Max total requests in the intake pool. Prevents OOM under high load. "
+             "Default: 1000000. Set to 0 for unlimited (not recommended).",
     )
     parser.add_argument(
         "--enable-prepack",
@@ -541,6 +551,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         decode_step_timeout=parsed.decode_step_timeout,
         startup_timeout=parsed.startup_timeout,
         max_pool_size=parsed.max_pool_size,
+        max_intake_capacity=parsed.max_intake_capacity,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

@@ -145,6 +145,30 @@ class BatchGenHttpClient:
         self._timeout_s = timeout_s
         self._session = requests.Session()
 
+    def _request_with_retry(
+        self, method: str, url: str, max_retries: int = 5, **kwargs
+    ) -> "requests.Response":
+        """Send HTTP request with retry on 429 (server at capacity).
+
+        Uses exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 60s).
+        """
+        import time as _time
+        for attempt in range(max_retries):
+            response = self._session.request(method, url, timeout=self._timeout_s, **kwargs)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else min(2 ** attempt, 60)
+                logger.warning(
+                    f"Server at capacity (429). Retrying in {wait}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                _time.sleep(wait)
+                continue
+            return response
+        raise RuntimeError(
+            f"{method} {url} failed: server at capacity after {max_retries} retries"
+        )
+
     def post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Send a POST request with JSON payload.
 
@@ -156,7 +180,7 @@ class BatchGenHttpClient:
             Response JSON as dictionary
         """
         url = f"{self._base_url}{path}"
-        response = self._session.post(url, json=payload, timeout=self._timeout_s)
+        response = self._request_with_retry("POST", url, json=payload)
         self._raise_for_status(response, "POST", url)
         if not response.content:
             return {}
@@ -246,8 +270,8 @@ class BatchGenHttpClient:
         with open(file_path, "rb") as f:
             files = {"file": (file_path.split("/")[-1], f)}
             data = {"purpose": purpose}
-            response = self._session.post(
-                url, files=files, data=data, timeout=self._timeout_s
+            response = self._request_with_retry(
+                "POST", url, files=files, data=data,
             )
         self._raise_for_status(response, "POST", url)
         return response.json()

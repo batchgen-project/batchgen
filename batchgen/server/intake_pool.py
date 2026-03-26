@@ -1,18 +1,25 @@
-"""IntakePool: unbounded pool of raw requests, partitioned by priority.
+"""IntakePool: capacity-limited pool of raw requests, partitioned by priority.
 
 Accepts raw (unparsed, untokenized) requests from submit_batch() calls.
 Requests are drained into the SchedulingPool at decision boundaries,
 highest priority first.
+
+Capacity limit prevents OOM under high load. Rejection is all-or-nothing
+per batch: if accepting the next batch would overflow, the entire batch
+is rejected.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict, Deque, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class Priority(IntEnum):
@@ -41,17 +48,26 @@ class IntakeBatchInfo:
 
 
 class IntakePool:
-    """Unbounded pool of raw requests, partitioned by priority.
+    """Capacity-limited pool of raw requests, partitioned by priority.
 
     Thread-safe. Multiple batches can coexist. Higher-priority batch
     entries are drained first.
+
+    Args:
+        max_capacity: Maximum total entries across all priorities.
+            Default 1,000,000. Set to 0 for unlimited (not recommended).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_capacity: int = 1_000_000) -> None:
         self._high: Deque[IntakeEntry] = deque()
         self._normal: Deque[IntakeEntry] = deque()
         self._lock = threading.Lock()
         self._batch_info: Dict[str, IntakeBatchInfo] = {}
+        self._max_capacity = max_capacity
+
+    @property
+    def max_capacity(self) -> int:
+        return self._max_capacity
 
     # -------------------- Public API --------------------
 
@@ -60,16 +76,29 @@ class IntakePool:
         batch_id: str,
         entries: List[IntakeEntry],
         priority: Priority = Priority.NORMAL,
-    ) -> None:
+    ) -> bool:
         """Add a batch of entries to the pool.
+
+        All-or-nothing: if accepting would overflow capacity, the entire
+        batch is rejected and False is returned.
 
         Args:
             batch_id: Unique batch identifier.
-            entries: Pre-constructed IntakeEntry objects (priority already set).
-            priority: Batch-level priority (used for tracking only; entry
-                      priority should already be set on each IntakeEntry).
+            entries: Pre-constructed IntakeEntry objects.
+            priority: Batch-level priority (for tracking).
+
+        Returns:
+            True if accepted, False if rejected (capacity exceeded).
         """
         with self._lock:
+            current = len(self._high) + len(self._normal)
+            if self._max_capacity > 0 and current + len(entries) > self._max_capacity:
+                logger.warning(
+                    f"[INTAKE] Batch {batch_id} REJECTED: {len(entries)} entries "
+                    f"would exceed capacity ({current}/{self._max_capacity})"
+                )
+                return False
+
             self._batch_info[batch_id] = IntakeBatchInfo(
                 batch_id=batch_id,
                 total_requests=len(entries),
@@ -81,6 +110,12 @@ class IntakePool:
                     self._high.append(entry)
                 else:
                     self._normal.append(entry)
+
+            logger.info(
+                f"[INTAKE] Batch {batch_id}: {len(entries)} entries accepted "
+                f"(pool: {current + len(entries)}/{self._max_capacity})"
+            )
+            return True
 
     def drain(self, max_n: int) -> List[IntakeEntry]:
         """Drain up to *max_n* entries, highest priority first.
@@ -102,6 +137,9 @@ class IntakePool:
                 result.append(entry)
                 self._decrement_batch_remaining(entry.batch_id)
 
+        if result:
+            remaining = self.size()
+            logger.info(f"[INTAKE] Drained {len(result)} entries (remaining: {remaining}/{self._max_capacity})")
         return result
 
     def is_empty(self) -> bool:
@@ -121,6 +159,11 @@ class IntakePool:
     def get_batch_info(self, batch_id: str) -> Optional[IntakeBatchInfo]:
         with self._lock:
             return self._batch_info.get(batch_id)
+
+    def remove_batch_info(self, batch_id: str) -> None:
+        """Clean up batch tracking info after batch is finalized."""
+        with self._lock:
+            self._batch_info.pop(batch_id, None)
 
     # -------------------- Internal --------------------
 

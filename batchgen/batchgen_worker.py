@@ -910,8 +910,23 @@ class BatchGenWorker:
 					)
 
 		for uuid in rejected_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			# Report rejection to response queue so batch tracker counts it
+			if self._response_queue is not None and self.rank == 0 and seq is not None:
+				self._response_queue.put({
+					"type": "completion",
+					"request_id": uuid,
+					"batch_id": getattr(seq, 'batch_id', None),
+					"error": {
+						"code": "context_length_exceeded",
+						"message": (
+							f"Prompt length {getattr(seq, 'prompt_length', '?')} exceeds "
+							f"model context {self.model_context_length}"
+						),
+					},
+					"text": "",
+				})
 			self.global_batch.remove_sequence(uuid)
-			# TODO: Report rejection to response_queue
 
 		# Assign buffer slots and fill token data
 		for i, seq in enumerate(sequences):
@@ -927,12 +942,15 @@ class BatchGenWorker:
 			)
 
 			slot = self._buffer_pool.allocate_slot()
+			try:
+				input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+				input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+				seq.input_ids = input_ids_view
+				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
+			except Exception:
+				self._buffer_pool.free_slot(slot)
+				raise
 			seq._buffer_slot = slot
-
-			input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-			input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
-			seq.input_ids = input_ids_view
-			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
 			seq.prompt_length = actual_prompt_len
 			seq.original_prompt_length = actual_prompt_len

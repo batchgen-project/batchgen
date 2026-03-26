@@ -105,7 +105,9 @@ class BatchScheduler:
         self._tokenizer_model: Optional[str] = None
         # Request pool state
         self._pool_mode = server_args.max_pool_size > 0
-        self._intake_pool = IntakePool()
+        self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
+        self._batch_timeout = 86400  # 24h default, matches completion_window
+        self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
         self._scheduling_pool = SchedulingPool(
             capacity=server_args.max_pool_size if self._pool_mode else 1024
         )
@@ -134,12 +136,30 @@ class BatchScheduler:
         if not self._task:
             return
         self._stopped.set()
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
+        # Cancel all tasks (background pool tasks + main task)
+        for task in [self._completion_listener_task, self._drain_task, self._task]:
+            if task:
+                task.cancel()
+        for task in [self._completion_listener_task, self._drain_task, self._task]:
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._task = None
+        self._completion_listener_task = None
+        self._drain_task = None
+
+    def intake_pool_usage_pct(self) -> float:
+        """Return intake pool usage as a fraction (0.0-1.0)."""
+        cap = self._intake_pool.max_capacity
+        return self._intake_pool.size() / cap if cap > 0 else 0.0
+
+    def intake_pool_size(self) -> int:
+        return self._intake_pool.size()
+
+    def intake_pool_capacity(self) -> int:
+        return self._intake_pool.max_capacity
 
     async def enqueue(self, batch_id: str) -> None:
         await self._queue.put(batch_id)
@@ -856,7 +876,19 @@ class BatchScheduler:
                 },
                 priority=Priority.NORMAL,
             ))
-        self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+        accepted = self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+        if not accepted:
+            current = self._intake_pool.size()
+            cap = self._intake_pool.max_capacity
+            error_msg = (
+                f"Server at capacity: intake pool has {current}/{cap} requests. "
+                f"Batch with {len(entries)} requests rejected. Retry later."
+            )
+            logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
+            self.storage.update_batch(batch_id, status="failed", error={
+                "code": "capacity_exceeded", "message": error_msg,
+            })
+            return
         # Store max_tokens for init message
         if not hasattr(self, '_pool_max_output_len'):
             self._pool_max_output_len = max_tokens
@@ -887,12 +919,30 @@ class BatchScheduler:
             f"(total in pool: {self._intake_pool.size()})"
         )
 
-        # Wait for this batch to complete
+        # Wait for this batch to complete (with timeout)
+        import time as _time
+        deadline = _time.time() + self._batch_timeout
+        batch_failed = False
         while True:
             tracker = self._scheduling_pool.get_batch_tracker(batch_id)
             if tracker and tracker.is_complete:
                 break
+            if tracker and getattr(tracker, 'error', None):
+                logger.error(f"[POOL] Batch {batch_id} failed: {tracker.error}")
+                batch_failed = True
+                break
+            if _time.time() > deadline:
+                logger.error(f"[POOL] Batch {batch_id} timed out after {self._batch_timeout}s")
+                batch_failed = True
+                break
             await asyncio.sleep(0.5)
+
+        if batch_failed:
+            error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
+            self.storage.update_batch(batch_id, status="failed", error={
+                "code": "batch_failed", "message": str(error_msg)
+            })
+            return
 
         # Finalize batch output
         self._finalize_batch_output(batch_id, requests, prompts)
@@ -961,12 +1011,20 @@ class BatchScheduler:
 
         logger.info("[POOL] Intake drain task stopped")
 
+    def _fail_all_active_batches(self, error_msg: str) -> None:
+        """Mark all in-progress batches as failed. Called on fatal listener error."""
+        for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
+            if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
+                tracker.error = error_msg
+                logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
+
     async def _pool_completion_listener(self) -> None:
         """Background task: read per-request completions from worker response queue.
 
         Routes each completion to the correct batch tracker and writes
         incremental output.
         """
+        import queue as queue_mod
         logger.info("[POOL] Completion listener started")
         while not self._stopped.is_set():
             try:
@@ -974,8 +1032,12 @@ class BatchScheduler:
                     self.worker.response_queue.get,
                     timeout=1.0,
                 )
-            except Exception:
+            except queue_mod.Empty:
                 continue
+            except Exception as e:
+                logger.error(f"[POOL] Completion listener fatal error: {e}", exc_info=True)
+                self._fail_all_active_batches(f"Worker error: {e}")
+                break
 
             if result is None:
                 break
@@ -1158,7 +1220,8 @@ class BatchScheduler:
             output_file_id=output_file_id,
         )
 
-        # Clean up batch tracker and request metadata
+        # Clean up batch tracker, intake info, and request metadata
         self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
         self._pool_request_meta.pop(batch_id, None)
         logger.info(f"[POOL] Batch {batch_id} finalized")

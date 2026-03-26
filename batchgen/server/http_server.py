@@ -160,6 +160,28 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
         return model_obj
 
+    # ==================== Pool Status Endpoint ====================
+
+    @app.get("/v1/pool/status")
+    async def pool_status(request: Request):
+        scheduler: BatchScheduler = request.app.state.scheduler
+        spool = scheduler._scheduling_pool
+        ipool = scheduler._intake_pool
+        active_batches = 0
+        with spool._lock:
+            for t in spool._batch_trackers.values():
+                if not t.is_complete and not t.is_failed:
+                    active_batches += 1
+        return {
+            "intake_pool_size": ipool.size(),
+            "intake_pool_capacity": ipool.max_capacity,
+            "scheduling_pool_active": spool.num_active_slots(),
+            "scheduling_pool_free": spool.num_free_slots(),
+            "scheduling_pool_capacity": spool.capacity,
+            "active_batches": active_batches,
+            "pool_mode": scheduler._pool_mode,
+        }
+
     # ==================== File Endpoints ====================
 
     @app.post("/v1/files", response_model=FileObject)
@@ -291,6 +313,16 @@ def create_app(
     async def create_batch(request: Request, body: CreateBatchRequest):
         storage: StorageManager = request.app.state.storage
         scheduler: BatchScheduler = request.app.state.scheduler
+
+        # Admission control: reject early if intake pool is near capacity (>90%)
+        if scheduler.intake_pool_usage_pct() > 0.9:
+            pool_size = scheduler.intake_pool_size()
+            pool_cap = scheduler.intake_pool_capacity()
+            raise HTTPException(
+                status_code=429,
+                detail=f"Server at capacity ({pool_size}/{pool_cap} requests in queue). Retry later.",
+                headers={"Retry-After": "30"},
+            )
 
         input_meta = storage.load_metadata(body.input_file_id)
         if not input_meta:
