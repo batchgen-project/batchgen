@@ -13,7 +13,7 @@
 #   - HostKVRebalancer: migration + eviction (step 10)
 #   - CompletionHandler: EOS detection (step 11)
 #
-# Migration status: Steps 1-8 (package + state + indexing + sync + kv_manager + batch_formation + prefill + boundary)
+# Migration status: Steps 1-9 (+ decode)
 # The main BatchGenWorker class remains in batchgen/batchgen_worker.py
 # and delegates to these sub-managers.
 
@@ -24,3 +24,4 @@ from batchgen.worker.kv_manager import KVCacheManager
 from batchgen.worker.batch_formation import BatchFormation
 from batchgen.worker.prefill import PrefillScheduler
 from batchgen.worker.boundary import BoundaryHandler
+from batchgen.worker.decode import DecodeScheduler
