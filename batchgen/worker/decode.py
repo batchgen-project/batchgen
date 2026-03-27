@@ -165,6 +165,7 @@ class DecodeScheduler:
 		self.state.model, self._worker.weight_copy_task = self.state.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		self._worker.model = self.state.model  # Sync back for _select_tokens etc.
 		self._worker.set_phase("decode")
 		self.state.core_engine.stop_h2d_worker()
 		self.state.core_engine.clear_kv_copy_queue()
