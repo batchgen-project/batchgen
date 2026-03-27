@@ -1,5 +1,7 @@
-from .modeling_deepseek_v3 import (
-	DeepseekV3ForCausalLM
+from .model import (
+	DeepSeekR1ForCausalLM,
+	DeepSeekR1MoE,
+	DeepSeekR1MoEBufferManager,
 )
 from .wrappers import DeepSeekExpertWrapper, DeepSeekAttnWrapper as Attn_Wrapper
 import logging
@@ -141,7 +143,7 @@ class DeepseekV3ParallelStrategyManager:
 
 		# Step 2: Initialize model
 		step_start = time.perf_counter()
-		self.model = DeepseekV3ForCausalLM(self.loaded_model_config)
+		self.model = DeepSeekR1ForCausalLM(self.loaded_model_config)
 		timings['model_init'] = time.perf_counter() - step_start
 
 		# Step 3: Initialize data structures
@@ -316,7 +318,7 @@ class DeepseekV3ParallelStrategyManager:
 		torch.cuda.empty_cache()
 
 		# Always use comm for NCCL collectives
-		self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+		self.model = DeepSeekR1ForCausalLM(self.loaded_model_config, comm)
 
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
@@ -456,6 +458,40 @@ class DeepseekV3ParallelStrategyManager:
 		self._config_attn_module()
 		self._config_expert_module()
 		self._config_lm_head_hook()
+
+		# --- NEW: Inject comm/device and init FP8 blockwise weights ---
+		device = self.engine_config.Basic_Config.device_torch
+		NUM_EXPERT_PER_RANK = NUM_TOTAL_EXPERTS // self.world_size
+		for layer_idx in range(
+			self.loaded_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			moe = self.model.model.layers[layer_idx].mlp
+			moe.comm = comm
+			moe.device = device
+			# Stack per-expert FP8 weights into 3D tensors for grouped GEMM
+			moe.init_fp8_blockwise_weights()
+
+		# Allocate shared MoE buffer manager (singleton across all layers)
+		effective_padding_bsz_buf = padding_bsz if padding_bsz is not None else 128
+		env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
+		if env_max_bsz is not None:
+			effective_padding_bsz_buf = int(env_max_bsz)
+		DeepSeekR1MoE._buf = DeepSeekR1MoEBufferManager(
+			E_local=NUM_EXPERT_PER_RANK,
+			max_global_bsz=self.world_size * effective_padding_bsz_buf,
+			H=self.loaded_model_config.hidden_size,
+			N_inter=self.loaded_model_config.moe_intermediate_size,
+			topk=self.loaded_model_config.num_experts_per_tok,
+			num_tokens_per_rank=effective_padding_bsz_buf,
+			device=device,
+		)
+		if self.rank == 0:
+			logging.info(
+				f"[MoE] FP8 blockwise weights stacked, buffer manager allocated "
+				f"(E_local={NUM_EXPERT_PER_RANK}, global_bsz={self.world_size * effective_padding_bsz_buf})"
+			)
+		# --- END NEW ---
 
 		# Set enable_ep_offloading flag on MoE layers for loop-based execution
 		if self.enable_ep_offloading:
