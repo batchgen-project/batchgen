@@ -6996,6 +6996,7 @@ class BatchGenWorker:
 		# Delete model directly without CPU transfer
 		del self.model
 		self.model = None
+		self._state.model = None  # Clear state ref to allow GC
 		self._cuda_graph_manager = None
 		self._whole_model_graph = False
 
