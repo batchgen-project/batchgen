@@ -485,14 +485,24 @@ class BatchGenWorker:
 		self.initializer = None
 		self.parallel_manager = None
 		
-		# 7. Batch State Placeholders
+		# 7. Sub-Managers (scheduler split refactor)
+		from batchgen.worker.state import WorkerState
+		from batchgen.worker.indexing import IndexManager
+		from batchgen.worker.sync import SyncCoordinator
+
+		self._state = WorkerState(
+			rank=self.rank,
+			local_rank=self.local_rank,
+			world_size=self.world_size,
+			torch_device=self.torch_device,
+		)
+		self._index = IndexManager(self._state)
+		self._sync = SyncCoordinator(self._state)
+
+		# 8. Batch State Placeholders (shared via WorkerState)
 		self.global_batch: Optional[SequenceBatch] = None
 		self.query_book: Optional[Dict] = None
 		self.model_batch_book: Dict = {}
-		self._local_to_uuid_map: Dict[int, str] = {}
-		self._uuid_to_local_map: Dict[str, int] = {}
-		self._free_local_indices: Set[int] = set()  # Track freed indices for O(1) allocation
-		self._next_local_idx: int = 0  # Next index if free list is empty
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
@@ -528,9 +538,6 @@ class BatchGenWorker:
 		self.gpu_memory_frac = args.gpu_memory_frac
 		self.gpu_kv_cache_size_gb: Optional[float] = None  # Calculated in _calculate_gpu_kv_cache_size()
 		
-		# Track sequences currently with GPU KV allocated
-		self._sequences_with_gpu_kv: Set[str] = set()
-
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
@@ -923,7 +930,7 @@ class BatchGenWorker:
 		"""Compute tokens for two-page buffer GPU allocation (NOT full context)."""
 		tokens = []
 		for local_idx in local_indices:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			pages = seq.get_gpu_pages_for_two_page_buffer()
 			tokens.append(pages * self.PAGE_SIZE)
@@ -947,7 +954,7 @@ class BatchGenWorker:
 		if manager is None:
 			return False
 		
-		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		global_ids = self._index.local_indices_to_global_seq_ids(local_sequence_ids)
 		
 		pages_per_seq = []
 		total_pages = 0
@@ -955,7 +962,7 @@ class BatchGenWorker:
 		# DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
 		alloc_details = []
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			pages = seq.get_gpu_pages_for_two_page_buffer()
 			pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
@@ -988,7 +995,7 @@ class BatchGenWorker:
 		
 		# Now safe to update tracking (allocation will succeed)
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			pages = seq.get_gpu_pages_for_two_page_buffer()
 			seq.gpu_pages_allocated = pages
@@ -1003,13 +1010,13 @@ class BatchGenWorker:
 		
 		# Track in set
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
-			self._sequences_with_gpu_kv.add(uuid)
+			uuid = self._state.local_to_uuid_map[local_idx]
+			self._state.sequences_with_gpu_kv.add(uuid)
 		
 		# Rebuild page table with ALL active sequences
 		all_active_global_ids = []
-		for uuid in self._sequences_with_gpu_kv:
-			if uuid in self._uuid_to_local_map:
+		for uuid in self._state.sequences_with_gpu_kv:
+			if uuid in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				all_active_global_ids.append(seq.global_idx)
 		all_active_global_ids.sort()
@@ -1049,7 +1056,7 @@ class BatchGenWorker:
 		total_additional = 0
 		
 		for uuid in uuids:
-			if uuid not in self._uuid_to_local_map:
+			if uuid not in self._state.uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			additional = seq.get_additional_gpu_pages_needed()
@@ -1067,7 +1074,7 @@ class BatchGenWorker:
 		# Perform extensions
 		for uuid, additional in extensions_needed:
 			seq = self.global_batch.get_sequence(uuid)
-			local_idx = self._uuid_to_local_map[uuid]
+			local_idx = self._state.uuid_to_local_map[uuid]
 			global_id = seq.global_idx
 			
 			# Extend allocation
@@ -1105,7 +1112,7 @@ class BatchGenWorker:
 		# Sort by decoded_length ASCENDING (least progress first - evict these)
 		candidates = []
 		for uuid in active_uuids:
-			if uuid not in self._uuid_to_local_map:
+			if uuid not in self._state.uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			candidates.append((uuid, seq.decoded_length, seq.gpu_pages_allocated))
@@ -1128,11 +1135,11 @@ class BatchGenWorker:
 		if not uuids:
 			return
 		
-		my_uuids = [u for u in uuids if u in self._uuid_to_local_map]
+		my_uuids = [u for u in uuids if u in self._state.uuid_to_local_map]
 		
 		if my_uuids:
-			local_indices = self._get_local_indices_for_uuids(my_uuids)
-			global_ids = self._local_indices_to_global_seq_ids(local_indices)
+			local_indices = self._index.get_local_indices_for_uuids(my_uuids)
+			global_ids = self._index.local_indices_to_global_seq_ids(local_indices)
 			
 			manager = self.gpu_paged_kv_cache_manager
 			if manager is not None:
@@ -1141,17 +1148,17 @@ class BatchGenWorker:
 			for uuid in my_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
-				self._sequences_with_gpu_kv.discard(uuid)
+				self._state.sequences_with_gpu_kv.discard(uuid)
 		
 		# self._update_batch_status(uuids, SequenceStatus.ON_HOLD)
 		
 		# FIX: Rebuild page table with remaining active sequences
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is not None and manager.is_initialized:
-			remaining_uuids = [u for u in self._sequences_with_gpu_kv if u not in set(uuids)]
+			remaining_uuids = [u for u in self._state.sequences_with_gpu_kv if u not in set(uuids)]
 			if remaining_uuids:
-				remaining_local = self._get_local_indices_for_uuids(remaining_uuids)
-				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
+				remaining_local = self._index.get_local_indices_for_uuids(remaining_uuids)
+				remaining_global = self._index.local_indices_to_global_seq_ids(remaining_local)
 				manager.rebuild_page_table(remaining_global)
 
 	def _flush_deferred_kv_to_host(self) -> None:
@@ -1248,7 +1255,7 @@ class BatchGenWorker:
 		append_diag = []
 		
 		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
 			# Write position is current position (0-indexed)
@@ -1284,7 +1291,7 @@ class BatchGenWorker:
 			for idx in nan_indices:
 				if idx < len(batch):
 					local_idx = batch[idx]
-					uuid = self._local_to_uuid_map.get(local_idx, "unknown")
+					uuid = self._state.local_to_uuid_map.get(local_idx, "unknown")
 					seq = self.global_batch.get_sequence(uuid) if uuid != "unknown" else None
 					nan_seq_info.append({
 						'batch_idx': idx,
@@ -1512,7 +1519,7 @@ class BatchGenWorker:
 		if query_entry.kv_token_budget is not None:
 			return query_entry.kv_token_budget
 		# Fallback: compute from sequence metadata (attention_mask removed)
-		uuid = self._local_to_uuid_map.get(sequence_id, "")
+		uuid = self._state.local_to_uuid_map.get(sequence_id, "")
 		seq = self.global_batch.get_sequence(uuid) if uuid else None
 		if seq is None:
 			raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
@@ -1618,7 +1625,7 @@ class BatchGenWorker:
 			return
 		
 		# Convert local indices to global_idx (consistent with host KV registration)
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		global_sequence_ids = self._index.local_indices_to_global_seq_ids(local_sequence_ids)
 		
 		sequence_tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
 		manager = self._ensure_gpu_paged_kv_manager(sequence_tokens)
@@ -1649,7 +1656,7 @@ class BatchGenWorker:
 		resuming_seq_info = []
 		for global_idx in global_sequence_ids:
 			# Find the sequence by global_idx
-			for uuid, local_idx in self._uuid_to_local_map.items():
+			for uuid, local_idx in self._state.uuid_to_local_map.items():
 				seq = self.global_batch.get_sequence(uuid)
 				if seq and seq.global_idx == global_idx and seq.decoded_length > 0:
 					resuming_seq_info.append({
@@ -1697,7 +1704,7 @@ class BatchGenWorker:
 		if manager is None or not local_sequence_ids:
 			return
 		
-		global_sequence_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		global_sequence_ids = self._index.local_indices_to_global_seq_ids(local_sequence_ids)
 		
 		if not global_sequence_ids:
 			return
@@ -1711,9 +1718,9 @@ class BatchGenWorker:
 			
 			# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
 			for local_idx in local_sequence_ids:
-				uuid = self._local_to_uuid_map.get(local_idx)
+				uuid = self._state.local_to_uuid_map.get(local_idx)
 				if uuid:
-					self._sequences_with_gpu_kv.discard(uuid)
+					self._state.sequences_with_gpu_kv.discard(uuid)
 					seq = self.global_batch.get_sequence(uuid)
 					if seq is not None:
 						seq.gpu_pages_allocated = 0
@@ -1754,7 +1761,7 @@ class BatchGenWorker:
 		manager.destroy(empty_cuda_cache=empty_cuda_cache)
 		
 		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
-		self._sequences_with_gpu_kv.clear()
+		self._state.sequences_with_gpu_kv.clear()
 		
 		# CRITICAL FIX: Reset GPU allocation state for ALL non-completed sequences
 		# Without this, sequences retain stale had_initial_gpu_reservation=True,
@@ -2414,7 +2421,7 @@ class BatchGenWorker:
 			# Free host KV pages
 			worker_view.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, decoded_tokens)
-			local_idx = self._uuid_to_local_map.get(uuid)
+			local_idx = self._state.uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
 				qb = self.query_book[local_idx]
 				# Send tensors via Gloo — must use .clone() because buffer pool views
@@ -2696,7 +2703,7 @@ class BatchGenWorker:
 		# uuid would be in its _uuid_to_local_map, but its state is stale!
 		migrated_uuids = [m.uuid for m in migrations]
 		if migrated_uuids:
-			self._sync_sequence_metadata(migrated_uuids)
+			self._sync.sync_metadata(migrated_uuids)
 			logging.info(
 				f"Rank {self.rank}: REBALANCE: Synced metadata for {len(migrated_uuids)} sequences "
 				f"BEFORE local mapping update (SEND side still owns them)"
@@ -2713,27 +2720,27 @@ class BatchGenWorker:
 
 			# Update local mappings on source rank (remove)
 			if self.rank == old_rank:
-				local_idx = self._uuid_to_local_map.pop(uuid, None)
+				local_idx = self._state.uuid_to_local_map.pop(uuid, None)
 				if local_idx is not None:
-					self._local_to_uuid_map.pop(local_idx, None)
-					self._sequences_with_gpu_kv.discard(uuid)
+					self._state.local_to_uuid_map.pop(local_idx, None)
+					self._state.sequences_with_gpu_kv.discard(uuid)
 					# Remove query_book entry
 					self.query_book.pop(local_idx, None)
 					# Add freed index to free list for O(1) reuse
-					self._free_local_indices.add(local_idx)
+					self._state.free_local_indices.add(local_idx)
 					logging.debug(f"Rank {self.rank}: Removed {uuid[:8]}... from local mappings (freed local_idx={local_idx})")
 
 			# Update local mappings on dest rank (add)
 			if self.rank == new_rank:
 				# O(1) allocation: prefer reusing freed indices, otherwise use next available
-				if self._free_local_indices:
-					new_local_idx = self._free_local_indices.pop()
+				if self._state.free_local_indices:
+					new_local_idx = self._state.free_local_indices.pop()
 				else:
-					new_local_idx = self._next_local_idx
-					self._next_local_idx += 1
+					new_local_idx = self._state.next_local_idx
+					self._state.next_local_idx += 1
 
-				self._uuid_to_local_map[uuid] = new_local_idx
-				self._local_to_uuid_map[new_local_idx] = uuid
+				self._state.uuid_to_local_map[uuid] = new_local_idx
+				self._state.local_to_uuid_map[new_local_idx] = uuid
 				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
 				# Create query_book entry from pending migrated data, copying into buffer pool
@@ -2848,6 +2855,7 @@ class BatchGenWorker:
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
+		self._state.global_batch = self.global_batch
 		for idx, text in enumerate(global_prompts):
 			max_dec = self.max_decoding_length
 			if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
@@ -2939,47 +2947,11 @@ class BatchGenWorker:
 		# Watchdog is now active - monitors prefill and decode phases
 		return self.generate()
 
-	# ============ UUID/Index Conversion Helpers ============
-
-	def _local_to_uuid(self, local_idx: int) -> str:
-		return self._local_to_uuid_map.get(local_idx, "")
-
-	def _uuid_to_local(self, uuid: str) -> int:
-		return self._uuid_to_local_map.get(uuid, -1)
-
-	def _local_indices_to_global_seq_ids(self, local_indices: List[int]) -> List[int]:
-		"""Convert local indices to global sequence IDs (global_idx from SequenceEntry)."""
-		global_seq_ids = []
-		missing_indices = []
-		for local_idx in local_indices:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid:
-				seq = self.global_batch.get_sequence(uuid)
-				global_seq_ids.append(seq.global_idx)
-			else:
-				missing_indices.append(local_idx)
-
-		# CRITICAL: Log if any local indices are missing - this causes length mismatch
-		# which leads to KV corruption (wrong sequence KV read for wrong batch position)
-		if missing_indices:
-			logging.error(
-				f"Rank {self.rank}: MISSING LOCAL INDICES in _local_indices_to_global_seq_ids! "
-				f"input_len={len(local_indices)}, output_len={len(global_seq_ids)}, "
-				f"missing={missing_indices[:10]}..."
-			)
-		return global_seq_ids
-
-	def _get_my_sequences_by_status(self, status: SequenceStatus) -> List[str]:
-		"""Get UUIDs of sequences assigned to this rank with given status."""
-		return self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
-
-	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
-		"""Convert global UUIDs to local indices for sequences assigned to this rank."""
-		local_indices = []
-		for uuid in uuids:
-			if uuid in self._uuid_to_local_map:
-				local_indices.append(self._uuid_to_local_map[uuid])
-		return local_indices
+	# ============ Index/Sync methods extracted to batchgen/worker/ ============
+	# _local_to_uuid, _uuid_to_local, _local_indices_to_global_seq_ids,
+	# _get_my_sequences_by_status, _get_local_indices_for_uuids → self._index (IndexManager)
+	# _sync_sequence_metadata, _sync_completion_status_tensor,
+	# _sync_decode_uuids_tensor → self._sync (SyncCoordinator)
 
 	# def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
 	# 	"""Update status for all sequences in a batch."""
@@ -3002,189 +2974,6 @@ class BatchGenWorker:
 				self.global_batch.update_status(uuid, new_status)
 			except ValueError as e:
 				logging.warning(f"Rank {self.rank}: Invalid status transition for {uuid}: {e}")
-
-	def _sync_sequence_metadata(self, decode_uuids: List[str]) -> None:
-		"""
-		Synchronize sequence metadata (decoded_length, current_context_length, 
-		gpu_pages_allocated) across all ranks.
-		
-		Each rank reports its local sequences' state, and all ranks update their 
-		local SequenceEntry objects with the gathered info.
-		
-		CRITICAL: Must be called at page boundaries to maintain consistent view.
-		"""
-		if not decode_uuids:
-			return
-		
-		# Step 1: Each rank reports state for sequences it owns
-		# CRITICAL FIX: Also compute and send prompt_length so receivers can validate ctx_len
-		local_state = {}
-		for uuid in decode_uuids:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				# CRITICAL: Ensure current_context_length is consistent before sending
-				# The invariant is: current_context_length = prompt_length + decoded_length
-				expected_ctx = seq.original_prompt_length + seq.decoded_length
-				if seq.current_context_length != expected_ctx:
-					logging.warning(
-						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
-						f"{seq.current_context_length} → {expected_ctx}"
-					)
-					seq.current_context_length = expected_ctx
-				
-				local_state[uuid] = {
-					'decoded_length': seq.decoded_length,
-					'current_context_length': seq.current_context_length,
-					'gpu_pages_allocated': seq.gpu_pages_allocated,
-					'eos_reached': seq.eos_reached,
-					'prompt_length': seq.prompt_length,  # Include for validation
-					'host_pages_allocated': seq.host_pages_allocated,
-					'host_token_capacity': seq.host_token_capacity,
-				}
-		
-		# Step 2: All-gather state from all ranks
-		all_states = [None] * self.world_size
-		dist.all_gather_object(all_states, local_state)
-		
-		# Step 3: Merge and update local SequenceEntry objects
-		for rank_state in all_states:
-			if rank_state:
-				for uuid, state in rank_state.items():
-					if uuid not in self._uuid_to_local_map:
-						# This sequence belongs to another rank - update our local copy
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None:
-							seq.decoded_length = state['decoded_length']
-							seq.current_context_length = state['current_context_length']
-							seq.gpu_pages_allocated = state['gpu_pages_allocated']
-							seq.eos_reached = state['eos_reached']
-							# Sync host KV fields for consistent migration planning
-							if 'host_pages_allocated' in state:
-								seq.host_pages_allocated = state['host_pages_allocated']
-							if 'host_token_capacity' in state:
-								seq.host_token_capacity = state['host_token_capacity']
-							
-							# VALIDATION: Ensure received ctx_len is consistent
-							expected_ctx = seq.original_prompt_length + seq.decoded_length
-							if seq.current_context_length != expected_ctx:
-								logging.error(
-									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
-									f"received={seq.current_context_length}, expected={expected_ctx} "
-									f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-								)
-								seq.current_context_length = expected_ctx
-
-	def _sync_completion_status_tensor(
-		self,
-		decode_uuids: List[str],
-	) -> Tuple[Set[str], List[str]]:
-		"""
-		Synchronize completion status across all ranks using tensor operations.
-
-		OPTIMIZATION: Replaces expensive all_gather_object with tensor-based all_reduce.
-		- all_gather_object requires Python serialization (pickle) - ~1-5ms per call
-		- all_reduce on tensors is pure NCCL - ~0.1ms per call
-
-		Returns:
-			(global_completed_uuids, active_decode_uuids) - both sorted by global_idx
-		"""
-		if not decode_uuids:
-			return set(), []
-
-		# Build global_idx to uuid mapping for decode candidates
-		idx_to_uuid = {}
-		uuid_to_idx = {}
-		for uuid in decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				idx_to_uuid[seq.global_idx] = uuid
-				uuid_to_idx[uuid] = seq.global_idx
-
-		if not idx_to_uuid:
-			return set(), []
-
-		# Get max global_idx to size the tensor
-		max_idx = max(idx_to_uuid.keys())
-
-		# Create completion tensor: 1 = completed, 0 = not completed
-		# Each rank marks its LOCAL sequences' completion status
-		completion_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
-
-		for uuid in decode_uuids:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None and uuid in uuid_to_idx:
-					is_completed = (seq.status == SequenceStatus.COMPLETED or seq.eos_reached)
-					if is_completed:
-						completion_tensor[uuid_to_idx[uuid]] = 1
-
-		# all_reduce with MAX: if ANY rank marks a sequence complete, result is 1
-		dist.all_reduce(completion_tensor, op=dist.ReduceOp.MAX)
-
-		# Decode back to UUIDs
-		global_completed = set()
-		active_uuids = []
-
-		# Sort by global_idx for deterministic ordering
-		for global_idx in sorted(idx_to_uuid.keys()):
-			uuid = idx_to_uuid[global_idx]
-			if completion_tensor[global_idx].item() == 1:
-				global_completed.add(uuid)
-				# Update local sequence status
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None:
-					seq.eos_reached = True
-					if seq.status != SequenceStatus.COMPLETED:
-						try:
-							self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
-						except ValueError as e:
-							logging.debug(
-								f"Rank {self.rank}: Could not update {uuid[:8]} to COMPLETED: {e}"
-							)
-			else:
-				active_uuids.append(uuid)
-
-		return global_completed, active_uuids
-
-	def _sync_decode_uuids_tensor(
-		self,
-		decode_uuids: List[str],
-	) -> List[str]:
-		"""
-		Synchronize decode_uuids across all ranks using tensor operations.
-
-		Uses global_idx as the common identifier and all_reduce to find intersection.
-		Returns sorted list of UUIDs that ALL ranks agree on.
-		"""
-		if not decode_uuids:
-			return []
-
-		# Build global_idx to uuid mapping
-		idx_to_uuid = {}
-		uuid_to_idx = {}
-		for seq in self.global_batch:
-			idx_to_uuid[seq.global_idx] = seq.uuid
-			uuid_to_idx[seq.uuid] = seq.global_idx
-
-		max_idx = max(idx_to_uuid.keys()) if idx_to_uuid else 0
-
-		# Create presence tensor: 1 = in decode_uuids, 0 = not
-		presence_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
-		for uuid in decode_uuids:
-			if uuid in uuid_to_idx:
-				presence_tensor[uuid_to_idx[uuid]] = 1
-
-		# all_reduce with MIN: only sequences present on ALL ranks will have value world_size
-		# First broadcast local counts, then sum
-		dist.all_reduce(presence_tensor, op=dist.ReduceOp.MIN)
-
-		# Extract UUIDs where all ranks agree (value == 1 after MIN means all had 1)
-		synced_uuids = []
-		for global_idx in sorted(idx_to_uuid.keys()):
-			if presence_tensor[global_idx].item() == 1:
-				synced_uuids.append(idx_to_uuid[global_idx])
-
-		return synced_uuids
 
 	# ============ Tokenization and Assignment ============
 
@@ -3473,10 +3262,10 @@ class BatchGenWorker:
 		)
 
 		self.query_book = {}
-		self._local_to_uuid_map: Dict[int, str] = {}
-		self._uuid_to_local_map: Dict[str, int] = {}
-		self._free_local_indices: Set[int] = set()  # Reset free list
-		self._next_local_idx = len(my_uuids)  # Next available index after initial assignment
+		self._state.local_to_uuid_map: Dict[int, str] = {}
+		self._state.uuid_to_local_map: Dict[str, int] = {}
+		self._state.free_local_indices: Set[int] = set()  # Reset free list
+		self._state.next_local_idx = len(my_uuids)  # Next available index after initial assignment
 
 		for local_idx, uuid in enumerate(my_uuids):
 			seq = self.global_batch.get_sequence(uuid)
@@ -3490,8 +3279,8 @@ class BatchGenWorker:
 				kv_token_budget=seq.kv_token_budget,
 			)
 
-			self._local_to_uuid_map[local_idx] = uuid
-			self._uuid_to_local_map[uuid] = local_idx
+			self._state.local_to_uuid_map[local_idx] = uuid
+			self._state.uuid_to_local_map[uuid] = local_idx
 		
 		# Validation: Check that we have all sequences assigned to this rank
 		expected_count = sum(
@@ -3642,7 +3431,7 @@ class BatchGenWorker:
 		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
 		# This ensures all ranks have consistent current_context_length values
 		# which is essential for correct KV migration validation later
-		self._sync_sequence_metadata(uuids)
+		self._sync.sync_metadata(uuids)
 
 		# Free GPU pages for these sequences
 		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
@@ -3652,7 +3441,7 @@ class BatchGenWorker:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq.assigned_rank == self.rank:
 					# Verify sequence is in local map (should be for IN_DECODE sequences)
-					if uuid in self._uuid_to_local_map:
+					if uuid in self._state.uuid_to_local_map:
 						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
 
 			if global_seq_ids:
@@ -3670,7 +3459,7 @@ class BatchGenWorker:
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
 					if seq.assigned_rank == self.rank:
-						self._sequences_with_gpu_kv.discard(uuid)
+						self._state.sequences_with_gpu_kv.discard(uuid)
 
 		# Update sequence status and reset GPU allocation
 		# NOTE: Only reset gpu_pages_allocated, NOT had_initial_gpu_reservation.
@@ -3777,10 +3566,10 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			expected_owner = seq.global_idx % self.world_size
-			if expected_owner == self.rank and uuid not in self._uuid_to_local_map:
+			if expected_owner == self.rank and uuid not in self._state.uuid_to_local_map:
 				should_be_mine_but_missing.append((uuid, seq.global_idx, seq.assigned_rank))
 			
-			if uuid in self._uuid_to_local_map:
+			if uuid in self._state.uuid_to_local_map:
 				local_ext_info[uuid] = {
 					'global_idx': seq.global_idx,
 					'decoded_length': seq.decoded_length,
@@ -3794,7 +3583,7 @@ class BatchGenWorker:
 				f"Rank {self.rank}: OWNERSHIP BUG - {len(should_be_mine_but_missing)} sequences "
 				f"should be mine but not in _uuid_to_local_map! First 5: {should_be_mine_but_missing[:5]}"
 			)
-			logging.error(f"Rank {self.rank}: _uuid_to_local_map has {len(self._uuid_to_local_map)} entries")
+			logging.error(f"Rank {self.rank}: _uuid_to_local_map has {len(self._state.uuid_to_local_map)} entries")
 		
 		# ============ Step 2: ALL-GATHER extension info (COLLECTIVE #1) ============
 		all_ext_info = [None] * self.world_size
@@ -3832,7 +3621,7 @@ class BatchGenWorker:
 		# ============ FIX Bug 5-6: Update local SequenceEntry with gathered info ============
 		# This ensures all ranks have consistent view of sequence state
 		for uuid, info in global_seq_info.items():
-			if uuid not in self._uuid_to_local_map:
+			if uuid not in self._state.uuid_to_local_map:
 				# This sequence belongs to another rank - update our local copy
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
@@ -3884,7 +3673,7 @@ class BatchGenWorker:
 			# No eviction needed - just extend locally
 			my_uuids_needing_extension = [
 				uuid for uuid in decode_uuids
-				if uuid in self._uuid_to_local_map 
+				if uuid in self._state.uuid_to_local_map 
 				and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
 			]
 			
@@ -3930,11 +3719,11 @@ class BatchGenWorker:
 			
 			# ============ Step 7: Execute eviction ============
 			onhold_set = set(global_onhold)
-			my_onhold = [u for u in global_onhold if u in self._uuid_to_local_map]
+			my_onhold = [u for u in global_onhold if u in self._state.uuid_to_local_map]
 			
 			if my_onhold:
-				local_indices = self._get_local_indices_for_uuids(my_onhold)
-				global_ids = self._local_indices_to_global_seq_ids(local_indices)
+				local_indices = self._index.get_local_indices_for_uuids(my_onhold)
+				global_ids = self._index.local_indices_to_global_seq_ids(local_indices)
 				
 				if global_ids:
 					manager.free_pages_for_sequences(global_ids)
@@ -3943,7 +3732,7 @@ class BatchGenWorker:
 				for uuid in my_onhold:
 					seq = self.global_batch.get_sequence(uuid)
 					seq.gpu_pages_allocated = 0
-					self._sequences_with_gpu_kv.discard(uuid)
+					self._state.sequences_with_gpu_kv.discard(uuid)
 				
 				logging.info(f"Rank {self.rank}: Evicted {len(my_onhold)} local sequences")
 			
@@ -3962,7 +3751,7 @@ class BatchGenWorker:
 			# ============ Step 8: Extend remaining sequences ============
 			my_remaining_needing_extension = [
 				uuid for uuid in decode_uuids
-				if uuid in self._uuid_to_local_map 
+				if uuid in self._state.uuid_to_local_map 
 				and uuid not in onhold_set
 				and global_seq_info.get(uuid, {}).get('additional_needed', 0) > 0
 			]
@@ -3980,7 +3769,7 @@ class BatchGenWorker:
 							global_id = seq.global_idx
 							manager.free_pages_for_sequences([global_id])
 						seq.gpu_pages_allocated = 0
-						self._sequences_with_gpu_kv.discard(uuid)
+						self._state.sequences_with_gpu_kv.discard(uuid)
 
 		# ============ ALL-GATHER extension failures (COLLECTIVE #3 - ALL RANKS MUST CALL) ============
 		all_failed = [None] * self.world_size
@@ -4008,14 +3797,14 @@ class BatchGenWorker:
 
 		# ============ Step 9: Build GLOBALLY CONSISTENT active lists ============
 		active_uuids = [u for u in decode_uuids if u not in onhold_set]
-		active_batch = self._get_local_indices_for_uuids(active_uuids)
+		active_batch = self._index.get_local_indices_for_uuids(active_uuids)
 
 		# ============ CRITICAL VALIDATION WITH REMOVAL ============
 		valid_active_batch = []
 		local_invalid_uuids = []
 
 		for local_idx in active_batch:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			
 			is_valid = True
@@ -4024,7 +3813,7 @@ class BatchGenWorker:
 				logging.error(f"Rank {self.rank}: REMOVING uuid={uuid} - gpu_pages_allocated=0")
 				is_valid = False
 			
-			if uuid not in self._sequences_with_gpu_kv:
+			if uuid not in self._state.sequences_with_gpu_kv:
 				logging.error(f"Rank {self.rank}: REMOVING uuid={uuid} - not in _sequences_with_gpu_kv")
 				is_valid = False
 			
@@ -4121,8 +3910,8 @@ class BatchGenWorker:
 				)
 			else:
 				active_uuids.append(uuid)
-				if uuid in self._uuid_to_local_map:
-					active_local_indices.append(self._uuid_to_local_map[uuid])
+				if uuid in self._state.uuid_to_local_map:
+					active_local_indices.append(self._state.uuid_to_local_map[uuid])
 
 		return active_uuids, active_local_indices, completed_uuids
 
@@ -4153,8 +3942,8 @@ class BatchGenWorker:
 		# Each rank collects tokens + finish_reason for its locally-owned completed sequences
 		my_completed_tokens = []
 		for uuid in completed_uuids:
-			if uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
+			if uuid in self._state.uuid_to_local_map:
+				local_idx = self._state.uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
 					finish_reason = self._get_finish_reason(seq)
@@ -4205,7 +3994,7 @@ class BatchGenWorker:
 			return current_decode_uuids, current_local_indices
 
 		# Get local indices for sequences belonging to THIS rank
-		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
+		new_local_indices = self._index.get_local_indices_for_uuids(new_uuids)
 		
 		if new_local_indices:
 			# Allocate and load (without final rebuild)
@@ -4220,7 +4009,7 @@ class BatchGenWorker:
 		
 		# Final page table rebuild with ALL active sequences
 		if self.gpu_paged_kv_cache_manager is not None and updated_batch:
-			all_global_ids = self._local_indices_to_global_seq_ids(updated_batch)
+			all_global_ids = self._index.local_indices_to_global_seq_ids(updated_batch)
 			self.gpu_paged_kv_cache_manager.rebuild_page_table(all_global_ids)
 		
 		logging.info(
@@ -4238,7 +4027,7 @@ class BatchGenWorker:
 	# 	if not local_sequence_ids: return
 		
 	# 	manager = self.gpu_paged_kv_cache_manager
-	# 	global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+	# 	global_ids = self._index.local_indices_to_global_seq_ids(local_sequence_ids)
 	# 	tokens = self._compute_host_kv_sequence_tokens(local_sequence_ids)
 
 	# 	# 1. Allocate GPU Pages
@@ -4254,7 +4043,7 @@ class BatchGenWorker:
 
 	# 	# 4. Rebuild Page Table for ALL active sequences (for next Attention forward)
 	# 	# active_uuids = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
-	# 	# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._uuid_to_local_map]
+	# 	# all_active_ids = [self.global_batch.get_sequence(u).global_idx for u in active_uuids if u in self._state.uuid_to_local_map]
 	# 	# # Union with new ids
 	# 	# final_ids = sorted(list(set(all_active_ids + global_ids)))
 	# 	# manager.rebuild_page_table(final_ids) t
@@ -4272,13 +4061,13 @@ class BatchGenWorker:
 			logging.warning("GPU KV manager not initialized, cannot load new sequences")
 			return
 		
-		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
+		global_ids = self._index.local_indices_to_global_seq_ids(local_sequence_ids)
 		tokens = self._compute_two_page_buffer_tokens(local_sequence_ids)
 		
 		# DIAGNOSTIC: Log details for resuming sequences (decoded_length > 0)
 		resuming_diag = []
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			if seq.decoded_length > 0:
 				qb = self.query_book.get(local_idx)
@@ -4315,7 +4104,7 @@ class BatchGenWorker:
 		# DIAGNOSTIC: After load, verify loaded data matches expected context length
 		post_load_diag = []
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			if seq.decoded_length > 0:  # Resuming sequence
 				allocated_pages = seq.get_gpu_pages_for_two_page_buffer()
@@ -4336,12 +4125,12 @@ class BatchGenWorker:
 		
 		# ← FIX: Update tracking state AFTER successful load
 		for local_idx in local_sequence_ids:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
-			self._sequences_with_gpu_kv.add(uuid)
+			self._state.sequences_with_gpu_kv.add(uuid)
 
 	# ============ Batch Statistics ============
 
@@ -4558,7 +4347,7 @@ class BatchGenWorker:
 				in_decode_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.IN_DECODE]
 				all_active_uuids = prefilled_uuids + on_hold_uuids + in_decode_uuids
 				if all_active_uuids:
-					self._sync_sequence_metadata(all_active_uuids)
+					self._sync.sync_metadata(all_active_uuids)
 					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
 
 				# STEP 0: Rebalance host KV BEFORE batch selection
@@ -4584,7 +4373,7 @@ class BatchGenWorker:
 					config_prefill_time += time.perf_counter() - config_start
 
 					# Get local indices AFTER config (new sequences now in map)
-					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
+					local_prefill_indices = self._index.get_local_indices_for_uuids(prefill_uuids)
 
 					# B. Execute Prefill
 					if local_prefill_indices:
@@ -4666,11 +4455,11 @@ class BatchGenWorker:
 
 				# Step 1: Sync decode_uuids across ranks using tensor operations
 				# This ensures all ranks have the same decode candidates
-				decode_uuids = self._sync_decode_uuids_tensor(decode_uuids)
+				decode_uuids = self._sync.sync_decode_uuids(decode_uuids)
 
 				# Step 2: Sync completion status using tensor-based all_reduce
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
-				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
+				global_completed, decode_uuids = self._sync.sync_completion_status(decode_uuids)
 
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
@@ -4691,9 +4480,9 @@ class BatchGenWorker:
 				# (capped by stale host_pages_allocated), causing KV corruption at the
 				# DECISION_INTERVAL boundary (~134-token truncation bug).
 				if decode_uuids:
-					self._sync_sequence_metadata(decode_uuids)
+					self._sync.sync_metadata(decode_uuids)
 
-				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
+				local_decode_indices = self._index.get_local_indices_for_uuids(decode_uuids)
 
 				# B. Config Decode
 				config_start = time.perf_counter()
@@ -4795,7 +4584,7 @@ class BatchGenWorker:
 		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
 		# Gathering strings (~KB each) instead reduces memory by ~100x.
 		local_results = []
-		for local_idx, uuid in self._local_to_uuid_map.items():
+		for local_idx, uuid in self._state.local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
@@ -4988,8 +4777,8 @@ class BatchGenWorker:
 
 			# Recreate query_book entry for this rank's evicted sequences (Q4)
 			# The old entry has stale input_ids/decoded_tokens references
-			if seq.assigned_rank == self.rank and uuid in self._uuid_to_local_map:
-				local_idx = self._uuid_to_local_map[uuid]
+			if seq.assigned_rank == self.rank and uuid in self._state.uuid_to_local_map:
+				local_idx = self._state.uuid_to_local_map[uuid]
 				self.query_book[local_idx] = query(
 					text=seq.text,
 					encoded={
@@ -5016,15 +4805,15 @@ class BatchGenWorker:
 			if seq.assigned_rank == self.rank:
 				my_prefill_uuids.append(uuid)
 				# Add to local maps if not already present (for new sequences)
-				if uuid not in self._uuid_to_local_map:
+				if uuid not in self._state.uuid_to_local_map:
 					# O(1) allocation: prefer reusing freed indices, otherwise use next available
-					if self._free_local_indices:
-						new_local_idx = self._free_local_indices.pop()
+					if self._state.free_local_indices:
+						new_local_idx = self._state.free_local_indices.pop()
 					else:
-						new_local_idx = self._next_local_idx
-						self._next_local_idx += 1
-					self._uuid_to_local_map[uuid] = new_local_idx
-					self._local_to_uuid_map[new_local_idx] = uuid
+						new_local_idx = self._state.next_local_idx
+						self._state.next_local_idx += 1
+					self._state.uuid_to_local_map[uuid] = new_local_idx
+					self._state.local_to_uuid_map[new_local_idx] = uuid
 					logging.debug(
 						f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
 						f"(local_idx={new_local_idx})"
@@ -5279,12 +5068,12 @@ class BatchGenWorker:
 		if local_decode_indices:
 			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
 			for local_idx in local_decode_indices:
-				uuid = self._local_to_uuid_map[local_idx]
+				uuid = self._state.local_to_uuid_map[local_idx]
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 				# Mark initial reservation done
 				seq.mark_initial_gpu_reservation_done()
-				self._sequences_with_gpu_kv.add(uuid)
+				self._state.sequences_with_gpu_kv.add(uuid)
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
@@ -5386,7 +5175,7 @@ class BatchGenWorker:
 		# Step 4: Load for THIS RANK
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
-		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
+		new_local_indices = self._index.get_local_indices_for_uuids(my_new_uuids)
 		
 		if new_local_indices:
 			self._allocate_gpu_kv_two_page_buffer(new_local_indices, load_from_host=True)
@@ -5418,7 +5207,7 @@ class BatchGenWorker:
 			logging.warning("Host paged KV worker view is unavailable")
 			return
 		
-		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
+		my_uuids = [uuid for uuid in uuids if uuid in self._state.uuid_to_local_map]
 		
 		if my_uuids:
 			global_sequence_ids = [
@@ -5442,7 +5231,7 @@ class BatchGenWorker:
 				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 				remaining_global_ids = []
 				for uuid in remaining_in_decode:
-					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
+					if uuid in self._state.uuid_to_local_map and uuid not in my_uuids:
 						seq = self.global_batch.get_sequence(uuid)
 						remaining_global_ids.append(seq.global_idx)
 				
@@ -5473,7 +5262,7 @@ class BatchGenWorker:
 		padded_attention_masks = []
 		for query_idx in batch:
 			seq_input_ids = self.query_book[query_idx].encoded["input_ids"]
-			uuid = self._local_to_uuid_map[query_idx]
+			uuid = self._state.local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			prompt_len = seq.prompt_length
 			seq_len = seq_input_ids.shape[1]
@@ -5531,7 +5320,7 @@ class BatchGenWorker:
 				cur_batch_local = batch[cur_batch_start : cur_batch_start + cur_batch_size]
 				
 				# Pass local indices - the C++ layer handles rank offset internally
-				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(cur_batch_local)
+				Attn_Wrapper.cur_batch = self._index.local_indices_to_global_seq_ids(cur_batch_local)
 				
 				cur_batch_start += cur_batch_size
 				assert len(cur_batch_local) == cur_batch_size
@@ -5551,7 +5340,7 @@ class BatchGenWorker:
 		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
 		new_tokens_cpu = new_tokens.cpu()
 		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			# Write token at correct offset (handles both fresh and re-entered sequences)
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
@@ -5585,7 +5374,7 @@ class BatchGenWorker:
 
 		for query_idx in batch:
 			input_ids = self.query_book[query_idx].encoded["input_ids"][:, :self.max_input_length]
-			uuid = self._local_to_uuid_map[query_idx]
+			uuid = self._state.local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			actual_len = min(seq.prompt_length, self.max_input_length)
 			seq_lengths.append(actual_len)
@@ -5721,7 +5510,7 @@ class BatchGenWorker:
 				Attn_Wrapper.position_ids = batch_position_ids_flat
 				# Map local batch indices to global seq ids for this micro-batch
 				batch_local_indices = batch[seq_start:seq_end]
-				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch_local_indices)
+				Attn_Wrapper.cur_batch = self._index.local_indices_to_global_seq_ids(batch_local_indices)
 
 				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
 				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
@@ -5821,7 +5610,7 @@ class BatchGenWorker:
 		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
 		new_tokens_cpu = new_tokens.cpu()
 		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
 			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
@@ -6080,7 +5869,7 @@ class BatchGenWorker:
 					rank0_set,
 					key=lambda u: self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
 				)
-				batch = self._get_local_indices_for_uuids(decode_uuids)
+				batch = self._index.get_local_indices_for_uuids(decode_uuids)
 				logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
 		
@@ -6120,7 +5909,7 @@ class BatchGenWorker:
 				# Verify page table matches batch, fix if needed
 				if gpu_manager._gpu_page_table_manager:
 					post_finalize_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_finalize_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+					post_finalize_batch_global_ids = self._index.local_indices_to_global_seq_ids(batch)
 					if post_finalize_slot_order != post_finalize_batch_global_ids:
 						gpu_manager.rebuild_page_table(post_finalize_batch_global_ids)
 
@@ -6134,7 +5923,7 @@ class BatchGenWorker:
 		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
 		
 		# DEBUG: Log decode_uuids and which ones this rank owns
-		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
+		my_owned = [u for u in decode_uuids if u in self._state.uuid_to_local_map]
 		if self.rank == 0:
 			logging.debug(
 				f"Rank {self.rank}: State gathering - decode_uuids_len={len(decode_uuids)}, "
@@ -6145,7 +5934,7 @@ class BatchGenWorker:
 		chunk_size = self._get_effective_chunk_size()
 		local_seq_state = {}
 		for uuid in decode_uuids:
-			if uuid in self._uuid_to_local_map:
+			if uuid in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				is_completed = self._is_sequence_completed(seq)
 				local_seq_state[uuid] = {
@@ -6171,7 +5960,7 @@ class BatchGenWorker:
 		decode_uuids_set = set(decode_uuids)
 		local_candidate_state = {}
 		valid_load_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
-		for uuid in self._uuid_to_local_map.keys():
+		for uuid in self._state.uuid_to_local_map.keys():
 			if uuid in decode_uuids_set:
 				continue  # Already in decode batch
 			seq = self.global_batch.get_sequence(uuid)
@@ -6227,7 +6016,7 @@ class BatchGenWorker:
 			for missing_uuid in missing_uuids[:10]:
 				seq = self.global_batch.get_sequence(missing_uuid)
 				expected_rank = seq.assigned_rank if seq else "N/A"
-				in_local_map = missing_uuid in self._uuid_to_local_map
+				in_local_map = missing_uuid in self._state.uuid_to_local_map
 				seq_status = seq.status.name if seq else "NOT_FOUND"
 				rank_reported = [r for r, p in enumerate(all_payloads)
 								if p and p.get('seq_state', {}).get(missing_uuid)]
@@ -6244,7 +6033,7 @@ class BatchGenWorker:
 
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
 		for uuid, state in global_seq_state.items():
-			if uuid not in self._uuid_to_local_map:
+			if uuid not in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
 					seq.decoded_length = state['decoded_length']
@@ -6285,9 +6074,9 @@ class BatchGenWorker:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
-			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+			my_completed = [u for u in completed_uuids if u in self._state.uuid_to_local_map]
 			if my_completed:
-				my_completed_local = self._get_local_indices_for_uuids(my_completed)
+				my_completed_local = self._index.get_local_indices_for_uuids(my_completed)
 				self._release_gpu_kv_pages(my_completed_local)
 				self._release_host_kv_pages_for_batch(my_completed)
 			# Report completions to adaptive chunk sizer
@@ -6311,7 +6100,7 @@ class BatchGenWorker:
 					)
 
 		decode_uuids = decisions.active_uuids
-		batch = self._get_local_indices_for_uuids(decode_uuids)
+		batch = self._index.get_local_indices_for_uuids(decode_uuids)
 
 		# B. Host KV growth
 		if decisions.growth_feasible and decisions.host_growth_uuids:
@@ -6324,7 +6113,7 @@ class BatchGenWorker:
 				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
 				seq.host_pages_allocated += growth_pages
 				# Only do actual host page allocation on owner rank
-				if uuid in self._uuid_to_local_map:
+				if uuid in self._state.uuid_to_local_map:
 					host_grow_requests.append((seq.global_idx, growth_pages))
 
 			if host_grow_requests and worker_view is not None:
@@ -6336,7 +6125,7 @@ class BatchGenWorker:
 					)
 				if self.rank == 0 and BATCHGEN_CB_DEBUG:
 					for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
-						if uuid in self._uuid_to_local_map:
+						if uuid in self._state.uuid_to_local_map:
 							seq = self.global_batch.get_sequence(uuid)
 							old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
 							runway = seq.host_token_capacity - seq.current_context_length
@@ -6349,9 +6138,9 @@ class BatchGenWorker:
 		# C. Host KV eviction
 		host_evicted_uuids = decisions.host_evicted_uuids
 		if host_evicted_uuids:
-			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
+			my_evicted = [u for u in host_evicted_uuids if u in self._state.uuid_to_local_map]
 			if my_evicted:
-				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
+				my_evicted_local = self._index.get_local_indices_for_uuids(my_evicted)
 				self._release_gpu_kv_pages(my_evicted_local)
 				for uuid in my_evicted:
 					seq = self.global_batch.get_sequence(uuid)
@@ -6384,12 +6173,12 @@ class BatchGenWorker:
 				seq.gpu_pages_allocated = 0
 				seq.host_pages_allocated = 0
 				seq.host_token_capacity = 0
-				self._sequences_with_gpu_kv.discard(uuid)
+				self._state.sequences_with_gpu_kv.discard(uuid)
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)
 			decode_uuids = [u for u in decode_uuids if u not in evicted_set]
-			batch = self._get_local_indices_for_uuids(decode_uuids)
+			batch = self._index.get_local_indices_for_uuids(decode_uuids)
 
 			if self.rank == 0:
 				logging.info(
@@ -6411,22 +6200,22 @@ class BatchGenWorker:
 		onhold_set = set(onhold_uuids)
 
 		if onhold_uuids:
-			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
+			my_onhold = [u for u in onhold_uuids if u in self._state.uuid_to_local_map]
 			if my_onhold:
-				local_indices = self._get_local_indices_for_uuids(my_onhold)
-				global_ids = self._local_indices_to_global_seq_ids(local_indices)
+				local_indices = self._index.get_local_indices_for_uuids(my_onhold)
+				global_ids = self._index.local_indices_to_global_seq_ids(local_indices)
 				if global_ids and gpu_manager:
 					gpu_manager.free_pages_for_sequences(global_ids)
 				for uuid in my_onhold:
 					seq = self.global_batch.get_sequence(uuid)
 					seq.gpu_pages_allocated = 0
-					self._sequences_with_gpu_kv.discard(uuid)
+					self._state.sequences_with_gpu_kv.discard(uuid)
 
 			for uuid in onhold_uuids:
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
-			batch = self._get_local_indices_for_uuids(decode_uuids)
+			batch = self._index.get_local_indices_for_uuids(decode_uuids)
 
 			if BATCHGEN_CB_DEBUG:
 				logging.info(
@@ -6437,7 +6226,7 @@ class BatchGenWorker:
 		# Extend GPU pages for sequences that need it (not on-hold)
 		seqs_needing_extension = decisions.seqs_needing_extension
 		remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
-		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
+		my_remaining_ext = [u for u in remaining_needing_ext if u in self._state.uuid_to_local_map]
 		if my_remaining_ext:
 			self._extend_gpu_kv_allocation(my_remaining_ext)
 
@@ -6453,7 +6242,7 @@ class BatchGenWorker:
 		if new_load_uuids and decode_uuids:
 			my_new_uuids = [u for u in new_load_uuids
 						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
-			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
+			new_load_local = self._index.get_local_indices_for_uuids(my_new_uuids)
 
 			if new_load_local:
 				actual_free = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
@@ -6464,7 +6253,7 @@ class BatchGenWorker:
 				pages_used = 0
 
 				for local_idx in new_load_local:
-					uuid = self._local_to_uuid_map[local_idx]
+					uuid = self._state.local_to_uuid_map[local_idx]
 					seq = self.global_batch.get_sequence(uuid)
 					pages_needed = seq.get_gpu_pages_for_two_page_buffer()
 
@@ -6489,7 +6278,7 @@ class BatchGenWorker:
 
 					t_launch = time.perf_counter()
 					if worker_view is not None:
-						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
+						existing_global_ids = self._index.local_indices_to_global_seq_ids(batch)
 						gpu_manager.rebuild_page_table(new_load_global)
 						k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
 						active_page_counts = gpu_manager.export_active_sequence_page_counts()
@@ -6524,7 +6313,7 @@ class BatchGenWorker:
 		# ========== FINAL PAGE TABLE REBUILD ==========
 		t0 = time.perf_counter()
 		if BATCHGEN_CB_DEBUG:
-			global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
+			global_ids_for_rebuild = self._index.local_indices_to_global_seq_ids(batch) if batch else []
 			logging.debug(
 				f"Rank {self.rank}: FINAL REBUILD: batch_size={len(batch)}, "
 				f"global_ids_count={len(global_ids_for_rebuild)}"
@@ -6564,7 +6353,7 @@ class BatchGenWorker:
 		
 		# ========== VERIFY BATCH CONSISTENCY ==========
 		# CRITICAL: Ensure batch matches decode_uuids for THIS rank
-		expected_local = self._get_local_indices_for_uuids(decode_uuids)
+		expected_local = self._index.get_local_indices_for_uuids(decode_uuids)
 		if set(batch) != set(expected_local):
 			logging.error(
 				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
@@ -6662,12 +6451,12 @@ class BatchGenWorker:
 		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
 
 		for local_idx in pending_local_indices:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
-			self._sequences_with_gpu_kv.add(uuid)
+			self._state.sequences_with_gpu_kv.add(uuid)
 			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
 			if local_idx in self.query_book:
 				self.query_book[local_idx] = query(
@@ -6682,11 +6471,11 @@ class BatchGenWorker:
 		
 		uuid_to_local = {}
 		for idx in current_batch:
-			uuid = self._local_to_uuid_map.get(idx)
+			uuid = self._state.local_to_uuid_map.get(idx)
 			if uuid:
 				uuid_to_local[uuid] = idx
 		for idx in pending_local_indices:
-			uuid = self._local_to_uuid_map.get(idx)
+			uuid = self._state.local_to_uuid_map.get(idx)
 			if uuid:
 				uuid_to_local[uuid] = idx
 		
@@ -7072,7 +6861,7 @@ class BatchGenWorker:
 		Attn_Wrapper.scale = scale_dict
 		Attn_Wrapper.past_key_states = past_key_states
 		Attn_Wrapper.past_value_states = past_value_states
-		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
+		Attn_Wrapper.cur_batch = self._index.local_indices_to_global_seq_ids(batch) if batch else []
 
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 		if isinstance(gpu_manager, DualKVCacheCoordinator):
@@ -7117,9 +6906,9 @@ class BatchGenWorker:
 		
 		# Validation
 		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid and uuid not in self._sequences_with_gpu_kv:
-				self._sequences_with_gpu_kv.add(uuid)
+			uuid = self._state.local_to_uuid_map.get(local_idx)
+			if uuid and uuid not in self._state.sequences_with_gpu_kv:
+				self._state.sequences_with_gpu_kv.add(uuid)
 		
 		# Use cumulative counters that persist across prefill/decode switches
 		# Initialize instance vars if not present (shouldn't happen, but safety)
@@ -7187,7 +6976,7 @@ class BatchGenWorker:
 				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
 					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+					post_boundary_batch_global_ids = self._index.local_indices_to_global_seq_ids(batch)
 
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
 						# Fix: Rebuild page table to match batch
@@ -7309,7 +7098,7 @@ class BatchGenWorker:
 			forward_start = time.perf_counter()
 
 			# Pre-compute batch_sequences for use in both forward setup and update loop
-			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+			batch_sequences = [self.global_batch.get_sequence(self._state.local_to_uuid_map[idx]) for idx in batch] if batch else []
 
 			with torch.inference_mode():
 				if batch:
@@ -7355,7 +7144,7 @@ class BatchGenWorker:
 					AttnWrapperBase.cur_batch = []
 				
 				if batch:
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+					Attn_Wrapper.cur_batch = self._index.local_indices_to_global_seq_ids(batch)
 					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 					# OPTIMIZATION: Only check page table if not already verified this batch
@@ -7400,7 +7189,7 @@ class BatchGenWorker:
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
 					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
+						uuid = self._state.local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						_kv_seq_ids.append(seq.global_idx)
 						_kv_seq_lengths.append(seq.current_context_length - 1)
@@ -7642,7 +7431,7 @@ class BatchGenWorker:
 			gpu_manager.clear_page_table()
 			return
 		
-		global_ids = self._local_indices_to_global_seq_ids(batch)
+		global_ids = self._index.local_indices_to_global_seq_ids(batch)
 		gpu_manager.rebuild_page_table(global_ids)
 		Attn_Wrapper.cur_batch = global_ids
 
@@ -7670,7 +7459,7 @@ class BatchGenWorker:
 		sequence_lengths = []
 		
 		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
 			sequence_lengths.append(seq.current_context_length - 1)
@@ -7689,7 +7478,7 @@ class BatchGenWorker:
 			for idx in nan_indices:
 				if idx < len(batch):
 					local_idx = batch[idx]
-					uuid = self._local_to_uuid_map.get(local_idx, "unknown")
+					uuid = self._state.local_to_uuid_map.get(local_idx, "unknown")
 					seq = self.global_batch.get_sequence(uuid) if uuid != "unknown" else None
 					nan_seq_info.append({
 						'batch_idx': idx,
@@ -7793,12 +7582,12 @@ class BatchGenWorker:
 		# Step 4: Get THIS RANK's sequences
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
-		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
+		new_local_indices = self._index.get_local_indices_for_uuids(my_new_uuids)
 		
 		if not new_local_indices:
 			return None, new_uuids, [], []
 		
-		new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
+		new_global_ids = self._index.local_indices_to_global_seq_ids(new_local_indices)
 		
 		# FIXED: Use two-page buffer tokens, NOT full context
 		tokens = self._compute_two_page_buffer_tokens(new_local_indices)
@@ -7824,7 +7613,7 @@ class BatchGenWorker:
 		# Step 7: Launch async load
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
-			existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+			existing_global_ids = self._index.local_indices_to_global_seq_ids(current_batch)
 			if existing_global_ids:
 				gpu_manager.rebuild_page_table(existing_global_ids)
 			return None, new_uuids, new_local_indices, new_global_ids
@@ -7838,7 +7627,7 @@ class BatchGenWorker:
 		)
 		
 		# Step 8: Restore page table
-		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+		existing_global_ids = self._index.local_indices_to_global_seq_ids(current_batch)
 		if existing_global_ids:
 			gpu_manager.rebuild_page_table(existing_global_ids)
 		
@@ -7887,7 +7676,7 @@ class BatchGenWorker:
 		# Each rank reports state for sequences it owns
 		local_seq_state = {}
 		for uuid in candidates:
-			if uuid in self._uuid_to_local_map:
+			if uuid in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				local_seq_state[uuid] = seq.get_gpu_pages_for_two_page_buffer()
 		
@@ -7928,10 +7717,10 @@ class BatchGenWorker:
 
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
-		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
+		new_local_indices = self._index.get_local_indices_for_uuids(my_new_uuids)
 
 		if new_local_indices:
-			new_global_ids = self._local_indices_to_global_seq_ids(new_local_indices)
+			new_global_ids = self._index.local_indices_to_global_seq_ids(new_local_indices)
 			tokens = self._compute_two_page_buffer_tokens(new_local_indices)
 			total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
 			current_free = gpu_manager.get_stats().num_free_pages
@@ -7975,7 +7764,7 @@ class BatchGenWorker:
 		t0 = time.perf_counter()
 		
 		# Capture existing batch for later restoration
-		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
+		existing_global_ids = self._index.local_indices_to_global_seq_ids(current_batch)
 		
 		# Rebuild page table for NEW sequences to get their pointers
 		gpu_manager.rebuild_page_table(new_global_ids)
@@ -8058,12 +7847,12 @@ class BatchGenWorker:
 		
 		# Update tracking for THIS RANK's sequences
 		for local_idx in pending_local_indices:
-			uuid = self._local_to_uuid_map[local_idx]
+			uuid = self._state.local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
-			self._sequences_with_gpu_kv.add(uuid)
+			self._state.sequences_with_gpu_kv.add(uuid)
 		
 		# Merge into decode batch with deterministic ordering
 		updated_uuids = current_decode_uuids + pending_uuids
@@ -8072,11 +7861,11 @@ class BatchGenWorker:
 		# Derive updated local batch
 		uuid_to_local = {}
 		for idx in current_batch:
-			uuid = self._local_to_uuid_map.get(idx)
+			uuid = self._state.local_to_uuid_map.get(idx)
 			if uuid:
 				uuid_to_local[uuid] = idx
 		for idx in pending_local_indices:
-			uuid = self._local_to_uuid_map.get(idx)
+			uuid = self._state.local_to_uuid_map.get(idx)
 			if uuid:
 				uuid_to_local[uuid] = idx
 		
@@ -8105,7 +7894,7 @@ class BatchGenWorker:
 		completion = torch.zeros(n, dtype=torch.int32, device=self.torch_device)
 		
 		for i, uuid in enumerate(decode_uuids):
-			if uuid in self._uuid_to_local_map:
+			if uuid in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				# FIXED: Use unified completion check
 				if self._is_sequence_completed(seq):
@@ -8210,7 +7999,7 @@ class BatchGenWorker:
 		# Step 5: Load GPU KV for THIS RANK's new sequences only
 		my_new_uuids = [u for u in new_uuids 
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
-		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
+		new_local_indices = self._index.get_local_indices_for_uuids(my_new_uuids)
 		
 		if new_local_indices:
 			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
@@ -8242,7 +8031,7 @@ class BatchGenWorker:
 		
 		tokens = []
 		for local_idx in batch:
-			uuid = self._local_to_uuid_map.get(local_idx)
+			uuid = self._state.local_to_uuid_map.get(local_idx)
 			if uuid is None:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
@@ -8281,7 +8070,7 @@ class BatchGenWorker:
 		completion_mask = torch.zeros(len(decode_uuids), dtype=torch.int32, device=self.torch_device)
 		
 		for i, uuid in enumerate(decode_uuids):
-			if uuid in self._uuid_to_local_map:
+			if uuid in self._state.uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
 				# FIXED: Use unified completion check
 				if self._is_sequence_completed(seq):
@@ -8331,9 +8120,9 @@ class BatchGenWorker:
 					# Incremental write: gather completed tokens to rank 0
 					self._submit_completed_to_incremental_writer(completed_uuids)
 					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
-					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+					my_completed = [u for u in completed_uuids if u in self._state.uuid_to_local_map]
 					if my_completed:
-						my_completed_local_indices = self._get_local_indices_for_uuids(my_completed)
+						my_completed_local_indices = self._index.get_local_indices_for_uuids(my_completed)
 						self._release_gpu_kv_pages(my_completed_local_indices)
 					self._release_host_kv_pages_for_batch(completed_uuids)
 				
@@ -8355,7 +8144,7 @@ class BatchGenWorker:
 					max_len = self.max_input_length + new_token_idx
 					cache_seqlens = []
 					for query_idx in batch:
-						uuid = self._local_to_uuid_map[query_idx]
+						uuid = self._state.local_to_uuid_map[query_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						cache_seqlens.append(seq.current_context_length)
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64)
@@ -8378,7 +8167,7 @@ class BatchGenWorker:
 
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
-						uuid = self._local_to_uuid_map[local_idx]
+						uuid = self._state.local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
@@ -8432,7 +8221,7 @@ class BatchGenWorker:
 					max_len = self.max_input_length + new_token_idx
 					cache_seqlens = []
 					for query_idx in batch:
-						uuid = self._local_to_uuid_map[query_idx]
+						uuid = self._state.local_to_uuid_map[query_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						cache_seqlens.append(seq.current_context_length)
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
@@ -8455,7 +8244,7 @@ class BatchGenWorker:
 
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
-						uuid = self._local_to_uuid_map[local_idx]
+						uuid = self._state.local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						seq.decoded_length = new_token_idx + 1
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
@@ -8961,10 +8750,10 @@ class BatchGenWorker:
 		if hasattr(self, 'global_batch') and self.global_batch is not None:
 			try:
 				worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-				if worker_view is not None and hasattr(self, '_uuid_to_local_map') and self._uuid_to_local_map:
+				if worker_view is not None and hasattr(self, '_uuid_to_local_map') and self._state.uuid_to_local_map:
 					# Collect all global_idx values for this rank's sequences
 					global_ids_to_release = []
-					for uuid in self._uuid_to_local_map.keys():
+					for uuid in self._state.uuid_to_local_map.keys():
 						seq = self.global_batch.get_sequence(uuid)
 						if seq is not None:
 							global_ids_to_release.append(seq.global_idx)
@@ -8995,18 +8784,19 @@ class BatchGenWorker:
 		
 		# 4. Reset global batch state
 		self.global_batch = None
+		self._state.global_batch = None
 		
 		# 5. Reset query book and mappings
 		self.query_book = None
-		self._local_to_uuid_map = {}
-		self._uuid_to_local_map = {}
+		self._state.local_to_uuid_map = {}
+		self._state.uuid_to_local_map = {}
 		
 		# 6. Reset counters
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		
 		# 7. Reset GPU KV tracking
-		self._sequences_with_gpu_kv = set()
+		self._state.sequences_with_gpu_kv = set()
 		
 		# 8. Clean up model weights (but NOT core_engine or parallel_manager)
 		if hasattr(self, 'model') and self.model is not None:
