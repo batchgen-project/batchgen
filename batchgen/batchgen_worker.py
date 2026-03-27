@@ -28,7 +28,7 @@ from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
-from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+
 from tqdm import trange
 import gc
 import numpy as np

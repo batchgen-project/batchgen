@@ -266,7 +266,7 @@ class DeepseekV3ParallelStrategyManager:
 		torch._dynamo.config.inline_inbuilt_nn_modules = True
 		if self.rank == 0:
 			logging.info("Start torch compile warmup")
-		# from .modeling_deepseek_v3 import warmup_compiled_moe_gate
+		# warmup_compiled_moe_gate removed — using new model.py gate
 		# device = self.engine_config.Basic_Config.device_torch
 		# with torch.inference_mode():
 		# 	warmup_compiled_moe_gate(device)

@@ -27,7 +27,7 @@ from tqdm import tqdm, trange
 import gc
 
 from .deepseekv2.modeling_deepseek_v2 import DeepseekV2ForCausalLM
-from .deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from .deepseekv3.model import DeepSeekR1ForCausalLM
 from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config as HFDeepseekV2Config
 from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config as HFDeepseekV3Config
 from ...ckpt_converter.ckpt_converter import ckpt_converter
@@ -137,12 +137,14 @@ class DeepSeek_Parameter_Server:
         return self.shm_name, self.tensor_meta_shm_name
 
     def _parse_state_dict(self):
-        # Use HuggingFace config for model instantiation (PretrainedConfig required)
-        self.hf_config._attn_implementation = "eager"
         if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
+            self.hf_config._attn_implementation = "eager"
             model = DeepseekV2ForCausalLM._from_config(self.hf_config).to('cpu')
         elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            model = DeepseekV3ForCausalLM._from_config(self.hf_config).to('cpu')
+            # Use new model.py (BatchGen-native, not HuggingFace)
+            self.model_config.phase = "prefill"
+            with torch.device('cpu'):
+                model = DeepSeekR1ForCausalLM(self.model_config)
         else:
             raise ValueError("Unknown model architecture")
         model.eval()

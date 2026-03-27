@@ -20,7 +20,7 @@ import triton
 import logging
 
 def Embedding():
-	
+	pass
 
 
 def DeepseekV3Model(model_config:dict):
