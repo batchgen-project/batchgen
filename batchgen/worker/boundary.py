@@ -750,7 +750,7 @@ class BoundaryHandler:
 		max_batch_size = local_batch_size.item()
 		
 		# Update MoE layers with the actual max batch size for this page
-		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.state.parallel_manager is not None:
+		if max_batch_size > 0 and self.state.parallel_manager is not None:
 			if hasattr(self.state.parallel_manager, 'set_num_tokens_per_rank'):
 				self.state.parallel_manager.set_num_tokens_per_rank(max_batch_size)
 		timing.moe_buffer_update_ms = (time.perf_counter() - t0) * 1000

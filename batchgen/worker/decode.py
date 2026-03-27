@@ -403,14 +403,14 @@ class DecodeScheduler:
 		
 		# Use cumulative counters that persist across prefill/decode switches
 		# Initialize instance vars if not present (shouldn't happen, but safety)
-		if not hasattr(self, '_cumulative_decode_iterations'):
-			self._cumulative_decode_iterations = 0
-		if not hasattr(self, '_cumulative_decode_boundaries'):
-			self._cumulative_decode_boundaries = 0
-		if not hasattr(self, '_cumulative_boundary_ms'):
-			self._cumulative_boundary_ms = 0.0
-		if not hasattr(self, '_cumulative_forward_ms'):
-			self._cumulative_forward_ms = 0.0
+		if not hasattr(self._worker, '_cumulative_decode_iterations'):
+			self._worker._cumulative_decode_iterations = 0
+		if not hasattr(self._worker, '_cumulative_decode_boundaries'):
+			self._worker._cumulative_decode_boundaries = 0
+		if not hasattr(self._worker, '_cumulative_boundary_ms'):
+			self._worker._cumulative_boundary_ms = 0.0
+		if not hasattr(self._worker, '_cumulative_forward_ms'):
+			self._worker._cumulative_forward_ms = 0.0
 
 		# Local iteration counter (for boundary interval tracking within this decode round)
 		local_iteration = 0
@@ -427,7 +427,7 @@ class DecodeScheduler:
 		dist.all_reduce(local_batch_size, op=dist.ReduceOp.MAX)
 		max_batch_size = local_batch_size.item()
 
-		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.state.parallel_manager is not None:
+		if max_batch_size > 0 and self.state.parallel_manager is not None:
 			if hasattr(self.state.parallel_manager, 'set_num_tokens_per_rank'):
 				self.state.parallel_manager.set_num_tokens_per_rank(max_batch_size)
 
@@ -439,7 +439,7 @@ class DecodeScheduler:
 		self._worker.enable_decode_watchdog()
 		while decode_uuids:
 			local_iteration += 1
-			self._cumulative_decode_iterations += 1
+			self._worker._cumulative_decode_iterations += 1
 
 			# Feed watchdogs to prevent timeout during long decoding
 			self._worker.feed_watchdog()
@@ -458,8 +458,8 @@ class DecodeScheduler:
 					pending_load_local, pending_load_global
 				)
 
-				self._cumulative_boundary_ms += timing.total_ms
-				self._cumulative_decode_boundaries += 1
+				self._worker._cumulative_boundary_ms += timing.total_ms
+				self._worker._cumulative_decode_boundaries += 1
 
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
@@ -519,8 +519,8 @@ class DecodeScheduler:
 					if BATCHGEN_CB_DEBUG:
 						# Detailed timing log when debug is enabled
 						logging.info(
-							f"[Decode Interval {self._cumulative_decode_boundaries}] "
-							f"iter={self._cumulative_decode_iterations}, "
+							f"[Decode Interval {self._worker._cumulative_decode_boundaries}] "
+							f"iter={self._worker._cumulative_decode_iterations}, "
 							f"total={timing.total_ms:.1f}ms | "
 							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
 							f"wait_async={timing.wait_async_load_ms:.1f}, "
@@ -543,7 +543,7 @@ class DecodeScheduler:
 					else:
 						# Minimal log without timing details
 						logging.info(
-							f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
+							f"[Decode {self._worker._cumulative_decode_boundaries}] iter={self._worker._cumulative_decode_iterations} | "
 							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
 							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
 							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
@@ -665,7 +665,7 @@ class DecodeScheduler:
 					_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.state.torch_device)
 					dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
 					_max_bs = max(_local_bs.item(), 1)
-					if hasattr(self, 'parallel_manager') and self.state.parallel_manager is not None:
+					if self.state.parallel_manager is not None:
 						if hasattr(self.state.parallel_manager, 'set_num_tokens_per_rank'):
 							self.state.parallel_manager.set_num_tokens_per_rank(_max_bs)
 				else:
@@ -825,7 +825,7 @@ class DecodeScheduler:
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
 
-			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+			self._worker._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
 		# Cleanup
 		self._kv.wait_pending_tasks()
@@ -855,14 +855,14 @@ class DecodeScheduler:
 		
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
-		if self.state.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
-			avg_forward = self._cumulative_forward_ms / self._cumulative_decode_iterations if self._cumulative_decode_iterations > 0 else 0
-			avg_round = self._cumulative_boundary_ms / self._cumulative_decode_boundaries
+		if self.state.rank == 0 and self._worker._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
+			avg_forward = self._worker._cumulative_forward_ms / self._worker._cumulative_decode_iterations if self._worker._cumulative_decode_iterations > 0 else 0
+			avg_round = self._worker._cumulative_boundary_ms / self._worker._cumulative_decode_boundaries
 			logging.debug(
 				f"\n{'='*50}\n"
 				f"DECODE SUMMARY (Rank 0)\n"
 				f"{'='*50}\n"
-				f"Total Iterations: {self._cumulative_decode_iterations}, Total Rounds: {self._cumulative_decode_boundaries}\n"
+				f"Total Iterations: {self._worker._cumulative_decode_iterations}, Total Rounds: {self._worker._cumulative_decode_boundaries}\n"
 				f"Avg forward: {avg_forward:.2f}ms\n"
 				f"Avg round overhead: {avg_round:.2f}ms\n"
 				f"Round overhead/token: {avg_round / self._worker.DECISION_INTERVAL:.3f}ms\n"
