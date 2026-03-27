@@ -1105,10 +1105,7 @@ class BatchGenWorker:
 			manager.extend_pages_for_sequence(global_id, new_total_tokens)
 			seq.gpu_pages_allocated = new_total_pages
 
-			if remaining_uuids:
-				remaining_local = self._index.get_local_indices_for_uuids(remaining_uuids)
-				remaining_global = self._index.local_indices_to_global_seq_ids(remaining_local)
-				manager.rebuild_page_table(remaining_global)
+		return True
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
