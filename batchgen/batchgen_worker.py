@@ -496,6 +496,7 @@ class BatchGenWorker:
 		from batchgen.worker.indexing import IndexManager
 		from batchgen.worker.sync import SyncCoordinator
 		from batchgen.worker.kv_manager import KVCacheManager
+		from batchgen.worker.batch_formation import BatchFormation
 
 		self._state = WorkerState(
 			rank=self.rank,
@@ -508,6 +509,7 @@ class BatchGenWorker:
 		self._index = IndexManager(self._state)
 		self._sync = SyncCoordinator(self._state)
 		self._kv = KVCacheManager(self._state, self._index, token_budget_fn=self._get_sequence_token_budget)
+		self._batch = BatchFormation(self._state)
 
 		# 8. Batch State Placeholders (shared via WorkerState)
 		self.global_batch: Optional[SequenceBatch] = None
@@ -1202,6 +1204,8 @@ class BatchGenWorker:
 		self.eos_token_id = self.tokenizer.eos_token_id
 		self.eos_token_ids = getattr(self.tokenizer, 'eos_token_ids', {self.eos_token_id})
 		self.pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+		self._state.tokenizer = self.tokenizer
+		self._state.pad_token_id = self.pad_token_id
 		logging.info(f"Rank {self.rank}: EOS token IDs set to {self.eos_token_ids}, pad_token_id={self.pad_token_id}")
 
 		logging.info(f"Rank {self.rank}: Start initializing engine config.")
@@ -1215,7 +1219,7 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = self.args.global_host_kv_cache_size_gb
 
 		self.attn_mode = None
-		self.query_book = None
+		self.query_book = None; self._state.query_book = None
 		self.model_batch_book = {}
 		self.token_k_cache_byte_size = 2048
 		self.num_k_storage_tokens = math.floor(50 * (1024**3) / 32 / 2048)
@@ -1313,7 +1317,7 @@ class BatchGenWorker:
 			self.input_arguments.num_queries = num_queries
 		
 		# Reset per-batch state
-		self.query_book = None
+		self.query_book = None; self._state.query_book = None
 		self.model_batch_book = {}
 		
 		logging.info(f"Rank {self.rank}: Batch config updated (max_input={self.max_input_length}, max_decode={self.max_decoding_length}, num_queries={num_queries})")
@@ -1858,7 +1862,7 @@ class BatchGenWorker:
 				# Free buffer slot after send completes
 				seq_for_slot = self.global_batch.get_sequence(uuid)
 				if hasattr(seq_for_slot, '_buffer_slot') and seq_for_slot._buffer_slot >= 0:
-					self._buffer_pool.free_slot(seq_for_slot._buffer_slot)
+					self._state.buffer_pool.free_slot(seq_for_slot._buffer_slot)
 					seq_for_slot._buffer_slot = -1
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
@@ -2184,12 +2188,12 @@ class BatchGenWorker:
 					)
 					if existing_slot < 0:
 						logging.error(f"Rank {self.rank}: Migration receive {uuid[:8]} has no buffer slot, allocating new")
-						existing_slot = self._buffer_pool.allocate_slot()
+						existing_slot = self._state.buffer_pool.allocate_slot()
 						seq._buffer_slot = existing_slot
-					self._buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
-					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
-					input_ids_view = self._buffer_pool.get_input_ids_view(existing_slot, budget)
-					decoded_view = self._buffer_pool.get_decoded_tokens_view(existing_slot)
+					self._state.buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
+					self._state.buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
+					input_ids_view = self._state.buffer_pool.get_input_ids_view(existing_slot, budget)
+					decoded_view = self._state.buffer_pool.get_decoded_tokens_view(existing_slot)
 					seq.input_ids = input_ids_view
 					seq.decoded_tokens = decoded_view
 					self.query_book[new_local_idx] = query(
@@ -2308,18 +2312,18 @@ class BatchGenWorker:
 			# Step 2: Tokenize all sequences (all ranks do this identically)
 			# This determines the actual max_input_length dynamically
 			t_step = time.perf_counter()
-			self._tokenize_global_batch()
+			self._batch.tokenize()
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2 _tokenize_global_batch: {time.perf_counter()-t_step:.2f}s")
 
 			# Rejection of over-limit sequences now happens inside _tokenize_global_batch()
-			# (between Phase 2 and Phase 3). self._rejected_sequences is set there.
+			# (between Phase 2 and Phase 3). self._state.rejected_sequences is set there.
 
 			# If all sequences rejected, skip inference entirely
 			if len(self.global_batch) == 0:
 				logging.info(f"Rank {self.rank}: All sequences rejected. Skipping inference.")
 				self._init_incremental_writer()
 				if self.rank == 0 and self._incremental_writer:
-					for global_idx, prompt_length in self._rejected_sequences:
+					for global_idx, prompt_length in self._state.rejected_sequences:
 						self._incremental_writer.submit_error(
 							global_idx, "context_length_exceeded",
 							f"This model's maximum context length is {self.model_context_length} tokens. "
@@ -2334,15 +2338,15 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2.1 _init_incremental_writer: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 2.15: Write rejection errors via incremental writer
-			if self.rank == 0 and self._incremental_writer and self._rejected_sequences:
-				for global_idx, prompt_length in self._rejected_sequences:
+			if self.rank == 0 and self._incremental_writer and self._state.rejected_sequences:
+				for global_idx, prompt_length in self._state.rejected_sequences:
 					self._incremental_writer.submit_error(
 						global_idx, "context_length_exceeded",
 						f"This model's maximum context length is {self.model_context_length} tokens. "
 						f"However, your messages resulted in {prompt_length} tokens. "
 						f"Please reduce the length of the messages.",
 					)
-				logging.info(f"Rank 0: Wrote {len(self._rejected_sequences)} rejection errors to incremental output")
+				logging.info(f"Rank 0: Wrote {len(self._state.rejected_sequences)} rejection errors to incremental output")
 
 			# Step 2.5: Update engine config with actual max_input_length after tokenization
 			t_step = time.perf_counter()
@@ -2351,12 +2355,13 @@ class BatchGenWorker:
 
 			# Step 3: Assign sequences to ranks (round-robin)
 			t_step = time.perf_counter()
-			self._assign_sequences_to_ranks()
+			self._batch.assign_to_ranks()
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 3 _assign_sequences_to_ranks: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 4: Build query_book for backward compatibility
 			t_step = time.perf_counter()
-			self._build_local_query_book()
+			self._batch.build_query_book()
+			self.query_book = self._state.query_book  # Sync reference for backward compat
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 4 _build_local_query_book: {time.perf_counter()-t_step:.2f}s")
 
 			# Step 5: Set counts for compatibility
@@ -2396,327 +2401,6 @@ class BatchGenWorker:
 				logging.warning(f"Rank {self.rank}: Invalid status transition for {uuid}: {e}")
 
 	# ============ Tokenization and Assignment ============
-
-	def _tokenize_global_batch(self) -> None:
-		"""
-		Tokenize all sequences in the global batch without truncation.
-		The max_prompt_length is determined dynamically as the longest prompt.
-
-		PARALLEL TOKENIZATION: Each rank tokenizes a subset of sequences, then
-		results are gathered across all ranks. This reduces tokenization time
-		by ~world_size and keeps NCCL alive during the process (prevents
-		NCCL HeartbeatMonitor timeout for large batches).
-
-		After tokenization, completion criteria uses:
-		- EOS token reached, OR
-		- decoded_length >= max_decoding_length, OR
-		- prompt_length + decoded_length >= model_context_length
-		"""
-		if self.global_batch is None:
-			raise RuntimeError("Global batch not initialized")
-
-		# Phase 1: PARALLEL batch tokenization across ranks
-		# Each rank tokenizes sequences[rank::world_size] to divide the work
-		all_texts = [seq.text for seq in self.global_batch]
-		num_sequences = len(all_texts)
-
-		# Determine this rank's subset of sequences to tokenize
-		my_indices = list(range(self.rank, num_sequences, self.world_size))
-		my_texts = [all_texts[i] for i in my_indices]
-
-		if self.rank == 0:
-			logging.info(
-				f"Parallel tokenizing {num_sequences} sequences across {self.world_size} ranks "
-				f"(~{len(my_indices)} per rank)..."
-			)
-
-		tokenize_start = time.perf_counter()
-
-		# Each rank tokenizes its subset
-		if my_texts:
-			my_batch_tokenized = self.tokenizer(
-				my_texts,
-				return_tensors="pt",
-				truncation=False,  # No truncation - keep full input
-				padding=True,      # Pad to longest in this subset
-				return_attention_mask=True,
-			)
-			# Extract individual sequences from the batch result
-			my_tokenized = []
-			for i in range(len(my_texts)):
-				actual_len = int(my_batch_tokenized["attention_mask"][i].sum().item())
-				my_tokenized.append({
-					"global_idx": my_indices[i],
-					"input_ids": my_batch_tokenized["input_ids"][i, :actual_len].tolist(),
-					"length": actual_len,
-				})
-		else:
-			my_tokenized = []
-
-		local_tokenize_time = time.perf_counter() - tokenize_start
-		logging.debug(f"Rank {self.rank}: Local tokenization of {len(my_texts)} sequences in {local_tokenize_time:.2f}s")
-
-		# DEBUG: Print tokenized prompts
-		if os.environ.get("BATCHGEN_DEBUG_TOKENIZE", "0") == "1" and self.rank == 0 and my_tokenized:
-			print(f"\n[TOKENIZE DEBUG] === First 3 tokenized prompts ===")
-			for i in range(min(3, len(my_tokenized))):
-				item = my_tokenized[i]
-				token_ids = item["input_ids"]
-				print(f"\n[TOKENIZE DEBUG] Sequence {item['global_idx']} (length={item['length']})")
-				# Show first 50 tokens
-				print(f"[TOKENIZE DEBUG] First 50 tokens: {token_ids[:50]}")
-				# Show last 50 tokens (includes question end)
-				print(f"[TOKENIZE DEBUG] Last 50 tokens: {token_ids[-50:]}")
-				# Decode first 200 chars of prompt
-				try:
-					decoded_start = self.tokenizer.decode(token_ids[:100])
-					decoded_end = self.tokenizer.decode(token_ids[-100:])
-					print(f"[TOKENIZE DEBUG] Start of prompt (decoded): {repr(decoded_start[:300])}")
-					print(f"[TOKENIZE DEBUG] End of prompt (decoded): {repr(decoded_end[-300:])}")
-				except Exception as e:
-					print(f"[TOKENIZE DEBUG] Decode error: {e}")
-				# Check for special tokens
-				special_token_ids = [199998, 199999, 200000, 200001, 200002, 200003, 200004, 200005, 200006, 200007, 200008, 200012]
-				found_special = [tid for tid in token_ids if tid in special_token_ids]
-				if found_special:
-					print(f"[TOKENIZE DEBUG] Special tokens found: {found_special}")
-
-		# Phase 1.5: Gather all tokenized results to all ranks
-		# This keeps NCCL alive and shares results efficiently
-		gather_start = time.perf_counter()
-		all_tokenized_lists = [None] * self.world_size
-		dist.all_gather_object(all_tokenized_lists, my_tokenized)
-		gather_time = time.perf_counter() - gather_start
-
-		# Merge results from all ranks, indexed by global_idx
-		# Store only lightweight data (lists), not tensors, to minimize memory
-		tokenized_by_idx = {}
-		for rank_results in all_tokenized_lists:
-			if rank_results:
-				for item in rank_results:
-					tokenized_by_idx[item["global_idx"]] = item
-
-		# Free the gathered lists immediately
-		del all_tokenized_lists
-
-		total_tokenize_time = time.perf_counter() - tokenize_start
-		if self.rank == 0:
-			logging.info(
-				f"Parallel tokenization complete in {total_tokenize_time:.2f}s "
-				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
-			)
-
-		# Phase 2: Find the longest prompt length to use as max_prompt_length
-		# Use lightweight length field instead of creating tensors
-		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
-		max_prompt_length = max(prompt_lengths)
-
-		# Phase 2.5: Reject sequences exceeding context length BEFORE buffer allocation.
-		# Must happen here because Phase 3 would crash trying to copy oversized tokens
-		# into model_context_length-sized buffers.
-		self._rejected_sequences = []
-		uuids_to_remove = []
-		for seq in self.global_batch:
-			pl = tokenized_by_idx[seq.global_idx]["length"]
-			if pl >= self.model_context_length:
-				self._rejected_sequences.append((seq.global_idx, pl))
-				uuids_to_remove.append(seq.uuid)
-				# Free tokenized data for rejected sequence
-				del tokenized_by_idx[seq.global_idx]
-
-		for uuid in uuids_to_remove:
-			self.global_batch.remove_sequence(uuid)
-
-		if self._rejected_sequences:
-			logging.info(
-				f"Rank {self.rank}: Rejected {len(self._rejected_sequences)}/"
-				f"{len(self._rejected_sequences) + len(self.global_batch)} "
-				f"sequences exceeding context length {self.model_context_length}"
-			)
-
-		# Recalculate max_prompt_length after rejection (remaining sequences only)
-		num_sequences = len(self.global_batch)
-		if num_sequences > 0:
-			remaining_lengths = [tokenized_by_idx[seq.global_idx]["length"] for seq in self.global_batch]
-			max_prompt_length = max(remaining_lengths)
-		else:
-			max_prompt_length = 0
-
-		# Update self.max_input_length to the actual longest prompt
-		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
-		self.max_input_length = max_prompt_length
-		if num_sequences > 0:
-			logging.info(
-				f"Rank {self.rank}: Dynamic max_prompt_length set to {max_prompt_length} "
-				f"(prompt lengths: min={min(remaining_lengths)}, max={max(remaining_lengths)}, "
-				f"count={num_sequences})"
-			)
-
-		# Phase 3: Create per-sequence tensor views from pre-allocated buffer pool.
-		# Pre-allocating 2 large contiguous buffers eliminates allocator contention
-		# when 16 ranks run Phase 3 simultaneously (was 192K allocations → now 32).
-		# Skip if all sequences were rejected in Phase 2.5.
-		if num_sequences == 0:
-			logging.info(f"Rank {self.rank}: All sequences rejected, skipping Phase 3 buffer allocation")
-			return
-
-		phase3_start = time.perf_counter()
-		num_seqs = len(self.global_batch)
-
-		self._buffer_pool = QueryBookBufferPool(
-			num_sequences=num_seqs,
-			model_context_length=self.model_context_length,
-			max_decoding_length=self.max_decoding_length,
-			pad_token_id=self.pad_token_id,
-		)
-		t_alloc = time.perf_counter() - phase3_start
-		logging.info(
-			f"Rank {self.rank}: Phase 3 buffer pool allocated in {t_alloc:.2f}s "
-			f"(input_ids: [{num_seqs}, {self.model_context_length}], "
-			f"decoded_tokens: [{num_seqs}, {self.max_decoding_length}])"
-		)
-
-		for seq_i, seq in enumerate(self.global_batch):
-			item = tokenized_by_idx[seq.global_idx]
-			input_ids_list = item["input_ids"]
-			actual_prompt_len = item["length"]
-
-			if len(input_ids_list) != actual_prompt_len:
-				logging.error(
-					f"Rank {self.rank}: Token length mismatch for seq {seq.global_idx}: "
-					f"list_len={len(input_ids_list)}, stored_len={actual_prompt_len}"
-				)
-				actual_prompt_len = len(input_ids_list)
-
-			seq_extended_size = min(
-				actual_prompt_len + self.max_decoding_length,
-				self.model_context_length
-			)
-
-			slot = self._buffer_pool.allocate_slot()
-			seq._buffer_slot = slot
-
-			input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-			input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
-			seq.input_ids = input_ids_view
-			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
-
-			# Free the tokenized data for this sequence immediately
-			del tokenized_by_idx[seq.global_idx]
-
-			seq.prompt_length = actual_prompt_len
-			seq.original_prompt_length = actual_prompt_len  # Must match prompt_length at tokenization time
-			seq.current_context_length = actual_prompt_len
-			seq.kv_token_budget = seq_extended_size
-
-			if (seq_i + 1) % 3000 == 0:
-				elapsed = time.perf_counter() - phase3_start
-				logging.info(
-					f"Rank {self.rank}: Phase 3 progress: {seq_i+1}/{num_seqs} sequences "
-					f"({elapsed:.1f}s elapsed)"
-				)
-
-		phase3_total = time.perf_counter() - phase3_start
-		logging.info(
-			f"Rank {self.rank}: Phase 3 complete: {num_seqs} sequences in {phase3_total:.2f}s "
-			f"(buffer alloc: {t_alloc:.2f}s, fill: {phase3_total-t_alloc:.2f}s)"
-		)
-
-		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
-
-	def _assign_sequences_to_ranks(self) -> None:
-		"""
-		Assign sequences to ranks balancing predicted attention tile workload.
-		All ranks execute this identically to maintain consistent assignment.
-
-		Uses greedy bin-packing: sort sequences by predicted tiles (descending),
-		then assign each to the rank with fewest total tiles. This balances
-		attention compute across ranks, reducing synchronization wait time.
-		"""
-		if self.global_batch is None:
-			raise RuntimeError("Global batch not initialized")
-
-		# Sort sequences by predicted total context (descending) for better bin-packing
-		# Larger sequences first ensures better balance
-		sequences = list(self.global_batch)
-		sequences.sort(
-			key=lambda s: s.prompt_length + s.max_decode_length,
-			reverse=True
-		)
-
-		# Track total tiles per rank (attention tile = 128 tokens)
-		TILE_SIZE = 128
-		rank_tiles = [0] * self.world_size
-
-		for seq in sequences:
-			# Predict total context length at decode completion
-			predicted_context = seq.prompt_length + seq.max_decode_length
-			predicted_tiles = (predicted_context + TILE_SIZE - 1) // TILE_SIZE  # ceil_div
-
-			# Assign to rank with fewest tiles (greedy)
-			target_rank = rank_tiles.index(min(rank_tiles))
-			self.global_batch.assign_rank(seq.uuid, target_rank)
-			rank_tiles[target_rank] += predicted_tiles
-
-		# Log balance quality
-		my_seqs = self.global_batch.get_sequences_for_rank(self.rank)
-		if self.rank == 0:
-			imbalance = (max(rank_tiles) - min(rank_tiles)) / max(rank_tiles) * 100 if max(rank_tiles) > 0 else 0
-			logging.info(
-				f"Workload distribution (tiles per rank): {rank_tiles}, "
-				f"imbalance: {imbalance:.1f}%"
-			)
-		logging.info(
-			f"Rank {self.rank}: Assigned {len(my_seqs)} sequences, "
-			f"tiles={rank_tiles[self.rank]}"
-		)
-
-	def _build_local_query_book(self) -> None:
-		"""
-		Build query_book from global_batch for sequences assigned to this rank.
-		Maps local indices (0, 1, 2, ...) to sequence data for backward compatibility.
-		"""
-		my_uuids = sorted(
-			self.global_batch.get_sequences_for_rank(self.rank),
-			key=lambda uuid: self.global_batch.get_sequence(uuid).global_idx
-		)
-
-		self.query_book = {}
-		self._state.local_to_uuid_map: Dict[int, str] = {}
-		self._state.uuid_to_local_map: Dict[str, int] = {}
-		self._state.free_local_indices: Set[int] = set()  # Reset free list
-		self._state.next_local_idx = len(my_uuids)  # Next available index after initial assignment
-
-		for local_idx, uuid in enumerate(my_uuids):
-			seq = self.global_batch.get_sequence(uuid)
-
-			self.query_book[local_idx] = query(
-				text=seq.text,
-				encoded={
-					"input_ids": seq.input_ids,
-				},
-				decoded_tokens=seq.decoded_tokens,
-				kv_token_budget=seq.kv_token_budget,
-			)
-
-			self._state.local_to_uuid_map[local_idx] = uuid
-			self._state.uuid_to_local_map[uuid] = local_idx
-		
-		# Validation: Check that we have all sequences assigned to this rank
-		expected_count = sum(
-			1 for seq in self.global_batch if seq.assigned_rank == self.rank
-		)
-
-		if len(my_uuids) != expected_count:
-			logging.error(
-				f"Rank {self.rank}: CRITICAL MISMATCH - expected {expected_count} sequences "
-				f"but got {len(my_uuids)} from get_sequences_for_rank!"
-			)
-
-		logging.info(
-			f"Rank {self.rank}: Built local query_book with {len(self.query_book)} entries "
-			f"(global_batch has {len(self.global_batch)} sequences)"
-		)
 
 	# ============ KV-Driven Batch Preparation ============
 
@@ -4167,9 +3851,9 @@ class BatchGenWorker:
 			# kv_token_budget stays unchanged (Q5 answer)
 			seq_extended_size = seq.kv_token_budget
 			slot = seq._buffer_slot
-			self._buffer_pool.input_ids_buffer[slot, :] = 0
-			self._buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
-			seq.input_ids = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
+			self._state.buffer_pool.input_ids_buffer[slot, :] = 0
+			self._state.buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
+			seq.input_ids = self._state.buffer_pool.get_input_ids_view(slot, seq_extended_size)
 
 			seq.prompt_length = new_prompt_len
 			seq.current_context_length = new_prompt_len
@@ -4177,8 +3861,8 @@ class BatchGenWorker:
 
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
 			# So the final decoded_tokens contains the COMPLETE response
-			self._buffer_pool.decoded_tokens_buffer[slot, :] = self._buffer_pool.pad_token_id
-			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
+			self._state.buffer_pool.decoded_tokens_buffer[slot, :] = self._state.buffer_pool.pad_token_id
+			seq.decoded_tokens = self._state.buffer_pool.get_decoded_tokens_view(slot)
 			if prev_decoded > 0:
 				# Extract old decoded tokens from evicted_token_ids
 				old_decoded = evicted_ids[seq.original_prompt_length:]
@@ -8077,7 +7761,7 @@ class BatchGenWorker:
 		self._state.global_batch = None
 		
 		# 5. Reset query book and mappings
-		self.query_book = None
+		self.query_book = None; self._state.query_book = None
 		self._state.local_to_uuid_map = {}
 		self._state.uuid_to_local_map = {}
 		

@@ -55,6 +55,11 @@ class WorkerState:
     # --- Model ---
     model: object = None  # nn.Module
     tokenizer: object = None
+    pad_token_id: int = 0
+
+    # --- Batch formation ---
+    buffer_pool: object = None  # QueryBookBufferPool
+    rejected_sequences: List = field(default_factory=list)
 
     # --- Async KV state ---
     deferred_kv_entries: List = field(default_factory=list)
