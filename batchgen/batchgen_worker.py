@@ -3572,7 +3572,7 @@ class BatchGenWorker:
 
 		all_candidates = evicted_uuids + queueing_uuids
 		if not all_candidates:
-			return []
+			return [], 0
 
 		gpus_per_node = torch.cuda.device_count()
 		num_nodes = self._get_num_nodes()
@@ -3629,7 +3629,7 @@ class BatchGenWorker:
 				f"per-node pages: {node_pages_used}"
 			)
 
-		return prefill_batch
+		return prefill_batch, chunk_size
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
@@ -4579,8 +4579,8 @@ class BatchGenWorker:
 							f"[PREFILL] Host KV rebalancing: {(time.perf_counter() - rebalance_start)*1000:.1f}ms"
 						)
 
-				prefill_uuids = self._prepare_prefill_batch()
-				
+				prefill_uuids, prefill_chunk_size = self._prepare_prefill_batch()
+
 				if prefill_uuids:
 					if self.rank == 0:
 						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
@@ -4588,7 +4588,7 @@ class BatchGenWorker:
 
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
 					config_start = time.perf_counter()
-					self._config_prefill_for_batch(prefill_uuids)
+					self._config_prefill_for_batch(prefill_uuids, chunk_size=prefill_chunk_size)
 					config_prefill_time += time.perf_counter() - config_start
 
 					# Get local indices AFTER config (new sequences now in map)
@@ -4864,7 +4864,7 @@ class BatchGenWorker:
 
 	# ============ Phase Configuration ============
 
-	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
+	def _config_prefill_for_batch(self, prefill_uuids: List[str], chunk_size: int = None) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
 		if self.rank == 0:
@@ -5035,7 +5035,10 @@ class BatchGenWorker:
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
-			chunk_size = self._get_effective_chunk_size()
+			# Use chunk_size from _prepare_prefill_batch to ensure consistency.
+			# Adaptive chunk sizer can return different values between calls.
+			if chunk_size is None:
+				chunk_size = self._get_effective_chunk_size()
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
