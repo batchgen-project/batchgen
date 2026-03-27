@@ -15,6 +15,7 @@ import torch.distributed as dist
 
 from batchgen.worker.state import WorkerState
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
+from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.continuous_batching import FastBoundaryTimingStats
 from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.sequence import SequenceStatus
