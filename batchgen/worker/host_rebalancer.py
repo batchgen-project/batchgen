@@ -483,7 +483,7 @@ class HostKVRebalancer:
 			# We'll load host KV → GPU → CPU buffer, then send
 			# (Temporary workaround - ideally would read directly from host memory)
 			manager = self._worker.gpu_paged_kv_cache_manager
-			worker_view = self.host_paged_kv_worker_view
+			worker_view = self.state.host_kv_view
 			if manager is None:
 				logging.error(f"Rank {self.state.rank}: GPU KV manager not initialized")
 				return
@@ -643,7 +643,7 @@ class HostKVRebalancer:
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.state.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
 			# Register and allocate host KV pages
-			worker_view = self.host_paged_kv_worker_view
+			worker_view = self.state.host_kv_view
 			tokens_needed = pages_needed * page_size
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
