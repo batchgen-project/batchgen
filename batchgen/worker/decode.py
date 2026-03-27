@@ -288,7 +288,7 @@ class DecodeScheduler:
 		# ============ SIMPLIFIED: Model and GPU KV manager already initialized ============
 		# Model loading and GPU KV manager init now happen in generate() BEFORE batch selection
 		# via _load_decode_model() and _init_gpu_kv_with_actual_size()
-		assert self.model is not None, (
+		assert self.state.model is not None, (
 			"Model must be loaded before _config_decoding_for_batch(). "
 			"Ensure _load_decode_model() was called first."
 		)
@@ -779,7 +779,7 @@ class DecodeScheduler:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
+					outputs = self.state.model(
 						new_tokens,
 						attention_mask=Attn_Wrapper.attention_mask,
 						position_ids=Attn_Wrapper.position_ids,
