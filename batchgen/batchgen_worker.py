@@ -579,6 +579,7 @@ class BatchGenWorker:
 		else:
 			self.max_input_length = max_input_length
 		self.max_decoding_length = max_decoding_length
+		self._state.max_decoding_length = max_decoding_length
 		self.max_context_length = max_context_length
 
 		# Cap adaptive chunk sizer's max_chunk by max_decoding_length
@@ -1189,6 +1190,7 @@ class BatchGenWorker:
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
 		client_max = getattr(self, 'max_context_length', None)
 		self.model_context_length = model_max if client_max is None else min(model_max, client_max)
+		self._state.model_context_length = self.model_context_length
 		if self.rank == 0:
 			logging.info(
 				f"Model context length set to {self.model_context_length} "
@@ -2313,6 +2315,7 @@ class BatchGenWorker:
 			# This determines the actual max_input_length dynamically
 			t_step = time.perf_counter()
 			self._batch.tokenize()
+			self.max_input_length = self._state.max_input_length  # Sync back from state
 			logging.info(f"Rank {self.rank}: [INIT TIMING] Step 2 _tokenize_global_batch: {time.perf_counter()-t_step:.2f}s")
 
 			# Rejection of over-limit sequences now happens inside _tokenize_global_batch()
