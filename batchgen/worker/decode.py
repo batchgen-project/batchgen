@@ -493,7 +493,7 @@ class DecodeScheduler:
 						f"sequences ON_HOLD, will trigger prefill"
 					)
 					# Put all remaining sequences ON_HOLD
-					self._put_sequences_on_hold(decode_uuids)
+					self._worker._rebalancer.put_on_hold(decode_uuids)
 					# Exit decode loop - will return to generate() which will trigger prefill
 					break
 				
