@@ -643,9 +643,16 @@ class HostKVRebalancer:
 			t_recv = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.state.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
-			# Register and allocate host KV pages
+			# Register and allocate host KV pages (with runtime free-page guard)
 			worker_view = self.state.host_kv_view
 			tokens_needed = pages_needed * page_size
+			stats = worker_view.get_stats()
+			if stats.num_free_pages < pages_needed:
+				logging.warning(
+					f"MIGRATION: Rank {self.state.rank}: Skipping migration of seq {uuid[:8]} — "
+					f"insufficient free pages (need={pages_needed}, free={stats.num_free_pages})"
+				)
+				return
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 			t_alloc = time.perf_counter()

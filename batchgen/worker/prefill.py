@@ -111,8 +111,19 @@ class PrefillScheduler:
 			assigned_rank = seq.assigned_rank
 			seq_node = self._worker._get_node_for_rank(assigned_rank)
 
-			# Dynamic reservation: only reserve initial chunk, not full budget
-			req_pages = seq.get_host_pages_for_initial_chunk(chunk_size)
+			# Exact page computation matching config_for_batch() allocation.
+			# For evicted sequences, use the re-entry prompt length (original + decoded),
+			# not the current prompt_length which hasn't been updated yet.
+			if seq.evicted_token_ids is not None:
+				prompt_len = len(seq.evicted_token_ids)
+			else:
+				prompt_len = seq.prompt_length
+			post_prefill = prompt_len + 1
+			gpu_initial_pages = math.ceil(post_prefill / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
+			initial_capacity = max(prompt_len + chunk_size, gpu_initial_tokens)
+			initial_capacity = min(initial_capacity, seq.kv_token_budget)
+			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
 			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
 				prefill_batch.append(uuid)
