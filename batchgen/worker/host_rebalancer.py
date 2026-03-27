@@ -652,7 +652,7 @@ class HostKVRebalancer:
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.state.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
 			# Move CPU → GPU for offload to host KV
-			k_gpu = k_cpu.to(self.device, non_blocking=True)
+			k_gpu = k_cpu.to(self.state.torch_device, non_blocking=True)
 			torch.cuda.synchronize(self.state.torch_device)
 			t_gpu = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
