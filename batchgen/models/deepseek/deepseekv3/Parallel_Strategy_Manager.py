@@ -314,6 +314,7 @@ class DeepseekV3ParallelStrategyManager:
 		"""
 		self.loaded_model_config.phase = "decode"
 		self.loaded_model_config._attn_implementation = "eager"
+		self.loaded_model_config.ep_size = self.world_size
 		self.model = None
 		torch.cuda.empty_cache()
 
