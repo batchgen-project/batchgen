@@ -302,16 +302,23 @@ class SequenceEntry:
         growth_tokens = min(chunk_size, remaining_budget)
         return math.ceil(growth_tokens / self.PAGE_SIZE)
 
-    def get_host_pages_for_initial_chunk(self, chunk_size: int) -> int:
+    def get_host_pages_for_initial_chunk(self, chunk_size: int, effective_prompt_length: int = None) -> int:
         """Get pages for initial host KV allocation.
 
         Must match the actual allocation in _config_prefill_host_kv():
         max(prompt + chunk_size, ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages)
         The +1 accounts for the first decoded token produced during prefill
         (current_context_length = prompt_length + 1 after prefill).
+
+        Args:
+            chunk_size: The chunk size for prefill.
+            effective_prompt_length: Override for self.prompt_length. Used for evicted
+                sequences where the re-entry prompt (original + decoded tokens) is
+                known but not yet written to self.prompt_length.
         """
-        chunk_tokens = self.prompt_length + chunk_size
-        post_prefill_length = self.prompt_length + 1  # prefill produces 1 decode token
+        prompt_len = effective_prompt_length if effective_prompt_length is not None else self.prompt_length
+        chunk_tokens = prompt_len + chunk_size
+        post_prefill_length = prompt_len + 1  # prefill produces 1 decode token
         gpu_initial_pages = math.ceil(post_prefill_length / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
         gpu_initial_tokens = gpu_initial_pages * self.PAGE_SIZE
         initial_tokens = max(chunk_tokens, gpu_initial_tokens)

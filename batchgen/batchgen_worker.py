@@ -3612,8 +3612,10 @@ class BatchGenWorker:
 			assigned_rank = seq.assigned_rank
 			seq_node = self._get_node_for_rank(assigned_rank)
 
-			# Dynamic reservation: only reserve initial chunk, not full budget
-			req_pages = seq.get_host_pages_for_initial_chunk(chunk_size)
+			# For evicted sequences, use real re-entry prompt length (original + decoded tokens).
+			# seq.prompt_length is stale here; it gets updated in _config_prefill_for_batch().
+			effective_prompt = len(seq.evicted_token_ids) if seq.evicted_token_ids is not None else None
+			req_pages = seq.get_host_pages_for_initial_chunk(chunk_size, effective_prompt_length=effective_prompt)
 
 			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
 				prefill_batch.append(uuid)
