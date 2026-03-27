@@ -3604,6 +3604,10 @@ class BatchGenWorker:
 
 		# Step 3: Select sequences considering per-node host KV capacity
 		# Use chunk-based pages instead of full kv_token_budget
+		# Reserve a small margin per node to absorb rounding differences
+		# between Python estimation and C++ allocation (typically 1-2 pages).
+		PAGE_MARGIN_PER_NODE = 16  # pages (~1 KB each, negligible)
+		per_node_host_free = [max(0, f - PAGE_MARGIN_PER_NODE) for f in per_node_host_free]
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
 
