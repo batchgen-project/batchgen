@@ -1507,8 +1507,7 @@ class BatchGenWorker:
 			chunk = min(chunk, self.max_decoding_length)
 		# Round up to page boundary
 		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
-		# Synchronize state across all ranks
-		dist.barrier()
+		return chunk
 
 	def _check_and_extend_page_buffer(
 		self,
