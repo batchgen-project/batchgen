@@ -97,6 +97,9 @@ class WorkerState:
     gpu_memory_frac: float = 0.9
     gpu_kv_cache_size_gb: Optional[float] = None
 
+    # --- Model management ---
+    parallel_manager: object = None
+
     # --- Distributed ---
     comm: object = None  # PyNcclCommunicator
     nccl_group: object = None
