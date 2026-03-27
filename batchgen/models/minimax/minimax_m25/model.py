@@ -30,6 +30,8 @@ Key features:
 """
 
 import logging
+
+logger = logging.getLogger(__name__)
 import math
 import os
 import time
@@ -328,18 +330,20 @@ class DecodeLayerTiming:
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            print(f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===",
-                  flush=True)
-            print(f"Total: {total_time:.2f} ms ({1000/max(total_time, 0.01):.1f} tokens/sec)",
-                  flush=True)
-            print(f"  Attention: {total_attn:.2f} ms ({100*total_attn/max(total_time, 0.01):.1f}%) "
-                  f"avg={avg_attn:.2f}ms/layer", flush=True)
-            print(f"  MoE:       {total_moe:.2f} ms ({100*total_moe/max(total_time, 0.01):.1f}%) "
-                  f"avg={avg_moe:.2f}ms/layer", flush=True)
-            print(f"\nPer-layer (first 5):", flush=True)
+            logger.debug(
+                f"\n=== Decode Timing (iter {cls._iteration_count}, {num_layers} layers) ===")
+            logger.debug(
+                f"Total: {total_time:.2f} ms ({1000/max(total_time, 0.01):.1f} tokens/sec)")
+            logger.debug(
+                f"  Attention: {total_attn:.2f} ms ({100*total_attn/max(total_time, 0.01):.1f}%) "
+                f"avg={avg_attn:.2f}ms/layer")
+            logger.debug(
+                f"  MoE:       {total_moe:.2f} ms ({100*total_moe/max(total_time, 0.01):.1f}%) "
+                f"avg={avg_moe:.2f}ms/layer")
+            logger.debug(f"\nPer-layer (first 5):")
             for s in cls.layer_stats[:5]:
-                print(f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms",
-                      flush=True)
+                logger.debug(
+                    f"  L{s.layer_idx}: attn={s.attn_ms:.2f}ms, moe={s.moe_ms:.2f}ms")
         cls.layer_stats.clear()
 
     @classmethod
