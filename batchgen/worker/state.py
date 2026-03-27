@@ -42,6 +42,10 @@ class WorkerState:
     gpu_kv_manager: object = None  # GPUPagedKVCacheManager
     host_kv_view: object = None  # core_engine.MLAHostPagedKVWorkerView or DefaultHostPagedKVWorkerView
     sequences_with_gpu_kv: Set[str] = field(default_factory=set)
+    core_engine: object = None
+    huggingface_ckpt_name: str = ""
+    deferred_kv_batch: object = None  # Tuple[List[int], List[int]] or None
+    deferred_kv_worker_view: object = None
 
     # --- Config ---
     engine_config: object = None  # EngineConfig
