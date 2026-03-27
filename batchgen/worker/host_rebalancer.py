@@ -455,7 +455,7 @@ class HostKVRebalancer:
 		# Do NOT use model_config.num_key_value_heads or loaded_model_config.qk_rope_head_dim
 		# as those have different values!
 		gpu_kv_config = self._worker.gpu_paged_kv_cache_manager.config
-		num_layers = self.model_config.num_hidden_layers
+		num_layers = self.state.model_config.num_hidden_layers
 		num_k_heads = gpu_kv_config.num_k_heads  # For MLA: 1
 		k_head_dim = gpu_kv_config.k_head_dim    # For MLA: 576 (compressed KV)
 		kv_dtype = gpu_kv_config.kv_dtype
