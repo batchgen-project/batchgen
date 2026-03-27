@@ -1186,7 +1186,8 @@ class BatchGenWorker:
 		config_torch_module_initializer()
 		
 		self.model_config = load_config(self.huggingface_ckpt_name)
-		
+		self._state.model_config = self.model_config
+
 		# Extract model's maximum context length from config
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
