@@ -696,15 +696,17 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
         cache_seqlens_for_attn = micro_cache_seqlens
 
-        # Decode attention — use WGMMA kernel if available, else FlashAttention
-        _use_wgmma = os.environ.get("BATCHGEN_USE_WGMMA_DECODE", "0") == "1"
+        # Decode attention — WGMMA kernel default (3× vs FA3 at B≥8), auto split-K for B=1.
+        # Set BATCHGEN_DISABLE_WGMMA_DECODE=1 to force FlashAttention fallback.
+        from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
+        if not getattr(self.__class__, '_warned_attn', False):
+            self.__class__._warned_attn = True
+            _backend = "FA3 (forced)" if os.environ.get("BATCHGEN_DISABLE_WGMMA_DECODE") == "1" \
+                       else "batchgen_gqa_decode_bf16 (WGMMA+auto-splitK, FA3 fallback)"
+            logging.warning(f"[Attn] HOT PATH: {_backend}")
 
-        if _use_wgmma:
-            from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16 as _wgmma_fn
-            if not getattr(self.__class__, '_warned_attn', False):
-                logging.warning("[Attn] HOT PATH: batchgen_gqa_decode_bf16 (WGMMA)")
-                self.__class__._warned_attn = True
-            attn_output, _ = _wgmma_fn(
+        if os.environ.get("BATCHGEN_DISABLE_WGMMA_DECODE") == "1":
+            attn_output, _ = gqa_decode_fa(
                 q=query,
                 k_cache=k_cache_layer,
                 v_cache=v_cache_layer,
@@ -712,10 +714,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
                 block_table=page_table,
             )
         else:
-            if not getattr(self.__class__, '_warned_attn', False):
-                logging.warning("[Attn] HOT PATH: gqa_decode_fa (FlashAttention)")
-                self.__class__._warned_attn = True
-            attn_output, _ = gqa_decode_fa(
+            attn_output, _ = batchgen_gqa_decode_bf16(
                 q=query,
                 k_cache=k_cache_layer,
                 v_cache=v_cache_layer,
