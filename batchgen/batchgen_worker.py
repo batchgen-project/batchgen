@@ -4547,6 +4547,12 @@ class BatchGenWorker:
 			# 1. PREFILL PHASE: Fill Host KV Cache
 			# =================================================================
 			if self.global_batch.has_queueing() or (self.enable_host_kv_eviction and self.global_batch.has_evicted()):
+				# Flush pending async KV append tasks from the decode phase FIRST.
+				# These are D2H copies on a separate CUDA stream that may still be
+				# in-flight. Must complete before any CUDA operations (barrier uses
+				# NCCL/GPU, migration uses pin_memory + GPU staging).
+				self._wait_pending_kv_append_tasks()
+
 				dist.barrier()
 
 				# CRITICAL FIX: Sync sequence metadata BEFORE rebalancing
@@ -4887,14 +4893,8 @@ class BatchGenWorker:
 					f"had_initial={seq.had_initial_gpu_reservation}"
 				)
 
-		# CRITICAL FIX: Flush pending KV append tasks before destroying GPU cache
-		# Without this, async KV writes may be in-flight when GPU cache is destroyed
-		if hasattr(self, '_pending_kv_append_tasks') and self._pending_kv_append_tasks:
-			logging.info(
-				f"Rank {self.rank}: Flushing {len(self._pending_kv_append_tasks)} pending KV append tasks before prefill config"
-			)
-			self._wait_pending_kv_append_tasks()
-			torch.cuda.synchronize(self.torch_device)
+		# NOTE: Pending KV append tasks are now flushed at the decode→prefill boundary
+		# (before barrier/migration) in generate(). No need to flush again here.
 
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
