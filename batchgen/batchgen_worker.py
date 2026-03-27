@@ -4053,9 +4053,6 @@ class BatchGenWorker:
 
 	# ============ Prefill and Decode ============
 
-
-		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered
-
 	def _finalize_async_load_minimal(
 		self,
 		async_task: object,
