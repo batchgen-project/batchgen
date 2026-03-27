@@ -225,14 +225,6 @@ class MiniMaxM25ParallelStrategyManager:
         Skeleton state dict uses HF checkpoint keys (block_sparse_moe).
         Model named_parameters() uses `mlp`. Map between them.
         """
-        if self.rank == 0:
-            logging.warning(f"[SKELETON] _load_model_skeleton called, "
-                            f"skeleton has {len(self.skeleton_state_dict)} keys")
-            # Log first few skeleton keys for debugging
-            for i, k in enumerate(sorted(self.skeleton_state_dict.keys())):
-                if i < 5 or "gate" in k:
-                    v = self.skeleton_state_dict[k]
-                    logging.warning(f"[SKELETON] skeleton_key[{i}]={k}: dtype={v.dtype}, shape={list(v.shape)}")
         loaded = 0
         not_found = []
         for key, param in self.model.named_parameters():
@@ -244,12 +236,6 @@ class MiniMaxM25ParallelStrategyManager:
                 found_key = key
             if found_key is not None:
                 raw_tensor = self.skeleton_state_dict[found_key]
-                # Log gate weight dtype to verify checkpoint format
-                if "gate" in key and self.rank == 0:
-                    logging.warning(
-                        f"[SKELETON] key={key}, ckpt_key={found_key}: "
-                        f"raw_dtype={raw_tensor.dtype}, shape={list(raw_tensor.shape)}, "
-                        f"param_dtype_before={param.dtype}")
                 param.data = raw_tensor
                 loaded += 1
             else:

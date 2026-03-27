@@ -602,11 +602,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
 
-        # Save pre-RoPE for one-time P4 validation (only first call)
-        if _HAS_CUDA_ROPE and not getattr(self.__class__, '_rope_validated', False):
-            query_save = query.clone()
-            key_save = key.clone()
-
         if _HAS_CUDA_ROPE:
             if not getattr(self.__class__, '_warned_rope', False):
                 logging.warning("[Attn] HOT PATH: CUDA rope_forward (partial rotation, passthrough copy)")
@@ -624,31 +619,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             half_dim = rotary_dim // 2  # 32 for MiniMax
             query, key = _cuda_rope_forward(
                 query, key, cos_k, sin_k, half_dim)
-
-            # One-time P4 validation: compare CUDA vs PyTorch RoPE
-            if not getattr(self.__class__, '_rope_validated', False):
-                self.__class__._rope_validated = True
-                cos_ref = cos[current_token_position].unsqueeze(1).unsqueeze(2)
-                sin_ref = sin[current_token_position].unsqueeze(1).unsqueeze(2)
-                q_ref_rot = query_save[..., :rotary_dim]
-                q_ref_pass = query_save[..., rotary_dim:]
-                q_ref = torch.cat([
-                    q_ref_rot * cos_ref + rotate_half(q_ref_rot) * sin_ref,
-                    q_ref_pass,
-                ], dim=-1)
-                k_ref_rot = key_save[..., :rotary_dim]
-                k_ref_pass = key_save[..., rotary_dim:]
-                k_ref = torch.cat([
-                    k_ref_rot * cos_ref + rotate_half(k_ref_rot) * sin_ref,
-                    k_ref_pass,
-                ], dim=-1)
-                q_diff = (query - q_ref).abs().max().item()
-                k_diff = (key - k_ref).abs().max().item()
-                q_pass_ok = torch.allclose(query[..., rotary_dim:], query_save[..., rotary_dim:], atol=1e-6)
-                k_pass_ok = torch.allclose(key[..., rotary_dim:], key_save[..., rotary_dim:], atol=1e-6)
-                logging.warning(
-                    f"[P4 VALIDATE] CUDA vs PyTorch RoPE: q_max_diff={q_diff:.2e}, k_max_diff={k_diff:.2e}, "
-                    f"q_pass_preserved={q_pass_ok}, k_pass_preserved={k_pass_ok}")
         else:
             if not getattr(self.__class__, '_warned_rope', False):
                 logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (fallback)")
