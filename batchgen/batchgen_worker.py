@@ -434,6 +434,9 @@ class BatchGenWorker:
 		self.enable_prepack = args.enable_prepack
 		self.host_kv_watermark = args.host_kv_watermark
 		self.enable_decode_preemption = args.enable_decode_preemption
+		# Sync to WorkerState for sub-managers
+		self._state.host_kv_watermark = self.host_kv_watermark
+		self._state.enable_decode_preemption = self.enable_decode_preemption
 
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
