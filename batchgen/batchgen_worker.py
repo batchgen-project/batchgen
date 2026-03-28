@@ -2366,6 +2366,9 @@ class BatchGenWorker:
 				# D. Cleanup
 				self._unregister_fp8_weights()
 				self.deep_free_model_memory()
+				# DIAG: Sync CUDA after model free to catch any async errors from decode
+				torch.cuda.synchronize(self.torch_device)
+				logging.info(f"Rank {self.rank}: [DIAG] Post-decode cleanup + CUDA sync OK")
 				dist.barrier()
 
 				# CRITICAL FIX: After decode returns (possibly due to watermark trigger),

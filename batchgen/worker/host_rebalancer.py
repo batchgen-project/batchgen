@@ -476,32 +476,51 @@ class HostKVRebalancer:
 		if self.state.rank == from_rank:
 			# ===== SOURCE RANK: Read from host KV, send directly over network =====
 			t0 = time.perf_counter()
-			logging.debug(
-				f"[MIGRATION] Rank {self.state.rank}: Send {uuid[:8]}... → rank {to_rank} "
-				f"({pages_needed} pages)"
-			)
-			# Allocate CPU buffer for KV data
-			# We'll load host KV → GPU → CPU buffer, then send
-			# (Temporary workaround - ideally would read directly from host memory)
 			manager = self._worker.gpu_paged_kv_cache_manager
 			worker_view = self.state.host_kv_view
 			if manager is None:
 				logging.error(f"Rank {self.state.rank}: GPU KV manager not initialized")
 				return
-			# Ensure GPU KV manager is initialized (may be destroyed between decode/prefill phases)
+
+			# DIAG: Log GPU KV manager state before migration
+			import torch as _torch
+			free_mem = _torch.cuda.mem_get_info(self.state.local_rank)[0] / 1e9
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Send {uuid[:8]}... → rank {to_rank}: "
+				f"pages_needed={pages_needed}, mgr.is_initialized={manager.is_initialized}, "
+				f"mgr._sequences_count={len(manager._sequences)}, "
+				f"mgr.config.num_pages={manager.config.num_pages}, "
+				f"gpu_free={free_mem:.2f}GB"
+			)
+
+			# Ensure GPU KV manager is initialized
 			if not manager.is_initialized:
-				logging.debug(f"[MIGRATION] Rank {self.state.rank}: Re-initializing GPU KV manager for migration")
+				logging.warning(
+					f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Re-initializing GPU KV manager! "
+					f"This allocates {manager.config.num_pages} pages on GPU with only {free_mem:.2f}GB free"
+				)
 				manager.initialize()
+
+			# DIAG: Sync before allocating to catch any prior async errors
+			_torch.cuda.synchronize(self.state.torch_device)
+			logging.info(f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Pre-alloc CUDA sync OK")
+
 			tokens_needed = pages_needed * page_size
-			# Allocate temporary GPU pages
+			free_pages = manager.get_stats().num_free_pages
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Allocating {pages_needed} pages "
+				f"(tokens={tokens_needed}), GPU KV free_pages={free_pages}"
+			)
 			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
-			# CRITICAL: Must rebuild page table after allocation before using get_padded_3d_page_pointers
-			# The GPU KV manager requires this to set up active slot mappings
 			manager.rebuild_page_table([global_idx])
-			# Load host KV → GPU
 			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
 			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
 			active_page_counts = manager.export_active_sequence_page_counts()
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Page table rebuilt, "
+				f"k_ptrs.shape={list(k_ptrs.shape)}, v_ptrs={'None' if v_ptrs is None else list(v_ptrs.shape)}, "
+				f"active_page_counts={active_page_counts.tolist()}"
+			)
 			
 			# PRE-LOAD DIAGNOSTIC: Log host KV state before loading
 			if BATCHGEN_CB_DEBUG:
@@ -513,6 +532,7 @@ class HostKVRebalancer:
 					f"host_stats=(used={host_stats.num_used_pages}, total={host_stats.num_total_pages})"
 				)
 			
+			logging.info(f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Launching async_load_layer_paged_kv_to_device")
 			load_task = worker_view.async_load_layer_paged_kv_to_device(
 				sequence_ids=sequence_tensor,
 				active_page_counts=active_page_counts,
@@ -520,13 +540,19 @@ class HostKVRebalancer:
 				v_device_ptrs=v_ptrs,
 			)
 			load_task.wait()
-			# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
-			torch.cuda.synchronize(self.state.torch_device)
+			_torch.cuda.synchronize(self.state.torch_device)
 			t_load = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.state.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] Host→GPU load+sync OK: "
+				f"{(t_load-t0)*1000:.1f}ms"
+			)
 			# Extract to contiguous tensor on GPU
 			k_gpu = manager.copy_kv_to_tensor(global_idx)
+			_torch.cuda.synchronize(self.state.torch_device)
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_SRC_DIAG] copy_kv_to_tensor+sync OK: "
+				f"k_gpu.shape={list(k_gpu.shape)}, dtype={k_gpu.dtype}"
+			)
 			t_extract = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.state.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
@@ -635,7 +661,13 @@ class HostKVRebalancer:
 					f"MIGRATION: Rank {self.state.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
 					f"({pages_needed} pages)"
 				)
-			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
+			# DIAG: Sync CUDA before allocating pinned memory to surface any prior async errors
+			import torch as _torch
+			_torch.cuda.synchronize(self.state.torch_device)
+			logging.info(
+				f"Rank {self.state.rank}: [MIGRATION_DST_DIAG] Pre-recv CUDA sync OK. "
+				f"Allocating pinned buffer k_shape={k_shape}, dtype={kv_dtype}"
+			)
 			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
 			# Receive via Gloo backend
 			gloo_group = self._get_or_create_gloo_group()
@@ -1001,33 +1033,46 @@ class HostKVRebalancer:
 			)
 
 		# CRITICAL FIX: Sync sequence metadata BEFORE putting on hold
-		# This ensures all ranks have consistent current_context_length values
-		# which is essential for correct KV migration validation later
 		self._sync.sync_metadata(uuids)
 
 		# Free GPU pages for these sequences
-		# CRITICAL FIX: GPU KV manager uses global_idx (not local_idx) as sequence ID
-		if hasattr(self, 'gpu_paged_kv_cache_manager') and self._worker.gpu_paged_kv_cache_manager:
+		if self._worker.gpu_paged_kv_cache_manager:
 			global_seq_ids = []
 			for uuid in uuids:
 				seq = self.state.global_batch.get_sequence(uuid)
 				if seq.assigned_rank == self.state.rank:
-					# Verify sequence is in local map (should be for IN_DECODE sequences)
 					if uuid in self.state.uuid_to_local_map:
-						global_seq_ids.append(seq.global_idx)  # Use global_idx, not local_idx!
+						global_seq_ids.append(seq.global_idx)
 
 			if global_seq_ids:
-				# Filter to only sequences the GPU manager actually tracks
 				mgr = self._worker.gpu_paged_kv_cache_manager
 				known_ids = [gid for gid in global_seq_ids if gid in mgr._sequences]
+
+				# DIAG: Log GPU state before free
+				free_before = mgr.get_stats().num_free_pages if mgr.is_initialized else -1
+				logging.info(
+					f"Rank {self.state.rank}: [PUT_ON_HOLD_DIAG] Freeing {len(known_ids)}/{len(global_seq_ids)} "
+					f"sequences from GPU KV (free_pages_before={free_before}, "
+					f"mgr._sequences_count={len(mgr._sequences)}, is_initialized={mgr.is_initialized})"
+				)
+
 				if known_ids:
 					mgr.free_pages_for_sequences(known_ids)
+
+				# DIAG: Sync CUDA and check for errors immediately after free
+				import torch
+				torch.cuda.synchronize(self.state.torch_device)
+				free_after = mgr.get_stats().num_free_pages if mgr.is_initialized else -1
+				logging.info(
+					f"Rank {self.state.rank}: [PUT_ON_HOLD_DIAG] After free+sync: "
+					f"free_pages_after={free_after}, reclaimed={free_after - free_before}"
+				)
+
 				if len(known_ids) < len(global_seq_ids):
 					unknown = len(global_seq_ids) - len(known_ids)
-					logging.debug(
+					logging.warning(
 						f"Rank {self.state.rank}: Skipped freeing {unknown} sequences not in GPU KV manager"
 					)
-				# Also remove from tracking set
 				for uuid in uuids:
 					seq = self.state.global_batch.get_sequence(uuid)
 					if seq.assigned_rank == self.state.rank:
