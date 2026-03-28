@@ -668,7 +668,7 @@ class HostKVRebalancer:
 				f"Rank {self.state.rank}: [MIGRATION_DST_DIAG] Pre-recv CUDA sync OK. "
 				f"Allocating pinned buffer k_shape={k_shape}, dtype={kv_dtype}"
 			)
-			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
+			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=False)
 			# Receive via Gloo backend
 			gloo_group = self._get_or_create_gloo_group()
 			dist.recv(tensor=k_cpu, src=from_rank, group=gloo_group)
