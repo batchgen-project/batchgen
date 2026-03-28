@@ -2287,6 +2287,7 @@ class BatchGenWorker:
 
 				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
 				decode_uuids = self._decode.prepare_batch()
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C1: prepare_batch done, {len(decode_uuids)} uuids")
 
 				# Include currently running sequences - PRESERVE ORDER
 				current_decoding = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
@@ -2305,11 +2306,15 @@ class BatchGenWorker:
 				# Step 1: Sync decode_uuids across ranks using tensor operations
 				# This ensures all ranks have the same decode candidates
 				decode_uuids = self._sync.sync_decode_uuids(decode_uuids)
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C2: pre sync_decode_uuids, {len(decode_uuids)} uuids")
 
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C3: post sync_decode_uuids, {len(decode_uuids)} uuids")
 				# Step 2: Sync completion status using tensor-based all_reduce
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
 				global_completed, decode_uuids = self._sync.sync_completion_status(decode_uuids)
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C4: pre sync_completion, {len(decode_uuids)} uuids")
 
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C5: post sync_completion, {len(decode_uuids)} active, {len(global_completed)} completed")
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
 					self._submit_completed_to_incremental_writer(list(global_completed))
@@ -2330,12 +2335,15 @@ class BatchGenWorker:
 				# DECISION_INTERVAL boundary (~134-token truncation bug).
 				if decode_uuids:
 					self._sync.sync_metadata(decode_uuids)
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C6: pre sync_metadata, {len(decode_uuids)} uuids")
 
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C7: post sync_metadata")
 				local_decode_indices = self._index.get_local_indices_for_uuids(decode_uuids)
 
 				# B. Config Decode
 				config_start = time.perf_counter()
 				self._decode.config_for_batch(decode_uuids, local_decode_indices)
+				logging.info(f"Rank {self.rank}: [DEADLOCK_TRACE] C8: pre config_for_batch, {len(decode_uuids)} uuids, {len(local_decode_indices)} local")
 				config_decode_time += time.perf_counter() - config_start
 
 				# CUDA Graph Warmup (lazy, one-time) — only capture for final batch
