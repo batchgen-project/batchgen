@@ -303,32 +303,6 @@ class PrefillScheduler:
 				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
-			# Defensive: check actual free pages before bulk allocation
-			# prepare_batch() estimates per-node, but allocation is per-rank.
-			# Rounding and C++ page conversion can cause small overflows.
-			actual_free = self.state.core_engine.host_paged_kv_worker_view.get_stats().num_free_pages
-			total_pages_needed = sum(math.ceil(t / 64) for t in sequence_tokens)  # PAGE_SIZE=64
-			if total_pages_needed > actual_free:
-				# Truncate: only allocate what fits
-				truncated_ids = []
-				truncated_tokens = []
-				pages_used = 0
-				for gid, tok in zip(global_sequence_ids, sequence_tokens):
-					p = math.ceil(tok / 64)
-					if pages_used + p <= actual_free:
-						truncated_ids.append(gid)
-						truncated_tokens.append(tok)
-						pages_used += p
-					else:
-						break
-				logging.warning(
-					f"Rank {self.state.rank}: Host KV overflow guard: truncated from "
-					f"{len(global_sequence_ids)} to {len(truncated_ids)} sequences "
-					f"(needed={total_pages_needed}, free={actual_free})"
-				)
-				global_sequence_ids = truncated_ids
-				sequence_tokens = truncated_tokens
-
 			logging.debug(
 				f"Rank {self.state.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
 				f"(chunk_size={chunk_size})"
