@@ -318,6 +318,28 @@ class SequenceEntry:
         initial_tokens = min(initial_tokens, self.kv_token_budget)
         return math.ceil(initial_tokens / self.PAGE_SIZE)
 
+    def compute_host_prefill_allocation(self, chunk_size: int) -> tuple:
+        """Compute host KV allocation for prefill — SINGLE SOURCE OF TRUTH.
+
+        Used by BOTH prepare_batch() (for batch selection) and
+        config_for_batch() (for actual C++ allocation). Having one
+        function eliminates mismatch bugs.
+
+        For evicted sequences, uses len(evicted_token_ids) as the
+        effective prompt length (the re-entry prompt).
+
+        Returns:
+            (initial_capacity_tokens, num_pages)
+        """
+        prompt_len = len(self.evicted_token_ids) if self.evicted_token_ids is not None else self.prompt_length
+        post_prefill = prompt_len + 1  # prefill produces 1 decode token
+        gpu_initial_pages = math.ceil(post_prefill / self.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
+        gpu_initial_tokens = gpu_initial_pages * self.PAGE_SIZE
+        initial_capacity = max(prompt_len + chunk_size, gpu_initial_tokens)
+        initial_capacity = min(initial_capacity, self.kv_token_budget)
+        num_pages = math.ceil(initial_capacity / self.PAGE_SIZE)
+        return initial_capacity, num_pages
+
     # ============ Completion and Status Methods ============
 
     def is_finished(self) -> bool:

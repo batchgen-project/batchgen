@@ -111,19 +111,8 @@ class PrefillScheduler:
 			assigned_rank = seq.assigned_rank
 			seq_node = self._worker._get_node_for_rank(assigned_rank)
 
-			# Exact page computation matching config_for_batch() allocation.
-			# For evicted sequences, use the re-entry prompt length (original + decoded),
-			# not the current prompt_length which hasn't been updated yet.
-			if seq.evicted_token_ids is not None:
-				prompt_len = len(seq.evicted_token_ids)
-			else:
-				prompt_len = seq.prompt_length
-			post_prefill = prompt_len + 1
-			gpu_initial_pages = math.ceil(post_prefill / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-			initial_capacity = max(prompt_len + chunk_size, gpu_initial_tokens)
-			initial_capacity = min(initial_capacity, seq.kv_token_budget)
-			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
+			# Single source of truth: SequenceEntry.compute_host_prefill_allocation()
+			_, req_pages = seq.compute_host_prefill_allocation(chunk_size)
 
 			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
 				prefill_batch.append(uuid)
@@ -294,14 +283,11 @@ class PrefillScheduler:
 			for uuid in my_prefill_uuids:
 				seq = self.state.global_batch.get_sequence(uuid)
 				global_sequence_ids.append(seq.global_idx)
-				post_prefill_length = seq.prompt_length + 1
-				gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-				initial_capacity = min(initial_capacity, seq.kv_token_budget)
+				# Single source of truth: same function as prepare_batch()
+				initial_capacity, num_pages = seq.compute_host_prefill_allocation(chunk_size)
 				sequence_tokens.append(initial_capacity)
 				seq.host_token_capacity = initial_capacity
-				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+				seq.host_pages_allocated = num_pages
 
 			# Defensive: check actual free pages before bulk allocation.
 			# If truncating, also clean up local_map for truncated sequences
