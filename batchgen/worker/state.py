@@ -87,7 +87,7 @@ class WorkerState:
 
     # --- Host KV config ---
     host_kv_chunk_size: int = 0
-    host_kv_eviction_watermark: int = 70
+    host_kv_eviction_watermark: int = 10  # Default 10%, synced from worker config
     enable_host_kv_eviction: bool = True
     enable_decode_preemption: bool = True
     host_kv_watermark: int = 70

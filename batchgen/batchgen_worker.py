@@ -346,6 +346,10 @@ class BatchGenWorker:
 		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
 		# Eviction is always enabled — it's a correctness requirement for chunked host KV
 		self.enable_host_kv_eviction = True
+		# Sync to WorkerState for sub-managers (boundary handler reads these)
+		self._state.host_kv_eviction_watermark = self.host_kv_eviction_watermark
+		self._state.host_kv_chunk_size = self.host_kv_chunk_size
+		self._state.enable_host_kv_eviction = self.enable_host_kv_eviction
 		if args.adaptive_chunk:
 			self.adaptive_chunk_sizer = AdaptiveChunkSizer(
 				initial_chunk=args.host_kv_chunk_size,
