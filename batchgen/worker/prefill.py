@@ -303,6 +303,38 @@ class PrefillScheduler:
 				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
+			# Defensive: check actual free pages before bulk allocation.
+			# If truncating, also clean up local_map for truncated sequences
+			# to prevent "not registered" errors at boundary growth.
+			actual_free = self.state.core_engine.host_paged_kv_worker_view.get_stats().num_free_pages
+			total_pages_needed = sum(math.ceil(t / 64) for t in sequence_tokens)
+			if total_pages_needed > actual_free:
+				keep_count = 0
+				pages_used = 0
+				for tok in sequence_tokens:
+					p = math.ceil(tok / 64)
+					if pages_used + p <= actual_free:
+						pages_used += p
+						keep_count += 1
+					else:
+						break
+				# Remove truncated sequences from local_map
+				truncated_uuids = my_prefill_uuids[keep_count:]
+				for uuid in truncated_uuids:
+					local_idx = self.state.uuid_to_local_map.pop(uuid, None)
+					if local_idx is not None:
+						self.state.local_to_uuid_map.pop(local_idx, None)
+						self.state.free_local_indices.add(local_idx)
+				logging.warning(
+					f"Rank {self.state.rank}: Host KV overflow guard: truncated from "
+					f"{len(global_sequence_ids)} to {keep_count} sequences "
+					f"(needed={total_pages_needed}, free={actual_free}), "
+					f"cleaned {len(truncated_uuids)} from local_map"
+				)
+				global_sequence_ids = global_sequence_ids[:keep_count]
+				sequence_tokens = sequence_tokens[:keep_count]
+				my_prefill_uuids = my_prefill_uuids[:keep_count]
+
 			logging.debug(
 				f"Rank {self.state.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
 				f"(chunk_size={chunk_size})"
