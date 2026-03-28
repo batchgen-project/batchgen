@@ -346,10 +346,6 @@ class BatchGenWorker:
 		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
 		# Eviction is always enabled — it's a correctness requirement for chunked host KV
 		self.enable_host_kv_eviction = True
-		# Sync to WorkerState for sub-managers (boundary handler reads these)
-		self._state.host_kv_eviction_watermark = self.host_kv_eviction_watermark
-		self._state.host_kv_chunk_size = self.host_kv_chunk_size
-		self._state.enable_host_kv_eviction = self.enable_host_kv_eviction
 		if args.adaptive_chunk:
 			self.adaptive_chunk_sizer = AdaptiveChunkSizer(
 				initial_chunk=args.host_kv_chunk_size,
@@ -434,9 +430,6 @@ class BatchGenWorker:
 		self.enable_prepack = args.enable_prepack
 		self.host_kv_watermark = args.host_kv_watermark
 		self.enable_decode_preemption = args.enable_decode_preemption
-		# Sync to WorkerState for sub-managers
-		self._state.host_kv_watermark = self.host_kv_watermark
-		self._state.enable_decode_preemption = self.enable_decode_preemption
 
 		# 4. Initialize Weights Storage (cudaHostRegister for weights)
 		logging.info(f"Rank {self.rank}: Initializing shared memory segments (local_rank={self.local_rank}).")
@@ -518,6 +511,12 @@ class BatchGenWorker:
 			host_kv_view=self.host_paged_kv_worker_view,
 			huggingface_ckpt_name=self.huggingface_ckpt_name,
 		)
+		# Sync config fields set before _state was created
+		self._state.host_kv_eviction_watermark = self.host_kv_eviction_watermark
+		self._state.host_kv_chunk_size = self.host_kv_chunk_size
+		self._state.enable_host_kv_eviction = self.enable_host_kv_eviction
+		self._state.host_kv_watermark = self.host_kv_watermark
+		self._state.enable_decode_preemption = self.enable_decode_preemption
 		self._index = IndexManager(self._state)
 		self._sync = SyncCoordinator(self._state)
 		self._kv = KVCacheManager(self._state, self._index, token_budget_fn=self._get_sequence_token_budget)
