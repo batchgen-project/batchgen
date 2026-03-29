@@ -30,6 +30,8 @@ from .scheduler.host_mem import get_physical_memory_info
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
+
+REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "0") == "1"
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
 import gc
@@ -7652,8 +7654,8 @@ class BatchGenWorker:
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
 
-				# Repetition detection: consecutive same-token check
-				if not seq._rep_detected:
+				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
+				if REP_DETECTION and not seq._rep_detected:
 					if token_id == seq._rep_last_token:
 						seq._rep_count += 1
 						if seq._rep_count >= 32:
@@ -8518,8 +8520,8 @@ class BatchGenWorker:
 						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
-						# Repetition detection
-						if not seq._rep_detected:
+						# Repetition detection (BATCHGEN_REP_DETECTION=1)
+						if REP_DETECTION and not seq._rep_detected:
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:
@@ -8611,8 +8613,8 @@ class BatchGenWorker:
 						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
 
-						# Repetition detection
-						if not seq._rep_detected:
+						# Repetition detection (BATCHGEN_REP_DETECTION=1)
+						if REP_DETECTION and not seq._rep_detected:
 							if token_id == seq._rep_last_token:
 								seq._rep_count += 1
 								if seq._rep_count >= 32:
