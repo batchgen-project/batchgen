@@ -488,12 +488,17 @@ class DecodeScheduler:
 							f"before putting sequences ON_HOLD"
 						)
 					
+					# Filter to IN_DECODE only — decode_uuids may contain EVICTED/COMPLETED/QUEUEING
+					in_decode_uuids = [
+						u for u in decode_uuids
+						if self.state.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
+					]
 					logging.info(
-						f"[WATERMARK] Rank {self.state.rank}: Decode interrupted - putting {len(decode_uuids)} "
-						f"sequences ON_HOLD, will trigger prefill"
+						f"[WATERMARK] Rank {self.state.rank}: Decode interrupted - putting {len(in_decode_uuids)} "
+						f"sequences ON_HOLD (filtered from {len(decode_uuids)} decode_uuids), will trigger prefill"
 					)
-					# Put all remaining sequences ON_HOLD
-					self._worker._rebalancer.put_on_hold(decode_uuids)
+					if in_decode_uuids:
+						self._worker._rebalancer.put_on_hold(in_decode_uuids)
 					# Exit decode loop - will return to generate() which will trigger prefill
 					break
 				
