@@ -90,22 +90,32 @@ def form_options(options: List[str]) -> str:
 def extract_prediction(model_output: str) -> Optional[str]:
     """Extract the predicted letter answer from model output.
 
-    For GPT-OSS models using Harmony format:
-    1. Parse the output to extract 'final' channel content
-    2. Apply answer extraction patterns to final content only
-    3. Fall back to full output if parsing fails
+    Handles multiple output formats:
+    - Harmony format (GPT-OSS): extracts from 'final' channel
+    - Thinking format (K2.5, R1): extracts from post-</think> section
+    - Plain text: extracts from full output
+
+    Uses LAST match (not first) to prefer the final answer over
+    intermediate reasoning in thinking models.
 
     Args:
-        model_output: Raw model output string (may contain Harmony tokens)
+        model_output: Raw model output string
 
     Returns:
         Extracted answer letter (A-J) or None if not found
     """
-    # Parse Harmony format to get final channel content
+    # Step 1: Determine search text based on output format
+    # Check Harmony format first (GPT-OSS)
     analysis_content, final_content = parse_harmony_output(model_output)
-
-    # Prefer final channel content, fall back to full output
-    search_text = final_content if final_content else model_output
+    if "<|channel|>" in model_output and final_content:
+        search_text = final_content
+    else:
+        # Check thinking format (K2.5, R1): extract post-</think> section
+        think_end = model_output.find("</think>")
+        if think_end != -1:
+            search_text = model_output[think_end + len("</think>"):]
+        else:
+            search_text = model_output
 
     # Answer extraction patterns (adapted from OpenAI's abcd_grader.py)
     # Extended to support A-J for MMLU-Pro's 10-choice questions
@@ -132,10 +142,11 @@ def extract_prediction(model_output: str) -> Optional[str]:
         r"^\s*([ABCDEFGHIJ])\s*$",
     ]
 
+    # Use findall + last match to prefer final answer over intermediate reasoning
     for pattern in patterns:
-        match = re.search(pattern, search_text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            return match.group(1).upper()
+        matches = re.findall(pattern, search_text, re.IGNORECASE | re.MULTILINE)
+        if matches:
+            return matches[-1].upper()
 
     return None
 
