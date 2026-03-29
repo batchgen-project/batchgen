@@ -13,7 +13,7 @@ Usage:
 Environment variables:
     MAX_JOBS        — parallel file compilation (default: cpu_count/2)
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
-    BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
+    BUILD_ARCH      — "sm90a" (default), "sm100", "sm120", or "all". Controls which arch kernels to build
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
@@ -83,6 +83,7 @@ if not os.environ.get("CUDA_HOME"):
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
+_build_sm120 = _build_arch in ("sm120", "all")
 
 # ── Multi-architecture flag sets ──
 
@@ -98,8 +99,15 @@ if _cuda_version:
     _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
     if (_cuda_major, _cuda_minor) >= (12, 8):
         _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
+    if (_cuda_major, _cuda_minor) >= (13, 0):
+        _sm80_gencode += ["-gencode", "arch=compute_120,code=sm_120"]
 
 _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
+
+# SM120 (Blackwell desktop/workstation: RTX PRO 6000, etc.)
+# Uses tcgen05 MMA (same as SM100), NOT WGMMA. Requires CUDA >= 13.0.
+_sm120_flags = ["-std=c++17", "-arch=sm_120", "-O3", "--ptxas-options=-v",
+                "-lineinfo", "--threads", _nvcc_threads]
 
 # ── Build extension list ──
 
@@ -361,12 +369,92 @@ _sm80_extensions = [
     ),
 ]
 
+# SM120 (Blackwell desktop/workstation) — F8F6F4 MMA kernels (NOT tcgen05)
+# SM120 uses mma.sync.aligned.kind::f8f6f4 (register-based, like SM80).
+# SM120 does NOT support WGMMA or tcgen05/TMEM.
+# These are SM120-native kernels + generic attention kernels recompiled for SM120.
+
+_sm120_gencode = ["-gencode", "arch=compute_120,code=sm_120"]
+_sm120_generic_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm120_gencode
+
+_sm120_extensions = [
+    # ── Generic attention kernels (no WGMMA, just recompiled for SM120) ──
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_kv_norm_rope",
+        sources=["src/attention/fused_kv_norm_rope_cache.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "--threads", _nvcc_threads] + _sm120_gencode,
+        },
+    ),
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_q_absorb",
+        sources=["src/attention/fused_q_absorb.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "--threads", _nvcc_threads] + _sm120_gencode,
+        },
+    ),
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_q_split",
+        sources=["src/attention/fused_q_split.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "--threads", _nvcc_threads] + _sm120_gencode,
+        },
+    ),
+    # ── Marlin W4A16 (SM80+ MMA, recompiled for SM120) ──
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_marlin_grouped_gemm",
+        sources=["src/moe/marlin_grouped_gemm.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "--use_fast_math", "-lineinfo",
+                     "-DUSE_BF16_COMPUTE",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads] + _sm120_gencode,
+        },
+    ),
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_marlin_transform",
+        sources=["src/moe/marlin_transform_kernel.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17",
+                     "--use_fast_math",
+                     "--threads", _nvcc_threads] + _sm120_gencode,
+        },
+    ),
+    # ── SM120 F8F6F4 MMA kernels (to be added) ──
+    # - FP8 grouped GEMM (mma.sync F8F6F4 + TMA)
+    # - FP8 blockwise GEMM (MXF8F6F4 blockscale)
+    # - QKV projection (F8F6F4)
+    #
+    # TODO: Port non-WGMMA routing kernels from _sm90a_extensions:
+    #   gate_topk_softmax.cu, dispatch_count_gather.cu, reduce_weighted_scatter.cu,
+    #   gate_sigmoid_topk.cu, router_epilogue.cu — all are generic SM80+ code
+    #   but compiled with compute_90a gencode. fused_gate.cu uses WGMMA → needs rewrite.
+    #
+    # TODO: Port dispatch_scatter_3d.cu (already SM80+ compatible)
+]
+
 # Assemble final extension list based on build flags
 _ext_modules = []
 if _build_sm90a:
     _ext_modules.extend(_sm90a_extensions)
 else:
     print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
+if _build_sm120:
+    _ext_modules.extend(_sm120_extensions)
+else:
+    if _build_arch == "sm120":
+        pass  # SM120-only build: only SM120 + SM80 kernels
+    else:
+        print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM120 kernels")
 _ext_modules.extend(_sm80_extensions)
 
 setup(

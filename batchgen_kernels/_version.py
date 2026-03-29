@@ -6,6 +6,7 @@ __init__.py re-exports __version__ and version_info at runtime.
 BUILD_ARCH env var controls the arch suffix in wheel names:
   "sm90a" (default) -> batchgen_kernels-0.2.0+sm90a
   "sm100"           -> batchgen_kernels-0.2.0+sm100
+  "sm120"           -> batchgen_kernels-0.2.0+sm120
   "all"             -> batchgen_kernels-0.2.0 (no suffix)
 """
 

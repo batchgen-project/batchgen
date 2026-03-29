@@ -1,7 +1,7 @@
 """batchgen_kernels — Pre-compiled CUDA kernels for BatchGen inference.
 
 Provides attention decode, MoE WGMMA, routing, and utility kernels.
-Requires SM90+ GPU (H100/H20/H800) or SM100+ (Blackwell).
+Requires SM90+ GPU (H100/H20/H800), SM100+ (B200/GB200), or SM120 (RTX PRO 6000).
 
 Usage:
     from batchgen_kernels.attention import attention_decode_bf16
@@ -70,11 +70,22 @@ def _jit_compile(module_name: str):
 
 
 def get_device_arch() -> str:
-    """Detect GPU architecture for kernel selection."""
+    """Detect GPU architecture for kernel selection.
+
+    Returns:
+        "sm120" for compute capability >= 12.0 (RTX PRO 6000, etc.)
+        "sm100" for compute capability >= 10.0 (B200, GB200, etc.)
+        "sm90a" for compute capability >= 9.0 (H100, H20, etc.)
+
+    Note: SM120 and SM100 have different instruction sets despite both being
+    "Blackwell". SM120 uses F8F6F4 MMA (register-based), SM100 uses tcgen05 (TMEM).
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("batchgen_kernels requires CUDA")
     cc = torch.cuda.get_device_capability()
-    if cc[0] >= 10:
+    if cc[0] >= 12:
+        return "sm120"
+    elif cc[0] >= 10:
         return "sm100"
     elif cc[0] >= 9:
         return "sm90a"

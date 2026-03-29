@@ -763,7 +763,7 @@ class KimiK25ParallelStrategyManager:
         start_time = time.perf_counter()
         for layer_idx in range(len(self.model.model.layers)):
             attn_module = self.model.model.layers[layer_idx].self_attn
-            if self.engine_config.Basic_Config.gpu_arch == "hopper":
+            if self.engine_config.Basic_Config.gpu_arch in ("hopper", "blackwell"):
                 from batchgen.attention.mla.fa3_backend import (
                     mla_prefill_flashattention3,
                     mla_prefill_flashattention3_prepacked,
