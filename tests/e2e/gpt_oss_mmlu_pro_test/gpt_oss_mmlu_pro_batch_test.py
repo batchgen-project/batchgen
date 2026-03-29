@@ -508,8 +508,16 @@ if __name__ == "__main__":
         top_p=args.top_p,
     )
 
-    # Sort results by custom_id to match original order
+    # Sort results by custom_id (mmlu-{idx}) to match original dataset order
     results.sort(key=lambda x: int(x.get("custom_id", "mmlu-0").split("-")[1]))
+
+    # Build custom_id → dataset index map for correct scoring
+    # custom_id is "mmlu-{idx}" where idx is the row index in the dataset
+    result_dataset_indices = []
+    for result in results:
+        custom_id = result.get("custom_id", "mmlu-0")
+        dataset_idx = int(custom_id.split("-")[1])
+        result_dataset_indices.append(dataset_idx)
 
     # Extract answers from results
     answer_set: List[str] = []
@@ -558,12 +566,15 @@ if __name__ == "__main__":
         print("-" * 50)
 
     # Print results with Harmony format parsing info
-    ground_truths = dataset["answer"].tolist()
+    # Use dataset index from custom_id for ground truth lookup
+    all_ground_truths = dataset["answer"].tolist()
     if args.verbose:
         # Verbose mode: print all samples with extracted vs ground truth
         for idx in range(len(answer_set)):
+            ds_idx = result_dataset_indices[idx]
+            gt = all_ground_truths[ds_idx]
             print("=" * 70)
-            print(f"[Sample {idx}]")
+            print(f"[Sample mmlu-{ds_idx}]")
             print(f"Query: {queries[idx][:500]}...")
             print(f"\nRaw Answer: {answer_set[idx][:1000]}")
             # Show parsed Harmony channels
@@ -576,8 +587,8 @@ if __name__ == "__main__":
             extracted = extract_prediction(answer_set[idx])
             print(f"\n--- Extracted vs Ground Truth ---")
             print(f"Extracted Choice: {extracted if extracted else '(FAILED)'}")
-            print(f"Ground Truth: {ground_truths[idx]}")
-            print(f"Result: {'CORRECT' if extracted == ground_truths[idx] else 'WRONG'}")
+            print(f"Ground Truth: {gt}")
+            print(f"Result: {'CORRECT' if extracted == gt else 'WRONG'}")
             print("=" * 70 + "\n")
     else:
         # Print first 5 samples for brevity (default behavior)
@@ -594,7 +605,7 @@ if __name__ == "__main__":
                 print(f"Final channel: {final[:300]}..." if final else "Final: (none)")
             print("==================================================================")
 
-    # Evaluate accuracy
+    # Evaluate accuracy — match by custom_id (mmlu-{dataset_idx}), not position
     success = 0
     extraction_failures = 0
     predictions: List[str] = []
@@ -602,6 +613,8 @@ if __name__ == "__main__":
     incorrect_samples: List[Dict[str, Any]] = []
 
     for i in range(total_samples):
+        ds_idx = result_dataset_indices[i]
+        gt = all_ground_truths[ds_idx]
         model_output = answer_set[i]
         extracted_answer = extract_prediction(model_output)
         if extracted_answer:
@@ -610,14 +623,14 @@ if __name__ == "__main__":
             extraction_failures += 1
             prediction = "Z"
         predictions.append(prediction)
-        if prediction == ground_truths[i]:
+        if prediction == gt:
             success += 1
         else:
             incorrect_samples.append(
                 {
-                    "id": i,
+                    "id": ds_idx,
                     "extracted": prediction,
-                    "ground_truth": ground_truths[i],
+                    "ground_truth": gt,
                     "extraction_failed": extracted_answer is None,
                 }
             )
