@@ -82,6 +82,13 @@ class SequenceEntry:
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
         '_buffer_slot',  # Index into QueryBookBufferPool buffers
+        # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
+        '_lifespan_log',   # List[SeqEventRecord], ring buffer
+        '_lifespan_idx',   # int, next write position
+        # Repetition detection
+        '_rep_last_token',  # int, last token ID seen
+        '_rep_count',       # int, consecutive same-token count
+        '_rep_detected',    # bool, whether repetition was detected
     )
 
     VALID_TRANSITIONS = {
@@ -137,6 +144,36 @@ class SequenceEntry:
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
         self._buffer_slot: int = -1
+
+        # Lifespan monitoring
+        self._lifespan_log: list = []
+        self._lifespan_idx: int = 0
+
+        # Repetition detection
+        self._rep_last_token: int = -1
+        self._rep_count: int = 0
+        self._rep_detected: bool = False
+
+    def log_event(self, event: int, rank: int, detail: str = "") -> None:
+        """Log a lifespan event. No-op when BATCHGEN_SEQ_LIFESPAN is not set."""
+        from batchgen.lifespan import ENABLED, MAX_EVENTS, SeqEventRecord
+        if not ENABLED:
+            return
+        record = SeqEventRecord(
+            event=event,
+            rank=rank,
+            decoded_length=self.decoded_length,
+            current_ctx=self.current_context_length,
+            expected_ctx=self.original_prompt_length + self.decoded_length,
+            gpu_pages=self.gpu_pages_allocated,
+            host_pages=self.host_pages_allocated,
+            detail=detail,
+        )
+        if len(self._lifespan_log) < MAX_EVENTS:
+            self._lifespan_log.append(record)
+        else:
+            self._lifespan_log[self._lifespan_idx % MAX_EVENTS] = record
+        self._lifespan_idx += 1
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:

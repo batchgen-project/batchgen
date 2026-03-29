@@ -28,6 +28,8 @@ from .models.deepseek.deepseek_parameter_server import DeepSeek_Parameter_Server
 from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
+from batchgen import lifespan
+from batchgen.lifespan import SeqEvent
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
 import gc
@@ -892,15 +894,30 @@ class BatchGenWorker:
 		if seq.eos_reached and not self._ignore_eos:
 			return True
 
+		# Repetition detected
+		if seq._rep_detected:
+			return True
+
 		return False
 
 	def _get_finish_reason(self, seq) -> str:
 		"""Return OpenAI-compatible finish_reason for a completed sequence."""
+		# Repetition detected — dump lifespan for root cause analysis
+		if seq._rep_detected:
+			seq.log_event(SeqEvent.COMPLETED, self.rank, "finish_reason=repetition")
+			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "REPETITION_COMPLETE")
+			return "repetition"
 		# EOS takes priority (natural completion)
 		if seq.eos_reached and not self._ignore_eos:
-			return "stop"
-		# Otherwise it's a length limit (decode cap or context cap)
-		return "length"
+			finish = "stop"
+		else:
+			finish = "length"
+		# Log completion event
+		seq.log_event(SeqEvent.COMPLETED, self.rank, f"finish_reason={finish}")
+		# Dump lifespan if non-stop or any ctx mismatch was recorded
+		if finish != "stop" or lifespan.has_ctx_mismatch(seq._lifespan_log):
+			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, f"COMPLETE_{finish.upper()}")
+		return finish
 
 	def _compute_two_page_buffer_allocation(
 		self, 
@@ -2670,6 +2687,15 @@ class BatchGenWorker:
 			# get_sequences_for_rank_with_status() - without this, the index
 			# becomes inconsistent and causes cross-rank state divergence.
 			try:
+				seq_for_log = self.global_batch.get_sequence(uuid)
+				if seq_for_log:
+					old_rank = seq_for_log.assigned_rank
+					if old_rank == self.rank:
+						seq_for_log.log_event(SeqEvent.MIGRATE_SEND, self.rank,
+							f"to_rank={new_rank}")
+					elif new_rank == self.rank:
+						seq_for_log.log_event(SeqEvent.MIGRATE_RECV, self.rank,
+							f"from_rank={old_rank}")
 				self.global_batch.assign_rank(uuid, new_rank)
 			except KeyError:
 				logging.error(f"Rank {self.rank}: Cannot update ownership for {uuid[:8]}... - sequence not found")
@@ -2859,6 +2885,7 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 				text=text,
 			)
+			seq.log_event(SeqEvent.CREATED, self.rank, f"max_dec={max_dec}")
 			self.global_batch.add_sequence(seq)
 
 		# VALIDATION: All ranks must have same global batch size
@@ -3030,8 +3057,10 @@ class BatchGenWorker:
 						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
 						f"{seq.current_context_length} → {expected_ctx}"
 					)
+					seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
+						f"old={seq.current_context_length}, new={expected_ctx}")
 					seq.current_context_length = expected_ctx
-				
+
 				local_state[uuid] = {
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
@@ -3072,6 +3101,8 @@ class BatchGenWorker:
 									f"received={seq.current_context_length}, expected={expected_ctx} "
 									f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
 								)
+								seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
+									f"sync_recv old={seq.current_context_length}, new={expected_ctx}")
 								seq.current_context_length = expected_ctx
 
 	def _sync_completion_status_tensor(
@@ -3679,6 +3710,7 @@ class BatchGenWorker:
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			seq.gpu_pages_allocated = 0
+			seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=watermark")
 			self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
 		# Synchronize state across all ranks
@@ -4100,10 +4132,12 @@ class BatchGenWorker:
 			ctx_lens[i] = seq.current_context_length
 			eos_flags[i] = seq.eos_reached and not ignore_eos
 
+		rep_flags = torch.tensor([seqs[i]._rep_detected for i in range(n)], dtype=torch.bool)
 		completed_mask = (
 			(decoded_lens >= max_lens)
 			| (ctx_lens >= self.model_context_length)
 			| eos_flags
+			| rep_flags
 		)
 
 		completed_uuids = []
@@ -4576,6 +4610,11 @@ class BatchGenWorker:
 				if prefill_uuids:
 					if self.rank == 0:
 						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
+					for uuid in prefill_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						is_reentry = seq.evicted_token_ids is not None
+						seq.log_event(SeqEvent.PREFILL_START, self.rank,
+							f"evicted_reentry={is_reentry}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.IN_PREFILL)
 
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
@@ -4610,6 +4649,10 @@ class BatchGenWorker:
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
+					for uuid in prefill_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
+							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
 					dist.barrier()
 
@@ -4679,6 +4722,11 @@ class BatchGenWorker:
 				if not decode_uuids:
 					break
 				
+				for uuid in decode_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					prev_status = "ON_HOLD" if seq.had_initial_gpu_reservation else "PREFILLED"
+					seq.log_event(SeqEvent.DECODE_START, self.rank,
+						f"from={prev_status}")
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 
 				# ============ CRITICAL: Sync metadata before decode config ============
@@ -4953,6 +5001,8 @@ class BatchGenWorker:
 			evicted_ids = seq.evicted_token_ids  # 1D tensor
 			new_prompt_len = len(evicted_ids)
 			prev_decoded = seq.total_decoded_before_eviction
+			seq.log_event(SeqEvent.REENTRY_START, self.rank,
+				f"new_prompt_len={new_prompt_len}, prev_decoded={prev_decoded}")
 
 			# Rebuild input_ids with new prompt — reuse buffer pool slot
 			# kv_token_budget stays unchanged (Q5 answer)
@@ -5194,6 +5244,8 @@ class BatchGenWorker:
 			# Repair if mismatched
 			if seq.current_context_length != expected_ctx:
 				old_ctx = seq.current_context_length
+				seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
+					f"config_decode old={old_ctx}, new={expected_ctx}")
 				seq.current_context_length = expected_ctx
 				ctx_len_repaired_count += 1
 				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
@@ -6254,6 +6306,12 @@ class BatchGenWorker:
 					# Sync host KV fields to keep all ranks consistent for migration planning
 					seq.host_pages_allocated = state['host_pages_allocated']
 					seq.host_token_capacity = state['host_token_capacity']
+					# Validate gathered ctx_len
+					expected_ctx = seq.original_prompt_length + seq.decoded_length
+					if seq.current_context_length != expected_ctx:
+						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
+							f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
+						seq.current_context_length = expected_ctx
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
@@ -6381,6 +6439,9 @@ class BatchGenWorker:
 			# Update status (all ranks)
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
+				saved = len(seq.evicted_token_ids) if seq.evicted_token_ids is not None else 0
+				seq.log_event(SeqEvent.EVICTED, self.rank,
+					f"saved_tokens={saved}, decoded={seq.decoded_length}")
 				seq.gpu_pages_allocated = 0
 				seq.host_pages_allocated = 0
 				seq.host_token_capacity = 0
@@ -6423,6 +6484,8 @@ class BatchGenWorker:
 					self._sequences_with_gpu_kv.discard(uuid)
 
 			for uuid in onhold_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=boundary")
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
 			decode_uuids = [u for u in decode_uuids if u not in onhold_set]
@@ -6637,10 +6700,10 @@ class BatchGenWorker:
 		"""Minimal finalize without extra rebuilds - rebuild done once at end."""
 		Attn_Wrapper.async_kv_load_active = False
 		Attn_Wrapper.async_kv_load_task = None
-		
+
 		if hasattr(self, '_async_load_tensors'):
 			self._async_load_tensors = None
-		
+
 		# VALIDATION: Verify all pending_uuids exist and have assigned ranks
 		valid_pending_uuids = []
 		for uuid in pending_uuids:
@@ -6652,13 +6715,13 @@ class BatchGenWorker:
 				logging.error(f"Rank {self.rank}: pending_uuid {uuid} has no assigned_rank!")
 				continue
 			valid_pending_uuids.append(uuid)
-		
+
 		if len(valid_pending_uuids) != len(pending_uuids):
 			logging.warning(
 				f"Rank {self.rank}: Filtered {len(pending_uuids) - len(valid_pending_uuids)} invalid "
 				f"pending_uuids out of {len(pending_uuids)}"
 			)
-		
+
 		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
 
 		for local_idx in pending_local_indices:
@@ -6668,6 +6731,15 @@ class BatchGenWorker:
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
+			# Validate context length after async load finalize
+			expected_ctx = seq.original_prompt_length + seq.decoded_length
+			if seq.current_context_length != expected_ctx:
+				seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
+					f"finalize_ctx={seq.current_context_length}, expected={expected_ctx}")
+				lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH_FINALIZE")
+				seq.current_context_length = expected_ctx
+			seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
+				f"gpu_pages={seq.gpu_pages_allocated}")
 			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
 			if local_idx in self.query_book:
 				self.query_book[local_idx] = query(
@@ -7313,14 +7385,23 @@ class BatchGenWorker:
 
 			with torch.inference_mode():
 				if batch:
-					# Collect context lengths, handling rare edge case of ctx_len == 0
+					# Collect context lengths with invariant validation
+					# ALWAYS: current_context_length == original_prompt_length + decoded_length
 					cache_seqlens = []
 					for seq in batch_sequences:
 						ctx_len = seq.current_context_length
-						if ctx_len == 0:  # Rare edge case - trust prompt_length + decoded_length
-							ctx_len = seq.original_prompt_length + seq.decoded_length
-							if ctx_len > 0:
-								seq.current_context_length = ctx_len
+						expected = seq.original_prompt_length + seq.decoded_length
+						if ctx_len != expected:
+							logging.error(
+								f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
+								f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
+								f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
+							)
+							seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
+								f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
+							lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
+							seq.current_context_length = expected
+							ctx_len = expected
 						cache_seqlens.append(ctx_len)
 
 					max_ctx = max(cache_seqlens)
@@ -7370,6 +7451,10 @@ class BatchGenWorker:
 							if slot_order != batch_global_order:
 								# Fix: Rebuild page table to match batch order
 								gpu_manager.rebuild_page_table(batch_global_order)
+								# Log page rebuild for affected sequences
+								for seq in batch_sequences:
+									seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
+										f"batch_size={len(batch)}")
 						_page_table_verified_this_batch = True
 				
 				# NOTE: Do NOT skip forward pass even with empty batch!
@@ -7539,11 +7624,31 @@ class BatchGenWorker:
 				seq.current_context_length += 1
 
 				# Use CPU tensor to avoid GPU sync
-				if self._should_stop_at_eos(new_tokens_cpu[i].item()):
+				token_id = new_tokens_cpu[i].item()
+				if self._should_stop_at_eos(token_id):
 					seq.eos_reached = True
 
 				if seq.decoded_length >= seq.max_decode_length:
 					seq.eos_reached = True
+
+				# Repetition detection: consecutive same-token check
+				if not seq._rep_detected:
+					if token_id == seq._rep_last_token:
+						seq._rep_count += 1
+						if seq._rep_count >= 32:
+							seq._rep_detected = True
+							seq.eos_reached = True
+							seq.log_event(SeqEvent.REPETITION, self.rank,
+								f"token={token_id}, count={seq._rep_count}")
+							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+								seq._lifespan_log, "REPETITION")
+							logging.warning(
+								f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
+								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+							)
+					else:
+						seq._rep_last_token = token_id
+						seq._rep_count = 1
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
@@ -8384,12 +8489,28 @@ class BatchGenWorker:
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
 
 						# Only mark eos_reached if we should stop at EOS
-						if self._should_stop_at_eos(new_tokens[i].item()):
+						token_id = new_tokens[i].item()
+						if self._should_stop_at_eos(token_id):
 							seq.eos_reached = True
-						
+
 						# Always check max length
 						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
+
+						# Repetition detection
+						if not seq._rep_detected:
+							if token_id == seq._rep_last_token:
+								seq._rep_count += 1
+								if seq._rep_count >= 32:
+									seq._rep_detected = True
+									seq.eos_reached = True
+									seq.log_event(SeqEvent.REPETITION, self.rank,
+										f"token={token_id}, count={seq._rep_count}")
+									lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+										seq._lifespan_log, "REPETITION")
+							else:
+								seq._rep_last_token = token_id
+								seq._rep_count = 1
 
 				new_token_idx += 1
 
@@ -8461,12 +8582,28 @@ class BatchGenWorker:
 						seq.current_context_length = seq.prompt_length + new_token_idx + 1
 
 						# Only mark eos_reached if we should stop at EOS
-						if self._should_stop_at_eos(new_tokens[i].item()):
+						token_id = new_tokens[i].item()
+						if self._should_stop_at_eos(token_id):
 							seq.eos_reached = True
-						
+
 						# Always check max length
 						if seq.decoded_length >= seq.max_decode_length:
 							seq.eos_reached = True
+
+						# Repetition detection
+						if not seq._rep_detected:
+							if token_id == seq._rep_last_token:
+								seq._rep_count += 1
+								if seq._rep_count >= 32:
+									seq._rep_detected = True
+									seq.eos_reached = True
+									seq.log_event(SeqEvent.REPETITION, self.rank,
+										f"token={token_id}, count={seq._rep_count}")
+									lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+										seq._lifespan_log, "REPETITION")
+							else:
+								seq._rep_last_token = token_id
+								seq._rep_count = 1
 
 				new_token_idx += 1
 
