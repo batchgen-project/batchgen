@@ -156,15 +156,17 @@ class SequenceEntry:
 
     def log_event(self, event: int, rank: int, detail: str = "") -> None:
         """Log a lifespan event. No-op when BATCHGEN_SEQ_LIFESPAN is not set."""
-        from batchgen.lifespan import ENABLED, MAX_EVENTS, SeqEventRecord
+        import logging
+        from batchgen.lifespan import ENABLED, MAX_EVENTS, SeqEvent, SeqEventRecord
         if not ENABLED:
             return
+        expected_ctx = self.original_prompt_length + self.decoded_length
         record = SeqEventRecord(
             event=event,
             rank=rank,
             decoded_length=self.decoded_length,
             current_ctx=self.current_context_length,
-            expected_ctx=self.original_prompt_length + self.decoded_length,
+            expected_ctx=expected_ctx,
             gpu_pages=self.gpu_pages_allocated,
             host_pages=self.host_pages_allocated,
             detail=detail,
@@ -174,6 +176,18 @@ class SequenceEntry:
         else:
             self._lifespan_log[self._lifespan_idx % MAX_EVENTS] = record
         self._lifespan_idx += 1
+        # Write to server log for immediate visibility
+        try:
+            name = SeqEvent(event).name
+        except ValueError:
+            name = f"EVT{event}"
+        mismatch = " ***MISMATCH***" if self.current_context_length != expected_ctx else ""
+        logging.info(
+            f"[LIFESPAN] {self.uuid[:8]} gid={self.global_idx} {name} "
+            f"rank={rank} dec={self.decoded_length} ctx={self.current_context_length} "
+            f"exp={expected_ctx} gpu_pg={self.gpu_pages_allocated} "
+            f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
+        )
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:

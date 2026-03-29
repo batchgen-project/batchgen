@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 ENABLED = os.environ.get("BATCHGEN_SEQ_LIFESPAN", "0") == "1"
 MAX_EVENTS = 256
 
+if ENABLED:
+    logging.getLogger(__name__).info("[LIFESPAN] Sequence lifespan monitoring ENABLED")
+
 # Session start time — set once at import, used for relative timestamps
 _SESSION_START = time.perf_counter()
 
