@@ -4619,8 +4619,13 @@ class BatchGenWorker:
 
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
 					config_start = time.perf_counter()
-					self._config_prefill_for_batch(prefill_uuids)
+					skipped_uuids = self._config_prefill_for_batch(prefill_uuids)
 					config_prefill_time += time.perf_counter() - config_start
+
+					# Remove skipped sequences (host KV exhaustion) from prefill batch
+					if skipped_uuids:
+						skipped_set = set(skipped_uuids)
+						prefill_uuids = [u for u in prefill_uuids if u not in skipped_set]
 
 					# Get local indices AFTER config (new sequences now in map)
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
@@ -4904,7 +4909,7 @@ class BatchGenWorker:
 
 	# ============ Phase Configuration ============
 
-	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
+	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> List[str]:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
 		if self.rank == 0:
@@ -5080,9 +5085,11 @@ class BatchGenWorker:
 						f"(local_idx={new_local_idx})"
 					)
 
+		skipped_uuids = []
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
+			sequence_pages = []
 			chunk_size = self._get_effective_chunk_size()
 
 			for uuid in my_prefill_uuids:
@@ -5100,25 +5107,71 @@ class BatchGenWorker:
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
 				sequence_tokens.append(initial_capacity)
+				sequence_pages.append(math.ceil(initial_capacity / seq.PAGE_SIZE))
 				seq.host_token_capacity = initial_capacity
-				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+				seq.host_pages_allocated = sequence_pages[-1]
 
-			logging.debug(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
-				f"(chunk_size={chunk_size})"
-			)
+			# Guard: verify free pages before allocation to prevent crash
+			total_pages_needed = sum(sequence_pages)
+			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
+			free_pages = kv_stats.num_free_pages
 
-			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(global_sequence_ids, sequence_tokens))
-			)
+			if total_pages_needed > free_pages:
+				# Trim: keep sequences that fit, skip the rest
+				fitting_ids = []
+				fitting_tokens = []
+				fitting_uuids = []
+				pages_used = 0
+				for gid, tokens, pages, uuid in zip(
+					global_sequence_ids, sequence_tokens, sequence_pages, my_prefill_uuids
+				):
+					if pages_used + pages <= free_pages:
+						fitting_ids.append(gid)
+						fitting_tokens.append(tokens)
+						fitting_uuids.append(uuid)
+						pages_used += pages
+					else:
+						# Revert metadata for skipped sequence
+						seq = self.global_batch.get_sequence(uuid)
+						seq.host_token_capacity = 0
+						seq.host_pages_allocated = 0
+						skipped_uuids.append(uuid)
+				logging.warning(
+					f"Rank {self.rank}: Host KV trimmed prefill batch: "
+					f"{len(fitting_ids)}/{len(my_prefill_uuids)} fit "
+					f"(need {total_pages_needed} pages, have {free_pages}, "
+					f"skipped {len(skipped_uuids)})"
+				)
+				global_sequence_ids = fitting_ids
+				sequence_tokens = fitting_tokens
+				my_prefill_uuids = fitting_uuids
+
+			if global_sequence_ids:
+				logging.debug(
+					f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
+					f"(chunk_size={chunk_size})"
+				)
+				self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
+				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
+					list(zip(global_sequence_ids, sequence_tokens))
+				)
 
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
 			if self.rank == 0:
 				logging.info(f"[PREFILL] Host KV allocated: {kv_stats.num_used_pages}/{kv_stats.num_total_pages} pages")
 
+		# Revert skipped sequences back to their prior status
+		for uuid in skipped_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.evicted_token_ids is not None:
+				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
+			else:
+				self.global_batch.update_status(uuid, SequenceStatus.QUEUEING)
+
 		if self.rank == 0:
 			logging.info(f"[PREFILL] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms")
+
+		return skipped_uuids
 
 	def _load_decode_model(self, max_num_seq: int, comm=None) -> None:
 		"""
