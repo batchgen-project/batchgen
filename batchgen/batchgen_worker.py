@@ -3635,6 +3635,11 @@ class BatchGenWorker:
 
 		# Step 3: Select sequences considering per-node host KV capacity
 		# Use chunk-based pages instead of full kv_token_budget
+		# Safety margin: reserve 1% of total pages to absorb timing drift between
+		# selection (here) and allocation (_config_prefill_for_batch). Active decode
+		# sequences may grow host KV via chunk extensions between these two points.
+		safety_margin_pages = max(100, int(per_node_host_free[0] * 0.01)) if per_node_host_free else 100
+		per_node_effective_free = [max(0, f - safety_margin_pages) for f in per_node_host_free]
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
 
@@ -3653,7 +3658,7 @@ class BatchGenWorker:
 			initial_capacity = min(initial_capacity, seq.kv_token_budget)
 			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
-			if node_pages_used[seq_node] + req_pages <= per_node_host_free[seq_node]:
+			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
 
