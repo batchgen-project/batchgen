@@ -4149,6 +4149,27 @@ class BatchGenWorker:
 			ctx_lens[i] = seq.current_context_length
 			eos_flags[i] = seq.eos_reached and not ignore_eos
 
+		# Always-on periodic repetition detection at decision boundary
+		# Check if last 64 tokens == previous 64 tokens (catches period <= 64)
+		# Only flag if >= 4 unique tokens (avoids false alarm on table dashes/formatting)
+		_REP_W = 64
+		for i in range(n):
+			seq = seqs[i]
+			if seq.decoded_length >= 2 * _REP_W and not seq._rep_detected:
+				uuid = decode_uuids[i]
+				local_idx = self._uuid_to_local_map.get(uuid)
+				if local_idx is not None and local_idx in self.query_book:
+					dl = seq.decoded_length
+					tokens = self.query_book[local_idx].decoded_tokens[0]
+					window = tokens[dl - _REP_W : dl]
+					if window.unique().numel() >= 4 and torch.equal(tokens[dl - 2 * _REP_W : dl - _REP_W], window):
+						seq._rep_detected = True
+						seq.eos_reached = True
+						logging.warning(
+							f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
+							f"gid={seq.global_idx} at decoded_len={dl}"
+						)
+
 		rep_flags = torch.tensor([seqs[i]._rep_detected for i in range(n)], dtype=torch.bool)
 		completed_mask = (
 			(decoded_lens >= max_lens)
@@ -7675,22 +7696,6 @@ class BatchGenWorker:
 					else:
 						seq._rep_last_token = token_id
 						seq._rep_count = 1
-					# Periodic multi-token pattern check every 128 steps
-					if not seq._rep_detected and seq.decoded_length >= 256 and seq.decoded_length % 128 == 0:
-						tokens = self.query_book[local_idx].decoded_tokens[0, seq.decoded_length - 256 : seq.decoded_length]
-						for period in (2, 3, 4, 6, 8, 12, 16):
-							if torch.equal(tokens[period:], tokens[:256 - period]):
-								seq._rep_detected = True
-								seq.eos_reached = True
-								seq.log_event(SeqEvent.REPETITION, self.rank,
-									f"periodic period={period}, decoded_len={seq.decoded_length}")
-								lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-									seq._lifespan_log, "REPETITION_PERIODIC")
-								logging.warning(
-									f"Rank {self.rank}: REPETITION (periodic p={period}) "
-									f"{seq.uuid[:8]} gid={seq.global_idx} at decoded_len={seq.decoded_length}"
-								)
-								break
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
