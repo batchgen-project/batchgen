@@ -1368,7 +1368,10 @@ class BatchGenWorker:
 		# This is used for completion criteria: prompt_length + decoded_length < context_length
 		model_max = getattr(self.model_config, 'max_position_embeddings', 131072)
 		client_max = getattr(self, 'max_context_length', None)
-		self.model_context_length = model_max if client_max is None else min(model_max, client_max)
+		# Model's native context window is the only hard cap.
+		# Batch-level max_context_length should NOT override per-request max_tokens.
+		# Per-request values are ground truth (docs/input-format.md).
+		self.model_context_length = model_max
 		if self.rank == 0:
 			logging.info(
 				f"Model context length set to {self.model_context_length} "
@@ -7672,6 +7675,22 @@ class BatchGenWorker:
 					else:
 						seq._rep_last_token = token_id
 						seq._rep_count = 1
+					# Periodic multi-token pattern check every 128 steps
+					if not seq._rep_detected and seq.decoded_length >= 256 and seq.decoded_length % 128 == 0:
+						tokens = self.query_book[local_idx].decoded_tokens[0, seq.decoded_length - 256 : seq.decoded_length]
+						for period in (2, 3, 4, 6, 8, 12, 16):
+							if torch.equal(tokens[period:], tokens[:256 - period]):
+								seq._rep_detected = True
+								seq.eos_reached = True
+								seq.log_event(SeqEvent.REPETITION, self.rank,
+									f"periodic period={period}, decoded_len={seq.decoded_length}")
+								lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+									seq._lifespan_log, "REPETITION_PERIODIC")
+								logging.warning(
+									f"Rank {self.rank}: REPETITION (periodic p={period}) "
+									f"{seq.uuid[:8]} gid={seq.global_idx} at decoded_len={seq.decoded_length}"
+								)
+								break
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 

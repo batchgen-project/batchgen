@@ -360,10 +360,11 @@ if __name__ == "__main__":
     logger.info(f"Loading LongBench dataset from {longbench_path}")
     query_df = load_longbench_datasets(longbench_path)
 
-    # Extract queries (raw context without chat template - batch API applies it)
+    # Extract queries: combine context + question fields
     queries: List[str] = []
-    for q in query_df['context']:
-        queries.append(q)
+    for _, row in query_df.iterrows():
+        prompt = row['context'] + "\n\n" + row['question']
+        queries.append(prompt)
         if args.max_prompts is not None and len(queries) >= args.max_prompts:
             break
 

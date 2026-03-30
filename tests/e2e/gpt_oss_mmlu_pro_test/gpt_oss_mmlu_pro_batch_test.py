@@ -260,7 +260,7 @@ def run_batch_workflow(
     base_url: str,
     poll_interval: float = 5.0,
     timeout: Optional[float] = None,
-    max_context_length: int = 131072,
+    max_context_length: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
