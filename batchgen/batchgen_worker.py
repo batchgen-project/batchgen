@@ -4149,26 +4149,27 @@ class BatchGenWorker:
 			ctx_lens[i] = seq.current_context_length
 			eos_flags[i] = seq.eos_reached and not ignore_eos
 
-		# Always-on periodic repetition detection at decision boundary
+		# Periodic repetition detection at decision boundary (BATCHGEN_REP_DETECTION=1)
 		# Check if last 64 tokens == previous 64 tokens (catches period <= 64)
 		# Only flag if >= 4 unique tokens (avoids false alarm on table dashes/formatting)
-		_REP_W = 64
-		for i in range(n):
-			seq = seqs[i]
-			if seq.decoded_length >= 2 * _REP_W and not seq._rep_detected:
-				uuid = decode_uuids[i]
-				local_idx = self._uuid_to_local_map.get(uuid)
-				if local_idx is not None and local_idx in self.query_book:
-					dl = seq.decoded_length
-					tokens = self.query_book[local_idx].decoded_tokens[0]
-					window = tokens[dl - _REP_W : dl]
-					if window.unique().numel() >= 4 and torch.equal(tokens[dl - 2 * _REP_W : dl - _REP_W], window):
-						seq._rep_detected = True
-						seq.eos_reached = True
-						logging.warning(
-							f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
-							f"gid={seq.global_idx} at decoded_len={dl}"
-						)
+		if REP_DETECTION:
+			_REP_W = 64
+			for i in range(n):
+				seq = seqs[i]
+				if seq.decoded_length >= 2 * _REP_W and not seq._rep_detected:
+					uuid = decode_uuids[i]
+					local_idx = self._uuid_to_local_map.get(uuid)
+					if local_idx is not None and local_idx in self.query_book:
+						dl = seq.decoded_length
+						tokens = self.query_book[local_idx].decoded_tokens[0]
+						window = tokens[dl - _REP_W : dl]
+						if window.unique().numel() >= 4 and torch.equal(tokens[dl - 2 * _REP_W : dl - _REP_W], window):
+							seq._rep_detected = True
+							seq.eos_reached = True
+							logging.warning(
+								f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
+								f"gid={seq.global_idx} at decoded_len={dl}"
+							)
 
 		rep_flags = torch.tensor([seqs[i]._rep_detected for i in range(n)], dtype=torch.bool)
 		completed_mask = (

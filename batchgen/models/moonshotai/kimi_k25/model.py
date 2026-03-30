@@ -1368,7 +1368,7 @@ class KimiK25ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states).float()
         return _CausalLMOutput(logits=logits)
 
     def eval(self):
