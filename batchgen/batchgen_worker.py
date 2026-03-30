@@ -2468,7 +2468,7 @@ class BatchGenWorker:
 					f"({pages_needed} pages)"
 				)
 			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
-			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=True)
+			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=False)
 			# Receive via Gloo backend
 			gloo_group = self._get_or_create_gloo_group()
 			dist.recv(tensor=k_cpu, src=from_rank, group=gloo_group)
