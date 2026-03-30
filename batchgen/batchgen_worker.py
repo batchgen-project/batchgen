@@ -2780,7 +2780,7 @@ class BatchGenWorker:
 						f"reusing existing_slot={existing_slot}, budget={budget}"
 					)
 					if existing_slot < 0:
-						logging.error(f"Rank {self.rank}: Migration receive {uuid[:8]} has no buffer slot, allocating new")
+						logging.info(f"Rank {self.rank}: Migration receive {uuid[:8]} has no buffer slot (expected for cross-rank migration), allocating new")
 						existing_slot = self._buffer_pool.allocate_slot()
 						seq._buffer_slot = existing_slot
 					self._buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
