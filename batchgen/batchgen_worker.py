@@ -7551,7 +7551,7 @@ class BatchGenWorker:
 							k_tensor = k_tensor.unsqueeze(2)
 						if v_tensor is not None and v_tensor.dim() == 3:
 							v_tensor = v_tensor.unsqueeze(2)
-						torch.cuda.synchronize()
+						torch.cuda.synchronize(self.torch_device)
 						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
 							layer_idx=layer_idx,
 							sequence_ids=_sync_kv_seq_ids,
