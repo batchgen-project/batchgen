@@ -23,7 +23,7 @@ def greedy_decode(logits: torch.Tensor) -> torch.Tensor:
 	Returns:
 		Tensor of shape [batch_size, 1] containing the indices of the selected tokens
 	"""
-	return torch.argmax(logits, dim=-1, keepdim=True)
+	return torch.argmax(logits.float(), dim=-1, keepdim=True)
 
 
 @torch.inference_mode()
@@ -54,7 +54,7 @@ def sample_tokens(
 	# --- Determine greedy mask ---
 	# Scalar fast path: all greedy or all same params
 	if temperature is None or (isinstance(temperature, (int, float)) and temperature <= 0):
-		return logits.argmax(dim=-1, keepdim=True)
+		return logits.float().argmax(dim=-1, keepdim=True)
 
 	# Convert scalars to [B] tensors for uniform code path
 	if isinstance(temperature, (int, float)):
@@ -82,7 +82,7 @@ def sample_tokens(
 
 	# Handle greedy sequences
 	if greedy_mask.any():
-		result[greedy_mask] = logits[greedy_mask].argmax(dim=-1, keepdim=True)
+		result[greedy_mask] = logits[greedy_mask].float().argmax(dim=-1, keepdim=True)
 
 	# Handle sampling sequences
 	if not sampling_mask.any():
