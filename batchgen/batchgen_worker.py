@@ -31,7 +31,7 @@ from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
 
-REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
+REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "0") == "1"
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
