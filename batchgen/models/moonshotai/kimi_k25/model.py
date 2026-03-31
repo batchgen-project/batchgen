@@ -1409,7 +1409,19 @@ class KimiK25ForCausalLM(nn.Module):
         if _HAS_BATCH_INVARIANT and hidden_states.numel() > 0:
             hs_shape = hidden_states.shape
             hs_2d = hidden_states.view(-1, hs_shape[-1])
-            logits = _bi_matmul(hs_2d, self.lm_head.weight.t().contiguous()).float()
+            M = hs_2d.shape[0]
+            if not hasattr(self, '_lm_head_weight_t') or self._lm_head_weight_t is None:
+                self._lm_head_weight_t = self.lm_head.weight.t().contiguous()
+            _CHUNK = 4096
+            if M <= _CHUNK:
+                logits = _bi_matmul(hs_2d, self._lm_head_weight_t).float()
+            else:
+                logits = torch.empty(M, self._lm_head_weight_t.shape[1],
+                                     device=hs_2d.device, dtype=torch.float32)
+                for start in range(0, M, _CHUNK):
+                    end = min(start + _CHUNK, M)
+                    logits[start:end] = _bi_matmul(
+                        hs_2d[start:end], self._lm_head_weight_t).float()
             logits = logits.view(*hs_shape[:-1], -1)
         else:
             logits = self.lm_head(hidden_states).float()
