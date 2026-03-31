@@ -55,13 +55,13 @@ conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install all wheels from the latest release
-RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v1.0.5"
+RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v1.0.6"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen_kernels-0.1.0-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-1.0.5-py3-none-any.whl"
+  "${RELEASE_URL}/batchgen_kernels-0.2.0-cp311-cp311-linux_x86_64.whl" \
+  "${RELEASE_URL}/batchgen-1.0.6-py3-none-any.whl"
 ```
 
 No source compilation needed — pip auto-installs all remaining Python dependencies
