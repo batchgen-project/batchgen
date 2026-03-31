@@ -597,7 +597,7 @@ class MoEGate(nn.Module):
             )
 
         if _HAS_BATCH_INVARIANT:
-            logits = _bi_matmul(hidden_states, self.weight.T).float()
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
         else:
             logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
@@ -617,7 +617,7 @@ class MoEGate(nn.Module):
         hidden_states = hidden_states.view(-1, h)
 
         if _HAS_BATCH_INVARIANT:
-            logits = _bi_matmul(hidden_states, self.weight.T).float()
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
         else:
             logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
@@ -1407,7 +1407,10 @@ class KimiK25ForCausalLM(nn.Module):
             use_cache=use_cache,
         )
         if _HAS_BATCH_INVARIANT:
-            logits = _bi_matmul(hidden_states, self.lm_head.weight.T).float()
+            hs_shape = hidden_states.shape
+            hs_2d = hidden_states.view(-1, hs_shape[-1])
+            logits = _bi_matmul(hs_2d, self.lm_head.weight.t().contiguous()).float()
+            logits = logits.view(*hs_shape[:-1], -1)
         else:
             logits = self.lm_head(hidden_states).float()
         return _CausalLMOutput(logits=logits)
