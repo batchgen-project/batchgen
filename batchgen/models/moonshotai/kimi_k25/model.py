@@ -1406,7 +1406,7 @@ class KimiK25ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
         )
-        if _HAS_BATCH_INVARIANT:
+        if _HAS_BATCH_INVARIANT and hidden_states.numel() > 0:
             hs_shape = hidden_states.shape
             hs_2d = hidden_states.view(-1, hs_shape[-1])
             logits = _bi_matmul(hs_2d, self.lm_head.weight.t().contiguous()).float()
