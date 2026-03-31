@@ -31,11 +31,11 @@ from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
 
-REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "0") == "1"
+REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
 
 def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
                               min_pattern: int = 2, max_pattern: int = 100,
-                              min_count: int = 16) -> bool:
+                              min_count: int = 32) -> bool:
 	"""Check if the tail of token_ids has a repeating N-gram pattern.
 
 	Scans pattern lengths from min_pattern to max_pattern. Returns True if
