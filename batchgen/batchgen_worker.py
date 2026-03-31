@@ -32,6 +32,32 @@ from batchgen import lifespan
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
+
+def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
+                              min_pattern: int = 2, max_pattern: int = 100,
+                              min_count: int = 32) -> bool:
+	"""Check if the tail of token_ids has a repeating N-gram pattern.
+
+	Scans pattern lengths from min_pattern to max_pattern. Returns True if
+	the last (pattern_len * min_count) tokens consist of the same pattern
+	repeated min_count times.
+	"""
+	if decoded_length < min_pattern * min_count:
+		return False
+	max_check = min(max_pattern + 1, decoded_length // min_count + 1)
+	for pattern_len in range(min_pattern, max_check):
+		is_repeat = True
+		for offset in range(pattern_len):
+			target = token_ids[decoded_length - 1 - offset].item()
+			for rep in range(1, min_count):
+				if token_ids[decoded_length - 1 - offset - pattern_len * rep].item() != target:
+					is_repeat = False
+					break
+			if not is_repeat:
+				break
+		if is_repeat:
+			return True
+	return False
 from .models.deepseek.deepseekv3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from tqdm import trange
 import gc
@@ -4149,25 +4175,22 @@ class BatchGenWorker:
 			ctx_lens[i] = seq.current_context_length
 			eos_flags[i] = seq.eos_reached and not ignore_eos
 
-		# Periodic repetition detection at decision boundary (BATCHGEN_REP_DETECTION=1)
-		# Check if last 64 tokens == previous 64 tokens (catches period <= 64)
-		# Only flag if >= 4 unique tokens (avoids false alarm on table dashes/formatting)
+		# Variable-length N-gram repetition detection at decision boundary
+		# Catches repeating patterns of length 2-100 tokens (32 repetitions required)
 		if REP_DETECTION:
-			_REP_W = 64
 			for i in range(n):
 				seq = seqs[i]
-				if seq.decoded_length >= 2 * _REP_W and not seq._rep_detected:
+				if seq.decoded_length >= 64 and not seq._rep_detected:
 					uuid = decode_uuids[i]
 					local_idx = self._uuid_to_local_map.get(uuid)
 					if local_idx is not None and local_idx in self.query_book:
 						dl = seq.decoded_length
 						tokens = self.query_book[local_idx].decoded_tokens[0]
-						window = tokens[dl - _REP_W : dl]
-						if window.unique().numel() >= 4 and torch.equal(tokens[dl - 2 * _REP_W : dl - _REP_W], window):
+						if _check_repeating_pattern(tokens, dl):
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
 								f"gid={seq.global_idx} at decoded_len={dl}"
 							)
 
@@ -7697,17 +7720,15 @@ class BatchGenWorker:
 					else:
 						seq._rep_last_token = token_id
 						seq._rep_count = 1
-					# Periodic multi-token pattern check (every 128 tokens, window=64)
-					if not seq._rep_detected and seq.decoded_length >= 128 and seq.decoded_length % 128 == 0:
-						_REP_W = 64
+					# Variable-length N-gram pattern check (every 64 tokens)
+					if not seq._rep_detected and seq.decoded_length >= 64 and seq.decoded_length % 64 == 0:
 						_dl = seq.decoded_length
 						_tokens = self.query_book[local_idx].decoded_tokens[0]
-						_window = _tokens[_dl - _REP_W : _dl]
-						if _window.unique().numel() >= 4 and torch.equal(_tokens[_dl - 2 * _REP_W : _dl - _REP_W], _window):
+						if _check_repeating_pattern(_tokens, _dl):
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 

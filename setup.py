@@ -134,7 +134,7 @@ print(f"find_packages: {find_packages()}")
 # install all files in the package, rather than just the egg
 setup(
     name="batchgen",
-    version=os.getenv("BATCHGEN_VERSION", "1.0.6"),
+    version=os.getenv("BATCHGEN_VERSION", "1.0.6.post1"),
     packages=find_packages(
         include=[
             "batchgen",
