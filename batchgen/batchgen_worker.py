@@ -7301,30 +7301,6 @@ class BatchGenWorker:
 				self._cumulative_boundary_ms += timing.total_ms
 				self._cumulative_decode_boundaries += 1
 
-				# Periodic repetition detection at decision boundary (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and decode_uuids:
-					_REP_W = 64
-					for _rep_uuid in decode_uuids:
-						_rep_seq = self.global_batch.get_sequence(_rep_uuid)
-						if _rep_seq.decoded_length >= 2 * _REP_W and not _rep_seq._rep_detected:
-							_rep_local = self._uuid_to_local_map.get(_rep_uuid)
-							if _rep_local is not None and _rep_local in self.query_book:
-								_dl = _rep_seq.decoded_length
-								_tokens = self.query_book[_rep_local].decoded_tokens[0]
-								_window = _tokens[_dl - _REP_W : _dl]
-								if _window.unique().numel() >= 4 and torch.equal(_tokens[_dl - 2 * _REP_W : _dl - _REP_W], _window):
-									_rep_seq._rep_detected = True
-									_rep_seq.eos_reached = True
-									logging.warning(
-										f"Rank {self.rank}: REPETITION (periodic) {_rep_seq.uuid[:8]} "
-										f"gid={_rep_seq.global_idx} at decoded_len={_dl}"
-									)
-					# Remove detected sequences from batch
-					_rep_completed = [u for u in decode_uuids if self.global_batch.get_sequence(u)._rep_detected]
-					if _rep_completed:
-						decode_uuids = [u for u in decode_uuids if u not in set(_rep_completed)]
-						batch = self._get_local_indices_for_uuids(decode_uuids)
-
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
 
@@ -7721,6 +7697,19 @@ class BatchGenWorker:
 					else:
 						seq._rep_last_token = token_id
 						seq._rep_count = 1
+					# Periodic multi-token pattern check (every 128 tokens, window=64)
+					if not seq._rep_detected and seq.decoded_length >= 128 and seq.decoded_length % 128 == 0:
+						_REP_W = 64
+						_dl = seq.decoded_length
+						_tokens = self.query_book[local_idx].decoded_tokens[0]
+						_window = _tokens[_dl - _REP_W : _dl]
+						if _window.unique().numel() >= 4 and torch.equal(_tokens[_dl - 2 * _REP_W : _dl - _REP_W], _window):
+							seq._rep_detected = True
+							seq.eos_reached = True
+							logging.warning(
+								f"Rank {self.rank}: REPETITION (periodic) {seq.uuid[:8]} "
+								f"gid={seq.global_idx} at decoded_len={_dl}"
+							)
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
