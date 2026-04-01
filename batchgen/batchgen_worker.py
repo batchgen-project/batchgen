@@ -6677,13 +6677,16 @@ class BatchGenWorker:
 		# Find max batch size across all ranks to minimize all-gather/all-reduce communication
 		t0 = time.perf_counter()
 		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-		dist.all_reduce(local_batch_size, op=dist.ReduceOp.MAX)
-		max_batch_size = local_batch_size.item()
-		
+		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
+		max_batch_size = _all_rank_counts.max().item()
+
 		# Update MoE layers with the actual max batch size for this page
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
+				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 		timing.moe_buffer_update_ms = (time.perf_counter() - t0) * 1000
 		
 		# ========== SINGLE FINAL BARRIER ==========
@@ -7287,12 +7290,15 @@ class BatchGenWorker:
 		# if one rank has more tokens than the initial estimate (ceil(total/world_size)),
 		# we get buffer overflow.
 		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-		dist.all_reduce(local_batch_size, op=dist.ReduceOp.MAX)
-		max_batch_size = local_batch_size.item()
+		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
+		max_batch_size = _all_rank_counts.max().item()
 
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
+				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
@@ -7539,11 +7545,14 @@ class BatchGenWorker:
 				if getattr(self, '_whole_model_graph', False):
 					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
 					_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-					dist.all_reduce(_local_bs, op=dist.ReduceOp.MAX)
-					_max_bs = max(_local_bs.item(), 1)
+					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+					dist.all_gather_into_tensor(_all_rank_counts, _local_bs)
+					_max_bs = max(_all_rank_counts.max().item(), 1)
 					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+						if hasattr(self.parallel_manager, 'set_rank_token_counts'):
+							self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 				else:
 					# Per-layer graph or eager: no NCCL in graph, use local batch size
 					_max_bs = max(len(batch), 1)
@@ -7721,7 +7730,7 @@ class BatchGenWorker:
 						seq._rep_last_token = token_id
 						seq._rep_count = 1
 					# Variable-length N-gram pattern check (every 64 tokens)
-					if not seq._rep_detected and seq.decoded_length >= 64 and seq.decoded_length % 64 == 0:
+					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
 						_dl = seq.decoded_length
 						_tokens = self.query_book[local_idx].decoded_tokens[0]
 						if _check_repeating_pattern(_tokens, _dl):

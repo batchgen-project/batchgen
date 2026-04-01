@@ -45,6 +45,14 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
+try:
+    from batch_invariant_ops import matmul_persistent as _bi_matmul
+    _HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "1") == "1"
+    if not _HAS_BATCH_INVARIANT:
+        logging.info("batch_invariant_ops disabled via BATCHGEN_BATCH_INVARIANT=0")
+except ImportError:
+    _HAS_BATCH_INVARIANT = False
+    logging.warning("batch_invariant_ops not installed; gate/lm_head use cuBLAS (non-deterministic across batch sizes)")
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
@@ -590,7 +598,10 @@ class MoEGate(nn.Module):
                 torch.empty(0, self.top_k, dtype=hidden_states.dtype, device=hidden_states.device),
             )
 
-        logits = F.linear(hidden_states, self.weight, None).float()
+        if _HAS_BATCH_INVARIANT:
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
+        else:
+            logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
@@ -607,7 +618,10 @@ class MoEGate(nn.Module):
             num_tokens = bsz * seq_len
         hidden_states = hidden_states.view(-1, h)
 
-        logits = F.linear(hidden_states, self.weight, None).float()
+        if _HAS_BATCH_INVARIANT:
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
+        else:
+            logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
@@ -631,6 +645,7 @@ class KimiK25MoE(nn.Module):
     """
 
     _buf: Optional['KimiK25MoEBufferManager'] = None
+    _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] per-rank token counts for padding masking
 
     def __init__(self, config):
         super().__init__()
@@ -847,6 +862,38 @@ class KimiK25MoE(nn.Module):
             logging.info(f"[MoE] Marlin 3-stage fused buffers initialized "
                          f"(E={E}, mtp={mtp})")
 
+    def _compact_after_allgather(self, all_tokens, num_tokens, num_global, H, device):
+        """Strip padding from AllGathered buffer so all GEMMs see only real tokens.
+
+        Returns (compact_tokens, total_real, my_offset).
+        Adds ~2s/128 iters overhead from CPU-GPU sync + Python copy loop.
+        Enable with BATCHGEN_MOE_COMPACT=1.
+        """
+        _local_cnt = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+        _all_cnts = torch.zeros(self.world_size, dtype=torch.int32, device=device)
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                _all_cnts, _local_cnt,
+                stream=torch.cuda.default_stream(device),
+            )
+        _counts_cpu = _all_cnts.tolist()
+        total_real = sum(_counts_cpu)
+
+        ntp = self.num_tokens_per_rank
+        if total_real < num_global and total_real > 0:
+            compact = torch.empty(total_real, H, device=device, dtype=all_tokens.dtype)
+            dst = 0
+            for r in range(self.world_size):
+                c = _counts_cpu[r]
+                if c > 0:
+                    compact[dst:dst + c] = all_tokens[r * ntp : r * ntp + c]
+                    dst += c
+            my_offset = sum(_counts_cpu[:self.rank])
+            return compact, total_real, my_offset
+        else:
+            t = total_real if total_real > 0 else num_global
+            return all_tokens[:t], t, self.rank * ntp
+
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → CUDA gate → 3D dispatch → inplace WGMMA → reduce → AllReduce."""
@@ -901,11 +948,30 @@ class KimiK25MoE(nn.Module):
                 stream=torch.cuda.default_stream(device),
             )
 
+        total_real = num_global
+        _my_offset = self.rank * self.num_tokens_per_rank
+
         if timer is not None:
             ev[1].record()  # after allgather, before gate
 
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+
+        # Mask padding tokens to prevent them from inflating expert_counts.
+        # rank_token_counts[r] = real token count for rank r (set by worker via PSM).
+        # Padding at positions [r*ntp + count_r, (r+1)*ntp) for each rank r.
+        # Setting topk_idx=-1 makes dispatch skip them (existing local_expert<0 guard).
+        rank_counts = self.__class__._rank_token_counts
+        if rank_counts is not None:
+            ntp = self.num_tokens_per_rank
+            positions = torch.arange(num_global, device=device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            max_valid = rank_counts[rank_ids]
+            padding_mask = local_pos >= max_valid
+            if padding_mask.any():
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
 
         if timer is not None:
             ev[2].record()  # after gate, before dispatch
@@ -918,7 +984,7 @@ class KimiK25MoE(nn.Module):
                 self.routed_expert_start_idx, self.experts_per_rank,
                 buf.max_tokens_padded,
                 buf.expert_counts, buf.expert_counters,
-                buf.topk_pos[:num_global * topk],
+                buf.topk_pos[:total_real * topk],
             )
         else:
             mtp = _DEFAULT_MTP
@@ -926,7 +992,7 @@ class KimiK25MoE(nn.Module):
             dispatched_x = torch.zeros(E * mtp, H, dtype=torch.bfloat16, device=device)
             expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
             expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
-            topk_pos = torch.full((num_global * topk,), -1, dtype=torch.int32, device=device)
+            topk_pos = torch.full((total_real * topk,), -1, dtype=torch.int32, device=device)
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
                 dispatched_x,
@@ -947,7 +1013,7 @@ class KimiK25MoE(nn.Module):
                 self._init_marlin_buffers(mtp)
 
             # Pigeonhole bound for CTA M-tiling grid size
-            max_possible_m = min(num_global, mtp)
+            max_possible_m = min(total_real, mtp)
             max_marlin_m_tiles = (max_possible_m + 15) // 16
 
             mod_m = self._marlin_mod
@@ -987,7 +1053,7 @@ class KimiK25MoE(nn.Module):
             # === WGMMA 2-Stage (used when Marlin disabled or prefill mode) ===
             mod = self._wgmma_mod
             w = self._moe_weights
-            avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
+            avg_per_expert = (total_real * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
@@ -1012,17 +1078,17 @@ class KimiK25MoE(nn.Module):
         if timer is not None:
             ev[5].record()  # after wgmma_s2, before reduce
 
-        # 5) Reduce: weighted scatter from 3D strided buffer to flat [G, H]
+        # 5) Reduce: weighted scatter from 3D strided buffer to flat [total_real, H]
         if buf is not None:
-            result_buf = buf.result_buffer[:num_global]
+            result_buf = buf.result_buffer[:total_real]
             global_results = reduce_weighted_scatter(
                 buf.expert_out, topk_pos, topk_weight,
-                num_global, H, topk, output=result_buf,
+                total_real, H, topk, output=result_buf,
             )
         else:
             global_results = reduce_weighted_scatter(
                 dispatched_x, topk_pos, topk_weight,
-                num_global, H, topk,
+                total_real, H, topk,
             )
 
         if timer is not None:
@@ -1044,9 +1110,7 @@ class KimiK25MoE(nn.Module):
         if timer is not None:
             ev[8].record()  # after shared_expert sync, before extract_combine
 
-        start = self.rank * self.num_tokens_per_rank
-        end = start + num_tokens
-        out = global_results[start:end] + shared_out
+        out = global_results[_my_offset:_my_offset + num_tokens] + shared_out
 
         if timer is not None:
             ev[9].record()  # after extract_combine
@@ -1368,7 +1432,25 @@ class KimiK25ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
         )
-        logits = self.lm_head(hidden_states).float()
+        if _HAS_BATCH_INVARIANT and hidden_states.numel() > 0:
+            hs_shape = hidden_states.shape
+            hs_2d = hidden_states.view(-1, hs_shape[-1])
+            M = hs_2d.shape[0]
+            if not hasattr(self, '_lm_head_weight_t') or self._lm_head_weight_t is None:
+                self._lm_head_weight_t = self.lm_head.weight.t().contiguous()
+            _CHUNK = 4096
+            if M <= _CHUNK:
+                logits = _bi_matmul(hs_2d, self._lm_head_weight_t).float()
+            else:
+                logits = torch.empty(M, self._lm_head_weight_t.shape[1],
+                                     device=hs_2d.device, dtype=torch.float32)
+                for start in range(0, M, _CHUNK):
+                    end = min(start + _CHUNK, M)
+                    logits[start:end] = _bi_matmul(
+                        hs_2d[start:end], self._lm_head_weight_t).float()
+            logits = logits.view(*hs_shape[:-1], -1)
+        else:
+            logits = self.lm_head(hidden_states).float()
         return _CausalLMOutput(logits=logits)
 
     def eval(self):
