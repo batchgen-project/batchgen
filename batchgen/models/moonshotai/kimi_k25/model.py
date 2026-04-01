@@ -45,14 +45,8 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
-try:
-    from batch_invariant_ops import matmul_persistent as _bi_matmul
-    _HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "1") == "1"
-    if not _HAS_BATCH_INVARIANT:
-        logging.info("batch_invariant_ops disabled via BATCHGEN_BATCH_INVARIANT=0")
-except ImportError:
-    _HAS_BATCH_INVARIANT = False
-    logging.warning("batch_invariant_ops not installed; gate/lm_head use cuBLAS (non-deterministic across batch sizes)")
+from batchgen.batch_invariant_matmul import matmul_persistent as _bi_matmul
+_HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "0") == "1"
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
