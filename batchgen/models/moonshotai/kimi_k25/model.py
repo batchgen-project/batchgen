@@ -643,6 +643,7 @@ class KimiK25MoE(nn.Module):
     """
 
     _buf: Optional['KimiK25MoEBufferManager'] = None
+    _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] per-rank token counts for padding masking
 
     def __init__(self, config):
         super().__init__()
@@ -945,26 +946,30 @@ class KimiK25MoE(nn.Module):
                 stream=torch.cuda.default_stream(device),
             )
 
-        # Two modes for handling padding after AllGather:
-        # - Flat (default): process all tokens including padding. Safe because
-        #   batch-invariant gate has fixed tiling, dispatch skips non-local,
-        #   reduce zeros out padding. No CPU-GPU sync overhead.
-        # - Compact (BATCHGEN_MOE_COMPACT=1): strip padding via AllGather of
-        #   per-rank counts + Python copy loop. Eliminates padding from all
-        #   GEMMs but adds ~2s/128 iters from CPU-GPU sync.
-        if os.environ.get("BATCHGEN_MOE_COMPACT", "0") == "1":
-            moe_tokens, total_real, _my_offset = self._compact_after_allgather(
-                all_tokens, num_tokens, num_global, H, device)
-        else:
-            moe_tokens = all_tokens
-            total_real = num_global
-            _my_offset = self.rank * self.num_tokens_per_rank
+        total_real = num_global
+        _my_offset = self.rank * self.num_tokens_per_rank
 
         if timer is not None:
             ev[1].record()  # after allgather, before gate
 
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
-        topk_idx, topk_weight = self.gate(moe_tokens.view(total_real, 1, H))
+        topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+
+        # Mask padding tokens to prevent them from inflating expert_counts.
+        # rank_token_counts[r] = real token count for rank r (set by worker via PSM).
+        # Padding at positions [r*ntp + count_r, (r+1)*ntp) for each rank r.
+        # Setting topk_idx=-1 makes dispatch skip them (existing local_expert<0 guard).
+        rank_counts = self.__class__._rank_token_counts
+        if rank_counts is not None:
+            ntp = self.num_tokens_per_rank
+            positions = torch.arange(num_global, device=device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            max_valid = rank_counts[rank_ids]
+            padding_mask = local_pos >= max_valid
+            if padding_mask.any():
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
 
         if timer is not None:
             ev[2].record()  # after gate, before dispatch
@@ -972,7 +977,7 @@ class KimiK25MoE(nn.Module):
         # 3) 3D dispatch scatter into strided buffer
         if buf is not None:
             expert_counts, topk_pos = dispatch_scatter_3d(
-                moe_tokens, topk_idx.to(torch.int32),
+                all_tokens, topk_idx.to(torch.int32),
                 buf.dispatched_x,
                 self.routed_expert_start_idx, self.experts_per_rank,
                 buf.max_tokens_padded,
@@ -987,7 +992,7 @@ class KimiK25MoE(nn.Module):
             expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
             topk_pos = torch.full((total_real * topk,), -1, dtype=torch.int32, device=device)
             expert_counts, topk_pos = dispatch_scatter_3d(
-                moe_tokens, topk_idx.to(torch.int32),
+                all_tokens, topk_idx.to(torch.int32),
                 dispatched_x,
                 self.routed_expert_start_idx, E, mtp,
                 expert_counts, expert_counters, topk_pos,
