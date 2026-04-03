@@ -227,10 +227,14 @@ def main():
         except Exception:
             pass
 
-        # Create and submit batch
+        # Create batch (non-blocking — returns immediately, poller tracks completion)
         path, answers = create_batch_jsonl(batch_samples, val_df, args.model, args.max_decoding_length, batch_idx)
-        batch = client.submit_batch(
-            input_file_path=path,
+        # Upload file
+        file_info = client.upload_file(path)
+        file_id = file_info.get("id")
+        # Create batch (returns immediately, does NOT wait for completion)
+        batch = client.create_batch(
+            input_file_id=file_id,
             endpoint="/v1/chat/completions",
             max_decoding_length=args.max_decoding_length,
             temperature=0,
