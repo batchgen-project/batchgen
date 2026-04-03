@@ -2600,9 +2600,35 @@ class BatchGenWorker:
 					my_migration = mig
 					break
 
-			# Execute migration if participating, otherwise just sync tensor shape info
+			# Pre-round check: filter migrations where dest has insufficient host KV pages.
+			# All ranks gather dest free pages and agree on which migrations to skip.
+			# This prevents deadlock (source send without dest recv) that would occur
+			# if we checked per-rank inside _execute_single_kv_migration.
+			viable_migrations = []
+			for mig in round_migrations:
+				# Dest rank reports its free pages, all ranks see the result
+				dest_free = torch.tensor([0], dtype=torch.int64, device=self.torch_device)
+				if self.rank == mig.to_rank:
+					host_stats = self.host_paged_kv_worker_view.get_stats()
+					dest_free[0] = host_stats.num_free_pages
+				dist.broadcast(dest_free, src=mig.to_rank)
+				if mig.pages > dest_free.item():
+					if self.rank == 0:
+						logging.warning(
+							f"MIGRATION: Skipping {mig.uuid[:8]} (rank {mig.from_rank}→{mig.to_rank}) — "
+							f"dest has {dest_free.item()} free pages, need {mig.pages}"
+						)
+				else:
+					viable_migrations.append(mig)
+
+			# Execute viable migrations
+			my_migration = None
+			for mig in viable_migrations:
+				if self.rank == mig.from_rank or self.rank == mig.to_rank:
+					my_migration = mig
+					break
+
 			if my_migration is not None:
-				# Verify sequence exists and is in expected state before migration
 				seq = self.global_batch.get_sequence(my_migration.uuid)
 				if seq is None:
 					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration.uuid[:8]}... not found!")
