@@ -2641,16 +2641,25 @@ class BatchGenWorker:
 		while remaining:
 			round_migrations = []
 			used_ranks = set()
+			used_src_nodes = set()
 
 			for mig in remaining[:]:  # Iterate over copy
 				from_rank = mig.from_rank
 				to_rank = mig.to_rank
+				src_node = from_rank // NUM_GPUS_PER_NODE
 
-				# Check if either rank is already used in this round
-				if from_rank not in used_ranks and to_rank not in used_ranks:
+				# Check rank exclusivity AND source node exclusivity.
+				# Source node limit: migration uses GPU KV as staging buffer
+				# (host→GPU→extract→CPU→send). Multiple source ranks on the same
+				# node share GPU KV pages. Without this limit, parallel migrations
+				# from the same node exhaust GPU KV staging pages.
+				if (from_rank not in used_ranks
+					and to_rank not in used_ranks
+					and src_node not in used_src_nodes):
 					round_migrations.append(mig)
 					used_ranks.add(from_rank)
 					used_ranks.add(to_rank)
+					used_src_nodes.add(src_node)
 					remaining.remove(mig)
 
 			rounds.append(round_migrations)
@@ -5131,13 +5140,6 @@ class BatchGenWorker:
 				if all_active_uuids:
 					self._sync_sequence_metadata(all_active_uuids)
 					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
-
-				# STEP 0: Free GPU KV and rebalance host KV BEFORE batch selection
-				# Destroy GPU KV first so migration can use GPU as staging buffer
-				# (host→GPU→extract→CPU→send). Without this, GPU KV pages from the
-				# previous decode phase leave insufficient free pages for staging.
-				# GPU KV is rebuilt in _load_decode_model() at decode phase start.
-				self._destroy_gpu_paged_kv_cache()
 
 				# This ensures batch selection uses accurate post-migration capacities
 				if self.enable_decode_preemption:
