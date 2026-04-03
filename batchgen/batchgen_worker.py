@@ -5199,6 +5199,20 @@ class BatchGenWorker:
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
 					dist.barrier()
 
+				# After prefill completes, poll for newly arrived sequences.
+				# If more QUEUEING sequences exist and host KV has capacity,
+				# loop back to prefill instead of entering decode.
+				if self._admission_queue is not None:
+					self._poll_admissions()
+				if self.global_batch.has_queueing():
+					next_prefill = self._prepare_prefill_batch()
+					if next_prefill:
+						if self.rank == 0:
+							logging.info(
+								f"[PREFILL] Back-to-back prefill: {len(next_prefill)} new sequences ready"
+							)
+						continue  # loop back to prefill phase
+
 			# =================================================================
 			# 2. DECODE PHASE: Continuous Batching (Host -> GPU Streaming)
 			# =================================================================
@@ -5319,8 +5333,15 @@ class BatchGenWorker:
 				self.deep_free_model_memory()
 				dist.barrier()
 
-				# CRITICAL FIX: After decode returns (possibly due to watermark trigger),
-				# check if there are queued sequences waiting for prefill.
+				# Poll for new admissions after each decode interval.
+				# This ensures newly submitted batches are admitted to global_batch
+				# so has_queueing() can detect them and trigger prefill.
+				if self._admission_queue is not None:
+					admitted = self._poll_admissions()
+					if admitted and self.rank == 0:
+						logging.info(f"[DECODE] Mid-cycle admission, total in batch: {len(self.global_batch)}")
+
+				# Check if there are queued sequences waiting for prefill.
 				# If so, break out of inner decode loop to allow outer loop to enter prefill.
 				needs_prefill = self.global_batch.has_queueing() or (
 					self.enable_host_kv_eviction and self.global_batch.has_evicted()
