@@ -919,10 +919,23 @@ class BatchScheduler:
             f"(total in pool: {self._intake_pool.size()})"
         )
 
-        # Wait for this batch to complete (with timeout)
+        # Launch background task to wait for completion and finalize output.
+        # Return immediately so the scheduler can process the next batch.
+        asyncio.ensure_future(
+            self._wait_and_finalize_batch(batch_id, requests, prompts)
+        )
+
+    async def _wait_and_finalize_batch(
+        self,
+        batch_id: str,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+    ) -> None:
+        """Background task: wait for a batch to complete, then finalize output."""
         import time as _time
         deadline = _time.time() + self._batch_timeout
         batch_failed = False
+
         while True:
             tracker = self._scheduling_pool.get_batch_tracker(batch_id)
             if tracker and tracker.is_complete:
@@ -944,7 +957,6 @@ class BatchScheduler:
             })
             return
 
-        # Finalize batch output
         self._finalize_batch_output(batch_id, requests, prompts)
 
     async def _drain_intake_to_worker(self) -> None:
