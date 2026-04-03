@@ -2740,76 +2740,32 @@ class BatchGenWorker:
 				)
 		elif self.rank == to_rank:
 			# ===== DEST RANK: Receive via Gloo, write directly to host KV =====
-			# No GPU staging needed — uses C++ WriteSequenceKVFromCPU (memcpy to shared memory)
 			t0 = time.perf_counter()
 			logging.info(
 				f"[MIGRATION] Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
 				f"({pages_needed} pages, direct CPU→host)"
 			)
-
-			# Receive K tensor (and V if MHA)
-			# We don't know the exact shape without GPU KV config, so receive
-			# into a flat buffer and let WriteSequenceKVFromCPU handle layout.
-			# The source sends read_sequence_kv_to_cpu output: [layers, pages, page_tokens, heads, dim]
-			# We need to receive with matching shape. Use source's k_cpu shape info.
 			gloo_group = self._get_or_create_gloo_group()
 
-			# First, receive a shape descriptor (source broadcasts k_cpu shape)
-			# Actually, we can reconstruct shape from host KV config + pages_needed
-			num_layers = config_.num_layers if hasattr(self, 'host_paged_kv_worker_view') else self.model_config.num_hidden_layers
-			# Use worker_view config to get KV dimensions
-			wv_stats = worker_view.get_stats()
-
-			# Receive K tensor — shape must match source's read_sequence_kv_to_cpu output
-			# Source tensor shape is determined by C++ host KV config, which is identical on dest
-			# So we can call read on a dummy to get shape... or just recv into empty with matching shape.
-			# Simplest: allocate buffer, recv, then write.
-			# The source's k_cpu.shape is known from the host KV config on this rank (same config).
-			# But we need page_tokens, num_k_heads, k_head_dim from config.
-			# These are accessible from the host KV worker view's internal config.
-			# For now, use model config as fallback.
-			page_tokens = SequenceEntry.PAGE_SIZE  # 64
-
-			# Receive K: source sends contiguous k_cpu
-			# We don't know exact dtype/shape without GPU config, so peek at what source sends
-			# Actually both nodes have same host KV config, so shapes match.
-			# The C++ ReadSequenceKVToCPU determines shape from config — we need the same.
-			# Simplest approach: receive into a buffer then write via C++ API.
-
-			# Register and allocate host KV pages FIRST (so WriteSequenceKVFromCPU has pages)
-			tokens_needed = pages_needed * page_tokens
+			# Allocate host KV pages for the incoming sequence
+			tokens_needed = pages_needed * SequenceEntry.PAGE_SIZE
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 
-			# Now read from a dummy to get the expected tensor shape
-			# Actually, just recv into a buffer sized by pages_needed
-			# The source called read_sequence_kv_to_cpu which returns shape based on its config
-			# Both ranks have identical host KV config, so we can do the same:
-			# Create a receive buffer, then write it back
-			# Use a temp read to determine shape (from our own config)
-			# OR: just receive the raw bytes and write them back.
-
-			# Best approach: receive k_cpu, then call write_sequence_kv_from_cpu
-			# We need the EXACT tensor shape. Since both ranks have the same host KV config,
-			# we can read our own config to determine the shape.
-			# But we don't have a Python accessor for the config fields.
-			# PRAGMATIC: just recv into a pre-allocated buffer matching the source shape.
-			# Source shape = [num_layers, pages_needed, page_size, num_k_heads, k_head_dim]
-			# We can get num_layers from model_config, and the rest from a test allocation.
-
-			# Actually the simplest: call read_sequence_kv_to_cpu on the freshly allocated
-			# (empty) pages to get tensor with correct shape/dtype, then recv into it.
+			# Read empty pages to get a tensor with correct shape/dtype for recv buffer.
+			# Both nodes have identical host KV config, so shape matches source's output.
 			k_recv, v_recv = worker_view.read_sequence_kv_to_cpu(global_idx)
 			dist.recv(tensor=k_recv, src=from_rank, group=gloo_group)
 			if v_recv.numel() > 0:
 				dist.recv(tensor=v_recv, src=from_rank, group=gloo_group)
 
 			# Write received data to host pages
-			worker_view.write_sequence_kv_from_cpu(global_idx, k_recv,
-				v_recv if v_recv.numel() > 0 else None)
-			t_write = time.perf_counter()
-			logging.debug(
-				f"MIGRATION: Rank {self.rank}: Recv+write: {(t_write-t0)*1000:.1f}ms"
+			worker_view.write_sequence_kv_from_cpu(
+				global_idx, k_recv, v_recv if v_recv.numel() > 0 else None
+			)
+			logging.info(
+				f"MIGRATION: Rank {self.rank}: Recv+write {uuid[:8]}... "
+				f"in {(time.perf_counter()-t0)*1000:.1f}ms"
 			)
 
 			# Receive query_book data (input_ids, decoded_tokens)
