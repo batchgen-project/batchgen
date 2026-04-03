@@ -2576,6 +2576,12 @@ class BatchGenWorker:
 		if not migrations:
 			return
 
+		# Ensure GPU KV manager exists for staging (host→GPU→extract→CPU→send).
+		# May be None if _config_prefill_for_batch destroyed it in a previous cycle.
+		if self.gpu_paged_kv_cache_manager is None or not self.gpu_paged_kv_cache_manager.is_initialized:
+			logging.info(f"Rank {self.rank}: Initializing GPU KV manager for migration staging")
+			self._init_gpu_kv_with_actual_size()
+
 		# CRITICAL: Create Gloo group BEFORE migrations start.
 		# dist.new_group() is a COLLECTIVE operation - ALL ranks must call it together.
 		# We create it here so all ranks participate, not just sender/receiver.
