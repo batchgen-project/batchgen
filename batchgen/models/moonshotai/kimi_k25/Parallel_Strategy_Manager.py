@@ -587,6 +587,11 @@ class KimiK25ParallelStrategyManager:
             if hasattr(layer, "set_num_tokens_per_rank"):
                 layer.set_num_tokens_per_rank(num_tokens_per_rank)
 
+    def set_rank_token_counts(self, counts: torch.Tensor):
+        """Store per-rank token counts [world_size] on GPU for MoE padding masking."""
+        from .model import KimiK25MoE
+        KimiK25MoE._rank_token_counts = counts
+
     def _init_ata_comms(self, padding_bsz):
         """Initialize All-to-All communication for multi-GPU MoE.
 

@@ -55,7 +55,13 @@ def _setup_nccl_env():
 	# Larger buffer improves throughput for multi-node communication
 	if "NCCL_BUFFSIZE" not in os.environ:
 		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
-	
+
+	# NCCL_ALGO: Force deterministic tree algorithm for all-reduce/reduce-scatter.
+	# The default (ring/auto) varies reduction order between runs, causing
+	# non-deterministic FP rounding that leads to batch-dependent repetition.
+	# Tree algorithm has fixed reduction order. All-gather is unaffected (already deterministic).
+	os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
+
 
 def server_worker_main(
 	rank_idx: int,

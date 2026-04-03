@@ -229,11 +229,14 @@ class MiniMaxM25ParallelStrategyManager:
         not_found = []
         for key, param in self.model.named_parameters():
             ckpt_key = self._model_key_to_ckpt_key(key)
+            found_key = None
             if ckpt_key in self.skeleton_state_dict:
-                param.data = self.skeleton_state_dict[ckpt_key]
-                loaded += 1
+                found_key = ckpt_key
             elif key in self.skeleton_state_dict:
-                param.data = self.skeleton_state_dict[key]
+                found_key = key
+            if found_key is not None:
+                raw_tensor = self.skeleton_state_dict[found_key]
+                param.data = raw_tensor
                 loaded += 1
             else:
                 not_found.append(key)
