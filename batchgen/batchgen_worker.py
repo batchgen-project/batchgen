@@ -7652,7 +7652,7 @@ class BatchGenWorker:
 							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
 							f"before putting sequences ON_HOLD"
 						)
-					
+
 					logging.info(
 						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
 						f"sequences ON_HOLD, will trigger prefill"
@@ -7661,7 +7661,22 @@ class BatchGenWorker:
 					self._put_sequences_on_hold(decode_uuids)
 					# Exit decode loop - will return to generate() which will trigger prefill
 					break
-				
+
+				# Poll for new admissions at each page boundary.
+				# New batches may have been submitted during decode — drain them
+				# and break for prefill if QUEUEING sequences arrive.
+				if self._admission_queue is not None:
+					admitted = self._poll_admissions()
+					if admitted and self.rank == 0:
+						logging.info(
+							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
+							f"total in batch: {len(self.global_batch)}"
+						)
+					if self.global_batch.has_queueing():
+						if self.rank == 0:
+							logging.info(f"[DECODE] Breaking for new batch prefill")
+						break
+
 				# Detailed logging at every boundary (only rank 0)
 				if self.rank == 0:
 					# Get status counts
