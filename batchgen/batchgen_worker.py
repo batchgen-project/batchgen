@@ -2576,16 +2576,6 @@ class BatchGenWorker:
 		if not migrations:
 			return
 
-		# Ensure GPU KV manager has free pages for staging (host→GPU→extract→CPU→send).
-		# After decode, the GPU KV is full of active sequences' pages. Destroy and
-		# reinitialize to get a fresh empty manager with maximum free pages.
-		# This is safe: we're at the decode→prefill boundary, all KV is in host.
-		if self.gpu_paged_kv_cache_manager is not None and self.gpu_paged_kv_cache_manager.is_initialized:
-			self.gpu_paged_kv_cache_manager.destroy()
-			self._sequences_with_gpu_kv.clear()
-		logging.info(f"Rank {self.rank}: Initializing GPU KV manager for migration staging")
-		self._init_gpu_kv_with_actual_size()
-
 		# CRITICAL: Create Gloo group BEFORE migrations start.
 		# dist.new_group() is a COLLECTIVE operation - ALL ranks must call it together.
 		# We create it here so all ranks participate, not just sender/receiver.
@@ -2692,158 +2682,37 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - sequence not found")
 			return
 
-		# CRITICAL: Use GPU KV manager's config for tensor shape - this matches what
-		# copy_kv_to_tensor() returns and what copy_tensor_to_kv() expects.
-		# For MLA: num_k_heads=1 (latent attention), k_head_dim=576 (compressed KV)
-		# Do NOT use model_config.num_key_value_heads or loaded_model_config.qk_rope_head_dim
-		# as those have different values!
-		gpu_kv_config = self.gpu_paged_kv_cache_manager.config
-		num_layers = self.model_config.num_hidden_layers
-		num_k_heads = gpu_kv_config.num_k_heads  # For MLA: 1
-		k_head_dim = gpu_kv_config.k_head_dim    # For MLA: 576 (compressed KV)
-		kv_dtype = gpu_kv_config.kv_dtype
-		page_size = gpu_kv_config.page_size_tokens  # Should be 64
-
 		global_idx = seq.global_idx
-		# CRITICAL FIX: Use actual host pages allocated, not full kv_token_budget.
-		# Host KV uses chunked growth, so host_pages_allocated < ceil(kv_token_budget/page_size).
-		# Using kv_token_budget causes IndexError when loading more pages than host has.
 		pages_needed = seq.host_pages_allocated
 		if pages_needed <= 0:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
 			return
 
-		# Tensor shape matches GPU KV manager: [num_layers, pages, page_size, num_k_heads, k_head_dim]
-		k_shape = (num_layers, pages_needed, page_size, num_k_heads, k_head_dim)
+		worker_view = self.host_paged_kv_worker_view
+
 		if self.rank == from_rank:
-			# ===== SOURCE RANK: Read from host KV, send directly over network =====
+			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
+			# No GPU staging needed — uses C++ ReadSequenceKVToCPU (memcpy from shared memory)
 			t0 = time.perf_counter()
-			logging.debug(
+			logging.info(
 				f"[MIGRATION] Rank {self.rank}: Send {uuid[:8]}... → rank {to_rank} "
-				f"({pages_needed} pages)"
+				f"({pages_needed} pages, direct host→CPU)"
 			)
-			# Allocate CPU buffer for KV data
-			# We'll load host KV → GPU → CPU buffer, then send
-			# (Temporary workaround - ideally would read directly from host memory)
-			manager = self.gpu_paged_kv_cache_manager
-			worker_view = self.host_paged_kv_worker_view
-			if manager is None:
-				logging.error(f"Rank {self.rank}: GPU KV manager not initialized")
-				return
-			# Ensure GPU KV manager is initialized (may be destroyed between decode/prefill phases)
-			if not manager.is_initialized:
-				logging.debug(f"[MIGRATION] Rank {self.rank}: Re-initializing GPU KV manager for migration")
-				manager.initialize()
-			tokens_needed = pages_needed * page_size
-			# Allocate temporary GPU pages
-			manager.allocate_pages_for_sequences([global_idx], [tokens_needed])
-			# CRITICAL: Must rebuild page table after allocation before using get_padded_3d_page_pointers
-			# The GPU KV manager requires this to set up active slot mappings
-			manager.rebuild_page_table([global_idx])
-			# Load host KV → GPU
-			sequence_tensor = torch.tensor([global_idx], dtype=torch.int64, device="cpu")
-			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-			active_page_counts = manager.export_active_sequence_page_counts()
-			
-			# PRE-LOAD DIAGNOSTIC: Log host KV state before loading
-			if BATCHGEN_CB_DEBUG:
-				host_stats = worker_view.get_stats()
-				logging.debug(
-					f"MIGRATION: Rank {self.rank}: Loading host KV for {uuid[:8]}... "
-					f"global_idx={global_idx}, tokens_needed={tokens_needed}, "
-					f"active_page_counts={active_page_counts.tolist()}, "
-					f"host_stats=(used={host_stats.num_used_pages}, total={host_stats.num_total_pages})"
-				)
-			
-			load_task = worker_view.async_load_layer_paged_kv_to_device(
-				sequence_ids=sequence_tensor,
-				active_page_counts=active_page_counts,
-				k_device_ptrs=k_ptrs,
-				v_device_ptrs=v_ptrs,
+
+			k_cpu, v_cpu = worker_view.read_sequence_kv_to_cpu(global_idx)
+			t_read = time.perf_counter()
+			logging.debug(
+				f"MIGRATION: Rank {self.rank}: Host→CPU read: {(t_read-t0)*1000:.1f}ms, "
+				f"k_shape={list(k_cpu.shape)}"
 			)
-			load_task.wait()
-			# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
-			torch.cuda.synchronize(self.torch_device)
-			t_load = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Host→GPU load: {(t_load-t0)*1000:.1f}ms")
-			# Extract to contiguous tensor on GPU
-			k_gpu = manager.copy_kv_to_tensor(global_idx)
-			t_extract = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: GPU tensor extraction: {(t_extract-t_load)*1000:.1f}ms")
 
-			# MIGRATION SEND VALIDATION: expensive validation only when explicitly enabled
-			if BATCHGEN_ENABLE_CRITICAL_DIAGS:
-				# NOTE: Only validate the VALID portion of KV (up to current_context_length)
-				# The last page may have uninitialized slots beyond the actual token count
-				valid_tokens = seq.current_context_length
-				total_slots = pages_needed * page_size
-			
-				# Reshape layer 0 to [total_tokens, num_k_heads, k_head_dim] to slice valid portion
-				flat_k = k_gpu[0].reshape(total_slots, num_k_heads, k_head_dim)
-				valid_k = flat_k[:valid_tokens]
-			
-				send_k_mean = valid_k.float().mean().item()
-				send_k_std = valid_k.float().std().item()
-				send_has_nan = torch.isnan(valid_k).any().item()
-				send_is_zero = (valid_k == 0).all().item()
-			
-				# Check if NaN only in padding (this is OK)
-				full_has_nan = torch.isnan(k_gpu[0]).any().item()
-				padding_info = ""
-				if full_has_nan and not send_has_nan:
-					padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
-			
-				logging.info(
-					f"MIGRATION SEND: Rank {self.rank}: Validating KV for {uuid[:8]}... (global_idx={global_idx}): "
-					f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
-					f"layer0_mean={send_k_mean:.4f}, std={send_k_std:.4f}, "
-					f"has_nan={send_has_nan}, is_zero={send_is_zero}{padding_info}, "
-					f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
-				)
-				if send_is_zero:
-					logging.error(
-						f"MIGRATION SEND: Rank {self.rank}: CRITICAL - KV to send is ALL ZEROS for {uuid[:8]}! "
-						f"Host KV may be corrupted or load failed."
-					)
-				if send_has_nan:
-					logging.error(f"MIGRATION SEND: Rank {self.rank}: CRITICAL - KV to send has NaN for {uuid[:8]}!")
-					# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
-					if BATCHGEN_CB_DEBUG:
-						nan_layers = []
-						for layer_idx in range(k_gpu.shape[0]):
-							layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
-							layer_valid_k = layer_k[:valid_tokens]
-							if torch.isnan(layer_valid_k).any():
-								# Find which tokens have NaN in this layer
-								nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
-								nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
-								nan_layers.append({
-									'layer': layer_idx,
-									'nan_token_count': nan_token_mask.sum().item(),
-									'first_nan_tokens': nan_token_indices,
-								})
-						logging.error(
-							f"MIGRATION SEND: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
-							f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
-							f"details={nan_layers[:5]}"  # First 5 layers with NaN
-						)
-
-			# Move GPU → CPU for Gloo transfer (Gloo supports CPU tensors, more memory efficient)
-			k_cpu = k_gpu.cpu().contiguous()
-			t_cpu = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: GPU→CPU copy: {(t_cpu-t_extract)*1000:.1f}ms")
-			# Send via Gloo backend (supports CPU tensors and RDMA if available)
+			# Send via Gloo backend
 			gloo_group = self._get_or_create_gloo_group()
-			dist.send(tensor=k_cpu, dst=to_rank, group=gloo_group)
-			t_send = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_cpu)*1000:.1f}ms")
-			# Free GPU pages
-			manager.free_pages_for_sequences([global_idx])
-			# Free host KV pages
+			dist.send(tensor=k_cpu.contiguous(), dst=to_rank, group=gloo_group)
+			if v_cpu.numel() > 0:
+				dist.send(tensor=v_cpu.contiguous(), dst=to_rank, group=gloo_group)
+
+			# Free host KV pages on source
 			worker_view.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
@@ -2870,159 +2739,89 @@ class BatchGenWorker:
 					f"in {(t_total-t0)*1000:.1f}ms"
 				)
 		elif self.rank == to_rank:
-			# ===== DEST RANK: Receive over network via Gloo, write to host KV =====
+			# ===== DEST RANK: Receive via Gloo, write directly to host KV =====
+			# No GPU staging needed — uses C++ WriteSequenceKVFromCPU (memcpy to shared memory)
 			t0 = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(
-					f"MIGRATION: Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
-					f"({pages_needed} pages)"
-				)
-			# Allocate CPU buffer for receiving (Gloo supports CPU tensors)
-			k_cpu = torch.empty(k_shape, dtype=kv_dtype, device="cpu", pin_memory=False)
-			# Receive via Gloo backend
+			logging.info(
+				f"[MIGRATION] Rank {self.rank}: Recv {uuid[:8]}... ← rank {from_rank} "
+				f"({pages_needed} pages, direct CPU→host)"
+			)
+
+			# Receive K tensor (and V if MHA)
+			# We don't know the exact shape without GPU KV config, so receive
+			# into a flat buffer and let WriteSequenceKVFromCPU handle layout.
+			# The source sends read_sequence_kv_to_cpu output: [layers, pages, page_tokens, heads, dim]
+			# We need to receive with matching shape. Use source's k_cpu shape info.
 			gloo_group = self._get_or_create_gloo_group()
-			dist.recv(tensor=k_cpu, src=from_rank, group=gloo_group)
-			t_recv = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo recv: {(t_recv-t0)*1000:.1f}ms")
-			# Register and allocate host KV pages
-			worker_view = self.host_paged_kv_worker_view
-			tokens_needed = pages_needed * page_size
+
+			# First, receive a shape descriptor (source broadcasts k_cpu shape)
+			# Actually, we can reconstruct shape from host KV config + pages_needed
+			num_layers = config_.num_layers if hasattr(self, 'host_paged_kv_worker_view') else self.model_config.num_hidden_layers
+			# Use worker_view config to get KV dimensions
+			wv_stats = worker_view.get_stats()
+
+			# Receive K tensor — shape must match source's read_sequence_kv_to_cpu output
+			# Source tensor shape is determined by C++ host KV config, which is identical on dest
+			# So we can call read on a dummy to get shape... or just recv into empty with matching shape.
+			# Simplest: allocate buffer, recv, then write.
+			# The source's k_cpu.shape is known from the host KV config on this rank (same config).
+			# But we need page_tokens, num_k_heads, k_head_dim from config.
+			# These are accessible from the host KV worker view's internal config.
+			# For now, use model config as fallback.
+			page_tokens = SequenceEntry.PAGE_SIZE  # 64
+
+			# Receive K: source sends contiguous k_cpu
+			# We don't know exact dtype/shape without GPU config, so peek at what source sends
+			# Actually both nodes have same host KV config, so shapes match.
+			# The C++ ReadSequenceKVToCPU determines shape from config — we need the same.
+			# Simplest approach: receive into a buffer then write via C++ API.
+
+			# Register and allocate host KV pages FIRST (so WriteSequenceKVFromCPU has pages)
+			tokens_needed = pages_needed * page_tokens
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
-			t_alloc = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Host allocation: {(t_alloc-t_recv)*1000:.1f}ms")
-			# Move CPU → GPU for offload to host KV
-			k_gpu = k_cpu.to(self.device, non_blocking=True)
-			torch.cuda.synchronize(self.torch_device)
-			t_gpu = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: CPU→GPU copy: {(t_gpu-t_alloc)*1000:.1f}ms")
 
-			# Offload layer-by-layer to host using async_offload_layer_kv_to_host
-			# API expects: k_tensor [batch=1, seq_len, num_heads, head_dim]
-			# Our k_gpu is [num_layers, num_pages, page_size, num_k_heads, k_head_dim]
-			# Reshape: num_pages * page_size = total tokens
-			seq_len = pages_needed * page_size
-			# API expects sequence_ids as Python list, not tensor
-			sequence_ids_list = [global_idx]
-			sequence_lengths = [seq_len]
+			# Now read from a dummy to get the expected tensor shape
+			# Actually, just recv into a buffer sized by pages_needed
+			# The source called read_sequence_kv_to_cpu which returns shape based on its config
+			# Both ranks have identical host KV config, so we can do the same:
+			# Create a receive buffer, then write it back
+			# Use a temp read to determine shape (from our own config)
+			# OR: just receive the raw bytes and write them back.
 
-			# MIGRATION RECV VALIDATION: expensive validation only when explicitly enabled
-			if BATCHGEN_ENABLE_CRITICAL_DIAGS:
-				# NOTE: Only validate the VALID portion of KV (up to current_context_length)
-				# The last page may have uninitialized slots beyond the actual token count
-				first_layer_k = k_gpu[0]  # [num_pages, page_size, num_k_heads, k_head_dim]
-				valid_tokens = seq.current_context_length
-				total_slots = pages_needed * page_size
-				
-				# Reshape to [total_tokens, num_k_heads, k_head_dim] to easily slice valid portion
-				flat_k = first_layer_k.reshape(total_slots, num_k_heads, k_head_dim)
-				valid_k = flat_k[:valid_tokens]  # Only validate actual tokens
-				
-				migration_k_mean = valid_k.float().mean().item()
-				migration_k_std = valid_k.float().std().item()
-				migration_has_nan = torch.isnan(valid_k).any().item()
-				migration_is_zero = (valid_k == 0).all().item()
-				
-				# Also check if the ENTIRE buffer has NaN (for debugging padding issues)
-				full_has_nan = torch.isnan(first_layer_k).any().item()
-				padding_info = ""
-				if full_has_nan and not migration_has_nan:
-					# NaN only in padding region - this is expected and OK
-					padding_info = f" [NaN in padding only - {total_slots - valid_tokens} unused slots]"
-				
-				if BATCHGEN_CB_DEBUG:
-					logging.info(
-						f"MIGRATION: Rank {self.rank}: Validating received KV for {uuid[:8]}... (global_idx={global_idx}): "
-						f"k_gpu_shape={list(k_gpu.shape)}, valid_tokens={valid_tokens}/{total_slots}, "
-						f"layer0_mean={migration_k_mean:.4f}, std={migration_k_std:.4f}, "
-						f"has_nan={migration_has_nan}, is_zero={migration_is_zero}{padding_info}, "
-						f"first_values={valid_k[0, 0, :4].tolist() if valid_k.numel() > 0 else 'N/A'}"
-					)
-				if migration_is_zero:
-					logging.error(
-						f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV is ALL ZEROS for {uuid[:8]}! "
-						f"This means network transfer failed or source had invalid data."
-					)
-				if migration_has_nan:
-					logging.error(
-						f"MIGRATION RECV: Rank {self.rank}: CRITICAL - Received KV has NaN for {uuid[:8]}!"
-					)
-					# DEEP LAYER-BY-LAYER NaN ANALYSIS (debug-only): Find exactly which layers have NaN
-					if BATCHGEN_CB_DEBUG:
-						nan_layers = []
-						for layer_idx in range(k_gpu.shape[0]):
-							layer_k = k_gpu[layer_idx].reshape(total_slots, num_k_heads, k_head_dim)
-							layer_valid_k = layer_k[:valid_tokens]
-							if torch.isnan(layer_valid_k).any():
-								# Find which tokens have NaN in this layer
-								nan_token_mask = torch.isnan(layer_valid_k).any(dim=-1).any(dim=-1)  # [tokens]
-								nan_token_indices = torch.where(nan_token_mask)[0][:5].tolist()  # First 5
-								nan_layers.append({
-									'layer': layer_idx,
-									'nan_token_count': nan_token_mask.sum().item(),
-									'first_nan_tokens': nan_token_indices,
-								})
-						logging.error(
-							f"MIGRATION RECV: Rank {self.rank}: NaN layer analysis for {uuid[:8]}: "
-							f"total_nan_layers={len(nan_layers)}/{k_gpu.shape[0]}, "
-							f"details={nan_layers[:5]}"  # First 5 layers with NaN
-						)
+			# Best approach: receive k_cpu, then call write_sequence_kv_from_cpu
+			# We need the EXACT tensor shape. Since both ranks have the same host KV config,
+			# we can read our own config to determine the shape.
+			# But we don't have a Python accessor for the config fields.
+			# PRAGMATIC: just recv into a pre-allocated buffer matching the source shape.
+			# Source shape = [num_layers, pages_needed, page_size, num_k_heads, k_head_dim]
+			# We can get num_layers from model_config, and the rest from a test allocation.
 
-			for layer_idx in range(num_layers):
-				# Extract layer [num_pages, page_size, num_k_heads, k_head_dim]
-				layer_k = k_gpu[layer_idx]  # [num_pages, page_size, num_k_heads, k_head_dim]
-				# Reshape to [seq_len, num_k_heads, k_head_dim] then add batch dim
-				layer_k_flat = layer_k.reshape(seq_len, num_k_heads, k_head_dim)
-				layer_k_batch = layer_k_flat.unsqueeze(0)  # [1, seq_len, num_k_heads, k_head_dim]
+			# Actually the simplest: call read_sequence_kv_to_cpu on the freshly allocated
+			# (empty) pages to get tensor with correct shape/dtype, then recv into it.
+			k_recv, v_recv = worker_view.read_sequence_kv_to_cpu(global_idx)
+			dist.recv(tensor=k_recv, src=from_rank, group=gloo_group)
+			if v_recv.numel() > 0:
+				dist.recv(tensor=v_recv, src=from_rank, group=gloo_group)
 
-				# CRITICAL: Keep a reference to the per-layer tensor until the
-				# async offload completes. The offload runs on a separate copy
-				# stream and uses the tensor's device memory; if Python GC
-				# frees/reuses that memory before the copy finishes we get
-				# corrupted data. We clear these refs after synchronizing below.
-				if not hasattr(self, '_pending_migration_offload_tensors'):
-					self._pending_migration_offload_tensors = []
-				self._pending_migration_offload_tensors.append(layer_k_batch)
-
-				worker_view.async_offload_layer_kv_to_host(
-					layer_idx=layer_idx,
-					sequence_ids=sequence_ids_list,
-					k_tensor=layer_k_batch,
-					v_tensor=None,  # MLA has no V
-					sequence_lengths=sequence_lengths,
-				)
-				# Note: async_offload_layer_kv_to_host is fire-and-forget for each layer
-
-			# Sync to ensure all offloads complete
-			torch.cuda.synchronize(self.torch_device)
-			# Clear held references for migration offload tensors so memory
-			# can be reclaimed now that copies are guaranteed complete.
-			if hasattr(self, '_pending_migration_offload_tensors'):
-				self._pending_migration_offload_tensors.clear()
-			t_store = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: GPU→Host offload all layers: {(t_store-t_gpu)*1000:.1f}ms")
-			# Note: GPU tensor k_gpu was only a staging buffer, not allocated in GPU paged KV manager
-			# It will be freed automatically when it goes out of scope
+			# Write received data to host pages
+			worker_view.write_sequence_kv_from_cpu(global_idx, k_recv,
+				v_recv if v_recv.numel() > 0 else None)
+			t_write = time.perf_counter()
+			logging.debug(
+				f"MIGRATION: Rank {self.rank}: Recv+write: {(t_write-t0)*1000:.1f}ms"
+			)
 
 			# Receive query_book data (input_ids, decoded_tokens)
-			# Get tensor shapes from the Sequence object (all ranks have seq metadata)
 			input_ids_shape = seq.input_ids.shape
 			decoded_tokens_shape = seq.decoded_tokens.shape
-
 			input_ids_recv = torch.empty(input_ids_shape, dtype=seq.input_ids.dtype, device="cpu")
 			decoded_tokens_recv = torch.empty(decoded_tokens_shape, dtype=seq.decoded_tokens.dtype, device="cpu")
-
 			dist.recv(tensor=input_ids_recv, src=from_rank, group=gloo_group)
 			dist.recv(tensor=decoded_tokens_recv, src=from_rank, group=gloo_group)
 
-			# Store in pending dict for later query_book creation
 			if not hasattr(self, '_pending_migrated_query_book'):
 				self._pending_migrated_query_book = {}
-			# Track migrated sequences for corruption correlation
 			if not hasattr(self, '_migrated_sequences'):
 				self._migrated_sequences = set()
 			self._migrated_sequences.add(uuid)
@@ -3032,15 +2831,12 @@ class BatchGenWorker:
 				'decoded_tokens': decoded_tokens_recv,
 				'kv_token_budget': seq.kv_token_budget,
 			}
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(f"MIGRATION: Rank {self.rank}: Recvd query_book for {uuid[:8]}...")
 
 			t_total = time.perf_counter()
-			if BATCHGEN_CB_DEBUG:
-				logging.debug(
-					f"MIGRATION: Rank {self.rank}: Recvd {uuid[:8]}... "
-					f"in {(t_total-t0)*1000:.1f}ms"
-				)
+			logging.debug(
+				f"MIGRATION: Rank {self.rank}: Recvd {uuid[:8]}... "
+				f"in {(t_total-t0)*1000:.1f}ms"
+			)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
 	def _rebalance_host_kv(self) -> None:

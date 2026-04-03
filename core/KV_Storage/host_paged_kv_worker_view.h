@@ -1080,6 +1080,139 @@ class HostPagedKVWorkerView {
         });
     }
 
+    // ================================================================
+    // Direct host→CPU read/write for migration (no GPU staging)
+    // ================================================================
+
+    /**
+     * Read all KV pages for a sequence directly to CPU tensors.
+     * Returns (k_tensor, v_tensor). For MLA mode, v_tensor is empty (0-dim).
+     * Shape: [num_layers, num_pages, page_size_tokens, num_heads, head_dim]
+     */
+    std::pair<torch::Tensor, torch::Tensor> ReadSequenceKVToCPU(
+        std::int64_t sequence_id) const {
+        const auto pages = page_table_.Pages(sequence_id);
+        const std::size_t num_pages = pages.size();
+        const std::size_t num_layers = config_.num_layers;
+        const std::size_t page_tokens = config_.page_size_tokens;
+        const std::size_t k_heads = config_.num_k_heads;
+        const std::size_t k_dim = config_.k_head_dim;
+        const std::size_t k_elem = config_.k_element_size_bytes;
+        const std::size_t k_page_bytes = layout_.KPageBytes();
+
+        // Determine torch dtype from element size
+        auto k_dtype = (k_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+
+        auto k_out = torch::empty(
+            {(int64_t)num_layers, (int64_t)num_pages, (int64_t)page_tokens,
+             (int64_t)k_heads, (int64_t)k_dim},
+            torch::TensorOptions().dtype(k_dtype).device(torch::kCPU));
+
+        auto* k_ptr = static_cast<std::byte*>(k_out.data_ptr());
+        const std::byte* host_base = backend_.DataBase();
+
+        for (std::size_t layer = 0; layer < num_layers; ++layer) {
+            for (std::size_t p = 0; p < num_pages; ++p) {
+                const void* src =
+                    layout_.KPageAddress(host_base, layer, pages[p]);
+                void* dst = k_ptr + (layer * num_pages + p) * k_page_bytes;
+                std::memcpy(dst, src, k_page_bytes);
+            }
+        }
+
+        // V cache (MHA only)
+        torch::Tensor v_out;
+        if constexpr (kHasVCache) {
+            const std::size_t v_heads = config_.num_v_heads;
+            const std::size_t v_dim = config_.v_head_dim;
+            const std::size_t v_elem = config_.v_element_size_bytes;
+            const std::size_t v_page_bytes = layout_.VPageBytes();
+            auto v_dtype = (v_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+
+            v_out = torch::empty(
+                {(int64_t)num_layers, (int64_t)num_pages,
+                 (int64_t)page_tokens, (int64_t)v_heads, (int64_t)v_dim},
+                torch::TensorOptions().dtype(v_dtype).device(torch::kCPU));
+
+            auto* v_ptr = static_cast<std::byte*>(v_out.data_ptr());
+            for (std::size_t layer = 0; layer < num_layers; ++layer) {
+                for (std::size_t p = 0; p < num_pages; ++p) {
+                    const void* src =
+                        layout_.VPageAddress(host_base, layer, pages[p]);
+                    void* dst =
+                        v_ptr + (layer * num_pages + p) * v_page_bytes;
+                    std::memcpy(dst, src, v_page_bytes);
+                }
+            }
+        } else {
+            v_out = torch::empty({0}, torch::kBFloat16);
+        }
+
+        logger_->info(
+            "ReadSequenceKVToCPU: seq={}, pages={}, layers={}, k_page_bytes={}",
+            sequence_id, num_pages, num_layers, k_page_bytes);
+
+        return {std::move(k_out), std::move(v_out)};
+    }
+
+    /**
+     * Write KV data from CPU tensors directly to host pages.
+     * For MLA mode, v_tensor is ignored.
+     * k_tensor shape: [num_layers, num_pages, page_size_tokens, num_k_heads, k_head_dim]
+     */
+    void WriteSequenceKVFromCPU(std::int64_t sequence_id,
+                                const torch::Tensor& k_tensor,
+                                const std::optional<torch::Tensor>& v_tensor = std::nullopt) {
+        const auto pages = page_table_.Pages(sequence_id);
+        const std::size_t num_pages = pages.size();
+        const std::size_t num_layers = config_.num_layers;
+        const std::size_t k_page_bytes = layout_.KPageBytes();
+
+        if ((std::size_t)k_tensor.size(0) != num_layers ||
+            (std::size_t)k_tensor.size(1) != num_pages) {
+            throw std::invalid_argument(
+                "WriteSequenceKVFromCPU: k_tensor shape mismatch "
+                "(expected layers=" +
+                std::to_string(num_layers) +
+                " pages=" + std::to_string(num_pages) + ")");
+        }
+
+        const auto* k_ptr =
+            static_cast<const std::byte*>(k_tensor.data_ptr());
+        std::byte* host_base = backend_.DataBase();
+
+        for (std::size_t layer = 0; layer < num_layers; ++layer) {
+            for (std::size_t p = 0; p < num_pages; ++p) {
+                void* dst =
+                    layout_.KPageAddress(host_base, layer, pages[p]);
+                const void* src =
+                    k_ptr + (layer * num_pages + p) * k_page_bytes;
+                std::memcpy(dst, src, k_page_bytes);
+            }
+        }
+
+        if constexpr (kHasVCache) {
+            if (v_tensor.has_value() && v_tensor->numel() > 0) {
+                const std::size_t v_page_bytes = layout_.VPageBytes();
+                const auto* v_ptr =
+                    static_cast<const std::byte*>(v_tensor->data_ptr());
+                for (std::size_t layer = 0; layer < num_layers; ++layer) {
+                    for (std::size_t p = 0; p < num_pages; ++p) {
+                        void* dst = layout_.VPageAddress(host_base, layer,
+                                                        pages[p]);
+                        const void* src =
+                            v_ptr + (layer * num_pages + p) * v_page_bytes;
+                        std::memcpy(dst, src, v_page_bytes);
+                    }
+                }
+            }
+        }
+
+        logger_->info(
+            "WriteSequenceKVFromCPU: seq={}, pages={}, layers={}",
+            sequence_id, num_pages, num_layers);
+    }
+
    private:
     struct PageLocation {
         std::int32_t page_idx = -1;
