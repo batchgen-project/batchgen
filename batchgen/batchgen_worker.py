@@ -2593,42 +2593,15 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.info(f"MIGRATION: Round {round_idx+1}/{len(rounds)}: {len(round_migrations)} parallel migrations")
 
-			# Find if this rank participates in this round
+			# Execute migration if participating, otherwise just sync tensor shape info
 			my_migration = None
 			for mig in round_migrations:
-				if self.rank == mig.from_rank or self.rank == mig.to_rank:
-					my_migration = mig
-					break
-
-			# Pre-round check: filter migrations where dest has insufficient host KV pages.
-			# All ranks gather dest free pages and agree on which migrations to skip.
-			# This prevents deadlock (source send without dest recv) that would occur
-			# if we checked per-rank inside _execute_single_kv_migration.
-			viable_migrations = []
-			for mig in round_migrations:
-				# Dest rank reports its free pages, all ranks see the result
-				dest_free = torch.tensor([0], dtype=torch.int64, device=self.torch_device)
-				if self.rank == mig.to_rank:
-					host_stats = self.host_paged_kv_worker_view.get_stats()
-					dest_free[0] = host_stats.num_free_pages
-				dist.broadcast(dest_free, src=mig.to_rank)
-				if mig.pages > dest_free.item():
-					if self.rank == 0:
-						logging.warning(
-							f"MIGRATION: Skipping {mig.uuid[:8]} (rank {mig.from_rank}→{mig.to_rank}) — "
-							f"dest has {dest_free.item()} free pages, need {mig.pages}"
-						)
-				else:
-					viable_migrations.append(mig)
-
-			# Execute viable migrations
-			my_migration = None
-			for mig in viable_migrations:
 				if self.rank == mig.from_rank or self.rank == mig.to_rank:
 					my_migration = mig
 					break
 
 			if my_migration is not None:
+				# Verify sequence exists and is in expected state before migration
 				seq = self.global_batch.get_sequence(my_migration.uuid)
 				if seq is None:
 					logging.error(f"MIGRATION: Rank {self.rank}: SKIP migration - seq {my_migration.uuid[:8]}... not found!")
@@ -5159,7 +5132,13 @@ class BatchGenWorker:
 					self._sync_sequence_metadata(all_active_uuids)
 					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
 
-				# STEP 0: Rebalance host KV BEFORE batch selection
+				# STEP 0: Free GPU KV and rebalance host KV BEFORE batch selection
+				# Destroy GPU KV first so migration can use GPU as staging buffer
+				# (host→GPU→extract→CPU→send). Without this, GPU KV pages from the
+				# previous decode phase leave insufficient free pages for staging.
+				# GPU KV is rebuilt in _load_decode_model() at decode phase start.
+				self._destroy_gpu_paged_kv_cache()
+
 				# This ensures batch selection uses accurate post-migration capacities
 				if self.enable_decode_preemption:
 					rebalance_start = time.perf_counter()
