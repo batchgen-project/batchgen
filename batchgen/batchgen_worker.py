@@ -4890,17 +4890,19 @@ class BatchGenWorker:
 		# Initialize empty global batch (Init may have created one via _reset)
 		self.global_batch = SequenceBatch()
 
-		# Pre-allocate buffer pool for max_pool_size
+		# Pre-allocate buffer pool for max_pool_size.
+		# Use model_context_length for decoded_tokens buffer (not max_decoding_length)
+		# because per-request max_completion_tokens can be up to the full context window.
 		self._buffer_pool = QueryBookBufferPool(
 			num_sequences=self._max_pool_size,
 			model_context_length=self.model_context_length,
-			max_decoding_length=self.max_decoding_length,
+			max_decoding_length=self.model_context_length,
 			pad_token_id=self.pad_token_id,
 		)
 		logging.info(
 			f"Rank {self.rank}: Buffer pool pre-allocated for {self._max_pool_size} sequences "
 			f"(context_length={self.model_context_length}, "
-			f"max_decoding={self.max_decoding_length})"
+			f"max_decoding={self.model_context_length})"
 		)
 
 		# Initialize index maps
