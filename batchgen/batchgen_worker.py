@@ -3236,6 +3236,11 @@ class BatchGenWorker:
 					'prompt_length': seq.prompt_length,  # Include for validation
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
+					# Eviction-related fields: needed so non-owning ranks can
+					# correctly size host KV during the next prefill selection
+					# and sort eviction candidates consistently.
+					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
+					'has_evicted_token_ids': seq.evicted_token_ids is not None,
 				}
 		
 		# Step 2: All-gather state from all ranks
@@ -3254,11 +3259,20 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
+							# Sync prompt_length too. For EVICTED sequences the
+							# owner rewrites prompt_length at eviction time to
+							# the reconstructed re-entry length; non-owners must
+							# pick that up or prefill selection under-counts.
+							if 'prompt_length' in state:
+								seq.prompt_length = state['prompt_length']
 							# Sync host KV fields for consistent migration planning
 							if 'host_pages_allocated' in state:
 								seq.host_pages_allocated = state['host_pages_allocated']
 							if 'host_token_capacity' in state:
 								seq.host_token_capacity = state['host_token_capacity']
+							# Eviction-related fields
+							if 'total_decoded_before_eviction' in state:
+								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
 							
 							# VALIDATION: Ensure received ctx_len is consistent
 							expected_ctx = seq.original_prompt_length + seq.decoded_length
@@ -3818,8 +3832,11 @@ class BatchGenWorker:
 			assigned_rank = seq.assigned_rank
 			seq_node = self._get_node_for_rank(assigned_rank)
 
-			# Use the SAME page calculation as _config_prefill_for_batch
-			# to prevent over-admission that causes host KV page exhaustion
+			# NOTE: For EVICTED sequences, seq.prompt_length has already been
+			# updated to the reconstructed re-entry length (= original prompt +
+			# previously-decoded tokens) at eviction time in _page_boundary_fast,
+			# and propagated to all ranks via _sync_sequence_metadata before we
+			# get here. So we can use seq.prompt_length uniformly.
 			post_prefill_length = seq.prompt_length + 1
 			gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
 			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
@@ -5437,13 +5454,27 @@ class BatchGenWorker:
 				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
-			# Safety assertion: log if selection over-admitted (should not happen after fix)
-			total_pages_needed = sum(math.ceil(t / 64) for t in sequence_tokens)
+			# Safety assertion: log if selection over-admitted. This should not
+			# happen after the EVICTED-length fix in _prepare_prefill_batch —
+			# if it fires, there's another selection bug to investigate.
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
+			total_pages_needed = sum(math.ceil(t / seq.PAGE_SIZE) for t in sequence_tokens)
 			if total_pages_needed > kv_stats.num_free_pages:
+				# Log per-sequence breakdown to help diagnose the selection bug.
+				seq_details = []
+				for gid, tokens in list(zip(global_sequence_ids, sequence_tokens))[:10]:
+					s = self.global_batch.get_sequence(
+						next(u for u in my_prefill_uuids if self.global_batch.get_sequence(u).global_idx == gid)
+					)
+					seq_details.append(
+						f"gid={gid} prompt_len={s.prompt_length} "
+						f"was_evicted={s.total_decoded_before_eviction > 0} "
+						f"tokens={tokens}"
+					)
 				logging.error(
 					f"Rank {self.rank}: Host KV OVER-ADMISSION: need {total_pages_needed} pages, "
-					f"have {kv_stats.num_free_pages}. Selection should have prevented this."
+					f"have {kv_stats.num_free_pages}. Selection should have prevented this. "
+					f"First 10 seqs: {seq_details}"
 				)
 
 			logging.debug(
@@ -6761,6 +6792,21 @@ class BatchGenWorker:
 					else:
 						seq.evicted_token_ids = prompt_tokens.clone()
 					seq.total_decoded_before_eviction = seq.decoded_length
+					# ARCHITECTURAL FIX: Update prompt_length to reflect the
+					# reconstructed re-entry prompt HERE at eviction time, not
+					# later in _config_prefill_for_batch. Reason: selection at
+					# _prepare_prefill_batch reads seq.prompt_length to size the
+					# host KV reservation. If we defer the update, selection
+					# under-counts by `total_decoded_before_eviction` tokens per
+					# evicted sequence, over-admits, and crashes the allocator
+					# with "Insufficient free pages".
+					#
+					# This update happens only on the owner; _sync_sequence_metadata
+					# (which already carries prompt_length) propagates it to all
+					# other ranks before the next decision boundary runs.
+					new_reentry_len = len(seq.evicted_token_ids)
+					seq.prompt_length = new_reentry_len
+					seq.current_context_length = new_reentry_len
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
