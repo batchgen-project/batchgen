@@ -186,6 +186,8 @@ def main():
     parser.add_argument("--model", default="moonshotai/Kimi-K2.5")
     parser.add_argument("--batch-size", type=int, default=2000)
     parser.add_argument("--interval", type=int, default=1200, help="Seconds between batch submissions (default 1200 = 20 min)")
+    parser.add_argument("--interval-min", type=int, default=None, help="Min interval for random range (overrides --interval)")
+    parser.add_argument("--interval-max", type=int, default=None, help="Max interval for random range")
     parser.add_argument("--max-decoding-length", type=int, default=262144)
     parser.add_argument("--max-prompts", type=int, default=None, help="Limit total prompts (default: full dataset)")
     args = parser.parse_args()
@@ -258,11 +260,16 @@ def main():
 
         # Wait interval before next batch (skip for last batch)
         if batch_idx < num_batches - 1:
-            logger.info(f"Waiting {args.interval}s before next batch submission...")
+            import random
+            if args.interval_min is not None and args.interval_max is not None:
+                interval = random.randint(args.interval_min, args.interval_max)
+            else:
+                interval = args.interval
+            logger.info(f"Waiting {interval}s ({interval/60:.1f} min) before next batch submission...")
             # Sleep in 30s chunks so we can report completions
             waited = 0
-            while waited < args.interval:
-                time.sleep(min(30, args.interval - waited))
+            while waited < interval:
+                time.sleep(min(30, interval - waited))
                 waited += 30
                 for p in pollers:
                     if p.done and not hasattr(p, '_reported'):
