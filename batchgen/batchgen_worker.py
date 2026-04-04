@@ -3236,11 +3236,9 @@ class BatchGenWorker:
 					'prompt_length': seq.prompt_length,  # Include for validation
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
-					# Eviction-related fields: needed so non-owning ranks can
-					# correctly size host KV during the next prefill selection
-					# and sort eviction candidates consistently.
+					# total_decoded_before_eviction: needed so non-owning ranks
+					# sort eviction candidates consistently in _prepare_prefill_batch.
 					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
-					'has_evicted_token_ids': seq.evicted_token_ids is not None,
 				}
 		
 		# Step 2: All-gather state from all ranks
@@ -4912,13 +4910,28 @@ class BatchGenWorker:
 				# have consistent current_context_length values before migration. PREFILLED
 				# sequences must be synced because their attention mask has been updated
 				# (prompt_len + 1) after prefill, and migration includes PREFILLED status.
+				# EVICTED sequences MUST be synced too: the owner rewrites their
+				# prompt_length at eviction time (in _page_boundary_fast) to the
+				# reconstructed re-entry length, and _prepare_prefill_batch (called
+				# a few lines below) reads prompt_length on all ranks to size the
+				# host KV reservation. Without this sync, non-owners read the stale
+				# original prompt length, under-count host KV pages, over-admit, and
+				# crash at allocate_pages_for_sequences.
 				prefilled_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.PREFILLED]
 				on_hold_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.ON_HOLD]
 				in_decode_uuids = [seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.IN_DECODE]
-				all_active_uuids = prefilled_uuids + on_hold_uuids + in_decode_uuids
+				evicted_uuids_for_sync = (
+					[seq.uuid for seq in self.global_batch if seq.status == SequenceStatus.EVICTED]
+					if self.enable_host_kv_eviction else []
+				)
+				all_active_uuids = prefilled_uuids + on_hold_uuids + in_decode_uuids + evicted_uuids_for_sync
 				if all_active_uuids:
 					self._sync_sequence_metadata(all_active_uuids)
-					logging.debug(f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance")
+					logging.debug(
+						f"Rank {self.rank}: Synced metadata for {len(all_active_uuids)} sequences before rebalance "
+						f"(prefilled={len(prefilled_uuids)}, on_hold={len(on_hold_uuids)}, "
+						f"in_decode={len(in_decode_uuids)}, evicted={len(evicted_uuids_for_sync)})"
+					)
 
 				# This ensures batch selection uses accurate post-migration capacities
 				if self.enable_decode_preemption:
