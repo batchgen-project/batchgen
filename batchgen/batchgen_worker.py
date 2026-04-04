@@ -5672,14 +5672,30 @@ class BatchGenWorker:
 
 		# Allocate GPU KV for sequences
 		if local_decode_indices:
-			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			for local_idx in local_decode_indices:
-				uuid = self._local_to_uuid_map[local_idx]
-				seq = self.global_batch.get_sequence(uuid)
-				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-				# Mark initial reservation done
-				seq.mark_initial_gpu_reservation_done()
-				self._sequences_with_gpu_kv.add(uuid)
+			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
+			if alloc_ok:
+				# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
+				# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
+				# Keep these for safety / idempotence.
+				for local_idx in local_decode_indices:
+					uuid = self._local_to_uuid_map[local_idx]
+					seq = self.global_batch.get_sequence(uuid)
+					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+					# Mark initial reservation done
+					seq.mark_initial_gpu_reservation_done()
+					self._sequences_with_gpu_kv.add(uuid)
+			else:
+				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
+				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
+				# do NOT add these sequences to tracking. Otherwise subsequent
+				# rebuild_page_table() calls will crash with KeyError because the
+				# sequences exist in _sequences_with_gpu_kv / batch but were never
+				# registered in gpu_manager._sequences.
+				logging.error(
+					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
+					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
+				)
+				local_decode_indices.clear()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
@@ -8106,6 +8122,26 @@ class BatchGenWorker:
 			return
 		
 		global_ids = self._local_indices_to_global_seq_ids(batch)
+		# DEFENSIVE FIX: Filter out sequences not registered in the GPU manager.
+		# During decode→prefill→decode transitions with mid-decode admission, the
+		# batch can contain sequences whose GPU KV allocation failed or was not
+		# yet registered. Passing such IDs to rebuild_page_table crashes with
+		# KeyError. Filter them here and log.
+		manager_sequences = getattr(gpu_manager, '_sequences', None)
+		if manager_sequences is not None:
+			allocated_ids = [gid for gid in global_ids if gid in manager_sequences]
+			if len(allocated_ids) < len(global_ids):
+				missing = [gid for gid in global_ids if gid not in manager_sequences]
+				logging.error(
+					f"Rank {self.rank}: _rebuild_page_table_for_batch: filtering "
+					f"{len(missing)} unallocated sequences out of {len(global_ids)}: "
+					f"first_missing={missing[:10]}"
+				)
+				global_ids = allocated_ids
+		if not global_ids:
+			Attn_Wrapper.cur_batch = []
+			gpu_manager.clear_page_table()
+			return
 		gpu_manager.rebuild_page_table(global_ids)
 		Attn_Wrapper.cur_batch = global_ids
 
