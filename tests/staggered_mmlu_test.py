@@ -36,21 +36,36 @@ logger = logging.getLogger(__name__)
 # ---------- Dataset helpers ----------
 
 def form_options(options: List[str]) -> str:
+    """Format multiple choice options. Must match r1_mmlu_pro_batch_test.py
+    exactly — the "Options are:\\n" header is part of the prompt that the
+    reference 84% accuracy depends on."""
+    option_str = "Options are:\n"
     letters = "ABCDEFGHIJ"
-    return "".join(f"({letters[i]}): {opt}\n" for i, opt in enumerate(options))
+    for opt, letter in zip(options, letters):
+        option_str += f"({letter}): {opt}\n"
+    return option_str
 
 
 def build_few_shot_prefix(val_df: pd.DataFrame, category: str) -> str:
-    cat_examples = val_df[val_df["category"] == category].head(5)
+    """Build few-shot prefix from the validation set for a category.
+
+    Must match r1_mmlu_pro_batch_test.py exactly: concatenates ALL validation
+    rows for this category using raw cot_content (which already contains
+    "A: <reasoning>...The answer is (X)."). Do NOT strip or re-wrap cot_content;
+    that corrupts the in-context examples and tanks accuracy.
+    """
     parts = []
-    for _, row in cat_examples.iterrows():
-        cot = row.get("cot_content", "")
-        if isinstance(cot, str) and cot.startswith("A: "):
-            cot = cot[3:]
-        q = row["question"]
-        opts = form_options(row["options"])
-        ans = row["answer"]
-        parts.append(f"Q: {q}\n{opts}A: {cot}\nThe answer is ({ans}).\n\n")
+    for _, row in val_df[val_df["category"] == category].iterrows():
+        parts.append(
+            "Q:"
+            + " "
+            + row["question"]
+            + "\n"
+            + form_options(row["options"])
+            + "\n"
+            + row["cot_content"]
+            + "\n\n"
+        )
     return "".join(parts)
 
 
@@ -69,18 +84,76 @@ QUERY_TEMPLATE = (
 )
 
 
+_TIGHT_ANSWER_PATTERN = re.compile(r"answer is \(?([ABCDEFGHIJ])\)?", re.IGNORECASE)
+_FALLBACK_ANSWER_PATTERNS = [
+    # Loose variants covering cases where the model used a different phrasing
+    # or the reasoning trace was truncated before the model produced the
+    # canonical "the answer is (X)" line.
+    re.compile(r"(?i)\b(?:the\s+)?answer\s+(?:is|should\s+be|would\s+be|must\s+be)\s*\(?([ABCDEFGHIJ])\)?"),
+    re.compile(r"(?i)\b(?:correct\s+answer|final\s+answer)\s*(?:is|:)?\s*\(?([ABCDEFGHIJ])\)?"),
+    re.compile(r"(?i)\bAnswer[s]?\s*[:\-]\s*\(?([ABCDEFGHIJ])\)?"),
+    re.compile(r"\\boxed\{[^}]*?([ABCDEFGHIJ])[^}]*\}"),
+    re.compile(r"(?m)^\s*\(?([ABCDEFGHIJ])\)?\s*$"),
+]
+
+
+def _search_last(pattern: re.Pattern, text: str) -> Optional[str]:
+    """Return the LAST match of pattern in text, or None.
+
+    For reasoning-model outputs, the final answer tends to appear near the
+    end of the text. re.search returns the first match, which may be inside
+    an intermediate discussion ("initially I thought the answer is B, but
+    actually the answer is C"). Taking the last match is closer to the
+    model's final decision.
+    """
+    last = None
+    for m in pattern.finditer(text):
+        last = m
+    return last.group(1).upper() if last else None
+
+
 def extract_answer(text: str) -> Optional[str]:
-    patterns = [
-        r"(?i)\b(?:the\s+)?answer\s+is\s*\(?([ABCDEFGHIJ])\)?",
-        r"(?i)Answer[s]?\s*[:\-]?\s*\(?([ABCDEFGHIJ])\)?",
-        r"\\boxed\{[^}]*?([ABCDEFGHIJ])[^}]*\}",
-        r"(?<![A-Za-z0-9])[\(\[]\s*([ABCDEFGHIJ])\s*[\)\]](?![A-Za-z0-9])",
-        r"^\s*([ABCDEFGHIJ])\s*$",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.MULTILINE)
-        if m:
-            return m.group(1).upper()
+    """Extract the final answer letter from a model output.
+
+    Based on r1_mmlu_pro_batch_test.py's extract_prediction, with extensions
+    for outputs where the model did not complete its reasoning trace:
+
+      1. If the output contains </think>, search ONLY after that tag first.
+         Kimi K2.5 is a reasoning model; the canonical final answer appears
+         after </think>. Using the tight pattern
+         r"answer is \\(?([ABCDEFGHIJ])\\)?" on the post-</think> span gives
+         the cleanest signal.
+
+      2. If no match is found in the post-</think> span (or no </think> at
+         all, which happens when the model hit max_completion_tokens mid-
+         reasoning and never closed the think tag), fall back to searching
+         the full text with a set of looser patterns. Take the LAST match,
+         not the first, since the final decision in a reasoning trace
+         typically comes at the end.
+    """
+    think_end_pos = text.find("</think>")
+    if think_end_pos != -1:
+        post = text[think_end_pos + len("</think>"):]
+        # Prefer the tight pattern on the post-</think> span.
+        m = _search_last(_TIGHT_ANSWER_PATTERN, post)
+        if m is not None:
+            return m
+        # Tight failed on post-</think>; still try fallbacks on post-</think>
+        # before resorting to the full text.
+        for pat in _FALLBACK_ANSWER_PATTERNS:
+            m = _search_last(pat, post)
+            if m is not None:
+                return m
+
+    # No </think> (reasoning was truncated) — search the whole text.
+    # Tight pattern first, then fallbacks. In both cases take the LAST match.
+    m = _search_last(_TIGHT_ANSWER_PATTERN, text)
+    if m is not None:
+        return m
+    for pat in _FALLBACK_ANSWER_PATTERNS:
+        m = _search_last(pat, text)
+        if m is not None:
+            return m
     return None
 
 
