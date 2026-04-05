@@ -114,6 +114,9 @@ else:
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 
+# Optional decode-time invariant check: assert cache_seqlens <= gpu_pages_allocated * PAGE_SIZE
+BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
+
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
 
@@ -7086,7 +7089,36 @@ class BatchGenWorker:
 		remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
 		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
 		if my_remaining_ext:
-			self._extend_gpu_kv_allocation(my_remaining_ext)
+			success = self._extend_gpu_kv_allocation(my_remaining_ext)
+			if not success:
+				# Extension failed — put failed sequences ON_HOLD to prevent
+				# cache_seqlens from exceeding gpu_pages_allocated × PAGE_SIZE,
+				# which would cause FlashAttention to read -1 sentinel page
+				# indices and trigger CUDA illegal memory access.
+				logging.warning(
+					f"Rank {self.rank}: GPU page extension FAILED for "
+					f"{len(my_remaining_ext)} sequences at boundary — "
+					f"moving to ON_HOLD to prevent illegal memory access"
+				)
+				# Owner: release GPU pages
+				ext_failed_local = self._get_local_indices_for_uuids(my_remaining_ext)
+				ext_failed_global = self._local_indices_to_global_seq_ids(ext_failed_local)
+				if ext_failed_global:
+					gpu_manager.free_pages_for_sequences(ext_failed_global)
+				for uuid in my_remaining_ext:
+					self._sequences_with_gpu_kv.discard(uuid)
+
+				# All ranks: zero scalars and update status for ALL failed seqs
+				# (remaining_needing_ext is the globally-consistent list)
+				ext_failed_set = set(remaining_needing_ext)
+				for uuid in remaining_needing_ext:
+					seq = self.global_batch.get_sequence(uuid)
+					seq.gpu_pages_allocated = 0
+					seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
+					self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+
+				decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
+				batch = self._get_local_indices_for_uuids(decode_uuids)
 
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
 
@@ -7987,6 +8019,26 @@ class BatchGenWorker:
 
 			# Pre-compute batch_sequences for use in both forward setup and update loop
 			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+
+			# Invariant check: cache_seqlens must not exceed allocated pages.
+			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
+			if BATCHGEN_DECODE_ASSERT and batch:
+				for seq in batch_sequences:
+					max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
+					if seq.current_context_length > max_tokens:
+						logging.error(
+							f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
+							f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
+							f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
+							f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
+							f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
+							f"status={seq.status})"
+						)
+						raise RuntimeError(
+							f"cache_seqlens overrun: ctx={seq.current_context_length} > "
+							f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
+							f"{max_tokens} for {seq.uuid[:8]}"
+						)
 
 			with torch.inference_mode():
 				if batch:
