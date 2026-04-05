@@ -654,11 +654,18 @@ class GPUPagedKVCacheManager:
 				stage to the prefill stage. During the prefill stage, the GPU will
 				continue to rely on the caching allocator’s memory, so clearing the
 				cache is usually unnecessary.
+
+		This is idempotent: calling destroy() twice in a row (e.g. back-to-back
+		prefill cycles in generate()) is a no-op on the second call because
+		_reset_runtime_state has already set _is_initialized=False and cleared
+		all GPU buffer references. We log at debug level (not warning) to avoid
+		scaring operators.
 		"""
 
 		if not self._is_initialized:
-			logging.warning(
-				"GPUPagedKVCacheManager.destroy called while uninitialized; skipping"
+			logging.debug(
+				"GPUPagedKVCacheManager.destroy called while uninitialized; "
+				"no-op (state was already reset by a prior destroy call)"
 			)
 			return
 
