@@ -5351,14 +5351,55 @@ class BatchGenWorker:
 		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
 		# STEP 3: Prepare evicted sequences for re-entry (before host KV allocation)
-		# Evicted sequences need their metadata updated to reflect the new "prompt"
-		# (original prompt + previously decoded tokens) and pre-filled decoded_tokens.
+		#
+		# Split into two loops:
+		#   (a) All-ranks scalar metadata update (runs on every rank using
+		#       fields already synchronized via Phase 4.C of the eviction
+		#       boundary and via _sync_sequence_metadata).
+		#   (b) Owner-only tensor buffer setup (only the owning rank has
+		#       the QueryBookBufferPool slot for this sequence).
+		#
+		# The previous single-loop version ran both steps gated on
+		# evicted_token_ids — which is an owner-only tensor — so non-owning
+		# ranks silently skipped the scalar updates and held stale values
+		# for decoded_length / reentry_decoded_baseline / max_decode_length
+		# until the next _sync_sequence_metadata call.
+
+		# (a) All-ranks scalar metadata update for re-entering sequences.
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			# FIX: Check evicted_token_ids instead of status.
-			# Status was already changed to IN_PREFILL at line 4891 before this runs,
-			# so checking status == EVICTED always fails. evicted_token_ids is the
-			# ground truth for whether a sequence needs re-entry reconstruction.
+			# total_decoded_before_eviction > 0 identifies sequences that have
+			# been evicted at least once and are now re-entering. This field is
+			# synced across ranks, unlike evicted_token_ids which is owner-only.
+			if seq.total_decoded_before_eviction == 0:
+				continue
+
+			# seq.prompt_length and seq.current_context_length were already
+			# updated to the new reconstructed length by Phase 4.C of the
+			# eviction boundary and synced to all ranks.
+
+			# Baseline = accumulated historical output length carried forward
+			# into decoded_tokens. With the Phase 4.C cascade fix, this is
+			# exactly (prompt_length - original_prompt_length) = sum of new
+			# decoded counts across all past cycles.
+			baseline_candidate = seq.prompt_length - seq.original_prompt_length
+			n_old = min(baseline_candidate, self.max_decoding_length)
+			if n_old < 0:
+				n_old = 0
+			seq.decoded_length = n_old
+			seq.reentry_decoded_baseline = n_old
+
+			# Remaining decode budget for this re-entry
+			seq.max_decode_length = max(
+				0,
+				seq.original_max_decode_length - seq.total_decoded_before_eviction,
+			)
+
+		# (b) Owner-only tensor buffer setup. Also clears seq.evicted_token_ids.
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			# Gate on evicted_token_ids (owner-only tensor); non-owners fall
+			# through here because their copy is always None.
 			if seq.evicted_token_ids is None:
 				continue
 
@@ -5368,40 +5409,49 @@ class BatchGenWorker:
 			seq.log_event(SeqEvent.REENTRY_START, self.rank,
 				f"new_prompt_len={new_prompt_len}, prev_decoded={prev_decoded}")
 
+			# Sanity: owner-side new_prompt_len must match scalar math done
+			# in loop (a). Mismatches indicate a drift between the tensor
+			# built by Phase 4.C and the scalar accounting.
+			if new_prompt_len != seq.prompt_length:
+				logging.error(
+					f"Rank {self.rank}: re-entry prep length mismatch for "
+					f"{uuid[:8]}: tensor={new_prompt_len}, scalar="
+					f"{seq.prompt_length}. Trusting tensor."
+				)
+				seq.prompt_length = new_prompt_len
+				seq.current_context_length = new_prompt_len
+
 			# Rebuild input_ids with new prompt — reuse buffer pool slot
-			# kv_token_budget stays unchanged (Q5 answer)
 			seq_extended_size = seq.kv_token_budget
 			slot = seq._buffer_slot
 			self._buffer_pool.input_ids_buffer[slot, :] = 0
 			self._buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
 			seq.input_ids = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
 
-			seq.prompt_length = new_prompt_len
-			seq.current_context_length = new_prompt_len
-			# original_prompt_length stays unchanged (set at init)
-
 			# Pre-fill decoded_tokens with previously decoded tokens (Q1/Q2)
-			# So the final decoded_tokens contains the COMPLETE response
+			# so the final decoded_tokens contains the COMPLETE response.
 			self._buffer_pool.decoded_tokens_buffer[slot, :] = self._buffer_pool.pad_token_id
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			if prev_decoded > 0:
-				# Extract old decoded tokens from evicted_token_ids
 				old_decoded = evicted_ids[seq.original_prompt_length:]
 				n_old = min(len(old_decoded), self.max_decoding_length)
 				seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
-				seq.decoded_length = n_old
-			else:
-				seq.decoded_length = 0
-
-			# Remaining decode budget
-			remaining_decode = max(0, seq.original_max_decode_length - prev_decoded)
-			seq.max_decode_length = remaining_decode
+				# decoded_length and reentry_decoded_baseline are already set
+				# by loop (a); setting them here is redundant but harmless and
+				# acts as a local invariant check.
+				if seq.decoded_length != n_old:
+					logging.error(
+						f"Rank {self.rank}: re-entry decoded_length mismatch for "
+						f"{uuid[:8]}: tensor_n_old={n_old}, scalar="
+						f"{seq.decoded_length}. Trusting tensor."
+					)
+					seq.decoded_length = n_old
+					seq.reentry_decoded_baseline = n_old
 
 			# Clear eviction state
 			seq.evicted_token_ids = None
 
 			# Recreate query_book entry for this rank's evicted sequences (Q4)
-			# The old entry has stale input_ids/decoded_tokens references
 			if seq.assigned_rank == self.rank and uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				self.query_book[local_idx] = query(
@@ -5413,13 +5463,10 @@ class BatchGenWorker:
 					kv_token_budget=seq.kv_token_budget,
 				)
 
-			# Status already set to IN_PREFILL at line 4891 (before _config_prefill_for_batch)
-			# Skip redundant transition that would fail with IN_PREFILL → IN_PREFILL
-
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
 				f"new_prompt={new_prompt_len}, prev_decoded={prev_decoded}, "
-				f"remaining_decode={remaining_decode}, kv_budget={seq.kv_token_budget}"
+				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
 			)
 
 		# STEP 4: Allocate host KV pages for sequences (only THIS RANK's sequences)
@@ -6837,6 +6884,18 @@ class BatchGenWorker:
 		if host_evicted_uuids:
 			# Owner-only: build and stash the evicted_token_ids tensor and
 			# release on-device resources (GPU KV pages, host KV worker view).
+			#
+			# CASCADING RE-ENTRY FIX: only append decoded tokens BEYOND the
+			# re-entry baseline. For a fresh sequence the baseline is 0 (all
+			# decoded tokens are genuinely new). For a sequence that has
+			# already been re-entered, decoded_tokens[0:reentry_decoded_baseline]
+			# contains the historical output copied in at the last re-entry
+			# prep — those tokens ALSO live inside the current reconstructed
+			# prompt (input_ids[original_prompt_length:prompt_length]), so
+			# re-appending them here would double-count them and the next
+			# re-entry cycle would receive a prompt that grew by prev_decoded
+			# instead of by new_decoded_count, producing the geometric
+			# doubling seen in multi-eviction runs.
 			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
 			if my_evicted:
 				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
@@ -6844,9 +6903,13 @@ class BatchGenWorker:
 				for uuid in my_evicted:
 					seq = self.global_batch.get_sequence(uuid)
 					prompt_tokens = seq.input_ids[0, :seq.prompt_length]
-					if seq.decoded_tokens is not None and seq.decoded_length > 0:
-						decoded = seq.decoded_tokens[0, :seq.decoded_length]
-						seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
+					baseline = seq.reentry_decoded_baseline
+					if (
+						seq.decoded_tokens is not None
+						and seq.decoded_length > baseline
+					):
+						new_decoded = seq.decoded_tokens[0, baseline:seq.decoded_length]
+						seq.evicted_token_ids = torch.cat([prompt_tokens, new_decoded])
 					else:
 						seq.evicted_token_ids = prompt_tokens.clone()
 					if BATCHGEN_CB_DEBUG:
@@ -6864,21 +6927,32 @@ class BatchGenWorker:
 					worker_view.unregister_sequences(evicted_global_ids)
 
 			# All-ranks: update scalar metadata deterministically. Compute
-			# new_reentry_len from already-synced prompt_length+decoded_length
-			# so every rank arrives at the same value without needing the
-			# owner's evicted_token_ids tensor.
+			# new_reentry_len from already-synced prompt_length, decoded_length,
+			# and reentry_decoded_baseline so every rank arrives at the same
+			# value without needing the owner's evicted_token_ids tensor.
+			#
+			# Matches the owner's tensor computation exactly:
+			#   len(evicted_token_ids)
+			#   = len(prompt_tokens[:prompt_length]) + len(decoded_tokens[baseline:decoded_length])
+			#   = prompt_length + max(0, decoded_length - baseline)
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				# Re-entry reconstruction length: current effective prompt
-				# plus any decoded tokens accumulated since the last prefill.
-				# Matches the len(evicted_token_ids) computed on the owner.
-				new_reentry_len = seq.prompt_length + seq.decoded_length
+				baseline = seq.reentry_decoded_baseline
+				new_decoded_count = max(0, seq.decoded_length - baseline)
+				new_reentry_len = seq.prompt_length + new_decoded_count
+				# total_decoded_before_eviction tracks cumulative output length,
+				# which at this point equals seq.decoded_length (the full output
+				# buffer including historical tokens carried forward across
+				# re-entry cycles). Used downstream for eviction priority
+				# sorting and for computing remaining_decode_budget at the
+				# next re-entry.
 				seq.total_decoded_before_eviction = seq.decoded_length
 				seq.prompt_length = new_reentry_len
 				seq.current_context_length = new_reentry_len
 				saved = new_reentry_len
 				seq.log_event(SeqEvent.EVICTED, self.rank,
-					f"saved_tokens={saved}, decoded={seq.decoded_length}")
+					f"saved_tokens={saved}, decoded={seq.decoded_length}, "
+					f"new_this_cycle={new_decoded_count}")
 				seq.gpu_pages_allocated = 0
 				seq.host_pages_allocated = 0
 				seq.host_token_capacity = 0
