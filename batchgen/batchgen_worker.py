@@ -1051,11 +1051,18 @@ class BatchGenWorker:
 			if seq._buffer_slot >= 0:
 				self._buffer_pool.free_slot(seq._buffer_slot)
 
-		# Free local index mapping
+		# Free local index mapping.
+		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
+		# stray pops with downstream "Missing UUID" errors.
 		local_idx = self._uuid_to_local_map.pop(uuid, None)
 		if local_idx is not None:
 			del self._local_to_uuid_map[local_idx]
 			self._free_local_indices.add(local_idx)
+			if seq.assigned_rank == self.rank:
+				logging.debug(
+					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
+					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
+				)
 
 		# Only rank 0 sends to response queue
 		if self.rank != 0 or self._response_queue is None:
@@ -2914,7 +2921,11 @@ class BatchGenWorker:
 					self.query_book.pop(local_idx, None)
 					# Add freed index to free list for O(1) reuse
 					self._free_local_indices.add(local_idx)
-					logging.debug(f"Rank {self.rank}: Removed {uuid[:8]}... from local mappings (freed local_idx={local_idx})")
+					logging.debug(
+						f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
+						f"{uuid[:8]} (local_idx={local_idx}, from_rank={old_rank}, "
+						f"to_rank={new_rank})"
+					)
 
 			# Update local mappings on dest rank (add)
 			if self.rank == new_rank:
@@ -5072,8 +5083,25 @@ class BatchGenWorker:
 					# Gather decoded tokens from owning ranks before reporting
 					# (each rank only writes decoded tokens for its own sequences)
 					gathered_texts = self._gather_completed_tokens(list(global_completed))
-					# Report completions to response queue (pool mode)
-					for uuid in global_completed:
+					# ORDERING FIX: release resources BEFORE _report_completion
+					# pops local_map entries. See matching fix in _page_boundary_fast
+					# Phase 4.A and in the legacy decode path.
+					completed_list = list(global_completed)
+					my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
+					if my_completed:
+						my_completed_local = self._get_local_indices_for_uuids(my_completed)
+						self._release_gpu_kv_pages(my_completed_local)
+						self._release_host_kv_pages_for_batch(my_completed)
+					# All-ranks scalar cleanup
+					for uuid in completed_list:
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None:
+							seq.gpu_pages_allocated = 0
+							seq.host_pages_allocated = 0
+							seq.host_token_capacity = 0
+							self._sequences_with_gpu_kv.discard(uuid)
+					# Report completions (pops local_map; runs LAST)
+					for uuid in completed_list:
 						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 
 				if not decode_uuids:
@@ -6728,6 +6756,29 @@ class BatchGenWorker:
 				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
 				f"Missing first 5: {missing_uuids[:5]}"
 			)
+			# DEFENSIVE: mark orphaned sequences as COMPLETED on all ranks so
+			# they stop coming back to this filter every boundary and eventually
+			# desync a collective. These sequences are unrecoverable — their
+			# local_map entry on the owner was lost, so their decoded_tokens /
+			# input_ids buffers are no longer reachable. Force-terminating them
+			# contains the damage to the affected sequences rather than
+			# crashing the whole server after a 1-hour NCCL timeout.
+			for orphan_uuid in missing_uuids:
+				orphan_seq = self.global_batch.get_sequence(orphan_uuid)
+				if orphan_seq is None:
+					continue
+				orphan_seq.gpu_pages_allocated = 0
+				orphan_seq.host_pages_allocated = 0
+				orphan_seq.host_token_capacity = 0
+				self._sequences_with_gpu_kv.discard(orphan_uuid)
+				if orphan_seq.status != SequenceStatus.COMPLETED:
+					try:
+						self.global_batch.update_status(orphan_uuid, SequenceStatus.COMPLETED)
+					except ValueError:
+						# If current status doesn't allow direct transition to
+						# COMPLETED (e.g., QUEUEING), at least drop it from
+						# active tracking.
+						pass
 			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
 
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
@@ -6783,6 +6834,18 @@ class BatchGenWorker:
 		# All ranks execute the same decisions, but only operate on locally-owned sequences
 
 		# A. Release completed sequences
+		#
+		# ORDERING FIX: _release_gpu_kv_pages and _release_host_kv_pages_for_batch
+		# must run BEFORE _report_completion. Previously _report_completion ran
+		# first, which pops seq.uuid from self._uuid_to_local_map on ALL ranks
+		# (including the owner). The subsequent
+		#     my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+		# filter then always produced an EMPTY list on the owner — so the host
+		# KV worker view never released its pages for completed sequences, and
+		# the GPU KV manager never released its pages either. Host KV slowly
+		# filled up across the test run, triggering excessive eviction cycles,
+		# which amplified the cross-rank state drift that eventually crashed the
+		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
@@ -6790,19 +6853,18 @@ class BatchGenWorker:
 			self._submit_completed_to_incremental_writer(completed_uuids)
 			# Gather decoded tokens from owning ranks before reporting
 			gathered_texts = self._gather_completed_tokens(completed_uuids)
-			# Report completions to response queue (pool mode)
-			for uuid in completed_uuids:
-				self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+
+			# Release resources on owners BEFORE popping local_map entries via
+			# _report_completion (see ordering fix note above).
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
 				self._release_gpu_kv_pages(my_completed_local)
 				self._release_host_kv_pages_for_batch(my_completed)
+
 			# All-ranks: zero scalar counters so downstream reads (e.g.
 			# migration planning iterating all sequences) never see a stale
-			# non-zero page count for completed sequences. The owner-side
-			# _release_gpu_kv_pages already zeros its own copy; this loop
-			# closes the gap for non-owners.
+			# non-zero page count for completed sequences.
 			for uuid in completed_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
@@ -6810,6 +6872,12 @@ class BatchGenWorker:
 					seq.host_pages_allocated = 0
 					seq.host_token_capacity = 0
 					self._sequences_with_gpu_kv.discard(uuid)
+
+			# Report completions (this is what pops local_map on the owner).
+			# Must run LAST so the _release_*_pages calls above see the
+			# correct local_map state.
+			for uuid in completed_uuids:
+				self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 			# Report completions to adaptive chunk sizer
 			if self.adaptive_chunk_sizer is not None:
 				for uuid in completed_uuids:
@@ -9008,15 +9076,18 @@ class BatchGenWorker:
 					self._submit_completed_to_incremental_writer(completed_uuids)
 					# Gather decoded tokens from owning ranks before reporting
 					gathered_texts = self._gather_completed_tokens(completed_uuids)
-					# Report completions to response queue (pool mode)
-					for uuid in completed_uuids:
-						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
-					# FIX: Must release GPU KV pages BEFORE releasing host KV pages
+					# ORDERING FIX: release GPU/host KV BEFORE _report_completion
+					# pops local_map entries. Previously the filter below
+					# captured an empty list because _report_completion ran
+					# first and popped every local_map entry on the owner.
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:
 						my_completed_local_indices = self._get_local_indices_for_uuids(my_completed)
 						self._release_gpu_kv_pages(my_completed_local_indices)
 					self._release_host_kv_pages_for_batch(completed_uuids)
+					# Report completions (this pops local_map; must run LAST).
+					for uuid in completed_uuids:
+						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
 				
 				if decode_uuids:
 					decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
