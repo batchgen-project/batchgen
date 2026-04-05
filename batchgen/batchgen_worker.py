@@ -6591,6 +6591,17 @@ class BatchGenWorker:
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
+					# prompt_length: required so Phase 4.C can compute the
+					# re-entry reconstruction length on ALL ranks deterministically,
+					# not just the owner. Without this, non-owning ranks have a
+					# stale prompt_length for re-evicted sequences (where the
+					# owner has already rewritten prompt_length in a prior
+					# eviction). See Phase 4.C.
+					'prompt_length': seq.prompt_length,
+					# total_decoded_before_eviction: propagated here so the
+					# next _prepare_prefill_batch's eviction priority sort is
+					# consistent across ranks.
+					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
 				}
 		
 		# Get candidates for loading - report PREFILLED/ON_HOLD sequences that could be loaded
@@ -6684,6 +6695,15 @@ class BatchGenWorker:
 					# Sync host KV fields to keep all ranks consistent for migration planning
 					seq.host_pages_allocated = state['host_pages_allocated']
 					seq.host_token_capacity = state['host_token_capacity']
+					# Sync prompt_length (may have been rewritten by a prior
+					# eviction on the owner) and total_decoded_before_eviction
+					# so Phase 4 mutations can be computed deterministically on
+					# all ranks, and the next _prepare_prefill_batch selection
+					# priority sort is consistent.
+					if 'prompt_length' in state:
+						seq.prompt_length = state['prompt_length']
+					if 'total_decoded_before_eviction' in state:
+						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
 					# Validate gathered ctx_len
 					expected_ctx = seq.original_prompt_length + seq.decoded_length
 					if seq.current_context_length != expected_ctx:
@@ -6731,6 +6751,18 @@ class BatchGenWorker:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
 				self._release_gpu_kv_pages(my_completed_local)
 				self._release_host_kv_pages_for_batch(my_completed)
+			# All-ranks: zero scalar counters so downstream reads (e.g.
+			# migration planning iterating all sequences) never see a stale
+			# non-zero page count for completed sequences. The owner-side
+			# _release_gpu_kv_pages already zeros its own copy; this loop
+			# closes the gap for non-owners.
+			for uuid in completed_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None:
+					seq.gpu_pages_allocated = 0
+					seq.host_pages_allocated = 0
+					seq.host_token_capacity = 0
+					self._sequences_with_gpu_kv.discard(uuid)
 			# Report completions to adaptive chunk sizer
 			if self.adaptive_chunk_sizer is not None:
 				for uuid in completed_uuids:
@@ -6788,38 +6820,35 @@ class BatchGenWorker:
 							)
 
 		# C. Host KV eviction
+		#
+		# SYNC MODEL: Mutations here must keep every rank consistent without
+		# requiring a follow-up _sync_sequence_metadata call. The only pieces
+		# that can only live on the owning rank are the actual token tensors
+		# (evicted_token_ids, input_ids view, decoded_tokens buffer). All
+		# scalar metadata — prompt_length, current_context_length,
+		# total_decoded_before_eviction, host/gpu page counters, status — is
+		# updated on ALL ranks deterministically, using values already
+		# synchronized in Phase 1/2 of this same boundary call.
+		#
+		# For re-entry length: new_reentry_len = seq.prompt_length +
+		# seq.decoded_length. At Phase 4.C time, both operands are consistent
+		# across ranks because Phase 2 synced them from the owner.
 		host_evicted_uuids = decisions.host_evicted_uuids
 		if host_evicted_uuids:
+			# Owner-only: build and stash the evicted_token_ids tensor and
+			# release on-device resources (GPU KV pages, host KV worker view).
 			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
 			if my_evicted:
 				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
 				self._release_gpu_kv_pages(my_evicted_local)
 				for uuid in my_evicted:
 					seq = self.global_batch.get_sequence(uuid)
-					if seq.original_prompt_length == seq.prompt_length:
-						pass  # Already correct from init
 					prompt_tokens = seq.input_ids[0, :seq.prompt_length]
 					if seq.decoded_tokens is not None and seq.decoded_length > 0:
 						decoded = seq.decoded_tokens[0, :seq.decoded_length]
 						seq.evicted_token_ids = torch.cat([prompt_tokens, decoded])
 					else:
 						seq.evicted_token_ids = prompt_tokens.clone()
-					seq.total_decoded_before_eviction = seq.decoded_length
-					# ARCHITECTURAL FIX: Update prompt_length to reflect the
-					# reconstructed re-entry prompt HERE at eviction time, not
-					# later in _config_prefill_for_batch. Reason: selection at
-					# _prepare_prefill_batch reads seq.prompt_length to size the
-					# host KV reservation. If we defer the update, selection
-					# under-counts by `total_decoded_before_eviction` tokens per
-					# evicted sequence, over-admits, and crashes the allocator
-					# with "Insufficient free pages".
-					#
-					# This update happens only on the owner; _sync_sequence_metadata
-					# (which already carries prompt_length) propagates it to all
-					# other ranks before the next decision boundary runs.
-					new_reentry_len = len(seq.evicted_token_ids)
-					seq.prompt_length = new_reentry_len
-					seq.current_context_length = new_reentry_len
 					if BATCHGEN_CB_DEBUG:
 						logging.debug(
 							f"[HOST_KV_EVICT_DETAIL] seq={uuid[:8]} "
@@ -6834,10 +6863,20 @@ class BatchGenWorker:
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
 
-			# Update status (all ranks)
+			# All-ranks: update scalar metadata deterministically. Compute
+			# new_reentry_len from already-synced prompt_length+decoded_length
+			# so every rank arrives at the same value without needing the
+			# owner's evicted_token_ids tensor.
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
-				saved = len(seq.evicted_token_ids) if seq.evicted_token_ids is not None else 0
+				# Re-entry reconstruction length: current effective prompt
+				# plus any decoded tokens accumulated since the last prefill.
+				# Matches the len(evicted_token_ids) computed on the owner.
+				new_reentry_len = seq.prompt_length + seq.decoded_length
+				seq.total_decoded_before_eviction = seq.decoded_length
+				seq.prompt_length = new_reentry_len
+				seq.current_context_length = new_reentry_len
+				saved = new_reentry_len
 				seq.log_event(SeqEvent.EVICTED, self.rank,
 					f"saved_tokens={saved}, decoded={seq.decoded_length}")
 				seq.gpu_pages_allocated = 0
@@ -6870,6 +6909,7 @@ class BatchGenWorker:
 		onhold_set = set(onhold_uuids)
 
 		if onhold_uuids:
+			# Owner-only: actually free GPU KV pages for locally-held sequences.
 			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
 			if my_onhold:
 				local_indices = self._get_local_indices_for_uuids(my_onhold)
@@ -6877,12 +6917,16 @@ class BatchGenWorker:
 				if global_ids and gpu_manager:
 					gpu_manager.free_pages_for_sequences(global_ids)
 				for uuid in my_onhold:
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = 0
 					self._sequences_with_gpu_kv.discard(uuid)
 
+			# All-ranks: scalar metadata must be kept consistent. Non-owners
+			# MUST also zero gpu_pages_allocated; otherwise their stale value
+			# leaks into subsequent decision-making (e.g. migration planning
+			# that iterates over all sequences). This was previously in the
+			# my_onhold owner-only branch, creating a cross-rank desync window.
 			for uuid in onhold_uuids:
 				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = 0
 				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=boundary")
 				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
