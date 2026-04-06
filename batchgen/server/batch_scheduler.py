@@ -991,7 +991,7 @@ class BatchScheduler:
                 if not hasattr(self, '_drain_blocked_logged'):
                     self._drain_blocked_logged = False
                 if not self._drain_blocked_logged:
-                    logger.info(
+                    logger.warning(
                         f"[POOL] Drain blocked: scheduling pool full "
                         f"(active={self._scheduling_pool.num_active_slots()}, "
                         f"capacity={self._scheduling_pool._capacity}, "
@@ -1027,7 +1027,7 @@ class BatchScheduler:
                 "entries": admit_entries,
             }
             self.worker.request_queue.put(admission_msg)
-            logger.info(
+            logger.warning(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
                 f"(intake remaining: {self._intake_pool.size()}, "
                 f"scheduling active: {self._scheduling_pool.num_active_slots()}, "
@@ -1082,7 +1082,7 @@ class BatchScheduler:
                         self._completion_count = 0
                     self._completion_count += 1
                     if self._completion_count % 500 == 0:
-                        logger.info(
+                        logger.warning(
                             f"[POOL] Completion #{self._completion_count}: "
                             f"active={self._scheduling_pool.num_active_slots()}, "
                             f"free={self._scheduling_pool.num_free_slots()}, "
