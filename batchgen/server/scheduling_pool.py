@@ -162,18 +162,21 @@ class SchedulingPool:
     def mark_request_completed(self, request_id: str, batch_id: str) -> bool:
         """Mark a request as completed and update its batch tracker.
 
-        Idempotent: duplicate completions for the same request_id are ignored.
+        Idempotent: duplicate completions for the same (batch_id, request_id)
+        pair are ignored. The dedup key is scoped per-batch so that
+        identical request_ids across different batches are counted separately.
 
         Returns:
             True if this was the last request in the batch (batch is now complete).
         """
         with self._lock:
-            if request_id in self._completed_requests:
+            dedup_key = (batch_id, request_id)
+            if dedup_key in self._completed_requests:
                 logger.warning(
                     f"[SCHED] Duplicate completion for {request_id} in batch {batch_id}, ignoring"
                 )
                 return False
-            self._completed_requests.add(request_id)
+            self._completed_requests.add(dedup_key)
 
             tracker = self._batch_trackers.get(batch_id)
             if tracker is None:
@@ -196,18 +199,20 @@ class SchedulingPool:
     def mark_request_failed(self, request_id: str, batch_id: str) -> bool:
         """Mark a request as failed and update its batch tracker.
 
-        Idempotent: duplicate failures for the same request_id are ignored.
+        Idempotent: duplicate failures for the same (batch_id, request_id)
+        pair are ignored.
 
         Returns:
             True if this was the last request in the batch.
         """
         with self._lock:
-            if request_id in self._completed_requests:
+            dedup_key = (batch_id, request_id)
+            if dedup_key in self._completed_requests:
                 logger.warning(
                     f"[SCHED] Duplicate fail for {request_id} in batch {batch_id}, ignoring"
                 )
                 return False
-            self._completed_requests.add(request_id)
+            self._completed_requests.add(dedup_key)
 
             tracker = self._batch_trackers.get(batch_id)
             if tracker is None:
@@ -223,17 +228,15 @@ class SchedulingPool:
         """Remove and return a batch tracker (e.g., after batch completes).
 
         Also cleans up completed request IDs for this batch to prevent
-        unbounded growth.
+        unbounded growth of the dedup set.
         """
         with self._lock:
             tracker = self._batch_trackers.pop(batch_id, None)
-            # Clean up completed request IDs for this batch
-            # We don't track per-batch request sets, so we can't selectively clean.
-            # Instead, prune if total tracked > 2x active batches' total requests.
-            total_expected = sum(t.total_requests for t in self._batch_trackers.values())
-            if len(self._completed_requests) > max(total_expected * 2, 10000):
-                self._completed_requests.clear()
-                logger.info("[SCHED] Pruned completed_requests set")
+            # Clean up dedup entries scoped to this batch
+            self._completed_requests = {
+                k for k in self._completed_requests
+                if k[0] != batch_id
+            }
             return tracker
 
     # -------------------- Intake Selection --------------------
