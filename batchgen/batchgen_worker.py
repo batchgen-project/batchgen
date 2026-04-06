@@ -117,6 +117,9 @@ BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
 # Optional decode-time invariant check: assert cache_seqlens <= gpu_pages_allocated * PAGE_SIZE
 BATCHGEN_DECODE_ASSERT = os.environ.get("BATCHGEN_DECODE_ASSERT", "0") == "1"
 
+# Multi-batch diagnostic logging for investigating metadata corruption
+BATCHGEN_MULTI_BATCH_DIAG = os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
+
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
 
@@ -4739,6 +4742,8 @@ class BatchGenWorker:
 		config_decode_time = 0.0
 
 		# Initialize cumulative decode counters (persist across prefill/decode switches)
+		self._timing_logged = False  # Print timing once per batch group
+		self._decode_group_idx = 0  # Track decode groups for diagnostic logging
 		self._cumulative_decode_iterations = 0
 		self._cumulative_decode_boundaries = 0
 		self._cumulative_boundary_ms = 0.0
@@ -4848,9 +4853,28 @@ class BatchGenWorker:
 				admitted = self._poll_admissions()
 				if admitted and self.rank == 0:
 					logging.info(f"[POOL] Admitted new sequences, total in batch: {len(self.global_batch)}")
+					self._timing_logged = False  # Reset for new batch group
 
 			# --- TERMINATION CHECK ---
 			if self.global_batch.all_completed():
+				# Print timing summary when all current work is done
+				if not self._timing_logged and self.rank == 0:
+					gen_time = time.perf_counter() - generation_start_time
+					total_prompt = sum(s.prompt_length for s in self.global_batch)
+					total_decoded = sum(s.decoded_length for s in self.global_batch)
+					num_seq = len(self.global_batch)
+					pf_tp = total_prompt / prefill_time if prefill_time > 0 else 0
+					dc_tp = total_decoded / decoding_time if decoding_time > 0 else 0
+					ov_tp = (total_prompt + total_decoded) / gen_time if gen_time > 0 else 0
+					logging.info(
+						f"Pool batch group completed:\n"
+						f"  Sequences: {num_seq}\n"
+						f"  Prefill: {prefill_time:.1f}s ({pf_tp:,.0f} tok/s)\n"
+						f"  Decode: {decoding_time:.1f}s ({dc_tp:,.0f} tok/s)\n"
+						f"  Total: {gen_time:.1f}s ({ov_tp:,.0f} tok/s)\n"
+						f"  Prompt tokens: {total_prompt:,}, Decoded tokens: {total_decoded:,}"
+					)
+					self._timing_logged = True
 				if self._admission_queue is None:
 					break  # Legacy mode: no pool, just finish
 				if self._shutdown_requested:
@@ -5180,20 +5204,24 @@ class BatchGenWorker:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
 						logging.info(f"[DECODE] Breaking for prefill (watermark) - {num_queued} queued, {num_evicted} evicted")
-					# CRITICAL: Transition IN_DECODE → ON_HOLD before prefill.
-					# Without this, _destroy_gpu_paged_kv_cache in prefill phase destroys
-					# GPU KV under IN_DECODE sequences. The subsequent reload through
-					# _allocate_gpu_kv_two_page_buffer has subtle bugs that corrupt KV
-					# for some sequences (~134-token truncation). The ON_HOLD path
-					# properly syncs metadata, frees GPU pages, and ensures sequences
-					# resume through the standard ON_HOLD→IN_DECODE load path.
-					# Filter to IN_DECODE only (decode_uuids may contain EVICTED/COMPLETED)
 					in_decode_uuids = [
 						u for u in decode_uuids
 						if self.global_batch.get_sequence(u).status == SequenceStatus.IN_DECODE
 					]
+					# DIAG: Log ON_HOLD transition details
+					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and in_decode_uuids:
+						sample = in_decode_uuids[:5]
+						for u in sample:
+							s = self.global_batch.get_sequence(u)
+							logging.info(
+								f"[MULTI_DIAG] ON_HOLD transition: {u[:8]} gid={s.global_idx} "
+								f"decoded={s.decoded_length} ctx={s.current_context_length} "
+								f"prompt={s.prompt_length} gpu_pages={s.gpu_pages_allocated}"
+							)
+						logging.info(f"[MULTI_DIAG] Putting {len(in_decode_uuids)} seqs ON_HOLD (decode_group={self._decode_group_idx})")
 					if in_decode_uuids:
 						self._put_sequences_on_hold(in_decode_uuids)
+					self._decode_group_idx += 1
 					break
 		
 		# Log timing stats
@@ -8066,6 +8094,21 @@ class BatchGenWorker:
 						cache_seqlens.append(ctx_len)
 
 					max_ctx = max(cache_seqlens)
+
+					# DIAG: Log cache_seqlens at first iteration of each decode group
+					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
+						fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
+						resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
+						logging.info(
+							f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
+							f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
+							f"max_ctx={max_ctx}"
+						)
+						for uid, dl, ctx in fresh[:5]:
+							logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
+						for uid, dl, ctx, pg in resumed[:5]:
+							logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
+
 					# Build attention metadata directly on GPU
 					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
 
@@ -8289,6 +8332,13 @@ class BatchGenWorker:
 
 				# Use CPU tensor to avoid GPU sync
 				token_id = new_tokens_cpu[i].item()
+
+				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
+				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
+					logging.info(
+						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
+						f"decoded_len={seq.decoded_length} token={token_id}"
+					)
 				if self._should_stop_at_eos(token_id):
 					seq.eos_reached = True
 
