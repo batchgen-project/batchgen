@@ -5166,16 +5166,20 @@ class BatchGenWorker:
 					if admitted and self.rank == 0:
 						logging.info(f"[DECODE] Mid-cycle admission, total in batch: {len(self.global_batch)}")
 
-				# Check if there are queued sequences waiting for prefill.
-				# If so, break out of inner decode loop to allow outer loop to enter prefill.
-				needs_prefill = self.global_batch.has_queueing() or (
+				# Check if there are queued sequences waiting for prefill AND
+				# host KV has enough free capacity to make prefill worthwhile.
+				# Without the watermark check, decode oscillates: breaks every
+				# DECISION_INTERVAL, puts all seqs ON_HOLD (~12s reload), prefills
+				# only a handful of sequences, then resumes — destroying throughput.
+				has_pending = self.global_batch.has_queueing() or (
 					self.enable_host_kv_eviction and self.global_batch.has_evicted()
 				)
+				needs_prefill = has_pending and self._check_host_kv_watermark_trigger()
 				if needs_prefill:
 					if self.rank == 0:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
-						logging.info(f"[DECODE] Breaking for prefill - {num_queued} queued, {num_evicted} evicted")
+						logging.info(f"[DECODE] Breaking for prefill (watermark) - {num_queued} queued, {num_evicted} evicted")
 					# CRITICAL: Transition IN_DECODE → ON_HOLD before prefill.
 					# Without this, _destroy_gpu_paged_kv_cache in prefill phase destroys
 					# GPU KV under IN_DECODE sequences. The subsequent reload through
@@ -7921,9 +7925,9 @@ class BatchGenWorker:
 							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
 							f"total in batch: {len(self.global_batch)}"
 						)
-					if self.global_batch.has_queueing():
+					if self.global_batch.has_queueing() and watermark_triggered:
 						if self.rank == 0:
-							logging.info(f"[DECODE] Breaking for new batch prefill")
+							logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
 						break
 
 				# Detailed logging at every boundary (only rank 0)
