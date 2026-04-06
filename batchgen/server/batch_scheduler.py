@@ -987,8 +987,20 @@ class BatchScheduler:
             # Drain from IntakePool (up to scheduling pool free slots)
             free_slots = self._scheduling_pool.num_free_slots()
             if free_slots <= 0:
+                # DIAG: Log when drain is blocked by full scheduling pool
+                if not hasattr(self, '_drain_blocked_logged'):
+                    self._drain_blocked_logged = False
+                if not self._drain_blocked_logged:
+                    logger.info(
+                        f"[POOL] Drain blocked: scheduling pool full "
+                        f"(active={self._scheduling_pool.num_active_slots()}, "
+                        f"capacity={self._scheduling_pool._capacity}, "
+                        f"intake={self._intake_pool.size()})"
+                    )
+                    self._drain_blocked_logged = True
                 await asyncio.sleep(0.2)
                 continue
+            self._drain_blocked_logged = False
 
             drained = self._scheduling_pool.select_from_intake(
                 self._intake_pool, max_n=free_slots
@@ -1018,7 +1030,8 @@ class BatchScheduler:
             logger.info(
                 f"[POOL] Drained {len(admit_entries)} entries to worker "
                 f"(intake remaining: {self._intake_pool.size()}, "
-                f"scheduling active: {self._scheduling_pool.num_active_slots()})"
+                f"scheduling active: {self._scheduling_pool.num_active_slots()}, "
+                f"free={self._scheduling_pool.num_free_slots()})"
             )
 
         logger.info("[POOL] Intake drain task stopped")
@@ -1064,6 +1077,17 @@ class BatchScheduler:
                             self._scheduling_pool.free_slot(request_id)
                         except KeyError:
                             pass
+                    # DIAG: Periodic slot status after completions
+                    if not hasattr(self, '_completion_count'):
+                        self._completion_count = 0
+                    self._completion_count += 1
+                    if self._completion_count % 500 == 0:
+                        logger.info(
+                            f"[POOL] Completion #{self._completion_count}: "
+                            f"active={self._scheduling_pool.num_active_slots()}, "
+                            f"free={self._scheduling_pool.num_free_slots()}, "
+                            f"intake={self._intake_pool.size()}"
+                        )
                     # Write output JSONL line
                     if batch_id and request_id:
                         self._write_pool_completion(batch_id, request_id, result)

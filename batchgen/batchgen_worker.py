@@ -7953,7 +7953,14 @@ class BatchGenWorker:
 							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
 							f"total in batch: {len(self.global_batch)}"
 						)
-					if self.global_batch.has_queueing() and watermark_triggered:
+					has_q = self.global_batch.has_queueing()
+					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
+						num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
+						logging.info(
+							f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
+							f"watermark={watermark_triggered} admitted={admitted}"
+						)
+					if has_q and watermark_triggered:
 						if self.rank == 0:
 							logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
 						break
