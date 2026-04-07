@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
 from batchgen.batch_invariant_matmul import matmul_persistent as _bi_matmul
-_HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "1") == "1"
+_HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "0") == "1"
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
