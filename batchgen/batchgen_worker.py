@@ -907,13 +907,17 @@ class BatchGenWorker:
 		my_texts = [all_texts[i] for i in my_indices]
 
 		if my_texts:
-			# padding=False avoids allocating a [N, max_len] padded tensor.
-			# Returns List[List[int]] — no attention_mask needed since each
-			# list is already the exact sequence length.
+			# padding=False + return_tensors=None: returns List[List[int]]
+			# directly — no padded 2D tensor, no attention_mask overhead.
+			# Must pass return_tensors=None explicitly because model-specific
+			# tokenizers (e.g., Kimi K2.5) default to "pt" which crashes on
+			# ragged lists.
 			my_batch_tokenized = self.tokenizer(
 				my_texts,
+				return_tensors=None,
 				truncation=False,
 				padding=False,
+				return_attention_mask=False,
 			)
 			my_tokenized = [
 				{
@@ -3459,14 +3463,14 @@ class BatchGenWorker:
 		tokenize_start = time.perf_counter()
 
 		# Each rank tokenizes its subset.
-		# padding=False avoids allocating a [N, max_len] padded 2D tensor on CPU.
-		# Returns List[List[int]] — each list is exact sequence length, no
-		# attention_mask needed.
+		# padding=False + return_tensors=None avoids the padded 2D tensor.
 		if my_texts:
 			my_batch_tokenized = self.tokenizer(
 				my_texts,
+				return_tensors=None,
 				truncation=False,
 				padding=False,
+				return_attention_mask=False,
 			)
 			my_tokenized = [
 				{
