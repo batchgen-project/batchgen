@@ -889,37 +889,44 @@ class BatchGenWorker:
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
 		"""Tokenize newly admitted sequences and assign buffer pool slots.
 
-		Uses parallel tokenization across ranks (same pattern as _tokenize_global_batch
-		but only for the new sequences).
+		Reuses the same parallel tokenization + buffer pool fill pattern as
+		_tokenize_global_batch Phase 1 + Phase 3. Key differences:
+		- Uses existing buffer pool (not creating a new one)
+		- Only processes the new sequences, not the full global_batch
+
+		Optimization: uses padding=False to avoid creating a large padded 2D
+		tensor on CPU. The tokenizer returns List[List[int]] directly, which
+		is lighter than a [N, max_len] padded tensor + attention_mask.
 		"""
 		sequences = [self.global_batch.get_sequence(u) for u in uuids]
 		all_texts = [seq.text for seq in sequences]
 		num_new = len(all_texts)
 
-		# Parallel tokenization across ranks
+		# Phase 1: Parallel tokenization across ranks (same as _tokenize_global_batch)
 		my_indices = list(range(self.rank, num_new, self.world_size))
 		my_texts = [all_texts[i] for i in my_indices]
 
 		if my_texts:
+			# padding=False avoids allocating a [N, max_len] padded tensor.
+			# Returns List[List[int]] — no attention_mask needed since each
+			# list is already the exact sequence length.
 			my_batch_tokenized = self.tokenizer(
 				my_texts,
-				return_tensors="pt",
 				truncation=False,
-				padding=True,
-				return_attention_mask=True,
+				padding=False,
 			)
-			my_tokenized = []
-			for i in range(len(my_texts)):
-				actual_len = int(my_batch_tokenized["attention_mask"][i].sum().item())
-				my_tokenized.append({
+			my_tokenized = [
+				{
 					"idx": my_indices[i],
-					"input_ids": my_batch_tokenized["input_ids"][i, :actual_len].tolist(),
-					"length": actual_len,
-				})
+					"input_ids": my_batch_tokenized["input_ids"][i],
+					"length": len(my_batch_tokenized["input_ids"][i]),
+				}
+				for i in range(len(my_texts))
+			]
 		else:
 			my_tokenized = []
 
-		# Gather across ranks
+		# Phase 1.5: Gather across ranks
 		all_tokenized_lists = [None] * self.world_size
 		dist.all_gather_object(all_tokenized_lists, my_tokenized)
 
@@ -930,7 +937,7 @@ class BatchGenWorker:
 					tokenized_by_idx[item["idx"]] = item
 		del all_tokenized_lists
 
-		# Reject sequences exceeding context length
+		# Phase 2.5: Reject sequences exceeding context length
 		rejected_uuids = []
 		for i, seq in enumerate(sequences):
 			item = tokenized_by_idx.get(i)
@@ -947,7 +954,6 @@ class BatchGenWorker:
 
 		for uuid in rejected_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			# Report rejection to response queue so batch tracker counts it
 			if self._response_queue is not None and self.rank == 0 and seq is not None:
 				self._response_queue.put({
 					"type": "completion",
@@ -964,7 +970,9 @@ class BatchGenWorker:
 				})
 			self.global_batch.remove_sequence(uuid)
 
-		# Assign buffer slots and fill token data
+		# Phase 3: Assign buffer pool slots and fill token data
+		# Same pattern as _tokenize_global_batch Phase 3 — allocate slot from
+		# existing buffer pool, write tokens directly into the view.
 		for i, seq in enumerate(sequences):
 			if seq.uuid in rejected_uuids:
 				continue
@@ -3450,24 +3458,24 @@ class BatchGenWorker:
 
 		tokenize_start = time.perf_counter()
 
-		# Each rank tokenizes its subset
+		# Each rank tokenizes its subset.
+		# padding=False avoids allocating a [N, max_len] padded 2D tensor on CPU.
+		# Returns List[List[int]] — each list is exact sequence length, no
+		# attention_mask needed.
 		if my_texts:
 			my_batch_tokenized = self.tokenizer(
 				my_texts,
-				return_tensors="pt",
-				truncation=False,  # No truncation - keep full input
-				padding=True,      # Pad to longest in this subset
-				return_attention_mask=True,
+				truncation=False,
+				padding=False,
 			)
-			# Extract individual sequences from the batch result
-			my_tokenized = []
-			for i in range(len(my_texts)):
-				actual_len = int(my_batch_tokenized["attention_mask"][i].sum().item())
-				my_tokenized.append({
+			my_tokenized = [
+				{
 					"global_idx": my_indices[i],
-					"input_ids": my_batch_tokenized["input_ids"][i, :actual_len].tolist(),
-					"length": actual_len,
-				})
+					"input_ids": my_batch_tokenized["input_ids"][i],
+					"length": len(my_batch_tokenized["input_ids"][i]),
+				}
+				for i in range(len(my_texts))
+			]
 		else:
 			my_tokenized = []
 
