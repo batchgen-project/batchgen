@@ -107,7 +107,7 @@ class SequenceEntry:
     VALID_TRANSITIONS = {
         SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL},
         SequenceStatus.IN_PREFILL: {SequenceStatus.PREFILLED},
-        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE},
+        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED},
         SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.COMPLETED: set(),

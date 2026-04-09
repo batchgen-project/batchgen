@@ -5127,9 +5127,23 @@ class BatchGenWorker:
 							seq.host_pages_allocated = 0
 							seq.host_token_capacity = 0
 							self._sequences_with_gpu_kv.discard(uuid)
-					# Report completions (pops local_map; runs LAST)
+					# Report completions (pops local_map; runs LAST).
+					# Guard: only report if status actually reached COMPLETED.
+					# _sync_completion_status_tensor may detect eos_reached=True
+					# for a PREFILLED sequence (stale from pre-eviction), but
+					# PREFILLED→COMPLETED is an invalid transition. Without this
+					# guard, _report_completion pops local_map for a sequence
+					# whose status never changed, creating an orphan.
 					for uuid in completed_list:
-						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None and seq.status == SequenceStatus.COMPLETED:
+							self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+						elif seq is not None:
+							logging.warning(
+								f"Rank {self.rank}: Skipping _report_completion for {uuid[:8]} "
+								f"(status={seq.status.name}, expected COMPLETED). "
+								f"Likely stale eos_reached from pre-eviction cycle."
+							)
 
 				if not decode_uuids:
 					break
@@ -5457,6 +5471,19 @@ class BatchGenWorker:
 				0,
 				seq.original_max_decode_length - seq.total_decoded_before_eviction,
 			)
+
+			# Reset completion flags — the sequence may have hit EOS in its
+			# previous decode cycle before being evicted. Without this reset,
+			# _sync_completion_status_tensor falsely detects the re-entering
+			# sequence as completed (stale eos_reached=True), calls
+			# _report_completion (popping local_map), but the PREFILLED→COMPLETED
+			# status transition fails (invalid), leaving a zombie: PREFILLED
+			# status with no local_map entry, invisible to the boundary load
+			# mechanism (which iterates local_map), stuck for the entire decode
+			# cycle until _prepare_decode_batch picks it up → CRITICAL error.
+			seq.eos_reached = False
+			if hasattr(seq, '_rep_detected'):
+				seq._rep_detected = False
 
 		# (b) Owner-only tensor buffer setup. Also clears seq.evicted_token_ids.
 		for uuid in prefill_uuids:
