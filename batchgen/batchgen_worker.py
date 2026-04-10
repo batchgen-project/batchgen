@@ -4910,14 +4910,17 @@ class BatchGenWorker:
 							self._admit_sequences_from_message(msg)
 							# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and msg.get("command") == "reload":
-							# Hot-reload command — broadcast to all ranks then handle
+							# Hot-reload command — broadcast to all ranks then handle.
+							# Result is written to /tmp/batchgen_reload_status/rank_<N>.json
+							# inside _handle_hot_reload (via _write_reload_status), NOT
+							# put on response_queue. Putting on response_queue would
+							# deadlock the FastAPI event loop because the sync HTTP
+							# handler can't drain mp.Queue while blocking.
 							status = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
-							result = self._handle_hot_reload(msg)
-							if self._response_queue is not None:
-								self._response_queue.put(result)
+							self._handle_hot_reload(msg)
 						else:
 							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
@@ -9914,16 +9917,45 @@ class BatchGenWorker:
 				f"rebound {rebound} methods, skipped {skipped}"
 				+ (f", {len(missing)} missing attrs" if missing else "")
 			)
-			return {
+			result = {
 				"status": "reload_success",
 				"rank": self.rank,
 				"rebound": rebound,
 				"skipped": skipped,
 				"missing_attrs": missing,
 			}
+			self._write_reload_status(result)
+			return result
 		except Exception as e:
 			_log.error(f"Rank {self.rank}: Hot reload FAILED: {e}", exc_info=True)
-			return {"status": "reload_failed", "rank": self.rank, "error": str(e)}
+			result = {"status": "reload_failed", "rank": self.rank, "error": str(e)}
+			self._write_reload_status(result)
+			return result
+
+	def _write_reload_status(self, result: dict) -> None:
+		"""Write reload status atomically to /tmp/batchgen_reload_status/rank_<N>.json.
+
+		The HTTP server polls these files instead of waiting on a queue,
+		which avoids deadlocks when the FastAPI event loop is blocked.
+		"""
+		import json
+		import os
+		import tempfile
+		import time as _time
+		try:
+			result_with_time = dict(result)
+			result_with_time["timestamp"] = _time.time()
+			status_dir = "/tmp/batchgen_reload_status"
+			os.makedirs(status_dir, exist_ok=True)
+			# Write to temp then atomic rename
+			fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")
+			with os.fdopen(fd, "w") as f:
+				json.dump(result_with_time, f)
+			final_path = os.path.join(status_dir, f"rank_{self.rank}.json")
+			os.rename(tmp_path, final_path)
+		except Exception as e:
+			import logging as _log
+			_log.warning(f"Rank {self.rank}: Failed to write reload status: {e}")
 
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.
