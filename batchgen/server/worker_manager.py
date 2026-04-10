@@ -361,6 +361,13 @@ class WorkerManager:
             result = self.response_queue.get()
         return result
 
+    def send_reload_command(self, reload_deps: bool = True) -> dict:
+        """Send hot-reload command to all worker ranks."""
+        with self._lock:
+            self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+            result = self.response_queue.get()
+        return result
+
     # ---------------------- Startup helpers ----------------------
     def _compact_memory(self) -> None:
         """Drop page cache and compact memory for stable THP allocation."""

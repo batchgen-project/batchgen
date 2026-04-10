@@ -498,6 +498,26 @@ def create_app(
 
         return response_data
 
+    @app.post("/v1/reload")
+    async def reload_worker(request: Request):
+        """Hot-reload worker code without restarting the server.
+
+        Reloads batchgen_worker module and dependent modules, then rebinds
+        all methods on the existing worker instance. Host KV, weights, and
+        NCCL stay alive.
+
+        Body (optional):
+            {"reload_deps": true}  — also reload batch_scheduler, intake_pool, etc.
+        """
+        worker_manager: WorkerManager = request.app.state.worker_manager
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reload_deps = body.get("reload_deps", True)
+        result = worker_manager.send_reload_command(reload_deps=reload_deps)
+        return result
+
     @app.get("/health")
     async def health_check(request: Request):
         health: ServerHealthState = request.app.state.health
