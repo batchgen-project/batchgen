@@ -7835,8 +7835,8 @@ class BatchGenWorker:
 		3. Reduced logging overhead
 		4. No timing object allocation in hot path
 		"""
-		# RELOAD-TEST-MARKER-v3: SUCCESSFUL HOT RELOAD via /v1/reload
-		logging.info(f"[RELOAD-TEST-V3] LIVE-PATCHED decoding_continuous on rank {getattr(self, 'global_rank', '?')}")
+		# RELOAD-TEST-MARKER-v4: HOT RELOAD via /v1/reload (post-deadlock-fix)
+		logging.info(f"[RELOAD-TEST-V4] DEADLOCK-FIXED hot-reload on rank {getattr(self, 'global_rank', '?')}")
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
