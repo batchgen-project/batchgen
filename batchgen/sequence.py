@@ -81,7 +81,20 @@ class SequenceEntry:
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
+        # Baseline decoded_length at the most recent re-entry. Set at re-entry
+        # prep to n_old (the count of previously-decoded tokens that were
+        # restored into decoded_tokens buffer for output preservation). At the
+        # NEXT eviction, only tokens decoded BEYOND this baseline are genuinely
+        # new and should be appended to evicted_token_ids — the tokens at
+        # positions [0:baseline] are already present in the reconstructed
+        # prompt (input_ids) and appending them again would create a geometric
+        # cascade of duplicated tokens across re-entry cycles.
+        'reentry_decoded_baseline',
         '_buffer_slot',  # Index into QueryBookBufferPool buffers
+        # Request pool fields
+        'batch_id',              # Which batch this sequence belongs to (for result routing)
+        'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
+        'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
         # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
         '_lifespan_log',   # List[SeqEventRecord], ring buffer
         '_lifespan_idx',   # int, next write position
@@ -94,7 +107,7 @@ class SequenceEntry:
     VALID_TRANSITIONS = {
         SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL},
         SequenceStatus.IN_PREFILL: {SequenceStatus.PREFILLED},
-        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE},
+        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED},
         SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.COMPLETED: set(),
@@ -143,7 +156,17 @@ class SequenceEntry:
         self.original_prompt_length: int = prompt_length
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
+        # Baseline decoded_length at the most recent re-entry. Starts at 0 for
+        # fresh sequences that have never been evicted. Incremented at each
+        # re-entry prep so that subsequent evictions only append NEW decoded
+        # tokens (not the ones already baked into the reconstructed prompt).
+        self.reentry_decoded_baseline: int = 0
         self._buffer_slot: int = -1
+
+        # Request pool fields (set externally when using pool-based scheduling)
+        self.batch_id: Optional[str] = None
+        self.pool_slot_index: int = -1
+        self.priority: int = 0  # 0=NORMAL, 1=HIGH
 
         # Lifespan monitoring
         self._lifespan_log: list = []
