@@ -509,7 +509,7 @@ def create_app(
         Body (optional):
             {"reload_deps": true}  — also reload batch_scheduler, intake_pool, etc.
         """
-        worker_manager: WorkerManager = request.app.state.worker_manager
+        worker_manager: WorkerManager = request.app.state.worker
         try:
             body = await request.json()
         except Exception:
