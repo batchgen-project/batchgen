@@ -4693,18 +4693,6 @@ class BatchGenWorker:
 		Uses Init() to set up model/tokenizer/KV, then enters generate()
 		with an empty global_batch that accepts sequences via admission messages.
 		"""
-		# Re-extraction opt-in (plan M6 production swap). Gated on
-		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
-		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
-		if should_use_reextract():
-			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate_persistent() to WorkerOrchestrator")
-			# Ensure core state still initialized via the legacy path first.
-			if not self._core_initialized:
-				self.Init(None, self.max_decoding_length, 0,
-					max_context_length=self.max_context_length)
-			build_orchestrator(self).generate_persistent(max_iterations=None)
-			return
-
 		logging.info(f"Rank {self.rank}: Entering persistent generate() mode")
 
 		# Use Init() to set up core components (model, tokenizer, KV config)
@@ -4750,6 +4738,17 @@ class BatchGenWorker:
 		# Without this, padding_length stays at 8192 which causes wrong
 		# KV_Storage_Config.reserved_length and GPU buffer sizing.
 		self.max_input_length = 0
+
+		# Re-extraction opt-in (plan M6 production swap). Gated on
+		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
+		# Placed AFTER setup so self.global_batch and the index maps are
+		# initialized before the orchestrator constructs its handlers.
+		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
+		if should_use_reextract():
+			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating pool mode to WorkerOrchestrator.generate_persistent")
+			self._in_pool_mode = True
+			build_orchestrator(self).generate_persistent(max_iterations=None)
+			return None
 
 		# Enter the persistent generate loop
 		return self.generate()
