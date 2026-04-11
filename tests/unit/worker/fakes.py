@@ -282,6 +282,7 @@ class FakeTokenizer:
         self.eos_token_ids: set[int] = set(eos_token_ids or {0})
         self._max_len = max_len
         self.encode_calls: list[str] = []
+        self.decode_calls: list[list[int]] = []
 
     def encode(self, text: str) -> list[int]:
         self.encode_calls.append(text)
@@ -289,6 +290,14 @@ class FakeTokenizer:
         if self._max_len is not None:
             ids = ids[: self._max_len]
         return ids
+
+    def decode(self, ids: list[int]) -> str:
+        """Inverse of encode for ascii-range ids; space-joined int form otherwise."""
+        self.decode_calls.append(list(ids))
+        try:
+            return "".join(chr(i) for i in ids)
+        except (ValueError, OverflowError):
+            return " ".join(str(i) for i in ids)
 
 
 class FakeModelExecutor:

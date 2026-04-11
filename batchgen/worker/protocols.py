@@ -115,7 +115,7 @@ class HostKvBackend(Protocol):
 
 
 class TokenizerBackend(Protocol):
-    """Minimal tokenizer surface used by BatchFormation.
+    """Minimal tokenizer surface used by BatchFormation and CompletionHandler.
 
     Honors the plural-EOS convention from `conventions.md`: `eos_token_ids` is
     a set so custom tokenizers can declare multiple stop tokens.
@@ -124,6 +124,8 @@ class TokenizerBackend(Protocol):
     eos_token_ids: set[int]
 
     def encode(self, text: str) -> list[int]: ...
+
+    def decode(self, ids: list[int]) -> str: ...
 
 
 class ModelExecutorBackend(Protocol):
