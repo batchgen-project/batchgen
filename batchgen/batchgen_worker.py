@@ -4892,38 +4892,59 @@ class BatchGenWorker:
 				if self._shutdown_requested:
 					break  # Pool mode: shutdown requested and all done
 				# Pool mode: wait briefly for more work before exiting
+				# status tensor encoding: [has_new_work, shutdown, reload]
 				import queue as queue_mod
 				if self.rank == 0:
 					try:
 						msg = self._admission_queue.get(timeout=1.0)
 						if msg is None:
 							self._shutdown_requested = True
+							status = torch.tensor([0, 1, 0], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
 						elif isinstance(msg, dict) and msg.get("type") == "admit":
 							# Broadcast that we got new work
-							status = torch.tensor([1, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([1, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
 							self._admit_sequences_from_message(msg)
 							# Continue loop — new sequences will be picked up
+						elif isinstance(msg, dict) and msg.get("command") == "reload":
+							# Hot-reload command — broadcast to all ranks then handle.
+							# Result is written to /tmp/batchgen_reload_status/rank_<N>.json
+							# inside _handle_hot_reload (via _write_reload_status), NOT
+							# put on response_queue. Putting on response_queue would
+							# deadlock the FastAPI event loop because the sync HTTP
+							# handler can't drain mp.Queue while blocking.
+							status = torch.tensor([0, 0, 1], dtype=torch.int32, device=self.torch_device)
+							dist.broadcast(status, src=0)
+							container = [msg]
+							dist.broadcast_object_list(container, src=0)
+							self._handle_hot_reload(msg)
 						else:
-							status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
 					except queue_mod.Empty:
 						# No work arrived, broadcast no-work to other ranks
-						status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+						status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 						dist.broadcast(status, src=0)
 						continue  # Try again
 				else:
 					# Non-rank-0: wait for rank 0's broadcast
-					status = torch.tensor([0, 0], dtype=torch.int32, device=self.torch_device)
+					status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 					dist.broadcast(status, src=0)
 					has_new = status[0].item() == 1
+					is_shutdown = status[1].item() == 1
+					is_reload = status[2].item() == 1
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
 						self._admit_sequences_from_message(container[0])
-					elif status[1].item() == 1:
+					elif is_reload:
+						container = [None]
+						dist.broadcast_object_list(container, src=0)
+						self._handle_hot_reload(container[0])
+					elif is_shutdown:
 						self._shutdown_requested = True
 					# Continue loop regardless
 				if self.global_batch.all_completed() and self._shutdown_requested:
@@ -7814,6 +7835,8 @@ class BatchGenWorker:
 		3. Reduced logging overhead
 		4. No timing object allocation in hot path
 		"""
+		# RELOAD-TEST-MARKER-v4: HOT RELOAD via /v1/reload (post-deadlock-fix)
+		logging.info(f"[RELOAD-TEST-V4] DEADLOCK-FIXED hot-reload on rank {getattr(self, 'global_rank', '?')}")
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
@@ -9825,6 +9848,114 @@ class BatchGenWorker:
 						self.model.model.layers[layer_idx].mlp.experts[routed_expert_idx]._unregister_fp8_weights()
 				if hasattr(self.model.model.layers[layer_idx].mlp, "cleanup"):
 					self.model.model.layers[layer_idx].mlp.cleanup()
+
+	def _handle_hot_reload(self, msg: dict) -> dict:
+		"""Hot-reload batchgen_worker module and rebind methods on this instance.
+
+		Called from inside generate_persistent() admission loop. Both rank 0
+		and other ranks must call this so all ranks reload in lockstep.
+
+		Returns: dict with status, rebound count, skipped count, missing attrs.
+		"""
+		import importlib
+		import inspect
+		import re
+		import sys
+		import logging as _log
+		try:
+			reload_deps = msg.get("reload_deps", True) if isinstance(msg, dict) else True
+
+			# Reload commonly-changed dependent modules first
+			if reload_deps:
+				dep_modules = [
+					"batchgen.server.batch_scheduler",
+					"batchgen.server.intake_pool",
+					"batchgen.server.scheduling_pool",
+					"batchgen.kv_cache.gpu_paged_kv_manager",
+				]
+				for mod_name in dep_modules:
+					if mod_name in sys.modules:
+						importlib.reload(sys.modules[mod_name])
+						_log.info(f"Rank {self.rank}: Reloaded dependency {mod_name}")
+
+			# Reload the worker module itself
+			import batchgen.batchgen_worker as worker_module
+			importlib.reload(worker_module)
+			NewClass = worker_module.BatchGenWorker
+
+			# Validate: warn if new __init__ adds attrs missing on this instance
+			missing = []
+			try:
+				new_init_src = inspect.getsource(NewClass.__init__)
+				old_init_src = inspect.getsource(type(self).__init__)
+				if new_init_src != old_init_src:
+					new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
+					missing = sorted([a for a in new_attrs if not hasattr(self, a)])
+					if missing:
+						_log.warning(
+							f"Rank {self.rank}: RELOAD WARNING — new __init__ has "
+							f"{len(missing)} attrs missing on existing worker: {missing[:10]}"
+						)
+			except (OSError, TypeError):
+				pass
+
+			# Rebind all methods (skip __init__ and dunders)
+			rebound = 0
+			skipped = 0
+			for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
+				if name == "__init__":
+					skipped += 1
+					continue
+				try:
+					setattr(self, name, method.__get__(self, type(self)))
+					rebound += 1
+				except Exception:
+					skipped += 1
+
+			_log.info(
+				f"Rank {self.rank}: Hot reload SUCCESS — "
+				f"rebound {rebound} methods, skipped {skipped}"
+				+ (f", {len(missing)} missing attrs" if missing else "")
+			)
+			result = {
+				"status": "reload_success",
+				"rank": self.rank,
+				"rebound": rebound,
+				"skipped": skipped,
+				"missing_attrs": missing,
+			}
+			self._write_reload_status(result)
+			return result
+		except Exception as e:
+			_log.error(f"Rank {self.rank}: Hot reload FAILED: {e}", exc_info=True)
+			result = {"status": "reload_failed", "rank": self.rank, "error": str(e)}
+			self._write_reload_status(result)
+			return result
+
+	def _write_reload_status(self, result: dict) -> None:
+		"""Write reload status atomically to /tmp/batchgen_reload_status/rank_<N>.json.
+
+		The HTTP server polls these files instead of waiting on a queue,
+		which avoids deadlocks when the FastAPI event loop is blocked.
+		"""
+		import json
+		import os
+		import tempfile
+		import time as _time
+		try:
+			result_with_time = dict(result)
+			result_with_time["timestamp"] = _time.time()
+			status_dir = "/tmp/batchgen_reload_status"
+			os.makedirs(status_dir, exist_ok=True)
+			# Write to temp then atomic rename
+			fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")
+			with os.fdopen(fd, "w") as f:
+				json.dump(result_with_time, f)
+			final_path = os.path.join(status_dir, f"rank_{self.rank}.json")
+			os.rename(tmp_path, final_path)
+		except Exception as e:
+			import logging as _log
+			_log.warning(f"Rank {self.rank}: Failed to write reload status: {e}")
 
 	def deep_free_model_memory(self):
 		"""Release model memory without CPU transfer overhead.

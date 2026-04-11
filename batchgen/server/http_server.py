@@ -498,6 +498,52 @@ def create_app(
 
         return response_data
 
+    @app.post("/v1/reload")
+    async def reload_worker(request: Request):
+        """Hot-reload worker code without restarting the server.
+
+        Reloads batchgen_worker module and dependent modules, then rebinds
+        all methods on the existing worker instance. Host KV, weights, and
+        NCCL stay alive.
+
+        Body (optional):
+            {"reload_deps": true}    — also reload batch_scheduler, intake_pool, etc.
+            {"timeout": 30}          — timeout in seconds for collecting per-rank status
+            {"pool_mode": true|false} — override pool-mode detection
+        """
+        worker_manager: WorkerManager = request.app.state.worker
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reload_deps = body.get("reload_deps", True)
+        timeout = float(body.get("timeout", 30.0))
+
+        # Pool mode is detected via the scheduler. If a BatchScheduler is
+        # active and the worker has been initialized into pool mode, use
+        # send_pool_reload (file-polling). Otherwise use legacy sync RPC.
+        pool_mode = body.get("pool_mode")
+        if pool_mode is None:
+            # Auto-detect: pool mode means the worker main loop has handed
+            # off to generate_persistent and is no longer servicing the
+            # request_queue/response_queue sync path.
+            scheduler = getattr(request.app.state, "scheduler", None)
+            pool_mode = bool(getattr(scheduler, "_pool_initialized", False)) if scheduler else False
+
+        if pool_mode:
+            result = await asyncio.to_thread(
+                worker_manager.send_pool_reload,
+                reload_deps=reload_deps,
+                timeout=timeout,
+            )
+        else:
+            result = await asyncio.to_thread(
+                worker_manager.send_reload_command,
+                reload_deps=reload_deps,
+                timeout=timeout,
+            )
+        return result
+
     @app.get("/health")
     async def health_check(request: Request):
         health: ServerHealthState = request.app.state.health

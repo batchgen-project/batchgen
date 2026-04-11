@@ -450,6 +450,18 @@ class SequenceBatch:
         self._rank_index: Dict[int, Set[str]] = {}
 
     def add_sequence(self, sequence: SequenceEntry) -> None:
+        # Handle UUID collision: if a sequence with this uuid already exists,
+        # clean it out of the status and rank indices first. Otherwise the old
+        # status entry lingers (e.g., COMPLETED) even after the dict is
+        # overwritten, corrupting all_completed() and status-based queries.
+        # This matters for pool mode when multiple batches reuse request_ids
+        # (e.g., mmlu-0..mmlu-31).
+        existing = self.sequences.get(sequence.uuid)
+        if existing is not None:
+            self._status_index[existing.status].discard(sequence.uuid)
+            if (existing.assigned_rank is not None
+                    and existing.assigned_rank in self._rank_index):
+                self._rank_index[existing.assigned_rank].discard(sequence.uuid)
         self.sequences[sequence.uuid] = sequence
         self._status_index[sequence.status].add(sequence.uuid)
         if sequence.assigned_rank is not None:
