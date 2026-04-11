@@ -4693,6 +4693,18 @@ class BatchGenWorker:
 		Uses Init() to set up model/tokenizer/KV, then enters generate()
 		with an empty global_batch that accepts sequences via admission messages.
 		"""
+		# Re-extraction opt-in (plan M6 production swap). Gated on
+		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
+		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
+		if should_use_reextract():
+			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate_persistent() to WorkerOrchestrator")
+			# Ensure core state still initialized via the legacy path first.
+			if not self._core_initialized:
+				self.Init(None, self.max_decoding_length, 0,
+					max_context_length=self.max_context_length)
+			build_orchestrator(self).generate_persistent(max_iterations=None)
+			return
+
 		logging.info(f"Rank {self.rank}: Entering persistent generate() mode")
 
 		# Use Init() to set up core components (model, tokenizer, KV config)
@@ -4746,6 +4758,14 @@ class BatchGenWorker:
 		"""
 		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
 		"""
+		# Re-extraction opt-in (plan M6 production swap). Gated on
+		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
+		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
+		if should_use_reextract():
+			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate() to WorkerOrchestrator")
+			build_orchestrator(self).run_batch()
+			return
+
 		# Initialize timing trackers
 		generation_start_time = time.perf_counter()
 		prefill_time = 0.0
