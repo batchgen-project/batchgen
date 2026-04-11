@@ -59,6 +59,8 @@ class FakeCollectiveBackend:
         *,
         all_gather_object_responses: list[list[Any]] | None = None,
         all_reduce_max_deltas: list[torch.Tensor] | None = None,
+        all_reduce_min_deltas: list[torch.Tensor] | None = None,
+        all_gather_into_tensor_responses: list[torch.Tensor] | None = None,
         broadcast_object_responses: list[list[Any]] | None = None,
     ) -> None:
         self.rank = rank
@@ -66,6 +68,8 @@ class FakeCollectiveBackend:
         self.calls: list[CollectiveCall] = []
         self._agather_obj_resp = list(all_gather_object_responses or [])
         self._arm_deltas = list(all_reduce_max_deltas or [])
+        self._armin_deltas = list(all_reduce_min_deltas or [])
+        self._agit_resp = list(all_gather_into_tensor_responses or [])
         self._bcast_obj_resp = list(broadcast_object_responses or [])
 
     # -- record helper ------------------------------------------------------
@@ -78,6 +82,12 @@ class FakeCollectiveBackend:
         if self._arm_deltas:
             delta = self._arm_deltas.pop(0)
             tensor.copy_(torch.maximum(tensor, delta))
+
+    def all_reduce_min(self, tensor: torch.Tensor) -> None:
+        self._record("all_reduce_min", tuple(tensor.shape))
+        if self._armin_deltas:
+            delta = self._armin_deltas.pop(0)
+            tensor.copy_(torch.minimum(tensor, delta))
 
     def all_reduce_sum(self, tensor: torch.Tensor) -> None:
         self._record("all_reduce_sum", tuple(tensor.shape))
@@ -102,6 +112,13 @@ class FakeCollectiveBackend:
             tuple(out.shape),
             tuple(tensor.shape),
         )
+        if self._agit_resp:
+            full = self._agit_resp.pop(0)
+            out.copy_(full)
+        else:
+            # Default: populate only the self-slice, leave other slices zero.
+            stride = tensor.shape[0] if tensor.ndim > 0 else 1
+            out[self.rank * stride : (self.rank + 1) * stride].copy_(tensor)
 
     def all_gather_object(self, obj_list: list[Any], obj: Any) -> None:
         self._record("all_gather_object", len(obj_list))
