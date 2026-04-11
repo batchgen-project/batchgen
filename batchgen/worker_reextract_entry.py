@@ -265,6 +265,27 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     # -- admission queue ----------------------------------------------
     admission_queue = _find(worker, "_admission_queue", "admission_queue")
 
+    # -- admission delegate (hybrid production path) -----------------
+    def admission_delegate() -> bool:
+        """Delegate the entire admission cycle to legacy ``_poll_admissions``.
+
+        Legacy ``_poll_admissions`` handles: polling the queue on rank 0,
+        broadcasting the message to all ranks, converting message
+        ``entries`` to ``SequenceEntry``, tokenizing via
+        ``_tokenize_admitted_sequences``, assigning ranks, and
+        **critically** building the legacy ``query_book`` dict that
+        ``worker.prefill`` / ``worker.decoding_continuous`` consume.
+
+        Returns the bool result from legacy, which the
+        AdmissionCoordinator normalizes to an empty uuid list — the
+        orchestrator's run_batch rediscovers admitted sequences by
+        re-reading ``state.global_batch`` afterwards.
+        """
+        poll = getattr(worker, "_poll_admissions", None)
+        if poll is None:
+            return False
+        return bool(poll())
+
     return WorkerOrchestrator(
         state,
         config,
@@ -278,6 +299,7 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         clock=_WallClock(),
         admission_queue=admission_queue,
         decode_delegate=decode_delegate,
+        admission_delegate=admission_delegate,
     )
 
 

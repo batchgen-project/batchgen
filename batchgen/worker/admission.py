@@ -66,10 +66,27 @@ class AdmissionCoordinator:
         state: WorkerState,
         collectives: CollectiveBackend,
         admission_queue: AdmissionQueueBackend | None = None,
+        admission_delegate: "Any | None" = None,
     ) -> None:
+        """
+        admission_delegate: optional production hook. When set,
+            :meth:`poll_and_broadcast` calls the delegate instead of
+            running the orchestrator's own polling + tokenization +
+            query-book-build pipeline. The delegate is expected to
+            perform the entire admission cycle (legacy
+            ``_poll_admissions``) and return the list of newly
+            admitted UUIDs. In the hybrid production swap this
+            closure wraps ``BatchGenWorker._poll_admissions`` which
+            builds the legacy ``query_book`` as a side effect — that
+            dict is what ``BatchGenWorker.prefill`` /
+            ``BatchGenWorker.decoding_continuous`` consume.
+            Unit tests leave this as ``None`` and rely on the
+            orchestrator's own admission pipeline.
+        """
         self._state = state
         self._collectives = collectives
         self._queue = admission_queue
+        self._delegate = admission_delegate
 
     def poll_and_broadcast(self) -> list[UUID]:
         """Poll (rank 0) + broadcast (all ranks) + materialize sequences.
@@ -84,7 +101,24 @@ class AdmissionCoordinator:
         coordinator converts it to ``{"type": "shutdown"}`` INSIDE the
         single broadcast payload so the collective order stays exactly
         one ``broadcast_object`` call per poll (invariant #6).
+
+        When an ``admission_delegate`` is set (hybrid production path),
+        this method short-circuits the orchestrator's own polling +
+        tokenization logic and returns whatever the delegate returns.
         """
+        if self._delegate is not None:
+            result = self._delegate()
+            # Delegate may return a bool (legacy _poll_admissions
+            # semantic) or a list of uuids. Normalize to list[UUID].
+            if isinstance(result, list):
+                return list(result)
+            if isinstance(result, bool):
+                # We don't know WHICH uuids were admitted; the
+                # orchestrator's hybrid run_batch will read
+                # state.global_batch afterwards to discover them.
+                return []
+            return []
+
         msg: dict[str, Any] | None = None
         if self._state.rank == 0 and self._queue is not None:
             try:

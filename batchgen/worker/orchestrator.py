@@ -88,6 +88,7 @@ class WorkerOrchestrator:
         clock: ClockBackend,
         admission_queue: AdmissionQueueBackend | None = None,
         decode_delegate: Callable[[list[UUID]], None] | None = None,
+        admission_delegate: Callable[[], Any] | None = None,
     ) -> None:
         """
         decode_delegate: production-only hook (see
@@ -96,6 +97,15 @@ class WorkerOrchestrator:
             provided closure, bypassing the fake tick loop. In the
             hybrid production swap this closure wraps
             ``BatchGenWorker.decoding_continuous``.
+        admission_delegate: production-only hook. When set, the
+            orchestrator's AdmissionCoordinator short-circuits its
+            own polling pipeline and calls the delegate, which is
+            expected to perform the entire admission cycle
+            (legacy ``_poll_admissions`` including tokenization +
+            query_book build). Required for the hybrid production
+            path because legacy ``prefill`` /
+            ``decoding_continuous`` consume the
+            legacy-built ``query_book``.
         """
         self._state = state
         self._config = config
@@ -123,7 +133,10 @@ class WorkerOrchestrator:
             model_context_length=config.model_context_length,
         )
         self._admission = AdmissionCoordinator(
-            state, collectives, admission_queue=admission_queue
+            state,
+            collectives,
+            admission_queue=admission_queue,
+            admission_delegate=admission_delegate,
         )
         self._completion = CompletionHandler(
             state,
