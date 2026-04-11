@@ -378,11 +378,19 @@ class WorkerOrchestrator:
           3. Call :meth:`run_batch` to drive the newly-admitted work
              plus any existing live sequences.
 
-        Returns after the loop has been empty of work for one poll
-        with nothing admitted — the same termination main uses in
-        ``generate_persistent`` after ``_shutdown_requested``. Tests
-        cap with ``max_iterations`` so the loop is bounded.
+        Termination:
+          - ``max_iterations`` (test path): return after that many
+            polls regardless of work state. Unit tests rely on this
+            to keep runs bounded.
+          - ``max_iterations=None`` (production path): block
+            forever — the worker process only exits when the server
+            sends SIGTERM or the ``_shutdown_requested`` flag is set
+            on the legacy worker (main's semantic). Never return
+            early on an empty queue — doing so triggers worker
+            cleanup that races with live NCCL state.
         """
+        import time as _time
+
         self.init()
         iteration = 0
         while True:
@@ -396,10 +404,21 @@ class WorkerOrchestrator:
                 self.run_batch()
 
             iteration += 1
-            if not admitted and not self._has_unfinished_work():
-                return iteration
             if max_iterations is not None and iteration >= max_iterations:
                 return iteration
+
+            if max_iterations is None:
+                # Production path: keep polling. When nothing happened
+                # this iteration, yield the CPU briefly so we do not
+                # busy-spin on rank 0's queue.get_nowait().
+                if not admitted and not self._has_unfinished_work():
+                    _time.sleep(0.001)
+            else:
+                # Test path: if max_iterations is set (finite), still
+                # honor the legacy "empty then done" termination so
+                # bounded runs finish promptly.
+                if not admitted and not self._has_unfinished_work():
+                    return iteration
 
 
 __all__ = ["BatchStats", "WorkerOrchestrator"]
