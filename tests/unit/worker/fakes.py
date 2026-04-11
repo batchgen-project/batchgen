@@ -207,11 +207,12 @@ class FakeGpuKvBackend:
         self._free += len(pages)
 
     def extend_pages(self, uuid: str, n: int) -> list[int]:
+        """Grant `n` more pages to `uuid`. Matches main's semantic where
+        extend is "allocate more for this uuid" — if the uuid had no
+        prior allocation, this creates one. The KVCacheManager layer
+        still treats extend as a post-allocate operation; the fake
+        tracks either order."""
         self._record("extend_pages", uuid, n)
-        if uuid not in self._allocs:
-            raise RuntimeError(
-                f"FakeGpuKvBackend: extend_pages({uuid}) before allocate"
-            )
         return self.allocate_pages(uuid, n)
 
     def append_kv(self, uuid: str, layer: int, kv: torch.Tensor) -> None:

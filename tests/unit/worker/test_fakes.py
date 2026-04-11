@@ -118,10 +118,15 @@ class TestFakeGpuKvBackend:
         assert fake.allocated_pages("u1") == [0, 1, 2, 3, 4]
         assert fake.free_pages() == 5
 
-    def test_extend_before_allocate_raises(self) -> None:
+    def test_extend_without_prior_allocate_creates_allocation(self) -> None:
+        """Relaxed semantic: extend_pages is allocate-or-grow. Matches
+        main's GpuKvManager.extend which grants pages for a uuid
+        regardless of whether it had a prior allocation."""
         fake = FakeGpuKvBackend(free_pages=10)
-        with pytest.raises(RuntimeError, match="before allocate"):
-            fake.extend_pages("u1", 2)
+        pages = fake.extend_pages("u1", 2)
+        assert pages == [0, 1]
+        assert fake.allocated_pages("u1") == [0, 1]
+        assert fake.free_pages() == 8
 
     def test_rebuild_page_table_records_uuid_order(self) -> None:
         fake = FakeGpuKvBackend()
