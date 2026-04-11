@@ -194,12 +194,14 @@ class TestHandlerReleasePath:
 class TestHandlerExtendPath:
     def test_in_decode_near_overflow_triggers_extend(self) -> None:
         state = _make_state()
-        # 2 pages allocated, ctx_len just under the page budget → need 4 more
+        # prompt=127 + decoded=0 => ctx_len=127 (CTX invariant holds)
+        # 2 pages allocated = 128 tokens, headroom = 1 < freq*PAGE = 128 → extend
         _add(
             state,
             "u1",
             status_path=IN_DECODE_PATH,
-            current_context_length=127,  # headroom = 128 - 127 = 1 token
+            prompt_length=127,
+            decoded_length=0,
             gpu_pages_allocated=2,
         )
         handler, _col, _kv, gpu, _host = _make_handler(state)
@@ -214,12 +216,14 @@ class TestHandlerExtendPath:
 
     def test_in_decode_with_zero_gpu_free_onholds(self) -> None:
         state = _make_state()
+        # prompt=77 + decoded=50 => ctx_len=127 (CTX holds), 2 pages = 128 tokens,
+        # headroom = 1 < freq*PAGE = 128 → needs extend but gpu_free=0 → hold
         _add(
             state,
             "u1",
             status_path=IN_DECODE_PATH,
+            prompt_length=77,
             decoded_length=50,
-            current_context_length=127,
             gpu_pages_allocated=2,
         )
         handler, col, _kv, _gpu, _host = _make_handler(state, gpu_free=0)
