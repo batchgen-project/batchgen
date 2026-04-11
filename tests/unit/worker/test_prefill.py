@@ -43,7 +43,7 @@ def _make_scheduler(
         initial_gpu_page_buffer=8,
         extension_gpu_page_buffer=4,
         host_kv_total_pages=10000,
-        host_kv_watermark_pct=70,
+        prefill_watermark_pct=70,
     )
     me = model or FakeModelExecutor(prefill_output="PREFILL_OUT")
     return PrefillScheduler(state, kv, me), me

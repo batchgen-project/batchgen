@@ -41,7 +41,8 @@ def _make_manager(
     host_total: int = 1000,
     initial: int = 8,
     extension: int = 4,
-    watermark_pct: int = 70,
+    prefill_watermark_pct: int = 70,
+    eviction_watermark_pct: int = 10,
 ) -> tuple[KVCacheManager, FakeGpuKvBackend, FakeHostKvBackend]:
     gpu = FakeGpuKvBackend(free_pages=gpu_free)
     host = FakeHostKvBackend(free_pages=host_free)
@@ -52,7 +53,8 @@ def _make_manager(
         initial_gpu_page_buffer=initial,
         extension_gpu_page_buffer=extension,
         host_kv_total_pages=host_total,
-        host_kv_watermark_pct=watermark_pct,
+        prefill_watermark_pct=prefill_watermark_pct,
+        eviction_watermark_pct=eviction_watermark_pct,
     )
     return mgr, gpu, host
 
@@ -73,7 +75,7 @@ class TestConstructorValidation:
                 initial_gpu_page_buffer=0,
                 extension_gpu_page_buffer=4,
                 host_kv_total_pages=100,
-                host_kv_watermark_pct=70,
+                prefill_watermark_pct=70,
             )
 
     def test_extension_negative_raises(self) -> None:
@@ -86,7 +88,7 @@ class TestConstructorValidation:
                 initial_gpu_page_buffer=8,
                 extension_gpu_page_buffer=-1,
                 host_kv_total_pages=100,
-                host_kv_watermark_pct=70,
+                prefill_watermark_pct=70,
             )
 
     def test_host_total_zero_raises(self) -> None:
@@ -99,12 +101,12 @@ class TestConstructorValidation:
                 initial_gpu_page_buffer=8,
                 extension_gpu_page_buffer=4,
                 host_kv_total_pages=0,
-                host_kv_watermark_pct=70,
+                prefill_watermark_pct=70,
             )
 
-    def test_watermark_out_of_range_raises(self) -> None:
+    def test_prefill_watermark_out_of_range_raises(self) -> None:
         state = _make_state()
-        with pytest.raises(ValueError, match="host_kv_watermark_pct"):
+        with pytest.raises(ValueError, match="prefill_watermark_pct"):
             KVCacheManager(
                 state,
                 FakeGpuKvBackend(),
@@ -112,7 +114,21 @@ class TestConstructorValidation:
                 initial_gpu_page_buffer=8,
                 extension_gpu_page_buffer=4,
                 host_kv_total_pages=100,
-                host_kv_watermark_pct=101,
+                prefill_watermark_pct=101,
+            )
+
+    def test_eviction_watermark_must_be_below_prefill_watermark(self) -> None:
+        state = _make_state()
+        with pytest.raises(ValueError, match="eviction_watermark_pct"):
+            KVCacheManager(
+                state,
+                FakeGpuKvBackend(),
+                FakeHostKvBackend(),
+                initial_gpu_page_buffer=8,
+                extension_gpu_page_buffer=4,
+                host_kv_total_pages=100,
+                prefill_watermark_pct=70,
+                eviction_watermark_pct=70,  # must be strictly less
             )
 
 
@@ -293,34 +309,66 @@ class TestFreePageDelegation:
 # ---------------------------------------------------------------------------
 
 
-class TestCheckWatermarkTrigger:
-    def test_free_above_watermark_returns_false(self) -> None:
-        """800/1000 free = 80%, watermark 70. Above → no trigger."""
-        state = _make_state()
-        mgr, _, _ = _make_manager(state, host_free=800, host_total=1000, watermark_pct=70)
-        assert mgr.check_watermark_trigger() is False
+class TestCheckPrefillWatermarkTrigger:
+    """The PREFILL watermark is the "underutilized" threshold: trigger
+    when host free % is STRICTLY ABOVE it AND there is pending work.
+    Matches main _check_host_kv_watermark_trigger (lines 2345/2351)."""
 
-    def test_free_at_watermark_returns_false(self) -> None:
-        """700/1000 free = 70%, strict < not <=. At → no trigger."""
+    def test_above_watermark_with_pending_returns_true(self) -> None:
+        """800/1000 free = 80%, watermark 70. Above → trigger."""
         state = _make_state()
-        mgr, _, _ = _make_manager(state, host_free=700, host_total=1000, watermark_pct=70)
-        assert mgr.check_watermark_trigger() is False
+        mgr, _, _ = _make_manager(state, host_free=800, host_total=1000, prefill_watermark_pct=70)
+        assert mgr.check_prefill_watermark_trigger(has_pending=True) is True
 
-    def test_free_below_watermark_returns_true(self) -> None:
+    def test_at_watermark_returns_false(self) -> None:
+        """700/1000 free = 70%, strict >. At → no trigger."""
         state = _make_state()
-        mgr, _, _ = _make_manager(state, host_free=699, host_total=1000, watermark_pct=70)
-        assert mgr.check_watermark_trigger() is True
+        mgr, _, _ = _make_manager(state, host_free=700, host_total=1000, prefill_watermark_pct=70)
+        assert mgr.check_prefill_watermark_trigger(has_pending=True) is False
 
-    def test_zero_free_returns_true(self) -> None:
+    def test_below_watermark_returns_false(self) -> None:
         state = _make_state()
-        mgr, _, _ = _make_manager(state, host_free=0, host_total=1000, watermark_pct=70)
-        assert mgr.check_watermark_trigger() is True
+        mgr, _, _ = _make_manager(state, host_free=500, host_total=1000, prefill_watermark_pct=70)
+        assert mgr.check_prefill_watermark_trigger(has_pending=True) is False
 
-    def test_watermark_zero_never_triggers(self) -> None:
-        """A watermark of 0% means 'free < 0%' — impossible → never trigger."""
+    def test_without_pending_never_triggers(self) -> None:
+        """No queued/evicted work → no switch to prefill even if host is empty."""
         state = _make_state()
-        mgr, _, _ = _make_manager(state, host_free=0, host_total=1000, watermark_pct=0)
-        assert mgr.check_watermark_trigger() is False
+        mgr, _, _ = _make_manager(state, host_free=1000, host_total=1000, prefill_watermark_pct=70)
+        assert mgr.check_prefill_watermark_trigger(has_pending=False) is False
+
+    def test_fully_free_with_pending_triggers(self) -> None:
+        state = _make_state()
+        mgr, _, _ = _make_manager(state, host_free=1000, host_total=1000, prefill_watermark_pct=70)
+        assert mgr.check_prefill_watermark_trigger(has_pending=True) is True
+
+
+class TestCheckEvictionWatermarkTrigger:
+    """The EVICTION watermark is the "nearly full" threshold: trigger
+    when host free % is STRICTLY BELOW it. Matches main line 6474."""
+
+    def test_below_eviction_watermark_returns_true(self) -> None:
+        """50/1000 free = 5%, eviction watermark 10. Below → evict."""
+        state = _make_state()
+        mgr, _, _ = _make_manager(
+            state, host_free=50, host_total=1000, eviction_watermark_pct=10
+        )
+        assert mgr.check_eviction_watermark_trigger() is True
+
+    def test_at_eviction_watermark_returns_false(self) -> None:
+        """100/1000 free = 10%, strict <. At → no trigger."""
+        state = _make_state()
+        mgr, _, _ = _make_manager(
+            state, host_free=100, host_total=1000, eviction_watermark_pct=10
+        )
+        assert mgr.check_eviction_watermark_trigger() is False
+
+    def test_above_eviction_watermark_returns_false(self) -> None:
+        state = _make_state()
+        mgr, _, _ = _make_manager(
+            state, host_free=800, host_total=1000, eviction_watermark_pct=10
+        )
+        assert mgr.check_eviction_watermark_trigger() is False
 
 
 # ---------------------------------------------------------------------------

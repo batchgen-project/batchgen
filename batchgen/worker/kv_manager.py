@@ -21,10 +21,16 @@ Public surface:
     the fake tests it's a no-op hook that tests assert was called.
   - get_host_free_pages(): delegates to `HostKvBackend.free_pages`.
   - get_gpu_free_pages(): delegates to `GpuKvBackend.free_pages`.
-  - check_watermark_trigger(): True if host-KV free percentage is strictly
-    below ``host_kv_watermark_pct``. ``<`` (not ``<=``) so configuring
-    ``70`` means "trigger preemption while we're under 70% free", which
-    matches main's behavior at ``_check_host_kv_watermark_trigger``.
+  - check_prefill_watermark_trigger(has_pending): True when host-KV
+    free percentage is strictly ABOVE ``prefill_watermark_pct`` AND the
+    caller passes ``has_pending=True`` (queued or evicted sequences
+    exist). Matches main at lines 2345/2351: the watermark is the
+    "underutilized" threshold — crossing it upward means the host has
+    enough slack to switch from decode to prefill.
+  - check_eviction_watermark_trigger(): True when host-KV free
+    percentage is strictly BELOW ``eviction_watermark_pct``. This is
+    the OTHER end of the host-KV capacity spectrum (default 10% in
+    main at line 6474): when host is nearly full, fire eviction.
 """
 
 from __future__ import annotations
@@ -59,7 +65,8 @@ class KVCacheManager:
         initial_gpu_page_buffer: int,
         extension_gpu_page_buffer: int,
         host_kv_total_pages: int,
-        host_kv_watermark_pct: int,
+        prefill_watermark_pct: int,
+        eviction_watermark_pct: int = 10,
     ) -> None:
         if initial_gpu_page_buffer < 1:
             raise ValueError(
@@ -73,9 +80,18 @@ class KVCacheManager:
             raise ValueError(
                 f"host_kv_total_pages must be >= 1, got {host_kv_total_pages}"
             )
-        if not 0 <= host_kv_watermark_pct <= 100:
+        if not 0 <= prefill_watermark_pct <= 100:
             raise ValueError(
-                f"host_kv_watermark_pct must be in [0, 100], got {host_kv_watermark_pct}"
+                f"prefill_watermark_pct must be in [0, 100], got {prefill_watermark_pct}"
+            )
+        if not 0 <= eviction_watermark_pct <= 100:
+            raise ValueError(
+                f"eviction_watermark_pct must be in [0, 100], got {eviction_watermark_pct}"
+            )
+        if eviction_watermark_pct >= prefill_watermark_pct:
+            raise ValueError(
+                f"eviction_watermark_pct ({eviction_watermark_pct}) must be "
+                f"< prefill_watermark_pct ({prefill_watermark_pct})"
             )
         self._state = state
         self._gpu_kv = gpu_kv
@@ -83,7 +99,8 @@ class KVCacheManager:
         self._initial = initial_gpu_page_buffer
         self._extension = extension_gpu_page_buffer
         self._host_total = host_kv_total_pages
-        self._watermark_pct = host_kv_watermark_pct
+        self._prefill_watermark_pct = prefill_watermark_pct
+        self._eviction_watermark_pct = eviction_watermark_pct
         self._deferred: list[DeferredAppend] = []
         self._pending_count: int = 0
         self._wait_pending_calls: int = 0
@@ -175,16 +192,35 @@ class KVCacheManager:
     def get_gpu_free_pages(self) -> int:
         return self._gpu_kv.free_pages()
 
-    def check_watermark_trigger(self) -> bool:
-        """True if host-KV free percentage is strictly below the watermark.
+    def check_prefill_watermark_trigger(self, has_pending: bool) -> bool:
+        """True when host free % is strictly above `prefill_watermark_pct`
+        AND `has_pending` is True.
 
-        Used by ``DecodeScheduler`` to decide whether to preempt decode
-        for queued prefill. Strict ``<`` (not ``<=``) so setting the
-        watermark to 70 means "trigger when free < 70%", matching main.
+        Matches main's ``_check_host_kv_watermark_trigger`` at lines
+        2345/2351: the watermark is the "underutilized" threshold —
+        when host free rises above it AND there is queueing/evicted
+        work pending, the scheduler switches from decode back to
+        prefill. Strict ``>`` (not ``>=``) mirrors main.
+
+        ``has_pending`` is passed in rather than derived from state so
+        the planner stays a pure function over its inputs.
+        """
+        if not has_pending:
+            return False
+        free = self._host_kv.free_pages()
+        free_pct = (free * 100) // self._host_total
+        return free_pct > self._prefill_watermark_pct
+
+    def check_eviction_watermark_trigger(self) -> bool:
+        """True when host free % is strictly below `eviction_watermark_pct`.
+
+        The OTHER end of the host-KV capacity spectrum (plan Decision
+        #3 / main line 6474): host is nearly full → evict. Strict
+        ``<`` mirrors main.
         """
         free = self._host_kv.free_pages()
         free_pct = (free * 100) // self._host_total
-        return free_pct < self._watermark_pct
+        return free_pct < self._eviction_watermark_pct
 
     # ------------------------------------------------------------------
     # Introspection for tests

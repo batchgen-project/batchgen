@@ -69,7 +69,7 @@ def _make_rebalancer(
     gpu_free: int = 128,
     host_free: int = 512,
     host_total: int = 1000,
-    watermark: int = 70,
+    prefill_watermark: int = 70,
 ) -> tuple[HostKVRebalancer, FakeGpuKvBackend, FakeHostKvBackend, FakeCollectiveBackend, KVCacheManager]:
     gpu = FakeGpuKvBackend(free_pages=gpu_free)
     host = FakeHostKvBackend(free_pages=host_free)
@@ -81,7 +81,7 @@ def _make_rebalancer(
         initial_gpu_page_buffer=8,
         extension_gpu_page_buffer=4,
         host_kv_total_pages=host_total,
-        host_kv_watermark_pct=watermark,
+        prefill_watermark_pct=prefill_watermark,
     )
     sync = SyncCoordinator(state, col)
     rb = HostKVRebalancer(
