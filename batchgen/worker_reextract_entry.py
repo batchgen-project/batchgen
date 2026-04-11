@@ -171,26 +171,82 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     tokenizer = TorchTokenizerBackend(worker.tokenizer)
 
     # -- model executor ------------------------------------------------
+    def _uuids_to_local_indices(uuids: list[str]) -> list[int]:
+        """Translate UUIDs to legacy worker local indices.
+
+        The legacy ``prefill`` / ``decoding_continuous`` methods take
+        ``batch: list[int]`` where the ints are local indices into
+        ``query_book``. The orchestrator speaks UUIDs everywhere, so
+        every call into the monolithic methods translates via the
+        legacy worker's own ``_uuid_to_local_map``.
+        """
+        out: list[int] = []
+        for uuid in uuids:
+            local_idx = worker._uuid_to_local_map.get(uuid)
+            if local_idx is not None:
+                out.append(local_idx)
+        return out
+
     def prefill_fn(batch: dict[str, Any]) -> Any:
-        # Delegate to whichever prefill path the legacy worker exposes.
         uuids = batch.get("uuids", [])
+        local_batch = _uuids_to_local_indices(uuids)
+        if not local_batch:
+            return None
         use_prepacked = batch.get("prepacked", False) and hasattr(
             worker, "prefill_prepacked"
         )
         if use_prepacked:
-            return worker.prefill_prepacked(uuids)
+            return worker.prefill_prepacked(local_batch)
         if hasattr(worker, "prefill"):
-            return worker.prefill(uuids)
+            return worker.prefill(local_batch)
         return None
 
     def decode_fn(batch: dict[str, Any]) -> Any:
-        # Main's decode loop fires in larger chunks than one-step; the
-        # orchestrator's inner loop ticks sequence metadata directly,
-        # so forward_decode here is allowed to be a no-op per iteration
-        # until the production swap wires a per-step entry.
+        # Unused in the hybrid path — DecodeScheduler bypasses
+        # forward_decode when decode_delegate is set. Kept as a no-op
+        # so any stray call does not raise.
         return None
 
     model = TorchModelExecutorBackend(prefill_fn=prefill_fn, decode_fn=decode_fn)
+
+    # -- decode delegate (hybrid production path) --------------------
+    def decode_delegate(uuids: list[str]) -> None:
+        """Run one full decode cycle via legacy
+        ``BatchGenWorker.decoding_continuous``.
+
+        The legacy method takes ``(new_tokens, decode_uuids, batch)``
+        where ``batch`` is a list of local indices. We translate the
+        orchestrator's uuid list on every call and let the legacy
+        method handle the inner loop, page boundaries, sampling,
+        completion detection, and state mutation on ``global_batch``.
+        """
+        local_batch = _uuids_to_local_indices(uuids)
+        if not local_batch:
+            return
+
+        # Build initial new_tokens tensor via the legacy helper which
+        # pulls the last token of each sequence from its decoded_tokens
+        # buffer. ``_rebuild_input_tokens`` returns a (batch_size, 1)
+        # tensor on the worker's torch_device.
+        rebuild = getattr(worker, "_rebuild_input_tokens", None)
+        if rebuild is None:
+            # Fallback: empty zero tensor — legacy method will
+            # recompute via its own _rebuild_input_tokens path after
+            # the first page boundary.
+            import torch
+
+            new_tokens = torch.zeros(
+                (len(local_batch), 1), dtype=torch.int64, device=worker.torch_device
+            )
+        else:
+            new_tokens = rebuild(local_batch)
+
+        # Call the legacy all-in-one decode loop. Its return value
+        # (updated decode_uuids, batch) is currently ignored — the
+        # orchestrator's outer run_batch loop re-reads
+        # state.global_batch after each decode phase to determine
+        # what remains.
+        worker.decoding_continuous(new_tokens, list(uuids), list(local_batch))
 
     # -- lifespan + response sink -------------------------------------
     lifespan = TorchLifespanLogger(rank=state.rank)
@@ -221,6 +277,7 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         sink=sink,
         clock=_WallClock(),
         admission_queue=admission_queue,
+        decode_delegate=decode_delegate,
     )
 
 

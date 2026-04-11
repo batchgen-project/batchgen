@@ -11,6 +11,7 @@ the full M5 behavioral notes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.boundary import BoundaryHandler, BoundaryPlan
@@ -40,7 +41,20 @@ class DecodeScheduler:
         *,
         decision_frequency_pages: int,
         initial_gpu_page_buffer: int,
+        decode_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
+        """
+        decode_delegate: optional production hook. When provided,
+            :meth:`run_continuous` calls the delegate ONCE per
+            invocation (passing the full uuid batch) instead of
+            running the fake tick loop + :meth:`BoundaryHandler.run`
+            cycle. The delegate is responsible for the entire decode
+            cycle including per-token state updates, page boundaries,
+            and completion handling — in the hybrid production swap
+            this is a closure around ``BatchGenWorker.decoding_continuous``.
+            Unit tests leave this as ``None`` and rely on the fake
+            tick loop for deterministic per-token assertions.
+        """
         if decision_frequency_pages < 1:
             raise ValueError(
                 f"decision_frequency_pages must be >= 1, got {decision_frequency_pages}"
@@ -55,6 +69,7 @@ class DecodeScheduler:
         self._boundary = boundary
         self._decision_frequency_pages = decision_frequency_pages
         self._initial_gpu_page_buffer = initial_gpu_page_buffer
+        self._decode_delegate = decode_delegate
         self._model_loaded = False
         self.last_configured: list[UUID] = []
 
@@ -131,7 +146,38 @@ class DecodeScheduler:
     # ------------------------------------------------------------------
 
     def run_continuous(self, uuids: list[UUID]) -> DecodeStepResult:
-        """Run exactly one decision interval then invoke the boundary."""
+        """Run exactly one decision interval then invoke the boundary.
+
+        Two execution modes:
+
+        **Test mode** (``decode_delegate is None``): run the fake tick
+        loop via :func:`run_decode_interval` for
+        ``decision_frequency_pages * PAGE_SIZE`` iterations, then
+        invoke :meth:`BoundaryHandler.run`. Unit tests rely on this
+        path for deterministic per-token assertions.
+
+        **Production mode** (``decode_delegate`` is set): call the
+        delegate once with the full uuid list. The delegate is
+        expected to run the entire decode cycle (forward passes,
+        boundary checks, completion handling) inside
+        ``BatchGenWorker.decoding_continuous`` and mutate
+        ``state.global_batch`` in place. The orchestrator's
+        :class:`BoundaryHandler` is NOT invoked — production legacy
+        ``decoding_continuous`` already handles boundaries
+        internally.
+        """
+        if self._decode_delegate is not None:
+            self._decode_delegate(list(uuids))
+            # Production path: return a synthetic result so the
+            # orchestrator's run_batch can observe completion via
+            # state.global_batch. ``tokens_produced=-1`` marks the
+            # delegated path for traces.
+            return DecodeStepResult(
+                tokens_produced=-1,
+                uuids_decoded=tuple(uuids),
+                boundary_plan=BoundaryPlan(),
+            )
+
         tokens_produced = run_decode_interval(
             self._state,
             self._model,

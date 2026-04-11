@@ -28,6 +28,7 @@ containers still runs against the original worker.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.admission import AdmissionCoordinator, AdmissionQueueBackend
@@ -86,7 +87,16 @@ class WorkerOrchestrator:
         sink: ResponseSinkBackend,
         clock: ClockBackend,
         admission_queue: AdmissionQueueBackend | None = None,
+        decode_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
+        """
+        decode_delegate: production-only hook (see
+            :class:`DecodeScheduler` docstring). When set, the decode
+            phase delegates one full cycle per invocation to the
+            provided closure, bypassing the fake tick loop. In the
+            hybrid production swap this closure wraps
+            ``BatchGenWorker.decoding_continuous``.
+        """
         self._state = state
         self._config = config
         self._collectives = collectives
@@ -148,7 +158,9 @@ class WorkerOrchestrator:
             self._boundary,
             decision_frequency_pages=config.decision_frequency_pages,
             initial_gpu_page_buffer=config.initial_gpu_page_buffer,
+            decode_delegate=decode_delegate,
         )
+        self._decode_delegate = decode_delegate
 
         self._initialized = False
 
