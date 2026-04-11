@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from batchgen.sequence import SequenceEntry, SequenceStatus
+from batchgen.sequence import SequenceEntry
 from batchgen.worker.indexing import (
     DuplicateSequenceError,
     IndexManager,
@@ -27,16 +27,14 @@ def _make_state() -> WorkerState:
 def _make_seq(uuid: str, global_idx: int) -> SequenceEntry:
     """Minimal SequenceEntry for IndexManager tests.
 
-    Uses SequenceEntry's actual constructor signature. Only the fields
-    IndexManager reads (uuid, global_idx) matter here.
+    Only the fields IndexManager reads (`uuid`, `global_idx`) matter here;
+    the rest get whatever defaults `SequenceEntry.__init__` picks.
     """
     return SequenceEntry(
         uuid=uuid,
         global_idx=global_idx,
         prompt_length=1,
         max_decode_length=1,
-        input_ids=[0],
-        text="",
     )
 
 
