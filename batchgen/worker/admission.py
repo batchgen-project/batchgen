@@ -76,45 +76,39 @@ class AdmissionCoordinator:
 
         Returns:
             List of newly-admitted UUIDs in the order they appeared in the
-            message. Empty list when no admission is pending on rank 0
-            (and therefore nothing is broadcast downstream either).
+            message. Empty list when no admission is pending on rank 0.
+
+        Shutdown encoding: a literal ``None`` pulled from the queue
+        (``get_nowait()`` returning ``None``, not raising
+        :class:`queue.Empty`) is the main-worker shutdown sentinel. The
+        coordinator converts it to ``{"type": "shutdown"}`` INSIDE the
+        single broadcast payload so the collective order stays exactly
+        one ``broadcast_object`` call per poll (invariant #6).
         """
         msg: dict[str, Any] | None = None
-        shutdown_signal = False
         if self._state.rank == 0 and self._queue is not None:
             try:
                 raw = self._queue.get_nowait()
+                if raw is None:
+                    # Explicit shutdown sentinel from main. Convert to
+                    # a typed message so the single broadcast carries
+                    # the signal without a second collective.
+                    msg = {"type": "shutdown"}
+                elif isinstance(raw, dict):
+                    msg = raw
             except Empty:
-                raw = None
-            if raw is None and self._queue is not None:
-                # Distinguish "queue empty" from "explicit None shutdown".
-                # queue.get_nowait() only returns here if it DID pull a
-                # None; Empty is caught above. Main uses None as the
-                # shutdown sentinel.
-                # Note: queue.Queue.get_nowait raises Empty on empty, so
-                # the `raw is None` branch only fires on explicit None.
-                shutdown_signal = True
-            else:
-                msg = raw
+                msg = None
 
-        # Broadcast the message (may be None if no admission pending).
         obj_list: list[Any] = [msg]
         self._collectives.broadcast_object(obj_list, src=0)
         msg = obj_list[0]
 
-        # Broadcast the shutdown flag separately so non-rank-0 see it too.
-        # Uses broadcast_object for simplicity; production would use a
-        # small tensor but this path is out-of-hot-loop.
-        shutdown_obj: list[Any] = [shutdown_signal]
-        self._collectives.broadcast_object(shutdown_obj, src=0)
-        if shutdown_obj[0]:
-            # Signal shutdown via the orchestrator's _shutdown flag, if
-            # it exists on state. Handlers check state.shutdown_requested
-            # in the outer generate_persistent loop.
-            setattr(self._state, "shutdown_requested", True)
+        if not msg:
             return []
 
-        if not msg:
+        # Shutdown takes precedence over admission parsing.
+        if isinstance(msg, dict) and msg.get("type") == "shutdown":
+            setattr(self._state, "shutdown_requested", True)
             return []
 
         # Determine message shape and extract the entries list.
