@@ -95,13 +95,14 @@ class BatchFormation:
         """Round-robin `assigned_rank` across `world_size`, deterministic across ranks.
 
         Ordering is taken from the sorted `uuids` list so every rank assigns
-        identical ranks to identical UUIDs without any collective.
+        identical ranks to identical UUIDs without any collective. UUIDs
+        missing from `global_batch` are filtered OUT before round-robin so
+        they do not silently consume a slot; the remaining UUIDs see a
+        gap-free assignment.
         """
         world = self._state.world_size
-        for i, uuid in enumerate(sorted(uuids)):
-            seq = self._state.global_batch.get_sequence(uuid)
-            if seq is None:
-                continue
+        present = sorted(u for u in uuids if self._state.global_batch.get_sequence(u) is not None)
+        for i, uuid in enumerate(present):
             self._state.global_batch.assign_rank(uuid, i % world)
 
     # -- build_query_book --------------------------------------------------
