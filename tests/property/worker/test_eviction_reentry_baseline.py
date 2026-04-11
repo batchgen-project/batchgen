@@ -185,32 +185,34 @@ def test_invariant_holds_after_every_cycle(
 @settings(max_examples=50, deadline=None)
 @given(
     original_prompt_length=st.integers(min_value=1, max_value=1000),
-    cycles_of_pairs=st.lists(
-        st.tuples(
-            st.integers(min_value=0, max_value=300),
-            st.integers(min_value=0, max_value=300),
-        ),
-        min_size=1,
-        max_size=4,
-    ),
+    first_cycle_decoded=st.integers(min_value=0, max_value=500),
+    extra_after_reenter=st.integers(min_value=1, max_value=500),
 )
-def test_extra_decode_after_reenter_does_not_retro_shift_prompt(
-    original_prompt_length: int, cycles_of_pairs: list[tuple[int, int]]
+def test_decoding_after_reenter_does_not_retro_shift_prompt_until_next_evict(
+    original_prompt_length: int,
+    first_cycle_decoded: int,
+    extra_after_reenter: int,
 ) -> None:
-    """After re-entry, decoding more tokens must NOT change ``prompt_length``
-    until the next eviction. The prompt is fixed for the duration of the
-    decode phase; only evict-then-reenter moves it.
+    """``prompt_length`` is FIXED for the duration of the decode phase and
+    only moves at the next evict-then-reenter. This test runs one
+    evict+reenter, then decodes more, and asserts ``prompt_length`` is
+    unchanged until the NEXT evict+reenter (at which point it jumps by
+    ``extra_after_reenter``).
     """
     s = _fresh(original_prompt_length)
-    cumulative = 0
-    for (pre_evict, post_reenter_more) in cycles_of_pairs:
-        _decode(s, pre_evict)
-        _evict(s)
-        _reenter(s)
-        cumulative += pre_evict
-        prompt_after_reenter = s.prompt_length
-        assert prompt_after_reenter == original_prompt_length + cumulative
+    _decode(s, first_cycle_decoded)
+    _evict(s)
+    _reenter(s)
+    prompt_after_first_reenter = s.prompt_length
+    assert prompt_after_first_reenter == original_prompt_length + first_cycle_decoded
 
-        # Decode more AFTER re-entry — prompt must NOT change
-        _decode(s, post_reenter_more)
-        assert s.prompt_length == prompt_after_reenter
+    # Decode more AFTER re-entry — prompt_length must stay put.
+    _decode(s, extra_after_reenter)
+    assert s.prompt_length == prompt_after_first_reenter
+
+    # Next evict+reenter picks up the newly-decoded tokens.
+    _evict(s)
+    _reenter(s)
+    assert s.prompt_length == (
+        original_prompt_length + first_cycle_decoded + extra_after_reenter
+    )
