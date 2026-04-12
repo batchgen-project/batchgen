@@ -336,18 +336,25 @@ class WorkerOrchestrator:
     def _run_decode_phase(self, stats: BatchStats) -> int:
         """Run decode intervals until PREFILLED/IN_DECODE/ON_HOLD are
         drained or a boundary plan returns the batch to prefill."""
+        import logging as _log
         intervals = 0
         while True:
+            _log.info(f"[ORCH] rank={self._state.rank}: decode_phase prepare_batch...")
             uuids = self._decode.prepare_batch()
+            _log.info(f"[ORCH] rank={self._state.rank}: prepare_batch returned {len(uuids)} uuids")
             if not uuids:
                 return intervals
 
             # Production hybrid path: delegate decode setup to legacy
             # (lazy model load + GPU KV init + batch config)
             if self._decode_setup_delegate is not None:
+                _log.info(f"[ORCH] rank={self._state.rank}: calling decode_setup_delegate...")
                 self._decode_setup_delegate(uuids)
+                _log.info(f"[ORCH] rank={self._state.rank}: decode_setup_delegate done")
 
+            _log.info(f"[ORCH] rank={self._state.rank}: try_load_new...")
             self._decode.try_load_new(uuids)
+            _log.info(f"[ORCH] rank={self._state.rank}: try_load_new done, transitioning statuses...")
             for uuid in uuids:
                 seq = self._state.global_batch.get_sequence(uuid)
                 if seq is None:
@@ -367,11 +374,15 @@ class WorkerOrchestrator:
                     == SequenceStatus.IN_DECODE
                 )
             ]
+            _log.info(f"[ORCH] rank={self._state.rank}: in_decode={len(in_decode)}")
             if not in_decode:
                 return intervals
 
+            _log.info(f"[ORCH] rank={self._state.rank}: config_for_batch...")
             self._decode.config_for_batch(in_decode)
+            _log.info(f"[ORCH] rank={self._state.rank}: run_continuous...")
             self._decode.run_continuous(in_decode)
+            _log.info(f"[ORCH] rank={self._state.rank}: run_continuous done")
 
             completed = self._completion.check_and_handle(in_decode)
             stats.completed_uuids.extend(sorted(completed))
