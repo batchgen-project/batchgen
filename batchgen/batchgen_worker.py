@@ -7815,39 +7815,27 @@ class BatchGenWorker:
 					f"CUDA graphs ready: {stats['total_capture_time_ms']:.0f}ms"
 				)
 
-	def decoding_continuous(
-		self,
-		new_tokens: torch.Tensor,
-		decode_uuids: List[str],
-		batch: List[int],
-		past_key_states: Optional[torch.Tensor] = None,
-		past_value_states: Optional[torch.Tensor] = None,
-		scale_dict: Optional[dict] = None,
-	) -> Tuple[List[str], List[int]]:
-		"""
-		Continuous decoding with optimized collective operations.
+	# ------------------------------------------------------------------
+	# decoding_continuous — modularized helpers
+	# ------------------------------------------------------------------
 
-		Key optimizations:
-		1. Single batched all_gather per page boundary (vs 10+ in original)
-		2. Single page table rebuild per boundary (vs 4 in original)
-		3. Reduced logging overhead
-		4. No timing object allocation in hot path
+	def _decode_bind_attn_wrapper(
+		self,
+		batch: List[int],
+		past_key_states: Optional[torch.Tensor],
+		past_value_states: Optional[torch.Tensor],
+		scale_dict: Optional[dict],
+	) -> Tuple:
+		"""Bind Attn_Wrapper / AttnWrapperBase and verify entry page-table order.
+
+		Returns (gpu_manager, worker_view) for use in the decode loop.
 		"""
-		if "deepseek" in self.model_config.model_type:
-			self.model.model._use_flash_attention_2 = True
-		
-		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
-		if RUNTIME_ATTN_MODE != 3:
-			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
-			return decode_uuids, batch
-		
-		# Setup
 		gpu_manager = self.gpu_paged_kv_cache_manager
 		if gpu_manager is None:
 			gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
-		
+
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		
+
 		Attn_Wrapper.gpu_paged_kv_manager = gpu_manager
 		Attn_Wrapper.host_paged_kv_worker_view = worker_view
 		Attn_Wrapper.scale = scale_dict
@@ -7866,7 +7854,7 @@ class BatchGenWorker:
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
-		# This fixes order mismatch that can occur during decode→prefill→decode transitions
+		# This fixes order mismatch that can occur during decode->prefill->decode transitions
 		if gpu_manager and gpu_manager._gpu_page_table_manager:
 			entry_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
@@ -7887,21 +7875,23 @@ class BatchGenWorker:
 						f"batch_size={len(batch)}, cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''}"
 					)
 
+		return gpu_manager, worker_view
+
+	def _decode_init_state(self, batch: List[int]):
+		"""Initialize async state, validate GPU KV tracking, init cumulative counters.
+
+		Returns (local_iteration, last_boundary, global_batch_size).
+		"""
 		# Async state
 		self._pending_kv_append_tasks = []
 		self._pending_kv_append_tensors = []
-		
-		pending_async_task = None
-		pending_load_uuids = []
-		pending_load_local = []
-		pending_load_global = []
-		
+
 		# Validation
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map.get(local_idx)
 			if uuid and uuid not in self._sequences_with_gpu_kv:
 				self._sequences_with_gpu_kv.add(uuid)
-		
+
 		# Use cumulative counters that persist across prefill/decode switches
 		# Initialize instance vars if not present (shouldn't happen, but safety)
 		if not hasattr(self, '_cumulative_decode_iterations'):
@@ -7913,17 +7903,14 @@ class BatchGenWorker:
 		if not hasattr(self, '_cumulative_forward_ms'):
 			self._cumulative_forward_ms = 0.0
 
-		# Local iteration counter (for boundary interval tracking within this decode round)
-		local_iteration = 0
-		last_boundary = 0
-		global_batch_size = len(self.global_batch)
+		return 0, 0, len(self.global_batch)
 
-		# ========== INITIAL MOE BUFFER SYNC ==========
-		# Sync buffer size BEFORE first forward pass to prevent overflow.
-		# The boundary sync (in _page_boundary_fast) only happens after DECISION_INTERVAL
-		# iterations, but the first forward pass runs immediately. Without this sync,
-		# if one rank has more tokens than the initial estimate (ceil(total/world_size)),
-		# we get buffer overflow.
+	def _decode_initial_moe_sync(self, batch: List[int]):
+		"""Sync MoE buffer sizes across ranks BEFORE the first forward pass.
+
+		Without this sync, if one rank has more tokens than the initial
+		estimate (ceil(total/world_size)), we get buffer overflow.
+		"""
 		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
 		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
@@ -7935,514 +7922,516 @@ class BatchGenWorker:
 			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
 				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 
-		# OPTIMIZATION: Track if page table was verified since last batch change
-		# Avoids redundant page table checks between boundaries
-		_page_table_verified_this_batch = True  # Start True after entry check
+	def _decode_handle_boundary(
+		self,
+		local_iteration: int,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager,
+		pending_async_task,
+		pending_load_uuids: List[str],
+		pending_load_local: List[int],
+		pending_load_global: List[int],
+		global_batch_size: int,
+		new_tokens: torch.Tensor,
+	) -> Tuple:
+		"""Handle page boundary check, watermark, admission poll, pending load finalization.
 
-		# Main decode loop — enable decode watchdog for monitoring
-		self.enable_decode_watchdog()
-		while decode_uuids:
-			local_iteration += 1
-			self._cumulative_decode_iterations += 1
+		Returns (decode_uuids, batch, pending_async_task, pending_load_uuids,
+		         pending_load_local, pending_load_global, new_tokens,
+		         should_break, should_continue, page_table_verified).
+		"""
+		should_break = False
+		should_continue = False
 
-			# Feed watchdogs to prevent timeout during long decoding
-			self.feed_watchdog()
-			self.feed_decode_watchdog()
+		(decode_uuids, batch,
+		 pending_async_task, pending_load_uuids,
+		 pending_load_local, pending_load_global,
+		 timing, watermark_triggered) = self._page_boundary_fast(
+			decode_uuids, batch, gpu_manager,
+			pending_async_task, pending_load_uuids,
+			pending_load_local, pending_load_global
+		)
 
-			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
-			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
-				last_boundary = local_iteration
+		self._cumulative_boundary_ms += timing.total_ms
+		self._cumulative_decode_boundaries += 1
 
-				(decode_uuids, batch,
-				 pending_async_task, pending_load_uuids,
-				 pending_load_local, pending_load_global,
-				 timing, watermark_triggered) = self._page_boundary_fast(
-					decode_uuids, batch, gpu_manager,
-					pending_async_task, pending_load_uuids,
-					pending_load_local, pending_load_global
+		# Batch may have changed - need to verify page table
+		page_table_verified = False
+
+		# Post-boundary: verify page table matches batch and fix if needed
+		if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
+			post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+			post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
+
+			if post_boundary_slot_order != post_boundary_batch_global_ids:
+				# Fix: Rebuild page table to match batch
+				gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
+
+		# Page table is now verified for this batch
+		page_table_verified = True
+
+		# Check if watermark triggered - interrupt decode for prefill
+		if watermark_triggered:
+			# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
+			# Without this, KV data may not be fully written to host when sequences
+			# are later resumed, causing KV corruption and gibberish output.
+			num_waited = self._wait_pending_kv_append_tasks()
+			if num_waited > 0:
+				logging.info(
+					f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
+					f"before putting sequences ON_HOLD"
 				)
 
-				self._cumulative_boundary_ms += timing.total_ms
-				self._cumulative_decode_boundaries += 1
+			logging.info(
+				f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
+				f"sequences ON_HOLD, will trigger prefill"
+			)
+			# Put all remaining sequences ON_HOLD
+			self._put_sequences_on_hold(decode_uuids)
+			# Exit decode loop - will return to generate() which will trigger prefill
+			should_break = True
+			return (decode_uuids, batch, pending_async_task, pending_load_uuids,
+					pending_load_local, pending_load_global, new_tokens,
+					should_break, should_continue, page_table_verified)
 
-				# Batch may have changed - need to verify page table
-				_page_table_verified_this_batch = False
-
-				# Post-boundary: verify page table matches batch and fix if needed
-				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
-					post_boundary_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-					post_boundary_batch_global_ids = self._local_indices_to_global_seq_ids(batch)
-
-					if post_boundary_slot_order != post_boundary_batch_global_ids:
-						# Fix: Rebuild page table to match batch
-						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
-
-				# Page table is now verified for this batch
-				_page_table_verified_this_batch = True
-
-				# Check if watermark triggered - interrupt decode for prefill
-				if watermark_triggered:
-					# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
-					# Without this, KV data may not be fully written to host when sequences
-					# are later resumed, causing KV corruption and gibberish output.
-					num_waited = self._wait_pending_kv_append_tasks()
-					if num_waited > 0:
-						logging.info(
-							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
-							f"before putting sequences ON_HOLD"
-						)
-
-					logging.info(
-						f"[WATERMARK] Rank {self.rank}: Decode interrupted - putting {len(decode_uuids)} "
-						f"sequences ON_HOLD, will trigger prefill"
-					)
-					# Put all remaining sequences ON_HOLD
-					self._put_sequences_on_hold(decode_uuids)
-					# Exit decode loop - will return to generate() which will trigger prefill
-					break
-
-				# Poll for new admissions at each page boundary.
-				# New batches may have been submitted during decode — drain them
-				# and break for prefill if QUEUEING sequences arrive.
-				if self._admission_queue is not None:
-					admitted = self._poll_admissions()
-					if admitted and self.rank == 0:
-						logging.info(
-							f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
-							f"total in batch: {len(self.global_batch)}"
-						)
-					has_q = self.global_batch.has_queueing()
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
-						num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
-						logging.info(
-							f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
-							f"watermark={watermark_triggered} admitted={admitted}"
-						)
-					if has_q and watermark_triggered:
-						if self.rank == 0:
-							logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
-						break
-
-				# Detailed logging at every boundary (only rank 0)
+		# Poll for new admissions at each page boundary.
+		# New batches may have been submitted during decode -- drain them
+		# and break for prefill if QUEUEING sequences arrive.
+		if self._admission_queue is not None:
+			admitted = self._poll_admissions()
+			if admitted and self.rank == 0:
+				logging.info(
+					f"[DECODE] Mid-decode admission at iter {self._cumulative_decode_iterations}, "
+					f"total in batch: {len(self.global_batch)}"
+				)
+			has_q = self.global_batch.has_queueing()
+			if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and has_q:
+				num_q = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
+				logging.info(
+					f"[MULTI_DIAG] has_queueing={has_q} num_q={num_q} "
+					f"watermark={watermark_triggered} admitted={admitted}"
+				)
+			if has_q and watermark_triggered:
 				if self.rank == 0:
-					# Get status counts
-					# - in_decode: sequences currently in decode batch (IN_DECODE status)
-					# - onhold: sequences paused with host KV (ON_HOLD status)  
-					# - prefilled: sequences prefilled but not yet decoding (PREFILLED status)
-					# - host_kv_total: total sequences with host KV = prefilled + onhold + in_decode
-					num_in_decode = timing.total_active
-					num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
-					num_prefilled = timing.total_prefilled
-					num_completed_total = timing.total_completed_cumulative
-					num_host_kv_total = num_prefilled + num_onhold + num_in_decode
-					
-					# Get page stats if available
-					page_info = ""
-					if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
-						ps = self._host_kv_page_stats
-						page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
+					logging.info(f"[DECODE] Breaking for new batch prefill (watermark triggered)")
+				should_break = True
+				return (decode_uuids, batch, pending_async_task, pending_load_uuids,
+						pending_load_local, pending_load_global, new_tokens,
+						should_break, should_continue, page_table_verified)
 
-					if BATCHGEN_CB_DEBUG:
-						# Detailed timing log when debug is enabled
-						logging.info(
-							f"[Decode Interval {self._cumulative_decode_boundaries}] "
-							f"iter={self._cumulative_decode_iterations}, "
-							f"total={timing.total_ms:.1f}ms | "
-							f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
-							f"wait_async={timing.wait_async_load_ms:.1f}, "
-							f"finalize={timing.finalize_load_ms:.1f}, "
-							f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
-							f"gather={timing.gather_ms:.1f}, "
-							f"proc={timing.process_ms:.1f}, "
-							f"ext={timing.extension_ms:.1f}, "
-							f"load_sel={timing.load_select_ms:.1f}, "
-							f"load_alloc={timing.load_alloc_ms:.1f}, "
-							f"load_launch={timing.load_launch_ms:.1f}, "
-							f"rebuild={timing.rebuild_ms:.1f}, "
-							f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
-							f"barrier={timing.barrier_ms:.1f}ms | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-					else:
-						# Minimal log without timing details
-						logging.info(
-							f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
-							f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
-							f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
-							f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
-							f"{page_info}"
-						)
-				
-				if not decode_uuids:
-					# Check for pending loads
-					if pending_load_uuids:
-						if pending_async_task is not None:
-							pending_async_task.wait()
-							torch.cuda.synchronize(self.torch_device)
-						dist.barrier()
-						
-						decode_uuids, batch = self._finalize_async_load_minimal(
-							pending_async_task, pending_load_uuids,
-							pending_load_local, pending_load_global,
-							decode_uuids, batch, gpu_manager
-						)
-						self._rebuild_page_table_for_batch(batch, gpu_manager)
-						
-						if batch:
-							new_tokens = self._rebuild_input_tokens(batch)
-						
-						pending_async_task = None
-						pending_load_uuids = []
-						pending_load_local = []
-						pending_load_global = []
-						
-						if decode_uuids:
-							continue
-					break
-				
-				new_tokens = self._rebuild_input_tokens(batch)
-				# DEBUG: Log tokens rebuild after boundary
-				if new_tokens.shape[0] != len(batch):
-					logging.error(
-						f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
-						f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
-					)
-			
-			# Forward pass
-			forward_start = time.perf_counter()
+		# Detailed logging at every boundary (only rank 0)
+		if self.rank == 0:
+			num_in_decode = timing.total_active
+			num_onhold = len(self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))
+			num_prefilled = timing.total_prefilled
+			num_completed_total = timing.total_completed_cumulative
+			num_host_kv_total = num_prefilled + num_onhold + num_in_decode
 
-			# Pre-compute batch_sequences for use in both forward setup and update loop
-			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+			# Get page stats if available
+			page_info = ""
+			if hasattr(self, '_host_kv_page_stats') and self._host_kv_page_stats:
+				ps = self._host_kv_page_stats
+				page_info = f" | Host KV: {ps['used']}/{ps['total']} pages ({ps['free_percent']}% free)"
 
-			# Invariant check: cache_seqlens must not exceed allocated pages.
-			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
-			if BATCHGEN_DECODE_ASSERT and batch:
-				for seq in batch_sequences:
-					max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
-					if seq.current_context_length > max_tokens:
-						logging.error(
-							f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
-							f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
-							f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
-							f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
-							f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
-							f"status={seq.status})"
-						)
-						raise RuntimeError(
-							f"cache_seqlens overrun: ctx={seq.current_context_length} > "
-							f"pages={seq.gpu_pages_allocated}×{SequenceEntry.PAGE_SIZE}="
-							f"{max_tokens} for {seq.uuid[:8]}"
-						)
-
-			with torch.inference_mode():
-				if batch:
-					# Collect context lengths with invariant validation
-					# ALWAYS: current_context_length == original_prompt_length + decoded_length
-					cache_seqlens = []
-					for seq in batch_sequences:
-						ctx_len = seq.current_context_length
-						expected = seq.original_prompt_length + seq.decoded_length
-						if ctx_len != expected:
-							logging.error(
-								f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
-								f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
-								f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-							)
-							seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-								f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
-							seq.current_context_length = expected
-							ctx_len = expected
-						cache_seqlens.append(ctx_len)
-
-					max_ctx = max(cache_seqlens)
-
-					# DIAG: Log cache_seqlens at first iteration of each decode group
-					if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
-						fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
-						resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
-						logging.info(
-							f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
-							f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
-							f"max_ctx={max_ctx}"
-						)
-						for uid, dl, ctx in fresh[:5]:
-							logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
-						for uid, dl, ctx, pg in resumed[:5]:
-							logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
-
-					# Build attention metadata directly on GPU
-					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
-
-					Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
-					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
-					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
-					Attn_Wrapper.max_seqlen = max_ctx
-
-					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-					AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.max_seqlen = max_ctx
-
-					if new_tokens.shape[0] != len(batch):
-						new_tokens = self._rebuild_input_tokens(batch)
-				else:
-					Attn_Wrapper.attention_mask = None
-					Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
-					Attn_Wrapper.max_seqlen = 0
-					Attn_Wrapper.cur_batch = []
-					new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
-					# Also bind empty state to AttnWrapperBase for GPT-OSS
-					AttnWrapperBase.attention_mask = None
-					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
-					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
-					AttnWrapperBase.max_seqlen = 0
-					AttnWrapperBase.cur_batch = []
-				
-				if batch:
-					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
-					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-
-					# OPTIMIZATION: Only check page table if not already verified this batch
-					# Between boundaries, batch doesn't change so page table stays valid
-					if not _page_table_verified_this_batch:
-						# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
-						# This is the root cause of KV corruption after resume - if they don't match,
-						# cache_seqlens[i] will correspond to wrong page_table[i], causing gibberish output
-						if gpu_manager and gpu_manager._gpu_page_table_manager:
-							slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
-							batch_global_order = Attn_Wrapper.cur_batch
-							if slot_order != batch_global_order:
-								# Fix: Rebuild page table to match batch order
-								gpu_manager.rebuild_page_table(batch_global_order)
-								# Log page rebuild for affected sequences
-								for seq in batch_sequences:
-									seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
-										f"batch_size={len(batch)}")
-						_page_table_verified_this_batch = True
-				
-				# NOTE: Do NOT skip forward pass even with empty batch!
-				# MoE models have all-to-all collective operations that ALL ranks must participate in.
-				# Skipping would cause deadlock as other ranks wait for this rank.
-
-				# MoE buffer sync: only needed at decision boundaries (batch size changes).
-				# Between boundaries, batch size is constant — skip the all_reduce + .item()
-				# CPU-GPU sync that drains the GPU pipeline every step.
-				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				if getattr(self, '_whole_model_graph', False):
-					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
-					_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
-					dist.all_gather_into_tensor(_all_rank_counts, _local_bs)
-					_max_bs = max(_all_rank_counts.max().item(), 1)
-					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
-						if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-							self.parallel_manager.set_rank_token_counts(_all_rank_counts)
-				else:
-					# Per-layer graph or eager: no NCCL in graph, use local batch size
-					_max_bs = max(len(batch), 1)
-
-				# KV append callback — deferred: accumulate during forward, single sync after
-				current_batch = list(batch)
-				_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-
-				if _kv_worker_view is not None:
-					_kv_seq_ids = []
-					_kv_seq_lengths = []
-					for local_idx in current_batch:
-						uuid = self._local_to_uuid_map[local_idx]
-						seq = self.global_batch.get_sequence(uuid)
-						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
-					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
-					self._deferred_kv_entries = []
-					self._deferred_kv_worker_view = _kv_worker_view
-
-				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
-					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
-					_sync_kv_seq_ids = _kv_seq_ids
-					_sync_kv_seq_lengths = _kv_seq_lengths
-					_sync_kv_worker_view = _kv_worker_view
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						if k_tensor.dim() == 3:
-							k_tensor = k_tensor.unsqueeze(2)
-						if v_tensor is not None and v_tensor.dim() == 3:
-							v_tensor = v_tensor.unsqueeze(2)
-						torch.cuda.synchronize(self.torch_device)
-						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
-							layer_idx=layer_idx,
-							sequence_ids=_sync_kv_seq_ids,
-							k_tensor=k_tensor,
-							v_tensor=v_tensor,
-							sequence_lengths=_sync_kv_seq_lengths,
-						)
-						if task is not None:
-							task.wait()
-				else:
-					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
-
-				Attn_Wrapper.kv_append_callback = kv_append_callback
-				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-				AttnWrapperBase.kv_append_callback = kv_append_callback
-
-				# Forward
-				_use_graph = (
-					getattr(self, '_whole_model_graph', False)
-					and self._cuda_graph_manager is not None
-					and _max_bs <= self._whole_model_bucketing._max_bucket
+			if BATCHGEN_CB_DEBUG:
+				logging.info(
+					f"[Decode Interval {self._cumulative_decode_boundaries}] "
+					f"iter={self._cumulative_decode_iterations}, "
+					f"total={timing.total_ms:.1f}ms | "
+					f"wait_kv={timing.wait_kv_append_ms:.1f}({timing.num_kv_append_tasks}), "
+					f"wait_async={timing.wait_async_load_ms:.1f}, "
+					f"finalize={timing.finalize_load_ms:.1f}, "
+					f"sync_uuids={timing.sync_decode_uuids_ms:.1f}, "
+					f"gather={timing.gather_ms:.1f}, "
+					f"proc={timing.process_ms:.1f}, "
+					f"ext={timing.extension_ms:.1f}, "
+					f"load_sel={timing.load_select_ms:.1f}, "
+					f"load_alloc={timing.load_alloc_ms:.1f}, "
+					f"load_launch={timing.load_launch_ms:.1f}, "
+					f"rebuild={timing.rebuild_ms:.1f}, "
+					f"moe_buf={timing.moe_buffer_update_ms:.1f}, "
+					f"barrier={timing.barrier_ms:.1f}ms | "
+					f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+					f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
+					f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+					f"{page_info}"
 				)
-				if _use_graph:
-					# Whole-model CUDA graph replay.
-					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
-					# computation, NOT local len(batch). The graph has NCCL all_reduce
-					# baked inside — all ranks MUST replay the same bucket's graph,
-					# otherwise mismatched NCCL ops cause deadlock.
-					batch_size = len(batch)
-					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
-					page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
-					slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
-					if slot_indices_tensor is None:
-						# Rebuild may have cleared it; reconstruct as simple arange
-						slot_indices_tensor = torch.arange(
-							page_table_tensor.shape[0], dtype=torch.int32,
-							device=self.torch_device,
-						)
-					# Page table may have fewer columns than the static buffer
-					# (gpu_table gets rebuilt with varying max_pages_per_sequence).
-					# Pad to match the captured spec width.
-					wm_max_pages = self._whole_model_segment.max_pages_per_seq
-					pt_slice = page_table_tensor[:batch_size]
-					if pt_slice.shape[1] < wm_max_pages:
-						pt_slice = torch.nn.functional.pad(
-							pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
-						)
-					elif pt_slice.shape[1] > wm_max_pages:
-						pt_slice = pt_slice[:, :wm_max_pages]
-					graph_out = self._cuda_graph_manager.replay(
-						"whole_model", bucket,
-						input_ids=new_tokens,
-						cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-						page_table=pt_slice,
-						slot_indices=slot_indices_tensor[:batch_size],
+			else:
+				logging.info(
+					f"[Decode {self._cumulative_decode_boundaries}] iter={self._cumulative_decode_iterations} | "
+					f"STATUS: in_decode={num_in_decode}, onhold={num_onhold}, prefilled={num_prefilled}, "
+					f"host_kv_total={num_host_kv_total}, completed={num_completed_total}/{global_batch_size}, "
+					f"Δ completed={timing.num_completed}, loaded={timing.num_loaded}, onhold={timing.num_onhold}"
+					f"{page_info}"
+				)
+
+		if not decode_uuids:
+			# Check for pending loads
+			if pending_load_uuids:
+				if pending_async_task is not None:
+					pending_async_task.wait()
+					torch.cuda.synchronize(self.torch_device)
+				dist.barrier()
+
+				decode_uuids, batch = self._finalize_async_load_minimal(
+					pending_async_task, pending_load_uuids,
+					pending_load_local, pending_load_global,
+					decode_uuids, batch, gpu_manager
+				)
+				self._rebuild_page_table_for_batch(batch, gpu_manager)
+
+				if batch:
+					new_tokens = self._rebuild_input_tokens(batch)
+
+				pending_async_task = None
+				pending_load_uuids = []
+				pending_load_local = []
+				pending_load_global = []
+
+				if decode_uuids:
+					should_continue = True
+					return (decode_uuids, batch, pending_async_task, pending_load_uuids,
+							pending_load_local, pending_load_global, new_tokens,
+							should_break, should_continue, page_table_verified)
+			should_break = True
+			return (decode_uuids, batch, pending_async_task, pending_load_uuids,
+					pending_load_local, pending_load_global, new_tokens,
+					should_break, should_continue, page_table_verified)
+
+		new_tokens = self._rebuild_input_tokens(batch)
+		# DEBUG: Log tokens rebuild after boundary
+		if new_tokens.shape[0] != len(batch):
+			logging.error(
+				f"Rank {self.rank}: POST-BOUNDARY new_tokens mismatch! "
+				f"batch_size={len(batch)}, new_tokens.shape={new_tokens.shape}"
+			)
+
+		return (decode_uuids, batch, pending_async_task, pending_load_uuids,
+				pending_load_local, pending_load_global, new_tokens,
+				should_break, should_continue, page_table_verified)
+
+	def _decode_forward_step(
+		self,
+		batch: List[int],
+		new_tokens: torch.Tensor,
+		gpu_manager,
+		_page_table_verified_this_batch: bool,
+		local_iteration: int,
+	) -> torch.Tensor:
+		"""Run one forward pass (graph or eager) and return new_tokens_out.
+
+		Handles cache_seqlens construction, CTX invariant check, page table
+		verification, KV append callback setup, and the actual forward call.
+		"""
+		# Pre-compute batch_sequences for use in both forward setup and update loop
+		batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+
+		# Invariant check: cache_seqlens must not exceed allocated pages.
+		# Violations cause FlashAttention to read -1 sentinel -> CUDA illegal access.
+		if BATCHGEN_DECODE_ASSERT and batch:
+			for seq in batch_sequences:
+				max_tokens = seq.gpu_pages_allocated * SequenceEntry.PAGE_SIZE
+				if seq.current_context_length > max_tokens:
+					logging.error(
+						f"DECODE_ASSERT FAIL rank={self.rank}: {seq.uuid[:8]} gid={seq.global_idx} "
+						f"ctx={seq.current_context_length} > max_tokens={max_tokens} "
+						f"(pages={seq.gpu_pages_allocated}, PAGE_SIZE={SequenceEntry.PAGE_SIZE}, "
+						f"prompt={seq.prompt_length}, orig_prompt={seq.original_prompt_length}, "
+						f"decoded={seq.decoded_length}, baseline={seq.reentry_decoded_baseline}, "
+						f"status={seq.status})"
+					)
+					raise RuntimeError(
+						f"cache_seqlens overrun: ctx={seq.current_context_length} > "
+						f"pages={seq.gpu_pages_allocated}x{SequenceEntry.PAGE_SIZE}="
+						f"{max_tokens} for {seq.uuid[:8]}"
 					)
 
-					logits = graph_out["logits"][:batch_size]
-					new_tokens_out = self._select_tokens(logits)
-
-					# Fire KV host offload callbacks for all layers.
-					# KV buffers are static-address tensors written inside the graph;
-					# clone before passing to async D2H to protect tensor lifespan.
-					kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
-					wm_seg = getattr(self, '_whole_model_segment', None)
-					if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
-						for layer_idx in range(wm_seg.num_layers):
-							kv_buf = wm_seg._kv_buffers[layer_idx]
-							# K2.5 MLA has no separate V cache — pass None for v_tensor
-							v_buf = kv_buf.get("value")
-							v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
-							kv_cb(
-								layer_idx,
-								kv_buf["key"][:batch_size].clone(),
-								v_clone,
-							)
-				else:
-					# Per-layer graph or eager forward
-					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
-					# Without this, the model generates position_ids = [[0]] for all decode steps,
-					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
-						new_tokens,
-						attention_mask=Attn_Wrapper.attention_mask,
-						position_ids=Attn_Wrapper.position_ids,
-						use_cache=False
-					)
-					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
-
-			new_tokens = new_tokens_out
-
-			# Flush deferred KV entries — single sync for all layers
-			self._flush_deferred_kv_to_host()
-
-			# Optimization: Single GPU→CPU transfer for all tokens (vs N transfers in loop)
-			# This avoids N GPU synchronizations which cause heavy CPU overhead
-			new_tokens_cpu = new_tokens.cpu()
-
-			# Update sequences (reuse batch_sequences from forward pass setup)
-			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
-				if self._is_sequence_completed(seq):
-					continue
-
-				decode_pos = seq.decoded_length
-				if BATCHGEN_CB_DEBUG:
-					qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
-					seq_ptr = seq.decoded_tokens.data_ptr()
-					if qb_ptr != seq_ptr:
+		with torch.inference_mode():
+			if batch:
+				# Collect context lengths with invariant validation
+				# ALWAYS: current_context_length == original_prompt_length + decoded_length
+				cache_seqlens = []
+				for seq in batch_sequences:
+					ctx_len = seq.current_context_length
+					expected = seq.original_prompt_length + seq.decoded_length
+					if ctx_len != expected:
 						logging.error(
-							f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
-							f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
-							f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+							f"Rank {self.rank}: CTX MISMATCH {seq.uuid[:8]} gid={seq.global_idx}: "
+							f"ctx={ctx_len} expected={expected} (orig_prompt={seq.original_prompt_length}, "
+							f"prompt={seq.prompt_length}, decoded={seq.decoded_length})"
 						)
-				self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
+						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
+							f"ctx={ctx_len}, expected={expected}, prompt={seq.prompt_length}")
+						lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH")
+						seq.current_context_length = expected
+						ctx_len = expected
+					cache_seqlens.append(ctx_len)
 
-				seq.decoded_length += 1
-				seq.current_context_length += 1
+				max_ctx = max(cache_seqlens)
 
-				# Use CPU tensor to avoid GPU sync
-				token_id = new_tokens_cpu[i].item()
-
-				# DIAG: Log first 3 tokens for first 10 seqs in each decode group
-				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
+				# DIAG: Log cache_seqlens at first iteration of each decode group
+				if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 1:
+					fresh = [(s.uuid[:8], s.decoded_length, ctx) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length <= 1]
+					resumed = [(s.uuid[:8], s.decoded_length, ctx, s.gpu_pages_allocated) for s, ctx in zip(batch_sequences, cache_seqlens) if s.decoded_length > 1]
 					logging.info(
-						f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
-						f"decoded_len={seq.decoded_length} token={token_id}"
+						f"[MULTI_DIAG] decode_group={self._decode_group_idx} iter={local_iteration}: "
+						f"batch={len(batch)}, fresh={len(fresh)}, resumed={len(resumed)}, "
+						f"max_ctx={max_ctx}"
 					)
-				if self._should_stop_at_eos(token_id):
-					seq.eos_reached = True
+					for uid, dl, ctx in fresh[:5]:
+						logging.info(f"[MULTI_DIAG]   FRESH: {uid} decoded={dl} cache_seqlen={ctx}")
+					for uid, dl, ctx, pg in resumed[:5]:
+						logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
 
-				if seq.decoded_length >= seq.max_decode_length:
-					seq.eos_reached = True
+				# Build attention metadata directly on GPU
+				seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
 
-				# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
-				if REP_DETECTION and not seq._rep_detected:
-					if token_id == seq._rep_last_token:
-						seq._rep_count += 1
-						if seq._rep_count >= 32:
-							seq._rep_detected = True
-							seq.eos_reached = True
-							seq.log_event(SeqEvent.REPETITION, self.rank,
-								f"token={token_id}, count={seq._rep_count}")
-							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
-								seq._lifespan_log, "REPETITION")
-							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
-								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
-							)
-					else:
-						seq._rep_last_token = token_id
-						seq._rep_count = 1
-					# Variable-length N-gram pattern check (every 64 tokens)
-					if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
-						_dl = seq.decoded_length
-						_tokens = self.query_book[local_idx].decoded_tokens[0]
-						if _check_repeating_pattern(_tokens, _dl):
-							seq._rep_detected = True
-							seq.eos_reached = True
-							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
-								f"gid={seq.global_idx} at decoded_len={_dl}"
-							)
+				Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
+				Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
+				Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
+				Attn_Wrapper.max_seqlen = max_ctx
 
-			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+				AttnWrapperBase.attention_mask = None  # Removed: no longer used in decode
+				AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+				AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+				AttnWrapperBase.max_seqlen = max_ctx
 
-		# Cleanup
+				if new_tokens.shape[0] != len(batch):
+					new_tokens = self._rebuild_input_tokens(batch)
+			else:
+				Attn_Wrapper.attention_mask = None
+				Attn_Wrapper.position_ids = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+				Attn_Wrapper.cache_seqlens = torch.zeros((0,), dtype=torch.int32, device=self.torch_device)
+				Attn_Wrapper.max_seqlen = 0
+				Attn_Wrapper.cur_batch = []
+				new_tokens = torch.zeros((0, 1), dtype=torch.int64, device=self.torch_device)
+				# Also bind empty state to AttnWrapperBase for GPT-OSS
+				AttnWrapperBase.attention_mask = None
+				AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
+				AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
+				AttnWrapperBase.max_seqlen = 0
+				AttnWrapperBase.cur_batch = []
+
+			if batch:
+				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
+				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+
+				# OPTIMIZATION: Only check page table if not already verified this batch
+				# Between boundaries, batch doesn't change so page table stays valid
+				if not _page_table_verified_this_batch:
+					# CRITICAL FIX: Ensure page table order matches batch order BEFORE forward pass
+					if gpu_manager and gpu_manager._gpu_page_table_manager:
+						slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
+						batch_global_order = Attn_Wrapper.cur_batch
+						if slot_order != batch_global_order:
+							# Fix: Rebuild page table to match batch order
+							gpu_manager.rebuild_page_table(batch_global_order)
+							# Log page rebuild for affected sequences
+							for seq in batch_sequences:
+								seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
+									f"batch_size={len(batch)}")
+
+			# NOTE: Do NOT skip forward pass even with empty batch!
+			# MoE models have all-to-all collective operations that ALL ranks must participate in.
+			# Skipping would cause deadlock as other ranks wait for this rank.
+
+			# MoE buffer sync: only needed at decision boundaries (batch size changes).
+			if getattr(self, '_whole_model_graph', False):
+				# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
+				_local_bs = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
+				_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+				dist.all_gather_into_tensor(_all_rank_counts, _local_bs)
+				_max_bs = max(_all_rank_counts.max().item(), 1)
+				if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+					if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+						self.parallel_manager.set_num_tokens_per_rank(_max_bs)
+					if hasattr(self.parallel_manager, 'set_rank_token_counts'):
+						self.parallel_manager.set_rank_token_counts(_all_rank_counts)
+			else:
+				# Per-layer graph or eager: no NCCL in graph, use local batch size
+				_max_bs = max(len(batch), 1)
+
+			# KV append callback -- deferred: accumulate during forward, single sync after
+			current_batch = list(batch)
+			_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+
+			if _kv_worker_view is not None:
+				_kv_seq_ids = []
+				_kv_seq_lengths = []
+				for local_idx in current_batch:
+					uuid = self._local_to_uuid_map[local_idx]
+					seq = self.global_batch.get_sequence(uuid)
+					_kv_seq_ids.append(seq.global_idx)
+					_kv_seq_lengths.append(seq.current_context_length - 1)
+				self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
+				self._deferred_kv_entries = []
+				self._deferred_kv_worker_view = _kv_worker_view
+
+			if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
+				# SYNC MODE: Immediately write each layer's KV to host (no deferral)
+				_sync_kv_seq_ids = _kv_seq_ids
+				_sync_kv_seq_lengths = _kv_seq_lengths
+				_sync_kv_worker_view = _kv_worker_view
+				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					if v_tensor is not None and v_tensor.dim() == 3:
+						v_tensor = v_tensor.unsqueeze(2)
+					torch.cuda.synchronize(self.torch_device)
+					task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+						layer_idx=layer_idx,
+						sequence_ids=_sync_kv_seq_ids,
+						k_tensor=k_tensor,
+						v_tensor=v_tensor,
+						sequence_lengths=_sync_kv_seq_lengths,
+					)
+					if task is not None:
+						task.wait()
+			else:
+				def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+					self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
+
+			Attn_Wrapper.kv_append_callback = kv_append_callback
+			# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
+			AttnWrapperBase.kv_append_callback = kv_append_callback
+
+			# Forward
+			_use_graph = (
+				getattr(self, '_whole_model_graph', False)
+				and self._cuda_graph_manager is not None
+				and _max_bs <= self._whole_model_bucketing._max_bucket
+			)
+			if _use_graph:
+				# Whole-model CUDA graph replay.
+				batch_size = len(batch)
+				bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
+				page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
+				slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+				if slot_indices_tensor is None:
+					slot_indices_tensor = torch.arange(
+						page_table_tensor.shape[0], dtype=torch.int32,
+						device=self.torch_device,
+					)
+				wm_max_pages = self._whole_model_segment.max_pages_per_seq
+				pt_slice = page_table_tensor[:batch_size]
+				if pt_slice.shape[1] < wm_max_pages:
+					pt_slice = torch.nn.functional.pad(
+						pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+					)
+				elif pt_slice.shape[1] > wm_max_pages:
+					pt_slice = pt_slice[:, :wm_max_pages]
+				graph_out = self._cuda_graph_manager.replay(
+					"whole_model", bucket,
+					input_ids=new_tokens,
+					cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+					page_table=pt_slice,
+					slot_indices=slot_indices_tensor[:batch_size],
+				)
+
+				logits = graph_out["logits"][:batch_size]
+				new_tokens_out = self._select_tokens(logits)
+
+				# Fire KV host offload callbacks for all layers.
+				kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+				wm_seg = getattr(self, '_whole_model_segment', None)
+				if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
+					for layer_idx in range(wm_seg.num_layers):
+						kv_buf = wm_seg._kv_buffers[layer_idx]
+						v_buf = kv_buf.get("value")
+						v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
+						kv_cb(
+							layer_idx,
+							kv_buf["key"][:batch_size].clone(),
+							v_clone,
+						)
+			else:
+				# Per-layer graph or eager forward
+				outputs = self.model(
+					new_tokens,
+					attention_mask=Attn_Wrapper.attention_mask,
+					position_ids=Attn_Wrapper.position_ids,
+					use_cache=False
+				)
+				new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+
+		return new_tokens_out
+
+	def _decode_update_sequences(
+		self,
+		batch: List[int],
+		batch_sequences: list,
+		new_tokens_cpu: torch.Tensor,
+		local_iteration: int,
+	) -> None:
+		"""Write decoded tokens back, advance decoded_length, check EOS/repetition."""
+		for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
+			if self._is_sequence_completed(seq):
+				continue
+
+			decode_pos = seq.decoded_length
+			if BATCHGEN_CB_DEBUG:
+				qb_ptr = self.query_book[local_idx].decoded_tokens.data_ptr()
+				seq_ptr = seq.decoded_tokens.data_ptr()
+				if qb_ptr != seq_ptr:
+					logging.error(
+						f"Rank {self.rank}: query_book/seq decoded_tokens MISMATCH for "
+						f"local_idx={local_idx}, uuid={seq.uuid[:8]}, "
+						f"qb_ptr={qb_ptr:#x}, seq_ptr={seq_ptr:#x}"
+					)
+			self.query_book[local_idx].decoded_tokens[:, decode_pos] = new_tokens_cpu[i]
+
+			seq.decoded_length += 1
+			seq.current_context_length += 1
+
+			# Use CPU tensor to avoid GPU sync
+			token_id = new_tokens_cpu[i].item()
+
+			# DIAG: Log first 3 tokens for first 10 seqs in each decode group
+			if BATCHGEN_MULTI_BATCH_DIAG and self.rank == 0 and local_iteration <= 3 and i < 10:
+				logging.info(
+					f"[MULTI_DIAG] iter={local_iteration} seq={seq.uuid[:8]} "
+					f"decoded_len={seq.decoded_length} token={token_id}"
+				)
+			if self._should_stop_at_eos(token_id):
+				seq.eos_reached = True
+
+			if seq.decoded_length >= seq.max_decode_length:
+				seq.eos_reached = True
+
+			# Repetition detection: consecutive same-token check (BATCHGEN_REP_DETECTION=1)
+			if REP_DETECTION and not seq._rep_detected:
+				if token_id == seq._rep_last_token:
+					seq._rep_count += 1
+					if seq._rep_count >= 32:
+						seq._rep_detected = True
+						seq.eos_reached = True
+						seq.log_event(SeqEvent.REPETITION, self.rank,
+							f"token={token_id}, count={seq._rep_count}")
+						lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+							seq._lifespan_log, "REPETITION")
+						logging.warning(
+							f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
+							f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+						)
+				else:
+					seq._rep_last_token = token_id
+					seq._rep_count = 1
+				# Variable-length N-gram pattern check (every 64 tokens)
+				if not seq._rep_detected and seq.decoded_length >= 6 and seq.decoded_length % 64 == 0:
+					_dl = seq.decoded_length
+					_tokens = self.query_book[local_idx].decoded_tokens[0]
+					if _check_repeating_pattern(_tokens, _dl):
+						seq._rep_detected = True
+						seq.eos_reached = True
+						logging.warning(
+							f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
+							f"gid={seq.global_idx} at decoded_len={_dl}"
+						)
+
+	def _decode_cleanup(self, pending_async_task) -> None:
+		"""Wait for pending async tasks, unbind Attn_Wrapper/AttnWrapperBase, log summary."""
 		self._wait_pending_kv_append_tasks()
 		if pending_async_task is not None:
 			pending_async_task.wait()
@@ -8467,7 +8456,7 @@ class BatchGenWorker:
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
 		AttnWrapperBase.kv_append_callback = None
-		
+
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
 		if self.rank == 0 and self._cumulative_decode_boundaries > 0 and BATCHGEN_CB_DEBUG:
@@ -8485,6 +8474,114 @@ class BatchGenWorker:
 			)
 
 		self.disable_decode_watchdog()
+
+
+	def decoding_continuous(
+		self,
+		new_tokens: torch.Tensor,
+		decode_uuids: List[str],
+		batch: List[int],
+		past_key_states: Optional[torch.Tensor] = None,
+		past_value_states: Optional[torch.Tensor] = None,
+		scale_dict: Optional[dict] = None,
+	) -> Tuple[List[str], List[int]]:
+		"""
+		Continuous decoding with optimized collective operations.
+
+		Key optimizations:
+		1. Single batched all_gather per page boundary (vs 10+ in original)
+		2. Single page table rebuild per boundary (vs 4 in original)
+		3. Reduced logging overhead
+		4. No timing object allocation in hot path
+
+		Internal logic is split into helper methods:
+		  - _decode_bind_attn_wrapper: setup Attn_Wrapper bindings + page table entry check
+		  - _decode_init_state: async state init, GPU KV tracking, cumulative counters
+		  - _decode_initial_moe_sync: MoE buffer sync before first forward
+		  - _decode_handle_boundary: page boundary + watermark + admission poll
+		  - _decode_forward_step: forward pass (graph or eager) + token selection
+		  - _decode_update_sequences: token write-back, EOS/repetition detection
+		  - _decode_cleanup: wait pending tasks, unbind wrappers, summary log
+		"""
+		if "deepseek" in self.model_config.model_type:
+			self.model.model._use_flash_attention_2 = True
+
+		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+		if RUNTIME_ATTN_MODE != 3:
+			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
+			return decode_uuids, batch
+
+		# === Setup phase ===
+		gpu_manager, worker_view = self._decode_bind_attn_wrapper(
+			batch, past_key_states, past_value_states, scale_dict
+		)
+		local_iteration, last_boundary, global_batch_size = self._decode_init_state(batch)
+
+		pending_async_task = None
+		pending_load_uuids = []
+		pending_load_local = []
+		pending_load_global = []
+
+		# === Initial MoE buffer sync ===
+		self._decode_initial_moe_sync(batch)
+
+		# OPTIMIZATION: Track if page table was verified since last batch change
+		_page_table_verified_this_batch = True  # Start True after entry check
+
+		# Main decode loop - enable decode watchdog for monitoring
+		self.enable_decode_watchdog()
+		while decode_uuids:
+			local_iteration += 1
+			self._cumulative_decode_iterations += 1
+
+			# Feed watchdogs to prevent timeout during long decoding
+			self.feed_watchdog()
+			self.feed_decode_watchdog()
+
+			# Page boundary check - use DECISION_INTERVAL
+			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
+				last_boundary = local_iteration
+
+				(decode_uuids, batch, pending_async_task, pending_load_uuids,
+				 pending_load_local, pending_load_global, new_tokens,
+				 should_break, should_continue, page_table_verified
+				) = self._decode_handle_boundary(
+					local_iteration, decode_uuids, batch, gpu_manager,
+					pending_async_task, pending_load_uuids,
+					pending_load_local, pending_load_global,
+					global_batch_size, new_tokens,
+				)
+				_page_table_verified_this_batch = page_table_verified
+
+				if should_break:
+					break
+				if should_continue:
+					continue
+
+			# Forward pass
+			forward_start = time.perf_counter()
+
+			new_tokens_out = self._decode_forward_step(
+				batch, new_tokens, gpu_manager,
+				_page_table_verified_this_batch, local_iteration,
+			)
+
+			new_tokens = new_tokens_out
+
+			# Flush deferred KV entries - single sync for all layers
+			self._flush_deferred_kv_to_host()
+
+			# Optimization: Single GPU->CPU transfer for all tokens (vs N transfers in loop)
+			new_tokens_cpu = new_tokens.cpu()
+
+			# Update sequences
+			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+			self._decode_update_sequences(batch, batch_sequences, new_tokens_cpu, local_iteration)
+
+			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
+
+		# Cleanup
+		self._decode_cleanup(pending_async_task)
 		return decode_uuids, batch
 
 	def _wait_pending_kv_append_tasks(self) -> int:
