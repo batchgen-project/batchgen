@@ -3427,30 +3427,18 @@ class BatchGenWorker:
 
 	# ============ Tokenization and Assignment ============
 
-	def _tokenize_global_batch(self) -> None:
+	# ------------------------------------------------------------------
+	# _tokenize_global_batch — modularized helpers
+	# ------------------------------------------------------------------
+
+	def _tokenize_parallel(self) -> dict:
+		"""Phase 1: Parallel tokenization across ranks + all_gather.
+
+		Returns tokenized_by_idx dict mapping global_idx -> {input_ids, length}.
 		"""
-		Tokenize all sequences in the global batch without truncation.
-		The max_prompt_length is determined dynamically as the longest prompt.
-
-		PARALLEL TOKENIZATION: Each rank tokenizes a subset of sequences, then
-		results are gathered across all ranks. This reduces tokenization time
-		by ~world_size and keeps NCCL alive during the process (prevents
-		NCCL HeartbeatMonitor timeout for large batches).
-
-		After tokenization, completion criteria uses:
-		- EOS token reached, OR
-		- decoded_length >= max_decoding_length, OR
-		- prompt_length + decoded_length >= model_context_length
-		"""
-		if self.global_batch is None:
-			raise RuntimeError("Global batch not initialized")
-
-		# Phase 1: PARALLEL batch tokenization across ranks
-		# Each rank tokenizes sequences[rank::world_size] to divide the work
 		all_texts = [seq.text for seq in self.global_batch]
 		num_sequences = len(all_texts)
 
-		# Determine this rank's subset of sequences to tokenize
 		my_indices = list(range(self.rank, num_sequences, self.world_size))
 		my_texts = [all_texts[i] for i in my_indices]
 
@@ -3462,8 +3450,6 @@ class BatchGenWorker:
 
 		tokenize_start = time.perf_counter()
 
-		# Each rank tokenizes its subset.
-		# padding=False + return_tensors=None avoids the padded 2D tensor.
 		if my_texts:
 			my_batch_tokenized = self.tokenizer(
 				my_texts,
@@ -3493,11 +3479,8 @@ class BatchGenWorker:
 				item = my_tokenized[i]
 				token_ids = item["input_ids"]
 				print(f"\n[TOKENIZE DEBUG] Sequence {item['global_idx']} (length={item['length']})")
-				# Show first 50 tokens
 				print(f"[TOKENIZE DEBUG] First 50 tokens: {token_ids[:50]}")
-				# Show last 50 tokens (includes question end)
 				print(f"[TOKENIZE DEBUG] Last 50 tokens: {token_ids[-50:]}")
-				# Decode first 200 chars of prompt
 				try:
 					decoded_start = self.tokenizer.decode(token_ids[:100])
 					decoded_end = self.tokenizer.decode(token_ids[-100:])
@@ -3505,28 +3488,23 @@ class BatchGenWorker:
 					print(f"[TOKENIZE DEBUG] End of prompt (decoded): {repr(decoded_end[-300:])}")
 				except Exception as e:
 					print(f"[TOKENIZE DEBUG] Decode error: {e}")
-				# Check for special tokens
 				special_token_ids = [199998, 199999, 200000, 200001, 200002, 200003, 200004, 200005, 200006, 200007, 200008, 200012]
 				found_special = [tid for tid in token_ids if tid in special_token_ids]
 				if found_special:
 					print(f"[TOKENIZE DEBUG] Special tokens found: {found_special}")
 
-		# Phase 1.5: Gather all tokenized results to all ranks
-		# This keeps NCCL alive and shares results efficiently
+		# Gather all tokenized results to all ranks
 		gather_start = time.perf_counter()
 		all_tokenized_lists = [None] * self.world_size
 		dist.all_gather_object(all_tokenized_lists, my_tokenized)
 		gather_time = time.perf_counter() - gather_start
 
-		# Merge results from all ranks, indexed by global_idx
-		# Store only lightweight data (lists), not tensors, to minimize memory
 		tokenized_by_idx = {}
 		for rank_results in all_tokenized_lists:
 			if rank_results:
 				for item in rank_results:
 					tokenized_by_idx[item["global_idx"]] = item
 
-		# Free the gathered lists immediately
 		del all_tokenized_lists
 
 		total_tokenize_time = time.perf_counter() - tokenize_start
@@ -3536,14 +3514,14 @@ class BatchGenWorker:
 				f"(local: {local_tokenize_time:.2f}s, gather: {gather_time:.2f}s)"
 			)
 
-		# Phase 2: Find the longest prompt length to use as max_prompt_length
-		# Use lightweight length field instead of creating tensors
-		prompt_lengths = [tokenized_by_idx[i]["length"] for i in range(num_sequences)]
-		max_prompt_length = max(prompt_lengths)
+		return tokenized_by_idx
 
-		# Phase 2.5: Reject sequences exceeding context length BEFORE buffer allocation.
-		# Must happen here because Phase 3 would crash trying to copy oversized tokens
-		# into model_context_length-sized buffers.
+	def _tokenize_reject_overlimit(self, tokenized_by_idx: dict) -> int:
+		"""Phase 2: Reject sequences exceeding context length, compute max_prompt_length.
+
+		Modifies self.global_batch (removes rejected), sets self.max_input_length.
+		Returns max_prompt_length.
+		"""
 		self._rejected_sequences = []
 		uuids_to_remove = []
 		for seq in self.global_batch:
@@ -3551,7 +3529,6 @@ class BatchGenWorker:
 			if pl >= self.model_context_length:
 				self._rejected_sequences.append((seq.global_idx, pl))
 				uuids_to_remove.append(seq.uuid)
-				# Free tokenized data for rejected sequence
 				del tokenized_by_idx[seq.global_idx]
 
 		for uuid in uuids_to_remove:
@@ -3564,7 +3541,6 @@ class BatchGenWorker:
 				f"sequences exceeding context length {self.model_context_length}"
 			)
 
-		# Recalculate max_prompt_length after rejection (remaining sequences only)
 		num_sequences = len(self.global_batch)
 		if num_sequences > 0:
 			remaining_lengths = [tokenized_by_idx[seq.global_idx]["length"] for seq in self.global_batch]
@@ -3572,8 +3548,6 @@ class BatchGenWorker:
 		else:
 			max_prompt_length = 0
 
-		# Update self.max_input_length to the actual longest prompt
-		# This is used for attention mask shape: [bsz, max_prompt_length + max_decoding_length]
 		self.max_input_length = max_prompt_length
 		if num_sequences > 0:
 			logging.info(
@@ -3582,18 +3556,17 @@ class BatchGenWorker:
 				f"count={num_sequences})"
 			)
 
-		# Phase 3: Create per-sequence tensor views from pre-allocated buffer pool.
-		# Pre-allocating 2 large contiguous buffers eliminates allocator contention
-		# when 16 ranks run Phase 3 simultaneously (was 192K allocations → now 32).
-		# Skip if all sequences were rejected in Phase 2.5.
-		if num_sequences == 0:
+		return max_prompt_length
+
+	def _tokenize_allocate_buffers(self, tokenized_by_idx: dict) -> None:
+		"""Phase 3: Allocate buffer pool and create per-sequence tensor views."""
+		num_seqs = len(self.global_batch)
+		if num_seqs == 0:
 			logging.info(f"Rank {self.rank}: All sequences rejected, skipping Phase 3 buffer allocation")
 			return
 
 		phase3_start = time.perf_counter()
-		num_seqs = len(self.global_batch)
 
-		# Use max_pool_size for pre-allocation if in pool mode (allows future admissions)
 		pool_capacity = max(num_seqs, self._max_pool_size) if self._max_pool_size > 0 else num_seqs
 		self._buffer_pool = QueryBookBufferPool(
 			num_sequences=pool_capacity,
@@ -3633,11 +3606,10 @@ class BatchGenWorker:
 			seq.input_ids = input_ids_view
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
-			# Free the tokenized data for this sequence immediately
 			del tokenized_by_idx[seq.global_idx]
 
 			seq.prompt_length = actual_prompt_len
-			seq.original_prompt_length = actual_prompt_len  # Must match prompt_length at tokenization time
+			seq.original_prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
@@ -3655,6 +3627,22 @@ class BatchGenWorker:
 		)
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
+
+
+	def _tokenize_global_batch(self) -> None:
+		"""Tokenize all sequences in the global batch.
+
+		Split into helpers:
+		  - _tokenize_parallel: parallel tokenization across ranks + all_gather
+		  - _tokenize_reject_overlimit: reject overlength, compute max_prompt_length
+		  - _tokenize_allocate_buffers: buffer pool allocation + per-sequence views
+		"""
+		if self.global_batch is None:
+			raise RuntimeError("Global batch not initialized")
+
+		tokenized_by_idx = self._tokenize_parallel()
+		self._tokenize_reject_overlimit(tokenized_by_idx)
+		self._tokenize_allocate_buffers(tokenized_by_idx)
 
 	def _assign_sequences_to_ranks(self) -> None:
 		"""
