@@ -6620,40 +6620,29 @@ class BatchGenWorker:
 
 	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============
 
-	def _page_boundary_fast(
+	# ------------------------------------------------------------------
+	# _page_boundary_fast — modularized phase helpers
+	# ------------------------------------------------------------------
+
+	def _boundary_wait_pending(
 		self,
 		decode_uuids: List[str],
 		batch: List[int],
-		gpu_manager: GPUPagedKVCacheManager,
-		pending_async_load_task: Optional[object],
+		gpu_manager,
+		pending_async_load_task,
 		pending_load_uuids: List[str],
 		pending_load_local_indices: List[int],
 		pending_load_global_ids: List[int],
-		cumulative_completed: int = 0,  # Track total completed so far
-	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats, bool]:
+		timing,
+	) -> Tuple[List[str], List[int]]:
+		"""Phase 0: Wait for pending async KV ops, integrate previous async load.
+
+		Returns updated (decode_uuids, batch).
 		"""
-		OPTIMIZED page boundary with consolidated collective operations.
-
-		Reduces 10+ collectives to 2-3 by batching:
-		1. Single all_gather_object for: sequence metadata + completion status + extension info + free pages
-		2. One final barrier
-
-		CRITICAL INVARIANTS FOR RANK ALIGNMENT:
-		- All ranks must compute IDENTICAL decode_uuids, completed_uuids, onhold_uuids, new_load_uuids
-		- Local operations (GPU page allocation, KV release) are rank-specific but globally coordinated
-		- All decisions are based on gathered global state, not local state
-
-		Returns:
-			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered)
-		"""
-		timing = FastBoundaryTimingStats()
-		boundary_start = time.perf_counter()
-		
-		# ========== PHASE 0: Wait for pending async operations ==========
 		t0 = time.perf_counter()
 		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks()
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
-		
+
 		# decode_uuids sync: only run in debug mode for desync detection.
 		# In production, rank 0 makes all decisions so sync is unnecessary.
 		t_sync = time.perf_counter()
@@ -6681,7 +6670,7 @@ class BatchGenWorker:
 				batch = self._get_local_indices_for_uuids(decode_uuids)
 				logging.warning(f"Rank {self.rank}: Using rank-0 authoritative set at boundary start, decode_uuids now {len(decode_uuids)}")
 		timing.sync_decode_uuids_ms = (time.perf_counter() - t_sync) * 1000
-		
+
 		# Integrate previous async load if any
 		if pending_load_uuids:  # ALL ranks have identical pending_load_uuids
 			t0 = time.perf_counter()
@@ -6699,7 +6688,7 @@ class BatchGenWorker:
 
 			# barrier ensures all ranks finish async load before continuing
 			dist.barrier()
-			
+
 			t0 = time.perf_counter()
 			decode_uuids, batch = self._finalize_async_load_minimal(
 				pending_async_load_task,
@@ -6711,7 +6700,7 @@ class BatchGenWorker:
 				gpu_manager
 			)
 			timing.finalize_load_ms = (time.perf_counter() - t0) * 1000
-			
+
 			# Rebuild page table to include newly loaded sequences
 			if batch and gpu_manager is not None and gpu_manager.is_initialized:
 				self._rebuild_page_table_for_batch(batch, gpu_manager)
@@ -6722,15 +6711,22 @@ class BatchGenWorker:
 					if post_finalize_slot_order != post_finalize_batch_global_ids:
 						gpu_manager.rebuild_page_table(post_finalize_batch_global_ids)
 
-		if not decode_uuids:
-			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
-			return decode_uuids, batch, None, [], [], [], timing, False
-		
-		# ========== PHASE 1: SINGLE BATCHED ALL_GATHER ==========
+		return decode_uuids, batch
+
+	def _boundary_gather_state(
+		self,
+		decode_uuids: List[str],
+		gpu_manager,
+		timing,
+	) -> Tuple[list, int]:
+		"""Phase 1: Single batched all_gather of seq metadata + free pages.
+
+		Returns (all_payloads, chunk_size).
+		"""
 		t0 = time.perf_counter()
-		
+
 		local_free_pages = gpu_manager.get_stats().num_free_pages if gpu_manager and gpu_manager.is_initialized else 0
-		
+
 		# DEBUG: Log decode_uuids and which ones this rank owns
 		my_owned = [u for u in decode_uuids if u in self._uuid_to_local_map]
 		if self.rank == 0:
@@ -6738,7 +6734,7 @@ class BatchGenWorker:
 				f"Rank {self.rank}: State gathering - decode_uuids_len={len(decode_uuids)}, "
 				f"my_owned_count={len(my_owned)}"
 			)
-		
+
 		# Build local state for sequences owned by this rank
 		chunk_size = self._get_effective_chunk_size()
 		local_seq_state = {}
@@ -6753,64 +6749,60 @@ class BatchGenWorker:
 					'eos_reached': seq.eos_reached,
 					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
-					'assigned_rank': seq.assigned_rank,  # Include for consistency
-					# Host KV growth fields
+					'assigned_rank': seq.assigned_rank,
 					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
-					# prompt_length: required so Phase 4.C can compute the
-					# re-entry reconstruction length on ALL ranks deterministically,
-					# not just the owner. Without this, non-owning ranks have a
-					# stale prompt_length for re-evicted sequences (where the
-					# owner has already rewritten prompt_length in a prior
-					# eviction). See Phase 4.C.
 					'prompt_length': seq.prompt_length,
-					# total_decoded_before_eviction: propagated here so the
-					# next _prepare_prefill_batch's eviction priority sort is
-					# consistent across ranks.
 					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
 				}
-		
+
 		# Get candidates for loading - report PREFILLED/ON_HOLD sequences that could be loaded
-		# CRITICAL FIX: Only report PREFILLED or ON_HOLD sequences as load candidates.
-		# QUEUEING sequences have NOT been registered with host KV yet (registration
-		# happens during _config_prefill_for_batch), so trying to load them would fail
-		# with "Sequence X is not registered" error from the host KV backend.
 		decode_uuids_set = set(decode_uuids)
 		local_candidate_state = {}
 		valid_load_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD}
 		for uuid in self._uuid_to_local_map.keys():
 			if uuid in decode_uuids_set:
-				continue  # Already in decode batch
+				continue
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
 			if seq.status == SequenceStatus.COMPLETED:
-				continue  # Don't load completed sequences
+				continue
 			if seq.status not in valid_load_statuses:
-				continue  # Only load PREFILLED/ON_HOLD (not QUEUEING/IN_PREFILL)
-			# Report this as a potential load candidate
+				continue
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
 				'assigned_rank': seq.assigned_rank,
-				'status': seq.status.name,  # Include status for debugging
-				'decoded_length': seq.decoded_length,  # For prioritized loading
+				'status': seq.status.name,
+				'decoded_length': seq.decoded_length,
 			}
-		
+
 		# Pack everything into one dict for single all_gather
 		local_payload = {
 			'free_pages': local_free_pages,
 			'seq_state': local_seq_state,
 			'candidate_state': local_candidate_state,
 		}
-		
+
 		all_payloads = [None] * self.world_size
 		dist.all_gather_object(all_payloads, local_payload)
-		
+
 		timing.gather_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== PHASE 2: MERGE GATHERED DATA + RANK-0 DECISIONS ==========
+		return all_payloads, chunk_size
+
+	def _boundary_merge_and_decide(
+		self,
+		decode_uuids: List[str],
+		all_payloads: list,
+		chunk_size: int,
+		timing,
+	) -> Tuple[dict, dict, list, object]:
+		"""Phase 2-3: Merge gathered data, rank-0 decisions, broadcast.
+
+		Returns (global_seq_state, global_candidate_info, per_rank_free, decisions).
+		"""
 		t0 = time.perf_counter()
 
 		# Extract per-rank free pages
@@ -6849,13 +6841,6 @@ class BatchGenWorker:
 				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
 				f"Missing first 5: {missing_uuids[:5]}"
 			)
-			# DEFENSIVE: mark orphaned sequences as COMPLETED on all ranks so
-			# they stop coming back to this filter every boundary and eventually
-			# desync a collective. These sequences are unrecoverable — their
-			# local_map entry on the owner was lost, so their decoded_tokens /
-			# input_ids buffers are no longer reachable. Force-terminating them
-			# contains the damage to the affected sequences rather than
-			# crashing the whole server after a 1-hour NCCL timeout.
 			for orphan_uuid in missing_uuids:
 				orphan_seq = self.global_batch.get_sequence(orphan_uuid)
 				if orphan_seq is None:
@@ -6868,9 +6853,6 @@ class BatchGenWorker:
 					try:
 						self.global_batch.update_status(orphan_uuid, SequenceStatus.COMPLETED)
 					except ValueError:
-						# If current status doesn't allow direct transition to
-						# COMPLETED (e.g., QUEUEING), at least drop it from
-						# active tracking.
 						pass
 			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
 
@@ -6883,28 +6865,19 @@ class BatchGenWorker:
 					seq.current_context_length = state['current_context_length']
 					seq.gpu_pages_allocated = state['gpu_pages_allocated']
 					seq.eos_reached = state['eos_reached']
-					# Sync host KV fields to keep all ranks consistent for migration planning
 					seq.host_pages_allocated = state['host_pages_allocated']
 					seq.host_token_capacity = state['host_token_capacity']
-					# Sync prompt_length (may have been rewritten by a prior
-					# eviction on the owner) and total_decoded_before_eviction
-					# so Phase 4 mutations can be computed deterministically on
-					# all ranks, and the next _prepare_prefill_batch selection
-					# priority sort is consistent.
 					if 'prompt_length' in state:
 						seq.prompt_length = state['prompt_length']
 					if 'total_decoded_before_eviction' in state:
 						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
-					# Validate gathered ctx_len
 					expected_ctx = seq.original_prompt_length + seq.decoded_length
 					if seq.current_context_length != expected_ctx:
 						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
 							f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
 						seq.current_context_length = expected_ctx
 
-		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
-		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
-		# This eliminates desync from independent decision-making.
+		# Rank 0 computes all decisions
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
 		if self.rank == 0:
@@ -6915,49 +6888,47 @@ class BatchGenWorker:
 		else:
 			decisions = None
 
-		# ========== PHASE 3: BROADCAST DECISIONS ==========
+		# Broadcast decisions
 		decisions_list = [decisions]
 		dist.broadcast_object_list(decisions_list, src=0)
 		decisions = decisions_list[0]
 
 		timing.num_completed = len(decisions.completed_uuids)
 		timing.num_onhold = len(decisions.onhold_uuids)
+		timing.process_ms = (time.perf_counter() - t0) * 1000
 
-		# ========== PHASE 4: EXECUTE DECISIONS LOCALLY ==========
-		# All ranks execute the same decisions, but only operate on locally-owned sequences
+		return global_seq_state, global_candidate_info, per_rank_free, decisions
+
+	def _boundary_execute_decisions(
+		self,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager,
+		decisions,
+		global_seq_state: dict,
+		global_candidate_info: dict,
+		chunk_size: int,
+		timing,
+	) -> Tuple[List[str], List[int]]:
+		"""Phase 4: Execute completions, host KV growth, eviction, on-hold, extension.
+
+		Returns updated (decode_uuids, batch).
+		"""
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 
 		# A. Release completed sequences
-		#
-		# ORDERING FIX: _release_gpu_kv_pages and _release_host_kv_pages_for_batch
-		# must run BEFORE _report_completion. Previously _report_completion ran
-		# first, which pops seq.uuid from self._uuid_to_local_map on ALL ranks
-		# (including the owner). The subsequent
-		#     my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
-		# filter then always produced an EMPTY list on the owner — so the host
-		# KV worker view never released its pages for completed sequences, and
-		# the GPU KV manager never released its pages either. Host KV slowly
-		# filled up across the test run, triggering excessive eviction cycles,
-		# which amplified the cross-rank state drift that eventually crashed the
-		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
-			# Gather decoded tokens from owning ranks before reporting
 			gathered_texts = self._gather_completed_tokens(completed_uuids)
 
-			# Release resources on owners BEFORE popping local_map entries via
-			# _report_completion (see ordering fix note above).
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
 				my_completed_local = self._get_local_indices_for_uuids(my_completed)
 				self._release_gpu_kv_pages(my_completed_local)
 				self._release_host_kv_pages_for_batch(my_completed)
 
-			# All-ranks: zero scalar counters so downstream reads (e.g.
-			# migration planning iterating all sequences) never see a stale
-			# non-zero page count for completed sequences.
 			for uuid in completed_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
@@ -6966,18 +6937,13 @@ class BatchGenWorker:
 					seq.host_token_capacity = 0
 					self._sequences_with_gpu_kv.discard(uuid)
 
-			# Report completions (this is what pops local_map on the owner).
-			# Must run LAST so the _release_*_pages calls above see the
-			# correct local_map state.
 			for uuid in completed_uuids:
 				self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
-			# Report completions to adaptive chunk sizer
 			if self.adaptive_chunk_sizer is not None:
 				for uuid in completed_uuids:
 					state = global_seq_state.get(uuid)
 					if state:
 						self.adaptive_chunk_sizer.report_completion(state['decoded_length'])
-			# Log completion details for diagnostics
 			if self.rank == 0 and BATCHGEN_CB_DEBUG:
 				for uuid in completed_uuids:
 					seq = self.global_batch.get_sequence(uuid)
@@ -6998,13 +6964,9 @@ class BatchGenWorker:
 		if decisions.growth_feasible and decisions.host_growth_uuids:
 			host_grow_requests = []
 			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
-				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
-				# This keeps host_pages_allocated consistent across ranks, which is
-				# critical for deterministic migration planning in _plan_kv_migration().
 				seq = self.global_batch.get_sequence(uuid)
 				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
 				seq.host_pages_allocated += growth_pages
-				# Only do actual host page allocation on owner rank
 				if uuid in self._uuid_to_local_map:
 					host_grow_requests.append((seq.global_idx, growth_pages))
 
@@ -7028,35 +6990,8 @@ class BatchGenWorker:
 							)
 
 		# C. Host KV eviction
-		#
-		# SYNC MODEL: Mutations here must keep every rank consistent without
-		# requiring a follow-up _sync_sequence_metadata call. The only pieces
-		# that can only live on the owning rank are the actual token tensors
-		# (evicted_token_ids, input_ids view, decoded_tokens buffer). All
-		# scalar metadata — prompt_length, current_context_length,
-		# total_decoded_before_eviction, host/gpu page counters, status — is
-		# updated on ALL ranks deterministically, using values already
-		# synchronized in Phase 1/2 of this same boundary call.
-		#
-		# For re-entry length: new_reentry_len = seq.prompt_length +
-		# seq.decoded_length. At Phase 4.C time, both operands are consistent
-		# across ranks because Phase 2 synced them from the owner.
 		host_evicted_uuids = decisions.host_evicted_uuids
 		if host_evicted_uuids:
-			# Owner-only: build and stash the evicted_token_ids tensor and
-			# release on-device resources (GPU KV pages, host KV worker view).
-			#
-			# CASCADING RE-ENTRY FIX: only append decoded tokens BEYOND the
-			# re-entry baseline. For a fresh sequence the baseline is 0 (all
-			# decoded tokens are genuinely new). For a sequence that has
-			# already been re-entered, decoded_tokens[0:reentry_decoded_baseline]
-			# contains the historical output copied in at the last re-entry
-			# prep — those tokens ALSO live inside the current reconstructed
-			# prompt (input_ids[original_prompt_length:prompt_length]), so
-			# re-appending them here would double-count them and the next
-			# re-entry cycle would receive a prompt that grew by prev_decoded
-			# instead of by new_decoded_count, producing the geometric
-			# doubling seen in multi-eviction runs.
 			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
 			if my_evicted:
 				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
@@ -7087,26 +7022,12 @@ class BatchGenWorker:
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
 
-			# All-ranks: update scalar metadata deterministically. Compute
-			# new_reentry_len from already-synced prompt_length, decoded_length,
-			# and reentry_decoded_baseline so every rank arrives at the same
-			# value without needing the owner's evicted_token_ids tensor.
-			#
-			# Matches the owner's tensor computation exactly:
-			#   len(evicted_token_ids)
-			#   = len(prompt_tokens[:prompt_length]) + len(decoded_tokens[baseline:decoded_length])
-			#   = prompt_length + max(0, decoded_length - baseline)
+			# All-ranks: update scalar metadata deterministically
 			for uuid in host_evicted_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				baseline = seq.reentry_decoded_baseline
 				new_decoded_count = max(0, seq.decoded_length - baseline)
 				new_reentry_len = seq.prompt_length + new_decoded_count
-				# total_decoded_before_eviction tracks cumulative output length,
-				# which at this point equals seq.decoded_length (the full output
-				# buffer including historical tokens carried forward across
-				# re-entry cycles). Used downstream for eviction priority
-				# sorting and for computing remaining_decode_budget at the
-				# next re-entry.
 				seq.total_decoded_before_eviction = seq.decoded_length
 				seq.prompt_length = new_reentry_len
 				seq.current_context_length = new_reentry_len
@@ -7129,22 +7050,18 @@ class BatchGenWorker:
 					f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences"
 				)
 
-		timing.process_ms = (time.perf_counter() - t0) * 1000
-
-		# Calculate completed count BEFORE early return to ensure final iteration reports correctly
+		# Calculate completed count BEFORE early return
 		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
 
 		if not decode_uuids:
-			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
-			return decode_uuids, batch, None, [], [], [], timing, False
+			return decode_uuids, batch
 
-		# D. GPU page extension / on-hold (using rank-0 decisions)
+		# D. GPU page extension / on-hold
 		t0 = time.perf_counter()
 		onhold_uuids = decisions.onhold_uuids
 		onhold_set = set(onhold_uuids)
 
 		if onhold_uuids:
-			# Owner-only: actually free GPU KV pages for locally-held sequences.
 			my_onhold = [u for u in onhold_uuids if u in self._uuid_to_local_map]
 			if my_onhold:
 				local_indices = self._get_local_indices_for_uuids(my_onhold)
@@ -7154,11 +7071,6 @@ class BatchGenWorker:
 				for uuid in my_onhold:
 					self._sequences_with_gpu_kv.discard(uuid)
 
-			# All-ranks: scalar metadata must be kept consistent. Non-owners
-			# MUST also zero gpu_pages_allocated; otherwise their stale value
-			# leaks into subsequent decision-making (e.g. migration planning
-			# that iterates over all sequences). This was previously in the
-			# my_onhold owner-only branch, creating a cross-rank desync window.
 			for uuid in onhold_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
@@ -7181,16 +7093,11 @@ class BatchGenWorker:
 		if my_remaining_ext:
 			success = self._extend_gpu_kv_allocation(my_remaining_ext)
 			if not success:
-				# Extension failed — put failed sequences ON_HOLD to prevent
-				# cache_seqlens from exceeding gpu_pages_allocated × PAGE_SIZE,
-				# which would cause FlashAttention to read -1 sentinel page
-				# indices and trigger CUDA illegal memory access.
 				logging.warning(
 					f"Rank {self.rank}: GPU page extension FAILED for "
-					f"{len(my_remaining_ext)} sequences at boundary — "
+					f"{len(my_remaining_ext)} sequences at boundary -- "
 					f"moving to ON_HOLD to prevent illegal memory access"
 				)
-				# Owner: release GPU pages
 				ext_failed_local = self._get_local_indices_for_uuids(my_remaining_ext)
 				ext_failed_global = self._local_indices_to_global_seq_ids(ext_failed_local)
 				if ext_failed_global:
@@ -7198,8 +7105,6 @@ class BatchGenWorker:
 				for uuid in my_remaining_ext:
 					self._sequences_with_gpu_kv.discard(uuid)
 
-				# All ranks: zero scalars and update status for ALL failed seqs
-				# (remaining_needing_ext is the globally-consistent list)
 				ext_failed_set = set(remaining_needing_ext)
 				for uuid in remaining_needing_ext:
 					seq = self.global_batch.get_sequence(uuid)
@@ -7212,7 +7117,21 @@ class BatchGenWorker:
 
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
 
-		# E. Async load (using rank-0 decisions)
+		return decode_uuids, batch
+
+	def _boundary_async_load(
+		self,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager,
+		decisions,
+		global_candidate_info: dict,
+		timing,
+	) -> Tuple[object, List[str], List[int], List[int]]:
+		"""Phase 4E: Launch async load of new sequences from host to GPU.
+
+		Returns (new_async_task, new_load_uuids, new_load_local, new_load_global).
+		"""
 		t0 = time.perf_counter()
 		new_async_task = None
 		new_load_uuids = decisions.new_load_uuids
@@ -7257,6 +7176,7 @@ class BatchGenWorker:
 					timing.load_alloc_ms = (time.perf_counter() - t0) * 1000
 
 					t_launch = time.perf_counter()
+					worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 					if worker_view is not None:
 						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
 						gpu_manager.rebuild_page_table(new_load_global)
@@ -7287,10 +7207,23 @@ class BatchGenWorker:
 						f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
 						f"actual_free={actual_free}"
 					)
-		
+
 		timing.num_loaded = len(new_load_uuids)
-		
-		# ========== FINAL PAGE TABLE REBUILD ==========
+		return new_async_task, new_load_uuids, new_load_local, new_load_global
+
+	def _boundary_finalize(
+		self,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager,
+		timing,
+		boundary_start: float,
+	) -> bool:
+		"""Final phases: page table rebuild, MoE sync, barrier, verification, watermark.
+
+		Returns watermark_triggered.
+		"""
+		# Page table rebuild
 		t0 = time.perf_counter()
 		if BATCHGEN_CB_DEBUG:
 			global_ids_for_rebuild = self._local_indices_to_global_seq_ids(batch) if batch else []
@@ -7307,47 +7240,43 @@ class BatchGenWorker:
 					f"slot_to_seq_id_len={len(mgr.slot_to_seq_id)}"
 				)
 		timing.rebuild_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== UPDATE MOE BUFFER SIZE ==========
-		# Find max batch size across all ranks to minimize all-gather/all-reduce communication
+
+		# MoE buffer sync
 		t0 = time.perf_counter()
 		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
 		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
 		max_batch_size = _all_rank_counts.max().item()
 
-		# Update MoE layers with the actual max batch size for this page
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
 			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
 				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 		timing.moe_buffer_update_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== SINGLE FINAL BARRIER ==========
+
+		# Final barrier
 		t0 = time.perf_counter()
 		dist.barrier()
 		timing.barrier_ms = (time.perf_counter() - t0) * 1000
-		
-		# ========== COLLECT STATUS COUNTS ==========
+
+		# Status counts
 		timing.total_active = len(decode_uuids)
 		timing.total_prefilled = len(self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))
 		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
-		
-		# ========== VERIFY BATCH CONSISTENCY ==========
-		# CRITICAL: Ensure batch matches decode_uuids for THIS rank
+
+		# Batch consistency verification
 		expected_local = self._get_local_indices_for_uuids(decode_uuids)
 		if set(batch) != set(expected_local):
 			logging.error(
 				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
 				f"batch={sorted(batch)}, expected={sorted(expected_local)}"
 			)
-			batch = expected_local  # Fix the batch
-			# CRITICAL: Rebuild page table to match the corrected batch
+			batch = expected_local
 			self._rebuild_page_table_for_batch(batch, gpu_manager)
 			logging.info(f"Rank {self.rank}: Page table rebuilt after batch correction")
-		
-		# FINAL VERIFICATION: Ensure page table matches batch before returning
+
+		# Final page table verification
 		if batch and gpu_manager and gpu_manager.is_initialized:
 			mgr = gpu_manager._gpu_page_table_manager
 			if mgr and mgr.gpu_table is not None:
@@ -7356,10 +7285,10 @@ class BatchGenWorker:
 						f"Rank {self.rank}: CRITICAL - Page table STILL mismatched at function return! "
 						f"gpu_table.shape[0]={mgr.gpu_table.shape[0]}, batch_size={len(batch)}"
 					)
-		
+
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 
-		# Periodic host KV diagnostic summary
+		# Periodic host KV diagnostic
 		self._boundary_count += 1
 		if self.rank == 0 and BATCHGEN_CB_DEBUG and self._boundary_count % 10 == 0:
 			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
@@ -7367,13 +7296,11 @@ class BatchGenWorker:
 				hs = worker_view.get_stats()
 				used = hs.num_total_pages - hs.num_free_pages
 				pct = (used / hs.num_total_pages * 100) if hs.num_total_pages > 0 else 0
-				# Gather status counts
 				status_counts = {}
 				for s in SequenceStatus:
 					cnt = len(self.global_batch.get_sequences_by_status(s))
 					if cnt > 0:
 						status_counts[s.name] = cnt
-				# Per-sequence host page stats
 				host_pages_list = []
 				for uuid in decode_uuids:
 					seq = self.global_batch.get_sequence(uuid)
@@ -7391,8 +7318,87 @@ class BatchGenWorker:
 					f"per_seq_host_pages: min={hp_min} max={hp_max} avg={hp_avg:.0f}"
 				)
 
-		# Check watermark trigger for dynamic prefill switching
+		# Watermark check
 		watermark_triggered = self._check_host_kv_watermark_trigger()
+		return watermark_triggered
+
+
+	def _page_boundary_fast(
+		self,
+		decode_uuids: List[str],
+		batch: List[int],
+		gpu_manager: GPUPagedKVCacheManager,
+		pending_async_load_task: Optional[object],
+		pending_load_uuids: List[str],
+		pending_load_local_indices: List[int],
+		pending_load_global_ids: List[int],
+		cumulative_completed: int = 0,
+	) -> Tuple[List[str], List[int], Optional[object], List[str], List[int], List[int], FastBoundaryTimingStats, bool]:
+		"""
+		OPTIMIZED page boundary with consolidated collective operations.
+
+		Reduces 10+ collectives to 2-3 by batching:
+		1. Single all_gather_object for: sequence metadata + completion status + extension info + free pages
+		2. One final barrier
+
+		Internal logic split into phase helpers:
+		  - _boundary_wait_pending: wait KV appends, debug UUID sync, integrate async load
+		  - _boundary_gather_state: single batched all_gather of seq metadata
+		  - _boundary_merge_and_decide: merge data, rank-0 decisions, broadcast
+		  - _boundary_execute_decisions: completions, growth, eviction, on-hold, extension
+		  - _boundary_async_load: launch async host->GPU load for new sequences
+		  - _boundary_finalize: page table rebuild, MoE sync, barrier, verification
+
+		Returns:
+			(decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered)
+		"""
+		timing = FastBoundaryTimingStats()
+		boundary_start = time.perf_counter()
+
+		# Phase 0: Wait for pending async operations
+		decode_uuids, batch = self._boundary_wait_pending(
+			decode_uuids, batch, gpu_manager,
+			pending_async_load_task, pending_load_uuids,
+			pending_load_local_indices, pending_load_global_ids,
+			timing,
+		)
+
+		if not decode_uuids:
+			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+			return decode_uuids, batch, None, [], [], [], timing, False
+
+		# Phase 1: Gather state from all ranks
+		all_payloads, chunk_size = self._boundary_gather_state(
+			decode_uuids, gpu_manager, timing,
+		)
+
+		# Phase 2-3: Merge data + rank-0 decisions + broadcast
+		global_seq_state, global_candidate_info, per_rank_free, decisions = \
+			self._boundary_merge_and_decide(
+				decode_uuids, all_payloads, chunk_size, timing,
+			)
+
+		# Phase 4: Execute decisions locally
+		decode_uuids, batch = self._boundary_execute_decisions(
+			decode_uuids, batch, gpu_manager, decisions,
+			global_seq_state, global_candidate_info, chunk_size, timing,
+		)
+
+		if not decode_uuids:
+			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+			return decode_uuids, batch, None, [], [], [], timing, False
+
+		# Phase 4E: Async load new sequences
+		new_async_task, new_load_uuids, new_load_local, new_load_global = \
+			self._boundary_async_load(
+				decode_uuids, batch, gpu_manager, decisions,
+				global_candidate_info, timing,
+			)
+
+		# Final: page table rebuild, MoE sync, barrier, verification
+		watermark_triggered = self._boundary_finalize(
+			decode_uuids, batch, gpu_manager, timing, boundary_start,
+		)
 
 		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered
 
