@@ -252,11 +252,18 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
 
             _decode_model_loaded[0] = True
 
-        # Config decode batch (GPU KV allocation for these sequences)
+        # Config decode batch: repair CTX + allocate GPU KV.
+        # Skip _decode_config_validate (has dist.all_gather collective)
+        # because ranks may reach this point at different times in the
+        # hybrid path, causing deadlock. The CTX repair and GPU KV
+        # allocation are safe (local operations only).
         local_batch = _uuids_to_local_indices(uuids)
-        config_fn = getattr(worker, "_config_decoding_for_batch", None)
-        if config_fn is not None and local_batch:
-            config_fn(uuids, local_batch)
+        repair_fn = getattr(worker, "_decode_config_repair_ctx_lengths", None)
+        if repair_fn is not None:
+            repair_fn(uuids)
+        alloc_fn = getattr(worker, "_decode_config_allocate_gpu_kv", None)
+        if alloc_fn is not None and local_batch:
+            alloc_fn(local_batch)
 
     # -- decode delegate (hybrid production path) --------------------
     def decode_delegate(uuids: list[str]) -> None:

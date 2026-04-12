@@ -384,6 +384,32 @@ class WorkerOrchestrator:
             self._decode.run_continuous(in_decode)
             _log.info(f"[ORCH] rank={self._state.rank}: run_continuous done")
 
+            # Skip check_and_handle when decode_delegate is set — the
+            # delegate (decoding_continuous) handles completions
+            # internally via _page_boundary_fast Phase 4.A. Calling
+            # check_and_handle after the delegate would deadlock because
+            # gather_tokens uses all_gather_object and different ranks
+            # see different eos_reached flags (only the owning rank sets
+            # eos_reached in decoding_continuous's _decode_update_sequences).
+            if self._decode_delegate is not None:
+                # Completions already handled by legacy path.
+                # Re-discover what was completed by checking status.
+                newly_completed = [
+                    uuid for uuid in in_decode
+                    if (self._state.global_batch.get_sequence(uuid) is not None
+                        and self._state.global_batch.get_sequence(uuid).status
+                        == SequenceStatus.COMPLETED)
+                ]
+                stats.completed_uuids.extend(sorted(newly_completed))
+                intervals += 1
+                if not self._state.global_batch.get_sequences_by_status(
+                    SequenceStatus.IN_DECODE
+                ) and not self._state.global_batch.get_sequences_by_status(
+                    SequenceStatus.PREFILLED
+                ):
+                    return intervals
+                continue
+
             completed = self._completion.check_and_handle(in_decode)
             stats.completed_uuids.extend(sorted(completed))
             intervals += 1
