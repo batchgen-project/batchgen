@@ -4770,6 +4770,8 @@ class BatchGenWorker:
 		# Placed AFTER setup so self.global_batch and the index maps are
 		# initialized before the orchestrator constructs its handlers.
 		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
+		_reextract_val = os.environ.get("BATCHGEN_USE_REEXTRACT", "0")
+		logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT={_reextract_val} (should_use={should_use_reextract()})")
 		if should_use_reextract():
 			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating pool mode to WorkerOrchestrator.generate_persistent")
 			self._in_pool_mode = True
