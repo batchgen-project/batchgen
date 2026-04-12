@@ -2820,64 +2820,20 @@ class BatchGenWorker:
 			)
 		# No barrier here - will be done in _rebalance_host_kv after all migrations
 
-	def _rebalance_host_kv(self) -> None:
-		"""Rebalance host KV cache by migrating sequences between nodes.
+	# ------------------------------------------------------------------
+	# _rebalance_host_kv — modularized helpers
+	# ------------------------------------------------------------------
 
-		Called during _config_prefill_for_batch() before assigning new sequences.
-		This orchestrates the full rebalancing process:
-		1. Plan migrations (deterministic across all ranks)
-		2. Execute all migrations (NCCL transfers)
-		3. Barrier to ensure all transfers complete
-		4. Update sequence ownership metadata
-		5. Barrier to ensure metadata consistency
+	def _rebalance_update_ownership(self, migrations: List[MigrationOp]) -> None:
+		"""Update sequence ownership metadata and sync across ranks.
+
+		Uses assign_rank() to keep both seq.assigned_rank and _rank_index consistent.
+		Syncs metadata BEFORE local mapping updates so SEND side can still report state.
 		"""
-		if not self.enable_decode_preemption:
-			return
-
-		rebalance_start = time.perf_counter()
-		if self.rank == 0:
-			logging.info("REBALANCE: Starting host KV rebalancing")
-
-		# Plan migrations (all ranks compute same plan deterministically)
-		migrations = self._plan_kv_migration()
-
-		if not migrations:
-			if self.rank == 0:
-				logging.info("REBALANCE: No migrations needed, host KV already balanced")
-			return
-
-		# Log migration summary
-		if self.rank == 0:
-			total_pages = sum(m.pages for m in migrations)
-			logging.info(
-				f"REBALANCE: Executing {len(migrations)} migrations "
-				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
-			)
-
-		# STEP 1: Execute all migrations in parallel (host-to-host transfers)
-		# Parallel execution utilizes all network cards by having multiple rank pairs
-		# communicate simultaneously
-		migration_start = time.perf_counter()
-		self._execute_kv_migrations_parallel(migrations)
-		migration_end = time.perf_counter()
-		if self.rank == 0:
-			logging.info(
-				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
-				f"({(migration_end-migration_start)*1000/len(migrations):.1f}ms per migration avg)"
-			)
-
-		# STEP 2: Update sequence ownership metadata and local mappings
-		# CRITICAL: All ranks must update global_batch consistently
-		# MUST use assign_rank() to update both seq.assigned_rank AND _rank_index
 		for mig in migrations:
 			uuid = mig.uuid
 			new_rank = mig.to_rank
 
-			# CRITICAL FIX: Use assign_rank() instead of direct assignment!
-			# Direct assignment (seq.assigned_rank = x) only updates the attribute.
-			# assign_rank() also updates the _rank_index which is used by
-			# get_sequences_for_rank_with_status() - without this, the index
-			# becomes inconsistent and causes cross-rank state divergence.
 			try:
 				seq_for_log = self.global_batch.get_sequence(uuid)
 				if seq_for_log:
@@ -2893,11 +2849,6 @@ class BatchGenWorker:
 				logging.error(f"Rank {self.rank}: Cannot update ownership for {uuid[:8]}... - sequence not found")
 				continue
 
-			# IMPORTANT: Don't change sequence status - it remains PREFILLED or ON_HOLD
-			# The sequence is still valid, just owned by a different rank now
-
-			# Update host KV tracking to match actual allocation on dest.
-			# All ranks execute this (migration list is deterministic), keeping fields consistent.
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is not None:
 				seq.host_pages_allocated = mig.host_pages
@@ -2906,12 +2857,7 @@ class BatchGenWorker:
 		# Barrier to ensure all ranks have updated global_batch
 		dist.barrier()
 
-		# CRITICAL FIX: Sync sequence metadata BEFORE updating local mappings!
-		# At this point:
-		# - SEND side still has migrated sequences in _uuid_to_local_map (will report correct state)
-		# - RECV side does NOT have them in _uuid_to_local_map yet (will receive and update)
-		# If we sync AFTER updating local mappings, RECV side would skip updating because
-		# uuid would be in its _uuid_to_local_map, but its state is stale!
+		# Sync metadata BEFORE updating local mappings
 		migrated_uuids = [m.uuid for m in migrations]
 		if migrated_uuids:
 			self._sync_sequence_metadata(migrated_uuids)
@@ -2923,21 +2869,24 @@ class BatchGenWorker:
 		# Barrier to ensure all ranks have synced metadata
 		dist.barrier()
 
-		# STEP 3: Update local mappings (rank-specific, after global metadata is consistent)
+	def _rebalance_update_local_mappings(self, migrations: List[MigrationOp]) -> None:
+		"""Update local mappings: remove on source rank, add on dest rank.
+
+		Source rank: pop from local maps, free query_book entry, add to free indices.
+		Dest rank: allocate local index, copy pending migrated data into buffer pool.
+		"""
 		for mig in migrations:
 			old_rank = mig.from_rank
 			new_rank = mig.to_rank
 			uuid = mig.uuid
 
-			# Update local mappings on source rank (remove)
+			# Remove on source rank
 			if self.rank == old_rank:
 				local_idx = self._uuid_to_local_map.pop(uuid, None)
 				if local_idx is not None:
 					self._local_to_uuid_map.pop(local_idx, None)
 					self._sequences_with_gpu_kv.discard(uuid)
-					# Remove query_book entry
 					self.query_book.pop(local_idx, None)
-					# Add freed index to free list for O(1) reuse
 					self._free_local_indices.add(local_idx)
 					logging.debug(
 						f"Rank {self.rank}: [LOCALMAP-POP] migration popped "
@@ -2945,9 +2894,8 @@ class BatchGenWorker:
 						f"to_rank={new_rank})"
 					)
 
-			# Update local mappings on dest rank (add)
+			# Add on dest rank
 			if self.rank == new_rank:
-				# O(1) allocation: prefer reusing freed indices, otherwise use next available
 				if self._free_local_indices:
 					new_local_idx = self._free_local_indices.pop()
 				else:
@@ -2956,14 +2904,10 @@ class BatchGenWorker:
 
 				self._uuid_to_local_map[uuid] = new_local_idx
 				self._local_to_uuid_map[new_local_idx] = uuid
-				# Note: Don't add to _sequences_with_gpu_kv - KV is in host, not GPU
 
-				# Create query_book entry from pending migrated data, copying into buffer pool
 				if hasattr(self, '_pending_migrated_query_book') and uuid in self._pending_migrated_query_book:
 					pending = self._pending_migrated_query_book.pop(uuid)
 					budget = pending['kv_token_budget']
-					# Reuse existing buffer slot — Phase 3 already allocated a slot for every
-					# sequence in global_batch, so seq._buffer_slot is valid
 					seq = self.global_batch.get_sequence(uuid)
 					existing_slot = seq._buffer_slot
 					logging.info(
@@ -2992,11 +2936,55 @@ class BatchGenWorker:
 
 				logging.debug(f"Rank {self.rank}: Added {uuid[:8]}... to local mappings (new local_idx={new_local_idx})")
 
-		# BARRIER 2: Ensure all local mapping updates are complete across all ranks
+		# Barrier to ensure all local mapping updates are complete
 		dist.barrier()
 
-		# NOTE: Metadata sync was already done BEFORE local mapping updates (above)
-		# At this point, all ranks have consistent metadata for migrated sequences.
+
+	def _rebalance_host_kv(self) -> None:
+		"""Rebalance host KV cache by migrating sequences between nodes.
+
+		Split into helpers:
+		  - _plan_kv_migration: plan migrations (deterministic across ranks)
+		  - _execute_kv_migrations_parallel: NCCL transfers
+		  - _rebalance_update_ownership: update assigned_rank + sync metadata
+		  - _rebalance_update_local_mappings: update local maps on source/dest ranks
+		"""
+		if not self.enable_decode_preemption:
+			return
+
+		rebalance_start = time.perf_counter()
+		if self.rank == 0:
+			logging.info("REBALANCE: Starting host KV rebalancing")
+
+		migrations = self._plan_kv_migration()
+
+		if not migrations:
+			if self.rank == 0:
+				logging.info("REBALANCE: No migrations needed, host KV already balanced")
+			return
+
+		if self.rank == 0:
+			total_pages = sum(m.pages for m in migrations)
+			logging.info(
+				f"REBALANCE: Executing {len(migrations)} migrations "
+				f"({total_pages} total pages, ~{total_pages * 64} tokens)"
+			)
+
+		# Step 1: Execute migrations (host-to-host transfers)
+		migration_start = time.perf_counter()
+		self._execute_kv_migrations_parallel(migrations)
+		migration_end = time.perf_counter()
+		if self.rank == 0:
+			logging.info(
+				f"REBALANCE: All migrations completed in {(migration_end-migration_start)*1000:.1f}ms "
+				f"({(migration_end-migration_start)*1000/len(migrations):.1f}ms per migration avg)"
+			)
+
+		# Step 2: Update ownership metadata + sync
+		self._rebalance_update_ownership(migrations)
+
+		# Step 3: Update local mappings
+		self._rebalance_update_local_mappings(migrations)
 
 		rebalance_end = time.perf_counter()
 		if self.rank == 0:
@@ -3005,7 +2993,6 @@ class BatchGenWorker:
 				f"in {(rebalance_end-rebalance_start)*1000:.1f}ms total"
 			)
 
-			# Log final distribution
 			if self.local_rank == 0:
 				final_stats = self._get_host_kv_utilization()
 				logging.info(
