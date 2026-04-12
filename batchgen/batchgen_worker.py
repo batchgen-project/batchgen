@@ -5426,6 +5426,11 @@ class BatchGenWorker:
 
 	def _prefill_flush_and_reconfigure(self) -> None:
 		"""Flush pending KV, deep free decode memory, destroy GPU cache, reconfigure model for prefill."""
+		logging.info(
+			f"Rank {self.rank}: _prefill_flush_and_reconfigure: max_input_length={self.max_input_length}, "
+			f"model_context_length={self.model_context_length}, "
+			f"padding_length={getattr(self.engine_config.Basic_Config, 'padding_length', 'N/A') if self.engine_config else 'N/A'}"
+		)
 		# Flush pending KV append tasks before destroying GPU cache
 		if hasattr(self, '_pending_kv_append_tasks') and self._pending_kv_append_tasks:
 			logging.info(
