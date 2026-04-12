@@ -212,9 +212,15 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         local_batch = _uuids_to_local_indices(uuids)
         if not local_batch:
             return None
-        use_prepacked = batch.get("prepacked", False) and hasattr(
-            worker, "prefill_prepacked"
-        )
+        # Prefer prefill_prepacked when the worker supports it — required for
+        # GPT-OSS (and similar multi-sequence prefill) because plain prefill()
+        # doesn't pass position_ids through to self.model(), causing rope_cos
+        # shape mismatch for batch > 1 (model generates [1, seq] position_ids
+        # that expand to wrong shape for multi-sequence prefill).
+        use_prepacked = (
+            batch.get("prepacked", False)
+            or getattr(worker, "enable_prepack", False)
+        ) and hasattr(worker, "prefill_prepacked")
         if use_prepacked:
             return worker.prefill_prepacked(local_batch)
         if hasattr(worker, "prefill"):
