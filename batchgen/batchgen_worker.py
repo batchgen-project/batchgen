@@ -5759,41 +5759,24 @@ class BatchGenWorker:
 			stats = self.gpu_paged_kv_cache_manager.get_stats()
 			logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
 
-	def _config_decoding_for_batch(
-		self,
-		decode_uuids: List[str],
-		local_decode_indices: List[int]
-	) -> None:
-		"""
-		Configure decoding for a specific batch - allocates GPU KV pages.
+	# ------------------------------------------------------------------
+	# _config_decoding_for_batch — modularized helpers
+	# ------------------------------------------------------------------
 
-		NOTE: This method is SIMPLIFIED - model loading and GPU KV manager init
-		now happen earlier in generate() via _load_decode_model() and
-		_init_gpu_kv_with_actual_size(). This method only handles:
-		1. Context length repair
-		2. Validation/diagnostics
-		3. GPU KV page allocation
-		"""
-		start_time = time.perf_counter()
+	def _decode_config_repair_ctx_lengths(self, decode_uuids: List[str]) -> None:
+		"""Repair current_context_length for all decode sequences.
 
-		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
-		# This must happen BEFORE any validation or diagnostics that read current_context_length.
-		# The root cause of ctx_len=0 bug is that current_context_length can become stale during
-		# decode→prefill→decode transitions, especially after migrations.
-		# The fix: current_context_length = prompt_length + decoded_length is ALWAYS the correct value
-		# for sequences that have started decoding (decoded_length > 0 or have been prefilled).
+		current_context_length can become stale during decode->prefill->decode
+		transitions. The invariant: ctx_len = original_prompt_length + decoded_length.
+		"""
 		ctx_len_repaired_count = 0
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
-			
-			# Compute the correct context length
-			# For sequences with decoded tokens: ctx_len = prompt_length + decoded_length
-			# For freshly prefilled sequences: ctx_len should equal prompt_length (decoded_length=0)
+
 			expected_ctx = seq.original_prompt_length + seq.decoded_length
-			
-			# Repair if mismatched
+
 			if seq.current_context_length != expected_ctx:
 				old_ctx = seq.current_context_length
 				seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
@@ -5801,37 +5784,35 @@ class BatchGenWorker:
 				seq.current_context_length = expected_ctx
 				ctx_len_repaired_count += 1
 				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
-					# Only log significant mismatches to avoid log spam
 					logging.warning(
 						f"Rank {self.rank}: Repaired {uuid[:8]} gid={seq.global_idx}: "
-						f"ctx_len {old_ctx} → {expected_ctx} (prompt={seq.prompt_length}, decoded={seq.decoded_length})"
+						f"ctx_len {old_ctx} -> {expected_ctx} (prompt={seq.prompt_length}, decoded={seq.decoded_length})"
 					)
-		
+
 		if ctx_len_repaired_count > 0:
 			logging.info(
 				f"Rank {self.rank}: Repaired current_context_length for {ctx_len_repaired_count}/{len(decode_uuids)} sequences"
 			)
-		
-		# ============ END CRITICAL FIX ============
-		
-		# VALIDATION: Verify decode_uuids consistency across all ranks
+
+	def _decode_config_validate(self, decode_uuids: List[str]) -> None:
+		"""Validate decode_uuids consistency across ranks + diagnostic logging."""
+		# Cross-rank count check
 		local_uuid_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
 		all_uuid_counts = [torch.zeros_like(local_uuid_count) for _ in range(self.world_size)]
 		dist.all_gather(all_uuid_counts, local_uuid_count)
 		uuid_counts = [int(t.item()) for t in all_uuid_counts]
-		
+
 		if len(set(uuid_counts)) > 1:
 			logging.error(
 				f"Rank {self.rank}: CRITICAL - decode_uuids count mismatch at _config_decoding_for_batch entry! Counts: {uuid_counts}."
 			)
-		
-		# DIAGNOSTIC: Log sequence states at decode config entry
-		# This helps identify KV corruption issues during prefill→decode transitions
+
+		# Diagnostic: log sequence states
 		resuming_seqs = []
 		fresh_seqs = []
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			
+
 			seq_info = {
 				'uuid': seq.uuid[:8],
 				'global_idx': seq.global_idx,
@@ -5845,15 +5826,14 @@ class BatchGenWorker:
 				resuming_seqs.append(seq_info)
 			else:
 				fresh_seqs.append(seq_info)
-		
+
 		if resuming_seqs and BATCHGEN_CB_DEBUG:
 			logging.debug(
 				f"Rank {self.rank}: _config_decoding_for_batch: "
 				f"{len(resuming_seqs)} RESUMING sequences (decoded_length > 0). "
 				f"First 5: {resuming_seqs[:5]}"
 			)
-			# Check for potential issues: sequences with decoded tokens but no GPU reservation flag reset
-			problematic = [s for s in resuming_seqs 
+			problematic = [s for s in resuming_seqs
 						   if s['gpu_pages_allocated'] == 0 and s['had_initial_gpu_reservation']]
 			if problematic:
 				logging.error(
@@ -5861,15 +5841,14 @@ class BatchGenWorker:
 					f"decoded_length>0, gpu_pages_allocated=0, but had_initial_gpu_reservation=True! "
 					f"First 5: {problematic[:5]}"
 				)
-		
+
 		if fresh_seqs and self.rank == 0 and BATCHGEN_CB_DEBUG:
 			logging.debug(
 				f"_config_decoding_for_batch: {len(fresh_seqs)} FRESH sequences (decoded_length=0)"
 			)
 
-		# ============ SIMPLIFIED: Model and GPU KV manager already initialized ============
-		# Model loading and GPU KV manager init now happen in generate() BEFORE batch selection
-		# via _load_decode_model() and _init_gpu_kv_with_actual_size()
+	def _decode_config_allocate_gpu_kv(self, local_decode_indices: List[int]) -> None:
+		"""Allocate GPU KV pages for local decode sequences."""
 		assert self.model is not None, (
 			"Model must be loaded before _config_decoding_for_batch(). "
 			"Ensure _load_decode_model() was called first."
@@ -5879,33 +5858,41 @@ class BatchGenWorker:
 			"Ensure _init_gpu_kv_with_actual_size() was called first."
 		)
 
-		# Allocate GPU KV for sequences
 		if local_decode_indices:
 			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
 			if alloc_ok:
-				# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
-				# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
-				# Keep these for safety / idempotence.
 				for local_idx in local_decode_indices:
 					uuid = self._local_to_uuid_map[local_idx]
 					seq = self.global_batch.get_sequence(uuid)
 					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					# Mark initial reservation done
 					seq.mark_initial_gpu_reservation_done()
 					self._sequences_with_gpu_kv.add(uuid)
 			else:
-				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
-				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
-				# do NOT add these sequences to tracking. Otherwise subsequent
-				# rebuild_page_table() calls will crash with KeyError because the
-				# sequences exist in _sequences_with_gpu_kv / batch but were never
-				# registered in gpu_manager._sequences.
 				logging.error(
 					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
 					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
 				)
 				local_decode_indices.clear()
-		
+
+
+	def _config_decoding_for_batch(
+		self,
+		decode_uuids: List[str],
+		local_decode_indices: List[int]
+	) -> None:
+		"""Configure decoding for a specific batch - allocates GPU KV pages.
+
+		Split into helpers:
+		  - _decode_config_repair_ctx_lengths: repair stale current_context_length
+		  - _decode_config_validate: cross-rank count check + diagnostic logging
+		  - _decode_config_allocate_gpu_kv: GPU KV page allocation
+		"""
+		start_time = time.perf_counter()
+
+		self._decode_config_repair_ctx_lengths(decode_uuids)
+		self._decode_config_validate(decode_uuids)
+		self._decode_config_allocate_gpu_kv(local_decode_indices)
+
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
 
