@@ -239,26 +239,32 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     _decode_model_loaded = [False]  # mutable closure state
 
     def decode_setup_delegate(uuids: list[str]) -> None:
-        """Lazy-load decode model + init GPU KV + config decode batch.
+        """Lazy-load decode model + init PyNccl + GPU KV + config decode batch.
 
         Called once before the first decode cycle. Subsequent calls only
         run _config_decoding_for_batch (model stays loaded).
 
-        NOTE: Does NOT call _generate_ensure_comms() — that has
-        collectives (barrier, all_reduce) which would deadlock if
-        ranks enter the decode phase at different times. Comms are
-        already established by the time pool mode reaches here.
+        All ranks call this delegate in lockstep inside the orchestrator's
+        _run_decode_phase, so collectives inside (PyNccl init's
+        all_reduce/broadcast/barrier, _init_gpu_kv_with_actual_size's
+        broadcast) are safe.
         """
         if not _decode_model_loaded[0]:
-            # Load decode model (no collectives inside)
+            # Comms setup (PyNccl for MoE EP). Required because
+            # _forward_ep uses self.comm.change_state(...) which is None
+            # without this init. The legacy path calls this at the top
+            # of generate() — we need to call it here for pool mode.
+            ensure_comms = getattr(worker, "_generate_ensure_comms", None)
+            if ensure_comms is not None:
+                ensure_comms()
+
+            # Load decode model
             max_num_seq = len(worker.global_batch) if worker.global_batch else 1
             load_fn = getattr(worker, "_load_decode_model", None)
             if load_fn is not None:
                 load_fn(max_num_seq, getattr(worker, "comm", None))
 
-            # Init GPU KV with actual size (has broadcast inside — safe
-            # because all ranks call decode_setup_delegate at the same
-            # point in the orchestrator's _run_decode_phase)
+            # Init GPU KV with actual size
             init_kv = getattr(worker, "_init_gpu_kv_with_actual_size", None)
             if init_kv is not None:
                 init_kv()
