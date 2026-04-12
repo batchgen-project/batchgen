@@ -195,10 +195,17 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         - Reconfigure model for prefill (configure_prefill)
         - Prepare evicted sequences for re-entry
         - Allocate host KV pages
+
+        Barrier after config to ensure all ranks complete the MoE layer
+        swap before any rank enters the prefill forward pass. Without
+        this, fast ranks start all-to-all with ranks still mid-swap,
+        causing rope_cos shape errors.
         """
+        import torch.distributed as _dist
         config_fn = getattr(worker, "_config_prefill_for_batch", None)
         if config_fn is not None:
             config_fn(uuids)
+        _dist.barrier()
 
     def prefill_fn(batch: dict[str, Any]) -> Any:
         uuids = batch.get("uuids", [])
@@ -251,6 +258,11 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
                 init_kv()
 
             _decode_model_loaded[0] = True
+
+        # Barrier after model load + GPU KV init to ensure all ranks
+        # complete before any rank proceeds to decode config.
+        import torch.distributed as _dist
+        _dist.barrier()
 
         # Config decode batch: repair CTX + allocate GPU KV.
         # Skip _decode_config_validate (has dist.all_gather collective)
