@@ -88,7 +88,9 @@ class WorkerOrchestrator:
         clock: ClockBackend,
         admission_queue: AdmissionQueueBackend | None = None,
         decode_delegate: Callable[[list[UUID]], None] | None = None,
+        decode_setup_delegate: Callable[[list[UUID]], None] | None = None,
         admission_delegate: Callable[[], Any] | None = None,
+        prefill_config_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
         """
         decode_delegate: production-only hook (see
@@ -97,6 +99,9 @@ class WorkerOrchestrator:
             provided closure, bypassing the fake tick loop. In the
             hybrid production swap this closure wraps
             ``BatchGenWorker.decoding_continuous``.
+        decode_setup_delegate: production-only hook. Called before the
+            first decode cycle with the uuid batch. Lazy-loads the decode
+            model, initializes GPU KV, and configures decode for the batch.
         admission_delegate: production-only hook. When set, the
             orchestrator's AdmissionCoordinator short-circuits its
             own polling pipeline and calls the delegate, which is
@@ -106,11 +111,16 @@ class WorkerOrchestrator:
             path because legacy ``prefill`` /
             ``decoding_continuous`` consume the
             legacy-built ``query_book``.
+        prefill_config_delegate: production-only hook. Called before
+            each prefill round to configure the prefill model, handle
+            re-entry, and allocate host KV pages.
         """
         self._state = state
         self._config = config
         self._collectives = collectives
         self._model = model
+        self._prefill_config_delegate = prefill_config_delegate
+        self._decode_setup_delegate = decode_setup_delegate
 
         # -- handlers -------------------------------------------------
         self._index = IndexManager(state)
@@ -298,6 +308,10 @@ class WorkerOrchestrator:
             if not uuids:
                 return rounds
 
+            # Production hybrid path: delegate prefill config to legacy
+            if self._prefill_config_delegate is not None:
+                self._prefill_config_delegate(uuids)
+
             self._prefill.config_for_batch(uuids)
             self._prefill.run(uuids)
 
@@ -327,6 +341,11 @@ class WorkerOrchestrator:
             uuids = self._decode.prepare_batch()
             if not uuids:
                 return intervals
+
+            # Production hybrid path: delegate decode setup to legacy
+            # (lazy model load + GPU KV init + batch config)
+            if self._decode_setup_delegate is not None:
+                self._decode_setup_delegate(uuids)
 
             self._decode.try_load_new(uuids)
             for uuid in uuids:

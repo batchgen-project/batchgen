@@ -187,6 +187,19 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
                 out.append(local_idx)
         return out
 
+    def prefill_config_delegate(uuids: list[str]) -> None:
+        """Delegate prefill configuration to legacy worker.
+
+        Calls _config_prefill_for_batch which handles:
+        - Flush pending KV + deep free decode model memory
+        - Reconfigure model for prefill (configure_prefill)
+        - Prepare evicted sequences for re-entry
+        - Allocate host KV pages
+        """
+        config_fn = getattr(worker, "_config_prefill_for_batch", None)
+        if config_fn is not None:
+            config_fn(uuids)
+
     def prefill_fn(batch: dict[str, Any]) -> Any:
         uuids = batch.get("uuids", [])
         local_batch = _uuids_to_local_indices(uuids)
@@ -208,6 +221,40 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         return None
 
     model = TorchModelExecutorBackend(prefill_fn=prefill_fn, decode_fn=decode_fn)
+
+    # -- decode setup delegate (hybrid production path) ---------------
+    _decode_model_loaded = [False]  # mutable closure state
+
+    def decode_setup_delegate(uuids: list[str]) -> None:
+        """Lazy-load decode model + init GPU KV + config decode batch.
+
+        Called once before the first decode cycle. Subsequent calls only
+        run _config_decoding_for_batch (model stays loaded).
+        """
+        if not _decode_model_loaded[0]:
+            # Comms setup (PyNccl)
+            ensure_comms = getattr(worker, "_generate_ensure_comms", None)
+            if ensure_comms is not None:
+                ensure_comms()
+
+            # Load decode model
+            max_num_seq = len(worker.global_batch) if worker.global_batch else 1
+            load_fn = getattr(worker, "_load_decode_model", None)
+            if load_fn is not None:
+                load_fn(max_num_seq, getattr(worker, "comm", None))
+
+            # Init GPU KV with actual size
+            init_kv = getattr(worker, "_init_gpu_kv_with_actual_size", None)
+            if init_kv is not None:
+                init_kv()
+
+            _decode_model_loaded[0] = True
+
+        # Config decode batch (GPU KV allocation for these sequences)
+        local_batch = _uuids_to_local_indices(uuids)
+        config_fn = getattr(worker, "_config_decoding_for_batch", None)
+        if config_fn is not None and local_batch:
+            config_fn(uuids, local_batch)
 
     # -- decode delegate (hybrid production path) --------------------
     def decode_delegate(uuids: list[str]) -> None:
@@ -299,7 +346,9 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         clock=_WallClock(),
         admission_queue=admission_queue,
         decode_delegate=decode_delegate,
+        decode_setup_delegate=decode_setup_delegate,
         admission_delegate=admission_delegate,
+        prefill_config_delegate=prefill_config_delegate,
     )
 
 
