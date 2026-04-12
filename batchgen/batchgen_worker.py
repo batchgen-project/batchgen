@@ -4753,42 +4753,22 @@ class BatchGenWorker:
 		# Enter the persistent generate loop
 		return self.generate()
 
-	def generate(self):
-		"""
-		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
-		"""
-		# Re-extraction opt-in (plan M6 production swap). Gated on
-		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
-		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
-		if should_use_reextract():
-			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate() to WorkerOrchestrator")
-			build_orchestrator(self).run_batch()
-			return
+	# ------------------------------------------------------------------
+	# generate() — modularized helpers
+	# ------------------------------------------------------------------
 
-		# Initialize timing trackers
-		generation_start_time = time.perf_counter()
-		prefill_time = 0.0
-		decoding_time = 0.0
-		config_prefill_time = 0.0
-		config_decode_time = 0.0
+	def _generate_ensure_comms(self) -> None:
+		"""Verify distributed connections and coordinate PyNccl communicator init.
 
-		# Initialize cumulative decode counters (persist across prefill/decode switches)
-		self._timing_logged = False  # Print timing once per batch group
-		self._decode_group_idx = 0  # Track decode groups for diagnostic logging
-		self._cumulative_decode_iterations = 0
-		self._cumulative_decode_boundaries = 0
-		self._cumulative_boundary_ms = 0.0
-		self._cumulative_forward_ms = 0.0
-		
-		# NOTE: torch.distributed health was already verified in _reset_for_new_batch() via
-		# _ensure_dist_healthy(). This is just a sanity check - should never fail here.
+		All ranks must call this. Single-GPU mode skips PyNccl.
+		"""
 		logging.info(f"Rank {self.rank}: Verifying distributed connections...")
 		if not dist.is_initialized():
 			raise RuntimeError(f"Rank {self.rank}: torch.distributed not initialized (should have been verified in _reset_for_new_batch)")
 		if not self._check_and_reinit_pynccl():
 			raise RuntimeError(f"Rank {self.rank}: Failed to ensure healthy PyNccl communicator")
 		logging.info(f"Rank {self.rank}: Distributed connections verified")
-		
+
 		# Ensure communicator is ready
 		if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
 			# Verify rank consistency
@@ -4846,27 +4826,24 @@ class BatchGenWorker:
 						self._nccl_port = port_tensor.item()
 
 						# CRITICAL: Barrier before TCPStore creation to ensure rank 0 (the server)
-						# is ready before other ranks try to connect. Different ranks may reach
-						# this point at very different times due to tokenization workload.
+						# is ready before other ranks try to connect.
 						logging.debug(f"Rank {self.rank}: Waiting for all ranks before PyNccl init...")
 						dist.barrier()
 
 						try:
 							logging.debug(f"Rank {self.rank}: Creating PyNccl communicator on port {self._nccl_port}")
 
-							# Store group separately so we can properly destroy it on reinit
 							self._nccl_group = StatelessProcessGroup.create(
 								host=comm_master_addr,
 								port=self._nccl_port,
 								rank=self.rank,
 								world_size=self.world_size,
-								data_expiration_seconds=36000,  # 10 hours
+								data_expiration_seconds=36000,
 							)
 							self.comm = PyNcclCommunicator(
 								group=self._nccl_group,
 								device=device
 							)
-							# Only rank 0 logs at INFO level to reduce verbosity
 							if self.rank == 0:
 								logging.info(f"PyNccl communicator initialized on port {self._nccl_port}")
 							else:
@@ -4874,6 +4851,116 @@ class BatchGenWorker:
 						except Exception as e:
 							logging.error(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
 							raise RuntimeError(f"Rank {self.rank}: PyNccl communicator initialization failed - {e}")
+
+	def _generate_collect_results(
+		self,
+		generation_start_time: float,
+		prefill_time: float,
+		decoding_time: float,
+		config_prefill_time: float,
+		config_decode_time: float,
+	) -> dict:
+		"""Log timing stats, gather decoded strings from all ranks, return result dict."""
+		generation_time = time.perf_counter() - generation_start_time
+		phase_switching_time = config_prefill_time + config_decode_time
+
+		# Compute throughput metrics from all sequences
+		total_prompt_tokens = 0
+		total_decoded_tokens = 0
+		num_sequences = 0
+		if self.global_batch is not None:
+			for seq in self.global_batch:
+				total_prompt_tokens += seq.prompt_length
+				total_decoded_tokens += seq.decoded_length
+				num_sequences += 1
+
+		prefill_throughput = total_prompt_tokens / prefill_time if prefill_time > 0 else 0
+		decode_throughput = total_decoded_tokens / decoding_time if decoding_time > 0 else 0
+		total_tokens = total_prompt_tokens + total_decoded_tokens
+		overall_throughput = total_tokens / generation_time if generation_time > 0 else 0
+
+		if self.rank == 0:
+			logging.info(
+				f"Generation completed:\n"
+				f"  Prefill total time: {prefill_time:.1f}s\n"
+				f"  Decoding total time: {decoding_time:.1f}s\n"
+				f"  Generation total time: {generation_time:.1f}s\n"
+				f"  Phase switching time: {phase_switching_time:.1f}s\n"
+				f"  Config prefill time: {config_prefill_time:.1f}s\n"
+				f"  Config decoding time: {config_decode_time:.1f}s\n"
+				f"  ---\n"
+				f"  Total sequences: {num_sequences}\n"
+				f"  Total prompt tokens: {total_prompt_tokens:,}\n"
+				f"  Total decoded tokens: {total_decoded_tokens:,}\n"
+				f"  Prefill throughput: {prefill_throughput:,.1f} tokens/s\n"
+				f"  Decode throughput: {decode_throughput:,.1f} tokens/s\n"
+				f"  Overall throughput: {overall_throughput:,.1f} tokens/s"
+			)
+			self._log_batch_statistics()
+
+		# Gather Results in Original Order
+		local_results = []
+		for local_idx, uuid in self._local_to_uuid_map.items():
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
+				continue
+			global_idx = seq.global_idx
+			if local_idx not in self.query_book:
+				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
+				continue
+			decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
+			decoded_str = self._decode_tokens_to_string(decoded_tokens)
+			local_results.append((global_idx, decoded_str))
+
+		all_results = [None] * self.world_size
+		dist.all_gather_object(all_results, local_results)
+		all_results = [item for sublist in all_results for item in sublist]
+		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
+
+		if self.rank == 0:
+			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
+			self._log_decode_timing()
+
+		dist.barrier()
+		self._batch_completed = True
+
+		if self.rank == 0:
+			return result_dict
+		else:
+			return {}
+
+
+	def generate(self):
+		"""
+		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
+		"""
+		# Re-extraction opt-in (plan M6 production swap). Gated on
+		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
+		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
+		if should_use_reextract():
+			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate() to WorkerOrchestrator")
+			build_orchestrator(self).run_batch()
+			return
+
+		# Initialize timing trackers
+		generation_start_time = time.perf_counter()
+		prefill_time = 0.0
+		decoding_time = 0.0
+		config_prefill_time = 0.0
+		config_decode_time = 0.0
+
+		# Initialize cumulative decode counters (persist across prefill/decode switches)
+		self._timing_logged = False  # Print timing once per batch group
+		self._decode_group_idx = 0  # Track decode groups for diagnostic logging
+		self._cumulative_decode_iterations = 0
+		self._cumulative_decode_boundaries = 0
+		self._cumulative_boundary_ms = 0.0
+		self._cumulative_forward_ms = 0.0
+		
+		# NOTE: torch.distributed health was already verified in _reset_for_new_batch() via
+		# _ensure_dist_healthy(). This is just a sanity check - should never fail here.
+		self._generate_ensure_comms()
 
 		iteration = 0
 
@@ -5269,81 +5356,10 @@ class BatchGenWorker:
 					self._decode_group_idx += 1
 					break
 		
-		# Log timing stats
-		generation_time = time.perf_counter() - generation_start_time
-		phase_switching_time = config_prefill_time + config_decode_time
-
-		# Compute throughput metrics from all sequences
-		total_prompt_tokens = 0
-		total_decoded_tokens = 0
-		num_sequences = 0
-		if self.global_batch is not None:
-			for seq in self.global_batch:
-				total_prompt_tokens += seq.prompt_length
-				total_decoded_tokens += seq.decoded_length
-				num_sequences += 1
-
-		# Calculate throughput (tokens/second)
-		prefill_throughput = total_prompt_tokens / prefill_time if prefill_time > 0 else 0
-		decode_throughput = total_decoded_tokens / decoding_time if decoding_time > 0 else 0
-		total_tokens = total_prompt_tokens + total_decoded_tokens
-		overall_throughput = total_tokens / generation_time if generation_time > 0 else 0
-
-		if self.rank == 0:
-			logging.info(
-				f"Generation completed:\n"
-				f"  Prefill total time: {prefill_time:.1f}s\n"
-				f"  Decoding total time: {decoding_time:.1f}s\n"
-				f"  Generation total time: {generation_time:.1f}s\n"
-				f"  Phase switching time: {phase_switching_time:.1f}s\n"
-				f"  Config prefill time: {config_prefill_time:.1f}s\n"
-				f"  Config decoding time: {config_decode_time:.1f}s\n"
-				f"  ---\n"
-				f"  Total sequences: {num_sequences}\n"
-				f"  Total prompt tokens: {total_prompt_tokens:,}\n"
-				f"  Total decoded tokens: {total_decoded_tokens:,}\n"
-				f"  Prefill throughput: {prefill_throughput:,.1f} tokens/s\n"
-				f"  Decode throughput: {decode_throughput:,.1f} tokens/s\n"
-				f"  Overall throughput: {overall_throughput:,.1f} tokens/s"
-			)
-
-			# Compute and log batch statistics
-			self._log_batch_statistics()
-
-		# ============ Gather Results in Original Order ============
-		# Detokenize locally on each rank to avoid gathering large token tensors.
-		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
-		# Gathering strings (~KB each) instead reduces memory by ~100x.
-		local_results = []
-		for local_idx, uuid in self._local_to_uuid_map.items():
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
-				continue
-			global_idx = seq.global_idx
-			if local_idx not in self.query_book:
-				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
-				continue
-			decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
-			decoded_str = self._decode_tokens_to_string(decoded_tokens)
-			local_results.append((global_idx, decoded_str))
-
-		all_results = [None] * self.world_size
-		dist.all_gather_object(all_results, local_results)
-		all_results = [item for sublist in all_results for item in sublist]
-		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
-
-		if self.rank == 0:
-			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
-			self._log_decode_timing()
-
-		dist.barrier()
-		self._batch_completed = True
-
-		if self.rank == 0:
-			return result_dict
-		else:
-			return {}
+		return self._generate_collect_results(
+			generation_start_time, prefill_time, decoding_time,
+			config_prefill_time, config_decode_time,
+		)
 
 	def _decode_tokens_to_string(self, tokens: torch.Tensor, min_tokens: int = 1) -> str:
 		"""Decode token IDs to string, stopping at first EOS token.
@@ -6075,6 +6091,50 @@ class BatchGenWorker:
 
 	# ============ Prefill and Decode ============
 
+	# ------------------------------------------------------------------
+	# prefill / prefill_prepacked — shared helpers
+	# ------------------------------------------------------------------
+
+	def _prefill_update_sequences(
+		self,
+		batch: list[int],
+		new_tokens: torch.Tensor,
+	) -> None:
+		"""Post-prefill token write-back and EOS check (shared by both prefill paths).
+
+		For evicted re-entry: first new token goes at decoded_length offset (not 0).
+		For fresh sequences: decoded_length is 0, so offset is 0.
+		"""
+		new_tokens_cpu = new_tokens.cpu()
+		for i, local_idx in enumerate(batch):
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			# Write token at correct offset (handles both fresh and re-entered sequences)
+			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
+			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+			seq.decoded_length = token_pos + 1
+			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
+
+			# Check for EOS respecting ignore_eos flag
+			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
+				seq.eos_reached = True
+
+	def _prefill_reset_prepack_wrappers(self) -> None:
+		"""Reset prepack mode flags on Attn_Wrapper and AttnWrapperBase."""
+		Attn_Wrapper.prepack_mode = False
+		Attn_Wrapper.prepack_cu_seqlens = None
+		Attn_Wrapper.prepack_max_seqlen = None
+		Attn_Wrapper.prepack_num_sequences = None
+		Attn_Wrapper.prepack_seq_lengths = None
+
+		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
+
+
 	def prefill(self, batch: list[int]):
 		"""
 		Handle the prefill for a batch.
@@ -6170,21 +6230,7 @@ class BatchGenWorker:
 		new_tokens = torch.cat(output_tokens, dim=0)
 
 		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		# For fresh sequences: decoded_length is 0, so offset is 0 (same as before)
-		new_tokens_cpu = new_tokens.cpu()
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			# Write token at correct offset (handles both fresh and re-entered sequences)
-			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
-			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
-			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
-
-			# MODIFIED: Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
-				seq.eos_reached = True
+		self._prefill_update_sequences(batch, new_tokens)
 
 		return new_tokens
 
@@ -6393,42 +6439,16 @@ class BatchGenWorker:
 				output_tokens.append(batch_new_tokens)
 
 		# Reset prepack mode
-		Attn_Wrapper.prepack_mode = False
-		Attn_Wrapper.prepack_cu_seqlens = None
-		Attn_Wrapper.prepack_max_seqlen = None
-		Attn_Wrapper.prepack_num_sequences = None
-		Attn_Wrapper.prepack_seq_lengths = None
+		self._prefill_reset_prepack_wrappers()
 
-		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
-
-		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 
 		# Update sequence state after prefill
-		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
-		new_tokens_cpu = new_tokens.cpu()
-		for i, local_idx in enumerate(batch):
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			token_pos = seq.decoded_length  # 0 for fresh, prev_decoded for re-entry
-			self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
-			seq.decoded_length = token_pos + 1
-			seq.current_context_length = seq.original_prompt_length + seq.decoded_length
-
-			# Check for EOS respecting ignore_eos flag
-			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
-				seq.eos_reached = True
+		self._prefill_update_sequences(batch, new_tokens)
 
 		return new_tokens
-
-	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 
 	def _compute_boundary_decisions(
 		self,
