@@ -54,6 +54,7 @@ from batchgen.worker.protocols import (
     CollectiveBackend,
     GpuKvBackend,
     HostKvBackend,
+    LegacyInfraBackend,
     LifespanLoggerBackend,
     ModelExecutorBackend,
     ResponseSinkBackend,
@@ -87,6 +88,7 @@ class WorkerOrchestrator:
         sink: ResponseSinkBackend,
         clock: ClockBackend,
         admission_queue: AdmissionQueueBackend | None = None,
+        legacy_infra: LegacyInfraBackend | None = None,
         decode_delegate: Callable[[list[UUID]], None] | None = None,
         decode_setup_delegate: Callable[[list[UUID]], None] | None = None,
         admission_delegate: Callable[[], Any] | None = None,
@@ -114,9 +116,17 @@ class WorkerOrchestrator:
         prefill_config_delegate: production-only hook. Called before
             each prefill round to configure the prefill model, handle
             re-entry, and allocate host KV pages.
+        legacy_infra: Phase 2 full-refactor adapter exposing the
+            legacy `BatchGenWorker` infrastructure surface
+            (CUDA / KV / parallel_manager / core_engine). Native
+            handlers ported from `batchgen_worker.py` in Phases F2–F10
+            call methods on this adapter instead of the delegates
+            above. Kept alongside delegates during the phased
+            migration; once F10 completes, the delegates are removed.
         """
         self._state = state
         self._config = config
+        self._legacy_infra = legacy_infra
         self._collectives = collectives
         self._model = model
         self._prefill_config_delegate = prefill_config_delegate

@@ -366,6 +366,13 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
             return False
         return bool(poll())
 
+    # -- Phase 2 full-refactor infrastructure adapter ----------------
+    # Wraps the BatchGenWorker instance, exposing the infrastructure surface
+    # (CUDA/KV/parallel_manager) that native handlers ported from
+    # batchgen_worker.py in Phases F2-F10 will call instead of the delegates.
+    from batchgen.worker.backends.legacy_adapter import LegacyWorkerBackend
+    legacy_infra = LegacyWorkerBackend(worker)
+
     return WorkerOrchestrator(
         state,
         config,
@@ -378,6 +385,7 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         sink=sink,
         clock=_WallClock(),
         admission_queue=admission_queue,
+        legacy_infra=legacy_infra,
         decode_delegate=decode_delegate,
         decode_setup_delegate=decode_setup_delegate,
         admission_delegate=admission_delegate,

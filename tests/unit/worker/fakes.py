@@ -392,6 +392,194 @@ class FakeResponseSink:
         self.call_order.append(uuid)
 
 
+class FakeLegacyBackend:
+    """Records every call routed through the LegacyInfraBackend surface.
+
+    CPU-only, no torch/CUDA. Every method is a no-op (or returns a sensible
+    default) and appends to `self.calls` so tests can assert on the exact
+    sequence of infrastructure calls a handler made.
+
+    Satisfies :class:`batchgen.worker.protocols.LegacyInfraBackend`.
+    """
+
+    def __init__(
+        self,
+        rank: int = 0,
+        local_rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.rank = rank
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.calls: list[tuple[str, tuple, dict]] = []
+        # Mutable state the fake owns, so tests can inspect and preset
+        self._uuid_to_local: dict[str, int] = {}
+        self._local_to_uuid: dict[int, str] = {}
+        self._sequences_with_gpu_kv: set[str] = set()
+        self._admission_messages: list[Any] = []
+
+    def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
+        self.calls.append((name, args, kwargs))
+
+    # --- model lifecycle ---
+    def configure_prefill_model(self) -> Any:
+        self._record("configure_prefill_model")
+        return ("fake_prefill_model", None)
+
+    def configure_decode_model(self, max_num_seq: int, comm: Any) -> Any:
+        self._record("configure_decode_model", max_num_seq, comm)
+        return ("fake_decode_model", None)
+
+    def deep_free_model_memory(self) -> None:
+        self._record("deep_free_model_memory")
+
+    def init_nvshmem(self) -> None:
+        self._record("init_nvshmem")
+
+    def set_phase(self, phase: str) -> None:
+        self._record("set_phase", phase)
+
+    def destroy_gpu_paged_kv_cache(self) -> None:
+        self._record("destroy_gpu_paged_kv_cache")
+
+    # --- KV cache primitives ---
+    def release_gpu_kv_pages(self, local_indices: list[int]) -> None:
+        self._record("release_gpu_kv_pages", local_indices)
+
+    def release_host_kv_pages_for_batch(self, uuids: list[str]) -> None:
+        self._record("release_host_kv_pages_for_batch", uuids)
+
+    def extend_gpu_kv_allocation(self, uuids: list[str]) -> bool:
+        self._record("extend_gpu_kv_allocation", uuids)
+        return True
+
+    def allocate_gpu_kv_two_page_buffer(
+        self, local_indices: list[int], load_from_host: bool
+    ) -> bool:
+        self._record(
+            "allocate_gpu_kv_two_page_buffer",
+            local_indices,
+            load_from_host=load_from_host,
+        )
+        return True
+
+    def flush_deferred_kv_to_host(self) -> None:
+        self._record("flush_deferred_kv_to_host")
+
+    def wait_pending_kv_append_tasks(self) -> int:
+        self._record("wait_pending_kv_append_tasks")
+        return 0
+
+    def rebuild_page_table_for_batch(self, batch: list[int], gpu_manager: Any) -> None:
+        self._record("rebuild_page_table_for_batch", batch)
+
+    def finalize_async_load_minimal(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("finalize_async_load_minimal", *args, **kwargs)
+        return ([], [])
+
+    def check_host_kv_watermark_trigger(self) -> bool:
+        self._record("check_host_kv_watermark_trigger")
+        return False
+
+    def get_effective_chunk_size(self) -> int:
+        self._record("get_effective_chunk_size")
+        return 4096
+
+    def put_sequences_on_hold(self, uuids: list[str]) -> None:
+        self._record("put_sequences_on_hold", uuids)
+
+    # --- index / UUID mapping ---
+    def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
+        self._record("local_indices_to_global_seq_ids", batch)
+        return list(batch)
+
+    def get_local_indices_for_uuids(self, uuids: list[str]) -> list[int]:
+        self._record("get_local_indices_for_uuids", uuids)
+        return [self._uuid_to_local[u] for u in uuids if u in self._uuid_to_local]
+
+    def uuid_to_local_map(self) -> dict[str, int]:
+        return self._uuid_to_local
+
+    def local_to_uuid_map(self) -> dict[int, str]:
+        return self._local_to_uuid
+
+    def sequences_with_gpu_kv(self) -> set[str]:
+        return self._sequences_with_gpu_kv
+
+    # --- sampling / IO ---
+    def select_tokens(self, logits: Any) -> Any:
+        self._record("select_tokens")
+        return None
+
+    def should_stop_at_eos(self, token_id: int) -> bool:
+        self._record("should_stop_at_eos", token_id)
+        return False
+
+    def rebuild_input_tokens(self, batch: list[int]) -> Any:
+        self._record("rebuild_input_tokens", batch)
+        return None
+
+    def decode_tokens_to_string(self, tokens: Any) -> str:
+        self._record("decode_tokens_to_string")
+        return ""
+
+    def report_completion(self, uuid: str, gathered_text: str | None) -> None:
+        self._record("report_completion", uuid, gathered_text)
+
+    def gather_completed_tokens(self, uuids: list[str]) -> dict[str, str]:
+        self._record("gather_completed_tokens", uuids)
+        return {u: "" for u in uuids}
+
+    def submit_completed_to_incremental_writer(self, uuids: list[str]) -> None:
+        self._record("submit_completed_to_incremental_writer", uuids)
+
+    # --- admission / tokenization ---
+    def poll_admission_queue_nowait(self) -> Any:
+        self._record("poll_admission_queue_nowait")
+        if not self._admission_messages:
+            import queue as _queue
+            raise _queue.Empty
+        return self._admission_messages.pop(0)
+
+    def admit_sequences_from_message(self, msg: dict) -> list[str]:
+        self._record("admit_sequences_from_message", msg)
+        return []
+
+    def tokenize_admitted_sequences(self, uuids: list[str]) -> None:
+        self._record("tokenize_admitted_sequences", uuids)
+
+    def build_local_query_book_for_admitted(self, uuids: list[str]) -> None:
+        self._record("build_local_query_book_for_admitted", uuids)
+
+    # --- sequence-batch helpers ---
+    def is_sequence_completed(self, seq: Any) -> bool:
+        self._record("is_sequence_completed")
+        return bool(getattr(seq, "eos_reached", False))
+
+    def update_batch_status(self, uuids: list[str], status: Any) -> None:
+        self._record("update_batch_status", uuids, status)
+
+    # --- lifecycle infrastructure ---
+    def feed_watchdog(self) -> None:
+        self._record("feed_watchdog")
+
+    def enable_decode_watchdog(self) -> None:
+        self._record("enable_decode_watchdog")
+
+    def disable_decode_watchdog(self) -> None:
+        self._record("disable_decode_watchdog")
+
+    def feed_decode_watchdog(self) -> None:
+        self._record("feed_decode_watchdog")
+
+    # --- distributed init ---
+    def ensure_comms(self) -> None:
+        self._record("ensure_comms")
+
+    def init_gpu_kv_with_actual_size(self) -> None:
+        self._record("init_gpu_kv_with_actual_size")
+
+
 __all__ = [
     "CollectiveCall",
     "FakeCollectiveBackend",
@@ -403,4 +591,5 @@ __all__ = [
     "RecordingLifespanLogger",
     "FakeClock",
     "FakeResponseSink",
+    "FakeLegacyBackend",
 ]
