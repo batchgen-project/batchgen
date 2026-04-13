@@ -600,6 +600,11 @@ class FakeLegacyBackend:
     def enable_prepack(self) -> bool:
         return False
 
+    # --- prefill sizing (Phase 2.7) ---
+    def effective_chunk_size(self) -> int:
+        self._record("effective_chunk_size")
+        return getattr(self, "_chunk_size", 4096)
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._record("prefill_flush_and_reconfigure")

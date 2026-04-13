@@ -78,8 +78,17 @@ class PrefillScheduler:
         Returns the selected UUIDs in execution order. Sequences that fit
         within the remaining host-KV page budget are appended in priority
         order; the first over-budget candidate terminates accumulation.
+
+        Phase 2.7: the per-sequence page count is **byte-identical** to
+        what ``_prefill_allocate_host_kv`` will reserve — computed via
+        :meth:`SequenceEntry.get_host_pages_for_initial_chunk` with the
+        ``chunk_size`` reported by the adapter. Previously the scheduler
+        over-reserved ``ceil((prompt + max_decode) / PAGE_SIZE)`` which,
+        at L4 scale (max_decode ≈ 256k), admitted ~1 sequence per round
+        instead of the ~40+ that actually fit.
         """
         host_free = self._kv.get_host_free_pages()
+        chunk_size = self._effective_chunk_size()
 
         # Resolve SequenceEntry objects for each status, skipping ghosts.
         evicted = self._seqs_in(SequenceStatus.EVICTED)
@@ -91,7 +100,7 @@ class PrefillScheduler:
         selected: list[UUID] = []
         used = 0
         for seq in evicted + queueing:
-            need = self._pages_for(seq)
+            need = self._pages_for(seq, chunk_size)
             if used + need > host_free:
                 break
             selected.append(seq.uuid)
@@ -106,12 +115,34 @@ class PrefillScheduler:
                 out.append(seq)
         return out
 
+    def _effective_chunk_size(self) -> int:
+        """Return the adapter-reported chunk size, or a CPU-test fallback.
+
+        The CPU-test fallback (``SequenceEntry.PAGE_SIZE``) is chosen so
+        ``max(prompt + chunk, gpu_initial_tokens)`` in
+        :meth:`SequenceEntry.get_host_pages_for_initial_chunk` reliably
+        collapses to the ``gpu_initial_tokens`` branch, preserving the
+        existing CPU-test expectation that a sequence's host-page budget
+        is dominated by ``INITIAL_GPU_PAGE_BUFFER`` on empty state.
+        """
+        if self._legacy is not None:
+            return int(self._legacy.effective_chunk_size())
+        return SequenceEntry.PAGE_SIZE
+
     @staticmethod
-    def _pages_for(seq: SequenceEntry) -> int:
-        """Host-KV page count needed to fully store `seq` through decode."""
-        tokens = seq.prompt_length + seq.max_decode_length
-        page = SequenceEntry.PAGE_SIZE
-        return (tokens + page - 1) // page
+    def _pages_for(seq: SequenceEntry, chunk_size: int) -> int:
+        """Host-KV page count that ``_prefill_allocate_host_kv`` will
+        reserve for ``seq``.
+
+        Delegates to :meth:`SequenceEntry.get_host_pages_for_initial_chunk`
+        which mirrors the allocator formula verbatim:
+
+            initial_tokens = max(prompt + chunk_size,
+                                 (ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER) * PAGE_SIZE)
+            initial_tokens = min(initial_tokens, kv_token_budget)
+            pages = ceil(initial_tokens / PAGE_SIZE)
+        """
+        return seq.get_host_pages_for_initial_chunk(chunk_size)
 
     # ------------------------------------------------------------------
     # Forward-pass invocation (M3 thin — real GPU-KV wiring lands in M5)

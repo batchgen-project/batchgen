@@ -309,6 +309,13 @@ class LegacyInfraBackend(Protocol):
     (``worker.enable_prepack`` + ``worker.prefill_prepacked``). The
     scheduler uses this to decide which forward function to call."""
 
+    # --- prefill sizing (Phase 2.7: scheduler/allocator parity) ---
+    def effective_chunk_size(self) -> int: ...
+    """Return the current host KV chunk size (legacy
+    ``_get_effective_chunk_size``). The scheduler uses this to compute
+    the exact per-sequence host page reservation that the allocator
+    will apply — no estimate, no drift."""
+
     # --- prefill config (F3: native PrefillScheduler.config_for_batch) ---
     def prefill_flush_and_reconfigure(self) -> None: ...
     """Legacy `_prefill_flush_and_reconfigure`: flush pending KV append

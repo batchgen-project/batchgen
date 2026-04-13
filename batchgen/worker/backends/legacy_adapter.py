@@ -237,6 +237,10 @@ class LegacyWorkerBackend:
             and hasattr(self._w, "prefill_prepacked")
         )
 
+    # --- prefill sizing (Phase 2.7) ---
+    def effective_chunk_size(self) -> int:
+        return self._w._get_effective_chunk_size()
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._w._prefill_flush_and_reconfigure()
