@@ -4765,21 +4765,16 @@ class BatchGenWorker:
 		# KV_Storage_Config.reserved_length and GPU buffer sizing.
 		self.max_input_length = 0
 
-		# Re-extraction opt-in (plan M6 production swap). Gated on
-		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
-		# Placed AFTER setup so self.global_batch and the index maps are
+		# Phase-2 full refactor: the orchestrator is the ONLY path.
+		# The env-var gate (BATCHGEN_USE_REEXTRACT) and the legacy
+		# `self.generate()` fallback are gone.  Placed here (after
+		# setup) so `self.global_batch` + the index maps are
 		# initialized before the orchestrator constructs its handlers.
-		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
-		_reextract_val = os.environ.get("BATCHGEN_USE_REEXTRACT", "0")
-		logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT={_reextract_val} (should_use={should_use_reextract()})")
-		if should_use_reextract():
-			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating pool mode to WorkerOrchestrator.generate_persistent")
-			self._in_pool_mode = True
-			build_orchestrator(self).generate_persistent(max_iterations=None)
-			return None
-
-		# Enter the persistent generate loop
-		return self.generate()
+		from batchgen.worker_reextract_entry import build_orchestrator
+		logging.info(f"Rank {self.rank}: Phase-2 native path — WorkerOrchestrator.generate_persistent")
+		self._in_pool_mode = True
+		build_orchestrator(self).generate_persistent(max_iterations=None)
+		return None
 
 	# ------------------------------------------------------------------
 	# generate() — modularized helpers
@@ -4960,17 +4955,31 @@ class BatchGenWorker:
 
 
 	def generate(self):
-		"""
-		Main Loop: Config Prefill -> Prefill -> Config Decode -> Decode (Continuous).
-		"""
-		# Re-extraction opt-in (plan M6 production swap). Gated on
-		# BATCHGEN_USE_REEXTRACT=1; default off, production unchanged.
-		from batchgen.worker_reextract_entry import should_use_reextract, build_orchestrator
-		if should_use_reextract():
-			logging.info(f"Rank {self.rank}: BATCHGEN_USE_REEXTRACT=1 — delegating generate() to WorkerOrchestrator")
-			build_orchestrator(self).run_batch()
-			return
+		"""Phase-2 full refactor: the orchestrator is the ONLY path.
 
+		Every control-flow method that used to live here has moved into
+		``batchgen/worker/``. ``BatchGenWorker`` keeps only the
+		infrastructure surface (prefill, decoding_continuous,
+		configure_prefill/decoding, KV primitives, etc.) which the
+		:class:`LegacyWorkerBackend` adapter exposes to the orchestrator.
+
+		The legacy generate body is preserved as
+		:meth:`_generate_legacy_bak` for reference only; it is no longer
+		reachable in production.
+		"""
+		from batchgen.worker_reextract_entry import build_orchestrator
+		logging.info(f"Rank {self.rank}: Phase-2 native path — WorkerOrchestrator.run_batch()")
+		build_orchestrator(self).run_batch()
+		return
+
+	def _generate_legacy_bak(self):
+		"""LEGACY — Preserved for reference only, not called in Phase-2.
+
+		The original :meth:`generate` body. Left here because several
+		sub-helpers (`_generate_ensure_comms`, `_select_tokens`, etc.)
+		are still called by the adapter, and the branch structure is a
+		useful record of the pre-refactor control flow.
+		"""
 		# Initialize timing trackers
 		generation_start_time = time.perf_counter()
 		prefill_time = 0.0

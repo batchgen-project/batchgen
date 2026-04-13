@@ -27,7 +27,6 @@ every test) stays strictly inside ``batchgen/worker/``.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from batchgen.worker.backends.torch_collectives import TorchCollectiveBackend
@@ -43,12 +42,13 @@ from batchgen.worker.state import WorkerState
 
 
 def should_use_reextract() -> bool:
-    """True when ``BATCHGEN_USE_REEXTRACT=1`` is set in ``os.environ``.
+    """DEPRECATED — Phase-2 full refactor retires the env-var gate.
 
-    Default off: production runs behave identically to the untouched
-    monolithic worker until POIS flips the flag for a smoke test.
+    The orchestrator is the only code path; this function always
+    returns True and is kept only so external callers that still
+    import it don't break. It will be removed once no caller remains.
     """
-    return os.environ.get("BATCHGEN_USE_REEXTRACT", "0") == "1"
+    return True
 
 
 def _find(worker: Any, *names: str) -> Any:
