@@ -341,17 +341,26 @@ class WorkerOrchestrator:
         import logging as _log
         intervals = 0
         while True:
+            # Cheap early-exit: any candidates at all?
+            from batchgen.sequence import SequenceStatus as _Status
+            if (
+                not self._state.global_batch.get_sequences_by_status(_Status.PREFILLED)
+                and not self._state.global_batch.get_sequences_by_status(_Status.ON_HOLD)
+            ):
+                return intervals
+
+            # F5: ensure decode model + GPU KV cache are ready BEFORE
+            # prepare_batch (Phase 2.5: prepare_batch is now capacity-
+            # aware and queries free GPU pages, which requires the KV
+            # manager to be initialized). Idempotent — only does work
+            # after a prefill round invalidated the previous decode setup.
+            self._decode.ensure_decode_setup()
+
             _log.info(f"[ORCH] rank={self._state.rank}: decode_phase prepare_batch...")
             uuids = self._decode.prepare_batch()
             _log.info(f"[ORCH] rank={self._state.rank}: prepare_batch returned {len(uuids)} uuids")
             if not uuids:
                 return intervals
-
-            # F5: ensure decode model + GPU KV cache are ready BEFORE
-            # try_load_new (which allocates GPU KV pages for ON_HOLD
-            # sequences). Idempotent — only does work after a prefill
-            # round invalidated the previous decode setup.
-            self._decode.ensure_decode_setup()
 
             _log.info(f"[ORCH] rank={self._state.rank}: try_load_new...")
             self._decode.try_load_new(uuids)

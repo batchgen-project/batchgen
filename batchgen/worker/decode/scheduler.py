@@ -83,7 +83,25 @@ class DecodeScheduler:
     # ------------------------------------------------------------------
 
     def prepare_batch(self) -> list[UUID]:
-        """Return PREFILLED + ON_HOLD UUIDs sorted by ``(global_idx, uuid)``."""
+        """Return PREFILLED + ON_HOLD UUIDs sorted by ``(global_idx, uuid)``.
+
+        Phase 2.5: selection is now GPU-capacity-aware, matching the
+        legacy `_prepare_decode_batch_two_page_buffer`:
+
+          1. Sort candidates by (global_idx, uuid) for cross-rank
+             determinism.
+          2. For each candidate, sum ``get_gpu_pages_for_two_page_buffer()``.
+          3. Stop as soon as the cumulative requirement would exceed
+             ``self._kv.get_gpu_free_pages()``.
+          4. Respect the legacy per-rank cap
+             ``MoE_decoding_micro_batch_size`` when available on the
+             LegacyInfraBackend (skipped in CPU unit tests where no
+             adapter is wired).
+
+        Previously the orchestrator returned every candidate and let
+        ``_decode_config_allocate_gpu_kv`` raise `GpuKvExhaustion` on
+        over-admit; the legacy path avoided that crash by capping here.
+        """
         candidates: list[SequenceEntry] = []
         for status in (SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD):
             for uuid in self._state.global_batch.get_sequences_by_status(status):
@@ -91,7 +109,45 @@ class DecodeScheduler:
                 if seq is not None:
                     candidates.append(seq)
         candidates.sort(key=lambda s: (s.global_idx, s.uuid))
-        return [s.uuid for s in candidates]
+
+        # Unit-test path: no adapter → the CPU harness doesn't track
+        # `get_gpu_pages_for_two_page_buffer` semantics accurately, so
+        # keep the pre-2.5 behavior of returning every candidate.
+        if self._legacy is None:
+            return [s.uuid for s in candidates]
+
+        # Production path: capacity-aware selection.
+        free_pages = self._kv.get_gpu_free_pages()
+        max_per_rank = self._max_decode_seqs_per_rank()
+        rank_counts: list[int] = [0] * max(self._state.world_size, 1)
+        total_pages = 0
+        selected: list[UUID] = []
+        for seq in candidates:
+            rank = getattr(seq, "assigned_rank", None)
+            if rank is not None and max_per_rank is not None:
+                if rank_counts[rank] >= max_per_rank:
+                    continue
+            pages = seq.get_gpu_pages_for_two_page_buffer()
+            if total_pages + pages > free_pages:
+                break
+            selected.append(seq.uuid)
+            total_pages += pages
+            if rank is not None and max_per_rank is not None:
+                rank_counts[rank] += 1
+        return selected
+
+    def _max_decode_seqs_per_rank(self) -> int | None:
+        """Return MoE_decoding_micro_batch_size if exposed by the adapter."""
+        engine_config = getattr(self._legacy, "engine_config", None) if self._legacy else None
+        if engine_config is None:
+            w = getattr(self._legacy, "_w", None)
+            engine_config = getattr(w, "engine_config", None) if w else None
+        if engine_config is None:
+            return None
+        mod_batching = getattr(engine_config, "Module_Batching_Config", None)
+        if mod_batching is None:
+            return None
+        return getattr(mod_batching, "MoE_decoding_micro_batch_size", None)
 
     # ------------------------------------------------------------------
     # ON_HOLD → IN_DECODE reload

@@ -45,6 +45,11 @@ class LegacyWorkerBackend:
         self._pynccl_initialized: bool = False
         self._decode_setup_done: bool = False
 
+    # --- engine config passthrough (Phase 2.5 capacity-aware prepare_batch) ---
+    @property
+    def engine_config(self) -> Any:
+        return getattr(self._w, "engine_config", None)
+
     # --- rank / topology ---
     @property
     def rank(self) -> int:
