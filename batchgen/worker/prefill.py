@@ -148,27 +148,50 @@ class PrefillScheduler:
     # Forward-pass invocation (M3 thin — real GPU-KV wiring lands in M5)
     # ------------------------------------------------------------------
 
+    def ensure_prefill_setup(self) -> None:
+        """Phase-2.7: run the decode→prefill transition once per phase.
+
+        ``prefill_flush_and_reconfigure`` is *expensive* — it flushes
+        pending KV append tasks, ``deep_free_model_memory`` releases the
+        decode model, ``_destroy_gpu_paged_kv_cache`` nulls the GPU KV
+        manager, and ``parallel_manager.configure_prefill`` reloads
+        prefill weights. That work is only meaningful when transitioning
+        *from* decode; subsequent prefill rounds within the same phase
+        reuse the same prefill-configured model.
+
+        The adapter tracks the transition with ``_prefill_setup_done``,
+        which is cleared by ``decode_setup_once`` (symmetric to
+        ``_decode_setup_done`` being cleared by
+        ``prefill_flush_and_reconfigure``). This method is idempotent —
+        subsequent calls within the same prefill phase are a no-op.
+
+        Followed by a ``collectives.barrier()`` so all ranks finish the
+        MoE layer swap before any rank begins prefill forward.
+        """
+        if self._legacy is None:
+            return
+        if not self._legacy.prefill_setup_done():
+            self._legacy.prefill_flush_and_reconfigure()
+            if self._collectives is not None:
+                self._collectives.barrier()
+
     def config_for_batch(self, uuids: list[UUID]) -> None:
-        """Prepare GPU state for prefilling ``uuids``.
+        """Per-round prefill prep for ``uuids``: re-entry + host-KV alloc.
 
-        Native (F3) path — when a :class:`LegacyInfraBackend` adapter is
-        wired, this runs the three-phase configuration that was previously
-        invoked by ``prefill_config_delegate``:
+        Phase-2.7 split: the expensive decode→prefill transition
+        (``prefill_flush_and_reconfigure``) moved to
+        :meth:`ensure_prefill_setup`, which the orchestrator calls once
+        per prefill phase. This method now contains only the per-batch
+        work that genuinely runs every round:
 
-          1. ``prefill_flush_and_reconfigure`` — flush pending KV, free
-             decode-model memory, destroy GPU KV cache, reconfigure model
-             for prefill.
-          2. ``prefill_prepare_reentry(uuids)`` — rebuild re-entry state
+          1. ``prefill_prepare_reentry(uuids)`` — rebuild re-entry state
              for EVICTED uuids (scalar fields on all ranks + buffer/query
              rebuild on owner rank).
-          3. ``prefill_allocate_host_kv(uuids)`` — register rank-owned
+          2. ``prefill_allocate_host_kv(uuids)`` — register rank-owned
              uuids in local maps and allocate host KV pages for them.
 
-        Afterwards a ``collectives.barrier()`` is issued so every rank
-        completes the MoE layer swap before any rank enters the prefill
-        forward pass — without this, fast ranks trigger all-to-all while
-        slower ranks are still mid-swap and the forward pass fails with
-        ``rope_cos`` shape mismatches.
+        No barrier here — the phase-level barrier already fired in
+        ``ensure_prefill_setup``.
 
         Unit-test path (``legacy_infra is None``) remains thin: we just
         record the uuid list for call-order assertions.
@@ -177,11 +200,8 @@ class PrefillScheduler:
         if self._legacy is None:
             return
 
-        self._legacy.prefill_flush_and_reconfigure()
         self._legacy.prefill_prepare_reentry(list(uuids))
         self._legacy.prefill_allocate_host_kv(list(uuids))
-        if self._collectives is not None:
-            self._collectives.barrier()
 
     def run(self, uuids: list[UUID]) -> Any:
         """Run the prefill forward pass.

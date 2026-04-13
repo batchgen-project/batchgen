@@ -304,16 +304,36 @@ class WorkerOrchestrator:
         """Run prefill rounds until `prepare_batch` returns empty.
 
         Returns the number of rounds executed.
+
+        Phase 2.7 ordering: the expensive decode→prefill transition
+        (``prefill_flush_and_reconfigure``) runs ONCE at the start of
+        the phase via :meth:`PrefillScheduler.ensure_prefill_setup`.
+        Subsequent rounds inside the loop do per-batch work only
+        (``config_for_batch`` = ``prefill_prepare_reentry`` +
+        ``prefill_allocate_host_kv``). Previously that flush fired
+        every round, turning large prefill phases into a flush-and-
+        reconfigure storm (L4 stress: ~5 s overhead × 140+ rounds).
+
+        The peek at PREFILL candidates before `ensure_prefill_setup`
+        keeps the setup out of the fast path when there is no work to
+        do, matching the decode-phase pattern.
         """
+        from batchgen.sequence import SequenceStatus as _Status
+        if (
+            not self._state.global_batch.get_sequences_by_status(_Status.QUEUEING)
+            and not self._state.global_batch.get_sequences_by_status(_Status.EVICTED)
+        ):
+            return 0
+        self._prefill.ensure_prefill_setup()
+
         rounds = 0
         while True:
             uuids = self._prefill.prepare_batch()
             if not uuids:
                 return rounds
 
-            # F3: PrefillScheduler.config_for_batch now runs the full
-            # three-phase native config via the LegacyInfraBackend
-            # adapter (when set). No more `prefill_config_delegate`.
+            # Phase 2.7: only per-batch work — re-entry + host-KV alloc.
+            # Flush-and-reconfigure lives in ensure_prefill_setup above.
             self._prefill.config_for_batch(uuids)
             self._prefill.run(uuids)
 

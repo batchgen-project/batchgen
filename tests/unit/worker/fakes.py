@@ -605,9 +605,13 @@ class FakeLegacyBackend:
         self._record("effective_chunk_size")
         return getattr(self, "_chunk_size", 4096)
 
+    def prefill_setup_done(self) -> bool:
+        return getattr(self, "_prefill_setup_done", False)
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._record("prefill_flush_and_reconfigure")
+        self._prefill_setup_done = True
 
     def prefill_prepare_reentry(self, uuids: list[str]) -> None:
         self._record("prefill_prepare_reentry", uuids)

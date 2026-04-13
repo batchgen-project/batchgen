@@ -42,8 +42,14 @@ class LegacyWorkerBackend:
         # ready right now?" — it is cleared by
         # `prefill_flush_and_reconfigure` because that helper frees
         # the decode model and destroys the GPU KV cache.
+        # Phase 2.7: symmetric `_prefill_setup_done` tracks "is the
+        # prefill-configured model loaded right now?" — cleared by
+        # `decode_setup_once` (which overwrites the parallel_manager
+        # config with decode weights) and set by
+        # `prefill_flush_and_reconfigure` (the expensive transition).
         self._pynccl_initialized: bool = False
         self._decode_setup_done: bool = False
+        self._prefill_setup_done: bool = False
 
     # --- engine config passthrough (Phase 2.5 capacity-aware prepare_batch) ---
     @property
@@ -241,6 +247,9 @@ class LegacyWorkerBackend:
     def effective_chunk_size(self) -> int:
         return self._w._get_effective_chunk_size()
 
+    def prefill_setup_done(self) -> bool:
+        return self._prefill_setup_done
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._w._prefill_flush_and_reconfigure()
@@ -248,6 +257,9 @@ class LegacyWorkerBackend:
         # and destroyed by _prefill_flush_and_reconfigure, so the next
         # decode phase must re-run decode_setup_once.
         self._decode_setup_done = False
+        # Phase 2.7: mark the prefill config live so subsequent prefill
+        # rounds inside the same phase skip the expensive re-run.
+        self._prefill_setup_done = True
 
     def prefill_prepare_reentry(self, uuids: list[str]) -> None:
         self._w._prefill_prepare_reentry(uuids)
@@ -269,6 +281,10 @@ class LegacyWorkerBackend:
             self._w._load_decode_model(max_num_seq, getattr(self._w, "comm", None))
             self._w._init_gpu_kv_with_actual_size()
             self._decode_setup_done = True
+            # Phase 2.7: loading the decode model overwrote the
+            # parallel_manager's prefill config, so the next prefill
+            # phase must re-run ensure_prefill_setup.
+            self._prefill_setup_done = False
 
     def decode_config_for_batch(self, uuids: list[str]) -> None:
         # Repair CTX lengths (all-ranks safe local op)

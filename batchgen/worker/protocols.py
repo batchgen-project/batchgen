@@ -316,6 +316,14 @@ class LegacyInfraBackend(Protocol):
     the exact per-sequence host page reservation that the allocator
     will apply — no estimate, no drift."""
 
+    def prefill_setup_done(self) -> bool: ...
+    """Phase 2.7: True when ``prefill_flush_and_reconfigure`` has
+    already fired since the last decode→prefill transition. The
+    orchestrator's ``ensure_prefill_setup`` uses this to avoid
+    re-flushing every prefill round (expensive
+    ``deep_free_model_memory`` + ``_destroy_gpu_paged_kv_cache`` +
+    ``configure_prefill``). Cleared by ``decode_setup_once``."""
+
     # --- prefill config (F3: native PrefillScheduler.config_for_batch) ---
     def prefill_flush_and_reconfigure(self) -> None: ...
     """Legacy `_prefill_flush_and_reconfigure`: flush pending KV append
