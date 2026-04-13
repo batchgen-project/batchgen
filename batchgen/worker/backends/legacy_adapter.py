@@ -37,7 +37,12 @@ class LegacyWorkerBackend:
 
     def __init__(self, worker: "BatchGenWorker") -> None:
         self._w = worker
-        # F5 lazy decode setup: idempotent one-time init
+        # F5 setup flags. PyNccl init runs exactly once ever.
+        # `_decode_setup_done` tracks "is the decode model + GPU KV
+        # ready right now?" — it is cleared by
+        # `prefill_flush_and_reconfigure` because that helper frees
+        # the decode model and destroys the GPU KV cache.
+        self._pynccl_initialized: bool = False
         self._decode_setup_done: bool = False
 
     # --- rank / topology ---
@@ -230,6 +235,10 @@ class LegacyWorkerBackend:
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._w._prefill_flush_and_reconfigure()
+        # F5 invalidation: the decode model + GPU KV cache were freed
+        # and destroyed by _prefill_flush_and_reconfigure, so the next
+        # decode phase must re-run decode_setup_once.
+        self._decode_setup_done = False
 
     def prefill_prepare_reentry(self, uuids: list[str]) -> None:
         self._w._prefill_prepare_reentry(uuids)
@@ -239,15 +248,18 @@ class LegacyWorkerBackend:
 
     # --- decode setup + continuous (F5/F6) ---
     def decode_setup_once(self, max_num_seq: int) -> None:
-        if self._decode_setup_done:
-            return
-        # PyNccl init (required because _forward_ep uses self.comm.change_state)
-        self._w._generate_ensure_comms()
-        # Load decode model (uses max_num_seq for buffer sizing)
-        self._w._load_decode_model(max_num_seq, getattr(self._w, "comm", None))
-        # Init GPU KV with actual free HBM
-        self._w._init_gpu_kv_with_actual_size()
-        self._decode_setup_done = True
+        # PyNccl init is truly one-time — _forward_ep relies on
+        # self.comm.change_state(...) which is None without this init.
+        if not self._pynccl_initialized:
+            self._w._generate_ensure_comms()
+            self._pynccl_initialized = True
+
+        # Decode model + GPU KV are reset by each prefill round via
+        # prefill_flush_and_reconfigure; re-establish them when stale.
+        if not self._decode_setup_done:
+            self._w._load_decode_model(max_num_seq, getattr(self._w, "comm", None))
+            self._w._init_gpu_kv_with_actual_size()
+            self._decode_setup_done = True
 
     def decode_config_for_batch(self, uuids: list[str]) -> None:
         # Repair CTX lengths (all-ranks safe local op)
