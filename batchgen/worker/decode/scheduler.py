@@ -137,7 +137,16 @@ class DecodeScheduler:
         return selected
 
     def _max_decode_seqs_per_rank(self) -> int | None:
-        """Return MoE_decoding_micro_batch_size if exposed by the adapter."""
+        """Return the per-rank decode-batch cap.
+
+        Prefers ``MoE_decoding_micro_batch_size`` but falls back to
+        ``attn_decoding_micro_batch_size`` when the former is 0 (the
+        config convention for "MoE path unused / default to attention
+        cap"). A final 0 (or missing config) is treated as **no cap**
+        so we don't lock out all admissions — matching legacy
+        behavior observed at L4 where MoE_decoding=0 but
+        attn_decoding=64 and decode still ran.
+        """
         engine_config = getattr(self._legacy, "engine_config", None) if self._legacy else None
         if engine_config is None:
             w = getattr(self._legacy, "_w", None)
@@ -147,7 +156,13 @@ class DecodeScheduler:
         mod_batching = getattr(engine_config, "Module_Batching_Config", None)
         if mod_batching is None:
             return None
-        return getattr(mod_batching, "MoE_decoding_micro_batch_size", None)
+        moe = getattr(mod_batching, "MoE_decoding_micro_batch_size", 0) or 0
+        if moe > 0:
+            return moe
+        attn = getattr(mod_batching, "attn_decoding_micro_batch_size", 0) or 0
+        if attn > 0:
+            return attn
+        return None  # treat as uncapped
 
     # ------------------------------------------------------------------
     # ON_HOLD → IN_DECODE reload
