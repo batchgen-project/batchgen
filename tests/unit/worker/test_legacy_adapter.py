@@ -52,7 +52,9 @@ EXPECTED_METHODS = {
     "poll_admission_queue_nowait",
     "admit_sequences_from_message",
     "tokenize_admitted_sequences",
+    "assign_admitted_sequences_to_ranks",
     "build_local_query_book_for_admitted",
+    "update_max_input_length",
     # sequence-batch
     "is_sequence_completed",
     "update_batch_status",

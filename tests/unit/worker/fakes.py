@@ -548,8 +548,14 @@ class FakeLegacyBackend:
     def tokenize_admitted_sequences(self, uuids: list[str]) -> None:
         self._record("tokenize_admitted_sequences", uuids)
 
+    def assign_admitted_sequences_to_ranks(self, uuids: list[str]) -> None:
+        self._record("assign_admitted_sequences_to_ranks", uuids)
+
     def build_local_query_book_for_admitted(self, uuids: list[str]) -> None:
         self._record("build_local_query_book_for_admitted", uuids)
+
+    def update_max_input_length(self, new_len: int) -> None:
+        self._record("update_max_input_length", new_len)
 
     # --- sequence-batch helpers ---
     def is_sequence_completed(self, seq: Any) -> bool:

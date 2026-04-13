@@ -46,7 +46,7 @@ from queue import Empty
 from typing import Any, Protocol
 
 from batchgen.sequence import SequenceEntry
-from batchgen.worker.protocols import UUID, CollectiveBackend
+from batchgen.worker.protocols import UUID, CollectiveBackend, LegacyInfraBackend
 from batchgen.worker.state import WorkerState
 
 
@@ -66,59 +66,46 @@ class AdmissionCoordinator:
         state: WorkerState,
         collectives: CollectiveBackend,
         admission_queue: AdmissionQueueBackend | None = None,
-        admission_delegate: "Any | None" = None,
+        legacy_infra: LegacyInfraBackend | None = None,
     ) -> None:
         """
-        admission_delegate: optional production hook. When set,
-            :meth:`poll_and_broadcast` calls the delegate instead of
-            running the orchestrator's own polling + tokenization +
-            query-book-build pipeline. The delegate is expected to
-            perform the entire admission cycle (legacy
-            ``_poll_admissions``) and return the list of newly
-            admitted UUIDs. In the hybrid production swap this
-            closure wraps ``BatchGenWorker._poll_admissions`` which
-            builds the legacy ``query_book`` as a side effect — that
-            dict is what ``BatchGenWorker.prefill`` /
-            ``BatchGenWorker.decoding_continuous`` consume.
-            Unit tests leave this as ``None`` and rely on the
-            orchestrator's own admission pipeline.
+        legacy_infra: Phase-F2 production adapter. When set,
+            :meth:`poll_and_broadcast` runs the FULL admission cycle
+            natively (poll + broadcast in this module) and uses the
+            adapter for the infrastructure-heavy steps
+            (tokenization, rank assignment, query_book build,
+            max_input_length propagation). The adapter is the only
+            callback into legacy `BatchGenWorker` — the control
+            flow lives here.
+            Unit tests pass ``legacy_infra=None`` and rely on the
+            lightweight path that only materializes
+            ``SequenceEntry`` objects (no tokenization, no query_book).
         """
         self._state = state
         self._collectives = collectives
         self._queue = admission_queue
-        self._delegate = admission_delegate
+        self._legacy = legacy_infra
 
     def poll_and_broadcast(self) -> list[UUID]:
         """Poll (rank 0) + broadcast (all ranks) + materialize sequences.
 
+        Full native flow (when ``legacy_infra`` is set):
+
+          1. Rank 0 polls ``admission_queue`` (or via
+             ``legacy_infra.poll_admission_queue_nowait`` if no direct
+             queue is wired).
+          2. Single ``broadcast_object`` sends the message (or
+             ``None``/shutdown sentinel) to every rank — invariant #6.
+          3. All ranks parse entries, create ``SequenceEntry`` objects,
+             and add them to ``state.global_batch``.
+          4. When ``legacy_infra`` is set, all ranks then run
+             tokenization + rank-assignment + query_book build +
+             max_input_length propagation via the adapter.
+
         Returns:
-            List of newly-admitted UUIDs in the order they appeared in the
-            message. Empty list when no admission is pending on rank 0.
-
-        Shutdown encoding: a literal ``None`` pulled from the queue
-        (``get_nowait()`` returning ``None``, not raising
-        :class:`queue.Empty`) is the main-worker shutdown sentinel. The
-        coordinator converts it to ``{"type": "shutdown"}`` INSIDE the
-        single broadcast payload so the collective order stays exactly
-        one ``broadcast_object`` call per poll (invariant #6).
-
-        When an ``admission_delegate`` is set (hybrid production path),
-        this method short-circuits the orchestrator's own polling +
-        tokenization logic and returns whatever the delegate returns.
+            List of newly-admitted UUIDs in the order they appeared in
+            the message. Empty list when no admission is pending.
         """
-        if self._delegate is not None:
-            result = self._delegate()
-            # Delegate may return a bool (legacy _poll_admissions
-            # semantic) or a list of uuids. Normalize to list[UUID].
-            if isinstance(result, list):
-                return list(result)
-            if isinstance(result, bool):
-                # We don't know WHICH uuids were admitted; the
-                # orchestrator's hybrid run_batch will read
-                # state.global_batch afterwards to discover them.
-                return []
-            return []
-
         msg: dict[str, Any] | None = None
         if self._state.rank == 0 and self._queue is not None:
             try:
@@ -145,19 +132,63 @@ class AdmissionCoordinator:
             setattr(self._state, "shutdown_requested", True)
             return []
 
-        # Determine message shape and extract the entries list.
+        # Step 1: parse entries + materialize SequenceEntry objects
         entries = self._extract_entries(msg)
         if not entries:
             return []
 
-        base_idx = len(self._state.global_batch.sequences)
+        admitted: list[UUID] = self._materialize_entries(entries)
+
+        # Step 2 (native path, legacy_infra set): tokenize + assign +
+        # query_book + propagate max_input_length. This replaces the
+        # legacy `_admit_sequences_from_message` pipeline entirely —
+        # the adapter calls into battle-tested legacy infrastructure
+        # without going through a `admission_delegate` closure.
+        if admitted and self._legacy is not None:
+            self._legacy.tokenize_admitted_sequences(admitted)
+
+            # Propagate max_input_length from the admitted prompts.
+            # Mirrors legacy `_admit_sequences_from_message` step 2.5.
+            max_prompt = max(
+                (
+                    self._state.global_batch.get_sequence(u).prompt_length
+                    for u in admitted
+                    if self._state.global_batch.get_sequence(u) is not None
+                ),
+                default=0,
+            )
+            self._legacy.update_max_input_length(max_prompt)
+
+            self._legacy.assign_admitted_sequences_to_ranks(admitted)
+            self._legacy.build_local_query_book_for_admitted(admitted)
+
+        return admitted
+
+    def _materialize_entries(
+        self, entries: list[dict[str, Any]]
+    ) -> list[UUID]:
+        """Build `SequenceEntry` objects from entries and add to batch.
+
+        Mirrors legacy `_admit_sequences_from_message` steps 1 (global_idx
+        assignment + `SequenceEntry` construction). Shared by both the
+        native (legacy_infra) path and the lightweight CPU test path.
+        """
+        # global_idx must continue from existing batch state, mirroring
+        # legacy (which uses `max(..., default=-1) + 1`). This keeps
+        # cross-rank determinism when the batch already has sequences.
+        existing_max = -1
+        for seq in self._state.global_batch:
+            if seq.global_idx > existing_max:
+                existing_max = seq.global_idx
+        start_idx = existing_max + 1
+
         admitted: list[UUID] = []
         for offset, spec in enumerate(entries):
             # Production shape uses request_id + max_tokens; legacy test
             # shape uses uuid + max_decode_length. Support both.
             uuid = spec.get("request_id") or spec["uuid"]
             max_dec = int(spec.get("max_tokens", spec.get("max_decode_length", 32)))
-            global_idx = base_idx + offset
+            global_idx = start_idx + offset
             seq = SequenceEntry(
                 uuid=uuid,
                 global_idx=global_idx,

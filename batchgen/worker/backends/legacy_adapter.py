@@ -164,8 +164,19 @@ class LegacyWorkerBackend:
     def tokenize_admitted_sequences(self, uuids: list[str]) -> None:
         self._w._tokenize_admitted_sequences(uuids)
 
+    def assign_admitted_sequences_to_ranks(self, uuids: list[str]) -> None:
+        self._w._assign_admitted_sequences_to_ranks(uuids)
+
     def build_local_query_book_for_admitted(self, uuids: list[str]) -> None:
         self._w._build_local_query_book_for_admitted(uuids)
+
+    def update_max_input_length(self, new_len: int) -> None:
+        import logging
+        if new_len > self._w.max_input_length:
+            self._w.max_input_length = new_len
+            if self._w.rank == 0:
+                logging.info(f"[ADMIT] Updated max_input_length to {new_len}")
+            self._w._update_config_after_tokenization()
 
     # --- sequence-batch helpers ---
     def is_sequence_completed(self, seq: Any) -> bool:

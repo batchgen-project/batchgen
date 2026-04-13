@@ -345,33 +345,16 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     # -- admission queue ----------------------------------------------
     admission_queue = _find(worker, "_admission_queue", "admission_queue")
 
-    # -- admission delegate (hybrid production path) -----------------
-    def admission_delegate() -> bool:
-        """Delegate the entire admission cycle to legacy ``_poll_admissions``.
-
-        Legacy ``_poll_admissions`` handles: polling the queue on rank 0,
-        broadcasting the message to all ranks, converting message
-        ``entries`` to ``SequenceEntry``, tokenizing via
-        ``_tokenize_admitted_sequences``, assigning ranks, and
-        **critically** building the legacy ``query_book`` dict that
-        ``worker.prefill`` / ``worker.decoding_continuous`` consume.
-
-        Returns the bool result from legacy, which the
-        AdmissionCoordinator normalizes to an empty uuid list — the
-        orchestrator's run_batch rediscovers admitted sequences by
-        re-reading ``state.global_batch`` afterwards.
-        """
-        poll = getattr(worker, "_poll_admissions", None)
-        if poll is None:
-            return False
-        return bool(poll())
-
     # -- Phase 2 full-refactor infrastructure adapter ----------------
     # Wraps the BatchGenWorker instance, exposing the infrastructure surface
     # (CUDA/KV/parallel_manager) that native handlers ported from
-    # batchgen_worker.py in Phases F2-F10 will call instead of the delegates.
+    # batchgen_worker.py in Phases F2-F10 call instead of legacy delegates.
     from batchgen.worker.backends.legacy_adapter import LegacyWorkerBackend
     legacy_infra = LegacyWorkerBackend(worker)
+    # F2 DONE: AdmissionCoordinator now runs the full admission cycle
+    # natively (poll + broadcast + materialize + tokenize via adapter +
+    # assign_ranks + build_query_book via adapter). The admission_delegate
+    # closure and the `admission_delegate` orchestrator kwarg are gone.
 
     return WorkerOrchestrator(
         state,
@@ -388,7 +371,6 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         legacy_infra=legacy_infra,
         decode_delegate=decode_delegate,
         decode_setup_delegate=decode_setup_delegate,
-        admission_delegate=admission_delegate,
         prefill_config_delegate=prefill_config_delegate,
     )
 

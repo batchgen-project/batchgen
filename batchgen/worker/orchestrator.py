@@ -91,7 +91,6 @@ class WorkerOrchestrator:
         legacy_infra: LegacyInfraBackend | None = None,
         decode_delegate: Callable[[list[UUID]], None] | None = None,
         decode_setup_delegate: Callable[[list[UUID]], None] | None = None,
-        admission_delegate: Callable[[], Any] | None = None,
         prefill_config_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
         """
@@ -104,15 +103,6 @@ class WorkerOrchestrator:
         decode_setup_delegate: production-only hook. Called before the
             first decode cycle with the uuid batch. Lazy-loads the decode
             model, initializes GPU KV, and configures decode for the batch.
-        admission_delegate: production-only hook. When set, the
-            orchestrator's AdmissionCoordinator short-circuits its
-            own polling pipeline and calls the delegate, which is
-            expected to perform the entire admission cycle
-            (legacy ``_poll_admissions`` including tokenization +
-            query_book build). Required for the hybrid production
-            path because legacy ``prefill`` /
-            ``decoding_continuous`` consume the
-            legacy-built ``query_book``.
         prefill_config_delegate: production-only hook. Called before
             each prefill round to configure the prefill model, handle
             re-entry, and allocate host KV pages.
@@ -152,11 +142,15 @@ class WorkerOrchestrator:
             self._index,
             model_context_length=config.model_context_length,
         )
+        # F2: AdmissionCoordinator takes the LegacyInfraBackend adapter
+        # directly. The `admission_delegate` param on the Orchestrator
+        # is kept during the phased migration for backwards compatibility
+        # but is no longer forwarded — a set adapter supersedes it.
         self._admission = AdmissionCoordinator(
             state,
             collectives,
             admission_queue=admission_queue,
-            admission_delegate=admission_delegate,
+            legacy_infra=legacy_infra,
         )
         self._completion = CompletionHandler(
             state,

@@ -268,9 +268,18 @@ class LegacyInfraBackend(Protocol):
     max_input_length + padding_length via
     `_update_config_after_tokenization`."""
 
+    def assign_admitted_sequences_to_ranks(self, uuids: list[UUID]) -> None: ...
+    """Legacy `_assign_admitted_sequences_to_ranks`: round-robin rank
+    assignment continuing from existing batch state."""
+
     def build_local_query_book_for_admitted(self, uuids: list[UUID]) -> None: ...
     """Legacy `_build_local_query_book_for_admitted`: constructs
     `query_book[local_idx]` entries for this rank's admitted uuids."""
+
+    def update_max_input_length(self, new_len: int) -> None: ...
+    """Updates ``self.max_input_length`` on the worker and propagates
+    to ``engine_config.Basic_Config.padding_length`` via
+    ``_update_config_after_tokenization``. No-op if new_len <= current."""
 
     # --- sequence-batch helpers ---
     def is_sequence_completed(self, seq: Any) -> bool: ...
