@@ -480,7 +480,14 @@ class WorkerOrchestrator:
         iteration = 0
         while True:
             admitted = self._admission.poll_and_broadcast()
-            if admitted:
+            # F2: when the LegacyInfraBackend is set, AdmissionCoordinator
+            # already ran tokenize + assign_ranks + build_query_book via
+            # the adapter (using the legacy buffer pool + _uuid_to_local_map).
+            # Running the orchestrator's BatchFormation on top would create
+            # duplicate state and corrupt the legacy maps — skip in that case.
+            # Once F3+F4 port prefill forward natively, BatchFormation can
+            # fully replace the legacy tokenize path and this branch flips.
+            if admitted and self._legacy_infra is None:
                 self._batch_formation.tokenize(admitted)
                 self._batch_formation.assign_ranks(admitted)
                 self._batch_formation.build_query_book(admitted)
