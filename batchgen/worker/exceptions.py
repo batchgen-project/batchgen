@@ -50,4 +50,43 @@ class CtxInvariantViolation(RuntimeError):
         )
 
 
-__all__ = ["CtxInvariantViolation"]
+class GpuKvExhaustion(RuntimeError):
+    """Raised when a GPU KV allocation cannot fit in the free page budget.
+
+    Phase 2.5 replaces the legacy "log ERROR + return False" fallback in
+    `_allocate_gpu_kv_two_page_buffer` and
+    `_allocate_and_load_gpu_kv_for_new_sequences` with this exception so
+    pressure-relief bugs surface a real stack trace instead of silently
+    dropping the in-flight batch.
+
+    Attributes:
+        rank: Rank that detected the exhaustion.
+        needed: Number of GPU pages the allocation requested.
+        free: Number of free GPU pages available at the check.
+        num_sequences: How many sequences the allocation covered.
+        site: Short label of the call site ("two_page_buffer" /
+            "load_new_sequences") so catchers can disambiguate.
+    """
+
+    def __init__(
+        self,
+        *,
+        rank: int,
+        needed: int,
+        free: int,
+        num_sequences: int,
+        site: str,
+    ) -> None:
+        self.rank = rank
+        self.needed = needed
+        self.free = free
+        self.num_sequences = num_sequences
+        self.site = site
+        super().__init__(
+            f"GPU KV exhaustion at {site} on rank {rank}: "
+            f"need {needed} pages, only {free} free "
+            f"({num_sequences} sequences)"
+        )
+
+
+__all__ = ["CtxInvariantViolation", "GpuKvExhaustion"]

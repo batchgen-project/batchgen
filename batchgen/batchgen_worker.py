@@ -1415,13 +1415,20 @@ class BatchGenWorker:
 
 		free_pages = manager.get_stats().num_free_pages
 		if total_pages > free_pages:
-			logging.error(
-				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
-				f"only {free_pages} free"
+			# Phase 2.5: hard-fail on exhaustion. The legacy fallback (log
+			# ERROR + return False) hid the bug downstream where a caller
+			# would clear in-flight state and the orchestrator would loop
+			# forever on a dead batch. Surface the OOM with a real trace
+			# so the watermark / boundary handler can be fixed properly.
+			from batchgen.worker.exceptions import GpuKvExhaustion
+			raise GpuKvExhaustion(
+				rank=self.rank,
+				needed=total_pages,
+				free=free_pages,
+				num_sequences=len(local_sequence_ids),
+				site="two_page_buffer",
 			)
-			# Don't set gpu_pages_allocated since we're failing
-			return False
-		
+
 		# Now safe to update tracking (allocation will succeed)
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
@@ -2141,27 +2148,25 @@ class BatchGenWorker:
 		if not global_sequence_ids:
 			return
 		
-		try:
-			manager.free_pages_for_sequences(global_sequence_ids)
-			# NOTE: No sync needed - page deallocation is synchronous to the allocator
-			logging.debug(
-				f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
-			)
-			
-			# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
-			for local_idx in local_sequence_ids:
-				uuid = self._local_to_uuid_map.get(local_idx)
-				if uuid:
-					self._sequences_with_gpu_kv.discard(uuid)
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is not None:
-						seq.gpu_pages_allocated = 0
-					
-		except KeyError as exc:
-			logging.warning(
-				"Rank %s failed to release GPU KV pages for %s: %s",
-				self.rank, global_sequence_ids, exc,
-			)
+		# Phase 2.5: was wrapped in try/except KeyError that logged a
+		# warning and continued — orphaning pages and masking the bug
+		# that produced an unknown global_idx in the first place. The
+		# manager's KeyError now propagates so the caller is forced to
+		# fix the source of the stale id.
+		manager.free_pages_for_sequences(global_sequence_ids)
+		# NOTE: No sync needed - page deallocation is synchronous to the allocator
+		logging.debug(
+			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
+		)
+
+		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid:
+				self._sequences_with_gpu_kv.discard(uuid)
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None:
+					seq.gpu_pages_allocated = 0
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Destroy the GPU paged KV cache manager if it is present."""
@@ -4601,11 +4606,15 @@ class BatchGenWorker:
 		total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
 		free_pages = manager.get_stats().num_free_pages
 		if total_pages_needed > free_pages:
-			logging.error(
-				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages_needed} pages, "
-				f"only {free_pages} free. Skipping load for {len(global_ids)} sequences."
+			# Phase 2.5: hard-fail on exhaustion (was: log + return → silent skip).
+			from batchgen.worker.exceptions import GpuKvExhaustion
+			raise GpuKvExhaustion(
+				rank=self.rank,
+				needed=total_pages_needed,
+				free=free_pages,
+				num_sequences=len(global_ids),
+				site="load_new_sequences",
 			)
-			return
 		
 		# 1. Allocate GPU Pages
 		manager.allocate_pages_for_sequences(global_ids, tokens)
@@ -5875,20 +5884,17 @@ class BatchGenWorker:
 		)
 
 		if local_decode_indices:
-			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			if alloc_ok:
-				for local_idx in local_decode_indices:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					seq.mark_initial_gpu_reservation_done()
-					self._sequences_with_gpu_kv.add(uuid)
-			else:
-				logging.error(
-					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
-					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
-				)
-				local_decode_indices.clear()
+			# Phase 2.5: _allocate_gpu_kv_two_page_buffer raises GpuKvExhaustion
+			# on OOM; the prior False-return + clear-batch fallback is gone.
+			# A successful return guarantees every sequence got its 2-page
+			# buffer, so the bookkeeping below always runs.
+			self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
+			for local_idx in local_decode_indices:
+				uuid = self._local_to_uuid_map[local_idx]
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+				seq.mark_initial_gpu_reservation_done()
+				self._sequences_with_gpu_kv.add(uuid)
 
 
 	def _config_decoding_for_batch(
@@ -7863,21 +7869,21 @@ class BatchGenWorker:
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-		# CRITICAL FIX: Ensure page table matches cur_batch at entry
-		# This fixes order mismatch that can occur during decode->prefill->decode transitions
+		# Phase 2.5: page-table order MUST match cur_batch at entry. Any
+		# mismatch is a real bug in the upstream allocation/eviction path —
+		# silently rebuilding masks the root cause and corrupts decode
+		# state. Hard-fail with the two orderings so the trace identifies
+		# the upstream caller.
 		if gpu_manager and gpu_manager._gpu_page_table_manager:
 			entry_slot_order = list(gpu_manager._gpu_page_table_manager.slot_to_seq_id) if gpu_manager._gpu_page_table_manager.slot_to_seq_id else []
 			entry_cur_batch = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
 			if entry_slot_order != entry_cur_batch:
-				logging.error(
+				raise AssertionError(
 					f"Rank {self.rank}: ORDER MISMATCH at decoding_continuous entry: "
-					f"slot_to_seq_id={entry_slot_order[:5]}{'...' if len(entry_slot_order) > 5 else ''} (len={len(entry_slot_order)}), "
-					f"cur_batch={entry_cur_batch[:5]}{'...' if len(entry_cur_batch) > 5 else ''} (len={len(entry_cur_batch)}). Rebuilding page table..."
+					f"slot_to_seq_id={entry_slot_order[:20]} (len={len(entry_slot_order)}), "
+					f"cur_batch={entry_cur_batch[:20]} (len={len(entry_cur_batch)}). "
+					f"Upstream caller must keep them in sync; do not rebuild here."
 				)
-				# Rebuild page table to match cur_batch order
-				if entry_cur_batch:
-					gpu_manager.rebuild_page_table(entry_cur_batch)
-					logging.info(f"Rank {self.rank}: Page table rebuilt to match cur_batch order")
 			else:
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(
