@@ -347,8 +347,11 @@ class WorkerOrchestrator:
             if not uuids:
                 return intervals
 
-            # F5: decode setup now happens natively inside
-            # DecodeScheduler.config_for_batch via LegacyInfraBackend.
+            # F5: ensure decode model + GPU KV cache are ready BEFORE
+            # try_load_new (which allocates GPU KV pages for ON_HOLD
+            # sequences). Idempotent — only does work after a prefill
+            # round invalidated the previous decode setup.
+            self._decode.ensure_decode_setup()
 
             _log.info(f"[ORCH] rank={self._state.rank}: try_load_new...")
             self._decode.try_load_new(uuids)

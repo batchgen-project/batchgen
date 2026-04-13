@@ -130,14 +130,35 @@ class DecodeScheduler:
     # CTX fast-fail pre-forward check
     # ------------------------------------------------------------------
 
+    def ensure_decode_setup(self) -> None:
+        """Run the one-time decode setup (idempotent: returns
+        immediately if already done).
+
+        F5 native path: ``decode_setup_once`` re-establishes the
+        decode model + GPU KV cache after every prefill round
+        (the adapter clears its `_decode_setup_done` flag inside
+        ``prefill_flush_and_reconfigure``). Followed by a
+        ``collectives.barrier()`` so all ranks finish the MoE swap
+        before any rank touches the GPU KV.
+
+        Must be called BEFORE :meth:`try_load_new` because that
+        method allocates GPU KV pages for ON_HOLD sequences and
+        crashes if the GPU KV manager is None / uninitialized.
+        """
+        if self._legacy is None:
+            return
+        max_num_seq = max(len(self._state.global_batch), 1)
+        self._legacy.decode_setup_once(max_num_seq)
+        if self._collectives is not None:
+            self._collectives.barrier()
+
     def config_for_batch(self, uuids: list[UUID]) -> None:
         """Pre-forward CTX invariant fast-fail (plan Decision #6).
 
-        F5 native path: when :class:`LegacyInfraBackend` is wired, also
-        run the one-time ``decode_setup_once`` (idempotent) and
-        per-batch ``decode_config_for_batch`` via the adapter. A
-        barrier is issued after setup to keep ranks in lockstep
-        across the MoE decode-model swap + GPU KV init.
+        F5 native path: per-batch ``decode_config_for_batch`` (repair
+        CTX + allocate GPU KV) via the adapter. The one-time setup
+        (model + KV manager init) lives in :meth:`ensure_decode_setup`
+        and must run earlier in the decode phase.
         """
         for uuid in uuids:
             seq = self._state.global_batch.get_sequence(uuid)
@@ -154,12 +175,6 @@ class DecodeScheduler:
         self.last_configured = list(uuids)
 
         if self._legacy is not None:
-            # One-time: ensure_comms + load_decode_model + init_gpu_kv.
-            max_num_seq = max(len(self._state.global_batch), 1)
-            self._legacy.decode_setup_once(max_num_seq)
-            if self._collectives is not None:
-                self._collectives.barrier()
-            # Per-batch: repair CTX + allocate GPU KV.
             self._legacy.decode_config_for_batch(list(uuids))
 
     # ------------------------------------------------------------------
