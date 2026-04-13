@@ -153,13 +153,32 @@ class PrefillScheduler:
             self._collectives.barrier()
 
     def run(self, uuids: list[UUID]) -> Any:
-        """Run the standard prefill forward pass via ModelExecutorBackend."""
+        """Run the prefill forward pass.
+
+        F4 native path: when a :class:`LegacyInfraBackend` adapter is
+        wired, call ``prefill_forward_prepacked`` if the worker supports
+        the prepacked path (``enable_prepack``), otherwise
+        ``prefill_forward``. This replaces the ``prefill_fn`` closure
+        that previously lived in ``worker_reextract_entry.py``.
+
+        Unit-test path: delegate to :class:`ModelExecutorBackend`.
+        """
+        if self._legacy is not None:
+            if self._legacy.enable_prepack():
+                return self._legacy.prefill_forward_prepacked(list(uuids))
+            return self._legacy.prefill_forward(list(uuids))
         return self._model.forward_prefill(
             {"uuids": list(uuids), "prepacked": False}
         )
 
     def run_prepacked(self, uuids: list[UUID]) -> Any:
-        """Run the prepacked prefill variant (``BATCHGEN_ENABLE_PREPACK=1``)."""
+        """Run the prepacked prefill variant explicitly.
+
+        Used by tests only — production path auto-selects prepacked via
+        :meth:`run` when the adapter reports ``enable_prepack()``.
+        """
+        if self._legacy is not None:
+            return self._legacy.prefill_forward_prepacked(list(uuids))
         return self._model.forward_prefill(
             {"uuids": list(uuids), "prepacked": True}
         )

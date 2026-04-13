@@ -37,6 +37,8 @@ class LegacyWorkerBackend:
 
     def __init__(self, worker: "BatchGenWorker") -> None:
         self._w = worker
+        # F5 lazy decode setup: idempotent one-time init
+        self._decode_setup_done: bool = False
 
     # --- rank / topology ---
     @property
@@ -198,6 +200,33 @@ class LegacyWorkerBackend:
     def feed_decode_watchdog(self) -> None:
         self._w.feed_decode_watchdog()
 
+    # --- prefill forward (F4) ---
+    def _uuids_to_local_indices(self, uuids: list[str]) -> list[int]:
+        out: list[int] = []
+        for uuid in uuids:
+            local_idx = self._w._uuid_to_local_map.get(uuid)
+            if local_idx is not None:
+                out.append(local_idx)
+        return out
+
+    def prefill_forward(self, uuids: list[str]) -> Any:
+        batch = self._uuids_to_local_indices(uuids)
+        if not batch:
+            return None
+        return self._w.prefill(batch)
+
+    def prefill_forward_prepacked(self, uuids: list[str]) -> Any:
+        batch = self._uuids_to_local_indices(uuids)
+        if not batch:
+            return None
+        return self._w.prefill_prepacked(batch)
+
+    def enable_prepack(self) -> bool:
+        return (
+            bool(getattr(self._w, "enable_prepack", False))
+            and hasattr(self._w, "prefill_prepacked")
+        )
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._w._prefill_flush_and_reconfigure()
@@ -207,6 +236,46 @@ class LegacyWorkerBackend:
 
     def prefill_allocate_host_kv(self, uuids: list[str]) -> None:
         self._w._prefill_allocate_host_kv(uuids)
+
+    # --- decode setup + continuous (F5/F6) ---
+    def decode_setup_once(self, max_num_seq: int) -> None:
+        if self._decode_setup_done:
+            return
+        # PyNccl init (required because _forward_ep uses self.comm.change_state)
+        self._w._generate_ensure_comms()
+        # Load decode model (uses max_num_seq for buffer sizing)
+        self._w._load_decode_model(max_num_seq, getattr(self._w, "comm", None))
+        # Init GPU KV with actual free HBM
+        self._w._init_gpu_kv_with_actual_size()
+        self._decode_setup_done = True
+
+    def decode_config_for_batch(self, uuids: list[str]) -> None:
+        # Repair CTX lengths (all-ranks safe local op)
+        repair_fn = getattr(self._w, "_decode_config_repair_ctx_lengths", None)
+        if repair_fn is not None:
+            repair_fn(uuids)
+        # Allocate GPU KV for owner rank's batch
+        local_batch = self._uuids_to_local_indices(uuids)
+        alloc_fn = getattr(self._w, "_decode_config_allocate_gpu_kv", None)
+        if alloc_fn is not None and local_batch:
+            alloc_fn(local_batch)
+
+    def decoding_continuous(self, uuids: list[str]) -> None:
+        local_batch = self._uuids_to_local_indices(uuids)
+        if not local_batch:
+            return
+        # Build initial new_tokens tensor from decoded_tokens buffers.
+        rebuild = getattr(self._w, "_rebuild_input_tokens", None)
+        if rebuild is None:
+            import torch as _torch
+            new_tokens = _torch.zeros(
+                (len(local_batch), 1),
+                dtype=_torch.int64,
+                device=self._w.torch_device,
+            )
+        else:
+            new_tokens = rebuild(local_batch)
+        self._w.decoding_continuous(new_tokens, list(uuids), list(local_batch))
 
     # --- distributed init ---
     def ensure_comms(self) -> None:

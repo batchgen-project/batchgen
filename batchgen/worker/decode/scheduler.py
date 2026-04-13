@@ -11,14 +11,18 @@ the full M5 behavioral notes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.boundary import BoundaryHandler, BoundaryPlan
 from batchgen.worker.decode.continuous_loop import run_decode_interval
 from batchgen.worker.exceptions import CtxInvariantViolation
 from batchgen.worker.kv_manager import KVCacheManager
-from batchgen.worker.protocols import UUID, ModelExecutorBackend
+from batchgen.worker.protocols import (
+    UUID,
+    CollectiveBackend,
+    LegacyInfraBackend,
+    ModelExecutorBackend,
+)
 from batchgen.worker.state import WorkerState
 
 
@@ -41,19 +45,19 @@ class DecodeScheduler:
         *,
         decision_frequency_pages: int,
         initial_gpu_page_buffer: int,
-        decode_delegate: Callable[[list[UUID]], None] | None = None,
+        legacy_infra: LegacyInfraBackend | None = None,
+        collectives: CollectiveBackend | None = None,
     ) -> None:
         """
-        decode_delegate: optional production hook. When provided,
-            :meth:`run_continuous` calls the delegate ONCE per
-            invocation (passing the full uuid batch) instead of
-            running the fake tick loop + :meth:`BoundaryHandler.run`
-            cycle. The delegate is responsible for the entire decode
-            cycle including per-token state updates, page boundaries,
-            and completion handling — in the hybrid production swap
-            this is a closure around ``BatchGenWorker.decoding_continuous``.
-            Unit tests leave this as ``None`` and rely on the fake
-            tick loop for deterministic per-token assertions.
+        legacy_infra: Phase-F6 production adapter. When set,
+            :meth:`run_continuous` delegates the full decode cycle
+            (forward, sampling, page boundary, completion detection)
+            to ``legacy_infra.decoding_continuous``, bypassing the
+            fake tick loop + :meth:`BoundaryHandler.run`. Unit tests
+            leave this ``None`` for deterministic per-token assertions.
+        collectives: used to issue a barrier after the one-time
+            ``decode_setup_once`` so all ranks complete the MoE decode
+            model swap + GPU KV init before any rank enters a forward.
         """
         if decision_frequency_pages < 1:
             raise ValueError(
@@ -69,7 +73,8 @@ class DecodeScheduler:
         self._boundary = boundary
         self._decision_frequency_pages = decision_frequency_pages
         self._initial_gpu_page_buffer = initial_gpu_page_buffer
-        self._decode_delegate = decode_delegate
+        self._legacy = legacy_infra
+        self._collectives = collectives
         self._model_loaded = False
         self.last_configured: list[UUID] = []
 
@@ -126,7 +131,14 @@ class DecodeScheduler:
     # ------------------------------------------------------------------
 
     def config_for_batch(self, uuids: list[UUID]) -> None:
-        """Pre-forward CTX invariant fast-fail (plan Decision #6)."""
+        """Pre-forward CTX invariant fast-fail (plan Decision #6).
+
+        F5 native path: when :class:`LegacyInfraBackend` is wired, also
+        run the one-time ``decode_setup_once`` (idempotent) and
+        per-batch ``decode_config_for_batch`` via the adapter. A
+        barrier is issued after setup to keep ranks in lockstep
+        across the MoE decode-model swap + GPU KV init.
+        """
         for uuid in uuids:
             seq = self._state.global_batch.get_sequence(uuid)
             if seq is None:
@@ -141,6 +153,15 @@ class DecodeScheduler:
                 )
         self.last_configured = list(uuids)
 
+        if self._legacy is not None:
+            # One-time: ensure_comms + load_decode_model + init_gpu_kv.
+            max_num_seq = max(len(self._state.global_batch), 1)
+            self._legacy.decode_setup_once(max_num_seq)
+            if self._collectives is not None:
+                self._collectives.barrier()
+            # Per-batch: repair CTX + allocate GPU KV.
+            self._legacy.decode_config_for_batch(list(uuids))
+
     # ------------------------------------------------------------------
     # run_continuous — one decision interval + boundary
     # ------------------------------------------------------------------
@@ -150,28 +171,27 @@ class DecodeScheduler:
 
         Two execution modes:
 
-        **Test mode** (``decode_delegate is None``): run the fake tick
+        **Test mode** (``legacy_infra is None``): run the fake tick
         loop via :func:`run_decode_interval` for
         ``decision_frequency_pages * PAGE_SIZE`` iterations, then
         invoke :meth:`BoundaryHandler.run`. Unit tests rely on this
         path for deterministic per-token assertions.
 
-        **Production mode** (``decode_delegate`` is set): call the
-        delegate once with the full uuid list. The delegate is
-        expected to run the entire decode cycle (forward passes,
-        boundary checks, completion handling) inside
-        ``BatchGenWorker.decoding_continuous`` and mutate
-        ``state.global_batch`` in place. The orchestrator's
-        :class:`BoundaryHandler` is NOT invoked — production legacy
-        ``decoding_continuous`` already handles boundaries
-        internally.
+        **Production mode** (``legacy_infra`` is set): delegate the
+        full cycle to ``legacy_infra.decoding_continuous(uuids)``
+        which handles forward passes, boundary checks, completion
+        handling, and mutates ``state.global_batch`` in place. The
+        orchestrator's :class:`BoundaryHandler` is NOT invoked —
+        production legacy ``decoding_continuous`` already handles
+        boundaries internally.
         """
-        if self._decode_delegate is not None:
-            self._decode_delegate(list(uuids))
-            # Production path: return a synthetic result so the
-            # orchestrator's run_batch can observe completion via
-            # state.global_batch. ``tokens_produced=-1`` marks the
-            # delegated path for traces.
+        if self._legacy is not None:
+            # F6 native path: delegate the full decode cycle (forward,
+            # sampling, page boundary, completion detection) to legacy
+            # `decoding_continuous` via the adapter. The adapter
+            # rebuilds the initial `new_tokens` tensor, translates
+            # uuids → local indices, and invokes the legacy method.
+            self._legacy.decoding_continuous(list(uuids))
             return DecodeStepResult(
                 tokens_produced=-1,
                 uuids_decoded=tuple(uuids),

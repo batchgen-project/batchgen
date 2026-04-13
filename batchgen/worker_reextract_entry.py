@@ -170,143 +170,15 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     # -- tokenizer -----------------------------------------------------
     tokenizer = TorchTokenizerBackend(worker.tokenizer)
 
-    # -- model executor ------------------------------------------------
-    def _uuids_to_local_indices(uuids: list[str]) -> list[int]:
-        """Translate UUIDs to legacy worker local indices.
-
-        The legacy ``prefill`` / ``decoding_continuous`` methods take
-        ``batch: list[int]`` where the ints are local indices into
-        ``query_book``. The orchestrator speaks UUIDs everywhere, so
-        every call into the monolithic methods translates via the
-        legacy worker's own ``_uuid_to_local_map``.
-        """
-        out: list[int] = []
-        for uuid in uuids:
-            local_idx = worker._uuid_to_local_map.get(uuid)
-            if local_idx is not None:
-                out.append(local_idx)
-        return out
-
-    def prefill_fn(batch: dict[str, Any]) -> Any:
-        uuids = batch.get("uuids", [])
-        local_batch = _uuids_to_local_indices(uuids)
-        if not local_batch:
-            return None
-        # Prefer prefill_prepacked when the worker supports it — required for
-        # GPT-OSS (and similar multi-sequence prefill) because plain prefill()
-        # doesn't pass position_ids through to self.model(), causing rope_cos
-        # shape mismatch for batch > 1 (model generates [1, seq] position_ids
-        # that expand to wrong shape for multi-sequence prefill).
-        use_prepacked = (
-            batch.get("prepacked", False)
-            or getattr(worker, "enable_prepack", False)
-        ) and hasattr(worker, "prefill_prepacked")
-        if use_prepacked:
-            return worker.prefill_prepacked(local_batch)
-        if hasattr(worker, "prefill"):
-            return worker.prefill(local_batch)
+    # -- model executor (F4: prefill forward is native via adapter) ----
+    # TorchModelExecutorBackend stays only as a no-op shim for protocol
+    # satisfaction — the scheduler never invokes it in production when
+    # `legacy_infra` is set (the adapter's prefill_forward* methods are
+    # called directly).
+    def _noop(batch: dict[str, Any]) -> Any:
         return None
 
-    def decode_fn(batch: dict[str, Any]) -> Any:
-        # Unused in the hybrid path — DecodeScheduler bypasses
-        # forward_decode when decode_delegate is set. Kept as a no-op
-        # so any stray call does not raise.
-        return None
-
-    model = TorchModelExecutorBackend(prefill_fn=prefill_fn, decode_fn=decode_fn)
-
-    # -- decode setup delegate (hybrid production path) ---------------
-    _decode_model_loaded = [False]  # mutable closure state
-
-    def decode_setup_delegate(uuids: list[str]) -> None:
-        """Lazy-load decode model + init PyNccl + GPU KV + config decode batch.
-
-        Called once before the first decode cycle. Subsequent calls only
-        run _config_decoding_for_batch (model stays loaded).
-
-        All ranks call this delegate in lockstep inside the orchestrator's
-        _run_decode_phase, so collectives inside (PyNccl init's
-        all_reduce/broadcast/barrier, _init_gpu_kv_with_actual_size's
-        broadcast) are safe.
-        """
-        if not _decode_model_loaded[0]:
-            # Comms setup (PyNccl for MoE EP). Required because
-            # _forward_ep uses self.comm.change_state(...) which is None
-            # without this init. The legacy path calls this at the top
-            # of generate() — we need to call it here for pool mode.
-            ensure_comms = getattr(worker, "_generate_ensure_comms", None)
-            if ensure_comms is not None:
-                ensure_comms()
-
-            # Load decode model
-            max_num_seq = len(worker.global_batch) if worker.global_batch else 1
-            load_fn = getattr(worker, "_load_decode_model", None)
-            if load_fn is not None:
-                load_fn(max_num_seq, getattr(worker, "comm", None))
-
-            # Init GPU KV with actual size
-            init_kv = getattr(worker, "_init_gpu_kv_with_actual_size", None)
-            if init_kv is not None:
-                init_kv()
-
-            _decode_model_loaded[0] = True
-
-        # Barrier after model load + GPU KV init to ensure all ranks
-        # complete before any rank proceeds to decode config.
-        import torch.distributed as _dist
-        _dist.barrier()
-
-        # Config decode batch: repair CTX + allocate GPU KV.
-        # Skip _decode_config_validate (has dist.all_gather collective)
-        # because ranks may reach this point at different times in the
-        # hybrid path, causing deadlock. The CTX repair and GPU KV
-        # allocation are safe (local operations only).
-        local_batch = _uuids_to_local_indices(uuids)
-        repair_fn = getattr(worker, "_decode_config_repair_ctx_lengths", None)
-        if repair_fn is not None:
-            repair_fn(uuids)
-        alloc_fn = getattr(worker, "_decode_config_allocate_gpu_kv", None)
-        if alloc_fn is not None and local_batch:
-            alloc_fn(local_batch)
-
-    # -- decode delegate (hybrid production path) --------------------
-    def decode_delegate(uuids: list[str]) -> None:
-        """Run one full decode cycle via legacy
-        ``BatchGenWorker.decoding_continuous``.
-
-        The legacy method takes ``(new_tokens, decode_uuids, batch)``
-        where ``batch`` is a list of local indices. We translate the
-        orchestrator's uuid list on every call and let the legacy
-        method handle the inner loop, page boundaries, sampling,
-        completion detection, and state mutation on ``global_batch``.
-        """
-        local_batch = _uuids_to_local_indices(uuids)
-        if not local_batch:
-            return
-
-        # Build initial new_tokens tensor via the legacy helper which
-        # pulls the last token of each sequence from its decoded_tokens
-        # buffer. ``_rebuild_input_tokens`` returns a (batch_size, 1)
-        # tensor on the worker's torch_device.
-        rebuild = getattr(worker, "_rebuild_input_tokens", None)
-        if rebuild is None:
-            # Fallback: empty zero tensor — legacy method will
-            # recompute via its own _rebuild_input_tokens path after
-            # the first page boundary.
-            import torch
-
-            new_tokens = torch.zeros(
-                (len(local_batch), 1), dtype=torch.int64, device=worker.torch_device
-            )
-        else:
-            new_tokens = rebuild(local_batch)
-
-        # Call the legacy all-in-one decode loop. Its return value
-        # (updated decode_uuids, batch) is currently ignored — the
-        # orchestrator's outer run_batch loop re-reads
-        # state.global_batch after each decode phase to determine
-        # what remains.
-        worker.decoding_continuous(new_tokens, list(uuids), list(local_batch))
+    model = TorchModelExecutorBackend(prefill_fn=_noop, decode_fn=_noop)
 
     # -- lifespan + response sink -------------------------------------
     lifespan = TorchLifespanLogger(rank=state.rank)
@@ -328,13 +200,10 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
     # -- Phase 2 full-refactor infrastructure adapter ----------------
     # Wraps the BatchGenWorker instance, exposing the infrastructure surface
     # (CUDA/KV/parallel_manager) that native handlers ported from
-    # batchgen_worker.py in Phases F2-F10 call instead of legacy delegates.
+    # batchgen_worker.py in Phases F2-F6 call. All control-flow now lives
+    # in batchgen/worker/; the adapter is the ONLY coupling point.
     from batchgen.worker.backends.legacy_adapter import LegacyWorkerBackend
     legacy_infra = LegacyWorkerBackend(worker)
-    # F2 DONE: AdmissionCoordinator now runs the full admission cycle
-    # natively (poll + broadcast + materialize + tokenize via adapter +
-    # assign_ranks + build_query_book via adapter). The admission_delegate
-    # closure and the `admission_delegate` orchestrator kwarg are gone.
 
     return WorkerOrchestrator(
         state,
@@ -349,8 +218,6 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         clock=_WallClock(),
         admission_queue=admission_queue,
         legacy_infra=legacy_infra,
-        decode_delegate=decode_delegate,
-        decode_setup_delegate=decode_setup_delegate,
     )
 
 

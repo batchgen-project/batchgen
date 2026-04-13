@@ -28,7 +28,6 @@ containers still runs against the original worker.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
 
 from batchgen.sequence import SequenceStatus
 from batchgen.worker.admission import AdmissionCoordinator, AdmissionQueueBackend
@@ -89,19 +88,8 @@ class WorkerOrchestrator:
         clock: ClockBackend,
         admission_queue: AdmissionQueueBackend | None = None,
         legacy_infra: LegacyInfraBackend | None = None,
-        decode_delegate: Callable[[list[UUID]], None] | None = None,
-        decode_setup_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
         """
-        decode_delegate: production-only hook (see
-            :class:`DecodeScheduler` docstring). When set, the decode
-            phase delegates one full cycle per invocation to the
-            provided closure, bypassing the fake tick loop. In the
-            hybrid production swap this closure wraps
-            ``BatchGenWorker.decoding_continuous``.
-        decode_setup_delegate: production-only hook. Called before the
-            first decode cycle with the uuid batch. Lazy-loads the decode
-            model, initializes GPU KV, and configures decode for the batch.
         legacy_infra: Phase 2 full-refactor adapter exposing the
             legacy `BatchGenWorker` infrastructure surface
             (CUDA / KV / parallel_manager / core_engine). Native
@@ -115,7 +103,6 @@ class WorkerOrchestrator:
         self._legacy_infra = legacy_infra
         self._collectives = collectives
         self._model = model
-        self._decode_setup_delegate = decode_setup_delegate
 
         # -- handlers -------------------------------------------------
         self._index = IndexManager(state)
@@ -184,6 +171,12 @@ class WorkerOrchestrator:
             BoundaryGuards(state),
             self._kv,
         )
+        # F5/F6: DecodeScheduler takes the LegacyInfraBackend adapter
+        # directly. When set, config_for_batch runs the one-time
+        # decode_setup_once + per-batch decode_config_for_batch; and
+        # run_continuous delegates the full cycle (forward, sampling,
+        # page boundary, completion) to the adapter's
+        # `decoding_continuous`.
         self._decode = DecodeScheduler(
             state,
             self._kv,
@@ -191,9 +184,9 @@ class WorkerOrchestrator:
             self._boundary,
             decision_frequency_pages=config.decision_frequency_pages,
             initial_gpu_page_buffer=config.initial_gpu_page_buffer,
-            decode_delegate=decode_delegate,
+            legacy_infra=legacy_infra,
+            collectives=collectives,
         )
-        self._decode_delegate = decode_delegate
 
         self._initialized = False
 
@@ -354,12 +347,8 @@ class WorkerOrchestrator:
             if not uuids:
                 return intervals
 
-            # Production hybrid path: delegate decode setup to legacy
-            # (lazy model load + GPU KV init + batch config)
-            if self._decode_setup_delegate is not None:
-                _log.info(f"[ORCH] rank={self._state.rank}: calling decode_setup_delegate...")
-                self._decode_setup_delegate(uuids)
-                _log.info(f"[ORCH] rank={self._state.rank}: decode_setup_delegate done")
+            # F5: decode setup now happens natively inside
+            # DecodeScheduler.config_for_batch via LegacyInfraBackend.
 
             _log.info(f"[ORCH] rank={self._state.rank}: try_load_new...")
             self._decode.try_load_new(uuids)
@@ -393,14 +382,15 @@ class WorkerOrchestrator:
             self._decode.run_continuous(in_decode)
             _log.info(f"[ORCH] rank={self._state.rank}: run_continuous done")
 
-            # Skip check_and_handle when decode_delegate is set — the
-            # delegate (decoding_continuous) handles completions
-            # internally via _page_boundary_fast Phase 4.A. Calling
-            # check_and_handle after the delegate would deadlock because
+            # Skip check_and_handle when legacy_infra is set — native
+            # decoding_continuous handles completions internally via
+            # _page_boundary_fast Phase 4.A. Calling check_and_handle
+            # after the adapter call would deadlock because
             # gather_tokens uses all_gather_object and different ranks
-            # see different eos_reached flags (only the owning rank sets
-            # eos_reached in decoding_continuous's _decode_update_sequences).
-            if self._decode_delegate is not None:
+            # see different eos_reached flags (only the owning rank
+            # sets eos_reached in decoding_continuous's
+            # _decode_update_sequences).
+            if self._legacy_infra is not None:
                 # Completions already handled by legacy path.
                 # Re-discover what was completed by checking status.
                 newly_completed = [

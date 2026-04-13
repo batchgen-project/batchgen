@@ -291,6 +291,24 @@ class LegacyInfraBackend(Protocol):
     def disable_decode_watchdog(self) -> None: ...
     def feed_decode_watchdog(self) -> None: ...
 
+    # --- prefill forward (F4: native PrefillScheduler.run) ---
+    def prefill_forward(self, uuids: list[UUID]) -> Any: ...
+    """Legacy ``BatchGenWorker.prefill`` — the standard multi-sequence
+    padded prefill forward pass. Takes UUIDs (the adapter maps to the
+    worker's local indices internally). Returns any value the worker
+    returns (currently ignored by the scheduler)."""
+
+    def prefill_forward_prepacked(self, uuids: list[UUID]) -> Any: ...
+    """Legacy ``BatchGenWorker.prefill_prepacked`` — the prepacked
+    variant required for GPT-OSS and other models whose plain
+    ``prefill()`` path doesn't forward ``position_ids`` through,
+    producing ``rope_cos`` shape mismatches for batch > 1."""
+
+    def enable_prepack(self) -> bool: ...
+    """True when the worker has the prepacked prefill path wired
+    (``worker.enable_prepack`` + ``worker.prefill_prepacked``). The
+    scheduler uses this to decide which forward function to call."""
+
     # --- prefill config (F3: native PrefillScheduler.config_for_batch) ---
     def prefill_flush_and_reconfigure(self) -> None: ...
     """Legacy `_prefill_flush_and_reconfigure`: flush pending KV append
@@ -312,6 +330,29 @@ class LegacyInfraBackend(Protocol):
     indices), then compute per-sequence initial host capacity and
     invoke ``host_paged_kv_worker_view.register_sequences`` +
     ``allocate_pages_for_sequences``."""
+
+    # --- decode setup + continuous (F5/F6) ---
+    def decode_setup_once(self, max_num_seq: int) -> None: ...
+    """F5 native decode one-time setup (idempotent). Combines:
+      1. `_generate_ensure_comms` — PyNccl init for MoE EP
+      2. `_load_decode_model(max_num_seq, comm)` — decode model load
+      3. `_init_gpu_kv_with_actual_size` — GPU KV manager init
+    All ranks must call in lockstep; returns when all three steps
+    completed at least once."""
+
+    def decode_config_for_batch(self, uuids: list[UUID]) -> None: ...
+    """F5 per-batch decode config (called before every decode cycle).
+    Runs `_decode_config_repair_ctx_lengths(uuids)` +
+    `_decode_config_allocate_gpu_kv(local_batch)` via the adapter.
+    Skips the all_gather-based validate step (hybrid ranks reach this
+    point at different times, causing deadlock)."""
+
+    def decoding_continuous(self, uuids: list[UUID]) -> None: ...
+    """F6 native decoding_continuous cycle. Builds the initial
+    `new_tokens` tensor via `_rebuild_input_tokens`, then invokes
+    legacy `BatchGenWorker.decoding_continuous(new_tokens, uuids,
+    local_batch)` which handles the inner loop, page boundaries,
+    sampling, completion detection, and state mutation."""
 
     # --- distributed init (PyNccl for MoE EP) ---
     def ensure_comms(self) -> None: ...

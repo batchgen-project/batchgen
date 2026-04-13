@@ -578,6 +578,28 @@ class FakeLegacyBackend:
     def feed_decode_watchdog(self) -> None:
         self._record("feed_decode_watchdog")
 
+    # --- decode setup + continuous (F5/F6) ---
+    def decode_setup_once(self, max_num_seq: int) -> None:
+        self._record("decode_setup_once", max_num_seq)
+
+    def decode_config_for_batch(self, uuids: list[str]) -> None:
+        self._record("decode_config_for_batch", uuids)
+
+    def decoding_continuous(self, uuids: list[str]) -> None:
+        self._record("decoding_continuous", uuids)
+
+    # --- prefill forward (F4) ---
+    def prefill_forward(self, uuids: list[str]) -> Any:
+        self._record("prefill_forward", uuids)
+        return None
+
+    def prefill_forward_prepacked(self, uuids: list[str]) -> Any:
+        self._record("prefill_forward_prepacked", uuids)
+        return None
+
+    def enable_prepack(self) -> bool:
+        return False
+
     # --- prefill config (F3) ---
     def prefill_flush_and_reconfigure(self) -> None:
         self._record("prefill_flush_and_reconfigure")
