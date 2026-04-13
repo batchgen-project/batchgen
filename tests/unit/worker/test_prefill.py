@@ -347,36 +347,58 @@ class TestNativeConfigForBatchF3:
         )
         return sch, legacy, col
 
-    def test_calls_adapter_in_legacy_order(self) -> None:
+    def test_config_for_batch_does_not_flush(self) -> None:
+        """Phase 2.7: flush_and_reconfigure moved out of config_for_batch.
+
+        config_for_batch now only runs per-batch work
+        (prefill_prepare_reentry + prefill_allocate_host_kv). The
+        expensive decode→prefill transition lives in ensure_prefill_setup.
+        """
         state = _make_state()
-        sch, legacy, col = self._mk_sched(state)
+        sch, legacy, _ = self._mk_sched(state)
         sch.config_for_batch(["u1", "u2"])
 
         names = [c[0] for c in legacy.calls]
+        assert "prefill_flush_and_reconfigure" not in names
         assert names == [
-            "prefill_flush_and_reconfigure",
             "prefill_prepare_reentry",
             "prefill_allocate_host_kv",
         ]
-        # uuid list is forwarded to the two uuid-bearing steps
+        assert legacy.calls[0][1] == (["u1", "u2"],)
         assert legacy.calls[1][1] == (["u1", "u2"],)
-        assert legacy.calls[2][1] == (["u1", "u2"],)
 
-    def test_barrier_issued_after_config(self) -> None:
+    def test_ensure_prefill_setup_fires_flush_and_barrier(self) -> None:
+        state = _make_state()
+        sch, legacy, col = self._mk_sched(state)
+        sch.ensure_prefill_setup()
+
+        names = [c[0] for c in legacy.calls]
+        assert names == ["prefill_flush_and_reconfigure"]
+        assert col is not None
+        assert col.call_names() == ["barrier"]
+
+    def test_ensure_prefill_setup_is_idempotent(self) -> None:
+        """Second call within the same phase is a no-op (guard on
+        prefill_setup_done), preventing the L4 flush-storm."""
+        state = _make_state()
+        sch, legacy, col = self._mk_sched(state)
+
+        sch.ensure_prefill_setup()
+        sch.ensure_prefill_setup()
+        sch.ensure_prefill_setup()
+
+        names = [c[0] for c in legacy.calls]
+        assert names == ["prefill_flush_and_reconfigure"]
+        assert col is not None
+        assert col.call_names() == ["barrier"]
+
+    def test_config_for_batch_has_no_barrier(self) -> None:
+        """The post-config barrier moved to ensure_prefill_setup too."""
         state = _make_state()
         sch, _, col = self._mk_sched(state)
         sch.config_for_batch(["u1"])
         assert col is not None
-        assert col.call_names() == ["barrier"]
-
-    def test_barrier_skipped_without_collectives(self) -> None:
-        """Unit-test branch: adapter runs, no barrier collective."""
-        state = _make_state()
-        sch, legacy, _ = self._mk_sched(state, with_collectives=False)
-        sch.config_for_batch(["u1"])
-        # adapter still called; no collectives attribute means no barrier
-        names = [c[0] for c in legacy.calls]
-        assert names[0] == "prefill_flush_and_reconfigure"
+        assert col.call_names() == []
 
     def test_last_configured_still_set(self) -> None:
         """Native path must still update ``last_configured`` so tests
@@ -390,14 +412,14 @@ class TestNativeConfigForBatchF3:
         """An empty batch is handled by the scheduler (prepare_batch
         returns [] and _run_prefill_phase skips before calling
         config_for_batch). But if a caller does invoke with []
-        explicitly, the adapter is still called — the flush/reconfigure
-        phase does not take the uuid list."""
+        explicitly, config_for_batch still forwards to the adapter
+        for prepare_reentry / allocate_host_kv — cheap no-ops on an
+        empty list, and the phase-level flush is not repeated."""
         state = _make_state()
         sch, legacy, _ = self._mk_sched(state)
         sch.config_for_batch([])
         names = [c[0] for c in legacy.calls]
         assert names == [
-            "prefill_flush_and_reconfigure",
             "prefill_prepare_reentry",
             "prefill_allocate_host_kv",
         ]
