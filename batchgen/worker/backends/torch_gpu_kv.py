@@ -22,7 +22,7 @@ The Protocol method stays for API symmetry.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.state import WorkerState
@@ -31,14 +31,30 @@ from batchgen.worker.state import WorkerState
 class TorchGpuKvBackend:
     """Production adapter for :class:`GpuKvBackend`.
 
-    Constructed with the worker's :class:`GpuPagedKVCacheManager` and a
-    reference to the shared :class:`WorkerState` (for uuid→global_idx
-    resolution).
+    ``manager`` may be either the ``GpuPagedKVCacheManager`` directly or
+    a zero-arg getter that returns the current manager. The getter
+    form matters for the Phase-2 path where the legacy
+    ``_init_gpu_kv_with_actual_size`` creates the manager AFTER the
+    orchestrator is constructed, and ``_destroy_gpu_paged_kv_cache``
+    tears it back down at every prefill round — a cached direct
+    reference quickly goes stale.
     """
 
-    def __init__(self, manager: Any, state: WorkerState) -> None:
-        self._m = manager
+    def __init__(
+        self,
+        manager: "Any | Callable[[], Any]",
+        state: WorkerState,
+    ) -> None:
+        self._get_manager: Callable[[], Any]
+        if callable(manager) and not hasattr(manager, "get_stats"):
+            self._get_manager = manager  # type: ignore[assignment]
+        else:
+            self._get_manager = lambda m=manager: m
         self._state = state
+
+    @property
+    def _m(self) -> Any:
+        return self._get_manager()
 
     # ------------------------------------------------------------------
     # Helpers

@@ -598,19 +598,34 @@ class WorkerOrchestrator:
             world_size=state.world_size,
         )
 
-        gpu_manager = _find(
-            "gpu_paged_kv_cache_manager",
-            "gpu_kv_manager",
-            "_gpu_paged_kv_cache_manager",
-        )
-        host_worker_view = _find(
-            "host_paged_kv_worker_view",
-            "host_kv_view",
-            "_host_paged_kv_worker_view",
-        )
-        gpu_kv = TorchGpuKvBackend(gpu_manager, state)
+        # GPU / host KV managers may be created, torn down, and
+        # recreated across prefill↔decode transitions (the legacy
+        # worker destroys the GPU KV cache on every prefill config).
+        # Pass getters so each backend call looks up the current live
+        # object on the worker instead of caching a stale reference.
+        def _gpu_manager_getter() -> Any:
+            for name in (
+                "gpu_paged_kv_cache_manager",
+                "gpu_kv_manager",
+                "_gpu_paged_kv_cache_manager",
+            ):
+                if hasattr(worker, name):
+                    return getattr(worker, name)
+            return None
+
+        def _host_view_getter() -> Any:
+            for name in (
+                "host_paged_kv_worker_view",
+                "host_kv_view",
+                "_host_paged_kv_worker_view",
+            ):
+                if hasattr(worker, name):
+                    return getattr(worker, name)
+            return None
+
+        gpu_kv = TorchGpuKvBackend(_gpu_manager_getter, state)
         host_kv = TorchHostKvBackend(
-            host_worker_view, state, total_pages=config.host_kv_total_pages
+            _host_view_getter, state, total_pages=config.host_kv_total_pages
         )
 
         tokenizer = TorchTokenizerBackend(worker.tokenizer)

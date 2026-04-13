@@ -18,25 +18,39 @@ the actual async handle machinery.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from batchgen.sequence import SequenceEntry
 from batchgen.worker.state import WorkerState
 
 
 class TorchHostKvBackend:
-    """Production adapter for :class:`HostKvBackend`."""
+    """Production adapter for :class:`HostKvBackend`.
+
+    ``worker_view`` may be a direct view or a zero-arg getter. The
+    getter form handles the production case where the view is created
+    after orchestrator construction (lazy init).
+    """
 
     def __init__(
         self,
-        worker_view: Any,
+        worker_view: "Any | Callable[[], Any]",
         state: WorkerState,
         *,
         total_pages: int,
     ) -> None:
-        self._view = worker_view
+        if callable(worker_view) and not hasattr(
+            worker_view, "allocate_pages_for_sequences"
+        ):
+            self._get_view: Callable[[], Any] = worker_view  # type: ignore[assignment]
+        else:
+            self._get_view = lambda v=worker_view: v
         self._state = state
         self._total_pages = total_pages
+
+    @property
+    def _view(self) -> Any:
+        return self._get_view()
 
     def _gid(self, uuid: str) -> int:
         seq = self._state.global_batch.get_sequence(uuid)
