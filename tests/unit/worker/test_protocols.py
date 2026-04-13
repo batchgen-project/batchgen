@@ -21,6 +21,7 @@ EXPECTED_PROTOCOLS = {
     "LifespanLoggerBackend",
     "ClockBackend",
     "ResponseSinkBackend",
+    "LegacyInfraBackend",
 }
 
 EXPECTED_ALIASES = {"UUID", "PageId", "AsyncHandle"}
