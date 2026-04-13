@@ -187,26 +187,6 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
                 out.append(local_idx)
         return out
 
-    def prefill_config_delegate(uuids: list[str]) -> None:
-        """Delegate prefill configuration to legacy worker.
-
-        Calls _config_prefill_for_batch which handles:
-        - Flush pending KV + deep free decode model memory
-        - Reconfigure model for prefill (configure_prefill)
-        - Prepare evicted sequences for re-entry
-        - Allocate host KV pages
-
-        Barrier after config to ensure all ranks complete the MoE layer
-        swap before any rank enters the prefill forward pass. Without
-        this, fast ranks start all-to-all with ranks still mid-swap,
-        causing rope_cos shape errors.
-        """
-        import torch.distributed as _dist
-        config_fn = getattr(worker, "_config_prefill_for_batch", None)
-        if config_fn is not None:
-            config_fn(uuids)
-        _dist.barrier()
-
     def prefill_fn(batch: dict[str, Any]) -> Any:
         uuids = batch.get("uuids", [])
         local_batch = _uuids_to_local_indices(uuids)
@@ -371,7 +351,6 @@ def build_orchestrator(worker: Any) -> WorkerOrchestrator:
         legacy_infra=legacy_infra,
         decode_delegate=decode_delegate,
         decode_setup_delegate=decode_setup_delegate,
-        prefill_config_delegate=prefill_config_delegate,
     )
 
 

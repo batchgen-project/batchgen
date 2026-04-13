@@ -9,8 +9,10 @@ from batchgen.worker.kv_manager import KVCacheManager
 from batchgen.worker.prefill import PrefillScheduler
 from batchgen.worker.state import WorkerState
 from tests.unit.worker.fakes import (
+    FakeCollectiveBackend,
     FakeGpuKvBackend,
     FakeHostKvBackend,
+    FakeLegacyBackend,
     FakeModelExecutor,
 )
 
@@ -286,6 +288,119 @@ class TestConfigForBatch:
         sch.config_for_batch(["a"])
         sch.config_for_batch(["x", "y"])
         assert sch.last_configured == ["x", "y"]
+
+    def test_no_legacy_infra_is_thin(self) -> None:
+        """Without the adapter, config_for_batch must NOT issue collectives
+        (unit-test path stays pure)."""
+        state = _make_state()
+        gpu = FakeGpuKvBackend()
+        host = FakeHostKvBackend(free_pages=100)
+        kv = KVCacheManager(
+            state, gpu, host,
+            initial_gpu_page_buffer=8,
+            extension_gpu_page_buffer=4,
+            host_kv_total_pages=10000,
+            prefill_watermark_pct=70,
+        )
+        col = FakeCollectiveBackend()
+        sch = PrefillScheduler(
+            state, kv, FakeModelExecutor(), collectives=col
+        )  # no legacy_infra
+        sch.config_for_batch(["a"])
+        assert col.call_names() == []
+
+
+# ---------------------------------------------------------------------------
+# F3: native config_for_batch via LegacyInfraBackend
+# ---------------------------------------------------------------------------
+
+
+class TestNativeConfigForBatchF3:
+    """Phase-F3 native path: PrefillScheduler.config_for_batch drives the
+    three-phase prefill configuration via the LegacyInfraBackend adapter,
+    followed by a ``collectives.barrier()``.
+
+    Adapter call order must match legacy ``_config_prefill_for_batch``:
+      1. prefill_flush_and_reconfigure
+      2. prefill_prepare_reentry(uuids)
+      3. prefill_allocate_host_kv(uuids)
+    """
+
+    def _mk_sched(
+        self, state: WorkerState, *, with_collectives: bool = True
+    ) -> tuple[PrefillScheduler, FakeLegacyBackend, FakeCollectiveBackend | None]:
+        gpu = FakeGpuKvBackend()
+        host = FakeHostKvBackend(free_pages=100)
+        kv = KVCacheManager(
+            state, gpu, host,
+            initial_gpu_page_buffer=8,
+            extension_gpu_page_buffer=4,
+            host_kv_total_pages=10000,
+            prefill_watermark_pct=70,
+        )
+        legacy = FakeLegacyBackend(rank=0, local_rank=0, world_size=1)
+        col = FakeCollectiveBackend() if with_collectives else None
+        sch = PrefillScheduler(
+            state, kv, FakeModelExecutor(),
+            legacy_infra=legacy,
+            collectives=col,
+        )
+        return sch, legacy, col
+
+    def test_calls_adapter_in_legacy_order(self) -> None:
+        state = _make_state()
+        sch, legacy, col = self._mk_sched(state)
+        sch.config_for_batch(["u1", "u2"])
+
+        names = [c[0] for c in legacy.calls]
+        assert names == [
+            "prefill_flush_and_reconfigure",
+            "prefill_prepare_reentry",
+            "prefill_allocate_host_kv",
+        ]
+        # uuid list is forwarded to the two uuid-bearing steps
+        assert legacy.calls[1][1] == (["u1", "u2"],)
+        assert legacy.calls[2][1] == (["u1", "u2"],)
+
+    def test_barrier_issued_after_config(self) -> None:
+        state = _make_state()
+        sch, _, col = self._mk_sched(state)
+        sch.config_for_batch(["u1"])
+        assert col is not None
+        assert col.call_names() == ["barrier"]
+
+    def test_barrier_skipped_without_collectives(self) -> None:
+        """Unit-test branch: adapter runs, no barrier collective."""
+        state = _make_state()
+        sch, legacy, _ = self._mk_sched(state, with_collectives=False)
+        sch.config_for_batch(["u1"])
+        # adapter still called; no collectives attribute means no barrier
+        names = [c[0] for c in legacy.calls]
+        assert names[0] == "prefill_flush_and_reconfigure"
+
+    def test_last_configured_still_set(self) -> None:
+        """Native path must still update ``last_configured`` so tests
+        and diagnostics can inspect the most-recent batch."""
+        state = _make_state()
+        sch, _, _ = self._mk_sched(state)
+        sch.config_for_batch(["a", "b"])
+        assert sch.last_configured == ["a", "b"]
+
+    def test_empty_uuids_still_runs_adapter(self) -> None:
+        """An empty batch is handled by the scheduler (prepare_batch
+        returns [] and _run_prefill_phase skips before calling
+        config_for_batch). But if a caller does invoke with []
+        explicitly, the adapter is still called — the flush/reconfigure
+        phase does not take the uuid list."""
+        state = _make_state()
+        sch, legacy, _ = self._mk_sched(state)
+        sch.config_for_batch([])
+        names = [c[0] for c in legacy.calls]
+        assert names == [
+            "prefill_flush_and_reconfigure",
+            "prefill_prepare_reentry",
+            "prefill_allocate_host_kv",
+        ]
 
 
 class TestRun:

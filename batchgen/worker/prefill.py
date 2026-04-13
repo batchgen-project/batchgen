@@ -28,7 +28,12 @@ from typing import Any
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import KVCacheManager
-from batchgen.worker.protocols import UUID, ModelExecutorBackend
+from batchgen.worker.protocols import (
+    UUID,
+    CollectiveBackend,
+    LegacyInfraBackend,
+    ModelExecutorBackend,
+)
 from batchgen.worker.state import WorkerState
 
 
@@ -38,10 +43,29 @@ class PrefillScheduler:
         state: WorkerState,
         kv: KVCacheManager,
         model: ModelExecutorBackend,
+        *,
+        legacy_infra: LegacyInfraBackend | None = None,
+        collectives: CollectiveBackend | None = None,
     ) -> None:
+        """
+        legacy_infra: Phase-F3 production adapter. When set,
+            :meth:`config_for_batch` runs the native three-phase
+            prefill configuration via the adapter
+            (``prefill_flush_and_reconfigure`` →
+            ``prefill_prepare_reentry`` →
+            ``prefill_allocate_host_kv``) followed by a
+            ``collectives.barrier()`` to keep ranks in lockstep
+            across the MoE layer swap before any rank enters the
+            forward pass. CPU tests pass ``legacy_infra=None``.
+        collectives: used only to issue the post-config barrier when
+            ``legacy_infra`` is set. Optional; when absent the
+            barrier is skipped (unit-test path).
+        """
         self._state = state
         self._kv = kv
         self._model = model
+        self._legacy = legacy_infra
+        self._collectives = collectives
         self.last_configured: list[UUID] = []
 
     # ------------------------------------------------------------------
@@ -94,8 +118,39 @@ class PrefillScheduler:
     # ------------------------------------------------------------------
 
     def config_for_batch(self, uuids: list[UUID]) -> None:
-        """Prepare GPU state for prefilling `uuids`. Records the list for tests."""
+        """Prepare GPU state for prefilling ``uuids``.
+
+        Native (F3) path — when a :class:`LegacyInfraBackend` adapter is
+        wired, this runs the three-phase configuration that was previously
+        invoked by ``prefill_config_delegate``:
+
+          1. ``prefill_flush_and_reconfigure`` — flush pending KV, free
+             decode-model memory, destroy GPU KV cache, reconfigure model
+             for prefill.
+          2. ``prefill_prepare_reentry(uuids)`` — rebuild re-entry state
+             for EVICTED uuids (scalar fields on all ranks + buffer/query
+             rebuild on owner rank).
+          3. ``prefill_allocate_host_kv(uuids)`` — register rank-owned
+             uuids in local maps and allocate host KV pages for them.
+
+        Afterwards a ``collectives.barrier()`` is issued so every rank
+        completes the MoE layer swap before any rank enters the prefill
+        forward pass — without this, fast ranks trigger all-to-all while
+        slower ranks are still mid-swap and the forward pass fails with
+        ``rope_cos`` shape mismatches.
+
+        Unit-test path (``legacy_infra is None``) remains thin: we just
+        record the uuid list for call-order assertions.
+        """
         self.last_configured = list(uuids)
+        if self._legacy is None:
+            return
+
+        self._legacy.prefill_flush_and_reconfigure()
+        self._legacy.prefill_prepare_reentry(list(uuids))
+        self._legacy.prefill_allocate_host_kv(list(uuids))
+        if self._collectives is not None:
+            self._collectives.barrier()
 
     def run(self, uuids: list[UUID]) -> Any:
         """Run the standard prefill forward pass via ModelExecutorBackend."""

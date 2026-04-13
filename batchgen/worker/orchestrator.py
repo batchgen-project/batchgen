@@ -91,7 +91,6 @@ class WorkerOrchestrator:
         legacy_infra: LegacyInfraBackend | None = None,
         decode_delegate: Callable[[list[UUID]], None] | None = None,
         decode_setup_delegate: Callable[[list[UUID]], None] | None = None,
-        prefill_config_delegate: Callable[[list[UUID]], None] | None = None,
     ) -> None:
         """
         decode_delegate: production-only hook (see
@@ -103,9 +102,6 @@ class WorkerOrchestrator:
         decode_setup_delegate: production-only hook. Called before the
             first decode cycle with the uuid batch. Lazy-loads the decode
             model, initializes GPU KV, and configures decode for the batch.
-        prefill_config_delegate: production-only hook. Called before
-            each prefill round to configure the prefill model, handle
-            re-entry, and allocate host KV pages.
         legacy_infra: Phase 2 full-refactor adapter exposing the
             legacy `BatchGenWorker` infrastructure surface
             (CUDA / KV / parallel_manager / core_engine). Native
@@ -119,7 +115,6 @@ class WorkerOrchestrator:
         self._legacy_infra = legacy_infra
         self._collectives = collectives
         self._model = model
-        self._prefill_config_delegate = prefill_config_delegate
         self._decode_setup_delegate = decode_setup_delegate
 
         # -- handlers -------------------------------------------------
@@ -162,7 +157,18 @@ class WorkerOrchestrator:
             rep_detection_enabled=config.rep_detection_enabled,
         )
         self._rebalancer = HostKVRebalancer(state, self._kv, self._sync)
-        self._prefill = PrefillScheduler(state, self._kv, model)
+        # F3: PrefillScheduler takes the LegacyInfraBackend adapter
+        # directly. When set, config_for_batch runs the three-phase
+        # native prefill configuration (flush_and_reconfigure →
+        # prepare_reentry → allocate_host_kv) + post-config barrier via
+        # the adapter. The `prefill_config_delegate` kwarg is gone.
+        self._prefill = PrefillScheduler(
+            state,
+            self._kv,
+            model,
+            legacy_infra=legacy_infra,
+            collectives=collectives,
+        )
         self._boundary = BoundaryHandler(
             state,
             BoundarySynchronizer(state, self._sync, collectives),
@@ -312,10 +318,9 @@ class WorkerOrchestrator:
             if not uuids:
                 return rounds
 
-            # Production hybrid path: delegate prefill config to legacy
-            if self._prefill_config_delegate is not None:
-                self._prefill_config_delegate(uuids)
-
+            # F3: PrefillScheduler.config_for_batch now runs the full
+            # three-phase native config via the LegacyInfraBackend
+            # adapter (when set). No more `prefill_config_delegate`.
             self._prefill.config_for_batch(uuids)
             self._prefill.run(uuids)
 

@@ -291,6 +291,28 @@ class LegacyInfraBackend(Protocol):
     def disable_decode_watchdog(self) -> None: ...
     def feed_decode_watchdog(self) -> None: ...
 
+    # --- prefill config (F3: native PrefillScheduler.config_for_batch) ---
+    def prefill_flush_and_reconfigure(self) -> None: ...
+    """Legacy `_prefill_flush_and_reconfigure`: flush pending KV append
+    tasks, deep-free decode model memory, destroy GPU paged KV cache,
+    configure the model for prefill (``parallel_manager.configure_prefill``),
+    set phase='prefill', restart h2d worker with the prefill weight-copy
+    queue. Called once per prefill round before the forward pass."""
+
+    def prefill_prepare_reentry(self, uuids: list[UUID]) -> None: ...
+    """Legacy `_prefill_prepare_reentry`: for every EVICTED uuid, rebuild
+    scalar re-entry state (decoded_length, baseline, max_decode_length,
+    eos flags) on all ranks, and on the owning rank rebuild input_ids +
+    decoded_tokens buffer views + query_book entry. Fresh QUEUEING uuids
+    are skipped."""
+
+    def prefill_allocate_host_kv(self, uuids: list[UUID]) -> None: ...
+    """Legacy `_prefill_allocate_host_kv`: register rank-owned uuids in
+    ``_uuid_to_local_map`` / ``_local_to_uuid_map`` (reusing freed
+    indices), then compute per-sequence initial host capacity and
+    invoke ``host_paged_kv_worker_view.register_sequences`` +
+    ``allocate_pages_for_sequences``."""
+
     # --- distributed init (PyNccl for MoE EP) ---
     def ensure_comms(self) -> None: ...
     """Legacy `_generate_ensure_comms`: verifies dist, coordinates PyNccl

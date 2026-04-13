@@ -198,6 +198,16 @@ class LegacyWorkerBackend:
     def feed_decode_watchdog(self) -> None:
         self._w.feed_decode_watchdog()
 
+    # --- prefill config (F3) ---
+    def prefill_flush_and_reconfigure(self) -> None:
+        self._w._prefill_flush_and_reconfigure()
+
+    def prefill_prepare_reentry(self, uuids: list[str]) -> None:
+        self._w._prefill_prepare_reentry(uuids)
+
+    def prefill_allocate_host_kv(self, uuids: list[str]) -> None:
+        self._w._prefill_allocate_host_kv(uuids)
+
     # --- distributed init ---
     def ensure_comms(self) -> None:
         self._w._generate_ensure_comms()

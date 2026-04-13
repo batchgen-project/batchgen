@@ -578,6 +578,16 @@ class FakeLegacyBackend:
     def feed_decode_watchdog(self) -> None:
         self._record("feed_decode_watchdog")
 
+    # --- prefill config (F3) ---
+    def prefill_flush_and_reconfigure(self) -> None:
+        self._record("prefill_flush_and_reconfigure")
+
+    def prefill_prepare_reentry(self, uuids: list[str]) -> None:
+        self._record("prefill_prepare_reentry", uuids)
+
+    def prefill_allocate_host_kv(self, uuids: list[str]) -> None:
+        self._record("prefill_allocate_host_kv", uuids)
+
     # --- distributed init ---
     def ensure_comms(self) -> None:
         self._record("ensure_comms")
