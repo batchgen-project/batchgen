@@ -511,4 +511,146 @@ class WorkerOrchestrator:
                     return iteration
 
 
+    # ------------------------------------------------------------------
+    # F9: legacy-worker construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_legacy_worker(cls, worker: "object") -> "WorkerOrchestrator":
+        """Construct an orchestrator from an in-memory ``BatchGenWorker``.
+
+        The legacy worker remains the owner of the live infrastructure
+        (process group, KV managers, tokenizer, model). This factory
+        wraps each piece in the corresponding ``Torch*Backend`` adapter
+        and routes everything through :class:`LegacyWorkerBackend`,
+        which is the single coupling point between the orchestrator
+        and the legacy class. There is no env-var gate — the
+        orchestrator is the only path.
+        """
+        # Imports are local to keep the orchestrator's module-level
+        # surface free of GPU-only deps (the unit-test path imports
+        # WorkerOrchestrator without torch.distributed available).
+        from typing import Any
+        import torch
+        from batchgen.worker.backends.legacy_adapter import LegacyWorkerBackend
+        from batchgen.worker.backends.torch_collectives import TorchCollectiveBackend
+        from batchgen.worker.backends.torch_gpu_kv import TorchGpuKvBackend
+        from batchgen.worker.backends.torch_host_kv import TorchHostKvBackend
+        from batchgen.worker.backends.torch_lifespan import TorchLifespanLogger
+        from batchgen.worker.backends.torch_model_executor import TorchModelExecutorBackend
+        from batchgen.worker.backends.torch_response_sink import TorchResponseSink
+        from batchgen.worker.backends.torch_tokenizer import TorchTokenizerBackend
+
+        def _find(*names: str) -> Any:
+            for name in names:
+                if hasattr(worker, name):
+                    return getattr(worker, name)
+            return None
+
+        device = getattr(worker, "device", 0)
+        local_rank = getattr(worker, "local_rank", 0)
+        rank = getattr(worker, "rank", getattr(worker, "global_rank", 0))
+        world_size = getattr(worker, "world_size", 1)
+        torch_device = getattr(worker, "torch_device", None) or torch.device(
+            f"cuda:{device}"
+        )
+
+        state = WorkerState(
+            rank=int(rank),
+            local_rank=int(local_rank),
+            world_size=int(world_size),
+            device=int(device),
+            torch_device=torch_device,
+        )
+        # Alias the legacy worker's live containers so mutations land on
+        # the same dicts/sets the legacy code observes.
+        state.global_batch = worker.global_batch
+        if hasattr(worker, "_local_to_uuid_map"):
+            state.local_to_uuid_map = worker._local_to_uuid_map
+        if hasattr(worker, "_uuid_to_local_map"):
+            state.uuid_to_local_map = worker._uuid_to_local_map
+        if hasattr(worker, "_free_local_indices"):
+            state.free_local_indices = worker._free_local_indices
+        if hasattr(worker, "_next_local_idx"):
+            state.next_local_idx = int(worker._next_local_idx)
+
+        host_total = (
+            _find("host_kv_total_pages", "_host_kv_total_pages")
+            or _find("host_kv_num_pages")
+            or 10000
+        )
+        model_context_length = _find(
+            "model_context_length", "_model_context_length"
+        ) or 4096
+        max_pool_size = _find("_max_pool_size", "max_pool_size") or 0
+        config = WorkerConfig.from_env(
+            host_kv_total_pages=int(host_total),
+            model_context_length=int(model_context_length),
+            max_pool_size=int(max_pool_size),
+        )
+
+        process_group = _find(
+            "process_group", "_process_group", "model_parallel_group"
+        )
+        collectives = TorchCollectiveBackend(
+            process_group=process_group,
+            rank=state.rank,
+            world_size=state.world_size,
+        )
+
+        gpu_manager = _find(
+            "gpu_paged_kv_cache_manager",
+            "gpu_kv_manager",
+            "_gpu_paged_kv_cache_manager",
+        )
+        host_worker_view = _find(
+            "host_paged_kv_worker_view",
+            "host_kv_view",
+            "_host_paged_kv_worker_view",
+        )
+        gpu_kv = TorchGpuKvBackend(gpu_manager, state)
+        host_kv = TorchHostKvBackend(
+            host_worker_view, state, total_pages=config.host_kv_total_pages
+        )
+
+        tokenizer = TorchTokenizerBackend(worker.tokenizer)
+
+        # Prefill forward + decode are routed through LegacyInfraBackend;
+        # this no-op model executor only satisfies the protocol.
+        def _noop(batch: dict[str, Any]) -> Any:
+            return None
+        model = TorchModelExecutorBackend(prefill_fn=_noop, decode_fn=_noop)
+
+        lifespan = TorchLifespanLogger(rank=state.rank)
+        sink = TorchResponseSink(
+            response_queue=_find("_response_queue", "response_queue"),
+            incremental_writer=_find(
+                "_incremental_writer", "incremental_writer"
+            ),
+        )
+
+        class _WallClock:
+            def now(self) -> float:
+                import time
+                return time.monotonic()
+
+        admission_queue = _find("_admission_queue", "admission_queue")
+        legacy_infra = LegacyWorkerBackend(worker)
+
+        return cls(
+            state,
+            config,
+            collectives=collectives,
+            gpu_kv=gpu_kv,
+            host_kv=host_kv,
+            tokenizer=tokenizer,
+            model=model,
+            lifespan=lifespan,
+            sink=sink,
+            clock=_WallClock(),
+            admission_queue=admission_queue,
+            legacy_infra=legacy_infra,
+        )
+
+
 __all__ = ["BatchStats", "WorkerOrchestrator"]

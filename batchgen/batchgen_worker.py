@@ -4770,10 +4770,10 @@ class BatchGenWorker:
 		# `self.generate()` fallback are gone.  Placed here (after
 		# setup) so `self.global_batch` + the index maps are
 		# initialized before the orchestrator constructs its handlers.
-		from batchgen.worker_reextract_entry import build_orchestrator
+		from batchgen.worker.orchestrator import WorkerOrchestrator
 		logging.info(f"Rank {self.rank}: Phase-2 native path — WorkerOrchestrator.generate_persistent")
 		self._in_pool_mode = True
-		build_orchestrator(self).generate_persistent(max_iterations=None)
+		WorkerOrchestrator.from_legacy_worker(self).generate_persistent(max_iterations=None)
 		return None
 
 	# ------------------------------------------------------------------
@@ -4967,9 +4967,9 @@ class BatchGenWorker:
 		:meth:`_generate_legacy_bak` for reference only; it is no longer
 		reachable in production.
 		"""
-		from batchgen.worker_reextract_entry import build_orchestrator
+		from batchgen.worker.orchestrator import WorkerOrchestrator
 		logging.info(f"Rank {self.rank}: Phase-2 native path — WorkerOrchestrator.run_batch()")
-		build_orchestrator(self).run_batch()
+		WorkerOrchestrator.from_legacy_worker(self).run_batch()
 		return
 
 	def _generate_legacy_bak(self):
