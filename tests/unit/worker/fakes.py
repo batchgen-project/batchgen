@@ -568,6 +568,9 @@ class FakeLegacyBackend:
     def wait_async_load_task(self, task: Any) -> None:
         self._record("wait_async_load_task", task=task)
 
+    def reset_pending_kv_append_tasks(self) -> None:
+        self._record("reset_pending_kv_append_tasks")
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)

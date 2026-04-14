@@ -78,6 +78,7 @@ EXPECTED_METHODS = {
     "check_repeating_ngram_pattern",
     "unbind_decode_context",
     "wait_async_load_task",
+    "reset_pending_kv_append_tasks",
 }
 
 

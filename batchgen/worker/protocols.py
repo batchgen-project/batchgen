@@ -335,6 +335,15 @@ class LegacyInfraBackend(Protocol):
     run_continuous call exits with a still-pending async load on the
     handler's pending stash."""
 
+    def reset_pending_kv_append_tasks(self) -> None: ...
+    """Phase 2.8.2i: initialise the worker's
+    ``_pending_kv_append_tasks`` / ``_pending_kv_append_tensors``
+    lists. Legacy ``_decode_init_state`` (batchgen_worker.py:7902)
+    clears them at entry; ``_flush_deferred_kv_to_host`` appends to
+    them. Native ``init_decode_state`` calls this adapter method so
+    the first flush doesn't hit ``AttributeError`` on a worker that
+    was constructed without prior decode phase."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...

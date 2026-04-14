@@ -221,6 +221,10 @@ class LegacyWorkerBackend:
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
 
+    def reset_pending_kv_append_tasks(self) -> None:
+        self._w._pending_kv_append_tasks = []
+        self._w._pending_kv_append_tensors = []
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)

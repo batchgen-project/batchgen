@@ -42,6 +42,13 @@ def init_decode_state(
     ``state.global_batch`` length (used by helpers that log / cap by
     batch progress).
     """
+    # Reset deferred-KV-append task lists the legacy worker mutates
+    # from ``_flush_deferred_kv_to_host``. Legacy
+    # ``_decode_init_state`` initialised them inline (batchgen_worker
+    # .py:7902); without this, the first flush raises
+    # ``AttributeError: _pending_kv_append_tasks``.
+    adapter.reset_pending_kv_append_tasks()
+
     uuid_to_local = adapter.uuid_to_local_map()
     local_to_uuid = adapter.local_to_uuid_map()
     sequences_with_gpu_kv = adapter.sequences_with_gpu_kv()
