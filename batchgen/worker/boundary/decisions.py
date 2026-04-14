@@ -236,34 +236,28 @@ class BoundaryPlan:
 
 @dataclass(frozen=True)
 class BoundaryResult:
-    """Return value of ``BoundaryHandler.run``.
+    """Return value of ``BoundaryHandler.run_full``.
 
-    Matches the legacy ``_page_boundary_fast`` output 1:1 so the Stage 2
-    decode-loop port can swap the call in place without reshaping the
-    caller. Fields:
+    Minimum information the decode loop needs to continue:
 
-      * ``plan``: the ``BoundaryPlan`` the handler applied.
-      * ``decode_uuids``: post-boundary IN_DECODE cohort.
-      * ``batch``: post-boundary local-index list matching ``decode_uuids``.
-      * ``new_async_task``: async handle returned by the executor's
-        new-load sub-step (``None`` when no new loads launched).
-      * ``new_load_uuids`` / ``new_load_local`` / ``new_load_global``:
-        the uuids / local indices / global ids that were handed to the
-        async load; the decode loop threads these back into the next
-        boundary cycle via ``BoundaryHandler.run``.
-      * ``watermark_triggered``: final host-KV watermark bool (from
-        ``adapter.check_host_kv_watermark_trigger()`` in
-        ``boundary/finalize.py``). The decode loop reads this to decide
-        whether to break back to prefill.
+      * ``plan``: the ``BoundaryPlan`` that was applied (useful for
+        tracing, assertions, and watermark-break handling).
+      * ``decode_uuids`` / ``batch``: the post-boundary IN_DECODE
+        cohort and its local-index view.
+      * ``watermark_triggered``: whether the host-KV watermark fired.
+        The decode loop reads this to decide whether to yield back
+        to prefill after this cycle.
+
+    Async-load state (``new_async_task``, ``new_load_uuids``,
+    ``new_load_local``, ``new_load_global``) is deliberately NOT in
+    the result — the handler stashes it internally and reads it back
+    itself at the start of the next cycle, so the decode loop never
+    has to thread transient plumbing through its state machine.
     """
 
     plan: BoundaryPlan
     decode_uuids: tuple[UUID, ...] = ()
     batch: tuple[int, ...] = ()
-    new_async_task: object | None = None
-    new_load_uuids: tuple[UUID, ...] = ()
-    new_load_local: tuple[int, ...] = ()
-    new_load_global: tuple[int, ...] = ()
     watermark_triggered: bool = False
 
 

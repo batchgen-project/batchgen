@@ -106,6 +106,15 @@ class BoundaryHandler:
         self._adapter = adapter
         self._collectives = collectives
         self._handler_config = handler_config
+        # Transient async-load state stashed between boundary cycles.
+        # The handler owns it so the decode loop never has to thread
+        # these fields through its state machine — they are valid
+        # only from the moment a ``NewLoadAsync`` decision fires to
+        # the next cycle's ``wait_pending`` step that integrates it.
+        self._pending_async_task: Any = None
+        self._pending_load_uuids: list[UUID] = []
+        self._pending_load_local: list[int] = []
+        self._pending_load_global: list[int] = []
 
     def run(self, uuids: list[UUID]) -> BoundaryPlan:
         """Run one full boundary cycle, return the executed plan.
@@ -198,16 +207,14 @@ class BoundaryHandler:
         decode_uuids: list[UUID],
         batch: list[int],
         gpu_manager: Any,
-        pending_async_task: Any = None,
-        pending_load_uuids: list[UUID] | None = None,
-        pending_load_local: list[int] | None = None,
-        pending_load_global: list[int] | None = None,
     ) -> BoundaryResult:
         """Run one full boundary cycle through the Stage 1 native path.
 
-        Signature matches legacy ``_page_boundary_fast``
-        (batchgen_worker.py:7336) so the Stage 2 decode-loop port can
-        swap the call 1:1. Order mirrors
+        Async-load state (handle + uuids + local / global indices) is
+        kept on the handler between cycles (``self._pending_*``).
+        Callers only hand over the current decode cohort + batch +
+        gpu_manager; everything else is bookkeeping the handler owns
+        internally. Flow mirrors
         ``docs/phase_2.8_stage1_design.md §3.7``:
 
           1. ``wait_pending`` drains deferred KV writes + integrates
@@ -247,20 +254,24 @@ class BoundaryHandler:
         collectives = self._collectives
         cfg = self._handler_config
 
-        pending_load_uuids = list(pending_load_uuids or [])
-        pending_load_local = list(pending_load_local or [])
-        pending_load_global = list(pending_load_global or [])
-
-        # Step 1 — drain + integrate prior async load.
+        # Step 1 — drain + integrate prior async load (state on self).
         decode_uuids, batch = _wait_pending(
             self._state, adapter, collectives,
             decode_uuids=list(decode_uuids), batch=list(batch),
             gpu_manager=gpu_manager,
-            pending_async_load_task=pending_async_task,
-            pending_load_uuids=pending_load_uuids,
-            pending_load_local=pending_load_local,
-            pending_load_global=pending_load_global,
+            pending_async_load_task=self._pending_async_task,
+            pending_load_uuids=list(self._pending_load_uuids),
+            pending_load_local=list(self._pending_load_local),
+            pending_load_global=list(self._pending_load_global),
         )
+        # The prior pending-load (if any) has been folded into
+        # (decode_uuids, batch); clear the stash so step-8 can record
+        # a new one cleanly.
+        self._pending_async_task = None
+        self._pending_load_uuids = []
+        self._pending_load_local = []
+        self._pending_load_global = []
+
         if not decode_uuids:
             return BoundaryResult(plan=BoundaryPlan())
 
@@ -311,7 +322,9 @@ class BoundaryHandler:
         # Step 7 — pre-execution sanity.
         self._guards.check_pre(plan)
 
-        # Step 8 — canonical-order apply.
+        # Step 8 — canonical-order apply. Any async load that fires
+        # lands on self._pending_* so next cycle's step 1 integrates
+        # it.
         (
             decode_uuids,
             batch,
@@ -329,14 +342,13 @@ class BoundaryHandler:
             chunk_size=chunk_size,
             adapter=adapter,
         )
+        self._pending_async_task = new_async_task
+        self._pending_load_uuids = list(new_load_uuids)
+        self._pending_load_local = list(new_load_local)
+        self._pending_load_global = list(new_load_global)
+
         if not decode_uuids:
-            return BoundaryResult(
-                plan=plan,
-                new_async_task=new_async_task,
-                new_load_uuids=tuple(new_load_uuids),
-                new_load_local=tuple(new_load_local),
-                new_load_global=tuple(new_load_global),
-            )
+            return BoundaryResult(plan=plan)
 
         # Step 9 — finalize (page table + MoE + watermark).
         batch, watermark_triggered = _finalize(
@@ -354,10 +366,6 @@ class BoundaryHandler:
             plan=plan,
             decode_uuids=tuple(decode_uuids),
             batch=tuple(batch),
-            new_async_task=new_async_task,
-            new_load_uuids=tuple(new_load_uuids),
-            new_load_local=tuple(new_load_local),
-            new_load_global=tuple(new_load_global),
             watermark_triggered=watermark_triggered,
         )
 

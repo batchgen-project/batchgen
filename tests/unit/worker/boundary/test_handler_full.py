@@ -195,8 +195,7 @@ class TestConstructionGuards:
         handler = BoundaryHandler(state, synchronizer, planner, executor, guards, kv)
         with pytest.raises(RuntimeError, match="run_full requires"):
             handler.run_full(
-                decode_uuids=["u"], batch=[0],
-                gpu_manager=FakeGpuManager(),
+                decode_uuids=["u"], batch=[0], gpu_manager=FakeGpuManager(),
             )
 
 
@@ -247,6 +246,47 @@ class TestHappyCycle:
         assert result.decode_uuids == ("u",)
         assert result.batch == (0,)
         assert result.watermark_triggered is False
+
+
+class TestPendingLoadStateOnHandler:
+    def test_handler_starts_with_empty_pending_state(self) -> None:
+        state = WorkerState(
+            rank=0, local_rank=0, world_size=1, device=0,
+            torch_device=torch.device("cpu"),
+        )
+        handler, _, _ = _build_handler(state)
+        assert handler._pending_async_task is None
+        assert handler._pending_load_uuids == []
+        assert handler._pending_load_local == []
+        assert handler._pending_load_global == []
+
+    def test_pending_state_is_cleared_after_wait_pending(self) -> None:
+        """After step 1 integrates any prior pending load the stash is
+        empty, so a subsequent executor NewLoadAsync decision cleanly
+        records the new load without conflict."""
+        state = WorkerState(
+            rank=0, local_rank=0, world_size=1, device=0,
+            torch_device=torch.device("cpu"),
+        )
+        _add_seq(state, "u")
+        handler, _, adapter = _build_handler(state)
+        adapter._uuid_to_local = {"u": 0}
+        # Pre-seed a pending load as if the last cycle launched one.
+        handler._pending_async_task = object()
+        handler._pending_load_uuids = ["load_from_prev_cycle"]
+        handler._pending_load_local = [7]
+        handler._pending_load_global = [42]
+
+        handler.run_full(
+            decode_uuids=["u"], batch=[0], gpu_manager=FakeGpuManager(),
+        )
+        # The executor in this happy-path did not fire NewLoadAsync
+        # (no load candidates in the snapshot), so after the cycle
+        # the stash is back to empty.
+        assert handler._pending_async_task is None
+        assert handler._pending_load_uuids == []
+        assert handler._pending_load_local == []
+        assert handler._pending_load_global == []
 
 
 class TestWatermarkBreakPath:

@@ -145,28 +145,20 @@ class TestBoundaryResult:
         assert r.plan is p
         assert r.decode_uuids == ()
         assert r.batch == ()
-        assert r.new_async_task is None
-        assert r.new_load_uuids == ()
-        assert r.new_load_local == ()
-        assert r.new_load_global == ()
         assert r.watermark_triggered is False
 
     def test_full_populated_result(self) -> None:
         p = BoundaryPlan()
-        handle = object()  # opaque async handle
         r = BoundaryResult(
             plan=p,
             decode_uuids=("u1",),
             batch=(0,),
-            new_async_task=handle,
-            new_load_uuids=("u2",),
-            new_load_local=(1,),
-            new_load_global=(17,),
             watermark_triggered=True,
         )
-        assert r.new_async_task is handle
+        assert r.plan is p
+        assert r.decode_uuids == ("u1",)
+        assert r.batch == (0,)
         assert r.watermark_triggered is True
-        assert r.new_load_uuids == ("u2",)
 
     def test_frozen(self) -> None:
         r = BoundaryResult(plan=BoundaryPlan())
