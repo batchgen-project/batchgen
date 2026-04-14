@@ -158,6 +158,20 @@ class LegacyWorkerBackend:
             batch, past_key_states, past_value_states, scale_dict,
         )
 
+    def forward_decode_step(
+        self,
+        *,
+        batch: list[int],
+        new_tokens: "torch.Tensor",
+        gpu_manager: Any,
+        page_table_verified: bool,
+        local_iteration: int,
+    ) -> "torch.Tensor":
+        return self._w._decode_forward_step(
+            batch, new_tokens, gpu_manager,
+            page_table_verified, local_iteration,
+        )
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)

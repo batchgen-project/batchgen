@@ -73,6 +73,7 @@ EXPECTED_METHODS = {
     "report_chunk_sizer_completion",
     # decode Stage 2 passthroughs
     "bind_decode_context",
+    "forward_decode_step",
 }
 
 

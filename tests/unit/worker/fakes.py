@@ -523,6 +523,28 @@ class FakeLegacyBackend:
             getattr(self, "_bind_worker_view", None),
         )
 
+    def forward_decode_step(
+        self,
+        *,
+        batch: list[int],
+        new_tokens: Any,
+        gpu_manager: Any,
+        page_table_verified: bool,
+        local_iteration: int,
+    ) -> Any:
+        self._record(
+            "forward_decode_step",
+            batch=list(batch),
+            new_tokens=new_tokens,
+            gpu_manager=gpu_manager,
+            page_table_verified=page_table_verified,
+            local_iteration=local_iteration,
+        )
+        # Default: echo the input tokens unchanged — tests that need
+        # sampling side effects set `_forward_step_output` instead.
+        out = getattr(self, "_forward_step_output", None)
+        return out if out is not None else new_tokens
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)

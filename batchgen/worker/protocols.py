@@ -281,6 +281,26 @@ class LegacyInfraBackend(Protocol):
     Returns ``(gpu_manager, worker_view)`` for the native decode loop
     to thread through subsequent helpers."""
 
+    def forward_decode_step(
+        self,
+        *,
+        batch: list[int],
+        new_tokens: "torch.Tensor",
+        gpu_manager: Any,
+        page_table_verified: bool,
+        local_iteration: int,
+    ) -> "torch.Tensor": ...
+    """Phase 2.8.2d: one CUDA-graph or eager forward pass + token
+    selection + per-layer KV write-back.
+
+    Kept on the adapter deliberately — ``_decode_forward_step``
+    (batchgen_worker.py:8130-8376) is infrastructure-heavy (CUDA
+    graph bookkeeping, per-layer KV append callbacks, MoE expert
+    routing) and has no control-flow decisions that POIS's rule
+    concerns. Native control flow lives around this call, not inside
+    it. Returns the sampled ``new_tokens`` tensor for the next
+    iteration."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...
