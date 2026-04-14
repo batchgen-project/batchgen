@@ -166,13 +166,16 @@ def _executor(state: WorkerState) -> BoundaryExecutor:
     col = FakeCollectiveBackend(rank=state.rank, world_size=state.world_size)
     sync = SyncCoordinator(state, col)
     kv = KVCacheManager(
-        state=state,
-        sync=sync,
-        gpu=FakeGpuKvBackend(),
-        host=FakeHostKvBackend(),
+        state,
+        FakeGpuKvBackend(),
+        FakeHostKvBackend(),
+        initial_gpu_page_buffer=8,
+        extension_gpu_page_buffer=4,
+        host_kv_total_pages=1000,
+        prefill_watermark_pct=70,
     )
-    rebalancer = HostKVRebalancer(state=state, kv=kv, sync=sync)
-    return BoundaryExecutor(state=state, kv=kv, rebalancer=rebalancer)
+    rebalancer = HostKVRebalancer(state, kv, sync)
+    return BoundaryExecutor(state, kv, rebalancer)
 
 
 def _state_for(uuid: str, **overrides) -> SeqBoundaryState:
