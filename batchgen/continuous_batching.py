@@ -187,20 +187,18 @@ def select_sequences_for_eviction(
         return [], 0
 
     # Sort based on strategy - CRITICAL: Use tie-breaker for determinism
+    # Priority-aware: NORMAL (0) evicted before HIGH (1) within same strategy
     if strategy == EvictionStrategy.SHORTEST_FIRST:
-        # Shortest decoded_length first (ascending)
         sorted_seqs = sorted(
-            sequences, key=lambda x: (x[1].get("decoded_length", 0), x[0])
+            sequences, key=lambda x: (x[1].get("priority", 0), x[1].get("decoded_length", 0), x[0])
         )
     elif strategy == EvictionStrategy.LONGEST_FIRST:
-        # Longest decoded_length first (descending)
         sorted_seqs = sorted(
-            sequences, key=lambda x: (-x[1].get("decoded_length", 0), x[0])
+            sequences, key=lambda x: (x[1].get("priority", 0), -x[1].get("decoded_length", 0), x[0])
         )
     else:  # FIFO
-        # By global_idx ascending
         sorted_seqs = sorted(
-            sequences, key=lambda x: (x[1].get("global_idx", float("inf")), x[0])
+            sequences, key=lambda x: (x[1].get("priority", 0), x[1].get("global_idx", float("inf")), x[0])
         )
 
     evict_uuids = []

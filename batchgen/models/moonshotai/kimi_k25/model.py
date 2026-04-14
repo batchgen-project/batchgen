@@ -34,6 +34,7 @@ Design:
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -44,6 +45,8 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
+from batchgen.batch_invariant_matmul import matmul_persistent as _bi_matmul
+_HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "0") == "1"
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
@@ -59,6 +62,167 @@ from batchgen.moe.dispatch_scatter_3d import (
 class _CausalLMOutput:
     """Minimal output container with .logits attribute for worker compatibility."""
     logits: torch.Tensor
+
+
+# ============================================================================
+# Per-Layer Sub-Op Timer (BATCHGEN_K25_TIMING=1 to enable)
+# ============================================================================
+
+_K25_TIMING_ENABLED = os.environ.get("BATCHGEN_K25_TIMING", "0") == "1"
+_K25_TIMING_LOG_INTERVAL = int(os.environ.get("BATCHGEN_K25_TIMING_INTERVAL", "10"))
+_K25_TIMING_SYNC_EVERY = int(os.environ.get("BATCHGEN_K25_TIMING_SYNC_EVERY", "50"))
+
+# MoE sub-op names (order matters for table output)
+_MOE_OPS = [
+    "allgather", "gate", "dispatch", "wgmma_s1", "wgmma_s2",
+    "reduce", "allreduce", "shared_expert", "extract_combine",
+]
+# Layer-level op names
+_LAYER_OPS = ["input_ln", "mla", "post_ln_res", "mlp", "res_add"]
+
+
+class K25DecodeTimer:
+    """CUDA event-based per-layer sub-op timer for K2.5 decode.
+
+    Enabled by BATCHGEN_K25_TIMING=1. Accumulates timings across steps,
+    logs averages every BATCHGEN_K25_TIMING_INTERVAL steps (default 10).
+
+    Events are recorded without sync during forward. A single sync happens
+    at step_done() to read all event pairs at once (avoids per-layer sync).
+    """
+
+    def __init__(self, num_layers: int = 61, device: str = "cuda"):
+        self.num_layers = num_layers
+        self.device = device
+        self.step_count = 0
+
+        # Per-layer, per-op accumulators (us)
+        self.layer_accum = {
+            op: [0.0] * num_layers for op in _LAYER_OPS
+        }
+        self.moe_accum = {
+            op: [0.0] * num_layers for op in _MOE_OPS
+        }
+        self.samples = 0
+
+        # Deferred event pairs: list of (layer_idx, events, op_names, "layer"|"moe")
+        self._pending_events = []
+
+    def make_events(self, n: int):
+        """Create n+1 CUDA events (n intervals between n+1 markers)."""
+        return [torch.cuda.Event(enable_timing=True) for _ in range(n + 1)]
+
+    def defer_layer_times(self, layer_idx: int, events, op_names):
+        """Store events for deferred processing (no sync needed)."""
+        self._pending_events.append((layer_idx, events, op_names, "layer"))
+
+    def defer_moe_times(self, layer_idx: int, events, op_names):
+        """Store events for deferred processing (no sync needed)."""
+        self._pending_events.append((layer_idx, events, op_names, "moe"))
+
+    def step_done(self):
+        """Called after one full forward pass (all 61 layers).
+
+        Only sync every _K25_TIMING_SYNC_EVERY steps to avoid serializing
+        the GPU pipeline. On non-sync steps, discard pending events.
+        """
+        self.step_count += 1
+
+        if self.step_count % _K25_TIMING_SYNC_EVERY != 0:
+            # Non-sync step: discard events to avoid memory buildup
+            self._pending_events.clear()
+            return
+
+        # Sync step: read all deferred events
+        torch.cuda.synchronize()
+        for layer_idx, events, op_names, kind in self._pending_events:
+            accum = self.layer_accum if kind == "layer" else self.moe_accum
+            for i, op in enumerate(op_names):
+                us = events[i].elapsed_time(events[i + 1]) * 1000.0
+                accum[op][layer_idx] += us
+        self._pending_events.clear()
+
+        self.samples += 1
+        if self.samples >= _K25_TIMING_LOG_INTERVAL:
+            self._log_and_reset()
+
+    def _log_and_reset(self):
+        n = self.samples
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            self.samples = 0
+            for op in _LAYER_OPS:
+                self.layer_accum[op] = [0.0] * self.num_layers
+            for op in _MOE_OPS:
+                self.moe_accum[op] = [0.0] * self.num_layers
+            return
+
+        header_layer = "layer | " + " | ".join(f"{op:>10}" for op in _LAYER_OPS) + " | total_us"
+        header_moe = "layer | " + " | ".join(f"{op:>14}" for op in _MOE_OPS) + " | moe_total"
+        sep_layer = "-" * len(header_layer)
+        sep_moe = "-" * len(header_moe)
+
+        lines = [
+            f"\n[K25 Timing] avg over {n} steps (step {self.step_count - n + 1}-{self.step_count}):",
+            "",
+            "=== Layer-level breakdown (us) ===",
+            header_layer,
+            sep_layer,
+        ]
+        for l in range(self.num_layers):
+            vals = [self.layer_accum[op][l] / n for op in _LAYER_OPS]
+            total = sum(vals)
+            row = f"  {l:3d} | " + " | ".join(f"{v:10.1f}" for v in vals) + f" | {total:8.1f}"
+            lines.append(row)
+
+        # Averages for layer 0 vs 1-60
+        lines.append(sep_layer)
+        avg0 = {op: self.layer_accum[op][0] / n for op in _LAYER_OPS}
+        avg_rest = {op: sum(self.layer_accum[op][1:]) / (n * 60) for op in _LAYER_OPS}
+        row0 = "  L0  | " + " | ".join(f"{avg0[op]:10.1f}" for op in _LAYER_OPS) + f" | {sum(avg0.values()):8.1f}"
+        row_r = " L1-60| " + " | ".join(f"{avg_rest[op]:10.1f}" for op in _LAYER_OPS) + f" | {sum(avg_rest.values()):8.1f}"
+        lines.extend([row0, row_r])
+
+        lines.extend([
+            "",
+            "=== MoE sub-op breakdown (us, layers 1-60 only) ===",
+            header_moe,
+            sep_moe,
+        ])
+        for l in range(1, self.num_layers):
+            vals = [self.moe_accum[op][l] / n for op in _MOE_OPS]
+            total = sum(vals)
+            row = f"  {l:3d} | " + " | ".join(f"{v:14.1f}" for v in vals) + f" | {total:9.1f}"
+            lines.append(row)
+
+        # MoE averages
+        lines.append(sep_moe)
+        avg_moe = {op: sum(self.moe_accum[op][1:]) / (n * 60) for op in _MOE_OPS}
+        row_m = " avg  | " + " | ".join(f"{avg_moe[op]:14.1f}" for op in _MOE_OPS) + f" | {sum(avg_moe.values()):9.1f}"
+        lines.append(row_m)
+
+        logging.info("\n".join(lines))
+
+        # Reset
+        self.samples = 0
+        for op in _LAYER_OPS:
+            self.layer_accum[op] = [0.0] * self.num_layers
+        for op in _MOE_OPS:
+            self.moe_accum[op] = [0.0] * self.num_layers
+
+
+# Global timer instance (lazy init)
+_k25_timer: Optional[K25DecodeTimer] = None
+
+
+def _get_k25_timer(num_layers: int = 61) -> Optional[K25DecodeTimer]:
+    global _k25_timer
+    if not _K25_TIMING_ENABLED:
+        return None
+    if _k25_timer is None:
+        _k25_timer = K25DecodeTimer(num_layers=num_layers)
+        logging.info(f"[K25 Timing] Enabled: {num_layers} layers, log every {_K25_TIMING_LOG_INTERVAL} steps")
+    return _k25_timer
 
 
 # ============================================================================
@@ -428,7 +592,10 @@ class MoEGate(nn.Module):
                 torch.empty(0, self.top_k, dtype=hidden_states.dtype, device=hidden_states.device),
             )
 
-        logits = F.linear(hidden_states, self.weight, None).float()
+        if _HAS_BATCH_INVARIANT:
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
+        else:
+            logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
@@ -445,7 +612,10 @@ class MoEGate(nn.Module):
             num_tokens = bsz * seq_len
         hidden_states = hidden_states.view(-1, h)
 
-        logits = F.linear(hidden_states, self.weight, None).float()
+        if _HAS_BATCH_INVARIANT:
+            logits = _bi_matmul(hidden_states, self.weight.t().contiguous()).float()
+        else:
+            logits = F.linear(hidden_states, self.weight, None).float()
         topk_idx, topk_weight = gate_sigmoid_topk_cuda(
             logits, self.e_score_correction_bias.float(),
             k=self.top_k, routed_scaling_factor=self.routed_scaling_factor,
@@ -469,6 +639,7 @@ class KimiK25MoE(nn.Module):
     """
 
     _buf: Optional['KimiK25MoEBufferManager'] = None
+    _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] per-rank token counts for padding masking
 
     def __init__(self, config):
         super().__init__()
@@ -586,13 +757,141 @@ class KimiK25MoE(nn.Module):
             self._moe_weights = weights
             self._wgmma_mod = _load_int4_grouped_module()
             self._use_grouped_wgmma = True
+
+            # Marlin W4A16 3-stage decode: weight pointers only (mtp-dependent buffers deferred)
+            self._use_marlin_decode = False
+            self._marlin_mtp = 0
+            # Marlin decode is default for K2.5
+            try:
+                N = self.moe_intermediate_size
+                K = self.config.hidden_size
+
+                # Collect weight pointers for all 3 projections
+                gate_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                gate_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                up_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_w_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+                down_s_ptrs = torch.empty(E, dtype=torch.int64, device=device)
+
+                for local_e in range(E):
+                    global_e = self.routed_expert_start_idx + local_e
+                    wrapper = self.experts[global_e]
+                    module = wrapper.module if hasattr(wrapper, 'module') else wrapper
+                    gate_w_ptrs[local_e] = module.marlin_gate_qw.data_ptr()
+                    gate_s_ptrs[local_e] = module.marlin_gate_scale.data_ptr()
+                    up_w_ptrs[local_e] = module.marlin_up_qw.data_ptr()
+                    up_s_ptrs[local_e] = module.marlin_up_scale.data_ptr()
+                    down_w_ptrs[local_e] = module.marlin_down_qw.data_ptr()
+                    down_s_ptrs[local_e] = module.marlin_down_scale.data_ptr()
+
+                mw = {}
+                # S1 fused: separate gate/up [E] each
+                mw['gate_B_ptrs'] = gate_w_ptrs
+                mw['gate_scales_ptrs'] = gate_s_ptrs
+                mw['up_B_ptrs'] = up_w_ptrs
+                mw['up_scales_ptrs'] = up_s_ptrs
+                # S3: down [E]
+                mw['s3_B_ptrs'] = down_w_ptrs
+                mw['s3_scales_ptrs'] = down_s_ptrs
+                mw['N'] = N
+                mw['K'] = K
+
+                self._marlin_weights = mw
+                self._use_marlin_decode = True
+            except AttributeError as e:
+                logging.warning(f"[MoE] Marlin weights not found: {e}")
+                self._use_marlin_decode = False
         except Exception as e:
             logging.warning(f"[MoE] Grouped WGMMA init failed, using loop fallback: {e}")
             self._use_grouped_wgmma = False
 
+    # Class-level shared Marlin buffers (like _buf, allocated once for all layers)
+    _marlin_gate_buf = None
+    _marlin_up_buf = None
+
+    def _init_marlin_buffers(self, mtp: int):
+        """Init Marlin 3-stage decode buffers.
+
+        gate_buf and up_buf are class-level (shared across all 60 MoE layers).
+        Called once during model init, before KV cache sizing.
+        Per-instance: expert_starts, C_ptrs, workspaces.
+        """
+        mw = self._marlin_weights
+        E = self.num_persistent_local_experts
+        N = mw['N']  # 2048
+        K = mw['K']  # 7168
+        device = self.device
+
+        # Expert starts: mtp stride for 3D buffer access
+        mw['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
+
+        # S1 fused C_ptrs [E]: output into buf.intermediate at mtp stride
+        buf = self.__class__._buf
+        bpr_N = N * 2  # bytes per row (BF16)
+        mw['s1_fused_C_ptrs'] = torch.tensor(
+            [buf.intermediate.data_ptr() + e * mtp * bpr_N for e in range(E)],
+            dtype=torch.int64, device=device)
+
+        # S1 workspace (E matrices for fused kernel)
+        n_tiles_s1 = N // 256  # 8
+        mw['s1_workspace'] = torch.zeros(
+            E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+
+        # S3 workspace
+        n_tiles_s3 = K // 256  # 28
+        mw['s3_workspace'] = torch.zeros(
+            E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
+
+        # S3 C_ptrs: pre-computed, recomputed only if expert_out moves
+        mw['_s3_expert_out_ptr'] = None
+        mw['s3_C_ptrs'] = None
+
+        # Cache Marlin module to avoid per-step import + function call
+        from batchgen.moe.marlin_grouped_moe import _load_module
+        self._marlin_mod = _load_module()
+
+        self._marlin_mtp = mtp
+        if self.rank == 0:
+            logging.info(f"[MoE] Marlin 3-stage fused buffers initialized "
+                         f"(E={E}, mtp={mtp})")
+
+    def _compact_after_allgather(self, all_tokens, num_tokens, num_global, H, device):
+        """Strip padding from AllGathered buffer so all GEMMs see only real tokens.
+
+        Returns (compact_tokens, total_real, my_offset).
+        Adds ~2s/128 iters overhead from CPU-GPU sync + Python copy loop.
+        Enable with BATCHGEN_MOE_COMPACT=1.
+        """
+        _local_cnt = torch.tensor([num_tokens], dtype=torch.int32, device=device)
+        _all_cnts = torch.zeros(self.world_size, dtype=torch.int32, device=device)
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                _all_cnts, _local_cnt,
+                stream=torch.cuda.default_stream(device),
+            )
+        _counts_cpu = _all_cnts.tolist()
+        total_real = sum(_counts_cpu)
+
+        ntp = self.num_tokens_per_rank
+        if total_real < num_global and total_real > 0:
+            compact = torch.empty(total_real, H, device=device, dtype=all_tokens.dtype)
+            dst = 0
+            for r in range(self.world_size):
+                c = _counts_cpu[r]
+                if c > 0:
+                    compact[dst:dst + c] = all_tokens[r * ntp : r * ntp + c]
+                    dst += c
+            my_offset = sum(_counts_cpu[:self.rank])
+            return compact, total_real, my_offset
+        else:
+            t = total_real if total_real > 0 else num_global
+            return all_tokens[:t], t, self.rank * ntp
+
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → CUDA gate → 3D dispatch → inplace WGMMA → reduce → AllReduce."""
+        timer = _get_k25_timer()
         buf = self.__class__._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -631,6 +930,11 @@ class KimiK25MoE(nn.Module):
         with torch.cuda.stream(shared_stream):
             shared_out = self.shared_experts(identity)
 
+        # --- MoE sub-op timing (9 ops, 10 events on compute stream) ---
+        if timer is not None:
+            ev = timer.make_events(len(_MOE_OPS))
+            ev[0].record()  # before allgather
+
         # AllGather on compute stream (normal path)
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
@@ -638,8 +942,33 @@ class KimiK25MoE(nn.Module):
                 stream=torch.cuda.default_stream(device),
             )
 
+        total_real = num_global
+        _my_offset = self.rank * self.num_tokens_per_rank
+
+        if timer is not None:
+            ev[1].record()  # after allgather, before gate
+
         # 2) CUDA gate: sigmoid + top-k + normalize + scale
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+
+        # Mask padding tokens to prevent them from inflating expert_counts.
+        # rank_token_counts[r] = real token count for rank r (set by worker via PSM).
+        # Padding at positions [r*ntp + count_r, (r+1)*ntp) for each rank r.
+        # Setting topk_idx=-1 makes dispatch skip them (existing local_expert<0 guard).
+        rank_counts = self.__class__._rank_token_counts
+        if rank_counts is not None:
+            ntp = self.num_tokens_per_rank
+            positions = torch.arange(num_global, device=device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            max_valid = rank_counts[rank_ids]
+            padding_mask = local_pos >= max_valid
+            if padding_mask.any():
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
+
+        if timer is not None:
+            ev[2].record()  # after gate, before dispatch
 
         # 3) 3D dispatch scatter into strided buffer
         if buf is not None:
@@ -649,7 +978,7 @@ class KimiK25MoE(nn.Module):
                 self.routed_expert_start_idx, self.experts_per_rank,
                 buf.max_tokens_padded,
                 buf.expert_counts, buf.expert_counters,
-                buf.topk_pos[:num_global * topk],
+                buf.topk_pos[:total_real * topk],
             )
         else:
             mtp = _DEFAULT_MTP
@@ -657,7 +986,7 @@ class KimiK25MoE(nn.Module):
             dispatched_x = torch.zeros(E * mtp, H, dtype=torch.bfloat16, device=device)
             expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
             expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
-            topk_pos = torch.full((num_global * topk,), -1, dtype=torch.int32, device=device)
+            topk_pos = torch.full((total_real * topk,), -1, dtype=torch.int32, device=device)
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
                 dispatched_x,
@@ -665,18 +994,63 @@ class KimiK25MoE(nn.Module):
                 expert_counts, expert_counters, topk_pos,
             )
 
+        if timer is not None:
+            ev[3].record()  # after dispatch, before wgmma_s1
+
         # 4) Expert compute: grouped INT4 WGMMA inplace on 3D strided buffers
-        if getattr(self, '_use_grouped_wgmma', False) \
+        mtp = buf.max_tokens_padded if buf is not None else 0
+
+        if getattr(self, '_use_marlin_decode', False) and buf is not None:
+            # === DECODE: Marlin 3-Stage (weight-format-driven, no runtime dispatch) ===
+            # Marlin weights are loaded at init time. Kernel selection follows weight format.
+            if self._marlin_mtp != mtp:
+                self._init_marlin_buffers(mtp)
+
+            # Pigeonhole bound for CTA M-tiling grid size
+            max_possible_m = min(total_real, mtp)
+            max_marlin_m_tiles = (max_possible_m + 15) // 16
+
+            mod_m = self._marlin_mod
+            mw = self._marlin_weights
+            E_local = buf.E_local
+
+            # S3 C_ptrs: recompute only if expert_out buffer moved
+            if mw['_s3_expert_out_ptr'] != buf.expert_out.data_ptr():
+                bpr_K = mw['K'] * 2
+                mw['s3_C_ptrs'] = torch.tensor(
+                    [buf.expert_out.data_ptr() + e * mtp * bpr_K for e in range(E_local)],
+                    dtype=torch.int64, device=device)
+                mw['_s3_expert_out_ptr'] = buf.expert_out.data_ptr()
+
+            # Stage 1: fused gate+up+SiLU (single kernel, E matrices)
+            n_tiles_s1 = N // 256
+            mod_m.grouped_marlin_gemm_m16_s1(
+                buf.dispatched_x,
+                mw['gate_B_ptrs'], mw['up_B_ptrs'], mw['s1_fused_C_ptrs'],
+                mw['gate_scales_ptrs'], mw['up_scales_ptrs'],
+                mw['expert_starts'], expert_counts,
+                E_local, N, K, mw['s1_workspace'], n_tiles_s1, max_marlin_m_tiles)
+
+            if timer is not None:
+                ev[4].record()  # after fused S1, before S3
+
+            # Stage 3: down GEMM (E matrices)
+            n_tiles_s3 = K // 256
+            mod_m.grouped_marlin_gemm_m16(
+                buf.intermediate, mw['s3_B_ptrs'], mw['s3_C_ptrs'],
+                mw['s3_scales_ptrs'], mw['expert_starts'], expert_counts,
+                E_local, K, N, mw['s3_workspace'],
+                E_local, n_tiles_s3, max_marlin_m_tiles)
+
+        elif getattr(self, '_use_grouped_wgmma', False) \
                 and buf is not None and buf.tma_dispatched is not None:
+            # === WGMMA 2-Stage (used when Marlin disabled or prefill mode) ===
             mod = self._wgmma_mod
             w = self._moe_weights
-            mtp = buf.max_tokens_padded
-            # Heuristic grid: assume worst-case ~2x uniform distribution
-            avg_per_expert = (num_global * topk + buf.E_local - 1) // buf.E_local
+            avg_per_expert = (total_real * topk + buf.E_local - 1) // buf.E_local
             max_m_tiles = (min(avg_per_expert * 2, mtp) + _BLOCK_M - 1) // _BLOCK_M
             max_m_tiles = max(max_m_tiles, 1)
 
-            # Stage 1 inplace: dispatched_x → intermediate
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 expert_counts,
@@ -685,8 +1059,8 @@ class KimiK25MoE(nn.Module):
                 buf.empty_bias, buf.empty_bias,
                 N, K // 2, K // 32, max_m_tiles, mtp,
             )
-
-            # Stage 2 inplace: intermediate → expert_out
+            if timer is not None:
+                ev[4].record()  # after stage1, before stage2
             mod.grouped_int4_moe_stage2_inplace(
                 buf.intermediate, buf.expert_out, buf.tma_intermediate,
                 expert_counts,
@@ -695,18 +1069,24 @@ class KimiK25MoE(nn.Module):
                 K, N // 2, N // 32, max_m_tiles, mtp,
             )
 
-        # 5) Reduce: weighted scatter from 3D strided buffer to flat [G, H]
+        if timer is not None:
+            ev[5].record()  # after wgmma_s2, before reduce
+
+        # 5) Reduce: weighted scatter from 3D strided buffer to flat [total_real, H]
         if buf is not None:
-            result_buf = buf.result_buffer[:num_global]
+            result_buf = buf.result_buffer[:total_real]
             global_results = reduce_weighted_scatter(
                 buf.expert_out, topk_pos, topk_weight,
-                num_global, H, topk, output=result_buf,
+                total_real, H, topk, output=result_buf,
             )
         else:
             global_results = reduce_weighted_scatter(
                 dispatched_x, topk_pos, topk_weight,
-                num_global, H, topk,
+                total_real, H, topk,
             )
+
+        if timer is not None:
+            ev[6].record()  # after reduce, before allreduce
 
         # 6) AllReduce
         with self.comm.change_state(enable=True):
@@ -715,11 +1095,21 @@ class KimiK25MoE(nn.Module):
                 stream=torch.cuda.default_stream(device),
             )
 
+        if timer is not None:
+            ev[7].record()  # after allreduce, before shared_expert sync
+
         # 7) Sync shared expert stream and combine
         compute_stream.wait_stream(shared_stream)
-        start = self.rank * self.num_tokens_per_rank
-        end = start + num_tokens
-        out = global_results[start:end] + shared_out
+
+        if timer is not None:
+            ev[8].record()  # after shared_expert sync, before extract_combine
+
+        out = global_results[_my_offset:_my_offset + num_tokens] + shared_out
+
+        if timer is not None:
+            ev[9].record()  # after extract_combine
+            timer.defer_moe_times(self._layer_idx, ev, _MOE_OPS)
+
         return out.view(*orig_shape)
 
     @torch.inference_mode()
@@ -783,6 +1173,7 @@ class KimiK25DecoderLayer(nn.Module):
             self.mlp = DenseMLP(config)
         else:
             self.mlp = KimiK25MoE(config)
+            self.mlp._layer_idx = layer_idx
 
     @staticmethod
     def _get_fused_add_rmsnorm_fn():
@@ -795,6 +1186,16 @@ class KimiK25DecoderLayer(nn.Module):
         except Exception:
             return None
 
+    def enable_cuda_graph(self, manager, attn_name: str, max_pages_per_seq: int = 0):
+        """Enable per-layer CUDA graph for MLA attention.
+
+        MoE stays eager (preserves async shared expert overlap).
+        Each rank uses local batch_size for bucket selection (DP-attention, no NCCL).
+        """
+        self.cuda_graph_manager = manager
+        self._attn_segment_name = attn_name
+        self._graph_max_pages = max_pages_per_seq
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -805,31 +1206,101 @@ class KimiK25DecoderLayer(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+
+        timer = _get_k25_timer()
+        layer_idx = kwargs.get("layer_idx", self.layer_idx)
+        batch_size = hidden_states.shape[0]
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
 
-        # Pre-norm attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(hidden_states=hidden_states)
-        hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+        if timer is not None:
+            ev = timer.make_events(len(_LAYER_OPS))
+            ev[0].record()
 
-        # Fused: residual += attn_out, then post_attention_layernorm
-        if fused_add_norm is not None:
-            hidden_states, residual = fused_add_norm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.variance_epsilon,
-            )
-        else:
-            hidden_states = residual + hidden_states
+        # ---- MLA Attention: CUDA graph or eager ----
+        use_graph = (hasattr(self, 'cuda_graph_manager')
+                     and self.cuda_graph_manager is not None
+                     and getattr(self, '_attn_segment_name', None) is not None
+                     and batch_size > 0)
+        attn_done = False
+
+        if use_graph:
+            try:
+                gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
+                _, _, page_table = gpu_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
+                slot_indices = gpu_kv_manager._gpu_page_table_manager._slot_index_tensor
+                cache_seqlens = AttnWrapperBase.cache_seqlens
+
+                pt = page_table[:batch_size]
+                if self._graph_max_pages > 0 and pt.shape[1] < self._graph_max_pages:
+                    pt = torch.nn.functional.pad(
+                        pt, (0, self._graph_max_pages - pt.shape[1]), value=0
+                    )
+                elif self._graph_max_pages > 0 and pt.shape[1] > self._graph_max_pages:
+                    pt = pt[:, :self._graph_max_pages]
+
+                out = self.cuda_graph_manager.replay(
+                    self._attn_segment_name,
+                    batch_size,
+                    hidden_states=hidden_states,
+                    cache_seqlens=cache_seqlens[:batch_size],
+                    page_table=pt,
+                    slot_indices=slot_indices[:batch_size],
+                )
+
+                hidden_states = out["normed"]
+                residual = out["residual"]
+
+                kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+                if kv_cb is not None:
+                    kv_cb(self.layer_idx, out["k_tensor"][:batch_size].clone(), None)
+
+                attn_done = True
+            except (ValueError, RuntimeError) as e:
+                logging.warning(f"Layer {self.layer_idx} graph replay failed: {e}, falling back to eager")
+                attn_done = False
+
+        if timer is not None:
+            ev[1].record()  # input_ln (includes graph setup overhead if graph path)
+
+        if not attn_done:
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            if timer is not None:
+                ev[1].record()  # re-record after actual input_ln
 
-        # MoE/FFN
+            attn_out = self.self_attn(hidden_states=hidden_states)
+            hidden_states = attn_out[0] if isinstance(attn_out, tuple) else attn_out
+
+            if fused_add_norm is not None:
+                hidden_states, residual = fused_add_norm(
+                    residual, hidden_states,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = residual + hidden_states
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if timer is not None:
+            ev[2].record()  # after mla
+
+        if timer is not None:
+            ev[3].record()  # post_ln_res (fused with mla in eager, part of graph in graph path)
+
+        # ---- MoE/FFN: always eager (preserves async shared expert overlap) ----
         hidden_states = self.mlp(hidden_states)
+
+        if timer is not None:
+            ev[4].record()  # after mlp
 
         # residual += mlp_out
         hidden_states = residual + hidden_states
+
+        if timer is not None:
+            ev[5].record()  # after res_add
+            timer.defer_layer_times(layer_idx, ev, _LAYER_OPS)
 
         return (hidden_states, None, None)
 
@@ -898,15 +1369,22 @@ class KimiK25Model(nn.Module):
 
         hidden_states = inputs_embeds
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             layer_output = layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                layer_idx=layer_idx,
             )
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
         hidden_states = self.norm(hidden_states)
+
+        # Signal step done to timer
+        timer = _get_k25_timer()
+        if timer is not None:
+            timer.step_done()
+
         return hidden_states
 
 
@@ -948,7 +1426,25 @@ class KimiK25ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
         )
-        logits = self.lm_head(hidden_states)
+        if _HAS_BATCH_INVARIANT and hidden_states.numel() > 0:
+            hs_shape = hidden_states.shape
+            hs_2d = hidden_states.view(-1, hs_shape[-1])
+            M = hs_2d.shape[0]
+            if not hasattr(self, '_lm_head_weight_t') or self._lm_head_weight_t is None:
+                self._lm_head_weight_t = self.lm_head.weight.t().contiguous()
+            _CHUNK = 4096
+            if M <= _CHUNK:
+                logits = _bi_matmul(hs_2d, self._lm_head_weight_t).float()
+            else:
+                logits = torch.empty(M, self._lm_head_weight_t.shape[1],
+                                     device=hs_2d.device, dtype=torch.float32)
+                for start in range(0, M, _CHUNK):
+                    end = min(start + _CHUNK, M)
+                    logits[start:end] = _bi_matmul(
+                        hs_2d[start:end], self._lm_head_weight_t).float()
+            logits = logits.view(*hs_shape[:-1], -1)
+        else:
+            logits = self.lm_head(hidden_states).float()
         return _CausalLMOutput(logits=logits)
 
     def eval(self):

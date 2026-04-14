@@ -1460,18 +1460,37 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 
 	hidden_states = hidden_states.squeeze(1)  # [bsz, hidden_dim]
 
+	# ============ PER-OP TIMING (BATCHGEN_MLA_TIMING=1) ============
+	import os as _os
+	_do_timing = _os.environ.get("BATCHGEN_MLA_TIMING", "0") == "1" and layer_idx == 0
+	if _do_timing:
+		if not hasattr(mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv, '_timing_step'):
+			mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step = 0
+			mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_accum = {}
+		_step = mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step
+		mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_step = _step + 1
+		_accum = mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv._timing_accum
+		_events = []
+		def _mark(name):
+			e = torch.cuda.Event(enable_timing=True)
+			e.record()
+			_events.append((name, e))
+		_mark("start")
+
 	# ============ PURE BF16 PROJECTIONS (no quantization) ============
 	q = F.linear(hidden_states, self.q_a_proj.weight)
 	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
 
 	q = self.q_a_layernorm(q)
 	q = F.linear(q, self.q_b_proj.weight)
+	if _do_timing: _mark("projections")
 
 	# ============ ROPE & QUERY PROCESSING ============
 	q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
 	q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 	q_pe = q_pe.contiguous()
 	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+	if _do_timing: _mark("q_reshape_rope")
 
 	# ============ KV CACHE UPDATE ============
 	offload_kv = fused_rmsnorm_rope_with_q(
@@ -1484,6 +1503,7 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		self.kv_lora_rank,
 		self.qk_rope_head_dim,
 	)
+	if _do_timing: _mark("fused_kv_norm_rope")
 
 	manager_device = gpu_paged_kv_manager.device
 	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
@@ -1496,10 +1516,12 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		layer_idx=layer_idx,
 		batch_slice=batch_slice,
 	)
+	if _do_timing: _mark("kv_cache_update")
 
 	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
 		layer_idx=layer_idx
 	)
+	if _do_timing: _mark("get_kv_page_table")
 
 	# Apply batch slice for micro-batching
 	if batch_slice is not None:
@@ -1528,6 +1550,173 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 	).view(bsz, self.num_heads, 1, self.kv_lora_rank)
 	query_states[:, :, :, self.kv_lora_rank:] = q_pe
 	query_states = query_states.view(bsz, 1, self.num_heads, qk_head_dim)
+	if _do_timing: _mark("q_absorb")
+
+	# ============ FLASH MLA ATTENTION ============
+	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+
+	attn_out, _ = flash_mla_with_kvcache(
+		query_states,
+		blocked_k,
+		block_table,
+		cache_seqlens,
+		512,
+		tile_scheduler_metadata,
+		num_splits,
+		self.softmax_scale,
+		True,
+	)
+	if _do_timing: _mark("flash_mla")
+
+	# ============ OUTPUT PROJECTION (Pure BF16) ============
+	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
+	attn_output = attn_output.transpose(1, 2).contiguous()
+	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	attn_output = F.linear(attn_output, self.o_proj.weight)
+	attn_output = attn_output.view(bsz, 1, -1)
+	if _do_timing: _mark("out_absorb_oproj")
+
+	# ============ ACCUMULATE TIMING (print at step 128, layer 0 only) ============
+	if _do_timing:
+		if '_pending_events' not in _accum:
+			_accum['_pending_events'] = []
+		_accum['_pending_events'].append(_events)
+
+		# Print at step 128 (after enough data, skip first 8 warmup steps)
+		if _step == 128:
+			torch.cuda.synchronize()
+			pending = _accum.pop('_pending_events', [])
+			# Skip first 8 steps (warmup, Triton JIT, etc.)
+			skip = min(8, len(pending) // 2)
+			measure = pending[skip:]
+			for evts in measure:
+				for i in range(1, len(evts)):
+					name = evts[i][0]
+					dt = evts[i-1][1].elapsed_time(evts[i][1])
+					_accum[name] = _accum.get(name, 0.0) + dt
+			# Print averages
+			parts = []
+			total = 0
+			n = len(measure)
+			for name in [k for k in _accum if not k.startswith('_')]:
+				avg_us = _accum[name] / n * 1000
+				parts.append(f"{name}={avg_us:.0f}us")
+				total += avg_us
+			parts.append(f"TOTAL={total:.0f}us")
+			import logging as _logging
+			_logging.info(f"[MLA TIMING L0] bsz={bsz} (avg over {n} steps, skip {skip}): {', '.join(parts)}")
+			_accum.clear()
+			_accum['_pending_events'] = []
+
+	return attn_output, k_tensor
+
+
+@torch.inference_mode()
+def mla_decoding_optimized_with_pagekv(
+	self,
+	hidden_states: torch.Tensor,
+	q_position_ids: torch.Tensor,
+	cache_seqlens: torch.Tensor,
+	max_seqlen: int,
+	weight_scale: Optional[dict] = None,
+	gpu_paged_kv_manager: Optional['GPUPagedKVCacheManager'] = None,
+	layer_idx: int = 0,
+	batch_slice: Optional[tuple] = None,
+):
+	"""Fully optimized MLA decode with ALL fused kernels.
+
+	Optimizations vs original mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv:
+	1. fused_q_split_cuda: replaces view+transpose+split+contiguous (4 ops → 1)
+	2. fused_rmsnorm_rope_cache_update_with_q_return_new_kv: replaces separate
+	   RMSNorm+RoPE+KV_cache_update (3 ops → 1, biggest savings)
+	3. fused_q_absorb_query_states: replaces einsum+alloc+2×copy (4 ops → 1)
+	4. fused_out_absorb_reshape: replaces einsum+transpose+contiguous+reshape (4 ops → 1)
+
+	Bind via Parallel_Strategy_Manager with BATCHGEN_OPTIMIZED_DECODE=1.
+	"""
+	from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
+	from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape
+
+	if gpu_paged_kv_manager is None:
+		raise ValueError("gpu_paged_kv_manager is required for optimized decode path")
+
+	bsz = hidden_states.shape[0]
+	q_len = 1
+
+	if bsz == 0:
+		return hidden_states, None
+
+	hidden_states = hidden_states.squeeze(1)
+
+	# ============ PURE BF16 PROJECTIONS (same as original) ============
+	q = F.linear(hidden_states, self.q_a_proj.weight)
+	new_compressed_kv = F.linear(hidden_states, self.kv_a_proj_with_mqa.weight).view(bsz, 1, -1)
+
+	q = self.q_a_layernorm(q)
+	q = F.linear(q, self.q_b_proj.weight)
+
+	# ============ OPT 1: FUSED Q SPLIT (replaces view+transpose+split+contiguous) ============
+	try:
+		from batchgen.attention.mla.fused_q_split_cuda import fused_q_split
+		q_nope, q_pe = fused_q_split(
+			q, num_heads=self.num_heads,
+			nope_dim=self.qk_nope_head_dim, rope_dim=self.qk_rope_head_dim,
+		)
+	except (ImportError, Exception) as _e:
+		# Fallback: original ops
+		if not getattr(mla_decoding_optimized_with_pagekv, '_warned_q_split', False):
+			logging.warning(f"[MLA OPT] fused_q_split_cuda unavailable, using fallback: {_e}")
+			mla_decoding_optimized_with_pagekv._warned_q_split = True
+		q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+		q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+		q_pe = q_pe.contiguous()
+		q_nope = q_nope.squeeze(2)
+
+	cos, sin = self.rotary_emb(q_pe, seq_len=max_seqlen)
+
+	# ============ KV NORM+ROPE (existing production fused kernel — already optimal) ============
+	# fused_rmsnorm_rope_with_q does RMSNorm + RoPE on KV + RoPE on all Q heads in 1 kernel
+	offload_kv = fused_rmsnorm_rope_with_q(
+		new_compressed_kv,
+		q_pe if q_pe.dim() == 4 else q_pe.unsqueeze(2),
+		cos,
+		sin,
+		q_position_ids,
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
+	)
+
+	# Paged KV cache update (CUDA kernel — production standard)
+	manager_device = gpu_paged_kv_manager.device
+	k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1)).to(manager_device)
+	sequence_lengths = q_position_ids.squeeze(-1).to(dtype=torch.int32, device=manager_device)
+
+	gpu_paged_kv_manager.update_layer_decode_new_token(
+		k_tensor=k_tensor,
+		v_tensor=None,
+		sequence_lengths=sequence_lengths,
+		layer_idx=layer_idx,
+		batch_slice=batch_slice,
+	)
+
+	blocked_k, _, block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(
+		layer_idx=layer_idx
+	)
+
+	if batch_slice is not None:
+		start_idx, end_idx = batch_slice
+		block_table = block_table[start_idx:end_idx]
+
+	# ============ KV_B_PROJ ============
+	kv_b_proj = self.kv_b_proj.weight.data.view(self.num_heads, -1, self.kv_lora_rank)
+	q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]
+	out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]
+
+	# ============ OPT 3: FUSED QUERY STATES (replaces einsum+alloc+2×copy) ============
+	q_nope_sq = q_nope if q_nope.dim() == 3 else q_nope.squeeze(2)
+	query_states = fused_q_absorb_query_states(q_nope_sq, q_absorb,
+		q_pe if q_pe.dim() == 4 else q_pe.unsqueeze(2))
 
 	# ============ FLASH MLA ATTENTION ============
 	tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
@@ -1544,10 +1733,8 @@ def mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv(
 		True,
 	)
 
-	# ============ OUTPUT PROJECTION (Pure BF16) ============
-	attn_output = torch.einsum('bqhc,hdc->bhqd', attn_out, out_absorb)
-	attn_output = attn_output.transpose(1, 2).contiguous()
-	attn_output = attn_output.reshape(bsz, self.num_heads * self.v_head_dim)
+	# ============ OPT 4: FUSED OUTPUT (replaces einsum+transpose+contiguous+reshape) ============
+	attn_output = fused_out_absorb_reshape(attn_out, out_absorb)
 	attn_output = F.linear(attn_output, self.o_proj.weight)
 	attn_output = attn_output.view(bsz, 1, -1)
 

@@ -31,6 +31,8 @@ from batchgen.server.io_struct import (
     ToolCallFunction,
     Usage,
 )
+from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
+from batchgen.server.scheduling_pool import SchedulingPool
 from batchgen.server.server_args import ServerArgs
 from batchgen.server.storage import StorageManager
 from batchgen.server.worker_manager import WorkerManager
@@ -101,23 +103,63 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
+        # Request pool state
+        self._pool_mode = server_args.max_pool_size > 0
+        self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
+        self._batch_timeout = 86400  # 24h default, matches completion_window
+        self._intake_pool = IntakePool(max_capacity=self._max_intake_capacity)
+        self._scheduling_pool = SchedulingPool(
+            capacity=server_args.max_pool_size if self._pool_mode else 1024
+        )
+        self._pool_initialized = False  # First batch triggers worker init
+        self._completion_listener_task: Optional[asyncio.Task] = None
+        self._drain_task: Optional[asyncio.Task] = None
+        # Per-request metadata for building output JSONL in pool mode
+        # Structure: {batch_id: {request_id: {custom_id, url, model, prompt_text}}}
+        self._pool_request_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     async def start(self) -> None:
         if self._task:
             return
         self._stopped.clear()
         self._task = asyncio.create_task(self._run())
+        # Start pool mode background tasks
+        if self._pool_mode:
+            self._completion_listener_task = asyncio.create_task(
+                self._pool_completion_listener()
+            )
+            self._drain_task = asyncio.create_task(
+                self._drain_intake_to_worker()
+            )
 
     async def stop(self) -> None:
         if not self._task:
             return
         self._stopped.set()
-        self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
+        # Cancel all tasks (background pool tasks + main task)
+        for task in [self._completion_listener_task, self._drain_task, self._task]:
+            if task:
+                task.cancel()
+        for task in [self._completion_listener_task, self._drain_task, self._task]:
+            if task:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._task = None
+        self._completion_listener_task = None
+        self._drain_task = None
+
+    def intake_pool_usage_pct(self) -> float:
+        """Return intake pool usage as a fraction (0.0-1.0)."""
+        cap = self._intake_pool.max_capacity
+        return self._intake_pool.size() / cap if cap > 0 else 0.0
+
+    def intake_pool_size(self) -> int:
+        return self._intake_pool.size()
+
+    def intake_pool_capacity(self) -> int:
+        return self._intake_pool.max_capacity
 
     async def enqueue(self, batch_id: str) -> None:
         await self._queue.put(batch_id)
@@ -237,6 +279,15 @@ class BatchScheduler:
                 parse_tool_call=self.server_args.parse_tool_call,
             )
 
+        # --- Pool mode: send admission messages instead of blocking infer() ---
+        if self._pool_mode:
+            await self._process_batch_pool_mode(
+                batch_id, batch, requests, prompts,
+                per_request_max_tokens, sampling_params, incremental_kwargs,
+            )
+            return
+
+        # --- Legacy mode: blocking infer() ---
         try:
             results = await asyncio.to_thread(
                 self.worker.infer,
@@ -425,19 +476,26 @@ class BatchScheduler:
     def _build_output_items(
         self,
         requests: List[BatchRequestItem],
-        results: List[Any],
+        results: Any,
         prompts: List[str],
     ) -> List[BatchResultItem]:
         output: List[BatchResultItem] = []
-        normalized_results = self._normalize_worker_results(
-            results, len(requests)
-        )
-        for idx, request in enumerate(requests):
-            result = (
-                normalized_results[idx]
-                if idx < len(normalized_results)
-                else None
+        # Support both dict (new: {global_idx: str}) and list (legacy) results
+        if isinstance(results, dict):
+            normalized_results = results
+        else:
+            normalized_results = self._normalize_worker_results(
+                results, len(requests)
             )
+        for idx, request in enumerate(requests):
+            if isinstance(normalized_results, dict):
+                result = normalized_results.get(idx)
+            else:
+                result = (
+                    normalized_results[idx]
+                    if idx < len(normalized_results)
+                    else None
+                )
             response = None
             error = None
             if result is None:
@@ -776,3 +834,431 @@ class BatchScheduler:
                 for key, val in value.items()
             }
         return value
+
+    # ============ Pool Mode ============
+
+    async def _process_batch_pool_mode(
+        self,
+        batch_id: str,
+        batch: Any,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+        per_request_max_tokens: List[int],
+        sampling_params: List[Dict[str, Any]],
+        incremental_kwargs: Dict[str, Any],
+    ) -> None:
+        """Process a batch in pool mode: push to IntakePool for async processing.
+
+        All batches (including the first) go through IntakePool → drain task → worker.
+        The drain task sends an "init" message on first drain, then admission messages.
+        """
+        max_tokens = max(per_request_max_tokens)
+
+        # Register batch for completion tracking
+        self._scheduling_pool.register_batch(
+            batch_id=batch_id,
+            total_requests=len(requests),
+            output_path=str(
+                self.storage.output_dir / f"{batch_id}_output.jsonl"
+            ) if hasattr(self.storage, 'output_dir') else None,
+        )
+
+        # Build IntakeEntry objects and push to IntakePool
+        entries = []
+        for idx, req in enumerate(requests):
+            entries.append(IntakeEntry(
+                request_id=req.custom_id or f"{batch_id}_req_{idx}",
+                batch_id=batch_id,
+                raw_request={
+                    "text": prompts[idx],
+                    "max_tokens": per_request_max_tokens[idx],
+                    "priority": 0,  # TODO: support per-batch priority from API
+                    "sampling_params": sampling_params[idx] if sampling_params else {},
+                },
+                priority=Priority.NORMAL,
+            ))
+        accepted = self._intake_pool.submit_batch(batch_id, entries, Priority.NORMAL)
+        if not accepted:
+            current = self._intake_pool.size()
+            cap = self._intake_pool.max_capacity
+            error_msg = (
+                f"Server at capacity: intake pool has {current}/{cap} requests. "
+                f"Batch with {len(entries)} requests rejected. Retry later."
+            )
+            logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
+            self.storage.update_batch(batch_id, status="failed", error={
+                "code": "capacity_exceeded", "message": error_msg,
+            })
+            return
+        # Store max_tokens for init message
+        if not hasattr(self, '_pool_max_output_len'):
+            self._pool_max_output_len = max_tokens
+        else:
+            self._pool_max_output_len = max(self._pool_max_output_len, max_tokens)
+        if not hasattr(self, '_pool_max_context_length'):
+            self._pool_max_context_length = batch.max_context_length
+
+        # Store per-request metadata for output JSONL building
+        self._pool_request_meta[batch_id] = {}
+        for idx, req in enumerate(requests):
+            rid = req.custom_id or f"{batch_id}_req_{idx}"
+            self._pool_request_meta[batch_id][rid] = {
+                "custom_id": rid,
+                "url": req.url.value,
+                "model": req.body.model,
+                "prompt_text": prompts[idx],
+            }
+
+        # Ensure incremental output directory exists
+        incr_dir = self.server_args.incremental_output_dir
+        if incr_dir:
+            from pathlib import Path
+            Path(incr_dir).mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"[POOL] Batch {batch_id}: {len(entries)} requests pushed to IntakePool "
+            f"(total in pool: {self._intake_pool.size()})"
+        )
+
+        # Launch background task to wait for completion and finalize output.
+        # Return immediately so the scheduler can process the next batch.
+        asyncio.ensure_future(
+            self._wait_and_finalize_batch(batch_id, requests, prompts)
+        )
+
+    async def _wait_and_finalize_batch(
+        self,
+        batch_id: str,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+    ) -> None:
+        """Background task: wait for a batch to complete, then finalize output."""
+        import time as _time
+        deadline = _time.time() + self._batch_timeout
+        batch_failed = False
+
+        while True:
+            tracker = self._scheduling_pool.get_batch_tracker(batch_id)
+            if tracker and tracker.is_complete:
+                break
+            if tracker and getattr(tracker, 'error', None):
+                logger.error(f"[POOL] Batch {batch_id} failed: {tracker.error}")
+                batch_failed = True
+                break
+            if _time.time() > deadline:
+                logger.error(f"[POOL] Batch {batch_id} timed out after {self._batch_timeout}s")
+                batch_failed = True
+                break
+            await asyncio.sleep(0.5)
+
+        if batch_failed:
+            error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
+            self.storage.update_batch(batch_id, status="failed", error={
+                "code": "batch_failed", "message": str(error_msg)
+            })
+            return
+
+        self._finalize_batch_output(batch_id, requests, prompts)
+
+    async def _drain_intake_to_worker(self) -> None:
+        """Background task: drain IntakePool → send admission messages to worker.
+
+        On first drain, sends an "init" message to trigger worker initialization.
+        Subsequent drains send "admit" messages with sequences.
+        """
+        logger.info("[POOL] Intake drain task started")
+        while not self._stopped.is_set():
+            if self._intake_pool.is_empty():
+                await asyncio.sleep(0.1)
+                continue
+
+            # First drain: send init message to worker
+            if not self._pool_initialized:
+                init_msg = {
+                    "type": "init",
+                    "max_output_len": getattr(self, '_pool_max_output_len', 4096),
+                    "max_context_length": getattr(self, '_pool_max_context_length', None),
+                }
+                self.worker.request_queue.put(init_msg)
+                self._pool_initialized = True
+                logger.info("[POOL] Init message sent to worker")
+                # Brief wait for worker to initialize before sending sequences
+                await asyncio.sleep(1.0)
+
+            # Drain from IntakePool (up to scheduling pool free slots)
+            free_slots = self._scheduling_pool.num_free_slots()
+            if free_slots <= 0:
+                # DIAG: Log when drain is blocked by full scheduling pool
+                if not hasattr(self, '_drain_blocked_logged'):
+                    self._drain_blocked_logged = False
+                if not self._drain_blocked_logged:
+                    logger.warning(
+                        f"[POOL] Drain blocked: scheduling pool full "
+                        f"(active={self._scheduling_pool.num_active_slots()}, "
+                        f"capacity={self._scheduling_pool._capacity}, "
+                        f"intake={self._intake_pool.size()})"
+                    )
+                    self._drain_blocked_logged = True
+                await asyncio.sleep(0.2)
+                continue
+            self._drain_blocked_logged = False
+
+            drained = self._scheduling_pool.select_from_intake(
+                self._intake_pool, max_n=free_slots
+            )
+            if not drained:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Build admission message from drained entries
+            admit_entries = []
+            for entry in drained:
+                slot = self._scheduling_pool.allocate_slot(entry.request_id)
+                admit_entries.append({
+                    "request_id": entry.request_id,
+                    "text": entry.raw_request.get("text", ""),
+                    "max_tokens": entry.raw_request.get("max_tokens", 4096),
+                    "batch_id": entry.batch_id,
+                    "priority": entry.priority.value,
+                    "sampling_params": entry.raw_request.get("sampling_params", {}),
+                })
+
+            admission_msg = {
+                "type": "admit",
+                "entries": admit_entries,
+            }
+            self.worker.request_queue.put(admission_msg)
+            logger.warning(
+                f"[POOL] Drained {len(admit_entries)} entries to worker "
+                f"(intake remaining: {self._intake_pool.size()}, "
+                f"scheduling active: {self._scheduling_pool.num_active_slots()}, "
+                f"free={self._scheduling_pool.num_free_slots()})"
+            )
+
+        logger.info("[POOL] Intake drain task stopped")
+
+    def _fail_all_active_batches(self, error_msg: str) -> None:
+        """Mark all in-progress batches as failed. Called on fatal listener error."""
+        for batch_id, tracker in list(self._scheduling_pool._batch_trackers.items()):
+            if not tracker.is_complete and not getattr(tracker, 'is_failed', False):
+                tracker.error = error_msg
+                logger.error(f"[POOL] Batch {batch_id} marked FAILED: {error_msg}")
+
+    async def _pool_completion_listener(self) -> None:
+        """Background task: read per-request completions from worker response queue.
+
+        Routes each completion to the correct batch tracker and writes
+        incremental output.
+        """
+        import queue as queue_mod
+        logger.info("[POOL] Completion listener started")
+        while not self._stopped.is_set():
+            try:
+                result = await asyncio.to_thread(
+                    self.worker.response_queue.get,
+                    timeout=1.0,
+                )
+            except queue_mod.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"[POOL] Completion listener fatal error: {e}", exc_info=True)
+                self._fail_all_active_batches(f"Worker error: {e}")
+                break
+
+            if result is None:
+                break
+
+            if isinstance(result, dict):
+                msg_type = result.get("type")
+                if msg_type == "completion":
+                    request_id = result.get("request_id")
+                    batch_id = result.get("batch_id")
+                    if request_id:
+                        try:
+                            self._scheduling_pool.free_slot(request_id)
+                        except KeyError:
+                            pass
+                    # DIAG: Periodic slot status after completions
+                    if not hasattr(self, '_completion_count'):
+                        self._completion_count = 0
+                    self._completion_count += 1
+                    if self._completion_count % 500 == 0:
+                        logger.warning(
+                            f"[POOL] Completion #{self._completion_count}: "
+                            f"active={self._scheduling_pool.num_active_slots()}, "
+                            f"free={self._scheduling_pool.num_free_slots()}, "
+                            f"intake={self._intake_pool.size()}"
+                        )
+                    # Write output JSONL line
+                    if batch_id and request_id:
+                        self._write_pool_completion(batch_id, request_id, result)
+                    if batch_id:
+                        batch_done = self._scheduling_pool.mark_request_completed(
+                            request_id, batch_id
+                        )
+                        if batch_done:
+                            logger.info(f"[POOL] Batch {batch_id} completed")
+                elif msg_type == "pool_shutdown":
+                    logger.info("[POOL] Worker shutdown signal received")
+                    break
+                elif "error" in result:
+                    logger.error(f"[POOL] Worker error: {result}")
+                    break
+                else:
+                    # Legacy result dict — should not happen in pool mode
+                    logger.warning(f"[POOL] Unexpected result: {type(result)}")
+
+        logger.info("[POOL] Completion listener stopped")
+
+    def _write_pool_completion(
+        self, batch_id: str, request_id: str, result: dict
+    ) -> None:
+        """Write a single completion to the batch output JSONL file.
+
+        Builds an OpenAI-compatible BatchResultItem and appends it to
+        {incremental_output_dir}/{batch_id}.jsonl.
+        """
+        incr_dir = self.server_args.incremental_output_dir
+        if not incr_dir:
+            return
+
+        meta = self._pool_request_meta.get(batch_id, {}).get(request_id)
+        if not meta:
+            logger.warning(f"[POOL] No metadata for {request_id} in batch {batch_id}")
+            return
+
+        decoded_text = result.get("text", "")
+        prompt_length = result.get("prompt_length", 0)
+        decoded_length = result.get("decoded_length", 0)
+        model = meta["model"]
+        custom_id = meta["custom_id"]
+        url = meta["url"]
+        created_at = int(time.time())
+
+        # Build response body based on endpoint type
+        if url == "/v1/chat/completions":
+            body = {
+                "id": f"chatcmpl-{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": created_at,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": decoded_text,
+                    },
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_length,
+                    "completion_tokens": decoded_length,
+                    "total_tokens": prompt_length + decoded_length,
+                },
+            }
+        else:
+            body = {
+                "id": f"cmpl-{uuid.uuid4().hex}",
+                "object": "text_completion",
+                "created": created_at,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "text": decoded_text,
+                    "logprobs": None,
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_length,
+                    "completion_tokens": decoded_length,
+                    "total_tokens": prompt_length + decoded_length,
+                },
+            }
+
+        result_item = {
+            "id": f"batch_req_{uuid.uuid4().hex[:24]}",
+            "custom_id": custom_id,
+            "response": {
+                "status_code": 200,
+                "request_id": f"req_{uuid.uuid4().hex}",
+                "body": body,
+            },
+            "error": None,
+        }
+
+        # Append to JSONL file
+        from pathlib import Path
+        output_path = Path(incr_dir) / f"{batch_id}.jsonl"
+        try:
+            with open(output_path, "a") as f:
+                f.write(json.dumps(result_item, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception as e:
+            logger.error(f"[POOL] Failed to write completion for {request_id}: {e}")
+
+    def _finalize_batch_output(
+        self,
+        batch_id: str,
+        requests: List[BatchRequestItem],
+        prompts: List[str],
+    ) -> None:
+        """Finalize batch output after all requests complete.
+
+        In pool mode, the incremental writer handles per-request output.
+        This method writes the batch status and output file metadata.
+        """
+        output_file_id = f"file-{uuid.uuid4().hex}"
+
+        # Check for incremental output
+        incremental_path = None
+        incremental_output_dir = (
+            self.server_args.incremental_output_dir
+            if not self.server_args.no_incremental_save
+            else None
+        )
+        if incremental_output_dir:
+            from pathlib import Path
+            import shutil
+            incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
+
+        if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
+            import shutil
+            api_path = self.storage.files_dir / output_file_id
+            shutil.copy2(incremental_path, api_path)
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            shutil.copy2(incremental_path, output_path)
+        else:
+            # No incremental output available — write empty placeholder
+            output_path = self.storage.output_dir / f"{output_file_id}.jsonl"
+            output_path.write_text("")
+            logger.warning(
+                f"[POOL] Batch {batch_id}: no incremental output found, "
+                f"writing empty output"
+            )
+
+        output_meta = FileObject(
+            id=output_file_id,
+            bytes=output_path.stat().st_size,
+            created_at=int(time.time()),
+            filename=output_path.name,
+            purpose=FilePurpose.BATCH_OUTPUT.value,
+            status=FileStatus.PROCESSED.value,
+            status_details=None,
+            checksum=None,
+        )
+        self.storage.save_metadata(output_file_id, output_meta.dict())
+
+        completed_at = int(time.time())
+        self.storage.update_batch_status(
+            batch_id,
+            BatchStatus.COMPLETED,
+            completed_at=completed_at,
+            output_file_id=output_file_id,
+        )
+
+        # Clean up batch tracker, intake info, and request metadata
+        self._scheduling_pool.remove_batch_tracker(batch_id)
+        self._intake_pool.remove_batch_info(batch_id)
+        self._pool_request_meta.pop(batch_id, None)
+        logger.info(f"[POOL] Batch {batch_id} finalized")

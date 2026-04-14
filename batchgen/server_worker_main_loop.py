@@ -5,6 +5,7 @@ import signal
 import sys
 import time
 import traceback
+from datetime import timedelta
 from typing import Any, List, Optional
 
 import torch
@@ -16,15 +17,77 @@ from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.watchdog import Watchdog
 
 
-def _reload_worker_module():
+def _reload_worker_module(reload_deps=False):
 	"""
 	Hot-reload the batchgen_worker module to pick up code changes.
 	This reloads the module but doesn't affect already-instantiated objects.
-	For method-level changes, we can rebind methods to the existing worker.
+	For method-level changes, we rebind all methods to the existing worker.
+
+	Args:
+		reload_deps: If True, also reload commonly-changed dependent modules
+			(batch_scheduler, intake_pool, scheduling_pool, gpu_paged_kv_manager)
+			before reloading batchgen_worker. This ensures cross-module changes
+			take effect.
 	"""
+	if reload_deps:
+		dep_modules = [
+			"batchgen.server.batch_scheduler",
+			"batchgen.server.intake_pool",
+			"batchgen.server.scheduling_pool",
+			"batchgen.kv_cache.gpu_paged_kv_manager",
+		]
+		for mod_name in dep_modules:
+			if mod_name in sys.modules:
+				importlib.reload(sys.modules[mod_name])
+				logging.info(f"  Reloaded dependency: {mod_name}")
 	import batchgen.batchgen_worker as worker_module
 	importlib.reload(worker_module)
 	return worker_module
+
+
+def _rebind_all_methods(worker, NewClass):
+	"""Rebind all methods from NewClass onto existing worker instance.
+
+	Skips __init__ and dunder methods. Returns (rebound, skipped) counts.
+	"""
+	import inspect
+	rebound = 0
+	skipped = 0
+	for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
+		if name == "__init__":
+			skipped += 1
+			continue
+		try:
+			setattr(worker, name, method.__get__(worker, type(worker)))
+			rebound += 1
+		except Exception:
+			skipped += 1
+	return rebound, skipped
+
+
+def _validate_reload(worker, NewClass):
+	"""Warn if new __init__ references instance attrs missing on existing worker.
+
+	Returns list of missing attribute names (empty if safe).
+	"""
+	import inspect
+	import re
+	try:
+		old_init_src = inspect.getsource(type(worker).__init__)
+		new_init_src = inspect.getsource(NewClass.__init__)
+	except (OSError, TypeError):
+		return []
+	if old_init_src == new_init_src:
+		return []
+	new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
+	missing = [a for a in sorted(new_attrs) if not hasattr(worker, a)]
+	if missing:
+		logging.warning(
+			f"RELOAD WARNING: New __init__ has {len(missing)} attrs "
+			f"missing on existing worker: {missing[:10]}. "
+			f"These will cause AttributeError if accessed."
+		)
+	return missing
 
 
 def _setup_nccl_env():
@@ -54,7 +117,13 @@ def _setup_nccl_env():
 	# Larger buffer improves throughput for multi-node communication
 	if "NCCL_BUFFSIZE" not in os.environ:
 		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
-	
+
+	# NCCL_ALGO: Force deterministic tree algorithm for all-reduce/reduce-scatter.
+	# The default (ring/auto) varies reduction order between runs, causing
+	# non-deterministic FP rounding that leads to batch-dependent repetition.
+	# Tree algorithm has fixed reduction order. All-gather is unaffected (already deterministic).
+	os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
+
 
 def server_worker_main(
 	rank_idx: int,
@@ -139,14 +208,18 @@ def _server_worker_main_impl(
 	torch.cuda.set_device(args.local_rank)
 
 	try:
-		dist.init_process_group(
+		pg_kwargs = dict(
 			backend="nccl",
 			init_method="tcp://" + args.dist_init_addr,
 			world_size=args.world_size,
 			rank=args.global_rank,
-			device_id=args.local_rank,
-			timeout=torch.distributed.timedelta(seconds=3600),
+			timeout=timedelta(seconds=3600),
 		)
+		# device_id requires torch >= 2.8
+		import inspect
+		if 'device_id' in inspect.signature(dist.init_process_group).parameters:
+			pg_kwargs['device_id'] = torch.device(f"cuda:{args.local_rank}")
+		dist.init_process_group(**pg_kwargs)
 	except Exception as e:
 		logging.error(f"Failed to initialize process group: {e}")
 		sys.exit(1)
@@ -289,42 +362,78 @@ def _server_worker_main_impl(
 		
 		# --- STEP 3.5: Hot Reload Command ---
 		if isinstance(task_data, dict) and task_data.get("command") == "reload":
-			logging.info(f"Rank {global_rank}: Received reload command, hot-reloading worker module...")
+			reload_deps = task_data.get("reload_deps", True)
+			logging.info(f"Rank {global_rank}: Received reload command (reload_deps={reload_deps}), hot-reloading...")
 			try:
-				new_module = _reload_worker_module()
-				# Rebind key methods to the existing worker instance
-				# This allows code changes to take effect without recreating the worker
-				worker._page_boundary_fast = new_module.BatchGenWorker._page_boundary_fast.__get__(worker, type(worker))
-				worker.decoding_continuous = new_module.BatchGenWorker.decoding_continuous.__get__(worker, type(worker))
-				worker.generate = new_module.BatchGenWorker.generate.__get__(worker, type(worker))
-				worker._rebuild_input_tokens = new_module.BatchGenWorker._rebuild_input_tokens.__get__(worker, type(worker))
-				logging.info(f"Rank {global_rank}: Hot reload successful!")
+				new_module = _reload_worker_module(reload_deps=reload_deps)
+				NewClass = new_module.BatchGenWorker
+				missing = _validate_reload(worker, NewClass)
+				rebound, skipped = _rebind_all_methods(worker, NewClass)
+				logging.info(
+					f"Rank {global_rank}: Hot reload successful! "
+					f"Rebound {rebound} methods, skipped {skipped}"
+					+ (f", {len(missing)} missing attrs" if missing else "")
+				)
 				if global_rank == 0:
-					response_queue.put({"status": "reload_success"})
+					response_queue.put({
+						"status": "reload_success",
+						"rebound": rebound,
+						"skipped": skipped,
+						"missing_attrs": missing,
+					})
 			except Exception as e:
 				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
 				if global_rank == 0:
 					response_queue.put({"status": "reload_failed", "error": str(e)})
-			continue  # Skip to next iteration
+			continue
 
-		# --- STEP 4: Inference with full global batch ---
+		# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
+		if isinstance(task_data, dict) and task_data.get("type") == "init":
+			logging.info(f"Rank {global_rank}: Pool mode init received")
+			try:
+				current_max_output = task_data.get("max_output_len", 4096)
+				max_context_length = task_data.get("max_context_length", None)
+
+				# Initialize worker with pool capacity (no sequences yet)
+				worker.Init(None, current_max_output, 0,
+					max_context_length=max_context_length)
+
+				# Set admission and response queues for persistent generate()
+				worker.set_admission_queue(request_queue)
+				worker.set_response_queue(response_queue)
+
+				if global_rank == 0:
+					logging.info(
+						f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
+						f"Entering persistent generate() loop."
+					)
+
+				# Enter persistent generate() — blocks until shutdown
+				# generate() starts with empty global_batch, polls for admissions
+				worker.generate_persistent()
+
+			except Exception as e:
+				logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
+				if global_rank == 0:
+					response_queue.put({"type": "pool_shutdown", "error": str(e)})
+
+			# Pool mode exits here — send shutdown sentinel and break
+			if global_rank == 0:
+				response_queue.put({"type": "pool_shutdown"})
+			break
+
+		# --- STEP 4: Legacy inference with full global batch ---
 		local_results = []
 		inference_error = None
 		try:
-			# Unpack payload - all ranks now have the full global batch
 			global_prompts = task_data.get("prompts", [])
-			# max_input_len: If None or not provided, will be determined dynamically
-			# from the longest prompt in the batch during tokenization
 			current_max_input = task_data.get("max_input_len", None)
 			current_max_output = task_data.get("max_output_len")
 			max_context_length = task_data.get("max_context_length", None)
 			ignore_eos = task_data.get("ignore_eos", False)
-			# Sampling parameters (None = greedy decoding)
 			temperature = task_data.get("temperature", None)
 			top_p = task_data.get("top_p", None)
-			# Per-request sampling params (list of dicts, one per prompt)
 			sampling_params = task_data.get("sampling_params", None)
-			# Per-sequence max output token limits
 			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
 			if global_rank == 0:
 				if sampling_params:
@@ -332,7 +441,6 @@ def _server_worker_main_impl(
 				else:
 					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
 
-			# Stage incremental writer config on rank 0 (writer created after tokenizer init)
 			incr_output_dir = task_data.get("incremental_output_dir")
 			incr_custom_ids = task_data.get("custom_id_map")
 			if global_rank == 0 and incr_output_dir and incr_custom_ids:
@@ -347,28 +455,17 @@ def _server_worker_main_impl(
 					"parse_tool_call": task_data.get("parse_tool_call", False),
 				}
 
-			# Clear previous state if supported
 			if hasattr(worker, 'reset_runtime_state'):
 				worker.reset_runtime_state()
 
 			if len(global_prompts) > 0:
-				# Initialize worker with global batch info
-				# max_input_length can be None - will be determined by longest prompt
 				worker.Init(current_max_input, current_max_output, len(global_prompts),
 					max_context_length=max_context_length)
-
-				# Set ignore_eos flag on worker
 				worker.set_ignore_eos(ignore_eos)
-
-				# Set sampling parameters
 				if sampling_params:
-					# Per-request sampling params from batch API
 					worker.set_per_sequence_sampling_params(sampling_params)
 				else:
-					# Global sampling params (legacy /v1/inference path)
 					worker.set_sampling_params(temperature=temperature, top_p=top_p)
-
-				# Process the global batch - worker internally handles distribution
 				local_results = worker.process_new_batch(
 					global_prompts,
 					per_sequence_max_tokens=per_sequence_max_tokens,
@@ -381,58 +478,46 @@ def _server_worker_main_impl(
 			inference_error = str(e)
 			local_results = []
 		finally:
-			# Close incremental writer regardless of success/failure
 			if getattr(worker, '_incremental_writer', None) is not None:
 				worker._incremental_writer.close()
 				worker._incremental_writer = None
-			# Clean up staged config
 			if hasattr(worker, '_incremental_writer_config'):
 				del worker._incremental_writer_config
 
 		# --- STEP 5: Synchronize and check for errors ---
-		# Sync CUDA to catch any async errors
 		try:
 			torch.cuda.synchronize()
 		except RuntimeError as e:
 			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
 			inference_error = str(e)
 
-		# Barrier to ensure all ranks complete inference
 		dist.barrier()
 
-		# Check for errors across all ranks using all_reduce
-		# Each rank contributes 1 if it has an error, 0 otherwise
 		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
 		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
 		has_any_error = error_flag.item() > 0
 
 		if has_any_error:
-			# Gather error messages from all ranks
 			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
 			dist.gather_object(inference_error, error_list, dst=0)
-
 			if global_rank == 0:
 				errors = [e for e in error_list if e is not None]
 				logging.error(f"Inference failed with errors from ranks: {errors}")
 				response_queue.put({"error": errors[0], "all_errors": errors})
 			continue
 
-		# --- STEP 6: Response (Rank 0 Only) ---
-		# Results are already on rank 0 (local_results), no gather needed
-		# Other ranks have empty results by design
+		# --- STEP 6: Legacy Response (Rank 0 Only) ---
 		if global_rank == 0:
-			final_results = local_results if local_results else []
-
-			# Safeguard: if results are empty but no errors, something went wrong
+			final_results = local_results if local_results else {}
 			if not final_results and len(task_data.get("prompts", [])) > 0:
-				logging.error(f"Results are unexpectedly empty!")
-				response_queue.put({"error": "Results unexpectedly empty after inference"})
-				continue
-
+				rejected = getattr(worker, '_rejected_sequences', None)
+				if rejected:
+					logging.info(f"All {len(rejected)} sequences rejected (context length exceeded).")
+				else:
+					logging.error(f"Results are unexpectedly empty!")
+					response_queue.put({"error": "Results unexpectedly empty after inference"})
+					continue
 			response_queue.put(final_results)
-
-		# NOTE: Watchdog is fed within prefill/decode phases in the worker,
-		# not here. This ensures we only monitor actual inference operations.
 
 	# Cleanup
 	dist.destroy_process_group()

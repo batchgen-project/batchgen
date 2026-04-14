@@ -29,7 +29,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(
         ..., description="Conversation messages"
     )
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
@@ -72,7 +72,7 @@ class CompletionRequest(BaseModel):
     )
     max_tokens: Optional[int] = Field(default=None, ge=1)
     max_completion_tokens: Optional[int] = Field(default=None, ge=1)
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0, description="Top-k filtering. None or 0 = disabled.")
     n: Optional[int] = Field(default=1, ge=1, le=128)
@@ -346,3 +346,25 @@ def _normalize_result_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _normalize_result_value(val) for key, val in value.items()}
     return value
+
+
+# ======================== Model Metadata ========================
+
+
+class ModelObject(BaseModel):
+    """OpenAI-compatible model object with BatchGen extensions."""
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "batchgen"
+    max_context_length: int = Field(
+        description="Maximum context length (prompt + completion tokens)"
+    )
+
+
+class ListModelsResponse(BaseModel):
+    """OpenAI-compatible response for GET /v1/models."""
+
+    object: Literal["list"] = "list"
+    data: List[ModelObject]

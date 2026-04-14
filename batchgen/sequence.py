@@ -81,13 +81,33 @@ class SequenceEntry:
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
         'original_max_decode_length',  # Original max_decode_length before eviction
         'total_decoded_before_eviction',  # Tokens decoded before this eviction cycle
+        # Baseline decoded_length at the most recent re-entry. Set at re-entry
+        # prep to n_old (the count of previously-decoded tokens that were
+        # restored into decoded_tokens buffer for output preservation). At the
+        # NEXT eviction, only tokens decoded BEYOND this baseline are genuinely
+        # new and should be appended to evicted_token_ids — the tokens at
+        # positions [0:baseline] are already present in the reconstructed
+        # prompt (input_ids) and appending them again would create a geometric
+        # cascade of duplicated tokens across re-entry cycles.
+        'reentry_decoded_baseline',
         '_buffer_slot',  # Index into QueryBookBufferPool buffers
+        # Request pool fields
+        'batch_id',              # Which batch this sequence belongs to (for result routing)
+        'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
+        'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
+        # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
+        '_lifespan_log',   # List[SeqEventRecord], ring buffer
+        '_lifespan_idx',   # int, next write position
+        # Repetition detection
+        '_rep_last_token',  # int, last token ID seen
+        '_rep_count',       # int, consecutive same-token count
+        '_rep_detected',    # bool, whether repetition was detected
     )
 
     VALID_TRANSITIONS = {
         SequenceStatus.QUEUEING: {SequenceStatus.IN_PREFILL},
         SequenceStatus.IN_PREFILL: {SequenceStatus.PREFILLED},
-        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE},
+        SequenceStatus.PREFILLED: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED},
         SequenceStatus.IN_DECODE: {SequenceStatus.ON_HOLD, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.ON_HOLD: {SequenceStatus.IN_DECODE, SequenceStatus.COMPLETED, SequenceStatus.EVICTED},
         SequenceStatus.COMPLETED: set(),
@@ -136,7 +156,61 @@ class SequenceEntry:
         self.original_prompt_length: int = prompt_length
         self.original_max_decode_length: int = max_decode_length
         self.total_decoded_before_eviction: int = 0
+        # Baseline decoded_length at the most recent re-entry. Starts at 0 for
+        # fresh sequences that have never been evicted. Incremented at each
+        # re-entry prep so that subsequent evictions only append NEW decoded
+        # tokens (not the ones already baked into the reconstructed prompt).
+        self.reentry_decoded_baseline: int = 0
         self._buffer_slot: int = -1
+
+        # Request pool fields (set externally when using pool-based scheduling)
+        self.batch_id: Optional[str] = None
+        self.pool_slot_index: int = -1
+        self.priority: int = 0  # 0=NORMAL, 1=HIGH
+
+        # Lifespan monitoring
+        self._lifespan_log: list = []
+        self._lifespan_idx: int = 0
+
+        # Repetition detection
+        self._rep_last_token: int = -1
+        self._rep_count: int = 0
+        self._rep_detected: bool = False
+
+    def log_event(self, event: int, rank: int, detail: str = "") -> None:
+        """Log a lifespan event. No-op when BATCHGEN_SEQ_LIFESPAN is not set."""
+        import logging
+        from batchgen.lifespan import ENABLED, MAX_EVENTS, SeqEvent, SeqEventRecord
+        if not ENABLED:
+            return
+        expected_ctx = self.original_prompt_length + self.decoded_length
+        record = SeqEventRecord(
+            event=event,
+            rank=rank,
+            decoded_length=self.decoded_length,
+            current_ctx=self.current_context_length,
+            expected_ctx=expected_ctx,
+            gpu_pages=self.gpu_pages_allocated,
+            host_pages=self.host_pages_allocated,
+            detail=detail,
+        )
+        if len(self._lifespan_log) < MAX_EVENTS:
+            self._lifespan_log.append(record)
+        else:
+            self._lifespan_log[self._lifespan_idx % MAX_EVENTS] = record
+        self._lifespan_idx += 1
+        # Write to server log for immediate visibility
+        try:
+            name = SeqEvent(event).name
+        except ValueError:
+            name = f"EVT{event}"
+        mismatch = " ***MISMATCH***" if self.current_context_length != expected_ctx else ""
+        logging.info(
+            f"[LIFESPAN] {self.uuid[:8]} gid={self.global_idx} {name} "
+            f"rank={rank} dec={self.decoded_length} ctx={self.current_context_length} "
+            f"exp={expected_ctx} gpu_pg={self.gpu_pages_allocated} "
+            f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
+        )
 
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:
@@ -376,12 +450,33 @@ class SequenceBatch:
         self._rank_index: Dict[int, Set[str]] = {}
 
     def add_sequence(self, sequence: SequenceEntry) -> None:
+        # Handle UUID collision: if a sequence with this uuid already exists,
+        # clean it out of the status and rank indices first. Otherwise the old
+        # status entry lingers (e.g., COMPLETED) even after the dict is
+        # overwritten, corrupting all_completed() and status-based queries.
+        # This matters for pool mode when multiple batches reuse request_ids
+        # (e.g., mmlu-0..mmlu-31).
+        existing = self.sequences.get(sequence.uuid)
+        if existing is not None:
+            self._status_index[existing.status].discard(sequence.uuid)
+            if (existing.assigned_rank is not None
+                    and existing.assigned_rank in self._rank_index):
+                self._rank_index[existing.assigned_rank].discard(sequence.uuid)
         self.sequences[sequence.uuid] = sequence
         self._status_index[sequence.status].add(sequence.uuid)
         if sequence.assigned_rank is not None:
             if sequence.assigned_rank not in self._rank_index:
                 self._rank_index[sequence.assigned_rank] = set()
             self._rank_index[sequence.assigned_rank].add(sequence.uuid)
+
+    def remove_sequence(self, uuid: str) -> Optional[SequenceEntry]:
+        """Remove a sequence from the batch and all indices."""
+        seq = self.sequences.pop(uuid, None)
+        if seq:
+            self._status_index[seq.status].discard(uuid)
+            if seq.assigned_rank is not None and seq.assigned_rank in self._rank_index:
+                self._rank_index[seq.assigned_rank].discard(uuid)
+        return seq
 
     def get_sequence(self, uuid: str) -> Optional[SequenceEntry]:
         return self.sequences.get(uuid, None)

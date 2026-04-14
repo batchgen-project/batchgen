@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import uvicorn
@@ -19,6 +20,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from batchgen.server.batch_scheduler import BatchScheduler, parse_batch_file
+from batchgen.config.model_registry import (
+    CONFIG_REGISTRY,
+    _detect_model_type_from_identifier,
+)
 from batchgen.server.io_struct import (
     BatchObject,
     BatchStatus,
@@ -31,6 +36,8 @@ from batchgen.server.io_struct import (
     ListBatchesResponse,
     ListFilesRequest,
     ListFilesResponse,
+    ListModelsResponse,
+    ModelObject,
     RawInferenceRequest,
     normalize_inference_results,
 )
@@ -43,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Pattern for endpoints that should have quiet logging (only log errors)
 # GET requests to batch status endpoints are very frequent during polling
-QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /health$")
+QUIET_ENDPOINTS = re.compile(r"^GET /v1/batches/[^/]+$|^GET /v1/models|^GET /health$")
 
 
 class QuietAccessLogMiddleware(BaseHTTPMiddleware):
@@ -101,6 +108,23 @@ def create_app(
         app.state.worker = worker
         app.state.scheduler = scheduler
 
+        # Build model metadata object (cached for lifetime of server)
+        # Only use BatchGen-maintained registered configs — never fall back to HF config.json
+        detected_type = _detect_model_type_from_identifier(server_args.model)
+        if detected_type is None or detected_type not in CONFIG_REGISTRY:
+            raise ValueError(
+                f"Model '{server_args.model}' is not registered in BatchGen CONFIG_REGISTRY. "
+                f"Cannot serve /v1/models metadata. Registered types: {list(CONFIG_REGISTRY.keys())}"
+            )
+        model_config = CONFIG_REGISTRY[detected_type]()
+        model_id = Path(server_args.model).name
+        app.state.model_object = ModelObject(
+            id=model_id,
+            created=int(time.time()),
+            owned_by="batchgen",
+            max_context_length=model_config.max_position_embeddings,
+        )
+
         worker.start()
         await scheduler.start()
         health_state.mark_startup_complete()
@@ -122,6 +146,43 @@ def create_app(
 
     # Add custom access logging middleware (replaces uvicorn's default)
     app.add_middleware(QuietAccessLogMiddleware)
+
+    # ==================== Model Endpoints ====================
+
+    @app.get("/v1/models", response_model=ListModelsResponse)
+    async def list_models(request: Request):
+        return ListModelsResponse(data=[request.app.state.model_object])
+
+    @app.get("/v1/models/{model_id:path}", response_model=ModelObject)
+    async def retrieve_model(request: Request, model_id: str):
+        model_obj: ModelObject = request.app.state.model_object
+        if model_id != model_obj.id:
+            raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+        return model_obj
+
+    # ==================== Pool Status Endpoint ====================
+
+    @app.get("/v1/pool/status")
+    async def pool_status(request: Request):
+        scheduler: BatchScheduler = request.app.state.scheduler
+        spool = scheduler._scheduling_pool
+        ipool = scheduler._intake_pool
+        active_batches = 0
+        with spool._lock:
+            for t in spool._batch_trackers.values():
+                if not t.is_complete and not t.is_failed:
+                    active_batches += 1
+        return {
+            "intake_pool_size": ipool.size(),
+            "intake_pool_capacity": ipool.max_capacity,
+            "scheduling_pool_active": spool.num_active_slots(),
+            "scheduling_pool_free": spool.num_free_slots(),
+            "scheduling_pool_capacity": spool.capacity,
+            "active_batches": active_batches,
+            "pool_mode": scheduler._pool_mode,
+        }
+
+    # ==================== File Endpoints ====================
 
     @app.post("/v1/files", response_model=FileObject)
     async def upload_file(
@@ -253,6 +314,16 @@ def create_app(
         storage: StorageManager = request.app.state.storage
         scheduler: BatchScheduler = request.app.state.scheduler
 
+        # Admission control: reject early if intake pool is near capacity (>90%)
+        if scheduler.intake_pool_usage_pct() > 0.9:
+            pool_size = scheduler.intake_pool_size()
+            pool_cap = scheduler.intake_pool_capacity()
+            raise HTTPException(
+                status_code=429,
+                detail=f"Server at capacity ({pool_size}/{pool_cap} requests in queue). Retry later.",
+                headers={"Retry-After": "30"},
+            )
+
         input_meta = storage.load_metadata(body.input_file_id)
         if not input_meta:
             raise HTTPException(
@@ -379,6 +450,9 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
         latency_ms = int((time.perf_counter() - start) * 1000)
+        # Worker returns dict {global_idx: str} — convert to ordered list
+        if isinstance(results, dict):
+            results = [results[k] for k in sorted(results.keys())]
         normalized_results = normalize_inference_results(results)
 
         response_data = {
@@ -423,6 +497,52 @@ def create_app(
             logger.info(f"Saved inference results to {output_path}")
 
         return response_data
+
+    @app.post("/v1/reload")
+    async def reload_worker(request: Request):
+        """Hot-reload worker code without restarting the server.
+
+        Reloads batchgen_worker module and dependent modules, then rebinds
+        all methods on the existing worker instance. Host KV, weights, and
+        NCCL stay alive.
+
+        Body (optional):
+            {"reload_deps": true}    — also reload batch_scheduler, intake_pool, etc.
+            {"timeout": 30}          — timeout in seconds for collecting per-rank status
+            {"pool_mode": true|false} — override pool-mode detection
+        """
+        worker_manager: WorkerManager = request.app.state.worker
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reload_deps = body.get("reload_deps", True)
+        timeout = float(body.get("timeout", 30.0))
+
+        # Pool mode is detected via the scheduler. If a BatchScheduler is
+        # active and the worker has been initialized into pool mode, use
+        # send_pool_reload (file-polling). Otherwise use legacy sync RPC.
+        pool_mode = body.get("pool_mode")
+        if pool_mode is None:
+            # Auto-detect: pool mode means the worker main loop has handed
+            # off to generate_persistent and is no longer servicing the
+            # request_queue/response_queue sync path.
+            scheduler = getattr(request.app.state, "scheduler", None)
+            pool_mode = bool(getattr(scheduler, "_pool_initialized", False)) if scheduler else False
+
+        if pool_mode:
+            result = await asyncio.to_thread(
+                worker_manager.send_pool_reload,
+                reload_deps=reload_deps,
+                timeout=timeout,
+            )
+        else:
+            result = await asyncio.to_thread(
+                worker_manager.send_reload_command,
+                reload_deps=reload_deps,
+                timeout=timeout,
+            )
+        return result
 
     @app.get("/health")
     async def health_check(request: Request):

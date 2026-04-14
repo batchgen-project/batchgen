@@ -1,6 +1,6 @@
 # ---------------------------------------------------------------------------- #
 #  BatchGen                                                                      #
-#  copyright (c) EfficientMoE team 2025                                             #
+#  copyright (c) EfficientMoE team 2025-2026                                        #
 #                                                                               #
 #  licensed under the apache license, version 2.0 (the "license");              #
 #  you may not use this file except in compliance with the license.             #
@@ -134,7 +134,7 @@ print(f"find_packages: {find_packages()}")
 # install all files in the package, rather than just the egg
 setup(
     name="batchgen",
-    version=os.getenv("MOEGEN_VERSION", "0.1"),
+    version=os.getenv("BATCHGEN_VERSION", "1.0.7"),
     packages=find_packages(
         include=[
             "batchgen",
@@ -176,7 +176,7 @@ setup(
     include_package_data=True,
     install_requires=install_requires,
     author="EfficientMoE Team",
-    description="BatchGen is a library for High-throughput offline inference for MoE models with limited GPUs",
+    description="High-throughput offline batch inference engine for MoE models",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     classifiers=[

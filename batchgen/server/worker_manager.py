@@ -366,6 +366,90 @@ class WorkerManager:
             result = self.response_queue.get()
         return result
 
+    def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
+        """Send hot-reload command to all worker ranks (legacy sync RPC path).
+
+        Used by the non-pool-mode worker main loop (one request → one response
+        via request_queue/response_queue). For pool-mode workers, use
+        send_pool_reload() instead — pool mode never returns to the main loop.
+        """
+        import queue as _queue
+        with self._lock:
+            self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+            try:
+                return self.response_queue.get(timeout=timeout)
+            except _queue.Empty:
+                return {"status": "reload_timeout", "timeout_s": timeout}
+
+    def send_pool_reload(self, reload_deps: bool = True, timeout: float = 30.0,
+                         expected_ranks: Optional[int] = None) -> dict:
+        """Send hot-reload to pool-mode workers via fire-and-forget queue +
+        status file polling.
+
+        Pool-mode workers (generate_persistent loop) read the reload command
+        from request_queue and write per-rank status to
+        /tmp/batchgen_reload_status/rank_<N>.json. This method polls those
+        files for up to `timeout` seconds, returning aggregated status.
+
+        Why not response_queue: pool mode admission queue and response_queue
+        are designed for batched async I/O (per-completion notifications via
+        OutputWriter), not sync RPC. Putting reload results on response_queue
+        deadlocks the FastAPI event loop.
+        """
+        import json
+        import os
+        import shutil
+        import time as _time
+
+        status_dir = "/tmp/batchgen_reload_status"
+        # Clear stale status files from previous reloads
+        if os.path.isdir(status_dir):
+            try:
+                shutil.rmtree(status_dir)
+            except OSError:
+                pass
+        os.makedirs(status_dir, exist_ok=True)
+
+        # Send the command (no lock — pool admission queue is fire-and-forget)
+        self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+
+        # Poll for status files
+        if expected_ranks is None:
+            expected_ranks = self.args.world_size if self.args.world_size else 1
+        deadline = _time.monotonic() + timeout
+        results: List[dict] = []
+        seen_ranks: set = set()
+        while _time.monotonic() < deadline:
+            try:
+                for entry in os.listdir(status_dir):
+                    if not entry.startswith("rank_") or not entry.endswith(".json"):
+                        continue
+                    rank_str = entry[len("rank_"):-len(".json")]
+                    if rank_str in seen_ranks:
+                        continue
+                    path = os.path.join(status_dir, entry)
+                    try:
+                        with open(path, "r") as f:
+                            results.append(json.load(f))
+                        seen_ranks.add(rank_str)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                if len(seen_ranks) >= expected_ranks:
+                    break
+            except OSError:
+                pass
+            _time.sleep(0.1)
+
+        # Aggregate
+        all_success = all(r.get("status") == "reload_success" for r in results)
+        return {
+            "status": "reload_success" if all_success and len(results) >= expected_ranks else "reload_partial",
+            "ranks_reported": len(results),
+            "ranks_expected": expected_ranks,
+            "elapsed_s": timeout - max(0, deadline - _time.monotonic()),
+            "per_rank": results,
+        }
+
     # ---------------------- Startup helpers ----------------------
     def _compact_memory(self) -> None:
         """Drop page cache and compact memory for stable THP allocation."""
@@ -522,6 +606,7 @@ class WorkerManager:
             adaptive_chunk_ema_alpha=self.args.adaptive_chunk_ema_alpha,
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
+            max_pool_size=self.args.max_pool_size,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),

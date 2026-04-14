@@ -207,9 +207,10 @@ if __name__ == "__main__":
 
     query_df = load_longbench_datasets(longbench_path)
     queries = []
-    # Load queries - limit to max_prompts if specified, otherwise load all
-    for q in query_df['context']:
-        queries.append(q)
+    # Load queries: combine context + question fields
+    for _, row in query_df.iterrows():
+        prompt = row['context'] + "\n\n" + row['question']
+        queries.append(prompt)
         if max_prompts is not None and len(queries) >= max_prompts:
             break
 
