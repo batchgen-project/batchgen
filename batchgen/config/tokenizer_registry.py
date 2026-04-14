@@ -64,6 +64,11 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
     "Kimi-K2.5": "kimi_k25",
+    # GLM-5 / GLM-5.1 share the same tokenizer (vocab_size=154880, identical
+    # EOS/pad). More-specific patterns first so `GLM-5.1-FP8` doesn't get
+    # swallowed by `GLM-5`.
+    "GLM-5.1-FP8": "glm_moe_dsa",
+    "GLM-5.1": "glm_moe_dsa",
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",

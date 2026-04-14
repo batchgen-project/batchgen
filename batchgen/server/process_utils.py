@@ -50,6 +50,9 @@ MODEL_BYTE_SIZES = {
     "zai-org/GLM-5-FP8": 760 * 1024**3,
     # GLM-5: 1350GB BF16 experts + 17.3GB attn+DSA + 5.4GB shared + 4.5GB embed/dense ≈ 1380GB + buffer
     "zai-org/GLM-5": 1400 * 1024**3,
+    # GLM-5.1 / GLM-5.1-FP8: same architecture + param count as GLM-5 (754B), same sizes.
+    "zai-org/GLM-5.1-FP8": 760 * 1024**3,
+    "zai-org/GLM-5.1": 1400 * 1024**3,
 }
 
 # Default byte_size when model not in lookup (700GB for backwards compatibility)
