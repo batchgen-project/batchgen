@@ -1402,14 +1402,26 @@ class BatchGenWorker:
 		return False
 
 	def _get_finish_reason(self, seq) -> str:
-		"""Return OpenAI-compatible finish_reason for a completed sequence."""
+		"""Return OpenAI-compatible finish_reason for a completed sequence.
+
+		Note: seq.eos_reached is overloaded elsewhere as a generic
+		"sequence is done" flag (set on length limit, rep detection,
+		and cross-rank completion sync — not just real EOS). So we
+		must look at the true cause of completion here, not just the
+		eos_reached bit.
+		"""
 		# Repetition detected — dump lifespan for root cause analysis
 		if seq._rep_detected:
 			seq.log_event(SeqEvent.COMPLETED, self.rank, "finish_reason=repetition")
 			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "REPETITION_COMPLETE")
 			return "repetition"
-		# EOS takes priority (natural completion)
-		if seq.eos_reached and not self._ignore_eos:
+		# Length truncation — per-sequence decode budget or model context limit
+		if seq.decoded_length >= seq.max_decode_length:
+			finish = "length"
+		elif seq.current_context_length >= self.model_context_length:
+			finish = "length"
+		# Real EOS only — the token at seq.decoded_length-1 matches an EOS id
+		elif seq.eos_reached and not self._ignore_eos:
 			finish = "stop"
 		else:
 			finish = "length"
