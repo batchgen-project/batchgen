@@ -17,11 +17,22 @@ Key differences from DeepSeek:
 """
 
 import logging
+import os
 from contextlib import nullcontext as _nullctx
 from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+# DSA fused kernel enable flags. WP2/WP4 default OFF because their
+# run_act_quant only emits per-row FP8 activation scales, while the WGMMA
+# kernel consumes them as per-row-per-K-block — resulting in magnitude
+# drift that drops MMLU-Pro by ~44 points. Re-enable with
+# BATCHGEN_GLM5_WP2=1 / BATCHGEN_GLM5_WP4=1 once the act_quant call sites
+# are switched to the per-block `act_quant` in fa3_backend.
+_GLM5_WP2_ENABLED = os.environ.get("BATCHGEN_GLM5_WP2", "0") == "1"
+_GLM5_WP4_ENABLED = os.environ.get("BATCHGEN_GLM5_WP4", "0") == "1"
+_GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
@@ -275,13 +286,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
-        if _HAS_FP8_ABSORB:
+        if _HAS_FP8_ABSORB and _GLM5_WP5_ENABLED:
             try:
                 self._fp8_absorb_weights = FP8AbsorbWeights(
                     self._cached_q_absorb,   # [H, 192, 512]
                     self._cached_out_absorb,  # [H, 256, 512]
                 )
-                logging.warning(
+                logging.debug(
                     f"[layer {self.layer_idx}] FP8 absorb weights initialized"
                 )
             except Exception as e:
@@ -312,7 +323,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
-        if _HAS_FUSED_INDEXER_KV:
+        if _HAS_FUSED_INDEXER_KV and _GLM5_WP2_ENABLED:
             try:
                 self._indexer_cuda_module = _build_indexer_module()
                 # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
@@ -333,7 +344,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = None
 
         # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+        if _HAS_FUSED_SCORE and _GLM5_WP4_ENABLED and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
