@@ -10,11 +10,19 @@ the full M5 behavioral notes.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from batchgen.sequence import SequenceEntry, SequenceStatus
 from batchgen.worker.boundary import BoundaryHandler, BoundaryPlan
+from batchgen.worker.decode.bind import bind_decode_context
+from batchgen.worker.decode.cleanup import decode_cleanup
 from batchgen.worker.decode.continuous_loop import run_decode_interval
+from batchgen.worker.decode.forward_step import forward_decode_step
+from batchgen.worker.decode.handle_boundary import handle_boundary
+from batchgen.worker.decode.init_state import init_decode_state
+from batchgen.worker.decode.moe_sync import initial_moe_sync
+from batchgen.worker.decode.update_sequences import update_sequences
 from batchgen.worker.exceptions import CtxInvariantViolation
 from batchgen.worker.kv_manager import KVCacheManager
 from batchgen.worker.protocols import (
@@ -24,6 +32,19 @@ from batchgen.worker.protocols import (
     ModelExecutorBackend,
 )
 from batchgen.worker.state import WorkerState
+
+
+def _use_native_decode() -> bool:
+    """Phase 2.8.2 shadow switch (read fresh on every call).
+
+    Default ``BATCHGEN_NATIVE_DECODE=0`` keeps the production path on
+    legacy ``decoding_continuous``. ``=1`` routes
+    ``run_continuous`` through the Stage 2 native helpers. Checking
+    the env var per call lets us flip it between benchmark rounds in
+    the same server process (``os.environ[...] = "1"`` from a
+    notebook / debugger) without restarting.
+    """
+    return os.environ.get("BATCHGEN_NATIVE_DECODE", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -272,11 +293,14 @@ class DecodeScheduler:
         boundaries internally.
         """
         if self._legacy is not None:
-            # F6 native path: delegate the full decode cycle (forward,
-            # sampling, page boundary, completion detection) to legacy
-            # `decoding_continuous` via the adapter. The adapter
-            # rebuilds the initial `new_tokens` tensor, translates
-            # uuids → local indices, and invokes the legacy method.
+            # Phase 2.8.2i shadow switch: when BATCHGEN_NATIVE_DECODE=1
+            # AND the model is on attention mode 3 (the only path the
+            # native helpers have been written for), route through the
+            # Stage 2 native loop. Any other case falls back to legacy
+            # ``decoding_continuous`` — the pre-refactor baseline.
+            if _use_native_decode() and self._can_run_native():
+                return self._run_continuous_native(list(uuids))
+            # F6 baseline: legacy `decoding_continuous` via the adapter.
             self._legacy.decoding_continuous(list(uuids))
             return DecodeStepResult(
                 tokens_produced=-1,
@@ -295,6 +319,163 @@ class DecodeScheduler:
             tokens_produced=tokens_produced,
             uuids_decoded=tuple(uuids),
             boundary_plan=plan,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 2.8.2i — native decode loop (shadow-gated)
+    # ------------------------------------------------------------------
+
+    def _can_run_native(self) -> bool:
+        """Guard: the native loop only handles attention mode 3.
+
+        Legacy ``decoding_continuous`` line 8526-8528 falls back to
+        ``_decoding_legacy_modes`` when
+        ``engine_config.Basic_Config.attn_mode != 3``; that path has
+        ~400 LOC of model-specific branching that Stage 2 does not
+        port. Return False so the scheduler keeps using legacy for
+        those models while the native path shadows on attn_mode=3
+        (DeepSeek / most MoE models).
+        """
+        engine_config = getattr(self._legacy, "engine_config", None)
+        if engine_config is None:
+            w = getattr(self._legacy, "_w", None)
+            engine_config = getattr(w, "engine_config", None) if w else None
+        if engine_config is None:
+            # Tests / CPU harness: no engine_config wired → bail out.
+            return False
+        basic = getattr(engine_config, "Basic_Config", None)
+        if basic is None:
+            return False
+        return int(getattr(basic, "attn_mode", 0)) == 3
+
+    def _run_continuous_native(
+        self, uuids: list[UUID],
+    ) -> "DecodeStepResult":
+        """Native replacement for ``legacy.decoding_continuous``.
+
+        Ports ``decoding_continuous`` (batchgen_worker.py:8495-8601)
+        using the Stage 2 helpers. Only runs when
+        ``BATCHGEN_NATIVE_DECODE=1`` AND the model is on attn_mode 3
+        — the shadow switch guard is in :meth:`run_continuous`.
+
+        Flow:
+
+          1. Translate uuids → local batch via adapter.
+          2. Build initial ``new_tokens`` via
+             ``adapter.rebuild_input_tokens(batch)``.
+          3. ``bind_decode_context`` — class-level wrapper singletons.
+          4. ``init_decode_state`` — fresh DecodeState with counters.
+          5. ``initial_moe_sync`` — per-rank MoE buffer sizing.
+          6. ``adapter.enable_decode_watchdog()``.
+          7. Main loop:
+              a. Increment iteration counters.
+              b. Feed watchdog + decode-watchdog.
+              c. Every ``decision_interval_tokens`` tokens, call
+                 ``handle_boundary``; break / continue per outcome.
+              d. ``forward_decode_step`` → new tokens.
+              e. ``adapter.flush_deferred_kv_to_host``.
+              f. ``update_sequences`` — EOS / rep / buffer write.
+          8. ``decode_cleanup`` in ``finally`` so teardown runs
+             even if the loop raises.
+
+        Returns a :class:`DecodeStepResult` with the iteration count
+        as ``tokens_produced`` (approximate — matches legacy's
+        informational stat) and the final decode_uuids.
+        """
+        assert self._legacy is not None
+        assert self._collectives is not None, (
+            "DecodeScheduler._run_continuous_native requires the "
+            "CollectiveBackend to be wired (needed for initial_moe_sync)."
+        )
+        adapter = self._legacy
+
+        # Translate + build initial new_tokens.
+        batch = adapter.get_local_indices_for_uuids(list(uuids))
+        new_tokens = adapter.rebuild_input_tokens(batch) if batch else None
+
+        gpu_manager, _worker_view = bind_decode_context(
+            adapter,
+            batch=batch,
+            past_key_states=None,
+            past_value_states=None,
+            scale_dict=None,
+        )
+
+        decode_state = init_decode_state(
+            self._state, adapter,
+            decode_uuids=list(uuids), batch=batch,
+        )
+        decode_state.new_tokens = new_tokens
+        decode_state.page_table_verified = True
+
+        initial_moe_sync(
+            self._state, adapter, self._collectives, batch=batch,
+        )
+
+        adapter.enable_decode_watchdog()
+
+        decision_interval_tokens = (
+            self._decision_frequency_pages * SequenceEntry.PAGE_SIZE
+        )
+        tokens_produced = 0
+        last_plan: BoundaryPlan = BoundaryPlan()
+
+        try:
+            while decode_state.decode_uuids:
+                decode_state.local_iteration += 1
+                decode_state.cumulative_iterations += 1
+
+                adapter.feed_watchdog()
+                adapter.feed_decode_watchdog()
+
+                if (
+                    decode_state.local_iteration - decode_state.last_boundary
+                    >= decision_interval_tokens
+                ):
+                    decode_state.last_boundary = decode_state.local_iteration
+                    outcome = handle_boundary(
+                        self._state, adapter, self._boundary,
+                        decode_state, gpu_manager=gpu_manager,
+                    )
+                    last_plan = outcome.result.plan
+                    if outcome.should_break:
+                        break
+                    if outcome.should_continue:
+                        continue
+
+                if not decode_state.batch:
+                    # Defensive: if the boundary handler emptied batch
+                    # without setting should_break, avoid issuing a
+                    # zero-size forward (which would crash most kernels).
+                    break
+
+                new_tokens_out = forward_decode_step(
+                    adapter,
+                    batch=decode_state.batch,
+                    new_tokens=decode_state.new_tokens,
+                    gpu_manager=gpu_manager,
+                    page_table_verified=decode_state.page_table_verified,
+                    local_iteration=decode_state.local_iteration,
+                )
+                decode_state.new_tokens = new_tokens_out
+
+                adapter.flush_deferred_kv_to_host()
+
+                new_tokens_cpu = new_tokens_out.cpu()
+                update_sequences(
+                    self._state, adapter,
+                    batch=decode_state.batch,
+                    new_tokens_cpu=new_tokens_cpu,
+                    local_iteration=decode_state.local_iteration,
+                )
+                tokens_produced += 1
+        finally:
+            decode_cleanup(adapter, self._boundary)
+
+        return DecodeStepResult(
+            tokens_produced=tokens_produced,
+            uuids_decoded=tuple(decode_state.decode_uuids),
+            boundary_plan=last_plan,
         )
 
 

@@ -79,6 +79,19 @@ class WorkerConfig:
     env var in main; exposed via BatchGenWorkerArgs). Handler:
     KVCacheManager. Main default 10."""
 
+    enable_host_kv_eviction: bool = True
+    """Host-KV eviction master switch. Env:
+    ``BATCHGEN_ENABLE_HOST_KV_EVICTION``. Main default ``True`` (see
+    batchgen_worker.py:379). Handler: BoundaryPlanner (Stage 1d
+    Rule 3). Disabling it bypasses the HostEvict decision path."""
+
+    host_kv_eviction_watermark_pct: int = 20
+    """Free host-KV % below which Stage 1d plan_full emits HostEvict
+    decisions. Env: ``BATCHGEN_HOST_KV_EVICTION_WATERMARK`` (same
+    env var as ``eviction_watermark_pct`` for compatibility; the two
+    knobs are kept separate so future code can disentangle them).
+    Handler: BoundaryHandler (via BoundaryHandlerConfig)."""
+
     host_kv_total_pages: int = 10000
     """Total host KV page count used for watermark % math. Env:
     (derived from ``BATCHGEN_GPU_KV_CACHE_SIZE_GB`` + host KV args).
@@ -160,6 +173,8 @@ class WorkerConfig:
             extension_gpu_page_buffer=_int_env("BATCHGEN_EXTENSION_GPU_PAGE_BUFFER", 4),
             prefill_watermark_pct=_int_env("BATCHGEN_HOST_KV_WATERMARK", 70),
             eviction_watermark_pct=_int_env("BATCHGEN_HOST_KV_EVICTION_WATERMARK", 10),
+            enable_host_kv_eviction=_bool_env("BATCHGEN_ENABLE_HOST_KV_EVICTION", True),
+            host_kv_eviction_watermark_pct=_int_env("BATCHGEN_HOST_KV_EVICTION_WATERMARK", 20),
             host_kv_total_pages=host_kv_total_pages,
             rep_detection_enabled=_bool_env("BATCHGEN_REP_DETECTION", True),
             preemption_enabled=_bool_env("BATCHGEN_ENABLE_DECODE_PREEMPTION", True),

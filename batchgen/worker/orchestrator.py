@@ -36,6 +36,7 @@ from batchgen.worker.boundary import (
     BoundaryExecutor,
     BoundaryGuards,
     BoundaryHandler,
+    BoundaryHandlerConfig,
     BoundaryPlanner,
     BoundarySynchronizer,
     PlannerConfig,
@@ -170,6 +171,16 @@ class WorkerOrchestrator:
             BoundaryExecutor(state, self._kv, self._rebalancer),
             BoundaryGuards(state),
             self._kv,
+            # Phase 2.8.2i: wire the Stage 1 run_full dependencies so
+            # the native decode loop (enabled via
+            # BATCHGEN_NATIVE_DECODE=1) can reach them. The M4 run()
+            # path ignores these args.
+            adapter=legacy_infra,
+            collectives=collectives,
+            handler_config=BoundaryHandlerConfig(
+                enable_host_kv_eviction=config.enable_host_kv_eviction,
+                host_kv_eviction_watermark=config.host_kv_eviction_watermark_pct,
+            ),
         )
         # F5/F6: DecodeScheduler takes the LegacyInfraBackend adapter
         # directly. When set, config_for_batch runs the one-time
