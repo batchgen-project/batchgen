@@ -11,14 +11,20 @@ scheduler-split branch kept creating.
 
 from __future__ import annotations
 
+from typing import Any
+
 from batchgen.worker.boundary.decisions import (
     AsyncLoadHostToGpu,
     BoundaryPlan,
     Evict,
     ExtendPages,
+    HostEvict,
+    HostGrow,
+    NewLoadAsync,
     OnHold,
     ReleasePages,
 )
+from batchgen.worker.protocols import LegacyInfraBackend
 from batchgen.worker.state import WorkerState
 
 
@@ -78,7 +84,9 @@ class BoundaryGuards:
 
     @staticmethod
     def _uuids_of(decision) -> tuple[str, ...]:  # type: ignore[no-untyped-def]
-        if isinstance(decision, (ReleasePages, Evict, OnHold)):
+        if isinstance(decision, (ReleasePages, Evict, OnHold, HostEvict, NewLoadAsync)):
+            return tuple(decision.uuids)
+        if isinstance(decision, HostGrow):
             return tuple(decision.uuids)
         if isinstance(decision, ExtendPages):
             return (decision.uuid,)
@@ -168,6 +176,57 @@ class BoundaryGuards:
                 check="post",
                 invariant="free_slot_exclusive",
                 detail={"overlapping_local_indices": sorted(overlap)},
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 2.8.1h: post-boundary page-table order check
+    # ------------------------------------------------------------------
+
+    def check_post_page_table_order(
+        self,
+        adapter: LegacyInfraBackend,
+        gpu_manager: Any,
+        batch: list[int],
+    ) -> None:
+        """Verify the GPU paged-KV slot order matches the boundary batch.
+
+        After ``boundary/finalize.py`` runs, ``slot_to_seq_id`` on the
+        page-table manager must equal
+        ``adapter.local_indices_to_global_seq_ids(batch)``. Legacy
+        logged + continued on mismatch (batchgen_worker.py:7717-7721);
+        Phase 2.5 elevated related page-table inconsistencies to a
+        hard-fail (commit c9f2dcd2). We stay consistent: raise
+        :class:`GuardViolation` and let the handler surface it.
+
+        Called by ``BoundaryHandler.run`` after ``finalize`` on the
+        post-boundary batch. No-op when:
+          * ``gpu_manager`` is ``None`` or not initialised.
+          * The page-table manager does not yet have a
+            ``slot_to_seq_id`` attribute.
+          * ``batch`` is empty (nothing to verify).
+        """
+        if not batch:
+            return
+        if gpu_manager is None or not getattr(gpu_manager, "is_initialized", False):
+            return
+        page_table_mgr = getattr(gpu_manager, "_gpu_page_table_manager", None)
+        if page_table_mgr is None:
+            return
+        slot_to_seq = getattr(page_table_mgr, "slot_to_seq_id", None)
+        if slot_to_seq is None:
+            return
+
+        actual = list(slot_to_seq)
+        expected = adapter.local_indices_to_global_seq_ids(batch)
+        if actual != expected:
+            raise GuardViolation(
+                check="post",
+                invariant="page_table_order",
+                detail={
+                    "actual_slot_to_seq_id": actual,
+                    "expected_global_ids": expected,
+                    "batch": list(batch),
+                },
             )
 
 
