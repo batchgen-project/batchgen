@@ -619,20 +619,29 @@ class GLM5ParallelStrategyManager:
                             self.dequant_scale[key].to(device))
 
     def _init_fused_kernels(self):
-        """Initialize TMA-based CUDA kernels after FP8 scales are attached."""
-        count = 0
-        for layer_idx in range(len(self.model.model.layers)):
+        """Initialize TMA-based CUDA kernels after FP8 scales are attached.
+
+        Counts WP2/WP4 init failures so a silent fallback to PyTorch
+        doesn't regress perf unnoticed.
+        """
+        total = len(self.model.model.layers)
+        inited = 0
+        wp2_ok = 0
+        wp4_ok = 0
+        for layer_idx in range(total):
             wrapper = self.model.model.layers[layer_idx].self_attn
-            has_method = hasattr(wrapper, 'initialize_fused_kernels')
-            if layer_idx == 0:
-                logging.warning(
-                    f"[_init_fused_kernels] layer 0: type={type(wrapper).__name__}, "
-                    f"has_method={has_method}"
-                )
-            if has_method:
+            if hasattr(wrapper, 'initialize_fused_kernels'):
                 wrapper.initialize_fused_kernels()
-                count += 1
-        logging.warning(f"[_init_fused_kernels] called {count}/{len(self.model.model.layers)} layers")
+                inited += 1
+                if getattr(wrapper, '_indexer_cuda_weights', None) is not None:
+                    wp2_ok += 1
+                if getattr(wrapper, '_fused_wqb_weights', None) is not None:
+                    wp4_ok += 1
+        if self.rank == 0:
+            logging.info(
+                f"[DSA kernels] init={inited}/{total} layers, "
+                f"WP2={wp2_ok}/{inited}, WP4={wp4_ok}/{inited}"
+            )
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)

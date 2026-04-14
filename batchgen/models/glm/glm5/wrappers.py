@@ -35,7 +35,7 @@ try:
     _HAS_FP8_ABSORB = True
 except Exception as _e:
     _HAS_FP8_ABSORB = False
-    logging.warning(f"[WP5] FP8 absorb import failed: {_e}")
+    logging.debug(f"[WP5] FP8 absorb import failed: {_e}")
 
 # Try importing fused indexer KV proj (WP2)
 try:
@@ -46,7 +46,7 @@ try:
     _HAS_FUSED_INDEXER_KV = True
 except Exception as _e:
     _HAS_FUSED_INDEXER_KV = False
-    logging.warning(f"[WP2] Fused indexer KV proj import failed: {_e}")
+    logging.debug(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
 # Try importing fused scoring pipeline (WP4)
 try:
@@ -57,7 +57,7 @@ try:
     _HAS_FUSED_SCORE = True
 except Exception as _e:
     _HAS_FUSED_SCORE = False
-    logging.warning(f"[WP4] Fused scoring import failed: {_e}")
+    logging.debug(f"[WP4] Fused scoring import failed: {_e}")
 
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
 _GLM5_ATTN_CATEGORIES = [
@@ -296,23 +296,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """Initialize TMA-based CUDA kernels (WP2/WP4).
 
         Must be called AFTER torch.cuda.set_device(local_rank) — TMA descriptors
-        contain physical GPU addresses and are not portable across devices.
+        contain physical GPU addresses and are not portable across devices —
+        AND after _setup_fp8_scales has attached indexer.wk_scale / wq_b_scale.
         """
-        import sys
         attn = self.module
         indexer = attn.indexer
 
-        if self.layer_idx == 0:
-            print(f"[DEBUG] initialize_fused_kernels layer 0: "
-                  f"_HAS_FUSED_INDEXER_KV={_HAS_FUSED_INDEXER_KV}, "
-                  f"_HAS_FUSED_SCORE={_HAS_FUSED_SCORE}, "
-                  f"_HAS_FP8_ABSORB={_HAS_FP8_ABSORB}, "
-                  f"has_wk_scale={hasattr(indexer, 'wk_scale')}, "
-                  f"has_wq_b_scale={hasattr(indexer, 'wq_b_scale')}",
-                  flush=True, file=sys.stderr)
+        # Load-bearing ordering contract: WP2/WP4 both need the FP8 dequant scales
+        # attached by PSM._setup_fp8_scales. If this fires, somebody moved
+        # _init_fused_kernels back in front of _setup_fp8_scales (see commit
+        # d3b99222).
+        assert hasattr(indexer, 'wk_scale'), (
+            f"[layer {self.layer_idx}] initialize_fused_kernels called before "
+            "_setup_fp8_scales attached indexer.wk_scale"
+        )
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
-        if _HAS_FUSED_INDEXER_KV and hasattr(indexer, 'wk_scale'):
+        if _HAS_FUSED_INDEXER_KV:
             try:
                 self._indexer_cuda_module = _build_indexer_module()
                 # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
@@ -322,7 +322,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = FP8IndexerWeightsCUDA(
                     wk_bf16, self._indexer_cuda_module,
                 )
-                logging.warning(
+                logging.debug(
                     f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
                 )
             except Exception as e:
@@ -332,8 +332,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_module = None
                 self._indexer_cuda_weights = None
 
-        # WP4: DISABLED for debugging — isolating WP2 accuracy
-        if False and _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+        # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
+        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
@@ -345,7 +345,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer._fused_score_weights = self._fused_wqb_weights
                 indexer._fused_score_module = self._indexer_cuda_module
                 indexer._warned_fused_score_fallback = False
-                logging.warning(
+                logging.debug(
                     f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
                 )
             except Exception as e:
