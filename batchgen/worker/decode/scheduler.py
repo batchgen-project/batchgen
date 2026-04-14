@@ -420,10 +420,26 @@ class DecodeScheduler:
         tokens_produced = 0
         last_plan: BoundaryPlan = BoundaryPlan()
 
+        import logging as _native_log
+        _native_log.info(
+            f"[NATIVE_DECODE] rank={self._state.rank} entry: "
+            f"decode_uuids={len(decode_state.decode_uuids)} "
+            f"batch={len(batch)} "
+            f"decision_interval_tokens={decision_interval_tokens}"
+        )
+
         try:
             while decode_state.decode_uuids:
                 decode_state.local_iteration += 1
                 decode_state.cumulative_iterations += 1
+
+                if decode_state.local_iteration % 64 == 0:
+                    _native_log.info(
+                        f"[NATIVE_DECODE] rank={self._state.rank} "
+                        f"iter={decode_state.local_iteration} "
+                        f"batch_size={len(decode_state.batch)} "
+                        f"uuids={len(decode_state.decode_uuids)}"
+                    )
 
                 adapter.feed_watchdog()
                 adapter.feed_decode_watchdog()
@@ -438,6 +454,15 @@ class DecodeScheduler:
                         decode_state, gpu_manager=gpu_manager,
                     )
                     last_plan = outcome.result.plan
+                    _native_log.info(
+                        f"[NATIVE_DECODE] rank={self._state.rank} "
+                        f"boundary at iter={decode_state.local_iteration}: "
+                        f"should_break={outcome.should_break} "
+                        f"should_continue={outcome.should_continue} "
+                        f"post_decode_uuids={len(decode_state.decode_uuids)} "
+                        f"watermark_break={outcome.result.plan.watermark_break} "
+                        f"wm_triggered={outcome.result.watermark_triggered}"
+                    )
                     if outcome.should_break:
                         break
                     if outcome.should_continue:
@@ -473,6 +498,13 @@ class DecodeScheduler:
                 tokens_produced += 1
         finally:
             decode_cleanup(adapter, self._boundary)
+
+        _native_log.info(
+            f"[NATIVE_DECODE] rank={self._state.rank} exit: "
+            f"local_iteration={decode_state.local_iteration} "
+            f"tokens_produced={tokens_produced} "
+            f"final_decode_uuids={len(decode_state.decode_uuids)}"
+        )
 
         return DecodeStepResult(
             tokens_produced=tokens_produced,

@@ -444,6 +444,13 @@ class WorkerOrchestrator:
                 ]
                 stats.completed_uuids.extend(sorted(newly_completed))
                 intervals += 1
+                _log.info(
+                    f"[ORCH] rank={self._state.rank}: "
+                    f"newly_completed={len(newly_completed)} "
+                    f"in_decode_remaining={len(self._state.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE))} "
+                    f"on_hold={len(self._state.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD))} "
+                    f"prefilled={len(self._state.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))}"
+                )
                 if not self._state.global_batch.get_sequences_by_status(
                     SequenceStatus.IN_DECODE
                 ) and not self._state.global_batch.get_sequences_by_status(
