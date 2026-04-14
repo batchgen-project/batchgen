@@ -132,10 +132,19 @@ class LegacyWorkerBackend:
 
     # --- boundary Stage 1 passthroughs ---
     def set_num_tokens_per_rank(self, n: int) -> None:
-        self._w.parallel_manager.set_num_tokens_per_rank(n)
+        # Not every parallel_manager exposes this (GPT-OSS uses
+        # GptOssParallelStrategyManager which has no MoE token
+        # accounting). Legacy ``_decode_initial_moe_sync`` /
+        # ``_boundary_finalize`` both hasattr-guarded the call
+        # (batchgen_worker.py:7936, 7262); mirror that here.
+        pm = getattr(self._w, "parallel_manager", None)
+        if pm is not None and hasattr(pm, "set_num_tokens_per_rank"):
+            pm.set_num_tokens_per_rank(n)
 
     def set_rank_token_counts(self, counts: "torch.Tensor") -> None:
-        self._w.parallel_manager.set_rank_token_counts(counts)
+        pm = getattr(self._w, "parallel_manager", None)
+        if pm is not None and hasattr(pm, "set_rank_token_counts"):
+            pm.set_rank_token_counts(counts)
 
     def host_paged_kv_worker_view(self) -> Any:
         return getattr(self._w.core_engine, "host_paged_kv_worker_view", None)
