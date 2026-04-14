@@ -562,6 +562,12 @@ class FakeLegacyBackend:
         )
         return bool(getattr(self, "_ngram_pattern_result", False))
 
+    def unbind_decode_context(self) -> None:
+        self._record("unbind_decode_context")
+
+    def wait_async_load_task(self, task: Any) -> None:
+        self._record("wait_async_load_task", task=task)
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)

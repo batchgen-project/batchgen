@@ -76,6 +76,8 @@ EXPECTED_METHODS = {
     "forward_decode_step",
     "record_decoded_token",
     "check_repeating_ngram_pattern",
+    "unbind_decode_context",
+    "wait_async_load_task",
 }
 
 

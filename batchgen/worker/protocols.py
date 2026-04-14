@@ -322,6 +322,19 @@ class LegacyInfraBackend(Protocol):
     ``query_book[local_idx].decoded_tokens[0]`` — the buffer pointer
     dance stays out of the native update loop."""
 
+    def unbind_decode_context(self) -> None: ...
+    """Phase 2.8.2g: reset ``Attn_Wrapper`` / ``AttnWrapperBase``
+    class-level fields to ``None`` at decode teardown. Mirrors
+    legacy ``_decode_cleanup`` (batchgen_worker.py:8456-8474). Keeps
+    the class-level singletons from holding stale pointers between
+    decode rounds."""
+
+    def wait_async_load_task(self, task: Any) -> None: ...
+    """Phase 2.8.2g: synchronously wait on an async load handle +
+    ``torch.cuda.synchronize``. Used by decode cleanup when the
+    run_continuous call exits with a still-pending async load on the
+    handler's pending stash."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...

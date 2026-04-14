@@ -184,6 +184,34 @@ class LegacyWorkerBackend:
         tokens = self._w.query_book[local_idx].decoded_tokens[0]
         return bool(_check_repeating_pattern(tokens, decoded_length))
 
+    def unbind_decode_context(self) -> None:
+        from batchgen.models.wrappers import AttnWrapperBase
+        # ``Attn_Wrapper`` is an alias for AttnWrapperBase in
+        # batchgen.batchgen_worker; resetting AttnWrapperBase covers
+        # both (legacy 8456-8474).
+        AttnWrapperBase.kv_append_callback = None
+        AttnWrapperBase.scale = None
+        AttnWrapperBase.past_key_states = None
+        AttnWrapperBase.past_value_states = None
+        AttnWrapperBase.gpu_paged_kv_manager = None
+        AttnWrapperBase.gpu_paged_kv_manager_aux = None
+        AttnWrapperBase.host_paged_kv_worker_view = None
+        AttnWrapperBase.host_paged_kv_worker_view_aux = None
+        AttnWrapperBase.cache_seqlens = None
+        AttnWrapperBase.attention_mask = None
+        AttnWrapperBase.position_ids = None
+        AttnWrapperBase.max_seqlen = None
+        AttnWrapperBase.cur_batch = None
+
+    def wait_async_load_task(self, task: Any) -> None:
+        if task is None:
+            return
+        task.wait()
+        import torch
+        device = getattr(self._w, "torch_device", None)
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)
