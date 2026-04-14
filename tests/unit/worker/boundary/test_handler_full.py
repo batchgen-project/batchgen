@@ -272,7 +272,10 @@ class TestPendingLoadStateOnHandler:
         handler, _, adapter = _build_handler(state)
         adapter._uuid_to_local = {"u": 0}
         # Pre-seed a pending load as if the last cycle launched one.
-        handler._pending_async_task = object()
+        class _Task:
+            def wait(self) -> None:
+                pass
+        handler._pending_async_task = _Task()
         handler._pending_load_uuids = ["load_from_prev_cycle"]
         handler._pending_load_local = [7]
         handler._pending_load_global = [42]
