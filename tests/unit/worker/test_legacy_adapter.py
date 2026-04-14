@@ -74,6 +74,8 @@ EXPECTED_METHODS = {
     # decode Stage 2 passthroughs
     "bind_decode_context",
     "forward_decode_step",
+    "record_decoded_token",
+    "check_repeating_ngram_pattern",
 }
 
 

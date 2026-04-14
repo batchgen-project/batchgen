@@ -545,6 +545,23 @@ class FakeLegacyBackend:
         out = getattr(self, "_forward_step_output", None)
         return out if out is not None else new_tokens
 
+    def record_decoded_token(
+        self, *, local_idx: int, decode_pos: int, token: Any
+    ) -> None:
+        self._record(
+            "record_decoded_token",
+            local_idx=local_idx, decode_pos=decode_pos, token=token,
+        )
+
+    def check_repeating_ngram_pattern(
+        self, *, local_idx: int, decoded_length: int
+    ) -> bool:
+        self._record(
+            "check_repeating_ngram_pattern",
+            local_idx=local_idx, decoded_length=decoded_length,
+        )
+        return bool(getattr(self, "_ngram_pattern_result", False))
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)

@@ -172,6 +172,18 @@ class LegacyWorkerBackend:
             page_table_verified, local_iteration,
         )
 
+    def record_decoded_token(
+        self, *, local_idx: int, decode_pos: int, token: "torch.Tensor"
+    ) -> None:
+        self._w.query_book[local_idx].decoded_tokens[:, decode_pos] = token
+
+    def check_repeating_ngram_pattern(
+        self, *, local_idx: int, decoded_length: int
+    ) -> bool:
+        from batchgen.batchgen_worker import _check_repeating_pattern
+        tokens = self._w.query_book[local_idx].decoded_tokens[0]
+        return bool(_check_repeating_pattern(tokens, decoded_length))
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)

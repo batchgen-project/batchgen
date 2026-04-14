@@ -301,6 +301,27 @@ class LegacyInfraBackend(Protocol):
     it. Returns the sampled ``new_tokens`` tensor for the next
     iteration."""
 
+    def record_decoded_token(
+        self,
+        *,
+        local_idx: int,
+        decode_pos: int,
+        token: "torch.Tensor",
+    ) -> None: ...
+    """Phase 2.8.2e: write a single sampled token into the query-book
+    buffer pool slot for ``local_idx``. Infrastructure — the buffer
+    pool layout + view sharing with SequenceEntry.decoded_tokens is
+    worker-internal (legacy batchgen_worker.py:8399)."""
+
+    def check_repeating_ngram_pattern(
+        self, *, local_idx: int, decoded_length: int
+    ) -> bool: ...
+    """Phase 2.8.2e: variable-length N-gram repetition check over
+    the decoded-tokens buffer for ``local_idx``. Wraps
+    ``_check_repeating_pattern`` (batchgen_worker.py:36) which reads
+    ``query_book[local_idx].decoded_tokens[0]`` — the buffer pointer
+    dance stays out of the native update loop."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...
