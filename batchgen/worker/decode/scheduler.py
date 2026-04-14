@@ -443,12 +443,14 @@ class DecodeScheduler:
                     if outcome.should_continue:
                         continue
 
-                if not decode_state.batch:
-                    # Defensive: if the boundary handler emptied batch
-                    # without setting should_break, avoid issuing a
-                    # zero-size forward (which would crash most kernels).
-                    break
-
+                # NOTE: DO NOT skip the forward step when batch is empty.
+                # MoE models (GPT-OSS, DeepSeek) run an all-to-all + per-
+                # iteration all_gather_into_tensor inside
+                # ``_decode_forward_step`` that every rank must hit in
+                # lockstep — if this rank bails, peers deadlock waiting
+                # on the collective. Legacy documents the same rule at
+                # batchgen_worker.py:8252-8254. Pass the empty batch in;
+                # legacy's forward handles it correctly.
                 new_tokens_out = forward_decode_step(
                     adapter,
                     batch=decode_state.batch,
