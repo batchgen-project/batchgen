@@ -88,10 +88,20 @@ class TestNoPendingLoad:
 # ---------------------------------------------------------------------------
 
 
+class _PassThroughAdapter(FakeLegacyBackend):
+    """Fake adapter that returns the input ``(decode_uuids, batch)``
+    from ``finalize_async_load_minimal`` so the rebuild path fires."""
+
+    def finalize_async_load_minimal(self, *args: Any, **kwargs: Any) -> Any:
+        self._record("finalize_async_load_minimal", *args, **kwargs)
+        # args[4] = decode_uuids, args[5] = batch in wait_pending's call.
+        return (args[4], args[5])
+
+
 class TestPendingLoad:
     def test_waits_on_task_and_finalizes(self) -> None:
         state = _make_state()
-        legacy = FakeLegacyBackend()
+        legacy = _PassThroughAdapter()
         col = FakeCollectiveBackend(rank=0, world_size=1)
         task = _FakeAsyncTask()
         gpu = _fake_gpu_manager()
@@ -120,7 +130,7 @@ class TestPendingLoad:
         finalize + barrier. That behaviour is preserved so eagerly
         pre-loaded sequences (no handle) still integrate correctly."""
         state = _make_state()
-        legacy = FakeLegacyBackend()
+        legacy = _PassThroughAdapter()
         col = FakeCollectiveBackend(rank=0, world_size=1)
 
         wait_pending(
