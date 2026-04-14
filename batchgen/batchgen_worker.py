@@ -1688,22 +1688,27 @@ class BatchGenWorker:
 	def _flush_deferred_kv_to_host(self) -> None:
 		"""Flush all deferred KV host offload entries accumulated during forward.
 
-		ONE event.synchronize() covers all layers, then batch-launch D2H copies.
-		This replaces N per-layer syncs with a single post-forward sync.
+		ONE event.synchronize() covers all layers (primary MLA KV + the
+		DSA auxiliary indexer KV if present), then batch-launch D2H
+		copies. Replaces N per-layer syncs with a single post-forward
+		sync for both caches.
 		"""
 		entries = getattr(self, '_deferred_kv_entries', [])
-		if not entries:
+		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
+		if not entries and not entries_aux:
 			return
 
 		worker_view = getattr(self, '_deferred_kv_worker_view', None)
 		batch_info = getattr(self, '_deferred_kv_batch', None)
-		if worker_view is None or batch_info is None:
+		aux_view = getattr(self, '_deferred_kv_worker_view_aux', None)
+		if (worker_view is None or batch_info is None) and not aux_view:
 			self._deferred_kv_entries = []
+			self._deferred_kv_entries_aux = []
 			return
 
-		sequence_ids, sequence_lengths = batch_info
+		sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
 
-		# ONE sync for ALL layers — the key optimization
+		# ONE sync for ALL layers across BOTH caches — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
@@ -1713,31 +1718,51 @@ class BatchGenWorker:
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 
-		for layer_idx, k_tensor, v_tensor in entries:
-			if k_tensor.dim() == 3:
-				k_tensor = k_tensor.unsqueeze(2)
-			if v_tensor is not None and v_tensor.dim() == 3:
-				v_tensor = v_tensor.unsqueeze(2)
+		if entries and worker_view is not None and sequence_ids is not None:
+			for layer_idx, k_tensor, v_tensor in entries:
+				if k_tensor.dim() == 3:
+					k_tensor = k_tensor.unsqueeze(2)
+				if v_tensor is not None and v_tensor.dim() == 3:
+					v_tensor = v_tensor.unsqueeze(2)
 
-			task = worker_view.async_append_decode_kv_to_host(
-				layer_idx=layer_idx,
-				sequence_ids=sequence_ids,
-				k_tensor=k_tensor,
-				v_tensor=v_tensor,
-				sequence_lengths=sequence_lengths,
-			)
+				task = worker_view.async_append_decode_kv_to_host(
+					layer_idx=layer_idx,
+					sequence_ids=sequence_ids,
+					k_tensor=k_tensor,
+					v_tensor=v_tensor,
+					sequence_lengths=sequence_lengths,
+				)
 
-			self._pending_kv_append_tensors.append(k_tensor)
-			if v_tensor is not None:
-				self._pending_kv_append_tensors.append(v_tensor)
-			if task is not None:
-				self._pending_kv_append_tasks.append(task)
+				self._pending_kv_append_tensors.append(k_tensor)
+				if v_tensor is not None:
+					self._pending_kv_append_tensors.append(v_tensor)
+				if task is not None:
+					self._pending_kv_append_tasks.append(task)
+
+		# Aux (DSA indexer) cache — shares the same post-forward sync
+		if entries_aux and aux_view is not None and sequence_ids is not None:
+			for layer_idx, k_tensor, v_tensor in entries_aux:
+				if k_tensor.dim() == 3:
+					k_tensor = k_tensor.unsqueeze(2)
+
+				task = aux_view.async_append_decode_kv_to_host(
+					layer_idx=layer_idx,
+					sequence_ids=sequence_ids,
+					k_tensor=k_tensor,
+					v_tensor=None,
+					sequence_lengths=sequence_lengths,
+				)
+
+				self._pending_kv_append_tensors.append(k_tensor)
+				if task is not None:
+					self._pending_kv_append_tasks.append(task)
 
 		# Throttle: prevent thread exhaustion from std::async
 		if len(self._pending_kv_append_tasks) >= 256:
 			self._wait_pending_kv_append_tasks()
 
 		self._deferred_kv_entries = []
+		self._deferred_kv_entries_aux = []
 
 	def _append_decode_kv_to_host_async(
 		self,
@@ -8446,7 +8471,9 @@ class BatchGenWorker:
 						_kv_seq_lengths.append(seq.current_context_length - 1)
 					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
 					self._deferred_kv_entries = []
+					self._deferred_kv_entries_aux = []
 					self._deferred_kv_worker_view = _kv_worker_view
+					self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
 				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
 					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
@@ -8476,11 +8503,18 @@ class BatchGenWorker:
 				# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
 				AttnWrapperBase.kv_append_callback = kv_append_callback
 
-				# DSA: auxiliary KV append callback for indexer host cache
+				# DSA: auxiliary KV append callback for indexer host cache.
+				# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
+				# to _deferred_kv_entries_aux; a single event.synchronize in
+				# _flush_deferred_kv_to_host covers both primary and aux caches.
 				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 				if aux_view is not None:
-					def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-						self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+					if BATCHGEN_SYNC_KV:
+						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+					else:
+						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
