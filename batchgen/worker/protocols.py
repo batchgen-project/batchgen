@@ -261,6 +261,26 @@ class LegacyInfraBackend(Protocol):
     is wired; no-op otherwise. Called from the boundary executor on
     every release-completed decision."""
 
+    # --- decode Stage 2 passthroughs ---
+    def bind_decode_context(
+        self,
+        *,
+        batch: list[int],
+        past_key_states: Any,
+        past_value_states: Any,
+        scale_dict: dict | None,
+    ) -> tuple[Any, Any]: ...
+    """Phase 2.8.2a: port of legacy ``_decode_bind_attn_wrapper``.
+
+    Binds ``Attn_Wrapper`` / ``AttnWrapperBase`` class-level singletons
+    to the current decode batch's managers + tensors. Raises
+    ``AssertionError`` when the GPU page-table slot-to-seq-id order
+    drifts from ``cur_batch`` (Phase 2.5 invariant: silent rebuild
+    corrupts decode state — the caller must keep them in sync).
+
+    Returns ``(gpu_manager, worker_view)`` for the native decode loop
+    to thread through subsequent helpers."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...

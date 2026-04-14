@@ -145,6 +145,19 @@ class LegacyWorkerBackend:
         if sizer is not None:
             sizer.report_completion(decoded_length)
 
+    # --- decode Stage 2 passthroughs ---
+    def bind_decode_context(
+        self,
+        *,
+        batch: list[int],
+        past_key_states: Any,
+        past_value_states: Any,
+        scale_dict: dict | None,
+    ) -> tuple[Any, Any]:
+        return self._w._decode_bind_attn_wrapper(
+            batch, past_key_states, past_value_states, scale_dict,
+        )
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)

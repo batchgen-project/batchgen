@@ -502,6 +502,27 @@ class FakeLegacyBackend:
     def report_chunk_sizer_completion(self, decoded_length: int) -> None:
         self._record("report_chunk_sizer_completion", decoded_length)
 
+    # --- decode Stage 2 passthroughs ---
+    def bind_decode_context(
+        self,
+        *,
+        batch: list[int],
+        past_key_states: Any,
+        past_value_states: Any,
+        scale_dict: Any,
+    ) -> tuple[Any, Any]:
+        self._record(
+            "bind_decode_context",
+            batch=list(batch),
+            past_key_states=past_key_states,
+            past_value_states=past_value_states,
+            scale_dict=scale_dict,
+        )
+        return (
+            getattr(self, "_bind_gpu_manager", None),
+            getattr(self, "_bind_worker_view", None),
+        )
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)

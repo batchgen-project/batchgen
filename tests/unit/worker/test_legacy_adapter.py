@@ -71,6 +71,8 @@ EXPECTED_METHODS = {
     "set_rank_token_counts",
     "host_paged_kv_worker_view",
     "report_chunk_sizer_completion",
+    # decode Stage 2 passthroughs
+    "bind_decode_context",
 }
 
 
