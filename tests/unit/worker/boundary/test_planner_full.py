@@ -323,9 +323,11 @@ class TestRule4GpuExtension:
         assert extends[0] == ExtendPages(uuid="u", additional_pages=3)
 
     def test_rank_oversubscribed_holds_shortest_first(self) -> None:
-        # Both seqs need 4 pages on rank 0; rank 0 has only 4 free, so
-        # one must go to ON_HOLD. Shortest-decoded-first → "shortest"
-        # picked for OnHold so longer-running "longest" keeps decoding.
+        # Both seqs need 4 pages on rank 0; rank 0 has 6 free (2 pages
+        # short), so exactly one must go to ON_HOLD — holding the
+        # shortest-progress seq frees its 2 gpu_pages, closing the gap.
+        # Shortest-decoded-first → "shortest" picked for OnHold so
+        # longer-running "longest" keeps decoding.
         states = {
             "shortest": _state(
                 decoded_length=5,
@@ -344,7 +346,7 @@ class TestRule4GpuExtension:
             BoundaryPlanner(_cfg()),
             decode_uuids=["shortest", "longest"],
             global_seq_state=states,
-            per_rank_free=[4],
+            per_rank_free=[6],
         )
         onholds = [
             d for d in plan.decisions_of(OnHold)
@@ -390,7 +392,7 @@ class TestRule4GpuExtension:
             BoundaryPlanner(_cfg()),
             decode_uuids=["normal", "high"],
             global_seq_state=states,
-            per_rank_free=[4],
+            per_rank_free=[6],
             priority_by_uuid={"normal": 0, "high": 1},
         )
         onholds = [
