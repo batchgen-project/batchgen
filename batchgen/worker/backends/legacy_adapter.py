@@ -130,6 +130,21 @@ class LegacyWorkerBackend:
     def put_sequences_on_hold(self, uuids: list[str]) -> None:
         self._w._put_sequences_on_hold(uuids)
 
+    # --- boundary Stage 1 passthroughs ---
+    def set_num_tokens_per_rank(self, n: int) -> None:
+        self._w.parallel_manager.set_num_tokens_per_rank(n)
+
+    def set_rank_token_counts(self, counts: "torch.Tensor") -> None:
+        self._w.parallel_manager.set_rank_token_counts(counts)
+
+    def host_paged_kv_worker_view(self) -> Any:
+        return getattr(self._w.core_engine, "host_paged_kv_worker_view", None)
+
+    def report_chunk_sizer_completion(self, decoded_length: int) -> None:
+        sizer = getattr(self._w, "adaptive_chunk_sizer", None)
+        if sizer is not None:
+            sizer.report_completion(decoded_length)
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         return self._w._local_indices_to_global_seq_ids(batch)

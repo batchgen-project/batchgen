@@ -66,6 +66,11 @@ EXPECTED_METHODS = {
     # dist init
     "ensure_comms",
     "init_gpu_kv_with_actual_size",
+    # boundary Stage 1 passthroughs
+    "set_num_tokens_per_rank",
+    "set_rank_token_counts",
+    "host_paged_kv_worker_view",
+    "report_chunk_sizer_completion",
 }
 
 

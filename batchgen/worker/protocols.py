@@ -237,6 +237,30 @@ class LegacyInfraBackend(Protocol):
     def get_effective_chunk_size(self) -> int: ...
     def put_sequences_on_hold(self, uuids: list[UUID]) -> None: ...
 
+    # --- boundary Stage 1 passthroughs ---
+    def set_num_tokens_per_rank(self, n: int) -> None: ...
+    """Phase 2.8.1: forward to ``parallel_manager.set_num_tokens_per_rank``.
+    Called by ``boundary/finalize.py`` after every boundary cycle so the
+    MoE EP allocation tracks the new max batch size across ranks."""
+
+    def set_rank_token_counts(self, counts: "torch.Tensor") -> None: ...
+    """Phase 2.8.1: forward to ``parallel_manager.set_rank_token_counts``.
+    Paired with ``set_num_tokens_per_rank``; the tensor holds the exact
+    per-rank token count for the current decode batch."""
+
+    def host_paged_kv_worker_view(self) -> Any: ...
+    """Phase 2.8.1: return the core engine's
+    ``host_paged_kv_worker_view`` (or ``None`` if unavailable). The
+    boundary executor uses the view for host-KV grow / release /
+    async-load operations that the adapter deliberately does NOT
+    wrap 1:1 — the view's surface is wide and legacy-shaped."""
+
+    def report_chunk_sizer_completion(self, decoded_length: int) -> None: ...
+    """Phase 2.8.1: forward to
+    ``adaptive_chunk_sizer.report_completion`` when the adaptive sizer
+    is wired; no-op otherwise. Called from the boundary executor on
+    every release-completed decision."""
+
     # --- index / UUID mapping (read-only access to legacy state) ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]: ...
     def get_local_indices_for_uuids(self, uuids: list[UUID]) -> list[int]: ...

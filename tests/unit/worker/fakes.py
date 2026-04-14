@@ -488,6 +488,20 @@ class FakeLegacyBackend:
     def put_sequences_on_hold(self, uuids: list[str]) -> None:
         self._record("put_sequences_on_hold", uuids)
 
+    # --- boundary Stage 1 passthroughs ---
+    def set_num_tokens_per_rank(self, n: int) -> None:
+        self._record("set_num_tokens_per_rank", n)
+
+    def set_rank_token_counts(self, counts: Any) -> None:
+        self._record("set_rank_token_counts", counts)
+
+    def host_paged_kv_worker_view(self) -> Any:
+        self._record("host_paged_kv_worker_view")
+        return getattr(self, "_host_paged_kv_worker_view", None)
+
+    def report_chunk_sizer_completion(self, decoded_length: int) -> None:
+        self._record("report_chunk_sizer_completion", decoded_length)
+
     # --- index / UUID mapping ---
     def local_indices_to_global_seq_ids(self, batch: list[int]) -> list[int]:
         self._record("local_indices_to_global_seq_ids", batch)
