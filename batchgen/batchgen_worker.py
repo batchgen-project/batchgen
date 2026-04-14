@@ -1184,6 +1184,7 @@ class BatchGenWorker:
 			"text": text,
 			"prompt_length": seq.prompt_length,
 			"decoded_length": seq.decoded_length,
+			"finish_reason": self._get_finish_reason(seq),
 		})
 
 	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:

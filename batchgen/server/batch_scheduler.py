@@ -1130,6 +1130,7 @@ class BatchScheduler:
         decoded_text = result.get("text", "")
         prompt_length = result.get("prompt_length", 0)
         decoded_length = result.get("decoded_length", 0)
+        finish_reason = result.get("finish_reason", "stop")
         model = meta["model"]
         custom_id = meta["custom_id"]
         url = meta["url"]
@@ -1149,7 +1150,7 @@ class BatchScheduler:
                         "content": decoded_text,
                     },
                     "logprobs": None,
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_length,
@@ -1167,7 +1168,7 @@ class BatchScheduler:
                     "index": 0,
                     "text": decoded_text,
                     "logprobs": None,
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_length,
