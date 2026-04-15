@@ -423,24 +423,47 @@ def act_quant(
     x_flat = x.view(-1, original_shape[-1])
     M, N = x_flat.shape
 
-    # The validated kernel launches a 3D Triton grid (bsz, seq_len, num_blocks).
-    # For prepacked prefill with very long total sequences (L4 with ~2K-4K
-    # seqs per batch), M can reach hundreds of thousands of tokens and blow
-    # past CUDA's 65535-per-dim grid cap → "Triton Error [CUDA]: invalid
-    # argument". Chunk along M to stay under ACT_QUANT_MAX_ROWS (32K).
+    # Route bf16 to the validated quant kernels:
+    #   - Decode (M small, typically ≤ 128): the CUDA act_quant_3d kernel
+    #     from batchgen_kernels.moe._C_fp8_blockwise_ops, reused from the
+    #     MiniMax-M25 path. Persistent-CTA (one CTA per expert) with a
+    #     trivial mapping of "expert = token" + tokens_per_expert = [1] per
+    #     slot. No grid-cap, hand-tuned CUDA.
+    #   - Prefill (M arbitrarily large, up to hundreds of thousands in
+    #     prepacked): the 1D-grid Triton variant
+    #     per_token_blocked_quantize_bf16_to_fp8_flat. grid=(M*num_blocks,)
+    #     on the X dim caps at 2^31-1, lifting the 65535 cap that the
+    #     original 3D kernel's Y dim had.
+    # Both kernels use the same blockwise FP8 semantics (FP8_SAFE_MAX=440,
+    # per-block scale = amax / 440, saturating cast).
     if x.dtype == torch.bfloat16 and M > 0:
-        from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
-        num_blocks = (N + block_size - 1) // block_size
-        y_flat = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
-        scale_flat = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
-        for chunk_start in range(0, M, ACT_QUANT_MAX_ROWS):
-            chunk_end = min(chunk_start + ACT_QUANT_MAX_ROWS, M)
-            x_chunk_3d = x_flat[chunk_start:chunk_end].unsqueeze(0).contiguous()  # [1, chunk, N]
-            y_chunk_3d, s_chunk_3d = per_token_blocked_quantize_bf16_to_fp8(
-                x_chunk_3d, block_size=block_size
-            )
-            y_flat[chunk_start:chunk_end] = y_chunk_3d.view(chunk_end - chunk_start, N)
-            scale_flat[chunk_start:chunk_end] = s_chunk_3d.view(chunk_end - chunk_start, num_blocks)
+        try:
+            from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
+            _HAS_CUDA_ACT_QUANT = True
+        except ImportError:
+            _HAS_CUDA_ACT_QUANT = False
+
+        _DECODE_M_THRESHOLD = 128  # anything below this is decode-sized; use CUDA kernel
+        if _HAS_CUDA_ACT_QUANT and M <= _DECODE_M_THRESHOLD and block_size == 128:
+            # act_quant_3d expects [E, mtp, K]. We use E=M, mtp=1, one valid
+            # token per "expert". Allocated tokens_per_expert is a [M] int32.
+            x_3d = x_flat.view(M, 1, N).contiguous()
+            tokens_per_expert = torch.ones(M, dtype=torch.int32, device=x.device)
+            y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+            # act_quant_3d outputs uint8 for the FP8 bytes; deep_gemm consumes
+            # float8_e4m3fn, so reinterpret.
+            y_fp8_3d = y_uint8_3d.view(torch.float8_e4m3fn)
+            y = y_fp8_3d.view(*original_shape)
+            num_blocks = scale_3d.size(-1)
+            scale = scale_3d.view(*original_shape[:-1], num_blocks)
+            return y, scale
+
+        # Prefill: 1D-grid Triton kernel, no chunking, no grid-cap ceiling.
+        from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_flat
+        y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_flat(
+            x_flat, block_size=block_size
+        )
+        num_blocks = scale_flat.size(-1)
         y = y_flat.view(*original_shape)
         scale = scale_flat.view(*original_shape[:-1], num_blocks)
         return y, scale
