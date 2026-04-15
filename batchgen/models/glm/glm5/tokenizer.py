@@ -100,7 +100,13 @@ class GLM5Tokenizer(FastTokenizer):
 
         from jinja2 import Template
 
-        template = Template(self.chat_template)
+        # HuggingFace transformers renders chat templates with
+        # trim_blocks=True + lstrip_blocks=True (via ImmutableSandboxedEnvironment).
+        # Without these, Jinja leaves raw newlines/spaces from block tags like
+        # {%- if ... -%}, producing prompts that diverge from HF and training —
+        # for GLM-5 that shows up as an extra "\n        \n" (token 8942)
+        # inserted between <sop> and <|system|>, derailing tok-0 generation.
+        template = Template(self.chat_template, trim_blocks=True, lstrip_blocks=True)
         rendered = template.render(
             messages=messages,
             bos_token="",

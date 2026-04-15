@@ -318,9 +318,17 @@ class FastTokenizer(BaseTokenizer):
                 "Install it with: pip install jinja2"
             )
 
-        # Create Jinja2 template (use permissive Undefined like HuggingFace transformers,
-        # since chat templates may access optional attributes like current_date)
-        template = Template(self.chat_template, undefined=Undefined)
+        # Match HuggingFace transformers' chat-template rendering: permissive
+        # Undefined (same as HF), and crucially trim_blocks=True + lstrip_blocks=True
+        # (HF uses ImmutableSandboxedEnvironment which sets both to True). Without
+        # these Jinja leaves raw newlines/whitespace from block tags that the model
+        # was not trained to see.
+        template = Template(
+            self.chat_template,
+            undefined=Undefined,
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
 
         # Render the template with messages and special tokens
         rendered = template.render(
