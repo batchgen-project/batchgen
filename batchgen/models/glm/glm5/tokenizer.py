@@ -77,6 +77,21 @@ class GLM5Tokenizer(FastTokenizer):
         self.eos_token = id_to_token.get(self.eos_token_id)
         self.pad_token = self.eos_token
 
+        # Pre-compile the Jinja template ONCE — reused on every apply_chat_template.
+        # Template() is a ~10 ms Parse+AST+codegen; rendering is ~30 µs. Without
+        # this cache, scheduler dispatch of N prompts cost ~N × 10 ms (N=3361 →
+        # ~32 s of wall-clock on the L4 admit path).
+        # trim_blocks=True, lstrip_blocks=True match HF's ImmutableSandboxedEnvironment
+        # behavior — prevents extra whitespace tokens (e.g. token 8942 between
+        # <sop> and <|system|>) that diverge from training.
+        if self.chat_template:
+            from jinja2 import Template
+            self._jinja_template = Template(
+                self.chat_template, trim_blocks=True, lstrip_blocks=True
+            )
+        else:
+            self._jinja_template = None
+
         logger.info(
             f"GLM-5 tokenizer initialized: vocab_size={self.vocab_size}, "
             f"eos={self.eos_token_id}, stop_tokens={self.stop_token_ids}"
@@ -91,23 +106,15 @@ class GLM5Tokenizer(FastTokenizer):
     ) -> Union[str, List[int]]:
         """Apply GLM-5 chat template.
 
-        Overrides parent to use permissive Jinja2 undefined (not StrictUndefined),
-        since the GLM-5 template checks optional variables like 'tools',
+        Uses the pre-compiled `self._jinja_template` built once in __init__ —
+        do not rebuild on every call. Parent uses permissive Jinja2 undefined
+        (not StrictUndefined) for optional variables like 'tools',
         'enable_thinking', 'clear_thinking' with {% if %} guards.
         """
-        if not self.chat_template:
+        if self._jinja_template is None:
             raise ValueError("No chat template available for GLM-5 tokenizer.")
 
-        from jinja2 import Template
-
-        # HuggingFace transformers renders chat templates with
-        # trim_blocks=True + lstrip_blocks=True (via ImmutableSandboxedEnvironment).
-        # Without these, Jinja leaves raw newlines/spaces from block tags like
-        # {%- if ... -%}, producing prompts that diverge from HF and training —
-        # for GLM-5 that shows up as an extra "\n        \n" (token 8942)
-        # inserted between <sop> and <|system|>, derailing tok-0 generation.
-        template = Template(self.chat_template, trim_blocks=True, lstrip_blocks=True)
-        rendered = template.render(
+        rendered = self._jinja_template.render(
             messages=messages,
             bos_token="",
             eos_token=self.eos_token or "",

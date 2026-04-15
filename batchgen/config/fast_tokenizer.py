@@ -310,25 +310,30 @@ class FastTokenizer(BaseTokenizer):
                 "Cannot apply chat template formatting."
             )
 
-        try:
-            from jinja2 import Template, Undefined
-        except ImportError:
-            raise ImportError(
-                "jinja2 is required for apply_chat_template. "
-                "Install it with: pip install jinja2"
+        # Lazily build + cache the Jinja Template. Template() is ~10 ms per
+        # construction; render() is ~30 µs. Rebuilding every call is the
+        # reason scheduler admission of 3361 L4 prompts took ~90 s.
+        template = getattr(self, "_jinja_template", None)
+        if template is None:
+            try:
+                from jinja2 import Template, Undefined
+            except ImportError:
+                raise ImportError(
+                    "jinja2 is required for apply_chat_template. "
+                    "Install it with: pip install jinja2"
+                )
+            # Match HuggingFace transformers' rendering: permissive Undefined
+            # + trim_blocks=True + lstrip_blocks=True (HF uses
+            # ImmutableSandboxedEnvironment which sets both to True). Without
+            # these, raw newlines/whitespace from block tags leak into the
+            # rendered prompt.
+            template = Template(
+                self.chat_template,
+                undefined=Undefined,
+                trim_blocks=True,
+                lstrip_blocks=True,
             )
-
-        # Match HuggingFace transformers' chat-template rendering: permissive
-        # Undefined (same as HF), and crucially trim_blocks=True + lstrip_blocks=True
-        # (HF uses ImmutableSandboxedEnvironment which sets both to True). Without
-        # these Jinja leaves raw newlines/whitespace from block tags that the model
-        # was not trained to see.
-        template = Template(
-            self.chat_template,
-            undefined=Undefined,
-            trim_blocks=True,
-            lstrip_blocks=True,
-        )
+            self._jinja_template = template
 
         # Render the template with messages and special tokens
         rendered = template.render(
