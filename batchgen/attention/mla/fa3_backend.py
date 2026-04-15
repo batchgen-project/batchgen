@@ -403,22 +403,36 @@ def act_quant_kernel_2d(
 ACT_QUANT_MAX_ROWS = 32768  # 32K rows per chunk
 
 def act_quant(
-    x: torch.Tensor, 
+    x: torch.Tensor,
     block_size: int = 128,
     eps: float = 1e-12
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies FP8 quantization. Handles arbitrary tensor shapes by flattening dims 0..-2.
     For very long sequences, processes in chunks to avoid CUDA kernel limitations.
+
+    For bf16 inputs with non-empty shape, delegates to the validated kernel in
+    batchgen_kernels (FP8_SAFE_MAX=440 + FP8_E4M3_MIN_NORMAL guard + NaN/Inf → 0),
+    which is used on every decode-path call from wrappers.py (hidden_flat → kv_a /
+    q_a_proj, q_a_normed → q_b_proj, attn_output → o_proj). Falls back to the
+    in-file Triton kernel for dtype/shape edge cases (m=0, non-bf16).
     """
     assert x.is_contiguous(), 'Input must be contiguous'
-    
-    fp8_max = 448.0
+
     original_shape = x.shape
-    
-    # 1. View as 2D (Rows, Hidden)
     x_flat = x.view(-1, original_shape[-1])
     M, N = x_flat.shape
+
+    if x.dtype == torch.bfloat16 and M > 0:
+        from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
+        x_bf16_3d = x_flat.unsqueeze(0).contiguous()  # [1, M, N]
+        y_3d, s_3d = per_token_blocked_quantize_bf16_to_fp8(x_bf16_3d, block_size=block_size)
+        num_blocks = s_3d.size(-1)
+        y = y_3d.view(*original_shape)
+        scale = s_3d.view(*original_shape[:-1], num_blocks)
+        return y, scale
+
+    fp8_max = 448.0
     
     # 2. Allocate Outputs
     y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
@@ -581,20 +595,9 @@ def w8a16_gemm(
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
 
-	# Prefer the validated per-token blocked quant kernel from batchgen_kernels
-	# (FP8_SAFE_MAX=440 with headroom + FP8_E4M3_MIN_NORMAL guard + NaN/Inf→0).
-	# Falls back to the in-file Triton act_quant for non-bf16 activations or
-	# for empty m=0 sub-batches (kernel asserts on empty dim).
-	if x.dtype == torch.bfloat16 and m > 0:
-		from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
-		x_bf16_3d = x.unsqueeze(0).contiguous()  # [1, m, k]
-		x_q, x_s = per_token_blocked_quantize_bf16_to_fp8(x_bf16_3d, block_size=128)
-		num_blocks = x_s.size(-1)
-		x_q = x_q.view(m, k)
-		x_s = x_s.view(m, num_blocks)
-		x_fp8 = (x_q, x_s)
-	else:
-		x_fp8 = act_quant(x)
+	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
+	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
+	x_fp8 = act_quant(x)
 	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)
