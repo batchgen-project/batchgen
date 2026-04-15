@@ -583,14 +583,15 @@ def w8a16_gemm(
 
 	# Prefer the validated per-token blocked quant kernel from batchgen_kernels
 	# (FP8_SAFE_MAX=440 with headroom + FP8_E4M3_MIN_NORMAL guard + NaN/Inf→0).
-	# Falls back to the in-file Triton act_quant if the validated kernel isn't
-	# importable (e.g., bf16 assertion fails for non-bf16 activations).
-	if x.dtype == torch.bfloat16:
+	# Falls back to the in-file Triton act_quant for non-bf16 activations or
+	# for empty m=0 sub-batches (kernel asserts on empty dim).
+	if x.dtype == torch.bfloat16 and m > 0:
 		from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
 		x_bf16_3d = x.unsqueeze(0).contiguous()  # [1, m, k]
 		x_q, x_s = per_token_blocked_quantize_bf16_to_fp8(x_bf16_3d, block_size=128)
+		num_blocks = x_s.size(-1)
 		x_q = x_q.view(m, k)
-		x_s = x_s.view(m, -1)
+		x_s = x_s.view(m, num_blocks)
 		x_fp8 = (x_q, x_s)
 	else:
 		x_fp8 = act_quant(x)
