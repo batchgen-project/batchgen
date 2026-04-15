@@ -61,6 +61,13 @@ class GLM5Tokenizer(FastTokenizer):
         self.eos_token_id = GLM5_EOS_TOKEN_ID
         self.pad_token_id = GLM5_PAD_TOKEN_ID
         self.stop_token_ids = GLM5_STOP_TOKEN_IDS
+        # batchgen_worker reads `eos_token_ids` (plural) to build the EOS set
+        # used by _should_stop_at_eos. Expose all three GLM-5 turn-end tokens
+        # here (primary EOS + <|user|> + the legacy third stop token), not
+        # just the primary — otherwise <|user|> the model emits after a
+        # normal answer is not recognized as stop and decoding loops until
+        # the length cap, producing degenerate "TheTheThe..." tails.
+        self.eos_token_ids = set(GLM5_STOP_TOKEN_IDS)
         self.vocab_size = GLM5_VOCAB_SIZE
 
         # Find pad token string for padding setup
