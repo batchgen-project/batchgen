@@ -15,6 +15,34 @@ from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 
+import os as _os
+_GLM5_NAN_PROBE = _os.environ.get("BATCHGEN_GLM5_NAN_PROBE", "0") == "1"
+
+
+def _glm5_nan_probe(t: torch.Tensor, stage: str, attn_mod) -> None:
+	"""Log + raise on NaN/Inf in the GLM-5 prefill FP8 path.
+
+	Gated on BATCHGEN_GLM5_NAN_PROBE=1 to avoid any overhead in production.
+	When triggered, reports layer_idx (if the attention module exposes it),
+	the stage name, and tensor statistics so the first NaN source is pinpointed.
+	"""
+	if not _GLM5_NAN_PROBE:
+		return
+	has_nan = torch.isnan(t).any().item()
+	has_inf = torch.isinf(t).any().item()
+	if has_nan or has_inf:
+		layer_idx = getattr(attn_mod, "layer_idx", "?")
+		absmax = t.abs().max().item() if t.numel() else float("nan")
+		finite = t[torch.isfinite(t)]
+		finite_absmax = finite.abs().max().item() if finite.numel() else float("nan")
+		msg = (
+			f"[GLM5 NaN-probe layer={layer_idx} stage={stage}] "
+			f"nan={has_nan} inf={has_inf} shape={tuple(t.shape)} dtype={t.dtype} "
+			f"absmax={absmax} finite_absmax={finite_absmax}"
+		)
+		logging.error(msg)
+		raise ValueError(msg)
+
 @torch.inference_mode()
 def mla_prefill_flashattention3(
 	self,
@@ -595,42 +623,37 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 				 f"q_a_layernorm.weight.dtype={self.q_a_layernorm.weight.dtype}, "
 				 f"variance_epsilon={self.q_a_layernorm.variance_epsilon}")
 
-	# Check if NaN or Inf in query_states
-	# if torch.isnan(query_states).any() or torch.isinf(query_states).any():
-	# 	logging.error("NaN or Inf detected in query_states after first GEMM.")
-	# 	raise ValueError("NaN or Inf detected in query_states after first GEMM.")
+	_glm5_nan_probe(query_states, "q_a_proj", self)
 	query_states = self.q_a_layernorm(query_states)
+	_glm5_nan_probe(query_states, "q_a_layernorm", self)
 	query_states = w8a16_gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
-	# Check if NaN or Inf in query_states
-	# if torch.isnan(query_states).any() or torch.isinf(query_states).any():
-	# 	logging.error("NaN or Inf detected in query_states after second GEMM.")
-	# 	raise ValueError("NaN or Inf detected in query_states after second GEMM.")
+	_glm5_nan_probe(query_states, "q_b_proj", self)
 
 	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
 		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-	)	
+	)
 	compressed_kv = w8a16_gemm(
 		self.kv_a_proj_with_mqa.weight.data,
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
-	)	
-	# Check if NaN or Inf in compressed_kv
-	# if torch.isnan(compressed_kv).any() or torch.isinf(compressed_kv).any():
-	# 	logging.error("NaN or Inf detected in compressed_kv after third GEMM.")
-	# 	raise ValueError("NaN or Inf detected in compressed_kv after third GEMM.")
+	)
+	_glm5_nan_probe(compressed_kv, "kv_a_proj_with_mqa", self)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-	)	
+	)
 	normed_kv = self.kv_a_layernorm(compressed_kv)
+	_glm5_nan_probe(normed_kv, "kv_a_layernorm", self)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
 	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
 	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
+	_glm5_nan_probe(q_pe, "q_pe_rope", self)
+	_glm5_nan_probe(k_pe, "k_pe_rope", self)
 	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1
@@ -641,10 +664,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		weight_scale["kv_b_proj.weight_scale_inv"],
 		normed_kv
 	)
-	# Check if NaN or Inf in kv
-	# if torch.isnan(kv).any() or torch.isinf(kv).any():
-	# 	logging.error("NaN or Inf detected in kv after fourth GEMM.")
-	# 	raise ValueError("NaN or Inf detected in kv after fourth GEMM.")
+	_glm5_nan_probe(kv, "kv_b_proj", self)
 	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -700,19 +720,13 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim
 	).contiguous()
-	# Check if NaN or Inf in attn_output before o_proj
-	# if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
-	# 	logging.error("NaN or Inf detected in attn_output before o_proj.")
-	# 	raise ValueError("NaN or Inf detected in attn_output before o_proj.")
+	_glm5_nan_probe(attn_output, "pre_o_proj", self)
 	attn_output = w8a16_gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
-	# Check if NaN or Inf in attn_output after o_proj
-	# if torch.isnan(attn_output).any() or torch.isinf(attn_output).any():
-	# 	logging.error("NaN or Inf detected in attn_output after o_proj.")
-	# 	raise ValueError("NaN or Inf detected in attn_output after o_proj.")
+	_glm5_nan_probe(attn_output, "o_proj", self)
 
 	return attn_output, offload_kv
 

@@ -51,6 +51,20 @@ def sample_tokens(
 	"""
 	B, V = logits.shape
 
+	# --- Pre-sampling NaN/Inf guard (diagnostic; gated by BATCHGEN_GLM5_NAN_PROBE) ---
+	import os as _os
+	if _os.environ.get("BATCHGEN_GLM5_NAN_PROBE", "0") == "1":
+		_has_nan = torch.isnan(logits).any().item()
+		_has_inf = torch.isinf(logits).any().item()
+		if _has_nan or _has_inf:
+			_nan_per_row = torch.isnan(logits).any(dim=-1).sum().item()
+			_inf_per_row = torch.isinf(logits).any(dim=-1).sum().item()
+			logger.error(
+				f"[GLM5 NaN-probe sampling] logits shape={tuple(logits.shape)} "
+				f"nan_rows={_nan_per_row}/{B} inf_rows={_inf_per_row}/{B} "
+				f"absmax_finite={logits[torch.isfinite(logits)].abs().max().item() if torch.isfinite(logits).any() else float('nan')}"
+			)
+
 	# --- Determine greedy mask ---
 	# Scalar fast path: all greedy or all same params
 	if temperature is None or (isinstance(temperature, (int, float)) and temperature <= 0):
