@@ -423,13 +423,26 @@ def act_quant(
     x_flat = x.view(-1, original_shape[-1])
     M, N = x_flat.shape
 
+    # The validated kernel launches a 3D Triton grid (bsz, seq_len, num_blocks).
+    # For prepacked prefill with very long total sequences (L4 with ~2K-4K
+    # seqs per batch), M can reach hundreds of thousands of tokens and blow
+    # past CUDA's 65535-per-dim grid cap → "Triton Error [CUDA]: invalid
+    # argument". Chunk along M to stay under ACT_QUANT_MAX_ROWS (32K).
     if x.dtype == torch.bfloat16 and M > 0:
         from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
-        x_bf16_3d = x_flat.unsqueeze(0).contiguous()  # [1, M, N]
-        y_3d, s_3d = per_token_blocked_quantize_bf16_to_fp8(x_bf16_3d, block_size=block_size)
-        num_blocks = s_3d.size(-1)
-        y = y_3d.view(*original_shape)
-        scale = s_3d.view(*original_shape[:-1], num_blocks)
+        num_blocks = (N + block_size - 1) // block_size
+        y_flat = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
+        scale_flat = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
+        for chunk_start in range(0, M, ACT_QUANT_MAX_ROWS):
+            chunk_end = min(chunk_start + ACT_QUANT_MAX_ROWS, M)
+            x_chunk_3d = x_flat[chunk_start:chunk_end].unsqueeze(0).contiguous()  # [1, chunk, N]
+            y_chunk_3d, s_chunk_3d = per_token_blocked_quantize_bf16_to_fp8(
+                x_chunk_3d, block_size=block_size
+            )
+            y_flat[chunk_start:chunk_end] = y_chunk_3d.view(chunk_end - chunk_start, N)
+            scale_flat[chunk_start:chunk_end] = s_chunk_3d.view(chunk_end - chunk_start, num_blocks)
+        y = y_flat.view(*original_shape)
+        scale = scale_flat.view(*original_shape[:-1], num_blocks)
         return y, scale
 
     fp8_max = 448.0
