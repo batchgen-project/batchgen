@@ -444,6 +444,15 @@ class GLM5ParallelStrategyManager:
                     mla_decoding_flashmla_attn_mode_3_fp8_kv_bf16_attn, attn_module))
                 setattr(attn_module, "fused_get_query_states_triton", types.MethodType(
                     fused_get_query_states_triton, attn_module))
+                # GLM-5 uses HF NeoX/Llama split-half RoPE, not the DeepSeek-style
+                # interleaved layout. This attribute is read by the shared MLA
+                # prefill helpers in fa3_backend.py to skip the deinterleave step,
+                # and by Glm5Indexer._fused_rope_hadamard_or_fallback / score_and_select
+                # to force the PyTorch fallback (the CUDA WP2 fused kernel is
+                # hard-coded for interleaved layout).
+                attn_module.rope_interleave = False
+                if hasattr(attn_module, "indexer"):
+                    attn_module.indexer.rope_interleave = False
             elif self.engine_config.Basic_Config.gpu_arch == "ampere":
                 from batchgen.attention.mla.fa2_backend import mla_chunked_prefill_flashattention2
                 from batchgen.attention.mla.torch_backend import mla_decoding_torch

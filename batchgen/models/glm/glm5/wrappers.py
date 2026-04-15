@@ -580,10 +580,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             ).view(bsz, 1, -1)
 
             cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
+            rope_interleave = getattr(attn, "rope_interleave", True)
             offload_kv = fused_rmsnorm_rope_with_q(
                 new_compressed_kv, q_pe, cos, sin, position_ids,
                 attn.kv_a_layernorm.weight,
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
+                interleave=rope_interleave,
             )
 
         # Pre-compute seq_lengths_i32 once (shared by kv_write and indexer_k)

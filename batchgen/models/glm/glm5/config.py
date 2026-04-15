@@ -60,8 +60,12 @@ class GLM5Config(BaseModelConfig):
     index_n_heads: int = 32
     index_head_dim: int = 128
     index_topk: int = 2048
-    rope_interleave: bool = True
-    indexer_rope_interleave: bool = True
+    # HF reference `glm_moe_dsa` uses NeoX/Llama split-half RoPE (rotate_half
+    # directly, no deinterleave). These fields are vestigial in GLM-5 — kept for
+    # config-dump parity only. The effective flag at runtime is the per-module
+    # `rope_interleave` attribute set by Parallel_Strategy_Manager.
+    rope_interleave: bool = False
+    indexer_rope_interleave: bool = False
 
     # ==================== Context: Full attention ====================
     sliding_window_size: Optional[int] = None
