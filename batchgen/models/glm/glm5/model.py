@@ -678,12 +678,16 @@ class Glm5MoEGate(nn.Module):
             topk_weights: [batch*seq, num_experts_per_tok]
             topk_indices: [batch*seq, num_experts_per_tok]
         """
-        # Sigmoid scoring (n_group=1: score all experts directly)
-        logits = F.linear(hidden_states, self.weight.to(hidden_states.dtype))  # [bsz_seq, num_experts]
+        # Router logits in FP32 — HF computes this GEMM in FP32 explicitly
+        # (GlmMoeDsaTopkRouter.forward does F.linear(x.type(fp32), w.type(fp32))).
+        # bf16 router_logits shifts the sigmoid+bias decision boundary enough to
+        # re-order top-K expert selection for scores within ~1% of each other,
+        # and that drift compounds across 75 MoE layers.
+        logits = F.linear(hidden_states.float(), self.weight.float())  # [bsz_seq, num_experts]
         scores = torch.sigmoid(logits)
 
         # Bias is for SELECTION only — do not mutate `scores` itself
-        biased = scores + self.e_score_correction_bias.unsqueeze(0)
+        biased = scores + self.e_score_correction_bias.float().unsqueeze(0)
 
         # Simple top-K on biased scores (n_group=1, no group-based routing)
         _, topk_indices = torch.topk(biased, k=self.num_experts_per_tok, dim=-1)
@@ -1011,10 +1015,12 @@ class Glm5MoE(nn.Module):
                 bufs = Glm5MoE._buf
                 if bufs is not None:
                     G = x.shape[0]
-                    rl_bf16 = bufs.router_logits_bf16[:G]
                     rl_fp32 = bufs.router_logits[:G]
-                    torch.mm(x, self.gate.weight.t(), out=rl_bf16)
-                    rl_fp32.copy_(rl_bf16)
+                    # HF router matmul is FP32: F.linear(x.float(), w.float()).
+                    # The previous bf16 mm → copy-to-fp32 path lost ~7 bits of
+                    # routing precision which re-ordered top-K for scores within
+                    # ~1% of each other, compounding across 75 MoE layers.
+                    torch.matmul(x.float(), self.gate.weight.float().t(), out=rl_fp32)
                     return gate_sigmoid_topk_cuda(
                         rl_fp32,
                         self.gate.e_score_correction_bias.float(),
@@ -1022,7 +1028,8 @@ class Glm5MoE(nn.Module):
                         routed_scaling_factor=self.gate.routed_scaling_factor,
                     )
                 else:
-                    router_logits = F.linear(x, self.gate.weight).float()
+                    # HF computes router_logits in FP32 directly.
+                    router_logits = F.linear(x.float(), self.gate.weight.float())
                     return gate_sigmoid_topk_cuda(
                         router_logits,
                         self.gate.e_score_correction_bias.float(),
