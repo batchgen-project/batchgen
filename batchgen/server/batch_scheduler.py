@@ -469,6 +469,12 @@ class BatchScheduler:
             raise RuntimeError(
                 f"Tokenizer for {model} does not support apply_chat_template"
             )
+        # DEBUG: force enable_thinking=False on GLM-5 to test whether the
+        # default thinking-mode <think> suffix conflicts with LongBench
+        # "don't output any words except the answer" instructions.
+        # Revert this after verification.
+        if "glm" in model.lower() and "enable_thinking" not in kwargs:
+            kwargs["enable_thinking"] = False
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
