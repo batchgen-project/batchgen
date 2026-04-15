@@ -159,20 +159,30 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
     caps at 2^31-1 (~2.1B), sufficient for every GLM-5 prepacked prefill
     shape and beyond. Per-CTA overhead: one constexpr-divisor divmod
     (~2-3 cycles), negligible vs the ~100-cycle quant body.
+
+    IMPORTANT: use int64 for the row-major offset computation. Triton's
+    default program_id() / stride arithmetic is int32, and `pid_m *
+    q_stride_m` overflows when M × hidden_dim > 2^31 (e.g. M=500K, N=6144
+    → 3.07B). That overflow silently wraps, corrupting every load/store
+    address past the first ~350K rows and producing NaN/garbage FP8. The
+    3D kernel has the same issue at this scale but hits the grid-cap
+    failure first.
     """
     FP8_SAFE_MAX: tl.constexpr = 440.0
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
 
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     pid_m = pid // num_blocks
     pid_b = pid % num_blocks
 
     block_start = pid_b * block_size
-    cols = block_start + tl.arange(0, block_size)
+    cols = block_start + tl.arange(0, block_size).to(tl.int64)
     col_mask = cols < dim
 
-    q_offsets = pid_m * q_stride_m + cols * q_stride_d
+    q_stride_m_i64 = tl.cast(q_stride_m, tl.int64)
+    out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
+    q_offsets = pid_m * q_stride_m_i64 + cols * q_stride_d
     q_bf16 = tl.load(q_ptr + q_offsets, mask=col_mask, other=0.0)
     q_float = q_bf16.to(tl.float32)
 
@@ -188,9 +198,10 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
 
     q_fp8 = q_scaled.to(tl.float8e4nv)
 
-    out_offsets = pid_m * out_stride_m + cols * out_stride_d
+    scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
+    out_offsets = pid_m * out_stride_m_i64 + cols * out_stride_d
     tl.store(out_ptr + out_offsets, q_fp8, mask=col_mask)
-    tl.store(scale_ptr + pid_m * scale_stride_m + pid_b * scale_stride_b, scale)
+    tl.store(scale_ptr + pid_m * scale_stride_m_i64 + pid_b * scale_stride_b, scale)
 
 
 def per_token_blocked_quantize_bf16_to_fp8_flat(
