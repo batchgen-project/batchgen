@@ -581,11 +581,19 @@ def w8a16_gemm(
 	out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
 	y_fp8 = (weight_data_fp8, weight_scale_inv_fp32)
 
-	# x_fp8 = per_token_cast_to_fp8(x)
-	# x_fp8 = act_quant(x)
-	x_fp8 = act_quant(x)
-	# x_fp8 = (x_fp8[0], get_col_major_tma_aligned_tensor(x_fp8[1]))
-	# deep_gemm.gemm_fp8_fp8_bf16_nt(x_fp8, y_fp8, out)
+	# Prefer the validated per-token blocked quant kernel from batchgen_kernels
+	# (FP8_SAFE_MAX=440 with headroom + FP8_E4M3_MIN_NORMAL guard + NaN/Inf→0).
+	# Falls back to the in-file Triton act_quant if the validated kernel isn't
+	# importable (e.g., bf16 assertion fails for non-bf16 activations).
+	if x.dtype == torch.bfloat16:
+		from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8
+		x_bf16_3d = x.unsqueeze(0).contiguous()  # [1, m, k]
+		x_q, x_s = per_token_blocked_quantize_bf16_to_fp8(x_bf16_3d, block_size=128)
+		x_q = x_q.view(m, k)
+		x_s = x_s.view(m, -1)
+		x_fp8 = (x_q, x_s)
+	else:
+		x_fp8 = act_quant(x)
 	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)

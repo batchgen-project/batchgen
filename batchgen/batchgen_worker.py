@@ -28,6 +28,46 @@ from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan
+
+import os as _os_env  # alias to avoid collision with the local `os` usage later
+
+
+def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: int = 20) -> None:
+	"""Log top-K token IDs + logits + decoded strings for GLM-5 diagnostic.
+
+	Called only when BATCHGEN_GLM5_LOGIT_DUMP=1. Fires once per prefill call
+	(suppresses subsequent calls via a module-level flag to keep logs readable).
+	"""
+	global _GLM5_LOGIT_DUMP_FIRED
+	if _GLM5_LOGIT_DUMP_FIRED:
+		return
+	_GLM5_LOGIT_DUMP_FIRED = True
+	try:
+		# logits: [batch_size, vocab_size]
+		n = min(logits.shape[0], 3)  # first 3 sequences
+		for seq_idx in range(n):
+			row = logits[seq_idx].float()
+			absmax = row.abs().max().item()
+			mean = row.mean().item()
+			std = row.std().item()
+			top_vals, top_idx = torch.topk(row, topk)
+			rows_str = []
+			for v, i in zip(top_vals.tolist(), top_idx.tolist()):
+				try:
+					decoded = tokenizer.decode([i], skip_special_tokens=False)
+				except Exception:
+					decoded = "<decode error>"
+				rows_str.append(f"  {i:>7d}  {v:>10.4f}  {decoded!r}")
+			logging.error(
+				f"[GLM5 LOGIT-DUMP rank={rank} seq={seq_idx}] "
+				f"absmax={absmax:.4f} mean={mean:.4f} std={std:.4f} top{topk}:\n"
+				+ "\n".join(rows_str)
+			)
+	except Exception as e:
+		logging.error(f"[GLM5 LOGIT-DUMP] failed: {e}")
+
+
+_GLM5_LOGIT_DUMP_FIRED = False
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
@@ -6586,6 +6626,11 @@ class BatchGenWorker:
 					self.model.lm_head.weight,
 					self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 				)
+
+				# Debug: dump top-20 logits at the final prefill position for the first
+				# few sequences of a batch. Gated by BATCHGEN_GLM5_LOGIT_DUMP=1.
+				if _os_env.environ.get("BATCHGEN_GLM5_LOGIT_DUMP", "0") == "1":
+					_glm5_dump_top_logits(logits, self.tokenizer, rank=getattr(self, "rank", 0))
 
 				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
