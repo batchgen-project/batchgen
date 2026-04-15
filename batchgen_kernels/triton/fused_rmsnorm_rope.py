@@ -504,7 +504,6 @@ def fused_rmsnorm_rope_with_q_kernel(
     qk_rope_head_dim,
     variance_epsilon: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    INTERLEAVE: tl.constexpr = True,
 ):
     """Standalone fused RMSNorm + RoPE kernel that omits cache writes."""
     batch_idx = tl.program_id(0)
@@ -571,19 +570,15 @@ def fused_rmsnorm_rope_with_q_kernel(
             other=0.0,
         )
 
-        if INTERLEAVE:
-            first_indices = offsets * 2
-            second_indices = offsets * 2 + 1
-        else:
-            first_indices = offsets
-            second_indices = half_dim + offsets
+        even_indices = offsets * 2
+        odd_indices = offsets * 2 + 1
         kv_even = tl.load(
-            new_compressed_kv_ptr + input_rope_offset + first_indices,
+            new_compressed_kv_ptr + input_rope_offset + even_indices,
             mask=mask,
             other=0.0,
         )
         kv_odd = tl.load(
-            new_compressed_kv_ptr + input_rope_offset + second_indices,
+            new_compressed_kv_ptr + input_rope_offset + odd_indices,
             mask=mask,
             other=0.0,
         )
@@ -605,12 +600,12 @@ def fused_rmsnorm_rope_with_q_kernel(
         for head_idx in range(num_heads):
             q_pe_base_offset = batch_idx * q_pe_batch_stride + head_idx * q_pe_head_stride
             q_even = tl.load(
-                q_pe_ptr + q_pe_base_offset + first_indices,
+                q_pe_ptr + q_pe_base_offset + even_indices,
                 mask=mask,
                 other=0.0,
             )
             q_odd = tl.load(
-                q_pe_ptr + q_pe_base_offset + second_indices,
+                q_pe_ptr + q_pe_base_offset + odd_indices,
                 mask=mask,
                 other=0.0,
             )
@@ -638,15 +633,8 @@ def fused_rmsnorm_rope_with_q(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     eps: float = 1e-6,
-    interleave: bool = True,
 ) -> torch.Tensor:
-    """Apply fused RMSNorm + RoPE to KV and Q without cache updates.
-
-    `interleave=True` (default) matches DeepSeek-V3 / K2.5 where the source RoPE
-    dims are laid out as interleaved pairs `[x0, x1, x2, x3, ...]`.
-    `interleave=False` is the HF split-half layout (GLM-5), where the source is
-    `[a_0, ..., a_{half-1}, b_0, ..., b_{half-1}]` and no permutation is required.
-    """
+    """Apply fused RMSNorm + RoPE to KV and Q without cache updates."""
     bsz, q_len, total_dim = new_compressed_kv.shape
     assert q_len == 1, "This kernel assumes q_len = 1 for decoding"
     assert total_dim == kv_lora_rank + qk_rope_head_dim
@@ -674,7 +662,6 @@ def fused_rmsnorm_rope_with_q(
         qk_rope_head_dim,
         eps,
         BLOCK_SIZE=64,
-        INTERLEAVE=interleave,
     )
 
     return processed_kv

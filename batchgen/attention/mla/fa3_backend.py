@@ -39,9 +39,8 @@ def mla_prefill_flashattention3(
 	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
-	rope_interleave = getattr(self, "rope_interleave", True)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
-	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
 	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1
@@ -630,9 +629,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
-	rope_interleave = getattr(self, "rope_interleave", True)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
-	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
 	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1
@@ -765,9 +763,8 @@ def mla_prefill_w8a16_deepgemm(
 	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
-	rope_interleave = getattr(self, "rope_interleave", True)
-	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
-	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2, interleave=rope_interleave)
+	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
+	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
 	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1

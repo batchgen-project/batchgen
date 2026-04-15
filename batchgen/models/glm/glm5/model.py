@@ -86,23 +86,28 @@ class Glm5RotaryEmbedding(nn.Module):
 def apply_rotary_pos_emb_interleaved(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply RoPE matching HF `glm_moe_dsa` (NeoX/Llama split-half).
+    """Apply RoPE with interleaved pattern (rope_interleave=True).
 
-    Despite the historical function name, GLM-5's `rope_interleave=True` config
-    flag is vestigial — the HF reference `apply_rotary_pos_emb` uses split-half
-    `rotate_half` with no element permutation. Cos/sin are expected at full
-    rope-head-dim (built via `cat((freqs, freqs), dim=-1)`).
+    Interleaved: even indices get cos/sin, odd indices get -sin/cos.
+    q[..., 0::2] and q[..., 1::2] form the pairs.
     """
     cos = cos.unsqueeze(1)  # [seq, 1, dim]
     sin = sin.unsqueeze(1)  # [seq, 1, dim]
 
-    def _rot_half(x: torch.Tensor) -> torch.Tensor:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
+    # Interleaved: pair (x[0], x[1]), (x[2], x[3]), ...
+    q1, q2 = q[..., 0::2], q[..., 1::2]
+    k1, k2 = k[..., 0::2], k[..., 1::2]
 
-    q_rot = (q * cos) + (_rot_half(q) * sin)
-    k_rot = (k * cos) + (_rot_half(k) * sin)
+    # cos/sin have shape [seq, 1, rope_dim] where rope_dim = 2 * dim//2
+    # We need half the cos/sin for the pairs
+    cos_half = cos[..., : cos.shape[-1] // 2]
+    sin_half = sin[..., : sin.shape[-1] // 2]
+
+    q_rot = torch.stack([q1 * cos_half - q2 * sin_half, q2 * cos_half + q1 * sin_half], dim=-1)
+    q_rot = q_rot.flatten(-2)
+    k_rot = torch.stack([k1 * cos_half - k2 * sin_half, k2 * cos_half + k1 * sin_half], dim=-1)
+    k_rot = k_rot.flatten(-2)
+
     return q_rot, k_rot
 
 
@@ -242,19 +247,8 @@ class Glm5Indexer(nn.Module):
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Fused interleaved RoPE + Hadamard, falling back to separate ops.
-
-        The CUDA `_fused_rope_hadamard_fn` kernel is hard-coded for interleaved
-        RoPE (DeepSeek-V3 layout). GLM-5 uses HF split-half RoPE, so when
-        `rope_interleave=False` we must take the PyTorch fallback path which
-        goes through `_apply_rope_to_k` → `apply_rotary_pos_emb_interleaved`
-        (the latter has been rewritten to the HF split-half formula).
-        """
-        use_fused = (
-            _fused_rope_hadamard_fn is not None
-            and getattr(self, "rope_interleave", True)
-        )
-        if use_fused:
+        """Fused interleaved RoPE + Hadamard, falling back to separate ops."""
+        if _fused_rope_hadamard_fn is not None:
             seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
             cos, sin = self.rotary_emb(k, seq_len)
             return _fused_rope_hadamard_fn(
@@ -334,13 +328,7 @@ class Glm5Indexer(nn.Module):
 
         # Apply RoPE + Hadamard to Q (must match cached K processing)
         if positions is not None and self.rotary_emb is not None:
-            # CUDA fused kernel is hard-coded for DeepSeek-style interleaved RoPE;
-            # GLM-5 uses HF split-half, so fall through to PyTorch path.
-            use_fused = (
-                _fused_rope_hadamard_fn is not None
-                and getattr(self, "rope_interleave", True)
-            )
-            if use_fused:
+            if _fused_rope_hadamard_fn is not None:
                 cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), max_seqlen)
                 # Reshape [B, n_heads, 128] → [B*n_heads, 128], expand positions
                 B = q.shape[0]
