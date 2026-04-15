@@ -691,9 +691,11 @@ class Glm5MoEGate(nn.Module):
         # Gather RAW (un-biased) sigmoid scores at the selected indices
         topk_weights = scores.gather(-1, topk_indices)
 
-        # Normalize over raw weights
+        # Normalize over raw weights. The `+ 1e-20` matches the dedicated CUDA
+        # gate_sigmoid_topk_kernel (gate_sigmoid_topk.cu:119) for byte-parity
+        # between prefill (this Python path) and decode (CUDA kernel).
         if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
 
         # Scale
         topk_weights = topk_weights * self.routed_scaling_factor

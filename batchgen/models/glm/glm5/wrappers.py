@@ -580,10 +580,17 @@ class GLM5AttnWrapper(AttnWrapperBase):
             ).view(bsz, 1, -1)
 
             cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
+            # Explicitly pass the module's RMSNorm eps (config.rms_norm_eps=1e-5
+            # for GLM-5). The kernel default is 1e-6; without this override the
+            # decode-side new-KV gets normalized with a 10× tighter regularizer
+            # than the prefill-cached KV, creating a slow drift that compounds
+            # across 78 layers × decode steps and manifests as ngram loops /
+            # off-topic generation after ~hundreds of tokens.
             offload_kv = fused_rmsnorm_rope_with_q(
                 new_compressed_kv, q_pe, cos, sin, position_ids,
                 attn.kv_a_layernorm.weight,
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
+                eps=attn.kv_a_layernorm.eps,
             )
 
         # Pre-compute seq_lengths_i32 once (shared by kv_write and indexer_k)
