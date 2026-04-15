@@ -2934,7 +2934,11 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
 			return
 
-		worker_view = self.host_paged_kv_worker_view
+		# Use the unwrapped primary view for migration. Aux (DSA indexer) KV is
+		# mirrored explicitly below — the coordinator does not implement
+		# read/write_sequence_kv_to_cpu, so go direct on primary and aux.
+		worker_view = self.core_engine.host_paged_kv_worker_view
+		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
@@ -2946,6 +2950,7 @@ class BatchGenWorker:
 			)
 
 			k_cpu, v_cpu = worker_view.read_sequence_kv_to_cpu(global_idx)
+			k_cpu_aux = aux_view.read_sequence_kv_to_cpu(global_idx)[0] if aux_view is not None else None
 			t_read = time.perf_counter()
 			logging.debug(
 				f"MIGRATION: Rank {self.rank}: Host→CPU read: {(t_read-t0)*1000:.1f}ms, "
@@ -2957,11 +2962,15 @@ class BatchGenWorker:
 			dist.send(tensor=k_cpu.contiguous(), dst=to_rank, group=gloo_group)
 			if v_cpu.numel() > 0:
 				dist.send(tensor=v_cpu.contiguous(), dst=to_rank, group=gloo_group)
+			if k_cpu_aux is not None:
+				dist.send(tensor=k_cpu_aux.contiguous(), dst=to_rank, group=gloo_group)
 			t_send = time.perf_counter()
 			if BATCHGEN_CB_DEBUG:
 				logging.debug(f"MIGRATION: Rank {self.rank}: Gloo send: {(t_send-t_read)*1000:.1f}ms")
-			# Free host KV pages on source (DualHostKVCoordinator handles both primary + aux)
+			# Free host KV pages on source (mirror aux for DSA)
 			worker_view.release_sequence_pages([global_idx])
+			if aux_view is not None:
+				aux_view.release_sequence_pages([global_idx])
 			# Also send query_book data (input_ids, decoded_tokens)
 			local_idx = self._uuid_to_local_map.get(uuid)
 			if local_idx is not None and local_idx in self.query_book:
@@ -2995,10 +3004,13 @@ class BatchGenWorker:
 			)
 			gloo_group = self._get_or_create_gloo_group()
 
-			# Allocate host KV pages for the incoming sequence
+			# Allocate host KV pages for the incoming sequence (mirror aux for DSA)
 			tokens_needed = pages_needed * SequenceEntry.PAGE_SIZE
 			worker_view.register_sequences([global_idx])
 			worker_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
+			if aux_view is not None:
+				aux_view.register_sequences([global_idx])
+				aux_view.allocate_pages_for_sequences([(global_idx, tokens_needed)])
 
 			# Read empty pages to get a tensor with correct shape/dtype for recv buffer.
 			# Both nodes have identical host KV config, so shape matches source's output.
@@ -3011,6 +3023,12 @@ class BatchGenWorker:
 			worker_view.write_sequence_kv_from_cpu(
 				global_idx, k_recv, v_recv if v_recv.numel() > 0 else None
 			)
+
+			# Mirror aux KV: recv aux K and write into aux host pages.
+			if aux_view is not None:
+				k_recv_aux = aux_view.read_sequence_kv_to_cpu(global_idx)[0]
+				dist.recv(tensor=k_recv_aux, src=from_rank, group=gloo_group)
+				aux_view.write_sequence_kv_from_cpu(global_idx, k_recv_aux, None)
 			logging.info(
 				f"MIGRATION: Rank {self.rank}: Recv+write {uuid[:8]}... "
 				f"in {(time.perf_counter()-t0)*1000:.1f}ms"
@@ -7253,6 +7271,10 @@ class BatchGenWorker:
 
 			if host_grow_requests and worker_view is not None:
 				worker_view.grow_pages_for_sequences(host_grow_requests)
+				# DSA: mirror growth on auxiliary host KV
+				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+				if aux_view is not None:
+					aux_view.grow_pages_for_sequences(host_grow_requests)
 				if self.rank == 0:
 					logging.debug(
 						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
@@ -7329,6 +7351,11 @@ class BatchGenWorker:
 				if worker_view is not None:
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
+					# DSA: mirror release + unregister on auxiliary host KV
+					aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+					if aux_view is not None:
+						aux_view.release_sequence_pages(evicted_global_ids)
+						aux_view.unregister_sequences(evicted_global_ids)
 
 			# All-ranks: update scalar metadata deterministically. Compute
 			# new_reentry_len from already-synced prompt_length, decoded_length,

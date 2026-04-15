@@ -253,10 +253,20 @@ class DualHostKVCoordinator:
 		if self.auxiliary is not None:
 			self.auxiliary.release_sequence_pages(sequence_ids)
 
-	# -- Query (primary only) --
+	# -- Query: report the capacity-tighter of {primary, auxiliary} --
 
 	def get_stats(self):
-		return self.primary.get_stats()
+		primary_stats = self.primary.get_stats()
+		if self.auxiliary is None:
+			return primary_stats
+		aux_stats = self.auxiliary.get_stats()
+		# Both views share num_pages (see _compute_dual_page_count), but they
+		# can drift if mirroring ever fails partway (e.g. aux register raises
+		# after primary succeeds). Report whichever side has fewer free pages
+		# so the watermark fires on the tighter bound, not the optimistic one.
+		if aux_stats.num_free_pages < primary_stats.num_free_pages:
+			return aux_stats
+		return primary_stats
 
 	# -- Migration (primary only, aux rebuilt during prefill) --
 

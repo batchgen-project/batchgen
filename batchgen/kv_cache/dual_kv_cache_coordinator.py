@@ -143,6 +143,11 @@ class DualKVCacheCoordinator:
 	def _gpu_page_table_manager(self):
 		return self.primary._gpu_page_table_manager
 
+	@property
+	def _sequences(self):
+		# Both managers track identical sequences — primary is authoritative.
+		return self.primary._sequences
+
 	def copy_kv_to_tensor(self, sequence_id: int) -> torch.Tensor:
 		return self.primary.copy_kv_to_tensor(sequence_id)
 
