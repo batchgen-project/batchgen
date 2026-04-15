@@ -663,27 +663,35 @@ class Glm5MoEGate(nn.Module):
         self.e_score_correction_bias = nn.Parameter(torch.zeros(config.n_routed_experts))
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens to experts.
+        """Route tokens to experts (DeepSeek-V3 noaux_tc semantics).
+
+        The `e_score_correction_bias` is used for SELECTION only; the
+        returned top-K weights are the RAW sigmoid scores at the selected
+        indices, not the biased values. This matches the dedicated CUDA
+        `gate_sigmoid_topk_kernel` used by the decode path, the HF reference
+        modeling for DeepSeek-V3 / glm_moe_dsa, and sglang. Using biased
+        scores as weights (the previous behavior) shifts the expert mixing
+        coefficients and injects drift at every MoE layer, which for GLM-5
+        shows up as a small bias at the final-position logits.
 
         Returns:
             topk_weights: [batch*seq, num_experts_per_tok]
             topk_indices: [batch*seq, num_experts_per_tok]
         """
-        bsz_seq = hidden_states.shape[0]
-
         # Sigmoid scoring (n_group=1: score all experts directly)
         logits = F.linear(hidden_states, self.weight.to(hidden_states.dtype))  # [bsz_seq, num_experts]
         scores = torch.sigmoid(logits)
 
-        # Apply score correction bias
-        scores = scores + self.e_score_correction_bias.unsqueeze(0)
+        # Bias is for SELECTION only — do not mutate `scores` itself
+        biased = scores + self.e_score_correction_bias.unsqueeze(0)
 
-        # Simple top-K (n_group=1, no group-based routing)
-        topk_weights, topk_indices = torch.topk(
-            scores, k=self.num_experts_per_tok, dim=-1
-        )
+        # Simple top-K on biased scores (n_group=1, no group-based routing)
+        _, topk_indices = torch.topk(biased, k=self.num_experts_per_tok, dim=-1)
 
-        # Normalize
+        # Gather RAW (un-biased) sigmoid scores at the selected indices
+        topk_weights = scores.gather(-1, topk_indices)
+
+        # Normalize over raw weights
         if self.norm_topk_prob:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
