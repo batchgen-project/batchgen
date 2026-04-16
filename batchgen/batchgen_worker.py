@@ -1128,17 +1128,58 @@ class BatchGenWorker:
 			seq.kv_token_budget = seq_extended_size
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
-		"""Assign newly admitted sequences to ranks using round-robin.
+		"""Assign newly admitted sequences to ranks.
 
-		Continues the round-robin from the current state (balancing across ranks).
+		Default (BATCHGEN_L2_BALANCE=1, default): least-sum(L²) argmin with
+		FFD ordering (longest first). Attention is O(L²) so balancing on L²
+		minimizes the wall-clock spread between fastest and slowest rank
+		during prefill — without this, all LongBench long-context seqs land
+		on rank 14-15 under round-robin and stall the per-iteration barrier.
+
+		Fallback (BATCHGEN_L2_BALANCE=0): least-count argmin (legacy).
 		"""
-		# Count current assignments per rank
+		import os as _os
+		use_l2 = _os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+
+		if use_l2:
+			# Per-rank load = sum of (prompt_length ** 2) over already-assigned seqs.
+			rank_load = [0.0] * self.world_size
+			for seq in self.global_batch:
+				if seq.uuid in uuids or seq.assigned_rank is None:
+					continue
+				L = getattr(seq, "prompt_length", 0) or 0
+				rank_load[seq.assigned_rank] += float(L) * float(L)
+
+			# Resolve uuids → seqs and sort by length DESC (FFD).
+			pending = []
+			for uuid in uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					continue
+				L = getattr(seq, "prompt_length", 0) or 0
+				pending.append((L, uuid))
+			pending.sort(key=lambda t: -t[0])
+
+			for L, uuid in pending:
+				min_rank = min(range(self.world_size), key=lambda r: rank_load[r])
+				self.global_batch.assign_rank(uuid, min_rank)
+				rank_load[min_rank] += float(L) * float(L)
+
+			if self.rank == 0 and rank_load:
+				lo = min(rank_load); hi = max(rank_load)
+				ratio = (hi / lo) if lo > 0 else float("inf")
+				logging.info(
+					f"[L2_BALANCE] per-rank sum(L^2): min={lo:.3e} max={hi:.3e} "
+					f"ratio={ratio:.2f} ranks={[f'{x:.2e}' for x in rank_load]}"
+				)
+			return
+
+		# Legacy: round-robin / least-count
 		rank_counts = [0] * self.world_size
 		for seq in self.global_batch:
 			if seq.uuid not in uuids and seq.assigned_rank is not None:
 				rank_counts[seq.assigned_rank] += 1
 
-		# Assign new sequences to least-loaded rank
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
@@ -6524,31 +6565,52 @@ class BatchGenWorker:
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 
-		# Create micro-batches bounded by token count
+		# Create micro-batches bounded by token count, optionally also by sum(L^2)
+		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
+		# on one micro-batch when a single very long sequence is present.
+		import os as _os_mb
+		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		total_tokens_all = sum(seq_lengths_list)
+		total_l2_all = sum(L * L for L in seq_lengths_list)
+		# Estimate number of micro-batches from token cap, then derive an L^2
+		# target per micro-batch. Add 20% slack so the L^2 cap rarely bites
+		# unless a single seq is dominant.
+		est_num_mb = max(1, (total_tokens_all + MAX_TOKENS_PER_MICRO_BATCH - 1) // MAX_TOKENS_PER_MICRO_BATCH)
+		l2_cap = int(1.2 * total_l2_all / est_num_mb) if (_USE_L2_MB and est_num_mb > 0) else 0
+
 		micro_batches = []
 		current_batch_start = 0
 		current_batch_tokens = 0
+		current_batch_l2 = 0
 
 		for seq_idx in range(num_sequences):
 			seq_len = seq_lengths_list[seq_idx]
+			seq_l2 = seq_len * seq_len
 
-			# If adding this sequence would exceed limit, finalize current batch
-			if current_batch_tokens + seq_len > MAX_TOKENS_PER_MICRO_BATCH and current_batch_tokens > 0:
+			# Finalize the current batch if adding this seq would exceed
+			# either the token cap or (when enabled) the L^2 cap. Always
+			# allow the first seq into an empty batch even if it alone
+			# blows the L^2 cap (single huge seq case).
+			over_tokens = current_batch_tokens + seq_len > MAX_TOKENS_PER_MICRO_BATCH
+			over_l2 = (l2_cap > 0) and (current_batch_l2 + seq_l2 > l2_cap)
+			if (over_tokens or over_l2) and current_batch_tokens > 0:
 				micro_batches.append((current_batch_start, seq_idx))
 				current_batch_start = seq_idx
 				current_batch_tokens = 0
+				current_batch_l2 = 0
 
 			current_batch_tokens += seq_len
+			current_batch_l2 += seq_l2
 
 		# Don't forget the last batch
 		if current_batch_start < num_sequences:
 			micro_batches.append((current_batch_start, num_sequences))
 
 		if self.rank == 0:
-			total_tokens = sum(seq_lengths_list)
 			logging.info(
 				f"Prepacked prefill: {len(micro_batches)} micro batches, "
-				f"{total_tokens:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
+				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
+				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
 
 		output_tokens = []

@@ -402,6 +402,52 @@ def act_quant_kernel_2d(
 # and memory access issues with very long sequences
 ACT_QUANT_MAX_ROWS = 32768  # 32K rows per chunk
 
+# Quant diagnostic state: print once per (M_bucket, N) tuple per process so
+# every layer/site logs once but we don't drown the log on every call.
+_QUANT_DIAG_SEEN: set = set()
+_FP8_E4M3_MIN_NORMAL = 1.52587890625e-05
+
+def _emit_quant_diag(
+    x_flat: torch.Tensor,
+    y_flat: torch.Tensor,
+    scale_flat: torch.Tensor,
+    M: int,
+    N: int,
+    block_size: int,
+    used_chunked_3d: bool,
+) -> None:
+    """One-shot quant kernel diagnostic. Gated by BATCHGEN_GLM5_QUANT_DIAG."""
+    import logging
+    # Bucket M by order-of-magnitude so different prefill sizes each log once.
+    m_bucket = 0 if M == 0 else 1 << (M.bit_length() - 1)
+    key = (m_bucket, N, used_chunked_3d)
+    if key in _QUANT_DIAG_SEEN:
+        return
+    _QUANT_DIAG_SEEN.add(key)
+    try:
+        amax = scale_flat.flatten().float()
+        floor_frac = float((amax < (_FP8_E4M3_MIN_NORMAL / 440.0)).float().mean().item())
+        n_sample = min(1000, M)
+        if n_sample > 0:
+            x_ref = x_flat[:n_sample].float()
+            num_blocks = scale_flat.size(-1)
+            s_rep = scale_flat[:n_sample].repeat_interleave(block_size, dim=-1)[:, :N]
+            x_deq = y_flat[:n_sample].float() * s_rep
+            denom = x_ref.norm().clamp_min(1e-9)
+            rt_rel_l2 = float(((x_deq - x_ref).norm() / denom).item())
+        else:
+            rt_rel_l2 = 0.0
+        path = "chunked3d" if used_chunked_3d else "flat1d"
+        logging.info(
+            f"[QDIAG path={path} M={M} N={N} bs={block_size} nb={scale_flat.size(-1)}] "
+            f"amax mean={amax.mean().item():.3e} min={amax.min().item():.3e} "
+            f"max={amax.max().item():.3e} floor_frac={floor_frac:.4f} "
+            f"rt_rel_l2={rt_rel_l2:.3e}"
+        )
+    except Exception as e:
+        logging.warning(f"[QDIAG] failed: {e}")
+
+
 def act_quant(
     x: torch.Tensor,
     block_size: int = 128,
@@ -458,14 +504,34 @@ def act_quant(
             scale = scale_3d.view(*original_shape[:-1], num_blocks)
             return y, scale
 
-        # Prefill: 1D-grid Triton kernel, no chunking, no grid-cap ceiling.
-        from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_flat
-        y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_flat(
-            x_flat, block_size=block_size
-        )
+        # Prefill: default to chunked 3D Triton (proven kernel from L1/L2),
+        # called in M-axis chunks of ≤ 32K so the 65535 grid-Y cap is never
+        # hit. Fall back to the 1D flat kernel only if env var explicitly
+        # opts back in (A/B testing). Suspicion: the 1D flat kernel produces
+        # wrong values on prepacked-prefill shapes (see L4 gibberish output
+        # post dual-KV fix; M ≫ 128 always took the flat path).
+        import os as _os
+        _USE_CHUNKED_3D = _os.environ.get("BATCHGEN_USE_CHUNKED_3D_QUANT", "1") == "1"
+        if _USE_CHUNKED_3D:
+            from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_chunked
+            y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_chunked(
+                x_flat, block_size=block_size, chunk_rows=ACT_QUANT_MAX_ROWS,
+            )
+        else:
+            from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_flat
+            y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_flat(
+                x_flat, block_size=block_size
+            )
         num_blocks = scale_flat.size(-1)
         y = y_flat.view(*original_shape)
         scale = scale_flat.view(*original_shape[:-1], num_blocks)
+
+        # Quant diagnostics — env-gated, prints once per layer per process.
+        # Layer id is inferred from caller stack (best-effort) so we don't
+        # need to plumb it through. If unavailable, key on 0.
+        if _os.environ.get("BATCHGEN_GLM5_QUANT_DIAG", "0") == "1":
+            _emit_quant_diag(x_flat, y_flat, scale_flat, M, N, block_size, _USE_CHUNKED_3D)
+
         return y, scale
 
     fp8_max = 448.0

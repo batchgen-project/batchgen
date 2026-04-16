@@ -274,6 +274,51 @@ def per_token_blocked_quantize_bf16_to_fp8(x: torch.Tensor, block_size: int = 12
 	return out, scale
 
 
+def per_token_blocked_quantize_bf16_to_fp8_chunked(
+	x_2d: torch.Tensor,
+	block_size: int = 128,
+	chunk_rows: int = 32768,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Chunked 2D wrapper that calls the validated 3D kernel.
+
+	Loops the proven per_token_blocked_quantize_bf16_to_fp8 (3D Triton)
+	over M-axis chunks ≤ chunk_rows so the (bsz=1, chunk_rows, num_blocks)
+	grid stays under the 65535 Y-cap. Used as a drop-in replacement for
+	the 1D flat kernel when we suspect it of producing wrong values.
+
+	Args:
+		x_2d: [M, dim] bf16, contiguous
+		block_size: per-token quant block (default 128)
+		chunk_rows: rows per kernel launch; must keep grid_y ≤ 65535
+
+	Returns:
+		out:   [M, dim]                 dtype=float8_e4m3fn
+		scale: [M, num_blocks]          dtype=float32
+	"""
+	assert x_2d.dtype == torch.bfloat16
+	assert x_2d.is_contiguous()
+	assert x_2d.dim() == 2, f"Expected 2D got {x_2d.dim()}D shape {x_2d.shape}"
+	assert chunk_rows > 0 and chunk_rows <= 65535
+
+	M, dim = x_2d.shape
+	num_blocks = (dim + block_size - 1) // block_size
+
+	out = torch.empty((M, dim), device=x_2d.device, dtype=torch.float8_e4m3fn)
+	scale = torch.empty((M, num_blocks), device=x_2d.device, dtype=torch.float32)
+
+	for start in range(0, M, chunk_rows):
+		end = min(start + chunk_rows, M)
+		# Reshape to [1, chunk_M, dim]; .contiguous() guards against any
+		# stride surprise though slicing a contiguous 2D on dim 0 stays
+		# contiguous.
+		x_chunk = x_2d[start:end].unsqueeze(0)
+		y_c, s_c = per_token_blocked_quantize_bf16_to_fp8(x_chunk, block_size)
+		out[start:end].copy_(y_c.squeeze(0))
+		scale[start:end].copy_(s_c.squeeze(0))
+
+	return out, scale
+
+
 def compressed_kv_fp8_to_bf16_per_token(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
 		"""
 		Dequantize the output of bf16_to_fp8_per_token back to BF16.
