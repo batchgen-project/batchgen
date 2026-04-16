@@ -707,6 +707,35 @@ def w8a16_gemm(
 		out = out.view(m, n)
 	return out
 
+def w8a16_gemm_dequant(
+	weight_data_fp8: torch.Tensor,
+	weight_scale_inv_fp32: torch.Tensor,
+	activation_bf16: torch.Tensor,
+) -> torch.Tensor:
+	"""True W8A16: dequant FP8 weight → BF16, then BF16 matmul.
+
+	Avoids quantizing the activation to FP8 (which w8a16_gemm does despite
+	its name). Uses the validated deepseek_v3_dequantization Triton kernel
+	for blocked FP8→BF16 weight dequant.
+	"""
+	from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+
+	assert weight_data_fp8.dim() == 2
+	assert activation_bf16.dim() in (2, 3)
+	is_3d = activation_bf16.dim() == 3
+	if is_3d:
+		n_group, l, _ = activation_bf16.size()
+
+	weight_bf16 = deepseek_v3_dequantization(
+		weight_data_fp8, weight_scale_inv_fp32, block_size=128
+	)
+	x = activation_bf16.view(-1, activation_bf16.size(-1))
+	out = torch.mm(x, weight_bf16.T)
+	if is_3d:
+		out = out.view(n_group, l, -1)
+	return out
+
+
 @torch.inference_mode()
 def mla_prefill_flashattention3_w8a16_deepgemm(
 	self,
@@ -1218,14 +1247,20 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	"""
 	total_tokens = hidden_states.shape[0]
 
-	# Project Q with W8A16
-	query_states = w8a16_gemm(
+	# True W8A16 for prefill: dequant FP8 weights to BF16, BF16 matmul.
+	# Avoids act_quant (FP8 activation noise) which compounds across 78
+	# layers × 5 GEMMs and degrades long-context attention.
+	import os as _os_gemm
+	_gemm = w8a16_gemm_dequant if _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "1") == "1" else w8a16_gemm
+
+	# Project Q
+	query_states = _gemm(
 		self.q_a_proj.weight.data,
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
 	query_states = self.q_a_layernorm(query_states)
-	query_states = w8a16_gemm(
+	query_states = _gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
@@ -1236,8 +1271,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
 	)
 
-	# Project KV with W8A16
-	compressed_kv = w8a16_gemm(
+	# Project KV
+	compressed_kv = _gemm(
 		self.kv_a_proj_with_mqa.weight.data,
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
@@ -1257,8 +1292,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
 	del compressed_kv, k_pe_flat
 
-	# Expand KV with W8A16
-	kv = w8a16_gemm(
+	# Expand KV
+	kv = _gemm(
 		self.kv_b_proj.weight.data,
 		weight_scale["kv_b_proj.weight_scale_inv"],
 		normed_kv
@@ -1301,7 +1336,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		attn_output = attn_output[0]
 
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
-	attn_output = w8a16_gemm(
+	attn_output = _gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
