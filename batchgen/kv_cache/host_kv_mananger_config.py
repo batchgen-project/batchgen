@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence
 
@@ -203,10 +204,19 @@ for canonical, aliases in {
 
 
 def _resolve_indexer_profile(model_name: str) -> _HostKVModelProfile | None:
-	"""Maps a model name to its DSA indexer profile, or None if not a DSA model."""
+	"""Maps a model name to its DSA indexer profile, or None if not a DSA model.
+
+	Also returns None for GLM-5 aliases when BATCHGEN_GLM5_USE_DENSE_MLA=1 is
+	set in the environment. This cascades through is_dsa_model()-gated
+	allocations (DualHostKVCoordinator, DualKVCacheCoordinator, aux GPU/host
+	KV cache) so the stack collapses to a single KV path without any DSA
+	construction. Paired with a compile-time Glm5Indexer skip in model.py.
+	"""
 	alias = model_name.strip().lower()
 	canonical = _INDEXER_PROFILE_ALIASES.get(alias)
 	if canonical is None:
+		return None
+	if canonical == "glm5_indexer" and os.environ.get("BATCHGEN_GLM5_USE_DENSE_MLA", "0") == "1":
 		return None
 	return _PROFILE_REGISTRY[canonical]
 

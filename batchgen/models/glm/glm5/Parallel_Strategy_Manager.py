@@ -639,11 +639,14 @@ class GLM5ParallelStrategyManager:
             attn = self.model.model.layers[layer_idx].self_attn
             # After wrapping, self_attn is GLM5AttnWrapper; original Glm5MLA is at .module
             inner = attn.module if hasattr(attn, 'module') else attn
-            indexer = inner.indexer
-            for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
-                key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"
-                if key in self.dequant_scale:
-                    setattr(indexer, attr, self.dequant_scale[key].to(device))
+            # When use_dense_mla is set, Glm5MLA skips indexer construction;
+            # skip the scale attach too (no destination).
+            if hasattr(inner, "indexer"):
+                indexer = inner.indexer
+                for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
+                    key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"
+                    if key in self.dequant_scale:
+                        setattr(indexer, attr, self.dequant_scale[key].to(device))
         for layer_idx in range(self.FIRST_K_DENSE):
             mlp = self.model.model.layers[layer_idx].mlp
             for proj in ["gate_proj", "up_proj", "down_proj"]:
@@ -657,7 +660,16 @@ class GLM5ParallelStrategyManager:
 
         Counts WP2/WP4 init failures so a silent fallback to PyTorch
         doesn't regress perf unnoticed.
+
+        Skipped entirely when config.use_dense_mla is True — WP2/WP4 belong
+        to the DSA indexer path (absent in dense mode) and WP5 (FP8 absorb)
+        is explicitly off in _forward_decode_dense (uses einsum). No fused
+        kernel initialization runs in dense-MLA mode.
         """
+        if getattr(self.model_config, "use_dense_mla", False):
+            if self.rank == 0:
+                logging.info("[DSA kernels] skipped (use_dense_mla=True)")
+            return
         total = len(self.model.model.layers)
         inited = 0
         wp2_ok = 0

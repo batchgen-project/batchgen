@@ -535,8 +535,11 @@ class Glm5MLA(nn.Module):
         # Softmax scale
         self.softmax_scale = self.q_head_dim ** -0.5
 
-        # DSA indexer
-        self.indexer = Glm5Indexer(config, layer_idx)
+        # DSA indexer — structurally absent when config.use_dense_mla is True.
+        # Downstream decode dispatch uses hasattr(self.module, 'indexer') as
+        # the signal to route to the dense-MLA (DeepSeek-V3 / Kimi style) path.
+        if not getattr(config, "use_dense_mla", False):
+            self.indexer = Glm5Indexer(config, layer_idx)
 
         # Absorbed projections for decode (set by initialize())
         self.q_absorb = None

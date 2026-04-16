@@ -508,19 +508,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
                 return (attn_output, None, None)
 
-            # Standard BF16 paged KV path (full-cache attention, no DSA)
-            attn_output, k_tensor = self.module.decoding_attn_mode_3_bf16(
-                hidden_states,
-                position_ids,
-                cache_seqlens,
-                max_seqlen,
-                self.weight_dequant_scale,
+            # Dense-MLA path (use_dense_mla=True, indexer not constructed).
+            # Uses absorbed MLA with top-K = arange(max_seqlen); WP2/WP4/WP5
+            # never fire; no aux KV cache. Mirrors Kimi-K2.5's decode shape
+            # but uses sparse_flash_mla_decode (which supports head_dim_v=
+            # kv_lora_rank=512) instead of flash_mla_with_kvcache (requires
+            # head_size_v=576, incompatible with GLM-5's absorbed layout).
+            attn_output = self._forward_decode_dense(
+                hidden_states, position_ids, cache_seqlens, max_seqlen,
                 gpu_paged_kv_manager,
-                self.layer_idx,
-                None
             )
-            if AttnWrapperBase.kv_append_callback is not None:
-                AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
             return (attn_output, None, None)
         else:
             # FP8 KV cache with tensor references
@@ -540,6 +537,162 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self.weight_dequant_scale
             )
             return (attn_output, updated_past_key, updated_scale)
+
+    def _forward_decode_dense(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+    ) -> torch.Tensor:
+        """Dense absorbed-MLA decode (no DSA, no WP5).
+
+        Shape matches Kimi-K2.5's decode (absorbed MLA over full KV cache)
+        but uses sparse_flash_mla_decode with top-K = arange(max_seqlen) so
+        we can pass head_dim_v=kv_lora_rank=512 — flash_mla_with_kvcache
+        enforces head_size_v=576 which GLM-5's absorbed layout can't satisfy.
+
+        WP5 (fp8_q_absorb / fp8_out_absorb) is intentionally NOT used here;
+        absorbed Q and out are pure torch.einsum for maximum clarity on this
+        diagnostic path. WP2/WP4 are irrelevant because no indexer is
+        constructed when use_dense_mla=True.
+        """
+        from batchgen.attention.mla.fa3_backend import act_quant
+        from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+        from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
+        from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
+        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+        from batchgen.timing import get_decode_timer
+
+        weight_scale = self.weight_dequant_scale
+        attn = self.module
+        bsz = hidden_states.shape[0]
+        dt = get_decode_timer()
+        li = self.layer_idx
+
+        if bsz == 0:
+            return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        with (dt.timed("act_quant", li) if dt else _nullctx()):
+            hidden_flat = hidden_states.squeeze(1)
+            hidden_fp8, hidden_scale = act_quant(hidden_flat)
+
+        # --- Q path ---
+        with (dt.timed("q_proj", li) if dt else _nullctx()):
+            q_a = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
+            )
+            q_a_normed = attn.q_a_layernorm(q_a)
+            q_a_fp8, q_a_scale = act_quant(q_a_normed)
+            q = w8a8_deepgemm(
+                q_a_fp8, q_a_scale,
+                attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
+            )
+            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
+            q_nope, q_pe = torch.split(
+                q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
+            )
+            q_pe = q_pe.contiguous()
+
+        # --- KV path ---
+        with (dt.timed("kv_proj", li) if dt else _nullctx()):
+            new_compressed_kv = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.kv_a_proj_with_mqa.weight,
+                weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+            ).view(bsz, 1, -1)
+            cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
+            offload_kv = fused_rmsnorm_rope_with_q(
+                new_compressed_kv, q_pe, cos, sin, position_ids,
+                attn.kv_a_layernorm.weight,
+                attn.kv_lora_rank, attn.qk_rope_head_dim,
+                eps=attn.kv_a_layernorm.eps,
+            )
+
+        new_token_pos = position_ids.squeeze(-1)
+        manager_device = gpu_paged_kv_manager.device
+        seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+
+        # Step 1: write new MLA KV to primary cache
+        with (dt.timed("kv_write", li) if dt else _nullctx()):
+            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+            if k_tensor.device != manager_device:
+                k_tensor = k_tensor.to(manager_device)
+            gpu_paged_kv_manager.update_layer_decode_new_token(
+                k_tensor=k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32,
+                layer_idx=li,
+            )
+            if AttnWrapperBase.kv_append_callback is not None:
+                AttnWrapperBase.kv_append_callback(li, k_tensor, None)
+
+        # Step 3 (replaced): dense top-K = arange over the full cache.
+        updated_seqlens = cache_seqlens
+        top_k_indices = torch.arange(
+            max_seqlen, device=hidden_states.device, dtype=torch.long,
+        ).unsqueeze(0).expand(bsz, -1)
+
+        # Step 4: gather from primary cache (structurally dense)
+        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
+            mla_blocked_k, _, mla_block_table = \
+                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+            sparse_mla_kv = sparse_gather_from_paged_kv(
+                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
+            )
+
+        # Step 5: absorbed Q via einsum (WP5 off), sparse_flash_mla_decode
+        with (dt.timed("q_absorb", li) if dt else _nullctx()):
+            if self._cached_q_absorb is not None:
+                q_absorb = self._cached_q_absorb
+                out_absorb = self._cached_out_absorb
+            else:
+                kv_b_proj = deepseek_v3_dequantization(
+                    attn.kv_b_proj.weight.data,
+                    weight_scale["kv_b_proj.weight_scale_inv"],
+                ).view(attn.num_heads, -1, attn.kv_lora_rank)
+                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
+                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+
+            qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+            query_states = torch.empty(
+                bsz, attn.num_heads, 1, qk_head_dim,
+                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
+            )
+            q_nope_squeezed = q_nope.squeeze(2)
+            # Pure einsum absorbed Q (matches Kimi wrappers.py flashmla_backend:1548-1550).
+            query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
+                "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
+            ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            query_states[:, :, :, attn.kv_lora_rank:] = q_pe
+            query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
+
+        with (dt.timed("sparse_attn", li) if dt else _nullctx()):
+            topk = top_k_indices.shape[1]
+            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
+            attn_out = sparse_flash_mla_decode(
+                query_states, sparse_mla_kv, sparse_seqlens,
+                attn.num_heads, attn.softmax_scale,
+                head_dim_v=attn.kv_lora_rank,
+                page_size=mla_page_size,
+            )
+
+        # Step 6: out-absorb via einsum → FP8 quant → o_proj
+        with (dt.timed("o_proj", li) if dt else _nullctx()):
+            attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
+            attn_output_fp8, attn_output_scale = act_quant(attn_output)
+            attn_output = w8a8_deepgemm(
+                attn_output_fp8, attn_output_scale,
+                attn.o_proj.weight, weight_scale["o_proj.weight_scale_inv"],
+            )
+            attn_output = attn_output.view(bsz, 1, -1)
+
+        return attn_output
 
     def _forward_decode_dsa(
         self,
