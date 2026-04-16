@@ -188,6 +188,26 @@ NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
 
 
+class _DualAsyncLoadTask:
+	"""Forwards .wait() to both primary and aux async KV load tasks.
+
+	Either side may be None (non-DSA model or aux-disabled diagnostic mode);
+	.wait() skips None. Used by mid-decode reload paths where we must ensure
+	both caches are on-GPU before the next decode step reads them.
+	"""
+	__slots__ = ("_primary", "_aux")
+
+	def __init__(self, primary_task, aux_task):
+		self._primary = primary_task
+		self._aux = aux_task
+
+	def wait(self):
+		if self._primary is not None:
+			self._primary.wait()
+		if self._aux is not None:
+			self._aux.wait()
+
+
 class query:
 	def __init__(
 		self,
@@ -2364,6 +2384,34 @@ class BatchGenWorker:
 		manager.allocate_pages_for_sequences(global_sequence_ids, sequence_tokens)
 		manager.rebuild_page_table(global_sequence_ids)
 		self._load_host_kv_to_gpu(manager, global_sequence_ids)
+
+	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
+		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
+
+		Why: mid-decode reload paths at lines 7688, 9201, 9370 load primary KV
+		only. For DSA models, aux pages are allocated (coordinator mirrors
+		allocate/grow/free) but never filled on reload, so the indexer reads
+		stale or zeroed K vectors and produces garbage top-K. This helper
+		mirrors the primary load under the same rebuilt-page-table state.
+
+		Safe to call when aux is not configured: returns None without side
+		effects. The returned task must be .wait()'d before the first decode
+		step that consumes the aux cache.
+		"""
+		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		if aux_view is None:
+			return None
+		if not isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
+			return None
+		aux_mgr = self.gpu_paged_kv_cache_manager.auxiliary
+		k_ptrs_aux, v_ptrs_aux = aux_mgr.get_padded_3d_page_pointers()
+		page_counts_aux = aux_mgr.export_active_sequence_page_counts()
+		return aux_view.async_load_layer_paged_kv_to_device(
+			sequence_ids=sequence_tensor,
+			active_page_counts=page_counts_aux,
+			k_device_ptrs=k_ptrs_aux,
+			v_device_ptrs=v_ptrs_aux,
+		)
 
 	def _load_host_kv_to_gpu(
 		self,
@@ -7692,6 +7740,13 @@ class BatchGenWorker:
 							v_device_ptrs=v_ptrs,
 						)
 
+						# DSA: mirror load for auxiliary indexer KV under the
+						# same rebuilt-page-table state. Without this, the
+						# indexer reads stale/zero pages after eviction+reload.
+						aux_task = self._launch_aux_host_kv_load(sequence_tensor)
+						if aux_task is not None:
+							new_async_task = _DualAsyncLoadTask(new_async_task, aux_task)
+
 						if existing_global_ids:
 							gpu_manager.rebuild_page_table(existing_global_ids)
 
@@ -9204,12 +9259,18 @@ class BatchGenWorker:
 			k_device_ptrs=k_ptrs,
 			v_device_ptrs=v_ptrs,
 		)
-		
+
+		# DSA: mirror load for auxiliary indexer KV under the same
+		# rebuilt-page-table state, before we restore to existing_global_ids.
+		aux_task = self._launch_aux_host_kv_load(sequence_tensor)
+		if aux_task is not None:
+			async_task = _DualAsyncLoadTask(async_task, aux_task)
+
 		# Step 8: Restore page table
 		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
 		if existing_global_ids:
 			gpu_manager.rebuild_page_table(existing_global_ids)
-		
+
 		return async_task, new_uuids, new_local_indices, new_global_ids
 
 	def _launch_async_load_new_sequences_timed(
@@ -9350,29 +9411,38 @@ class BatchGenWorker:
 		k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
 		active_page_counts = gpu_manager.export_active_sequence_page_counts()
 		sequence_tensor = torch.tensor(new_global_ids, dtype=torch.int64, device="cpu")
-		
+
+		# DSA: launch aux indexer KV load NOW (while aux's page table still
+		# reflects new_global_ids). The helper captures aux pointers and fires
+		# the C++ async task; by the time we restore the page table below,
+		# the aux task has already been queued with the correct pointers.
+		# If aux is not configured (non-DSA or diag mode), returns None.
+		aux_task = self._launch_aux_host_kv_load(sequence_tensor)
+
 		# FIX: Restore page table to ONLY existing sequences (not all)
 		# New sequences are being loaded async and NOT part of current forward pass
 		if existing_global_ids:
 			gpu_manager.rebuild_page_table(existing_global_ids)
 		# If no existing sequences, page table will be rebuilt when batch becomes non-empty
-		
+
 		timing['prepare_ms'] = (time.perf_counter() - t0) * 1000
-		
+
 		# ============ PHASE 8: Launch async load ============
 		t0 = time.perf_counter()
-		
+
 		if worker_view is None:
 			logging.warning(f"Rank {self.rank}: worker_view is None, cannot launch async load")
 			timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 			return None, new_uuids, new_local_indices, new_global_ids, timing
-		
+
 		async_task = worker_view.async_load_layer_paged_kv_to_device(
 			sequence_ids=sequence_tensor,
 			active_page_counts=active_page_counts,
 			k_device_ptrs=k_ptrs,
 			v_device_ptrs=v_ptrs,
 		)
+		if aux_task is not None:
+			async_task = _DualAsyncLoadTask(async_task, aux_task)
 		
 		# ASYNC MODE: Return task without waiting - wait happens at page boundary
 		# The async load overlaps with the next page's decoding iterations
