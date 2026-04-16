@@ -67,12 +67,21 @@ class Glm5RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _set_cos_sin_cache(self, seq_len: int, device, dtype):
+        # Keep the cache in FP32. Each position's cos/sin is a transcendental
+        # quantized once at cache build, then reused for every attention Q.K
+        # across 78 layers and all decode steps. Casting down to BF16 here
+        # bakes ~2^-7 rounding per (pos, dim) into every subsequent dot
+        # product, which compounds over long prompts and has been traced to
+        # repetition / immediate-EOS pathology on GLM-5-FP8. SGLang caches
+        # FP32 explicitly ("needs to be in FP32 for numerical stability");
+        # vLLM matches. The cast to x.dtype happens in forward() at use time.
+        del dtype
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq.to(device))
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = emb.cos().to(dtype)
-        self.sin_cached = emb.sin().to(dtype)
+        self.cos_cached = emb.cos()
+        self.sin_cached = emb.sin()
 
     def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.cos_cached is None or seq_len > self.max_seq_len_cached:
