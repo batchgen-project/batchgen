@@ -680,14 +680,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # cache_seqlens already includes the new token (pre-incremented in worker)
             updated_seqlens = cache_seqlens
 
-            if max_seqlen <= indexer.index_topk:
+            # BATCHGEN_GLM5_FORCE_DENSE_MLA=1: bypass DSA indexer scoring entirely
+            # and run dense MLA over ALL cached tokens, even past index_topk.
+            # Used to bisect whether the indexer.score_and_select_paged path is
+            # the source of L4 LongBench gibberish. Read per-iter — hot-pluggable.
+            _force_dense = _os_dsa_diag.environ.get("BATCHGEN_GLM5_FORCE_DENSE_MLA", "0") == "1"
+            if _force_dense or max_seqlen <= indexer.index_topk:
                 # Short-circuit: all sequences fit within topk — use full range
                 max_len = max_seqlen
                 top_k_indices = torch.arange(
                     max_len, device=hidden_states.device, dtype=torch.long,
                 ).unsqueeze(0).expand(bsz, -1)
                 if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
-                    _dsa_diag_log("dense", max_seqlen, bsz)
+                    branch = "dense-forced" if _force_dense else "dense"
+                    _dsa_diag_log(branch, max_seqlen, bsz)
             else:
                 if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
                     _dsa_diag_log("sparse", max_seqlen, bsz)
