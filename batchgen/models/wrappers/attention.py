@@ -70,6 +70,13 @@ class AttnWrapperBase(BaseModuleWrapper):
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
+    # Pending prefill-offload tasks. async_offload_layer_kv_to_host returns
+    # KVAsyncTask futures; if Python discards them (fire-and-forget), the
+    # CPU thread that queues cudaMemcpyAsync may not have run yet by the
+    # time decode starts reading the host KV. Capture each task here and
+    # .wait() on them before exiting prefill.
+    pending_prefill_offload_tasks: ClassVar[list] = []
+
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
     prepack_cu_seqlens: ClassVar[Optional[torch.Tensor]] = None

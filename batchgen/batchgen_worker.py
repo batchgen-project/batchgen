@@ -5332,9 +5332,26 @@ class BatchGenWorker:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
 
-						# CRITICAL: Wait for all async KV offloads to complete before decode
-						# The async_offload_layer_kv_to_host() calls during prefill are fire-and-forget.
-						# Decode reads KV from host, so offloads MUST complete first.
+						# CRITICAL: Wait for all async KV offloads to complete before decode.
+						# async_offload_layer_kv_to_host returns a future backed by a
+						# std::async CPU thread that issues cudaMemcpyAsync on a d2h
+						# stream. Discarding the future (fire-and-forget) is unsafe —
+						# the CPU thread may not have run yet, so torch.cuda.synchronize
+						# would have nothing to wait for. Wait on every captured future
+						# first, then sync the device to flush the d2h stream.
+						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+						pending = _AWB.pending_prefill_offload_tasks
+						if pending:
+							for _t in pending:
+								try:
+									_t.wait()
+								except Exception as _e:
+									logging.warning(f"prefill offload task wait failed: {_e}")
+							if self.rank == 0:
+								logging.info(
+									f"[PREFILL_SYNC] waited on {len(pending)} async KV offload tasks"
+								)
+							pending.clear()
 						torch.cuda.synchronize(self.torch_device)
 
 					# Cleanup & Status Update

@@ -436,13 +436,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
             seq_len = end_idx - start_idx
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
-            AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
+            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=seq_global_id,
                 k_tensor=seq_kv,
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            # Capture the future. CPU thread issues cudaMemcpyAsync inside; if
+            # we discard the task, decode may start reading host KV before the
+            # offload's CPU lambda has even queued its copies.
+            if task is not None:
+                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload KV cache per-sequence to host memory."""
@@ -456,13 +461,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             seq_len = end_idx - start_idx
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+            task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=seq_global_id,
                 k_tensor=seq_kv,
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            if task is not None:
+                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward with DSA sparse attention.
