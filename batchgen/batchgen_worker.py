@@ -6704,11 +6704,11 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
-				# Call lm_head directly using F.linear to bypass the hook
+				# Call lm_head in FP32 for logit precision (matches Kimi convention).
 				logits = torch.nn.functional.linear(
-					last_token_hidden,
-					self.model.lm_head.weight,
-					self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+					last_token_hidden.float(),
+					self.model.lm_head.weight.float(),
+					self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 				)
 
 				# Debug: dump top-20 logits at the final prefill position for the first
