@@ -561,9 +561,34 @@ class BatchGenWorker:
 			dual_host.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: DualHostKVCoordinator cudaHostRegister completed (local_rank={self.local_rank})")
 		else:
+			# When BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces a single view for a DSA
+			# model, the parent allocated separate primary + aux memfds; primary's
+			# memfd is sized for ONLY the primary portion of the budget. Scale the
+			# requested size down to match.
+			single_view_budget_bytes = host_budget_bytes
+			if _disable_dual:
+				try:
+					from batchgen.kv_cache.host_kv_mananger_config import (
+						_resolve_profile, _resolve_indexer_profile,
+					)
+					prim_p = _resolve_profile(args.model_name)
+					aux_p = _resolve_indexer_profile(args.model_name)
+					prim_bytes = prim_p.bytes_per_page() * prim_p.num_layers
+					aux_bytes = aux_p.bytes_per_page() * aux_p.num_layers
+					if prim_bytes + aux_bytes > 0:
+						num_pages = host_budget_bytes // (prim_bytes + aux_bytes)
+						single_view_budget_bytes = num_pages * prim_bytes
+						if self.rank == 0:
+							logging.info(
+								f"DISABLE_DUAL_KV: scaling single-view budget to "
+								f"{single_view_budget_bytes/1024**3:.1f}GB "
+								f"(primary share of {host_budget_bytes/1024**3:.1f}GB total)"
+							)
+				except Exception as _e:
+					logging.warning(f"DISABLE_DUAL_KV: budget scaling failed ({_e}); using full budget")
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
-				host_kv_cache_size=host_budget_bytes,
+				host_kv_cache_size=single_view_budget_bytes,
 			)
 			if args.fast_init:
 				worker_kv_config.enable_memfd = True
