@@ -84,6 +84,21 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 
+# DSA decode-iter diagnostic. Gated by BATCHGEN_GLM5_DSA_DIAG=1.
+# Logs which DSA branch (dense short-circuit ≤ index_topk vs sparse scoring
+# > index_topk) fires on each decode iter at layer 0 — proves the sparse
+# path engages once context exceeds 2048.
+import os as _os_dsa_diag
+_DSA_DIAG_SEEN: dict = {}
+def _dsa_diag_log(branch: str, max_seqlen: int, batch_size: int) -> None:
+    # Bucket max_seqlen by power of two so each shape logs ~once.
+    key = (branch, max_seqlen.bit_length())
+    if key in _DSA_DIAG_SEEN:
+        return
+    _DSA_DIAG_SEEN[key] = True
+    logging.info(f"[DSA L0] branch={branch} max_seqlen={max_seqlen} batch={batch_size}")
+
+
 def glm5_fp8_dequantization(
     weight_data_fp8: torch.Tensor,
     weight_scale_inv_fp32: torch.Tensor,
@@ -664,7 +679,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 top_k_indices = torch.arange(
                     max_len, device=hidden_states.device, dtype=torch.long,
                 ).unsqueeze(0).expand(bsz, -1)
+                if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
+                    _dsa_diag_log("dense", max_seqlen, bsz)
             else:
+                if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
+                    _dsa_diag_log("sparse", max_seqlen, bsz)
                 # Full indexer scoring path
                 q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
                 indexer_blocked_k, _, idx_block_table = \

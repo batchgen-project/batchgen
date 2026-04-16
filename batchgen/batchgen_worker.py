@@ -2202,7 +2202,10 @@ class BatchGenWorker:
 		seq = self.global_batch.get_sequence(uuid) if uuid else None
 		if seq is None:
 			raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
-		input_tokens = min(seq.prompt_length, self.max_input_length)
+		# NO truncation: KV budget must cover the FULL prompt + decode budget.
+		# An earlier min(...) here silently undersized KV when max_input_length
+		# lagged behind the actual prompt length on multi-batch admits.
+		input_tokens = seq.prompt_length
 		total_tokens = input_tokens + self.max_decoding_length
 		query_entry.kv_token_budget = total_tokens
 		return total_tokens
@@ -6508,15 +6511,27 @@ class BatchGenWorker:
 		seq_lengths = []
 
 		for query_idx in batch:
-			input_ids = self.query_book[query_idx].encoded["input_ids"][:, :self.max_input_length]
 			uuid = self._local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			actual_len = min(seq.prompt_length, self.max_input_length)
-			seq_lengths.append(actual_len)
+			# NO truncation: every prompt is tokenized to its OWN length.
+			# An earlier `[:, :self.max_input_length]` slice silently dropped
+			# the tail of long LongBench prompts when max_input_length was
+			# carried over from a smaller earlier admit batch, causing the
+			# model to "continue" mid-sentence instead of answering. Bind
+			# everything to seq.prompt_length directly.
+			L = seq.prompt_length
+			encoded = self.query_book[query_idx].encoded["input_ids"]
+			assert encoded.size(-1) >= L, (
+				f"encoded prompt length {encoded.size(-1)} < seq.prompt_length {L} "
+				f"for query_idx={query_idx} uuid={uuid[:8]}"
+			)
+			input_ids = encoded[:, :L]
+			seq_lengths.append(L)
 
-			# Construct attention mask on-the-fly from prompt_length
+			# Per-seq mask marks the L valid positions for the prepacker.
+			# Causal attention is enforced by FA varlen + cu_seqlens.
 			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
-			attention_mask[0, :actual_len] = 1
+			attention_mask[0, :L] = 1
 
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
