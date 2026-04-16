@@ -2403,27 +2403,24 @@ class BatchGenWorker:
 		if not global_sequence_ids:
 			return
 		
-		try:
-			manager.free_pages_for_sequences(global_sequence_ids)
-			# NOTE: No sync needed - page deallocation is synchronous to the allocator
-			logging.debug(
-				f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
-			)
-			
-			# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
-			for local_idx in local_sequence_ids:
-				uuid = self._local_to_uuid_map.get(local_idx)
-				if uuid:
-					self._sequences_with_gpu_kv.discard(uuid)
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is not None:
-						seq.gpu_pages_allocated = 0
-					
-		except KeyError as exc:
-			logging.warning(
-				"Rank %s failed to release GPU KV pages for %s: %s",
-				self.rank, global_sequence_ids, exc,
-			)
+		# All call sites now intersect `my_completed` with `_sequences_with_gpu_kv`
+		# before reaching here, so a KeyError from the manager indicates a real
+		# bookkeeping bug (the source-of-truth set drifted from the manager's
+		# state). Surface it loudly instead of swallowing.
+		manager.free_pages_for_sequences(global_sequence_ids)
+		# NOTE: No sync needed - page deallocation is synchronous to the allocator
+		logging.debug(
+			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
+		)
+
+		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
+		for local_idx in local_sequence_ids:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid:
+				self._sequences_with_gpu_kv.discard(uuid)
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None:
+					seq.gpu_pages_allocated = 0
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Destroy the GPU paged KV cache manager if it is present."""
@@ -5431,8 +5428,15 @@ class BatchGenWorker:
 					completed_list = list(global_completed)
 					my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
 					if my_completed:
-						my_completed_local = self._get_local_indices_for_uuids(my_completed)
-						self._release_gpu_kv_pages(my_completed_local)
+						# Only release GPU pages for seqs that were actually GPU-allocated.
+						# prefill_prepacked writes KV directly to host (never registers
+						# with the GPU paged manager), so zero-tok-EOS prefill completions
+						# are in _uuid_to_local_map but never in manager._sequences.
+						# _sequences_with_gpu_kv is the source-of-truth tracking set
+						# (added at :1619/:4904/:6191, discarded on release/eviction).
+						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+						if gpu_allocated:
+							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
 						self._release_host_kv_pages_for_batch(my_completed)
 					# All-ranks scalar cleanup
 					for uuid in completed_list:
@@ -7274,8 +7278,13 @@ class BatchGenWorker:
 			# _report_completion (see ordering fix note above).
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
-				my_completed_local = self._get_local_indices_for_uuids(my_completed)
-				self._release_gpu_kv_pages(my_completed_local)
+				# Only release GPU pages for seqs that were actually GPU-allocated.
+				# See note at the matching site (~line 5435) — zero-tok-EOS
+				# prefill completions are in _uuid_to_local_map but never
+				# registered with the GPU paged manager.
+				gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+				if gpu_allocated:
+					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
 				self._release_host_kv_pages_for_batch(my_completed)
 
 			# All-ranks: zero scalar counters so downstream reads (e.g.
@@ -7386,8 +7395,12 @@ class BatchGenWorker:
 			# doubling seen in multi-eviction runs.
 			my_evicted = [u for u in host_evicted_uuids if u in self._uuid_to_local_map]
 			if my_evicted:
-				my_evicted_local = self._get_local_indices_for_uuids(my_evicted)
-				self._release_gpu_kv_pages(my_evicted_local)
+				# Host-eviction usually targets seqs already in DECODE (so they
+				# have GPU pages), but defensively intersect with the source-of-
+				# truth set in case an EVICTED seq never reached decode.
+				gpu_allocated = [u for u in my_evicted if u in self._sequences_with_gpu_kv]
+				if gpu_allocated:
+					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
 				for uuid in my_evicted:
 					seq = self.global_batch.get_sequence(uuid)
 					prompt_tokens = seq.input_ids[0, :seq.prompt_length]
@@ -9617,8 +9630,11 @@ class BatchGenWorker:
 					# first and popped every local_map entry on the owner.
 					my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 					if my_completed:
-						my_completed_local_indices = self._get_local_indices_for_uuids(my_completed)
-						self._release_gpu_kv_pages(my_completed_local_indices)
+						# Intersect with source-of-truth GPU-allocated set (see
+						# note at the matching site ~line 5435).
+						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+						if gpu_allocated:
+							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
 					self._release_host_kv_pages_for_batch(completed_uuids)
 					# Report completions (this pops local_map; must run LAST).
 					for uuid in completed_uuids:
