@@ -86,9 +86,14 @@ class Glm5RotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.cos_cached is None or seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len, x.device, x.dtype)
+        # Return FP32 cos/sin. PyTorch dtype promotion will upcast the BF16
+        # query/key during rotate (t * cos, rotate_half(t) * sin), computing
+        # the rotation in FP32 and casting back to BF16 at the downstream
+        # assignment. Casting cos/sin down to x.dtype here would bake BF16
+        # rounding into every position and defeat the FP32 cache.
         return (
-            self.cos_cached[:seq_len].to(x.dtype),
-            self.sin_cached[:seq_len].to(x.dtype),
+            self.cos_cached[:seq_len],
+            self.sin_cached[:seq_len],
         )
 
 
