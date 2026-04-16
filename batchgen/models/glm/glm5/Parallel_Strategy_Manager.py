@@ -661,14 +661,15 @@ class GLM5ParallelStrategyManager:
         Counts WP2/WP4 init failures so a silent fallback to PyTorch
         doesn't regress perf unnoticed.
 
-        Skipped entirely when config.use_dense_mla is True — WP2/WP4 belong
-        to the DSA indexer path (absent in dense mode) and WP5 (FP8 absorb)
-        is explicitly off in _forward_decode_dense (uses einsum). No fused
-        kernel initialization runs in dense-MLA mode.
+        Skipped entirely in dense-MLA mode (no indexer module → nothing to
+        fuse). Structural check on the first attention layer — more robust
+        than threading a config flag through two parallel config types.
         """
-        if getattr(self.model_config, "use_dense_mla", False):
+        first_attn = self.model.model.layers[0].self_attn
+        first_inner = first_attn.module if hasattr(first_attn, "module") else first_attn
+        if not hasattr(first_inner, "indexer"):
             if self.rank == 0:
-                logging.info("[DSA kernels] skipped (use_dense_mla=True)")
+                logging.info("[DSA kernels] skipped (no indexer — dense-MLA mode)")
             return
         total = len(self.model.model.layers)
         inited = 0

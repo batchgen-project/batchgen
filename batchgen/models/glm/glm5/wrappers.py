@@ -325,6 +325,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         AND after _setup_fp8_scales has attached indexer.wk_scale / wq_b_scale.
         """
         attn = self.module
+        if not hasattr(attn, "indexer"):
+            return
         indexer = attn.indexer
 
         # Load-bearing ordering contract: WP2/WP4 both need the FP8 dequant scales
