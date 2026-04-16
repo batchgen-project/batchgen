@@ -531,17 +531,30 @@ class BatchGenWorker:
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 
-		# DSA models: create DualHostKVCoordinator with proportional budget split
+		# DSA models: create DualHostKVCoordinator with proportional budget split.
+		# Diagnostic env BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces the single-view
+		# path (Kimi-style) — used to bisect whether the dual coordinator setup
+		# itself corrupts primary KV. Combine with BATCHGEN_GLM5_FORCE_DENSE_MLA=1
+		# so aux-side reads/writes are also bypassed.
+		import os as _os_dual_kv
+		_disable_dual = _os_dual_kv.environ.get("BATCHGEN_GLM5_DISABLE_DUAL_KV", "0") == "1"
 		host_budget_bytes = int(args.global_host_kv_cache_size_gb * (1024**3))
-		dual_host = DualHostKVCoordinator.from_budget(
-			model_name=args.model_name,
-			host_kv_cache_size=host_budget_bytes,
-			core_engine_module=core_engine,
-			enable_memfd=args.fast_init,
-			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
-			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
-			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
-		)
+		if _disable_dual:
+			logging.warning(
+				f"Rank {self.rank}: BATCHGEN_GLM5_DISABLE_DUAL_KV=1 — skipping "
+				f"DualHostKVCoordinator; using single primary view only (Kimi-style)."
+			)
+			dual_host = None
+		else:
+			dual_host = DualHostKVCoordinator.from_budget(
+				model_name=args.model_name,
+				host_kv_cache_size=host_budget_bytes,
+				core_engine_module=core_engine,
+				enable_memfd=args.fast_init,
+				memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
+				memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
+				aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
+			)
 		if dual_host is not None:
 			self.host_paged_kv_worker_view = dual_host
 			logging.info(f"Rank {self.rank}: Initializing DualHostKVCoordinator with parallel cudaHostRegister (local_rank={self.local_rank})")
@@ -764,7 +777,13 @@ class BatchGenWorker:
 		if self.gpu_kv_cache_size_gb is None:
 			self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
 
-		if is_dsa_model(self.huggingface_ckpt_name):
+		# Diagnostic env: BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces single GPU manager
+		# even for DSA models. Bisects whether the dual coordinator setup itself
+		# corrupts primary KV. Combine with BATCHGEN_GLM5_FORCE_DENSE_MLA=1.
+		import os as _os_dual_gpu
+		_disable_dual_gpu = _os_dual_gpu.environ.get("BATCHGEN_GLM5_DISABLE_DUAL_KV", "0") == "1"
+
+		if is_dsa_model(self.huggingface_ckpt_name) and not _disable_dual_gpu:
 			# Split memory budget between primary MLA cache and auxiliary indexer cache.
 			# Compute the ratio of bytes-per-page for primary vs auxiliary so both
 			# get the same number of pages (they share the same page table).

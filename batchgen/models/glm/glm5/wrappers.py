@@ -426,6 +426,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
         """Offload indexer KV cache per-sequence to auxiliary host memory."""
+        # Early-return if auxiliary view is unavailable (e.g.,
+        # BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces single primary view).
+        if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
+            return
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
@@ -635,45 +639,48 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
         # --- Step 2: Write indexer K to auxiliary cache ---
-        with (dt.timed("indexer_k", li) if dt else _nullctx()):
-            # WP2: Fused CUDA WGMMA wk_proj (GEMM only) + PyTorch LayerNorm + RoPE + Hadamard
-            if self._indexer_cuda_weights is not None:
-                from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import cuda_wk_proj_gemm_only
-                # CUDA kernel: hidden_states → FP8 act_quant → WGMMA wk_proj
-                k_raw = cuda_wk_proj_gemm_only(
-                    hidden_flat,  # [B, hidden_size] — already squeezed above
-                    self._indexer_cuda_weights,
-                    self._indexer_cuda_module,
-                )  # [B, index_head_dim=128]
-                # LayerNorm (model uses nn.LayerNorm with bias, not RMSNorm)
-                k_normed = indexer.k_norm(k_raw)
-                # Apply RoPE + Hadamard (reuse indexer's fused op)
-                k_normed_3d = k_normed.unsqueeze(1)  # [B, 1, 128]
-                indexer_kv = indexer._fused_rope_hadamard_or_fallback(
-                    k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
-                ).unsqueeze(2)  # [B, 1, 1, 128]
-            else:
-                if not self._warned_indexer_kv_fallback:
-                    self._warned_indexer_kv_fallback = True
-                    logging.warning(
-                        f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
-                        "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
+        # Skip entirely when aux is disabled (BATCHGEN_GLM5_DISABLE_DUAL_KV).
+        # Combine with BATCHGEN_GLM5_FORCE_DENSE_MLA so scoring also bypasses aux.
+        if gpu_paged_kv_manager_aux is not None:
+            with (dt.timed("indexer_k", li) if dt else _nullctx()):
+                # WP2: Fused CUDA WGMMA wk_proj (GEMM only) + PyTorch LayerNorm + RoPE + Hadamard
+                if self._indexer_cuda_weights is not None:
+                    from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import cuda_wk_proj_gemm_only
+                    # CUDA kernel: hidden_states → FP8 act_quant → WGMMA wk_proj
+                    k_raw = cuda_wk_proj_gemm_only(
+                        hidden_flat,  # [B, hidden_size] — already squeezed above
+                        self._indexer_cuda_weights,
+                        self._indexer_cuda_module,
+                    )  # [B, index_head_dim=128]
+                    # LayerNorm (model uses nn.LayerNorm with bias, not RMSNorm)
+                    k_normed = indexer.k_norm(k_raw)
+                    # Apply RoPE + Hadamard (reuse indexer's fused op)
+                    k_normed_3d = k_normed.unsqueeze(1)  # [B, 1, 128]
+                    indexer_kv = indexer._fused_rope_hadamard_or_fallback(
+                        k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
+                    ).unsqueeze(2)  # [B, 1, 1, 128]
+                else:
+                    if not self._warned_indexer_kv_fallback:
+                        self._warned_indexer_kv_fallback = True
+                        logging.warning(
+                            f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
+                            "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
+                        )
+                    indexer_kv = indexer.compute_indexer_kv(
+                        hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
                     )
-                indexer_kv = indexer.compute_indexer_kv(
-                    hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
+                indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
+                aux_device = gpu_paged_kv_manager_aux.device
+                seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
+                gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+                    k_tensor=indexer_k_tensor,
+                    v_tensor=None,
+                    sequence_lengths=seq_lengths_i32_aux,
+                    layer_idx=li,
                 )
-            indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-            aux_device = gpu_paged_kv_manager_aux.device
-            seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
-            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                k_tensor=indexer_k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32_aux,
-                layer_idx=li,
-            )
-            # Offload indexer K to auxiliary host cache
-            if AttnWrapperBase.kv_append_callback_aux is not None:
-                AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
+                # Offload indexer K to auxiliary host cache
+                if AttnWrapperBase.kv_append_callback_aux is not None:
+                    AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
 
         # --- Step 3: Score all cached tokens (including new), select top-K ---
         with (dt.timed("indexer_score", li) if dt else _nullctx()):
