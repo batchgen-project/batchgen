@@ -1084,34 +1084,60 @@ class Glm5MoE(nn.Module):
         n_blocks_pad4 = (n_blocks + 3) // 4 * 4
 
         # GLM-5 has ~4x larger MoE projections than minimax (6144x2048 vs
-        # 3072x1536), so torch.stack() would duplicate ~576 MB per MoE layer
-        # x 75 layers = ~43 GB of fp8 weight memory per rank → OOM at init.
-        # Fix: after stacking, rebind the per-expert references to views
-        # into the stacked tensor so the original per-expert allocations
-        # become garbage-collectable.
-        self.fp8_gate_w3d = torch.stack(self.gate_list).contiguous()
+        # 3072x1536). Each MoE-layer weight has THREE live references:
+        #   1. placeholder attr  — expert.module.fp8_{gate,up,down}
+        #   2. wrapper cache     — wrapper.cached_{gate,up,down}
+        #   3. local list        — self.{gate,up,down}_list[i]
+        # torch.stack() would allocate a brand-new 576 MB contiguous tensor
+        # per projection while all three references still keep the
+        # originals alive → ~43 GB of duplicate fp8 weights per rank
+        # (75 MoE layers x 576 MB) and OOMs the 95 GB H20.
+        # Fix: allocate the stacked tensor empty, copy each expert in
+        # one at a time, and rebind ALL THREE references so the original
+        # per-expert allocation becomes refcount=0 and the CUDA allocator
+        # reclaims it before the next expert's copy.
+        start = self.routed_expert_start_idx
+        gate_shape = self.gate_list[0].shape
+        self.fp8_gate_w3d = torch.empty(
+            (E, *gate_shape), dtype=self.gate_list[0].dtype, device=self.device)
         for i in range(E):
+            self.fp8_gate_w3d[i].copy_(self.gate_list[i])
             view = self.fp8_gate_w3d[i]
+            wrapper = self.experts[start + i]
+            wrapper.cached_gate = view
+            if hasattr(wrapper.module, 'fp8_gate'):
+                wrapper.module.fp8_gate = view
             self.gate_list[i] = view
-            self.experts[self.routed_expert_start_idx + i].cached_gate = view
         self.gate_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.gate_list],
             dtype=torch.int64, device=self.device)
 
-        self.fp8_up_w3d = torch.stack(self.up_list).contiguous()
+        up_shape = self.up_list[0].shape
+        self.fp8_up_w3d = torch.empty(
+            (E, *up_shape), dtype=self.up_list[0].dtype, device=self.device)
         for i in range(E):
+            self.fp8_up_w3d[i].copy_(self.up_list[i])
             view = self.fp8_up_w3d[i]
+            wrapper = self.experts[start + i]
+            wrapper.cached_up = view
+            if hasattr(wrapper.module, 'fp8_up'):
+                wrapper.module.fp8_up = view
             self.up_list[i] = view
-            self.experts[self.routed_expert_start_idx + i].cached_up = view
         self.up_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.up_list],
             dtype=torch.int64, device=self.device)
 
-        self.fp8_down_w3d = torch.stack(self.down_list).contiguous()
+        down_shape = self.down_list[0].shape
+        self.fp8_down_w3d = torch.empty(
+            (E, *down_shape), dtype=self.down_list[0].dtype, device=self.device)
         for i in range(E):
+            self.fp8_down_w3d[i].copy_(self.down_list[i])
             view = self.fp8_down_w3d[i]
+            wrapper = self.experts[start + i]
+            wrapper.cached_down = view
+            if hasattr(wrapper.module, 'fp8_down'):
+                wrapper.module.fp8_down = view
             self.down_list[i] = view
-            self.experts[self.routed_expert_start_idx + i].cached_down = view
         self.down_ptrs_ptr = torch.tensor(
             [r.data_ptr() for r in self.down_list],
             dtype=torch.int64, device=self.device)
