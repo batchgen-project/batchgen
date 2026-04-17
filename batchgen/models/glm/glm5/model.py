@@ -110,9 +110,9 @@ class Glm5RotaryEmbedding(nn.Module):
         # across 78 layers and all decode steps. Casting down to BF16 here
         # bakes ~2^-7 rounding per (pos, dim) into every subsequent dot
         # product, which compounds over long prompts and has been traced to
-        # repetition / immediate-EOS pathology on GLM-5-FP8. SGLang caches
-        # FP32 explicitly ("needs to be in FP32 for numerical stability");
-        # vLLM matches. The cast to x.dtype happens in forward() at use time.
+        # repetition / immediate-EOS pathology on GLM-5-FP8. Reference impls
+        # cache cos/sin in FP32 explicitly for numerical stability; the cast
+        # to x.dtype happens in forward() at use time.
         del dtype
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
@@ -218,7 +218,7 @@ def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
 
 
 class Glm5Indexer(nn.Module):
-    """NSA (Nested Sparse Attention) Indexer for GLM-5.
+    """GLM-5 DSA indexer.
 
     Uses MQA (Multi-Query Attention) pattern for scoring:
     - K is single-head: hidden_states -> wk [hidden_size -> head_dim=128] -> k_norm
@@ -230,7 +230,6 @@ class Glm5Indexer(nn.Module):
     - Aggregate across heads -> top-K selection
 
     The K cached per token is only head_dim=128 (not n_heads*head_dim=4096).
-    Reference: sglang nsa_indexer.py
     """
 
     def __init__(self, config: Glm5Config, layer_idx: int = 0):
@@ -418,6 +417,88 @@ class Glm5Indexer(nn.Module):
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
 
+        return top_k_indices
+
+    def score_and_select_relu_gated(
+        self,
+        q_a: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cached_k: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+    ) -> torch.Tensor:
+        """ReLU-gated scoring: score = (relu(Q·K * softmax_scale) * head_gates).sum(heads).
+
+        Two differences vs ``score_and_select``:
+
+        1. ``F.relu`` is applied to per-head scores BEFORE head-weighting. Without
+           ReLU, negative per-head scores cancel positive ones from other heads
+           during the sum, distorting the top-K selection vs the training-time
+           formulation of GLM-5's indexer.
+        2. ``softmax_scale`` multiplies the Q·K product directly (not folded into
+           ``head_gates``). Equivalent when ReLU is absent, but with ReLU the
+           ordering matters because scaling the input changes which values clip
+           to zero.
+
+        Also masks ``positions >= cache_seqlens`` with ``-inf`` BEFORE the sum
+        rather than after, so padded positions can't leak any post-ReLU energy
+        into the aggregate.
+
+        Args, returns: same as ``score_and_select``.
+        """
+        batch_size = q_a.shape[0]
+        if max_seqlen is None:
+            max_seqlen = cached_k.shape[1]
+
+        # Q from shared q_a intermediate (same as score_and_select).
+        if hasattr(self, 'wq_b_scale'):
+            from batchgen.attention.mla.fa3_backend import w8a16_gemm
+            q = w8a16_gemm(self.wq_b.weight.data, self.wq_b_scale, q_a)
+        else:
+            q = self.wq_b(q_a)
+        q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
+
+        # RoPE + Hadamard on Q (same as score_and_select).
+        if positions is not None and self.rotary_emb is not None:
+            if _fused_rope_hadamard_fn is not None:
+                cos, sin = self.rotary_emb(q.view(-1, 1, self.rope_head_dim), max_seqlen)
+                B = q.shape[0]
+                q_flat = q.reshape(-1, self.index_head_dim)
+                pos_expanded = positions.reshape(-1).repeat_interleave(self.index_n_heads)
+                q = _fused_rope_hadamard_fn(
+                    q_flat.to(torch.bfloat16), cos.float(), sin.float(),
+                    pos_expanded, scale=self.index_head_dim ** -0.5,
+                ).reshape(B, self.index_n_heads, self.index_head_dim).to(q.dtype)
+            else:
+                q = self._apply_rope_to_q(q, positions)
+                q = _hadamard_transform(q.to(torch.bfloat16)).to(q.dtype)
+
+        # Score in float for numerical stability.
+        q_f = q.float()                                     # [B, H, D]
+        k_f = cached_k.float()                              # [B, T, D]
+        # Q·K^T: [B, H, T] = einsum('bhd,btd->bht', q, k)
+        scores = torch.einsum("bhd,btd->bht", q_f, k_f) * self.softmax_scale
+
+        # Mask invalid positions BEFORE ReLU so they become 0 after F.relu(-inf).
+        # Using a very-negative (not -inf) sentinel would still pass ReLU as 0; -inf
+        # is the safe choice because subsequent ops are sums (not softmaxes).
+        position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
+        mask = position_indices >= cache_seqlens.unsqueeze(1)    # [B, T]
+        scores = scores.masked_fill(mask.unsqueeze(1), float("-inf"))
+
+        # Per-head ReLU clips negative scores to 0 before aggregation.
+        scores = F.relu(scores)
+
+        # Head gates: weights_proj(hidden) * n_heads^-0.5 (softmax_scale already folded in above).
+        head_gates = self.weights_proj(hidden_states.squeeze(1)).float()  # [B, H]
+        head_gates = head_gates * (self.index_n_heads ** -0.5)
+
+        # Weighted sum over heads: [B, T]
+        aggregated = torch.einsum("bht,bh->bt", scores, head_gates)
+
+        effective_topk = min(self.index_topk, max_seqlen)
+        _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
         return top_k_indices
 
     def score_and_select_paged(
@@ -723,8 +804,8 @@ class Glm5MoEGate(nn.Module):
         The `e_score_correction_bias` is used for SELECTION only; the
         returned top-K weights are the RAW sigmoid scores at the selected
         indices, not the biased values. This matches the dedicated CUDA
-        `gate_sigmoid_topk_kernel` used by the decode path, the HF reference
-        modeling for DeepSeek-V3 / glm_moe_dsa, and sglang. Using biased
+        `gate_sigmoid_topk_kernel` used by the decode path and the HF reference
+        modeling for DeepSeek-V3 / glm_moe_dsa. Using biased
         scores as weights (the previous behavior) shifts the expert mixing
         coefficients and injects drift at every MoE layer, which for GLM-5
         shows up as a small bias at the final-position logits.
