@@ -189,14 +189,23 @@ class WorkerManager:
             self._config_hugepages(byte_size)
             self._hugepages_enabled = True
 
+        import sys as _diag_sys
+        def _diag(msg):
+            print(f"[DIAG {_time.time():.3f}] {msg}", flush=True)
+            _diag_sys.stdout.flush()
+
+        _diag(">>> config_torch_module_initializer")
         config_torch_module_initializer()
+        _diag("<<< config_torch_module_initializer")
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
             try:
+                _diag(">>> allocate_host_kv_cache")
                 result = self.allocate_host_kv_cache(
                     self.args.host_kv_cache_size, self.args.model,
                     enable_memfd=self.args.fast_init,
                 )
+                _diag("<<< allocate_host_kv_cache")
                 if isinstance(result, tuple):
                     self.host_kv_manager, self.host_kv_aux_manager = result
                 else:
@@ -210,14 +219,22 @@ class WorkerManager:
                         _time.monotonic() - kv_start)
 
         model_start = _time.monotonic()
+        _diag(">>> _load_model_resources")
         self._load_model_resources()
+        _diag("<<< _load_model_resources")
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
 
         spawn_start = _time.monotonic()
+        _diag(">>> _spawn_workers")
         self._spawn_workers()
+        _diag("<<< _spawn_workers")
+        _diag(">>> _start_worker_monitor")
         self._start_worker_monitor()
+        _diag("<<< _start_worker_monitor")
+        _diag(">>> _wait_for_workers_ready")
         self._wait_for_workers_ready()
+        _diag("<<< _wait_for_workers_ready")
         logger.info("[startup] Workers ready in %.2fs",
                     _time.monotonic() - spawn_start)
 
