@@ -35,15 +35,18 @@ import os as _os_env  # alias to avoid collision with the local `os` usage later
 def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: int = 20) -> None:
 	"""Log top-K token IDs + logits + decoded strings for GLM-5 diagnostic.
 
-	Called only when BATCHGEN_GLM5_LOGIT_DUMP=1. Fires once per prefill call
-	(suppresses subsequent calls via a module-level flag to keep logs readable).
-	Dumps up to BATCHGEN_GLM5_LOGIT_DUMP_N sequences (default 64 → effectively
-	all seqs in a single prepacked prefill batch).
+	Called only when BATCHGEN_GLM5_LOGIT_DUMP=1. Fires up to
+	BATCHGEN_GLM5_LOGIT_DUMP_CALLS prefill invocations (default 20, enough
+	for a diagnostic L2 MMLU run plus a LongBench smoke). Dumps up to
+	BATCHGEN_GLM5_LOGIT_DUMP_N sequences per invocation (default 64 → all
+	seqs in a single prepacked prefill batch).
 	"""
-	global _GLM5_LOGIT_DUMP_FIRED
-	if _GLM5_LOGIT_DUMP_FIRED:
+	global _GLM5_LOGIT_DUMP_COUNT
+	max_calls = int(os.environ.get("BATCHGEN_GLM5_LOGIT_DUMP_CALLS", "20"))
+	if _GLM5_LOGIT_DUMP_COUNT >= max_calls:
 		return
-	_GLM5_LOGIT_DUMP_FIRED = True
+	_GLM5_LOGIT_DUMP_COUNT += 1
+	call_idx = _GLM5_LOGIT_DUMP_COUNT
 	try:
 		# logits: [batch_size, vocab_size]
 		max_n = int(os.environ.get("BATCHGEN_GLM5_LOGIT_DUMP_N", "64"))
@@ -62,7 +65,7 @@ def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: 
 					decoded = "<decode error>"
 				rows_str.append(f"  {i:>7d}  {v:>10.4f}  {decoded!r}")
 			logging.error(
-				f"[GLM5 LOGIT-DUMP rank={rank} seq={seq_idx}] "
+				f"[GLM5 LOGIT-DUMP call={call_idx} rank={rank} seq={seq_idx}] "
 				f"absmax={absmax:.4f} mean={mean:.4f} std={std:.4f} top{topk}:\n"
 				+ "\n".join(rows_str)
 			)
@@ -70,7 +73,7 @@ def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: 
 		logging.error(f"[GLM5 LOGIT-DUMP] failed: {e}")
 
 
-_GLM5_LOGIT_DUMP_FIRED = False
+_GLM5_LOGIT_DUMP_COUNT = 0
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
