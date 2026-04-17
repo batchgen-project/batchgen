@@ -675,8 +675,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
 
-        # GLM-5 seq bookkeeping dump (decode-side view). Pairs with the
-        # KV-write dump in gpu_paged_kv_manager.update_layer_decode_new_token.
+        # GLM-5 per-global-seq bookkeeping dump (decode-side view). Pairs
+        # with the KV-write dump in
+        # gpu_paged_kv_manager.update_layer_decode_new_token. Correlates
+        # local micro-batch slots to global seq ids via
+        # AttnWrapperBase.cur_batch so BATCHGEN_GLM5_BOOKKEEP_SEQS=24 hits
+        # global seq 24 regardless of which local slot it occupies.
         _BOOKKEEP = _os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
         if _BOOKKEEP and li == 0:
             try:
@@ -686,15 +690,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 _rank = 0
             if _rank == 0:
                 import logging as _logging
-                _seqs = [int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()]
-                for _seq in _seqs:
-                    if _seq >= bsz:
-                        continue
-                    _cs = int(updated_seqlens[_seq].item())
-                    _bt_row = mla_block_table[_seq].tolist()
+                _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+                _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
+                _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
+                            if loc < len(_cur) and _cur[loc] in _target_set]
+                for _loc, _gid in _bk_hits:
+                    _cs = int(updated_seqlens[_loc].item())
+                    _bt_row = mla_block_table[_loc].tolist()
                     _logging.warning(
-                        f"[BOOKKEEP L0 decode seq={_seq}] cache_seqlen={_cs} "
-                        f"block_table={_bt_row}"
+                        f"[BOOKKEEP L0 decode gid={_gid}] loc={_loc} "
+                        f"cache_seqlen={_cs} block_table={_bt_row}"
                     )
 
         if not _use_kimi_mla:
@@ -768,7 +773,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     True,  # causal
                 )
 
-        # Post-attn bookkeeping probe: dump attn_out fingerprint for target seqs.
+        # Post-attn bookkeeping probe: dump attn_out fingerprint for global
+        # target seqs, via cur_batch mapping.
         if _BOOKKEEP and li == 0:
             try:
                 import torch.distributed as _dist
@@ -777,13 +783,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 _rank_check = 0
             if _rank_check == 0:
                 import logging as _logging
-                _seqs = [int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()]
-                for _seq in _seqs:
-                    if _seq >= bsz:
-                        continue
-                    _attn_fp = attn_out[_seq, 0, 0, :8].float().tolist()
+                _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+                _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
+                _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
+                            if loc < len(_cur) and _cur[loc] in _target_set]
+                for _loc, _gid in _bk_hits:
+                    _attn_fp = attn_out[_loc, 0, 0, :8].float().tolist()
                     _logging.warning(
-                        f"[BOOKKEEP L0 attn_out seq={_seq}] head0[:8]={_attn_fp}"
+                        f"[BOOKKEEP L0 attn_out gid={_gid}] loc={_loc} head0[:8]={_attn_fp}"
                     )
 
         # Step 6: out-absorb via einsum → FP8 quant → o_proj
