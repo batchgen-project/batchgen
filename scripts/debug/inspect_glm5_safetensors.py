@@ -4,15 +4,19 @@ shape, dtype, and shard to a Markdown reference doc.
 Why: the 3D-MoE port assumed minimax-style per-expert shapes
 (`gate.weight = [N, K]`, `down.weight = [K, N]`) but L2 accuracy
 regressed 71.9% → 3.9% after enabling it. Before patching the port,
-we need ground truth for the on-disk layout. This script produces a
-git-tracked markdown doc at `docs/glm5_fp8_weight_layout.md` so
-future sessions don't need to re-walk 780 GB of shards.
+we need ground truth for the on-disk layout.
 
-Usage (on H20 where weights live):
+The generated doc is kept OUT of this repo (checkpoint metadata is
+reference material, not source) — the canonical location is
+`~/mac-batchgen/batchgen_design/glm5_fp8_weight_layout.md` on the
+local workstation, so any machine mounting mac-batchgen can read
+it without re-walking 780 GB of shards.
+
+Usage (on H20 where weights live, writing to the SSHFS-mounted mac path):
 
     python scripts/debug/inspect_glm5_safetensors.py \\
         --model-path /data2/models/zai-org/GLM-5-FP8 \\
-        --out docs/glm5_fp8_weight_layout.md
+        --out ~/mac-batchgen/batchgen_design/glm5_fp8_weight_layout.md
 
 No tensor data is ever loaded — only headers via `safe_open(...).get_slice(k)`.
 """
