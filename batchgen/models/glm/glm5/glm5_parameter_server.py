@@ -17,25 +17,42 @@ Key differences from DeepSeek:
 - byte_size: ~760 GB (FP8 experts) or ~1400 GB (BF16 experts)
 """
 
+import sys as _diag_sys
+import time as _diag_time
+def _diag(msg):
+    print(f"[DIAG {_diag_time.time():.3f}] glm5_ps_import: {msg}", flush=True)
+    _diag_sys.stdout.flush()
+
+_diag("start")
 import gc
 import logging
 import os
 import shutil
 from multiprocessing import Process
+_diag("stdlib done")
 
 import torch
+_diag("torch done")
 from safetensors.torch import load_file
+_diag("safetensors done")
 from tqdm import tqdm, trange
+_diag("tqdm done")
 
 from .configuration_glm5 import Glm5Config
+_diag("configuration_glm5 done")
 from .model import Glm5ForCausalLM
+_diag("model (Glm5ForCausalLM) done")
 from batchgen.config.model_registry import load_config
+_diag("model_registry done")
 
 try:
     from batchgen.core_engine import Parameter_Server
+    _diag("core_engine (prebuilt) done")
 except ImportError:
+    _diag("core_engine ImportError -> engine_loader JIT")
     from batchgen.models.engine_loader import core_engine
     Parameter_Server = core_engine.Parameter_Server
+    _diag("engine_loader done")
 
 
 class GLM5_Parameter_Server:
