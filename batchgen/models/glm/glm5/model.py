@@ -32,6 +32,44 @@ from .configuration_glm5 import Glm5Config
 
 
 # ============================================================================
+# K2.5 3D-buffer MoE kernels — port of minimax-m25's validated decode path.
+# ============================================================================
+# Feature flags mirror batchgen/models/minimax/minimax_m25/model.py:69-94.
+# The MoE 3D path uses `dispatch_scatter_3d` + `grouped_fp8_blockwise_*` +
+# `reduce_weighted_scatter`. Gated at runtime by BATCHGEN_GLM5_USE_3D_MOE=1
+# so the existing _triton_compute / WGMMA paths stay the default until this
+# port is validated for GLM-5 shapes (hidden=6144, moe_intermediate=2048).
+
+try:
+    from batchgen.moe.grouped_fp8_blockwise_moe import (
+        grouped_fp8_blockwise_s1_silu,
+        grouped_fp8_blockwise_fused_s1,
+        grouped_fp8_blockwise_s3,
+    )
+    _GLM5_HAS_FP8_BLOCKWISE = True
+except ImportError:
+    _GLM5_HAS_FP8_BLOCKWISE = False
+
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import (
+        act_quant_3d, fused_silu_quant_3d,
+    )
+    _GLM5_HAS_FP8_OPS = True
+except ImportError:
+    _GLM5_HAS_FP8_OPS = False
+
+try:
+    from batchgen.moe.dispatch_scatter_3d import (
+        dispatch_scatter_3d, reduce_weighted_scatter,
+    )
+    _GLM5_HAS_DISPATCH_3D = True
+except ImportError:
+    _GLM5_HAS_DISPATCH_3D = False
+
+_GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "256"))
+
+
+# ============================================================================
 # RMSNorm
 # ============================================================================
 
@@ -798,6 +836,71 @@ def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
 
 
 # ============================================================================
+# K2.5 3D MoE Buffer Manager — port of MiniMaxM25MoEBufferManager
+# ============================================================================
+
+class Glm5MoE3DBuffers:
+    """Pre-allocated buffers for GLM-5 MoE decode on the K2.5 3D strided layout.
+
+    One instance per model, shared across all 75 MoE layers. Mirrors
+    MiniMaxM25MoEBufferManager (batchgen/models/minimax/minimax_m25/model.py:609)
+    exactly in shape + lifetime; only the docstring / logging labels differ.
+    """
+
+    def __init__(
+        self,
+        E_local: int,
+        max_global_bsz: int,
+        H: int,
+        N_inter: int,
+        topk: int,
+        num_tokens_per_rank: int,
+        device: torch.device,
+        max_tokens_padded: int,
+    ):
+        self.E_local = E_local
+        self.H = H
+        self.N_inter = N_inter
+        self.topk = topk
+        self.max_global_bsz = max_global_bsz
+        self.num_tokens_per_rank = num_tokens_per_rank
+        self.device = device
+        self.max_tokens_padded = max_tokens_padded
+
+        NK = max_global_bsz * topk
+        buf_rows = E_local * max_tokens_padded
+
+        self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
+        self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
+        self.dispatched_x = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
+        self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+
+        total_bytes = 0
+        for t in (self.all_tokens, self.padded, self.expert_counts, self.expert_counters,
+                  self.topk_pos, self.dispatched_x, self.expert_out, self.result_buffer):
+            total_bytes += t.nelement() * t.element_size()
+        logging.info(
+            f"[Glm5MoE3DBuffers] E_local={E_local}, mtp={max_tokens_padded}, "
+            f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
+            f"total={total_bytes / (1024**3):.2f} GiB"
+        )
+
+    def resize_if_needed(self, global_bsz: int):
+        if global_bsz <= self.max_global_bsz:
+            return
+        logging.info(f"[Glm5MoE3DBuffers] Resizing: {self.max_global_bsz} -> {global_bsz}")
+        self.max_global_bsz = global_bsz
+        NK = global_bsz * self.topk
+        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
+        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+
+# ============================================================================
 # MoE Layer (Decode with EP) — standalone nn.Module (K2.5 pattern)
 # ============================================================================
 
@@ -818,6 +921,11 @@ class Glm5MoE(nn.Module):
     _wgmma_modules = None       # (wgmma_mod, fast_mod, dr_mod)
     _buf = None                 # WGMMAMoEBuffers instance (unified: GEMM + comm buffers)
     _wgmma_next_layer_id = 0    # Counter for layer registration
+
+    # K2.5 3D-MoE path (minimax parity) — opt-in via BATCHGEN_GLM5_USE_3D_MOE=1.
+    _3d_buf: Optional[Glm5MoE3DBuffers] = None
+    _warned_k25_path = False
+    _warned_gemm_3d = False
 
     def __init__(self, config: Glm5Config, comm=None):
         super().__init__()
@@ -844,10 +952,12 @@ class Glm5MoE(nn.Module):
         self.num_persistent_local_experts = self.experts_per_rank
 
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
+        self.use_3d_moe = os.environ.get("BATCHGEN_GLM5_USE_3D_MOE", "0") == "1"
 
         self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
+        self._fp8_blockwise_ready = False
 
     # ── Token count management (called by PSM) ──
 
@@ -877,6 +987,19 @@ class Glm5MoE(nn.Module):
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
 
+        # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
+        if self.use_3d_moe and _GLM5_HAS_DISPATCH_3D and Glm5MoE._3d_buf is None:
+            Glm5MoE._3d_buf = Glm5MoE3DBuffers(
+                E_local=self.experts_per_rank,
+                max_global_bsz=global_num_tokens,
+                H=self.hidden_size,
+                N_inter=self.config.moe_intermediate_size,
+                topk=K,
+                num_tokens_per_rank=num_tokens_per_rank,
+                device=self.device,
+                max_tokens_padded=_GLM5_3D_MTP,
+            )
+
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
             return
@@ -891,6 +1014,10 @@ class Glm5MoE(nn.Module):
         self.topk_pos = torch.arange(
             K, dtype=torch.int32, device=self.device
         ).repeat(global_num_tokens)
+
+        # Resize 3D buffers if global token count exceeded
+        if self.use_3d_moe and Glm5MoE._3d_buf is not None:
+            Glm5MoE._3d_buf.resize_if_needed(global_num_tokens)
 
     # ── Weight pointer setup (called by PSM) ──
 
@@ -933,6 +1060,61 @@ class Glm5MoE(nn.Module):
             self._wgmma_layer_id = Glm5MoE._wgmma_next_layer_id
             Glm5MoE._wgmma_next_layer_id += 1
 
+        # K2.5 3D-MoE weight stacking (per-layer) — mirror
+        # MiniMaxM25MoE._init_fp8_blockwise_weights at model.py:874-926.
+        if self.use_3d_moe and _GLM5_HAS_FP8_BLOCKWISE:
+            self._init_fp8_blockwise_weights()
+
+    def _init_fp8_blockwise_weights(self):
+        """Stack per-expert FP8 weights into 3D tensors for blockwise GEMM.
+
+        Mirrors MiniMaxM25MoE._init_fp8_blockwise_weights (model.py:874-926).
+        GLM-5 shapes: hidden_size=6144, moe_intermediate_size=2048, both
+        divisible by 128 → fits CuTe alignment.
+        """
+        E = self.experts_per_rank
+        K = self.hidden_size                       # 6144
+        N = self.config.moe_intermediate_size      # 2048
+        scale_block = 128
+
+        k_blocks = K // scale_block
+        n_blocks = N // scale_block
+        k_blocks_pad4 = (k_blocks + 3) // 4 * 4
+        n_blocks_pad4 = (n_blocks + 3) // 4 * 4
+
+        self.fp8_gate_w3d = torch.stack(self.gate_list).contiguous()
+        self.fp8_up_w3d = torch.stack(self.up_list).contiguous()
+        self.fp8_down_w3d = torch.stack(self.down_list).contiguous()
+
+        self.fp8_gate_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.gate_scale_list):
+            self.fp8_gate_ws3d[i, :, :k_blocks] = s
+
+        self.fp8_up_ws3d = torch.zeros(
+            E, n_blocks, k_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.up_scale_list):
+            self.fp8_up_ws3d[i, :, :k_blocks] = s
+
+        self.fp8_down_ws3d = torch.zeros(
+            E, k_blocks, n_blocks_pad4,
+            dtype=torch.float32, device=self.device)
+        for i, s in enumerate(self.down_scale_list):
+            self.fp8_down_ws3d[i, :, :n_blocks] = s
+
+        self._fp8_blockwise_ready = True
+
+        if not getattr(Glm5MoE, '_warned_weights_stacked', False):
+            logging.info(
+                f"[Glm5MoE] FP8 blockwise 3D weights ready: "
+                f"gate={list(self.fp8_gate_w3d.shape)}, "
+                f"down={list(self.fp8_down_w3d.shape)}, "
+                f"gate_scale={list(self.fp8_gate_ws3d.shape)}"
+            )
+            Glm5MoE._warned_weights_stacked = True
+
     def cleanup(self):
         for attr in ('gate_list', 'up_list', 'down_list',
                       'gate_scale_list', 'up_scale_list', 'down_scale_list',
@@ -951,6 +1133,12 @@ class Glm5MoE(nn.Module):
     @torch.inference_mode()
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → Gate → Expert Compute → AllReduce → Extract + Shared."""
+        # K2.5 3D-MoE path (opt-in) — routes through validated minimax/kimi
+        # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
+        if (self.use_3d_moe and self._fp8_blockwise_ready and
+                Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
+            return self._forward_decode_3d(hidden_states)
+
         import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
@@ -1021,6 +1209,159 @@ class Glm5MoE(nn.Module):
         out = global_results[start:start + num_tokens].to(hidden_states.dtype)
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
+
+    # ── K2.5 3D MoE decode path (minimax/Kimi parity) ──
+
+    @torch.inference_mode()
+    def _forward_decode_3d(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """K2.5 pattern decode: AllGather → Gate → 3D dispatch → blockwise FP8 GEMM → weighted scatter → AllReduce → Shared.
+
+        Mirrors MiniMaxM25MoE.moe_infer_allgather_allreduce_bf16_acc
+        (model.py:1180-1287). Only difference is GLM-5's `shared_experts`
+        addition at the end (minimax has no shared expert).
+        """
+        import torch.distributed as dist
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_states
+        num_tokens, hidden_size = hidden_states.shape
+
+        if num_tokens > self.num_tokens_per_rank:
+            raise RuntimeError(
+                f"MoE buffer overflow: num_tokens={num_tokens} > "
+                f"num_tokens_per_rank={self.num_tokens_per_rank}"
+            )
+
+        ntp = self.num_tokens_per_rank
+        num_global = ntp * self.world_size
+        topk = self.num_experts_per_tok
+        buf = Glm5MoE._3d_buf
+        buf.resize_if_needed(num_global)
+
+        if not getattr(Glm5MoE, '_warned_k25_path', False):
+            logging.warning(
+                "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
+            Glm5MoE._warned_k25_path = True
+
+        # 1) AllGather
+        all_tokens = buf.all_tokens[:num_global]
+        padded = buf.padded
+        padded.zero_()
+        if num_tokens > 0:
+            padded[:num_tokens] = hidden_states
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.default_stream(self.device),
+            )
+
+        # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
+        topk_idx, topk_weight = self._gate_decode(all_tokens)
+
+        # 3) 3D dispatch
+        buf.dispatched_x.zero_()
+        expert_counts, topk_pos = dispatch_scatter_3d(
+            all_tokens, topk_idx.to(torch.int32),
+            buf.dispatched_x,
+            self.routed_expert_start_idx, self.experts_per_rank,
+            buf.max_tokens_padded,
+            buf.expert_counts, buf.expert_counters,
+            buf.topk_pos[:num_global * topk],
+        )
+
+        # 4) FP8 blockwise GEMM on 3D buffer
+        self._fp8_blockwise_gemm_3d(buf, expert_counts)
+
+        # 5) Weighted scatter reduce
+        result_buf = buf.result_buffer[:num_global]
+        result_buf.zero_()
+        global_results = reduce_weighted_scatter(
+            buf.expert_out, topk_pos, topk_weight,
+            num_global, hidden_size, topk,
+            output=result_buf,
+        )
+
+        # 6) AllReduce across EP ranks
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                global_results, op=dist.ReduceOp.SUM,
+                stream=torch.cuda.default_stream(self.device),
+            )
+
+        # 7) Slice local + add shared expert
+        if num_tokens == 0:
+            return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
+        start = self.rank * ntp
+        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
+        out = out + self.shared_expert_forward(identity)
+        return out.view(*orig_shape)
+
+    def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
+        """FP8 blockwise grouped GEMM on 3D strided buffer (in-place, no scatter/gather).
+
+        Mirrors MiniMaxM25MoE._fp8_blockwise_gemm_3d (model.py:1106-1177).
+        Reads buf.dispatched_x, writes buf.expert_out.
+        """
+        if not getattr(Glm5MoE, '_warned_gemm_3d', False):
+            logging.warning(
+                f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
+                f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
+            Glm5MoE._warned_gemm_3d = True
+
+        E = self.experts_per_rank
+        K = self.hidden_size                  # 6144
+        N = self.config.moe_intermediate_size  # 2048
+        mtp = buf.max_tokens_padded
+        cu_seqlens = torch.arange(
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
+        seqlens = expert_counts[:E]
+        avg = max(mtp // max(E, 1), 1)
+
+        # Stage input quant (3D if CUDA ops available, else Triton fallback)
+        if _GLM5_HAS_FP8_OPS:
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+            x_quant = x_quant_3d.view(E * mtp, K)
+            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
+            x_scale_t = x_scale.t().contiguous()
+
+        # S1: gate + up + SiLU (fused if possible) → BF16 intermediate
+        if _GLM5_HAS_FP8_OPS:
+            s1_result = grouped_fp8_blockwise_fused_s1(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            inter_quant_3d, inter_scale_3d = act_quant_3d(
+                s1_result.view(E, mtp, N), seqlens)
+            inter_quant = inter_quant_3d.view(E * mtp, N)
+            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            intermediate = grouped_fp8_blockwise_s1_silu(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            inter_quant, inter_scale = _act_quant(intermediate)
+            inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection
+        result = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
 
     # ── Gate + Expert Compute ──
 
