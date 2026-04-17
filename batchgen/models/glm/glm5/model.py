@@ -1083,9 +1083,38 @@ class Glm5MoE(nn.Module):
         k_blocks_pad4 = (k_blocks + 3) // 4 * 4
         n_blocks_pad4 = (n_blocks + 3) // 4 * 4
 
+        # GLM-5 has ~4x larger MoE projections than minimax (6144x2048 vs
+        # 3072x1536), so torch.stack() would duplicate ~576 MB per MoE layer
+        # x 75 layers = ~43 GB of fp8 weight memory per rank → OOM at init.
+        # Fix: after stacking, rebind the per-expert references to views
+        # into the stacked tensor so the original per-expert allocations
+        # become garbage-collectable.
         self.fp8_gate_w3d = torch.stack(self.gate_list).contiguous()
+        for i in range(E):
+            view = self.fp8_gate_w3d[i]
+            self.gate_list[i] = view
+            self.experts[self.routed_expert_start_idx + i].cached_gate = view
+        self.gate_ptrs_ptr = torch.tensor(
+            [r.data_ptr() for r in self.gate_list],
+            dtype=torch.int64, device=self.device)
+
         self.fp8_up_w3d = torch.stack(self.up_list).contiguous()
+        for i in range(E):
+            view = self.fp8_up_w3d[i]
+            self.up_list[i] = view
+            self.experts[self.routed_expert_start_idx + i].cached_up = view
+        self.up_ptrs_ptr = torch.tensor(
+            [r.data_ptr() for r in self.up_list],
+            dtype=torch.int64, device=self.device)
+
         self.fp8_down_w3d = torch.stack(self.down_list).contiguous()
+        for i in range(E):
+            view = self.fp8_down_w3d[i]
+            self.down_list[i] = view
+            self.experts[self.routed_expert_start_idx + i].cached_down = view
+        self.down_ptrs_ptr = torch.tensor(
+            [r.data_ptr() for r in self.down_list],
+            dtype=torch.int64, device=self.device)
 
         self.fp8_gate_ws3d = torch.zeros(
             E, n_blocks, k_blocks_pad4,
