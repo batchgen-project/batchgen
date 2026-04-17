@@ -60,7 +60,14 @@ def sparse_gather_from_paged_kv(
 		block_table, 1, logical_page_idx.long()
 	)  # [batch, topk]
 
-	# Clamp -1 (unused) page entries to 0 to prevent negative indexing
+	# Track -1 entries so we can zero-out those gather results. Historically
+	# we clamped to 0 here, which silently routed out-of-range positions to
+	# page 0 — if the sparse attention kernel failed to honor sparse_seqlens
+	# for any reason, page-0 KV (owned by another sequence) bled into the
+	# attention context and produced training-data-style corrupted outputs
+	# (observed 10 %+ of responses with Russian/repetition/README-like
+	# tail bleed). Zero-mask makes the fallback benign.
+	invalid_mask = physical_page_idx < 0  # [batch, topk]
 	physical_page_idx = physical_page_idx.clamp(min=0)
 
 	# Compute flat index into blocked_k reshaped as [num_pages * page_size, ...]
@@ -73,5 +80,13 @@ def sparse_gather_from_paged_kv(
 	flat_idx_expanded = flat_idx.reshape(-1).long()  # [batch * topk]
 	gathered_flat = blocked_flat[flat_idx_expanded]  # [batch * topk, num_k_heads * k_head_dim]
 	gathered_kv = gathered_flat.view(batch_size, topk, num_k_heads, k_head_dim)
+
+	# Zero out gather results at invalid (-1) page positions so downstream
+	# attention kernels can't read another sequence's data even if their
+	# own seqlen masking misfires.
+	if invalid_mask.any():
+		gathered_kv = gathered_kv.masked_fill(
+			invalid_mask.unsqueeze(-1).unsqueeze(-1), 0,
+		)
 
 	return gathered_kv
