@@ -550,16 +550,31 @@ class GLM5AttnWrapper(AttnWrapperBase):
     ) -> torch.Tensor:
         """Dense absorbed-MLA decode (no DSA, no WP5).
 
-        Shape matches Kimi-K2.5's decode (absorbed MLA over full KV cache)
-        but uses sparse_flash_mla_decode with top-K = arange(max_seqlen) so
-        we can pass head_dim_v=kv_lora_rank=512 — flash_mla_with_kvcache
-        enforces head_size_v=576 which GLM-5's absorbed layout can't satisfy.
+        Two attention kernel paths supported, gated by env:
+
+        - Default: ``sparse_flash_mla_decode`` with ``top_k_indices = arange(max_seqlen)``.
+          Structurally equivalent to full dense attention, implemented via the
+          DSA sparse kernel so we can pass ``head_dim_v=kv_lora_rank=512``.
+
+        - ``BATCHGEN_GLM5_USE_KIMI_MLA=1``: Kimi / DeepSeek-V3 path —
+          ``flash_mla_with_kvcache`` on paged KV directly (no sparse gather).
+          This is the validated FlashMLA kernel used by Kimi-K2.5's
+          ``mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv``
+          (flashmla_backend.py:1555-1568). Head dims line up between GLM-5
+          and Kimi at the kernel boundary:
+            * query/K compressed dim  = kv_lora_rank + qk_rope_head_dim = 576
+            * head_size_v             = kv_lora_rank                   = 512
+          The GLM-5-specific qk_nope_head_dim=192 and v_head_dim=256 differ
+          from Kimi but appear only in the absorb/out-absorb einsums around
+          the kernel call, which are parametrized via ``attn.qk_nope_head_dim``
+          and ``attn.v_head_dim`` and remain correct for GLM-5.
 
         WP5 (fp8_q_absorb / fp8_out_absorb) is intentionally NOT used here;
         absorbed Q and out are pure torch.einsum for maximum clarity on this
         diagnostic path. WP2/WP4 are irrelevant because no indexer is
         constructed when use_dense_mla=True.
         """
+        import os as _os
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
@@ -567,6 +582,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
+
+        _use_kimi_mla = _os.environ.get("BATCHGEN_GLM5_USE_KIMI_MLA", "0") == "1"
 
         weight_scale = self.weight_dequant_scale
         attn = self.module
@@ -632,22 +649,30 @@ class GLM5AttnWrapper(AttnWrapperBase):
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
-        # Step 3 (replaced): dense top-K = arange over the full cache.
         updated_seqlens = cache_seqlens
-        top_k_indices = torch.arange(
-            max_seqlen, device=hidden_states.device, dtype=torch.long,
-        ).unsqueeze(0).expand(bsz, -1)
 
-        # Step 4: gather from primary cache (structurally dense)
-        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
+        # Step 4: fetch paged KV (both kernel paths need this).
+        with (dt.timed("kv_fetch", li) if dt else _nullctx()):
             mla_blocked_k, _, mla_block_table = \
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
-            sparse_mla_kv = sparse_gather_from_paged_kv(
-                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
-            )
 
-        # Step 5: absorbed Q via einsum (WP5 off), sparse_flash_mla_decode
+        if not _use_kimi_mla:
+            # Legacy diagnostic path: sparse_flash_mla_decode with arange top-K.
+            top_k_indices = torch.arange(
+                max_seqlen, device=hidden_states.device, dtype=torch.long,
+            ).unsqueeze(0).expand(bsz, -1)
+            with (dt.timed("sparse_gather", li) if dt else _nullctx()):
+                sparse_mla_kv = sparse_gather_from_paged_kv(
+                    mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
+                )
+            query_kv_dtype = sparse_mla_kv.dtype
+            query_kv_device = sparse_mla_kv.device
+        else:
+            query_kv_dtype = mla_blocked_k.dtype
+            query_kv_device = mla_blocked_k.device
+
+        # Step 5: absorbed Q via einsum (WP5 off) — same for both kernel paths.
         with (dt.timed("q_absorb", li) if dt else _nullctx()):
             if self._cached_q_absorb is not None:
                 q_absorb = self._cached_q_absorb
@@ -663,7 +688,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
             query_states = torch.empty(
                 bsz, attn.num_heads, 1, qk_head_dim,
-                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
+                dtype=query_kv_dtype, device=query_kv_device,
             )
             q_nope_squeezed = q_nope.squeeze(2)
             # Pure einsum absorbed Q (matches Kimi wrappers.py flashmla_backend:1548-1550).
@@ -673,15 +698,35 @@ class GLM5AttnWrapper(AttnWrapperBase):
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
-        with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            topk = top_k_indices.shape[1]
-            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
-            attn_out = sparse_flash_mla_decode(
-                query_states, sparse_mla_kv, sparse_seqlens,
-                attn.num_heads, attn.softmax_scale,
-                head_dim_v=attn.kv_lora_rank,
-                page_size=mla_page_size,
-            )
+        if not _use_kimi_mla:
+            with (dt.timed("sparse_attn", li) if dt else _nullctx()):
+                topk = top_k_indices.shape[1]
+                sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
+                attn_out = sparse_flash_mla_decode(
+                    query_states, sparse_mla_kv, sparse_seqlens,
+                    attn.num_heads, attn.softmax_scale,
+                    head_dim_v=attn.kv_lora_rank,
+                    page_size=mla_page_size,
+                )
+        else:
+            # Kimi / DeepSeek path: flash_mla_with_kvcache on paged KV.
+            # head_size_v = kv_lora_rank = 512 (GLM-5 and Kimi match exactly here).
+            from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+            with (dt.timed("flash_mla", li) if dt else _nullctx()):
+                tile_scheduler_metadata, num_splits = get_mla_metadata(
+                    updated_seqlens.to(torch.int32), attn.num_heads, 1,
+                )
+                attn_out, _ = flash_mla_with_kvcache(
+                    query_states,
+                    mla_blocked_k,
+                    mla_block_table,
+                    updated_seqlens.to(torch.int32),
+                    attn.kv_lora_rank,  # head_size_v = 512
+                    tile_scheduler_metadata,
+                    num_splits,
+                    attn.softmax_scale,
+                    True,  # causal
+                )
 
         # Step 6: out-absorb via einsum → FP8 quant → o_proj
         with (dt.timed("o_proj", li) if dt else _nullctx()):
