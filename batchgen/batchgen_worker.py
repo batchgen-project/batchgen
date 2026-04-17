@@ -37,6 +37,8 @@ def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: 
 
 	Called only when BATCHGEN_GLM5_LOGIT_DUMP=1. Fires once per prefill call
 	(suppresses subsequent calls via a module-level flag to keep logs readable).
+	Dumps up to BATCHGEN_GLM5_LOGIT_DUMP_N sequences (default 64 → effectively
+	all seqs in a single prepacked prefill batch).
 	"""
 	global _GLM5_LOGIT_DUMP_FIRED
 	if _GLM5_LOGIT_DUMP_FIRED:
@@ -44,7 +46,8 @@ def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: 
 	_GLM5_LOGIT_DUMP_FIRED = True
 	try:
 		# logits: [batch_size, vocab_size]
-		n = min(logits.shape[0], 3)  # first 3 sequences
+		max_n = int(os.environ.get("BATCHGEN_GLM5_LOGIT_DUMP_N", "64"))
+		n = min(logits.shape[0], max_n)
 		for seq_idx in range(n):
 			row = logits[seq_idx].float()
 			absmax = row.abs().max().item()
