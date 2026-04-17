@@ -1103,6 +1103,44 @@ class GPUPagedKVCacheManager:
 							print(f"[GPU KV WRITE L0] V head0 MISMATCH at dim {i}: written={w}, read={r}")
 							break
 
+		# GLM-5 seq-24 bookkeeping dump. Triggered via
+		#   BATCHGEN_GLM5_BOOKKEEP_SEQS=<comma-separated slot indices>
+		# Fires only on layer 0, rank 0. Prints per-seq block_table row,
+		# slot_index, write position, first 8 of k written, and a read-back
+		# from the expected physical page; if readback != written, the
+		# Triton KV-write kernel missed and we have a bookkeeping bug.
+		_BOOKKEEP = os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+		if _BOOKKEEP and layer_idx == 0:
+			try:
+				import torch.distributed as _dist
+				_rank = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+			except Exception:
+				_rank = 0
+			if _rank == 0:
+				_seqs = [int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()]
+				torch.cuda.synchronize()
+				_ps = self.config.page_size_tokens
+				_hd = self.config.k_head_dim
+				for _seq in _seqs:
+					if _seq >= batch_size:
+						print(f"[BOOKKEEP L0 seq={_seq}] out of batch (batch_size={batch_size}), skip")
+						continue
+					_slot = int(slot_indices[_seq].item())
+					_pos = int(token_indices[_seq].item())
+					_pt_row = page_table_view[_slot].tolist()
+					_page_idx = _pos // _ps
+					_page_off = _pos % _ps
+					_phys = int(page_table_view[_slot, _page_idx].item()) if _page_idx < len(_pt_row) else -99
+					_kwrote = k_tokens[_seq, 0:_hd].tolist()[:8]
+					print(f"[BOOKKEEP L0 seq={_seq}] slot={_slot} write_pos={_pos} "
+					      f"page_idx={_page_idx} page_off={_page_off} phys_page={_phys}")
+					print(f"[BOOKKEEP L0 seq={_seq}] page_table_row={_pt_row}")
+					print(f"[BOOKKEEP L0 seq={_seq}] k_written[head0,:8]={_kwrote}")
+					if _phys >= 0:
+						_kread = k_cache_layer[_phys, _page_off, 0, :].tolist()[:8]
+						_match = all(abs(w - r) < 1e-3 for w, r in zip(_kwrote, _kread))
+						print(f"[BOOKKEEP L0 seq={_seq}] k_readback[head0,:8]={_kread} match={_match}")
+
 			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
 			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
 			print(f"[GPU KV WRITE L0] page_table_view.shape={page_table_view.shape}")

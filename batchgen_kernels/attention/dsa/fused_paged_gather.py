@@ -52,6 +52,12 @@ def _paged_gather_kernel(
             logical_page = tl.minimum(tl.maximum(logical_page, 0), max_pages_per_seq - 1)
 
             physical_page = tl.load(block_table_ptr + pid_b * max_pages_per_seq + logical_page)
+            # BatchGen `-1` sentinel for unallocated page_table slots. The
+            # Python fallback (sparse_gather.py:70-90, commit 43bdf1c4) zeroes
+            # invalid rows; keep the Triton kernel in sync so the two paths
+            # produce byte-identical output and the kv-read never silently
+            # bleeds page-0 / cross-sequence data at OOB positions.
+            is_invalid = physical_page < 0
             physical_page = tl.maximum(physical_page, 0)
 
             flat_idx = physical_page * page_size + page_offset
@@ -59,6 +65,7 @@ def _paged_gather_kernel(
             # Vectorized copy
             src = blocked_kv_ptr + flat_idx * D + d_offs
             vals = tl.load(src, mask=d_mask, other=0.0)
+            vals = tl.where(is_invalid, 0.0, vals)
 
             dst = out_ptr + (pid_b * num_tokens + t) * D + d_offs
             tl.store(dst, vals, mask=d_mask)
@@ -143,8 +150,14 @@ def paged_gather_reference(
     max_pages = block_table.shape[1]
     logical_page_idx = logical_page_idx.clamp(max=max_pages - 1)
     physical_page_idx = torch.gather(block_table, 1, logical_page_idx.long())
+    invalid_mask = physical_page_idx < 0
     physical_page_idx = physical_page_idx.clamp(min=0)
     flat_idx = physical_page_idx * page_size + page_offset
     blocked_flat = blocked_kv.reshape(-1, num_heads * head_dim)
     gathered = blocked_flat[flat_idx.reshape(-1).long()]
-    return gathered.view(B, topk, num_heads, head_dim)
+    gathered = gathered.view(B, topk, num_heads, head_dim)
+    if invalid_mask.any():
+        gathered = gathered.masked_fill(
+            invalid_mask.unsqueeze(-1).unsqueeze(-1), 0,
+        )
+    return gathered

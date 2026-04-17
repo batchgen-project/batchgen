@@ -675,6 +675,28 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
 
+        # GLM-5 seq bookkeeping dump (decode-side view). Pairs with the
+        # KV-write dump in gpu_paged_kv_manager.update_layer_decode_new_token.
+        _BOOKKEEP = _os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+        if _BOOKKEEP and li == 0:
+            try:
+                import torch.distributed as _dist
+                _rank = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            except Exception:
+                _rank = 0
+            if _rank == 0:
+                import logging as _logging
+                _seqs = [int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()]
+                for _seq in _seqs:
+                    if _seq >= bsz:
+                        continue
+                    _cs = int(updated_seqlens[_seq].item())
+                    _bt_row = mla_block_table[_seq].tolist()
+                    _logging.warning(
+                        f"[BOOKKEEP L0 decode seq={_seq}] cache_seqlen={_cs} "
+                        f"block_table={_bt_row}"
+                    )
+
         if not _use_kimi_mla:
             # Legacy diagnostic path: sparse_flash_mla_decode with arange top-K.
             top_k_indices = torch.arange(
@@ -745,6 +767,24 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     attn.softmax_scale,
                     True,  # causal
                 )
+
+        # Post-attn bookkeeping probe: dump attn_out fingerprint for target seqs.
+        if _BOOKKEEP and li == 0:
+            try:
+                import torch.distributed as _dist
+                _rank_check = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+            except Exception:
+                _rank_check = 0
+            if _rank_check == 0:
+                import logging as _logging
+                _seqs = [int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()]
+                for _seq in _seqs:
+                    if _seq >= bsz:
+                        continue
+                    _attn_fp = attn_out[_seq, 0, 0, :8].float().tolist()
+                    _logging.warning(
+                        f"[BOOKKEEP L0 attn_out seq={_seq}] head0[:8]={_attn_fp}"
+                    )
 
         # Step 6: out-absorb via einsum → FP8 quant → o_proj
         with (dt.timed("o_proj", li) if dt else _nullctx()):
