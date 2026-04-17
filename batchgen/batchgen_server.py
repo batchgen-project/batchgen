@@ -116,6 +116,9 @@ class BatchGenServer:
 	
 	def load_model_resources(self):
 		"""Loads model weights via local or external parameter server."""
+		import sys as _diag_sys, time as _diag_time
+		print(f"[DIAG {_diag_time.time():.3f}] >>> load_model_resources entered for {self.args.model}", flush=True)
+		_diag_sys.stdout.flush()
 		logging.info("Loading model resources for %s", self.args.model)
 		endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
 		hf_cache_dir = self.args.hf_cache_dir or os.path.expanduser("~/.cache/huggingface")
@@ -267,9 +270,18 @@ class BatchGenServer:
 			config_torch_module_initializer()
 			
 			# 1. Allocate KV & Load Model & Spawn Workers
+			import sys as _diag_sys, time as _diag_time
+			print(f"[DIAG {_diag_time.time():.3f}] >>> start() calling allocate_host_kv_cache", flush=True)
+			_diag_sys.stdout.flush()
 			self.allocate_host_kv_cache(self.args.host_kv_cache_size)
+			print(f"[DIAG {_diag_time.time():.3f}] <<< allocate_host_kv_cache returned; calling load_model_resources", flush=True)
+			_diag_sys.stdout.flush()
 			self.load_model_resources()
+			print(f"[DIAG {_diag_time.time():.3f}] <<< load_model_resources returned; calling spawn_workers", flush=True)
+			_diag_sys.stdout.flush()
 			self.spawn_workers()
+			print(f"[DIAG {_diag_time.time():.3f}] <<< spawn_workers returned", flush=True)
+			_diag_sys.stdout.flush()
 			
 			# 2. Start TCP Listener
 			self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -476,7 +488,10 @@ class BatchGenServer:
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
 	def _load_model_locally(self, _hf_cache_dir: str, converted_ckpt_dir: str) -> None:
-		
+		import sys as _diag_sys, time as _diag_time
+		print(f"[DIAG {_diag_time.time():.3f}] >>> _load_model_locally entered", flush=True)
+		_diag_sys.stdout.flush()
+
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import (
 				DeepSeek_Parameter_Server,
@@ -499,16 +514,26 @@ class BatchGenServer:
 				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+			print(f"[DIAG {_diag_time.time():.3f}] >>> importing GLM5_Parameter_Server", flush=True)
+			_diag_sys.stdout.flush()
 			from batchgen.models.glm.glm5.glm5_parameter_server import (
 				GLM5_Parameter_Server,
 			)
+			print(f"[DIAG {_diag_time.time():.3f}] >>> constructing GLM5_Parameter_Server", flush=True)
+			_diag_sys.stdout.flush()
 			ps = GLM5_Parameter_Server(
 				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
+			print(f"[DIAG {_diag_time.time():.3f}] <<< GLM5_Parameter_Server constructed", flush=True)
+			_diag_sys.stdout.flush()
 		else:
 			raise NotImplementedError(f"Model type for {self.args.model} not supported")
 
+		print(f"[DIAG {_diag_time.time():.3f}] >>> calling ps.Init()", flush=True)
+		_diag_sys.stdout.flush()
 		shm_name, tensor_meta_shm_name = ps.Init()
+		print(f"[DIAG {_diag_time.time():.3f}] <<< ps.Init() returned", flush=True)
+		_diag_sys.stdout.flush()
 		ps_size = ps.parameter_server.byte_size()
 
 		# Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
