@@ -32,6 +32,18 @@ import torch.nn as nn
 _GLM5_WP2_ENABLED = os.environ.get("BATCHGEN_GLM5_WP2", "1") == "1"
 _GLM5_WP4_ENABLED = os.environ.get("BATCHGEN_GLM5_WP4", "1") == "1"
 _GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
+
+# Opt-in DSA decode rebuild. Routes the DSA-active batch through
+# `_forward_decode_dsa_v2` which:
+#   - reuses the validated Q/KV prep + KV-cache-write from the dense-MLA path,
+#   - computes indexer K/Q in bf16 (no WP2/WP4 fused kernels),
+#   - scores via `Glm5Indexer.score_and_select_relu_gated` (ReLU-gated),
+#   - properly per-seq clamps the skip-topk arange path so every sequence
+#     sees only its own valid positions,
+#   - and uses the same sparse-gather + sparse_flash_mla_decode exit as the
+#     existing DSA path (WP5 FP8 absorb is not used).
+# Default off. Legacy `_forward_decode_dsa` is preserved for comparison.
+_GLM5_USE_DSA_V2 = os.environ.get("BATCHGEN_GLM5_USE_DSA_V2", "0") == "1"
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
@@ -504,6 +516,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
 
             if dsa_active:
+                if _GLM5_USE_DSA_V2:
+                    attn_output = self._forward_decode_dsa_v2(
+                        hidden_states, position_ids, cache_seqlens, max_seqlen,
+                        gpu_paged_kv_manager, gpu_paged_kv_manager_aux,
+                    )
+                    return (attn_output, None, None)
                 attn_output = self._forward_decode_dsa(
                     hidden_states, position_ids, cache_seqlens, max_seqlen,
                     gpu_paged_kv_manager, gpu_paged_kv_manager_aux,
@@ -986,6 +1004,235 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             else:
                 attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
+            attn_output_fp8, attn_output_scale = act_quant(attn_output)
+            attn_output = w8a8_deepgemm(
+                attn_output_fp8, attn_output_scale,
+                attn.o_proj.weight, weight_scale["o_proj.weight_scale_inv"],
+            )
+            attn_output = attn_output.view(bsz, 1, -1)
+
+        return attn_output
+
+    def _forward_decode_dsa_v2(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+    ) -> torch.Tensor:
+        """DSA decode v2: validated dense-MLA kernels + ReLU-gated indexer scoring.
+
+        Flow (same surface as ``_forward_decode_dsa`` with several fixes):
+          1. Shared FP8 activation quant + Q/KV projections + fused RMSNorm/RoPE
+             (byte-for-byte the same as ``_forward_decode_dense`` — known good).
+          2. Write compressed MLA KV to the primary paged cache.
+          3. Write BF16 indexer K to the aux paged cache — WP2 fused kernel is
+             bypassed; we use ``Glm5Indexer.compute_indexer_kv`` directly.
+          4. Score cached tokens via ``score_and_select_relu_gated`` (ReLU on
+             per-head Q·K before head-weighted sum). For the short-context
+             skip-topk branch (``max_seqlen <= index_topk``) we clamp the
+             arange indices per sequence so none of them exceed
+             ``cache_seqlens[b] - 1`` — fixes the bug candidate where every
+             sequence got the same ``[0..max_seqlen-1]`` regardless of its
+             own length.
+          5. Gather sparse MLA KV via ``sparse_gather_from_paged_kv`` using
+             the top-K indices.
+          6. Absorbed-Q einsum (WP5 absorb kernel intentionally bypassed).
+          7. ``sparse_flash_mla_decode`` (same kernel as the existing DSA
+             exit) + out-absorb einsum + FP8 o_proj.
+        """
+        from batchgen.attention.mla.fa3_backend import act_quant
+        from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+        from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
+        from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
+        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+        from batchgen.timing import get_decode_timer
+
+        weight_scale = self.weight_dequant_scale
+        attn = self.module
+        indexer = attn.indexer
+        bsz = hidden_states.shape[0]
+        dt = get_decode_timer()
+        li = self.layer_idx
+
+        if bsz == 0:
+            return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        # --- Step 1: Shared FP8 activation quant + Q/KV projections + RoPE/KV write ---
+        with (dt.timed("act_quant", li) if dt else _nullctx()):
+            hidden_flat = hidden_states.squeeze(1)
+            hidden_fp8, hidden_scale = act_quant(hidden_flat)
+
+        with (dt.timed("q_proj", li) if dt else _nullctx()):
+            q_a = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
+            )
+            q_a_normed = attn.q_a_layernorm(q_a)
+            q_a_fp8, q_a_scale = act_quant(q_a_normed)
+            q = w8a8_deepgemm(
+                q_a_fp8, q_a_scale,
+                attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
+            )
+            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
+            q_nope, q_pe = torch.split(
+                q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
+            )
+            q_pe = q_pe.contiguous()
+
+        with (dt.timed("kv_proj", li) if dt else _nullctx()):
+            new_compressed_kv = w8a8_deepgemm(
+                hidden_fp8, hidden_scale,
+                attn.kv_a_proj_with_mqa.weight,
+                weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+            ).view(bsz, 1, -1)
+            cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
+            offload_kv = fused_rmsnorm_rope_with_q(
+                new_compressed_kv, q_pe, cos, sin, position_ids,
+                attn.kv_a_layernorm.weight,
+                attn.kv_lora_rank, attn.qk_rope_head_dim,
+                eps=attn.kv_a_layernorm.eps,
+            )
+
+        new_token_pos = position_ids.squeeze(-1)
+        manager_device = gpu_paged_kv_manager.device
+        seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+
+        # --- Step 2: Write compressed MLA KV to primary cache ---
+        with (dt.timed("kv_write", li) if dt else _nullctx()):
+            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+            if k_tensor.device != manager_device:
+                k_tensor = k_tensor.to(manager_device)
+            gpu_paged_kv_manager.update_layer_decode_new_token(
+                k_tensor=k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32,
+                layer_idx=li,
+            )
+            if AttnWrapperBase.kv_append_callback is not None:
+                AttnWrapperBase.kv_append_callback(li, k_tensor, None)
+
+        # --- Step 3: Write indexer K to aux paged cache (BF16, WP2 off) ---
+        with (dt.timed("indexer_k", li) if dt else _nullctx()):
+            indexer_kv = indexer.compute_indexer_kv(
+                hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
+            )  # [batch, 1, 1, index_dim]
+            aux_device = gpu_paged_kv_manager_aux.device
+            seq_lengths_i32_aux = (
+                seq_lengths_i32 if aux_device == manager_device
+                else new_token_pos.to(dtype=torch.int32, device=aux_device)
+            )
+            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+                k_tensor=indexer_kv,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32_aux,
+                layer_idx=li,
+            )
+            if AttnWrapperBase.kv_append_callback_aux is not None:
+                AttnWrapperBase.kv_append_callback_aux(li, indexer_kv, None)
+
+        # --- Step 4: Score and select top-K ---
+        updated_seqlens = cache_seqlens
+        with (dt.timed("indexer_score", li) if dt else _nullctx()):
+            if max_seqlen <= indexer.index_topk:
+                # Short-context branch: every valid token fits within topk.
+                # Build per-seq indices clamped to (cache_seqlens[b] - 1) so
+                # positions past the seq's own length never land in the
+                # sparse gather. The legacy code used
+                # `arange(max_seqlen).expand(bsz, -1)` which gave every
+                # sequence the same indices regardless of its length.
+                base = torch.arange(
+                    max_seqlen, device=hidden_states.device, dtype=torch.long
+                ).unsqueeze(0).expand(bsz, -1)
+                cap = (updated_seqlens.to(torch.long) - 1).clamp(min=0).unsqueeze(-1)
+                top_k_indices = torch.minimum(base, cap)
+            else:
+                q_a_for_indexer = q_a_normed.unsqueeze(1)
+                indexer_blocked_k, _, idx_block_table = \
+                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
+
+                # Materialize contiguous K for the ReLU-gated scorer (same
+                # gather pattern as the existing `score_and_select_paged`).
+                batch_size = idx_block_table.shape[0]
+                num_k_heads = indexer_blocked_k.shape[2]
+                k_head_dim = indexer_blocked_k.shape[3]
+                cache_key = (idx_block_table.data_ptr(), max_seqlen, aux_page_size)
+                gc_key = getattr(indexer, "_gather_cache_v2_key", None)
+                if getattr(indexer, "_gather_cache_v2", None) is None or gc_key != cache_key:
+                    device = idx_block_table.device
+                    token_positions = torch.arange(max_seqlen, device=device)
+                    page_indices = (token_positions // aux_page_size).unsqueeze(0).expand(batch_size, -1)
+                    page_offsets = token_positions % aux_page_size
+                    max_pages = idx_block_table.shape[1]
+                    page_indices_clamped = page_indices.clamp(max=max_pages - 1)
+                    physical_pages = torch.gather(idx_block_table, 1, page_indices_clamped)
+                    flat = (physical_pages * aux_page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
+                    indexer._gather_cache_v2 = flat
+                    indexer._gather_cache_v2_key = cache_key
+                    indexer._gather_cache_v2_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
+                flat_idx = indexer._gather_cache_v2
+                blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
+                gathered_k = blocked_flat[flat_idx].view(indexer._gather_cache_v2_shape).squeeze(2)
+
+                top_k_indices = indexer.score_and_select_relu_gated(
+                    q_a_for_indexer, hidden_states, gathered_k,
+                    updated_seqlens,
+                    positions=new_token_pos,
+                    max_seqlen=max_seqlen,
+                )
+
+        # --- Step 5: Sparse gather MLA KV at top-K positions ---
+        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
+            mla_blocked_k, _, mla_block_table = \
+                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+            sparse_mla_kv = sparse_gather_from_paged_kv(
+                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
+            )
+
+        # --- Step 6: Absorbed Q (BF16 einsum, WP5 off) ---
+        with (dt.timed("q_absorb", li) if dt else _nullctx()):
+            if self._cached_q_absorb is not None:
+                q_absorb = self._cached_q_absorb
+                out_absorb = self._cached_out_absorb
+            else:
+                kv_b_proj = deepseek_v3_dequantization(
+                    attn.kv_b_proj.weight.data,
+                    weight_scale["kv_b_proj.weight_scale_inv"],
+                ).view(attn.num_heads, -1, attn.kv_lora_rank)
+                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
+                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+
+            qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+            query_states = torch.empty(
+                bsz, attn.num_heads, 1, qk_head_dim,
+                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
+            )
+            q_nope_squeezed = q_nope.squeeze(2)
+            query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
+                "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
+            ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            query_states[:, :, :, attn.kv_lora_rank:] = q_pe
+            query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
+
+        # --- Step 7: Sparse attention + out-absorb + o_proj ---
+        with (dt.timed("sparse_attn", li) if dt else _nullctx()):
+            topk = top_k_indices.shape[1]
+            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
+            attn_out = sparse_flash_mla_decode(
+                query_states, sparse_mla_kv, sparse_seqlens,
+                attn.num_heads, attn.softmax_scale,
+                head_dim_v=attn.kv_lora_rank,
+                page_size=mla_page_size,
+            )
+
+        with (dt.timed("o_proj", li) if dt else _nullctx()):
+            attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
