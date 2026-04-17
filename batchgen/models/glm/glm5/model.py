@@ -926,6 +926,7 @@ class Glm5MoE(nn.Module):
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
     _warned_k25_path = False
     _warned_gemm_3d = False
+    _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
     def __init__(self, config: Glm5Config, comm=None):
         super().__init__()
@@ -1257,6 +1258,22 @@ class Glm5MoE(nn.Module):
 
         # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
         topk_idx, topk_weight = self._gate_decode(all_tokens)
+
+        # Mask padding tokens so they don't inflate expert_counts nor pollute
+        # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
+        # each rank contributes `num_tokens_per_rank` slots but only the first
+        # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
+        # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
+        rank_counts = Glm5MoE._rank_token_counts
+        if rank_counts is not None:
+            positions = torch.arange(num_global, device=self.device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            max_valid = rank_counts[rank_ids]
+            padding_mask = local_pos >= max_valid
+            if padding_mask.any():
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
 
         # 3) 3D dispatch
         buf.dispatched_x.zero_()

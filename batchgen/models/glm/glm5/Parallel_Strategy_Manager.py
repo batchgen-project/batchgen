@@ -313,6 +313,18 @@ class GLM5ParallelStrategyManager:
             if hasattr(layer, "set_num_tokens_per_rank"):
                 layer.set_num_tokens_per_rank(num_tokens_per_rank)
 
+    def set_rank_token_counts(self, counts: torch.Tensor):
+        """Store per-rank real-token counts [world_size] on GPU for 3D-MoE padding masking.
+
+        Mirrors KimiK25ParallelStrategyManager.set_rank_token_counts
+        (moonshotai/kimi_k25/Parallel_Strategy_Manager.py:590). Worker
+        (batchgen_worker.py ~line 7805) calls this each decode iter when the
+        active batch has mixed real/padded rows, so the 3D-MoE path can
+        mask topk_idx for padded positions before dispatch_scatter_3d.
+        """
+        from .model import Glm5MoE
+        Glm5MoE._rank_token_counts = counts
+
     def _init_decoding_padding_bsz(self, padding_bsz):
         env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
         max_rank_bsz = int(env_max_bsz) if env_max_bsz else padding_bsz
