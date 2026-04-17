@@ -1018,7 +1018,22 @@ class Glm5MoE(nn.Module):
 
         # Resize 3D buffers if global token count exceeded
         if self.use_3d_moe and Glm5MoE._3d_buf is not None:
-            Glm5MoE._3d_buf.resize_if_needed(global_num_tokens)
+            buf = Glm5MoE._3d_buf
+            buf.resize_if_needed(global_num_tokens)
+            # The send buffer MUST match num_tokens_per_rank exactly — NCCL
+            # all_gather sends `input.numel()` elements per rank. If padded
+            # stays at its initial size (e.g. 128) while num_tokens_per_rank
+            # shrinks to 8, every rank sends 128*H elements instead of 8*H,
+            # and the `all_tokens[:num_global]` slice ends up holding only
+            # rank 0's contribution (padded with zeros) — ranks 1..15's
+            # tokens land past the slice end and are never read, collapsing
+            # MoE compute to near-zero input. Mirrors MiniMaxM25MoE.
+            if buf.padded.shape[0] != num_tokens_per_rank:
+                buf.padded = torch.zeros(
+                    num_tokens_per_rank, buf.H,
+                    dtype=torch.bfloat16, device=buf.device,
+                )
+                buf.num_tokens_per_rank = num_tokens_per_rank
 
     # ── Weight pointer setup (called by PSM) ──
 
