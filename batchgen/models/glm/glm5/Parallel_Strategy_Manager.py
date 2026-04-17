@@ -68,34 +68,44 @@ class GLM5ParallelStrategyManager:
         """Rank-0 one-shot log of loaded norm/gate stats for sanity-check vs disk."""
         if self.rank != 0:
             return
+
+        def _attn(layer_idx):
+            a = self.model.model.layers[layer_idx].self_attn
+            return a.module if hasattr(a, "module") else a
+
         targets = [
-            ("L0.input_layernorm.weight", lambda m: m.model.layers[0].input_layernorm.weight),
-            ("L0.post_attn_layernorm.weight", lambda m: m.model.layers[0].post_attention_layernorm.weight),
-            ("L0.q_a_layernorm.weight", lambda m: m.model.layers[0].self_attn.q_a_layernorm.weight),
-            ("L0.kv_a_layernorm.weight", lambda m: m.model.layers[0].self_attn.kv_a_layernorm.weight),
-            ("L3.mlp.gate.weight", lambda m: m.model.layers[3].mlp.gate.weight),
+            ("L0.input_layernorm.weight", lambda: self.model.model.layers[0].input_layernorm.weight),
+            ("L0.post_attn_layernorm.weight", lambda: self.model.model.layers[0].post_attention_layernorm.weight),
+            ("L0.q_a_layernorm.weight", lambda: _attn(0).q_a_layernorm.weight),
+            ("L0.kv_a_layernorm.weight", lambda: _attn(0).kv_a_layernorm.weight),
+            ("L3.mlp.gate.weight", lambda: self.model.model.layers[3].mlp.gate.weight),
             ("L3.mlp.gate.e_score_correction_bias",
-                lambda m: m.model.layers[3].mlp.gate.e_score_correction_bias),
+                lambda: self.model.model.layers[3].mlp.gate.e_score_correction_bias),
             ("L3.indexer.k_norm.weight",
-                lambda m: m.model.layers[3].self_attn.indexer.k_norm.weight),
+                lambda: _attn(3).indexer.k_norm.weight),
             ("L3.indexer.k_norm.bias",
-                lambda m: m.model.layers[3].self_attn.indexer.k_norm.bias),
-            ("model.norm.weight", lambda m: m.model.norm.weight),
+                lambda: _attn(3).indexer.k_norm.bias),
+            ("model.norm.weight", lambda: self.model.model.norm.weight),
         ]
         logging.info("[GLM5 WEIGHT-VERIFY] dumping loaded stats (compare to disk)")
+        dense_mla = not hasattr(_attn(3), "indexer")
         for name, getter in targets:
             try:
-                t = getter(self.model)
-                f32 = t.float()
-                first = [f"{x:.6g}" for x in t.flatten()[:5].tolist()]
-                logging.info(
-                    f"[GLM5 WEIGHT-VERIFY] {name}: dtype={t.dtype} shape={tuple(t.shape)} "
-                    f"min={f32.min().item():.6g} max={f32.max().item():.6g} "
-                    f"mean={f32.mean().item():.6g} std={f32.std().item():.6g} "
-                    f"first5={first}"
-                )
-            except Exception as e:
-                logging.error(f"[GLM5 WEIGHT-VERIFY] {name}: FAILED — {e}")
+                t = getter()
+            except AttributeError as e:
+                if "indexer" in name and dense_mla:
+                    logging.info(f"[GLM5 WEIGHT-VERIFY] {name}: skipped (dense-MLA mode)")
+                else:
+                    logging.warning(f"[GLM5 WEIGHT-VERIFY] {name}: skipped — {e}")
+                continue
+            f32 = t.float()
+            first = [f"{x:.6g}" for x in t.flatten()[:5].tolist()]
+            logging.info(
+                f"[GLM5 WEIGHT-VERIFY] {name}: dtype={t.dtype} shape={tuple(t.shape)} "
+                f"min={f32.min().item():.6g} max={f32.max().item():.6g} "
+                f"mean={f32.mean().item():.6g} std={f32.std().item():.6g} "
+                f"first5={first}"
+            )
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
