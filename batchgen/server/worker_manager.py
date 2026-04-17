@@ -516,6 +516,12 @@ class WorkerManager:
                 )
 
     def _load_model_resources(self) -> None:
+        import sys as _diag_sys, time as _diag_time
+        def _diag(msg):
+            print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
+            _diag_sys.stdout.flush()
+
+        _diag(f"  _load_model_resources entered, model={self.args.model}")
         logger.info("Loading model resources for %s", self.args.model)
         endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
         hf_cache_dir = self.args.hf_cache_dir or Path(
@@ -527,18 +533,27 @@ class WorkerManager:
             or Path(self.args.cache_dir or ".") / "converted_ckpt"
         )
         self.args.converted_ckpt_dir = converted_ckpt_dir
+        _diag(f"  paths resolved: endpoint={endpoint!r}, cache_dir={self.args.cache_dir!r}")
 
         if not endpoint and self.args.cache_dir is None:
+            _diag("  >>> _download_model_snapshot")
             self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
+            _diag("  <<< _download_model_snapshot")
 
         if endpoint:
+            _diag("  >>> _load_model_from_remote_server")
             self._load_model_from_remote_server(
                 endpoint, hf_cache_dir, converted_ckpt_dir
             )
+            _diag("  <<< _load_model_from_remote_server")
         else:
+            _diag("  >>> _load_model_locally")
             self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
+            _diag("  <<< _load_model_locally")
 
+        _diag("  >>> _configure_host_kv_cache_budget")
         self._configure_host_kv_cache_budget()
+        _diag("  <<< _configure_host_kv_cache_budget")
         logger.info("Model Loaded. SHM: %s", self.model_info.get("shm_name"))
 
     def _spawn_workers(self) -> None:
@@ -827,10 +842,15 @@ class WorkerManager:
                 enable_memfd=self.args.fast_init,
             )
         elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+            import sys as _diag_sys, time as _diag_time
+            def _diag(msg):
+                print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
+                _diag_sys.stdout.flush()
+            _diag("    glm5: importing GLM5_Parameter_Server")
             from batchgen.models.glm.glm5.glm5_parameter_server import (
                 GLM5_Parameter_Server,
             )
-
+            _diag("    glm5: constructing GLM5_Parameter_Server")
             parameter_server = GLM5_Parameter_Server(
                 self.args.model,
                 self.args.cache_dir,
@@ -838,13 +858,21 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
+            _diag("    glm5: GLM5_Parameter_Server constructed")
         else:
             raise NotImplementedError(
                 f"Model type for {self.args.model} not supported"
             )
 
+        import sys as _diag_sys2, time as _diag_time2
+        def _diag2(msg):
+            print(f"[DIAG {_diag_time2.time():.3f}] {msg}", flush=True)
+            _diag_sys2.stdout.flush()
+        _diag2("    >>> parameter_server.Init()")
         shm_name, tensor_meta_shm_name = parameter_server.Init()
+        _diag2("    <<< parameter_server.Init() returned")
         ps_size = parameter_server.parameter_server.byte_size()
+        _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
         # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
         skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
