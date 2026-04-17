@@ -27,7 +27,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 	Returns:
 		`tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
 	"""
-	
+
+	# Cos/sin are kept in FP32 for precision (see Glm5RotaryEmbedding); cast
+	# back to input dtype at the end so FA3 (bf16/fp16/fp8 only) doesn't
+	# reject the rotated tensors.
+	q_dtype = q.dtype
+	k_dtype = k.dtype
+
 	cos = cos[position_ids].unsqueeze(unsqueeze_dim)
 	sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
@@ -39,24 +45,28 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 	q_embed = (q * cos) + (rotate_half(q) * sin)
 	k_embed = (k * cos) + (rotate_half(k) * sin)
-	return q_embed, k_embed
+	return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 def rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
-	# logging.info(f"Applying rotary position embedding t shape: {t.shape}, cos shape: {cos.shape}, sin shape: {sin.shape}, position_ids shape: {position_ids.shape}, unsqueeze_dim: {unsqueeze_dim}")
+	# Cos/sin are kept in FP32 (Glm5RotaryEmbedding); rotation auto-promotes
+	# to FP32. Cast result back to t.dtype here so downstream kernels (FA3
+	# flash_attn_varlen_func, flash-MLA decode) that only accept bf16/fp16/fp8
+	# aren't handed an FP32 tensor via pre-allocated assembly buffers.
+	orig_dtype = t.dtype
 	cos = cos[position_ids].unsqueeze(unsqueeze_dim)
 	sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-	# logging.info(f"cos shape after unsqueeze: {cos.shape}, sin shape after unsqueeze: {sin.shape}")
 
 	b, h, s, d = t.shape
 	t = t.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
 	t_embed = (t * cos) + (rotate_half(t) * sin)
-	return t_embed
+	return t_embed.to(orig_dtype)
 
 def mla_rotary_pos_emb(t, cos, sin, position_ids, unsqueeze_dim=1):
+	orig_dtype = t.dtype
 	cos = cos[position_ids].unsqueeze(unsqueeze_dim)
 	sin = sin[position_ids].unsqueeze(unsqueeze_dim)
 
 	b, s, d = t.shape
 	t = t.view(b, s, d // 2, 2).transpose(3, 2).reshape(b, s, d)
 	t_embed = (t * cos) + (rotate_half(t) * sin)
-	return t_embed
+	return t_embed.to(orig_dtype)
