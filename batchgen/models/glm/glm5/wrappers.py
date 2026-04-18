@@ -623,7 +623,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
             )
             # Forward-time norm-weight probe (env-gated).
-            if _os.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1" and li in (0, 1, 2, 39):
+            _log_norm_dec = _os.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1"
+            _log_io_dec = _os.environ.get("BATCHGEN_GLM5_RMSNORM_IO_LOG", "0") == "1"
+            if _log_norm_dec and li in (0, 1, 2, 39):
                 _w = attn.q_a_layernorm.weight
                 _w2 = attn.kv_a_layernorm.weight
                 logging.warning(
@@ -638,7 +640,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"abs_mean={_w2.detach().float().abs().mean().item():.4f} "
                     f"first5={_w2.detach().float()[:5].tolist()}"
                 )
+            if _log_io_dec and li == 0:
+                _w = attn.q_a_layernorm.weight
+                _in_abs = q_a.detach().float().abs().mean().item()
+                logging.warning(
+                    f"[RMSNORM-IO L0 decode PRE q_a] "
+                    f"weight.data_ptr={_w.data_ptr():#x} "
+                    f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
+                    f"x_abs_mean={_in_abs:.6f}"
+                )
             q_a_normed = attn.q_a_layernorm(q_a)
+            if _log_io_dec and li == 0:
+                _out_abs = q_a_normed.detach().float().abs().mean().item()
+                logging.warning(
+                    f"[RMSNORM-IO L0 decode POST q_a] "
+                    f"out_abs_mean={_out_abs:.6f} "
+                    f"ratio_out_over_in={_out_abs/max(_in_abs, 1e-12):.6f}"
+                )
             q_a_fp8, q_a_scale = act_quant(q_a_normed)
             q = w8a8_deepgemm(
                 q_a_fp8, q_a_scale,

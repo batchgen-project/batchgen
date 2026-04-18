@@ -1247,11 +1247,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	"""
 	total_tokens = hidden_states.shape[0]
 
-	# True W8A16 for prefill: dequant FP8 weights to BF16, BF16 matmul.
-	# Avoids act_quant (FP8 activation noise) which compounds across 78
-	# layers × 5 GEMMs and degrades long-context attention.
+	# Default: FP8 act_quant + DeepGEMM fp8_gemm_nt (matches SGLang/DeepGEMM
+	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). The
+	# dequant-to-BF16 path was a diagnostic variant; restore it only via
+	# BATCHGEN_W8A16_DEQUANT=1 when investigating FP8 act_quant regressions.
 	import os as _os_gemm
-	_gemm = w8a16_gemm_dequant if _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "1") == "1" else w8a16_gemm
+	_gemm = w8a16_gemm_dequant if _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1" else w8a16_gemm
 
 	# Project Q
 	query_states = _gemm(
@@ -1262,18 +1263,38 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	# Forward-time norm-weight probe (env-gated). If the trained norm
 	# weight isn't what's being used at forward time, we need to know.
 	import os as _os_nfwd
-	if _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1":
+	_layer_idx = getattr(self, "layer_idx", -1)
+	_log_norm = _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1"
+	_log_io = _os_nfwd.environ.get("BATCHGEN_GLM5_RMSNORM_IO_LOG", "0") == "1"
+	if _log_norm and _layer_idx in (0, 1, 2, 39):
 		import logging as _logging_nfwd
-		_layer_idx = getattr(self, "layer_idx", -1)
-		if _layer_idx in (0, 1, 2, 39):
-			_w = self.q_a_layernorm.weight
-			_logging_nfwd.warning(
-				f"[NORM-FWD L{_layer_idx} prefill] q_a_layernorm.weight: "
-				f"dtype={_w.dtype} device={_w.device} "
-				f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
-				f"first5={_w.detach().float()[:5].tolist()}"
-			)
+		_w = self.q_a_layernorm.weight
+		_logging_nfwd.warning(
+			f"[NORM-FWD L{_layer_idx} prefill] q_a_layernorm.weight: "
+			f"dtype={_w.dtype} device={_w.device} "
+			f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
+			f"first5={_w.detach().float()[:5].tolist()}"
+		)
+	# I/O probe: capture x abs_mean + weight ptr pre-call, out abs_mean post.
+	if _log_io and _layer_idx == 0:
+		import logging as _logging_io
+		_w = self.q_a_layernorm.weight
+		_in_abs = query_states.detach().float().abs().mean().item()
+		_logging_io.warning(
+			f"[RMSNORM-IO L0 prefill PRE q_a] "
+			f"weight.data_ptr={_w.data_ptr():#x} "
+			f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
+			f"x_abs_mean={_in_abs:.6f}"
+		)
 	query_states = self.q_a_layernorm(query_states)
+	if _log_io and _layer_idx == 0:
+		import logging as _logging_io
+		_out_abs = query_states.detach().float().abs().mean().item()
+		_logging_io.warning(
+			f"[RMSNORM-IO L0 prefill POST q_a] "
+			f"out_abs_mean={_out_abs:.6f} "
+			f"ratio_out_over_in={_out_abs/max(_in_abs, 1e-12):.6f}"
+		)
 	query_states = _gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
@@ -1292,21 +1313,37 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		hidden_states
 	)
 	# Forward-time norm-weight probe for kv_a_layernorm as well.
-	if _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1":
-		_layer_idx = getattr(self, "layer_idx", -1)
-		if _layer_idx in (0, 1, 2, 39):
-			_w = self.kv_a_layernorm.weight
-			import logging as _logging_nfwd
-			_logging_nfwd.warning(
-				f"[NORM-FWD L{_layer_idx} prefill] kv_a_layernorm.weight: "
-				f"dtype={_w.dtype} device={_w.device} "
-				f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
-				f"first5={_w.detach().float()[:5].tolist()}"
-			)
+	if _log_norm and _layer_idx in (0, 1, 2, 39):
+		_w = self.kv_a_layernorm.weight
+		import logging as _logging_nfwd
+		_logging_nfwd.warning(
+			f"[NORM-FWD L{_layer_idx} prefill] kv_a_layernorm.weight: "
+			f"dtype={_w.dtype} device={_w.device} "
+			f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
+			f"first5={_w.detach().float()[:5].tolist()}"
+		)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
+	if _log_io and _layer_idx == 0:
+		import logging as _logging_io
+		_w = self.kv_a_layernorm.weight
+		_in_abs_kv = compressed_kv.detach().float().abs().mean().item()
+		_logging_io.warning(
+			f"[RMSNORM-IO L0 prefill PRE kv_a] "
+			f"weight.data_ptr={_w.data_ptr():#x} "
+			f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
+			f"x_abs_mean={_in_abs_kv:.6f}"
+		)
 	normed_kv = self.kv_a_layernorm(compressed_kv)
+	if _log_io and _layer_idx == 0:
+		import logging as _logging_io
+		_out_abs_kv = normed_kv.detach().float().abs().mean().item()
+		_logging_io.warning(
+			f"[RMSNORM-IO L0 prefill POST kv_a] "
+			f"out_abs_mean={_out_abs_kv:.6f} "
+			f"ratio_out_over_in={_out_abs_kv/max(_in_abs_kv, 1e-12):.6f}"
+		)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Apply rotary embeddings
