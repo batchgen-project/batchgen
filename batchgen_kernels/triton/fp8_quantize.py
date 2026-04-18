@@ -91,7 +91,7 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     out_stride0, out_stride1, out_stride2
 ):
     # Constants matching C++ implementation
-    FP8_SAFE_MAX: tl.constexpr = 440.0  # Leave headroom
+    FP8_SAFE_MAX: tl.constexpr = 448.0  # Leave headroom
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
     
@@ -168,7 +168,7 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
     3D kernel has the same issue at this scale but hits the grid-cap
     failure first.
     """
-    FP8_SAFE_MAX: tl.constexpr = 440.0
+    FP8_SAFE_MAX: tl.constexpr = 448.0
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
 

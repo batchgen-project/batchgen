@@ -770,10 +770,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 dtype=query_kv_dtype, device=query_kv_device,
             )
             q_nope_squeezed = q_nope.squeeze(2)
-            # Pure einsum absorbed Q (matches Kimi wrappers.py flashmla_backend:1548-1550).
-            query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
-                "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
-            ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            # FP8 absorb kernel (match Kimi/DeepSeek-V3 FP8 decode path).
+            # fp8_q_absorb does: act_quant(q_nope) -> FP8 WGMMA with pre-quantized
+            # FP8 weight -> BF16 output. Avoids the BF16 einsum over dequanted
+            # kv_b_proj that accumulates extra precision loss and mismatches
+            # SGLang's FP8-throughout numerics.
+            if self._fp8_absorb_weights is not None:
+                absorbed_q = fp8_q_absorb(
+                    q_nope_squeezed, self._fp8_absorb_weights,
+                )  # [B, H, kv_lora_rank]
+                query_states[:, :, :, :attn.kv_lora_rank] = \
+                    absorbed_q.view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+            else:
+                # BF16 einsum fallback (kernel unavailable).
+                query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
+                    "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
+                ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
@@ -827,9 +839,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         f"[BOOKKEEP L0 attn_out gid={_gid}] loc={_loc} head0[:8]={_attn_fp}"
                     )
 
-        # Step 6: out-absorb via einsum → FP8 quant → o_proj
+        # Step 6: out-absorb via FP8 WGMMA → FP8 quant → o_proj
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+            if self._fp8_absorb_weights is not None:
+                # fp8_out_absorb expects [B, 1, H, 512] or [B, H, 512] → [B, H, 256]
+                attn_output = fp8_out_absorb(
+                    attn_out, self._fp8_absorb_weights,
+                )  # [B, 1, H, v_head_dim] (kernel preserves the Q=1 dim)
+            else:
+                attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
