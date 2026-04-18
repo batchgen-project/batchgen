@@ -1045,6 +1045,45 @@ class GPUPagedKVCacheManager:
 			else:
 				print(f"[GPU KV WRITE L0] v_tokens=None (BUG: V should be written for GQA!)")
 
+		# GLM-5 PRE-WRITE readback for bookkeeping diagnostic: reads the
+		# target slot's current K BEFORE the Triton kernel writes. If
+		# prefill already populated that slot, the bytes will be non-zero
+		# and distinct from the k_written we're about to deposit. If the
+		# slot is fresh (never written by prefill), all bytes will be 0.
+		# Distinguishes POIS hypothesis 1 (step-0 overwrite) from
+		# "step-0 writes a fresh slot past prefill's last position".
+		_BOOKKEEP_PRE = os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+		if _BOOKKEEP_PRE and layer_idx == 0:
+			try:
+				from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB_PRE
+				_cur_pre = list(_AWB_PRE.cur_batch) if _AWB_PRE.cur_batch else []
+			except Exception:
+				_cur_pre = []
+			_tgt_pre = {int(s) for s in _BOOKKEEP_PRE.split(",") if s.strip().isdigit()}
+			_hits_pre = [(loc, _cur_pre[loc]) for loc in range(batch_size)
+			             if loc < len(_cur_pre) and _cur_pre[loc] in _tgt_pre]
+			if _hits_pre and not getattr(self.__class__, "_prewrite_dumped", False):
+				torch.cuda.synchronize()
+				_ps_pre = self.config.page_size_tokens
+				for _loc_p, _gid_p in _hits_pre:
+					_slot_p = int(slot_indices[_loc_p].item())
+					_pos_p = int(token_indices[_loc_p].item())
+					_pidx_p = _pos_p // _ps_pre
+					_poff_p = _pos_p % _ps_pre
+					try:
+						_phys_p = int(page_table_view[_slot_p, _pidx_p].item())
+					except Exception:
+						_phys_p = -99
+					if _phys_p >= 0:
+						_kbefore = k_cache_layer[_phys_p, _poff_p, 0, :].tolist()[:8]
+						_kabs_max = max(abs(x) for x in _kbefore) if _kbefore else 0.0
+						print(f"[BOOKKEEP L0 PREWRITE gid={_gid_p}] slot={_slot_p} write_pos={_pos_p} "
+						      f"phys_page={_phys_p} page_off={_poff_p} "
+						      f"k_before_write[head0,:8]={_kbefore} absmax={_kabs_max:.6g}")
+				# Only dump pre-write once per process (first iter) — that's the one
+				# that distinguishes overwrite vs fresh.
+				self.__class__._prewrite_dumped = True
+
 		run_paged_kv_token_update_fused(
 			k_cache=k_cache_layer,
 			k_tokens=k_tokens,
