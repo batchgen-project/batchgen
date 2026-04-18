@@ -1385,6 +1385,34 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	key_states = key_states.contiguous()
 	value_states = value_states.contiguous()
 
+	# Phase A probe: FA3-vs-PyTorch-SDPA fingerprint for seq 0 at layer 0, rank 0.
+	# Log-only; compares FA3 output vs FP32 SDPA reference on symmetric (256,256,256)
+	# MLA Q/K/V shape. Gate: BATCHGEN_GLM5_ATTN_COMPARE=1.
+	import os as _os_attn_cmp
+	_attn_cmp = (
+		_os_attn_cmp.environ.get("BATCHGEN_GLM5_ATTN_COMPARE", "0") == "1"
+		and getattr(self, "layer_idx", -1) == 0
+		and (not dist.is_initialized() or dist.get_rank() == 0)
+	)
+	_attn_ref_s0 = None
+	_s0_start = 0
+	_s0_end = 0
+	if _attn_cmp:
+		_s0_start = int(cu_seqlens[0].item())
+		_s0_end = int(cu_seqlens[1].item())
+		_q0 = query_states[_s0_start:_s0_end]
+		_k0 = key_states[_s0_start:_s0_end]
+		_v0 = value_states[_s0_start:_s0_end]
+		_q_ref = _q0.unsqueeze(0).transpose(1, 2).float()
+		_k_ref = _k0.unsqueeze(0).transpose(1, 2).float()
+		_v_ref = _v0.unsqueeze(0).transpose(1, 2).float()
+		_attn_ref_s0 = torch.nn.functional.scaled_dot_product_attention(
+			_q_ref, _k_ref, _v_ref,
+			attn_mask=None, is_causal=True,
+			scale=self.softmax_scale,
+		)
+		_attn_ref_s0 = _attn_ref_s0.transpose(1, 2).squeeze(0)
+
 	# Flash attention with varlen
 	attn_output = flash_attn_varlen_func(
 		query_states,
@@ -1397,6 +1425,28 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		softmax_scale=self.softmax_scale,
 		causal=True
 	)
+
+	if isinstance(attn_output, tuple):
+		_attn_out_view = attn_output[0]
+	else:
+		_attn_out_view = attn_output
+
+	if _attn_cmp and _attn_ref_s0 is not None:
+		import logging as _logging_attn_cmp
+		_attn_fa3 = _attn_out_view[_s0_start:_s0_end]
+		_diff = (_attn_fa3.float() - _attn_ref_s0.float()).abs()
+		_abs_ref = _attn_ref_s0.float().abs().clamp(min=1e-6)
+		_L0 = _s0_end - _s0_start
+		_logging_attn_cmp.warning(
+			f"[ATTN-COMPARE L0 seq0] L0={_L0} heads={self.num_heads} "
+			f"fa3[t0,h0,:8]={_attn_fa3[0,0,:8].float().tolist()} "
+			f"ref[t0,h0,:8]={_attn_ref_s0[0,0,:8].float().tolist()} "
+			f"Linf={_diff.max().item():.6f} "
+			f"L2={_diff.norm().item():.6f} "
+			f"rel_Linf={(_diff / _abs_ref).max().item():.6f} "
+			f"mean_abs_ref={_abs_ref.mean().item():.6f}"
+		)
+
 	del query_states, key_states, value_states
 
 	if isinstance(attn_output, tuple):

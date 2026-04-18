@@ -74,6 +74,60 @@ def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: 
 
 
 _GLM5_LOGIT_DUMP_COUNT = 0
+
+
+def _glm5_dump_top5_for_gids(
+	logits: torch.Tensor,
+	tokenizer,
+	cur_batch,
+	target_gids,
+	rank: int = 0,
+	topk: int = 5,
+) -> None:
+	"""Log prefill-last-position top-K for specific global seq ids.
+
+	Phase C of the velvet-popping-hopper plan. Emits one
+	`[PREFILL-TOP5 gid=<N> pos=last]` block per target gid.
+
+	Args:
+		logits: [batch_size, vocab_size] FP32 logits at prefill-last position.
+		tokenizer: HF tokenizer for decoding token ids.
+		cur_batch: list of global seq ids aligned with logits rows.
+		target_gids: iterable of global seq ids to dump.
+		rank: TP rank for log prefix.
+		topk: number of top tokens to dump (default 5).
+	"""
+	try:
+		_cur = list(cur_batch or [])
+		_targets = {int(g) for g in (target_gids or [])}
+		if not _targets:
+			return
+		for loc, gid in enumerate(_cur):
+			if int(gid) not in _targets or loc >= logits.shape[0]:
+				continue
+			row = logits[loc].float()
+			probs = torch.softmax(row, dim=-1)
+			top_vals, top_idx = torch.topk(row, topk)
+			top_probs = probs[top_idx]
+			absmax = row.abs().max().item()
+			mean = row.mean().item()
+			std = row.std().item()
+			rows_str = []
+			for v, i, p in zip(top_vals.tolist(), top_idx.tolist(), top_probs.tolist()):
+				try:
+					decoded = tokenizer.decode([i], skip_special_tokens=False)
+				except Exception:
+					decoded = "<decode error>"
+				rows_str.append(f"  {i:>7d}  logit={v:>10.4f}  prob={p:>.6f}  {decoded!r}")
+			logging.warning(
+				f"[PREFILL-TOP5 rank={rank} gid={gid} loc={loc} pos=last] "
+				f"absmax={absmax:.4f} mean={mean:.4f} std={std:.4f} top{topk}:\n"
+				+ "\n".join(rows_str)
+			)
+	except Exception as e:
+		logging.error(f"[PREFILL-TOP5] failed: {e}")
+
+
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
@@ -6864,6 +6918,19 @@ class BatchGenWorker:
 				# few sequences of a batch. Gated by BATCHGEN_GLM5_LOGIT_DUMP=1.
 				if _os_env.environ.get("BATCHGEN_GLM5_LOGIT_DUMP", "0") == "1":
 					_glm5_dump_top_logits(logits, self.tokenizer, rank=getattr(self, "rank", 0))
+					# Phase C: per-gid top-5 dump targeted by BOOKKEEP_SEQS.
+					if _bookkeep_env:
+						try:
+							_tgids = {int(s) for s in _bookkeep_env.split(",") if s.strip()}
+							_glm5_dump_top5_for_gids(
+								logits,
+								self.tokenizer,
+								Attn_Wrapper.cur_batch,
+								_tgids,
+								rank=getattr(self, "rank", 0),
+							)
+						except Exception as _e_top5:
+							logging.warning(f"[PREFILL-TOP5] wiring failed: {_e_top5}")
 
 				batch_new_tokens = self._select_tokens(logits)
 				output_tokens.append(batch_new_tokens)
