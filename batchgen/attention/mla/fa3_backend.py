@@ -1449,14 +1449,39 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		_diff = (_attn_fa3.float() - _attn_ref_s0.float()).abs()
 		_abs_ref = _attn_ref_s0.float().abs().clamp(min=1e-6)
 		_L0 = _s0_end - _s0_start
+		_last = _L0 - 1
+		_mid = _L0 // 2
 		_logging_attn_cmp.warning(
 			f"[ATTN-COMPARE L0 seq0] L0={_L0} heads={self.num_heads} "
-			f"fa3[t0,h0,:8]={_attn_fa3[0,0,:8].float().tolist()} "
-			f"ref[t0,h0,:8]={_attn_ref_s0[0,0,:8].float().tolist()} "
 			f"Linf={_diff.max().item():.6f} "
 			f"L2={_diff.norm().item():.6f} "
 			f"rel_Linf={(_diff / _abs_ref).max().item():.6f} "
 			f"mean_abs_ref={_abs_ref.mean().item():.6f}"
+		)
+		_logging_attn_cmp.warning(
+			f"[ATTN-COMPARE L0 seq0 t=0   ] "
+			f"fa3[h0,:8]={_attn_fa3[0, 0, :8].float().tolist()} "
+			f"ref[h0,:8]={_attn_ref_s0[0, 0, :8].float().tolist()}"
+		)
+		_logging_attn_cmp.warning(
+			f"[ATTN-COMPARE L0 seq0 t=mid ] tmid={_mid} "
+			f"fa3[h0,:8]={_attn_fa3[_mid, 0, :8].float().tolist()} "
+			f"ref[h0,:8]={_attn_ref_s0[_mid, 0, :8].float().tolist()}"
+		)
+		_logging_attn_cmp.warning(
+			f"[ATTN-COMPARE L0 seq0 t=last] tlast={_last} "
+			f"fa3[h0,:8]={_attn_fa3[_last, 0, :8].float().tolist()} "
+			f"ref[h0,:8]={_attn_ref_s0[_last, 0, :8].float().tolist()}"
+		)
+		# Per-token Linf to detect position-dependent divergence
+		_per_tok_linf = (_attn_fa3.float() - _attn_ref_s0.float()).abs().amax(dim=(1, 2))
+		_logging_attn_cmp.warning(
+			f"[ATTN-COMPARE L0 seq0 per-tok Linf] "
+			f"t0={_per_tok_linf[0].item():.6f} "
+			f"tmid={_per_tok_linf[_mid].item():.6f} "
+			f"tlast={_per_tok_linf[_last].item():.6f} "
+			f"max={_per_tok_linf.max().item():.6f} "
+			f"argmax={_per_tok_linf.argmax().item()}"
 		)
 
 	del query_states, key_states, value_states
