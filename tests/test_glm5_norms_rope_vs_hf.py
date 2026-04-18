@@ -123,9 +123,11 @@ from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_n
 def test_glm5_rmsnorm_vs_hf(batch_size, seq_len, hidden_size):
     """Test Glm5RMSNorm forward matches HfGlmMoeDsaRMSNorm element-by-element."""
     
-    # Create identical modules
-    hf_norm = HfGlmMoeDsaRMSNorm(hidden_size, eps=1e-6)
-    batchgen_norm = Glm5RMSNorm(hidden_size, eps=1e-5)
+    # Use the SAME eps on both sides (matches GLM-5 config rms_norm_eps=1e-5).
+    # HF's default class eps=1e-6 but at runtime it receives config.rms_norm_eps.
+    eps = 1e-5
+    hf_norm = HfGlmMoeDsaRMSNorm(hidden_size, eps=eps)
+    batchgen_norm = Glm5RMSNorm(hidden_size, eps=eps)
     
     # Copy weight for perfect match (note: eps differs slightly)
     batchgen_norm.weight.data = hf_norm.weight.data.clone()
@@ -172,49 +174,47 @@ def test_glm5_rope_cache_vs_hf(batch_size, seq_len, head_dim):
     base = 1000000.0
     device = torch.device("cpu")
     
-    # HF RoPE: compute cos/sin for a batch of positions
+    # HF RoPE: compute cos/sin for a batch of positions. HF casts to x.dtype
+    # (BF16 in practice) on output. We use an FP32 x so both engines return
+    # FP32 cos/sin and the comparison reveals only true math differences, not
+    # BF16 round-off from HF's output cast.
     hf_rope = HfGlmMoeDsaRotaryEmbedding(head_dim, base=base, device=device)
-    
-    # BatchGen RoPE: build cache
+
+    # BatchGen RoPE: build cache (always FP32 internally)
     batchgen_rope = Glm5RotaryEmbedding(dim=head_dim, max_position_embeddings=seq_len, base=base)
-    batchgen_rope._set_cos_sin_cache(seq_len, device, torch.bfloat16)
-    
+    batchgen_rope._set_cos_sin_cache(seq_len, device, torch.float32)
+
     # Create position_ids for the batch
     position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    
-    # Dummy x for HF (only used for device/dtype)
-    x = torch.randn(batch_size, seq_len, head_dim, dtype=torch.bfloat16)
-    
+
+    # Use FP32 x so HF's `cos.to(dtype=x.dtype)` cast is a no-op on precision.
+    x = torch.randn(batch_size, seq_len, head_dim, dtype=torch.float32)
+
     with torch.no_grad():
         hf_cos, hf_sin = hf_rope(x, position_ids)
-        
+
         # BatchGen: index the cache by position_ids
         batchgen_cos = batchgen_rope.cos_cached[position_ids]
         batchgen_sin = batchgen_rope.sin_cached[position_ids]
-    
+
     # Compare shapes
     assert hf_cos.shape == batchgen_cos.shape, \
         f"cos shape mismatch: HF={hf_cos.shape}, BatchGen={batchgen_cos.shape}"
     assert hf_sin.shape == batchgen_sin.shape, \
         f"sin shape mismatch: HF={hf_sin.shape}, BatchGen={batchgen_sin.shape}"
-    
-    # Compare values (should be identical in FP32 before dtype conversion)
-    hf_cos_f32 = hf_cos.float()
-    hf_sin_f32 = hf_sin.float()
-    batchgen_cos_f32 = batchgen_cos.float()
-    batchgen_sin_f32 = batchgen_sin.float()
-    
-    if torch.allclose(hf_cos_f32, batchgen_cos_f32, atol=1e-6, rtol=1e-6):
+
+    # Both are FP32 now; expect bit-level match (same formula: emb=cat(freqs,freqs).cos()).
+    if torch.allclose(hf_cos, batchgen_cos, atol=1e-6, rtol=1e-6):
         print(f"✓ RoPE cos cache test passed: shape={hf_cos.shape}")
     else:
-        max_diff = (hf_cos_f32 - batchgen_cos_f32).abs().max()
-        pytest.fail(f"RoPE cos cache diverges by {max_diff:.6e}")
+        max_diff = (hf_cos - batchgen_cos).abs().max()
+        pytest.fail(f"RoPE cos cache diverges by {max_diff:.6e} (FP32-vs-FP32)")
     
-    if torch.allclose(hf_sin_f32, batchgen_sin_f32, atol=1e-6, rtol=1e-6):
+    if torch.allclose(hf_sin, batchgen_sin, atol=1e-6, rtol=1e-6):
         print(f"✓ RoPE sin cache test passed: shape={hf_sin.shape}")
     else:
-        max_diff = (hf_sin_f32 - batchgen_sin_f32).abs().max()
-        pytest.fail(f"RoPE sin cache diverges by {max_diff:.6e}")
+        max_diff = (hf_sin - batchgen_sin).abs().max()
+        pytest.fail(f"RoPE sin cache diverges by {max_diff:.6e} (FP32-vs-FP32)")
 
 
 # ============================================================================
@@ -284,9 +284,14 @@ def test_glm5_rope_interleaved_rotation(batch_size, seq_len, head_dim):
     torch.manual_seed(456)
     x_bhsd = torch.randn(batch_size, 8, seq_len, head_dim, dtype=torch.bfloat16)
     
-    # Position IDs for all tokens
-    position_ids = torch.arange(seq_len, dtype=torch.long)
-    
+    # Position IDs for all tokens, shaped [B, S] so cos_cached[position_ids]
+    # broadcasts cleanly against x_bhsd[B, H, S, D] after unsqueeze_dim=1.
+    position_ids = (
+        torch.arange(seq_len, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
     with torch.no_grad():
         # Apply BatchGen's native interleaved rotation
         x_rotated = rotary_pos_emb_interleaved_native(
@@ -404,9 +409,14 @@ def test_glm5_rope_prefill_usage(batch_size, seq_len, head_dim):
     torch.manual_seed(789)
     q = torch.randn(batch_size, 8, seq_len, head_dim, dtype=torch.bfloat16)
     
-    # Position IDs for prefill: [0, 1, 2, ..., seq_len-1] repeated for each batch
-    position_ids = torch.arange(seq_len, dtype=torch.long)
-    
+    # Position IDs for prefill: [0, 1, 2, ..., seq_len-1] repeated per-batch.
+    # Shape [B, S] for broadcasting with unsqueeze_dim=1.
+    position_ids = (
+        torch.arange(seq_len, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
     with torch.no_grad():
         q_rotated = rotary_pos_emb_interleaved_native(
             q, rope.cos_cached, rope.sin_cached, position_ids, unsqueeze_dim=1
