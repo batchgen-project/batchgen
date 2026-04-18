@@ -55,6 +55,13 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Enable/disable thinking mode (None = model default)",
     )
+    enable_thinking: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Alternate name for `thinking` (GLM/SGLang convention). "
+            "If both set, `enable_thinking` takes precedence."
+        ),
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:

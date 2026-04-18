@@ -384,10 +384,20 @@ class BatchScheduler:
                     body.model,
                     body.reasoning_effort,
                 )
-                # Forward extra kwargs (thinking, tools) to chat template
+                # Forward extra kwargs (thinking, tools) to chat template.
+                # The GLM-5 / SGLang convention is `enable_thinking`; older
+                # callers may send `thinking`. Prefer `enable_thinking` when
+                # both are set, and forward BOTH names so templates written
+                # against either convention work.
                 template_kwargs = {}
-                if body.thinking is not None:
-                    template_kwargs["thinking"] = body.thinking
+                thinking_val = (
+                    body.enable_thinking
+                    if body.enable_thinking is not None
+                    else body.thinking
+                )
+                if thinking_val is not None:
+                    template_kwargs["enable_thinking"] = thinking_val
+                    template_kwargs["thinking"] = thinking_val
                 if body.tools is not None:
                     template_kwargs["tools"] = body.tools
                 prompt = self._format_chat_messages(
