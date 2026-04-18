@@ -594,12 +594,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """
         import os as _os
         from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.attention.mla.fused_rmsnorm_rope import (
+            fused_rmsnorm_rope_with_q,
+            fused_rmsnorm_rope_with_q_native,
+        )
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
         from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
+
+        # Select the decode RoPE variant to stay aligned with the prefill
+        # path (fa3_backend.py). Default: native interleaved output layout
+        # (matches rotary_pos_emb_interleaved_native). Opt back into the
+        # split-half-permuted legacy kernel with BATCHGEN_GLM5_ROPE_LEGACY=1.
+        _fused_rmsnorm_rope = (
+            fused_rmsnorm_rope_with_q
+            if _os.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
+            else fused_rmsnorm_rope_with_q_native
+        )
 
         _use_kimi_mla = _os.environ.get("BATCHGEN_GLM5_USE_KIMI_MLA", "0") == "1"
 
@@ -676,7 +689,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
             ).view(bsz, 1, -1)
             cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
-            offload_kv = fused_rmsnorm_rope_with_q(
+            offload_kv = _fused_rmsnorm_rope(
                 new_compressed_kv, q_pe, cos, sin, position_ids,
                 attn.kv_a_layernorm.weight,
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
@@ -872,13 +885,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Computes MLA KV and writes to primary cache first, then runs indexer
         scoring on aux cache, gathers sparse MLA KV, and runs sparse FlashMLA.
         """
+        import os as _os
         from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.attention.mla.fused_rmsnorm_rope import (
+            fused_rmsnorm_rope_with_q,
+            fused_rmsnorm_rope_with_q_native,
+        )
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
         from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
+
+        _fused_rmsnorm_rope = (
+            fused_rmsnorm_rope_with_q
+            if _os.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
+            else fused_rmsnorm_rope_with_q_native
+        )
 
         weight_scale = self.weight_dequant_scale
         attn = self.module
@@ -929,7 +952,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # than the prefill-cached KV, creating a slow drift that compounds
             # across 78 layers × decode steps and manifests as ngram loops /
             # off-topic generation after ~hundreds of tokens.
-            offload_kv = fused_rmsnorm_rope_with_q(
+            offload_kv = _fused_rmsnorm_rope(
                 new_compressed_kv, q_pe, cos, sin, position_ids,
                 attn.kv_a_layernorm.weight,
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
@@ -1143,13 +1166,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
           7. ``sparse_flash_mla_decode`` (same kernel as the existing DSA
              exit) + out-absorb einsum + FP8 o_proj.
         """
+        import os as _os
         from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.attention.mla.fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
+        from batchgen.attention.mla.fused_rmsnorm_rope import (
+            fused_rmsnorm_rope_with_q,
+            fused_rmsnorm_rope_with_q_native,
+        )
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
         from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
+
+        _fused_rmsnorm_rope = (
+            fused_rmsnorm_rope_with_q
+            if _os.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
+            else fused_rmsnorm_rope_with_q_native
+        )
 
         weight_scale = self.weight_dequant_scale
         attn = self.module
@@ -1190,7 +1223,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
             ).view(bsz, 1, -1)
             cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
-            offload_kv = fused_rmsnorm_rope_with_q(
+            offload_kv = _fused_rmsnorm_rope(
                 new_compressed_kv, q_pe, cos, sin, position_ids,
                 attn.kv_a_layernorm.weight,
                 attn.kv_lora_rank, attn.qk_rope_head_dim,
