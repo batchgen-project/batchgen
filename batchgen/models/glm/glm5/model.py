@@ -45,12 +45,9 @@ def glm5_prefill_trace(tensor, stage: str, layer_idx: int = 0) -> None:
 		return
 	if layer_idx != 0:
 		return
-	try:
-		import torch.distributed as _dist_trace
-		if _dist_trace.is_initialized() and _dist_trace.get_rank() != 0:
-			return
-	except Exception:
-		pass
+	# Note: no rank filter — target gids are distributed across ranks via
+	# prepack admission. The inner loop already filters to target gids, so
+	# only ranks that actually hold a target seq will log.
 	_bookkeep = _os_trace.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
 	if not _bookkeep:
 		return
@@ -78,8 +75,13 @@ def glm5_prefill_trace(tensor, stage: str, layer_idx: int = 0) -> None:
 			if s_end >= t.shape[0]:
 				continue
 			row = t[s_end].detach().float().reshape(-1)
+			try:
+				import torch.distributed as _d
+				_rk = _d.get_rank() if _d.is_initialized() else 0
+			except Exception:
+				_rk = 0
 			_logging_trace.warning(
-				f"[PREFILL-TRACE L0 stage={stage} gid={gid} loc={loc}] "
+				f"[PREFILL-TRACE rank={_rk} L0 stage={stage} gid={gid} loc={loc}] "
 				f"shape={tuple(tensor.shape)} pos_last={s_end} "
 				f"abs_mean={row.abs().mean().item():.6f} "
 				f"max_abs={row.abs().max().item():.6f} "
