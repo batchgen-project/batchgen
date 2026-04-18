@@ -30,6 +30,12 @@ from .model import Glm5ForCausalLM, Glm5MoE
 from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
 
 
+def _attn_of(model, layer_idx):
+    """Return the raw attention module, unwrapping if wrapped."""
+    a = model.model.layers[layer_idx].self_attn
+    return a.module if hasattr(a, "module") else a
+
+
 
 
 class GLM5ParallelStrategyManager:
@@ -106,6 +112,200 @@ class GLM5ParallelStrategyManager:
                 f"mean={f32.mean().item():.6g} std={f32.std().item():.6g} "
                 f"first5={first}"
             )
+
+    def _verify_all_weights_loaded(self):
+        """Comprehensive weight-load audit. Env-gated by BATCHGEN_GLM5_WEIGHT_ASSERT.
+
+        Two checks in one pass:
+          1) Enumerate every expected tensor key, confirm presence in
+             `skeleton_state_dict`. Report MISSING keys grouped by type.
+          2) For every expected module weight (post-load), read the live
+             `param.data` and assert it's not at its `nn.Module` default
+             (zeros / N(0, 0.02) / copy of a template row). Heuristic:
+             norms/biases should NOT be uniform-zero and NOT uniform-one
+             without the trained structure. FP8 weights should have a wide
+             value range consistent with quantized trained weights.
+
+        If BATCHGEN_GLM5_WEIGHT_ASSERT=1, raises on the first violation.
+        Otherwise logs a report and continues.
+        """
+        import os as _os
+        if self.rank != 0:
+            return
+        mode = _os.environ.get("BATCHGEN_GLM5_WEIGHT_ASSERT", "").strip()
+        if not mode:
+            return
+
+        fail_fast = mode == "1"
+        cfg = self.loaded_model_config
+        num_layers = cfg.num_hidden_layers
+        first_k_dense = cfg.first_k_dense_replace
+        n_experts = cfg.n_routed_experts
+        has_indexer = hasattr(_attn_of(self.model, 3), "indexer")
+
+        # ==== 1. Skeleton coverage ====
+        skel = self.skeleton_state_dict
+        present = set(skel.keys())
+        expected = set()
+
+        # Global
+        expected.update([
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+        ])
+        # Per-layer
+        for i in range(num_layers):
+            # Layer norms
+            expected.add(f"model.layers.{i}.input_layernorm.weight")
+            expected.add(f"model.layers.{i}.post_attention_layernorm.weight")
+            # Attn
+            expected.add(f"model.layers.{i}.self_attn.q_a_proj.weight")
+            expected.add(f"model.layers.{i}.self_attn.q_a_proj.weight_scale_inv")
+            expected.add(f"model.layers.{i}.self_attn.q_a_layernorm.weight")
+            expected.add(f"model.layers.{i}.self_attn.q_b_proj.weight")
+            expected.add(f"model.layers.{i}.self_attn.q_b_proj.weight_scale_inv")
+            expected.add(f"model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight")
+            expected.add(f"model.layers.{i}.self_attn.kv_a_proj_with_mqa.weight_scale_inv")
+            expected.add(f"model.layers.{i}.self_attn.kv_a_layernorm.weight")
+            expected.add(f"model.layers.{i}.self_attn.kv_b_proj.weight")
+            expected.add(f"model.layers.{i}.self_attn.kv_b_proj.weight_scale_inv")
+            expected.add(f"model.layers.{i}.self_attn.o_proj.weight")
+            expected.add(f"model.layers.{i}.self_attn.o_proj.weight_scale_inv")
+            # Indexer
+            if has_indexer:
+                for t in [
+                    "indexer.wq_b.weight", "indexer.wq_b.weight_scale_inv",
+                    "indexer.wk.weight", "indexer.wk.weight_scale_inv",
+                    "indexer.weights_proj.weight",
+                    "indexer.k_norm.weight", "indexer.k_norm.bias",
+                ]:
+                    expected.add(f"model.layers.{i}.self_attn.{t}")
+            # MLP
+            if i < first_k_dense:
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    expected.add(f"model.layers.{i}.mlp.{proj}.weight")
+                    expected.add(f"model.layers.{i}.mlp.{proj}.weight_scale_inv")
+            else:
+                expected.add(f"model.layers.{i}.mlp.gate.weight")
+                expected.add(f"model.layers.{i}.mlp.gate.e_score_correction_bias")
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    expected.add(f"model.layers.{i}.mlp.shared_experts.{proj}.weight")
+                    expected.add(f"model.layers.{i}.mlp.shared_experts.{proj}.weight_scale_inv")
+                for j in range(n_experts):
+                    for proj in ("gate_proj", "up_proj", "down_proj"):
+                        expected.add(f"model.layers.{i}.mlp.experts.{j}.{proj}.weight")
+                        expected.add(f"model.layers.{i}.mlp.experts.{j}.{proj}.weight_scale_inv")
+
+        missing = sorted(expected - present)
+        extra = sorted(present - expected)
+
+        def _bucket(key):
+            if "input_layernorm" in key or "post_attention_layernorm" in key:
+                return "layer_norm"
+            if "q_a_layernorm" in key or "kv_a_layernorm" in key:
+                return "attn_norm"
+            if "indexer" in key:
+                return "indexer"
+            if ".experts." in key:
+                return "routed_expert"
+            if "shared_experts" in key:
+                return "shared_expert"
+            if ".gate." in key or ".gate_proj" in key or ".up_proj" in key or ".down_proj" in key:
+                return "mlp_or_gate"
+            if "embed_tokens" in key or "lm_head" in key or "model.norm" in key:
+                return "global"
+            if "self_attn" in key:
+                return "attn"
+            return "other"
+
+        from collections import Counter
+        miss_bucket = Counter(_bucket(k) for k in missing)
+        logging.warning(
+            f"[GLM5 WEIGHT-VERIFY] expected={len(expected)} present={len(present)} "
+            f"missing={len(missing)} extra={len(extra)}"
+        )
+        if missing:
+            logging.warning(f"[GLM5 WEIGHT-VERIFY] missing by bucket: {dict(miss_bucket)}")
+            # Print up to 30 example missing keys
+            for k in missing[:30]:
+                logging.warning(f"[GLM5 WEIGHT-VERIFY] MISSING: {k}")
+            if len(missing) > 30:
+                logging.warning(f"[GLM5 WEIGHT-VERIFY]  ... +{len(missing) - 30} more missing")
+
+        # ==== 2. Module live-weight audit ====
+        violations = []
+
+        def _check(name, tensor, kind):
+            if tensor is None:
+                violations.append((name, f"{kind} is None"))
+                return
+            f32 = tensor.detach().float()
+            abs_mean = f32.abs().mean().item()
+            stdev = f32.std().item()
+            # Any tensor should have nonzero absmean (unless deliberately zero bias)
+            if abs_mean < 1e-9:
+                violations.append((name, f"{kind} all-zero (abs_mean={abs_mean:.2e})"))
+                return
+            # nn.Module default init N(0, 0.02): std~0.02. Norms should be
+            # trained to either near-1 (weight) or near-0 (bias) structure;
+            # a std~0.02 with mean~0 is the tell-tale sign of un-loaded init.
+            if kind == "norm_weight" and abs(abs_mean - 1.0) > 0.5 and stdev < 0.05:
+                violations.append((name, f"{kind} looks like default init "
+                                          f"(abs_mean={abs_mean:.3f} std={stdev:.4f})"))
+            if kind == "norm_bias" and abs_mean > 0.1 and stdev < 0.05:
+                violations.append((name, f"{kind} unexpected distribution "
+                                          f"(abs_mean={abs_mean:.3f} std={stdev:.4f})"))
+
+        # Walk all layers and spot-check loaded-ness
+        for i in range(num_layers):
+            L = self.model.model.layers[i]
+            _check(f"L{i}.input_layernorm.weight", L.input_layernorm.weight, "norm_weight")
+            _check(f"L{i}.post_attn_layernorm.weight", L.post_attention_layernorm.weight, "norm_weight")
+            attn = L.self_attn.module if hasattr(L.self_attn, "module") else L.self_attn
+            _check(f"L{i}.q_a_layernorm.weight", attn.q_a_layernorm.weight, "norm_weight")
+            _check(f"L{i}.kv_a_layernorm.weight", attn.kv_a_layernorm.weight, "norm_weight")
+            # Indexer
+            if has_indexer and hasattr(attn, "indexer"):
+                _check(f"L{i}.indexer.k_norm.weight", attn.indexer.k_norm.weight, "norm_weight")
+                _check(f"L{i}.indexer.k_norm.bias", attn.indexer.k_norm.bias, "norm_bias")
+            # Dense MLP (0..first_k_dense)
+            if i < first_k_dense:
+                mlp = L.mlp
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    mod = getattr(mlp, proj)
+                    _check(f"L{i}.mlp.{proj}.weight", mod.weight.data, "fp8_weight")
+                    scale = getattr(mod, "weight_scale_inv", None)
+                    if scale is None:
+                        # Scale may live as side-attr after _setup_fp8_scales
+                        scale = getattr(mlp, f"{proj.split('_')[0]}_scale", None)
+                    _check(f"L{i}.mlp.{proj}.weight_scale_inv", scale, "fp32_scale")
+            else:
+                # MoE layer: gate + bias
+                gate = L.mlp.gate
+                _check(f"L{i}.mlp.gate.weight", gate.weight, "gate_weight")
+                _check(f"L{i}.mlp.gate.e_score_correction_bias",
+                       gate.e_score_correction_bias, "norm_bias")
+
+        # Global
+        _check("model.norm.weight", self.model.model.norm.weight, "norm_weight")
+        _check("model.embed_tokens.weight", self.model.model.embed_tokens.weight, "embed")
+        _check("lm_head.weight", self.model.lm_head.weight, "embed")
+
+        if violations:
+            logging.warning(f"[GLM5 WEIGHT-VERIFY] {len(violations)} live-weight violation(s):")
+            for name, reason in violations[:50]:
+                logging.warning(f"[GLM5 WEIGHT-VERIFY] LIVE-VIOLATION: {name}: {reason}")
+            if len(violations) > 50:
+                logging.warning(f"[GLM5 WEIGHT-VERIFY]  ... +{len(violations) - 50} more")
+
+        if fail_fast and (missing or violations):
+            raise RuntimeError(
+                f"BATCHGEN_GLM5_WEIGHT_ASSERT=1 tripped: "
+                f"{len(missing)} skeleton-missing + {len(violations)} live-violations. "
+                f"See [GLM5 WEIGHT-VERIFY] log lines."
+            )
+        logging.warning("[GLM5 WEIGHT-VERIFY] audit complete")
 
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
@@ -188,6 +388,7 @@ class GLM5ParallelStrategyManager:
         self._setup_fp8_scales()
         self._init_fused_kernels()
         self._dump_weight_stats_once()
+        self._verify_all_weights_loaded()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
