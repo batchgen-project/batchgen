@@ -242,7 +242,7 @@ class HfGlmMoeDsaAttention(nn.Module):
 # ============================================================================
 
 from batchgen.models.glm.glm5.model import Glm5Indexer, Glm5MLA, Glm5RMSNorm, Glm5RotaryEmbedding, Glm5Config
-from batchgen.attention.mla.rotary_embedding import apply_rotary_pos_emb_interleaved, rotary_pos_emb_interleaved_native
+from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
 
 
 # ============================================================================
