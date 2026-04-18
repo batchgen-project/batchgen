@@ -1121,36 +1121,55 @@ class GPUPagedKVCacheManager:
 			except Exception:
 				_rank = 0
 			if _rank == 0:
-				try:
-					from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-					_cur_batch = list(_AWB.cur_batch) if _AWB.cur_batch else []
-				except Exception:
+				# Rate-limit to first N iters per rank to keep log tractable.
+				_iter_cap = int(os.environ.get("BATCHGEN_GLM5_BOOKKEEP_MAX_ITERS", "30"))
+				if not hasattr(self.__class__, "_bookkeep_iter_count"):
+					self.__class__._bookkeep_iter_count = 0
+				if self.__class__._bookkeep_iter_count < _iter_cap:
+					self.__class__._bookkeep_iter_count += 1
+					_iter_idx = self.__class__._bookkeep_iter_count
 					_cur_batch = []
-				_target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
-				# Scan every local slot; dump only when its global seq id is
-				# in the target set.
-				_hits = [(loc, _cur_batch[loc]) for loc in range(batch_size)
-				         if loc < len(_cur_batch) and _cur_batch[loc] in _target_set]
-				if _hits:
-					torch.cuda.synchronize()
-					_ps = self.config.page_size_tokens
-					_hd = self.config.k_head_dim
-					for _loc, _gid in _hits:
-						_slot = int(slot_indices[_loc].item())
-						_pos = int(token_indices[_loc].item())
-						_pt_row = page_table_view[_slot].tolist()
-						_page_idx = _pos // _ps
-						_page_off = _pos % _ps
-						_phys = int(page_table_view[_slot, _page_idx].item()) if _page_idx < len(_pt_row) else -99
-						_kwrote = k_tokens[_loc, 0:_hd].tolist()[:8]
-						print(f"[BOOKKEEP L0 gid={_gid}] loc={_loc} slot={_slot} "
-						      f"write_pos={_pos} page_idx={_page_idx} page_off={_page_off} phys_page={_phys}")
-						print(f"[BOOKKEEP L0 gid={_gid}] page_table_row={_pt_row}")
-						print(f"[BOOKKEEP L0 gid={_gid}] k_written[head0,:8]={_kwrote}")
-						if _phys >= 0:
-							_kread = k_cache_layer[_phys, _page_off, 0, :].tolist()[:8]
-							_match = all(abs(w - r) < 1e-3 for w, r in zip(_kwrote, _kread))
-							print(f"[BOOKKEEP L0 gid={_gid}] k_readback[head0,:8]={_kread} match={_match}")
+					for _src in ("batchgen.models.wrappers.attention", "batchgen.models.glm.glm5.wrappers"):
+						try:
+							_mod = __import__(_src, fromlist=["*"])
+							_AWB = getattr(_mod, "AttnWrapperBase", None) or getattr(_mod, "Attn_Wrapper", None)
+							if _AWB is not None and getattr(_AWB, "cur_batch", None):
+								_cur_batch = list(_AWB.cur_batch)
+								break
+						except Exception:
+							pass
+					_target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
+					# One-line iter breadcrumb so we can see when the diagnostic
+					# is active and what global_idx are in this micro-batch.
+					print(f"[BOOKKEEP L0 iter={_iter_idx}] bs={batch_size} cur_batch={_cur_batch[:10]} target={sorted(_target_set)}")
+					# When cur_batch is populated, dump matching target seqs.
+					# When cur_batch is empty (path that doesn't set it), dump
+					# first 10 slots so we can at least see bookkeeping state.
+					if _cur_batch:
+						_hits = [(loc, _cur_batch[loc]) for loc in range(batch_size)
+						         if loc < len(_cur_batch) and _cur_batch[loc] in _target_set]
+					else:
+						_hits = [(loc, -1) for loc in range(min(batch_size, 10))]
+					if _hits:
+						torch.cuda.synchronize()
+						_ps = self.config.page_size_tokens
+						_hd = self.config.k_head_dim
+						for _loc, _gid in _hits:
+							_slot = int(slot_indices[_loc].item())
+							_pos = int(token_indices[_loc].item())
+							_pt_row = page_table_view[_slot].tolist()
+							_page_idx = _pos // _ps
+							_page_off = _pos % _ps
+							_phys = int(page_table_view[_slot, _page_idx].item()) if _page_idx < len(_pt_row) else -99
+							_kwrote = k_tokens[_loc, 0:_hd].tolist()[:8]
+							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] loc={_loc} slot={_slot} "
+							      f"write_pos={_pos} page_idx={_page_idx} page_off={_page_off} phys_page={_phys}")
+							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] page_table_row={_pt_row}")
+							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] k_written[head0,:8]={_kwrote}")
+							if _phys >= 0:
+								_kread = k_cache_layer[_phys, _page_off, 0, :].tolist()[:8]
+								_match = all(abs(w - r) < 1e-3 for w, r in zip(_kwrote, _kread))
+								print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] k_readback[head0,:8]={_kread} match={_match}")
 
 			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
 			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
