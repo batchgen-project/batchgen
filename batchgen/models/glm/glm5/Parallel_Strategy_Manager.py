@@ -327,9 +327,15 @@ class GLM5ParallelStrategyManager:
 
         step_start = time.perf_counter()
         for layer_idx in range(self.model_config.num_hidden_layers):
-            # Attention (EXCLUDING indexer → skeleton)
+            # Attention (EXCLUDING indexer → skeleton; EXCLUDING q_a_layernorm /
+            # kv_a_layernorm → skeleton too. Both are tiny BF16 RMSNorm weights
+            # that don't need the copy-task machinery, and routing them through
+            # state_dict_name_map makes _load_model_skeleton skip them, leaving
+            # the live module at its ones_() init → silently-wrong Q/K RMSNorm.)
             for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
                 if name.startswith("indexer."):
+                    continue
+                if name in ("q_a_layernorm.weight", "kv_a_layernorm.weight"):
                     continue
                 tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
                 self.state_dict_name_map[tensor_full_name] = {
@@ -447,10 +453,14 @@ class GLM5ParallelStrategyManager:
 
         self.weight_copy_task["routed_expert"] = self.host_routed_experts
 
-        # Build state_dict_name_map for all modules
+        # Build state_dict_name_map for all modules (skip indexer and
+        # q_a/kv_a_layernorm — those route through skeleton, see
+        # configure_prefill for rationale).
         for layer_idx in range(self.model_config.num_hidden_layers):
             for name, _ in self.model.model.layers[layer_idx].self_attn.named_parameters():
                 if name.startswith("indexer."):
+                    continue
+                if name in ("q_a_layernorm.weight", "kv_a_layernorm.weight"):
                     continue
                 tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
                 self.state_dict_name_map[tensor_full_name] = {
