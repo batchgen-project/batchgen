@@ -302,12 +302,16 @@ class TestGlm5RouterVsHF:
         """
         from batchgen.models.glm.glm5.model import Glm5MoEGate
         
-        # Create HF reference
+        # Create HF reference. HfGlmMoeDsaTopkRouter uses
+        # nn.Parameter(torch.empty(...)) which can hold NaN garbage; initialize
+        # to a well-behaved random distribution explicitly before copying.
         hf_router = HfGlmMoeDsaTopkRouter(config).to(torch.bfloat16)
-        
+        nn.init.normal_(hf_router.weight, mean=0.0, std=0.02)
+        hf_router.e_score_correction_bias.data.zero_()
+
         # Create BatchGen equivalent
         batchgen_gate = Glm5MoEGate(config).to(torch.bfloat16)
-        
+
         # Copy weights
         batchgen_gate.weight.data.copy_(hf_router.weight.data)
         batchgen_gate.e_score_correction_bias.data.copy_(hf_router.e_score_correction_bias.data)
