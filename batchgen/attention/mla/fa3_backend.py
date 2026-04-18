@@ -1259,6 +1259,20 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
+	# Forward-time norm-weight probe (env-gated). If the trained norm
+	# weight isn't what's being used at forward time, we need to know.
+	import os as _os_nfwd
+	if _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1":
+		import logging as _logging_nfwd
+		_layer_idx = getattr(self, "layer_idx", -1)
+		if _layer_idx in (0, 1, 2, 39):
+			_w = self.q_a_layernorm.weight
+			_logging_nfwd.warning(
+				f"[NORM-FWD L{_layer_idx} prefill] q_a_layernorm.weight: "
+				f"dtype={_w.dtype} device={_w.device} "
+				f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
+				f"first5={_w.detach().float()[:5].tolist()}"
+			)
 	query_states = self.q_a_layernorm(query_states)
 	query_states = _gemm(
 		self.q_b_proj.weight.data,
@@ -1277,6 +1291,18 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
 	)
+	# Forward-time norm-weight probe for kv_a_layernorm as well.
+	if _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1":
+		_layer_idx = getattr(self, "layer_idx", -1)
+		if _layer_idx in (0, 1, 2, 39):
+			_w = self.kv_a_layernorm.weight
+			import logging as _logging_nfwd
+			_logging_nfwd.warning(
+				f"[NORM-FWD L{_layer_idx} prefill] kv_a_layernorm.weight: "
+				f"dtype={_w.dtype} device={_w.device} "
+				f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
+				f"first5={_w.detach().float()[:5].tolist()}"
+			)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)

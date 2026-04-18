@@ -622,6 +622,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 hidden_fp8, hidden_scale,
                 attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
             )
+            # Forward-time norm-weight probe (env-gated).
+            if _os.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1" and li in (0, 1, 2, 39):
+                _w = attn.q_a_layernorm.weight
+                _w2 = attn.kv_a_layernorm.weight
+                logging.warning(
+                    f"[NORM-FWD L{li} decode] q_a_layernorm.weight: "
+                    f"dtype={_w.dtype} device={_w.device} "
+                    f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
+                    f"first5={_w.detach().float()[:5].tolist()}"
+                )
+                logging.warning(
+                    f"[NORM-FWD L{li} decode] kv_a_layernorm.weight: "
+                    f"dtype={_w2.dtype} device={_w2.device} "
+                    f"abs_mean={_w2.detach().float().abs().mean().item():.4f} "
+                    f"first5={_w2.detach().float()[:5].tolist()}"
+                )
             q_a_normed = attn.q_a_layernorm(q_a)
             q_a_fp8, q_a_scale = act_quant(q_a_normed)
             q = w8a8_deepgemm(
