@@ -80,6 +80,17 @@ class Glm5RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import os as _os_rmsn
+        if _os_rmsn.environ.get("BATCHGEN_GLM5_FORCE_PT_RMSNORM", "0") == "1":
+            # PyTorch fallback — explicitly uses self.weight. If forward output
+            # differs between this and cuda_rmsnorm for the same weight, the
+            # CUDA kernel has a bug (likely a weight-dtype mismatch that
+            # misinterprets the weight bytes).
+            orig_dtype = x.dtype
+            x32 = x.to(torch.float32)
+            var = x32.pow(2).mean(-1, keepdim=True)
+            x32 = x32 * torch.rsqrt(var + self.eps)
+            return (self.weight.to(torch.float32) * x32).to(orig_dtype)
         from batchgen.attention.fused_kernels import cuda_rmsnorm
         return cuda_rmsnorm(x, self.weight, self.eps)
 
