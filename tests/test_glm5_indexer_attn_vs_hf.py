@@ -300,7 +300,7 @@ def test_indexer_k_path_vs_hf(glm5_config, random_seed):
     batch_size, seq_len = 2, 32
     
     # Create matching HF and BatchGen indexers
-    hf_indexer = HfGlmMoeDsaIndexer(glm5_config, layer_idx=0)
+    hf_indexer = HfGlmMoeDsaIndexer(glm5_config, layer_idx=0).to(torch.bfloat16)
     batchgen_indexer = Glm5Indexer(glm5_config, layer_idx=0)
     
     # Copy weights: HF -> BatchGen
@@ -361,7 +361,7 @@ def test_indexer_k_norm_eps_regression(glm5_config, random_seed):
     batch_size, seq_len = 1, 16
     
     # Create Indexers with different eps
-    hf_indexer = HfGlmMoeDsaIndexer(glm5_config, layer_idx=0)
+    hf_indexer = HfGlmMoeDsaIndexer(glm5_config, layer_idx=0).to(torch.bfloat16)
     batchgen_indexer = Glm5Indexer(glm5_config, layer_idx=0)
     
     # Match weights
@@ -405,7 +405,7 @@ def test_mla_q_projection_chain_vs_hf(glm5_config, random_seed):
     """
     batch_size, seq_len = 2, 32
     
-    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0)
+    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0).to(torch.bfloat16)
     batchgen_mla = Glm5MLA(glm5_config, layer_idx=0)
     
     # Copy weights: Q projection chain
@@ -519,7 +519,7 @@ def test_mla_kv_path_vs_hf(glm5_config, random_seed):
     """
     batch_size, seq_len = 2, 32
     
-    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0)
+    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0).to(torch.bfloat16)
     batchgen_mla = Glm5MLA(glm5_config, layer_idx=0)
     
     # Copy weights
@@ -578,7 +578,7 @@ def test_mla_full_forward_pre_rope_vs_hf(glm5_config, random_seed):
     """
     batch_size, seq_len = 1, 16
     
-    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0)
+    hf_attn = HfGlmMoeDsaAttention(glm5_config, layer_idx=0).to(torch.bfloat16)
     batchgen_mla = Glm5MLA(glm5_config, layer_idx=0)
     
     # Copy ALL weights
