@@ -92,34 +92,39 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
 ):
     # Constants matching C++ implementation
     FP8_SAFE_MAX: tl.constexpr = 448.0  # Leave headroom
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0  # Precomputed reciprocal.
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
-    
+
     pid_seq = tl.program_id(0)
     pid_token = tl.program_id(1)
     pid_block = tl.program_id(2)
-    
+
     # Calculate offsets
     block_start = pid_block * block_size
     block_offsets = pid_seq * q_stride0 + pid_token * q_stride1 + \
                     (block_start + tl.arange(0, block_size)) * q_stride2
-    
+
     # Load with masking for partial blocks
     mask = (block_start + tl.arange(0, block_size)) < dim
     q_bf16 = tl.load(q_ptr + block_offsets, mask=mask, other=0.0)
-    
+
     # Convert to float32 for computation
     q_float = q_bf16.to(tl.float32)
-    
+
     # Compute absolute maximum (symmetric quantization)
     q_abs = tl.abs(q_float)
     amax = tl.max(q_abs, axis=0)
-    
+
     # Apply minimum threshold (matching C++)
     amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    
-    # Compute scale factor
-    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+
+    # Compute scale factor. Use the SGLang formula ``amax * (1/448)``
+    # instead of ``amax / 448`` — Triton's FP32 division vs multiplication
+    # produce different sub-ULP bit patterns, which propagates into
+    # ``q/scale`` and yields different FP8 rounding on ~0.1% of elements
+    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
     
     # Quantize with explicit clamping
     q_scaled = q_float / scale
@@ -172,6 +177,7 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
     failure first.
     """
     FP8_SAFE_MAX: tl.constexpr = 448.0
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
 
@@ -191,7 +197,8 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
 
     amax = tl.max(tl.abs(q_float), axis=0)
     amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+    # SGLang formula: amax * (1/448). See 3D kernel above for rationale.
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
 
     q_scaled = q_float / scale
     q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
