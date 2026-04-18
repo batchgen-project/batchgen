@@ -827,9 +827,12 @@ class GLM5ParallelStrategyManager:
     def _load_model_skeleton(self):
         """Load skeleton weights as-is (no CPU dequant). FP8 dequant happens on-the-fly."""
         loaded, skipped, remapped = 0, 0, 0
+        qa_trace = []
         for key, param in self.model.named_parameters():
             if key in self.state_dict_name_map:
                 skipped += 1
+                if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
+                    qa_trace.append(f"SKIPPED (in state_dict_name_map): {key}")
                 continue
             # Try direct match first, then remapped key
             ckpt_key = key
@@ -842,12 +845,30 @@ class GLM5ParallelStrategyManager:
                 loaded += 1
                 if ckpt_key != key:
                     remapped += 1
+                if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
+                    qa_trace.append(f"LOADED: {key} (ckpt_key={ckpt_key})")
             elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
                 loaded += 1
+                if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
+                    qa_trace.append(f"LOADED (fallback): {key}")
             else:
+                if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
+                    qa_trace.append(f"MISSING from skeleton: {key} (tried ckpt_key={ckpt_key})")
                 if self.rank == 0 and "gate" in key:
                     logging.warning(f"[SKELETON] Missing key: {key} (tried ckpt_key={ckpt_key})")
+
+        if self.rank == 0 and qa_trace:
+            # Log first few samples from each bucket
+            seen_types = {}
+            for entry in qa_trace:
+                bucket = entry.split(":", 1)[0]
+                seen_types.setdefault(bucket, []).append(entry)
+            for bucket, entries in seen_types.items():
+                logging.warning(
+                    f"[SKELETON q_a/kv_a trace] {bucket}: {len(entries)} entries; "
+                    f"examples: {entries[:3]}"
+                )
 
         if self.rank == 0:
             logging.info(f"[SKELETON] loaded={loaded}, skipped={skipped}, remapped={remapped}")
