@@ -144,10 +144,18 @@ class GLM5_Parameter_Server:
         first_k_dense = self.model_config.first_k_dense_replace  # 3
 
         for layer_idx in trange(num_layers, desc="Parsing state_dict"):
-            # Attention parameters (EXCLUDING indexer — indexer goes to skeleton)
+            # Attention parameters (EXCLUDING indexer — indexer goes to skeleton;
+            # EXCLUDING q_a_layernorm/kv_a_layernorm — tiny BF16 RMSNorm weights,
+            # route them through skeleton too. If they stay in state_dict_name_map
+            # they get stripped from the skeleton loader AND never actually
+            # written into the live module at prefill time, so the module keeps
+            # its `ones_()` init and every attention layer's Q/K norm is wrong.
+            # q_a_layernorm is [2048] bf16 = 4KB/layer, kv_a_layernorm is [512]
+            # bf16 = 1KB/layer → ~400KB total, trivial to hold in skeleton.)
             for name, _ in model.model.layers[layer_idx].self_attn.named_parameters():
-                # Skip indexer parameters — they stay in skeleton
                 if name.startswith("indexer."):
+                    continue
+                if name in ("q_a_layernorm.weight", "kv_a_layernorm.weight"):
                     continue
                 tensor_full_name = f"model.layers.{layer_idx}.self_attn.{name}"
                 self.state_dict_name_map[tensor_full_name] = {

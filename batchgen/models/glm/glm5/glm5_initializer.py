@@ -105,13 +105,17 @@ class GLM5Initializer:
         # q_b_proj: [n_heads * (qk_nope + qk_rope), q_lora_rank] = [64*256, 2048] = [16384, 2048]
         # kv_b_proj: [n_heads * (qk_nope + v_head), kv_lora_rank] = [64*(192+256), 512] = [28672, 512]
         # o_proj: [hidden_size, n_heads * v_head_dim] = [6144, 64*256] = [6144, 16384]
+        # q_a_layernorm and kv_a_layernorm are now loaded via the skeleton path
+        # at model init (see glm5_parameter_server.py) — tiny BF16 RMSNorm
+        # weights that don't benefit from the async copy-task. Listing them
+        # here caused the copy-task bundle to allocate space but the actual
+        # data never got written, leaving the live nn.Module at its ones_()
+        # init and every attention Q/K RMSNorm silently wrong.
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
                 "q_a_proj.weight": [2048, 6144],
-                "q_a_layernorm.weight": [2048],
                 "q_b_proj.weight": [16384, 2048],
                 "kv_a_proj_with_mqa.weight": [576, 6144],
-                "kv_a_layernorm.weight": [512],
                 "kv_b_proj.weight": [28672, 512],
                 "o_proj.weight": [6144, 16384],
             },
@@ -127,12 +131,10 @@ class GLM5Initializer:
             },
         }
 
-        # Per-tensor dtype overrides: layernorm weights must be BF16
+        # No per-tensor dtype overrides needed — attn bundle is all FP8 now
+        # (norms moved to skeleton).
         self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
-            "attn": {
-                "q_a_layernorm.weight": torch.bfloat16,
-                "kv_a_layernorm.weight": torch.bfloat16,
-            },
+            "attn": {},
         }
 
     def _parse_model_config(self):

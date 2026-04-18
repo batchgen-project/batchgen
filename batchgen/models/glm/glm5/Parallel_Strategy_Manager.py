@@ -625,7 +625,12 @@ class GLM5ParallelStrategyManager:
                 )
 
     def _load_attn_module(self):
-        """Load attention FP8 weights for decode (persistent on GPU)."""
+        """Load attention FP8 weights for decode (persistent on GPU).
+
+        q_a_layernorm / kv_a_layernorm now route through the skeleton path at
+        model init (see glm5_parameter_server.py), so this function only moves
+        the 5 FP8 projections onto device.
+        """
         device = self.engine_config.Basic_Config.device_torch
         for layer_idx in range(len(self.model.model.layers)):
             attn = self.model.model.layers[layer_idx].self_attn
@@ -635,8 +640,6 @@ class GLM5ParallelStrategyManager:
             attn.kv_a_proj_with_mqa.weight.data = tensors["kv_a_proj_with_mqa.weight"].to(device)
             attn.kv_b_proj.weight.data = tensors["kv_b_proj.weight"].to(device)
             attn.o_proj.weight.data = tensors["o_proj.weight"].to(device)
-            attn.q_a_layernorm.weight.data = tensors["q_a_layernorm.weight"].to(device)
-            attn.kv_a_layernorm.weight.data = tensors["kv_a_layernorm.weight"].to(device)
 
     def _load_shared_expert_module(self):
         """Load shared expert FP8 weights for decode (persistent on GPU)."""
