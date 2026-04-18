@@ -1120,7 +1120,7 @@ class GPUPagedKVCacheManager:
 				_rank = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
 			except Exception:
 				_rank = 0
-			if _rank == 0:
+			if True:  # NO rank filter — data-parallel spreads seqs across all ranks
 				# Rate-limit to first N iters per rank to keep log tractable.
 				_iter_cap = int(os.environ.get("BATCHGEN_GLM5_BOOKKEEP_MAX_ITERS", "30"))
 				if not hasattr(self.__class__, "_bookkeep_iter_count"):
@@ -1141,7 +1141,7 @@ class GPUPagedKVCacheManager:
 					_target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
 					# One-line iter breadcrumb so we can see when the diagnostic
 					# is active and what global_idx are in this micro-batch.
-					print(f"[BOOKKEEP L0 iter={_iter_idx}] bs={batch_size} cur_batch={_cur_batch[:10]} target={sorted(_target_set)}")
+					print(f"[BOOKKEEP L0 rank={_rank} iter={_iter_idx}] bs={batch_size} cur_batch={_cur_batch[:10]} target={sorted(_target_set)}")
 					# When cur_batch is populated, dump matching target seqs.
 					# When cur_batch is empty (path that doesn't set it), dump
 					# first 10 slots so we can at least see bookkeeping state.
@@ -1162,14 +1162,14 @@ class GPUPagedKVCacheManager:
 							_page_off = _pos % _ps
 							_phys = int(page_table_view[_slot, _page_idx].item()) if _page_idx < len(_pt_row) else -99
 							_kwrote = k_tokens[_loc, 0:_hd].tolist()[:8]
-							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] loc={_loc} slot={_slot} "
+							print(f"[BOOKKEEP L0 rank={_rank} iter={_iter_idx} gid={_gid}] loc={_loc} slot={_slot} "
 							      f"write_pos={_pos} page_idx={_page_idx} page_off={_page_off} phys_page={_phys}")
-							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] page_table_row={_pt_row}")
-							print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] k_written[head0,:8]={_kwrote}")
+							print(f"[BOOKKEEP L0 rank={_rank} iter={_iter_idx} gid={_gid}] page_table_row={_pt_row}")
+							print(f"[BOOKKEEP L0 rank={_rank} iter={_iter_idx} gid={_gid}] k_written[head0,:8]={_kwrote}")
 							if _phys >= 0:
 								_kread = k_cache_layer[_phys, _page_off, 0, :].tolist()[:8]
 								_match = all(abs(w - r) < 1e-3 for w, r in zip(_kwrote, _kread))
-								print(f"[BOOKKEEP L0 iter={_iter_idx} gid={_gid}] k_readback[head0,:8]={_kread} match={_match}")
+								print(f"[BOOKKEEP L0 rank={_rank} iter={_iter_idx} gid={_gid}] k_readback[head0,:8]={_kread} match={_match}")
 
 			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
 			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
