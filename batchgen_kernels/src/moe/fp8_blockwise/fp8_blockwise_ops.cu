@@ -73,14 +73,23 @@ __global__ void act_quant_3d_kernel(
                 local_max = fmaxf(local_max, other);
             }
 
-            float s = fmaxf(local_max, QUANT_EPS) / FP8_MAX_VAL;
-            float inv_s = 1.0f / s;
+            // Match SGLang's FP32 op sequence (`scale = amax * (1/448)`,
+            // `scaled = x / scale`) so the CUDA kernel produces byte-exact
+            // FP8 vs SGLang's Triton `_act_quant_kernel`. Previously we did
+            //     s = fmax(local_max, eps) / FP8_MAX_VAL;  // FP32 division
+            //     inv_s = 1.0f / s;                        // FP32 reciprocal
+            //     scaled = vals[i] * inv_s;                // FP32 mul
+            // which introduces an extra FP32 rounding step and flips the
+            // final FP8 cast on ~0.1% of elements (see
+            // tests/test_glm5_act_quant_triton_vs_triton.py).
+            constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
+            float s = fmaxf(local_max, QUANT_EPS) * FP8_MAX_VAL_INV;
 
             #pragma unroll
             for (int i = 0; i < 4; i++) {
                 int col = col_base + lane_id * 4 + i;
                 if (col < K) {
-                    float scaled = vals[i] * inv_s;
+                    float scaled = vals[i] / s;
                     scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
                     y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
                 }
