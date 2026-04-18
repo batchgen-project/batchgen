@@ -312,30 +312,27 @@ class TestGlm5RouterVsHF:
         batchgen_gate.weight.data.copy_(hf_router.weight.data)
         batchgen_gate.e_score_correction_bias.data.copy_(hf_router.e_score_correction_bias.data)
         
-        # Random BF16 input
+        # Random BF16 input; flatten to match HF's internal view(-1, hidden_size).
         x = torch.randn(bsz, seq_len, config.hidden_size, dtype=torch.bfloat16)
-        
+        x_flat = x.view(-1, config.hidden_size)
+
         # Get logits
         with torch.no_grad():
-            # HF returns raw logits
+            # HF router internally flattens and returns [B*S, num_experts].
             hf_logits = hf_router(x)
-            
-            # BatchGen gate.forward returns (topk_weights, topk_indices)
-            # We need to extract the router logits before sigmoid/bias/topk
-            # Manually compute for comparison
-            batchgen_logits = F.linear(x.float(), batchgen_gate.weight.float())
-        
+            # BatchGen gate uses F.linear(x.float(), w.float()). Feed the
+            # already-flattened x so shapes align with HF's output.
+            batchgen_logits = F.linear(x_flat.float(), batchgen_gate.weight.float())
+
+        assert hf_logits.shape == batchgen_logits.shape, (
+            f"Shape mismatch: HF={hf_logits.shape}, BatchGen={batchgen_logits.shape}"
+        )
+
         # Compare logits (before sigmoid)
-        try:
-            torch.testing.assert_close(
-                batchgen_logits, hf_logits,
-                atol=1e-3, rtol=1e-3,
-                msg=f"Router logits mismatch (bsz={bsz}, seq={seq_len})"
-            )
-        except AssertionError as e:
-            max_diff = (batchgen_logits - hf_logits).abs().max().item()
-            logger.error(f"Router logits divergence: max_diff={max_diff:.6e}")
-            raise
+        if torch.allclose(batchgen_logits, hf_logits, atol=1e-3, rtol=1e-3):
+            return  # pass
+        max_diff = (batchgen_logits - hf_logits).abs().max().item()
+        pytest.fail(f"Router logits divergence: max_diff={max_diff:.6e}")
 
     @pytest.mark.parametrize("bsz,seq_len", [
         (1, 16),
@@ -361,37 +358,33 @@ class TestGlm5RouterVsHF:
         batchgen_gate.weight.data.copy_(hf_moe.gate.weight.data)
         batchgen_gate.e_score_correction_bias.data.copy_(hf_moe.gate.e_score_correction_bias.data)
         
-        # Random hidden states
+        # Random hidden states; feed already-flattened to BatchGen.
         x = torch.randn(bsz, seq_len, config.hidden_size, dtype=torch.bfloat16)
-        
+        x_flat = x.view(-1, config.hidden_size)
+
         with torch.no_grad():
-            # HF: get router logits, then route
+            # HF: get router logits, then route (route works on [B*S, E])
             hf_logits = hf_moe.gate(x)
             hf_topk_indices, hf_topk_weights = hf_moe.route_tokens_to_experts(hf_logits)
-            
-            # BatchGen: directly call gate.forward
-            batchgen_topk_weights, batchgen_topk_indices = batchgen_gate(x)
-        
-        # Compare indices
+
+            # BatchGen: directly call gate.forward on flat input
+            batchgen_topk_weights, batchgen_topk_indices = batchgen_gate(x_flat)
+
+        # Shapes must match
+        assert batchgen_topk_indices.shape == hf_topk_indices.shape, (
+            f"topk_indices shape mismatch: "
+            f"BatchGen={batchgen_topk_indices.shape} HF={hf_topk_indices.shape}"
+        )
+
+        # topk indices should be identical (deterministic given identical logits)
         assert (batchgen_topk_indices == hf_topk_indices).all(), \
-            f"topk_indices divergence detected"
-        
+            f"topk_indices value divergence"
+
         # Compare weights element-wise
-        try:
-            torch.testing.assert_close(
-                batchgen_topk_weights, hf_topk_weights,
-                atol=1e-3, rtol=1e-3,
-                msg=f"topk_weights mismatch (bsz={bsz}, seq={seq_len})"
-            )
-        except AssertionError as e:
-            max_diff = (batchgen_topk_weights - hf_topk_weights).abs().max().item()
-            max_idx = (batchgen_topk_weights - hf_topk_weights).abs().argmax().item()
-            logger.error(
-                f"topk_weights divergence: max_diff={max_diff:.6e} at index {max_idx}\n"
-                f"batchgen[{max_idx}]={batchgen_topk_weights.view(-1)[max_idx].item():.8f}, "
-                f"hf[{max_idx}]={hf_topk_weights.view(-1)[max_idx].item():.8f}"
-            )
-            raise
+        if torch.allclose(batchgen_topk_weights, hf_topk_weights, atol=1e-3, rtol=1e-3):
+            return
+        max_diff = (batchgen_topk_weights - hf_topk_weights).abs().max().item()
+        pytest.fail(f"topk_weights divergence: max_diff={max_diff:.6e}")
 
 
 # ============================================================================
@@ -410,11 +403,13 @@ class TestGlm5ExpertPrefillVsHF:
         from batchgen.models.glm.glm5.model import Glm5Expert
         
         bsz, seq_len = 2, 16
-        
-        # Create HF expert (extract as if from naive MoE)
-        hf_gate_up = nn.Linear(config.hidden_size, 2 * config.moe_intermediate_size, bias=False)
-        hf_down = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)
-        
+
+        # Create HF expert (extract as if from naive MoE) in BF16 to match
+        # BatchGen expert dtype — otherwise F.linear rejects BF16 input with
+        # an FP32 weight matrix.
+        hf_gate_up = nn.Linear(config.hidden_size, 2 * config.moe_intermediate_size, bias=False).to(torch.bfloat16)
+        hf_down = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False).to(torch.bfloat16)
+
         # Create BatchGen expert
         batchgen_expert = Glm5Expert(config.hidden_size, config.moe_intermediate_size).to(torch.bfloat16)
         
@@ -603,22 +598,26 @@ class TestCriticalBiasHandling:
         hf_moe = HfGlmMoeDsaMoE(config).to(torch.bfloat16)
         batchgen_gate = Glm5MoEGate(config).to(torch.bfloat16)
         
-        # Set non-zero bias (to detect if it's being applied to weights)
+        # Set non-zero bias (to detect if it's being applied to weights). Use
+        # .data.copy_ because e_score_correction_bias is an nn.Parameter with
+        # requires_grad; direct copy_ on Parameter with requires_grad=True
+        # throws a "leaf variable requires grad" error.
         bias_value = torch.tensor([1.0, -1.0, 0.5, -0.5, 0.1, -0.1, 0.2, -0.2])[:config.n_routed_experts]
-        hf_moe.gate.e_score_correction_bias.copy_(bias_value)
-        batchgen_gate.e_score_correction_bias.copy_(bias_value)
-        
+        hf_moe.gate.e_score_correction_bias.data.copy_(bias_value)
+        batchgen_gate.e_score_correction_bias.data.copy_(bias_value)
+
         # Copy other weights
         batchgen_gate.weight.data.copy_(hf_moe.gate.weight.data)
-        
-        # Single token, single sequence
+
+        # Single token, single sequence; pass flattened to BatchGen.
         x = torch.randn(1, 1, config.hidden_size, dtype=torch.bfloat16)
-        
+        x_flat = x.view(-1, config.hidden_size)
+
         with torch.no_grad():
             hf_logits = hf_moe.gate(x)
             hf_topk_idx, hf_topk_weights = hf_moe.route_tokens_to_experts(hf_logits)
-            
-            batchgen_topk_weights, batchgen_topk_idx = batchgen_gate(x)
+
+            batchgen_topk_weights, batchgen_topk_idx = batchgen_gate(x_flat)
         
         # Verify: weights are NOT affected by bias
         # Extract the chosen expert scores before bias
@@ -689,24 +688,29 @@ class TestRobustness:
     def test_router_zero_bias(self, config, torch_seed):
         """Test router with zero bias (sanity check)."""
         from batchgen.models.glm.glm5.model import Glm5MoEGate
-        
+
         hf_moe = HfGlmMoeDsaMoE(config).to(torch.bfloat16)
         batchgen_gate = Glm5MoEGate(config).to(torch.bfloat16)
-        
-        # Explicitly zero bias
-        hf_moe.gate.e_score_correction_bias.zero_()
-        batchgen_gate.e_score_correction_bias.zero_()
-        
+
+        # Explicitly zero bias. .data.zero_ avoids the "leaf Variable
+        # requires grad" error on Parameters with requires_grad=True.
+        hf_moe.gate.e_score_correction_bias.data.zero_()
+        batchgen_gate.e_score_correction_bias.data.zero_()
+
         batchgen_gate.weight.data.copy_(hf_moe.gate.weight.data)
-        
+
         x = torch.randn(4, 32, config.hidden_size, dtype=torch.bfloat16)
-        
+        x_flat = x.view(-1, config.hidden_size)
+
         with torch.no_grad():
             hf_logits = hf_moe.gate(x)
             hf_topk_idx, hf_topk_weights = hf_moe.route_tokens_to_experts(hf_logits)
-            
-            batchgen_topk_weights, batchgen_topk_idx = batchgen_gate(x)
-        
+
+            batchgen_topk_weights, batchgen_topk_idx = batchgen_gate(x_flat)
+
+        assert batchgen_topk_idx.shape == hf_topk_idx.shape, (
+            f"Shape mismatch: BatchGen={batchgen_topk_idx.shape} HF={hf_topk_idx.shape}"
+        )
         assert (batchgen_topk_idx == hf_topk_idx).all()
         torch.testing.assert_close(batchgen_topk_weights, hf_topk_weights, atol=1e-3, rtol=1e-3)
 
