@@ -700,7 +700,11 @@ def w8a16_gemm(
 	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
 	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
 	x_fp8 = act_quant(x)
-	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
+	# disable_ue8m0_cast removed — on Hopper (SM90) the flag is a no-op
+	# (layout.hpp:22 early-exits for arch_major==9 regardless), and omitting
+	# lets DeepGEMM's default handling apply (same as SGLang). This also
+	# ensures Blackwell upgrade path uses UE8M0 natively when appropriate.
+	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)
 	else:
