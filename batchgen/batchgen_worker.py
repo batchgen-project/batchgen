@@ -6907,12 +6907,22 @@ class BatchGenWorker:
 					except Exception as _e:
 						logging.warning(f"[BOOKKEEP prefill-hidden] dump failed: {_e}")
 
-				# Call lm_head in FP32 for logit precision (matches Kimi convention).
-				logits = torch.nn.functional.linear(
-					last_token_hidden.float(),
-					self.model.lm_head.weight.float(),
-					self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-				)
+				# lm_head matmul: default BF16 (matches HF / SGLang / vLLM; avoids
+				# FP32 amplification of upstream BF16 round-off across a 944M-element
+				# matmul that can flip top-1 at tight logit margins). Opt into the
+				# old FP32-cast path with BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
+				if _os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+					logits = torch.nn.functional.linear(
+						last_token_hidden.float(),
+						self.model.lm_head.weight.float(),
+						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+					)
+				else:
+					logits = torch.nn.functional.linear(
+						last_token_hidden,
+						self.model.lm_head.weight,
+						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+					).float()
 
 				# Debug: dump top-20 logits at the final prefill position for the first
 				# few sequences of a batch. Gated by BATCHGEN_GLM5_LOGIT_DUMP=1.

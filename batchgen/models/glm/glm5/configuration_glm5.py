@@ -91,6 +91,17 @@ class Glm5Config(PretrainedConfig):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        # GLM-5 checkpoints nest rope_theta under `rope_parameters` — unwrap it
+        # here so a future checkpoint that overrides the base does not silently
+        # fall back to the kwarg default. Top-level `rope_theta` (if ever
+        # passed) takes precedence. Also surface `rope_type`.
+        _rope_params = kwargs.get("rope_parameters")
+        if isinstance(_rope_params, dict):
+            rope_theta = _rope_params.get("rope_theta", rope_theta)
+            self.rope_type = _rope_params.get("rope_type", "default")
+        else:
+            self.rope_type = "default"
+        self.rope_parameters = _rope_params
         self.rope_theta = rope_theta
         self.rope_interleave = rope_interleave
         self.indexer_rope_interleave = indexer_rope_interleave

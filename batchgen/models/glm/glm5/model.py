@@ -1746,14 +1746,24 @@ class Glm5MoE(nn.Module):
         return self.shared_experts(identity)
 
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Prefill: per-expert loop (no EP)."""
+        """Prefill: per-expert loop (no EP).
+
+        Accumulation dtype: default BF16 (matches HF ``GlmMoeDsaNaiveMoe`` which
+        uses ``torch.zeros_like(hidden_states)`` keeping input dtype). Opt into
+        the old FP32 accumulate path with ``BATCHGEN_GLM5_MOE_FP32_ACCUM=1``.
+        """
+        import os as _os_moe
+        _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
 
         topk_weights, topk_indices = self.gate(hidden_flat)
 
-        output = torch.zeros_like(hidden_flat, dtype=torch.float32)
+        if _moe_fp32:
+            output = torch.zeros_like(hidden_flat, dtype=torch.float32)
+        else:
+            output = torch.zeros_like(hidden_flat)
         n_active = 0
         for i, expert in enumerate(self.experts):
             if isinstance(expert, _Glm5ExpertPlaceholder):
@@ -1769,9 +1779,13 @@ class Glm5MoE(nn.Module):
                 topk_weights[expert_mask],
                 torch.zeros_like(topk_weights[expert_mask])
             ).sum(dim=-1)
-            output[expert_mask] += expert_output.float() * expert_weight.unsqueeze(-1)
+            if _moe_fp32:
+                output[expert_mask] += expert_output.float() * expert_weight.unsqueeze(-1)
+            else:
+                output[expert_mask] += expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
 
-        output = output.to(hidden_flat.dtype)
+        if _moe_fp32:
+            output = output.to(hidden_flat.dtype)
         output = output + self.shared_experts(identity)
         return output.view(*orig_shape)
 

@@ -1356,10 +1356,20 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		pass
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
-	# Apply rotary embeddings
+	# Apply rotary embeddings. Default: native interleaved RoPE (matches HF /
+	# SGLang / vLLM `is_neox_style=False` when `rope_interleave=true`). The
+	# prior reshape+split-half trick is dot-product-equivalent but outputs a
+	# permuted layout that does not match SGLang element-for-element. Opt
+	# back into the legacy reshape trick via BATCHGEN_GLM5_ROPE_LEGACY=1.
+	import os as _os_rope
 	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	if _os_rope.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1":
+		q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	else:
+		from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
+		q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
