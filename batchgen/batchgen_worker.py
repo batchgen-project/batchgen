@@ -6834,6 +6834,25 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
+				# Hidden-state dump for GLM-5 bookkeeping diagnostic.
+				# Prints last_token_hidden[:8] for target global seqs so we can diff
+				# against an external reference (SGLang / HF). Env-gated via
+				# BATCHGEN_GLM5_BOOKKEEP_SEQS=<gid1,gid2,...>.
+				_bookkeep_env = _os_env.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+				if _bookkeep_env:
+					try:
+						_target_gids = {int(s) for s in _bookkeep_env.split(",") if s.strip()}
+						_cur = Attn_Wrapper.cur_batch or []
+						for _loc, _gid in enumerate(_cur):
+							if _gid in _target_gids and _loc < last_token_hidden.shape[0]:
+								_fp = last_token_hidden[_loc, :8].float().cpu().tolist()
+								logging.warning(
+									f"[BOOKKEEP prefill-hidden rank={getattr(self, 'rank', 0)} "
+									f"gid={_gid} loc={_loc}] last_token_hidden[:8]={_fp}"
+								)
+					except Exception as _e:
+						logging.warning(f"[BOOKKEEP prefill-hidden] dump failed: {_e}")
+
 				# Call lm_head in FP32 for logit precision (matches Kimi convention).
 				logits = torch.nn.functional.linear(
 					last_token_hidden.float(),
