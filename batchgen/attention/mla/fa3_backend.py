@@ -1348,6 +1348,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			f"out_abs_mean={_out_abs_kv:.6f} "
 			f"ratio_out_over_in={_out_abs_kv/max(_in_abs_kv, 1e-12):.6f}"
 		)
+	# Phase D stage 4: post kv_a_layernorm (layer 0 only)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(normed_kv, stage="kv_norm", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Apply rotary embeddings
@@ -1379,6 +1385,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
+	# Phase D stage 3: post Q assembly (q_nope + RoPE'd q_pe), layer 0
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(query_states, stage="q_assembled", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
@@ -1453,10 +1465,22 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		attn_output = attn_output[0]
 
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
+	# Phase D stage 5: post FA3 attention (pre-o_proj)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(attn_output, stage="attn_out", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	attn_output = _gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
+	# Phase D stage 6: post o_proj
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(attn_output, stage="o_proj", layer_idx=_layer_idx)
+	except Exception:
+		pass
 
 	return attn_output, offload_kv

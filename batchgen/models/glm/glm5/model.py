@@ -24,6 +24,73 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+
+def glm5_prefill_trace(tensor, stage: str, layer_idx: int = 0) -> None:
+	"""Phase D per-stage hidden-state trace for GLM-5 prefill.
+
+	Log-only diagnostic. Gated on:
+	  - env BATCHGEN_GLM5_PREFILL_TRACE=1
+	  - layer_idx == 0
+	  - rank 0 (if distributed)
+	  - env BATCHGEN_GLM5_BOOKKEEP_SEQS non-empty
+	  - Attn_Wrapper.prepack_cu_seqlens + cur_batch populated
+
+	For each target gid, logs the prefill-last-position fingerprint of the
+	given tensor (FP32-cast abs_mean, max_abs, mean, std, first16). Used by
+	Phase D (velvet-popping-hopper plan) to bisect which stage in the
+	layer-0 forward pass first diverges from SGLang's reference.
+	"""
+	import os as _os_trace
+	if _os_trace.environ.get("BATCHGEN_GLM5_PREFILL_TRACE", "0") != "1":
+		return
+	if layer_idx != 0:
+		return
+	try:
+		import torch.distributed as _dist_trace
+		if _dist_trace.is_initialized() and _dist_trace.get_rank() != 0:
+			return
+	except Exception:
+		pass
+	_bookkeep = _os_trace.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+	if not _bookkeep:
+		return
+	try:
+		targets = {int(s) for s in _bookkeep.split(",") if s.strip()}
+	except Exception:
+		return
+	try:
+		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+	except Exception:
+		return
+	cur_batch = getattr(_AWB, "cur_batch", None) or []
+	cu_seqlens = getattr(_AWB, "prepack_cu_seqlens", None)
+	if cu_seqlens is None or len(cur_batch) == 0:
+		return
+	try:
+		t = tensor
+		if t.dim() >= 3 and t.shape[0] == 1:
+			t = t[0]
+		import logging as _logging_trace
+		for loc, gid in enumerate(cur_batch):
+			if int(gid) not in targets:
+				continue
+			s_end = int(cu_seqlens[loc + 1].item()) - 1
+			if s_end >= t.shape[0]:
+				continue
+			row = t[s_end].detach().float().reshape(-1)
+			_logging_trace.warning(
+				f"[PREFILL-TRACE L0 stage={stage} gid={gid} loc={loc}] "
+				f"shape={tuple(tensor.shape)} pos_last={s_end} "
+				f"abs_mean={row.abs().mean().item():.6f} "
+				f"max_abs={row.abs().max().item():.6f} "
+				f"mean={row.mean().item():.6f} "
+				f"std={row.std().item():.6f} "
+				f"first16={row[:16].tolist()}"
+			)
+	except Exception as e:
+		import logging as _logging_trace
+		_logging_trace.warning(f"[PREFILL-TRACE stage={stage}] failed: {e}")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1839,6 +1906,8 @@ class Glm5DecoderLayer(nn.Module):
         # Pre-norm attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        # Phase D stage 2: post input_layernorm (layer 0 only)
+        glm5_prefill_trace(hidden_states, stage="input_ln", layer_idx=self.layer_idx)
         hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1854,10 +1923,14 @@ class Glm5DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.eps,
         )
+        # Phase D stage 7: post post_attention_layernorm (pre-MLP)
+        glm5_prefill_trace(hidden_states, stage="post_attn_ln", layer_idx=self.layer_idx)
 
         # MoE/FFN
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        # Phase D stage 8: post MLP + residual (layer 0 output)
+        glm5_prefill_trace(hidden_states, stage="mlp_out", layer_idx=self.layer_idx)
 
         return hidden_states, attn_weights, present
 
@@ -1907,6 +1980,8 @@ class Glm5Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
+        # Phase D stage 1: embedding output (pre-layer0)
+        glm5_prefill_trace(hidden_states, stage="embed", layer_idx=0)
 
         for idx, layer in enumerate(self.layers):
             past_kv = past_key_values[idx] if past_key_values is not None else None
