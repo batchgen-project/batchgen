@@ -143,6 +143,9 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "256"))
 # ============================================================================
 
 class Glm5RMSNorm(nn.Module):
+    # Class-level dedup set: per-process, one log per (data_ptr, hidden_size).
+    _RMSNORM_SELFCHECK_SEEN: set = set()
+
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -150,6 +153,34 @@ class Glm5RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         import os as _os_rmsn
+
+        # Self-check probe (env-gated): logs the EXACT weight tensor the
+        # forward uses — data_ptr + abs_mean + first-8 — so we can verify
+        # at runtime that the trained tensor (not a shadowed `ones`) is
+        # what reaches the kernel. Deduped per (data_ptr, hidden_size) so
+        # one log per unique tensor per rank. Complements the existing
+        # BATCHGEN_GLM5_RMSNORM_IO_LOG probe that logs at the caller.
+        if _os_rmsn.environ.get("BATCHGEN_GLM5_RMSNORM_SELFCHECK", "0") == "1":
+            _w = self.weight
+            _key = (_w.data_ptr(), _w.shape[-1])
+            if _key not in Glm5RMSNorm._RMSNORM_SELFCHECK_SEEN:
+                Glm5RMSNorm._RMSNORM_SELFCHECK_SEEN.add(_key)
+                try:
+                    import torch.distributed as _dist_sc
+                    _rk = _dist_sc.get_rank() if _dist_sc.is_initialized() else 0
+                except Exception:
+                    _rk = 0
+                import logging as _logging_sc
+                _wf = _w.detach().float()
+                _logging_sc.warning(
+                    f"[RMSNORM-SELFCHECK rank={_rk} ptr={_w.data_ptr():#x} "
+                    f"H={_w.shape[-1]} dtype={_w.dtype}] "
+                    f"abs_mean={_wf.abs().mean().item():.4f} "
+                    f"std={_wf.std().item():.4f} "
+                    f"min={_wf.min().item():.4f} max={_wf.max().item():.4f} "
+                    f"first8={_wf[:8].tolist()}"
+                )
+
         if _os_rmsn.environ.get("BATCHGEN_GLM5_USE_CUDA_RMSNORM", "0") == "1":
             from batchgen.attention.fused_kernels import cuda_rmsnorm
             return cuda_rmsnorm(x, self.weight, self.eps)
