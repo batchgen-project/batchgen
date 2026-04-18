@@ -129,14 +129,17 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     # Handle NaN/Inf (set to 0)
     is_finite = tl.abs(q_scaled) < 1e30  # Triton doesn't have isfinite
     q_scaled = tl.where(is_finite, q_scaled, 0.0)
-    
-    # Convert to FP8
-    q_fp8 = q_scaled.to(tl.float8e4nv)
-    
-    # Store results
+
+    # Store directly to FP8 output pointer — the typed pointer's dtype
+    # drives the implicit FP32→FP8 cast inside ``tl.store`` and uses
+    # round-to-nearest-even, matching SGLang's ``_act_quant_kernel``
+    # (triton_kernel.py:76-77). The prior explicit ``.to(tl.float8e4nv)``
+    # used a different rounding mode and produced FP8 bytes that differed
+    # from SGLang at ~0.03-0.20% of elements across typical GLM-5 shapes
+    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
     out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + \
                   (block_start + tl.arange(0, block_size)) * out_stride2
-    tl.store(out_ptr + out_offsets, q_fp8, mask=mask)
+    tl.store(out_ptr + out_offsets, q_scaled, mask=mask)
     tl.store(scale_ptr + pid_seq * scale_stride0 + pid_token * scale_stride1 + \
              pid_block * scale_stride2, scale)
 
@@ -196,11 +199,11 @@ def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
     is_finite = tl.abs(q_scaled) < 1e30
     q_scaled = tl.where(is_finite, q_scaled, 0.0)
 
-    q_fp8 = q_scaled.to(tl.float8e4nv)
-
+    # Implicit FP32 -> FP8 cast via typed pointer (round-to-nearest-even).
+    # See 3D-grid variant above for rationale.
     scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
     out_offsets = pid_m * out_stride_m_i64 + cols * out_stride_d
-    tl.store(out_ptr + out_offsets, q_fp8, mask=col_mask)
+    tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
     tl.store(scale_ptr + pid_m * scale_stride_m_i64 + pid_b * scale_stride_b, scale)
 
 
