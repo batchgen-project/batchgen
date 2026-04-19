@@ -30,7 +30,7 @@ Usage:
 
     # Load tokenizer
     from batchgen.config import load_tokenizer
-    tokenizer = load_tokenizer("/path/to/model")
+    tokenizer = load_tokenizer("/path/to/model", "/path/to/converted_ckpt")
 """
 
 # Model configuration

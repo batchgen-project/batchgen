@@ -156,8 +156,13 @@ setup(
             "external/**/*.rst",
             # Op builder Python files
             "op_builder/**/*.py",
-            # Data files (tokenizers, configs, etc.)
-            "**/*.json",
+            # Data files (model configs and authored assets)
+            "models/**/config*.json",
+            "models/**/generation_config.json",
+            "models/**/special_tokens_map.json",
+            "models/**/model.safetensors.index.json",
+            "models/**/preprocessor_config.json",
+            "models/moonshotai/kimi_k25/assets/tokenizer_config.json",
             "**/*.parquet",
             "**/*.jinja",
             "**/*.model",

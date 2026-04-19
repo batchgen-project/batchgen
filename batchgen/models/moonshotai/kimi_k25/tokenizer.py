@@ -26,7 +26,7 @@ The Kimi K2.5 tokenizer uses TikToken format with 163,840 tokens.
 
 import json
 import re
-from pathlib import Path
+from importlib.resources import as_file, files
 from typing import Dict, List, Optional, Union
 
 import torch
@@ -34,9 +34,6 @@ from tokenizers import AddedToken
 
 from batchgen.config.base_tokenizer import BaseTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
-
-# Kimi K2.5 tokenizer assets directory
-TOKENIZER_DIR = Path(__file__).parent / "assets"
 
 # Kimi K2.5 special token IDs (from tokenizer_config.json)
 KIMI_K25_BOS_TOKEN_ID = 163584  # "[BOS]"
@@ -60,16 +57,20 @@ class KimiK25Tokenizer(BaseTokenizer):
         vocab_size: 163840
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer_path: Optional[str] = None):
         """Initialize Kimi K2.5 tokenizer from assets."""
+        del tokenizer_path
+
         # Import TikTokenTokenizer from assets
         from batchgen.models.moonshotai.kimi_k25.assets.tokenization_kimi import (
             TikTokenTokenizer,
         )
 
         # Load tokenizer config
-        config_file = TOKENIZER_DIR / "tokenizer_config.json"
-        with open(config_file) as f:
+        config_resource = files("batchgen.models.moonshotai.kimi_k25.assets").joinpath(
+            "tokenizer_config.json"
+        )
+        with config_resource.open() as f:
             config = json.load(f)
 
         # Get added_tokens_decoder and convert to AddedToken format
@@ -80,20 +81,26 @@ class KimiK25Tokenizer(BaseTokenizer):
         }
 
         # Load tokenizer from tiktoken.model with added_tokens_decoder and special tokens
-        vocab_file = str(TOKENIZER_DIR / "tiktoken.model")
-        self._tokenizer = TikTokenTokenizer(
-            vocab_file,
-            bos_token="[BOS]",
-            eos_token="[EOS]",
-            pad_token="[PAD]",
-            unk_token="[UNK]",
-            added_tokens_decoder=added_tokens_decoder
+        vocab_resource = files("batchgen.models.moonshotai.kimi_k25.assets").joinpath(
+            "tiktoken.model"
         )
+        with as_file(vocab_resource) as vocab_file:
+            self._tokenizer = TikTokenTokenizer(
+                str(vocab_file),
+                bos_token="[BOS]",
+                eos_token="[EOS]",
+                pad_token="[PAD]",
+                unk_token="[UNK]",
+                added_tokens_decoder=added_tokens_decoder
+            )
 
         # Load chat template from jinja file
-        jinja_file = TOKENIZER_DIR / "chat_template.jinja"
-        if jinja_file.exists():
-            self._tokenizer.chat_template = jinja_file.read_text()
+        jinja_resource = files("batchgen.models.moonshotai.kimi_k25.assets").joinpath(
+            "chat_template.jinja"
+        )
+        if jinja_resource.is_file():
+            with jinja_resource.open() as jinja_file:
+                self._tokenizer.chat_template = jinja_file.read()
 
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID

@@ -46,9 +46,6 @@ from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Tokenizer config files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
-
 # GPT-OSS-120B special token IDs (from OpenAI reference)
 GPT_OSS_BOS_TOKEN_ID = 199998   # <|startoftext|>
 GPT_OSS_EOS_TOKEN_ID = 200002   # <|return|>
@@ -73,6 +70,16 @@ GPT_OSS_SPECIAL_TOKENS = {
     "<|reserved_200011|>": 200011,
     "<|call|>": 200012,
 }
+
+GPT_OSS_DEFAULT_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message.role == 'system' %}<|start|>system<|message|>{{ message.content }}\n\n"
+    "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>"
+    "{% elif message.role == 'user' %}<|start|>user<|message|>{{ message.content }}<|end|>"
+    "{% elif message.role == 'assistant' %}<|start|>assistant<|channel|>final<|message|>{{ message.content }}<|end|>"
+    "{% endif %}{% endfor %}"
+    "{% if add_generation_prompt %}<|start|>assistant{% endif %}"
+)
 
 
 def _get_tiktoken_tokenizer() -> tiktoken.Encoding:
@@ -114,8 +121,9 @@ class GPTOssTokenizer(BaseTokenizer):
         vocab_size: 201,088
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer_path: str | Path | None = None):
         """Initialize the GPT-OSS tokenizer using tiktoken."""
+        self.tokenizer_path = Path(tokenizer_path) if tokenizer_path is not None else None
         self.tokenizer = _get_tiktoken_tokenizer()
 
         # Set special token IDs
@@ -140,15 +148,18 @@ class GPTOssTokenizer(BaseTokenizer):
 
     def _load_chat_template(self) -> Optional[str]:
         """Load chat template from tokenizer_config.json if available."""
-        config_file = TOKENIZER_DIR / "tokenizer_config.json"
-        if config_file.exists():
-            try:
-                with open(config_file, "r") as f:
-                    config = json.load(f)
-                return config.get("chat_template")
-            except Exception as e:
-                logger.warning(f"Failed to load chat template: {e}")
-        return None
+        if self.tokenizer_path is not None:
+            config_file = self.tokenizer_path / "tokenizer_config.json"
+            if config_file.exists():
+                try:
+                    with open(config_file, "r") as f:
+                        config = json.load(f)
+                    return config.get("chat_template")
+                except Exception as e:
+                    logger.warning(f"Failed to load chat template: {e}")
+
+        logger.info("Using built-in GPT-OSS chat template fallback")
+        return GPT_OSS_DEFAULT_CHAT_TEMPLATE
 
     def encode(
         self,

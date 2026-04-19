@@ -103,6 +103,7 @@ class BatchScheduler:
         self._stopped = asyncio.Event()
         self._tokenizer = None
         self._tokenizer_model: Optional[str] = None
+        self._tokenizer_dir: Optional[str] = None
         # Request pool state
         self._pool_mode = server_args.max_pool_size > 0
         self._max_intake_capacity = getattr(server_args, 'max_intake_capacity', 1_000_000)
@@ -763,14 +764,23 @@ class BatchScheduler:
         The model name is used for pattern matching to select the appropriate
         tokenizer. Tokenizer files are loaded from the BatchGen package directory.
         """
-        if self._tokenizer_model == model and self._tokenizer is not None:
+        tokenizer_dir = (
+            str(self.server_args.converted_ckpt_dir)
+            if self.server_args.converted_ckpt_dir is not None
+            else None
+        )
+
+        if (
+            self._tokenizer_model == model
+            and self._tokenizer_dir == tokenizer_dir
+            and self._tokenizer is not None
+        ):
             return self._tokenizer
 
         from batchgen.config.tokenizer_registry import load_tokenizer
 
         try:
-            # Model name used for pattern matching; tokenizer loads from package dir
-            tokenizer = load_tokenizer(model)
+            tokenizer = load_tokenizer(model, self.server_args.converted_ckpt_dir)
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to load tokenizer for {model}: {exc}"
@@ -778,6 +788,7 @@ class BatchScheduler:
 
         self._tokenizer = tokenizer
         self._tokenizer_model = model
+        self._tokenizer_dir = tokenizer_dir
         return tokenizer
 
     def _normalize_worker_results(

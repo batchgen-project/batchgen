@@ -1795,10 +1795,12 @@ class BatchGenWorker:
 				f"(model_config={model_max}, client_max_context_length={client_max})"
 			)
 		
-		# Load tokenizer using BatchGen's tokenizer abstraction
-		# This removes the dependency on transformers.AutoTokenizer
-		# Pass model identifier for pattern matching; tokenizer loads from package dir
-		self.tokenizer = load_tokenizer(self.huggingface_ckpt_name)
+		# Load tokenizer using BatchGen's tokenizer abstraction.
+		# Tokenizer assets now live in the converted checkpoint directory.
+		self.tokenizer = load_tokenizer(
+			self.huggingface_ckpt_name,
+			self.converted_ckpt_dir,
+		)
 
 		# Set EOS token IDs from tokenizer (support multiple stop tokens)
 		self.eos_token_id = self.tokenizer.eos_token_id
@@ -10096,4 +10098,3 @@ class BatchGenWorker:
 		dist.barrier()
 		
 		logging.info(f"Rank {self.rank}: State reset completed")
-

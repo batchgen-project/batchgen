@@ -10,13 +10,14 @@ GLM-5 tokenizer specifications:
 - EOS tokens: [154820, 154827, 154829] (multiple stop tokens)
 - PAD token: 154820 (same as first EOS)
 - BOS token: not used
-- Uses HuggingFace tokenizer.json format (bundled in this directory)
+- Uses HuggingFace tokenizer.json format copied into the converted checkpoint dir
 """
 
 import json
 import logging
 import re
 import uuid
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -24,8 +25,6 @@ from batchgen.config.fast_tokenizer import FastTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
-
-TOKENIZER_DIR = Path(__file__).parent
 
 GLM5_EOS_TOKEN_ID = 154820
 GLM5_PAD_TOKEN_ID = 154820
@@ -37,7 +36,7 @@ GLM5_VOCAB_SIZE = 154880
 class GLM5Tokenizer(FastTokenizer):
     """GLM-5 tokenizer.
 
-    Loads tokenizer.json from package directory (not user cache).
+    Loads tokenizer.json from the converted checkpoint directory.
     Requires tokenizers>=0.21 which natively supports ignore_merges.
 
     Attributes:
@@ -47,15 +46,16 @@ class GLM5Tokenizer(FastTokenizer):
         vocab_size: 154,880
     """
 
-    def __init__(self):
-        super().__init__(str(TOKENIZER_DIR))
+    def __init__(self, tokenizer_path: str | Path):
+        super().__init__(str(tokenizer_path))
 
-        # Load chat template from separate jinja file (not inline in tokenizer_config.json)
-        chat_template_file = TOKENIZER_DIR / "chat_template.jinja"
-        if chat_template_file.exists():
-            self.chat_template = chat_template_file.read_text()
-        else:
-            self.chat_template = self._config.get("chat_template")
+        # chat_template.jinja remains packaged with BatchGen; only tokenizer JSONs move.
+        chat_template_resource = files(__package__) / "chat_template.jinja"
+        with as_file(chat_template_resource) as chat_template_file:
+            if chat_template_file.exists():
+                self.chat_template = chat_template_file.read_text()
+            else:
+                self.chat_template = self._config.get("chat_template")
 
         self.bos_token_id = None
         self.eos_token_id = GLM5_EOS_TOKEN_ID

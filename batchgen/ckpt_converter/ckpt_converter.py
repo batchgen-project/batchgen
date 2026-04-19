@@ -4,7 +4,8 @@ from safetensors.torch import load_file
 import torch
 import os
 import logging
-import ctypes	
+import shutil
+import ctypes
 class ckpt_converter:
 	"""
 		Convert .safetesors or .pt checkpoints to a format compatible with BatchGen.
@@ -26,7 +27,51 @@ class ckpt_converter:
 		We save the tensors in a file. And the metadata in a json file.
 	"""
 	def __init__(self):
-		pass
+		self._copied_tokenizer_assets = set()
+
+	def _copy_tokenizer_assets(self, source_dir, output_dir):
+		"""Copy tokenizer assets from source checkpoint dir into converted output dir."""
+		copy_key = (os.path.abspath(source_dir), os.path.abspath(output_dir))
+		if copy_key in self._copied_tokenizer_assets:
+			return
+		self._copied_tokenizer_assets.add(copy_key)
+
+		tokenizer_found = False
+		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+			source_file = os.path.join(source_dir, file_name)
+			if not os.path.exists(source_file):
+				continue
+
+			if file_name == "tokenizer.json":
+				tokenizer_found = True
+
+			target_file = os.path.join(output_dir, file_name)
+			shutil.copyfile(source_file, target_file)
+			logging.info(f"Copied {file_name} to converted checkpoint dir: {target_file}")
+
+		if not tokenizer_found:
+			logging.warning(
+				f"tokenizer.json not found in source checkpoint directory: {source_dir}. "
+				"Conversion will continue without tokenizer assets."
+			)
+
+	def _backfill_missing_tokenizer_assets(self, source_dir, output_dir):
+		"""Copy missing tokenizer assets into an existing converted checkpoint dir."""
+		copied_files = []
+		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+			source_file = os.path.join(source_dir, file_name)
+			target_file = os.path.join(output_dir, file_name)
+			if not os.path.exists(source_file) or os.path.exists(target_file):
+				continue
+
+			shutil.copyfile(source_file, target_file)
+			copied_files.append(file_name)
+
+		if copied_files:
+			logging.info(
+				f"Backfilled tokenizer assets into existing converted checkpoint dir {output_dir}: "
+				f"{copied_files}"
+			)
 
 	def _dtype_to_str(self, dtype):
 		"""
@@ -177,6 +222,8 @@ class ckpt_converter:
 		with open(out_metadata_name, "w") as metadata_file:
 			json.dump(metadata, metadata_file, indent=4)
 
+		self._copy_tokenizer_assets(os.path.dirname(os.path.abspath(ckpt_path)), output_dir)
+
 	def _get_checkpoint_files(self, input_dir):
 		"""
 		Get list of checkpoint files (.safetensors or .pt) in a directory.
@@ -192,6 +239,24 @@ class ckpt_converter:
 			if file_name.endswith(".safetensors") or file_name.endswith(".pt"):
 				file_list.append(os.path.join(input_dir, file_name))
 		return sorted(file_list)
+
+	def _get_expected_output_files(self, input_dir):
+		"""Return the exact set of files expected in the converted output dir."""
+		expected_files = set()
+		for src_file in self._get_checkpoint_files(input_dir):
+			file_name = os.path.basename(src_file)
+			expected_files.add(
+				file_name.replace(".safetensors", ".json").replace(".pt", ".json")
+			)
+			expected_files.add(
+				file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
+			)
+
+		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+			if os.path.exists(os.path.join(input_dir, file_name)):
+				expected_files.add(file_name)
+
+		return expected_files
 
 	def validate_converted_directory(self, input_dir, output_dir):
 		"""
@@ -209,27 +274,8 @@ class ckpt_converter:
 		if not file_list:
 			return False, f"No checkpoint files (.safetensors or .pt) found in {input_dir}"
 
-		# Count metadata and bin files
-		metadata_files = []
-		bin_files = []
-		for file_name in os.listdir(output_dir):
-			if file_name.endswith(".json"):
-				metadata_files.append(os.path.join(output_dir, file_name))
-			elif file_name.endswith(".bin"):
-				bin_files.append(os.path.join(output_dir, file_name))
-
-		# Check counts match
-		if len(metadata_files) != len(bin_files):
-			return False, (
-				f"Metadata files ({len(metadata_files)}) and bin files ({len(bin_files)}) count mismatch. "
-				f"Please clean {output_dir} and reconvert."
-			)
-
-		if len(metadata_files) != len(file_list):
-			return False, (
-				f"Converted files ({len(metadata_files)}) and source checkpoint files ({len(file_list)}) count mismatch. "
-				f"Please clean {output_dir} and reconvert."
-			)
+		if not os.path.isdir(output_dir):
+			return False, f"Output directory {output_dir} does not exist or is not a directory."
 
 		# Check each source file has corresponding converted files
 		for src_file in file_list:
@@ -253,6 +299,24 @@ class ckpt_converter:
 					f"Bin file {bin_file} does not exist. "
 					f"Please clean {output_dir} and reconvert."
 				)
+
+		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+			source_file = os.path.join(input_dir, file_name)
+			output_file = os.path.join(output_dir, file_name)
+			if os.path.exists(source_file) and not os.path.exists(output_file):
+				return False, (
+					f"Tokenizer asset {output_file} does not exist. "
+					f"Please clean {output_dir} and reconvert."
+				)
+
+		expected_files = self._get_expected_output_files(input_dir)
+		actual_files = {entry.name for entry in os.scandir(output_dir)}
+		unexpected_files = sorted(actual_files - expected_files)
+		if unexpected_files:
+			return False, (
+				f"Unexpected files or directories in {output_dir}: {unexpected_files}. "
+				f"Please clean {output_dir} and reconvert."
+			)
 
 		return True, None
 
@@ -299,6 +363,7 @@ class ckpt_converter:
 
 		# Check if already converted
 		if os.path.exists(output_dir) and not force:
+			self._backfill_missing_tokenizer_assets(input_dir, output_dir)
 			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir)
 			if is_valid:
 				logging.info(f"Converted checkpoint files already exist and are valid in {output_dir}")
@@ -346,7 +411,4 @@ class ckpt_converter:
 
 
 		
-
-
-
 

@@ -16,7 +16,8 @@ import os
 
 from gpt_oss.torch.model import TokenGenerator, Transformer, ModelConfig
 from gpt_oss.torch.weights import Checkpoint
-from gpt_oss.tokenizer import get_tokenizer
+
+from batchgen.config.tokenizer_registry import load_tokenizer
 
 
 def patched_from_checkpoint(path: str, device: str = "cuda"):
@@ -53,12 +54,13 @@ def patched_from_checkpoint(path: str, device: str = "cuda"):
 
 def main():
     checkpoint_path = "/data2/tairan/modelscope/hub/models/openai/gpt-oss-120b/original"
+    converted_checkpoint_path = os.path.join(checkpoint_path, "converted_ckpt")
     device = torch.device("cpu")
 
     # Patch the from_checkpoint method
     Transformer.from_checkpoint = staticmethod(patched_from_checkpoint)
 
-    tokenizer = get_tokenizer()
+    tokenizer = load_tokenizer("openai/gpt-oss-120b", converted_checkpoint_path)
 
     print("Loading model...")
     generator = TokenGenerator(checkpoint_path, device)
@@ -88,7 +90,7 @@ def main():
         print(f"PROMPT: {prompt}")
         print(f"{'='*60}")
 
-        tokens = tokenizer.encode(prompt, allowed_special="all")
+        tokens = tokenizer.encode(prompt)
         print(f"Tokens: {len(tokens)}")
 
         print("Generating (max 30 tokens, temp=0)...")
