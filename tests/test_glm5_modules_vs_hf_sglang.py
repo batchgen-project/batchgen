@@ -297,6 +297,66 @@ def _sgl_rmsnorm(x, weight_bf16, cfg, device):
     return out.to(torch.bfloat16)
 
 
+# ============================================================================
+# Step 3 — `q_a_proj` (first FP8 blockwise linear after input_layernorm)
+# ============================================================================
+
+def _bg_linear_fp8(x_bf16, weight_name, device):
+    """BatchGen: run w8a16_gemm (act_quant + DeepGEMM fp8_gemm_nt) on the
+    raw FP8 weight + FP32 blockwise scale from disk.
+
+    Note: we import w8a16_gemm directly — no full BatchGen runtime init.
+    """
+    from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
+    w_fp8 = _load_tensor(weight_name).to(device)
+    w_scale = _load_tensor(weight_name + "_scale_inv").to(device).to(torch.float32)
+    # w8a16_gemm accepts (B, L, K) or (M, K); x shape is (1, L, 6144) → fine.
+    return w8a16_gemm(w_fp8, w_scale, x_bf16).to(torch.bfloat16)
+
+
+def _sgl_linear_fp8_via_dequant(x_bf16, weight_name, device):
+    """SGLang's default GLM-5-on-Hopper path: block-dequant weight to BF16
+    once at load time, then plain BF16 F.linear. This is the canonical
+    reference (matches HF exactly since HF just does BF16 linear on BF16
+    weights)."""
+    w_bf16 = _dequant_fp8_weight(weight_name).to(device)
+    return F.linear(x_bf16, w_bf16).to(torch.bfloat16)
+
+
+def _hf_linear(x_bf16, weight_name, device):
+    """HF ground truth: identical to SGL-dequant (same BF16 × BF16 linear)."""
+    return _sgl_linear_fp8_via_dequant(x_bf16, weight_name, device)
+
+
+@pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
+def test_step3_q_a_proj(probe_ids, embed_weight, ckpt_cfg, device):
+    """Step 3: layer-0 q_a_proj — the first FP8 block-quant linear. BG runs
+    act_quant+fp8_gemm_nt; SGL and HF run BF16 F.linear on the block-dequant
+    weight. Tolerance relaxed slightly to allow for FP8 activation-quant noise
+    (~1e-3 beyond BF16 ULP)."""
+    # Get x = input_layernorm(embed_tokens(probe_ids))
+    x = _hf_embed(probe_ids, embed_weight, ckpt_cfg, device)
+    w_ln = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
+    x = _hf_rmsnorm(x, w_ln, ckpt_cfg, device)  # shared reference
+
+    # Run q_a_proj three ways.
+    wname = "model.layers.0.self_attn.q_a_proj.weight"
+    bg = _bg_linear_fp8(x, wname, device)
+    sgl = _sgl_linear_fp8_via_dequant(x, wname, device)
+    hf = _hf_linear(x, wname, device)
+
+    # HF ≡ SGL here (same math). BG includes FP8 act-quant noise.
+    bg_ok, sgl_ok, verdict = _emit_verdict(
+        "q_a_proj", bg, hf, sgl,
+        rtol=5e-2,  # BF16 GEMM (~1e-2) + FP8 act-quant (~1e-2) headroom
+        atol=2e-2,
+    )
+    assert verdict in ("match",), (
+        f"q_a_proj divergence beyond FP8-quant noise — bg_ok={bg_ok} "
+        f"sgl_ok={sgl_ok} verdict={verdict}"
+    )
+
+
 @pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
 def test_step2_input_layernorm(probe_ids, embed_weight, ckpt_cfg, device):
     """Step 2: layer-0 input_layernorm. Feed HF-side embedding output
@@ -342,4 +402,6 @@ if __name__ == "__main__":
     test_step1_embed_tokens(_probe, _embed_w, _cfg, _device)
     # Step 2 — input_layernorm
     test_step2_input_layernorm(_probe, _embed_w, _cfg, _device)
+    # Step 3 — q_a_proj (first FP8 GEMM)
+    test_step3_q_a_proj(_probe, _embed_w, _cfg, _device)
     print("\n[ALL TESTS PASSED]")
