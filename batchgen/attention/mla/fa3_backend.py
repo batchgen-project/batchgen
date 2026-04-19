@@ -1264,6 +1264,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(query_states, stage="q_a_proj_out", layer_idx=getattr(self, "layer_idx", -1))
+	except Exception:
+		pass
 	# Forward-time norm-weight probe (env-gated). If the trained norm
 	# weight isn't what's being used at forward time, we need to know.
 	import os as _os_nfwd
@@ -1299,11 +1304,21 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			f"out_abs_mean={_out_abs:.6f} "
 			f"ratio_out_over_in={_out_abs/max(_in_abs, 1e-12):.6f}"
 		)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(query_states, stage="q_a_normed", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	query_states = _gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(query_states, stage="q_b_proj_out", layer_idx=_layer_idx)
+	except Exception:
+		pass
 
 	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -1326,6 +1341,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
 			f"first5={_w.detach().float()[:5].tolist()}"
 		)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(compressed_kv, stage="kv_a_proj_out", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
@@ -1381,6 +1401,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["kv_b_proj.weight_scale_inv"],
 		normed_kv
 	)
+	try:
+		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
+		_glm5_trace(kv, stage="kv_b_proj_out", layer_idx=_layer_idx)
+	except Exception:
+		pass
 	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -1399,6 +1424,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	try:
 		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
 		_glm5_trace(query_states, stage="q_assembled", layer_idx=_layer_idx)
+		_glm5_trace(key_states, stage="k_assembled", layer_idx=_layer_idx)
+		_glm5_trace(value_states, stage="value", layer_idx=_layer_idx)
 	except Exception:
 		pass
 	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
