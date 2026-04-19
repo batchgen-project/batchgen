@@ -119,14 +119,26 @@ def run_batchgen(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, t
         y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
         out["input_ln"] = y.to(torch.bfloat16).cpu()
 
+    # Env var BATCHGEN_W8A16_DEQUANT=1 swaps the GEMM path to
+    # `w8a16_gemm_dequant` (dequant weight to BF16 once, then plain BF16
+    # matmul — identical to SGL's Hopper GLM-5 path). Matches the dispatch
+    # in `fa3_backend.py:1259`.
+    _bg_use_dequant = os.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
+
+    def _bg_gemm(w_fp8, w_scale, x):
+        from batchgen.attention.mla.fa3_backend import (  # type: ignore
+            w8a16_gemm, w8a16_gemm_dequant,
+        )
+        fn = w8a16_gemm_dequant if _bg_use_dequant else w8a16_gemm
+        return fn(w_fp8, w_scale, x)
+
     # Step 3 — q_a_proj via BatchGen's real w8a16_gemm (fa3_backend.py:679)
     if "q_a_proj" in steps:
-        from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
         x = _upstream("input_ln")
         wname = "model.layers.0.self_attn.q_a_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
-        y = w8a16_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
+        y = _bg_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
         out["q_a_proj"] = y.cpu()
 
     # Step 4 — q_a_layernorm via BatchGen's Glm5RMSNorm (F.rms_norm)
@@ -137,14 +149,14 @@ def run_batchgen(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, t
         y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
         out["q_a_normed"] = y.to(torch.bfloat16).cpu()
 
-    # Step 5 — q_b_proj via BatchGen's real w8a16_gemm
+    # Step 5 — q_b_proj via BatchGen's real w8a16_gemm (or w8a16_gemm_dequant
+    # when BATCHGEN_W8A16_DEQUANT=1)
     if "q_b_proj" in steps:
-        from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
         x = _upstream("q_a_normed")
         wname = "model.layers.0.self_attn.q_b_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
-        y = w8a16_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
+        y = _bg_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
         out["q_b_proj"] = y.cpu()
 
     return out
