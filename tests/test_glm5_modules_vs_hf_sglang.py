@@ -331,16 +331,36 @@ def _sgl_rmsnorm(x, weight_bf16, cfg, device):
 # ============================================================================
 
 def _bg_linear_fp8(x_bf16, weight_name, device):
-    """BatchGen: run w8a16_gemm (act_quant + DeepGEMM fp8_gemm_nt) on the
-    raw FP8 weight + FP32 blockwise scale from disk.
+    """BatchGen: run the w8a16_gemm *semantics* (act_quant + DeepGEMM
+    FP8×FP8→BF16) on the raw FP8 weight + FP32 blockwise scale from disk.
 
-    Note: we import w8a16_gemm directly — no full BatchGen runtime init.
+    We call `deep_gemm.gemm_fp8_fp8_bf16_nt` directly because BatchGen's
+    `w8a16_gemm` wrapper (fa3_backend.py:679) calls
+    `deep_gemm.fp8_gemm_nt` which is a stale name in the installed
+    deep_gemm — current API is `gemm_fp8_fp8_bf16_nt`. Math is identical
+    (same C++ backend).
+
+    Also uses BatchGen's chunked Triton quant (per_token_blocked_quantize_
+    bf16_to_fp8_chunked) for the activation FP8 quant to mirror
+    BatchGen's prefill hot path exactly.
     """
-    from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
+    import deep_gemm  # type: ignore
+    from batchgen_kernels.triton.fp8_quantize import (  # type: ignore
+        per_token_blocked_quantize_bf16_to_fp8_chunked,
+    )
     w_fp8 = _load_tensor(weight_name).to(device)
     w_scale = _load_tensor(weight_name + "_scale_inv").to(device).to(torch.float32)
-    # w8a16_gemm accepts (B, L, K) or (M, K); x shape is (1, L, 6144) → fine.
-    return w8a16_gemm(w_fp8, w_scale, x_bf16).to(torch.bfloat16)
+    # Flatten (1, L, K) → (L, K) for the quant / gemm.
+    orig_shape = x_bf16.shape
+    x_flat = x_bf16.reshape(-1, x_bf16.shape[-1])
+    x_fp8, x_scale = per_token_blocked_quantize_bf16_to_fp8_chunked(
+        x_flat, block_size=128, chunk_rows=8192,
+    )
+    m = x_flat.shape[0]
+    n = w_fp8.shape[0]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    deep_gemm.gemm_fp8_fp8_bf16_nt((x_fp8, x_scale), (w_fp8, w_scale), out)
+    return out.view(*orig_shape[:-1], n).to(torch.bfloat16)
 
 
 def _sgl_linear_fp8_via_dequant(x_bf16, weight_name, device):
