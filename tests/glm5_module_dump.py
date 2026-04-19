@@ -46,7 +46,11 @@ PROBE_TOKEN_IDS = torch.tensor(
     dtype=torch.long,
 )
 
-ALL_STEPS = ["embed", "input_ln", "q_a_proj", "q_a_normed", "q_b_proj"]
+ALL_STEPS = [
+    "embed", "input_ln",
+    "q_a_proj", "q_a_normed", "q_b_proj",
+    "kv_a_proj", "kv_norm", "kv_b_proj",
+]
 
 
 # ============================================================================
@@ -158,6 +162,38 @@ def run_batchgen(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, t
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
         y = _bg_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
         out["q_b_proj"] = y.cpu()
+
+    # Step 6 — kv_a_proj_with_mqa — FP8 GEMM. Output is [..., kv_lora_rank +
+    # qk_rope_head_dim] = [..., 512 + 64 = 576]. The downstream split into
+    # (kv_a, k_pe) happens at step 7.
+    if "kv_a_proj" in steps:
+        x = _upstream("input_ln")
+        wname = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        y = _bg_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
+        out["kv_a_proj"] = y.cpu()
+
+    # Step 7 — kv_a_layernorm on the kv_a slice of kv_a_proj_out (first
+    # kv_lora_rank=512 dims). BatchGen's Glm5RMSNorm → F.rms_norm.
+    if "kv_norm" in steps:
+        import torch.nn.functional as F
+        kv_a_proj = _upstream("kv_a_proj")
+        kv_lora_rank = cfg["kv_lora_rank"]  # 512
+        kv_a = kv_a_proj[..., :kv_lora_rank].contiguous()
+        w = _load_tensor("model.layers.0.self_attn.kv_a_layernorm.weight").to(device)
+        y = F.rms_norm(kv_a, (kv_a.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
+        out["kv_norm"] = y.to(torch.bfloat16).cpu()
+
+    # Step 8 — kv_b_proj — expands kv_norm [..., 512] → [..., num_heads *
+    # (qk_nope_head_dim + v_head_dim)]. BG uses w8a16_gemm.
+    if "kv_b_proj" in steps:
+        x = _upstream("kv_norm")
+        wname = "model.layers.0.self_attn.kv_b_proj.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        y = _bg_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
+        out["kv_b_proj"] = y.cpu()
 
     return out
 
@@ -280,6 +316,52 @@ def run_sglang(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, tor
         ).to(torch.bfloat16)
         out["q_b_proj"] = y.cpu()
 
+    # Step 6 — kv_a_proj_with_mqa via SGLang's real FP8 GEMM.
+    if "kv_a_proj" in steps:
+        from sglang.srt.layers.quantization.fp8_utils import (  # type: ignore
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+        x = _upstream("input_ln")
+        wname = "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        y = deepgemm_w8a8_block_fp8_linear_with_fallback(
+            x, w_fp8, [128, 128], w_scale,
+        ).to(torch.bfloat16)
+        out["kv_a_proj"] = y.cpu()
+
+    # Step 7 — kv_a_layernorm (SGLang RMSNorm, same recipe as step 2/4).
+    if "kv_norm" in steps:
+        from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
+        kv_a_proj = _upstream("kv_a_proj")
+        kv_lora_rank = cfg["kv_lora_rank"]
+        kv_a = kv_a_proj[..., :kv_lora_rank].contiguous()
+        w = _load_tensor("model.layers.0.self_attn.kv_a_layernorm.weight").to(device)
+        assert w.dtype == torch.bfloat16
+        norm = SglRMSNorm(
+            kv_a.shape[-1], eps=cfg["rms_norm_eps"], weight_dtype=torch.bfloat16,
+        ).to(device)
+        with torch.no_grad():
+            norm.weight.copy_(w)
+        orig_shape = kv_a.shape
+        x_2d = kv_a.reshape(-1, kv_a.shape[-1]).contiguous()
+        y = norm(x_2d).reshape(*orig_shape).to(torch.bfloat16)
+        out["kv_norm"] = y.cpu()
+
+    # Step 8 — kv_b_proj via SGLang's real FP8 GEMM.
+    if "kv_b_proj" in steps:
+        from sglang.srt.layers.quantization.fp8_utils import (  # type: ignore
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+        )
+        x = _upstream("kv_norm")
+        wname = "model.layers.0.self_attn.kv_b_proj.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        y = deepgemm_w8a8_block_fp8_linear_with_fallback(
+            x, w_fp8, [128, 128], w_scale,
+        ).to(torch.bfloat16)
+        out["kv_b_proj"] = y.cpu()
+
     return out
 
 
@@ -369,11 +451,10 @@ def run_hf(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.T
         y = norm(x).to(torch.bfloat16)
         out["q_a_normed"] = y.cpu()
 
-    # Step 5 — q_b_proj via HF BF16 linear on dequant weight
-    if "q_b_proj" in steps:
+    # HF reference: plain BF16 linear on block-dequanted weight.
+    # Pure-math "upper bound"; neither production engine hits this path at runtime.
+    def _hf_linear(x, wname):
         import torch.nn.functional as F
-        x = _upstream("q_a_normed")
-        wname = "model.layers.0.self_attn.q_b_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
         block = 128
@@ -381,8 +462,40 @@ def run_hf(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.T
             block, dim=-1
         )[..., : w_fp8.shape[-2], : w_fp8.shape[-1]]
         w_bf16 = (w_fp8.to(torch.float32) * w_scale_rep).to(torch.bfloat16)
-        y = F.linear(x, w_bf16).to(torch.bfloat16)
-        out["q_b_proj"] = y.cpu()
+        return F.linear(x, w_bf16).to(torch.bfloat16)
+
+    # Step 5 — q_b_proj (HF BF16 linear on dequant weight)
+    if "q_b_proj" in steps:
+        out["q_b_proj"] = _hf_linear(
+            _upstream("q_a_normed"),
+            "model.layers.0.self_attn.q_b_proj.weight",
+        ).cpu()
+
+    # Step 6 — kv_a_proj_with_mqa
+    if "kv_a_proj" in steps:
+        out["kv_a_proj"] = _hf_linear(
+            _upstream("input_ln"),
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+        ).cpu()
+
+    # Step 7 — kv_a_layernorm on the kv_a slice
+    if "kv_norm" in steps:
+        kv_a_proj = _upstream("kv_a_proj")
+        kv_lora_rank = cfg["kv_lora_rank"]
+        kv_a = kv_a_proj[..., :kv_lora_rank].contiguous()
+        w = _load_tensor("model.layers.0.self_attn.kv_a_layernorm.weight").to(device)
+        norm = GlmMoeDsaRMSNorm(kv_a.shape[-1], eps=cfg["rms_norm_eps"]).to(device)
+        with torch.no_grad():
+            norm.weight.copy_(w.to(torch.float32))
+        y = norm(kv_a).to(torch.bfloat16)
+        out["kv_norm"] = y.cpu()
+
+    # Step 8 — kv_b_proj
+    if "kv_b_proj" in steps:
+        out["kv_b_proj"] = _hf_linear(
+            _upstream("kv_norm"),
+            "model.layers.0.self_attn.kv_b_proj.weight",
+        ).cpu()
 
     return out
 
