@@ -241,6 +241,85 @@ def test_step1_embed_tokens(probe_ids, embed_weight, ckpt_cfg, device):
     assert verdict == "match", f"unexpected verdict at embed_tokens: {verdict}"
 
 
+# ============================================================================
+# Step 2 — `input_layernorm` (Glm5RMSNorm / RMSNorm / GlmMoeDsaRMSNorm)
+# ============================================================================
+
+class _HfRMSNorm(nn.Module):
+    """Inlined copy of HF's GlmMoeDsaRMSNorm (modeling_glm_moe_dsa.py:47-65)
+    — cast-then-weight semantics: FP32 variance, cast hidden back to input
+    dtype, then `weight * hidden`.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+def _bg_rmsnorm(x, weight_bf16, cfg, device):
+    """BatchGen Glm5RMSNorm (model.py:145-192) wraps `F.rms_norm` — weight-then-cast."""
+    norm = nn.Module().to(device)  # dummy — just call F.rms_norm directly
+    eps = cfg["rms_norm_eps"]
+    # F.rms_norm signature: (input, normalized_shape, weight=None, eps=None)
+    out = F.rms_norm(x, (x.shape[-1],), weight=weight_bf16, eps=eps)
+    return out.to(torch.bfloat16)
+
+
+def _hf_rmsnorm(x, weight_bf16, cfg, device):
+    eps = cfg["rms_norm_eps"]
+    norm = _HfRMSNorm(x.shape[-1], eps=eps).to(device)
+    with torch.no_grad():
+        # HF's Parameter is FP32 by default — copy preserves FP32 storage
+        # but values come from BF16 weight (exact BF16→FP32 upcast).
+        norm.weight.copy_(weight_bf16.to(torch.float32))
+    out = norm(x)
+    return out.to(torch.bfloat16)
+
+
+def _sgl_rmsnorm(x, weight_bf16, cfg, device):
+    """SGLang RMSNorm forward_native: FP32 variance, `(x * weight).to(orig_dtype)`."""
+    from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
+    eps = cfg["rms_norm_eps"]
+    norm = SglRMSNorm(x.shape[-1], eps=eps).to(device)
+    with torch.no_grad():
+        # SGLang's Parameter defaults to FP32; same exact upcast from BF16.
+        norm.weight.data = norm.weight.data.to(torch.float32)
+        norm.weight.copy_(weight_bf16.to(torch.float32))
+    out = norm.forward_native(x)
+    return out.to(torch.bfloat16)
+
+
+@pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
+def test_step2_input_layernorm(probe_ids, embed_weight, ckpt_cfg, device):
+    """Step 2: layer-0 input_layernorm. Feed HF-side embedding output
+    (same as BG / SGL since embed_tokens matches bit-exact — confirmed at
+    step 1)."""
+    # 1. Get the common "x" for all three engines — the embedding output.
+    x = _hf_embed(probe_ids, embed_weight, ckpt_cfg, device)
+    # 2. Load input_layernorm weight (BF16 on disk per modules_to_not_convert).
+    w = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
+    assert w.dtype == torch.bfloat16, f"expected BF16 input_layernorm, got {w.dtype}"
+    # 3. Run all three RMSNorms.
+    bg = _bg_rmsnorm(x, w, ckpt_cfg, device)
+    hf = _hf_rmsnorm(x, w, ckpt_cfg, device)
+    sgl = _sgl_rmsnorm(x, w, ckpt_cfg, device)
+    bg_ok, sgl_ok, verdict = _emit_verdict(
+        "input_layernorm", bg, hf, sgl,
+        rtol=1e-2, atol=1e-2,
+    )
+    assert verdict in ("match",), (
+        f"RMSNorm divergence — bg_ok={bg_ok} sgl_ok={sgl_ok} verdict={verdict}"
+    )
+
+
 if __name__ == "__main__":
     # Standalone runner — avoids the pytest dependency so the script can
     # run inside any Python env that has torch + sglang (on H20 the sglang
@@ -259,6 +338,8 @@ if __name__ == "__main__":
         _cfg = json.load(_f)
     _probe = PROBE_TOKEN_IDS.to(_device)
     _embed_w = _load_tensor("model.embed_tokens.weight").to(_device)
-    # Step 1
+    # Step 1 — embed_tokens
     test_step1_embed_tokens(_probe, _embed_w, _cfg, _device)
+    # Step 2 — input_layernorm
+    test_step2_input_layernorm(_probe, _embed_w, _cfg, _device)
     print("\n[ALL TESTS PASSED]")
