@@ -114,7 +114,8 @@ class GLM5ParallelStrategyManager:
             )
 
     def _verify_all_weights_loaded(self):
-        """Comprehensive weight-load audit. Env-gated by BATCHGEN_GLM5_WEIGHT_ASSERT.
+        """Comprehensive weight-load audit. Always runs on rank 0; assert only
+        when BATCHGEN_GLM5_WEIGHT_ASSERT=1.
 
         Two checks in one pass:
           1) Enumerate every expected tensor key, confirm presence in
@@ -133,9 +134,6 @@ class GLM5ParallelStrategyManager:
         if self.rank != 0:
             return
         mode = _os.environ.get("BATCHGEN_GLM5_WEIGHT_ASSERT", "").strip()
-        if not mode:
-            return
-
         fail_fast = mode == "1"
         cfg = self.loaded_model_config
         num_layers = cfg.num_hidden_layers
@@ -265,6 +263,12 @@ class GLM5ParallelStrategyManager:
             attn = L.self_attn.module if hasattr(L.self_attn, "module") else L.self_attn
             _check(f"L{i}.q_a_layernorm.weight", attn.q_a_layernorm.weight, "norm_weight")
             _check(f"L{i}.kv_a_layernorm.weight", attn.kv_a_layernorm.weight, "norm_weight")
+            # Attn projection FP8 weights: all-zero or all-same-byte would
+            # mean the weight_copy_task / skeleton path missed them.
+            for _proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
+                _mod = getattr(attn, _proj, None)
+                if _mod is not None and getattr(_mod, "weight", None) is not None:
+                    _check(f"L{i}.self_attn.{_proj}.weight", _mod.weight.data, "fp8_weight")
             # Indexer
             if has_indexer and hasattr(attn, "indexer"):
                 _check(f"L{i}.indexer.k_norm.weight", attn.indexer.k_norm.weight, "norm_weight")
@@ -286,6 +290,18 @@ class GLM5ParallelStrategyManager:
                 _check(f"L{i}.mlp.gate.weight", gate.weight, "gate_weight")
                 _check(f"L{i}.mlp.gate.e_score_correction_bias",
                        gate.e_score_correction_bias, "norm_bias")
+                # Explicit per-layer bias stats — POIS flagged L18 specifically.
+                # Zero-everywhere here means the disk key was missed and routing
+                # silently degrades to raw-sigmoid top-K (no bias correction).
+                if i in (first_k_dense, 18, 39, num_layers - 1):
+                    _b = gate.e_score_correction_bias.detach().float()
+                    logging.warning(
+                        f"[GLM5 WEIGHT-VERIFY] L{i}.mlp.gate.e_score_correction_bias "
+                        f"abs_mean={_b.abs().mean().item():.6f} "
+                        f"min={_b.min().item():.4f} max={_b.max().item():.4f} "
+                        f"nonzero_frac={(_b.abs() > 1e-9).float().mean().item():.3f} "
+                        f"first5={[round(x, 4) for x in _b[:5].tolist()]}"
+                    )
 
         # Global
         _check("model.norm.weight", self.model.model.norm.weight, "norm_weight")
@@ -509,6 +525,7 @@ class GLM5ParallelStrategyManager:
             used = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
             logging.info(f"[MODEL] GPU memory after init: {used / (1024**3):.2f} GB used")
 
+        self._verify_all_weights_loaded()
         self._init_mode_decoding()
         effective_bsz = padding_bsz if padding_bsz is not None else 128
         self._init_decoding_padding_bsz(effective_bsz)
@@ -836,8 +853,33 @@ class GLM5ParallelStrategyManager:
 
     def _load_model_skeleton(self):
         """Load skeleton weights as-is (no CPU dequant). FP8 dequant happens on-the-fly."""
+        from collections import Counter
         loaded, skipped, remapped = 0, 0, 0
         qa_trace = []
+        # Per-bucket counters so a zero-count category (e.g. attn_norm,
+        # e_score_correction_bias) pops immediately in the summary.
+        loaded_bucket = Counter()
+        missing_bucket = Counter()
+
+        def _bucket_for(k: str) -> str:
+            if "q_a_layernorm" in k or "kv_a_layernorm" in k:
+                return "attn_norm"
+            if "input_layernorm" in k or "post_attention_layernorm" in k:
+                return "layer_norm"
+            if "e_score_correction_bias" in k:
+                return "gate_bias"
+            if "indexer" in k:
+                return "indexer"
+            if ".mlp.gate.weight" in k:
+                return "gate_weight"
+            if "embed_tokens" in k or "lm_head" in k or "model.norm" in k:
+                return "global"
+            if ".self_attn." in k:
+                return "attn_other"
+            if ".mlp." in k:
+                return "mlp_other"
+            return "other"
+
         for key, param in self.model.named_parameters():
             if key in self.state_dict_name_map:
                 skipped += 1
@@ -853,6 +895,7 @@ class GLM5ParallelStrategyManager:
             if ckpt_key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[ckpt_key]
                 loaded += 1
+                loaded_bucket[_bucket_for(key)] += 1
                 if ckpt_key != key:
                     remapped += 1
                 if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
@@ -860,12 +903,14 @@ class GLM5ParallelStrategyManager:
             elif key in self.skeleton_state_dict:
                 param.data = self.skeleton_state_dict[key]
                 loaded += 1
+                loaded_bucket[_bucket_for(key)] += 1
                 if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
                     qa_trace.append(f"LOADED (fallback): {key}")
             else:
+                missing_bucket[_bucket_for(key)] += 1
                 if self.rank == 0 and ("q_a_layernorm" in key or "kv_a_layernorm" in key):
                     qa_trace.append(f"MISSING from skeleton: {key} (tried ckpt_key={ckpt_key})")
-                if self.rank == 0 and "gate" in key:
+                if self.rank == 0 and ("gate" in key or "e_score_correction_bias" in key):
                     logging.warning(f"[SKELETON] Missing key: {key} (tried ckpt_key={ckpt_key})")
 
         if self.rank == 0 and qa_trace:
@@ -882,6 +927,16 @@ class GLM5ParallelStrategyManager:
 
         if self.rank == 0:
             logging.info(f"[SKELETON] loaded={loaded}, skipped={skipped}, remapped={remapped}")
+            # Bucket summary — a zero count for attn_norm or gate_bias means
+            # those keys never matched the checkpoint and silently remain at
+            # init (ones for norms, zeros for bias).
+            logging.warning(
+                f"[SKELETON-BUCKETS loaded] {dict(loaded_bucket)}"
+            )
+            if missing_bucket:
+                logging.warning(
+                    f"[SKELETON-BUCKETS missing] {dict(missing_bucket)}"
+                )
 
         skeleton_size = sum(
             p.numel() * p.element_size() for p in self.model.parameters()

@@ -265,6 +265,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
         self._cached_q_absorb = None
         self._cached_out_absorb = None
+        # SGLang-aligned BF16 BMM absorb weights (set by
+        # initialize_decode_absorb). w_kc: [H, 192, 512] BF16 with
+        # SGLang's stride trick; w_vc: [H, 512, 256] BF16 non-contig view.
+        self.w_kc = None
+        self.w_vc = None
         # WP5: FP8 absorb weights (pre-quantized once at init)
         self._fp8_absorb_weights = None
         # WP2: Fused indexer KV proj (CUDA WGMMA)
@@ -310,6 +315,48 @@ class GLM5AttnWrapper(AttnWrapperBase):
         ).view(attn.num_heads, -1, attn.kv_lora_rank)
         self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
+
+        # SGLang-aligned absorb weights for BF16 BMM (matches
+        # deepseek_weight_loader.py:572-578 layout exactly).
+        #
+        #   self.w_kc — [H, qk_nope=192, kv_lora=512], BF16
+        #     `.transpose(1,2).contiguous().transpose(1,2)` is SGLang's stride
+        #     trick: physical memory laid out as [H, 512, 192] contiguous,
+        #     strides swapped on dim 1/2. Math-identical to [H, 192, 512] but
+        #     makes bmm/bmm_fp8 hit the same cuBLAS kernel SGLang triggers.
+        #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
+        #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
+        self.w_kc = self._cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
+        # Mirror SGLang exactly: .contiguous() first, then .transpose — the
+        # final tensor is a non-contiguous view with physical [H, 256, 512]
+        # and logical [H, 512, 256]. Adding a trailing .contiguous() would
+        # re-lay it out and change which cuBLAS kernel bmm dispatches to.
+        self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
+
+        # One-time log per layer (rank-0) so an all-zero dequant result
+        # (→ kv_b_proj weight or its scale missed the load) surfaces
+        # immediately instead of silently producing zero-contribution absorb.
+        if self.layer_idx in (0, 1, 2, 3, 18, 39):
+            try:
+                import torch.distributed as _dist_w
+                _rk = _dist_w.get_rank() if _dist_w.is_initialized() else 0
+            except Exception:
+                _rk = 0
+            if _rk == 0:
+                _q = self._cached_q_absorb.detach().float()
+                _o = self._cached_out_absorb.detach().float()
+                _wfp8 = attn.kv_b_proj.weight.data
+                _ws = weight_scale["kv_b_proj.weight_scale_inv"].detach().float()
+                logging.warning(
+                    f"[WRAPPER-VERIFY L{self.layer_idx} kv_b_proj] "
+                    f"fp8_dtype={_wfp8.dtype} fp8_shape={tuple(_wfp8.shape)} "
+                    f"scale_abs_mean={_ws.abs().mean().item():.6f} "
+                    f"scale_shape={tuple(_ws.shape)} "
+                    f"q_absorb_abs_mean={_q.abs().mean().item():.6f} "
+                    f"q_absorb_std={_q.std().item():.6f} "
+                    f"out_absorb_abs_mean={_o.abs().mean().item():.6f} "
+                    f"out_absorb_std={_o.std().item():.6f}"
+                )
 
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
         if _HAS_FP8_ABSORB and _GLM5_WP5_ENABLED:
@@ -764,7 +811,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             query_kv_dtype = mla_blocked_k.dtype
             query_kv_device = mla_blocked_k.device
 
-        # Step 5: absorbed Q via einsum (WP5 off) — same for both kernel paths.
+        # Step 5: absorbed Q (SGLang BF16 BMM when WP5 off) — same for both
+        # kernel paths.
         with (dt.timed("q_absorb", li) if dt else _nullctx()):
             if self._cached_q_absorb is not None:
                 q_absorb = self._cached_q_absorb
@@ -774,8 +822,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     attn.kv_b_proj.weight.data,
                     weight_scale["kv_b_proj.weight_scale_inv"],
                 ).view(attn.num_heads, -1, attn.kv_lora_rank)
-                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
-                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
+                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
+                if self.w_kc is None:
+                    self.w_kc = q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
+                    self.w_vc = out_absorb.contiguous().transpose(1, 2)
 
             qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
             query_states = torch.empty(
@@ -795,10 +846,17 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 query_states[:, :, :, :attn.kv_lora_rank] = \
                     absorbed_q.view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
             else:
-                # BF16 einsum fallback (kernel unavailable).
-                query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
-                    "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
-                ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+                # SGLang-aligned BF16 BMM absorb
+                # (forward_mla.py:298 — torch.bmm(q_nope.transpose(0,1), w_kc)).
+                # q_nope_squeezed: [B, H, 192]  →  .transpose(0,1) → [H, B, 192]
+                # self.w_kc:       [H, 192, 512]
+                # bmm:             [H, B, 512] → .transpose(0,1) → [B, H, 512]
+                q_nope_out = torch.bmm(
+                    q_nope_squeezed.transpose(0, 1), self.w_kc,
+                ).transpose(0, 1)  # [B, H, kv_lora_rank]
+                query_states[:, :, :, :attn.kv_lora_rank] = q_nope_out.view(
+                    bsz, attn.num_heads, 1, attn.kv_lora_rank,
+                )
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
@@ -860,7 +918,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     attn_out, self._fp8_absorb_weights,
                 )  # [B, 1, H, v_head_dim] (kernel preserves the Q=1 dim)
             else:
-                attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+                # SGLang-aligned BF16 BMM out-absorb
+                # (forward_mla.py:548 — torch.bmm(attn_output.transpose(0,1), w_vc)).
+                # attn_out:  [B, 1, H, kv_lora=512] → squeeze(1) → [B, H, 512]
+                #            .transpose(0,1) → [H, B, 512]
+                # self.w_vc: [H, kv_lora=512, v_head=256]
+                # bmm:       [H, B, 256] → .transpose(0,1) → [B, H, 256]
+                attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
+                attn_output = torch.bmm(
+                    attn_out_3d.transpose(0, 1), self.w_vc,
+                ).transpose(0, 1)  # [B, H, v_head_dim]
+                # Downstream reshape expects 4-D [B, 1, H, v_head_dim]
+                attn_output = attn_output.unsqueeze(1)
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
@@ -1077,8 +1146,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     attn.kv_b_proj.weight.data,
                     weight_scale["kv_b_proj.weight_scale_inv"],
                 ).view(attn.num_heads, -1, attn.kv_lora_rank)
-                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :]
-                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :]
+                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
+                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
+                # JIT SGLang-layout weights for the BMM fallback path.
+                if self.w_kc is None:
+                    self.w_kc = q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
+                    self.w_vc = out_absorb.contiguous().transpose(1, 2)
 
             qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
             query_states = torch.empty(
@@ -1087,7 +1160,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             q_nope_squeezed = q_nope.squeeze(2)  # [B, H, qk_nope_head_dim]
 
-            # WP5: FP8 absorb kernel or fallback to torch.einsum
+            # WP5: FP8 absorb kernel or SGLang-aligned BF16 BMM fallback
             if self._fp8_absorb_weights is not None:
                 absorbed_q = fp8_q_absorb(q_nope_squeezed, self._fp8_absorb_weights)
                 query_states[:, :, :, :attn.kv_lora_rank] = absorbed_q.view(
@@ -1098,11 +1171,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     self._warned_fp8_absorb_fallback = True
                     logging.warning(
                         f"[layer {self.layer_idx}] WP5 FP8 absorb unavailable, "
-                        "falling back to torch.einsum — check batchgen_kernels import"
+                        "falling back to SGLang-aligned BF16 BMM "
+                        "(bmm(q_nope.T, w_kc)) — see wrappers.initialize_decode_absorb"
                     )
-                query_states[:, :, :, :attn.kv_lora_rank] = torch.einsum(
-                    "bhd,hdc->bhc", q_nope_squeezed, q_absorb,
-                ).view(bsz, attn.num_heads, 1, attn.kv_lora_rank)
+                # Matches SGLang's forward_mla.py:298 exactly.
+                q_nope_out = torch.bmm(
+                    q_nope_squeezed.transpose(0, 1), self.w_kc,
+                ).transpose(0, 1)  # [B, H, kv_lora_rank]
+                query_states[:, :, :, :attn.kv_lora_rank] = q_nope_out.view(
+                    bsz, attn.num_heads, 1, attn.kv_lora_rank,
+                )
 
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
@@ -1121,11 +1199,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            # WP5: FP8 out_absorb kernel or fallback to torch.einsum
+            # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
             if self._fp8_absorb_weights is not None:
                 attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             else:
-                attn_output = torch.einsum('bqhc,hdc->bqhd', attn_out, out_absorb)
+                # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
+                attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
+                attn_output = torch.bmm(
+                    attn_out_3d.transpose(0, 1), self.w_vc,
+                ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
