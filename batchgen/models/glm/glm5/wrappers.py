@@ -661,7 +661,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             else fused_rmsnorm_rope_with_q_native
         )
 
-        _use_kimi_mla = _os.environ.get("BATCHGEN_GLM5_USE_KIMI_MLA", "0") == "1"
+        # Default to the DeepSeek-V3 / Kimi `flash_mla_with_kvcache` path:
+        # `causal=True` on the real paged KV with `cache_seqlens` driving the
+        # per-sequence mask — structurally identical to SGLang/vLLM's MLA decode.
+        # The old `sparse_flash_mla_decode` path used `causal=False` +
+        # `arange(max_seqlen)` top-K, which relied on sparse_seqlens clamping
+        # for correctness and was structurally different from both refs.
+        # Env override `BATCHGEN_GLM5_USE_KIMI_MLA=0` keeps the legacy sparse
+        # path for direct A/B comparison.
+        _use_kimi_mla = _os.environ.get("BATCHGEN_GLM5_USE_KIMI_MLA", "1") == "1"
 
         weight_scale = self.weight_dequant_scale
         attn = self.module

@@ -245,15 +245,21 @@ class GLM5ParallelStrategyManager:
             if abs_mean < 1e-9:
                 violations.append((name, f"{kind} all-zero (abs_mean={abs_mean:.2e})"))
                 return
-            # nn.Module default init N(0, 0.02): std~0.02. Norms should be
-            # trained to either near-1 (weight) or near-0 (bias) structure;
-            # a std~0.02 with mean~0 is the tell-tale sign of un-loaded init.
-            if kind == "norm_weight" and abs(abs_mean - 1.0) > 0.5 and stdev < 0.05:
-                violations.append((name, f"{kind} looks like default init "
-                                          f"(abs_mean={abs_mean:.3f} std={stdev:.4f})"))
-            if kind == "norm_bias" and abs_mean > 0.1 and stdev < 0.05:
-                violations.append((name, f"{kind} unexpected distribution "
-                                          f"(abs_mean={abs_mean:.3f} std={stdev:.4f})"))
+            # Default-init detection for RMSNorm.weight: `Glm5RMSNorm.__init__`
+            # uses `torch.ones(hidden_size)` → tensor is uniform 1.0 with
+            # stdev ≈ 0. Only flag if uniform — GLM-5's actual trained norm
+            # weights have small abs_mean (0.02-0.2) with stdev > 1e-4, which
+            # must NOT be mistaken for un-loaded init.
+            if kind == "norm_weight" and stdev < 1e-6 and abs(abs_mean - 1.0) < 1e-4:
+                violations.append((name, f"{kind} is uniform-1.0 (un-loaded ones_init) "
+                                          f"(abs_mean={abs_mean:.6f} std={stdev:.2e})"))
+            # N(0, 0.02) init for Linear.weight — absmean ≈ 0.016, std ≈ 0.02.
+            if kind in ("gate_weight", "embed") and abs_mean < 1e-6:
+                violations.append((name, f"{kind} all-zero "
+                                          f"(abs_mean={abs_mean:.2e})"))
+            # Bias correctness is too model-specific for a heuristic — GLM-5
+            # gate e_score_correction_bias has abs_mean ≈ 6-35 with stdev
+            # ≈ 0.1-0.2 (verified on disk). Only flag all-zero.
 
         # Walk all layers and spot-check loaded-ness
         for i in range(num_layers):
@@ -261,14 +267,30 @@ class GLM5ParallelStrategyManager:
             _check(f"L{i}.input_layernorm.weight", L.input_layernorm.weight, "norm_weight")
             _check(f"L{i}.post_attn_layernorm.weight", L.post_attention_layernorm.weight, "norm_weight")
             attn = L.self_attn.module if hasattr(L.self_attn, "module") else L.self_attn
+            wrapper = L.self_attn if hasattr(L.self_attn, "module") else None
             _check(f"L{i}.q_a_layernorm.weight", attn.q_a_layernorm.weight, "norm_weight")
             _check(f"L{i}.kv_a_layernorm.weight", attn.kv_a_layernorm.weight, "norm_weight")
-            # Attn projection FP8 weights: all-zero or all-same-byte would
-            # mean the weight_copy_task / skeleton path missed them.
-            for _proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-                _mod = getattr(attn, _proj, None)
-                if _mod is not None and getattr(_mod, "weight", None) is not None:
-                    _check(f"L{i}.self_attn.{_proj}.weight", _mod.weight.data, "fp8_weight")
+            # Attn projection FP8 weights: read from the wrapper's captured
+            # references (`self.fp8_q_a_proj` etc.) set by `_register_fp8_weights`
+            # — the underlying `attn.q_a_proj.weight.data` is reset/cleared
+            # after capture so reading it would misleadingly report all-zero.
+            _wrapper_attrs = {
+                "q_a_proj":            "fp8_q_a_proj",
+                "q_b_proj":            "fp8_q_b_proj",
+                "kv_a_proj_with_mqa":  "fp8_kv_a_proj",
+                "kv_b_proj":           "fp8_kv_b_proj",
+                "o_proj":              "fp8_o_proj",
+            }
+            for _proj, _wattr in _wrapper_attrs.items():
+                _t = getattr(wrapper, _wattr, None) if wrapper is not None else None
+                if _t is None:
+                    # Wrapper not populated yet (e.g. prefill phase) — fall
+                    # back to the live module weight.
+                    _mod = getattr(attn, _proj, None)
+                    if _mod is not None and getattr(_mod, "weight", None) is not None:
+                        _t = _mod.weight.data
+                if _t is not None:
+                    _check(f"L{i}.self_attn.{_proj}.weight", _t, "fp8_weight")
             # Indexer
             if has_indexer and hasattr(attn, "indexer"):
                 _check(f"L{i}.indexer.k_norm.weight", attn.indexer.k_norm.weight, "norm_weight")
