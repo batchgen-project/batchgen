@@ -176,10 +176,15 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
                 emb.weight.copy_(ew)
             x = emb(probe).to(torch.bfloat16)
         w = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
-        norm = SglRMSNorm(x.shape[-1], eps=cfg["rms_norm_eps"]).to(device)
+        assert w.dtype == torch.bfloat16
+        # Construct SGLang's RMSNorm with weight_dtype=BF16 so the Parameter
+        # matches disk and sgl_kernel sees the expected dtype. The default
+        # (weight_dtype=None → FP32) would mismatch the disk layout.
+        norm = SglRMSNorm(
+            x.shape[-1], eps=cfg["rms_norm_eps"], weight_dtype=torch.bfloat16,
+        ).to(device)
         with torch.no_grad():
-            norm.weight.data = norm.weight.data.to(torch.float32)
-            norm.weight.copy_(w.to(torch.float32))
+            norm.weight.copy_(w)
         # Call forward() which dispatches to forward_cuda (real sgl_kernel)
         # on CUDA platform. Reshape for the kernel's 2D input requirement.
         orig_shape = x.shape
