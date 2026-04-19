@@ -70,11 +70,28 @@ DEFAULT_ATOL = 1e-2
 _HAS_CUDA = torch.cuda.is_available()
 _HAS_CKPT = MODEL_DIR.exists() and (MODEL_DIR / "model.safetensors.index.json").exists()
 
-try:
-    from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant  # type: ignore
-    _HAS_SGLANG = True
-except Exception:
-    _HAS_SGLANG = False
+_HAS_SGLANG = True  # pure-Python inline — no sglang import needed
+
+
+def block_quant_dequant(
+    x_q_block: torch.Tensor,
+    x_s: torch.Tensor,
+    block_size,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Inlined copy of SGLang's `sglang.srt.layers.quantization.fp8_utils.block_quant_dequant`
+    (20 lines, pure-PyTorch — no sgl_kernel / sglang-env dependency).
+
+    Converts block-wise FP8 quant → dense BF16/FP32 tensor: repeat-interleave
+    the per-block scale over (block_n, block_k) and cast.
+    """
+    block_n, block_k = block_size[0], block_size[1]
+    *_, n, k = x_q_block.shape
+    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
+        block_k, dim=-1
+    )
+    x_scale_repeat = x_scale_repeat[..., :n, :k]
+    return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 pytestmark = [
     pytest.mark.skipif(not _HAS_CUDA, reason="CUDA required"),
@@ -230,7 +247,6 @@ def _emit_verdict(module_name: str, bg, hf, sgl, rtol=DEFAULT_RTOL, atol=DEFAULT
 # Tests (one per module; later modules added incrementally)
 # ============================================================================
 
-@pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
 def test_step1_embed_tokens(probe_ids, embed_weight, ckpt_cfg, device):
     """Step 1: embed_tokens. All three engines should produce identical output."""
     bg = _bg_embed(probe_ids, embed_weight, ckpt_cfg, device)
@@ -285,15 +301,20 @@ def _hf_rmsnorm(x, weight_bf16, cfg, device):
 
 
 def _sgl_rmsnorm(x, weight_bf16, cfg, device):
-    """SGLang RMSNorm forward_native: FP32 variance, `(x * weight).to(orig_dtype)`."""
-    from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
+    """Inlined copy of SGLang RMSNorm.forward_native (layernorm.py:287-331 in
+    /home/tairan/workspace/refs/sglang/...). FP32 variance, `(x * weight).to(orig_dtype)`
+    — weight-then-cast. Independent of the sgl_kernel runtime."""
     eps = cfg["rms_norm_eps"]
-    norm = SglRMSNorm(x.shape[-1], eps=eps).to(device)
-    with torch.no_grad():
-        # SGLang's Parameter defaults to FP32; same exact upcast from BF16.
-        norm.weight.data = norm.weight.data.to(torch.float32)
-        norm.weight.copy_(weight_bf16.to(torch.float32))
-    out = norm.forward_native(x)
+    orig_dtype = x.dtype
+    if not x.is_contiguous():
+        x = x.contiguous()
+    # SGLang's Parameter defaults to FP32; same exact upcast from BF16.
+    weight_fp32 = weight_bf16.to(torch.float32).to(device)
+    x_fp32 = x.to(torch.float32)
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    x_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    # cast_x_before_out_mul=False default → (x * weight).to(orig_dtype)
+    out = (x_fp32 * weight_fp32).to(orig_dtype)
     return out.to(torch.bfloat16)
 
 
@@ -328,7 +349,6 @@ def _hf_linear(x_bf16, weight_name, device):
     return _sgl_linear_fp8_via_dequant(x_bf16, weight_name, device)
 
 
-@pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
 def test_step3_q_a_proj(probe_ids, embed_weight, ckpt_cfg, device):
     """Step 3: layer-0 q_a_proj — the first FP8 block-quant linear. BG runs
     act_quant+fp8_gemm_nt; SGL and HF run BF16 F.linear on the block-dequant
@@ -357,7 +377,6 @@ def test_step3_q_a_proj(probe_ids, embed_weight, ckpt_cfg, device):
     )
 
 
-@pytest.mark.skipif(not _HAS_SGLANG, reason="sglang import required")
 def test_step2_input_layernorm(probe_ids, embed_weight, ckpt_cfg, device):
     """Step 2: layer-0 input_layernorm. Feed HF-side embedding output
     (same as BG / SGL since embed_tokens matches bit-exact — confirmed at
