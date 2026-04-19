@@ -225,12 +225,17 @@ def _diff_stats(a: torch.Tensor, b: torch.Tensor) -> Dict:
 
 
 def _emit_verdict(module_name: str, bg, hf, sgl, rtol=DEFAULT_RTOL, atol=DEFAULT_ATOL):
-    """Print the per-module verdict block + return (bg_matches_hf, sgl_matches_hf)."""
+    """Print the per-module verdict block + return (bg_matches_hf, sgl_matches_hf).
+
+    Uses `torch.allclose`-style element-wise criterion (|a-b| <= atol + rtol*|b|)
+    rather than raw max_rel — so a single near-zero reference element doesn't
+    blow up max_rel and cause false RED verdicts. Raw max_abs / max_rel stats
+    are still printed for human inspection."""
     bg_vs_hf = _diff_stats(bg, hf)
     sgl_vs_hf = _diff_stats(sgl, hf)
     bg_vs_sgl = _diff_stats(bg, sgl)
-    bg_ok = bg_vs_hf["max_abs"] <= atol and bg_vs_hf["max_rel"] <= rtol
-    sgl_ok = sgl_vs_hf["max_abs"] <= atol and sgl_vs_hf["max_rel"] <= rtol
+    bg_ok = torch.allclose(bg.float(), hf.float(), rtol=rtol, atol=atol)
+    sgl_ok = torch.allclose(sgl.float(), hf.float(), rtol=rtol, atol=atol)
     if bg_ok and sgl_ok:
         verdict = "match"
     elif bg_ok and not sgl_ok:
