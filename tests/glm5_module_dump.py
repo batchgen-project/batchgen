@@ -80,14 +80,27 @@ def _load_config() -> Dict:
 # BatchGen engine — runs BatchGen's real runtime modules
 # ============================================================================
 
-def run_batchgen(steps: List[str], device) -> Dict[str, torch.Tensor]:
+def run_batchgen(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.Tensor]:
     """Invoke BatchGen's real layer-0 forward on the fixed probe input.
     Returns a dict {step_name: output_tensor_cpu} so compare can run in
     any env.
+
+    If `ref_dump` is provided, each step reads its UPSTREAM input from
+    that dump instead of recomputing — so divergence at step N tests ONLY
+    that module's math, not accumulated noise from N-1 earlier modules.
     """
     out: Dict[str, torch.Tensor] = {}
     cfg = _load_config()
     probe = PROBE_TOKEN_IDS.to(device)
+
+    def _upstream(name: str) -> torch.Tensor:
+        """Return upstream-step tensor: from ref_dump if supplied, else
+        from this run's own `out` dict (computed above)."""
+        if ref_dump is not None and name in ref_dump:
+            return ref_dump[name].to(device)
+        if name in out:
+            return out[name].to(device)
+        raise RuntimeError(f"Upstream {name} not available — add to --step list")
 
     # Step 1 — embed_tokens (plain nn.Embedding in BatchGen — model.py:1997)
     if "embed" in steps:
@@ -101,7 +114,7 @@ def run_batchgen(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # Step 2 — input_layernorm (Glm5RMSNorm wraps F.rms_norm — model.py:145-192)
     if "input_ln" in steps:
         import torch.nn.functional as F
-        x = out["embed"].to(device) if "embed" in out else _fresh_embed(device, cfg, probe)
+        x = _upstream("embed")
         w = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
         y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
         out["input_ln"] = y.to(torch.bfloat16).cpu()
@@ -109,8 +122,7 @@ def run_batchgen(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # Step 3 — q_a_proj via BatchGen's real w8a16_gemm (fa3_backend.py:679)
     if "q_a_proj" in steps:
         from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
-        x = out["input_ln"].to(device) if "input_ln" in out else \
-            _fresh_input_ln(device, cfg, probe)
+        x = _upstream("input_ln")
         wname = "model.layers.0.self_attn.q_a_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
@@ -120,8 +132,7 @@ def run_batchgen(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # Step 4 — q_a_layernorm via BatchGen's Glm5RMSNorm (F.rms_norm)
     if "q_a_normed" in steps:
         import torch.nn.functional as F
-        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
-        assert x is not None, "q_a_proj required for q_a_normed"
+        x = _upstream("q_a_proj")
         w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
         y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
         out["q_a_normed"] = y.to(torch.bfloat16).cpu()
@@ -149,7 +160,7 @@ def _fresh_input_ln(device, cfg, probe):
 # SGLang engine — runs SGLang's real runtime modules
 # ============================================================================
 
-def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
+def run_sglang(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.Tensor]:
     """Invoke SGLang's real layer-0 forward on the fixed probe. SGLang
     modules (VocabParallelEmbedding, RMSNorm, ColumnParallelLinear) are
     instantiated directly — TP=1, no forward_batch needed for these
@@ -157,6 +168,13 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     cfg = _load_config()
     probe = PROBE_TOKEN_IDS.to(device)
+
+    def _upstream(name: str) -> torch.Tensor:
+        if ref_dump is not None and name in ref_dump:
+            return ref_dump[name].to(device)
+        if name in out:
+            return out[name].to(device)
+        raise RuntimeError(f"Upstream {name} not available — add to --step list")
 
     # Step 1 — embed_tokens via SGLang's VocabParallelEmbedding
     if "embed" in steps:
@@ -175,15 +193,7 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # (layernorm.py:151-222; forward_cuda uses sgl_kernel rmsnorm).
     if "input_ln" in steps:
         from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
-        x = out["embed"].to(device) if "embed" in out else None
-        if x is None:
-            # Recompute embed if skipped
-            import torch.nn as nn
-            ew = _load_tensor("model.embed_tokens.weight").to(device)
-            emb = nn.Embedding(cfg["vocab_size"], cfg["hidden_size"], cfg["pad_token_id"]).to(device)
-            with torch.no_grad():
-                emb.weight.copy_(ew)
-            x = emb(probe).to(torch.bfloat16)
+        x = _upstream("embed")
         w = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
         assert w.dtype == torch.bfloat16
         # Construct SGLang's RMSNorm with weight_dtype=BF16 so the Parameter
@@ -209,8 +219,7 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
             block_quant_dequant,
         )
         import torch.nn.functional as F
-        x = out["input_ln"].to(device) if "input_ln" in out else None
-        assert x is not None, "input_ln required for q_a_proj"
+        x = _upstream("input_ln")
         wname = "model.layers.0.self_attn.q_a_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
@@ -221,8 +230,7 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # Step 4 — q_a_layernorm via SGLang's real RMSNorm (sgl_kernel rmsnorm).
     if "q_a_normed" in steps:
         from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
-        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
-        assert x is not None, "q_a_proj required for q_a_normed"
+        x = _upstream("q_a_proj")
         w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
         assert w.dtype == torch.bfloat16
         norm = SglRMSNorm(
@@ -242,12 +250,19 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
 # HF engine — runs HF transformers' real modules
 # ============================================================================
 
-def run_hf(steps: List[str], device) -> Dict[str, torch.Tensor]:
+def run_hf(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.Tensor]:
     """Invoke HF transformers' real modules from `modeling_glm_moe_dsa.py`.
     Requires `transformers` importable in the env."""
     out: Dict[str, torch.Tensor] = {}
     cfg = _load_config()
     probe = PROBE_TOKEN_IDS.to(device)
+
+    def _upstream(name: str) -> torch.Tensor:
+        if ref_dump is not None and name in ref_dump:
+            return ref_dump[name].to(device)
+        if name in out:
+            return out[name].to(device)
+        raise RuntimeError(f"Upstream {name} not available — add to --step list")
 
     # Make refs/modeling_glm_moe_dsa.py importable by adding its dir.
     hf_ref_dir = "/home/tairan/workspace/refs"
@@ -283,8 +298,7 @@ def run_hf(steps: List[str], device) -> Dict[str, torch.Tensor]:
 
     # Step 2 — input_layernorm via HF's real GlmMoeDsaRMSNorm class
     if "input_ln" in steps:
-        x = out["embed"].to(device) if "embed" in out else None
-        assert x is not None, "embed required"
+        x = _upstream("embed")
         w = _load_tensor("model.layers.0.input_layernorm.weight").to(device)
         norm = GlmMoeDsaRMSNorm(x.shape[-1], eps=cfg["rms_norm_eps"]).to(device)
         with torch.no_grad():
@@ -295,8 +309,7 @@ def run_hf(steps: List[str], device) -> Dict[str, torch.Tensor]:
     # Step 3 — q_a_proj via HF's BF16 linear on dequant weight
     if "q_a_proj" in steps:
         import torch.nn.functional as F
-        x = out["input_ln"].to(device) if "input_ln" in out else None
-        assert x is not None
+        x = _upstream("input_ln")
         # Manual block dequant (same formula as block_quant_dequant, 20 lines)
         wname = "model.layers.0.self_attn.q_a_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
@@ -311,8 +324,7 @@ def run_hf(steps: List[str], device) -> Dict[str, torch.Tensor]:
 
     # Step 4 — q_a_layernorm via HF's real GlmMoeDsaRMSNorm
     if "q_a_normed" in steps:
-        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
-        assert x is not None
+        x = _upstream("q_a_proj")
         w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
         norm = GlmMoeDsaRMSNorm(x.shape[-1], eps=cfg["rms_norm_eps"]).to(device)
         with torch.no_grad():
@@ -373,6 +385,9 @@ def main():
     ap.add_argument("--step", default=",".join(ALL_STEPS),
                     help=f"Comma-separated step names (default: {ALL_STEPS})")
     ap.add_argument("--out", help="Output .pt path (producer mode)")
+    ap.add_argument("--from-ref", metavar="REF.pt",
+                    help="Feed each step its upstream input from this ref dump "
+                         "(isolates module-level divergence — no cascading noise)")
     ap.add_argument("--compare", nargs="+", metavar="DUMP.pt",
                     help="Compare mode: diff two or more .pt dumps")
     args = ap.parse_args()
@@ -385,13 +400,18 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     steps = args.step.split(",")
+    ref_dump = None
+    if args.from_ref:
+        ref_dump = torch.load(args.from_ref, map_location="cpu")
+        print(f"[{args.engine}] upstream ref: {args.from_ref} "
+              f"(steps available: {list(ref_dump.keys())})")
     print(f"[{args.engine}] running steps={steps} on {device}...")
     if args.engine == "batchgen":
-        out = run_batchgen(steps, device)
+        out = run_batchgen(steps, device, ref_dump=ref_dump)
     elif args.engine == "sglang":
-        out = run_sglang(steps, device)
+        out = run_sglang(steps, device, ref_dump=ref_dump)
     else:
-        out = run_hf(steps, device)
+        out = run_hf(steps, device, ref_dump=ref_dump)
     for k, v in out.items():
         print(f"  {k:12s} shape={tuple(v.shape)} dtype={v.dtype} "
               f"abs_mean={v.float().abs().mean().item():.4e}")
