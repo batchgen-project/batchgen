@@ -233,20 +233,21 @@ def run_sglang(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, tor
         y = norm(x_2d).reshape(*orig_shape).to(torch.bfloat16)
         out["input_ln"] = y.cpu()
 
-    # Step 3 — q_a_proj via SGLang's block-dequant + BF16 F.linear (the
-    # exact path `deepseek_weight_loader.py:513-518` configures on
-    # Hopper GLM-5 when weight_block_size=[128,128] + no DEEPGEMM_BMM).
+    # Step 3 — q_a_proj via SGLang's REAL Fp8LinearMethod runtime path
+    # (fp8.py:718-747). Block-quant FP8 weights → per-token-group FP8 act
+    # quant → DeepGEMM FP8 matmul. NOT block_quant_dequant + F.linear —
+    # that's only used for kv_b_proj's MLA absorb post-load.
     if "q_a_proj" in steps:
         from sglang.srt.layers.quantization.fp8_utils import (  # type: ignore
-            block_quant_dequant,
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
-        import torch.nn.functional as F
         x = _upstream("input_ln")
         wname = "model.layers.0.self_attn.q_a_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
-        w_bf16 = block_quant_dequant(w_fp8, w_scale, [128, 128], torch.bfloat16)
-        y = F.linear(x, w_bf16).to(torch.bfloat16)
+        y = deepgemm_w8a8_block_fp8_linear_with_fallback(
+            x, w_fp8, [128, 128], w_scale,
+        ).to(torch.bfloat16)
         out["q_a_proj"] = y.cpu()
 
     # Step 4 — q_a_layernorm via SGLang's real RMSNorm (sgl_kernel rmsnorm).
@@ -265,18 +266,18 @@ def run_sglang(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, tor
         y = norm(x_2d).reshape(*orig_shape).to(torch.bfloat16)
         out["q_a_normed"] = y.cpu()
 
-    # Step 5 — q_b_proj via SGLang block-dequant + F.linear
+    # Step 5 — q_b_proj via SGLang's REAL runtime path (same as step 3).
     if "q_b_proj" in steps:
         from sglang.srt.layers.quantization.fp8_utils import (  # type: ignore
-            block_quant_dequant,
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
-        import torch.nn.functional as F
         x = _upstream("q_a_normed")
         wname = "model.layers.0.self_attn.q_b_proj.weight"
         w_fp8 = _load_tensor(wname).to(device)
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
-        w_bf16 = block_quant_dequant(w_fp8, w_scale, [128, 128], torch.bfloat16)
-        y = F.linear(x, w_bf16).to(torch.bfloat16)
+        y = deepgemm_w8a8_block_fp8_linear_with_fallback(
+            x, w_fp8, [128, 128], w_scale,
+        ).to(torch.bfloat16)
         out["q_b_proj"] = y.cpu()
 
     return out
