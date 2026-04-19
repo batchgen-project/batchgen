@@ -21,6 +21,14 @@ import json
 import math
 import os
 import sys
+
+# Make the `batchgen` package importable when the test is invoked as a
+# standalone script (`python3 tests/xxx.py`) rather than via pytest. Adds
+# the repo root (`BatchGen/`) to sys.path so `from batchgen.foo import bar`
+# resolves.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 try:
     import pytest
     _HAS_PYTEST = True
