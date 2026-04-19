@@ -46,7 +46,7 @@ PROBE_TOKEN_IDS = torch.tensor(
     dtype=torch.long,
 )
 
-ALL_STEPS = ["embed", "input_ln", "q_a_proj", "q_a_normed"]
+ALL_STEPS = ["embed", "input_ln", "q_a_proj", "q_a_normed", "q_b_proj"]
 
 
 # ============================================================================
@@ -136,6 +136,16 @@ def run_batchgen(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, t
         w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
         y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
         out["q_a_normed"] = y.to(torch.bfloat16).cpu()
+
+    # Step 5 — q_b_proj via BatchGen's real w8a16_gemm
+    if "q_b_proj" in steps:
+        from batchgen.attention.mla.fa3_backend import w8a16_gemm  # type: ignore
+        x = _upstream("q_a_normed")
+        wname = "model.layers.0.self_attn.q_b_proj.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        y = w8a16_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
+        out["q_b_proj"] = y.cpu()
 
     return out
 
@@ -243,6 +253,20 @@ def run_sglang(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, tor
         y = norm(x_2d).reshape(*orig_shape).to(torch.bfloat16)
         out["q_a_normed"] = y.cpu()
 
+    # Step 5 — q_b_proj via SGLang block-dequant + F.linear
+    if "q_b_proj" in steps:
+        from sglang.srt.layers.quantization.fp8_utils import (  # type: ignore
+            block_quant_dequant,
+        )
+        import torch.nn.functional as F
+        x = _upstream("q_a_normed")
+        wname = "model.layers.0.self_attn.q_b_proj.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        w_bf16 = block_quant_dequant(w_fp8, w_scale, [128, 128], torch.bfloat16)
+        y = F.linear(x, w_bf16).to(torch.bfloat16)
+        out["q_b_proj"] = y.cpu()
+
     return out
 
 
@@ -331,6 +355,21 @@ def run_hf(steps: List[str], device, ref_dump: Dict = None) -> Dict[str, torch.T
             norm.weight.copy_(w.to(torch.float32))
         y = norm(x).to(torch.bfloat16)
         out["q_a_normed"] = y.cpu()
+
+    # Step 5 — q_b_proj via HF BF16 linear on dequant weight
+    if "q_b_proj" in steps:
+        import torch.nn.functional as F
+        x = _upstream("q_a_normed")
+        wname = "model.layers.0.self_attn.q_b_proj.weight"
+        w_fp8 = _load_tensor(wname).to(device)
+        w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
+        block = 128
+        w_scale_rep = w_scale.repeat_interleave(block, dim=-2).repeat_interleave(
+            block, dim=-1
+        )[..., : w_fp8.shape[-2], : w_fp8.shape[-1]]
+        w_bf16 = (w_fp8.to(torch.float32) * w_scale_rep).to(torch.bfloat16)
+        y = F.linear(x, w_bf16).to(torch.bfloat16)
+        out["q_b_proj"] = y.cpu()
 
     return out
 
