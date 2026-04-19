@@ -46,7 +46,7 @@ PROBE_TOKEN_IDS = torch.tensor(
     dtype=torch.long,
 )
 
-ALL_STEPS = ["embed", "input_ln", "q_a_proj"]
+ALL_STEPS = ["embed", "input_ln", "q_a_proj", "q_a_normed"]
 
 
 # ============================================================================
@@ -116,6 +116,15 @@ def run_batchgen(steps: List[str], device) -> Dict[str, torch.Tensor]:
         w_scale = _load_tensor(wname + "_scale_inv").to(device).to(torch.float32)
         y = w8a16_gemm(w_fp8, w_scale, x).to(torch.bfloat16)
         out["q_a_proj"] = y.cpu()
+
+    # Step 4 — q_a_layernorm via BatchGen's Glm5RMSNorm (F.rms_norm)
+    if "q_a_normed" in steps:
+        import torch.nn.functional as F
+        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
+        assert x is not None, "q_a_proj required for q_a_normed"
+        w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
+        y = F.rms_norm(x, (x.shape[-1],), weight=w, eps=cfg["rms_norm_eps"])
+        out["q_a_normed"] = y.to(torch.bfloat16).cpu()
 
     return out
 
@@ -209,6 +218,23 @@ def run_sglang(steps: List[str], device) -> Dict[str, torch.Tensor]:
         y = F.linear(x, w_bf16).to(torch.bfloat16)
         out["q_a_proj"] = y.cpu()
 
+    # Step 4 — q_a_layernorm via SGLang's real RMSNorm (sgl_kernel rmsnorm).
+    if "q_a_normed" in steps:
+        from sglang.srt.layers.layernorm import RMSNorm as SglRMSNorm  # type: ignore
+        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
+        assert x is not None, "q_a_proj required for q_a_normed"
+        w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
+        assert w.dtype == torch.bfloat16
+        norm = SglRMSNorm(
+            x.shape[-1], eps=cfg["rms_norm_eps"], weight_dtype=torch.bfloat16,
+        ).to(device)
+        with torch.no_grad():
+            norm.weight.copy_(w)
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        y = norm(x_2d).reshape(*orig_shape).to(torch.bfloat16)
+        out["q_a_normed"] = y.cpu()
+
     return out
 
 
@@ -282,6 +308,17 @@ def run_hf(steps: List[str], device) -> Dict[str, torch.Tensor]:
         w_bf16 = (w_fp8.to(torch.float32) * w_scale_rep).to(torch.bfloat16)
         y = F.linear(x, w_bf16).to(torch.bfloat16)
         out["q_a_proj"] = y.cpu()
+
+    # Step 4 — q_a_layernorm via HF's real GlmMoeDsaRMSNorm
+    if "q_a_normed" in steps:
+        x = out["q_a_proj"].to(device) if "q_a_proj" in out else None
+        assert x is not None
+        w = _load_tensor("model.layers.0.self_attn.q_a_layernorm.weight").to(device)
+        norm = GlmMoeDsaRMSNorm(x.shape[-1], eps=cfg["rms_norm_eps"]).to(device)
+        with torch.no_grad():
+            norm.weight.copy_(w.to(torch.float32))
+        y = norm(x).to(torch.bfloat16)
+        out["q_a_normed"] = y.cpu()
 
     return out
 
