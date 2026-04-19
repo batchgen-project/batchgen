@@ -20,7 +20,22 @@ from __future__ import annotations
 import json
 import math
 import os
-import pytest
+import sys
+try:
+    import pytest
+    _HAS_PYTEST = True
+except ImportError:
+    # Fallback shim so the file still parses without pytest installed.
+    # The __main__ block drives tests directly in that case.
+    _HAS_PYTEST = False
+    class _PytestShim:
+        mark = type("mark", (), {
+            "skipif": lambda *a, **k: (lambda fn: fn),
+        })()
+        def fixture(*a, **k):
+            def _deco(fn): return fn
+            return _deco
+    pytest = _PytestShim()  # type: ignore
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -227,4 +242,23 @@ def test_step1_embed_tokens(probe_ids, embed_weight, ckpt_cfg, device):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    # Standalone runner — avoids the pytest dependency so the script can
+    # run inside any Python env that has torch + sglang (on H20 the sglang
+    # conda env doesn't ship pytest). Each step_* test is invoked with
+    # fixture values produced here.
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    if not _HAS_CUDA:
+        print("CUDA unavailable — abort"); sys.exit(2)
+    if not _HAS_CKPT:
+        print(f"checkpoint not at {MODEL_DIR} — abort"); sys.exit(2)
+    if not _HAS_SGLANG:
+        print("sglang not importable — abort"); sys.exit(2)
+    _device = torch.device("cuda")
+    with open(MODEL_DIR / "config.json") as _f:
+        _cfg = json.load(_f)
+    _probe = PROBE_TOKEN_IDS.to(_device)
+    _embed_w = _load_tensor("model.embed_tokens.weight").to(_device)
+    # Step 1
+    test_step1_embed_tokens(_probe, _embed_w, _cfg, _device)
+    print("\n[ALL TESTS PASSED]")
