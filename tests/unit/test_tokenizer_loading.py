@@ -74,7 +74,12 @@ def test_load_tokenizer_from_converted_checkpoint_dir(
         assert tokenizer.decode(token_ids) == "hello world"
 
     if model_identifier == "moonshotai/Kimi-K2.5":
-        assert getattr(tokenizer._tokenizer, "chat_template", None)
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hello"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert rendered == "hello[GEN]"
 
 
 @pytest.mark.parametrize(
