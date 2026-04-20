@@ -184,7 +184,13 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
-from batchgen.prefill.prepack import prepack_sequences, unpack_last_token_logits, get_prepack_stats, PrepackMetadata
+from batchgen.prefill.prepack import (
+	prepack_sequences,
+	unpack_last_token_logits,
+	get_prepack_stats,
+	PrepackMetadata,
+	build_prefill_micro_batches,
+)
 
 # Import modularized components
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
@@ -6758,41 +6764,30 @@ class BatchGenWorker:
 		# on one micro-batch when a single very long sequence is present.
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		_ALLOW_GLM_MULTI_SEQ = _os_mb.environ.get(
+			"BATCHGEN_GLM5_ALLOW_MULTI_SEQ_PREPACK", "0"
+		) == "1"
+		model_type = str(getattr(self.model_config, "model_type", "")).lower()
+		force_single_seq_micro_batches = (
+			model_type == "glm_moe_dsa"
+			and num_sequences > 1
+			and not _ALLOW_GLM_MULTI_SEQ
+		)
+		micro_batches, l2_cap = build_prefill_micro_batches(
+			seq_lengths_list,
+			MAX_TOKENS_PER_MICRO_BATCH,
+			l2_balance=_USE_L2_MB,
+			single_sequence_only=force_single_seq_micro_batches,
+		)
 		total_tokens_all = sum(seq_lengths_list)
-		total_l2_all = sum(L * L for L in seq_lengths_list)
-		# Estimate number of micro-batches from token cap, then derive an L^2
-		# target per micro-batch. Add 20% slack so the L^2 cap rarely bites
-		# unless a single seq is dominant.
-		est_num_mb = max(1, (total_tokens_all + MAX_TOKENS_PER_MICRO_BATCH - 1) // MAX_TOKENS_PER_MICRO_BATCH)
-		l2_cap = int(1.2 * total_l2_all / est_num_mb) if (_USE_L2_MB and est_num_mb > 0) else 0
 
-		micro_batches = []
-		current_batch_start = 0
-		current_batch_tokens = 0
-		current_batch_l2 = 0
-
-		for seq_idx in range(num_sequences):
-			seq_len = seq_lengths_list[seq_idx]
-			seq_l2 = seq_len * seq_len
-
-			# Finalize the current batch if adding this seq would exceed
-			# either the token cap or (when enabled) the L^2 cap. Always
-			# allow the first seq into an empty batch even if it alone
-			# blows the L^2 cap (single huge seq case).
-			over_tokens = current_batch_tokens + seq_len > MAX_TOKENS_PER_MICRO_BATCH
-			over_l2 = (l2_cap > 0) and (current_batch_l2 + seq_l2 > l2_cap)
-			if (over_tokens or over_l2) and current_batch_tokens > 0:
-				micro_batches.append((current_batch_start, seq_idx))
-				current_batch_start = seq_idx
-				current_batch_tokens = 0
-				current_batch_l2 = 0
-
-			current_batch_tokens += seq_len
-			current_batch_l2 += seq_l2
-
-		# Don't forget the last batch
-		if current_batch_start < num_sequences:
-			micro_batches.append((current_batch_start, num_sequences))
+		if force_single_seq_micro_batches and self.rank == 0:
+			logging.warning(
+				"GLM-5 prepacked prefill: forcing single-sequence micro-batches "
+				"to avoid multi-sequence varlen corruption; set "
+				"BATCHGEN_GLM5_ALLOW_MULTI_SEQ_PREPACK=1 to restore the old "
+				"multi-sequence batching path for debugging."
+			)
 
 		if self.rank == 0:
 			logging.info(
@@ -10733,4 +10728,3 @@ class BatchGenWorker:
 		dist.barrier()
 		
 		logging.info(f"Rank {self.rank}: State reset completed")
-
