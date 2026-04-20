@@ -46,6 +46,7 @@ _GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
 _GLM5_USE_DSA_V2 = os.environ.get("BATCHGEN_GLM5_USE_DSA_V2", "0") == "1"
 import torch.nn.functional as F
 
+from batchgen.models.glm.glm5.decode_utils import build_clamped_dense_token_indices
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
@@ -576,11 +577,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 return (attn_output, None, None)
 
             # Dense-MLA path (use_dense_mla=True, indexer not constructed).
-            # Uses absorbed MLA with top-K = arange(max_seqlen); WP2/WP4/WP5
-            # never fire; no aux KV cache. Mirrors Kimi-K2.5's decode shape
-            # but uses sparse_flash_mla_decode (which supports head_dim_v=
-            # kv_lora_rank=512) instead of flash_mla_with_kvcache (requires
-            # head_size_v=576, incompatible with GLM-5's absorbed layout).
+            # Defaults to the validated Kimi / DeepSeek FlashMLA route. The
+            # legacy sparse-gather dense emulation remains available for
+            # debugging via BATCHGEN_GLM5_USE_KIMI_MLA=0.
             attn_output = self._forward_decode_dense(
                 hidden_states, position_ids, cache_seqlens, max_seqlen,
                 gpu_paged_kv_manager,
@@ -617,11 +616,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         Two attention kernel paths supported, gated by env:
 
-        - Default: ``sparse_flash_mla_decode`` with ``top_k_indices = arange(max_seqlen)``.
-          Structurally equivalent to full dense attention, implemented via the
-          DSA sparse kernel so we can pass ``head_dim_v=kv_lora_rank=512``.
-
-        - ``BATCHGEN_GLM5_USE_KIMI_MLA=1``: Kimi / DeepSeek-V3 path —
+        - Default: Kimi / DeepSeek-V3 path —
           ``flash_mla_with_kvcache`` on paged KV directly (no sparse gather).
           This is the validated FlashMLA kernel used by Kimi-K2.5's
           ``mla_decoding_flashmla_attn_mode_3_pure_bf16_with_pagekv``
@@ -633,6 +628,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
           from Kimi but appear only in the absorb/out-absorb einsums around
           the kernel call, which are parametrized via ``attn.qk_nope_head_dim``
           and ``attn.v_head_dim`` and remain correct for GLM-5.
+
+        - ``BATCHGEN_GLM5_USE_KIMI_MLA=0``: legacy dense emulation via
+          ``sparse_flash_mla_decode`` with per-sequence clamped dense indices.
+          This path is kept for debugging only.
 
         WP5 (fp8_q_absorb / fp8_out_absorb) is intentionally NOT used here;
         absorbed Q and out are pure torch.einsum for maximum clarity on this
@@ -805,10 +804,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     )
 
         if not _use_kimi_mla:
-            # Legacy diagnostic path: sparse_flash_mla_decode with arange top-K.
-            top_k_indices = torch.arange(
-                max_seqlen, device=hidden_states.device, dtype=torch.long,
-            ).unsqueeze(0).expand(bsz, -1)
+            # Legacy diagnostic path: dense top-K with per-sequence clamping so
+            # shorter rows never read unwritten tail positions.
+            top_k_indices = build_clamped_dense_token_indices(
+                updated_seqlens, max_seqlen, hidden_states.device,
+            )
             with (dt.timed("sparse_gather", li) if dt else _nullctx()):
                 sparse_mla_kv = sparse_gather_from_paged_kv(
                     mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
@@ -1110,11 +1110,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # the source of L4 LongBench gibberish. Read per-iter — hot-pluggable.
             _force_dense = _os_dsa_diag.environ.get("BATCHGEN_GLM5_FORCE_DENSE_MLA", "0") == "1"
             if _force_dense or max_seqlen <= indexer.index_topk:
-                # Short-circuit: all sequences fit within topk — use full range
-                max_len = max_seqlen
-                top_k_indices = torch.arange(
-                    max_len, device=hidden_states.device, dtype=torch.long,
-                ).unsqueeze(0).expand(bsz, -1)
+                # Short-circuit: clamp per-sequence so shorter rows never read
+                # unwritten slack from their last allocated page.
+                top_k_indices = build_clamped_dense_token_indices(
+                    updated_seqlens, max_seqlen, hidden_states.device,
+                )
                 if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
                     branch = "dense-forced" if _force_dense else "dense"
                     _dsa_diag_log(branch, max_seqlen, bsz)
@@ -1361,17 +1361,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         updated_seqlens = cache_seqlens
         with (dt.timed("indexer_score", li) if dt else _nullctx()):
             if max_seqlen <= indexer.index_topk:
-                # Short-context branch: every valid token fits within topk.
-                # Build per-seq indices clamped to (cache_seqlens[b] - 1) so
-                # positions past the seq's own length never land in the
-                # sparse gather. The legacy code used
-                # `arange(max_seqlen).expand(bsz, -1)` which gave every
-                # sequence the same indices regardless of its length.
-                base = torch.arange(
-                    max_seqlen, device=hidden_states.device, dtype=torch.long
-                ).unsqueeze(0).expand(bsz, -1)
-                cap = (updated_seqlens.to(torch.long) - 1).clamp(min=0).unsqueeze(-1)
-                top_k_indices = torch.minimum(base, cap)
+                top_k_indices = build_clamped_dense_token_indices(
+                    updated_seqlens, max_seqlen, hidden_states.device,
+                )
             else:
                 q_a_for_indexer = q_a_normed.unsqueeze(1)
                 indexer_blocked_k, _, idx_block_table = \

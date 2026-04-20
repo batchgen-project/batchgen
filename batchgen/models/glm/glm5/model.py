@@ -97,6 +97,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .decode_utils import clamp_token_indices_to_seqlens
 from .configuration_glm5 import Glm5Config
 
 
@@ -524,8 +525,7 @@ class Glm5Indexer(nn.Module):
         # Per-sequence masking (-inf) handles varying lengths within the batch.
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
-
-        return top_k_indices
+        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
 
     def score_and_select_relu_gated(
         self,
@@ -607,7 +607,7 @@ class Glm5Indexer(nn.Module):
 
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
-        return top_k_indices
+        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
 
     def score_and_select_paged(
         self,
@@ -690,7 +690,7 @@ class Glm5Indexer(nn.Module):
                 rope_dim=self.rope_head_dim,
                 topk=min(self.index_topk, max_seqlen),
             )
-            return top_k_indices
+            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
         else:
             if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
                 self._warned_fused_score_fallback = True
