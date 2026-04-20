@@ -2,8 +2,10 @@ import torch
 
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.models.glm.glm5.decode_utils import (
+    build_batch_slot_indices,
     build_clamped_dense_token_indices,
     clamp_token_indices_to_seqlens,
+    reorder_block_table_to_batch_slots,
 )
 
 
@@ -58,3 +60,39 @@ def test_clamped_dense_indices_prevent_stale_tail_reads():
 
     assert gathered[0, 60:68].tolist() == [1060.0, 1061.0, 1062.0, 1063.0, 2000.0, 2000.0, 2000.0, 2000.0]
     assert not bool((gathered[0, 65:128] >= 9000).any().item())
+
+
+def test_build_batch_slot_indices_uses_explicit_slot_mapping():
+    slots = build_batch_slot_indices(
+        current_batch=[105, 101, 109],
+        seq_id_to_slot={101: 0, 105: 2, 109: 1},
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+
+    assert slots.tolist() == [2, 0, 1]
+
+
+def test_reordered_block_table_prevents_cross_sequence_reads():
+    page_size = 4
+    blocked_k = torch.zeros(2, page_size, 1, 1, dtype=torch.float32)
+    blocked_k[0, :, 0, 0] = torch.tensor([100.0, 101.0, 102.0, 103.0])
+    blocked_k[1, :, 0, 0] = torch.tensor([200.0, 201.0, 202.0, 203.0])
+
+    slot_order_block_table = torch.tensor([[1, -1], [0, -1]], dtype=torch.int64)
+    top_k_indices = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+
+    wrong = sparse_gather_from_paged_kv(
+        blocked_k, slot_order_block_table, top_k_indices, page_size
+    ).squeeze(-1).squeeze(-1)
+
+    reordered = reorder_block_table_to_batch_slots(
+        slot_order_block_table,
+        torch.tensor([1, 0], dtype=torch.int32),
+    )
+    fixed = sparse_gather_from_paged_kv(
+        blocked_k, reordered, top_k_indices, page_size
+    ).squeeze(-1).squeeze(-1)
+
+    assert wrong.tolist() == [[200.0, 201.0], [100.0, 101.0]]
+    assert fixed.tolist() == [[100.0, 101.0], [200.0, 201.0]]

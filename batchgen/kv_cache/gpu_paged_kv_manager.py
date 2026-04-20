@@ -971,6 +971,7 @@ class GPUPagedKVCacheManager:
 		sequence_lengths: torch.Tensor,
 		layer_idx: int,
 		batch_slice: Optional[tuple] = None,  # (start_idx, end_idx) for micro-batching
+		slot_indices: Optional[torch.Tensor] = None,
 	) -> None:
 		"""Writes single-position KV tokens for ``layer_idx`` using the cached
 		GPU page table order.
@@ -983,6 +984,8 @@ class GPUPagedKVCacheManager:
 			batch_slice: Optional tuple (start_idx, end_idx) indicating which slice 
 				of the full batch this call represents. When provided, the page table 
 				and slot_indices will be sliced accordingly.
+			slot_indices: Optional explicit page-table slot indices aligned with
+				``k_tensor`` / ``sequence_lengths`` batch order.
 		"""
 		# op_name = "update_layer_decode_new_token"
 		# self._ensure_initialized()
@@ -1004,7 +1007,10 @@ class GPUPagedKVCacheManager:
 
 		# all the tensors are continuous
 		# slot_indices = self._gpu_page_table_manager.get_slot_index_tensor()
-		slot_indices = self._gpu_page_table_manager._slot_index_tensor
+		if slot_indices is None:
+			slot_indices = self._gpu_page_table_manager._slot_index_tensor
+		else:
+			slot_indices = slot_indices.to(device=page_table.device, dtype=torch.int32)
 		token_indices = sequence_lengths
 
 		# Apply batch slice if provided (for micro-batching)
@@ -1016,8 +1022,21 @@ class GPUPagedKVCacheManager:
 			start_idx, end_idx = batch_slice
 			# slot_indices[start_idx:end_idx] gives us [start_idx, start_idx+1, ..., end_idx-1]
 			# which correctly maps micro-batch tokens to full page table rows
-			slot_indices = slot_indices[start_idx:end_idx]
+			if slot_indices.shape[0] != batch_size:
+				slot_indices = slot_indices[start_idx:end_idx]
+			if token_indices.shape[0] != batch_size:
+				token_indices = token_indices[start_idx:end_idx]
 		page_table_view = page_table  # Always use full page table
+		if slot_indices.shape[0] != batch_size:
+			raise ValueError(
+				"update_layer_decode_new_token: slot_indices must align with k_tensor batch, "
+				f"got slot_indices.shape[0]={slot_indices.shape[0]}, batch_size={batch_size}"
+			)
+		if token_indices.shape[0] != batch_size:
+			raise ValueError(
+				"update_layer_decode_new_token: sequence_lengths must align with k_tensor batch, "
+				f"got sequence_lengths.shape[0]={token_indices.shape[0]}, batch_size={batch_size}"
+			)
 		k_tokens = k_tensor.view(batch_size, -1)
 
 		if v_tensor is not None and self._v_cache is not None:

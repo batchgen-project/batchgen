@@ -46,7 +46,11 @@ _GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
 _GLM5_USE_DSA_V2 = os.environ.get("BATCHGEN_GLM5_USE_DSA_V2", "0") == "1"
 import torch.nn.functional as F
 
-from batchgen.models.glm.glm5.decode_utils import build_clamped_dense_token_indices
+from batchgen.models.glm.glm5.decode_utils import (
+    build_batch_slot_indices,
+    build_clamped_dense_token_indices,
+    reorder_block_table_to_batch_slots,
+)
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
@@ -753,6 +757,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
         new_token_pos = position_ids.squeeze(-1)
         manager_device = gpu_paged_kv_manager.device
         seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+        primary_slot_indices = build_batch_slot_indices(
+            current_batch,
+            gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+            bsz,
+            manager_device,
+        )
 
         # Step 1: write new MLA KV to primary cache
         with (dt.timed("kv_write", li) if dt else _nullctx()):
@@ -764,6 +775,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=seq_lengths_i32,
                 layer_idx=li,
+                slot_indices=primary_slot_indices,
             )
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
@@ -774,6 +786,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         with (dt.timed("kv_fetch", li) if dt else _nullctx()):
             mla_blocked_k, _, mla_block_table = \
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_block_table = reorder_block_table_to_batch_slots(
+                mla_block_table, primary_slot_indices,
+            )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
 
         # GLM-5 per-global-seq bookkeeping dump (decode-side view). Pairs
@@ -1040,6 +1055,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
         new_token_pos = position_ids.squeeze(-1)  # [batch]
         manager_device = gpu_paged_kv_manager.device
         seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+        primary_slot_indices = build_batch_slot_indices(
+            current_batch,
+            gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+            bsz,
+            manager_device,
+        )
+        aux_device = gpu_paged_kv_manager_aux.device
+        aux_slot_indices = build_batch_slot_indices(
+            current_batch,
+            gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
+            bsz,
+            aux_device,
+        )
 
         # --- Step 1: Write new MLA KV to primary cache ---
         with (dt.timed("kv_write", li) if dt else _nullctx()):
@@ -1051,6 +1080,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=seq_lengths_i32,
                 layer_idx=li,
+                slot_indices=primary_slot_indices,
             )
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
@@ -1087,13 +1117,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
                     )
                 indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-                aux_device = gpu_paged_kv_manager_aux.device
                 seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
                 gpu_paged_kv_manager_aux.update_layer_decode_new_token(
                     k_tensor=indexer_k_tensor,
                     v_tensor=None,
                     sequence_lengths=seq_lengths_i32_aux,
                     layer_idx=li,
+                    slot_indices=aux_slot_indices,
                 )
                 # Offload indexer K to auxiliary host cache
                 if AttnWrapperBase.kv_append_callback_aux is not None:
@@ -1125,6 +1155,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
                 indexer_blocked_k, _, idx_block_table = \
                     gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                idx_block_table = reorder_block_table_to_batch_slots(
+                    idx_block_table, aux_slot_indices,
+                )
                 aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
                 top_k_indices = indexer.score_and_select_paged(
                     q_a_for_indexer, hidden_states,
@@ -1138,6 +1171,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         with (dt.timed("sparse_gather", li) if dt else _nullctx()):
             mla_blocked_k, _, mla_block_table = \
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_block_table = reorder_block_table_to_batch_slots(
+                mla_block_table, primary_slot_indices,
+            )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
             sparse_mla_kv = sparse_gather_from_paged_kv(
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
@@ -1323,6 +1359,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
         new_token_pos = position_ids.squeeze(-1)
         manager_device = gpu_paged_kv_manager.device
         seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+        primary_slot_indices = build_batch_slot_indices(
+            current_batch,
+            gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+            bsz,
+            manager_device,
+        )
+        aux_device = gpu_paged_kv_manager_aux.device
+        aux_slot_indices = build_batch_slot_indices(
+            current_batch,
+            gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
+            bsz,
+            aux_device,
+        )
 
         # --- Step 2: Write compressed MLA KV to primary cache ---
         with (dt.timed("kv_write", li) if dt else _nullctx()):
@@ -1334,6 +1384,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=seq_lengths_i32,
                 layer_idx=li,
+                slot_indices=primary_slot_indices,
             )
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(li, k_tensor, None)
@@ -1343,7 +1394,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             indexer_kv = indexer.compute_indexer_kv(
                 hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
             )  # [batch, 1, 1, index_dim]
-            aux_device = gpu_paged_kv_manager_aux.device
             seq_lengths_i32_aux = (
                 seq_lengths_i32 if aux_device == manager_device
                 else new_token_pos.to(dtype=torch.int32, device=aux_device)
@@ -1353,6 +1403,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=seq_lengths_i32_aux,
                 layer_idx=li,
+                slot_indices=aux_slot_indices,
             )
             if AttnWrapperBase.kv_append_callback_aux is not None:
                 AttnWrapperBase.kv_append_callback_aux(li, indexer_kv, None)
@@ -1368,6 +1419,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 q_a_for_indexer = q_a_normed.unsqueeze(1)
                 indexer_blocked_k, _, idx_block_table = \
                     gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                idx_block_table = reorder_block_table_to_batch_slots(
+                    idx_block_table, aux_slot_indices,
+                )
                 aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
 
                 # Materialize contiguous K for the ReLU-gated scorer (same
@@ -1404,6 +1458,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         with (dt.timed("sparse_gather", li) if dt else _nullctx()):
             mla_blocked_k, _, mla_block_table = \
                 gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+            mla_block_table = reorder_block_table_to_batch_slots(
+                mla_block_table, primary_slot_indices,
+            )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
             sparse_mla_kv = sparse_gather_from_paged_kv(
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
