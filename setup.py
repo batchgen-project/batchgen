@@ -162,7 +162,6 @@ setup(
             "models/**/special_tokens_map.json",
             "models/**/model.safetensors.index.json",
             "models/**/preprocessor_config.json",
-            "models/moonshotai/kimi_k25/assets/tokenizer_config.json",
             "**/*.parquet",
             "**/*.jinja",
             "**/*.model",

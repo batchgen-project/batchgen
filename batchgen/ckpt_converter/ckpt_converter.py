@@ -29,6 +29,19 @@ class ckpt_converter:
 	def __init__(self):
 		self._copied_tokenizer_assets = set()
 
+	def _get_tokenizer_asset_files(self, source_dir):
+		"""Return tokenizer asset files present in the source checkpoint dir."""
+		asset_files = []
+		for file_name in (
+			"tokenizer.json",
+			"tokenizer_config.json",
+			"tiktoken.model",
+			"chat_template.jinja",
+		):
+			if os.path.exists(os.path.join(source_dir, file_name)):
+				asset_files.append(file_name)
+		return asset_files
+
 	def _copy_tokenizer_assets(self, source_dir, output_dir):
 		"""Copy tokenizer assets from source checkpoint dir into converted output dir."""
 		copy_key = (os.path.abspath(source_dir), os.path.abspath(output_dir))
@@ -36,32 +49,30 @@ class ckpt_converter:
 			return
 		self._copied_tokenizer_assets.add(copy_key)
 
-		tokenizer_found = False
-		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+		primary_asset_found = False
+		for file_name in self._get_tokenizer_asset_files(source_dir):
 			source_file = os.path.join(source_dir, file_name)
-			if not os.path.exists(source_file):
-				continue
 
-			if file_name == "tokenizer.json":
-				tokenizer_found = True
+			if file_name in ("tokenizer.json", "tiktoken.model"):
+				primary_asset_found = True
 
 			target_file = os.path.join(output_dir, file_name)
 			shutil.copyfile(source_file, target_file)
 			logging.info(f"Copied {file_name} to converted checkpoint dir: {target_file}")
 
-		if not tokenizer_found:
+		if not primary_asset_found:
 			logging.warning(
-				f"tokenizer.json not found in source checkpoint directory: {source_dir}. "
+				f"No primary tokenizer asset (tokenizer.json or tiktoken.model) found in source checkpoint directory: {source_dir}. "
 				"Conversion will continue without tokenizer assets."
 			)
 
 	def _backfill_missing_tokenizer_assets(self, source_dir, output_dir):
 		"""Copy missing tokenizer assets into an existing converted checkpoint dir."""
 		copied_files = []
-		for file_name in ("tokenizer.json", "tokenizer_config.json"):
+		for file_name in self._get_tokenizer_asset_files(source_dir):
 			source_file = os.path.join(source_dir, file_name)
 			target_file = os.path.join(output_dir, file_name)
-			if not os.path.exists(source_file) or os.path.exists(target_file):
+			if os.path.exists(target_file):
 				continue
 
 			shutil.copyfile(source_file, target_file)
@@ -252,9 +263,8 @@ class ckpt_converter:
 				file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
 			)
 
-		for file_name in ("tokenizer.json", "tokenizer_config.json"):
-			if os.path.exists(os.path.join(input_dir, file_name)):
-				expected_files.add(file_name)
+		for file_name in self._get_tokenizer_asset_files(input_dir):
+			expected_files.add(file_name)
 
 		return expected_files
 
@@ -300,10 +310,9 @@ class ckpt_converter:
 					f"Please clean {output_dir} and reconvert."
 				)
 
-		for file_name in ("tokenizer.json", "tokenizer_config.json"):
-			source_file = os.path.join(input_dir, file_name)
+		for file_name in self._get_tokenizer_asset_files(input_dir):
 			output_file = os.path.join(output_dir, file_name)
-			if os.path.exists(source_file) and not os.path.exists(output_file):
+			if not os.path.exists(output_file):
 				return False, (
 					f"Tokenizer asset {output_file} does not exist. "
 					f"Please clean {output_dir} and reconvert."
