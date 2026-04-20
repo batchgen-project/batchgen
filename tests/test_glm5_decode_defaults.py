@@ -19,3 +19,15 @@ def test_glm5_dense_mla_uses_kimi_path_by_default():
         '_use_kimi_mla = _os.environ.get("BATCHGEN_GLM5_USE_KIMI_MLA", "1") == "1"'
         in source
     )
+
+
+def test_glm5_dense_decode_defaults_to_shared_pagekv_backend():
+    source = WRAPPERS.read_text()
+    assert (
+        '_GLM5_USE_SHARED_PAGEKV_DENSE = ('
+        in source
+    )
+    assert (
+        'os.environ.get("BATCHGEN_GLM5_USE_SHARED_PAGEKV_DENSE", "1") == "1"'
+        in source
+    )

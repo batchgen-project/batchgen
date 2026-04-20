@@ -8812,6 +8812,38 @@ class BatchGenWorker:
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
 
+					# GLM-5 targeted decode metadata probe. This logs the exact
+					# worker-side cache_seqlen / position_id pair that will be passed
+					# into the model wrapper, before any model-specific remapping.
+					_bookkeep_env = os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
+					if _bookkeep_env:
+						try:
+							_target_gids = {
+								int(s) for s in _bookkeep_env.split(",")
+								if s.strip().isdigit()
+							}
+							_cur_batch_dbg = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
+							for _loc, (_local_idx, _seq, _ctx) in enumerate(
+								zip(batch, batch_sequences, cache_seqlens)
+							):
+								if _seq.global_idx not in _target_gids:
+									continue
+								_pos = int(Attn_Wrapper.position_ids[_loc, 0].item())
+								_gid_from_batch = (
+									_cur_batch_dbg[_loc] if _loc < len(_cur_batch_dbg) else -1
+								)
+								logging.warning(
+									f"[BOOKKEEP worker-meta gid={_seq.global_idx}] "
+									f"loc={_loc} local_idx={_local_idx} "
+									f"ctx={int(_ctx)} pos={_pos} decoded={_seq.decoded_length} "
+									f"orig_prompt={_seq.original_prompt_length} "
+									f"cur_batch_gid={_gid_from_batch}"
+								)
+						except Exception as _bookkeep_exc:
+							logging.warning(
+								f"[BOOKKEEP worker-meta] dump failed: {_bookkeep_exc}"
+							)
+
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:

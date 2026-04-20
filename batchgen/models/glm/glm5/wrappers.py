@@ -44,6 +44,13 @@ _GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
 #     existing DSA path (WP5 FP8 absorb is not used).
 # Default off. Legacy `_forward_decode_dsa` is preserved for comparison.
 _GLM5_USE_DSA_V2 = os.environ.get("BATCHGEN_GLM5_USE_DSA_V2", "0") == "1"
+# Default dense-MLA decode to the shared page-KV backend already used by
+# Kimi's eager path. This removes GLM-5's extra dense-only wrapper logic
+# (notably the additional cur_batch/slot remap surface) from the default
+# non-DSA path while preserving the older custom path for direct A/B.
+_GLM5_USE_SHARED_PAGEKV_DENSE = (
+    os.environ.get("BATCHGEN_GLM5_USE_SHARED_PAGEKV_DENSE", "1") == "1"
+)
 import torch.nn.functional as F
 
 from batchgen.models.glm.glm5.decode_utils import (
@@ -619,9 +626,26 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 return (attn_output, None, None)
 
             # Dense-MLA path (use_dense_mla=True, indexer not constructed).
-            # Defaults to the validated Kimi / DeepSeek FlashMLA route. The
-            # legacy sparse-gather dense emulation remains available for
-            # debugging via BATCHGEN_GLM5_USE_KIMI_MLA=0.
+            # Default to the shared eager MLA page-KV backend already used by
+            # Kimi. It is structurally closer to the known-good eager path and
+            # avoids GLM-5's extra dense-only cur_batch remapping surface.
+            if _GLM5_USE_SHARED_PAGEKV_DENSE:
+                attn_output, k_tensor = self.module.decoding_attn_mode_3_bf16(
+                    hidden_states,
+                    position_ids,
+                    cache_seqlens,
+                    max_seqlen,
+                    self.weight_dequant_scale,
+                    gpu_paged_kv_manager,
+                    self.layer_idx,
+                    kwargs.get("batch_slice"),
+                )
+                if AttnWrapperBase.kv_append_callback is not None:
+                    AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
+                return (attn_output, None, None)
+
+            # Fallback: GLM-specific dense path. Kept for A/B if the shared
+            # backend needs to be bypassed explicitly.
             attn_output = self._forward_decode_dense(
                 hidden_states, position_ids, cache_seqlens, max_seqlen,
                 gpu_paged_kv_manager,
@@ -845,15 +869,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
             if _rank == 0:
                 import logging as _logging
                 _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+                _slot_order = list(
+                    gpu_paged_kv_manager._gpu_page_table_manager.slot_to_seq_id
+                ) if gpu_paged_kv_manager is not None and getattr(
+                    gpu_paged_kv_manager, "_gpu_page_table_manager", None
+                ) is not None else []
                 _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
                 _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
                             if loc < len(_cur) and _cur[loc] in _target_set]
                 for _loc, _gid in _bk_hits:
                     _cs = int(updated_seqlens[_loc].item())
+                    _pos = int(new_token_pos[_loc].item())
+                    _slot = int(primary_slot_indices[_loc].item())
                     _bt_row = mla_block_table[_loc].tolist()
                     _logging.warning(
                         f"[BOOKKEEP L0 decode gid={_gid}] loc={_loc} "
-                        f"cache_seqlen={_cs} block_table={_bt_row}"
+                        f"slot={_slot} pos={_pos} cache_seqlen={_cs} "
+                        f"slot_order={_slot_order[:10]} block_table={_bt_row}"
                     )
 
         if not _use_kimi_mla:
@@ -939,6 +971,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 tile_scheduler_metadata, num_splits = get_mla_metadata(
                     updated_seqlens.to(torch.int32), attn.num_heads, 1,
                 )
+                if _BOOKKEEP and li == 0:
+                    try:
+                        import torch.distributed as _dist
+                        _rank_fm = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
+                    except Exception:
+                        _rank_fm = 0
+                    if _rank_fm == 0:
+                        import logging as _logging
+                        _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+                        _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
+                        _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
+                                    if loc < len(_cur) and _cur[loc] in _target_set]
+                        for _loc, _gid in _bk_hits:
+                            _logging.warning(
+                                f"[BOOKKEEP L0 flashmla gid={_gid}] "
+                                f"loc={_loc} flashmla_seqlen={int(updated_seqlens[_loc].item())} "
+                                f"slot={int(primary_slot_indices[_loc].item())} "
+                                f"pos={int(new_token_pos[_loc].item())}"
+                            )
                 attn_out, _ = flash_mla_with_kvcache(
                     query_states,
                     mla_blocked_k,
