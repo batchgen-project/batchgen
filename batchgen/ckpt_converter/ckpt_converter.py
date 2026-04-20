@@ -6,6 +6,56 @@ import os
 import logging
 import shutil
 import ctypes
+
+KNOWN_TOKENIZER_ASSET_FILES = (
+	"tokenizer.json",
+	"tokenizer_config.json",
+	"tiktoken.model",
+	"chat_template.jinja",
+)
+
+MODEL_NAME_PATTERNS = (
+	("moonshotai/Kimi-K2.5", "kimi_k25"),
+	("Kimi-K2.5", "kimi_k25"),
+	("openai/gpt-oss-120b", "gpt_oss"),
+	("gpt-oss", "gpt_oss"),
+	("THUDM/GLM-5", "glm5"),
+	("GLM-5-FP8", "glm5"),
+	("GLM-5", "glm5"),
+	("MiniMaxAI/MiniMax-M2.5", "minimax_m25"),
+	("MiniMax-M2.5", "minimax_m25"),
+	("DeepSeek-R1", "deepseek"),
+	("DeepSeek-V3", "deepseek"),
+	("DeepSeek-V2-Lite", "deepseek"),
+	("DeepSeek-V2", "deepseek"),
+)
+
+MODEL_TYPE_ALIASES = {
+	"gpt_oss": "gpt_oss",
+	"deepseek_v3": "deepseek",
+	"deepseek_v2": "deepseek",
+	"minimax_m25": "minimax_m25",
+	"kimi_k25": "kimi_k25",
+}
+
+ARCHITECTURE_PATTERNS = (
+	("GptOss", "gpt_oss"),
+	("DeepseekV3", "deepseek"),
+	("DeepseekV2", "deepseek"),
+	("MiniMaxM2", "minimax_m25"),
+	("GLM", "glm5"),
+	("ChatGLM", "glm5"),
+)
+
+REQUIRED_TOKENIZER_ASSETS_BY_MODEL = {
+	"deepseek": ("tokenizer.json",),
+	"glm5": ("tokenizer.json",),
+	"minimax_m25": ("tokenizer.json",),
+	"kimi_k25": ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"),
+	"gpt_oss": ("chat_template.jinja",),
+}
+
+
 class ckpt_converter:
 	"""
 		Convert .safetesors or .pt checkpoints to a format compatible with BatchGen.
@@ -32,38 +82,66 @@ class ckpt_converter:
 	def _get_tokenizer_asset_files(self, source_dir):
 		"""Return tokenizer asset files present in the source checkpoint dir."""
 		asset_files = []
-		for file_name in (
-			"tokenizer.json",
-			"tokenizer_config.json",
-			"tiktoken.model",
-			"chat_template.jinja",
-		):
+		for file_name in KNOWN_TOKENIZER_ASSET_FILES:
 			if os.path.exists(os.path.join(source_dir, file_name)):
 				asset_files.append(file_name)
 		return asset_files
 
-	def _copy_tokenizer_assets(self, source_dir, output_dir):
+	def _detect_model_family(self, input_dir, model_identifier=None):
+		"""Infer model family for tokenizer asset validation."""
+		if model_identifier:
+			for pattern, model_family in MODEL_NAME_PATTERNS:
+				if pattern in str(model_identifier):
+					return model_family
+
+		config_path = os.path.join(input_dir, "config.json")
+		if os.path.exists(config_path):
+			try:
+				with open(config_path, "r") as f:
+					config = json.load(f)
+			except Exception:
+				config = {}
+			model_type = config.get("model_type")
+			if model_type in MODEL_TYPE_ALIASES:
+				return MODEL_TYPE_ALIASES[model_type]
+			for arch in config.get("architectures", []):
+				for pattern, model_family in ARCHITECTURE_PATTERNS:
+					if pattern in arch:
+						return model_family
+
+		for pattern, model_family in MODEL_NAME_PATTERNS:
+			if pattern in str(input_dir):
+				return model_family
+
+		return None
+
+	def _get_required_tokenizer_asset_files(self, input_dir, model_identifier=None):
+		"""Return required tokenizer assets for the detected model family."""
+		model_family = self._detect_model_family(input_dir, model_identifier=model_identifier)
+		if model_family is None:
+			return []
+		return list(REQUIRED_TOKENIZER_ASSETS_BY_MODEL.get(model_family, ()))
+
+	def _copy_tokenizer_assets(self, source_dir, output_dir, model_identifier=None):
 		"""Copy tokenizer assets from source checkpoint dir into converted output dir."""
 		copy_key = (os.path.abspath(source_dir), os.path.abspath(output_dir))
 		if copy_key in self._copied_tokenizer_assets:
 			return
 		self._copied_tokenizer_assets.add(copy_key)
 
-		primary_asset_found = False
-		for file_name in self._get_tokenizer_asset_files(source_dir):
+		present_assets = set(self._get_tokenizer_asset_files(source_dir))
+		for file_name in present_assets:
 			source_file = os.path.join(source_dir, file_name)
-
-			if file_name in ("tokenizer.json", "tiktoken.model"):
-				primary_asset_found = True
-
 			target_file = os.path.join(output_dir, file_name)
 			shutil.copyfile(source_file, target_file)
 			logging.info(f"Copied {file_name} to converted checkpoint dir: {target_file}")
 
-		if not primary_asset_found:
+		required_assets = set(self._get_required_tokenizer_asset_files(source_dir, model_identifier=model_identifier))
+		missing_required_assets = sorted(required_assets - present_assets)
+		if missing_required_assets:
 			logging.warning(
-				f"No primary tokenizer asset (tokenizer.json or tiktoken.model) found in source checkpoint directory: {source_dir}. "
-				"Conversion will continue without tokenizer assets."
+				f"Missing required tokenizer assets for source checkpoint directory {source_dir}: {missing_required_assets}. "
+				"Conversion will continue, but runtime tokenizer loading may fail."
 			)
 
 	def _backfill_missing_tokenizer_assets(self, source_dir, output_dir):
@@ -167,7 +245,7 @@ class ckpt_converter:
 			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections replaced in-place")
 		return ckpt
 
-	def convert(self, ckpt_path, output_dir, marlin=False):
+	def convert(self, ckpt_path, output_dir, marlin=False, model_identifier=None):
 		# Check if the file dir exists
 		if not os.path.exists(ckpt_path):
 			raise FileNotFoundError(f"Checkpoint file path {ckpt_path} does not exist.")
@@ -233,7 +311,7 @@ class ckpt_converter:
 		with open(out_metadata_name, "w") as metadata_file:
 			json.dump(metadata, metadata_file, indent=4)
 
-		self._copy_tokenizer_assets(os.path.dirname(os.path.abspath(ckpt_path)), output_dir)
+		self._copy_tokenizer_assets(os.path.dirname(os.path.abspath(ckpt_path)), output_dir, model_identifier=model_identifier)
 
 	def _get_checkpoint_files(self, input_dir):
 		"""
@@ -252,7 +330,7 @@ class ckpt_converter:
 		return sorted(file_list)
 
 	def _get_expected_output_files(self, input_dir):
-		"""Return the exact set of files expected in the converted output dir."""
+		"""Return the allowed set of files in the converted output dir."""
 		expected_files = set()
 		for src_file in self._get_checkpoint_files(input_dir):
 			file_name = os.path.basename(src_file)
@@ -263,12 +341,11 @@ class ckpt_converter:
 				file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
 			)
 
-		for file_name in self._get_tokenizer_asset_files(input_dir):
-			expected_files.add(file_name)
+		expected_files.update(KNOWN_TOKENIZER_ASSET_FILES)
 
 		return expected_files
 
-	def validate_converted_directory(self, input_dir, output_dir):
+	def validate_converted_directory(self, input_dir, output_dir, model_identifier=None):
 		"""
 		Validate that converted checkpoint files are consistent with source files.
 
@@ -310,11 +387,14 @@ class ckpt_converter:
 					f"Please clean {output_dir} and reconvert."
 				)
 
-		for file_name in self._get_tokenizer_asset_files(input_dir):
+		required_assets = self._get_required_tokenizer_asset_files(
+			input_dir, model_identifier=model_identifier
+		)
+		for file_name in required_assets:
 			output_file = os.path.join(output_dir, file_name)
 			if not os.path.exists(output_file):
 				return False, (
-					f"Tokenizer asset {output_file} does not exist. "
+					f"Required tokenizer asset {output_file} does not exist for model validation. "
 					f"Please clean {output_dir} and reconvert."
 				)
 
@@ -329,7 +409,7 @@ class ckpt_converter:
 
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, model_identifier=None):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -373,7 +453,7 @@ class ckpt_converter:
 		# Check if already converted
 		if os.path.exists(output_dir) and not force:
 			self._backfill_missing_tokenizer_assets(input_dir, output_dir)
-			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir)
+			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir, model_identifier=model_identifier)
 			if is_valid:
 				logging.info(f"Converted checkpoint files already exist and are valid in {output_dir}")
 				return output_dir
@@ -397,7 +477,7 @@ class ckpt_converter:
 
 		for file_path in file_iterator:
 			logging.debug(f"Converting {file_path} to {output_dir}")
-			self.convert(file_path, output_dir, marlin=marlin)
+			self.convert(file_path, output_dir, marlin=marlin, model_identifier=model_identifier)
 
 		logging.info(f"Conversion complete. Output directory: {output_dir}"
 		             f"{' (with Marlin repack)' if marlin else ''}")

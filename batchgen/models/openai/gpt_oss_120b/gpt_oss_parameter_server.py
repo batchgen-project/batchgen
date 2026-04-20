@@ -174,6 +174,25 @@ class GptOss_Parameter_Server:
 
         return self.shm_name, self.tensor_meta_shm_name
 
+    def _copy_chat_template_asset(self):
+        """Copy GPT-OSS chat_template.jinja into converted checkpoint dir if present."""
+        source_template = os.path.join(self.cache_dir, "chat_template.jinja")
+        target_template = os.path.join(self.converted_ckpt_dir, "chat_template.jinja")
+
+        if os.path.exists(target_template):
+            return
+
+        if not os.path.exists(source_template):
+            logging.warning(
+                "GPT-OSS chat template file is missing from source checkpoint dir: "
+                f"{source_template}. Runtime chat template loading will fail until "
+                "chat_template.jinja is available in the converted checkpoint dir."
+            )
+            return
+
+        shutil.copyfile(source_template, target_template)
+        logging.info(f"Copied GPT-OSS chat template to converted checkpoint dir: {target_template}")
+
     @property
     def weights_storage(self):
         """Return the C++ parameter server as weights storage for core engine."""
@@ -310,6 +329,7 @@ class GptOss_Parameter_Server:
         # Check if already converted
         converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
         if os.path.exists(converted_marker):
+            self._copy_chat_template_asset()
             logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
             # Log what converted files exist
             converted_files = [f for f in os.listdir(self.converted_ckpt_dir) if f.endswith(('.bin', '.json'))]
@@ -413,6 +433,7 @@ class GptOss_Parameter_Server:
 
         # Convert non-layer tensors (embeddings, final norm, lm_head)
         self._convert_non_layer_tensors(tensor_to_file)
+        self._copy_chat_template_asset()
 
         # Mark as converted
         with open(converted_marker, "w") as f:

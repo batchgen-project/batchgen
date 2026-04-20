@@ -81,6 +81,11 @@ Output Format:
         help='Only validate existing converted files without converting'
     )
     parser.add_argument(
+        '--model-identifier',
+        default=None,
+        help='Optional model identifier to enable model-specific tokenizer asset validation'
+    )
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose debug logging'
@@ -122,7 +127,7 @@ Output Format:
                 return 1
 
             logging.info(f"Validating converted files in {output_dir}...")
-            is_valid, error_msg = converter.validate_converted_directory(input_dir, output_dir)
+            is_valid, error_msg = converter.validate_converted_directory(input_dir, output_dir, model_identifier=parsed_args.model_identifier)
 
             if is_valid:
                 logging.info("Validation successful! All converted files are consistent with source checkpoints.")
@@ -142,6 +147,7 @@ Output Format:
                 output_dir=output_dir,
                 force=parsed_args.force,
                 marlin=not parsed_args.no_marlin,
+                model_identifier=parsed_args.model_identifier,
             )
 
             logging.info(f"Conversion completed successfully!")

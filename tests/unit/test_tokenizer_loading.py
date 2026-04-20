@@ -15,6 +15,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TOKENIZER_FIXTURE = FIXTURES_DIR / "tokenizer.json"
 KIMI_FIXTURE_DIR = FIXTURES_DIR / "kimi_k25"
 STANDARD_TOKENIZER_ASSETS = ("tokenizer.json", "tokenizer_config.json")
+GPT_OSS_TOKENIZER_ASSETS = ("chat_template.jinja",)
 KIMI_TOKENIZER_ASSETS = ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja")
 MODEL_IDENTIFIERS = [
     "deepseek-ai/DeepSeek-R1",
@@ -34,6 +35,8 @@ def _write_checkpoint(source_dir: Path) -> Path:
 def _asset_files_for_model(model_identifier: str | None = None) -> tuple[str, ...]:
     if model_identifier and "Kimi-K2.5" in model_identifier:
         return KIMI_TOKENIZER_ASSETS
+    if model_identifier == "openai/gpt-oss-120b":
+        return GPT_OSS_TOKENIZER_ASSETS
     return STANDARD_TOKENIZER_ASSETS
 
 
@@ -42,6 +45,15 @@ def _write_standard_tokenizer_assets(tokenizer_dir: Path) -> None:
     (tokenizer_dir / "tokenizer.json").write_bytes(TOKENIZER_FIXTURE.read_bytes())
     (tokenizer_dir / "tokenizer_config.json").write_bytes(
         b'{"chat_template":"{{ messages }}"}\n'
+    )
+
+
+def _write_gpt_oss_tokenizer_assets(tokenizer_dir: Path) -> None:
+    tokenizer_dir.mkdir(exist_ok=True)
+    (tokenizer_dir / "chat_template.jinja").write_text(
+        "{% for message in messages %}{{ message.content }}{% endfor %}"
+        "{% if add_generation_prompt %}<|start|>assistant{% endif %}",
+        encoding="utf-8",
     )
 
 
@@ -54,6 +66,9 @@ def _write_kimi_tokenizer_assets(tokenizer_dir: Path) -> None:
 def _write_tokenizer_assets(tokenizer_dir: Path, model_identifier: str | None = None) -> None:
     if model_identifier and "Kimi-K2.5" in model_identifier:
         _write_kimi_tokenizer_assets(tokenizer_dir)
+        return
+    if model_identifier == "openai/gpt-oss-120b":
+        _write_gpt_oss_tokenizer_assets(tokenizer_dir)
         return
     _write_standard_tokenizer_assets(tokenizer_dir)
 
@@ -80,6 +95,13 @@ def test_load_tokenizer_from_converted_checkpoint_dir(
             add_generation_prompt=True,
         )
         assert rendered == "hello[GEN]"
+    elif model_identifier == "openai/gpt-oss-120b":
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hello"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert rendered == "hello<|start|>assistant"
 
 
 @pytest.mark.parametrize(
@@ -98,16 +120,25 @@ def test_converter_copies_tokenizer_assets_byte_identically(
     _write_tokenizer_assets(source_dir, model_identifier)
 
     converter = ckpt_converter()
-    result_dir = Path(converter.convert_model_directory(str(source_dir), str(output_dir)))
+    result_dir = Path(converter.convert_model_directory(str(source_dir), str(output_dir), model_identifier=model_identifier))
 
     assert result_dir == output_dir
     for file_name in _asset_files_for_model(model_identifier):
         assert (result_dir / file_name).read_bytes() == (source_dir / file_name).read_bytes()
 
 
-def test_converter_warns_when_primary_tokenizer_assets_missing(
+@pytest.mark.parametrize(
+    "model_identifier, expected_missing_assets",
+    [
+        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json"]),
+        ("moonshotai/Kimi-K2.5", ["chat_template.jinja", "tiktoken.model", "tokenizer_config.json"]),
+    ],
+)
+def test_converter_warns_when_required_tokenizer_assets_missing(
     tmp_path: Path,
     caplog,
+    model_identifier: str,
+    expected_missing_assets: list[str],
 ) -> None:
     source_dir = tmp_path / "source"
     output_dir = tmp_path / "converted_ckpt"
@@ -117,11 +148,55 @@ def test_converter_warns_when_primary_tokenizer_assets_missing(
     converter = ckpt_converter()
 
     with caplog.at_level(logging.WARNING):
-        result_dir = Path(converter.convert_model_directory(str(source_dir), str(output_dir)))
+        result_dir = Path(
+            converter.convert_model_directory(
+                str(source_dir),
+                str(output_dir),
+                model_identifier=model_identifier,
+            )
+        )
 
     assert result_dir == output_dir
-    assert "No primary tokenizer asset" in caplog.text
     assert str(source_dir) in caplog.text
+    for asset_name in expected_missing_assets:
+        assert asset_name in caplog.text
+
+
+@pytest.mark.parametrize(
+    "model_identifier, required_assets_to_remove",
+    [
+        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json"]),
+        ("moonshotai/Kimi-K2.5", ["tiktoken.model", "tokenizer_config.json", "chat_template.jinja"]),
+    ],
+)
+def test_validation_requires_model_specific_tokenizer_assets(
+    tmp_path: Path,
+    model_identifier: str,
+    required_assets_to_remove: list[str],
+) -> None:
+    source_dir = tmp_path / "source"
+    output_dir = tmp_path / "converted_ckpt"
+    source_dir.mkdir()
+    _write_checkpoint(source_dir)
+    _write_tokenizer_assets(source_dir, model_identifier)
+
+    converter = ckpt_converter()
+    converter.convert_model_directory(
+        str(source_dir),
+        str(output_dir),
+        model_identifier=model_identifier,
+    )
+
+    for file_name in required_assets_to_remove:
+        (output_dir / file_name).unlink()
+
+    is_valid, error_msg = converter.validate_converted_directory(
+        str(source_dir),
+        str(output_dir),
+        model_identifier=model_identifier,
+    )
+    assert not is_valid
+    assert "Required tokenizer asset" in error_msg
 
 
 @pytest.mark.parametrize(
@@ -139,17 +214,19 @@ def test_validation_allows_tokenizer_assets_but_rejects_dirty_output_dir(
     _write_tokenizer_assets(source_dir, model_identifier)
 
     converter = ckpt_converter()
-    converter.convert_model_directory(str(source_dir), str(output_dir))
+    converter.convert_model_directory(
+        str(source_dir), str(output_dir), model_identifier=model_identifier
+    )
 
     is_valid, error_msg = converter.validate_converted_directory(
-        str(source_dir), str(output_dir)
+        str(source_dir), str(output_dir), model_identifier=model_identifier
     )
     assert is_valid
     assert error_msg is None
 
     (output_dir / "stale.json").write_text("{}\n")
     is_valid, error_msg = converter.validate_converted_directory(
-        str(source_dir), str(output_dir)
+        str(source_dir), str(output_dir), model_identifier=model_identifier
     )
     assert not is_valid
     assert "Unexpected files or directories" in error_msg
@@ -175,22 +252,20 @@ def test_existing_converted_checkpoint_backfills_missing_tokenizer_assets(
     for file_name in _asset_files_for_model(model_identifier):
         (output_dir / file_name).unlink()
 
-    result_dir = Path(converter.convert_model_directory(str(source_dir), str(output_dir)))
+    result_dir = Path(
+        converter.convert_model_directory(
+            str(source_dir), str(output_dir), model_identifier=model_identifier
+        )
+    )
 
     assert result_dir == output_dir
     for file_name in _asset_files_for_model(model_identifier):
         assert (output_dir / file_name).read_bytes() == (source_dir / file_name).read_bytes()
 
 
-def test_gpt_oss_tokenizer_uses_builtin_chat_template_fallback(tmp_path: Path) -> None:
+def test_gpt_oss_tokenizer_requires_chat_template_file(tmp_path: Path) -> None:
     converted_ckpt_dir = tmp_path / "converted_ckpt"
     converted_ckpt_dir.mkdir()
 
-    tokenizer = load_tokenizer("openai/gpt-oss-120b", converted_ckpt_dir)
-
-    rendered = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "hello"}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    assert rendered == "<|start|>user<|message|>hello<|end|><|start|>assistant"
+    with pytest.raises(FileNotFoundError, match="chat_template.jinja"):
+        load_tokenizer("openai/gpt-oss-120b", converted_ckpt_dir)
