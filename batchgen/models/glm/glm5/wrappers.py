@@ -499,6 +499,24 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
+        if cu_seqlens is None or num_sequences is None or global_sequence_ids is None:
+            raise RuntimeError("Prepacked indexer KV offload called without prepack metadata")
+        if len(global_sequence_ids) != num_sequences:
+            raise RuntimeError(
+                "Prepacked indexer KV offload batch mismatch: "
+                f"{len(global_sequence_ids)} sequence ids for {num_sequences} sequences"
+            )
+        if cu_seqlens.numel() != num_sequences + 1:
+            raise RuntimeError(
+                "Prepacked indexer KV offload cu_seqlens mismatch: "
+                f"{cu_seqlens.numel()} entries for {num_sequences} sequences"
+            )
+        expected_tokens = int(cu_seqlens[-1].item())
+        if offload_kv.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "Prepacked indexer KV offload token mismatch: "
+                f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
+            )
 
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens[seq_idx].item()
@@ -524,6 +542,24 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
+        if cu_seqlens is None or num_sequences is None or global_sequence_ids is None:
+            raise RuntimeError("Prepacked KV offload called without prepack metadata")
+        if len(global_sequence_ids) != num_sequences:
+            raise RuntimeError(
+                "Prepacked KV offload batch mismatch: "
+                f"{len(global_sequence_ids)} sequence ids for {num_sequences} sequences"
+            )
+        if cu_seqlens.numel() != num_sequences + 1:
+            raise RuntimeError(
+                "Prepacked KV offload cu_seqlens mismatch: "
+                f"{cu_seqlens.numel()} entries for {num_sequences} sequences"
+            )
+        expected_tokens = int(cu_seqlens[-1].item())
+        if offload_kv.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "Prepacked KV offload token mismatch: "
+                f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
+            )
 
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens[seq_idx].item()

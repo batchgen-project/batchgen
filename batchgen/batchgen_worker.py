@@ -173,7 +173,16 @@ from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.batch_order import (
 	batch_matches_expected_uuid_order,
+	build_prefill_sequence_spans,
 	local_indices_to_uuid_order,
+	prefill_sequence_spans_to_cu_seqlens,
+	prefill_sequence_spans_to_global_seq_ids,
+)
+from batchgen.query_book import (
+	QueryBookEntry as query,
+	bind_local_sequence_to_query_book,
+	make_query_book_entry,
+	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
@@ -276,20 +285,6 @@ class _DualAsyncLoadTask:
 			self._primary.wait()
 		if self._aux is not None:
 			self._aux.wait()
-
-
-class query:
-	def __init__(
-		self,
-		text: str = None,
-		encoded: Dict[str, torch.Tensor] = None,
-		decoded_tokens: torch.Tensor = None,
-		kv_token_budget: Optional[int] = None,
-	):
-		self.text = text
-		self.encoded = encoded
-		self.decoded_tokens = decoded_tokens
-		self.kv_token_budget = kv_token_budget
 
 
 class QueryBookBufferPool:
@@ -1322,29 +1317,34 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
-	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
-		"""Build local query book entries for newly admitted sequences on this rank."""
+	def _bind_local_sequence_to_query_book(
+		self,
+		uuid: str,
+		local_idx: Optional[int] = None,
+	) -> int:
+		"""Bind a sequence UUID to a local slot and refresh its query_book entry."""
+		seq = self.global_batch.get_sequence(uuid)
 		if self.query_book is None:
 			self.query_book = {}
+		local_idx, self._next_local_idx = bind_local_sequence_to_query_book(
+			uuid,
+			seq,
+			query_book=self.query_book,
+			local_to_uuid_map=self._local_to_uuid_map,
+			uuid_to_local_map=self._uuid_to_local_map,
+			free_local_indices=self._free_local_indices,
+			next_local_idx=self._next_local_idx,
+			local_idx=local_idx,
+		)
+		return local_idx
+
+	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
+		"""Build local query book entries for newly admitted sequences on this rank."""
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or seq.assigned_rank != self.rank:
 				continue
-			# Allocate local index
-			if self._free_local_indices:
-				local_idx = self._free_local_indices.pop()
-			else:
-				local_idx = self._next_local_idx
-				self._next_local_idx += 1
-			self._local_to_uuid_map[local_idx] = uuid
-			self._uuid_to_local_map[uuid] = local_idx
-			# Build query book entry (needed by prefill_prepacked)
-			self.query_book[local_idx] = query(
-				text=seq.text,
-				encoded={"input_ids": seq.input_ids},
-				decoded_tokens=seq.decoded_tokens,
-				kv_token_budget=seq.kv_token_budget,
-			)
+			self._bind_local_sequence_to_query_book(uuid)
 
 	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
 		"""Report a single sequence completion to the response queue.
@@ -1369,10 +1369,14 @@ class BatchGenWorker:
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
 		# stray pops with downstream "Missing UUID" errors.
-		local_idx = self._uuid_to_local_map.pop(uuid, None)
+		local_idx = release_local_query_slot(
+			uuid,
+			uuid_to_local_map=self._uuid_to_local_map,
+			local_to_uuid_map=self._local_to_uuid_map,
+			query_book=self.query_book,
+			free_local_indices=self._free_local_indices,
+		)
 		if local_idx is not None:
-			del self._local_to_uuid_map[local_idx]
-			self._free_local_indices.add(local_idx)
 			if seq.assigned_rank == self.rank:
 				logging.debug(
 					f"Rank {self.rank}: [LOCALMAP-POP] _report_completion popped "
@@ -4175,14 +4179,7 @@ class BatchGenWorker:
 		for local_idx, uuid in enumerate(my_uuids):
 			seq = self.global_batch.get_sequence(uuid)
 
-			self.query_book[local_idx] = query(
-				text=seq.text,
-				encoded={
-					"input_ids": seq.input_ids,
-				},
-				decoded_tokens=seq.decoded_tokens,
-				kv_token_budget=seq.kv_token_budget,
-			)
+			self.query_book[local_idx] = make_query_book_entry(seq)
 
 			self._local_to_uuid_map[local_idx] = uuid
 			self._uuid_to_local_map[uuid] = local_idx
@@ -6056,14 +6053,7 @@ class BatchGenWorker:
 			# Recreate query_book entry for this rank's evicted sequences (Q4)
 			if seq.assigned_rank == self.rank and uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
-				self.query_book[local_idx] = query(
-					text=seq.text,
-					encoded={
-						"input_ids": seq.input_ids,
-					},
-					decoded_tokens=seq.decoded_tokens,
-					kv_token_budget=seq.kv_token_budget,
-				)
+				self.query_book[local_idx] = make_query_book_entry(seq)
 
 			logging.info(
 				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
@@ -6080,14 +6070,7 @@ class BatchGenWorker:
 				my_prefill_uuids.append(uuid)
 				# Add to local maps if not already present (for new sequences)
 				if uuid not in self._uuid_to_local_map:
-					# O(1) allocation: prefer reusing freed indices, otherwise use next available
-					if self._free_local_indices:
-						new_local_idx = self._free_local_indices.pop()
-					else:
-						new_local_idx = self._next_local_idx
-						self._next_local_idx += 1
-					self._uuid_to_local_map[uuid] = new_local_idx
-					self._local_to_uuid_map[new_local_idx] = uuid
+					new_local_idx = self._bind_local_sequence_to_query_book(uuid)
 					logging.debug(
 						f"Rank {self.rank}: Added new sequence {uuid[:8]}... to local maps "
 						f"(local_idx={new_local_idx})"
@@ -6701,6 +6684,21 @@ class BatchGenWorker:
 		for query_idx in batch:
 			uuid = self._local_to_uuid_map[query_idx]
 			seq = self.global_batch.get_sequence(uuid)
+			query_entry = self.query_book[query_idx]
+			encoded = query_entry.encoded["input_ids"]
+			if encoded.data_ptr() != seq.input_ids.data_ptr():
+				raise RuntimeError(
+					f"Rank {self.rank}: stale query_book input_ids binding for "
+					f"local_idx={query_idx} uuid={uuid[:8]} "
+					f"(query_book_ptr={encoded.data_ptr():#x}, seq_ptr={seq.input_ids.data_ptr():#x})"
+				)
+			if query_entry.decoded_tokens.data_ptr() != seq.decoded_tokens.data_ptr():
+				raise RuntimeError(
+					f"Rank {self.rank}: stale query_book decoded_tokens binding for "
+					f"local_idx={query_idx} uuid={uuid[:8]} "
+					f"(query_book_ptr={query_entry.decoded_tokens.data_ptr():#x}, "
+					f"seq_ptr={seq.decoded_tokens.data_ptr():#x})"
+				)
 			# NO truncation: every prompt is tokenized to its OWN length.
 			# An earlier `[:, :self.max_input_length]` slice silently dropped
 			# the tail of long LongBench prompts when max_input_length was
@@ -6708,7 +6706,6 @@ class BatchGenWorker:
 			# model to "continue" mid-sentence instead of answering. Bind
 			# everything to seq.prompt_length directly.
 			L = seq.prompt_length
-			encoded = self.query_book[query_idx].encoded["input_ids"]
 			assert encoded.size(-1) >= L, (
 				f"encoded prompt length {encoded.size(-1)} < seq.prompt_length {L} "
 				f"for query_idx={query_idx} uuid={uuid[:8]}"
@@ -6842,11 +6839,32 @@ class BatchGenWorker:
 				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
 				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
 
-				# Create cu_seqlens for this micro-batch
-				batch_cu_seqlens = torch.zeros(batch_num_seqs + 1, dtype=torch.int32, device=self.torch_device)
-				for i, seq_len in enumerate(batch_seq_lengths):
-					batch_cu_seqlens[i + 1] = batch_cu_seqlens[i] + seq_len
+				batch_local_indices = batch[seq_start:seq_end]
+				local_to_global_seq_id_map = {}
+				for local_idx in batch_local_indices:
+					uuid = self._local_to_uuid_map.get(local_idx)
+					if uuid is None:
+						raise RuntimeError(
+							f"Rank {self.rank}: missing UUID for prefill local_idx={local_idx}"
+						)
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is None:
+						raise RuntimeError(
+							f"Rank {self.rank}: missing SequenceEntry for prefill uuid={uuid[:8]}"
+						)
+					local_to_global_seq_id_map[local_idx] = seq.global_idx
 
+				batch_spans = build_prefill_sequence_spans(
+					batch_local_indices,
+					batch_seq_lengths,
+					self._local_to_uuid_map,
+					local_to_global_seq_id_map,
+				)
+				batch_cu_seqlens = torch.tensor(
+					prefill_sequence_spans_to_cu_seqlens(batch_spans),
+					dtype=torch.int32,
+					device=self.torch_device,
+				)
 				batch_max_seqlen = max(batch_seq_lengths)
 
 				# Set up Attn_Wrapper for this micro-batch
@@ -6856,9 +6874,7 @@ class BatchGenWorker:
 				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
 				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
 				Attn_Wrapper.position_ids = batch_position_ids_flat
-				# Map local batch indices to global seq ids for this micro-batch
-				batch_local_indices = batch[seq_start:seq_end]
-				Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch_local_indices)
+				Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
 
 				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
 				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
@@ -6951,6 +6967,11 @@ class BatchGenWorker:
 							logging.warning(f"[PREFILL-TOP5] wiring failed: {_e_top5}")
 
 				batch_new_tokens = self._select_tokens(logits)
+				if batch_new_tokens.shape[0] != batch_num_seqs:
+					raise RuntimeError(
+						f"Rank {self.rank}: prefill token selection shape mismatch, "
+						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+					)
 				output_tokens.append(batch_new_tokens)
 
 		# Reset prepack mode
@@ -6971,6 +6992,11 @@ class BatchGenWorker:
 		self._log_prefill_timing()
 
 		new_tokens = torch.cat(output_tokens, dim=0)
+		if new_tokens.shape[0] != len(batch):
+			raise RuntimeError(
+				f"Rank {self.rank}: prefill writeback shape mismatch, "
+				f"got {new_tokens.shape[0]} rows for {len(batch)} local sequences"
+			)
 
 		# Update sequence state after prefill
 		# For evicted re-entry: first new token goes at decoded_length offset (not 0)
@@ -8044,12 +8070,7 @@ class BatchGenWorker:
 				f"gpu_pages={seq.gpu_pages_allocated}")
 			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
 			if local_idx in self.query_book:
-				self.query_book[local_idx] = query(
-					text=seq.text,
-					encoded={"input_ids": seq.input_ids},
-					decoded_tokens=seq.decoded_tokens,
-					kv_token_budget=seq.kv_token_budget,
-				)
+				self.query_book[local_idx] = make_query_book_entry(seq)
 
 		updated_uuids = current_decode_uuids + valid_pending_uuids
 		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
