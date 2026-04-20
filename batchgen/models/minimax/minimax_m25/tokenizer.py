@@ -21,17 +21,17 @@
 MiniMax-M2.5 tokenizer specifications:
 - Vocabulary size: 200,064 tokens
 - Uses HuggingFace tokenizer.json format
-- tokenizer.json must be bundled in this directory
+- tokenizer.json is loaded from the converted checkpoint directory
 
-To bundle the tokenizer files:
-    huggingface-cli download MiniMaxAI/MiniMax-M2.5 tokenizer.json tokenizer_config.json \
-        --local-dir batchgen/models/minimax/minimax_m25/
+Tokenizer assets are copied into the converted checkpoint directory during
+BatchGen checkpoint conversion.
 """
 
 import json
 import logging
 import re
 import uuid
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Optional
 
@@ -39,9 +39,6 @@ from batchgen.config.fast_tokenizer import FastTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
-
-# Tokenizer files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
 
 # MiniMax-M2.5 special token IDs (from tokenizer_config.json added_tokens_decoder)
 MINIMAX_M25_BOS_TOKEN_ID = 200034
@@ -53,7 +50,7 @@ MINIMAX_M25_VOCAB_SIZE = 200064
 class MiniMaxM25Tokenizer(FastTokenizer):
     """MiniMax-M2.5 tokenizer.
 
-    Loads tokenizer.json from package directory (not user cache).
+    Loads tokenizer.json from the converted checkpoint directory.
 
     Attributes:
         bos_token_id: BOS token ID
@@ -62,9 +59,9 @@ class MiniMaxM25Tokenizer(FastTokenizer):
         vocab_size: 200,064
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer_path: str | Path):
         """Initialize the MiniMax-M2.5 tokenizer."""
-        super().__init__(str(TOKENIZER_DIR))
+        super().__init__(str(tokenizer_path))
 
         self.bos_token_id = MINIMAX_M25_BOS_TOKEN_ID
         self.eos_token_id = MINIMAX_M25_EOS_TOKEN_ID
@@ -91,11 +88,12 @@ class MiniMaxM25Tokenizer(FastTokenizer):
                 pad_token=self.pad_token,
             )
 
-        # Load chat template from separate .jinja file (not in tokenizer_config.json)
-        chat_template_path = TOKENIZER_DIR / "chat_template.jinja"
-        if chat_template_path.exists():
-            self.chat_template = chat_template_path.read_text()
-            logger.info("Loaded chat template from chat_template.jinja")
+        # chat_template.jinja remains packaged with BatchGen; only tokenizer JSONs move.
+        chat_template_resource = files(__package__) / "chat_template.jinja"
+        with as_file(chat_template_resource) as chat_template_path:
+            if chat_template_path.exists():
+                self.chat_template = chat_template_path.read_text()
+                logger.info("Loaded chat template from packaged chat_template.jinja")
 
         logger.info(
             f"MiniMax-M2.5 tokenizer initialized: vocab_size={self.vocab_size}, "

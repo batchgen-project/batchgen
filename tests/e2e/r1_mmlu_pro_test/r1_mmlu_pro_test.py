@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
-from transformers import AutoTokenizer
 
 from batchgen.batchgen_client import BatchGenHttpClient
+from batchgen.config.tokenizer_registry import load_tokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,6 +97,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_decoding_length", type=int, required=True)
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--converted_ckpt_dir", type=str, default=None)
     # New HTTP API arguments
     parser.add_argument("--base_url", type=str, default=None,
                         help="Server base URL (e.g., http://localhost:10900). Takes precedence over host/port.")
@@ -178,11 +179,14 @@ if __name__ == "__main__":
         )
         queries.append(prompt)
 
-    tokenizer_kwargs: Dict[str, Any] = {"trust_remote_code": True}
-    if args.hf_cache_dir:
-        tokenizer_kwargs["cache_dir"] = args.hf_cache_dir
-    tokenizer = AutoTokenizer.from_pretrained(
-        hugging_face_checkpoint, **tokenizer_kwargs
+    tokenizer_dir = (
+        args.converted_ckpt_dir
+        or args.cache_dir
+        or hugging_face_checkpoint
+    )
+    tokenizer = load_tokenizer(
+        hugging_face_checkpoint,
+        tokenizer_dir,
     )
     for prompt_idx in range(len(queries)):
         messages = [

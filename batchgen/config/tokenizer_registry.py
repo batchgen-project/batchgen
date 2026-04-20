@@ -24,14 +24,14 @@ This module provides:
 3. A unified load_tokenizer() function to replace AutoTokenizer.from_pretrained()
 
 Key Design Principle:
-    Tokenizer files are bundled with BatchGen, NOT loaded from user's cache directory.
-    Each tokenizer class loads its tokenizer.json from its own package directory.
+    Tokenizer files are loaded from the converted checkpoint directory that the
+    server or worker is already configured to use.
 
 Usage:
     from batchgen.config.tokenizer_registry import load_tokenizer
 
     # Load tokenizer using model identifier for pattern matching
-    tokenizer = load_tokenizer("deepseek-ai/DeepSeek-R1")
+    tokenizer = load_tokenizer("deepseek-ai/DeepSeek-R1", "/path/to/converted_ckpt")
 
     # Encode/decode
     tokens = tokenizer.encode("Hello, world!")
@@ -41,8 +41,10 @@ Usage:
     batch = tokenizer(["Hello", "World"], return_tensors="pt", padding=True)
 """
 
-from typing import Dict, Type, Optional, TYPE_CHECKING
+import importlib
 import logging
+import os
+from typing import Dict, Type, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .base_tokenizer import BaseTokenizer
@@ -52,6 +54,16 @@ logger = logging.getLogger(__name__)
 
 # Registry mapping tokenizer_type -> tokenizer class
 TOKENIZER_REGISTRY: Dict[str, Type["BaseTokenizer"]] = {}
+
+TOKENIZER_MODULES: Dict[str, str] = {
+    "deepseek_v3": "batchgen.models.deepseek.deepseekv3.tokenizer",
+    "deepseek_v2": "batchgen.models.deepseek.deepseekv2.tokenizer",
+    "gpt_oss": "batchgen.models.openai.gpt_oss_120b.tokenizer",
+    "mixtral": "batchgen.models.mixtral.tokenizer",
+    "kimi_k25": "batchgen.models.moonshotai.kimi_k25.tokenizer",
+    "glm_moe_dsa": "batchgen.models.glm.glm5.tokenizer",
+    "minimax_m25": "batchgen.models.minimax.minimax_m25.tokenizer",
+}
 
 # Model name/identifier patterns for tokenizer detection
 # Maps patterns found in model names to tokenizer_type
@@ -92,32 +104,54 @@ def register_tokenizer(tokenizer_type: str):
     return decorator
 
 
-def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
+def load_tokenizer(
+    model_identifier: str,
+    converted_ckpt_dir: str | os.PathLike[str],
+) -> "BaseTokenizer":
     """Load appropriate tokenizer for model.
 
     This function replaces HuggingFace's AutoTokenizer.from_pretrained().
 
     The model_identifier is used ONLY for pattern matching to determine which
-    tokenizer type to use. Tokenizer files are loaded from the package directory
-    by each tokenizer class (not from user-provided paths).
+    tokenizer type to use. Tokenizer assets are loaded from the converted
+    checkpoint directory by each tokenizer class.
 
     Args:
         model_identifier: Model name or path for pattern matching
                          (e.g., "deepseek-ai/DeepSeek-R1", "DeepSeek-R1")
+        converted_ckpt_dir: Directory containing the converted checkpoint and
+                            copied tokenizer assets.
 
     Returns:
-        Appropriate tokenizer instance (loads files from package directory)
+        Appropriate tokenizer instance
 
     Raises:
         ValueError: If no registered tokenizer matches the model identifier
     """
+    if converted_ckpt_dir is None:
+        raise ValueError("converted_ckpt_dir is required to load tokenizer assets.")
+
+    tokenizer_path = os.fspath(converted_ckpt_dir)
+
     # Pattern match to find registered tokenizer
     for pattern, tokenizer_type in TOKENIZER_NAME_PATTERNS.items():
         if pattern in model_identifier:
+            if tokenizer_type not in TOKENIZER_REGISTRY:
+                module_path = TOKENIZER_MODULES.get(tokenizer_type)
+                if module_path is not None:
+                    try:
+                        importlib.import_module(module_path)
+                    except ImportError:
+                        logger.debug(
+                            "Deferred tokenizer import failed for type=%s module=%s",
+                            tokenizer_type,
+                            module_path,
+                            exc_info=True,
+                        )
+
             if tokenizer_type in TOKENIZER_REGISTRY:
                 logger.info(f"Using registered tokenizer for type={tokenizer_type}")
-                # Tokenizer loads from its own package directory (no path argument)
-                return TOKENIZER_REGISTRY[tokenizer_type]()
+                return TOKENIZER_REGISTRY[tokenizer_type](tokenizer_path)
 
     raise ValueError(
         f"No tokenizer registered for model: {model_identifier}. "

@@ -174,6 +174,33 @@ class GptOss_Parameter_Server:
 
         return self.shm_name, self.tensor_meta_shm_name
 
+    def _copy_tokenizer_assets(self):
+        """Copy GPT-OSS tokenizer assets into converted checkpoint dir if present."""
+        copied_files = []
+        for file_name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+            source_file = os.path.join(self.cache_dir, file_name)
+            target_file = os.path.join(self.converted_ckpt_dir, file_name)
+
+            if os.path.exists(target_file):
+                continue
+
+            if not os.path.exists(source_file):
+                if file_name in ("tokenizer_config.json", "chat_template.jinja"):
+                    logging.warning(
+                        "GPT-OSS required tokenizer asset is missing from source checkpoint dir: "
+                        f"{source_file}. Runtime tokenizer loading may fail until this file is available "
+                        "in the converted checkpoint dir."
+                    )
+                continue
+
+            shutil.copyfile(source_file, target_file)
+            copied_files.append(file_name)
+
+        if copied_files:
+            logging.info(
+                f"Copied GPT-OSS tokenizer assets to converted checkpoint dir: {copied_files}"
+            )
+
     @property
     def weights_storage(self):
         """Return the C++ parameter server as weights storage for core engine."""
@@ -310,6 +337,7 @@ class GptOss_Parameter_Server:
         # Check if already converted
         converted_marker = os.path.join(self.converted_ckpt_dir, ".gpt_oss_converted")
         if os.path.exists(converted_marker):
+            self._copy_tokenizer_assets()
             logging.info(f"Checkpoint already converted at {self.converted_ckpt_dir}")
             # Log what converted files exist
             converted_files = [f for f in os.listdir(self.converted_ckpt_dir) if f.endswith(('.bin', '.json'))]
@@ -413,6 +441,7 @@ class GptOss_Parameter_Server:
 
         # Convert non-layer tensors (embeddings, final norm, lm_head)
         self._convert_non_layer_tensors(tensor_to_file)
+        self._copy_tokenizer_assets()
 
         # Mark as converted
         with open(converted_marker, "w") as f:

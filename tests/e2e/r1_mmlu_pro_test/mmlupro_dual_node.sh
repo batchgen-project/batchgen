@@ -12,12 +12,14 @@ datetime=$(date +%Y%m%d_%H%M%S)
 mkdir -p ./deepseek-r1-bench
 
 export HF_ENDPOINT=https://hf-mirror.com
+CONVERTED_CKPT_DIR="/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/snapshots/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad/converted_ckpt"
 
 python test/r1_mmlu_pro_test/r1_mmlu_pro_test.py \
     --hugging_face_checkpoint "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/snapshots/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad" \
     --max_prompts 1024 \
     --max_decoding_length 10240 \
     --cache_dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/snapshots/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad" \
+    --converted_ckpt_dir "$CONVERTED_CKPT_DIR" \
     --base_url "http://localhost:10900" \
     --timeout 6000 \
     > ./deepseek-r1-bench/${datetime}.log 2>&1

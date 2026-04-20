@@ -46,9 +46,6 @@ from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Tokenizer config files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
-
 # GPT-OSS-120B special token IDs (from OpenAI reference)
 GPT_OSS_BOS_TOKEN_ID = 199998   # <|startoftext|>
 GPT_OSS_EOS_TOKEN_ID = 200002   # <|return|>
@@ -114,8 +111,9 @@ class GPTOssTokenizer(BaseTokenizer):
         vocab_size: 201,088
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer_path: str | Path | None = None):
         """Initialize the GPT-OSS tokenizer using tiktoken."""
+        self.tokenizer_path = Path(tokenizer_path) if tokenizer_path is not None else None
         self.tokenizer = _get_tiktoken_tokenizer()
 
         # Set special token IDs
@@ -129,7 +127,7 @@ class GPTOssTokenizer(BaseTokenizer):
         self.eos_token = "<|return|>"
         self.pad_token = "<|endoftext|>"
 
-        # Load chat template from tokenizer_config.json if available
+        # Load chat template from the converted checkpoint dir if available.
         self.chat_template = self._load_chat_template()
 
         logger.info(
@@ -139,16 +137,23 @@ class GPTOssTokenizer(BaseTokenizer):
         )
 
     def _load_chat_template(self) -> Optional[str]:
-        """Load chat template from tokenizer_config.json if available."""
-        config_file = TOKENIZER_DIR / "tokenizer_config.json"
-        if config_file.exists():
-            try:
-                with open(config_file, "r") as f:
-                    config = json.load(f)
-                return config.get("chat_template")
-            except Exception as e:
-                logger.warning(f"Failed to load chat template: {e}")
-        return None
+        """Load chat template from chat_template.jinja in converted checkpoint dir."""
+        if self.tokenizer_path is None:
+            return None
+
+        template_file = self.tokenizer_path / "chat_template.jinja"
+        if not template_file.exists():
+            raise FileNotFoundError(
+                f"Missing GPT-OSS chat template: expected {template_file}. "
+                "Re-convert the checkpoint so chat_template.jinja is copied into the converted checkpoint dir."
+            )
+
+        try:
+            return template_file.read_text(encoding="utf-8")
+        except OSError as e:
+            raise RuntimeError(
+                f"Failed to read GPT-OSS chat template from {template_file}: {e}"
+            ) from e
 
     def encode(
         self,
@@ -254,7 +259,7 @@ class GPTOssTokenizer(BaseTokenizer):
     ) -> Union[str, List[int]]:
         """Apply chat template to format messages.
 
-        Uses the Jinja2 chat_template from tokenizer_config.json to format
+        Uses the Jinja2 chat template from chat_template.jinja to format
         a list of chat messages into a prompt string.
 
         Args:

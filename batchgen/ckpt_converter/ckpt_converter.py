@@ -4,7 +4,41 @@ from safetensors.torch import load_file
 import torch
 import os
 import logging
-import ctypes	
+import shutil
+import ctypes
+
+from batchgen.config.model_detection import (
+	detect_model_type_from_directory,
+	detect_model_type_from_identifier,
+)
+
+KNOWN_TOKENIZER_ASSET_FILES = (
+	"tokenizer.json",
+	"tokenizer_config.json",
+	"tiktoken.model",
+	"chat_template.jinja",
+)
+
+
+
+# Model-specific tokenizer asset contract for files expected in converted_ckpt/.
+# This is used by converter warnings and validation after conversion.
+# It is intentionally narrower than KNOWN_TOKENIZER_ASSET_FILES:
+# - only assets that must survive into converted_ckpt for this model belong here
+# - packaged chat templates that still live in the wheel are not listed here
+# - GPT-OSS still copies tokenizer.json when present, but runtime construction is based on
+#   tiktoken + tokenizer_config/chat_template, so tokenizer.json is not a required asset
+#   for validation today
+REQUIRED_TOKENIZER_ASSETS_BY_MODEL = {
+	"deepseek_v3": ("tokenizer.json", "tokenizer_config.json"),
+	"deepseek_v2": ("tokenizer.json", "tokenizer_config.json"),
+	"glm5": ("tokenizer.json", "tokenizer_config.json"),
+	"minimax_m25": ("tokenizer.json", "tokenizer_config.json"),
+	"kimi_k25": ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"),
+	"gpt_oss": ("tokenizer_config.json", "chat_template.jinja"),
+}
+
+
 class ckpt_converter:
 	"""
 		Convert .safetesors or .pt checkpoints to a format compatible with BatchGen.
@@ -26,7 +60,71 @@ class ckpt_converter:
 		We save the tensors in a file. And the metadata in a json file.
 	"""
 	def __init__(self):
-		pass
+		self._copied_tokenizer_assets = set()
+
+	def _get_tokenizer_asset_files(self, source_dir):
+		"""Return tokenizer asset files present in the source checkpoint dir."""
+		asset_files = []
+		for file_name in KNOWN_TOKENIZER_ASSET_FILES:
+			if os.path.exists(os.path.join(source_dir, file_name)):
+				asset_files.append(file_name)
+		return asset_files
+
+	def _detect_model_family(self, input_dir, model_identifier=None):
+		"""Infer model family for tokenizer asset validation."""
+		if model_identifier:
+			detected = detect_model_type_from_identifier(str(model_identifier))
+			if detected is not None:
+				return detected
+
+		return detect_model_type_from_directory(input_dir)
+
+	def _get_required_tokenizer_asset_files(self, input_dir, model_identifier=None):
+		"""Return required tokenizer assets for the detected model family."""
+		model_family = self._detect_model_family(input_dir, model_identifier=model_identifier)
+		if model_family is None:
+			return []
+		return list(REQUIRED_TOKENIZER_ASSETS_BY_MODEL.get(model_family, ()))
+
+	def _copy_tokenizer_assets(self, source_dir, output_dir, model_identifier=None):
+		"""Copy tokenizer assets from source checkpoint dir into converted output dir."""
+		copy_key = (os.path.abspath(source_dir), os.path.abspath(output_dir))
+		if copy_key in self._copied_tokenizer_assets:
+			return
+		self._copied_tokenizer_assets.add(copy_key)
+
+		present_assets = set(self._get_tokenizer_asset_files(source_dir))
+		for file_name in present_assets:
+			source_file = os.path.join(source_dir, file_name)
+			target_file = os.path.join(output_dir, file_name)
+			shutil.copyfile(source_file, target_file)
+			logging.info(f"Copied {file_name} to converted checkpoint dir: {target_file}")
+
+		required_assets = set(self._get_required_tokenizer_asset_files(source_dir, model_identifier=model_identifier))
+		missing_required_assets = sorted(required_assets - present_assets)
+		if missing_required_assets:
+			logging.warning(
+				f"Missing required tokenizer assets for source checkpoint directory {source_dir}: {missing_required_assets}. "
+				"Conversion will continue, but runtime tokenizer loading may fail."
+			)
+
+	def _backfill_missing_tokenizer_assets(self, source_dir, output_dir):
+		"""Copy missing tokenizer assets into an existing converted checkpoint dir."""
+		copied_files = []
+		for file_name in self._get_tokenizer_asset_files(source_dir):
+			source_file = os.path.join(source_dir, file_name)
+			target_file = os.path.join(output_dir, file_name)
+			if os.path.exists(target_file):
+				continue
+
+			shutil.copyfile(source_file, target_file)
+			copied_files.append(file_name)
+
+		if copied_files:
+			logging.info(
+				f"Backfilled tokenizer assets into existing converted checkpoint dir {output_dir}: "
+				f"{copied_files}"
+			)
 
 	def _dtype_to_str(self, dtype):
 		"""
@@ -111,7 +209,7 @@ class ckpt_converter:
 			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections replaced in-place")
 		return ckpt
 
-	def convert(self, ckpt_path, output_dir, marlin=False):
+	def convert(self, ckpt_path, output_dir, marlin=False, model_identifier=None):
 		# Check if the file dir exists
 		if not os.path.exists(ckpt_path):
 			raise FileNotFoundError(f"Checkpoint file path {ckpt_path} does not exist.")
@@ -177,6 +275,8 @@ class ckpt_converter:
 		with open(out_metadata_name, "w") as metadata_file:
 			json.dump(metadata, metadata_file, indent=4)
 
+		self._copy_tokenizer_assets(os.path.dirname(os.path.abspath(ckpt_path)), output_dir, model_identifier=model_identifier)
+
 	def _get_checkpoint_files(self, input_dir):
 		"""
 		Get list of checkpoint files (.safetensors or .pt) in a directory.
@@ -193,7 +293,23 @@ class ckpt_converter:
 				file_list.append(os.path.join(input_dir, file_name))
 		return sorted(file_list)
 
-	def validate_converted_directory(self, input_dir, output_dir):
+	def _get_expected_output_files(self, input_dir):
+		"""Return the allowed set of files in the converted output dir."""
+		expected_files = set()
+		for src_file in self._get_checkpoint_files(input_dir):
+			file_name = os.path.basename(src_file)
+			expected_files.add(
+				file_name.replace(".safetensors", ".json").replace(".pt", ".json")
+			)
+			expected_files.add(
+				file_name.replace(".safetensors", ".bin").replace(".pt", ".bin")
+			)
+
+		expected_files.update(KNOWN_TOKENIZER_ASSET_FILES)
+
+		return expected_files
+
+	def validate_converted_directory(self, input_dir, output_dir, model_identifier=None):
 		"""
 		Validate that converted checkpoint files are consistent with source files.
 
@@ -209,27 +325,8 @@ class ckpt_converter:
 		if not file_list:
 			return False, f"No checkpoint files (.safetensors or .pt) found in {input_dir}"
 
-		# Count metadata and bin files
-		metadata_files = []
-		bin_files = []
-		for file_name in os.listdir(output_dir):
-			if file_name.endswith(".json"):
-				metadata_files.append(os.path.join(output_dir, file_name))
-			elif file_name.endswith(".bin"):
-				bin_files.append(os.path.join(output_dir, file_name))
-
-		# Check counts match
-		if len(metadata_files) != len(bin_files):
-			return False, (
-				f"Metadata files ({len(metadata_files)}) and bin files ({len(bin_files)}) count mismatch. "
-				f"Please clean {output_dir} and reconvert."
-			)
-
-		if len(metadata_files) != len(file_list):
-			return False, (
-				f"Converted files ({len(metadata_files)}) and source checkpoint files ({len(file_list)}) count mismatch. "
-				f"Please clean {output_dir} and reconvert."
-			)
+		if not os.path.isdir(output_dir):
+			return False, f"Output directory {output_dir} does not exist or is not a directory."
 
 		# Check each source file has corresponding converted files
 		for src_file in file_list:
@@ -254,9 +351,29 @@ class ckpt_converter:
 					f"Please clean {output_dir} and reconvert."
 				)
 
+		required_assets = self._get_required_tokenizer_asset_files(
+			input_dir, model_identifier=model_identifier
+		)
+		for file_name in required_assets:
+			output_file = os.path.join(output_dir, file_name)
+			if not os.path.exists(output_file):
+				return False, (
+					f"Required tokenizer asset {output_file} does not exist for model validation. "
+					f"Please clean {output_dir} and reconvert."
+				)
+
+		expected_files = self._get_expected_output_files(input_dir)
+		actual_files = {entry.name for entry in os.scandir(output_dir)}
+		unexpected_files = sorted(actual_files - expected_files)
+		if unexpected_files:
+			return False, (
+				f"Unexpected files or directories in {output_dir}: {unexpected_files}. "
+				f"Please clean {output_dir} and reconvert."
+			)
+
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, model_identifier=None):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -299,7 +416,8 @@ class ckpt_converter:
 
 		# Check if already converted
 		if os.path.exists(output_dir) and not force:
-			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir)
+			self._backfill_missing_tokenizer_assets(input_dir, output_dir)
+			is_valid, error_msg = self.validate_converted_directory(input_dir, output_dir, model_identifier=model_identifier)
 			if is_valid:
 				logging.info(f"Converted checkpoint files already exist and are valid in {output_dir}")
 				return output_dir
@@ -323,7 +441,7 @@ class ckpt_converter:
 
 		for file_path in file_iterator:
 			logging.debug(f"Converting {file_path} to {output_dir}")
-			self.convert(file_path, output_dir, marlin=marlin)
+			self.convert(file_path, output_dir, marlin=marlin, model_identifier=model_identifier)
 
 		logging.info(f"Conversion complete. Output directory: {output_dir}"
 		             f"{' (with Marlin repack)' if marlin else ''}")
@@ -346,7 +464,4 @@ class ckpt_converter:
 
 
 		
-
-
-
 

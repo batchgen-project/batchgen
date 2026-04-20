@@ -42,7 +42,13 @@ from typing import Dict, Type, Optional, TYPE_CHECKING
 from pathlib import Path
 import json
 import logging
-import os
+
+from .model_detection import (
+    ARCH_PATTERNS,
+    MODEL_NAME_PATTERNS,
+    detect_model_type_from_config_dict,
+    detect_model_type_from_identifier,
+)
 
 if TYPE_CHECKING:
     from .model_config import BaseModelConfig
@@ -53,30 +59,6 @@ logger = logging.getLogger(__name__)
 # Registry mapping model_type -> config class
 CONFIG_REGISTRY: Dict[str, Type["BaseModelConfig"]] = {}
 
-# Architecture name patterns for fallback detection
-ARCH_PATTERNS: Dict[str, str] = {
-    "DeepseekV3": "deepseek_v3",
-    "DeepseekV2": "deepseek_v2",
-    "Mixtral": "mixtral",
-    "GptOss": "gpt_oss",
-    "Qwen2Moe": "qwen2_moe",
-    "MiniMaxM2": "minimax_m25",
-}
-
-# Model name/identifier patterns for detection from HuggingFace model IDs
-# Maps patterns found in model names to model_type
-MODEL_NAME_PATTERNS: Dict[str, str] = {
-    "MiniMax-M2.5": "minimax_m25",
-    "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
-    "moonshotai/Kimi-K2.5": "kimi_k25",
-    "DeepSeek-R1": "deepseek_v3",
-    "DeepSeek-V3": "deepseek_v3",
-    "DeepSeek-V2-Lite": "deepseek_v2",
-    "DeepSeek-V2": "deepseek_v2",
-    "Mixtral-8x22B": "mixtral",
-    "Mixtral-8x7B": "mixtral",
-    "gpt-oss": "gpt_oss",
-}
 
 
 def register_config(model_type: str):
@@ -102,21 +84,11 @@ def register_config(model_type: str):
 
 
 def _detect_model_type_from_identifier(model_identifier: str) -> Optional[str]:
-    """Detect model type from HuggingFace model identifier.
-
-    Args:
-        model_identifier: HuggingFace model ID (e.g., "deepseek-ai/DeepSeek-R1")
-
-    Returns:
-        model_type string if detected, None otherwise
-    """
-    # Check each pattern - order matters (more specific patterns first)
-    # MODEL_NAME_PATTERNS is ordered with more specific patterns first
-    for pattern, model_type in MODEL_NAME_PATTERNS.items():
-        if pattern in model_identifier:
-            logger.debug(f"Detected model_type={model_type} from identifier={model_identifier}")
-            return model_type
-    return None
+    """Detect model type from HuggingFace model identifier."""
+    detected_type = detect_model_type_from_identifier(model_identifier)
+    if detected_type is not None:
+        logger.debug(f"Detected model_type={detected_type} from identifier={model_identifier}")
+    return detected_type
 
 
 def load_config(model_identifier: str) -> "BaseModelConfig":
@@ -158,24 +130,13 @@ def load_config(model_identifier: str) -> "BaseModelConfig":
         with open(config_path, 'r') as f:
             data = json.load(f)
 
-        # Try model_type first
         model_type = data.get("model_type", "")
-        if model_type in CONFIG_REGISTRY:
-            logger.debug(f"Loading config for model_type={model_type}")
-            config = CONFIG_REGISTRY[model_type].from_dir(model_identifier)
-        else:
-            # Fallback: detect from architectures
-            archs = data.get("architectures", [])
-            for arch in archs:
-                for pattern, config_type in ARCH_PATTERNS.items():
-                    if pattern in arch and config_type in CONFIG_REGISTRY:
-                        logger.debug(
-                            f"Detected model_type={config_type} from architecture={arch}"
-                        )
-                        config = CONFIG_REGISTRY[config_type].from_dir(model_identifier)
-                        break
-                if config is not None:
-                    break
+        archs = data.get("architectures", [])
+        detected_type = detect_model_type_from_config_dict(data)
+
+        if detected_type in CONFIG_REGISTRY:
+            logger.debug(f"Loading config for model_type={detected_type}")
+            config = CONFIG_REGISTRY[detected_type].from_dir(model_identifier)
 
         if config is None:
             # Ultimate fallback: use base config from local file

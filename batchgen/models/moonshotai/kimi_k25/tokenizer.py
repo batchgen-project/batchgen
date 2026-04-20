@@ -18,13 +18,14 @@
 
 """Kimi K2.5 Tokenizer for BatchGen.
 
-This module wraps the TikToken tokenizer from the assets directory
-and registers it with BatchGen's tokenizer registry.
+This module wraps the vendored TikToken tokenizer implementation while
+loading tokenizer assets from the converted checkpoint directory.
 
 The Kimi K2.5 tokenizer uses TikToken format with 163,840 tokens.
 """
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -35,8 +36,7 @@ from tokenizers import AddedToken
 from batchgen.config.base_tokenizer import BaseTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
 
-# Kimi K2.5 tokenizer assets directory
-TOKENIZER_DIR = Path(__file__).parent / "assets"
+logger = logging.getLogger(__name__)
 
 # Kimi K2.5 special token IDs (from tokenizer_config.json)
 KIMI_K25_BOS_TOKEN_ID = 163584  # "[BOS]"
@@ -60,40 +60,56 @@ class KimiK25Tokenizer(BaseTokenizer):
         vocab_size: 163840
     """
 
-    def __init__(self):
-        """Initialize Kimi K2.5 tokenizer from assets."""
-        # Import TikTokenTokenizer from assets
+    def __init__(self, tokenizer_path: Optional[str] = None):
+        """Initialize Kimi K2.5 tokenizer from converted checkpoint assets."""
+        if tokenizer_path is None:
+            raise ValueError("tokenizer_path is required for Kimi K2.5 tokenizer assets.")
+
+        asset_dir = Path(tokenizer_path)
+        config_file = asset_dir / "tokenizer_config.json"
+        vocab_file = asset_dir / "tiktoken.model"
+        chat_template_file = asset_dir / "chat_template.jinja"
+
+        if not config_file.exists():
+            raise FileNotFoundError(
+                f"Kimi K2.5 tokenizer_config.json not found in {asset_dir}"
+            )
+        if not vocab_file.exists():
+            raise FileNotFoundError(
+                f"Kimi K2.5 tiktoken.model not found in {asset_dir}"
+            )
+
+        # Import TikTokenTokenizer from vendored implementation.
         from batchgen.models.moonshotai.kimi_k25.assets.tokenization_kimi import (
             TikTokenTokenizer,
         )
 
-        # Load tokenizer config
-        config_file = TOKENIZER_DIR / "tokenizer_config.json"
-        with open(config_file) as f:
+        with config_file.open() as f:
             config = json.load(f)
 
-        # Get added_tokens_decoder and convert to AddedToken format
         added_tokens_decoder_raw = config.get("added_tokens_decoder", {})
         added_tokens_decoder = {
             int(k): AddedToken(v["content"], special=v.get("special", False))
             for k, v in added_tokens_decoder_raw.items()
         }
 
-        # Load tokenizer from tiktoken.model with added_tokens_decoder and special tokens
-        vocab_file = str(TOKENIZER_DIR / "tiktoken.model")
         self._tokenizer = TikTokenTokenizer(
-            vocab_file,
+            str(vocab_file),
             bos_token="[BOS]",
             eos_token="[EOS]",
             pad_token="[PAD]",
             unk_token="[UNK]",
-            added_tokens_decoder=added_tokens_decoder
+            added_tokens_decoder=added_tokens_decoder,
         )
 
-        # Load chat template from jinja file
-        jinja_file = TOKENIZER_DIR / "chat_template.jinja"
-        if jinja_file.exists():
-            self._tokenizer.chat_template = jinja_file.read_text()
+        if chat_template_file.is_file():
+            with chat_template_file.open() as jinja_file:
+                self._tokenizer.chat_template = jinja_file.read()
+        else:
+            logger.warning(
+                "Kimi K2.5 chat_template.jinja not found in tokenizer assets: %s",
+                asset_dir,
+            )
 
         # Set special token IDs
         self.bos_token_id = KIMI_K25_BOS_TOKEN_ID

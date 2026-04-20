@@ -27,8 +27,8 @@ DeepSeek tokenizer specifications:
 - EOS token: <｜end▁of▁sentence｜> (ID: 1)
 - Uses HuggingFace tokenizer.json format
 
-The tokenizer.json file is bundled with BatchGen in this directory.
-It is NOT loaded from user's cache directory.
+The tokenizer.json file is loaded from the converted checkpoint directory
+provided by the BatchGen runtime.
 """
 
 import json
@@ -43,9 +43,6 @@ from batchgen.config.tokenizer_registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Tokenizer files are in the same directory as this module
-TOKENIZER_DIR = Path(__file__).parent
-
 
 # DeepSeek-V3/R1 special token IDs
 DEEPSEEK_V3_BOS_TOKEN_ID = 0  # <｜begin▁of▁sentence｜>
@@ -57,7 +54,7 @@ DEEPSEEK_V3_VOCAB_SIZE = 129280
 class DeepSeekV3Tokenizer(FastTokenizer):
     """DeepSeek-V3/R1 tokenizer.
 
-    Loads tokenizer.json from package directory (not user cache).
+    Loads tokenizer.json from the converted checkpoint directory.
 
     Attributes:
         bos_token_id: 0 (<｜begin▁of▁sentence｜>)
@@ -66,13 +63,12 @@ class DeepSeekV3Tokenizer(FastTokenizer):
         vocab_size: 129,280
     """
 
-    def __init__(self):
+    def __init__(self, tokenizer_path: str | Path):
         """Initialize the DeepSeek-V3 tokenizer.
 
-        Loads tokenizer.json from the package directory (TOKENIZER_DIR).
+        Loads tokenizer.json from the converted checkpoint directory.
         """
-        # Load from package directory, not user path
-        super().__init__(str(TOKENIZER_DIR))
+        super().__init__(str(tokenizer_path))
 
         # Override with DeepSeek-specific special token IDs
         # These are the correct values for DeepSeek-V3/R1 models

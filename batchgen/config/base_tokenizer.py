@@ -24,7 +24,7 @@ providing a unified API that removes dependency on transformers.AutoTokenizer.
 Usage:
     from batchgen.config.tokenizer_registry import load_tokenizer
 
-    tokenizer = load_tokenizer("/path/to/model")
+    tokenizer = load_tokenizer("/path/to/model", "/path/to/converted_ckpt")
     tokens = tokenizer.encode("Hello, world!")
     text = tokenizer.decode(tokens)
 
