@@ -171,6 +171,10 @@ from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
+from batchgen.batch_order import (
+	batch_matches_expected_uuid_order,
+	local_indices_to_uuid_order,
+)
 from batchgen.utils import config_torch_module_initializer
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
@@ -3639,9 +3643,18 @@ class BatchGenWorker:
 	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
 		"""Convert global UUIDs to local indices for sequences assigned to this rank."""
 		local_indices = []
+		missing_uuids = []
 		for uuid in uuids:
 			if uuid in self._uuid_to_local_map:
 				local_indices.append(self._uuid_to_local_map[uuid])
+			else:
+				missing_uuids.append(uuid)
+		if missing_uuids:
+			logging.error(
+				f"Rank {self.rank}: MISSING UUIDS in _get_local_indices_for_uuids! "
+				f"input_len={len(uuids)}, output_len={len(local_indices)}, "
+				f"missing={[u[:8] for u in missing_uuids[:10]]}"
+			)
 		return local_indices
 
 	# def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
@@ -7910,10 +7923,17 @@ class BatchGenWorker:
 		# ========== VERIFY BATCH CONSISTENCY ==========
 		# CRITICAL: Ensure batch matches decode_uuids for THIS rank
 		expected_local = self._get_local_indices_for_uuids(decode_uuids)
-		if set(batch) != set(expected_local):
+		if not batch_matches_expected_uuid_order(
+			batch,
+			decode_uuids,
+			self._uuid_to_local_map,
+		):
+			actual_uuids = local_indices_to_uuid_order(batch, self._local_to_uuid_map)
 			logging.error(
 				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
-				f"batch={sorted(batch)}, expected={sorted(expected_local)}"
+				f"batch={batch}, expected={expected_local}, "
+				f"actual_uuids={[u[:8] if isinstance(u, str) else None for u in actual_uuids[:10]]}, "
+				f"expected_uuids={[u[:8] for u in decode_uuids[:10]]}"
 			)
 			batch = expected_local  # Fix the batch
 			# CRITICAL: Rebuild page table to match the corrected batch
