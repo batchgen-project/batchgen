@@ -24,6 +24,11 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from batchgen.models.glm.glm5.decode_utils import (
+	build_flat_paged_gather_indices,
+	build_paged_gather_cache_key,
+)
+
 
 def glm5_prefill_trace(tensor, stage: str, layer_idx: int = 0) -> None:
 	"""Phase D per-stage hidden-state trace for GLM-5 prefill.
@@ -616,6 +621,7 @@ class Glm5Indexer(nn.Module):
         indexer_blocked_k: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        indexer_kv_manager,
         page_size: int = 64,
         positions: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
@@ -632,6 +638,7 @@ class Glm5Indexer(nn.Module):
             indexer_blocked_k: [num_pages, page_size, 1, head_dim] — paged indexer cache
             block_table: [batch, max_num_pages_per_seq] — page mapping
             cache_seqlens: [batch] — valid lengths
+            indexer_kv_manager: paged KV manager providing page-table versioning
             page_size: tokens per page
             positions: [batch] — current token positions for Q RoPE
             max_seqlen: max sequence length (int) to avoid CPU-GPU sync
@@ -646,16 +653,18 @@ class Glm5Indexer(nn.Module):
         k_head_dim = indexer_blocked_k.shape[3]
 
         # Cache gather indices — same block_table and seqlens across all 78 layers
-        cache_key = (block_table.data_ptr(), max_seqlen, page_size)
+        cache_key = build_paged_gather_cache_key(
+            block_table,
+            max_seqlen,
+            page_size,
+            page_table_version=indexer_kv_manager.get_page_table_version(),
+        )
         if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
-            device = block_table.device
-            token_positions = torch.arange(max_seqlen, device=device)
-            page_indices = (token_positions // page_size).unsqueeze(0).expand(batch_size, -1)
-            page_offsets = token_positions % page_size
-            max_pages = block_table.shape[1]
-            page_indices_clamped = page_indices.clamp(max=max_pages - 1)
-            physical_pages = torch.gather(block_table, 1, page_indices_clamped)
-            self._gather_cache = (physical_pages * page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
+            self._gather_cache = build_flat_paged_gather_indices(
+                block_table,
+                max_seqlen,
+                page_size,
+            )
             self._gather_cache_key = cache_key
             self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
 

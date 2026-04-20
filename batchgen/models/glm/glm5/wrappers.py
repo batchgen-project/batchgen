@@ -47,7 +47,9 @@ _GLM5_USE_DSA_V2 = os.environ.get("BATCHGEN_GLM5_USE_DSA_V2", "0") == "1"
 import torch.nn.functional as F
 
 from batchgen.models.glm.glm5.decode_utils import (
+    build_flat_paged_gather_indices,
     build_batch_slot_indices,
+    build_paged_gather_cache_key,
     build_clamped_dense_token_indices,
     reorder_block_table_to_batch_slots,
 )
@@ -1198,7 +1200,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 top_k_indices = indexer.score_and_select_paged(
                     q_a_for_indexer, hidden_states,
                     indexer_blocked_k, idx_block_table,
-                    updated_seqlens, aux_page_size,
+                    updated_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
                     positions=new_token_pos,
                     max_seqlen=max_seqlen,
                 )
@@ -1465,18 +1467,19 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 batch_size = idx_block_table.shape[0]
                 num_k_heads = indexer_blocked_k.shape[2]
                 k_head_dim = indexer_blocked_k.shape[3]
-                cache_key = (idx_block_table.data_ptr(), max_seqlen, aux_page_size)
+                cache_key = build_paged_gather_cache_key(
+                    idx_block_table,
+                    max_seqlen,
+                    aux_page_size,
+                    page_table_version=gpu_paged_kv_manager_aux.get_page_table_version(),
+                )
                 gc_key = getattr(indexer, "_gather_cache_v2_key", None)
                 if getattr(indexer, "_gather_cache_v2", None) is None or gc_key != cache_key:
-                    device = idx_block_table.device
-                    token_positions = torch.arange(max_seqlen, device=device)
-                    page_indices = (token_positions // aux_page_size).unsqueeze(0).expand(batch_size, -1)
-                    page_offsets = token_positions % aux_page_size
-                    max_pages = idx_block_table.shape[1]
-                    page_indices_clamped = page_indices.clamp(max=max_pages - 1)
-                    physical_pages = torch.gather(idx_block_table, 1, page_indices_clamped)
-                    flat = (physical_pages * aux_page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
-                    indexer._gather_cache_v2 = flat
+                    indexer._gather_cache_v2 = build_flat_paged_gather_indices(
+                        idx_block_table,
+                        max_seqlen,
+                        aux_page_size,
+                    )
                     indexer._gather_cache_v2_key = cache_key
                     indexer._gather_cache_v2_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
                 flat_idx = indexer._gather_cache_v2

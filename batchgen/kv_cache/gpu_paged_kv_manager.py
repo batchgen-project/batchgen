@@ -356,6 +356,10 @@ class _GPUPageTableManager:
 		self._slot_to_seq_id_tensor: Optional[torch.Tensor] = None
 		# Flattened list of active page indices ordered by slot_to_seq_id.
 		self._active_page_indices_cpu: Optional[torch.Tensor] = None
+		# Monotonic version bumped on every logical page-table rebuild/clear so
+		# decode-side gather caches can invalidate even when the GPU tensor is
+		# reused in place and keeps the same data_ptr().
+		self.rebuild_version: int = 0
 
 	def rebuild(
 		self,
@@ -467,6 +471,7 @@ class _GPUPageTableManager:
 			self.slot_to_seq_id
 		)
 		self._active_page_indices_cpu = flat_pages_cpu
+		self.rebuild_version += 1
 		
 		# DEBUG: Log final state after rebuild
 		if BATCHGEN_CB_DEBUG:
@@ -823,6 +828,7 @@ class GPUPagedKVCacheManager:
 		mgr._slot_index_tensor = None
 		mgr._slot_to_seq_id_tensor = None
 		mgr._active_page_indices_cpu = None
+		mgr.rebuild_version += 1
 		
 		# Clear active page pointer tables
 		self._clear_active_page_pointer_tables()
@@ -1292,6 +1298,11 @@ class GPUPagedKVCacheManager:
 				"get_layer_kv_with_page_table: GPU page table is not initialized; "
 				"call allocate_pages_for_sequences and build_page_table before using this method"
 			)
+
+	def get_page_table_version(self) -> int:
+		"""Return a monotonic version for the active page-table contents."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.rebuild_version
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 		"""Exposes the raw K/V cache tensors."""

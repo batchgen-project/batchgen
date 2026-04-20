@@ -2,7 +2,9 @@ import torch
 
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.models.glm.glm5.decode_utils import (
+    build_flat_paged_gather_indices,
     build_batch_slot_indices,
+    build_paged_gather_cache_key,
     build_clamped_dense_token_indices,
     clamp_token_indices_to_seqlens,
     reorder_block_table_to_batch_slots,
@@ -96,3 +98,39 @@ def test_reordered_block_table_prevents_cross_sequence_reads():
 
     assert wrong.tolist() == [[200.0, 201.0], [100.0, 101.0]]
     assert fixed.tolist() == [[100.0, 101.0], [200.0, 201.0]]
+
+
+def test_paged_gather_cache_key_invalidates_in_place_page_table_rebuild():
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64)
+    original_ptr = block_table.data_ptr()
+
+    key_v1 = build_paged_gather_cache_key(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+        page_table_version=1,
+    )
+    flat_v1 = build_flat_paged_gather_indices(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+    )
+
+    block_table[:, :] = torch.tensor([[2, 3], [0, 1]], dtype=torch.int64)
+    rebuilt_ptr = block_table.data_ptr()
+    flat_v2 = build_flat_paged_gather_indices(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+    )
+    key_v2 = build_paged_gather_cache_key(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+        page_table_version=2,
+    )
+
+    assert rebuilt_ptr == original_ptr
+    assert key_v1 != key_v2
+    assert flat_v1.tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert flat_v2.tolist() == [4, 5, 6, 7, 0, 1, 2, 3]
