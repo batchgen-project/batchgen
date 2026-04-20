@@ -48,11 +48,11 @@ ARCHITECTURE_PATTERNS = (
 )
 
 REQUIRED_TOKENIZER_ASSETS_BY_MODEL = {
-	"deepseek": ("tokenizer.json",),
-	"glm5": ("tokenizer.json",),
-	"minimax_m25": ("tokenizer.json",),
+	"deepseek": ("tokenizer.json", "tokenizer_config.json"),
+	"glm5": ("tokenizer.json", "tokenizer_config.json"),
+	"minimax_m25": ("tokenizer.json", "tokenizer_config.json"),
 	"kimi_k25": ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"),
-	"gpt_oss": ("chat_template.jinja",),
+	"gpt_oss": ("tokenizer_config.json", "chat_template.jinja"),
 }
 
 

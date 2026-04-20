@@ -15,7 +15,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TOKENIZER_FIXTURE = FIXTURES_DIR / "tokenizer.json"
 KIMI_FIXTURE_DIR = FIXTURES_DIR / "kimi_k25"
 STANDARD_TOKENIZER_ASSETS = ("tokenizer.json", "tokenizer_config.json")
-GPT_OSS_TOKENIZER_ASSETS = ("chat_template.jinja",)
+GPT_OSS_TOKENIZER_ASSETS = ("tokenizer_config.json", "chat_template.jinja")
 KIMI_TOKENIZER_ASSETS = ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja")
 MODEL_IDENTIFIERS = [
     "deepseek-ai/DeepSeek-R1",
@@ -50,6 +50,10 @@ def _write_standard_tokenizer_assets(tokenizer_dir: Path) -> None:
 
 def _write_gpt_oss_tokenizer_assets(tokenizer_dir: Path) -> None:
     tokenizer_dir.mkdir(exist_ok=True)
+    (tokenizer_dir / "tokenizer_config.json").write_text(
+        '{"bos_token":"<|startoftext|>","eos_token":"<|return|>","pad_token":"<|endoftext|>"}\n',
+        encoding="utf-8",
+    )
     (tokenizer_dir / "chat_template.jinja").write_text(
         "{% for message in messages %}{{ message.content }}{% endfor %}"
         "{% if add_generation_prompt %}<|start|>assistant{% endif %}",
@@ -130,7 +134,10 @@ def test_converter_copies_tokenizer_assets_byte_identically(
 @pytest.mark.parametrize(
     "model_identifier, expected_missing_assets",
     [
-        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json"]),
+        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json", "tokenizer_config.json"]),
+        ("THUDM/GLM-5", ["tokenizer.json", "tokenizer_config.json"]),
+        ("MiniMaxAI/MiniMax-M2.5", ["tokenizer.json", "tokenizer_config.json"]),
+        ("openai/gpt-oss-120b", ["tokenizer_config.json", "chat_template.jinja"]),
         ("moonshotai/Kimi-K2.5", ["chat_template.jinja", "tiktoken.model", "tokenizer_config.json"]),
     ],
 )
@@ -165,7 +172,10 @@ def test_converter_warns_when_required_tokenizer_assets_missing(
 @pytest.mark.parametrize(
     "model_identifier, required_assets_to_remove",
     [
-        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json"]),
+        ("deepseek-ai/DeepSeek-R1", ["tokenizer.json", "tokenizer_config.json"]),
+        ("THUDM/GLM-5", ["tokenizer.json", "tokenizer_config.json"]),
+        ("MiniMaxAI/MiniMax-M2.5", ["tokenizer.json", "tokenizer_config.json"]),
+        ("openai/gpt-oss-120b", ["tokenizer_config.json", "chat_template.jinja"]),
         ("moonshotai/Kimi-K2.5", ["tiktoken.model", "tokenizer_config.json", "chat_template.jinja"]),
     ],
 )
