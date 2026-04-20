@@ -7,6 +7,11 @@ import logging
 import shutil
 import ctypes
 
+from batchgen.config.model_detection import (
+	detect_model_type_from_directory,
+	detect_model_type_from_identifier,
+)
+
 KNOWN_TOKENIZER_ASSET_FILES = (
 	"tokenizer.json",
 	"tokenizer_config.json",
@@ -14,43 +19,19 @@ KNOWN_TOKENIZER_ASSET_FILES = (
 	"chat_template.jinja",
 )
 
-MODEL_NAME_PATTERNS = (
-	("moonshotai/Kimi-K2.5", "kimi_k25"),
-	("Kimi-K2.5", "kimi_k25"),
-	("openai/gpt-oss-120b", "gpt_oss"),
-	("gpt-oss", "gpt_oss"),
-	("THUDM/GLM-5", "glm5"),
-	("GLM-5-FP8", "glm5"),
-	("GLM-5", "glm5"),
-	("MiniMaxAI/MiniMax-M2.5", "minimax_m25"),
-	("MiniMax-M2.5", "minimax_m25"),
-	("DeepSeek-R1", "deepseek"),
-	("DeepSeek-V3", "deepseek"),
-	("DeepSeek-V2-Lite", "deepseek"),
-	("DeepSeek-V2", "deepseek"),
-)
 
-MODEL_TYPE_ALIASES = {
-	"gpt_oss": "gpt_oss",
-	"deepseek_v3": "deepseek",
-	"deepseek_v2": "deepseek",
-	"minimax_m25": "minimax_m25",
-	"kimi_k25": "kimi_k25",
-	"kimi_k2": "kimi_k25",
-}
 
-ARCHITECTURE_PATTERNS = (
-	("GptOss", "gpt_oss"),
-	("DeepseekV3", "deepseek"),
-	("DeepseekV2", "deepseek"),
-	("KimiK25", "kimi_k25"),
-	("MiniMaxM2", "minimax_m25"),
-	("GLM", "glm5"),
-	("ChatGLM", "glm5"),
-)
-
+# Model-specific tokenizer asset contract for files expected in converted_ckpt/.
+# This is used by converter warnings and validation after conversion.
+# It is intentionally narrower than KNOWN_TOKENIZER_ASSET_FILES:
+# - only assets that must survive into converted_ckpt for this model belong here
+# - packaged chat templates that still live in the wheel are not listed here
+# - GPT-OSS still copies tokenizer.json when present, but runtime construction is based on
+#   tiktoken + tokenizer_config/chat_template, so tokenizer.json is not a required asset
+#   for validation today
 REQUIRED_TOKENIZER_ASSETS_BY_MODEL = {
-	"deepseek": ("tokenizer.json", "tokenizer_config.json"),
+	"deepseek_v3": ("tokenizer.json", "tokenizer_config.json"),
+	"deepseek_v2": ("tokenizer.json", "tokenizer_config.json"),
 	"glm5": ("tokenizer.json", "tokenizer_config.json"),
 	"minimax_m25": ("tokenizer.json", "tokenizer_config.json"),
 	"kimi_k25": ("tiktoken.model", "tokenizer_config.json", "chat_template.jinja"),
@@ -92,30 +73,11 @@ class ckpt_converter:
 	def _detect_model_family(self, input_dir, model_identifier=None):
 		"""Infer model family for tokenizer asset validation."""
 		if model_identifier:
-			for pattern, model_family in MODEL_NAME_PATTERNS:
-				if pattern in str(model_identifier):
-					return model_family
+			detected = detect_model_type_from_identifier(str(model_identifier))
+			if detected is not None:
+				return detected
 
-		config_path = os.path.join(input_dir, "config.json")
-		if os.path.exists(config_path):
-			try:
-				with open(config_path, "r") as f:
-					config = json.load(f)
-			except Exception:
-				config = {}
-			model_type = config.get("model_type")
-			if model_type in MODEL_TYPE_ALIASES:
-				return MODEL_TYPE_ALIASES[model_type]
-			for arch in config.get("architectures", []):
-				for pattern, model_family in ARCHITECTURE_PATTERNS:
-					if pattern in arch:
-						return model_family
-
-		for pattern, model_family in MODEL_NAME_PATTERNS:
-			if pattern in str(input_dir):
-				return model_family
-
-		return None
+		return detect_model_type_from_directory(input_dir)
 
 	def _get_required_tokenizer_asset_files(self, input_dir, model_identifier=None):
 		"""Return required tokenizer assets for the detected model family."""

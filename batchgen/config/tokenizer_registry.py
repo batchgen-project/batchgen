@@ -41,6 +41,7 @@ Usage:
     batch = tokenizer(["Hello", "World"], return_tensors="pt", padding=True)
 """
 
+import importlib
 import logging
 import os
 from typing import Dict, Type, Optional, TYPE_CHECKING
@@ -53,6 +54,16 @@ logger = logging.getLogger(__name__)
 
 # Registry mapping tokenizer_type -> tokenizer class
 TOKENIZER_REGISTRY: Dict[str, Type["BaseTokenizer"]] = {}
+
+TOKENIZER_MODULES: Dict[str, str] = {
+    "deepseek_v3": "batchgen.models.deepseek.deepseekv3.tokenizer",
+    "deepseek_v2": "batchgen.models.deepseek.deepseekv2.tokenizer",
+    "gpt_oss": "batchgen.models.openai.gpt_oss_120b.tokenizer",
+    "mixtral": "batchgen.models.mixtral.tokenizer",
+    "kimi_k25": "batchgen.models.moonshotai.kimi_k25.tokenizer",
+    "glm_moe_dsa": "batchgen.models.glm.glm5.tokenizer",
+    "minimax_m25": "batchgen.models.minimax.minimax_m25.tokenizer",
+}
 
 # Model name/identifier patterns for tokenizer detection
 # Maps patterns found in model names to tokenizer_type
@@ -125,6 +136,19 @@ def load_tokenizer(
     # Pattern match to find registered tokenizer
     for pattern, tokenizer_type in TOKENIZER_NAME_PATTERNS.items():
         if pattern in model_identifier:
+            if tokenizer_type not in TOKENIZER_REGISTRY:
+                module_path = TOKENIZER_MODULES.get(tokenizer_type)
+                if module_path is not None:
+                    try:
+                        importlib.import_module(module_path)
+                    except ImportError:
+                        logger.debug(
+                            "Deferred tokenizer import failed for type=%s module=%s",
+                            tokenizer_type,
+                            module_path,
+                            exc_info=True,
+                        )
+
             if tokenizer_type in TOKENIZER_REGISTRY:
                 logger.info(f"Using registered tokenizer for type={tokenizer_type}")
                 return TOKENIZER_REGISTRY[tokenizer_type](tokenizer_path)
