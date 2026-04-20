@@ -165,7 +165,7 @@ class KimiK25_Parameter_Server:
         if self.converted_ckpt_dir is None:
             converter = ckpt_converter()
             self.converted_ckpt_dir = converter.convert_model_directory(
-                self.cache_dir, marlin=True, model_identifier=self.huggingface_ckpt_name)  # Marlin layout is default for K2.5 decode
+                self.cache_dir, marlin=True)  # Marlin layout is default for K2.5 decode
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 

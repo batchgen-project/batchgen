@@ -36,12 +36,14 @@ MODEL_TYPE_ALIASES = {
 	"deepseek_v2": "deepseek",
 	"minimax_m25": "minimax_m25",
 	"kimi_k25": "kimi_k25",
+	"kimi_k2": "kimi_k25",
 }
 
 ARCHITECTURE_PATTERNS = (
 	("GptOss", "gpt_oss"),
 	("DeepseekV3", "deepseek"),
 	("DeepseekV2", "deepseek"),
+	("KimiK25", "kimi_k25"),
 	("MiniMaxM2", "minimax_m25"),
 	("GLM", "glm5"),
 	("ChatGLM", "glm5"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -24,6 +25,34 @@ MODEL_IDENTIFIERS = [
     "openai/gpt-oss-120b",
     "moonshotai/Kimi-K2.5",
 ]
+
+
+def _write_model_config(source_dir: Path, model_identifier: str) -> None:
+    config_by_model = {
+        "deepseek-ai/DeepSeek-R1": {
+            "model_type": "deepseek_v3",
+            "architectures": ["DeepseekV3ForCausalLM"],
+        },
+        "THUDM/GLM-5": {
+            "architectures": ["ChatGLMForConditionalGeneration"],
+        },
+        "MiniMaxAI/MiniMax-M2.5": {
+            "model_type": "minimax_m25",
+            "architectures": ["MiniMaxM2ForCausalLM"],
+        },
+        "openai/gpt-oss-120b": {
+            "model_type": "gpt_oss",
+            "architectures": ["GptOss"],
+        },
+        "moonshotai/Kimi-K2.5": {
+            "model_type": "kimi_k25",
+            "architectures": ["KimiK25ForCausalLM"],
+        },
+    }
+    source_dir.mkdir(exist_ok=True)
+    with (source_dir / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(config_by_model[model_identifier], f)
+        f.write("\n")
 
 
 def _write_checkpoint(source_dir: Path) -> Path:
@@ -120,6 +149,7 @@ def test_converter_copies_tokenizer_assets_byte_identically(
     output_dir = tmp_path / "converted_ckpt"
     source_dir.mkdir()
     _write_checkpoint(source_dir)
+    _write_model_config(source_dir, model_identifier)
 
     _write_tokenizer_assets(source_dir, model_identifier)
 
@@ -151,6 +181,7 @@ def test_converter_warns_when_required_tokenizer_assets_missing(
     output_dir = tmp_path / "converted_ckpt"
     source_dir.mkdir()
     _write_checkpoint(source_dir)
+    _write_model_config(source_dir, model_identifier)
 
     converter = ckpt_converter()
 
@@ -188,6 +219,7 @@ def test_validation_requires_model_specific_tokenizer_assets(
     output_dir = tmp_path / "converted_ckpt"
     source_dir.mkdir()
     _write_checkpoint(source_dir)
+    _write_model_config(source_dir, model_identifier)
     _write_tokenizer_assets(source_dir, model_identifier)
 
     converter = ckpt_converter()
@@ -221,6 +253,7 @@ def test_validation_allows_tokenizer_assets_but_rejects_dirty_output_dir(
     output_dir = tmp_path / "converted_ckpt"
     source_dir.mkdir()
     _write_checkpoint(source_dir)
+    _write_model_config(source_dir, model_identifier)
     _write_tokenizer_assets(source_dir, model_identifier)
 
     converter = ckpt_converter()
@@ -255,6 +288,7 @@ def test_existing_converted_checkpoint_backfills_missing_tokenizer_assets(
     output_dir = tmp_path / "converted_ckpt"
     source_dir.mkdir()
     ckpt_path = _write_checkpoint(source_dir)
+    _write_model_config(source_dir, model_identifier)
     _write_tokenizer_assets(source_dir, model_identifier)
 
     converter = ckpt_converter()
