@@ -185,15 +185,29 @@ class BaseModuleWrapper(nn.Module):
         Args:
             weights_dict: Dict mapping parameter names to weight tensors
         """
+        applied = set()
         for name, param in self.module.named_parameters():
             if name in weights_dict:
                 param.data = weights_dict[name]
+                applied.add(name)
+        # Record exactly which parameter names we populated so clear_weights
+        # can wipe only the buffer-backed ones. Skeleton-loaded weights
+        # (q_a/kv_a_layernorm, indexer.*) live on the module permanently and
+        # are never in weights_dict — if we wipe them here, the next forward
+        # hits empty(0) params and dies with normalized_shape=[0].
+        self._applied_param_keys = applied
 
     def clear_weights(self):
-        """Clear module parameter data to free GPU memory."""
+        """Clear only the buffer-loaded module parameters populated by the
+        most recent apply_weights call; preserve skeleton-loaded params.
+        """
         self._sync_device_before_release()
+        applied = getattr(self, "_applied_param_keys", None)
         for name, param in self.module.named_parameters():
+            if applied is not None and name not in applied:
+                continue
             param.data = torch.empty(0, device=param.data.device)
+        self._applied_param_keys = None
 
     def get_batch_size(self, batch_size_key: str) -> int:
         """Get micro-batch size from config.
