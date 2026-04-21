@@ -6532,14 +6532,16 @@ class BatchGenWorker:
 		# compute_indexer_kv → aux cache is never populated for prompt tokens
 		# → any later decode past 2048 tokens reads unwritten aux pages.
 		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
-		if _prefill_gpu_manager is None:
-			_prefill_gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
 		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
 			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
 			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
-		elif _prefill_gpu_manager is not None:
-			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager
-			AttnWrapperBase.gpu_paged_kv_manager_aux = None
+		else:
+			# self.gpu_paged_kv_cache_manager is None or not the coordinator at prefill
+			# entry; fall back to the per-kind slots that `_bind_gpu_paged_kv_manager`
+			# writes onto `core_engine` (line 2334-2335). Those are the primary and
+			# auxiliary managers directly, NOT a DualKVCacheCoordinator.
+			AttnWrapperBase.gpu_paged_kv_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+			AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
@@ -6669,14 +6671,16 @@ class BatchGenWorker:
 		# compute_indexer_kv → aux cache is never populated for prompt tokens
 		# → any later decode past 2048 tokens reads unwritten aux pages.
 		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
-		if _prefill_gpu_manager is None:
-			_prefill_gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
 		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
 			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
 			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
-		elif _prefill_gpu_manager is not None:
-			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager
-			AttnWrapperBase.gpu_paged_kv_manager_aux = None
+		else:
+			# self.gpu_paged_kv_cache_manager is None or not the coordinator at prefill
+			# entry; fall back to the per-kind slots that `_bind_gpu_paged_kv_manager`
+			# writes onto `core_engine` (line 2334-2335). Those are the primary and
+			# auxiliary managers directly, NOT a DualKVCacheCoordinator.
+			AttnWrapperBase.gpu_paged_kv_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+			AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
