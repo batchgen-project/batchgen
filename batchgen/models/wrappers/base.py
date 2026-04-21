@@ -147,12 +147,36 @@ class BaseModuleWrapper(nn.Module):
         """
         return self.core_engine.get_weights(module_key, self.phase)
 
+    def _sync_device_before_release(self) -> None:
+        """Drain all CUDA streams on this wrapper's device.
+
+        Called by free_weights / clear_weights before the underlying buffer
+        slot is returned to the pool or the Python-side tensor refs are
+        dropped. We must wait on the ENTIRE device (not just the current
+        compute stream) because prefill launches async D2H copies onto a
+        separate stream that PyTorch's caching allocator does not track —
+        current_stream().synchronize() leaves those D2H reads pending, and
+        if we release the source storage now the allocator can hand the
+        pages to the next layer's load_weights() while the D2H is still
+        mid-memcpy → the D2H captures corrupted data. Full-device sync is
+        the simplest correct guard; finer-grained stream ordering can be
+        added later once profiled.
+        """
+        try:
+            device = self.engine_config.Basic_Config.device_torch
+        except AttributeError:
+            # Fallback if engine_config is not available for some reason —
+            # issue a global sync so the safety guarantee still holds.
+            device = None
+        torch.cuda.synchronize(device) if device is not None else torch.cuda.synchronize()
+
     def free_weights(self, module_key: str):
         """Free weights buffer after use.
 
         Args:
             module_key: Key identifying the module weights to free
         """
+        self._sync_device_before_release()
         self.core_engine.free_weights_buffer(module_key)
 
     def apply_weights(self, weights_dict: Dict[str, torch.Tensor]):
@@ -167,6 +191,7 @@ class BaseModuleWrapper(nn.Module):
 
     def clear_weights(self):
         """Clear module parameter data to free GPU memory."""
+        self._sync_device_before_release()
         for name, param in self.module.named_parameters():
             param.data = torch.empty(0, device=param.data.device)
 
