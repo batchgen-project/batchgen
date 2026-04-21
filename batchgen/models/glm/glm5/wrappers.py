@@ -497,6 +497,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     )
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
+            # Unconditional stream sync replicating KV-SHAPE-PRIMARY's barrier.
+            torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
             # KV-shape probe: log offload_kv (primary MLA) shape before offload.
             if _os_kvshape.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in (0, 10, 39, 77):
                 import logging as _log_shp2
