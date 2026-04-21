@@ -1238,7 +1238,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
-	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
+	# del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
+	# ^^^ DISABLED: bisecting allocator-reuse aliasing bug in multi-seq prepacked
+	# prefill (seq 0 / first-seq letter-enum corruption). Dropping these refs
+	# lets the caching allocator hand the storage to the triple .contiguous()
+	# calls below, which — if the prior ops haven't retired on the stream yet —
+	# races with the new writes. Keep refs alive until function returns.
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
