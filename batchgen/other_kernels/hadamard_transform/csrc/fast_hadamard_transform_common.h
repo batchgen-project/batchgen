@@ -104,7 +104,13 @@ __device__ __forceinline__ void hadamard_mult_thread(float x[kNChunks][1 << kLog
     }
 }
 
-template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems>
+// kActiveMask names the physically active lanes of the warp (not the within-warp
+// group size). Defaults to FULL_MASK for the common case where blockDim.x >= 32
+// so the whole warp is populated. Callers that launch with blockDim.x < 32 (e.g.
+// fused_rope_hadamard with 16 threads) must override to e.g. 0x0000FFFFu —
+// naming phantom lanes in the sync mask is UB per the CUDA programming guide.
+template<int kLogWarpSize, int kStepStart, int kNChunks, int kNItems,
+         uint32_t kActiveMask = FULL_MASK>
 __device__ __forceinline__ void hadamard_mult_warp(float x[kNChunks][kNItems]) {
     constexpr int N = 1 << kLogWarpSize;
     int lane_id = threadIdx.x % N;
@@ -116,7 +122,7 @@ __device__ __forceinline__ void hadamard_mult_warp(float x[kNChunks][kNItems]) {
         for (int c = 0; c < kNChunks; ++c) {
             #pragma unroll
             for (int i = 0; i < kNItems; ++i) {
-                float x_val_other = __shfl_xor_sync(FULL_MASK, x[c][i], lane_mask);
+                float x_val_other = __shfl_xor_sync(kActiveMask, x[c][i], lane_mask);
                 x[c][i] = sign * x[c][i] + x_val_other;
             }
         }

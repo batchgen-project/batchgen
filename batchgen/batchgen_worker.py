@@ -32,102 +32,6 @@ from batchgen import lifespan
 import os as _os_env  # alias to avoid collision with the local `os` usage later
 
 
-def _glm5_dump_top_logits(logits: torch.Tensor, tokenizer, rank: int = 0, topk: int = 20) -> None:
-	"""Log top-K token IDs + logits + decoded strings for GLM-5 diagnostic.
-
-	Called only when BATCHGEN_GLM5_LOGIT_DUMP=1. Fires up to
-	BATCHGEN_GLM5_LOGIT_DUMP_CALLS prefill invocations (default 20, enough
-	for a diagnostic L2 MMLU run plus a LongBench smoke). Dumps up to
-	BATCHGEN_GLM5_LOGIT_DUMP_N sequences per invocation (default 64 → all
-	seqs in a single prepacked prefill batch).
-	"""
-	global _GLM5_LOGIT_DUMP_COUNT
-	max_calls = int(os.environ.get("BATCHGEN_GLM5_LOGIT_DUMP_CALLS", "20"))
-	if _GLM5_LOGIT_DUMP_COUNT >= max_calls:
-		return
-	_GLM5_LOGIT_DUMP_COUNT += 1
-	call_idx = _GLM5_LOGIT_DUMP_COUNT
-	try:
-		# logits: [batch_size, vocab_size]
-		max_n = int(os.environ.get("BATCHGEN_GLM5_LOGIT_DUMP_N", "64"))
-		n = min(logits.shape[0], max_n)
-		for seq_idx in range(n):
-			row = logits[seq_idx].float()
-			absmax = row.abs().max().item()
-			mean = row.mean().item()
-			std = row.std().item()
-			top_vals, top_idx = torch.topk(row, topk)
-			rows_str = []
-			for v, i in zip(top_vals.tolist(), top_idx.tolist()):
-				try:
-					decoded = tokenizer.decode([i], skip_special_tokens=False)
-				except Exception:
-					decoded = "<decode error>"
-				rows_str.append(f"  {i:>7d}  {v:>10.4f}  {decoded!r}")
-			logging.error(
-				f"[GLM5 LOGIT-DUMP call={call_idx} rank={rank} seq={seq_idx}] "
-				f"absmax={absmax:.4f} mean={mean:.4f} std={std:.4f} top{topk}:\n"
-				+ "\n".join(rows_str)
-			)
-	except Exception as e:
-		logging.error(f"[GLM5 LOGIT-DUMP] failed: {e}")
-
-
-_GLM5_LOGIT_DUMP_COUNT = 0
-
-
-def _glm5_dump_top5_for_gids(
-	logits: torch.Tensor,
-	tokenizer,
-	cur_batch,
-	target_gids,
-	rank: int = 0,
-	topk: int = 5,
-) -> None:
-	"""Log prefill-last-position top-K for specific global seq ids.
-
-	Phase C of the velvet-popping-hopper plan. Emits one
-	`[PREFILL-TOP5 gid=<N> pos=last]` block per target gid.
-
-	Args:
-		logits: [batch_size, vocab_size] FP32 logits at prefill-last position.
-		tokenizer: HF tokenizer for decoding token ids.
-		cur_batch: list of global seq ids aligned with logits rows.
-		target_gids: iterable of global seq ids to dump.
-		rank: TP rank for log prefix.
-		topk: number of top tokens to dump (default 5).
-	"""
-	try:
-		_cur = list(cur_batch or [])
-		_targets = {int(g) for g in (target_gids or [])}
-		if not _targets:
-			return
-		for loc, gid in enumerate(_cur):
-			if int(gid) not in _targets or loc >= logits.shape[0]:
-				continue
-			row = logits[loc].float()
-			probs = torch.softmax(row, dim=-1)
-			top_vals, top_idx = torch.topk(row, topk)
-			top_probs = probs[top_idx]
-			absmax = row.abs().max().item()
-			mean = row.mean().item()
-			std = row.std().item()
-			rows_str = []
-			for v, i, p in zip(top_vals.tolist(), top_idx.tolist(), top_probs.tolist()):
-				try:
-					decoded = tokenizer.decode([i], skip_special_tokens=False)
-				except Exception:
-					decoded = "<decode error>"
-				rows_str.append(f"  {i:>7d}  logit={v:>10.4f}  prob={p:>.6f}  {decoded!r}")
-			logging.warning(
-				f"[PREFILL-TOP5 rank={rank} gid={gid} loc={loc} pos=last] "
-				f"absmax={absmax:.4f} mean={mean:.4f} std={std:.4f} top{topk}:\n"
-				+ "\n".join(rows_str)
-			)
-	except Exception as e:
-		logging.error(f"[PREFILL-TOP5] failed: {e}")
-
-
 from batchgen.lifespan import SeqEvent
 
 REP_DETECTION = os.environ.get("BATCHGEN_REP_DETECTION", "1") == "1"
@@ -1135,6 +1039,70 @@ class BatchGenWorker:
 				f"[ADMIT] Admitted {len(entries)} sequences "
 				f"(global_idx {start_idx}-{start_idx + len(entries) - 1}), "
 				f"global_batch now has {len(self.global_batch)} sequences"
+			)
+
+		# Per-rank ownership dump — logs every sequence THIS rank now owns
+		# from the admission batch, with enough metadata to verify that
+		# drain → tokenize → rank-assign → query-book-bind placed each UUID
+		# on the right rank with distinct tokens/slots. Default on while
+		# debugging Phase-11 cross-seq contamination; disable with
+		# BATCHGEN_ADMIT_DUMP=0.
+		if os.environ.get("BATCHGEN_ADMIT_DUMP", "1") == "1":
+			self._log_local_admitted_sequences(new_uuids)
+
+	def _log_local_admitted_sequences(self, new_uuids: List[str]) -> None:
+		"""Log full metadata for every newly-admitted sequence owned by this rank.
+
+		Emits one [ADMIT-LOCAL ...] line per owned sequence and one
+		[ADMIT-SUMMARY ...] line per rank. Use across the 16 server logs to
+		verify rank-ownership invariants (no duplicates, no drops, distinct
+		prompt tokens per slot).
+		"""
+		owned_here = []
+		for uuid in new_uuids:
+			local_idx = self._uuid_to_local_map.get(uuid)
+			if local_idx is None:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				logging.warning(
+					f"[ADMIT-LOCAL rank={self.rank}] uuid={uuid} local_idx={local_idx} "
+					f"GLOBAL_BATCH_MISS (seq lookup returned None)"
+				)
+				continue
+			ids = seq.input_ids
+			if ids is not None:
+				fp_head = ids[:5].tolist() if hasattr(ids, "tolist") else list(ids[:5])
+				fp_tail = ids[-5:].tolist() if hasattr(ids, "tolist") else list(ids[-5:])
+				token_count = int(ids.shape[0]) if hasattr(ids, "shape") else len(ids)
+			else:
+				fp_head = None
+				fp_tail = None
+				token_count = 0
+			logging.warning(
+				f"[ADMIT-LOCAL rank={self.rank}/{self.world_size}] "
+				f"uuid={uuid} global_idx={seq.global_idx} local_idx={local_idx} "
+				f"assigned_rank={seq.assigned_rank} status={seq.status.name} "
+				f"prompt_len={seq.prompt_length} input_ids_len={token_count} "
+				f"max_decode_length={seq.max_decode_length} "
+				f"buffer_slot={seq._buffer_slot} pool_slot_index={seq.pool_slot_index} "
+				f"batch_id={seq.batch_id} priority={seq.priority} "
+				f"fp_head={fp_head} fp_tail={fp_tail}"
+			)
+			owned_here.append((uuid, local_idx, seq.global_idx))
+
+		if owned_here:
+			logging.warning(
+				f"[ADMIT-SUMMARY rank={self.rank}/{self.world_size}] "
+				f"owns {len(owned_here)} new seqs: "
+				f"local_idxs={[x[1] for x in owned_here]} "
+				f"global_idxs={[x[2] for x in owned_here]} "
+				f"uuids={[x[0] for x in owned_here]}"
+			)
+		else:
+			logging.warning(
+				f"[ADMIT-SUMMARY rank={self.rank}/{self.world_size}] "
+				f"owns 0 new seqs from this admit batch (total_new={len(new_uuids)})"
 			)
 
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
@@ -3645,20 +3613,16 @@ class BatchGenWorker:
 		return self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
 
 	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
-		"""Convert global UUIDs to local indices for sequences assigned to this rank."""
+		"""Convert global UUIDs to local indices for sequences assigned to this rank.
+
+		Non-owned UUIDs are silently skipped — callers typically pass the full
+		cross-rank decode_uuids list and each rank resolves only its own slice.
+		"""
 		local_indices = []
-		missing_uuids = []
 		for uuid in uuids:
-			if uuid in self._uuid_to_local_map:
-				local_indices.append(self._uuid_to_local_map[uuid])
-			else:
-				missing_uuids.append(uuid)
-		if missing_uuids:
-			logging.error(
-				f"Rank {self.rank}: MISSING UUIDS in _get_local_indices_for_uuids! "
-				f"input_len={len(uuids)}, output_len={len(local_indices)}, "
-				f"missing={[u[:8] for u in missing_uuids[:10]]}"
-			)
+			local_idx = self._uuid_to_local_map.get(uuid)
+			if local_idx is not None:
+				local_indices.append(local_idx)
 		return local_indices
 
 	# def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus) -> None:
@@ -5521,6 +5485,11 @@ class BatchGenWorker:
 								)
 							pending.clear()
 						torch.cuda.synchronize(self.torch_device)
+						# Release the pinned source tensors only AFTER wait() +
+						# device sync confirm the d2h memcpy has fully retired.
+						# Mirrors decode-side `_pending_kv_append_tensors` cleanup
+						# in `_wait_pending_kv_append_tasks`.
+						_AWB.pending_prefill_offload_tensors.clear()
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -6887,6 +6856,27 @@ class BatchGenWorker:
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
+				# Worker-side prepack diagnostic probe (paired with FA3-PREFILL-DIAG).
+				# Dumps the inputs handed to the model on every micro-batch when env is
+				# set, so we can compare seq-0's input fingerprint between single-seq
+				# and multi-seq prepack paths.
+				if _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
+					_cu_list = batch_cu_seqlens.tolist()
+					_pos_head = batch_position_ids_flat[:5].tolist()
+					_pos_tail0 = batch_position_ids_flat[max(0, batch_seq_lengths[0]-3):batch_seq_lengths[0]].tolist()
+					_pos_head1 = (batch_position_ids_flat[batch_seq_lengths[0]:batch_seq_lengths[0]+3].tolist()
+								  if batch_num_seqs > 1 else [])
+					_iid_head = batch_input_ids_flat[:5].tolist()
+					_iid_seq1 = (batch_input_ids_flat[batch_seq_lengths[0]:batch_seq_lengths[0]+5].tolist()
+								  if batch_num_seqs > 1 else [])
+					logging.warning(
+						f"[PREPACK-DIAG rank={self.rank} mb_seqs={batch_num_seqs} "
+						f"local_idx={batch_local_indices} gids={Attn_Wrapper.cur_batch} "
+						f"seq_lengths={batch_seq_lengths} cu={_cu_list} max_L={batch_max_seqlen} "
+						f"pos_head5={_pos_head} pos_seq0_last3={_pos_tail0} "
+						f"pos_seq1_first3={_pos_head1} iid_head5={_iid_head} iid_seq1_head5={_iid_seq1}]"
+					)
+
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
@@ -6894,6 +6884,8 @@ class BatchGenWorker:
 				hidden_states = inputs_embeds.unsqueeze(0)
 
 				# Forward through model layers
+				_layer_probe_set = (0, 10, 39, 77)
+				_layer_probe_on = _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1"
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					layer_outputs = decoder_layer(
 						hidden_states,
@@ -6904,6 +6896,23 @@ class BatchGenWorker:
 						use_cache=False,
 					)
 					hidden_states = layer_outputs[0]
+					# Per-layer per-seq hidden-state fingerprint. Fires only when
+					# BATCHGEN_GLM5_PREFILL_DIAG=1 at a sparse set of layers so we
+					# can diff single-seq vs multi-seq-per-rank output of the same
+					# seq at matching layer boundaries. .tolist/.item issues D2H
+					# syncs; this probe can shift the corruption victim across seqs.
+					if _layer_probe_on and layer_idx in _layer_probe_set:
+						_layer_fps = []
+						for _si in range(batch_num_seqs):
+							_t0 = int(batch_cu_seqlens[_si].item())
+							_fp = hidden_states[0, _t0, :8].float().tolist()
+							_nm = float(hidden_states[0, _t0].float().norm().item())
+							_layer_fps.append((_si, _t0, _fp, _nm))
+						logging.warning(
+							f"[LAYER-DIAG layer={layer_idx} rank={self.rank} "
+							f"mb_seqs={batch_num_seqs} gids={Attn_Wrapper.cur_batch} "
+							f"first_token_fp={_layer_fps}]"
+						)
 
 				# Final norm
 				hidden_states = self.model.model.norm(hidden_states)
@@ -6912,24 +6921,14 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
-				# Hidden-state dump for GLM-5 bookkeeping diagnostic.
-				# Prints last_token_hidden[:8] for target global seqs so we can diff
-				# against an external reference (SGLang / HF). Env-gated via
-				# BATCHGEN_GLM5_BOOKKEEP_SEQS=<gid1,gid2,...>.
-				_bookkeep_env = _os_env.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
-				if _bookkeep_env:
-					try:
-						_target_gids = {int(s) for s in _bookkeep_env.split(",") if s.strip()}
-						_cur = Attn_Wrapper.cur_batch or []
-						for _loc, _gid in enumerate(_cur):
-							if _gid in _target_gids and _loc < last_token_hidden.shape[0]:
-								_fp = last_token_hidden[_loc, :8].float().cpu().tolist()
-								logging.warning(
-									f"[BOOKKEEP prefill-hidden rank={getattr(self, 'rank', 0)} "
-									f"gid={_gid} loc={_loc}] last_token_hidden[:8]={_fp}"
-								)
-					except Exception as _e:
-						logging.warning(f"[BOOKKEEP prefill-hidden] dump failed: {_e}")
+				if _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
+					_lth_fps = [last_token_hidden[i, :8].float().tolist() for i in range(batch_num_seqs)]
+					_lth_norms = [float(last_token_hidden[i].float().norm().item()) for i in range(batch_num_seqs)]
+					logging.warning(
+						f"[LASTHID-DIAG rank={self.rank} mb_seqs={batch_num_seqs} "
+						f"gids={Attn_Wrapper.cur_batch} last_token_indices={last_token_indices.tolist()} "
+						f"last_hidden_first8_per_seq={_lth_fps} norms={_lth_norms}]"
+					)
 
 				# lm_head matmul: default BF16 (matches HF / SGLang / vLLM; avoids
 				# FP32 amplification of upstream BF16 round-off across a 944M-element
@@ -6947,24 +6946,6 @@ class BatchGenWorker:
 						self.model.lm_head.weight,
 						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					).float()
-
-				# Debug: dump top-20 logits at the final prefill position for the first
-				# few sequences of a batch. Gated by BATCHGEN_GLM5_LOGIT_DUMP=1.
-				if _os_env.environ.get("BATCHGEN_GLM5_LOGIT_DUMP", "0") == "1":
-					_glm5_dump_top_logits(logits, self.tokenizer, rank=getattr(self, "rank", 0))
-					# Phase C: per-gid top-5 dump targeted by BOOKKEEP_SEQS.
-					if _bookkeep_env:
-						try:
-							_tgids = {int(s) for s in _bookkeep_env.split(",") if s.strip()}
-							_glm5_dump_top5_for_gids(
-								logits,
-								self.tokenizer,
-								Attn_Wrapper.cur_batch,
-								_tgids,
-								rank=getattr(self, "rank", 0),
-							)
-						except Exception as _e_top5:
-							logging.warning(f"[PREFILL-TOP5] wiring failed: {_e_top5}")
 
 				batch_new_tokens = self._select_tokens(logits)
 				if batch_new_tokens.shape[0] != batch_num_seqs:
@@ -7947,22 +7928,24 @@ class BatchGenWorker:
 		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
 		
 		# ========== VERIFY BATCH CONSISTENCY ==========
-		# CRITICAL: Ensure batch matches decode_uuids for THIS rank
+		# Compare the LOCAL batch against the LOCAL subset of decode_uuids.
+		# (Earlier versions passed the full cross-rank decode_uuids to
+		# batch_matches_expected_uuid_order, which returns False whenever
+		# len(batch) != len(decode_uuids) — i.e., always on world_size > 1.
+		# The self-assignment `batch = expected_local` that followed was a
+		# no-op; the error line was spurious noise.)
 		expected_local = self._get_local_indices_for_uuids(decode_uuids)
-		if not batch_matches_expected_uuid_order(
-			batch,
-			decode_uuids,
-			self._uuid_to_local_map,
-		):
+		if list(batch) != expected_local:
 			actual_uuids = local_indices_to_uuid_order(batch, self._local_to_uuid_map)
+			expected_uuids_local = [
+				self._local_to_uuid_map.get(idx) for idx in expected_local
+			]
 			logging.error(
 				f"Rank {self.rank}: BATCH MISMATCH after boundary! "
-				f"batch={batch}, expected={expected_local}, "
-				f"actual_uuids={[u[:8] if isinstance(u, str) else None for u in actual_uuids[:10]]}, "
-				f"expected_uuids={[u[:8] for u in decode_uuids[:10]]}"
+				f"batch={batch} expected_local={expected_local} "
+				f"actual_uuids={actual_uuids} expected_uuids={expected_uuids_local}"
 			)
-			batch = expected_local  # Fix the batch
-			# CRITICAL: Rebuild page table to match the corrected batch
+			batch = expected_local
 			self._rebuild_page_table_for_batch(batch, gpu_manager)
 			logging.info(f"Rank {self.rank}: Page table rebuilt after batch correction")
 		
@@ -8811,38 +8794,6 @@ class BatchGenWorker:
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
-
-					# GLM-5 targeted decode metadata probe. This logs the exact
-					# worker-side cache_seqlen / position_id pair that will be passed
-					# into the model wrapper, before any model-specific remapping.
-					_bookkeep_env = os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
-					if _bookkeep_env:
-						try:
-							_target_gids = {
-								int(s) for s in _bookkeep_env.split(",")
-								if s.strip().isdigit()
-							}
-							_cur_batch_dbg = list(Attn_Wrapper.cur_batch) if Attn_Wrapper.cur_batch else []
-							for _loc, (_local_idx, _seq, _ctx) in enumerate(
-								zip(batch, batch_sequences, cache_seqlens)
-							):
-								if _seq.global_idx not in _target_gids:
-									continue
-								_pos = int(Attn_Wrapper.position_ids[_loc, 0].item())
-								_gid_from_batch = (
-									_cur_batch_dbg[_loc] if _loc < len(_cur_batch_dbg) else -1
-								)
-								logging.warning(
-									f"[BOOKKEEP worker-meta gid={_seq.global_idx}] "
-									f"loc={_loc} local_idx={_local_idx} "
-									f"ctx={int(_ctx)} pos={_pos} decoded={_seq.decoded_length} "
-									f"orig_prompt={_seq.original_prompt_length} "
-									f"cur_batch_gid={_gid_from_batch}"
-								)
-						except Exception as _bookkeep_exc:
-							logging.warning(
-								f"[BOOKKEEP worker-meta] dump failed: {_bookkeep_exc}"
-							)
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)

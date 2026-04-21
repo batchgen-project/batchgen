@@ -66,9 +66,12 @@ void fused_rope_hadamard_kernel(FusedRopeHadamardParams params) {
         }
     }
 
-    // 3. Hadamard butterfly: 3 thread-level + 4 warp-level stages
+    // 3. Hadamard butterfly: 3 thread-level + 4 warp-level stages.
+    // The warp only has 16 active lanes (blockDim.x = 16), so the shuffle sync
+    // mask must name lanes 0..15 only — passing FULL_MASK references phantom
+    // lanes 16..31 and is UB per the CUDA programming guide.
     hadamard_mult_thread<kLogNElts, kNChunks>(x_vals);
-    hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts>(x_vals);
+    hadamard_mult_warp<kLogWarpSize, 0, kNChunks, kNElts, 0x0000FFFFu>(x_vals);
     // kNWarps=1, kNChunks=1: no smem exchange, no transposed stage
 
     // 4. Scale and store

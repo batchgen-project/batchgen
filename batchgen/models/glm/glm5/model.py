@@ -29,75 +29,6 @@ from batchgen.models.glm.glm5.decode_utils import (
 	build_paged_gather_cache_key,
 )
 
-
-def glm5_prefill_trace(tensor, stage: str, layer_idx: int = 0) -> None:
-	"""Phase D per-stage hidden-state trace for GLM-5 prefill.
-
-	Log-only diagnostic. Gated on:
-	  - env BATCHGEN_GLM5_PREFILL_TRACE=1
-	  - layer_idx == 0
-	  - rank 0 (if distributed)
-	  - env BATCHGEN_GLM5_BOOKKEEP_SEQS non-empty
-	  - Attn_Wrapper.prepack_cu_seqlens + cur_batch populated
-
-	For each target gid, logs the prefill-last-position fingerprint of the
-	given tensor (FP32-cast abs_mean, max_abs, mean, std, first16). Used by
-	Phase D (velvet-popping-hopper plan) to bisect which stage in the
-	layer-0 forward pass first diverges from SGLang's reference.
-	"""
-	import os as _os_trace
-	if _os_trace.environ.get("BATCHGEN_GLM5_PREFILL_TRACE", "0") != "1":
-		return
-	if layer_idx != 0:
-		return
-	# Note: no rank filter — target gids are distributed across ranks via
-	# prepack admission. The inner loop already filters to target gids, so
-	# only ranks that actually hold a target seq will log.
-	_bookkeep = _os_trace.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
-	if not _bookkeep:
-		return
-	try:
-		targets = {int(s) for s in _bookkeep.split(",") if s.strip()}
-	except Exception:
-		return
-	try:
-		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-	except Exception:
-		return
-	cur_batch = getattr(_AWB, "cur_batch", None) or []
-	cu_seqlens = getattr(_AWB, "prepack_cu_seqlens", None)
-	if cu_seqlens is None or len(cur_batch) == 0:
-		return
-	try:
-		t = tensor
-		if t.dim() >= 3 and t.shape[0] == 1:
-			t = t[0]
-		import logging as _logging_trace
-		for loc, gid in enumerate(cur_batch):
-			if int(gid) not in targets:
-				continue
-			s_end = int(cu_seqlens[loc + 1].item()) - 1
-			if s_end >= t.shape[0]:
-				continue
-			row = t[s_end].detach().float().reshape(-1)
-			try:
-				import torch.distributed as _d
-				_rk = _d.get_rank() if _d.is_initialized() else 0
-			except Exception:
-				_rk = 0
-			_logging_trace.warning(
-				f"[PREFILL-TRACE rank={_rk} L0 stage={stage} gid={gid} loc={loc}] "
-				f"shape={tuple(tensor.shape)} pos_last={s_end} "
-				f"abs_mean={row.abs().mean().item():.6f} "
-				f"max_abs={row.abs().max().item():.6f} "
-				f"mean={row.mean().item():.6f} "
-				f"std={row.std().item():.6f} "
-				f"first16={row[:16].tolist()}"
-			)
-	except Exception as e:
-		import logging as _logging_trace
-		_logging_trace.warning(f"[PREFILL-TRACE stage={stage}] failed: {e}")
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -149,9 +80,6 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "256"))
 # ============================================================================
 
 class Glm5RMSNorm(nn.Module):
-    # Class-level dedup set: per-process, one log per (data_ptr, hidden_size).
-    _RMSNORM_SELFCHECK_SEEN: set = set()
-
     def __init__(self, hidden_size: int, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -159,33 +87,6 @@ class Glm5RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         import os as _os_rmsn
-
-        # Self-check probe (env-gated): logs the EXACT weight tensor the
-        # forward uses — data_ptr + abs_mean + first-8 — so we can verify
-        # at runtime that the trained tensor (not a shadowed `ones`) is
-        # what reaches the kernel. Deduped per (data_ptr, hidden_size) so
-        # one log per unique tensor per rank. Complements the existing
-        # BATCHGEN_GLM5_RMSNORM_IO_LOG probe that logs at the caller.
-        if _os_rmsn.environ.get("BATCHGEN_GLM5_RMSNORM_SELFCHECK", "0") == "1":
-            _w = self.weight
-            _key = (_w.data_ptr(), _w.shape[-1])
-            if _key not in Glm5RMSNorm._RMSNORM_SELFCHECK_SEEN:
-                Glm5RMSNorm._RMSNORM_SELFCHECK_SEEN.add(_key)
-                try:
-                    import torch.distributed as _dist_sc
-                    _rk = _dist_sc.get_rank() if _dist_sc.is_initialized() else 0
-                except Exception:
-                    _rk = 0
-                import logging as _logging_sc
-                _wf = _w.detach().float()
-                _logging_sc.warning(
-                    f"[RMSNORM-SELFCHECK rank={_rk} ptr={_w.data_ptr():#x} "
-                    f"H={_w.shape[-1]} dtype={_w.dtype}] "
-                    f"abs_mean={_wf.abs().mean().item():.4f} "
-                    f"std={_wf.std().item():.4f} "
-                    f"min={_wf.min().item():.4f} max={_wf.max().item():.4f} "
-                    f"first8={_wf[:8].tolist()}"
-                )
 
         if _os_rmsn.environ.get("BATCHGEN_GLM5_USE_CUDA_RMSNORM", "0") == "1":
             from batchgen.attention.fused_kernels import cuda_rmsnorm
@@ -1791,9 +1692,18 @@ class Glm5MoE(nn.Module):
         Accumulation dtype: default BF16 (matches HF ``GlmMoeDsaNaiveMoe`` which
         uses ``torch.zeros_like(hidden_states)`` keeping input dtype). Opt into
         the old FP32 accumulate path with ``BATCHGEN_GLM5_MOE_FP32_ACCUM=1``.
+
+        Scatter-add variant: ``BATCHGEN_GLM5_MOE_SCATTER_ADD=1`` replaces the
+        boolean-mask `output[expert_mask] += ...` (which goes through PyTorch's
+        index_put_ → may use parallel atomicAdd-style internal kernel for
+        accumulating duplicate row indices when a token is in K experts at once)
+        with an explicit `torch.scatter_add_` over precomputed token indices.
+        Probes the hypothesis that the boolean-mask path leaks state across
+        sequences in the multi-seq prepacked prefill batch.
         """
         import os as _os_moe
         _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
+        _moe_scatter = _os_moe.environ.get("BATCHGEN_GLM5_MOE_SCATTER_ADD", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
@@ -1820,13 +1730,42 @@ class Glm5MoE(nn.Module):
                 torch.zeros_like(topk_weights[expert_mask])
             ).sum(dim=-1)
             if _moe_fp32:
-                output[expert_mask] += expert_output.float() * expert_weight.unsqueeze(-1)
+                weighted = expert_output.float() * expert_weight.unsqueeze(-1)
             else:
-                output[expert_mask] += expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
+                weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
+
+            if _moe_scatter:
+                # Explicit scatter_add_ — per-row indices are unique within this
+                # iteration's `expert_mask`, so accumulation is well-defined.
+                token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
+                idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
+                output.scatter_add_(0, idx2d, weighted)
+            else:
+                output[expert_mask] += weighted
 
         if _moe_fp32:
             output = output.to(hidden_flat.dtype)
         output = output + self.shared_experts(identity)
+        # MoE prefill probe (BATCHGEN_GLM5_PREFILL_DIAG=1). Fires every MoE
+        # call, one line per call. Log lines arrive in layer order (0..77)
+        # because the layer loop iterates sequentially. We sample token
+        # positions [0], [100], [500], [1000] — whichever fit in total tokens
+        # — plus token-0 norm, to pin whether MoE output diverges at the
+        # same layer boundaries LAYER-DIAG highlights but via MoE output
+        # rather than the full decoder-layer output.
+        if _os_moe.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
+            import logging as _log_moe
+            T = output.shape[0]
+            sample_positions = [p for p in (0, 100, 500, 1000) if p < T]
+            fps = []
+            for p in sample_positions:
+                fp = output[p, :8].float().tolist()
+                nm = float(output[p].float().norm().item())
+                fps.append((p, fp, nm))
+            _log_moe.warning(
+                f"[MOE-DIAG total_tokens={T} n_active_experts={n_active} "
+                f"shape={list(output.shape)} sampled_fp={fps}]"
+            )
         return output.view(*orig_shape)
 
     # ── Internal helpers ──
@@ -1962,8 +1901,6 @@ class Glm5DecoderLayer(nn.Module):
         # Pre-norm attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Phase D stage 2: post input_layernorm (layer 0 only)
-        glm5_prefill_trace(hidden_states, stage="input_ln", layer_idx=self.layer_idx)
         hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1979,14 +1916,10 @@ class Glm5DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.eps,
         )
-        # Phase D stage 7: post post_attention_layernorm (pre-MLP)
-        glm5_prefill_trace(hidden_states, stage="post_attn_ln", layer_idx=self.layer_idx)
 
         # MoE/FFN
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        # Phase D stage 8: post MLP + residual (layer 0 output)
-        glm5_prefill_trace(hidden_states, stage="mlp_out", layer_idx=self.layer_idx)
 
         return hidden_states, attn_weights, present
 
@@ -2036,8 +1969,6 @@ class Glm5Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
-        # Phase D stage 1: embedding output (pre-layer0)
-        glm5_prefill_trace(hidden_states, stage="embed", layer_idx=0)
 
         for idx, layer in enumerate(self.layers):
             past_kv = past_key_values[idx] if past_key_values is not None else None

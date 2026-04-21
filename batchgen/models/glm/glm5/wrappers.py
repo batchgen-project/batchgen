@@ -110,21 +110,6 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 
-# DSA decode-iter diagnostic. Gated by BATCHGEN_GLM5_DSA_DIAG=1.
-# Logs which DSA branch (dense short-circuit ≤ index_topk vs sparse scoring
-# > index_topk) fires on each decode iter at layer 0 — proves the sparse
-# path engages once context exceeds 2048.
-import os as _os_dsa_diag
-_DSA_DIAG_SEEN: dict = {}
-def _dsa_diag_log(branch: str, max_seqlen: int, batch_size: int) -> None:
-    # Bucket max_seqlen by power of two so each shape logs ~once.
-    key = (branch, max_seqlen.bit_length())
-    if key in _DSA_DIAG_SEEN:
-        return
-    _DSA_DIAG_SEEN[key] = True
-    logging.info(f"[DSA L0] branch={branch} max_seqlen={max_seqlen} batch={batch_size}")
-
-
 def glm5_fp8_dequantization(
     weight_data_fp8: torch.Tensor,
     weight_scale_inv_fp32: torch.Tensor,
@@ -467,6 +452,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         2. Compute indexer K and write to auxiliary cache
         """
         if self.prepack_mode:
+            import os as _os_kvshape
             hidden_states_2d = hidden_states.squeeze(0)
             attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
                 hidden_states_2d,
@@ -485,8 +471,29 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     positions=self.position_ids.to(hidden_states_2d.device),
                 )
                 # indexer_kv: [1, total_tokens, 1, index_dim]
+                # KV-shape probe (BATCHGEN_GLM5_PREFILL_DIAG=1): log indexer_kv's
+                # shape + strides + dtype RIGHT BEFORE handing it to the offload path.
+                if _os_kvshape.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in (0, 10, 39, 77):
+                    import logging as _log_shp
+                    _ikv = indexer_kv
+                    _log_shp.warning(
+                        f"[KV-SHAPE-INDEXER layer={self.layer_idx} "
+                        f"num_seqs={self.prepack_num_sequences} "
+                        f"shape={list(_ikv.shape)} stride={list(_ikv.stride())} "
+                        f"dtype={_ikv.dtype} device={_ikv.device} "
+                        f"cu_seqlens={self.prepack_cu_seqlens.tolist()}]"
+                    )
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
+            # KV-shape probe: log offload_kv (primary MLA) shape before offload.
+            if _os_kvshape.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in (0, 10, 39, 77):
+                import logging as _log_shp2
+                _log_shp2.warning(
+                    f"[KV-SHAPE-PRIMARY layer={self.layer_idx} "
+                    f"num_seqs={self.prepack_num_sequences} "
+                    f"shape={list(offload_kv.shape)} stride={list(offload_kv.stride())} "
+                    f"dtype={offload_kv.dtype} device={offload_kv.device}]"
+                )
             self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
@@ -527,6 +534,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
             )
 
+        # Lifespan management mirrored from decode-side `_pending_kv_append_*`
+        # (worker.py:1898-1925). Drain compute stream via a CUDA event so the
+        # FA3 prefill kernel that wrote `offload_kv` has fully retired before
+        # the C++ async lambda's d2h memcpy reads the source memory; pin the
+        # source tensor (and the parent `offload_kv`) in the class-level list
+        # so PyTorch's caching allocator cannot re-hand the same physical
+        # pages to a later layer's K/V tensor while the d2h is in flight.
+        AttnWrapperBase.pending_prefill_offload_tensors.append(offload_kv)
+        evt = torch.cuda.Event()
+        evt.record(torch.cuda.current_stream())
+        evt.synchronize()
+
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens[seq_idx].item()
             end_idx = cu_seqlens[seq_idx + 1].item()
@@ -540,9 +559,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
-            # Capture the future. CPU thread issues cudaMemcpyAsync inside; if
-            # we discard the task, decode may start reading host KV before the
-            # offload's CPU lambda has even queued its copies.
+            # Pin both the per-seq view AND the parent offload_kv (already
+            # pinned outside the loop) so neither's storage is reclaimed.
+            AttnWrapperBase.pending_prefill_offload_tensors.append(seq_kv)
             if task is not None:
                 AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
@@ -570,6 +589,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
             )
 
+        # See _offload_prepacked_indexer_kv for rationale.
+        AttnWrapperBase.pending_prefill_offload_tensors.append(offload_kv)
+        evt = torch.cuda.Event()
+        evt.record(torch.cuda.current_stream())
+        evt.synchronize()
+
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens[seq_idx].item()
             end_idx = cu_seqlens[seq_idx + 1].item()
@@ -583,6 +608,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            AttnWrapperBase.pending_prefill_offload_tensors.append(seq_kv)
             if task is not None:
                 AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
@@ -755,41 +781,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 hidden_fp8, hidden_scale,
                 attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
             )
-            # Forward-time norm-weight probe (env-gated).
-            _log_norm_dec = _os.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1"
-            _log_io_dec = _os.environ.get("BATCHGEN_GLM5_RMSNORM_IO_LOG", "0") == "1"
-            if _log_norm_dec and li in (0, 1, 2, 39):
-                _w = attn.q_a_layernorm.weight
-                _w2 = attn.kv_a_layernorm.weight
-                logging.warning(
-                    f"[NORM-FWD L{li} decode] q_a_layernorm.weight: "
-                    f"dtype={_w.dtype} device={_w.device} "
-                    f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
-                    f"first5={_w.detach().float()[:5].tolist()}"
-                )
-                logging.warning(
-                    f"[NORM-FWD L{li} decode] kv_a_layernorm.weight: "
-                    f"dtype={_w2.dtype} device={_w2.device} "
-                    f"abs_mean={_w2.detach().float().abs().mean().item():.4f} "
-                    f"first5={_w2.detach().float()[:5].tolist()}"
-                )
-            if _log_io_dec and li == 0:
-                _w = attn.q_a_layernorm.weight
-                _in_abs = q_a.detach().float().abs().mean().item()
-                logging.warning(
-                    f"[RMSNORM-IO L0 decode PRE q_a] "
-                    f"weight.data_ptr={_w.data_ptr():#x} "
-                    f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
-                    f"x_abs_mean={_in_abs:.6f}"
-                )
             q_a_normed = attn.q_a_layernorm(q_a)
-            if _log_io_dec and li == 0:
-                _out_abs = q_a_normed.detach().float().abs().mean().item()
-                logging.warning(
-                    f"[RMSNORM-IO L0 decode POST q_a] "
-                    f"out_abs_mean={_out_abs:.6f} "
-                    f"ratio_out_over_in={_out_abs/max(_in_abs, 1e-12):.6f}"
-                )
             q_a_fp8, q_a_scale = act_quant(q_a_normed)
             q = w8a8_deepgemm(
                 q_a_fp8, q_a_scale,
@@ -852,41 +844,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 mla_block_table, primary_slot_indices,
             )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
-
-        # GLM-5 per-global-seq bookkeeping dump (decode-side view). Pairs
-        # with the KV-write dump in
-        # gpu_paged_kv_manager.update_layer_decode_new_token. Correlates
-        # local micro-batch slots to global seq ids via
-        # AttnWrapperBase.cur_batch so BATCHGEN_GLM5_BOOKKEEP_SEQS=24 hits
-        # global seq 24 regardless of which local slot it occupies.
-        _BOOKKEEP = _os.environ.get("BATCHGEN_GLM5_BOOKKEEP_SEQS", "").strip()
-        if _BOOKKEEP and li == 0:
-            try:
-                import torch.distributed as _dist
-                _rank = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
-            except Exception:
-                _rank = 0
-            if _rank == 0:
-                import logging as _logging
-                _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-                _slot_order = list(
-                    gpu_paged_kv_manager._gpu_page_table_manager.slot_to_seq_id
-                ) if gpu_paged_kv_manager is not None and getattr(
-                    gpu_paged_kv_manager, "_gpu_page_table_manager", None
-                ) is not None else []
-                _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
-                _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
-                            if loc < len(_cur) and _cur[loc] in _target_set]
-                for _loc, _gid in _bk_hits:
-                    _cs = int(updated_seqlens[_loc].item())
-                    _pos = int(new_token_pos[_loc].item())
-                    _slot = int(primary_slot_indices[_loc].item())
-                    _bt_row = mla_block_table[_loc].tolist()
-                    _logging.warning(
-                        f"[BOOKKEEP L0 decode gid={_gid}] loc={_loc} "
-                        f"slot={_slot} pos={_pos} cache_seqlen={_cs} "
-                        f"slot_order={_slot_order[:10]} block_table={_bt_row}"
-                    )
 
         if not _use_kimi_mla:
             # Legacy diagnostic path: dense top-K with per-sequence clamping so
@@ -971,25 +928,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 tile_scheduler_metadata, num_splits = get_mla_metadata(
                     updated_seqlens.to(torch.int32), attn.num_heads, 1,
                 )
-                if _BOOKKEEP and li == 0:
-                    try:
-                        import torch.distributed as _dist
-                        _rank_fm = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
-                    except Exception:
-                        _rank_fm = 0
-                    if _rank_fm == 0:
-                        import logging as _logging
-                        _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-                        _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
-                        _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
-                                    if loc < len(_cur) and _cur[loc] in _target_set]
-                        for _loc, _gid in _bk_hits:
-                            _logging.warning(
-                                f"[BOOKKEEP L0 flashmla gid={_gid}] "
-                                f"loc={_loc} flashmla_seqlen={int(updated_seqlens[_loc].item())} "
-                                f"slot={int(primary_slot_indices[_loc].item())} "
-                                f"pos={int(new_token_pos[_loc].item())}"
-                            )
                 attn_out, _ = flash_mla_with_kvcache(
                     query_states,
                     mla_blocked_k,
@@ -1001,26 +939,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     attn.softmax_scale,
                     True,  # causal
                 )
-
-        # Post-attn bookkeeping probe: dump attn_out fingerprint for global
-        # target seqs, via cur_batch mapping.
-        if _BOOKKEEP and li == 0:
-            try:
-                import torch.distributed as _dist
-                _rank_check = _dist.get_rank() if _dist.is_available() and _dist.is_initialized() else 0
-            except Exception:
-                _rank_check = 0
-            if _rank_check == 0:
-                import logging as _logging
-                _cur = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-                _target_set = {int(s) for s in _BOOKKEEP.split(",") if s.strip().isdigit()}
-                _bk_hits = [(loc, _cur[loc]) for loc in range(bsz)
-                            if loc < len(_cur) and _cur[loc] in _target_set]
-                for _loc, _gid in _bk_hits:
-                    _attn_fp = attn_out[_loc, 0, 0, :8].float().tolist()
-                    _logging.warning(
-                        f"[BOOKKEEP L0 attn_out gid={_gid}] loc={_loc} head0[:8]={_attn_fp}"
-                    )
 
         # Step 6: out-absorb via FP8 WGMMA → FP8 quant → o_proj
         with (dt.timed("o_proj", li) if dt else _nullctx()):
@@ -1227,19 +1145,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # and run dense MLA over ALL cached tokens, even past index_topk.
             # Used to bisect whether the indexer.score_and_select_paged path is
             # the source of L4 LongBench gibberish. Read per-iter — hot-pluggable.
-            _force_dense = _os_dsa_diag.environ.get("BATCHGEN_GLM5_FORCE_DENSE_MLA", "0") == "1"
+            _force_dense = _os.environ.get("BATCHGEN_GLM5_FORCE_DENSE_MLA", "0") == "1"
             if _force_dense or max_seqlen <= indexer.index_topk:
                 # Short-circuit: clamp per-sequence so shorter rows never read
                 # unwritten slack from their last allocated page.
                 top_k_indices = build_clamped_dense_token_indices(
                     updated_seqlens, max_seqlen, hidden_states.device,
                 )
-                if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
-                    branch = "dense-forced" if _force_dense else "dense"
-                    _dsa_diag_log(branch, max_seqlen, bsz)
             else:
-                if li == 0 and _os_dsa_diag.environ.get("BATCHGEN_GLM5_DSA_DIAG", "0") == "1":
-                    _dsa_diag_log("sparse", max_seqlen, bsz)
                 # Full indexer scoring path
                 q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
                 indexer_blocked_k, _, idx_block_table = \

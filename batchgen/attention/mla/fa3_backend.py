@@ -15,34 +15,6 @@ from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 
-import os as _os
-_GLM5_NAN_PROBE = _os.environ.get("BATCHGEN_GLM5_NAN_PROBE", "0") == "1"
-
-
-def _glm5_nan_probe(t: torch.Tensor, stage: str, attn_mod) -> None:
-	"""Log + raise on NaN/Inf in the GLM-5 prefill FP8 path.
-
-	Gated on BATCHGEN_GLM5_NAN_PROBE=1 to avoid any overhead in production.
-	When triggered, reports layer_idx (if the attention module exposes it),
-	the stage name, and tensor statistics so the first NaN source is pinpointed.
-	"""
-	if not _GLM5_NAN_PROBE:
-		return
-	has_nan = torch.isnan(t).any().item()
-	has_inf = torch.isinf(t).any().item()
-	if has_nan or has_inf:
-		layer_idx = getattr(attn_mod, "layer_idx", "?")
-		absmax = t.abs().max().item() if t.numel() else float("nan")
-		finite = t[torch.isfinite(t)]
-		finite_absmax = finite.abs().max().item() if finite.numel() else float("nan")
-		msg = (
-			f"[GLM5 NaN-probe layer={layer_idx} stage={stage}] "
-			f"nan={has_nan} inf={has_inf} shape={tuple(t.shape)} dtype={t.dtype} "
-			f"absmax={absmax} finite_absmax={finite_absmax}"
-		)
-		logging.error(msg)
-		raise ValueError(msg)
-
 @torch.inference_mode()
 def mla_prefill_flashattention3(
 	self,
@@ -402,51 +374,6 @@ def act_quant_kernel_2d(
 # and memory access issues with very long sequences
 ACT_QUANT_MAX_ROWS = 32768  # 32K rows per chunk
 
-# Quant diagnostic state: print once per (M_bucket, N) tuple per process so
-# every layer/site logs once but we don't drown the log on every call.
-_QUANT_DIAG_SEEN: set = set()
-_FP8_E4M3_MIN_NORMAL = 1.52587890625e-05
-
-def _emit_quant_diag(
-    x_flat: torch.Tensor,
-    y_flat: torch.Tensor,
-    scale_flat: torch.Tensor,
-    M: int,
-    N: int,
-    block_size: int,
-    used_chunked_3d: bool,
-) -> None:
-    """One-shot quant kernel diagnostic. Gated by BATCHGEN_GLM5_QUANT_DIAG."""
-    import logging
-    # Bucket M by order-of-magnitude so different prefill sizes each log once.
-    m_bucket = 0 if M == 0 else 1 << (M.bit_length() - 1)
-    key = (m_bucket, N, used_chunked_3d)
-    if key in _QUANT_DIAG_SEEN:
-        return
-    _QUANT_DIAG_SEEN.add(key)
-    try:
-        amax = scale_flat.flatten().float()
-        floor_frac = float((amax < (_FP8_E4M3_MIN_NORMAL / 440.0)).float().mean().item())
-        n_sample = min(1000, M)
-        if n_sample > 0:
-            x_ref = x_flat[:n_sample].float()
-            num_blocks = scale_flat.size(-1)
-            s_rep = scale_flat[:n_sample].repeat_interleave(block_size, dim=-1)[:, :N]
-            x_deq = y_flat[:n_sample].float() * s_rep
-            denom = x_ref.norm().clamp_min(1e-9)
-            rt_rel_l2 = float(((x_deq - x_ref).norm() / denom).item())
-        else:
-            rt_rel_l2 = 0.0
-        path = "chunked3d" if used_chunked_3d else "flat1d"
-        logging.info(
-            f"[QDIAG path={path} M={M} N={N} bs={block_size} nb={scale_flat.size(-1)}] "
-            f"amax mean={amax.mean().item():.3e} min={amax.min().item():.3e} "
-            f"max={amax.max().item():.3e} floor_frac={floor_frac:.4f} "
-            f"rt_rel_l2={rt_rel_l2:.3e}"
-        )
-    except Exception as e:
-        logging.warning(f"[QDIAG] failed: {e}")
-
 
 def act_quant(
     x: torch.Tensor,
@@ -525,12 +452,6 @@ def act_quant(
         num_blocks = scale_flat.size(-1)
         y = y_flat.view(*original_shape)
         scale = scale_flat.view(*original_shape[:-1], num_blocks)
-
-        # Quant diagnostics — env-gated, prints once per layer per process.
-        # Layer id is inferred from caller stack (best-effort) so we don't
-        # need to plumb it through. If unavailable, key on 0.
-        if _os.environ.get("BATCHGEN_GLM5_QUANT_DIAG", "0") == "1":
-            _emit_quant_diag(x_flat, y_flat, scale_flat, M, N, block_size, _USE_CHUNKED_3D)
 
         return y, scale
 
@@ -770,15 +691,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 				 f"q_a_layernorm.weight.dtype={self.q_a_layernorm.weight.dtype}, "
 				 f"variance_epsilon={self.q_a_layernorm.variance_epsilon}")
 
-	_glm5_nan_probe(query_states, "q_a_proj", self)
 	query_states = self.q_a_layernorm(query_states)
-	_glm5_nan_probe(query_states, "q_a_layernorm", self)
 	query_states = w8a16_gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
-	_glm5_nan_probe(query_states, "q_b_proj", self)
 
 	query_states = query_states.view(bsz, seq_len, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -789,18 +707,14 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
 	)
-	_glm5_nan_probe(compressed_kv, "kv_a_proj_with_mqa", self)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
 	normed_kv = self.kv_a_layernorm(compressed_kv)
-	_glm5_nan_probe(normed_kv, "kv_a_layernorm", self)
 	k_pe = k_pe.view(bsz, seq_len, 1, self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe, seq_len=seq_len)
 	q_pe = rotary_pos_emb(q_pe, cos, sin, position_ids, 2)
 	k_pe = rotary_pos_emb(k_pe, cos, sin, position_ids, 2)
-	_glm5_nan_probe(q_pe, "q_pe_rope", self)
-	_glm5_nan_probe(k_pe, "k_pe_rope", self)
 	k_pe = k_pe.view(bsz, seq_len, self.qk_rope_head_dim)
 	offload_kv = torch.cat(
 		[normed_kv, k_pe], dim=-1
@@ -811,7 +725,6 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 		weight_scale["kv_b_proj.weight_scale_inv"],
 		normed_kv
 	)
-	_glm5_nan_probe(kv, "kv_b_proj", self)
 	kv = kv.view(bsz, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -867,13 +780,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm(
 	attn_output = pad_input(attn_output_unpad, indices_q, bsz, seq_len).view(
 		bsz, seq_len, self.num_heads * self.v_head_dim
 	).contiguous()
-	_glm5_nan_probe(attn_output, "pre_o_proj", self)
 	attn_output = w8a16_gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
-	_glm5_nan_probe(attn_output, "o_proj", self)
 
 	return attn_output, offload_kv
 
@@ -1264,61 +1175,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["q_a_proj.weight_scale_inv"],
 		hidden_states
 	)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(query_states, stage="q_a_proj_out", layer_idx=getattr(self, "layer_idx", -1))
-	except Exception:
-		pass
-	# Forward-time norm-weight probe (env-gated). If the trained norm
-	# weight isn't what's being used at forward time, we need to know.
-	import os as _os_nfwd
-	_layer_idx = getattr(self, "layer_idx", -1)
-	_log_norm = _os_nfwd.environ.get("BATCHGEN_GLM5_NORM_FWD_LOG", "0") == "1"
-	_log_io = _os_nfwd.environ.get("BATCHGEN_GLM5_RMSNORM_IO_LOG", "0") == "1"
-	if _log_norm and _layer_idx in (0, 1, 2, 39):
-		import logging as _logging_nfwd
-		_w = self.q_a_layernorm.weight
-		_logging_nfwd.warning(
-			f"[NORM-FWD L{_layer_idx} prefill] q_a_layernorm.weight: "
-			f"dtype={_w.dtype} device={_w.device} "
-			f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
-			f"first5={_w.detach().float()[:5].tolist()}"
-		)
-	# I/O probe: capture x abs_mean + weight ptr pre-call, out abs_mean post.
-	if _log_io and _layer_idx == 0:
-		import logging as _logging_io
-		_w = self.q_a_layernorm.weight
-		_in_abs = query_states.detach().float().abs().mean().item()
-		_logging_io.warning(
-			f"[RMSNORM-IO L0 prefill PRE q_a] "
-			f"weight.data_ptr={_w.data_ptr():#x} "
-			f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
-			f"x_abs_mean={_in_abs:.6f}"
-		)
 	query_states = self.q_a_layernorm(query_states)
-	if _log_io and _layer_idx == 0:
-		import logging as _logging_io
-		_out_abs = query_states.detach().float().abs().mean().item()
-		_logging_io.warning(
-			f"[RMSNORM-IO L0 prefill POST q_a] "
-			f"out_abs_mean={_out_abs:.6f} "
-			f"ratio_out_over_in={_out_abs/max(_in_abs, 1e-12):.6f}"
-		)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(query_states, stage="q_a_normed", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	query_states = _gemm(
 		self.q_b_proj.weight.data,
 		weight_scale["q_b_proj.weight_scale_inv"],
 		query_states
 	)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(query_states, stage="q_b_proj_out", layer_idx=_layer_idx)
-	except Exception:
-		pass
 
 	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -1331,49 +1193,10 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
 		hidden_states
 	)
-	# Forward-time norm-weight probe for kv_a_layernorm as well.
-	if _log_norm and _layer_idx in (0, 1, 2, 39):
-		_w = self.kv_a_layernorm.weight
-		import logging as _logging_nfwd
-		_logging_nfwd.warning(
-			f"[NORM-FWD L{_layer_idx} prefill] kv_a_layernorm.weight: "
-			f"dtype={_w.dtype} device={_w.device} "
-			f"abs_mean={_w.detach().float().abs().mean().item():.4f} "
-			f"first5={_w.detach().float()[:5].tolist()}"
-		)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(compressed_kv, stage="kv_a_proj_out", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	if _log_io and _layer_idx == 0:
-		import logging as _logging_io
-		_w = self.kv_a_layernorm.weight
-		_in_abs_kv = compressed_kv.detach().float().abs().mean().item()
-		_logging_io.warning(
-			f"[RMSNORM-IO L0 prefill PRE kv_a] "
-			f"weight.data_ptr={_w.data_ptr():#x} "
-			f"weight_abs_mean={_w.detach().float().abs().mean().item():.6f} "
-			f"x_abs_mean={_in_abs_kv:.6f}"
-		)
 	normed_kv = self.kv_a_layernorm(compressed_kv)
-	if _log_io and _layer_idx == 0:
-		import logging as _logging_io
-		_out_abs_kv = normed_kv.detach().float().abs().mean().item()
-		_logging_io.warning(
-			f"[RMSNORM-IO L0 prefill POST kv_a] "
-			f"out_abs_mean={_out_abs_kv:.6f} "
-			f"ratio_out_over_in={_out_abs_kv/max(_in_abs_kv, 1e-12):.6f}"
-		)
-	# Phase D stage 4: post kv_a_layernorm (layer 0 only)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(normed_kv, stage="kv_norm", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Apply rotary embeddings. Default: native interleaved RoPE (matches HF /
@@ -1401,11 +1224,6 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["kv_b_proj.weight_scale_inv"],
 		normed_kv
 	)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(kv, stage="kv_b_proj_out", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -1420,47 +1238,33 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
-	# Phase D stage 3: post Q assembly (q_nope + RoPE'd q_pe), layer 0
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(query_states, stage="q_assembled", layer_idx=_layer_idx)
-		_glm5_trace(key_states, stage="k_assembled", layer_idx=_layer_idx)
-		_glm5_trace(value_states, stage="value", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
 	value_states = value_states.contiguous()
 
-	# Phase A probe: FA3-vs-PyTorch-SDPA fingerprint for seq 0 at layer 0, rank 0.
-	# Log-only; compares FA3 output vs FP32 SDPA reference on symmetric (256,256,256)
-	# MLA Q/K/V shape. Gate: BATCHGEN_GLM5_ATTN_COMPARE=1.
-	import os as _os_attn_cmp
-	_attn_cmp = (
-		_os_attn_cmp.environ.get("BATCHGEN_GLM5_ATTN_COMPARE", "0") == "1"
-		and getattr(self, "layer_idx", -1) == 0
-		and (not dist.is_initialized() or dist.get_rank() == 0)
-	)
-	_attn_ref_s0 = None
-	_s0_start = 0
-	_s0_end = 0
-	if _attn_cmp:
-		_s0_start = int(cu_seqlens[0].item())
-		_s0_end = int(cu_seqlens[1].item())
-		_q0 = query_states[_s0_start:_s0_end]
-		_k0 = key_states[_s0_start:_s0_end]
-		_v0 = value_states[_s0_start:_s0_end]
-		_q_ref = _q0.unsqueeze(0).transpose(1, 2).float()
-		_k_ref = _k0.unsqueeze(0).transpose(1, 2).float()
-		_v_ref = _v0.unsqueeze(0).transpose(1, 2).float()
-		_attn_ref_s0 = torch.nn.functional.scaled_dot_product_attention(
-			_q_ref, _k_ref, _v_ref,
-			attn_mask=None, is_causal=True,
-			scale=self.softmax_scale,
+	# Prepacked diagnostic probe: dump per-seq cu_seqlens + first-row K fingerprint
+	# at layer 0 only, gated by env. Helps localize where multi-seq differs from
+	# single-seq (greedy temp=0.0 sampling makes byte-equality the regression
+	# signal — this gives us granular runtime evidence). Fires for both single
+	# and multi seq cases so we can diff them.
+	import os as _os_diag
+	_PROBE_LAYERS = (0, 10, 39, 77)
+	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
+		import logging as _log_diag
+		fps = []
+		cu = cu_seqlens.tolist()
+		for i in range(num_sequences):
+			t0 = int(cu[i])
+			fp_h0 = key_states[t0, 0, :8].float().tolist()
+			fp_h1 = key_states[t0, 1, :8].float().tolist()
+			fps.append((i, t0, fp_h0, fp_h1))
+		_log_diag.warning(
+			f"[FA3-PREFILL-DIAG layer={self.layer_idx} num_seqs={num_sequences} max_seqlen={max_seqlen} "
+			f"cu={cu} key_shape={list(key_states.shape)} key_contig={key_states.is_contiguous()} "
+			f"first_row_K_per_seq={fps}]"
 		)
-		_attn_ref_s0 = _attn_ref_s0.transpose(1, 2).squeeze(0)
 
 	# Flash attention with varlen
 	attn_output = flash_attn_varlen_func(
@@ -1475,74 +1279,45 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		causal=True
 	)
 
-	if isinstance(attn_output, tuple):
-		_attn_out_view = attn_output[0]
-	else:
-		_attn_out_view = attn_output
-
-	if _attn_cmp and _attn_ref_s0 is not None:
-		import logging as _logging_attn_cmp
-		_attn_fa3 = _attn_out_view[_s0_start:_s0_end]
-		_diff = (_attn_fa3.float() - _attn_ref_s0.float()).abs()
-		_abs_ref = _attn_ref_s0.float().abs().clamp(min=1e-6)
-		_L0 = _s0_end - _s0_start
-		_last = _L0 - 1
-		_mid = _L0 // 2
-		_logging_attn_cmp.warning(
-			f"[ATTN-COMPARE L0 seq0] L0={_L0} heads={self.num_heads} "
-			f"Linf={_diff.max().item():.6f} "
-			f"L2={_diff.norm().item():.6f} "
-			f"rel_Linf={(_diff / _abs_ref).max().item():.6f} "
-			f"mean_abs_ref={_abs_ref.mean().item():.6f}"
-		)
-		_logging_attn_cmp.warning(
-			f"[ATTN-COMPARE L0 seq0 t=0   ] "
-			f"fa3[h0,:8]={_attn_fa3[0, 0, :8].float().tolist()} "
-			f"ref[h0,:8]={_attn_ref_s0[0, 0, :8].float().tolist()}"
-		)
-		_logging_attn_cmp.warning(
-			f"[ATTN-COMPARE L0 seq0 t=mid ] tmid={_mid} "
-			f"fa3[h0,:8]={_attn_fa3[_mid, 0, :8].float().tolist()} "
-			f"ref[h0,:8]={_attn_ref_s0[_mid, 0, :8].float().tolist()}"
-		)
-		_logging_attn_cmp.warning(
-			f"[ATTN-COMPARE L0 seq0 t=last] tlast={_last} "
-			f"fa3[h0,:8]={_attn_fa3[_last, 0, :8].float().tolist()} "
-			f"ref[h0,:8]={_attn_ref_s0[_last, 0, :8].float().tolist()}"
-		)
-		# Per-token Linf to detect position-dependent divergence
-		_per_tok_linf = (_attn_fa3.float() - _attn_ref_s0.float()).abs().amax(dim=(1, 2))
-		_logging_attn_cmp.warning(
-			f"[ATTN-COMPARE L0 seq0 per-tok Linf] "
-			f"t0={_per_tok_linf[0].item():.6f} "
-			f"tmid={_per_tok_linf[_mid].item():.6f} "
-			f"tlast={_per_tok_linf[_last].item():.6f} "
-			f"max={_per_tok_linf.max().item():.6f} "
-			f"argmax={_per_tok_linf.argmax().item()}"
-		)
-
 	del query_states, key_states, value_states
 
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
 
+	# Probe post-FA3 attn_output (shape [total_tokens, num_heads, v_head_dim]).
+	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
+		import logging as _log_diag_a
+		_fa_fps = []
+		_cu_fa = cu_seqlens.tolist()
+		for _ii in range(num_sequences):
+			_t0 = int(_cu_fa[_ii])
+			_fp_h0 = attn_output[_t0, 0, :8].float().tolist()
+			_fp_h1 = attn_output[_t0, 1, :8].float().tolist()
+			_fa_fps.append((_ii, _t0, _fp_h0, _fp_h1))
+		_log_diag_a.warning(
+			f"[FA3-POST-ATTN-DIAG layer={self.layer_idx} num_seqs={num_sequences} "
+			f"shape={list(attn_output.shape)} first_row_attn_per_seq={_fa_fps}]"
+		)
+
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
-	# Phase D stage 5: post FA3 attention (pre-o_proj)
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(attn_output, stage="attn_out", layer_idx=_layer_idx)
-	except Exception:
-		pass
 	attn_output = _gemm(
 		self.o_proj.weight.data,
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
-	# Phase D stage 6: post o_proj
-	try:
-		from batchgen.models.glm.glm5.model import glm5_prefill_trace as _glm5_trace
-		_glm5_trace(attn_output, stage="o_proj", layer_idx=_layer_idx)
-	except Exception:
-		pass
+	# Probe post-o_proj — attention block output before residual add.
+	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
+		import logging as _log_diag_o
+		_op_fps = []
+		_cu_op = cu_seqlens.tolist()
+		for _jj in range(num_sequences):
+			_t0 = int(_cu_op[_jj])
+			_fp = attn_output[_t0, :8].float().tolist()
+			_nm = float(attn_output[_t0].float().norm().item())
+			_op_fps.append((_jj, _t0, _fp, _nm))
+		_log_diag_o.warning(
+			f"[FA3-POST-OPROJ-DIAG layer={self.layer_idx} num_seqs={num_sequences} "
+			f"shape={list(attn_output.shape)} post_oproj_per_seq={_op_fps}]"
+		)
 
 	return attn_output, offload_kv
