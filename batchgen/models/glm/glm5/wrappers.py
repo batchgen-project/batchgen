@@ -553,7 +553,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
             start_idx = cu_seqlens[seq_idx].item()
             end_idx = cu_seqlens[seq_idx + 1].item()
             seq_len = end_idx - start_idx
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
+            # indexer_kv is already [T, H=1, D=128] after caller's .squeeze(0),
+            # so only .unsqueeze(0) is needed to add the B dim; don't also
+            # .unsqueeze(2) (that would make 5D — the primary-MLA path copy-paste
+            # of this code was for a 2D [T, kv_lora+rope] input).
+            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0)
             seq_global_id = [global_sequence_ids[seq_idx]]
             task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
