@@ -1249,6 +1249,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	key_states = key_states.contiguous()
 	value_states = value_states.contiguous()
 
+	# Unconditional stream sync replicating FA3-PREFILL-DIAG's implicit barrier.
+	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 	# Prepacked diagnostic probe: dump per-seq cu_seqlens + first-row K fingerprint
 	# at layer 0 only, gated by env. Helps localize where multi-seq differs from
 	# single-seq (greedy temp=0.0 sampling makes byte-equality the regression
@@ -1289,6 +1291,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
 
+	# Unconditional stream sync replicating FA3-POST-ATTN-DIAG's implicit barrier.
+	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 	# Probe post-FA3 attn_output (shape [total_tokens, num_heads, v_head_dim]).
 	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
 		import logging as _log_diag_a
@@ -1310,6 +1314,8 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		weight_scale["o_proj.weight_scale_inv"],
 		attn_output
 	)
+	# Unconditional stream sync replicating FA3-POST-OPROJ-DIAG's implicit barrier.
+	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 	# Probe post-o_proj — attention block output before residual add.
 	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
 		import logging as _log_diag_o

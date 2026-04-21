@@ -1753,6 +1753,10 @@ class Glm5MoE(nn.Module):
         # — plus token-0 norm, to pin whether MoE output diverges at the
         # same layer boundaries LAYER-DIAG highlights but via MoE output
         # rather than the full decoder-layer output.
+        # Unconditional sync replacing the MOE-DIAG probe's implicit .tolist/.item
+        # barrier. Fires 75× per prefill (once per MoE layer). The densest sync
+        # of the probe set — THE one that masked the first-seq alloc-reuse bug.
+        torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
         if _os_moe.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
             import logging as _log_moe
             T = output.shape[0]

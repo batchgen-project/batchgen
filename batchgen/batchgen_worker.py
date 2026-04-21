@@ -6909,6 +6909,8 @@ class BatchGenWorker:
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
 
+				# Sync replacing the PREPACK-DIAG implicit barrier before the layer loop.
+				torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 				# Forward through model layers
 				_layer_probe_set = (0, 10, 39, 77)
 				_layer_probe_on = _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1"
@@ -6922,6 +6924,8 @@ class BatchGenWorker:
 						use_cache=False,
 					)
 					hidden_states = layer_outputs[0]
+					# Sync every layer replacing the gated LAYER-DIAG probe's implicit barrier.
+					torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 					# Per-layer per-seq hidden-state fingerprint. Fires only when
 					# BATCHGEN_GLM5_PREFILL_DIAG=1 at a sparse set of layers so we
 					# can diff single-seq vs multi-seq-per-rank output of the same
@@ -6947,6 +6951,8 @@ class BatchGenWorker:
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
+				# Sync replacing the LASTHID-DIAG probe's implicit barrier.
+				torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 				if _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
 					_lth_fps = [last_token_hidden[i, :8].float().tolist() for i in range(batch_num_seqs)]
 					_lth_norms = [float(last_token_hidden[i].float().norm().item()) for i in range(batch_num_seqs)]

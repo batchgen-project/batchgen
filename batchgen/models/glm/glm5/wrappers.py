@@ -481,6 +481,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     positions=self.position_ids.to(hidden_states_2d.device),
                 )
                 # indexer_kv: [1, total_tokens, 1, index_dim]
+                # Unconditional stream sync replicating KV-SHAPE-INDEXER's barrier.
+                torch.cuda.current_stream().synchronize()
                 # KV-shape probe (BATCHGEN_GLM5_PREFILL_DIAG=1): log indexer_kv's
                 # shape + strides + dtype RIGHT BEFORE handing it to the offload path.
                 if _os_kvshape.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in (0, 10, 39, 77):
