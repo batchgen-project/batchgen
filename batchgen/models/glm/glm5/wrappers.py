@@ -222,9 +222,16 @@ class GLM5ExpertWrapper(ExpertWrapperBase):
         result = self._forward_impl(hidden_states)
 
         if not self.persistent:
-            torch.cuda.current_stream(
+            # Full-device sync (not just current stream): _forward_impl's
+            # GEMMs may launch async work on streams PyTorch's allocator
+            # doesn't track, and prefill's per-layer async KV D2H from the
+            # attention wrapper is still in flight on a separate stream.
+            # Without this sync, dropping `cached_gate/up/down` here can let
+            # the allocator reuse the weight storage for the next layer's
+            # load_weights while those async ops still read from it.
+            torch.cuda.synchronize(
                 self.engine_config.Basic_Config.device_torch
-            ).synchronize()
+            )
             self.free_weights(self.module_key)
             self.cached_gate = self.cached_up = self.cached_down = None
 
