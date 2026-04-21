@@ -6524,24 +6524,16 @@ class BatchGenWorker:
 		Handle the prefill for a batch.
 		batch: list of local indices
 		"""
-		# Bind aux KV managers BEFORE the decoder-layer loop. decoding_continuous
-		# sets these at line ~8460, but for DSA models the PREFILL path reaches
-		# the indexer-KV computation in GLM5AttnWrapper._forward_prefill BEFORE
-		# decoding_continuous runs. Without this binding the if-guard in
-		# wrappers.py:467 sees gpu_paged_kv_manager_aux=None and silently skips
-		# compute_indexer_kv → aux cache is never populated for prompt tokens
-		# → any later decode past 2048 tokens reads unwritten aux pages.
-		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
-		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
-			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
-			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
-		else:
-			# self.gpu_paged_kv_cache_manager is None or not the coordinator at prefill
-			# entry; fall back to the per-kind slots that `_bind_gpu_paged_kv_manager`
-			# writes onto `core_engine` (line 2334-2335). Those are the primary and
-			# auxiliary managers directly, NOT a DualKVCacheCoordinator.
-			AttnWrapperBase.gpu_paged_kv_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
-			AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
+		# loop. Without this binding, GLM-5's prefill indexer-K offload at
+		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
+		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
+		# populated for prompt tokens and any later decode past 2048 tokens
+		# reads unwritten aux pages.
+		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
+		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
+		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
+		# the host aux cache instead of early-returning on a None view.
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 
@@ -6663,24 +6655,16 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
-		# Bind aux KV managers BEFORE the decoder-layer loop. decoding_continuous
-		# sets these at line ~8460, but for DSA models the PREFILL path reaches
-		# the indexer-KV computation in GLM5AttnWrapper._forward_prefill BEFORE
-		# decoding_continuous runs. Without this binding the if-guard in
-		# wrappers.py:467 sees gpu_paged_kv_manager_aux=None and silently skips
-		# compute_indexer_kv → aux cache is never populated for prompt tokens
-		# → any later decode past 2048 tokens reads unwritten aux pages.
-		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
-		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
-			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
-			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
-		else:
-			# self.gpu_paged_kv_cache_manager is None or not the coordinator at prefill
-			# entry; fall back to the per-kind slots that `_bind_gpu_paged_kv_manager`
-			# writes onto `core_engine` (line 2334-2335). Those are the primary and
-			# auxiliary managers directly, NOT a DualKVCacheCoordinator.
-			AttnWrapperBase.gpu_paged_kv_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
-			AttnWrapperBase.gpu_paged_kv_manager_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
+		# loop. Without this binding, GLM-5's prefill indexer-K offload at
+		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
+		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
+		# populated for prompt tokens and any later decode past 2048 tokens
+		# reads unwritten aux pages.
+		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
+		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
+		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
+		# the host aux cache instead of early-returning on a None view.
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
 

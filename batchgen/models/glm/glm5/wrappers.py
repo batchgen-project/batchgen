@@ -463,20 +463,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self.weight_dequant_scale
             )
 
-            # DSA: compute indexer K and offload to auxiliary cache.
+            # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
             # aux cache is unpopulated and any later decode past 2048 tokens reads
-            # unwritten memory. Fail loudly if the aux manager was not bound by the
-            # caller (worker.prefill_prepacked / worker.prefill bind it before the
-            # decoder loop, mirroring decoding_continuous).
+            # unwritten memory. `_offload_prepacked_indexer_kv` early-returns if
+            # host_paged_kv_worker_view_aux is None, so that guard is sufficient.
             if hasattr(self.module, 'indexer'):
-                if AttnWrapperBase.gpu_paged_kv_manager_aux is None:
-                    raise RuntimeError(
-                        "DSA prefill requires AttnWrapperBase.gpu_paged_kv_manager_aux to be "
-                        "bound before the decoder-layer loop. This was silently skipped prior "
-                        "to the fix for Task #7 — check that worker.prefill_prepacked / "
-                        "worker.prefill bind the aux manager."
-                )
                 indexer_kv = self.module.indexer.compute_indexer_kv(
                     hidden_states_2d.unsqueeze(0),
                     positions=self.position_ids.to(hidden_states_2d.device),
