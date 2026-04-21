@@ -463,9 +463,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self.weight_dequant_scale
             )
 
-            # DSA: compute indexer K and offload to auxiliary cache
-            gpu_paged_kv_manager_aux = AttnWrapperBase.gpu_paged_kv_manager_aux
-            if gpu_paged_kv_manager_aux is not None and hasattr(self.module, 'indexer'):
+            # DSA: compute indexer K and offload to auxiliary cache.
+            # This path MUST run for every prompt token during prefill — otherwise
+            # aux cache is unpopulated and any later decode past 2048 tokens reads
+            # unwritten memory. Fail loudly if the aux manager was not bound by the
+            # caller (worker.prefill_prepacked / worker.prefill bind it before the
+            # decoder loop, mirroring decoding_continuous).
+            if hasattr(self.module, 'indexer'):
+                if AttnWrapperBase.gpu_paged_kv_manager_aux is None:
+                    raise RuntimeError(
+                        "DSA prefill requires AttnWrapperBase.gpu_paged_kv_manager_aux to be "
+                        "bound before the decoder-layer loop. This was silently skipped prior "
+                        "to the fix for Task #7 — check that worker.prefill_prepacked / "
+                        "worker.prefill bind the aux manager."
+                )
                 indexer_kv = self.module.indexer.compute_indexer_kv(
                     hidden_states_2d.unsqueeze(0),
                     positions=self.position_ids.to(hidden_states_2d.device),
@@ -1146,28 +1157,82 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # Used to bisect whether the indexer.score_and_select_paged path is
             # the source of L4 LongBench gibberish. Read per-iter — hot-pluggable.
             _force_dense = _os.environ.get("BATCHGEN_GLM5_FORCE_DENSE_MLA", "0") == "1"
-            if _force_dense or max_seqlen <= indexer.index_topk:
-                # Short-circuit: clamp per-sequence so shorter rows never read
-                # unwritten slack from their last allocated page.
+            # Per-seq dispatch between the dense short-circuit and the indexer
+            # scoring path. Previously dispatched at the batch level using
+            # max(cache_seqlens), which dragged short rows (cache_seqlen <=
+            # index_topk) through the indexer whenever any row in the batch
+            # exceeded index_topk. Now:
+            #   - all rows <= index_topk  : dense (topk = max_seqlen)
+            #   - all rows >  index_topk  : indexer (topk = index_topk)
+            #   - mixed                   : per-row dispatch, unified to
+            #     [batch, index_topk] via row-mask assignment.
+            if _force_dense:
                 top_k_indices = build_clamped_dense_token_indices(
                     updated_seqlens, max_seqlen, hidden_states.device,
                 )
             else:
-                # Full indexer scoring path
-                q_a_for_indexer = q_a_normed.unsqueeze(1)  # [batch, 1, q_lora_rank]
-                indexer_blocked_k, _, idx_block_table = \
-                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-                idx_block_table = reorder_block_table_to_batch_slots(
-                    idx_block_table, aux_slot_indices,
-                )
-                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-                top_k_indices = indexer.score_and_select_paged(
-                    q_a_for_indexer, hidden_states,
-                    indexer_blocked_k, idx_block_table,
-                    updated_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
-                    positions=new_token_pos,
-                    max_seqlen=max_seqlen,
-                )
+                _idx_topk = indexer.index_topk
+                _short_mask = updated_seqlens <= _idx_topk  # [batch] bool
+                _any_long = bool((~_short_mask).any().item())
+                _any_short = bool(_short_mask.any().item())
+                if not _any_long:
+                    # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
+                    top_k_indices = build_clamped_dense_token_indices(
+                        updated_seqlens, max_seqlen, hidden_states.device,
+                    )
+                elif not _any_short:
+                    # All rows > index_topk: full-batch indexer scoring (topk = index_topk).
+                    q_a_for_indexer = q_a_normed.unsqueeze(1)
+                    indexer_blocked_k, _, idx_block_table = \
+                        gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                    idx_block_table = reorder_block_table_to_batch_slots(
+                        idx_block_table, aux_slot_indices,
+                    )
+                    aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
+                    top_k_indices = indexer.score_and_select_paged(
+                        q_a_for_indexer, hidden_states,
+                        indexer_blocked_k, idx_block_table,
+                        updated_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
+                        positions=new_token_pos,
+                        max_seqlen=max_seqlen,
+                    )
+                else:
+                    # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
+                    _device = hidden_states.device
+                    _bsz = hidden_states.shape[0]
+                    _long_mask = ~_short_mask
+                    top_k_indices = torch.empty(
+                        _bsz, _idx_topk, dtype=torch.long, device=_device,
+                    )
+                    # Short rows: dense indices padded to index_topk via clamp.
+                    _short_indices = build_clamped_dense_token_indices(
+                        updated_seqlens[_short_mask], _idx_topk, _device,
+                    )  # [num_short, index_topk]
+                    top_k_indices[_short_mask] = _short_indices
+                    # Long rows: indexer scoring on the subset.
+                    _long_cache_seqlens = updated_seqlens[_long_mask]
+                    _long_max_seqlen = int(_long_cache_seqlens.max().item())
+                    _q_a_long = q_a_normed[_long_mask].unsqueeze(1)
+                    _hidden_long = hidden_states[_long_mask]
+                    _new_token_pos_long = (
+                        new_token_pos[_long_mask] if new_token_pos is not None else None
+                    )
+                    _long_mask_aux = _long_mask.to(aux_slot_indices.device)
+                    _aux_slot_indices_long = aux_slot_indices[_long_mask_aux]
+                    indexer_blocked_k, _, idx_block_table = \
+                        gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+                    _idx_block_table_long = reorder_block_table_to_batch_slots(
+                        idx_block_table, _aux_slot_indices_long,
+                    )
+                    aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
+                    _long_top_k = indexer.score_and_select_paged(
+                        _q_a_long, _hidden_long,
+                        indexer_blocked_k, _idx_block_table_long,
+                        _long_cache_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
+                        positions=_new_token_pos_long,
+                        max_seqlen=_long_max_seqlen,
+                    )  # [num_long, min(index_topk, _long_max_seqlen)] = [num_long, index_topk]
+                    top_k_indices[_long_mask] = _long_top_k
 
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
         with (dt.timed("sparse_gather", li) if dt else _nullctx()):

@@ -6524,6 +6524,25 @@ class BatchGenWorker:
 		Handle the prefill for a batch.
 		batch: list of local indices
 		"""
+		# Bind aux KV managers BEFORE the decoder-layer loop. decoding_continuous
+		# sets these at line ~8460, but for DSA models the PREFILL path reaches
+		# the indexer-KV computation in GLM5AttnWrapper._forward_prefill BEFORE
+		# decoding_continuous runs. Without this binding the if-guard in
+		# wrappers.py:467 sees gpu_paged_kv_manager_aux=None and silently skips
+		# compute_indexer_kv → aux cache is never populated for prompt tokens
+		# → any later decode past 2048 tokens reads unwritten aux pages.
+		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
+		if _prefill_gpu_manager is None:
+			_prefill_gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
+			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
+			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
+		elif _prefill_gpu_manager is not None:
+			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager
+			AttnWrapperBase.gpu_paged_kv_manager_aux = None
+		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
@@ -6642,6 +6661,25 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
+		# Bind aux KV managers BEFORE the decoder-layer loop. decoding_continuous
+		# sets these at line ~8460, but for DSA models the PREFILL path reaches
+		# the indexer-KV computation in GLM5AttnWrapper._forward_prefill BEFORE
+		# decoding_continuous runs. Without this binding the if-guard in
+		# wrappers.py:467 sees gpu_paged_kv_manager_aux=None and silently skips
+		# compute_indexer_kv → aux cache is never populated for prompt tokens
+		# → any later decode past 2048 tokens reads unwritten aux pages.
+		_prefill_gpu_manager = self.gpu_paged_kv_cache_manager
+		if _prefill_gpu_manager is None:
+			_prefill_gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		if isinstance(_prefill_gpu_manager, DualKVCacheCoordinator):
+			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager.primary
+			AttnWrapperBase.gpu_paged_kv_manager_aux = _prefill_gpu_manager.auxiliary
+		elif _prefill_gpu_manager is not None:
+			AttnWrapperBase.gpu_paged_kv_manager = _prefill_gpu_manager
+			AttnWrapperBase.gpu_paged_kv_manager_aux = None
+		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
