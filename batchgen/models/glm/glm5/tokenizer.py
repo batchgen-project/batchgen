@@ -47,11 +47,16 @@ class GLM5Tokenizer(FastTokenizer):
         vocab_size: 154,880
     """
 
+    # Filename of the Jinja chat template, loaded from this package's directory
+    # at init time. Subclasses override this to swap templates while reusing
+    # everything else (tokenizer.json, vocab, special tokens).
+    CHAT_TEMPLATE_FILENAME = "chat_template.jinja"
+
     def __init__(self):
         super().__init__(str(TOKENIZER_DIR))
 
         # Load chat template from separate jinja file (not inline in tokenizer_config.json)
-        chat_template_file = TOKENIZER_DIR / "chat_template.jinja"
+        chat_template_file = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
         if chat_template_file.exists():
             self.chat_template = chat_template_file.read_text()
         else:
@@ -176,3 +181,28 @@ class GLM5Tokenizer(FastTokenizer):
             })
         visible = self._TOOL_CALL_RE.sub("", text).strip()
         return tool_calls, visible
+
+
+@register_tokenizer("glm_moe_dsa_5_1")
+class GLM51Tokenizer(GLM5Tokenizer):
+    """GLM-5.1 tokenizer — shares the GLM-5 vocab (tokenizer.json, EOS/pad,
+    vocab_size=154880) but uses a richer Jinja chat template: tool_to_json
+    macro filtering defer_loading/strict, per-turn thinking_indices tracking,
+    <|observation|>-only-on-first-tool placement, and tool_reference-list
+    responses. Everything else is inherited unchanged from GLM5Tokenizer.
+    """
+
+    CHAT_TEMPLATE_FILENAME = "chat_template_5_1.jinja"
+
+    def __init__(self):
+        # Fail loud at server boot if the 5.1 template file is missing from the
+        # install — otherwise rendering would silently fall through to the
+        # tokenizer_config.json fallback (likely None) and the first chat
+        # request would raise.
+        template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"GLM-5.1 chat template not found at {template_path}. "
+                f"Ensure chat_template_5_1.jinja is bundled with the GLM-5 package."
+            )
+        super().__init__()
