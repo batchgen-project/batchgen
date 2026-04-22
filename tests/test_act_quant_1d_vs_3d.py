@@ -48,16 +48,22 @@ def bit_exact(y_a: torch.Tensor, s_a: torch.Tensor, y_b: torch.Tensor, s_b: torc
         diff = (s_a - s_b).abs()
         max_abs = diff.max().item()
         rel = (diff / s_a.abs().clamp(min=1e-12)).max().item()
+        del diff
     else:
         max_abs = 0.0
         rel = 0.0
-    # FP8 byte diff stats when not equal
+    total = ya_u8.numel()
     if not y_eq:
-        ne = (ya_u8 != yb_u8).sum().item()
-        total = ya_u8.numel()
+        # Stream the mismatch count in row-chunks to keep peak memory
+        # under ~100 MB even for M >= 65k at K=6144.
+        ya = ya_u8.view(y_a.size(0), -1)
+        yb = yb_u8.view(y_b.size(0), -1)
+        CHUNK = 4096
+        ne = 0
+        for i in range(0, ya.size(0), CHUNK):
+            ne += int((ya[i:i + CHUNK] != yb[i:i + CHUNK]).sum().item())
     else:
         ne = 0
-        total = ya_u8.numel()
     return y_eq, s_eq, ne, total, max_abs, rel
 
 
