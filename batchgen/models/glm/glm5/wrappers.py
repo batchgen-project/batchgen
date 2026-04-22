@@ -24,15 +24,6 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-# DSA fused kernel enable flags — all default ON after L2 validation
-# confirmed accuracy parity with the PyTorch fallback path (79.69% vs
-# 79.69%) and throughput gains (prefill +83 %, decode +24 %). Flip any
-# flag to 0 (e.g. BATCHGEN_GLM5_WP2=0) to force the PyTorch fallback
-# for that work-package — useful for bisecting any future regression.
-_GLM5_WP2_ENABLED = os.environ.get("BATCHGEN_GLM5_WP2", "1") == "1"
-_GLM5_WP4_ENABLED = os.environ.get("BATCHGEN_GLM5_WP4", "1") == "1"
-_GLM5_WP5_ENABLED = os.environ.get("BATCHGEN_GLM5_WP5", "1") == "1"
-
 import torch.nn.functional as F
 
 from batchgen.models.glm.glm5.decode_utils import (
@@ -338,7 +329,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
 
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
-        if _HAS_FP8_ABSORB and _GLM5_WP5_ENABLED:
+        if _HAS_FP8_ABSORB:
             try:
                 self._fp8_absorb_weights = FP8AbsorbWeights(
                     self._cached_q_absorb,   # [H, 192, 512]
@@ -377,7 +368,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
-        if _HAS_FUSED_INDEXER_KV and _GLM5_WP2_ENABLED:
+        if _HAS_FUSED_INDEXER_KV:
             try:
                 self._indexer_cuda_module = _build_indexer_module()
                 # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
@@ -398,7 +389,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = None
 
         # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if _HAS_FUSED_SCORE and _GLM5_WP4_ENABLED and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
@@ -658,23 +649,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Computes MLA KV and writes to primary cache first, then runs indexer
         scoring on aux cache, gathers sparse MLA KV, and runs sparse FlashMLA.
         """
-        import os as _os
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.attention.mla.fused_rmsnorm_rope import (
-            fused_rmsnorm_rope_with_q,
-            fused_rmsnorm_rope_with_q_native,
+            fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
         )
         from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
         from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
         from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
-
-        _fused_rmsnorm_rope = (
-            fused_rmsnorm_rope_with_q
-            if _os.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
-            else fused_rmsnorm_rope_with_q_native
-        )
 
         weight_scale = self.weight_dequant_scale
         attn = self.module

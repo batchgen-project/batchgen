@@ -40,11 +40,9 @@ from .configuration_glm5 import Glm5Config
 # ============================================================================
 # K2.5 3D-buffer MoE kernels — port of minimax-m25's validated decode path.
 # ============================================================================
-# Feature flags mirror batchgen/models/minimax/minimax_m25/model.py:69-94.
 # The MoE 3D path uses `dispatch_scatter_3d` + `grouped_fp8_blockwise_*` +
-# `reduce_weighted_scatter`. Gated at runtime by BATCHGEN_GLM5_USE_3D_MOE=1
-# so the existing _triton_compute / WGMMA paths stay the default until this
-# port is validated for GLM-5 shapes (hidden=6144, moe_intermediate=2048).
+# `reduce_weighted_scatter`. Falls back to `_triton_compute` if the 3D
+# kernels or FP8 blockwise ops aren't available.
 
 try:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
@@ -1021,7 +1019,7 @@ class Glm5MoE(nn.Module):
     _buf = None                 # WGMMAMoEBuffers instance (unified: GEMM + comm buffers)
     _wgmma_next_layer_id = 0    # Counter for layer registration
 
-    # K2.5 3D-MoE path (minimax parity) — opt-in via BATCHGEN_GLM5_USE_3D_MOE=1.
+    # K2.5 3D-MoE path (minimax parity).
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
     _warned_k25_path = False
     _warned_gemm_3d = False
@@ -1053,7 +1051,7 @@ class Glm5MoE(nn.Module):
         self.num_persistent_local_experts = self.experts_per_rank
 
         self.use_wgmma_fp8 = os.environ.get("BATCHGEN_USE_WGMMA_FP8", "0") == "1"
-        self.use_3d_moe = os.environ.get("BATCHGEN_GLM5_USE_3D_MOE", "0") == "1"
+        self.use_3d_moe = True
 
         self.gate = Glm5MoEGate(config)
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]

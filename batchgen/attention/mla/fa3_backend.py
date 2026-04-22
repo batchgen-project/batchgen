@@ -1199,19 +1199,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
-	# Apply rotary embeddings. Default: native interleaved RoPE (matches HF /
-	# SGLang / vLLM `is_neox_style=False` when `rope_interleave=true`). Opt
-	# back into the legacy reshape+split-half trick via BATCHGEN_GLM5_ROPE_LEGACY=1.
-	import os as _os_rope
-	_rope_legacy = _os_rope.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
+	# Native interleaved RoPE (matches HF / SGLang / vLLM is_neox_style=False
+	# when rope_interleave=true).
+	from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
 	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	if _rope_legacy:
-		q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-		k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	else:
-		from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
-		q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-		k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)

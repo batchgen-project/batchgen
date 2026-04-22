@@ -6660,30 +6660,12 @@ class BatchGenWorker:
 		# on one micro-batch when a single very long sequence is present.
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-		_ALLOW_GLM_MULTI_SEQ = _os_mb.environ.get(
-			"BATCHGEN_GLM5_ALLOW_MULTI_SEQ_PREPACK", "0"
-		) == "1"
-		model_type = str(getattr(self.model_config, "model_type", "")).lower()
-		force_single_seq_micro_batches = (
-			model_type == "glm_moe_dsa"
-			and num_sequences > 1
-			and not _ALLOW_GLM_MULTI_SEQ
-		)
 		micro_batches, l2_cap = build_prefill_micro_batches(
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
-			single_sequence_only=force_single_seq_micro_batches,
 		)
 		total_tokens_all = sum(seq_lengths_list)
-
-		if force_single_seq_micro_batches and self.rank == 0:
-			logging.warning(
-				"GLM-5 prepacked prefill: forcing single-sequence micro-batches "
-				"to avoid multi-sequence varlen corruption; set "
-				"BATCHGEN_GLM5_ALLOW_MULTI_SEQ_PREPACK=1 to restore the old "
-				"multi-sequence batching path for debugging."
-			)
 
 		if self.rank == 0:
 			logging.info(
