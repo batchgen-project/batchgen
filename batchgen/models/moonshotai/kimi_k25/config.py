@@ -136,7 +136,7 @@ class KimiK25Config(BaseModelConfig):
 
     # ==================== Tokenizer ====================
     bos_token_id: int = 163584
-    eos_token_id: int = 163585
+    eos_token_id: int = 163586
     pad_token_id: Optional[int] = 163839
     tie_word_embeddings: bool = False
 

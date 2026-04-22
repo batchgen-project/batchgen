@@ -18,6 +18,7 @@ import torch
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorkerArgs
+from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
@@ -772,7 +773,7 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
-        elif "moonshotai" in self.args.model.lower() or "kimi" in self.args.model.lower():
+        elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
                 KimiK25_Parameter_Server,
             )
