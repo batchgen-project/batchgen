@@ -203,6 +203,30 @@ def dump_rows(rank: int, site: str, layer_idx: int, global_ids, cu_seqlens,
             f.write(json.dumps(r) + "\n")
 
 
+def dump_full_tensor(rank: int, name: str, layer_idx: int,
+                     tensor: torch.Tensor) -> None:
+    """Serialize a FULL tensor (no token sampling) to a .pt file.
+
+    Intended for the one-shot layer-0 Q/K/V dump used to verify whether
+    the middle-token Q/K/V diverges between single-seq and multi-seq
+    prefill paths (which the site-D row sampling can't detect).
+
+    Gated by active run; writes
+      ${BATCHGEN_GLM5_ATTN_DUMP}/<active_run>/full_<name>_rank{NN}_layer{LL}.pt
+    """
+    if not enabled():
+        return
+    active = _active_run()
+    sub = os.path.join(_BASE_DIR, active)
+    os.makedirs(sub, exist_ok=True)
+    path = os.path.join(sub, f"full_{name}_rank{rank:02d}_layer{layer_idx:02d}.pt")
+    # Detach + move to CPU so the file is dtype-exact and allocator-free.
+    t = tensor.detach().cpu()
+    torch.save(t, path)
+    _log.warning(f"[ATTN-DUMP-FULL] rank={rank} layer={layer_idx} wrote {path} "
+                 f"shape={list(t.shape)} dtype={t.dtype}")
+
+
 def close_rank(rank: int) -> None:
     """Close all open file handles for this rank. Safe to call multiple times."""
     if not _BASE_DIR:

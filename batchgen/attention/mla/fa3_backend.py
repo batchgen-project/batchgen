@@ -1309,6 +1309,16 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			_trace_rank, "D_pre_fa3_v", _L, _gids_d, cu_seqlens,
 			value_states.reshape(total_tokens, -1),
 		)
+		# One-shot FULL tensor dump at layer 0 only (bounds file size).
+		# Activated by BATCHGEN_GLM5_DUMP_FULL_L0=1. Writes every token's
+		# Q/K/V + cu_seqlens so the post-hoc diff can check whether MIDDLE
+		# tokens (not sampled by row dumps) diverge between ref and test.
+		import os as _os_fulldump
+		if _os_fulldump.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and _L == 0:
+			_attn_dump.dump_full_tensor(_trace_rank, "q", _L, query_states)
+			_attn_dump.dump_full_tensor(_trace_rank, "k", _L, key_states)
+			_attn_dump.dump_full_tensor(_trace_rank, "v", _L, value_states)
+			_attn_dump.dump_full_tensor(_trace_rank, "cu_seqlens", _L, cu_seqlens)
 
 	# Flash attention with varlen
 	with _TraceSpan(_trace_rank, _L, "flash_attn_varlen",
