@@ -14,6 +14,7 @@ import logging
 from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
+from ...models.glm.glm5._prefill_trace import Span as _TraceSpan, skip as _trace_skip
 
 @torch.inference_mode()
 def mla_prefill_flashattention3(
@@ -1161,26 +1162,34 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
 	"""
 	total_tokens = hidden_states.shape[0]
+	_trace_rank = dist.get_rank() if dist.is_initialized() else 0
+	_L = self.layer_idx
 
 	# Default: FP8 act_quant + DeepGEMM fp8_gemm_nt (matches SGLang/DeepGEMM
 	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). The
 	# dequant-to-BF16 path was a diagnostic variant; restore it only via
 	# BATCHGEN_W8A16_DEQUANT=1 when investigating FP8 act_quant regressions.
 	import os as _os_gemm
-	_gemm = w8a16_gemm_dequant if _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1" else w8a16_gemm
+	_w8a16_dequant_path = _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
+	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
+	if _w8a16_dequant_path:
+		_trace_skip(_trace_rank, _L, "fp8_deepgemm_path", "w8a16_dequant_path")
 
 	# Project Q
-	query_states = _gemm(
-		self.q_a_proj.weight.data,
-		weight_scale["q_a_proj.weight_scale_inv"],
-		hidden_states
-	)
-	query_states = self.q_a_layernorm(query_states)
-	query_states = _gemm(
-		self.q_b_proj.weight.data,
-		weight_scale["q_b_proj.weight_scale_inv"],
-		query_states
-	)
+	with _TraceSpan(_trace_rank, _L, "q_a_proj", tokens=total_tokens):
+		query_states = _gemm(
+			self.q_a_proj.weight.data,
+			weight_scale["q_a_proj.weight_scale_inv"],
+			hidden_states
+		)
+	with _TraceSpan(_trace_rank, _L, "q_a_layernorm", tokens=total_tokens):
+		query_states = self.q_a_layernorm(query_states)
+	with _TraceSpan(_trace_rank, _L, "q_b_proj", tokens=total_tokens):
+		query_states = _gemm(
+			self.q_b_proj.weight.data,
+			weight_scale["q_b_proj.weight_scale_inv"],
+			query_states
+		)
 
 	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -1188,15 +1197,17 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	)
 
 	# Project KV
-	compressed_kv = _gemm(
-		self.kv_a_proj_with_mqa.weight.data,
-		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-		hidden_states
-	)
+	with _TraceSpan(_trace_rank, _L, "kv_a_proj", tokens=total_tokens):
+		compressed_kv = _gemm(
+			self.kv_a_proj_with_mqa.weight.data,
+			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+			hidden_states
+		)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	normed_kv = self.kv_a_layernorm(compressed_kv)
+	with _TraceSpan(_trace_rank, _L, "kv_a_layernorm", tokens=total_tokens):
+		normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Apply rotary embeddings. Default: native interleaved RoPE (matches HF /
@@ -1205,25 +1216,30 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	# permuted layout that does not match SGLang element-for-element. Opt
 	# back into the legacy reshape trick via BATCHGEN_GLM5_ROPE_LEGACY=1.
 	import os as _os_rope
-	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	if _os_rope.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1":
-		q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-		k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	else:
-		from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
-		q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-		k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	_rope_legacy = _os_rope.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
+	with _TraceSpan(_trace_rank, _L, "rope", tokens=total_tokens, legacy=_rope_legacy):
+		cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
+		if _rope_legacy:
+			q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+			k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		else:
+			from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
+			q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+			k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	if _rope_legacy:
+		_trace_skip(_trace_rank, _L, "rope_native_interleaved", "rope_legacy_path")
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
 	del compressed_kv, k_pe_flat
 
 	# Expand KV
-	kv = _gemm(
-		self.kv_b_proj.weight.data,
-		weight_scale["kv_b_proj.weight_scale_inv"],
-		normed_kv
-	)
+	with _TraceSpan(_trace_rank, _L, "kv_b_proj", tokens=total_tokens):
+		kv = _gemm(
+			self.kv_b_proj.weight.data,
+			weight_scale["kv_b_proj.weight_scale_inv"],
+			normed_kv
+		)
 	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -1274,17 +1290,19 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		)
 
 	# Flash attention with varlen
-	attn_output = flash_attn_varlen_func(
-		query_states,
-		key_states,
-		value_states,
-		cu_seqlens_q=cu_seqlens,
-		cu_seqlens_k=cu_seqlens,
-		max_seqlen_q=max_seqlen,
-		max_seqlen_k=max_seqlen,
-		softmax_scale=self.softmax_scale,
-		causal=True
-	)
+	with _TraceSpan(_trace_rank, _L, "flash_attn_varlen",
+					tokens=total_tokens, num_seqs=num_sequences, max_L=int(max_seqlen)):
+		attn_output = flash_attn_varlen_func(
+			query_states,
+			key_states,
+			value_states,
+			cu_seqlens_q=cu_seqlens,
+			cu_seqlens_k=cu_seqlens,
+			max_seqlen_q=max_seqlen,
+			max_seqlen_k=max_seqlen,
+			softmax_scale=self.softmax_scale,
+			causal=True
+		)
 
 	del query_states, key_states, value_states
 
@@ -1309,11 +1327,12 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		)
 
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
-	attn_output = _gemm(
-		self.o_proj.weight.data,
-		weight_scale["o_proj.weight_scale_inv"],
-		attn_output
-	)
+	with _TraceSpan(_trace_rank, _L, "o_proj", tokens=total_tokens):
+		attn_output = _gemm(
+			self.o_proj.weight.data,
+			weight_scale["o_proj.weight_scale_inv"],
+			attn_output
+		)
 	# Unconditional stream sync replicating FA3-POST-OPROJ-DIAG's implicit barrier.
 	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
 	# Probe post-o_proj — attention block output before residual add.
