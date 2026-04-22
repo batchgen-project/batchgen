@@ -384,10 +384,20 @@ class BatchScheduler:
                     body.model,
                     body.reasoning_effort,
                 )
-                # Forward extra kwargs (thinking, tools) to chat template
+                # Forward extra kwargs (thinking, tools) to chat template.
+                # The GLM-5 / SGLang convention is `enable_thinking`; older
+                # callers may send `thinking`. Prefer `enable_thinking` when
+                # both are set, and forward BOTH names so templates written
+                # against either convention work.
                 template_kwargs = {}
-                if body.thinking is not None:
-                    template_kwargs["thinking"] = body.thinking
+                thinking_val = (
+                    body.enable_thinking
+                    if body.enable_thinking is not None
+                    else body.thinking
+                )
+                if thinking_val is not None:
+                    template_kwargs["enable_thinking"] = thinking_val
+                    template_kwargs["thinking"] = thinking_val
                 if body.tools is not None:
                     template_kwargs["tools"] = body.tools
                 if body.preserve_thinking is not None:
@@ -739,9 +749,10 @@ class BatchScheduler:
         if tokenizer is None:
             return " ".join(str(token) for token in token_ids)
         trimmed = self._trim_tokens(token_ids, tokenizer)
+        include_special = getattr(self.server_args, "detokenization_include_special_tokens", False)
         return tokenizer.decode(
             trimmed,
-            skip_special_tokens=True,
+            skip_special_tokens=(not include_special),
             clean_up_tokenization_spaces=False,
         )
 
@@ -1138,6 +1149,7 @@ class BatchScheduler:
         decoded_text = result.get("text", "")
         prompt_length = result.get("prompt_length", 0)
         decoded_length = result.get("decoded_length", 0)
+        finish_reason = result.get("finish_reason", "stop")
         model = meta["model"]
         custom_id = meta["custom_id"]
         url = meta["url"]
@@ -1157,7 +1169,7 @@ class BatchScheduler:
                         "content": decoded_text,
                     },
                     "logprobs": None,
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_length,
@@ -1175,7 +1187,7 @@ class BatchScheduler:
                     "index": 0,
                     "text": decoded_text,
                     "logprobs": None,
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_length,

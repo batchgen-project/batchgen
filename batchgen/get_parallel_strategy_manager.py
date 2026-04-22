@@ -15,5 +15,8 @@ def get_parallel_strategy_manager(model_name:str):
 		return DeepseekV3ParallelStrategyManager
 	elif "gpt-oss-120b" in model_lower:
 		return GptOssParallelStrategyManager
+	elif "glm-5" in model_lower:
+		from batchgen.models.glm.glm5.Parallel_Strategy_Manager import GLM5ParallelStrategyManager
+		return GLM5ParallelStrategyManager
 	else:
 		raise ValueError(f"Unsupported model name: {model_name}")

@@ -63,6 +63,7 @@ ARCH_PATTERNS: Dict[str, str] = {
     "GptOss": "gpt_oss",
     "Qwen2Moe": "qwen2_moe",
     "MiniMaxM2": "minimax_m25",
+    "GlmMoeDsa": "glm_moe_dsa",
 }
 
 # Model name/identifier patterns for detection from HuggingFace model IDs
@@ -77,6 +78,13 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
+    # GLM-5 / GLM-5.1 share an architecturally-identical glm_moe_dsa graph
+    # (754B MoE + DSA, 78 layers, identical config.json apart from transformers_version).
+    # More-specific patterns first so `GLM-5.1-FP8` doesn't get swallowed by `GLM-5`.
+    "GLM-5.1-FP8": "glm_moe_dsa",
+    "GLM-5.1": "glm_moe_dsa",
+    "GLM-5-FP8": "glm_moe_dsa",
+    "GLM-5": "glm_moe_dsa",
 }
 
 for model_id in KIMI_K25_BACKEND_MODEL_IDS:
@@ -241,6 +249,11 @@ def _import_model_configs():
 
     try:
         from batchgen.models.minimax.minimax_m25 import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.glm.glm5 import config as _  # noqa: F401
     except ImportError:
         pass
 

@@ -47,11 +47,16 @@ class GLM5Tokenizer(FastTokenizer):
         vocab_size: 154,880
     """
 
+    # Filename of the Jinja chat template, loaded from this package's directory
+    # at init time. Subclasses override this to swap templates while reusing
+    # everything else (tokenizer.json, vocab, special tokens).
+    CHAT_TEMPLATE_FILENAME = "chat_template.jinja"
+
     def __init__(self):
         super().__init__(str(TOKENIZER_DIR))
 
         # Load chat template from separate jinja file (not inline in tokenizer_config.json)
-        chat_template_file = TOKENIZER_DIR / "chat_template.jinja"
+        chat_template_file = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
         if chat_template_file.exists():
             self.chat_template = chat_template_file.read_text()
         else:
@@ -61,6 +66,13 @@ class GLM5Tokenizer(FastTokenizer):
         self.eos_token_id = GLM5_EOS_TOKEN_ID
         self.pad_token_id = GLM5_PAD_TOKEN_ID
         self.stop_token_ids = GLM5_STOP_TOKEN_IDS
+        # batchgen_worker reads `eos_token_ids` (plural) to build the EOS set
+        # used by _should_stop_at_eos. Expose all three GLM-5 turn-end tokens
+        # here (primary EOS + <|user|> + the legacy third stop token), not
+        # just the primary — otherwise <|user|> the model emits after a
+        # normal answer is not recognized as stop and decoding loops until
+        # the length cap, producing degenerate "TheTheThe..." tails.
+        self.eos_token_ids = set(GLM5_STOP_TOKEN_IDS)
         self.vocab_size = GLM5_VOCAB_SIZE
 
         # Find pad token string for padding setup
@@ -69,6 +81,21 @@ class GLM5Tokenizer(FastTokenizer):
 
         self.eos_token = id_to_token.get(self.eos_token_id)
         self.pad_token = self.eos_token
+
+        # Pre-compile the Jinja template ONCE — reused on every apply_chat_template.
+        # Template() is a ~10 ms Parse+AST+codegen; rendering is ~30 µs. Without
+        # this cache, scheduler dispatch of N prompts cost ~N × 10 ms (N=3361 →
+        # ~32 s of wall-clock on the L4 admit path).
+        # trim_blocks=True, lstrip_blocks=True match HF's ImmutableSandboxedEnvironment
+        # behavior — prevents extra whitespace tokens (e.g. token 8942 between
+        # <sop> and <|system|>) that diverge from training.
+        if self.chat_template:
+            from jinja2 import Template
+            self._jinja_template = Template(
+                self.chat_template, trim_blocks=True, lstrip_blocks=True
+            )
+        else:
+            self._jinja_template = None
 
         logger.info(
             f"GLM-5 tokenizer initialized: vocab_size={self.vocab_size}, "
@@ -84,17 +111,15 @@ class GLM5Tokenizer(FastTokenizer):
     ) -> Union[str, List[int]]:
         """Apply GLM-5 chat template.
 
-        Overrides parent to use permissive Jinja2 undefined (not StrictUndefined),
-        since the GLM-5 template checks optional variables like 'tools',
+        Uses the pre-compiled `self._jinja_template` built once in __init__ —
+        do not rebuild on every call. Parent uses permissive Jinja2 undefined
+        (not StrictUndefined) for optional variables like 'tools',
         'enable_thinking', 'clear_thinking' with {% if %} guards.
         """
-        if not self.chat_template:
+        if self._jinja_template is None:
             raise ValueError("No chat template available for GLM-5 tokenizer.")
 
-        from jinja2 import Template
-
-        template = Template(self.chat_template)
-        rendered = template.render(
+        rendered = self._jinja_template.render(
             messages=messages,
             bos_token="",
             eos_token=self.eos_token or "",
@@ -156,3 +181,28 @@ class GLM5Tokenizer(FastTokenizer):
             })
         visible = self._TOOL_CALL_RE.sub("", text).strip()
         return tool_calls, visible
+
+
+@register_tokenizer("glm_moe_dsa_5_1")
+class GLM51Tokenizer(GLM5Tokenizer):
+    """GLM-5.1 tokenizer — shares the GLM-5 vocab (tokenizer.json, EOS/pad,
+    vocab_size=154880) but uses a richer Jinja chat template: tool_to_json
+    macro filtering defer_loading/strict, per-turn thinking_indices tracking,
+    <|observation|>-only-on-first-tool placement, and tool_reference-list
+    responses. Everything else is inherited unchanged from GLM5Tokenizer.
+    """
+
+    CHAT_TEMPLATE_FILENAME = "chat_template_5_1.jinja"
+
+    def __init__(self):
+        # Fail loud at server boot if the 5.1 template file is missing from the
+        # install — otherwise rendering would silently fall through to the
+        # tokenizer_config.json fallback (likely None) and the first chat
+        # request would raise.
+        template_path = TOKENIZER_DIR / self.CHAT_TEMPLATE_FILENAME
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"GLM-5.1 chat template not found at {template_path}. "
+                f"Ensure chat_template_5_1.jinja is bundled with the GLM-5 package."
+            )
+        super().__init__()

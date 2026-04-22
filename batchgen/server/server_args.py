@@ -92,6 +92,7 @@ class ServerArgs:
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+    detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
     # Dynamic host KV reservation settings
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
     host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
@@ -348,6 +349,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
     )
+    parser.add_argument(
+        "--detokenization-include-special-tokens",
+        action="store_true",
+        default=False,
+        help="Include special tokens in detokenized output (default: off, special tokens stripped).",
+    )
     # Dynamic host KV reservation
     parser.add_argument(
         "--host-kv-chunk-size",
@@ -538,6 +545,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
+        detokenization_include_special_tokens=parsed.detokenization_include_special_tokens,
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
         enable_host_kv_eviction=parsed.enable_host_kv_eviction,

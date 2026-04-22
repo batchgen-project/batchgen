@@ -295,12 +295,15 @@ void HostPagedKVBackend::SharedState::MapPointers() {
 }
 
 void HostPagedKVBackend::SharedState::ConstructSharedState() {
-    if (using_memfd) {
-        // memfd pages are kernel-zeroed on first fault, only zero metadata
-        std::memset(mapping, 0, data_offset);
-    } else {
-        std::memset(mapping, 0, total_bytes);
-    }
+    // Always zero the entire mapping — historically we skipped the data
+    // region under --fast-init because memfd pages are kernel-zeroed on
+    // first fault. That was fine for clean startup, but page 0 gets
+    // legitimately written by some sequence during a run, and if any
+    // gather path later reads page 0 via a -1->0 clamp fallback (see
+    // sparse_gather.py comment on invalid_mask), the reader picks up
+    // whatever that other sequence wrote. Explicit zero-init at
+    // allocation is the belt to the gather-level suspenders.
+    std::memset(mapping, 0, total_bytes);
     MapPointers();
     header->magic = kSharedMemoryMagic;
     header->layout_fingerprint = layout_fingerprint;

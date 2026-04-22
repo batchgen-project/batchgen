@@ -143,7 +143,25 @@ class BatchGenServer:
 		logging.info("Model Loaded. SHM: %s", self.model_info['shm_name'])
 
 	def allocate_host_kv_cache(self, host_kv_cache_size_gb: int):
-		"""Allocates shared host kv cache."""
+		"""Allocates shared host kv cache.
+
+		For DSA models, also allocates an auxiliary host KV cache for the
+		indexer, splitting the budget proportionally between primary and aux.
+		"""
+		from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+
+		# DSA models: split budget into primary + auxiliary
+		dual = DualHostKVCoordinator.create_managers(
+			model_name=self.args.model,
+			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+		)
+		if dual is not None:
+			primary_mgr, aux_mgr = dual
+			logging.info(
+				"Allocated dual host KV cache: primary + auxiliary (DSA indexer)"
+			)
+			return primary_mgr
+
 		config = build_host_kv_config(
 			host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
 			model_name=self.args.model
@@ -458,7 +476,7 @@ class BatchGenServer:
 			raise RuntimeError(f"Failed to download model: {exc}") from exc
 
 	def _load_model_locally(self, _hf_cache_dir: str, converted_ckpt_dir: str) -> None:
-		
+
 		if "deepseek" in self.args.model.lower():
 			from batchgen.models.deepseek.deepseek_parameter_server import (
 				DeepSeek_Parameter_Server,
@@ -478,6 +496,13 @@ class BatchGenServer:
 				MiniMaxM25_Parameter_Server,
 			)
 			ps = MiniMaxM25_Parameter_Server(
+				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
+			)
+		elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+			from batchgen.models.glm.glm5.glm5_parameter_server import (
+				GLM5_Parameter_Server,
+			)
+			ps = GLM5_Parameter_Server(
 				self.args.model, self.args.cache_dir, converted_ckpt_dir, self.args.enable_hugetlbfs
 			)
 		else:
@@ -631,7 +656,7 @@ def parse_args():
 	parser.add_argument("--hf-cache-dir", type=str, default=None)
 	parser.add_argument("--cache-dir", type=str, default=None)
 	parser.add_argument("--pt-ckpt-dir", type=str, default=None)
-	parser.add_argument("--enable-hugetlbfs", action='store_false')
+	parser.add_argument("--enable-hugetlbfs", action='store_true')
 	parser.add_argument("--dist-init-addr", type=str)
 	parser.add_argument("--kv-dtype", type=str, default="bfloat16")
 	parser.add_argument("--host-kv-cache-size", type=int, default=None)
@@ -657,6 +682,8 @@ def parse_args():
 		default=0.0,
 		help="Ratio of experts per layer to offload (0.0-1.0). E.g., 0.2 means 20%% of experts loaded/freed at runtime"
 	)
+	parser.add_argument("--converted-ckpt-dir", type=str, default=None,
+		help="Directory for converted checkpoint (default: <cache-dir>/converted_ckpt)")
 	parser.add_argument(
 		"--pre-dequantize-weights",
 		action="store_true",

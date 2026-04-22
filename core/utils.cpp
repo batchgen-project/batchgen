@@ -375,7 +375,11 @@ ModelConfig parse_model_config(const py::object& model_config) {
 
 std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
                                             const std::string& logger_name) {
-    auto logger = spdlog::stdout_color_mt(logger_name);
+    auto logger = spdlog::get(logger_name);
+    if (logger) {
+        return logger;
+    }
+    logger = spdlog::stdout_color_mt(logger_name);
 
     // Set colors for all five standard levels
     auto console_sink = dynamic_cast<spdlog::sinks::stdout_color_sink_mt*>(

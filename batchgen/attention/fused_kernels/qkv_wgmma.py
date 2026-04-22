@@ -8,6 +8,7 @@ Falls back gracefully on pre-SM90 GPUs (is_qkv_wgmma_available() returns False).
 """
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -57,6 +58,11 @@ def is_qkv_wgmma_available() -> bool:
         return _qkv_wgmma_available
 
     if not _check_wgmma_support():
+        _qkv_wgmma_available = False
+        return False
+
+    if os.environ.get("BATCHGEN_DISABLE_WGMMA_QKV", "0") == "1":
+        logger.info("QKV WGMMA kernel disabled by BATCHGEN_DISABLE_WGMMA_QKV")
         _qkv_wgmma_available = False
         return False
 

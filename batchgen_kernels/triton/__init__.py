@@ -27,6 +27,7 @@ from batchgen_kernels.triton.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_cache_update,
     fused_rmsnorm_rope_cache_update_with_q,
     fused_rmsnorm_rope_with_q,
+    fused_rmsnorm_rope_with_q_native,
     fused_rmsnorm_rope_cache_update_with_q_return_new_kv,
 )
 from batchgen_kernels.triton.fused_dequant_gemm import fused_fp8_bf16_gemm

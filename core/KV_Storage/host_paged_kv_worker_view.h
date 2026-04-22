@@ -192,7 +192,8 @@ class HostPagedKVWorkerView {
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache),
-          logger_(init_logger("info", "HostPagedKVWorkerView")) {}
+          logger_(init_logger("info",
+              config_.logger_name.empty() ? "HostPagedKVWorkerView" : config_.logger_name)) {}
 
     HostPagedKVWorkerView(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView& operator=(const HostPagedKVWorkerView&) = delete;
@@ -894,13 +895,18 @@ class HostPagedKVWorkerView {
                     "V tensor provided but V cache is disabled");
             }
         }
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
 
         return LaunchAsyncTask([this, layer_idx,
-                                sequence_ids = std::move(sequence_ids),
-                                sequence_lengths = std::move(sequence_lengths),
-                                prepared_k, prepared_v, tokens_per_sequence]() {
+                                 sequence_ids = std::move(sequence_ids),
+                                 sequence_lengths = std::move(sequence_lengths),
+                                 prepared_k, prepared_v, tokens_per_sequence,
+                                 producer_cuda_stream]() {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
@@ -1013,13 +1019,18 @@ class HostPagedKVWorkerView {
                 "AsyncAppendDecodeKVToHost expects tensors with a single token "
                 "per sequence");
         }
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
 
         return LaunchAsyncTask([this, layer_idx,
-                                sequence_ids = std::move(sequence_ids),
-                                sequence_lengths = std::move(sequence_lengths),
-                                prepared_k, prepared_v]() mutable {
+                                 sequence_ids = std::move(sequence_ids),
+                                 sequence_lengths = std::move(sequence_lengths),
+                                 prepared_k, prepared_v,
+                                 producer_cuda_stream]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
 
             const auto* k_base =
                 static_cast<const std::byte*>(prepared_k.data_ptr());
@@ -2075,6 +2086,16 @@ class HostPagedKVWorkerView {
         worker_detail::ScopedCudaEvent event(logger_);
         CUDA_CHECK(cudaEventRecord(event.get(), stream));
         CUDA_CHECK(cudaEventSynchronize(event.get()));
+    }
+
+    void WaitForProducerStream(cudaStream_t consumer_stream,
+                               cudaStream_t producer_stream) const {
+        if (producer_stream == nullptr || consumer_stream == producer_stream) {
+            return;
+        }
+        worker_detail::ScopedCudaEvent event(logger_);
+        CUDA_CHECK(cudaEventRecord(event.get(), producer_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, event.get(), 0));
     }
 
     HostPagedKVConfig config_;

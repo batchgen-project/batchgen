@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import torch
 
+try:
+	from batchgen_kernels.attention.dsa import fused_paged_gather as _fused_paged_gather
+except (ImportError, Exception):
+	_fused_paged_gather = None
+
 
 def sparse_gather_from_paged_kv(
 	blocked_k: torch.Tensor,
@@ -38,6 +43,10 @@ def sparse_gather_from_paged_kv(
 	num_k_heads = blocked_k.shape[2]
 	k_head_dim = blocked_k.shape[3]
 
+	# Use fused Triton kernel if available
+	if _fused_paged_gather is not None:
+		return _fused_paged_gather(blocked_k, block_table, token_indices, page_size)
+
 	# Convert absolute token positions to page index and offset
 	logical_page_idx = token_indices // page_size  # [batch, topk]
 	page_offset = token_indices % page_size  # [batch, topk]
@@ -51,6 +60,16 @@ def sparse_gather_from_paged_kv(
 		block_table, 1, logical_page_idx.long()
 	)  # [batch, topk]
 
+	# Track -1 entries so we can zero-out those gather results. Historically
+	# we clamped to 0 here, which silently routed out-of-range positions to
+	# page 0 — if the sparse attention kernel failed to honor sparse_seqlens
+	# for any reason, page-0 KV (owned by another sequence) bled into the
+	# attention context and produced training-data-style corrupted outputs
+	# (observed 10 %+ of responses with Russian/repetition/README-like
+	# tail bleed). Zero-mask makes the fallback benign.
+	invalid_mask = physical_page_idx < 0  # [batch, topk]
+	physical_page_idx = physical_page_idx.clamp(min=0)
+
 	# Compute flat index into blocked_k reshaped as [num_pages * page_size, ...]
 	flat_idx = physical_page_idx * page_size + page_offset  # [batch, topk]
 
@@ -61,5 +80,13 @@ def sparse_gather_from_paged_kv(
 	flat_idx_expanded = flat_idx.reshape(-1).long()  # [batch * topk]
 	gathered_flat = blocked_flat[flat_idx_expanded]  # [batch * topk, num_k_heads * k_head_dim]
 	gathered_kv = gathered_flat.view(batch_size, topk, num_k_heads, k_head_dim)
+
+	# Zero out gather results at invalid (-1) page positions so downstream
+	# attention kernels can't read another sequence's data even if their
+	# own seqlen masking misfires.
+	if invalid_mask.any():
+		gathered_kv = gathered_kv.masked_fill(
+			invalid_mask.unsqueeze(-1).unsqueeze(-1), 0,
+		)
 
 	return gathered_kv

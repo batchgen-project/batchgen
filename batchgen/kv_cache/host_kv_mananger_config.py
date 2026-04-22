@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence
 
@@ -106,11 +107,33 @@ _MINIMAX_M25_GQA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GLM-5: MLA cache (78 layers, compressed_kv_dim=576, same as DeepSeek)
+_GLM5_MLA_PROFILE = _HostKVModelProfile(
+	num_layers=78,
+	num_k_heads=1,
+	k_head_dim=576,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
+# GLM-5 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128)
+_GLM5_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=78,
+	num_k_heads=1,
+	k_head_dim=128,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
+	"glm5_mla": _GLM5_MLA_PROFILE,
+	"glm5_indexer": _GLM5_INDEXER_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -144,6 +167,18 @@ for canonical, aliases in {
 		"minimax-m2.5",
 		"minimax",
 	),
+	"glm5_mla": (
+		"zai-org/glm-5-fp8",
+		"zai-org/glm-5",
+		"glm-5-fp8",
+		"glm-5",
+		# GLM-5.1: architecturally identical to GLM-5 (same 78-layer MLA graph,
+		# compressed_kv_dim=576), shares the MLA host-KV profile.
+		"zai-org/glm-5.1-fp8",
+		"zai-org/glm-5.1",
+		"glm-5.1-fp8",
+		"glm-5.1",
+	),
 }.items():
 	for alias in aliases:
 		_PROFILE_ALIASES[alias.lower()] = canonical
@@ -155,6 +190,17 @@ for canonical, aliases in {
 		"deepseek-ai/deepseek-v3.2",
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
+	),
+	"glm5_indexer": (
+		"zai-org/glm-5-fp8",
+		"zai-org/glm-5",
+		"glm-5-fp8",
+		"glm-5",
+		# GLM-5.1: identical DSA indexer (32 heads, head_dim=128, 78 layers).
+		"zai-org/glm-5.1-fp8",
+		"zai-org/glm-5.1",
+		"glm-5.1-fp8",
+		"glm-5.1",
 	),
 }.items():
 	for alias in aliases:
@@ -363,35 +409,12 @@ def build_gpu_kv_config_fixed_size(
 	"""
 	from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 	
-	# Get model-specific KV dimensions
-	if "deepseek" in model_name.lower() or "kimi" in model_name.lower():
-		# DeepSeek-V3 / Kimi K2.5 MLA: compressed KV
-		# compressed_kv_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
-		kv_dim = 576  # compressed_kv_dim (was 512 - bug fix)
-		num_layers = 61
-		dtype_bytes = 2  # bfloat16
-	elif "gpt-oss-120b" in model_name.lower():
-		# GPT-OSS-120B GQA: 8 KV heads * 64 head_dim = 512 for K, same for V
-		kv_dim = 8 * 64 * 2  # K + V
-		num_layers = 36
-		dtype_bytes = 2  # bfloat16
-	elif "minimax" in model_name.lower():
-		# MiniMax-M2.5 GQA: 8 KV heads * 128 head_dim = 1024 for K, same for V
-		kv_dim = 8 * 128 * 2  # K + V
-		num_layers = 62
-		dtype_bytes = 2  # bfloat16
-	else:
-		raise NotImplementedError(f"Model {model_name} not supported")
-	
-	# Calculate bytes per page per layer
-	bytes_per_token = kv_dim * dtype_bytes
-	bytes_per_page = bytes_per_token * page_size_tokens
-	bytes_per_page_all_layers = bytes_per_page * num_layers
-	
-	# Calculate total pages from memory budget
+	profile = _resolve_profile(model_name)
+
+	# Calculate total pages from memory budget using profile
+	bytes_per_page_all_layers = profile.bytes_per_page() * profile.num_layers
 	total_bytes = int(gpu_kv_cache_size_gb * (1024 ** 3))
 	num_pages = total_bytes // bytes_per_page_all_layers
-	profile = _resolve_profile(model_name)
 	return GPUPagedKVConfig(
 		num_layers=profile.num_layers,
 		num_pages=num_pages,

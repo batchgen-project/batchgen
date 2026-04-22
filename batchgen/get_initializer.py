@@ -14,5 +14,8 @@ def get_initializer(model_name:str):
 		return DeepseekV3Initializer
 	elif "gpt-oss-120b" in model_lower:
 		return GptOssInitializer
+	elif "glm-5" in model_lower:
+		from batchgen.models.glm.glm5.glm5_initializer import GLM5Initializer
+		return GLM5Initializer
 	else:
 		raise ValueError(f"Unsupported model name: {model_name}")

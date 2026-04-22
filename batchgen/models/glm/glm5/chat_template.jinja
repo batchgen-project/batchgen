@@ -32,10 +32,10 @@ For each function call, output the function name and arguments within the follow
 {%- set ns = namespace(last_user_index=-1) %}
 {%- for m in messages %}
     {%- if m.role == 'user' %}
-        {% set ns.last_user_index = loop.index0 -%}
+        {%- set ns.last_user_index = loop.index0 -%}
     {%- endif %}
 {%- endfor %}
-{% for m in messages %}
+{%- for m in messages -%}
 {%- if m.role == 'user' -%}<|user|>{{ visible_text(m.content) }}
 {%- elif m.role == 'assistant' -%}
 <|assistant|>
