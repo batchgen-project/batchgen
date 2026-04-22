@@ -1226,6 +1226,24 @@ class BatchGenWorker:
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
+			# Probe: log the natural tokenized length per seq so we can compare
+			# the same custom_id across single-seq vs multi-seq client batches.
+			# If this number differs for the same MMLU prompt across runs, the
+			# tokenizer is producing different output for the same input string,
+			# which is the suspect causing the slot-0 padding bug.
+			try:
+				_iid_head = input_ids_list[:5]
+				_iid_tail = input_ids_list[-5:] if len(input_ids_list) >= 5 else input_ids_list
+			except Exception:
+				_iid_head = "?"
+				_iid_tail = "?"
+			logging.warning(
+				f"[PROMPT-LEN-SET site=admit_tokenized rank={self.rank} "
+				f"uuid={seq.uuid[:24]} prompt_length={actual_prompt_len} "
+				f"input_ids_len={len(input_ids_list)} "
+				f"iid_head5={_iid_head} iid_tail5={_iid_tail}]"
+			)
+
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
 
@@ -4063,6 +4081,20 @@ class BatchGenWorker:
 			seq.original_prompt_length = actual_prompt_len  # Must match prompt_length at tokenization time
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
+
+			# Probe (paired with admit_tokenized site): same fields so we can
+			# tell which admission path the bug travels via.
+			try:
+				_iid_head = input_ids_list[:5]
+				_iid_tail = input_ids_list[-5:] if len(input_ids_list) >= 5 else input_ids_list
+			except Exception:
+				_iid_head = "?"; _iid_tail = "?"
+			logging.warning(
+				f"[PROMPT-LEN-SET site=global_batch_phase3 rank={self.rank} "
+				f"uuid={seq.uuid[:24]} prompt_length={actual_prompt_len} "
+				f"input_ids_len={len(input_ids_list)} "
+				f"iid_head5={_iid_head} iid_tail5={_iid_tail}]"
+			)
 
 			if (seq_i + 1) % 3000 == 0:
 				elapsed = time.perf_counter() - phase3_start
