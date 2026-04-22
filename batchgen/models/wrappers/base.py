@@ -32,6 +32,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan
+
 
 class BaseModuleWrapper(nn.Module):
     """Base wrapper for BatchGen module execution.
@@ -145,7 +147,9 @@ class BaseModuleWrapper(nn.Module):
         Returns:
             Dict mapping parameter names to weight tensors
         """
-        return self.core_engine.get_weights(module_key, self.phase)
+        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "load_weights",
+                        module_key=module_key, phase=self.phase):
+            return self.core_engine.get_weights(module_key, self.phase)
 
     def _sync_device_before_release(self) -> None:
         """Drain all CUDA streams on this wrapper's device.
@@ -176,8 +180,10 @@ class BaseModuleWrapper(nn.Module):
         Args:
             module_key: Key identifying the module weights to free
         """
-        self._sync_device_before_release()
-        self.core_engine.free_weights_buffer(module_key)
+        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "free_weights",
+                        module_key=module_key):
+            self._sync_device_before_release()
+            self.core_engine.free_weights_buffer(module_key)
 
     def apply_weights(self, weights_dict: Dict[str, torch.Tensor]):
         """Apply loaded weights to module parameters.
@@ -186,28 +192,32 @@ class BaseModuleWrapper(nn.Module):
             weights_dict: Dict mapping parameter names to weight tensors
         """
         applied = set()
-        for name, param in self.module.named_parameters():
-            if name in weights_dict:
-                param.data = weights_dict[name]
-                applied.add(name)
-        # Record exactly which parameter names we populated so clear_weights
-        # can wipe only the buffer-backed ones. Skeleton-loaded weights
-        # (q_a/kv_a_layernorm, indexer.*) live on the module permanently and
-        # are never in weights_dict — if we wipe them here, the next forward
-        # hits empty(0) params and dies with normalized_shape=[0].
-        self._applied_param_keys = applied
+        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "apply_weights",
+                        applied=len(applied), dict_keys=len(weights_dict)):
+            for name, param in self.module.named_parameters():
+                if name in weights_dict:
+                    param.data = weights_dict[name]
+                    applied.add(name)
+            # Record exactly which parameter names we populated so clear_weights
+            # can wipe only the buffer-backed ones. Skeleton-loaded weights
+            # (q_a/kv_a_layernorm, indexer.*) live on the module permanently and
+            # are never in weights_dict — if we wipe them here, the next forward
+            # hits empty(0) params and dies with normalized_shape=[0].
+            self._applied_param_keys = applied
 
     def clear_weights(self):
         """Clear only the buffer-loaded module parameters populated by the
         most recent apply_weights call; preserve skeleton-loaded params.
         """
-        self._sync_device_before_release()
         applied = getattr(self, "_applied_param_keys", None)
-        for name, param in self.module.named_parameters():
-            if applied is not None and name not in applied:
-                continue
-            param.data = torch.empty(0, device=param.data.device)
-        self._applied_param_keys = None
+        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "clear_weights",
+                        wiped=(len(applied) if applied is not None else "all")):
+            self._sync_device_before_release()
+            for name, param in self.module.named_parameters():
+                if applied is not None and name not in applied:
+                    continue
+                param.data = torch.empty(0, device=param.data.device)
+            self._applied_param_keys = None
 
     def get_batch_size(self, batch_size_key: str) -> int:
         """Get micro-batch size from config.
