@@ -1047,11 +1047,12 @@ class Glm5MoE(nn.Module):
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
-    def __init__(self, config: Glm5Config, comm=None):
+    def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.layer_idx = layer_idx
         self.comm = comm
 
         import torch.distributed as dist
@@ -1919,7 +1920,7 @@ class Glm5DecoderLayer(nn.Module):
         if is_dense:
             self.mlp = Glm5MLP(config)
         else:
-            self.mlp = Glm5MoE(config)
+            self.mlp = Glm5MoE(config, layer_idx=layer_idx)
 
     def forward(
         self,
