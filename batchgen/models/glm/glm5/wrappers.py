@@ -677,6 +677,65 @@ class GLM5AttnWrapper(AttnWrapperBase):
             aux_device,
         )
 
+        # Index-OOB diagnostic (BATCHGEN_GLM5_VERIFY_INDICES=1). Logs the
+        # bounds relevant to every OOB-able op on the DSA decode path and
+        # asserts the pre-conditions. Fires only on layers 0..4 so we catch
+        # the first-decode-step crash without spamming every layer. The
+        # .item()s force a sync so the assertion traceback points at the
+        # true violator instead of a downstream H2D copy.
+        import os as _os_verify
+        _VERIFY = _os_verify.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
+        if _VERIFY and self.layer_idx <= 4:
+            _rk = AttnWrapperBase.get_rank_safe()
+            # Slot indices must index into their respective page tables.
+            _prim_pt = gpu_paged_kv_manager._gpu_page_table_manager.gpu_table
+            _aux_pt = gpu_paged_kv_manager_aux._gpu_page_table_manager.gpu_table
+            _prim_rows = 0 if _prim_pt is None else int(_prim_pt.shape[0])
+            _aux_rows = 0 if _aux_pt is None else int(_aux_pt.shape[0])
+            _prim_cols = 0 if _prim_pt is None else int(_prim_pt.shape[1])
+            _aux_cols = 0 if _aux_pt is None else int(_aux_pt.shape[1])
+            _prim_max = int(primary_slot_indices.max().item())
+            _prim_min = int(primary_slot_indices.min().item())
+            _aux_max = int(aux_slot_indices.max().item())
+            _aux_min = int(aux_slot_indices.min().item())
+            _cs_max = int(updated_seqlens.max().item()) if 'updated_seqlens' in dir() else int(cache_seqlens.max().item())
+            _cs_min = int(cache_seqlens.min().item())
+            _pos_max = int(new_token_pos.max().item())
+            _pos_min = int(new_token_pos.min().item())
+            _prim_pages = int(gpu_paged_kv_manager.config.num_pages)
+            _aux_pages = int(gpu_paged_kv_manager_aux.config.num_pages)
+            _prim_psz = int(gpu_paged_kv_manager.config.page_size_tokens)
+            _aux_psz = int(gpu_paged_kv_manager_aux.config.page_size_tokens)
+            logging.warning(
+                f"[VERIFY-DSA rank={_rk} L{self.layer_idx} bsz={bsz}] "
+                f"prim_slot=[{_prim_min},{_prim_max}] max_rows={_prim_rows} cols={_prim_cols} "
+                f"num_pages={_prim_pages} page_sz={_prim_psz} | "
+                f"aux_slot=[{_aux_min},{_aux_max}] max_rows={_aux_rows} cols={_aux_cols} "
+                f"num_pages={_aux_pages} page_sz={_aux_psz} | "
+                f"cache_seq=[{_cs_min},{_cs_max}] pos=[{_pos_min},{_pos_max}] "
+                f"max_seqlen={max_seqlen}"
+            )
+            assert _prim_max < _prim_rows, (
+                f"primary_slot_indices.max()={_prim_max} >= page_table.shape[0]={_prim_rows}"
+            )
+            assert _aux_max < _aux_rows, (
+                f"aux_slot_indices.max()={_aux_max} >= aux page_table.shape[0]={_aux_rows}"
+            )
+            _expected_prim_pages_for_ctx = (max_seqlen + _prim_psz - 1) // _prim_psz
+            _expected_aux_pages_for_ctx = (max_seqlen + _aux_psz - 1) // _aux_psz
+            if _expected_prim_pages_for_ctx > _prim_cols:
+                logging.warning(
+                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
+                    f"max_seqlen={max_seqlen} needs {_expected_prim_pages_for_ctx} primary pages "
+                    f"but page_table only has {_prim_cols} cols — gather will wrap"
+                )
+            if _expected_aux_pages_for_ctx > _aux_cols:
+                logging.warning(
+                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
+                    f"max_seqlen={max_seqlen} needs {_expected_aux_pages_for_ctx} aux pages "
+                    f"but aux page_table only has {_aux_cols} cols — gather will wrap"
+                )
+
         # --- Step 1: Write new MLA KV to primary cache ---
         with (dt.timed("kv_write", li) if dt else _nullctx()):
             k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
@@ -827,6 +886,42 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 mla_block_table, primary_slot_indices,
             )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
+
+            # Index-OOB diagnostic for sparse_gather_from_paged_kv. top_k_indices
+            # max must be < num_cached_tokens (approximated by max(cache_seqlens))
+            # so the page_idx=tok_idx//page_size stays within the block_table's
+            # column range. If this fires, the indexer returned stale positions
+            # past the valid cache range — the main suspected OOB cause.
+            if _VERIFY and self.layer_idx <= 4:
+                _rk = AttnWrapperBase.get_rank_safe()
+                _tk_max = int(top_k_indices.max().item())
+                _tk_min = int(top_k_indices.min().item())
+                _tk_shape = tuple(top_k_indices.shape)
+                _bt_shape = tuple(mla_block_table.shape)
+                _bk_shape = tuple(mla_blocked_k.shape)  # [num_pages, page_sz, heads, dim]
+                _num_pages_loaded = _bk_shape[0]
+                _max_flat_idx = _num_pages_loaded * mla_page_size
+                _expected_max_valid_tok = _bt_shape[1] * mla_page_size
+                logging.warning(
+                    f"[VERIFY-GATHER rank={_rk} L{self.layer_idx} bsz={bsz}] "
+                    f"top_k=[{_tk_min},{_tk_max}] shape={_tk_shape} | "
+                    f"mla_block_table.shape={_bt_shape} mla_blocked_k.shape={_bk_shape} "
+                    f"page_size={mla_page_size} "
+                    f"max_flat_idx_if_clean={_max_flat_idx} "
+                    f"max_tok_pos_in_bt_cols={_expected_max_valid_tok} | "
+                    f"which branch: "
+                    f"{'dense-short-circuit' if not _any_long else ('full-indexer' if not _any_short else 'mixed')}"
+                )
+                # If top_k_indices has any value >= _expected_max_valid_tok, the
+                # gather will clamp to the last page column — if that column has
+                # garbage, physical_pages * page_size + offset can land past
+                # num_pages * page_size → illegal access.
+                if _tk_max >= _expected_max_valid_tok:
+                    logging.error(
+                        f"[VERIFY-GATHER rank={_rk} L{self.layer_idx}] top_k_indices "
+                        f"contains position {_tk_max} >= block_table_cols*page_size="
+                        f"{_expected_max_valid_tok}; block_table row gather will wrap"
+                    )
             sparse_mla_kv = sparse_gather_from_paged_kv(
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
             )
