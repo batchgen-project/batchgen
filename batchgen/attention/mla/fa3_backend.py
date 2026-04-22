@@ -396,63 +396,23 @@ def act_quant(
     x_flat = x.view(-1, original_shape[-1])
     M, N = x_flat.shape
 
-    # Route bf16 to the validated quant kernels:
-    #   - Decode (M small, typically ≤ 128): the CUDA act_quant_3d kernel
-    #     from batchgen_kernels.moe._C_fp8_blockwise_ops, reused from the
-    #     MiniMax-M25 path. Persistent-CTA (one CTA per expert) with a
-    #     trivial mapping of "expert = token" + tokens_per_expert = [1] per
-    #     slot. No grid-cap, hand-tuned CUDA.
-    #   - Prefill (M arbitrarily large, up to hundreds of thousands in
-    #     prepacked): the 1D-grid Triton variant
-    #     per_token_blocked_quantize_bf16_to_fp8_flat. grid=(M*num_blocks,)
-    #     on the X dim caps at 2^31-1, lifting the 65535 cap that the
-    #     original 3D kernel's Y dim had.
-    # Both kernels use the same blockwise FP8 semantics (FP8_SAFE_MAX=440,
-    # per-block scale = amax / 440, saturating cast).
-    if x.dtype == torch.bfloat16 and M > 0:
-        try:
-            from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
-            _HAS_CUDA_ACT_QUANT = True
-        except ImportError:
-            _HAS_CUDA_ACT_QUANT = False
-
-        _DECODE_M_THRESHOLD = 128  # anything below this is decode-sized; use CUDA kernel
-        if _HAS_CUDA_ACT_QUANT and M <= _DECODE_M_THRESHOLD and block_size == 128:
-            # act_quant_3d expects [E, mtp, K]. We use E=M, mtp=1, one valid
-            # token per "expert". Allocated tokens_per_expert is a [M] int32.
-            x_3d = x_flat.view(M, 1, N).contiguous()
-            tokens_per_expert = torch.ones(M, dtype=torch.int32, device=x.device)
-            y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
-            # act_quant_3d outputs uint8 for the FP8 bytes; deep_gemm consumes
-            # float8_e4m3fn, so reinterpret.
-            y_fp8_3d = y_uint8_3d.view(torch.float8_e4m3fn)
-            y = y_fp8_3d.view(*original_shape)
-            num_blocks = scale_3d.size(-1)
-            scale = scale_3d.view(*original_shape[:-1], num_blocks)
-            return y, scale
-
-        # Prefill: default to chunked 3D Triton (proven kernel from L1/L2),
-        # called in M-axis chunks of ≤ 32K so the 65535 grid-Y cap is never
-        # hit. Fall back to the 1D flat kernel only if env var explicitly
-        # opts back in (A/B testing). Suspicion: the 1D flat kernel produces
-        # wrong values on prepacked-prefill shapes (see L4 gibberish output
-        # post dual-KV fix; M ≫ 128 always took the flat path).
-        import os as _os
-        _USE_CHUNKED_3D = _os.environ.get("BATCHGEN_USE_CHUNKED_3D_QUANT", "1") == "1"
-        if _USE_CHUNKED_3D:
-            from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_chunked
-            y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_chunked(
-                x_flat, block_size=block_size, chunk_rows=ACT_QUANT_MAX_ROWS,
-            )
-        else:
-            from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_flat
-            y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_flat(
-                x_flat, block_size=block_size
-            )
-        num_blocks = scale_flat.size(-1)
-        y = y_flat.view(*original_shape)
-        scale = scale_flat.view(*original_shape[:-1], num_blocks)
-
+    # bf16 blockwise act_quant — unconditional CUDA path via act_quant_3d
+    # (batchgen_kernels.moe._C_fp8_blockwise_ops). The kernel launches one CTA
+    # per token with a 1D grid of E=M, so it scales linearly for both decode
+    # (M=bsz) and prefill (M=total prepacked tokens). Persistent-CTA + per-block
+    # scale = amax / FP8_SAFE_MAX (440). Matches the MoE path's act_quant_3d.
+    if x.dtype == torch.bfloat16 and M > 0 and block_size == 128:
+        from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
+        # act_quant_3d signature: (x[E, mtp, K], tokens_per_expert[E] int32).
+        # We map E=M, mtp=1, one valid token per "expert".
+        x_3d = x_flat.view(M, 1, N).contiguous()
+        tokens_per_expert = torch.ones(M, dtype=torch.int32, device=x.device)
+        y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+        # Outputs are uint8 bytes; deep_gemm consumes float8_e4m3fn so reinterpret.
+        y_fp8_3d = y_uint8_3d.view(torch.float8_e4m3fn)
+        y = y_fp8_3d.view(*original_shape)
+        num_blocks = scale_3d.size(-1)
+        scale = scale_3d.view(*original_shape[:-1], num_blocks)
         return y, scale
 
     fp8_max = 448.0

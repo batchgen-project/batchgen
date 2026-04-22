@@ -84,17 +84,8 @@ class Glm5RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import os as _os_rmsn
-
-        if _os_rmsn.environ.get("BATCHGEN_GLM5_USE_CUDA_RMSNORM", "0") == "1":
-            from batchgen.attention.fused_kernels import cuda_rmsnorm
-            return cuda_rmsnorm(x, self.weight, self.eps)
-        # Default: PyTorch-native rms_norm (weight-explicit, FP32 internal).
-        # Matches HF/SGLang semantics; removes any chance of the custom
-        # cuda_rmsnorm kernel silently dropping the weight argument.
-        return torch.nn.functional.rms_norm(
-            x, (self.weight.shape[-1],), weight=self.weight, eps=self.eps,
-        )
+        from batchgen.attention.fused_kernels import cuda_rmsnorm
+        return cuda_rmsnorm(x, self.weight, self.eps)
 
 
 # ============================================================================
@@ -1552,40 +1543,23 @@ class Glm5MoE(nn.Module):
     # ── Gate + Expert Compute ──
 
     def _gate_decode(self, x: torch.Tensor):
-        """Sigmoid gating with e_score_correction. CUDA kernel with Python fallback."""
-        if self.use_wgmma_fp8:
-            try:
-                from batchgen.moe.routing import gate_sigmoid_topk_cuda
-                bufs = Glm5MoE._buf
-                if bufs is not None:
-                    G = x.shape[0]
-                    rl_fp32 = bufs.router_logits[:G]
-                    # HF router matmul is FP32: F.linear(x.float(), w.float()).
-                    # The previous bf16 mm → copy-to-fp32 path lost ~7 bits of
-                    # routing precision which re-ordered top-K for scores within
-                    # ~1% of each other, compounding across 75 MoE layers.
-                    torch.matmul(x.float(), self.gate.weight.float().t(), out=rl_fp32)
-                    return gate_sigmoid_topk_cuda(
-                        rl_fp32,
-                        self.gate.e_score_correction_bias.float(),
-                        k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate.routed_scaling_factor,
-                    )
-                else:
-                    # HF computes router_logits in FP32 directly.
-                    router_logits = F.linear(x.float(), self.gate.weight.float())
-                    return gate_sigmoid_topk_cuda(
-                        router_logits,
-                        self.gate.e_score_correction_bias.float(),
-                        k=self.num_experts_per_tok,
-                        routed_scaling_factor=self.gate.routed_scaling_factor,
-                    )
-            except ImportError:
-                logging.warning("gate_sigmoid_topk_cuda unavailable, using Python fallback")
+        """Sigmoid gating with e_score_correction — fused CUDA kernel.
 
-        # Python fallback
-        topk_weight, topk_idx = self.gate(x)
-        return topk_idx.to(torch.int32), topk_weight.to(torch.float32)
+        Single CUDA launch for sigmoid + e_score_correction bias + top-k +
+        normalize + scale. Replaces the 6-op PyTorch eager path
+        (F.linear → sigmoid → +bias → topk → gather → /sum → ×scale) with
+        one kernel. Router matmul is kept FP32 to match HF reference
+        (routing precision re-orders top-K for scores within ~1% of each
+        other, compounding across 75 MoE layers).
+        """
+        from batchgen.moe.routing import gate_sigmoid_topk_cuda
+        router_logits = F.linear(x.float(), self.gate.weight.float())
+        return gate_sigmoid_topk_cuda(
+            router_logits,
+            self.gate.e_score_correction_bias.float(),
+            k=self.num_experts_per_tok,
+            routed_scaling_factor=self.gate.routed_scaling_factor,
+        )
 
     def expert_compute_persistent(self, global_x, topk_idx, topk_weight):
         """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""
