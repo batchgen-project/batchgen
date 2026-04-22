@@ -128,6 +128,12 @@ def main():
 
     any_mismatch = False
     for M in ms:
+        # Aggressively free leftovers from previous M so large cases don't OOM
+        # when the GPU is shared with a running server (benches allocate
+        # per-iter outputs; their lifetime is bounded by the iter but cache
+        # pressure builds without an empty_cache between loop iterations).
+        torch.cuda.empty_cache()
+
         x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
         # Correctness run (fresh outputs).
         y_cuda, s_cuda = run_cuda_3d(x)
@@ -144,6 +150,9 @@ def main():
         else:
             bit_eq_str = fp8_diff_str = s_eq_str = s_max_abs_str = "-"
 
+        # Free correctness outputs before benching to reduce peak footprint.
+        del y_cuda, s_cuda, y_trit, s_trit
+
         if not args.no_bench:
             t_cuda = bench(run_cuda_3d, x, args.warmup, args.iters)
             t_trit = bench(run_triton_1d, x, args.warmup, args.iters)
@@ -154,8 +163,9 @@ def main():
         else:
             cuda_str = trit_str = sp_str = "-"
 
+        del x
         print(f"{M:>8}  {bit_eq_str:>7}  {fp8_diff_str:>10}  {s_eq_str:>8}  {s_max_abs_str:>14}  "
-              f"{cuda_str:>12}  {trit_str:>13}  {sp_str:>8}")
+              f"{cuda_str:>12}  {trit_str:>13}  {sp_str:>8}", flush=True)
 
     print()
     print(f"# Summary: {'MISMATCH found' if any_mismatch else 'all bit-exact'}")
