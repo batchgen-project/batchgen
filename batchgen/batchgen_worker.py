@@ -19,6 +19,7 @@ from batchgen.config.tokenizer_registry import load_tokenizer
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -6904,7 +6905,10 @@ class BatchGenWorker:
 					)
 
 				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+				with _TraceSpan(self.rank, -1, "embed_tokens",
+								tokens=int(batch_input_ids_flat.shape[0]),
+								mb_seqs=int(batch_num_seqs)):
+					inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
@@ -6914,6 +6918,10 @@ class BatchGenWorker:
 				# Forward through model layers
 				_layer_probe_set = (0, 10, 39, 77)
 				_layer_probe_on = _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1"
+				_trace_loop = _TraceSpan(self.rank, -1, "layer_loop",
+										 num_layers=len(self.model.model.layers),
+										 mb_seqs=int(batch_num_seqs))
+				_trace_loop.__enter__()
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					layer_outputs = decoder_layer(
 						hidden_states,
@@ -6944,8 +6952,12 @@ class BatchGenWorker:
 							f"first_token_fp={_layer_fps}]"
 						)
 
+				_trace_loop.__exit__(None, None, None)
+
 				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
+				with _TraceSpan(self.rank, -1, "final_norm",
+								tokens=int(hidden_states.shape[1])):
+					hidden_states = self.model.model.norm(hidden_states)
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
@@ -6966,18 +6978,21 @@ class BatchGenWorker:
 				# FP32 amplification of upstream BF16 round-off across a 944M-element
 				# matmul that can flip top-1 at tight logit margins). Opt into the
 				# old FP32-cast path with BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-				if _os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
+				with _TraceSpan(self.rank, -1, "lm_head",
+								mb_seqs=int(batch_num_seqs),
+								fp32=_os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1"):
+					if _os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+						logits = torch.nn.functional.linear(
+							last_token_hidden.float(),
+							self.model.lm_head.weight.float(),
+							self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						)
+					else:
+						logits = torch.nn.functional.linear(
+							last_token_hidden,
+							self.model.lm_head.weight,
+							self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						).float()
 
 				batch_new_tokens = self._select_tokens(logits)
 				if batch_new_tokens.shape[0] != batch_num_seqs:

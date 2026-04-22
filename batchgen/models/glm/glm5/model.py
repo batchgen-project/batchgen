@@ -1722,50 +1722,58 @@ class Glm5MoE(nn.Module):
         sequences in the multi-seq prepacked prefill batch.
         """
         import os as _os_moe
+        import torch.distributed as _dist_moe
+        _rk = _dist_moe.get_rank() if _dist_moe.is_initialized() else 0
         _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
         _moe_scatter = _os_moe.environ.get("BATCHGEN_GLM5_MOE_SCATTER_ADD", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
+        _T = hidden_flat.shape[0]
 
-        topk_weights, topk_indices = self.gate(hidden_flat)
+        with _TraceSpan(_rk, self.layer_idx, "moe_gate", tokens=_T):
+            topk_weights, topk_indices = self.gate(hidden_flat)
 
         if _moe_fp32:
             output = torch.zeros_like(hidden_flat, dtype=torch.float32)
         else:
             output = torch.zeros_like(hidden_flat)
         n_active = 0
-        for i, expert in enumerate(self.experts):
-            if isinstance(expert, _Glm5ExpertPlaceholder):
-                continue
-            expert_mask = (topk_indices == i).any(dim=-1)
-            if not expert_mask.any():
-                continue
-            n_active += 1
-            expert_input = hidden_flat[expert_mask]
-            expert_output = expert(expert_input)
-            expert_weight = torch.where(
-                topk_indices[expert_mask] == i,
-                topk_weights[expert_mask],
-                torch.zeros_like(topk_weights[expert_mask])
-            ).sum(dim=-1)
-            if _moe_fp32:
-                weighted = expert_output.float() * expert_weight.unsqueeze(-1)
-            else:
-                weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
+        with _TraceSpan(_rk, self.layer_idx, "moe_dispatch",
+                        tokens=_T, scatter=_moe_scatter, fp32=_moe_fp32):
+            for i, expert in enumerate(self.experts):
+                if isinstance(expert, _Glm5ExpertPlaceholder):
+                    continue
+                expert_mask = (topk_indices == i).any(dim=-1)
+                if not expert_mask.any():
+                    continue
+                n_active += 1
+                expert_input = hidden_flat[expert_mask]
+                expert_output = expert(expert_input)
+                expert_weight = torch.where(
+                    topk_indices[expert_mask] == i,
+                    topk_weights[expert_mask],
+                    torch.zeros_like(topk_weights[expert_mask])
+                ).sum(dim=-1)
+                if _moe_fp32:
+                    weighted = expert_output.float() * expert_weight.unsqueeze(-1)
+                else:
+                    weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
 
-            if _moe_scatter:
-                # Explicit scatter_add_ — per-row indices are unique within this
-                # iteration's `expert_mask`, so accumulation is well-defined.
-                token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
-                idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
-                output.scatter_add_(0, idx2d, weighted)
-            else:
-                output[expert_mask] += weighted
+                if _moe_scatter:
+                    # Explicit scatter_add_ — per-row indices are unique within this
+                    # iteration's `expert_mask`, so accumulation is well-defined.
+                    token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
+                    idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
+                    output.scatter_add_(0, idx2d, weighted)
+                else:
+                    output[expert_mask] += weighted
 
         if _moe_fp32:
             output = output.to(hidden_flat.dtype)
-        output = output + self.shared_experts(identity)
+        with _TraceSpan(_rk, self.layer_idx, "moe_shared_experts", tokens=_T,
+                        n_active=n_active):
+            output = output + self.shared_experts(identity)
         # MoE prefill probe (BATCHGEN_GLM5_PREFILL_DIAG=1). Fires every MoE
         # call, one line per call. Log lines arrive in layer order (0..77)
         # because the layer loop iterates sequentially. We sample token
@@ -1922,28 +1930,37 @@ class Glm5DecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        import torch.distributed as _dist_dl
+        _rk = _dist_dl.get_rank() if _dist_dl.is_initialized() else 0
+        _L = self.layer_idx
+        _tok = hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
         # Pre-norm attention
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, attn_weights, present = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
+        with _TraceSpan(_rk, _L, "input_layernorm", tokens=_tok):
+            hidden_states = self.input_layernorm(hidden_states)
+        with _TraceSpan(_rk, _L, "self_attn", tokens=_tok):
+            hidden_states, attn_weights, present = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
 
         # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        hidden_states, residual = cuda_add_rmsnorm(
-            residual, hidden_states,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
-        )
+        with _TraceSpan(_rk, _L, "residual_post_attn", tokens=_tok):
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
 
         # MoE/FFN
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        with _TraceSpan(_rk, _L, "mlp", tokens=_tok):
+            hidden_states = self.mlp(hidden_states)
+        with _TraceSpan(_rk, _L, "residual_post_mlp", tokens=_tok):
+            hidden_states = residual + hidden_states
 
         return hidden_states, attn_weights, present
 
