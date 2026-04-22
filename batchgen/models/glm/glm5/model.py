@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from .decode_utils import clamp_token_indices_to_seqlens
 from .configuration_glm5 import Glm5Config
+from ._prefill_trace import Span as _TraceSpan, skip as _trace_skip
 
 
 # ============================================================================
@@ -343,15 +344,34 @@ class Glm5Indexer(nn.Module):
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
                        head_dim=128 (single MQA head)
         """
-        if hasattr(self, 'wk_scale'):
-            from batchgen.attention.mla.fa3_backend import w8a16_gemm
-            k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
-        else:
-            k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
-        k = self.k_norm(k)
+        import torch.distributed as _dist_ix
+        _rk = _dist_ix.get_rank() if _dist_ix.is_initialized() else 0
+        with _TraceSpan(_rk, self.layer_idx, "indexer_wk",
+                        tokens=hidden_states.shape[1],
+                        w8a16=hasattr(self, 'wk_scale')):
+            if hasattr(self, 'wk_scale'):
+                from batchgen.attention.mla.fa3_backend import w8a16_gemm
+                k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
+            else:
+                k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
+        with _TraceSpan(_rk, self.layer_idx, "indexer_k_norm",
+                        tokens=hidden_states.shape[1]):
+            k = self.k_norm(k)
 
-        if positions is not None and self.rotary_emb is not None:
-            k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
+        if positions is None:
+            _trace_skip(_rk, self.layer_idx, "indexer_rope_hadamard",
+                        "positions_none")
+        elif self.rotary_emb is None:
+            _trace_skip(_rk, self.layer_idx, "indexer_rope_hadamard",
+                        "rotary_emb_none")
+        else:
+            with _TraceSpan(_rk, self.layer_idx, "indexer_rope_hadamard",
+                            tokens=hidden_states.shape[1],
+                            fused=(_fused_rope_hadamard_fn is not None)):
+                k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
+            if _fused_rope_hadamard_fn is None:
+                _trace_skip(_rk, self.layer_idx, "indexer_fused_kernel",
+                            "hadamard_fallback")
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 

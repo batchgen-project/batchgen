@@ -61,6 +61,7 @@ from batchgen.models.glm.glm5.decode_utils import (
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
+from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan, skip as _trace_skip
 from batchgen.timing import init_decode_timer
 
 # Try importing FP8 absorb kernels (WP5)
@@ -458,28 +459,40 @@ class GLM5AttnWrapper(AttnWrapperBase):
         1. Standard MLA prefill via FA3 (full attention)
         2. Compute indexer K and write to auxiliary cache
         """
+        _trace_rank = self.get_rank_safe()
         if self.prepack_mode:
             import os as _os_kvshape
             hidden_states_2d = hidden_states.squeeze(0)
-            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-                self.weight_dequant_scale
-            )
+            with _TraceSpan(_trace_rank, self.layer_idx, "mla_prefill",
+                            num_seqs=self.prepack_num_sequences,
+                            max_L=int(self.prepack_max_seqlen),
+                            tokens=hidden_states_2d.shape[0]):
+                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                    hidden_states_2d,
+                    self.position_ids.to(hidden_states_2d.device),
+                    self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                    self.prepack_max_seqlen,
+                    self.prepack_num_sequences,
+                    self.weight_dequant_scale
+                )
 
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
             # aux cache is unpopulated and any later decode past 2048 tokens reads
             # unwritten memory. `_offload_prepacked_indexer_kv` early-returns if
             # host_paged_kv_worker_view_aux is None, so that guard is sufficient.
-            if hasattr(self.module, 'indexer'):
-                indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0),
-                    positions=self.position_ids.to(hidden_states_2d.device),
-                )
+            if not hasattr(self.module, 'indexer'):
+                _trace_skip(_trace_rank, self.layer_idx, "indexer_path",
+                            "indexer_attr_missing")
+                indexer_kv = None
+            else:
+                with _TraceSpan(_trace_rank, self.layer_idx, "indexer_path",
+                                tokens=hidden_states_2d.shape[0]):
+                    indexer_kv = self.module.indexer.compute_indexer_kv(
+                        hidden_states_2d.unsqueeze(0),
+                        positions=self.position_ids.to(hidden_states_2d.device),
+                    )
+            if indexer_kv is not None:
                 # indexer_kv: [1, total_tokens, 1, index_dim]
                 # Unconditional stream sync replicating KV-SHAPE-INDEXER's barrier.
                 torch.cuda.current_stream().synchronize()
@@ -495,7 +508,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         f"dtype={_ikv.dtype} device={_ikv.device} "
                         f"cu_seqlens={self.prepack_cu_seqlens.tolist()}]"
                     )
-                self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
+                with _TraceSpan(_trace_rank, self.layer_idx, "indexer_offload",
+                                tokens=hidden_states_2d.shape[0]):
+                    self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             # Unconditional stream sync replicating KV-SHAPE-PRIMARY's barrier.
             torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
@@ -508,10 +523,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"shape={list(offload_kv.shape)} stride={list(offload_kv.stride())} "
                     f"dtype={offload_kv.dtype} device={offload_kv.device}]"
                 )
-            self._offload_prepacked_kv(offload_kv)
+            with _TraceSpan(_trace_rank, self.layer_idx, "primary_offload",
+                            tokens=hidden_states_2d.shape[0]):
+                self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
         else:
+            _trace_skip(_trace_rank, self.layer_idx, "prepack_branch",
+                        "prepack_mode=false")
             attention_mask = kwargs.get("attention_mask", None)
             position_ids = kwargs.get("position_ids", None)
             attn_output, offload_kv = self.module.prefill_attn_w8a16(
@@ -525,6 +544,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Early-return if auxiliary view is unavailable (e.g.,
         # BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces single primary view).
         if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
+            _trace_skip(self.get_rank_safe(), self.layer_idx,
+                        "indexer_offload", "aux_view_none")
             return
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
