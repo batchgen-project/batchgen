@@ -8653,6 +8653,19 @@ class BatchGenWorker:
 					AttnWrapperBase.position_ids = Attn_Wrapper.position_ids
 					AttnWrapperBase.max_seqlen = max_ctx
 
+					# Per-step DSA dispatch hint: count sequences whose cache is
+					# short enough to take the dense short-circuit instead of
+					# indexer scoring. Computing once here instead of inside
+					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
+					# per decode step on DSA models (GLM-5).
+					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
+					if _dsa_index_topk is not None:
+						AttnWrapperBase._dsa_short_count = int(
+							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
+						)
+					else:
+						AttnWrapperBase._dsa_short_count = None
+
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
 				else:

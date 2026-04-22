@@ -750,9 +750,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             #     [batch, index_topk] via row-mask assignment.
             _idx_topk = indexer.index_topk
             _short_mask = updated_seqlens <= _idx_topk  # [batch] bool
-            # Single D2H sync replacing the 2x .any().item() dispatch probes.
-            _short_count = int(_short_mask.sum().item())
             _bsz = _short_mask.shape[0]
+            # Dispatch hint is precomputed once per decode step by the worker
+            # (batchgen_worker.py decode loop) so the per-layer .sum().item()
+            # here — which would fire 78x per step — becomes a plain int read.
+            # Fallback recomputes locally if the hint wasn't populated (legacy
+            # forward paths / tests).
+            _short_count = AttnWrapperBase._dsa_short_count
+            if _short_count is None:
+                _short_count = int(_short_mask.sum().item())
             _any_short = _short_count > 0
             _any_long = _short_count < _bsz
             if not _any_long:

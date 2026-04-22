@@ -99,6 +99,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     scale: ClassVar[Optional[List[torch.Tensor]]] = None
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
+    # DSA per-step dispatch hint: count of rows with cache_seqlen <= index_topk.
+    # Set once per decode step by the worker so per-layer _forward_decode_dsa
+    # branches on it without doing a D2H .sum().item() 78 times per step.
+    _dsa_short_count: ClassVar[Optional[int]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)
