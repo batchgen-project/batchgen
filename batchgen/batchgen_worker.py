@@ -5213,6 +5213,12 @@ class BatchGenWorker:
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
 							self._admit_sequences_from_message(msg)
+							# Reset per-batch-group timing so each admission cycle
+							# emits its own "Pool batch group completed" summary.
+							prefill_time = 0.0
+							decoding_time = 0.0
+							generation_start_time = time.perf_counter()
+							self._timing_logged = False
 							# Continue loop — new sequences will be picked up
 						elif isinstance(msg, dict) and msg.get("command") == "reload":
 							# Hot-reload command — broadcast to all ranks then handle.
@@ -5245,6 +5251,11 @@ class BatchGenWorker:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
 						self._admit_sequences_from_message(container[0])
+						# Reset per-batch-group timing (matches rank-0 branch).
+						prefill_time = 0.0
+						decoding_time = 0.0
+						generation_start_time = time.perf_counter()
+						self._timing_logged = False
 					elif is_reload:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
