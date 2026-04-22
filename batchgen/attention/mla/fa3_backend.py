@@ -1290,6 +1290,26 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			f"first_row_K_per_seq={fps}]"
 		)
 
+	# Site D dump: per-seq Q/K/V rows *immediately before* FA3. Decides whether
+	# the multi-seq divergence first seen at site A (post-FA3) originates IN
+	# FA3 (D_* clean, A diverges) or UPSTREAM (D_* already diverges).
+	if _attn_dump.enabled():
+		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP_D
+		_gids_d = _Attn_DUMP_D.cur_batch or list(range(num_sequences))
+		# Reshape [T, H, D] → [T, H*D] for per-token row dump.
+		_attn_dump.dump_rows(
+			_trace_rank, "D_pre_fa3_q", _L, _gids_d, cu_seqlens,
+			query_states.reshape(total_tokens, -1),
+		)
+		_attn_dump.dump_rows(
+			_trace_rank, "D_pre_fa3_k", _L, _gids_d, cu_seqlens,
+			key_states.reshape(total_tokens, -1),
+		)
+		_attn_dump.dump_rows(
+			_trace_rank, "D_pre_fa3_v", _L, _gids_d, cu_seqlens,
+			value_states.reshape(total_tokens, -1),
+		)
+
 	# Flash attention with varlen
 	with _TraceSpan(_trace_rank, _L, "flash_attn_varlen",
 					tokens=total_tokens, num_seqs=num_sequences, max_L=int(max_seqlen)):
