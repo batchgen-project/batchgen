@@ -303,31 +303,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # re-lay it out and change which cuBLAS kernel bmm dispatches to.
         self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
 
-        # One-time log per layer (rank-0) so an all-zero dequant result
-        # (→ kv_b_proj weight or its scale missed the load) surfaces
-        # immediately instead of silently producing zero-contribution absorb.
-        if self.layer_idx in (0, 1, 2, 3, 18, 39):
-            try:
-                import torch.distributed as _dist_w
-                _rk = _dist_w.get_rank() if _dist_w.is_initialized() else 0
-            except Exception:
-                _rk = 0
-            if _rk == 0:
-                _q = self._cached_q_absorb.detach().float()
-                _o = self._cached_out_absorb.detach().float()
-                _wfp8 = attn.kv_b_proj.weight.data
-                _ws = weight_scale["kv_b_proj.weight_scale_inv"].detach().float()
-                logging.warning(
-                    f"[WRAPPER-VERIFY L{self.layer_idx} kv_b_proj] "
-                    f"fp8_dtype={_wfp8.dtype} fp8_shape={tuple(_wfp8.shape)} "
-                    f"scale_abs_mean={_ws.abs().mean().item():.6f} "
-                    f"scale_shape={tuple(_ws.shape)} "
-                    f"q_absorb_abs_mean={_q.abs().mean().item():.6f} "
-                    f"q_absorb_std={_q.std().item():.6f} "
-                    f"out_absorb_abs_mean={_o.abs().mean().item():.6f} "
-                    f"out_absorb_std={_o.std().item():.6f}"
-                )
-
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
         if _HAS_FP8_ABSORB:
             try:
@@ -467,24 +442,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
-        if cu_seqlens is None or num_sequences is None or global_sequence_ids is None:
-            raise RuntimeError("Prepacked indexer KV offload called without prepack metadata")
-        if len(global_sequence_ids) != num_sequences:
-            raise RuntimeError(
-                "Prepacked indexer KV offload batch mismatch: "
-                f"{len(global_sequence_ids)} sequence ids for {num_sequences} sequences"
-            )
-        if cu_seqlens.numel() != num_sequences + 1:
-            raise RuntimeError(
-                "Prepacked indexer KV offload cu_seqlens mismatch: "
-                f"{cu_seqlens.numel()} entries for {num_sequences} sequences"
-            )
-        expected_tokens = int(cu_seqlens[-1].item())
-        if offload_kv.shape[0] != expected_tokens:
-            raise RuntimeError(
-                "Prepacked indexer KV offload token mismatch: "
-                f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
-            )
 
         # Lifespan management mirrored from decode-side `_pending_kv_append_*`
         # (worker.py:1898-1925). Drain compute stream via a CUDA event so the
@@ -498,9 +455,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
 
+        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
+        cu = cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
+            start_idx = cu[seq_idx]
+            end_idx = cu[seq_idx + 1]
             seq_len = end_idx - start_idx
             # indexer_kv is already [T, H=1, D=128] after caller's .squeeze(0),
             # so only .unsqueeze(0) is needed to add the B dim; don't also
@@ -526,24 +485,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
-        if cu_seqlens is None or num_sequences is None or global_sequence_ids is None:
-            raise RuntimeError("Prepacked KV offload called without prepack metadata")
-        if len(global_sequence_ids) != num_sequences:
-            raise RuntimeError(
-                "Prepacked KV offload batch mismatch: "
-                f"{len(global_sequence_ids)} sequence ids for {num_sequences} sequences"
-            )
-        if cu_seqlens.numel() != num_sequences + 1:
-            raise RuntimeError(
-                "Prepacked KV offload cu_seqlens mismatch: "
-                f"{cu_seqlens.numel()} entries for {num_sequences} sequences"
-            )
-        expected_tokens = int(cu_seqlens[-1].item())
-        if offload_kv.shape[0] != expected_tokens:
-            raise RuntimeError(
-                "Prepacked KV offload token mismatch: "
-                f"{offload_kv.shape[0]} tokens for expected {expected_tokens}"
-            )
 
         # See _offload_prepacked_indexer_kv for rationale.
         AttnWrapperBase.pending_prefill_offload_tensors.append(offload_kv)
@@ -551,9 +492,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
 
+        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
+        cu = cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
+            start_idx = cu[seq_idx]
+            end_idx = cu[seq_idx + 1]
             seq_len = end_idx - start_idx
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
@@ -807,8 +750,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
             #     [batch, index_topk] via row-mask assignment.
             _idx_topk = indexer.index_topk
             _short_mask = updated_seqlens <= _idx_topk  # [batch] bool
-            _any_long = bool((~_short_mask).any().item())
-            _any_short = bool(_short_mask.any().item())
+            # Single D2H sync replacing the 2x .any().item() dispatch probes.
+            _short_count = int(_short_mask.sum().item())
+            _bsz = _short_mask.shape[0]
+            _any_short = _short_count > 0
+            _any_long = _short_count < _bsz
             if not _any_long:
                 # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
                 top_k_indices = build_clamped_dense_token_indices(
@@ -833,7 +779,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             else:
                 # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
                 _device = hidden_states.device
-                _bsz = hidden_states.shape[0]
                 _long_mask = ~_short_mask
                 top_k_indices = torch.empty(
                     _bsz, _idx_topk, dtype=torch.long, device=_device,

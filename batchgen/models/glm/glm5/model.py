@@ -1439,9 +1439,10 @@ class Glm5MoE(nn.Module):
             local_pos = positions % ntp
             max_valid = rank_counts[rank_ids]
             padding_mask = local_pos >= max_valid
-            if padding_mask.any():
-                topk_idx[padding_mask] = -1
-                topk_weight[padding_mask] = 0.0
+            # Unconditional mask application; skipping the .any() gate removes
+            # a per-layer D2H sync and the fancy-index op is a no-op when empty.
+            topk_idx[padding_mask] = -1
+            topk_weight[padding_mask] = 0.0
 
         # 3) 3D dispatch
         buf.dispatched_x.zero_()
@@ -1709,6 +1710,13 @@ class Glm5MoE(nn.Module):
 
         topk_weights, topk_indices = self.gate(hidden_flat)
 
+        # Precompute per-expert activity in a single D2H sync so the skip
+        # check below doesn't fire an .any() implicit-sync per expert per
+        # layer (~1200 syncs/prefill on 16 local experts * 75 layers).
+        _active = torch.zeros(self.total_experts, dtype=torch.bool, device=topk_indices.device)
+        _active[topk_indices.reshape(-1)] = True
+        _active_cpu = _active.tolist()
+
         if _moe_fp32:
             output = torch.zeros_like(hidden_flat, dtype=torch.float32)
         else:
@@ -1716,9 +1724,9 @@ class Glm5MoE(nn.Module):
         for i, expert in enumerate(self.experts):
             if isinstance(expert, _Glm5ExpertPlaceholder):
                 continue
-            expert_mask = (topk_indices == i).any(dim=-1)
-            if not expert_mask.any():
+            if not _active_cpu[i]:
                 continue
+            expert_mask = (topk_indices == i).any(dim=-1)
             expert_input = hidden_flat[expert_mask]
             expert_output = expert(expert_input)
             expert_weight = torch.where(
