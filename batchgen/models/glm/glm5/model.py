@@ -70,7 +70,8 @@ try:
 except ImportError:
     _GLM5_HAS_DISPATCH_3D = False
 
-_GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "256"))
+_GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
+_GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 
 
 # ============================================================================
@@ -978,14 +979,38 @@ class Glm5MoE3DBuffers:
         )
 
     def resize_if_needed(self, global_bsz: int):
-        if global_bsz <= self.max_global_bsz:
+        """Resize comm/routing buffers and — if per-expert worst case would exceed
+        the 3D stride — regrow the per-expert 3D buffers.
+
+        Mirrors Kimi MoEBufferManager.resize_if_needed (moonshotai/kimi_k25/model.py:314).
+        The per-expert slot capacity is `max_tokens_padded`; worst case a single
+        expert can receive up to `global_bsz` tokens (every routed token), so
+        `max_tokens_padded` must be >= global_bsz to guarantee no OOB write in
+        dispatch_scatter_3d / grouped_fp8_blockwise_fused_s1.
+        """
+        grew_comm = global_bsz > self.max_global_bsz
+        grew_mtp = global_bsz > self.max_tokens_padded
+
+        if not grew_comm and not grew_mtp:
             return
-        logging.info(f"[Glm5MoE3DBuffers] Resizing: {self.max_global_bsz} -> {global_bsz}")
-        self.max_global_bsz = global_bsz
-        NK = global_bsz * self.topk
-        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
-        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
-        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+        if grew_comm:
+            logging.info(
+                f"[Glm5MoE3DBuffers] Resizing comm buffers: {self.max_global_bsz} -> {global_bsz}")
+            self.max_global_bsz = global_bsz
+            NK = global_bsz * self.topk
+            self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+            self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
+            self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+        if grew_mtp:
+            new_mtp = ((global_bsz + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK) * _GLM5_MTP_BLOCK
+            logging.info(
+                f"[Glm5MoE3DBuffers] Resizing 3D buffers: mtp {self.max_tokens_padded} -> {new_mtp}")
+            self.max_tokens_padded = new_mtp
+            buf_rows = self.E_local * new_mtp
+            self.dispatched_x = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=self.device)
+            self.expert_out = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=self.device)
 
 
 # ============================================================================
