@@ -19,8 +19,6 @@ from batchgen.config.tokenizer_registry import load_tokenizer
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
-from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan
-from batchgen.models.glm.glm5 import _attn_dump as _attn_dump
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -30,8 +28,6 @@ from .scheduler.host_mem import get_physical_memory_info
 
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen import lifespan
-
-import os as _os_env  # alias to avoid collision with the local `os` usage later
 
 
 from batchgen.lifespan import SeqEvent
@@ -523,63 +519,26 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 
 		# DSA models: create DualHostKVCoordinator with proportional budget split.
-		# Diagnostic env BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces the single-view
-		# path (Kimi-style) — used to bisect whether the dual coordinator setup
-		# itself corrupts primary KV. Combine with BATCHGEN_GLM5_FORCE_DENSE_MLA=1
-		# so aux-side reads/writes are also bypassed.
-		import os as _os_dual_kv
-		_disable_dual = _os_dual_kv.environ.get("BATCHGEN_GLM5_DISABLE_DUAL_KV", "0") == "1"
+		# Non-DSA models get a single-view worker below.
 		host_budget_bytes = int(args.global_host_kv_cache_size_gb * (1024**3))
-		if _disable_dual:
-			logging.warning(
-				f"Rank {self.rank}: BATCHGEN_GLM5_DISABLE_DUAL_KV=1 — skipping "
-				f"DualHostKVCoordinator; using single primary view only (Kimi-style)."
-			)
-			dual_host = None
-		else:
-			dual_host = DualHostKVCoordinator.from_budget(
-				model_name=args.model_name,
-				host_kv_cache_size=host_budget_bytes,
-				core_engine_module=core_engine,
-				enable_memfd=args.fast_init,
-				memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
-				memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
-				aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
-			)
+		dual_host = DualHostKVCoordinator.from_budget(
+			model_name=args.model_name,
+			host_kv_cache_size=host_budget_bytes,
+			core_engine_module=core_engine,
+			enable_memfd=args.fast_init,
+			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
+			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
+			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
+		)
 		if dual_host is not None:
 			self.host_paged_kv_worker_view = dual_host
 			logging.info(f"Rank {self.rank}: Initializing DualHostKVCoordinator with parallel cudaHostRegister (local_rank={self.local_rank})")
 			dual_host.initialize(device_index=self.local_rank, create_region=False)
 			logging.info(f"Rank {self.rank}: DualHostKVCoordinator cudaHostRegister completed (local_rank={self.local_rank})")
 		else:
-			# When BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces a single view for a DSA
-			# model, the parent allocated separate primary + aux memfds; primary's
-			# memfd is sized for ONLY the primary portion of the budget. Scale the
-			# requested size down to match.
-			single_view_budget_bytes = host_budget_bytes
-			if _disable_dual:
-				try:
-					from batchgen.kv_cache.host_kv_mananger_config import (
-						_resolve_profile, _resolve_indexer_profile,
-					)
-					prim_p = _resolve_profile(args.model_name)
-					aux_p = _resolve_indexer_profile(args.model_name)
-					prim_bytes = prim_p.bytes_per_page() * prim_p.num_layers
-					aux_bytes = aux_p.bytes_per_page() * aux_p.num_layers
-					if prim_bytes + aux_bytes > 0:
-						num_pages = host_budget_bytes // (prim_bytes + aux_bytes)
-						single_view_budget_bytes = num_pages * prim_bytes
-						if self.rank == 0:
-							logging.info(
-								f"DISABLE_DUAL_KV: scaling single-view budget to "
-								f"{single_view_budget_bytes/1024**3:.1f}GB "
-								f"(primary share of {host_budget_bytes/1024**3:.1f}GB total)"
-							)
-				except Exception as _e:
-					logging.warning(f"DISABLE_DUAL_KV: budget scaling failed ({_e}); using full budget")
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
-				host_kv_cache_size=single_view_budget_bytes,
+				host_kv_cache_size=host_budget_bytes,
 			)
 			if args.fast_init:
 				worker_kv_config.enable_memfd = True
@@ -793,13 +752,7 @@ class BatchGenWorker:
 		if self.gpu_kv_cache_size_gb is None:
 			self.gpu_kv_cache_size_gb = self._calculate_gpu_kv_cache_size()
 
-		# Diagnostic env: BATCHGEN_GLM5_DISABLE_DUAL_KV=1 forces single GPU manager
-		# even for DSA models. Bisects whether the dual coordinator setup itself
-		# corrupts primary KV. Combine with BATCHGEN_GLM5_FORCE_DENSE_MLA=1.
-		import os as _os_dual_gpu
-		_disable_dual_gpu = _os_dual_gpu.environ.get("BATCHGEN_GLM5_DISABLE_DUAL_KV", "0") == "1"
-
-		if is_dsa_model(self.huggingface_ckpt_name) and not _disable_dual_gpu:
+		if is_dsa_model(self.huggingface_ckpt_name):
 			# Split memory budget between primary MLA cache and auxiliary indexer cache.
 			# Compute the ratio of bytes-per-page for primary vs auxiliary so both
 			# get the same number of pages (they share the same page table).
@@ -1043,70 +996,6 @@ class BatchGenWorker:
 				f"global_batch now has {len(self.global_batch)} sequences"
 			)
 
-		# Per-rank ownership dump — logs every sequence THIS rank now owns
-		# from the admission batch, with enough metadata to verify that
-		# drain → tokenize → rank-assign → query-book-bind placed each UUID
-		# on the right rank with distinct tokens/slots. Default on while
-		# debugging Phase-11 cross-seq contamination; disable with
-		# BATCHGEN_ADMIT_DUMP=0.
-		if os.environ.get("BATCHGEN_ADMIT_DUMP", "1") == "1":
-			self._log_local_admitted_sequences(new_uuids)
-
-	def _log_local_admitted_sequences(self, new_uuids: List[str]) -> None:
-		"""Log full metadata for every newly-admitted sequence owned by this rank.
-
-		Emits one [ADMIT-LOCAL ...] line per owned sequence and one
-		[ADMIT-SUMMARY ...] line per rank. Use across the 16 server logs to
-		verify rank-ownership invariants (no duplicates, no drops, distinct
-		prompt tokens per slot).
-		"""
-		owned_here = []
-		for uuid in new_uuids:
-			local_idx = self._uuid_to_local_map.get(uuid)
-			if local_idx is None:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				logging.warning(
-					f"[ADMIT-LOCAL rank={self.rank}] uuid={uuid} local_idx={local_idx} "
-					f"GLOBAL_BATCH_MISS (seq lookup returned None)"
-				)
-				continue
-			ids = seq.input_ids
-			if ids is not None:
-				fp_head = ids[:5].tolist() if hasattr(ids, "tolist") else list(ids[:5])
-				fp_tail = ids[-5:].tolist() if hasattr(ids, "tolist") else list(ids[-5:])
-				token_count = int(ids.shape[0]) if hasattr(ids, "shape") else len(ids)
-			else:
-				fp_head = None
-				fp_tail = None
-				token_count = 0
-			logging.warning(
-				f"[ADMIT-LOCAL rank={self.rank}/{self.world_size}] "
-				f"uuid={uuid} global_idx={seq.global_idx} local_idx={local_idx} "
-				f"assigned_rank={seq.assigned_rank} status={seq.status.name} "
-				f"prompt_len={seq.prompt_length} input_ids_len={token_count} "
-				f"max_decode_length={seq.max_decode_length} "
-				f"buffer_slot={seq._buffer_slot} pool_slot_index={seq.pool_slot_index} "
-				f"batch_id={seq.batch_id} priority={seq.priority} "
-				f"fp_head={fp_head} fp_tail={fp_tail}"
-			)
-			owned_here.append((uuid, local_idx, seq.global_idx))
-
-		if owned_here:
-			logging.warning(
-				f"[ADMIT-SUMMARY rank={self.rank}/{self.world_size}] "
-				f"owns {len(owned_here)} new seqs: "
-				f"local_idxs={[x[1] for x in owned_here]} "
-				f"global_idxs={[x[2] for x in owned_here]} "
-				f"uuids={[x[0] for x in owned_here]}"
-			)
-		else:
-			logging.warning(
-				f"[ADMIT-SUMMARY rank={self.rank}/{self.world_size}] "
-				f"owns 0 new seqs from this admit batch (total_new={len(new_uuids)})"
-			)
-
 	def _tokenize_admitted_sequences(self, uuids: List[str]) -> None:
 		"""Tokenize newly admitted sequences and assign buffer pool slots.
 
@@ -1225,24 +1114,6 @@ class BatchGenWorker:
 			seq.original_prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
-
-			# Probe: log the natural tokenized length per seq so we can compare
-			# the same custom_id across single-seq vs multi-seq client batches.
-			# If this number differs for the same MMLU prompt across runs, the
-			# tokenizer is producing different output for the same input string,
-			# which is the suspect causing the slot-0 padding bug.
-			try:
-				_iid_head = input_ids_list[:5]
-				_iid_tail = input_ids_list[-5:] if len(input_ids_list) >= 5 else input_ids_list
-			except Exception:
-				_iid_head = "?"
-				_iid_tail = "?"
-			logging.warning(
-				f"[PROMPT-LEN-SET site=admit_tokenized rank={self.rank} "
-				f"uuid={seq.uuid[:24]} prompt_length={actual_prompt_len} "
-				f"input_ids_len={len(input_ids_list)} "
-				f"iid_head5={_iid_head} iid_tail5={_iid_tail}]"
-			)
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
@@ -4082,20 +3953,6 @@ class BatchGenWorker:
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
-			# Probe (paired with admit_tokenized site): same fields so we can
-			# tell which admission path the bug travels via.
-			try:
-				_iid_head = input_ids_list[:5]
-				_iid_tail = input_ids_list[-5:] if len(input_ids_list) >= 5 else input_ids_list
-			except Exception:
-				_iid_head = "?"; _iid_tail = "?"
-			logging.warning(
-				f"[PROMPT-LEN-SET site=global_batch_phase3 rank={self.rank} "
-				f"uuid={seq.uuid[:24]} prompt_length={actual_prompt_len} "
-				f"input_ids_len={len(input_ids_list)} "
-				f"iid_head5={_iid_head} iid_tail5={_iid_tail}]"
-			)
-
 			if (seq_i + 1) % 3000 == 0:
 				elapsed = time.perf_counter() - phase3_start
 				logging.info(
@@ -5336,10 +5193,8 @@ class BatchGenWorker:
 					)
 					self._timing_logged = True
 				if self._admission_queue is None:
-					_attn_dump.close_rank(self.rank)
 					break  # Legacy mode: no pool, just finish
 				if self._shutdown_requested:
-					_attn_dump.close_rank(self.rank)
 					break  # Pool mode: shutdown requested and all done
 				# Pool mode: wait briefly for more work before exiting
 				# status tensor encoding: [has_new_work, shutdown, reload]
@@ -6918,55 +6773,12 @@ class BatchGenWorker:
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
-				# Record per-microbatch metadata for the attn-dump experiment.
-				if _attn_dump.enabled():
-					_attn_dump.note_microbatch(
-						self.rank, mb_idx=int(batch_idx),
-						global_ids=Attn_Wrapper.cur_batch,
-						cu_seqlens=batch_cu_seqlens,
-						max_seqlen=int(batch_max_seqlen),
-						prepack_mode=True,
-					)
-
-				# Worker-side prepack diagnostic probe (paired with FA3-PREFILL-DIAG).
-				# Dumps the inputs handed to the model on every micro-batch when env is
-				# set, so we can compare seq-0's input fingerprint between single-seq
-				# and multi-seq prepack paths.
-				if _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
-					_cu_list = batch_cu_seqlens.tolist()
-					_pos_head = batch_position_ids_flat[:5].tolist()
-					_pos_tail0 = batch_position_ids_flat[max(0, batch_seq_lengths[0]-3):batch_seq_lengths[0]].tolist()
-					_pos_head1 = (batch_position_ids_flat[batch_seq_lengths[0]:batch_seq_lengths[0]+3].tolist()
-								  if batch_num_seqs > 1 else [])
-					_iid_head = batch_input_ids_flat[:5].tolist()
-					_iid_seq1 = (batch_input_ids_flat[batch_seq_lengths[0]:batch_seq_lengths[0]+5].tolist()
-								  if batch_num_seqs > 1 else [])
-					logging.warning(
-						f"[PREPACK-DIAG rank={self.rank} mb_seqs={batch_num_seqs} "
-						f"local_idx={batch_local_indices} gids={Attn_Wrapper.cur_batch} "
-						f"seq_lengths={batch_seq_lengths} cu={_cu_list} max_L={batch_max_seqlen} "
-						f"pos_head5={_pos_head} pos_seq0_last3={_pos_tail0} "
-						f"pos_seq1_first3={_pos_head1} iid_head5={_iid_head} iid_seq1_head5={_iid_seq1}]"
-					)
-
 				# Embed tokens
-				with _TraceSpan(self.rank, -1, "embed_tokens",
-								tokens=int(batch_input_ids_flat.shape[0]),
-								mb_seqs=int(batch_num_seqs)):
-					inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
 
-				# Sync replacing the PREPACK-DIAG implicit barrier before the layer loop.
-				torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-				# Forward through model layers
-				_layer_probe_set = (0, 10, 39, 77)
-				_layer_probe_on = _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1"
-				_trace_loop = _TraceSpan(self.rank, -1, "layer_loop",
-										 num_layers=len(self.model.model.layers),
-										 mb_seqs=int(batch_num_seqs))
-				_trace_loop.__enter__()
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					layer_outputs = decoder_layer(
 						hidden_states,
@@ -6977,74 +6789,28 @@ class BatchGenWorker:
 						use_cache=False,
 					)
 					hidden_states = layer_outputs[0]
-					# Sync every layer replacing the gated LAYER-DIAG probe's implicit barrier.
-					torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-					# Site C dump: per-seq end-of-layer hidden state (all 78 layers).
-					if _attn_dump.enabled():
-						_gids_c = Attn_Wrapper.cur_batch or list(range(batch_num_seqs))
-						_attn_dump.dump_rows(
-							self.rank, "C_layer_out", layer_idx, _gids_c,
-							batch_cu_seqlens, hidden_states[0],
-						)
-					# Per-layer per-seq hidden-state fingerprint. Fires only when
-					# BATCHGEN_GLM5_PREFILL_DIAG=1 at a sparse set of layers so we
-					# can diff single-seq vs multi-seq-per-rank output of the same
-					# seq at matching layer boundaries. .tolist/.item issues D2H
-					# syncs; this probe can shift the corruption victim across seqs.
-					if _layer_probe_on and layer_idx in _layer_probe_set:
-						_layer_fps = []
-						for _si in range(batch_num_seqs):
-							_t0 = int(batch_cu_seqlens[_si].item())
-							_fp = hidden_states[0, _t0, :8].float().tolist()
-							_nm = float(hidden_states[0, _t0].float().norm().item())
-							_layer_fps.append((_si, _t0, _fp, _nm))
-						logging.warning(
-							f"[LAYER-DIAG layer={layer_idx} rank={self.rank} "
-							f"mb_seqs={batch_num_seqs} gids={Attn_Wrapper.cur_batch} "
-							f"first_token_fp={_layer_fps}]"
-						)
-
-				_trace_loop.__exit__(None, None, None)
 
 				# Final norm
-				with _TraceSpan(self.rank, -1, "final_norm",
-								tokens=int(hidden_states.shape[1])):
-					hidden_states = self.model.model.norm(hidden_states)
+				hidden_states = self.model.model.norm(hidden_states)
 
 				# Extract last token hidden states for each sequence
 				last_token_indices = batch_cu_seqlens[1:] - 1
 				last_token_hidden = hidden_states[0, last_token_indices, :]
 
-				# Sync replacing the LASTHID-DIAG probe's implicit barrier.
-				torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-				if _os_env.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
-					_lth_fps = [last_token_hidden[i, :8].float().tolist() for i in range(batch_num_seqs)]
-					_lth_norms = [float(last_token_hidden[i].float().norm().item()) for i in range(batch_num_seqs)]
-					logging.warning(
-						f"[LASTHID-DIAG rank={self.rank} mb_seqs={batch_num_seqs} "
-						f"gids={Attn_Wrapper.cur_batch} last_token_indices={last_token_indices.tolist()} "
-						f"last_hidden_first8_per_seq={_lth_fps} norms={_lth_norms}]"
+				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
+				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
+				if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+					logits = torch.nn.functional.linear(
+						last_token_hidden.float(),
+						self.model.lm_head.weight.float(),
+						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					)
-
-				# lm_head matmul: default BF16 (matches HF / SGLang / vLLM; avoids
-				# FP32 amplification of upstream BF16 round-off across a 944M-element
-				# matmul that can flip top-1 at tight logit margins). Opt into the
-				# old FP32-cast path with BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-				with _TraceSpan(self.rank, -1, "lm_head",
-								mb_seqs=int(batch_num_seqs),
-								fp32=_os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1"):
-					if _os_env.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-						logits = torch.nn.functional.linear(
-							last_token_hidden.float(),
-							self.model.lm_head.weight.float(),
-							self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-						)
-					else:
-						logits = torch.nn.functional.linear(
-							last_token_hidden,
-							self.model.lm_head.weight,
-							self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-						).float()
+				else:
+					logits = torch.nn.functional.linear(
+						last_token_hidden,
+						self.model.lm_head.weight,
+						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+					).float()
 
 				batch_new_tokens = self._select_tokens(logits)
 				if batch_new_tokens.shape[0] != batch_num_seqs:

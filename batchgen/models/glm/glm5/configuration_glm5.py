@@ -122,13 +122,7 @@ class Glm5Config(PretrainedConfig):
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
         self.index_topk = index_topk
-        # Structurally disable DSA indexer (clean dense-MLA mode). Honors
-        # env var BATCHGEN_GLM5_USE_DENSE_MLA=1 even when not set via config,
-        # so launching with the env flag alone is sufficient to switch paths.
-        import os as _os_glm5hf
-        self.use_dense_mla = bool(use_dense_mla) or (
-            _os_glm5hf.environ.get("BATCHGEN_GLM5_USE_DENSE_MLA", "0") == "1"
-        )
+        self.use_dense_mla = bool(use_dense_mla)
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.rms_norm_eps = rms_norm_eps

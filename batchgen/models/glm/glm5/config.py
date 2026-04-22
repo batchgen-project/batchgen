@@ -64,9 +64,7 @@ class GLM5Config(BaseModelConfig):
     indexer_rope_interleave: bool = True
     # Structurally disable the DSA indexer (no Glm5Indexer module constructed,
     # no aux KV cache, no WP2/WP4/WP5 kernels, pure einsum absorbed MLA in
-    # decode). Used to bisect whether output degradation lives in DSA or in
-    # the core MLA/MoE stack. Can also be toggled via env var
-    # BATCHGEN_GLM5_USE_DENSE_MLA=1 (propagated in batchgen_worker.py).
+    # decode). Set per-config to bypass DSA and run pure absorbed MLA.
     use_dense_mla: bool = False
 
     # ==================== Context: Full attention ====================
@@ -121,11 +119,3 @@ class GLM5Config(BaseModelConfig):
     def num_kv_heads(self) -> int:
         return self.num_key_value_heads
 
-    def __post_init__(self):
-        # Honor env var BATCHGEN_GLM5_USE_DENSE_MLA=1 even when the config
-        # dict didn't set it, so the flag can be flipped at launch time
-        # without editing config files. Matches the BATCHGEN_GLM5_* knob
-        # convention (FORCE_DENSE_MLA, DISABLE_DUAL_KV, DSA_DIAG).
-        import os as _os_glm5cfg
-        if _os_glm5cfg.environ.get("BATCHGEN_GLM5_USE_DENSE_MLA", "0") == "1":
-            self.use_dense_mla = True

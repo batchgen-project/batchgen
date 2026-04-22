@@ -32,8 +32,6 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
-from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan
-
 
 class BaseModuleWrapper(nn.Module):
     """Base wrapper for BatchGen module execution.
@@ -147,32 +145,11 @@ class BaseModuleWrapper(nn.Module):
         Returns:
             Dict mapping parameter names to weight tensors
         """
-        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "load_weights",
-                        module_key=module_key, phase=self.phase):
-            return self.core_engine.get_weights(module_key, self.phase)
+        return self.core_engine.get_weights(module_key, self.phase)
 
     def _sync_device_before_release(self) -> None:
-        """Drain all CUDA streams on this wrapper's device.
-
-        Called by free_weights / clear_weights before the underlying buffer
-        slot is returned to the pool or the Python-side tensor refs are
-        dropped. We must wait on the ENTIRE device (not just the current
-        compute stream) because prefill launches async D2H copies onto a
-        separate stream that PyTorch's caching allocator does not track —
-        current_stream().synchronize() leaves those D2H reads pending, and
-        if we release the source storage now the allocator can hand the
-        pages to the next layer's load_weights() while the D2H is still
-        mid-memcpy → the D2H captures corrupted data. Full-device sync is
-        the simplest correct guard; finer-grained stream ordering can be
-        added later once profiled.
-        """
-        try:
-            device = self.engine_config.Basic_Config.device_torch
-        except AttributeError:
-            # Fallback if engine_config is not available for some reason —
-            # issue a global sync so the safety guarantee still holds.
-            device = None
-        torch.cuda.synchronize(device) if device is not None else torch.cuda.synchronize()
+        """Drain the current compute stream before releasing weight storage."""
+        torch.cuda.current_stream().synchronize()
 
     def free_weights(self, module_key: str):
         """Free weights buffer after use.
@@ -180,10 +157,8 @@ class BaseModuleWrapper(nn.Module):
         Args:
             module_key: Key identifying the module weights to free
         """
-        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "free_weights",
-                        module_key=module_key):
-            self._sync_device_before_release()
-            self.core_engine.free_weights_buffer(module_key)
+        self._sync_device_before_release()
+        self.core_engine.free_weights_buffer(module_key)
 
     def apply_weights(self, weights_dict: Dict[str, torch.Tensor]):
         """Apply loaded weights to module parameters.
@@ -192,32 +167,27 @@ class BaseModuleWrapper(nn.Module):
             weights_dict: Dict mapping parameter names to weight tensors
         """
         applied = set()
-        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "apply_weights",
-                        applied=len(applied), dict_keys=len(weights_dict)):
-            for name, param in self.module.named_parameters():
-                if name in weights_dict:
-                    param.data = weights_dict[name]
-                    applied.add(name)
-            # Record exactly which parameter names we populated so clear_weights
-            # can wipe only the buffer-backed ones. Skeleton-loaded weights
-            # (q_a/kv_a_layernorm, indexer.*) live on the module permanently and
-            # are never in weights_dict — if we wipe them here, the next forward
-            # hits empty(0) params and dies with normalized_shape=[0].
-            self._applied_param_keys = applied
+        for name, param in self.module.named_parameters():
+            if name in weights_dict:
+                param.data = weights_dict[name]
+                applied.add(name)
+        # Track which parameter names we populated so clear_weights only wipes
+        # buffer-backed ones. Skeleton-loaded params (q_a/kv_a_layernorm,
+        # indexer.*) are never in weights_dict; wiping them would leave the
+        # module with empty(0) params and fail the next forward.
+        self._applied_param_keys = applied
 
     def clear_weights(self):
         """Clear only the buffer-loaded module parameters populated by the
         most recent apply_weights call; preserve skeleton-loaded params.
         """
         applied = getattr(self, "_applied_param_keys", None)
-        with _TraceSpan(self.get_rank_safe(), self.layer_idx, "clear_weights",
-                        wiped=(len(applied) if applied is not None else "all")):
-            self._sync_device_before_release()
-            for name, param in self.module.named_parameters():
-                if applied is not None and name not in applied:
-                    continue
-                param.data = torch.empty(0, device=param.data.device)
-            self._applied_param_keys = None
+        self._sync_device_before_release()
+        for name, param in self.module.named_parameters():
+            if applied is not None and name not in applied:
+                continue
+            param.data = torch.empty(0, device=param.data.device)
+        self._applied_param_keys = None
 
     def get_batch_size(self, batch_size_key: str) -> int:
         """Get micro-batch size from config.

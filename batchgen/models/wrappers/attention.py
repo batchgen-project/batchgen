@@ -238,19 +238,10 @@ class AttnWrapperBase(BaseModuleWrapper):
         else:
             result = self._forward_decode(hidden_states, **kwargs)
 
-        # Release buffer for non-persistent attention (following DeepSeek pattern)
-        # This allows the H2D worker to load the next layer's weights.
-        # Sync the ENTIRE device (not just the compute stream) before freeing:
-        # prefill's async KV D2H (async_offload_layer_kv_to_host) runs on a
-        # separate stream unknown to PyTorch's caching allocator, so
-        # current_stream().synchronize() leaves the D2H reads pending. If we
-        # release the source-tensor refs now, the allocator may hand the
-        # storage to the next layer's load_weights and the D2H captures
-        # corrupted data.
+        # Release buffer for non-persistent attention so the H2D worker can
+        # load the next layer's weights.
         if not self.persistent:
-            torch.cuda.synchronize(
-                self.engine_config.Basic_Config.device_torch
-            )
+            torch.cuda.current_stream().synchronize()
             self.free_weights(self.module_key)
             self.clear_weights()
 

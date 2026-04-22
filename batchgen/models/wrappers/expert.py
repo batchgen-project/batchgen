@@ -159,17 +159,7 @@ class ExpertWrapperBase(BaseModuleWrapper):
         result = self.micro_batch_forward(hidden_states, "expert")
 
         if not self.persistent:
-            # Sync the ENTIRE device (not just the compute stream) before
-            # releasing: prefill's async KV D2H (launched by attention wrappers
-            # via async_offload_layer_kv_to_host) runs on a separate stream
-            # unknown to PyTorch's caching allocator, so current_stream()
-            # .synchronize() leaves those D2H reads pending. Releasing the
-            # weight storage while the D2H is still reading lets the allocator
-            # hand the same pages to the next layer's load_weights → D2H
-            # captures corrupted data.
-            torch.cuda.synchronize(
-                self.engine_config.Basic_Config.device_torch
-            )
+            torch.cuda.current_stream().synchronize()
             self.free_weights(self.module_key)
             self.clear_weights()
 

@@ -35,7 +35,6 @@ import torch.nn.functional as F
 
 from .decode_utils import clamp_token_indices_to_seqlens
 from .configuration_glm5 import Glm5Config
-from ._prefill_trace import Span as _TraceSpan, skip as _trace_skip
 
 
 # ============================================================================
@@ -344,34 +343,15 @@ class Glm5Indexer(nn.Module):
             indexer_k: [batch, seq_len, 1, head_dim] shaped for paged KV manager
                        head_dim=128 (single MQA head)
         """
-        import torch.distributed as _dist_ix
-        _rk = _dist_ix.get_rank() if _dist_ix.is_initialized() else 0
-        with _TraceSpan(_rk, self.layer_idx, "indexer_wk",
-                        tokens=hidden_states.shape[1],
-                        w8a16=hasattr(self, 'wk_scale')):
-            if hasattr(self, 'wk_scale'):
-                from batchgen.attention.mla.fa3_backend import w8a16_gemm
-                k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
-            else:
-                k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
-        with _TraceSpan(_rk, self.layer_idx, "indexer_k_norm",
-                        tokens=hidden_states.shape[1]):
-            k = self.k_norm(k)
-
-        if positions is None:
-            _trace_skip(_rk, self.layer_idx, "indexer_rope_hadamard",
-                        "positions_none")
-        elif self.rotary_emb is None:
-            _trace_skip(_rk, self.layer_idx, "indexer_rope_hadamard",
-                        "rotary_emb_none")
+        if hasattr(self, 'wk_scale'):
+            from batchgen.attention.mla.fa3_backend import w8a16_gemm
+            k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
         else:
-            with _TraceSpan(_rk, self.layer_idx, "indexer_rope_hadamard",
-                            tokens=hidden_states.shape[1],
-                            fused=(_fused_rope_hadamard_fn is not None)):
-                k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
-            if _fused_rope_hadamard_fn is None:
-                _trace_skip(_rk, self.layer_idx, "indexer_fused_kernel",
-                            "hadamard_fallback")
+            k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
+        k = self.k_norm(k)
+
+        if positions is not None and self.rotary_emb is not None:
+            k = self._fused_rope_hadamard_or_fallback(k, positions, max_seqlen=max_seqlen)
 
         return k.unsqueeze(2)  # [batch, seq_len, 1, head_dim]
 
@@ -1723,82 +1703,48 @@ class Glm5MoE(nn.Module):
         sequences in the multi-seq prepacked prefill batch.
         """
         import os as _os_moe
-        import torch.distributed as _dist_moe
-        _rk = _dist_moe.get_rank() if _dist_moe.is_initialized() else 0
         _moe_fp32 = _os_moe.environ.get("BATCHGEN_GLM5_MOE_FP32_ACCUM", "0") == "1"
         _moe_scatter = _os_moe.environ.get("BATCHGEN_GLM5_MOE_SCATTER_ADD", "0") == "1"
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_flat
-        _T = hidden_flat.shape[0]
 
-        with _TraceSpan(_rk, self.layer_idx, "moe_gate", tokens=_T):
-            topk_weights, topk_indices = self.gate(hidden_flat)
+        topk_weights, topk_indices = self.gate(hidden_flat)
 
         if _moe_fp32:
             output = torch.zeros_like(hidden_flat, dtype=torch.float32)
         else:
             output = torch.zeros_like(hidden_flat)
-        n_active = 0
-        with _TraceSpan(_rk, self.layer_idx, "moe_dispatch",
-                        tokens=_T, scatter=_moe_scatter, fp32=_moe_fp32):
-            for i, expert in enumerate(self.experts):
-                if isinstance(expert, _Glm5ExpertPlaceholder):
-                    continue
-                expert_mask = (topk_indices == i).any(dim=-1)
-                if not expert_mask.any():
-                    continue
-                n_active += 1
-                expert_input = hidden_flat[expert_mask]
-                expert_output = expert(expert_input)
-                expert_weight = torch.where(
-                    topk_indices[expert_mask] == i,
-                    topk_weights[expert_mask],
-                    torch.zeros_like(topk_weights[expert_mask])
-                ).sum(dim=-1)
-                if _moe_fp32:
-                    weighted = expert_output.float() * expert_weight.unsqueeze(-1)
-                else:
-                    weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
+        for i, expert in enumerate(self.experts):
+            if isinstance(expert, _Glm5ExpertPlaceholder):
+                continue
+            expert_mask = (topk_indices == i).any(dim=-1)
+            if not expert_mask.any():
+                continue
+            expert_input = hidden_flat[expert_mask]
+            expert_output = expert(expert_input)
+            expert_weight = torch.where(
+                topk_indices[expert_mask] == i,
+                topk_weights[expert_mask],
+                torch.zeros_like(topk_weights[expert_mask])
+            ).sum(dim=-1)
+            if _moe_fp32:
+                weighted = expert_output.float() * expert_weight.unsqueeze(-1)
+            else:
+                weighted = expert_output * expert_weight.unsqueeze(-1).to(expert_output.dtype)
 
-                if _moe_scatter:
-                    # Explicit scatter_add_ — per-row indices are unique within this
-                    # iteration's `expert_mask`, so accumulation is well-defined.
-                    token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
-                    idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
-                    output.scatter_add_(0, idx2d, weighted)
-                else:
-                    output[expert_mask] += weighted
+            if _moe_scatter:
+                # Explicit scatter_add_ — per-row indices are unique within this
+                # iteration's `expert_mask`, so accumulation is well-defined.
+                token_idx = expert_mask.nonzero(as_tuple=False).squeeze(-1)
+                idx2d = token_idx.unsqueeze(-1).expand_as(weighted)
+                output.scatter_add_(0, idx2d, weighted)
+            else:
+                output[expert_mask] += weighted
 
         if _moe_fp32:
             output = output.to(hidden_flat.dtype)
-        with _TraceSpan(_rk, self.layer_idx, "moe_shared_experts", tokens=_T,
-                        n_active=n_active):
-            output = output + self.shared_experts(identity)
-        # MoE prefill probe (BATCHGEN_GLM5_PREFILL_DIAG=1). Fires every MoE
-        # call, one line per call. Log lines arrive in layer order (0..77)
-        # because the layer loop iterates sequentially. We sample token
-        # positions [0], [100], [500], [1000] — whichever fit in total tokens
-        # — plus token-0 norm, to pin whether MoE output diverges at the
-        # same layer boundaries LAYER-DIAG highlights but via MoE output
-        # rather than the full decoder-layer output.
-        # Unconditional sync replacing the MOE-DIAG probe's implicit .tolist/.item
-        # barrier. Fires 75× per prefill (once per MoE layer). The densest sync
-        # of the probe set — THE one that masked the first-seq alloc-reuse bug.
-        torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-        if _os_moe.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1":
-            import logging as _log_moe
-            T = output.shape[0]
-            sample_positions = [p for p in (0, 100, 500, 1000) if p < T]
-            fps = []
-            for p in sample_positions:
-                fp = output[p, :8].float().tolist()
-                nm = float(output[p].float().norm().item())
-                fps.append((p, fp, nm))
-            _log_moe.warning(
-                f"[MOE-DIAG total_tokens={T} n_active_experts={n_active} "
-                f"shape={list(output.shape)} sampled_fp={fps}]"
-            )
+        output = output + self.shared_experts(identity)
         return output.view(*orig_shape)
 
     # ── Internal helpers ──
@@ -1931,37 +1877,28 @@ class Glm5DecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        import torch.distributed as _dist_dl
-        _rk = _dist_dl.get_rank() if _dist_dl.is_initialized() else 0
-        _L = self.layer_idx
-        _tok = hidden_states.shape[1] if hidden_states.dim() == 3 else hidden_states.shape[0]
         # Pre-norm attention
         residual = hidden_states
-        with _TraceSpan(_rk, _L, "input_layernorm", tokens=_tok):
-            hidden_states = self.input_layernorm(hidden_states)
-        with _TraceSpan(_rk, _L, "self_attn", tokens=_tok):
-            hidden_states, attn_weights, present = self.self_attn(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, attn_weights, present = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
 
         # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        with _TraceSpan(_rk, _L, "residual_post_attn", tokens=_tok):
-            hidden_states, residual = cuda_add_rmsnorm(
-                residual, hidden_states,
-                self.post_attention_layernorm.weight,
-                self.post_attention_layernorm.eps,
-            )
+        hidden_states, residual = cuda_add_rmsnorm(
+            residual, hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
 
         # MoE/FFN
-        with _TraceSpan(_rk, _L, "mlp", tokens=_tok):
-            hidden_states = self.mlp(hidden_states)
-        with _TraceSpan(_rk, _L, "residual_post_mlp", tokens=_tok):
-            hidden_states = residual + hidden_states
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
         return hidden_states, attn_weights, present
 

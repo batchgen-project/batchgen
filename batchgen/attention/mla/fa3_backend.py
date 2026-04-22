@@ -14,8 +14,6 @@ import logging
 from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
-from ...models.glm.glm5._prefill_trace import Span as _TraceSpan, skip as _trace_skip
-from ...models.glm.glm5 import _attn_dump as _attn_dump
 
 @torch.inference_mode()
 def mla_prefill_flashattention3(
@@ -1163,34 +1161,26 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
 	"""
 	total_tokens = hidden_states.shape[0]
-	_trace_rank = dist.get_rank() if dist.is_initialized() else 0
-	_L = self.layer_idx
 
 	# Default: FP8 act_quant + DeepGEMM fp8_gemm_nt (matches SGLang/DeepGEMM
-	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). The
-	# dequant-to-BF16 path was a diagnostic variant; restore it only via
-	# BATCHGEN_W8A16_DEQUANT=1 when investigating FP8 act_quant regressions.
+	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). Opt into
+	# the dequant-to-BF16 path via BATCHGEN_W8A16_DEQUANT=1.
 	import os as _os_gemm
 	_w8a16_dequant_path = _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
 	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
-	if _w8a16_dequant_path:
-		_trace_skip(_trace_rank, _L, "fp8_deepgemm_path", "w8a16_dequant_path")
 
 	# Project Q
-	with _TraceSpan(_trace_rank, _L, "q_a_proj", tokens=total_tokens):
-		query_states = _gemm(
-			self.q_a_proj.weight.data,
-			weight_scale["q_a_proj.weight_scale_inv"],
-			hidden_states
-		)
-	with _TraceSpan(_trace_rank, _L, "q_a_layernorm", tokens=total_tokens):
-		query_states = self.q_a_layernorm(query_states)
-	with _TraceSpan(_trace_rank, _L, "q_b_proj", tokens=total_tokens):
-		query_states = _gemm(
-			self.q_b_proj.weight.data,
-			weight_scale["q_b_proj.weight_scale_inv"],
-			query_states
-		)
+	query_states = _gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states
+	)
+	query_states = self.q_a_layernorm(query_states)
+	query_states = _gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states
+	)
 
 	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
 	q_nope, q_pe = torch.split(
@@ -1198,49 +1188,41 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	)
 
 	# Project KV
-	with _TraceSpan(_trace_rank, _L, "kv_a_proj", tokens=total_tokens):
-		compressed_kv = _gemm(
-			self.kv_a_proj_with_mqa.weight.data,
-			weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-			hidden_states
-		)
+	compressed_kv = _gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states
+	)
 	compressed_kv, k_pe = torch.split(
 		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
 	)
-	with _TraceSpan(_trace_rank, _L, "kv_a_layernorm", tokens=total_tokens):
-		normed_kv = self.kv_a_layernorm(compressed_kv)
+	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
 	# Apply rotary embeddings. Default: native interleaved RoPE (matches HF /
-	# SGLang / vLLM `is_neox_style=False` when `rope_interleave=true`). The
-	# prior reshape+split-half trick is dot-product-equivalent but outputs a
-	# permuted layout that does not match SGLang element-for-element. Opt
-	# back into the legacy reshape trick via BATCHGEN_GLM5_ROPE_LEGACY=1.
+	# SGLang / vLLM `is_neox_style=False` when `rope_interleave=true`). Opt
+	# back into the legacy reshape+split-half trick via BATCHGEN_GLM5_ROPE_LEGACY=1.
 	import os as _os_rope
 	_rope_legacy = _os_rope.environ.get("BATCHGEN_GLM5_ROPE_LEGACY", "0") == "1"
-	with _TraceSpan(_trace_rank, _L, "rope", tokens=total_tokens, legacy=_rope_legacy):
-		cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-		if _rope_legacy:
-			q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-			k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-		else:
-			from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
-			q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-			k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
 	if _rope_legacy:
-		_trace_skip(_trace_rank, _L, "rope_native_interleaved", "rope_legacy_path")
+		q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	else:
+		from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
+		q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+		k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
 	del compressed_kv, k_pe_flat
 
 	# Expand KV
-	with _TraceSpan(_trace_rank, _L, "kv_b_proj", tokens=total_tokens):
-		kv = _gemm(
-			self.kv_b_proj.weight.data,
-			weight_scale["kv_b_proj.weight_scale_inv"],
-			normed_kv
-		)
+	kv = _gemm(
+		self.kv_b_proj.weight.data,
+		weight_scale["kv_b_proj.weight_scale_inv"],
+		normed_kv
+	)
 	kv = kv.view(total_tokens, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
 	k_nope, value_states = torch.split(
 		kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
@@ -1255,188 +1237,34 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 	key_states[:, :, :self.qk_nope_head_dim] = k_nope
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
-	# del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
-	# ^^^ DISABLED: bisecting allocator-reuse aliasing bug in multi-seq prepacked
-	# prefill (seq 0 / first-seq letter-enum corruption). Dropping these refs
-	# lets the caching allocator hand the storage to the triple .contiguous()
-	# calls below, which — if the prior ops haven't retired on the stream yet —
-	# races with the new writes. Keep refs alive until function returns.
+	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
 	query_states = query_states.contiguous()
 	key_states = key_states.contiguous()
 	value_states = value_states.contiguous()
 
-	# Unconditional stream sync replicating FA3-PREFILL-DIAG's implicit barrier.
-	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-	# Prepacked diagnostic probe: dump per-seq cu_seqlens + first-row K fingerprint
-	# at layer 0 only, gated by env. Helps localize where multi-seq differs from
-	# single-seq (greedy temp=0.0 sampling makes byte-equality the regression
-	# signal — this gives us granular runtime evidence). Fires for both single
-	# and multi seq cases so we can diff them.
-	import os as _os_diag
-	_PROBE_LAYERS = (0, 10, 39, 77)
-	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
-		import logging as _log_diag
-		fps = []
-		cu = cu_seqlens.tolist()
-		for i in range(num_sequences):
-			t0 = int(cu[i])
-			fp_h0 = key_states[t0, 0, :8].float().tolist()
-			fp_h1 = key_states[t0, 1, :8].float().tolist()
-			fps.append((i, t0, fp_h0, fp_h1))
-		_log_diag.warning(
-			f"[FA3-PREFILL-DIAG layer={self.layer_idx} num_seqs={num_sequences} max_seqlen={max_seqlen} "
-			f"cu={cu} key_shape={list(key_states.shape)} key_contig={key_states.is_contiguous()} "
-			f"first_row_K_per_seq={fps}]"
-		)
-
-	# Site D dump: per-seq Q/K/V rows *immediately before* FA3. Decides whether
-	# the multi-seq divergence first seen at site A (post-FA3) originates IN
-	# FA3 (D_* clean, A diverges) or UPSTREAM (D_* already diverges).
-	if _attn_dump.enabled():
-		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP_D
-		_gids_d = _Attn_DUMP_D.cur_batch or list(range(num_sequences))
-		# Reshape [T, H, D] → [T, H*D] for per-token row dump.
-		_attn_dump.dump_rows(
-			_trace_rank, "D_pre_fa3_q", _L, _gids_d, cu_seqlens,
-			query_states.reshape(total_tokens, -1),
-		)
-		_attn_dump.dump_rows(
-			_trace_rank, "D_pre_fa3_k", _L, _gids_d, cu_seqlens,
-			key_states.reshape(total_tokens, -1),
-		)
-		_attn_dump.dump_rows(
-			_trace_rank, "D_pre_fa3_v", _L, _gids_d, cu_seqlens,
-			value_states.reshape(total_tokens, -1),
-		)
-		# One-shot FULL tensor dump at layer 0 only (bounds file size).
-		# Activated by BATCHGEN_GLM5_DUMP_FULL_L0=1. Writes every token's
-		# Q/K/V + cu_seqlens so the post-hoc diff can check whether MIDDLE
-		# tokens (not sampled by row dumps) diverge between ref and test.
-		import os as _os_fulldump
-		if _os_fulldump.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and _L == 0:
-			_attn_dump.dump_full_tensor(_trace_rank, "q", _L, query_states)
-			_attn_dump.dump_full_tensor(_trace_rank, "k", _L, key_states)
-			_attn_dump.dump_full_tensor(_trace_rank, "v", _L, value_states)
-			_attn_dump.dump_full_tensor(_trace_rank, "cu_seqlens", _L, cu_seqlens)
-
-	# Log every FA3 call-site argument at layer 0 so we can verify (a) cu_seqlens
-	# is int32 on device with values matching our expectation, (b) max_seqlen is
-	# Python int == max-per-seq, (c) Q/K/V shape/dtype/contiguity/stride match.
-	# Gated by BATCHGEN_GLM5_DUMP_FULL_L0 so it fires once per prefill per rank.
-	import os as _os_fa3meta
-	if _os_fa3meta.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and self.layer_idx == 0:
-		import logging as _log_fa3_meta
-		try:
-			_cu_list = cu_seqlens.tolist()
-		except Exception:
-			_cu_list = "<unsupported-tolist>"
-		_log_fa3_meta.warning(
-			f"[FA3-META rank={_trace_rank} layer={_L} "
-			f"num_seqs={num_sequences} cu_seqlens={_cu_list} "
-			f"cu_dtype={cu_seqlens.dtype} cu_device={cu_seqlens.device} "
-			f"cu_numel={cu_seqlens.numel()} "
-			f"max_seqlen_q={int(max_seqlen)} max_seqlen_k={int(max_seqlen)} "
-			f"softmax_scale={float(self.softmax_scale):.6f} causal=True "
-			f"q_shape={list(query_states.shape)} q_dtype={query_states.dtype} "
-			f"q_stride={list(query_states.stride())} q_contig={query_states.is_contiguous()} "
-			f"k_shape={list(key_states.shape)} k_dtype={key_states.dtype} "
-			f"k_stride={list(key_states.stride())} k_contig={key_states.is_contiguous()} "
-			f"v_shape={list(value_states.shape)} v_dtype={value_states.dtype} "
-			f"v_stride={list(value_states.stride())} v_contig={value_states.is_contiguous()}]"
-		)
-	# Flash attention with varlen
-	with _TraceSpan(_trace_rank, _L, "flash_attn_varlen",
-					tokens=total_tokens, num_seqs=num_sequences, max_L=int(max_seqlen)):
-		attn_output = flash_attn_varlen_func(
-			query_states,
-			key_states,
-			value_states,
-			cu_seqlens_q=cu_seqlens,
-			cu_seqlens_k=cu_seqlens,
-			max_seqlen_q=max_seqlen,
-			max_seqlen_k=max_seqlen,
-			softmax_scale=self.softmax_scale,
-			causal=True
-		)
+	attn_output = flash_attn_varlen_func(
+		query_states,
+		key_states,
+		value_states,
+		cu_seqlens_q=cu_seqlens,
+		cu_seqlens_k=cu_seqlens,
+		max_seqlen_q=max_seqlen,
+		max_seqlen_k=max_seqlen,
+		softmax_scale=self.softmax_scale,
+		causal=True
+	)
 
 	del query_states, key_states, value_states
 
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
 
-	# Full-tensor dump at layer 0 *immediately after* FA3, before o_proj.
-	# Paired with the site-D pre-FA3 full dumps so a post-hoc diff can:
-	#   (a) compare middle-token Q/K/V between single-seq and multi-seq runs;
-	#   (b) compare FA3 varlen output against a per-seq loop run offline on
-	#       the dumped Q/K/V, settling whether FA3 or upstream is at fault.
-	import os as _os_fulldump_a
-	if _os_fulldump_a.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and self.layer_idx == 0:
-		_attn_dump.dump_full_tensor(_trace_rank, "attn_out_post_fa3", _L, attn_output)
-
-	# Unconditional stream sync replicating FA3-POST-ATTN-DIAG's implicit barrier.
-	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-	# Probe post-FA3 attn_output (shape [total_tokens, num_heads, v_head_dim]).
-	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
-		import logging as _log_diag_a
-		_fa_fps = []
-		_cu_fa = cu_seqlens.tolist()
-		for _ii in range(num_sequences):
-			_t0 = int(_cu_fa[_ii])
-			_fp_h0 = attn_output[_t0, 0, :8].float().tolist()
-			_fp_h1 = attn_output[_t0, 1, :8].float().tolist()
-			_fa_fps.append((_ii, _t0, _fp_h0, _fp_h1))
-		_log_diag_a.warning(
-			f"[FA3-POST-ATTN-DIAG layer={self.layer_idx} num_seqs={num_sequences} "
-			f"shape={list(attn_output.shape)} first_row_attn_per_seq={_fa_fps}]"
-		)
-
-	# Site A dump: per-seq MLA attention output *before* o_proj.
-	if _attn_dump.enabled():
-		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP
-		_gids = _Attn_DUMP.cur_batch or list(range(num_sequences))
-		# Reshape [T, H, V] -> [T, H*V] for row dump.
-		_attn_dump.dump_rows(
-			_trace_rank, "A_post_fa3", _L, _gids, cu_seqlens,
-			attn_output.view(total_tokens, self.num_heads * self.v_head_dim),
-		)
-
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
-	with _TraceSpan(_trace_rank, _L, "o_proj", tokens=total_tokens):
-		attn_output = _gemm(
-			self.o_proj.weight.data,
-			weight_scale["o_proj.weight_scale_inv"],
-			attn_output
-		)
-	# Unconditional stream sync replicating FA3-POST-OPROJ-DIAG's implicit barrier.
-	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
-	# Probe post-o_proj — attention block output before residual add.
-	if _os_diag.environ.get("BATCHGEN_GLM5_PREFILL_DIAG", "0") == "1" and self.layer_idx in _PROBE_LAYERS:
-		import logging as _log_diag_o
-		_op_fps = []
-		_cu_op = cu_seqlens.tolist()
-		for _jj in range(num_sequences):
-			_t0 = int(_cu_op[_jj])
-			_fp = attn_output[_t0, :8].float().tolist()
-			_nm = float(attn_output[_t0].float().norm().item())
-			_op_fps.append((_jj, _t0, _fp, _nm))
-		_log_diag_o.warning(
-			f"[FA3-POST-OPROJ-DIAG layer={self.layer_idx} num_seqs={num_sequences} "
-			f"shape={list(attn_output.shape)} post_oproj_per_seq={_op_fps}]"
-		)
-
-	# Site B dump: per-seq attention output *after* o_proj (pre-residual).
-	if _attn_dump.enabled():
-		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP_B
-		_gids_b = _Attn_DUMP_B.cur_batch or list(range(num_sequences))
-		_attn_dump.dump_rows(
-			_trace_rank, "B_post_oproj", _L, _gids_b, cu_seqlens, attn_output,
-		)
-		# Also one-shot full-tensor dump at layer 0 post-o_proj for the
-		# length-vs-FA3-itself diagnostic (paired with the pre-FA3 Q/K/V full
-		# dump). Gated by the same BATCHGEN_GLM5_DUMP_FULL_L0 env.
-		import os as _os_fulldump_b
-		if _os_fulldump_b.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and _L == 0:
-			_attn_dump.dump_full_tensor(_trace_rank, "attn_out_post_oproj", _L, attn_output)
+	attn_output = _gemm(
+		self.o_proj.weight.data,
+		weight_scale["o_proj.weight_scale_inv"],
+		attn_output
+	)
 
 	return attn_output, offload_kv
