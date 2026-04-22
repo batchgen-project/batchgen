@@ -15,6 +15,7 @@ from typing import Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 from ...models.glm.glm5._prefill_trace import Span as _TraceSpan, skip as _trace_skip
+from ...models.glm.glm5 import _attn_dump as _attn_dump
 
 @torch.inference_mode()
 def mla_prefill_flashattention3(
@@ -1326,6 +1327,16 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			f"shape={list(attn_output.shape)} first_row_attn_per_seq={_fa_fps}]"
 		)
 
+	# Site A dump: per-seq MLA attention output *before* o_proj.
+	if _attn_dump.enabled():
+		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP
+		_gids = _Attn_DUMP.cur_batch or list(range(num_sequences))
+		# Reshape [T, H, V] -> [T, H*V] for row dump.
+		_attn_dump.dump_rows(
+			_trace_rank, "A_post_fa3", _L, _gids, cu_seqlens,
+			attn_output.view(total_tokens, self.num_heads * self.v_head_dim),
+		)
+
 	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
 	with _TraceSpan(_trace_rank, _L, "o_proj", tokens=total_tokens):
 		attn_output = _gemm(
@@ -1348,6 +1359,14 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		_log_diag_o.warning(
 			f"[FA3-POST-OPROJ-DIAG layer={self.layer_idx} num_seqs={num_sequences} "
 			f"shape={list(attn_output.shape)} post_oproj_per_seq={_op_fps}]"
+		)
+
+	# Site B dump: per-seq attention output *after* o_proj (pre-residual).
+	if _attn_dump.enabled():
+		from ...models.wrappers import AttnWrapperBase as _Attn_DUMP_B
+		_gids_b = _Attn_DUMP_B.cur_batch or list(range(num_sequences))
+		_attn_dump.dump_rows(
+			_trace_rank, "B_post_oproj", _L, _gids_b, cu_seqlens, attn_output,
 		)
 
 	return attn_output, offload_kv

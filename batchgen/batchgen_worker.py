@@ -20,6 +20,7 @@ from batchgen.config.tokenizer_registry import load_tokenizer
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
 from batchgen.models.glm.glm5._prefill_trace import Span as _TraceSpan
+from batchgen.models.glm.glm5 import _attn_dump as _attn_dump
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -5303,8 +5304,10 @@ class BatchGenWorker:
 					)
 					self._timing_logged = True
 				if self._admission_queue is None:
+					_attn_dump.close_rank(self.rank)
 					break  # Legacy mode: no pool, just finish
 				if self._shutdown_requested:
+					_attn_dump.close_rank(self.rank)
 					break  # Pool mode: shutdown requested and all done
 				# Pool mode: wait briefly for more work before exiting
 				# status tensor encoding: [has_new_work, shutdown, reload]
@@ -6883,6 +6886,16 @@ class BatchGenWorker:
 				AttnWrapperBase.position_ids = batch_position_ids_flat
 				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
+				# Record per-microbatch metadata for the attn-dump experiment.
+				if _attn_dump.enabled():
+					_attn_dump.note_microbatch(
+						self.rank, mb_idx=int(batch_idx),
+						global_ids=Attn_Wrapper.cur_batch,
+						cu_seqlens=batch_cu_seqlens,
+						max_seqlen=int(batch_max_seqlen),
+						prepack_mode=True,
+					)
+
 				# Worker-side prepack diagnostic probe (paired with FA3-PREFILL-DIAG).
 				# Dumps the inputs handed to the model on every micro-batch when env is
 				# set, so we can compare seq-0's input fingerprint between single-seq
@@ -6934,6 +6947,13 @@ class BatchGenWorker:
 					hidden_states = layer_outputs[0]
 					# Sync every layer replacing the gated LAYER-DIAG probe's implicit barrier.
 					torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
+					# Site C dump: per-seq end-of-layer hidden state (all 78 layers).
+					if _attn_dump.enabled():
+						_gids_c = Attn_Wrapper.cur_batch or list(range(batch_num_seqs))
+						_attn_dump.dump_rows(
+							self.rank, "C_layer_out", layer_idx, _gids_c,
+							batch_cu_seqlens, hidden_states[0],
+						)
 					# Per-layer per-seq hidden-state fingerprint. Fires only when
 					# BATCHGEN_GLM5_PREFILL_DIAG=1 at a sparse set of layers so we
 					# can diff single-seq vs multi-seq-per-rank output of the same
