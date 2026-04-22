@@ -1320,6 +1320,31 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 			_attn_dump.dump_full_tensor(_trace_rank, "v", _L, value_states)
 			_attn_dump.dump_full_tensor(_trace_rank, "cu_seqlens", _L, cu_seqlens)
 
+	# Log every FA3 call-site argument at layer 0 so we can verify (a) cu_seqlens
+	# is int32 on device with values matching our expectation, (b) max_seqlen is
+	# Python int == max-per-seq, (c) Q/K/V shape/dtype/contiguity/stride match.
+	# Gated by BATCHGEN_GLM5_DUMP_FULL_L0 so it fires once per prefill per rank.
+	import os as _os_fa3meta
+	if _os_fa3meta.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and self.layer_idx == 0:
+		import logging as _log_fa3_meta
+		try:
+			_cu_list = cu_seqlens.tolist()
+		except Exception:
+			_cu_list = "<unsupported-tolist>"
+		_log_fa3_meta.warning(
+			f"[FA3-META rank={_trace_rank} layer={_L} "
+			f"num_seqs={num_sequences} cu_seqlens={_cu_list} "
+			f"cu_dtype={cu_seqlens.dtype} cu_device={cu_seqlens.device} "
+			f"cu_numel={cu_seqlens.numel()} "
+			f"max_seqlen_q={int(max_seqlen)} max_seqlen_k={int(max_seqlen)} "
+			f"softmax_scale={float(self.softmax_scale):.6f} causal=True "
+			f"q_shape={list(query_states.shape)} q_dtype={query_states.dtype} "
+			f"q_stride={list(query_states.stride())} q_contig={query_states.is_contiguous()} "
+			f"k_shape={list(key_states.shape)} k_dtype={key_states.dtype} "
+			f"k_stride={list(key_states.stride())} k_contig={key_states.is_contiguous()} "
+			f"v_shape={list(value_states.shape)} v_dtype={value_states.dtype} "
+			f"v_stride={list(value_states.stride())} v_contig={value_states.is_contiguous()}]"
+		)
 	# Flash attention with varlen
 	with _TraceSpan(_trace_rank, _L, "flash_attn_varlen",
 					tokens=total_tokens, num_seqs=num_sequences, max_L=int(max_seqlen)):
@@ -1339,6 +1364,15 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
+
+	# Full-tensor dump at layer 0 *immediately after* FA3, before o_proj.
+	# Paired with the site-D pre-FA3 full dumps so a post-hoc diff can:
+	#   (a) compare middle-token Q/K/V between single-seq and multi-seq runs;
+	#   (b) compare FA3 varlen output against a per-seq loop run offline on
+	#       the dumped Q/K/V, settling whether FA3 or upstream is at fault.
+	import os as _os_fulldump_a
+	if _os_fulldump_a.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and self.layer_idx == 0:
+		_attn_dump.dump_full_tensor(_trace_rank, "attn_out_post_fa3", _L, attn_output)
 
 	# Unconditional stream sync replicating FA3-POST-ATTN-DIAG's implicit barrier.
 	torch.cuda.current_stream().synchronize()  # sync replaces probe .tolist()/.item() — closes alloc-layout aliasing via stream barrier
@@ -1398,5 +1432,11 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 		_attn_dump.dump_rows(
 			_trace_rank, "B_post_oproj", _L, _gids_b, cu_seqlens, attn_output,
 		)
+		# Also one-shot full-tensor dump at layer 0 post-o_proj for the
+		# length-vs-FA3-itself diagnostic (paired with the pre-FA3 Q/K/V full
+		# dump). Gated by the same BATCHGEN_GLM5_DUMP_FULL_L0 env.
+		import os as _os_fulldump_b
+		if _os_fulldump_b.environ.get("BATCHGEN_GLM5_DUMP_FULL_L0", "0") == "1" and _L == 0:
+			_attn_dump.dump_full_tensor(_trace_rank, "attn_out_post_oproj", _L, attn_output)
 
 	return attn_output, offload_kv
