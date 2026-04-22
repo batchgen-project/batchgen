@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, root_validator, validator
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -54,6 +55,10 @@ class ChatCompletionRequest(BaseModel):
     thinking: Optional[bool] = Field(
         default=None,
         description="Enable/disable thinking mode (None = model default)",
+    )
+    preserve_thinking: Optional[bool] = Field(
+        default=None,
+        description="Preserve prior assistant reasoning_content in Kimi-style chat templates",
     )
 
     @validator("stream")

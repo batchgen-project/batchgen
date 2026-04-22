@@ -380,7 +380,7 @@ class BatchScheduler:
             if isinstance(body, ChatCompletionRequest):
                 # Inject reasoning_effort into system message for GPT-OSS models
                 messages = self._inject_reasoning_effort(
-                    [m.dict() for m in body.messages],
+                    [m.dict(exclude_none=True) for m in body.messages],
                     body.model,
                     body.reasoning_effort,
                 )
@@ -390,6 +390,8 @@ class BatchScheduler:
                     template_kwargs["thinking"] = body.thinking
                 if body.tools is not None:
                     template_kwargs["tools"] = body.tools
+                if body.preserve_thinking is not None:
+                    template_kwargs["preserve_thinking"] = body.preserve_thinking
                 prompt = self._format_chat_messages(
                     messages, body.model, **template_kwargs
                 )
@@ -744,11 +746,18 @@ class BatchScheduler:
         )
 
     def _trim_tokens(self, token_ids: List[int], tokenizer: Any) -> List[int]:
-        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
+        if eos_token_ids is None:
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            eos_token_ids = set() if eos_token_id is None else {eos_token_id}
+        else:
+            eos_token_ids = set(eos_token_ids)
         pad_token_id = getattr(tokenizer, "pad_token_id", None)
         trimmed = list(token_ids)
-        if eos_token_id is not None and eos_token_id in trimmed:
-            trimmed = trimmed[: trimmed.index(eos_token_id)]
+        if eos_token_ids:
+            eos_positions = [idx for idx, token_id in enumerate(trimmed) if token_id in eos_token_ids]
+            if eos_positions:
+                trimmed = trimmed[: eos_positions[0]]
         if pad_token_id is not None:
             while trimmed and trimmed[-1] == pad_token_id:
                 trimmed.pop()

@@ -44,6 +44,8 @@ Usage:
 from typing import Dict, Type, Optional, TYPE_CHECKING
 import logging
 
+from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
+
 if TYPE_CHECKING:
     from .base_tokenizer import BaseTokenizer
 
@@ -63,12 +65,14 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
-    "Kimi-K2.5": "kimi_k25",
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
 }
+
+for model_id in KIMI_K25_BACKEND_MODEL_IDS:
+    TOKENIZER_NAME_PATTERNS[model_id] = "kimi_k25"
 
 
 def register_tokenizer(tokenizer_type: str):

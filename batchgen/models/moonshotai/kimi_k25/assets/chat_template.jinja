@@ -36,15 +36,17 @@
   <|tool_calls_section_end|>
 {%- endmacro -%}
 
-
-{# Find last non-tool-call assisitant message #}
+{%- set preserve_thinking = preserve_thinking | default(false) -%}
+{# Find last non-tool-call assistant message. If preserve_thinking, keep -1 so hist is empty and all msgs use suffix (retain reasoning). #}
 {%- set ns = namespace(last_non_tool_call_assistant_msg=-1) -%}
+{%- if not preserve_thinking -%}
 {%- for idx in range(messages|length-1, -1, -1) -%}
     {%- if messages[idx]['role'] == 'assistant' and not messages[idx].get('tool_calls') -%}
         {%- set ns.last_non_tool_call_assistant_msg = idx -%}
         {%- break -%}
     {%- endif -%}
 {%- endfor -%}
+{%- endif -%}
 
 {# split all messages into history & suffix, reasoning_content in suffix should be reserved.#}
 {%- set hist_msgs = messages[:ns.last_non_tool_call_assistant_msg+1] -%}
@@ -78,10 +80,10 @@
 {%- for message in suffix_msgs -%}
   {{set_roles(message)}}
   {%- if message['role'] == 'assistant' -%}
-    {%- if thinking is defined and thinking is false -%}
+    {%- if thinking is defined and thinking is false and preserve_thinking is false -%}
     <think></think>{{render_content(message)}}
     {%- else -%}
-    {%- set rc = message.get('reasoning_content', '') -%}
+    {%- set rc = message.get('reasoning', message.get('reasoning_content', '')) -%}
     <think>{{rc}}</think>{{render_content(message)}}
     {%- endif -%}
     {%- if message.get('tool_calls') -%}

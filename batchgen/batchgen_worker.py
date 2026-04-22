@@ -74,6 +74,7 @@ from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
 from batchgen.utils import config_torch_module_initializer
+from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
@@ -7466,9 +7467,8 @@ class BatchGenWorker:
 			return
 
 		# Model guard: only capture for supported models
-		SUPPORTED_MODELS = {"gpt-oss-120b", "kimi-k2.5", "kimi_k2.5", "kimi-k25", "kimi_k25"}
 		model_name = getattr(self, 'model_name', '') or ''
-		if not any(s in model_name.lower() for s in SUPPORTED_MODELS):
+		if "gpt-oss-120b" not in model_name.lower() and not is_kimi_k25_backend_model(model_name):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
 
@@ -7552,7 +7552,7 @@ class BatchGenWorker:
 		from batchgen.models.wrappers.attention import AttnWrapperBase
 
 		# Detect K2.5 model for specialized graph segment
-		_is_k25 = any(s in (self.model_name or '').lower() for s in ('kimi-k2.5', 'kimi_k2.5', 'kimi-k25', 'kimi_k25'))
+		_is_k25 = is_kimi_k25_backend_model(self.model_name)
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
@@ -9965,4 +9965,3 @@ class BatchGenWorker:
 		dist.barrier()
 		
 		logging.info(f"Rank {self.rank}: State reset completed")
-
