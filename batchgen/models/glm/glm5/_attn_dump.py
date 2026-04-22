@@ -1,24 +1,33 @@
 """Per-rank attention-output dumper for the GLM-5 prefill hot path.
 
-Gate: BATCHGEN_GLM5_ATTN_DUMP=<dir>. Off by default. When set to a
-directory path, every rank *independently* writes its own
-`rows.rank{NN}.jsonl` + `manifest.rank{NN}.json` into that directory.
-Nothing is aggregated or dropped at runtime — every GPU keeps a complete
-record of what it computed.
+Gate: BATCHGEN_GLM5_ATTN_DUMP=<base_dir>. Off by default. When set,
+the module reads an **active-run pointer file** on every dump call so
+that a single long-running server can route dumps to different
+subdirectories back-to-back without a restart:
 
-Used for the "2×16 vs 1×32" batching-delta experiment: the same 32
-prompts are run two ways, per-seq attention outputs are dumped at fixed
-(layer, site, token_idx) keys, and a post-hoc comparator pairs them by
-`global_seq_id` to quantify the divergence introduced purely by
-multi-seq-prepacked prefill.
+    ${BATCHGEN_GLM5_ATTN_DUMP}/           # base dir (from env, read once)
+      .active_run                         # sidecar; contains current subdir name
+                                          # (empty/missing → dumping disabled)
+      ref16A/
+        rows.rank00.jsonl
+        manifest.rank00.json
+        ...
+      ref16B/
+        rows.rank00.jsonl
+        ...
+      test32/
+        rows.rank00.jsonl
+        ...
 
-Design choices:
-  - per-rank files (no cross-rank coordination; hold the whole device's
-    record no matter how ranks shard seqs)
-  - bounded cost: 6 token positions per seq per site per layer (~45k
-    rows × ~40 KB each = 1–3 GB per run — fits on /data2)
-  - row = full float list + first-8-floats summary + scalar norm, so the
-    comparator can do both fast (first8) and exact (full) diffs
+The experiment driver writes `ref16A` / `ref16B` / `test32` into
+`.active_run` before each client submission, so each client's prefill
+lands in its own subdir. File handles are re-opened when the active
+run name changes.
+
+Designed for the "2x16 vs 1x32" batching-delta experiment. Per-rank
+files (no cross-rank coordination), bounded cost (6 token positions
+per seq per site per layer), full float lists + first-8 + norm per row
+for both fast (first8) and exact (full) diffs.
 """
 
 import json
@@ -29,43 +38,91 @@ import threading
 import torch
 
 _ENV = "BATCHGEN_GLM5_ATTN_DUMP"
-_DIR = os.environ.get(_ENV, "")
+_BASE_DIR = os.environ.get(_ENV, "")
+_ACTIVE_FILE = os.path.join(_BASE_DIR, ".active_run") if _BASE_DIR else ""
 _LOCK = threading.Lock()
+
+# Per-rank state keyed by `(active_run_name, rank)` so that when the
+# active run changes between client submissions, the old file handle is
+# closed and a new one is opened in the new subdir.
 _ROWS_FH: dict = {}
 _MANIFEST: dict = {}
 _log = logging.getLogger("batchgen.attn_dump")
 
 
+def _active_run() -> str:
+    """Read the current active-run name from the sidecar file.
+
+    Returns empty string if BATCHGEN_GLM5_ATTN_DUMP isn't set, the
+    sidecar is missing, or the sidecar is empty (dumping disabled).
+    """
+    if not _ACTIVE_FILE:
+        return ""
+    try:
+        with open(_ACTIVE_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
 def enabled() -> bool:
-    return bool(_DIR)
+    """True iff BATCHGEN_GLM5_ATTN_DUMP is set AND a non-empty active
+    run name is currently written to the sidecar file."""
+    return bool(_BASE_DIR) and bool(_active_run())
 
 
-def _rows_fh(rank: int):
-    if rank not in _ROWS_FH:
-        os.makedirs(_DIR, exist_ok=True)
-        path = os.path.join(_DIR, f"rows.rank{rank:02d}.jsonl")
-        _ROWS_FH[rank] = open(path, "a", buffering=1)
-        _log.warning(f"[ATTN-DUMP] rank={rank} opened {path}")
-    return _ROWS_FH[rank]
+def _active_dir() -> str:
+    """Full path of the currently active run's subdir, or '' if off."""
+    run = _active_run()
+    if not run:
+        return ""
+    return os.path.join(_BASE_DIR, run)
+
+
+def _rows_fh(rank: int, active: str):
+    """Return the open file handle for this (active_run, rank).
+
+    When active_run changes, closes the old handle and opens a new one
+    in the new subdir. Thread-safe via module-level _LOCK (caller holds it).
+    """
+    key = (active, rank)
+    if key in _ROWS_FH:
+        return _ROWS_FH[key]
+    # Close any stale handles for this rank under a different run.
+    for (prev_run, r), fh in list(_ROWS_FH.items()):
+        if r == rank and prev_run != active:
+            try:
+                fh.close()
+            except Exception:
+                pass
+            del _ROWS_FH[(prev_run, r)]
+    sub = os.path.join(_BASE_DIR, active)
+    os.makedirs(sub, exist_ok=True)
+    path = os.path.join(sub, f"rows.rank{rank:02d}.jsonl")
+    _ROWS_FH[key] = open(path, "a", buffering=1)
+    _log.warning(f"[ATTN-DUMP] rank={rank} run={active} opened {path}")
+    return _ROWS_FH[key]
 
 
 def note_microbatch(rank: int, mb_idx: int, global_ids, cu_seqlens,
                     max_seqlen: int, prepack_mode: bool) -> None:
-    """Record per-microbatch metadata in the rank's manifest AND flush it
-    to disk right away.
+    """Record per-microbatch metadata AND flush the manifest atomically.
 
-    The flush-per-microbatch policy is deliberate: benchmark scripts
-    routinely kill the server with SIGKILL (pkill -9 python) between
-    runs, so a defer-to-graceful-shutdown manifest would be lost. The
-    file is tiny (a few KB) so flushing every call is free.
+    Flush-per-microbatch is deliberate: the experiment driver kills the
+    server with pkill -9 at the end, so deferring the flush to a
+    graceful shutdown hook would lose the manifest. The file is tiny
+    (a few KB) so flushing every call is free.
     """
     if not enabled():
         return
+    active = _active_run()
+    key = (active, rank)
     m = _MANIFEST.setdefault(
-        rank,
+        key,
         {
             "rank": rank,
-            "dir": _DIR,
+            "run": active,
+            "base_dir": _BASE_DIR,
             "allow_multi_seq_prepack": os.environ.get(
                 "BATCHGEN_GLM5_ALLOW_MULTI_SEQ_PREPACK", "0"
             ) == "1",
@@ -80,11 +137,12 @@ def note_microbatch(rank: int, mb_idx: int, global_ids, cu_seqlens,
         "max_seqlen": int(max_seqlen),
         "prepack_mode": bool(prepack_mode),
     })
-    # Atomic-ish write: dump to tmp file then rename. SIGKILL-safe.
-    path = os.path.join(_DIR, f"manifest.rank{rank:02d}.json")
-    tmp = path + ".tmp"
+    # Atomic write: dump to tmp + rename. SIGKILL-safe.
+    sub = os.path.join(_BASE_DIR, active)
     with _LOCK:
-        os.makedirs(_DIR, exist_ok=True)
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, f"manifest.rank{rank:02d}.json")
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(m, f, indent=2)
         os.replace(tmp, path)
@@ -107,10 +165,11 @@ def dump_rows(rank: int, site: str, layer_idx: int, global_ids, cu_seqlens,
                     the end of the seq. Out-of-range indices are skipped.
 
     Writes one JSON row per (rank, gid, site, layer, token_idx):
-      {rank, gid, site, layer, token_idx, norm, first8, full}
+      {rank, run, gid, site, layer, token_idx, norm, first8, full}
     """
     if not enabled():
         return
+    active = _active_run()
     cu = cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else list(cu_seqlens)
     t = tensor.detach().float().cpu()
     rows = []
@@ -126,11 +185,11 @@ def dump_rows(rank: int, site: str, layer_idx: int, global_ids, cu_seqlens,
             sl = t[start + ti_abs].reshape(-1)
             rows.append({
                 "rank": int(rank),
+                "run": active,
                 "gid": gid,
                 "site": site,
                 "layer": int(layer_idx),
-                "token_idx": int(ti),  # preserve the original request so the
-                                       # comparator can pair "last-3" on both runs
+                "token_idx": int(ti),
                 "token_idx_abs": int(ti_abs),
                 "norm": float(sl.norm().item()),
                 "first8": sl[:8].tolist(),
@@ -139,24 +198,22 @@ def dump_rows(rank: int, site: str, layer_idx: int, global_ids, cu_seqlens,
     if not rows:
         return
     with _LOCK:
-        f = _rows_fh(rank)
+        f = _rows_fh(rank, active)
         for r in rows:
             f.write(json.dumps(r) + "\n")
 
 
 def close_rank(rank: int) -> None:
-    """Flush the rank's manifest to disk and close the row file.
-
-    Call at server shutdown. Safe to call multiple times.
-    """
-    if not enabled():
+    """Close all open file handles for this rank. Safe to call multiple times."""
+    if not _BASE_DIR:
         return
     with _LOCK:
-        if rank in _MANIFEST:
-            path = os.path.join(_DIR, f"manifest.rank{rank:02d}.json")
-            with open(path, "w") as f:
-                json.dump(_MANIFEST[rank], f, indent=2)
-            _log.warning(f"[ATTN-DUMP] rank={rank} flushed manifest to {path}")
-        if rank in _ROWS_FH:
-            _ROWS_FH[rank].close()
-            del _ROWS_FH[rank]
+        for key in list(_ROWS_FH.keys()):
+            _, r = key
+            if r != rank:
+                continue
+            try:
+                _ROWS_FH[key].close()
+            except Exception:
+                pass
+            del _ROWS_FH[key]
