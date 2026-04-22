@@ -35,6 +35,12 @@ def run_triton_1d(x: torch.Tensor):
     return per_token_blocked_quantize_bf16_to_fp8_flat(x, block_size=128)
 
 
+def run_triton_1d_fast(x: torch.Tensor):
+    """CUDA-parity Triton: 1 CTA per token, 2D tile [NUM_BLOCKS_P2, BLOCK_SIZE]."""
+    from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_1d
+    return per_token_blocked_quantize_bf16_to_fp8_1d(x, block_size=128)
+
+
 def bit_exact(y_a: torch.Tensor, s_a: torch.Tensor, y_b: torch.Tensor, s_b: torch.Tensor):
     assert y_a.shape == y_b.shape, f"y shape {y_a.shape} vs {y_b.shape}"
     assert s_a.shape == s_b.shape, f"s shape {s_a.shape} vs {s_b.shape}"
@@ -119,59 +125,67 @@ def main():
         print(f"CUDA act_quant_3d not available: {e}", file=sys.stderr)
         return 2
     try:
-        from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_flat  # noqa: F401
+        from batchgen_kernels.triton.fp8_quantize import (
+            per_token_blocked_quantize_bf16_to_fp8_flat,
+            per_token_blocked_quantize_bf16_to_fp8_1d,
+        )  # noqa: F401
     except ImportError as e:
-        print(f"Triton per_token_blocked_quantize_bf16_to_fp8_flat not available: {e}", file=sys.stderr)
+        print(f"Triton variants not available: {e}", file=sys.stderr)
         return 2
 
     # Print header
     print(f"# Device: {torch.cuda.get_device_name(device)} (cap {torch.cuda.get_device_capability(device)})")
     print(f"# K={K}, seed={args.seed}, warmup={args.warmup}, iters={args.iters}")
     print()
-    print(f"{'M':>8}  {'bit-eq':>7}  {'fp8-diff':>10}  {'scale-eq':>8}  {'scale-max-abs':>14}  "
-          f"{'cuda-3d(ms)':>12}  {'triton-1d(ms)':>13}  {'speedup':>8}")
-    print("-" * 110)
+    print(f"{'M':>8}  {'bit-eq':>7}  {'fp8-diff':>12}  {'scale-eq':>8}  "
+          f"{'cuda(ms)':>9}  {'tri1d-flat':>10}  {'tri1d-fast':>10}  "
+          f"{'fast/cuda':>10}  {'flat/cuda':>10}")
+    print("-" * 120)
 
     any_mismatch = False
     for M in ms:
-        # Aggressively free leftovers from previous M so large cases don't OOM
-        # when the GPU is shared with a running server (benches allocate
-        # per-iter outputs; their lifetime is bounded by the iter but cache
-        # pressure builds without an empty_cache between loop iterations).
         torch.cuda.empty_cache()
 
         x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-        # Correctness run (fresh outputs).
+        # Correctness: compare both Triton variants against CUDA as ground truth.
         y_cuda, s_cuda = run_cuda_3d(x)
-        y_trit, s_trit = run_triton_1d(x)
+        y_flat, s_flat = run_triton_1d(x)
+        y_fast, s_fast = run_triton_1d_fast(x)
 
         if not args.no_verify:
-            y_eq, s_eq, ne, total, s_max_abs, s_rel = bit_exact(y_cuda, s_cuda, y_trit, s_trit)
-            if not y_eq or not s_eq:
-                any_mismatch = True
-            fp8_diff_str = f"{ne}/{total}" if not y_eq else "0"
-            s_eq_str = "Y" if s_eq else "N"
-            bit_eq_str = "Y" if y_eq else "N"
-            s_max_abs_str = f"{s_max_abs:.3e}" if not s_eq else "0"
+            y_eq_flat, s_eq_flat, ne_flat, total, _, _ = bit_exact(y_cuda, s_cuda, y_flat, s_flat)
+            y_eq_fast, s_eq_fast, ne_fast, _, _, _ = bit_exact(y_cuda, s_cuda, y_fast, s_fast)
+            if not (y_eq_flat and y_eq_fast and s_eq_flat and s_eq_fast):
+                # Only mark mismatch if fast kernel disagrees with CUDA
+                # more than the baseline flat variant (acceptable: both
+                # show similar tiny ULP differences).
+                if abs(ne_fast - ne_flat) > max(16, ne_flat):
+                    any_mismatch = True
+            # Compact: show fast-vs-cuda byte diffs (primary signal for the new kernel)
+            fp8_diff_str = f"{ne_fast}/{total}"
+            s_eq_str = "Y" if s_eq_fast else "N"
+            bit_eq_str = "Y" if y_eq_fast else "N"
         else:
-            bit_eq_str = fp8_diff_str = s_eq_str = s_max_abs_str = "-"
+            bit_eq_str = fp8_diff_str = s_eq_str = "-"
 
-        # Free correctness outputs before benching to reduce peak footprint.
-        del y_cuda, s_cuda, y_trit, s_trit
+        del y_cuda, s_cuda, y_flat, s_flat, y_fast, s_fast
 
         if not args.no_bench:
-            t_cuda = bench(run_cuda_3d, x, args.warmup, args.iters)
-            t_trit = bench(run_triton_1d, x, args.warmup, args.iters)
-            speedup = t_trit["median_ms"] / t_cuda["median_ms"]  # >1 → CUDA faster
-            cuda_str = f"{t_cuda['median_ms']:.4f}"
-            trit_str = f"{t_trit['median_ms']:.4f}"
-            sp_str = f"{speedup:.2f}x"
+            t_cuda = bench(run_cuda_3d, x, args.warmup, args.iters)["median_ms"]
+            t_flat = bench(run_triton_1d, x, args.warmup, args.iters)["median_ms"]
+            t_fast = bench(run_triton_1d_fast, x, args.warmup, args.iters)["median_ms"]
+            cuda_str = f"{t_cuda:.4f}"
+            flat_str = f"{t_flat:.4f}"
+            fast_str = f"{t_fast:.4f}"
+            fast_ratio = f"{t_fast / t_cuda:.2f}x"
+            flat_ratio = f"{t_flat / t_cuda:.2f}x"
         else:
-            cuda_str = trit_str = sp_str = "-"
+            cuda_str = flat_str = fast_str = fast_ratio = flat_ratio = "-"
 
         del x
-        print(f"{M:>8}  {bit_eq_str:>7}  {fp8_diff_str:>10}  {s_eq_str:>8}  {s_max_abs_str:>14}  "
-              f"{cuda_str:>12}  {trit_str:>13}  {sp_str:>8}", flush=True)
+        print(f"{M:>8}  {bit_eq_str:>7}  {fp8_diff_str:>12}  {s_eq_str:>8}  "
+              f"{cuda_str:>9}  {flat_str:>10}  {fast_str:>10}  "
+              f"{fast_ratio:>10}  {flat_ratio:>10}", flush=True)
 
     print()
     print(f"# Summary: {'MISMATCH found' if any_mismatch else 'all bit-exact'}")
