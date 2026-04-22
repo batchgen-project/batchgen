@@ -55,7 +55,7 @@ class KimiK25Tokenizer(BaseTokenizer):
 
     Attributes:
         bos_token_id: 163584 ("[BOS]")
-        eos_token_id: 163585 ("[EOS]")
+        eos_token_id: 163586 ("<|im_end|>")
         pad_token_id: 163839 ("[PAD]")
         vocab_size: 163840
     """

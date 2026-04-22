@@ -44,6 +44,7 @@ MODEL_BYTE_SIZES = {
     "mistralai/Mixtral-8x22B-Instruct-v0.1": 286 * 1024**3,
     # Kimi K2.5: ~580GB INT4 experts + ~20GB BF16 (attn/shared/embed) ≈ 600GB + buffer
     "moonshotai/Kimi-K2.5": 650 * 1024**3,
+    "moonshotai/Kimi-K2.6": 650 * 1024**3,
     # MiniMax-M2.5: ~225GB FP8 experts + ~8GB BF16 (attn/embed/router) ≈ 233GB
     "MiniMaxAI/MiniMax-M2.5": 250 * 1024**3,
     # GLM-5-FP8: 675GB FP8 experts + 17.3GB attn+DSA + 4.5GB embed/dense ≈ 700GB + buffer

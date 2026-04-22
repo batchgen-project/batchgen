@@ -44,6 +44,8 @@ import json
 import logging
 import os
 
+from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
+
 if TYPE_CHECKING:
     from .model_config import BaseModelConfig
 
@@ -69,7 +71,6 @@ ARCH_PATTERNS: Dict[str, str] = {
 MODEL_NAME_PATTERNS: Dict[str, str] = {
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
-    "moonshotai/Kimi-K2.5": "kimi_k25",
     "DeepSeek-R1": "deepseek_v3",
     "DeepSeek-V3": "deepseek_v3",
     "DeepSeek-V2-Lite": "deepseek_v2",
@@ -85,6 +86,9 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
 }
+
+for model_id in KIMI_K25_BACKEND_MODEL_IDS:
+    MODEL_NAME_PATTERNS[model_id] = "kimi_k25"
 
 
 def register_config(model_type: str):

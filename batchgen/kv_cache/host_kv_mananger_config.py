@@ -149,9 +149,13 @@ for canonical, aliases in {
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
 		"moonshotai/kimi-k2.5",
+		"moonshotai/kimi-k2.6",
 		"moonshotai/kimi-k25",
+		"moonshotai/kimi-k26",
 		"kimi-k2.5",
+		"kimi-k2.6",
 		"kimi-k25",
+		"kimi-k26",
 		"kimi",
 	),
 	"gpt_oss_gqa": (

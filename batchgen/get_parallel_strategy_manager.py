@@ -1,6 +1,7 @@
 from batchgen.models.deepseek.deepseekv3.Parallel_Strategy_Manager import DeepseekV3ParallelStrategyManager
 from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import GptOssParallelStrategyManager
 from batchgen.models.moonshotai.kimi_k25.Parallel_Strategy_Manager import KimiK25ParallelStrategyManager
+from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.models.minimax.minimax_m25.Parallel_Strategy_Manager import MiniMaxM25ParallelStrategyManager
 
 
@@ -8,7 +9,7 @@ def get_parallel_strategy_manager(model_name:str):
 	model_lower = model_name.lower()
 	if "minimax" in model_lower or "minimax-m2.5" in model_lower:
 		return MiniMaxM25ParallelStrategyManager
-	elif model_lower in ["moonshotai/kimi-k2.5"]:
+	elif is_kimi_k25_backend_model(model_name):
 		return KimiK25ParallelStrategyManager
 	elif model_lower in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
 		return DeepseekV3ParallelStrategyManager
