@@ -396,23 +396,44 @@ def act_quant(
     x_flat = x.view(-1, original_shape[-1])
     M, N = x_flat.shape
 
-    # bf16 blockwise act_quant — unconditional CUDA path via act_quant_3d
-    # (batchgen_kernels.moe._C_fp8_blockwise_ops). The kernel launches one CTA
-    # per token with a 1D grid of E=M, so it scales linearly for both decode
-    # (M=bsz) and prefill (M=total prepacked tokens). Persistent-CTA + per-block
-    # scale = amax / FP8_SAFE_MAX (440). Matches the MoE path's act_quant_3d.
+    # bf16 blockwise act_quant — always goes through the CUDA act_quant_3d
+    # kernel (batchgen_kernels.moe._C_fp8_blockwise_ops). The kernel launches
+    # one CTA per token with a 1D grid of E=M. grid-X caps at 65535 for this
+    # kernel build, so for M > 65535 (prefill prepack can hit ~20k-100k tokens)
+    # we chunk along M and call the same CUDA kernel once per chunk. Every
+    # call is still CUDA — no Triton on the hot path.
     if x.dtype == torch.bfloat16 and M > 0 and block_size == 128:
         from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
-        # act_quant_3d signature: (x[E, mtp, K], tokens_per_expert[E] int32).
-        # We map E=M, mtp=1, one valid token per "expert".
-        x_3d = x_flat.view(M, 1, N).contiguous()
-        tokens_per_expert = torch.ones(M, dtype=torch.int32, device=x.device)
-        y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
-        # Outputs are uint8 bytes; deep_gemm consumes float8_e4m3fn so reinterpret.
-        y_fp8_3d = y_uint8_3d.view(torch.float8_e4m3fn)
-        y = y_fp8_3d.view(*original_shape)
-        num_blocks = scale_3d.size(-1)
-        scale = scale_3d.view(*original_shape[:-1], num_blocks)
+        _ACT_QUANT_CHUNK = 65535  # kernel grid-X cap (see kernel source)
+        tokens_per_expert_full = None  # lazily allocated if chunking
+        num_blocks = (N + block_size - 1) // block_size
+
+        if M <= _ACT_QUANT_CHUNK:
+            x_3d = x_flat.view(M, 1, N).contiguous()
+            tokens_per_expert = torch.ones(M, dtype=torch.int32, device=x.device)
+            y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+            y_fp8_3d = y_uint8_3d.view(torch.float8_e4m3fn)
+            y = y_fp8_3d.view(*original_shape)
+            scale = scale_3d.view(*original_shape[:-1], num_blocks)
+            return y, scale
+
+        # Chunked path: splits M into pieces of <= 65535 rows. Each CUDA
+        # launch still processes the full K dim for its chunk. Output
+        # tensors are pre-allocated once so chunks write into contiguous
+        # slices (no post-hoc concat).
+        y_flat = torch.empty(M, N, dtype=torch.float8_e4m3fn, device=x.device)
+        scale_flat = torch.empty(M, num_blocks, dtype=torch.float32, device=x.device)
+        tokens_per_expert_chunk = torch.ones(_ACT_QUANT_CHUNK, dtype=torch.int32, device=x.device)
+        for start in range(0, M, _ACT_QUANT_CHUNK):
+            end = min(start + _ACT_QUANT_CHUNK, M)
+            chunk = end - start
+            tpe = tokens_per_expert_chunk[:chunk] if chunk == _ACT_QUANT_CHUNK else torch.ones(chunk, dtype=torch.int32, device=x.device)
+            x_chunk_3d = x_flat[start:end].view(chunk, 1, N).contiguous()
+            y_uint8_3d, scale_3d = _cuda_act_quant_3d(x_chunk_3d, tpe)
+            y_flat[start:end] = y_uint8_3d.view(torch.float8_e4m3fn).view(chunk, N)
+            scale_flat[start:end] = scale_3d.view(chunk, num_blocks)
+        y = y_flat.view(*original_shape)
+        scale = scale_flat.view(*original_shape[:-1], num_blocks)
         return y, scale
 
     fp8_max = 448.0
