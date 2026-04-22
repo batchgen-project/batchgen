@@ -62,49 +62,6 @@ class GLM5ParallelStrategyManager:
             "experts.0.gate_proj.weight_scale_inv" in k for k in skeleton_state_dict
         )
 
-    def _dump_weight_stats_once(self):
-        """Rank-0 one-shot log of loaded norm/gate stats for sanity-check vs disk."""
-        if self.rank != 0:
-            return
-
-        def _attn(layer_idx):
-            a = self.model.model.layers[layer_idx].self_attn
-            return a.module if hasattr(a, "module") else a
-
-        targets = [
-            ("L0.input_layernorm.weight", lambda: self.model.model.layers[0].input_layernorm.weight),
-            ("L0.post_attn_layernorm.weight", lambda: self.model.model.layers[0].post_attention_layernorm.weight),
-            ("L0.q_a_layernorm.weight", lambda: _attn(0).q_a_layernorm.weight),
-            ("L0.kv_a_layernorm.weight", lambda: _attn(0).kv_a_layernorm.weight),
-            ("L3.mlp.gate.weight", lambda: self.model.model.layers[3].mlp.gate.weight),
-            ("L3.mlp.gate.e_score_correction_bias",
-                lambda: self.model.model.layers[3].mlp.gate.e_score_correction_bias),
-            ("L3.indexer.k_norm.weight",
-                lambda: _attn(3).indexer.k_norm.weight),
-            ("L3.indexer.k_norm.bias",
-                lambda: _attn(3).indexer.k_norm.bias),
-            ("model.norm.weight", lambda: self.model.model.norm.weight),
-        ]
-        logging.info("[GLM5 WEIGHT-VERIFY] dumping loaded stats (compare to disk)")
-        dense_mla = not hasattr(_attn(3), "indexer")
-        for name, getter in targets:
-            try:
-                t = getter()
-            except AttributeError as e:
-                if "indexer" in name and dense_mla:
-                    logging.info(f"[GLM5 WEIGHT-VERIFY] {name}: skipped (dense-MLA mode)")
-                else:
-                    logging.warning(f"[GLM5 WEIGHT-VERIFY] {name}: skipped — {e}")
-                continue
-            f32 = t.float()
-            first = [f"{x:.6g}" for x in t.flatten()[:5].tolist()]
-            logging.info(
-                f"[GLM5 WEIGHT-VERIFY] {name}: dtype={t.dtype} shape={tuple(t.shape)} "
-                f"min={f32.min().item():.6g} max={f32.max().item():.6g} "
-                f"mean={f32.mean().item():.6g} std={f32.std().item():.6g} "
-                f"first5={first}"
-            )
-
     def configure_prefill(self):
         """Configure model for prefill (pure DP, all modules offloaded)."""
         start_time = time.perf_counter()
@@ -191,7 +148,6 @@ class GLM5ParallelStrategyManager:
         self.model.to(self.engine_config.Basic_Config.device_torch)
         self._setup_fp8_scales()
         self._init_fused_kernels()
-        self._dump_weight_stats_once()
         timings['to_device'] = time.perf_counter() - step_start
 
         total_time = time.perf_counter() - start_time
