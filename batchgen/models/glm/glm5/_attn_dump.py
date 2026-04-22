@@ -51,7 +51,14 @@ def _rows_fh(rank: int):
 
 def note_microbatch(rank: int, mb_idx: int, global_ids, cu_seqlens,
                     max_seqlen: int, prepack_mode: bool) -> None:
-    """Record per-microbatch metadata in the rank's manifest (flushed on close)."""
+    """Record per-microbatch metadata in the rank's manifest AND flush it
+    to disk right away.
+
+    The flush-per-microbatch policy is deliberate: benchmark scripts
+    routinely kill the server with SIGKILL (pkill -9 python) between
+    runs, so a defer-to-graceful-shutdown manifest would be lost. The
+    file is tiny (a few KB) so flushing every call is free.
+    """
     if not enabled():
         return
     m = _MANIFEST.setdefault(
@@ -73,6 +80,14 @@ def note_microbatch(rank: int, mb_idx: int, global_ids, cu_seqlens,
         "max_seqlen": int(max_seqlen),
         "prepack_mode": bool(prepack_mode),
     })
+    # Atomic-ish write: dump to tmp file then rename. SIGKILL-safe.
+    path = os.path.join(_DIR, f"manifest.rank{rank:02d}.json")
+    tmp = path + ".tmp"
+    with _LOCK:
+        os.makedirs(_DIR, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(m, f, indent=2)
+        os.replace(tmp, path)
 
 
 def dump_rows(rank: int, site: str, layer_idx: int, global_ids, cu_seqlens,
