@@ -63,7 +63,7 @@ from tqdm import trange
 import gc
 import numpy as np
 from datetime import timedelta
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext as _nullctx
 from dataclasses import dataclass
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
@@ -9095,15 +9095,31 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
-						new_tokens,
-						attention_mask=Attn_Wrapper.attention_mask,
-						position_ids=Attn_Wrapper.position_ids,
-						use_cache=False
-					)
-					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+					from batchgen.timing import get_decode_timer as _get_dt_fwd
+					_dt_fwd = _get_dt_fwd()
+					_fwd_ctx = _dt_fwd.timed("forward_total", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
+					with _fwd_ctx:
+						outputs = self.model(
+							new_tokens,
+							attention_mask=Attn_Wrapper.attention_mask,
+							position_ids=Attn_Wrapper.position_ids,
+							use_cache=False
+						)
+					_sample_ctx = _dt_fwd.timed("sampling", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
+					with _sample_ctx:
+						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
+
+			# Step boundary for per-invocation timing. Drains queued
+			# CUDA events, resolves elapsed_ms, advances step counter,
+			# periodically flushes CSV (BATCHGEN_DECODE_TIMING_CSV).
+			_dt_step = get_decode_timer() if 'get_decode_timer' in dir() else None
+			if _dt_step is None:
+				from batchgen.timing import get_decode_timer as _get_dt_step
+				_dt_step = _get_dt_step()
+			if _dt_step is not None and _dt_step.enabled:
+				_dt_step.step_done()
 
 			# Flush deferred KV entries — single sync for all layers
 			self._flush_deferred_kv_to_host()
