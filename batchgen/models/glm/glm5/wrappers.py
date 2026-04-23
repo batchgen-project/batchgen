@@ -814,9 +814,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # (batchgen_worker.py decode loop) so the per-layer .sum().item()
             # here — which would fire 78x per step — becomes a plain int read.
             # Fallback recomputes locally if the hint wasn't populated (legacy
-            # forward paths / tests).
+            # forward paths / tests). The fallback MUST NOT run inside a CUDA
+            # graph capture region: .item() requires a completed reduce, which
+            # the capture cannot produce until after it ends.
             _short_count = AttnWrapperBase._dsa_short_count
             if _short_count is None:
+                assert not torch.cuda.is_current_stream_capturing(), (
+                    "DSA _short_count hint must be populated before CUDA "
+                    "graph capture; set AttnWrapperBase._dsa_short_count in "
+                    "the worker decode loop (see batchgen_worker.py)."
+                )
                 _short_count = int(_short_mask.sum().item())
             _any_short = _short_count > 0
             _any_long = _short_count < _bsz
@@ -843,6 +850,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
             else:
                 # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
+                # This branch uses a per-row dispatch with a host-sync on
+                # `_long_cache_seqlens.max().item()` below — not capture-safe.
+                # The scheduler must route mixed batches to the eager fallback
+                # variant (see plan §5: Glm5BatchDescriptor dsa_variant="eager").
+                assert not torch.cuda.is_current_stream_capturing(), (
+                    "Mixed DSA batch (some rows <= index_topk, some >) is "
+                    "not capture-safe; dispatch to eager fallback before "
+                    "graph.replay()."
+                )
                 _device = hidden_states.device
                 _long_mask = ~_short_mask
                 top_k_indices = torch.empty(

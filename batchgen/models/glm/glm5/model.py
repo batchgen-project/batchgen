@@ -1630,7 +1630,18 @@ class Glm5MoE(nn.Module):
         """Mixed path: WGMMA for persistent + loop for non-persistent.
 
         One .tolist() sync for expert_offsets (acceptable on opt-in path).
+
+        NOT capture-safe: the .tolist() below and the per-expert Python loop
+        over non-persistent experts both require host-visible expert offsets.
+        Production GLM-5-FP8 runs the 3D path (_forward_decode_3d →
+        _fp8_blockwise_gemm_3d) which has zero host syncs; this function is
+        only reachable when 3D is disabled (use_3d_moe=False or EP offloading).
         """
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "expert_compute_mixed is not capture-safe (expert_offsets.tolist()+"
+            "Python per-expert loop). Capture requires the 3D MoE path; ensure "
+            "use_3d_moe, _fp8_blockwise_ready, and Glm5MoE._3d_buf are all set."
+        )
         from mgn_kernel import fused_moe_token_dispatch
 
         n_persistent = self.num_persistent_local_experts
@@ -1776,7 +1787,18 @@ class Glm5MoE(nn.Module):
 
     def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
                                   num_local_experts=None):
-        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path)."""
+        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path).
+
+        NOT capture-safe: uses expert_offsets[-1].item() and
+        num_active_experts.item() below. This function only fires on the
+        Triton fallback path (_triton_compute); the production 3D path does
+        not call it.
+        """
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "_grouped_dequant_moe_fp8 is not capture-safe (two .item() calls). "
+            "Capture requires the 3D MoE path; check that the FP8 blockwise "
+            "3D kernels are active."
+        )
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
         from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma

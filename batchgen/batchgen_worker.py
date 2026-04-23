@@ -2355,6 +2355,13 @@ class BatchGenWorker:
 		"""Copy prefetched host KV pages into the GPU cache."""
 		if not global_sequence_ids:
 			return
+		# Host→GPU KV copy is a prefill/resume path and MUST NOT run inside a
+		# CUDA graph capture region — it relies on synchronous .wait() / H2D
+		# DMA that would either be captured incorrectly or deadlock the stream.
+		assert not torch.cuda.is_current_stream_capturing(), (
+			"_load_host_kv_to_gpu called inside CUDA graph capture; "
+			"hoist this call above the capture boundary."
+		)
 		copy_start = time.perf_counter()
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
@@ -7951,6 +7958,31 @@ class BatchGenWorker:
 			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
 			return
 
+		# NCCL >= 2.18 is required for safe in-graph collectives (capture +
+		# replay of ncclAllReduce / ncclAllGather). Older NCCL versions can
+		# either fail capture or produce stale communicator state at replay.
+		try:
+			nccl_ver = torch.cuda.nccl.version()
+		except Exception as exc:
+			logging.warning(
+				f"Rank {self.rank}: could not query NCCL version ({exc}); "
+				"skipping CUDA graph warmup out of caution"
+			)
+			return
+		# torch.cuda.nccl.version() returns either a tuple (major, minor, patch)
+		# or a packed int like 21903 → 2.19.3. Normalise both.
+		if isinstance(nccl_ver, int):
+			major, minor = divmod(nccl_ver, 10000)[0], (nccl_ver // 100) % 100
+			nccl_tuple = (major, minor)
+		else:
+			nccl_tuple = tuple(nccl_ver[:2])
+		if nccl_tuple < (2, 18):
+			logging.warning(
+				f"Rank {self.rank}: NCCL {nccl_tuple} < (2, 18); "
+				"in-graph collectives require >= 2.18. Skipping CUDA graph warmup."
+			)
+			return
+
 		self._setup_cuda_graphs(gpu_manager)
 
 	@staticmethod
@@ -8080,6 +8112,14 @@ class BatchGenWorker:
 				if (hasattr(moe_decode, 'persistent_expert_indices')
 						and len(moe_decode.persistent_expert_indices) > 0
 						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+					# In-graph all_reduce / all_gather require the PyNccl
+					# communicator (explicit stream, no torch.distributed host
+					# ops). A silent fallback to torch.distributed would either
+					# fail capture or corrupt replay state.
+					assert isinstance(moe_decode.comm, PyNcclCommunicator), (
+						f"Layer {layer_idx}: MoE comm is {type(moe_decode.comm).__name__}, "
+						"expected PyNcclCommunicator for CUDA graph capture."
+					)
 					# Create shared pool once from first MoE layer's params
 					if moe_pool is None:
 						moe_pool = SharedMoEBufferPool(
