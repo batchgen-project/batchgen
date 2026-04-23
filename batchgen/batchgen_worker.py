@@ -7944,13 +7944,20 @@ class BatchGenWorker:
 		Called from generate() after model and GPU KV manager are ready.
 		Only captures graphs for supported models (currently GPT-OSS-120B).
 		"""
+		# Env-override: BATCHGEN_GLM5_CUDA_GRAPH=1 on a GLM-5 model implies
+		# the user wants graphs on; flip enable_cuda_graphs. Without this
+		# the default disable_cuda_graphs=True blocks capture before the
+		# model guard below would allow it.
+		model_name = getattr(self, 'model_name', '') or ''
+		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+		_model_is_glm5 = is_glm5_backend_model(model_name)
+		if _model_is_glm5 and _glm5_cg_enabled:
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
+
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
 			return
 
 		# Model guard: only capture for supported models
-		model_name = getattr(self, 'model_name', '') or ''
-		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
-		_model_is_glm5 = is_glm5_backend_model(model_name)
 		_supported = (
 			"gpt-oss-120b" in model_name.lower()
 			or is_kimi_k25_backend_model(model_name)
