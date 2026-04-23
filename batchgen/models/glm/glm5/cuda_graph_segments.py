@@ -404,3 +404,83 @@ class Glm5MoeSegment:
             )
         moe_output = self.moe._forward_decode_3d(hidden_states)
         return {"moe_output": moe_output}
+
+
+# ============================================================================
+# Phase 2b-ii: decode-time replay proxy
+# ============================================================================
+
+
+class Glm5MoeReplayProxy:
+    """Callable that replaces a `Glm5MoE` instance in-place after graph capture.
+
+    `Glm5DecoderLayer.forward` calls `self.mlp(hidden_states)` — wrapping
+    `decoder_layer.mlp` with this proxy routes the call through the captured
+    graph instead of eager `Glm5MoE.forward`, cutting per-layer kernel-launch
+    overhead on top of the 2a-alpha bucket-buffer HBM savings.
+
+    Per-step flow (inside the proxy's `__call__`):
+
+      1. bucket = bucketing.get_padded_size(actual_ntp)   # pure Python
+      2. moe.num_tokens_per_rank = bucket                  # align for replay
+      3. graph_manager.replay(
+             f"layer_{layer_idx}_moe", actual_ntp,
+             hidden_states=input,                          # manager zeros tail
+         )                                                 # bucket padding
+      4. return out["moe_output"][:actual_ntp]             # unpad
+
+    Oversize / zero-batch fall back to eager `self.moe(hidden_states)`.
+
+    Attribute access (other than `__call__`) falls through to the wrapped
+    Glm5MoE via `__getattr__`, preserving compatibility with any caller that
+    reads `mlp.num_tokens_per_rank`, `mlp.comm`, etc. `isinstance(mlp, Glm5MoE)`
+    is NOT preserved — callers that still need type-checking should grab the
+    underlying `proxy.moe`.
+    """
+
+    def __init__(self, moe_module, layer_idx: int, graph_manager, bucketing):
+        # Use object.__setattr__ so our __getattr__ fallback doesn't intercept
+        # these. Otherwise the first access would go to self.moe.
+        object.__setattr__(self, "moe", moe_module)
+        object.__setattr__(self, "layer_idx", layer_idx)
+        object.__setattr__(self, "graph_manager", graph_manager)
+        object.__setattr__(self, "bucketing", bucketing)
+        object.__setattr__(self, "_segment_name", f"layer_{layer_idx}_moe")
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        actual_ntp = hidden_states.shape[0]
+
+        # Zero-batch: eager handles it cleanly (returns empty tensor matching
+        # orig_shape). Graph replay with batch_size=0 is undefined.
+        if actual_ntp == 0:
+            return self.moe(hidden_states)
+
+        # Bucket selection. get_padded_size raises ValueError on oversize.
+        try:
+            bucket = self.bucketing.get_padded_size(actual_ntp)
+        except ValueError:
+            # Batch exceeds max captured bucket — fall back to eager.
+            return self.moe(hidden_states)
+
+        # Align moe.num_tokens_per_rank so _forward_decode_3d inside the
+        # captured graph reads the bucket-matched value. Bypasses
+        # set_num_tokens_per_rank side effects (non-3D-path only).
+        self.moe.num_tokens_per_rank = bucket
+
+        # Dispatch. graph_manager.replay handles padding: copies input[:actual_ntp]
+        # into static[:actual_ntp] and zeros static[actual_ntp:bucket].
+        out = self.graph_manager.replay(
+            self._segment_name,
+            actual_ntp,
+            hidden_states=hidden_states,
+        )
+        # Slice back to actual batch. Note: this slice is a view into the
+        # captured graph's static output buffer — the caller in
+        # Glm5DecoderLayer.forward immediately consumes it via `residual + out`,
+        # which evaluates before any subsequent layer's replay can overwrite.
+        return out["moe_output"][:actual_ntp]
+
+    def __getattr__(self, name):
+        # Called only when the attribute is not found via normal lookup —
+        # the four attributes set in __init__ go through the normal path.
+        return getattr(self.moe, name)

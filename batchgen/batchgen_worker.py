@@ -8130,32 +8130,67 @@ class BatchGenWorker:
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
 
-			from batchgen.models.glm.glm5.cuda_graph_segments import Glm5MoeSegment
+			from batchgen.models.glm.glm5.cuda_graph_segments import (
+				Glm5MoeReplayProxy,
+				Glm5MoeSegment,
+			)
 			from batchgen.models.glm.glm5.model import Glm5MoE
+
+			# DSA segment registration is gated — its forward raises
+			# NotImplementedError (Phase 2a-ii not landed yet), so including
+			# it would crash warmup_and_capture_all() below.
+			_glm5_dsa_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_DSA", "0") == "1"
+
+			# Phase 2b needs a bucket set to capture against. Build one from
+			# the pre-allocated bucket buffers so capture-time bucket_ntp
+			# matches the buffer's bucket_ntp (== num_tokens_per_rank after
+			# our fix). Fall back to the generic cuda_graph_max_bucket_size
+			# path if BATCHGEN_GLM5_MTP_BUCKETS wasn't set.
+			from batchgen.models.glm.glm5.model import Glm5MoE as _G5M
+			world_size = self.world_size
+			if _G5M._bucket_bufs:
+				# Bucket ntps derived from pre-allocated buffers.
+				bucket_ntps = sorted(
+					max(1, mtp // world_size) for mtp in _G5M._bucket_bufs.keys()
+				)
+				bucketing = BatchSizeBucketing(bucket_ntps)
+				manager = CUDAGraphManager(bucketing, device=self.torch_device)
+				logging.info(
+					f"Rank {self.rank}: GLM-5 MoE bucketing (bucket_ntps): "
+					f"{bucket_ntps} (from BATCHGEN_GLM5_MTP_BUCKETS)"
+				)
+			else:
+				logging.warning(
+					f"Rank {self.rank}: GLM-5 CUDA graph enabled but "
+					"BATCHGEN_GLM5_MTP_BUCKETS not set — MoE bucket buffers "
+					"were not pre-allocated; capture would hit the singleton "
+					"resize path. Skipping capture."
+				)
+				return
 
 			dsa_count = 0
 			moe_count = 0
+			moe_layers: list[tuple[int, "torch.nn.Module"]] = []
 			hidden_size = self.model.config.hidden_size
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-				attn_wrapper = decoder_layer.self_attn
-				for variant in ("short", "long"):
-					seg = Glm5DsaAttnSegment(
-						decoder_layer=decoder_layer,
-						attn_wrapper=attn_wrapper,
-						layer_idx=layer_idx,
-						variant=variant,
-						max_seq_len=max_seq_len,
-						max_pages_per_seq=max_pages,
-						max_aux_pages_per_seq=max_aux_pages,
-						page_size_tokens=page_size_tokens,
-						aux_page_size_tokens=aux_page_size_tokens,
-					)
-					manager.register_segment(f"layer_{layer_idx}_dsa_{variant}", seg)
-					dsa_count += 1
+				if _glm5_dsa_enabled:
+					attn_wrapper = decoder_layer.self_attn
+					for variant in ("short", "long"):
+						seg = Glm5DsaAttnSegment(
+							decoder_layer=decoder_layer,
+							attn_wrapper=attn_wrapper,
+							layer_idx=layer_idx,
+							variant=variant,
+							max_seq_len=max_seq_len,
+							max_pages_per_seq=max_pages,
+							max_aux_pages_per_seq=max_aux_pages,
+							page_size_tokens=page_size_tokens,
+							aux_page_size_tokens=aux_page_size_tokens,
+						)
+						manager.register_segment(f"layer_{layer_idx}_dsa_{variant}", seg)
+						dsa_count += 1
 
-				# Register MoE segment only for MoE layers (first few are dense FFN).
-				# Glm5DecoderLayer at model.py:1893 selects dense vs MoE by
-				# `layer_idx < config.first_k_dense_replace`. Check mlp type.
+				# Register MoE segment for MoE layers only (first few are dense FFN).
 				mlp = getattr(decoder_layer, "mlp", None)
 				if isinstance(mlp, Glm5MoE) and mlp.use_3d_moe:
 					moe_seg = Glm5MoeSegment(
@@ -8165,17 +8200,45 @@ class BatchGenWorker:
 						hidden_size=hidden_size,
 					)
 					manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+					moe_layers.append((layer_idx, decoder_layer))
 					moe_count += 1
 
-			self._cuda_graph_manager = manager
 			logging.info(
-				f"Rank {self.rank}: GLM-5 CUDA graph segments registered — "
-				f"{dsa_count} DSA (Phase 2a scaffolding) + "
-				f"{moe_count} MoE (Phase 2b). "
-				"DSA forward is NotImplementedError until Phase 2a-ii. "
-				"MoE forward delegates to _forward_decode_3d — requires "
-				"BATCHGEN_GLM5_MTP_BUCKETS matching the bucket list above."
+				f"Rank {self.rank}: GLM-5 CUDA graph — registered "
+				f"{dsa_count} DSA + {moe_count} MoE segments across "
+				f"{len(bucket_ntps)} buckets {bucket_ntps}. "
+				"Starting capture..."
 			)
+
+			# All ranks must participate in NCCL collectives during capture.
+			torch.cuda.synchronize(self.torch_device)
+			dist.barrier()
+
+			manager.warmup_and_capture_all()
+
+			# Swap in replay proxies for each MoE layer. After this point,
+			# Glm5DecoderLayer.forward's `self.mlp(hidden_states)` routes
+			# through graph replay instead of eager _forward_decode_3d.
+			for layer_idx, decoder_layer in moe_layers:
+				original_mlp = decoder_layer.mlp
+				proxy = Glm5MoeReplayProxy(
+					moe_module=original_mlp,
+					layer_idx=layer_idx,
+					graph_manager=manager,
+					bucketing=bucketing,
+				)
+				decoder_layer.mlp = proxy
+
+			self._cuda_graph_manager = manager
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"GLM-5 MoE graph capture ready: "
+					f"{stats.get('total_capture_time_ms', 0):.0f}ms total, "
+					f"{moe_count} MoE layers × {len(bucket_ntps)} buckets = "
+					f"{moe_count * len(bucket_ntps)} graphs. "
+					f"Proxies installed — decoder_layer.mlp now replays."
+				)
 			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
