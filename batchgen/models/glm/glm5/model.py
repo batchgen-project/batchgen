@@ -74,6 +74,35 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 
 
+def _parse_mtp_buckets() -> list[int]:
+    """Parse BATCHGEN_GLM5_MTP_BUCKETS="128,256,512,1024,2048,4096" into a
+    sorted deduped list of mtp values.
+
+    When unset, returns [] — callers fall back to the legacy single-buffer
+    path (buf grows to worst-case global_bsz and stays there). When set,
+    each listed value becomes a pre-allocated `Glm5MoE3DBuffers` instance;
+    decode picks the smallest that fits the current global_bsz, cutting
+    the 770 MiB/layer zero-fill + result-copy waste.
+
+    Each value is rounded up to `_GLM5_MTP_BLOCK` alignment.
+    """
+    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS", "").strip()
+    if not raw:
+        return []
+    out: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        aligned = ((v + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK) * _GLM5_MTP_BLOCK
+        out.add(aligned)
+    return sorted(out)
+
+
+_GLM5_MTP_BUCKETS = _parse_mtp_buckets()
+
+
 # ============================================================================
 # RMSNorm
 # ============================================================================
@@ -1037,6 +1066,12 @@ class Glm5MoE(nn.Module):
 
     # K2.5 3D-MoE path (minimax parity).
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
+    # Bucket-aware 3D MoE buffers: smaller-batch decode steps pick a
+    # smaller-mtp buffer to cut the 770 MiB/layer zero-fill + result-copy
+    # HBM traffic. Populated only when BATCHGEN_GLM5_MTP_BUCKETS is set;
+    # otherwise all decode steps use the legacy `_3d_buf` singleton.
+    _bucket_bufs: Dict[int, Glm5MoE3DBuffers] = {}
+    _warned_bucket_select: Dict[int, bool] = {}
     _warned_k25_path = False
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
@@ -1114,6 +1149,61 @@ class Glm5MoE(nn.Module):
                 device=self.device,
                 max_tokens_padded=_GLM5_3D_MTP,
             )
+
+            # Pre-allocate per-bucket 3D buffers when BATCHGEN_GLM5_MTP_BUCKETS
+            # is set. Each bucket picks its smallest-fitting buffer at decode
+            # time, cutting the 770 MiB/layer HBM waste on small batches.
+            # Independent of CUDA-graph capture; also delivers an eager-mode
+            # speedup when small decode batches are common.
+            if _GLM5_MTP_BUCKETS:
+                max_global_bsz_any = max(_GLM5_MTP_BUCKETS)
+                for mtp in _GLM5_MTP_BUCKETS:
+                    if mtp in Glm5MoE._bucket_bufs:
+                        continue
+                    Glm5MoE._bucket_bufs[mtp] = Glm5MoE3DBuffers(
+                        E_local=self.experts_per_rank,
+                        max_global_bsz=max_global_bsz_any,
+                        H=self.hidden_size,
+                        N_inter=self.config.moe_intermediate_size,
+                        topk=K,
+                        num_tokens_per_rank=num_tokens_per_rank,
+                        device=self.device,
+                        max_tokens_padded=mtp,
+                    )
+                logging.info(
+                    f"[Glm5MoE] Pre-allocated bucket buffers for mtp={_GLM5_MTP_BUCKETS}"
+                )
+
+    @classmethod
+    def _select_3d_buf(cls, global_num_tokens: int) -> Glm5MoE3DBuffers:
+        """Pick the smallest pre-allocated bucket buffer whose mtp fits
+        `global_num_tokens`. Falls back to the legacy `_3d_buf` singleton
+        when `BATCHGEN_GLM5_MTP_BUCKETS` is unset or no bucket fits.
+
+        NOTE: the fallback path still calls `buf.resize_if_needed` upstream,
+        which grows the singleton to worst-case. For CUDA graph capture
+        (Phase 2b) the caller must supply a bucket size that has a pre-
+        allocated buffer — otherwise the captured buffer addresses would
+        drift on the first grow event.
+        """
+        if cls._bucket_bufs:
+            for mtp in sorted(cls._bucket_bufs):
+                if mtp >= global_num_tokens:
+                    buf = cls._bucket_bufs[mtp]
+                    if not cls._warned_bucket_select.get(mtp):
+                        logging.info(
+                            f"[Glm5MoE] Selecting bucket buffer mtp={mtp} "
+                            f"for global_num_tokens={global_num_tokens}"
+                        )
+                        cls._warned_bucket_select[mtp] = True
+                    return buf
+            # Oversize — fall through to singleton (which will resize_if_needed).
+            logging.warning(
+                f"[Glm5MoE] global_num_tokens={global_num_tokens} exceeds all "
+                f"pre-allocated buckets {sorted(cls._bucket_bufs)}; "
+                "falling back to singleton (will resize)"
+            )
+        return cls._3d_buf
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
@@ -1420,8 +1510,22 @@ class Glm5MoE(nn.Module):
         ntp = self.num_tokens_per_rank
         num_global = ntp * self.world_size
         topk = self.num_experts_per_tok
-        buf = Glm5MoE._3d_buf
+        # Bucket-aware buffer selection — picks smallest mtp that fits
+        # global_num_tokens when BATCHGEN_GLM5_MTP_BUCKETS is set; otherwise
+        # falls back to the singleton _3d_buf. See _select_3d_buf for the
+        # resize_if_needed contract at the fallback boundary.
+        buf = Glm5MoE._select_3d_buf(num_global)
+        # Still need resize guard for the singleton (or oversize fallback);
+        # a pre-allocated bucket buffer already satisfies num_global, so
+        # resize_if_needed is a cheap no-op on that path.
         buf.resize_if_needed(num_global)
+        # Keep padded buffer width in sync with per-step num_tokens_per_rank
+        # when we switched to a bucket-buffer whose `padded` was sized to a
+        # different rank count. Mirrors set_num_tokens_per_rank:1145-1149.
+        if buf.padded.shape[0] != ntp:
+            buf.padded = torch.zeros(
+                ntp, buf.H, dtype=torch.bfloat16, device=buf.device,
+            )
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
             logging.warning(
