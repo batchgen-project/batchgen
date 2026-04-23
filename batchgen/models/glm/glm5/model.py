@@ -1138,7 +1138,21 @@ class Glm5MoE(nn.Module):
         ).repeat(global_num_tokens)
 
         # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
+        # When BATCHGEN_GLM5_MTP_BUCKETS is set, size the singleton to the
+        # largest bucket instead of _GLM5_3D_MTP=4096 — the bucket path
+        # always serves batches up to max(_GLM5_MTP_BUCKETS), so the 4096
+        # default is pure waste (~1.5 GiB/GPU for dispatched_x+expert_out
+        # at mtp=4096). Singleton is only used as fallback for oversize.
         if self.use_3d_moe and _GLM5_HAS_DISPATCH_3D and Glm5MoE._3d_buf is None:
+            if _GLM5_MTP_BUCKETS:
+                _singleton_mtp = max(_GLM5_MTP_BUCKETS)
+                logging.info(
+                    f"[Glm5MoE] Buckets set; sizing singleton _3d_buf to "
+                    f"max bucket mtp={_singleton_mtp} instead of "
+                    f"_GLM5_3D_MTP={_GLM5_3D_MTP} to avoid oversize waste"
+                )
+            else:
+                _singleton_mtp = _GLM5_3D_MTP
             Glm5MoE._3d_buf = Glm5MoE3DBuffers(
                 E_local=self.experts_per_rank,
                 max_global_bsz=global_num_tokens,
@@ -1147,7 +1161,7 @@ class Glm5MoE(nn.Module):
                 topk=K,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_GLM5_3D_MTP,
+                max_tokens_padded=_singleton_mtp,
             )
 
             # Pre-allocate per-bucket 3D buffers when BATCHGEN_GLM5_MTP_BUCKETS
