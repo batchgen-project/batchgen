@@ -165,6 +165,20 @@ class CUDAGraphManager:
         # Shared memory pool across all graphs to minimize HBM usage.
         self._pool = torch.cuda.graph_pool_handle()
 
+        # Dedicated capture/replay stream. Required for CUDA-graph-captured
+        # NCCL collectives: PyNccl (ctypes) bakes the submission stream
+        # handle into the recorded NCCL kernel args at capture time. At
+        # replay, those args use the SAME handle — so replay MUST also run
+        # on this exact stream or NCCL deadlocks waiting on peer coordination
+        # that never arrives (peers are using their own graph streams on the
+        # handles recorded into their respective graphs).
+        #
+        # By using one persistent stream for both capture and every replay,
+        # the captured stream handle stays valid at every replay. Callers
+        # sync the active stream with this one via wait_stream before/after
+        # the actual graph.replay() call (handled inside replay()).
+        self._graph_stream = torch.cuda.Stream(device=self.device)
+
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
         self._segments: Dict[str, CapturableSegment] = {}
@@ -235,16 +249,32 @@ class CUDAGraphManager:
         if hasattr(segment, 'setup_static_buffers'):
             segment.setup_static_buffers(bucket_size)
 
-        # 2. Warmup on current stream
-        for _ in range(self.WARMUP_ITERATIONS):
-            with torch.inference_mode():
-                segment.forward(**static_inputs)
+        # 2. Warmup + 3. Capture on the dedicated graph stream.
+        # Warmup must run on the same stream as capture so any lazy JIT /
+        # cuBLAS workspace init happens with the correct stream context;
+        # capture must run on the graph stream so NCCL's baked-in stream
+        # handle matches what we'll use at every replay (see __init__).
+        #
+        # Sync _graph_stream with the caller's current stream before
+        # warmup so any pre-existing work the segment needs (e.g. weight
+        # loads on default stream) is visible on _graph_stream.
+        caller_stream = torch.cuda.current_stream(self.device)
+        self._graph_stream.wait_stream(caller_stream)
 
-        # 3. Capture on current stream with shared pool
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
-            with torch.inference_mode():
-                static_outputs = segment.forward(**static_inputs)
+        with torch.cuda.stream(self._graph_stream):
+            for _ in range(self.WARMUP_ITERATIONS):
+                with torch.inference_mode():
+                    segment.forward(**static_inputs)
+            torch.cuda.synchronize(self.device)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._pool, stream=self._graph_stream):
+                with torch.inference_mode():
+                    static_outputs = segment.forward(**static_inputs)
+
+        # Caller's stream waits for graph stream so captured outputs are
+        # visible on default stream when this function returns.
+        caller_stream.wait_stream(self._graph_stream)
 
         # Normalize outputs to dict
         if not isinstance(static_outputs, dict):
@@ -285,32 +315,49 @@ class CUDAGraphManager:
                 f"Available: {list(self._graphs[name].keys())}"
             )
 
-        # Copy inputs to static buffers
-        for key, tensor in inputs.items():
-            static_tensor = captured.static_inputs.get(key)
-            if static_tensor is None:
-                raise KeyError(
-                    f"Input '{key}' not found in captured graph '{name}'. "
-                    f"Available: {list(captured.static_inputs.keys())}"
-                )
-            if tensor.shape[0] < static_tensor.shape[0]:
-                fill_val = captured.input_fill_values.get(key, 0.0)
-                padding_slice = static_tensor[tensor.shape[0]:]
-                if fill_val == 0.0:
-                    padding_slice.zero_()
-                else:
-                    padding_slice.fill_(fill_val)
-                static_tensor[:tensor.shape[0]].copy_(tensor, non_blocking=True)
-            elif tensor.shape[0] == static_tensor.shape[0]:
-                static_tensor.copy_(tensor, non_blocking=True)
-            else:
-                raise ValueError(
-                    f"Input '{key}' batch dim {tensor.shape[0]} exceeds "
-                    f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
-                )
+        # Sync the dedicated graph stream with the caller's current stream
+        # so captured collectives see input data that was written on the
+        # caller's stream (e.g. attention output feeding into MoE). Without
+        # this wait_stream, _graph_stream could start replaying before
+        # inputs are actually written.
+        caller_stream = torch.cuda.current_stream(self.device)
+        self._graph_stream.wait_stream(caller_stream)
 
-        # Replay on current stream — no cross-stream sync needed
-        captured.graph.replay()
+        with torch.cuda.stream(self._graph_stream):
+            # Copy inputs into static buffers (on _graph_stream, so downstream
+            # graph.replay() sees consistent stream ordering).
+            for key, tensor in inputs.items():
+                static_tensor = captured.static_inputs.get(key)
+                if static_tensor is None:
+                    raise KeyError(
+                        f"Input '{key}' not found in captured graph '{name}'. "
+                        f"Available: {list(captured.static_inputs.keys())}"
+                    )
+                if tensor.shape[0] < static_tensor.shape[0]:
+                    fill_val = captured.input_fill_values.get(key, 0.0)
+                    padding_slice = static_tensor[tensor.shape[0]:]
+                    if fill_val == 0.0:
+                        padding_slice.zero_()
+                    else:
+                        padding_slice.fill_(fill_val)
+                    static_tensor[:tensor.shape[0]].copy_(tensor, non_blocking=True)
+                elif tensor.shape[0] == static_tensor.shape[0]:
+                    static_tensor.copy_(tensor, non_blocking=True)
+                else:
+                    raise ValueError(
+                        f"Input '{key}' batch dim {tensor.shape[0]} exceeds "
+                        f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
+                    )
+
+            # Replay on the dedicated graph stream so the captured NCCL
+            # collective's baked-in stream handle matches the submission
+            # stream. (If we replayed on caller's stream, NCCL would
+            # deadlock — see __init__ docstring.)
+            captured.graph.replay()
+
+        # Caller's stream waits for _graph_stream so the returned output
+        # tensor views are consumable on the caller's stream.
+        caller_stream.wait_stream(self._graph_stream)
 
         # Return unpadded outputs
         result = {}
