@@ -87,7 +87,7 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import is_glm5_backend_model, is_kimi_k25_backend_model
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
@@ -7949,8 +7949,21 @@ class BatchGenWorker:
 
 		# Model guard: only capture for supported models
 		model_name = getattr(self, 'model_name', '') or ''
-		if "gpt-oss-120b" not in model_name.lower() and not is_kimi_k25_backend_model(model_name):
-			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
+		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+		_model_is_glm5 = is_glm5_backend_model(model_name)
+		_supported = (
+			"gpt-oss-120b" in model_name.lower()
+			or is_kimi_k25_backend_model(model_name)
+			or (_model_is_glm5 and _glm5_cg_enabled)
+		)
+		if not _supported:
+			if _model_is_glm5 and not _glm5_cg_enabled:
+				logging.info(
+					f"Rank {self.rank}: GLM-5 CUDA graphs gated off "
+					"(set BATCHGEN_GLM5_CUDA_GRAPH=1 to enable Phase 2a)"
+				)
+			else:
+				logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
 
 		gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
@@ -8059,6 +8072,11 @@ class BatchGenWorker:
 
 		# Detect K2.5 model for specialized graph segment
 		_is_k25 = is_kimi_k25_backend_model(self.model_name)
+		# Phase 2a (Glm5DsaAttnSegment — per-layer DSA attention only).
+		# Enabled via BATCHGEN_GLM5_CUDA_GRAPH=1; forward body is scaffolding
+		# until Phase 2a-ii refactor lands, so capture will raise
+		# NotImplementedError if registration is actually attempted today.
+		_is_glm5 = is_glm5_backend_model(self.model_name)
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
@@ -8074,6 +8092,68 @@ class BatchGenWorker:
 		# Use model's max_position_embeddings (not max_context_length) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
+
+		# GLM-5 Phase 2a: register per-layer DSA attention segments (scaffolding).
+		# Branch is taken before the GPT-OSS block because GLM-5 uses MLA+DSA,
+		# not GQA, and has its own segment class. Registration is a no-op if
+		# the Phase 2a-ii refactor hasn't landed — warmup_and_capture_all()
+		# will raise NotImplementedError loudly from Glm5DsaAttnSegment.forward.
+		if _is_glm5:
+			from batchgen.models.glm.glm5.cuda_graph_segments import Glm5DsaAttnSegment
+
+			# Static page-table widths for primary MLA KV + DSA indexer KV.
+			# Sized from the model's max_position_embeddings so sequences can
+			# grow to full context length without reading past the captured
+			# static buffer width.
+			max_seq_len = self.model.config.max_position_embeddings
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+			# Aux (DSA indexer) KV uses a separate manager with potentially
+			# different page size. Pull from the auxiliary manager if bound.
+			aux_manager = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+			if aux_manager is None:
+				logging.warning(
+					f"Rank {self.rank}: GLM-5 CUDA graph capture requested but "
+					"gpu_paged_kv_manager_aux not bound — skipping"
+				)
+				return
+			aux_page_size_tokens = aux_manager.config.page_size_tokens
+			max_aux_pages = (max_seq_len + aux_page_size_tokens - 1) // aux_page_size_tokens
+
+			# Pre-warm RoPE cos/sin cache on the shared rotary embedding.
+			shared_rope = getattr(self.model.model, "_shared_rotary_emb", None)
+			if shared_rope is not None:
+				dummy = torch.zeros(1, 1, 1, shared_rope.dim, device=self.torch_device)
+				shared_rope(dummy, seq_len=max_seq_len)
+
+			# Assert required host-side scheduler state is wired before capture.
+			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				attn_wrapper = decoder_layer.self_attn
+				for variant in ("short", "long"):
+					seg = Glm5DsaAttnSegment(
+						decoder_layer=decoder_layer,
+						attn_wrapper=attn_wrapper,
+						layer_idx=layer_idx,
+						variant=variant,
+						max_seq_len=max_seq_len,
+						max_pages_per_seq=max_pages,
+						max_aux_pages_per_seq=max_aux_pages,
+						page_size_tokens=page_size_tokens,
+						aux_page_size_tokens=aux_page_size_tokens,
+					)
+					manager.register_segment(f"layer_{layer_idx}_dsa_{variant}", seg)
+
+			self._cuda_graph_manager = manager
+			logging.info(
+				f"Rank {self.rank}: GLM-5 Phase-2a DSA segments registered "
+				f"({len(self.model.model.layers)} layers × 2 variants). "
+				"Capture will run warmup_and_capture_all() — scaffolding "
+				"forward() will raise NotImplementedError until Phase 2a-ii."
+			)
+			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
 		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
