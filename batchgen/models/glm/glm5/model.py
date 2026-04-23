@@ -1718,16 +1718,16 @@ class Glm5MoE(nn.Module):
                 inter_quant, inter_scale = _act_quant(intermediate)
                 inter_scale_t = inter_scale.t().contiguous()
 
-        # S3: down projection
+        # S3: down projection (in-place into buf.expert_out — matches kimi_k25
+        # pattern, eliminates ~35 ms/step of redundant copy traffic).
         with (dt.timed("s3_down", li) if dt else _nullctx()):
-            result = grouped_fp8_blockwise_s3(
+            grouped_fp8_blockwise_s3(
                 inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
                 self.fp8_down_w3d.view(torch.float8_e4m3fn),
                 self.fp8_down_ws3d,
                 seqlens, cu_seqlens, avg,
+                output=buf.expert_out[:E * mtp],
             )
-        with (dt.timed("expert_out_copy", li) if dt else _nullctx()):
-            buf.expert_out[:E * mtp].copy_(result[:E * mtp])
 
     # ── Gate + Expert Compute ──
 
