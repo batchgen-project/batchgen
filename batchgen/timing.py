@@ -130,7 +130,15 @@ class TimingStats:
     # -- Lifecycle ---------------------------------------------------------
 
     def reset(self):
-        """Clear records + pending. Event pool is preserved."""
+        """Clear records + pending. Preserves monotonic step counter.
+
+        DOES NOT reset `_step_idx`: batchgen_worker.py calls
+        `log_summary() + reset()` per decode step (batchgen_worker.py:9206),
+        so zeroing step_idx here would stamp every step's events with
+        step=0, making per-step analysis impossible. step_idx is monotonic
+        from process start; the CSV carries it through so downstream
+        pivots can aggregate or filter arbitrarily.
+        """
         # Recycle pending events (they may never resolve but freeing them
         # into the pool is still better than leaking).
         for ev in self._pending:
@@ -138,7 +146,6 @@ class TimingStats:
             self._recycle_event(ev.end_event)
         self._pending.clear()
         self._records.clear()
-        self._step_idx = 0
         self._call_counter = 0
         # Critical: CSV flush tracks `_csv_rows_written` as an index into
         # `_records`. If we clear records without resetting this cursor,
