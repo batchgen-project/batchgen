@@ -158,7 +158,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
@@ -182,7 +190,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         self.nccl.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -209,7 +225,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         self.nccl.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -228,7 +252,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -246,7 +278,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -264,7 +304,15 @@ class PyNcclCommunicator:
             f"but the input tensor is on {tensor.device}"
         )
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer
@@ -303,7 +351,15 @@ class PyNcclCommunicator:
             enable = self.available
 
         if stream is None:
-            stream = self.stream
+            # Default to the caller's current CUDA stream (vLLM / SGLang
+            # pattern). Falling back to self.stream — PyNccl's own warmup
+            # stream set at __init__ — caused cross-rank NCCL deadlocks
+            # when some call sites use current_stream() inside a captured
+            # CUDA graph while others hit this default and run on the
+            # warmup stream. Every NCCL submission must end up on the same
+            # logical ordering domain or peers hang on counter ticks that
+            # never arrive.
+            stream = torch.cuda.current_stream(self.device)
 
         old_disable = self.disabled
         old_stream = self.stream

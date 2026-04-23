@@ -315,49 +315,43 @@ class CUDAGraphManager:
                 f"Available: {list(self._graphs[name].keys())}"
             )
 
-        # Sync the dedicated graph stream with the caller's current stream
-        # so captured collectives see input data that was written on the
-        # caller's stream (e.g. attention output feeding into MoE). Without
-        # this wait_stream, _graph_stream could start replaying before
-        # inputs are actually written.
-        caller_stream = torch.cuda.current_stream(self.device)
-        self._graph_stream.wait_stream(caller_stream)
-
-        with torch.cuda.stream(self._graph_stream):
-            # Copy inputs into static buffers (on _graph_stream, so downstream
-            # graph.replay() sees consistent stream ordering).
-            for key, tensor in inputs.items():
-                static_tensor = captured.static_inputs.get(key)
-                if static_tensor is None:
-                    raise KeyError(
-                        f"Input '{key}' not found in captured graph '{name}'. "
-                        f"Available: {list(captured.static_inputs.keys())}"
-                    )
-                if tensor.shape[0] < static_tensor.shape[0]:
-                    fill_val = captured.input_fill_values.get(key, 0.0)
-                    padding_slice = static_tensor[tensor.shape[0]:]
-                    if fill_val == 0.0:
-                        padding_slice.zero_()
-                    else:
-                        padding_slice.fill_(fill_val)
-                    static_tensor[:tensor.shape[0]].copy_(tensor, non_blocking=True)
-                elif tensor.shape[0] == static_tensor.shape[0]:
-                    static_tensor.copy_(tensor, non_blocking=True)
+        # Replay runs on the CALLER'S CURRENT STREAM (vLLM / SGLang pattern).
+        # Earlier versions wrapped this in `torch.cuda.stream(_graph_stream)`,
+        # but that broke ordering with the eager NCCL ops issued by the
+        # attention path (which resolve to `current_stream()` at call time).
+        # When captured collectives ran on `_graph_stream` while eager
+        # collectives ran on the caller stream, cross-rank NCCL interleave
+        # desynchronized → peer coordination hang.
+        #
+        # `torch.cuda.CUDAGraph.replay()` re-emits the captured kernels on
+        # the currently-active stream; the capture stream chosen at record
+        # time is irrelevant at replay. Keep capture on `_graph_stream`
+        # (a CUDA restriction forbids capturing on the default stream), but
+        # let replay inherit the caller's stream.
+        for key, tensor in inputs.items():
+            static_tensor = captured.static_inputs.get(key)
+            if static_tensor is None:
+                raise KeyError(
+                    f"Input '{key}' not found in captured graph '{name}'. "
+                    f"Available: {list(captured.static_inputs.keys())}"
+                )
+            if tensor.shape[0] < static_tensor.shape[0]:
+                fill_val = captured.input_fill_values.get(key, 0.0)
+                padding_slice = static_tensor[tensor.shape[0]:]
+                if fill_val == 0.0:
+                    padding_slice.zero_()
                 else:
-                    raise ValueError(
-                        f"Input '{key}' batch dim {tensor.shape[0]} exceeds "
-                        f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
-                    )
+                    padding_slice.fill_(fill_val)
+                static_tensor[:tensor.shape[0]].copy_(tensor, non_blocking=True)
+            elif tensor.shape[0] == static_tensor.shape[0]:
+                static_tensor.copy_(tensor, non_blocking=True)
+            else:
+                raise ValueError(
+                    f"Input '{key}' batch dim {tensor.shape[0]} exceeds "
+                    f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
+                )
 
-            # Replay on the dedicated graph stream so the captured NCCL
-            # collective's baked-in stream handle matches the submission
-            # stream. (If we replayed on caller's stream, NCCL would
-            # deadlock — see __init__ docstring.)
-            captured.graph.replay()
-
-        # Caller's stream waits for _graph_stream so the returned output
-        # tensor views are consumable on the caller's stream.
-        caller_stream.wait_stream(self._graph_stream)
+        captured.graph.replay()
 
         # Return unpadded outputs
         result = {}
