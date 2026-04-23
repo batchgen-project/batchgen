@@ -140,6 +140,13 @@ class TimingStats:
         self._records.clear()
         self._step_idx = 0
         self._call_counter = 0
+        # Critical: CSV flush tracks `_csv_rows_written` as an index into
+        # `_records`. If we clear records without resetting this cursor,
+        # `_records[_csv_rows_written:]` is empty forever and subsequent
+        # decode groups' records never reach the CSV. log_summary() runs
+        # _flush_csv() before reset(), so any unflushed rows from the
+        # cleared group already made it out.
+        self._csv_rows_written = 0
 
     def enable(self):
         self.enabled = True
