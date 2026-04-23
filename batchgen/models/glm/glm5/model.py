@@ -1155,23 +1155,34 @@ class Glm5MoE(nn.Module):
             # time, cutting the 770 MiB/layer HBM waste on small batches.
             # Independent of CUDA-graph capture; also delivers an eager-mode
             # speedup when small decode batches are common.
+            #
+            # Each bucket's `padded` must be sized to `mtp // world_size` so
+            # NCCL all_gather sends exactly `bucket_ntp * H` elements per
+            # rank — matching the bucket's global_bsz. Sizing it to the
+            # current `num_tokens_per_rank` is a bug: _forward_decode_3d
+            # would then recreate padded on every step in eager mode (silent
+            # perf loss), and during capture it would either bake a stale
+            # size or recreate during stream capture (graph-invalid).
             if _GLM5_MTP_BUCKETS:
                 max_global_bsz_any = max(_GLM5_MTP_BUCKETS)
                 for mtp in _GLM5_MTP_BUCKETS:
                     if mtp in Glm5MoE._bucket_bufs:
                         continue
+                    bucket_ntp = max(1, mtp // self.world_size)
                     Glm5MoE._bucket_bufs[mtp] = Glm5MoE3DBuffers(
                         E_local=self.experts_per_rank,
                         max_global_bsz=max_global_bsz_any,
                         H=self.hidden_size,
                         N_inter=self.config.moe_intermediate_size,
                         topk=K,
-                        num_tokens_per_rank=num_tokens_per_rank,
+                        num_tokens_per_rank=bucket_ntp,
                         device=self.device,
                         max_tokens_padded=mtp,
                     )
                 logging.info(
-                    f"[Glm5MoE] Pre-allocated bucket buffers for mtp={_GLM5_MTP_BUCKETS}"
+                    f"[Glm5MoE] Pre-allocated bucket buffers for mtp={_GLM5_MTP_BUCKETS} "
+                    f"(world_size={self.world_size}, bucket_ntp="
+                    f"{[max(1, m // self.world_size) for m in _GLM5_MTP_BUCKETS]})"
                 )
 
     @classmethod
@@ -1519,10 +1530,26 @@ class Glm5MoE(nn.Module):
         # a pre-allocated bucket buffer already satisfies num_global, so
         # resize_if_needed is a cheap no-op on that path.
         buf.resize_if_needed(num_global)
-        # Keep padded buffer width in sync with per-step num_tokens_per_rank
-        # when we switched to a bucket-buffer whose `padded` was sized to a
-        # different rank count. Mirrors set_num_tokens_per_rank:1145-1149.
+        # Keep padded buffer width in sync with per-step num_tokens_per_rank.
+        # NCCL all_gather sends exactly `padded.numel()` elements per rank;
+        # a mismatch between `padded.shape[0]` and the actual `ntp` collapses
+        # all_gather (ranks 1..N's contributions land past the reader slice
+        # — see set_num_tokens_per_rank:1137-1144 for the original incident).
+        #
+        # In eager mode this recreate is benign. Inside CUDA-graph capture
+        # it is fatal: the tensor allocation happens in Python during stream
+        # capture, which either (a) gets recorded as an alloc in the graph
+        # pool (silently wastes memory + breaks static-address invariant)
+        # or (b) hits a torch.cuda.graph assertion. Force it to fail loud so
+        # the scheduler learns it must pad `ntp` to the bucket's `bucket_ntp`
+        # before replay.
         if buf.padded.shape[0] != ntp:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"Glm5MoE3DBuffers.padded.shape[0]={buf.padded.shape[0]} "
+                f"!= ntp={ntp} inside graph capture. The scheduler must "
+                "pad num_tokens_per_rank to the bucket's bucket_ntp "
+                "(= mtp // world_size) before calling graph.replay()."
+            )
             buf.padded = torch.zeros(
                 ntp, buf.H, dtype=torch.bfloat16, device=buf.device,
             )
