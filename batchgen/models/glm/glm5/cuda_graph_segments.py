@@ -459,17 +459,36 @@ class Glm5MoeReplayProxy(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         actual_ntp = hidden_states.shape[0]
 
-        # Zero-batch: eager handles it cleanly. Graph replay at batch=0
-        # is undefined (captured at a positive bucket).
+        # Pick the replay bucket. We MUST always take the captured path
+        # here — falling back to eager on some ranks (e.g. zero-batch or
+        # oversize) while other ranks replay creates mismatched NCCL
+        # collective counts across ranks → cross-rank peer deadlock
+        # observed in run #7/8: rank 4 went eager _forward_decode_3d
+        # while rank 0 replayed captured, their NCCL calls failed to
+        # pair up.
+        #
+        # Zero-batch: pass smallest bucket, slice [:0] post-replay.
+        # Captured graph handles zero real input correctly because it
+        # was captured with fill_value=0 static input (every replay
+        # zeros the tail anyway).
+        #
+        # Oversize: would require a larger bucket than we have. There's
+        # no safe way to handle this without cross-rank coordination —
+        # raise loudly so the bucket list can be extended.
         if actual_ntp == 0:
-            return self.moe(hidden_states)
-
-        # Bucket selection. get_padded_size raises ValueError on oversize.
-        try:
-            bucket = self.bucketing.get_padded_size(actual_ntp)
-        except ValueError:
-            # Batch exceeds max captured bucket — fall back to eager.
-            return self.moe(hidden_states)
+            bucket = min(self.bucketing.bucket_sizes)
+            replay_bs = bucket
+        else:
+            try:
+                bucket = self.bucketing.get_padded_size(actual_ntp)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
+                    f"actual_ntp={actual_ntp} exceeds max bucket "
+                    f"{max(self.bucketing.bucket_sizes)}. Increase "
+                    "BATCHGEN_GLM5_MTP_BUCKETS or disable CUDA graph."
+                ) from exc
+            replay_bs = actual_ntp
 
         # Align moe.num_tokens_per_rank so _forward_decode_3d inside the
         # captured graph reads the bucket-matched value.
@@ -479,13 +498,10 @@ class Glm5MoeReplayProxy(torch.nn.Module):
         # input[:actual_ntp] into static[:actual_ntp] and zeros the tail.
         out = self.graph_manager.replay(
             self._segment_name,
-            actual_ntp,
+            replay_bs,
             hidden_states=hidden_states,
         )
-        # Slice back to actual batch. This is a view into the captured
-        # graph's static output buffer; Glm5DecoderLayer.forward consumes
-        # it immediately via `residual + out`, so subsequent layers'
-        # replays overwriting the shared buffer is stream-ordered-safe.
+        # Slice back to actual batch.
         return out["moe_output"][:actual_ntp]
 
     def __getattr__(self, name):
