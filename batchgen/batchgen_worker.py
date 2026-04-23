@@ -1206,6 +1206,67 @@ class BatchGenWorker:
 				continue
 			self._bind_local_sequence_to_query_book(uuid)
 
+	def _maybe_log_completion_distribution(self, completed_uuids: List[str]) -> None:
+		"""Rank-0 distribution log for completed sequences.
+
+		Emits a [Distribution] line with prompt_len + decoded_len percentiles every
+		100 successful samples (cumulative since first call). Samples are bounded
+		to the last 10 000 to cap memory. Exception-safe — never crashes the hot
+		path. Self-initializes, so hot-reload (which rebinds methods but not
+		__init__) still works.
+
+		Counting invariant: st["count"] advances only when a sample is appended,
+		so the "every 100" trigger fires exactly once per real 100-sample boundary
+		even if get_sequence(uuid) returns None for some UUIDs.
+		"""
+		if self.rank != 0 or not completed_uuids:
+			return
+		try:
+			if not hasattr(self, "_dist_state"):
+				self._dist_state = {"count": 0, "prompt_lens": [], "decoded_lens": []}
+			st = self._dist_state
+
+			n_new = 0
+			for uuid in completed_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					continue
+				st["prompt_lens"].append(int(seq.prompt_length))
+				st["decoded_lens"].append(
+					int(seq.decoded_length)
+					+ int(getattr(seq, "total_decoded_before_eviction", 0))
+				)
+				n_new += 1
+			if n_new == 0:
+				return
+
+			# Ring-trim to last 10 000 samples (hard memory ceiling).
+			for key in ("prompt_lens", "decoded_lens"):
+				if len(st[key]) > 10_000:
+					st[key] = st[key][-10_000:]
+
+			prev = st["count"]
+			st["count"] += n_new
+			if st["count"] // 100 == prev // 100:
+				return  # no 100-boundary crossed this step
+
+			def _pct(xs, q):
+				n = len(xs); s = sorted(xs)
+				return s[min(int(q * (n - 1)), n - 1)]
+
+			pl, dl = st["prompt_lens"], st["decoded_lens"]
+			logging.info(
+				f"[Distribution] completed={st['count']} "
+				f"(Δ={n_new} this step, sample_n={len(pl)}) | "
+				f"prompt_len: min={min(pl)} p50={_pct(pl,0.50)} p90={_pct(pl,0.90)} "
+				f"p99={_pct(pl,0.99)} max={max(pl)} | "
+				f"decoded_len: min={min(dl)} p50={_pct(dl,0.50)} p90={_pct(dl,0.90)} "
+				f"p99={_pct(dl,0.99)} max={max(dl)}"
+			)
+		except Exception as exc:
+			# Diagnostic logging must never crash the worker hot path.
+			logging.warning(f"[Distribution] log emission failed: {exc!r}")
+
 	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
 		"""Report a single sequence completion to the response queue.
 
@@ -7369,6 +7430,10 @@ class BatchGenWorker:
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+			# Rank-0 distribution log — every 100 completions. Placed here
+			# (before _report_completion) so seqs are guaranteed still in
+			# global_batch with final decoded_length.
+			self._maybe_log_completion_distribution(completed_uuids)
 			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
 			# Gather decoded tokens from owning ranks before reporting
