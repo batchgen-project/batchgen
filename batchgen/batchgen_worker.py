@@ -8238,15 +8238,30 @@ class BatchGenWorker:
 			# Swap in replay proxies for each MoE layer. After this point,
 			# Glm5DecoderLayer.forward's `self.mlp(hidden_states)` routes
 			# through graph replay instead of eager _forward_decode_3d.
-			for layer_idx, decoder_layer in moe_layers:
-				original_mlp = decoder_layer.mlp
-				proxy = Glm5MoeReplayProxy(
-					moe_module=original_mlp,
-					layer_idx=layer_idx,
-					graph_manager=manager,
-					bucketing=bucketing,
+			#
+			# Diagnostic: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 captures the
+			# graphs but leaves decoder_layer.mlp pointing at the original
+			# eager Glm5MoE. Used to bisect "is the bug in capture-time
+			# state poisoning or in replay path?": if decode output is
+			# correct with skip_swap=1, the issue is in proxy/replay; if
+			# still garbage, capture is poisoning shared state.
+			_skip_swap = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP", "0") == "1"
+			if _skip_swap:
+				logging.warning(
+					f"Rank {self.rank}: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 — "
+					"graphs captured but proxies NOT installed. Decode uses "
+					"eager Glm5MoE. (Diagnostic mode)"
 				)
-				decoder_layer.mlp = proxy
+			else:
+				for layer_idx, decoder_layer in moe_layers:
+					original_mlp = decoder_layer.mlp
+					proxy = Glm5MoeReplayProxy(
+						moe_module=original_mlp,
+						layer_idx=layer_idx,
+						graph_manager=manager,
+						bucketing=bucketing,
+					)
+					decoder_layer.mlp = proxy
 
 			self._cuda_graph_manager = manager
 			if self.rank == 0:
@@ -8256,7 +8271,8 @@ class BatchGenWorker:
 					f"{stats.get('total_capture_time_ms', 0):.0f}ms total, "
 					f"{moe_count} MoE layers × {len(bucket_ntps)} buckets = "
 					f"{moe_count * len(bucket_ntps)} graphs. "
-					f"Proxies installed — decoder_layer.mlp now replays."
+					+ ("SKIP_SWAP=1, proxies NOT installed." if _skip_swap
+					   else "Proxies installed — decoder_layer.mlp now replays.")
 				)
 			return
 
