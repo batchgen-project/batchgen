@@ -8130,6 +8130,12 @@ class BatchGenWorker:
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
 
+			from batchgen.models.glm.glm5.cuda_graph_segments import Glm5MoeSegment
+			from batchgen.models.glm.glm5.model import Glm5MoE
+
+			dsa_count = 0
+			moe_count = 0
+			hidden_size = self.model.config.hidden_size
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				attn_wrapper = decoder_layer.self_attn
 				for variant in ("short", "long"):
@@ -8145,13 +8151,30 @@ class BatchGenWorker:
 						aux_page_size_tokens=aux_page_size_tokens,
 					)
 					manager.register_segment(f"layer_{layer_idx}_dsa_{variant}", seg)
+					dsa_count += 1
+
+				# Register MoE segment only for MoE layers (first few are dense FFN).
+				# Glm5DecoderLayer at model.py:1893 selects dense vs MoE by
+				# `layer_idx < config.first_k_dense_replace`. Check mlp type.
+				mlp = getattr(decoder_layer, "mlp", None)
+				if isinstance(mlp, Glm5MoE) and mlp.use_3d_moe:
+					moe_seg = Glm5MoeSegment(
+						decoder_layer=decoder_layer,
+						moe_module=mlp,
+						layer_idx=layer_idx,
+						hidden_size=hidden_size,
+					)
+					manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+					moe_count += 1
 
 			self._cuda_graph_manager = manager
 			logging.info(
-				f"Rank {self.rank}: GLM-5 Phase-2a DSA segments registered "
-				f"({len(self.model.model.layers)} layers × 2 variants). "
-				"Capture will run warmup_and_capture_all() — scaffolding "
-				"forward() will raise NotImplementedError until Phase 2a-ii."
+				f"Rank {self.rank}: GLM-5 CUDA graph segments registered — "
+				f"{dsa_count} DSA (Phase 2a scaffolding) + "
+				f"{moe_count} MoE (Phase 2b). "
+				"DSA forward is NotImplementedError until Phase 2a-ii. "
+				"MoE forward delegates to _forward_decode_3d — requires "
+				"BATCHGEN_GLM5_MTP_BUCKETS matching the bucket list above."
 			)
 			return
 

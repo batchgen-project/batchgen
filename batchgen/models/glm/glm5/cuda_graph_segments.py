@@ -289,3 +289,118 @@ class Glm5DsaAttnSegment:
             "of _forward_decode_dsa (Phase 2a-ii). See this method's docstring "
             "for the step-by-step porting plan."
         )
+
+
+# ============================================================================
+# Phase 2b: per-MoE-layer CUDA graph segment
+# ============================================================================
+
+
+class Glm5MoeSegment:
+    """GLM-5 MoE layer as a CUDA-graph-capturable segment (bucket-agnostic).
+
+    One instance per MoE layer. The CUDAGraphManager captures it once per
+    registered bucket; `setup_static_buffers(bucket_size)` (called by the
+    manager before each capture) aligns `moe.num_tokens_per_rank` with the
+    bucket so `_forward_decode_3d` reads consistent state.
+
+    At world_size=16, Phase 2b targets buckets matching
+    `ntp in {1, 2, 4, 8, 16, 32}` (= `mtp in {16, 32, 64, 128, 256, 512}` when
+    fed to `BATCHGEN_GLM5_MTP_BUCKETS`). Above bucket_ntp=32 the scheduler
+    falls back to eager.
+
+    Input / output
+    --------------
+    Inputs:
+      hidden_states  [bucket_ntp, 1, hidden_size] bf16 — post-attn-norm MoE
+                      input. Scheduler pads rows `actual_ntp..bucket_ntp`
+                      with zeros (zeros propagate as zeros through gate +
+                      FP8 GEMMs and scatter back as zero contributions).
+    Outputs:
+      moe_output     [bucket_ntp, 1, hidden_size] bf16
+
+    Scheduler contract at replay time
+    ---------------------------------
+    Before `graph.replay(f"layer_{i}_moe", bucket_ntp, hidden_states=H)`:
+
+    (1) `H.shape[0] == bucket_ntp` — pad actual input with zeros.
+    (2) `moe.num_tokens_per_rank == bucket_ntp` on THIS layer's MoE
+        instance — the segment's `setup_static_buffers` does this at
+        capture time; the scheduler must re-apply before each replay
+        (typically in the decode loop's pre-replay hook).
+
+    Padding correctness note
+    ------------------------
+    `Glm5MoE._rank_token_counts` is not touched by this segment. Zero-
+    padded input rows produce zero output after gate + FP8 GEMM + scatter,
+    so slicing `[:actual_ntp]` post-replay recovers the correct result
+    without needing the mask. Compute for padding rows is O(fill_ratio)
+    wasted — acceptable at small buckets.
+
+    Why delegation, not inlining
+    ----------------------------
+    `_forward_decode_3d` is already capture-safe: zero host syncs in body
+    and callees, static-address bucket buffer via `_select_3d_buf`, PyNccl
+    collectives via `change_state(enable=True)`. Inlining would duplicate
+    ~100 lines of logic for no correctness benefit; delegation inherits
+    future fixes to the eager path.
+    """
+
+    def __init__(
+        self,
+        decoder_layer,          # Glm5DecoderLayer
+        moe_module,             # Glm5MoE instance (decoder_layer.mlp)
+        layer_idx: int,
+        hidden_size: int,
+    ) -> None:
+        self.decoder_layer = decoder_layer
+        self.moe = moe_module
+        self.layer_idx = layer_idx
+        self.hidden_size = hidden_size
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        """Called by CUDAGraphManager before capture at this bucket size.
+
+        Aligns `self.moe.num_tokens_per_rank` with the bucket so
+        `_forward_decode_3d` computes `num_global = bucket * world_size`
+        and the bucket selector picks the matching pre-allocated buffer.
+
+        Bypasses `Glm5MoE.set_num_tokens_per_rank()` to avoid its side
+        effects (`token_idx` / `topk_pos` realloc, `resize_if_needed` on
+        the singleton) — those tensors are only used by the non-3D path
+        (`_triton_compute` / `expert_compute_mixed`), never by the 3D
+        decode path this segment captures.
+        """
+        self.moe.num_tokens_per_rank = bucket_size
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "hidden_states": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "moe_output": TensorSpec(
+                ("batch_size", 1, self.hidden_size), torch.bfloat16
+            ),
+        }
+
+    def forward(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Capture-safe MoE decode for one layer. Delegates to
+        `_forward_decode_3d`; see class docstring for the scheduler contract.
+        """
+        # Capture-time invariant: moe.num_tokens_per_rank must match the
+        # input's bucket size. setup_static_buffers enforces this at capture
+        # time; replay relies on the scheduler to re-apply per step.
+        if torch.cuda.is_current_stream_capturing():
+            assert self.moe.num_tokens_per_rank == hidden_states.shape[0], (
+                f"Glm5MoeSegment(layer={self.layer_idx}): "
+                f"moe.num_tokens_per_rank={self.moe.num_tokens_per_rank} "
+                f"!= hidden_states.shape[0]={hidden_states.shape[0]} "
+                "under graph capture. setup_static_buffers() must run "
+                "before forward() for each bucket."
+            )
+        moe_output = self.moe._forward_decode_3d(hidden_states)
+        return {"moe_output": moe_output}
