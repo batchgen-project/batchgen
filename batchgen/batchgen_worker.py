@@ -8115,17 +8115,6 @@ class BatchGenWorker:
 			max_seq_len = self.model.config.max_position_embeddings
 			page_size_tokens = gpu_manager.config.page_size_tokens
 			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
-			# Aux (DSA indexer) KV uses a separate manager with potentially
-			# different page size. Pull from the auxiliary manager if bound.
-			aux_manager = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
-			if aux_manager is None:
-				logging.warning(
-					f"Rank {self.rank}: GLM-5 CUDA graph capture requested but "
-					"gpu_paged_kv_manager_aux not bound — skipping"
-				)
-				return
-			aux_page_size_tokens = aux_manager.config.page_size_tokens
-			max_aux_pages = (max_seq_len + aux_page_size_tokens - 1) // aux_page_size_tokens
 
 			# Pre-warm RoPE cos/sin cache on the shared rotary embedding.
 			shared_rope = getattr(self.model.model, "_shared_rotary_emb", None)
@@ -8135,6 +8124,29 @@ class BatchGenWorker:
 
 			# Assert required host-side scheduler state is wired before capture.
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+			# DSA capture also needs the aux (indexer) paged-KV manager.
+			# For MoE-only capture (Phase 2b without DSA), this is optional.
+			_glm5_dsa_enabled_for_aux = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_DSA", "0") == "1"
+			aux_manager = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+			if _glm5_dsa_enabled_for_aux:
+				if aux_manager is None:
+					logging.warning(
+						f"Rank {self.rank}: DSA capture requested "
+						"(BATCHGEN_GLM5_CUDA_GRAPH_DSA=1) but "
+						"gpu_paged_kv_manager_aux not bound — skipping capture"
+					)
+					return
+				AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+				aux_page_size_tokens = aux_manager.config.page_size_tokens
+				max_aux_pages = (max_seq_len + aux_page_size_tokens - 1) // aux_page_size_tokens
+			else:
+				# MoE-only capture — aux manager not required. Stub values
+				# still need valid types so the DSA-segment constructor loop
+				# below (even though no DSA segments will be registered)
+				# doesn't hit NameError; safe sentinels are fine because
+				# we gate the DSA registration path on the env flag.
+				aux_page_size_tokens = 0
+				max_aux_pages = 0
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
 
 			from batchgen.models.glm.glm5.cuda_graph_segments import (
