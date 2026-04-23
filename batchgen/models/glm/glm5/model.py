@@ -51,24 +51,37 @@ try:
         grouped_fp8_blockwise_s3,
     )
     _GLM5_HAS_FP8_BLOCKWISE = True
-except ImportError:
+except ImportError as _e:
     _GLM5_HAS_FP8_BLOCKWISE = False
+    logging.warning(
+        f"[GLM5-FALLBACK-BOOT] grouped_fp8_blockwise_moe unavailable ({_e!r}); "
+        "MoE FP8 grouped GEMM path disabled."
+    )
 
 try:
     from batchgen_kernels.moe._C_fp8_blockwise_ops import (
         act_quant_3d, fused_silu_quant_3d,
     )
     _GLM5_HAS_FP8_OPS = True
-except ImportError:
+except ImportError as _e:
     _GLM5_HAS_FP8_OPS = False
+    logging.warning(
+        f"[GLM5-FALLBACK-BOOT] batchgen_kernels._C_fp8_blockwise_ops unavailable "
+        f"({_e!r}); MoE will use Triton per-token act_quant fallback — decode will "
+        "be measurably slower."
+    )
 
 try:
     from batchgen.moe.dispatch_scatter_3d import (
         dispatch_scatter_3d, reduce_weighted_scatter,
     )
     _GLM5_HAS_DISPATCH_3D = True
-except ImportError:
+except ImportError as _e:
     _GLM5_HAS_DISPATCH_3D = False
+    logging.warning(
+        f"[GLM5-FALLBACK-BOOT] dispatch_scatter_3d unavailable ({_e!r}); "
+        "3D-MoE path disabled, falling back to legacy gather/scatter."
+    )
 
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
@@ -237,6 +250,11 @@ class Glm5Indexer(nn.Module):
     The K cached per token is only head_dim=128 (not n_heads*head_dim=4096).
     """
 
+    # One-shot fallback guards (class-level, survive hot-reload of methods).
+    _warned_fused_rope_hadamard_fallback = False  # set in _fused_rope_hadamard_or_fallback
+    _warned_indexer_wk_fp8_missing = False        # set in compute_indexer_kv when wk_scale absent
+    _warned_indexer_wqb_fp8_missing = False       # set in score_and_select when wq_b_scale absent
+
     def __init__(self, config: Glm5Config, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
@@ -300,6 +318,10 @@ class Glm5Indexer(nn.Module):
         q_rope = q_rope.squeeze(2)
         return torch.cat([q_rope, q_nope], dim=-1)
 
+    # Class-level one-shot guard so the warning fires exactly once per process
+    # even though this method is called per-layer, per-step.
+    _warned_fused_rope_hadamard_fallback = False
+
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
@@ -312,6 +334,13 @@ class Glm5Indexer(nn.Module):
                 positions.reshape(-1), scale=k.shape[-1] ** -0.5,
             )
         # Fallback: separate RoPE + Hadamard
+        if not type(self)._warned_fused_rope_hadamard_fallback:
+            type(self)._warned_fused_rope_hadamard_fallback = True
+            logging.warning(
+                "[GLM5-FALLBACK] fused_rope_hadamard CUDA kernel missing "
+                "(_fused_rope_hadamard_fn is None) — using separate RoPE + "
+                "Hadamard. Indexer K-projection will be slower."
+            )
         k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
         return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
 
@@ -337,6 +366,13 @@ class Glm5Indexer(nn.Module):
             from batchgen.attention.mla.fa3_backend import w8a16_gemm
             k = w8a16_gemm(self.wk.weight.data, self.wk_scale, hidden_states)
         else:
+            if not type(self)._warned_indexer_wk_fp8_missing:
+                type(self)._warned_indexer_wk_fp8_missing = True
+                logging.warning(
+                    "[GLM5-FALLBACK] indexer.wk_scale missing — compute_indexer_kv "
+                    "using PyTorch BF16 Linear instead of w8a16_gemm. FP8 scales "
+                    "were not attached at boot."
+                )
             k = self.wk(hidden_states)   # [batch, seq_len, head_dim=128]
         k = self.k_norm(k)
 
@@ -379,6 +415,13 @@ class Glm5Indexer(nn.Module):
             from batchgen.attention.mla.fa3_backend import w8a16_gemm
             q = w8a16_gemm(self.wq_b.weight.data, self.wq_b_scale, q_a)
         else:
+            if not type(self)._warned_indexer_wqb_fp8_missing:
+                type(self)._warned_indexer_wqb_fp8_missing = True
+                logging.warning(
+                    "[GLM5-FALLBACK] indexer.wq_b_scale missing — score_and_select "
+                    "using PyTorch BF16 Linear instead of w8a16_gemm. FP8 scales "
+                    "were not attached at boot."
+                )
             q = self.wq_b(q_a)  # [batch, 1, n_heads * head_dim]
         q = q.view(batch_size, self.index_n_heads, self.index_head_dim)
 
@@ -1039,6 +1082,8 @@ class Glm5MoE(nn.Module):
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
     _warned_k25_path = False
     _warned_gemm_3d = False
+    _warned_triton_fp8_gemm_fallback = False
+    _warned_triton_moe_compute = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
@@ -1324,6 +1369,16 @@ class Glm5MoE(nn.Module):
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
             return self._forward_decode_3d(hidden_states)
 
+        if not Glm5MoE._warned_triton_moe_compute:
+            Glm5MoE._warned_triton_moe_compute = True
+            logging.warning(
+                "[GLM5-FALLBACK] _forward_decode: 3D-MoE path disabled "
+                f"(use_3d_moe={self.use_3d_moe}, fp8_blockwise_ready="
+                f"{self._fp8_blockwise_ready}, _3d_buf={Glm5MoE._3d_buf is not None}, "
+                f"HAS_DISPATCH_3D={_GLM5_HAS_DISPATCH_3D}) — falling back to legacy "
+                "expert_compute path (WGMMA or Triton per-token)."
+            )
+
         import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
@@ -1527,6 +1582,14 @@ class Glm5MoE(nn.Module):
             x_quant = x_quant_3d.view(E * mtp, K)
             x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
         else:
+            if not Glm5MoE._warned_triton_fp8_gemm_fallback:
+                Glm5MoE._warned_triton_fp8_gemm_fallback = True
+                logging.warning(
+                    "[GLM5-FALLBACK] _fp8_blockwise_gemm_3d: "
+                    "batchgen_kernels._C_fp8_blockwise_ops (act_quant_3d) "
+                    "unavailable — falling back to per-token Triton act_quant "
+                    "over the full E*mtp buffer. MoE decode will be slower."
+                )
             from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
             x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
             x_scale_t = x_scale.t().contiguous()

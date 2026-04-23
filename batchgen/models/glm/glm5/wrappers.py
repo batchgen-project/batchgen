@@ -212,6 +212,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
     - MLA dims: qk_nope=192, v_head=256, q_lora_rank=2048
     """
 
+    # Class-level one-shot flags for DSA sparse-vs-dense dispatch. Fire once
+    # per process across all 78 attention wrappers so we see which path is
+    # actually taken under the live workload.
+    _warned_dsa_dense_only = False        # all rows <= index_topk
+    _warned_dsa_sparse_full = False       # all rows >  index_topk (full indexer)
+    _warned_dsa_sparse_mixed = False      # mixed batch (per-row dispatch)
+
     def __init__(
         self,
         module: nn.Module,
@@ -822,11 +829,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
             _any_long = _short_count < _bsz
             if not _any_long:
                 # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
+                if not GLM5AttnWrapper._warned_dsa_dense_only:
+                    GLM5AttnWrapper._warned_dsa_dense_only = True
+                    logging.warning(
+                        f"[GLM5-DSA] dense short-circuit path activated "
+                        f"(all {_bsz} rows have cache_seqlen <= index_topk={_idx_topk}); "
+                        f"current max_seqlen={max_seqlen}. Indexer NOT engaged."
+                    )
                 top_k_indices = build_clamped_dense_token_indices(
                     updated_seqlens, max_seqlen, hidden_states.device,
                 )
             elif not _any_short:
                 # All rows > index_topk: full-batch indexer scoring (topk = index_topk).
+                if not GLM5AttnWrapper._warned_dsa_sparse_full:
+                    GLM5AttnWrapper._warned_dsa_sparse_full = True
+                    logging.warning(
+                        f"[GLM5-DSA] full-batch sparse indexer ACTIVATED "
+                        f"(all {_bsz} rows have cache_seqlen > index_topk={_idx_topk}); "
+                        f"current max_seqlen={max_seqlen}. Running score_and_select_paged."
+                    )
                 q_a_for_indexer = q_a_normed.unsqueeze(1)
                 indexer_blocked_k, _, idx_block_table = \
                     gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
@@ -843,6 +864,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
             else:
                 # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
+                if not GLM5AttnWrapper._warned_dsa_sparse_mixed:
+                    GLM5AttnWrapper._warned_dsa_sparse_mixed = True
+                    _n_long = _bsz - _short_count
+                    logging.warning(
+                        f"[GLM5-DSA] MIXED sparse+dense path activated "
+                        f"({_short_count} rows <= index_topk={_idx_topk}, "
+                        f"{_n_long} rows > index_topk). Sparse indexer ENGAGED "
+                        f"on the {_n_long} long rows."
+                    )
                 _device = hidden_states.device
                 _long_mask = ~_short_mask
                 top_k_indices = torch.empty(
