@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from batchgen.timing import get_decode_timer
 from batchgen.models.glm.glm5.decode_utils import (
 	build_flat_paged_gather_indices,
 	build_paged_gather_cache_key,
