@@ -103,6 +103,13 @@ class AttnWrapperBase(BaseModuleWrapper):
     # Set once per decode step by the worker so per-layer _forward_decode_dsa
     # branches on it without doing a D2H .sum().item() 78 times per step.
     _dsa_short_count: ClassVar[Optional[int]] = None
+    # DSA per-step slot-index hoists: build_batch_slot_indices() used to run
+    # per-layer inside _forward_decode_dsa, producing two tiny int32 HtoD
+    # copies per layer (×78 → 156 HtoDs/step). Inputs (cur_batch +
+    # seq_id_to_slot mapping) are step-constant, so the worker fills these
+    # once before the model forward and wrappers read them back.
+    primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)

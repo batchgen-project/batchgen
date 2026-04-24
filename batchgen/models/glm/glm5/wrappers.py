@@ -663,19 +663,38 @@ class GLM5AttnWrapper(AttnWrapperBase):
         manager_device = gpu_paged_kv_manager.device
         seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
         current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-        primary_slot_indices = build_batch_slot_indices(
-            current_batch,
-            gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
-            bsz,
-            manager_device,
-        )
+        # Read per-step hoisted tensors populated by the worker (see
+        # batchgen_worker.py near the _dsa_short_count block). Falls back to
+        # the per-layer build only when the hoist wasn't populated — keeps
+        # test paths + CUDA-graph capture paths correct. The fallback MUST
+        # NOT run under graph capture (torch.tensor from a python list
+        # performs HtoD + sync, which capture can't express).
+        primary_slot_indices = AttnWrapperBase.primary_slot_indices
+        if primary_slot_indices is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "AttnWrapperBase.primary_slot_indices must be populated by "
+                "the worker before CUDA graph capture; see batchgen_worker.py "
+                "per-step hoist."
+            )
+            primary_slot_indices = build_batch_slot_indices(
+                current_batch,
+                gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+                bsz,
+                manager_device,
+            )
         aux_device = gpu_paged_kv_manager_aux.device
-        aux_slot_indices = build_batch_slot_indices(
-            current_batch,
-            gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
-            bsz,
-            aux_device,
-        )
+        aux_slot_indices = AttnWrapperBase.aux_slot_indices
+        if aux_slot_indices is None:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "AttnWrapperBase.aux_slot_indices must be populated by the "
+                "worker before CUDA graph capture."
+            )
+            aux_slot_indices = build_batch_slot_indices(
+                current_batch,
+                gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
+                bsz,
+                aux_device,
+            )
 
         # Index-OOB diagnostic (BATCHGEN_GLM5_VERIFY_INDICES=1). Logs the
         # bounds relevant to every OOB-able op on the DSA decode path and
