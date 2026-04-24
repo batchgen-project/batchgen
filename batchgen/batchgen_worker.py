@@ -1798,11 +1798,10 @@ class BatchGenWorker:
 			self._pending_kv_append_tensors = []
 
 		# Phase A: collapse all (layer × seq) DtoH copies into a single UVA
-		# kernel launch per cache. Gated by BATCHGEN_KV_OFFLOAD_UVA_KERNEL=1
-		# until validated. Default path (per-layer loop) stays behind the
-		# fallback for safety.
+		# kernel launch per cache. Default ON; set BATCHGEN_KV_OFFLOAD_UVA_KERNEL=0
+		# to fall back to the per-layer loop.
 		_use_uva_kernel = os.environ.get(
-			"BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "0") == "1"
+			"BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1") == "1"
 
 		if _use_uva_kernel and hasattr(worker_view,
 			"async_append_decode_kv_to_host_batched_kernel"):
