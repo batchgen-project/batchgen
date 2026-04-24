@@ -36,16 +36,156 @@ from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 from .model import rotate_half
 
+
+# ============================================================================
+# Per-sub-op decode timing (BATCHGEN_DECODE_TIMING=1)
+# ============================================================================
+
+from batchgen.profiling.decode_timing import (
+    DecodeTimingStats,
+    decode_timing_enabled as _decode_timing_enabled,
+)
+
+_DECODE_TIMING = _decode_timing_enabled()
+DecodeTimingStats.set_model_name("MiniMax-M25")
+
 try:
     from batchgen.attention.mla.fa3_backend import w8a16_gemm
     _HAS_W8A16 = True
 except ImportError:
     _HAS_W8A16 = False
 
+# CUDA RoPE kernel (partial rotation with passthrough copy)
+try:
+    from batchgen_kernels.attention._C_fused_ops import rope_forward as _rope_forward_cuda
+    _HAS_CUDA_ROPE = True
+except ImportError:
+    _HAS_CUDA_ROPE = False
+    logging.warning("[RoPE] CUDA rope_forward not available — will use PyTorch fallback")
+
+
+def _cuda_rope_forward(query, key, cos, sin, half_dim):
+    """CUDA RoPE with partial rotation passthrough.
+
+    Args:
+        query: [B, S=1, num_q_heads, head_dim]
+        key:   [B, S=1, num_kv_heads, head_dim]
+        cos:   [B, S=1, head_dim] (padded to head_dim)
+        sin:   [B, S=1, head_dim]
+        half_dim: rotary_dim // 2
+
+    Returns:
+        (q_rotated, k_rotated) same shapes as input
+    """
+    return _rope_forward_cuda(query, key, cos, sin, half_dim, None)
+
 
 def _fp8_linear(weight_fp8, scale, x):
-    """FP8 weight × BF16 activation via w8a16_gemm. Scale factors are F32 (from checkpoint)."""
+    """FP8 weight × BF16 activation. Uses CUDA act_quant_3d(E=1) if available."""
+    if _HAS_CUDA_ACT_QUANT:
+        return _fp8_linear_cuda_quant(weight_fp8, scale, x)
     return w8a16_gemm(weight_fp8, scale, x)
+
+
+# CUDA act_quant for attention path (avoid Triton overhead on small M)
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d as _cuda_act_quant_3d
+    import deep_gemm
+    _HAS_CUDA_ACT_QUANT = True
+except ImportError:
+    _HAS_CUDA_ACT_QUANT = False
+    logging.warning("[Attn] CUDA act_quant_3d not available — using Triton act_quant in w8a16_gemm")
+
+_warned_cuda_act_quant = False
+
+
+def _fp8_linear_cuda_quant(weight_fp8, scale, x):
+    """FP8 linear with CUDA act_quant_3d(E=1) replacing Triton act_quant."""
+    global _warned_cuda_act_quant
+    if not _warned_cuda_act_quant:
+        logging.warning("[Attn] HOT PATH: _fp8_linear with CUDA act_quant_3d(E=1)")
+        _warned_cuda_act_quant = True
+
+    orig_shape = x.shape
+    x_2d = x.view(-1, x.size(-1))  # [M, K]
+    M, K = x_2d.shape
+    N = weight_fp8.size(0)
+
+    # CUDA act_quant_3d with E=1
+    tokens_per_expert = torch.tensor([M], dtype=torch.int32, device=x.device)
+    x_3d = x_2d.view(1, M, K)
+    x_fp8_3d, x_scale_3d = _cuda_act_quant_3d(x_3d, tokens_per_expert)
+    x_fp8 = x_fp8_3d.view(M, K)
+    x_scale = x_scale_3d.view(M, -1)
+
+    # DeepGEMM FP8×FP8→BF16
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    deep_gemm.fp8_gemm_nt(
+        (x_fp8.view(torch.float8_e4m3fn), x_scale),
+        (weight_fp8, scale),
+        out, disable_ue8m0_cast=True,
+    )
+
+    if len(orig_shape) == 3:
+        out = out.view(orig_shape[0], orig_shape[1], N)
+    return out
+
+
+# ============================================================================
+# Packed FP8 QKV projection (2.94× faster at decode)
+# ============================================================================
+
+try:
+    from batchgen_kernels.moe._C_fp8_blockwise_gemm import fp8_blockwise_grouped_gemm as _qkv_gemm
+    _HAS_PACKED_QKV = True
+except ImportError:
+    _HAS_PACKED_QKV = False
+
+_QKV_BLOCK_M = 64
+_QKV_SCALE_BK = 128
+
+
+def _packed_qkv_gemm(hidden_states, packed_w, packed_ws, q_size, kv_size):
+    """Fused QKV: act_quant → single FP8 GEMM → zero-copy split.
+
+    Replaces 3× _fp8_linear with 1× act_quant + 1× fp8_blockwise_grouped_gemm.
+    Weight packing is one-time at init (_pack_qkv_weights).
+
+    Args:
+        hidden_states: [*, K] BF16
+        packed_w: [1, N, K] FP8 (pre-packed at init)
+        packed_ws: [1, N/128, K/128_pad4] F32 (pre-packed at init)
+        q_size: int (6144)
+        kv_size: int (1024)
+
+    Returns:
+        Q, K, V: [*, q_size/kv_size/kv_size] BF16
+    """
+    orig_shape = hidden_states.shape[:-1]
+    x = hidden_states.reshape(-1, hidden_states.shape[-1])
+    M, K = x.shape
+
+    # Quantize activation to FP8 via CUDA act_quant_3d (E=1)
+    mtp = max(((M + _QKV_BLOCK_M - 1) // _QKV_BLOCK_M) * _QKV_BLOCK_M, _QKV_BLOCK_M)
+    x_3d = torch.zeros(1, mtp, K, dtype=x.dtype, device=x.device)
+    x_3d[0, :M] = x
+    seqlens = torch.tensor([M], dtype=torch.int32, device=x.device)
+    x_quant_3d, x_scale_3d = _cuda_act_quant_3d(x_3d, seqlens)
+
+    x_fp8 = x_quant_3d.view(mtp, K).view(torch.float8_e4m3fn)
+    x_scale_t = x_scale_3d.view(mtp, -1).t().contiguous()
+    cu_seqlens = torch.tensor([0, mtp], dtype=torch.int32, device=x.device)
+
+    # Single FP8 GEMM (production CuTe persistent kernel, E=1)
+    output = _qkv_gemm(x_fp8, packed_w, seqlens, cu_seqlens, x_scale_t, packed_ws, M)
+
+    # Split output — slices are non-contiguous (stride=N along dim 0), must make contiguous
+    out = output[:M]
+    Q = out[:, :q_size].contiguous().reshape(*orig_shape, q_size)
+    K_out = out[:, q_size:q_size + kv_size].contiguous().reshape(*orig_shape, kv_size)
+    V = out[:, q_size + kv_size:].contiguous().reshape(*orig_shape, kv_size)
+    return Q, K_out, V
+
 
 
 class MiniMaxM25ExpertWrapper(ExpertWrapperBase):
@@ -175,7 +315,10 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         self.o_scale = None
 
     def _register_fp8_weights(self, tensors):
-        """Cache FP8 attention weights and scales."""
+        """Cache FP8 attention weights and scales.
+
+        Also packs Q/K/V weights for fused projection (one-time at init).
+        """
         device = self.engine_config.Basic_Config.device_torch
         self.fp8_q = tensors["q_proj.weight"].to(device)
         self.fp8_k = tensors["k_proj.weight"].to(device)
@@ -189,6 +332,47 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         self.module.q_norm.weight.data = tensors["q_norm.weight"].to(device)
         self.module.k_norm.weight.data = tensors["k_norm.weight"].to(device)
 
+        # Pack QKV weights for fused projection (one-time cost)
+        if _HAS_PACKED_QKV:
+            self._pack_qkv_weights()
+
+    def _pack_qkv_weights(self):
+        """Pack separate Q/K/V FP8 weights into single tensor for fused GEMM.
+
+        One-time cost at model init. Converts per-row checkpoint scales to
+        blockwise format expected by fp8_blockwise_grouped_gemm.
+        """
+        K = self.fp8_q.shape[1]
+        self._qkv_q_size = self.fp8_q.shape[0]
+        self._qkv_kv_size = self.fp8_k.shape[0]
+        N = self._qkv_q_size + 2 * self._qkv_kv_size
+
+        # Pack FP8 weights: [1, N, K]
+        self.packed_qkv_w = torch.cat([
+            self.fp8_q.view(torch.uint8),
+            self.fp8_k.view(torch.uint8),
+            self.fp8_v.view(torch.uint8),
+        ], dim=0).unsqueeze(0).view(torch.float8_e4m3fn)
+
+        # Checkpoint scales are already blockwise [N_i/128, K/128].
+        # Pack into [1, N_total/128, K/128_pad4] for grouped GEMM API.
+        k_blocks = K // _QKV_SCALE_BK
+        k_blocks_pad = (k_blocks + 3) // 4 * 4
+
+        q_ws = self.q_scale.reshape(-1, k_blocks)   # [q_size/128, k_blocks]
+        k_ws = self.k_scale.reshape(-1, k_blocks)   # [kv_size/128, k_blocks]
+        v_ws = self.v_scale.reshape(-1, k_blocks)    # [kv_size/128, k_blocks]
+
+        n_blocks = N // _QKV_SCALE_BK
+        self.packed_qkv_ws = torch.zeros(
+            1, n_blocks, k_blocks_pad, dtype=torch.float32, device=self.fp8_q.device)
+        self.packed_qkv_ws[0, :, :k_blocks] = torch.cat([q_ws, k_ws, v_ws], dim=0)
+
+        if not getattr(self.__class__, '_warned_qkv_pack', False):
+            logging.warning(f"[Attn] Packed QKV: [{N}, {K}] FP8 "
+                            f"(Q={self._qkv_q_size}, KV={self._qkv_kv_size})")
+            self.__class__._warned_qkv_pack = True
+
     def _unregister_fp8_weights(self):
         self.fp8_q = None
         self.fp8_k = None
@@ -198,6 +382,8 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         self.k_scale = None
         self.v_scale = None
         self.o_scale = None
+        self.packed_qkv_w = None
+        self.packed_qkv_ws = None
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         """Forward with FP8-specific weight lifecycle.
@@ -253,10 +439,15 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         max_seqlen = self.prepack_max_seqlen
         position_ids = self.position_ids.to(hidden_states_2d.device)
 
-        # Q/K/V projection via FP8 GEMM
-        query = _fp8_linear(fp8_q, q_scale, hidden_states_2d)
-        key = _fp8_linear(fp8_k, k_scale, hidden_states_2d)
-        value = _fp8_linear(fp8_v, v_scale, hidden_states_2d)
+        # Q/K/V projection — packed FP8 GEMM (2.94× faster) or fallback
+        if _HAS_PACKED_QKV and hasattr(self, 'packed_qkv_w') and self.packed_qkv_w is not None:
+            query, key, value = _packed_qkv_gemm(
+                hidden_states_2d, self.packed_qkv_w, self.packed_qkv_ws,
+                self._qkv_q_size, self._qkv_kv_size)
+        else:
+            query = _fp8_linear(fp8_q, q_scale, hidden_states_2d)
+            key = _fp8_linear(fp8_k, k_scale, hidden_states_2d)
+            value = _fp8_linear(fp8_v, v_scale, hidden_states_2d)
 
         # QK Norm (on flat projected dims, before reshape)
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
@@ -347,7 +538,11 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             )
 
     def _forward_decode(self, hidden_states, **kwargs):
-        """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV FA."""
+        """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV attention.
+
+        Uses batchgen WGMMA decode kernel on H20, FlashAttention fallback otherwise.
+        Partial RoPE via CUDA rope_forward kernel (half_dim=rotary_dim//2).
+        """
         from batchgen.attention.gqa import gqa_decode_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
 
@@ -376,39 +571,78 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         head_dim = self.module.head_dim
         rotary_dim = self.module.rotary_dim
 
-        # Q/K/V projection via FP8 GEMM
-        query = _fp8_linear(fp8_q, q_scale, hidden_states)
-        key = _fp8_linear(fp8_k, k_scale, hidden_states)
-        value = _fp8_linear(fp8_v, v_scale, hidden_states)
+        # Q/K/V projection — packed FP8 GEMM (2.94× faster) or fallback
+        if _DECODE_TIMING:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+
+        if _HAS_PACKED_QKV and hasattr(self, 'packed_qkv_w') and self.packed_qkv_w is not None:
+            query, key, value = _packed_qkv_gemm(
+                hidden_states, self.packed_qkv_w, self.packed_qkv_ws,
+                self._qkv_q_size, self._qkv_kv_size)
+        else:
+            query = _fp8_linear(fp8_q, q_scale, hidden_states)
+            key = _fp8_linear(fp8_k, k_scale, hidden_states)
+            value = _fp8_linear(fp8_v, v_scale, hidden_states)
 
         # QK Norm
         query = cuda_rmsnorm(query, self.module.q_norm.weight, self.module.q_norm.eps)
         key = cuda_rmsnorm(key, self.module.k_norm.weight, self.module.k_norm.eps)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_qkv_proj", _t0)
+            _t0 = time.perf_counter()
 
         # Reshape: [batch, 1, num_heads, head_dim]
         query = query.view(batch, seq_len, num_heads, head_dim)
         key = key.view(batch, seq_len, num_kv_heads, head_dim)
         value = value.view(batch, seq_len, num_kv_heads, head_dim)
 
-        # Partial RoPE
+        # Partial RoPE — CUDA kernel or PyTorch fallback
         max_seqlen = AttnWrapperBase.max_seqlen
         cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
-        cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, rotary_dim]
-        sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        q_rot = query[..., :rotary_dim]
-        q_pass = query[..., rotary_dim:]
-        k_rot = key[..., :rotary_dim]
-        k_pass = key[..., rotary_dim:]
+        if _HAS_CUDA_ROPE:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: CUDA rope_forward (partial rotation, passthrough copy)")
+                self.__class__._warned_rope = True
+            # cos/sin from rotary_emb: [seq_len, rotary_dim]
+            # Index by position: [batch, rotary_dim]
+            cos_pos = cos[current_token_position]  # [batch, rotary_dim]
+            sin_pos = sin[current_token_position]  # [batch, rotary_dim]
+            # Pad to head_dim for kernel (kernel reads cos[batch_seq_idx * head_dim + tid])
+            cos_padded = torch.nn.functional.pad(cos_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            sin_padded = torch.nn.functional.pad(sin_pos, (0, head_dim - rotary_dim))  # [batch, head_dim]
+            # Reshape for kernel: [B, S=1, head_dim]
+            cos_k = cos_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            sin_k = sin_padded.unsqueeze(1)  # [batch, 1, head_dim]
+            half_dim = rotary_dim // 2  # 32 for MiniMax
+            query, key = _cuda_rope_forward(
+                query, key, cos_k, sin_k, half_dim)
+        else:
+            if not getattr(self.__class__, '_warned_rope', False):
+                logging.warning("[Attn] HOT PATH: PyTorch rotate_half RoPE (fallback)")
+                self.__class__._warned_rope = True
+            cos = cos[current_token_position].unsqueeze(1).unsqueeze(2)
+            sin = sin[current_token_position].unsqueeze(1).unsqueeze(2)
 
-        query = torch.cat([
-            q_rot * cos + rotate_half(q_rot) * sin,
-            q_pass,
-        ], dim=-1)
-        key = torch.cat([
-            k_rot * cos + rotate_half(k_rot) * sin,
-            k_pass,
-        ], dim=-1)
+            q_rot = query[..., :rotary_dim]
+            q_pass = query[..., rotary_dim:]
+            k_rot = key[..., :rotary_dim]
+            k_pass = key[..., rotary_dim:]
+
+            query = torch.cat([
+                q_rot * cos + rotate_half(q_rot) * sin,
+                q_pass,
+            ], dim=-1)
+            key = torch.cat([
+                k_rot * cos + rotate_half(k_rot) * sin,
+                k_pass,
+            ], dim=-1)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_rope", _t0)
+            _t0 = time.perf_counter()
 
         # Write new K,V to paged GPU cache
         gpu_kv_manager.update_layer_decode_new_token(
@@ -427,20 +661,48 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             start_idx, end_idx = batch_slice
             page_table = page_table[start_idx:end_idx]
 
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_kv_update", _t0)
+            _t0 = time.perf_counter()
+
         cache_seqlens_for_attn = micro_cache_seqlens
 
-        # FlashAttention decode with paged KV
-        attn_output, _ = gqa_decode_fa(
-            q=query,
-            k_cache=k_cache_layer,
-            v_cache=v_cache_layer,
-            cache_seqlens=cache_seqlens_for_attn,
-            block_table=page_table,
-        )
+        # Decode attention — WGMMA kernel default (3× vs FA3 at B≥8), auto split-K for B=1.
+        # Set BATCHGEN_DISABLE_WGMMA_DECODE=1 to force FlashAttention fallback.
+        from batchgen.attention.gqa.batchgen_gqa_decode_bf16 import batchgen_gqa_decode_bf16
+        if not getattr(self.__class__, '_warned_attn', False):
+            self.__class__._warned_attn = True
+            _backend = "FA3 (forced)" if os.environ.get("BATCHGEN_DISABLE_WGMMA_DECODE") == "1" \
+                       else "batchgen_gqa_decode_bf16 (WGMMA+auto-splitK, FA3 fallback)"
+            logging.warning(f"[Attn] HOT PATH: {_backend}")
+
+        if os.environ.get("BATCHGEN_DISABLE_WGMMA_DECODE") == "1":
+            attn_output, _ = gqa_decode_fa(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
+        else:
+            attn_output, _ = batchgen_gqa_decode_bf16(
+                q=query,
+                k_cache=k_cache_layer,
+                v_cache=v_cache_layer,
+                cache_seqlens=cache_seqlens_for_attn,
+                block_table=page_table,
+            )
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_forward", _t0)
+            _t0 = time.perf_counter()
 
         # Output projection via FP8 GEMM
         attn_output = attn_output.view(batch, 1, num_heads * head_dim)
         attn_output = _fp8_linear(fp8_o, o_scale, attn_output)
+
+        if _DECODE_TIMING:
+            DecodeTimingStats._sync_record("attn_output_proj", _t0)
 
         # Append KV to host
         kv_append_callback = getattr(AttnWrapperBase, 'kv_append_callback', None)

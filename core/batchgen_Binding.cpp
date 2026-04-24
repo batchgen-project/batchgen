@@ -366,6 +366,14 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("sequence_ids"))
        .def("release_sequence_pages", &WorkerView::ReleaseSequencePages,
             py::arg("sequence_ids"))
+       .def("read_sequence_kv_to_cpu", &WorkerView::ReadSequenceKVToCPU,
+            py::arg("sequence_id"),
+            "Read all KV pages for a sequence directly to CPU tensors (no GPU). "
+            "Returns (k_tensor, v_tensor). For MLA, v_tensor is empty.")
+       .def("write_sequence_kv_from_cpu", &WorkerView::WriteSequenceKVFromCPU,
+            py::arg("sequence_id"), py::arg("k_tensor"),
+            py::arg("v_tensor") = std::nullopt,
+            "Write KV data from CPU tensors directly to host pages (no GPU).")
        .def("async_offload_layer_kv_to_host",
            &WorkerView::AsyncOffloadLayerKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),

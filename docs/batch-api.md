@@ -6,6 +6,8 @@ OpenAI-compatible REST API for batch inference. Base URL: `http://<host>:<port>`
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/v1/models` | List available models |
+| GET | `/v1/models/{model_id}` | Get model metadata |
 | POST | `/v1/files` | Upload input file |
 | GET | `/v1/files` | List files |
 | GET | `/v1/files/{file_id}` | Get file metadata |
@@ -16,6 +18,55 @@ OpenAI-compatible REST API for batch inference. Base URL: `http://<host>:<port>`
 | GET | `/v1/batches/{batch_id}` | Get batch status |
 | POST | `/v1/batches/{batch_id}/cancel` | Cancel batch |
 | GET | `/health` | Health check |
+
+---
+
+## Model Endpoints
+
+### GET /v1/models
+
+List the model currently loaded on the server.
+
+```bash
+curl http://localhost:10900/v1/models
+```
+
+**Response:** `ListModelsResponse`
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Kimi-K2.5",
+      "object": "model",
+      "created": 1711234567,
+      "owned_by": "batchgen",
+      "max_context_length": 262144
+    }
+  ]
+}
+```
+
+### GET /v1/models/{model_id}
+
+Retrieve metadata for a specific model.
+
+```bash
+curl http://localhost:10900/v1/models/Kimi-K2.5
+```
+
+**Response:** `ModelObject`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Model name (last component of model path) |
+| `object` | string | Always `"model"` |
+| `created` | integer | Unix timestamp when server started |
+| `owned_by` | string | Always `"batchgen"` |
+| `max_context_length` | integer | Maximum context length in tokens (prompt + completion) |
+
+**Error:** Returns `404` if `model_id` does not match the loaded model.
 
 ---
 

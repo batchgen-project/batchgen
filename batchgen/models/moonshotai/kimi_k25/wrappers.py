@@ -30,6 +30,7 @@ Key differences from DeepSeek-V3:
 """
 
 import logging
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -129,8 +130,11 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         Accesses weights through self.module to always get the current device
         tensors (GPU views after _move_int4_to_gpu_contiguous).
+
+        If weights are in Marlin layout (from Marlin checkpoint), transforms
+        to raw INT4 on-the-fly for WGMMA prefill. ~180 us per expert.
         """
-        return {
+        weights = {
             "gate_proj.weight_packed": self.module.int4_gate_packed,
             "gate_proj.weight_scale": self.module.int4_gate_scale,
             "up_proj.weight_packed": self.module.int4_up_packed,
@@ -138,6 +142,59 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_packed": self.module.int4_down_packed,
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
+        # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA prefill
+        self._transform_marlin_to_raw(weights)
+        return weights
+
+    _transform_logged = False
+
+    def _transform_marlin_to_raw(self, weights: dict):
+        """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
+
+        Called for both persistent and non-persistent experts from Marlin checkpoint.
+        ~180 us per expert (3 projections × 58 us), negligible vs compute.
+
+        Core engine may reshape tensors to metadata shape [N, K//8] even though
+        data is in Marlin layout [K//16, N*2]. Both have the same number of
+        elements (N*K/8), so we reshape to Marlin dims before transforming.
+        """
+        from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+        transformed = 0
+        for key in list(weights.keys()):
+            if not key.endswith("_packed") and not key.endswith("packed"):
+                continue
+            packed = weights[key]
+            if not isinstance(packed, torch.Tensor) or packed.dim() != 2:
+                continue
+            scale_key = key.replace("_packed", "_scale").replace("packed", "scale")
+            if scale_key not in weights:
+                continue
+
+            if packed.shape[0] < packed.shape[1]:
+                # Already Marlin shape [K//16, N*2] (persistent experts)
+                K_proj = packed.shape[0] * 16
+                N_proj = packed.shape[1] // 2
+            else:
+                # Metadata shape [N, K//8] — reshape to Marlin [K//16, N*2]
+                N_proj = packed.shape[0]
+                K_proj = packed.shape[1] * 8
+                marlin_rows = K_proj // 16
+                marlin_cols = N_proj * 2
+                packed = packed.reshape(marlin_rows, marlin_cols)
+                # Also reshape scales: metadata [N, K//32] → Marlin [K//32, N]
+                scale = weights[scale_key]
+                scale = scale.reshape(K_proj // 32, N_proj)
+                weights[scale_key] = scale
+
+            raw_packed, raw_scale = marlin_to_wgmma_fused_gpu(
+                packed, weights[scale_key], K_proj, N_proj)
+            weights[key] = raw_packed
+            weights[scale_key] = raw_scale
+            transformed += 1
+        if not self.__class__._transform_logged and transformed > 0:
+            logging.info(f"[Marlin] Transformed {transformed} projections Marlin→raw "
+                         f"(first shape: {list(weights.values())[0].shape})")
+            self.__class__._transform_logged = True
 
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Direct BF16 GEMM path for pre-dequantized weights.
@@ -203,6 +260,8 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
+            # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA
+            self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
         if hidden_states.dtype != torch.bfloat16:
@@ -424,7 +483,9 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 None,
             )
 
-            if AttnWrapperBase.kv_append_callback is not None:
+            import os as _os
+            _skip_cb = _os.environ.get("BATCHGEN_SKIP_KV_CALLBACK", "0") == "1"
+            if not _skip_cb and AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
 
             return (attn_output, None, None)
