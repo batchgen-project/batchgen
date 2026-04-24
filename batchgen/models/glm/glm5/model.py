@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from batchgen.timing import get_decode_timer
 from batchgen.models.glm.glm5.decode_utils import (
 	build_flat_paged_gather_indices,
 	build_paged_gather_cache_key,
@@ -72,6 +73,35 @@ except ImportError:
 
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
+
+
+def _parse_mtp_buckets() -> list[int]:
+    """Parse BATCHGEN_GLM5_MTP_BUCKETS="128,256,512,1024,2048,4096" into a
+    sorted deduped list of mtp values.
+
+    When unset, returns [] — callers fall back to the legacy single-buffer
+    path (buf grows to worst-case global_bsz and stays there). When set,
+    each listed value becomes a pre-allocated `Glm5MoE3DBuffers` instance;
+    decode picks the smallest that fits the current global_bsz, cutting
+    the 770 MiB/layer zero-fill + result-copy waste.
+
+    Each value is rounded up to `_GLM5_MTP_BLOCK` alignment.
+    """
+    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS", "").strip()
+    if not raw:
+        return []
+    out: set[int] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        v = int(tok)
+        aligned = ((v + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK) * _GLM5_MTP_BLOCK
+        out.add(aligned)
+    return sorted(out)
+
+
+_GLM5_MTP_BUCKETS = _parse_mtp_buckets()
 
 
 # ============================================================================
@@ -1037,6 +1067,12 @@ class Glm5MoE(nn.Module):
 
     # K2.5 3D-MoE path (minimax parity).
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
+    # Bucket-aware 3D MoE buffers: smaller-batch decode steps pick a
+    # smaller-mtp buffer to cut the 770 MiB/layer zero-fill + result-copy
+    # HBM traffic. Populated only when BATCHGEN_GLM5_MTP_BUCKETS is set;
+    # otherwise all decode steps use the legacy `_3d_buf` singleton.
+    _bucket_bufs: Dict[int, Glm5MoE3DBuffers] = {}
+    _warned_bucket_select: Dict[int, bool] = {}
     _warned_k25_path = False
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
@@ -1103,7 +1139,21 @@ class Glm5MoE(nn.Module):
         ).repeat(global_num_tokens)
 
         # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
+        # When BATCHGEN_GLM5_MTP_BUCKETS is set, size the singleton to the
+        # largest bucket instead of _GLM5_3D_MTP=4096 — the bucket path
+        # always serves batches up to max(_GLM5_MTP_BUCKETS), so the 4096
+        # default is pure waste (~1.5 GiB/GPU for dispatched_x+expert_out
+        # at mtp=4096). Singleton is only used as fallback for oversize.
         if self.use_3d_moe and _GLM5_HAS_DISPATCH_3D and Glm5MoE._3d_buf is None:
+            if _GLM5_MTP_BUCKETS:
+                _singleton_mtp = max(_GLM5_MTP_BUCKETS)
+                logging.info(
+                    f"[Glm5MoE] Buckets set; sizing singleton _3d_buf to "
+                    f"max bucket mtp={_singleton_mtp} instead of "
+                    f"_GLM5_3D_MTP={_GLM5_3D_MTP} to avoid oversize waste"
+                )
+            else:
+                _singleton_mtp = _GLM5_3D_MTP
             Glm5MoE._3d_buf = Glm5MoE3DBuffers(
                 E_local=self.experts_per_rank,
                 max_global_bsz=global_num_tokens,
@@ -1112,8 +1162,74 @@ class Glm5MoE(nn.Module):
                 topk=K,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_GLM5_3D_MTP,
+                max_tokens_padded=_singleton_mtp,
             )
+
+            # Pre-allocate per-bucket 3D buffers when BATCHGEN_GLM5_MTP_BUCKETS
+            # is set. Each bucket picks its smallest-fitting buffer at decode
+            # time, cutting the 770 MiB/layer HBM waste on small batches.
+            # Independent of CUDA-graph capture; also delivers an eager-mode
+            # speedup when small decode batches are common.
+            #
+            # Each bucket's `padded` must be sized to `mtp // world_size` so
+            # NCCL all_gather sends exactly `bucket_ntp * H` elements per
+            # rank — matching the bucket's global_bsz. Sizing it to the
+            # current `num_tokens_per_rank` is a bug: _forward_decode_3d
+            # would then recreate padded on every step in eager mode (silent
+            # perf loss), and during capture it would either bake a stale
+            # size or recreate during stream capture (graph-invalid).
+            if _GLM5_MTP_BUCKETS:
+                max_global_bsz_any = max(_GLM5_MTP_BUCKETS)
+                for mtp in _GLM5_MTP_BUCKETS:
+                    if mtp in Glm5MoE._bucket_bufs:
+                        continue
+                    bucket_ntp = max(1, mtp // self.world_size)
+                    Glm5MoE._bucket_bufs[mtp] = Glm5MoE3DBuffers(
+                        E_local=self.experts_per_rank,
+                        max_global_bsz=max_global_bsz_any,
+                        H=self.hidden_size,
+                        N_inter=self.config.moe_intermediate_size,
+                        topk=K,
+                        num_tokens_per_rank=bucket_ntp,
+                        device=self.device,
+                        max_tokens_padded=mtp,
+                    )
+                logging.info(
+                    f"[Glm5MoE] Pre-allocated bucket buffers for mtp={_GLM5_MTP_BUCKETS} "
+                    f"(world_size={self.world_size}, bucket_ntp="
+                    f"{[max(1, m // self.world_size) for m in _GLM5_MTP_BUCKETS]})"
+                )
+
+    @classmethod
+    def _select_3d_buf(cls, global_num_tokens: int) -> Glm5MoE3DBuffers:
+        """Pick the smallest pre-allocated bucket buffer whose mtp fits
+        `global_num_tokens`. Falls back to the legacy `_3d_buf` singleton
+        when `BATCHGEN_GLM5_MTP_BUCKETS` is unset or no bucket fits.
+
+        NOTE: the fallback path still calls `buf.resize_if_needed` upstream,
+        which grows the singleton to worst-case. For CUDA graph capture
+        (Phase 2b) the caller must supply a bucket size that has a pre-
+        allocated buffer — otherwise the captured buffer addresses would
+        drift on the first grow event.
+        """
+        if cls._bucket_bufs:
+            for mtp in sorted(cls._bucket_bufs):
+                if mtp >= global_num_tokens:
+                    buf = cls._bucket_bufs[mtp]
+                    if not cls._warned_bucket_select.get(mtp):
+                        logging.info(
+                            f"[Glm5MoE] Selecting bucket buffer mtp={mtp} "
+                            f"for global_num_tokens={global_num_tokens}"
+                        )
+                        cls._warned_bucket_select[mtp] = True
+                    return buf
+            # Oversize — fall through to singleton (which will resize_if_needed).
+            logging.warning(
+                f"[Glm5MoE] global_num_tokens={global_num_tokens} exceeds all "
+                f"pre-allocated buckets {sorted(cls._bucket_bufs)}; "
+                "falling back to singleton (will resize)"
+            )
+        return cls._3d_buf
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
@@ -1362,7 +1478,7 @@ class Glm5MoE(nn.Module):
             with self.comm.change_state(enable=True):
                 self.comm.all_gather(
                     all_tokens, padded,
-                    stream=torch.cuda.default_stream(self.device),
+                    stream=torch.cuda.current_stream(self.device),
                 )
 
         # 2) Gate
@@ -1386,7 +1502,7 @@ class Glm5MoE(nn.Module):
             with self.comm.change_state(enable=True):
                 self.comm.all_reduce(
                     global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.default_stream(self.device),
+                    stream=torch.cuda.current_stream(self.device),
                 )
 
         # 6) Extract local slice + shared expert
@@ -1420,82 +1536,124 @@ class Glm5MoE(nn.Module):
         ntp = self.num_tokens_per_rank
         num_global = ntp * self.world_size
         topk = self.num_experts_per_tok
-        buf = Glm5MoE._3d_buf
+        # Bucket-aware buffer selection — picks smallest mtp that fits
+        # global_num_tokens when BATCHGEN_GLM5_MTP_BUCKETS is set; otherwise
+        # falls back to the singleton _3d_buf. See _select_3d_buf for the
+        # resize_if_needed contract at the fallback boundary.
+        buf = Glm5MoE._select_3d_buf(num_global)
+        # Still need resize guard for the singleton (or oversize fallback);
+        # a pre-allocated bucket buffer already satisfies num_global, so
+        # resize_if_needed is a cheap no-op on that path.
         buf.resize_if_needed(num_global)
+        # Keep padded buffer width in sync with per-step num_tokens_per_rank.
+        # NCCL all_gather sends exactly `padded.numel()` elements per rank;
+        # a mismatch between `padded.shape[0]` and the actual `ntp` collapses
+        # all_gather (ranks 1..N's contributions land past the reader slice
+        # — see set_num_tokens_per_rank:1137-1144 for the original incident).
+        #
+        # In eager mode this recreate is benign. Inside CUDA-graph capture
+        # it is fatal: the tensor allocation happens in Python during stream
+        # capture, which either (a) gets recorded as an alloc in the graph
+        # pool (silently wastes memory + breaks static-address invariant)
+        # or (b) hits a torch.cuda.graph assertion. Force it to fail loud so
+        # the scheduler learns it must pad `ntp` to the bucket's `bucket_ntp`
+        # before replay.
+        if buf.padded.shape[0] != ntp:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"Glm5MoE3DBuffers.padded.shape[0]={buf.padded.shape[0]} "
+                f"!= ntp={ntp} inside graph capture. The scheduler must "
+                "pad num_tokens_per_rank to the bucket's bucket_ntp "
+                "(= mtp // world_size) before calling graph.replay()."
+            )
+            buf.padded = torch.zeros(
+                ntp, buf.H, dtype=torch.bfloat16, device=buf.device,
+            )
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
             logging.warning(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
             Glm5MoE._warned_k25_path = True
 
+        # Timer for per-op breakdown. Resolves to None when disabled;
+        # timed() is a no-op in that case.
+        dt = get_decode_timer()
+        li = getattr(self, "layer_idx", 0)
+
         # 1) AllGather
-        all_tokens = buf.all_tokens[:num_global]
-        padded = buf.padded
-        padded.zero_()
-        if num_tokens > 0:
-            padded[:num_tokens] = hidden_states
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(
-                all_tokens, padded,
-                stream=torch.cuda.default_stream(self.device),
-            )
+        with (dt.timed("allgather_3d", li) if dt else _nullctx()):
+            all_tokens = buf.all_tokens[:num_global]
+            padded = buf.padded
+            padded.zero_()
+            if num_tokens > 0:
+                padded[:num_tokens] = hidden_states
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.current_stream(self.device),
+                )
 
         # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
-        topk_idx, topk_weight = self._gate_decode(all_tokens)
+        with (dt.timed("gate_3d", li) if dt else _nullctx()):
+            topk_idx, topk_weight = self._gate_decode(all_tokens)
 
-        # Mask padding tokens so they don't inflate expert_counts nor pollute
-        # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
-        # each rank contributes `num_tokens_per_rank` slots but only the first
-        # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
-        # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
-        rank_counts = Glm5MoE._rank_token_counts
-        if rank_counts is not None:
-            positions = torch.arange(num_global, device=self.device)
-            rank_ids = positions // ntp
-            local_pos = positions % ntp
-            max_valid = rank_counts[rank_ids]
-            padding_mask = local_pos >= max_valid
-            # Unconditional mask application; skipping the .any() gate removes
-            # a per-layer D2H sync and the fancy-index op is a no-op when empty.
-            topk_idx[padding_mask] = -1
-            topk_weight[padding_mask] = 0.0
+            # Mask padding tokens so they don't inflate expert_counts nor pollute
+            # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
+            # each rank contributes `num_tokens_per_rank` slots but only the first
+            # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
+            # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
+            rank_counts = Glm5MoE._rank_token_counts
+            if rank_counts is not None:
+                positions = torch.arange(num_global, device=self.device)
+                rank_ids = positions // ntp
+                local_pos = positions % ntp
+                max_valid = rank_counts[rank_ids]
+                padding_mask = local_pos >= max_valid
+                # Unconditional mask application; skipping the .any() gate removes
+                # a per-layer D2H sync and the fancy-index op is a no-op when empty.
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
 
         # 3) 3D dispatch
-        buf.dispatched_x.zero_()
-        expert_counts, topk_pos = dispatch_scatter_3d(
-            all_tokens, topk_idx.to(torch.int32),
-            buf.dispatched_x,
-            self.routed_expert_start_idx, self.experts_per_rank,
-            buf.max_tokens_padded,
-            buf.expert_counts, buf.expert_counters,
-            buf.topk_pos[:num_global * topk],
-        )
+        with (dt.timed("dispatch_3d", li) if dt else _nullctx()):
+            buf.dispatched_x.zero_()
+            expert_counts, topk_pos = dispatch_scatter_3d(
+                all_tokens, topk_idx.to(torch.int32),
+                buf.dispatched_x,
+                self.routed_expert_start_idx, self.experts_per_rank,
+                buf.max_tokens_padded,
+                buf.expert_counts, buf.expert_counters,
+                buf.topk_pos[:num_global * topk],
+            )
 
-        # 4) FP8 blockwise GEMM on 3D buffer
+        # 4) FP8 blockwise GEMM on 3D buffer (per-sub-op timing inside)
         self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
         # 5) Weighted scatter reduce
-        result_buf = buf.result_buffer[:num_global]
-        result_buf.zero_()
-        global_results = reduce_weighted_scatter(
-            buf.expert_out, topk_pos, topk_weight,
-            num_global, hidden_size, topk,
-            output=result_buf,
-        )
+        with (dt.timed("reduce_scatter_3d", li) if dt else _nullctx()):
+            result_buf = buf.result_buffer[:num_global]
+            result_buf.zero_()
+            global_results = reduce_weighted_scatter(
+                buf.expert_out, topk_pos, topk_weight,
+                num_global, hidden_size, topk,
+                output=result_buf,
+            )
 
         # 6) AllReduce across EP ranks
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
-                stream=torch.cuda.default_stream(self.device),
-            )
+        with (dt.timed("allreduce_3d", li) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.current_stream(self.device),
+                )
 
         # 7) Slice local + add shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * ntp
-        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
-        out = out + self.shared_expert_forward(identity)
+        with (dt.timed("moe_slice", li) if dt else _nullctx()):
+            start = self.rank * ntp
+            out = global_results[start:start + num_tokens].to(hidden_states.dtype)
+        with (dt.timed("shared_expert", li) if dt else _nullctx()):
+            out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
@@ -1510,6 +1668,8 @@ class Glm5MoE(nn.Module):
                 f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
             Glm5MoE._warned_gemm_3d = True
 
+        dt = get_decode_timer()
+        li = getattr(self, "layer_idx", 0)
         E = self.experts_per_rank
         K = self.hidden_size                  # 6144
         N = self.config.moe_intermediate_size  # 2048
@@ -1520,50 +1680,54 @@ class Glm5MoE(nn.Module):
         avg = max(mtp // max(E, 1), 1)
 
         # Stage input quant (3D if CUDA ops available, else Triton fallback)
-        if _GLM5_HAS_FP8_OPS:
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
-            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
-            x_quant = x_quant_3d.view(E * mtp, K)
-            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
-        else:
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
-            x_scale_t = x_scale.t().contiguous()
+        with (dt.timed("act_quant_3d", li) if dt else _nullctx()):
+            if _GLM5_HAS_FP8_OPS:
+                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+                x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+                x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+                x_quant = x_quant_3d.view(E * mtp, K)
+                x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+            else:
+                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+                x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
+                x_scale_t = x_scale.t().contiguous()
 
         # S1: gate + up + SiLU (fused if possible) → BF16 intermediate
-        if _GLM5_HAS_FP8_OPS:
-            s1_result = grouped_fp8_blockwise_fused_s1(
-                x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                seqlens, cu_seqlens, avg,
-            )
-            inter_quant_3d, inter_scale_3d = act_quant_3d(
-                s1_result.view(E, mtp, N), seqlens)
-            inter_quant = inter_quant_3d.view(E * mtp, N)
-            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
-        else:
-            intermediate = grouped_fp8_blockwise_s1_silu(
-                x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                seqlens, cu_seqlens, avg,
-            )
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            inter_quant, inter_scale = _act_quant(intermediate)
-            inter_scale_t = inter_scale.t().contiguous()
+        with (dt.timed("fused_s1", li) if dt else _nullctx()):
+            if _GLM5_HAS_FP8_OPS:
+                s1_result = grouped_fp8_blockwise_fused_s1(
+                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                    seqlens, cu_seqlens, avg,
+                )
+                inter_quant_3d, inter_scale_3d = act_quant_3d(
+                    s1_result.view(E, mtp, N), seqlens)
+                inter_quant = inter_quant_3d.view(E * mtp, N)
+                inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+            else:
+                intermediate = grouped_fp8_blockwise_s1_silu(
+                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                    seqlens, cu_seqlens, avg,
+                )
+                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+                inter_quant, inter_scale = _act_quant(intermediate)
+                inter_scale_t = inter_scale.t().contiguous()
 
-        # S3: down projection
-        result = grouped_fp8_blockwise_s3(
-            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
-            self.fp8_down_w3d.view(torch.float8_e4m3fn),
-            self.fp8_down_ws3d,
-            seqlens, cu_seqlens, avg,
-        )
-        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
+        # S3: down projection (in-place into buf.expert_out — matches kimi_k25
+        # pattern, eliminates ~35 ms/step of redundant copy traffic).
+        with (dt.timed("s3_down", li) if dt else _nullctx()):
+            grouped_fp8_blockwise_s3(
+                inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+                self.fp8_down_w3d.view(torch.float8_e4m3fn),
+                self.fp8_down_ws3d,
+                seqlens, cu_seqlens, avg,
+                output=buf.expert_out[:E * mtp],
+            )
 
     # ── Gate + Expert Compute ──
 
@@ -1630,7 +1794,18 @@ class Glm5MoE(nn.Module):
         """Mixed path: WGMMA for persistent + loop for non-persistent.
 
         One .tolist() sync for expert_offsets (acceptable on opt-in path).
+
+        NOT capture-safe: the .tolist() below and the per-expert Python loop
+        over non-persistent experts both require host-visible expert offsets.
+        Production GLM-5-FP8 runs the 3D path (_forward_decode_3d →
+        _fp8_blockwise_gemm_3d) which has zero host syncs; this function is
+        only reachable when 3D is disabled (use_3d_moe=False or EP offloading).
         """
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "expert_compute_mixed is not capture-safe (expert_offsets.tolist()+"
+            "Python per-expert loop). Capture requires the 3D MoE path; ensure "
+            "use_3d_moe, _fp8_blockwise_ready, and Glm5MoE._3d_buf are all set."
+        )
         from mgn_kernel import fused_moe_token_dispatch
 
         n_persistent = self.num_persistent_local_experts
@@ -1776,7 +1951,18 @@ class Glm5MoE(nn.Module):
 
     def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
                                   num_local_experts=None):
-        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path)."""
+        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path).
+
+        NOT capture-safe: uses expert_offsets[-1].item() and
+        num_active_experts.item() below. This function only fires on the
+        Triton fallback path (_triton_compute); the production 3D path does
+        not call it.
+        """
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "_grouped_dequant_moe_fp8 is not capture-safe (two .item() calls). "
+            "Capture requires the 3D MoE path; check that the FP8 blockwise "
+            "3D kernels are active."
+        )
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
         from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma
@@ -1949,8 +2135,10 @@ class Glm5Model(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
         use_cache: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        dt = get_decode_timer()
+        with (dt.timed("embed", 0) if dt else _nullctx()):
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
 
@@ -1959,7 +2147,8 @@ class Glm5Model(nn.Module):
             hidden_states, _, _ = layer(
                 hidden_states, attention_mask, position_ids, past_kv, use_cache,
             )
-        hidden_states = self.norm(hidden_states)
+        with (dt.timed("final_ln", 0) if dt else _nullctx()):
+            hidden_states = self.norm(hidden_states)
         return (hidden_states,)
 
 
@@ -1998,6 +2187,8 @@ class Glm5ForCausalLM(nn.Module):
             use_cache=use_cache,
         )
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        dt = get_decode_timer()
+        with (dt.timed("lm_head", 0) if dt else _nullctx()):
+            logits = self.lm_head(hidden_states)
         from types import SimpleNamespace
         return SimpleNamespace(logits=logits)

@@ -63,7 +63,7 @@ from tqdm import trange
 import gc
 import numpy as np
 from datetime import timedelta
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext as _nullctx
 from dataclasses import dataclass
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
@@ -87,7 +87,7 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import is_glm5_backend_model, is_kimi_k25_backend_model
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
@@ -1858,44 +1858,89 @@ class BatchGenWorker:
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 
-		if entries and worker_view is not None and sequence_ids is not None:
-			for layer_idx, k_tensor, v_tensor in entries:
-				if k_tensor.dim() == 3:
-					k_tensor = k_tensor.unsqueeze(2)
-				if v_tensor is not None and v_tensor.dim() == 3:
-					v_tensor = v_tensor.unsqueeze(2)
+		# Phase A: collapse all (layer × seq) DtoH copies into a single UVA
+		# kernel launch per cache. Default ON; set BATCHGEN_KV_OFFLOAD_UVA_KERNEL=0
+		# to fall back to the per-layer loop.
+		_use_uva_kernel = os.environ.get(
+			"BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "1") == "1"
 
-				task = worker_view.async_append_decode_kv_to_host(
-					layer_idx=layer_idx,
+		if _use_uva_kernel and hasattr(worker_view,
+			"async_append_decode_kv_to_host_batched_kernel"):
+			# Primary cache — one batched call
+			if entries and worker_view is not None and sequence_ids is not None:
+				_prepared_entries = []
+				for layer_idx, k_tensor, v_tensor in entries:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					if v_tensor is not None and v_tensor.dim() == 3:
+						v_tensor = v_tensor.unsqueeze(2)
+					_prepared_entries.append((layer_idx, k_tensor, v_tensor))
+					self._pending_kv_append_tensors.append(k_tensor)
+					if v_tensor is not None:
+						self._pending_kv_append_tensors.append(v_tensor)
+				task = worker_view.async_append_decode_kv_to_host_batched_kernel(
+					entries=_prepared_entries,
 					sequence_ids=sequence_ids,
-					k_tensor=k_tensor,
-					v_tensor=v_tensor,
 					sequence_lengths=sequence_lengths,
 				)
-
-				self._pending_kv_append_tensors.append(k_tensor)
-				if v_tensor is not None:
-					self._pending_kv_append_tensors.append(v_tensor)
 				if task is not None:
 					self._pending_kv_append_tasks.append(task)
 
-		# Aux (DSA indexer) cache — shares the same post-forward sync
-		if entries_aux and aux_view is not None and sequence_ids is not None:
-			for layer_idx, k_tensor, v_tensor in entries_aux:
-				if k_tensor.dim() == 3:
-					k_tensor = k_tensor.unsqueeze(2)
-
-				task = aux_view.async_append_decode_kv_to_host(
-					layer_idx=layer_idx,
+			# Aux (DSA indexer) cache — one batched call
+			if entries_aux and aux_view is not None and sequence_ids is not None:
+				_prepared_aux = []
+				for layer_idx, k_tensor, v_tensor in entries_aux:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					_prepared_aux.append((layer_idx, k_tensor, None))
+					self._pending_kv_append_tensors.append(k_tensor)
+				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
+					entries=_prepared_aux,
 					sequence_ids=sequence_ids,
-					k_tensor=k_tensor,
-					v_tensor=None,
 					sequence_lengths=sequence_lengths,
 				)
-
-				self._pending_kv_append_tensors.append(k_tensor)
 				if task is not None:
 					self._pending_kv_append_tasks.append(task)
+		else:
+			# Fallback: per-layer loop (current production path)
+			if entries and worker_view is not None and sequence_ids is not None:
+				for layer_idx, k_tensor, v_tensor in entries:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					if v_tensor is not None and v_tensor.dim() == 3:
+						v_tensor = v_tensor.unsqueeze(2)
+
+					task = worker_view.async_append_decode_kv_to_host(
+						layer_idx=layer_idx,
+						sequence_ids=sequence_ids,
+						k_tensor=k_tensor,
+						v_tensor=v_tensor,
+						sequence_lengths=sequence_lengths,
+					)
+
+					self._pending_kv_append_tensors.append(k_tensor)
+					if v_tensor is not None:
+						self._pending_kv_append_tensors.append(v_tensor)
+					if task is not None:
+						self._pending_kv_append_tasks.append(task)
+
+			# Aux (DSA indexer) cache — shares the same post-forward sync
+			if entries_aux and aux_view is not None and sequence_ids is not None:
+				for layer_idx, k_tensor, v_tensor in entries_aux:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+
+					task = aux_view.async_append_decode_kv_to_host(
+						layer_idx=layer_idx,
+						sequence_ids=sequence_ids,
+						k_tensor=k_tensor,
+						v_tensor=None,
+						sequence_lengths=sequence_lengths,
+					)
+
+					self._pending_kv_append_tensors.append(k_tensor)
+					if task is not None:
+						self._pending_kv_append_tasks.append(task)
 
 		# Throttle: prevent thread exhaustion from std::async
 		if len(self._pending_kv_append_tasks) >= 256:
@@ -2416,6 +2461,13 @@ class BatchGenWorker:
 		"""Copy prefetched host KV pages into the GPU cache."""
 		if not global_sequence_ids:
 			return
+		# Host→GPU KV copy is a prefill/resume path and MUST NOT run inside a
+		# CUDA graph capture region — it relies on synchronous .wait() / H2D
+		# DMA that would either be captured incorrectly or deadlock the stream.
+		assert not torch.cuda.is_current_stream_capturing(), (
+			"_load_host_kv_to_gpu called inside CUDA graph capture; "
+			"hoist this call above the capture boundary."
+		)
 		copy_start = time.perf_counter()
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
@@ -8002,18 +8054,63 @@ class BatchGenWorker:
 		Called from generate() after model and GPU KV manager are ready.
 		Only captures graphs for supported models (currently GPT-OSS-120B).
 		"""
+		# Env-override: BATCHGEN_GLM5_CUDA_GRAPH=1 on a GLM-5 model implies
+		# the user wants graphs on; flip enable_cuda_graphs. Without this
+		# the default disable_cuda_graphs=True blocks capture before the
+		# model guard below would allow it.
+		model_name = getattr(self, 'model_name', '') or ''
+		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+		_model_is_glm5 = is_glm5_backend_model(model_name)
+		if _model_is_glm5 and _glm5_cg_enabled:
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
+
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
 			return
 
 		# Model guard: only capture for supported models
-		model_name = getattr(self, 'model_name', '') or ''
-		if "gpt-oss-120b" not in model_name.lower() and not is_kimi_k25_backend_model(model_name):
-			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
+		_supported = (
+			"gpt-oss-120b" in model_name.lower()
+			or is_kimi_k25_backend_model(model_name)
+			or (_model_is_glm5 and _glm5_cg_enabled)
+		)
+		if not _supported:
+			if _model_is_glm5 and not _glm5_cg_enabled:
+				logging.info(
+					f"Rank {self.rank}: GLM-5 CUDA graphs gated off "
+					"(set BATCHGEN_GLM5_CUDA_GRAPH=1 to enable Phase 2a)"
+				)
+			else:
+				logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
 
 		gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
 		if gpu_manager is None:
 			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
+			return
+
+		# NCCL >= 2.18 is required for safe in-graph collectives (capture +
+		# replay of ncclAllReduce / ncclAllGather). Older NCCL versions can
+		# either fail capture or produce stale communicator state at replay.
+		try:
+			nccl_ver = torch.cuda.nccl.version()
+		except Exception as exc:
+			logging.warning(
+				f"Rank {self.rank}: could not query NCCL version ({exc}); "
+				"skipping CUDA graph warmup out of caution"
+			)
+			return
+		# torch.cuda.nccl.version() returns either a tuple (major, minor, patch)
+		# or a packed int like 21903 → 2.19.3. Normalise both.
+		if isinstance(nccl_ver, int):
+			major, minor = divmod(nccl_ver, 10000)[0], (nccl_ver // 100) % 100
+			nccl_tuple = (major, minor)
+		else:
+			nccl_tuple = tuple(nccl_ver[:2])
+		if nccl_tuple < (2, 18):
+			logging.warning(
+				f"Rank {self.rank}: NCCL {nccl_tuple} < (2, 18); "
+				"in-graph collectives require >= 2.18. Skipping CUDA graph warmup."
+			)
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
@@ -8092,6 +8189,11 @@ class BatchGenWorker:
 
 		# Detect K2.5 model for specialized graph segment
 		_is_k25 = is_kimi_k25_backend_model(self.model_name)
+		# Phase 2a (Glm5DsaAttnSegment — per-layer DSA attention only).
+		# Enabled via BATCHGEN_GLM5_CUDA_GRAPH=1; forward body is scaffolding
+		# until Phase 2a-ii refactor lands, so capture will raise
+		# NotImplementedError if registration is actually attempted today.
+		_is_glm5 = is_glm5_backend_model(self.model_name)
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
@@ -8107,6 +8209,182 @@ class BatchGenWorker:
 		# Use model's max_position_embeddings (not max_context_length) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
+
+		# GLM-5 Phase 2a: register per-layer DSA attention segments (scaffolding).
+		# Branch is taken before the GPT-OSS block because GLM-5 uses MLA+DSA,
+		# not GQA, and has its own segment class. Registration is a no-op if
+		# the Phase 2a-ii refactor hasn't landed — warmup_and_capture_all()
+		# will raise NotImplementedError loudly from Glm5DsaAttnSegment.forward.
+		if _is_glm5:
+			from batchgen.models.glm.glm5.cuda_graph_segments import Glm5DsaAttnSegment
+
+			# Static page-table widths for primary MLA KV + DSA indexer KV.
+			# Sized from the model's max_position_embeddings so sequences can
+			# grow to full context length without reading past the captured
+			# static buffer width.
+			max_seq_len = self.model.config.max_position_embeddings
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+
+			# Pre-warm RoPE cos/sin cache on the shared rotary embedding.
+			shared_rope = getattr(self.model.model, "_shared_rotary_emb", None)
+			if shared_rope is not None:
+				dummy = torch.zeros(1, 1, 1, shared_rope.dim, device=self.torch_device)
+				shared_rope(dummy, seq_len=max_seq_len)
+
+			# Assert required host-side scheduler state is wired before capture.
+			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
+			# DSA capture also needs the aux (indexer) paged-KV manager.
+			# For MoE-only capture (Phase 2b without DSA), this is optional.
+			_glm5_dsa_enabled_for_aux = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_DSA", "0") == "1"
+			aux_manager = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+			if _glm5_dsa_enabled_for_aux:
+				if aux_manager is None:
+					logging.warning(
+						f"Rank {self.rank}: DSA capture requested "
+						"(BATCHGEN_GLM5_CUDA_GRAPH_DSA=1) but "
+						"gpu_paged_kv_manager_aux not bound — skipping capture"
+					)
+					return
+				AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+				aux_page_size_tokens = aux_manager.config.page_size_tokens
+				max_aux_pages = (max_seq_len + aux_page_size_tokens - 1) // aux_page_size_tokens
+			else:
+				# MoE-only capture — aux manager not required. Stub values
+				# still need valid types so the DSA-segment constructor loop
+				# below (even though no DSA segments will be registered)
+				# doesn't hit NameError; safe sentinels are fine because
+				# we gate the DSA registration path on the env flag.
+				aux_page_size_tokens = 0
+				max_aux_pages = 0
+			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+
+			from batchgen.models.glm.glm5.cuda_graph_segments import (
+				Glm5MoeReplayProxy,
+				Glm5MoeSegment,
+			)
+			from batchgen.models.glm.glm5.model import Glm5MoE
+
+			# DSA segment registration is gated — its forward raises
+			# NotImplementedError (Phase 2a-ii not landed yet), so including
+			# it would crash warmup_and_capture_all() below.
+			_glm5_dsa_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_DSA", "0") == "1"
+
+			# Phase 2b needs a bucket set to capture against. Build one from
+			# the pre-allocated bucket buffers so capture-time bucket_ntp
+			# matches the buffer's bucket_ntp (== num_tokens_per_rank after
+			# our fix). Fall back to the generic cuda_graph_max_bucket_size
+			# path if BATCHGEN_GLM5_MTP_BUCKETS wasn't set.
+			from batchgen.models.glm.glm5.model import Glm5MoE as _G5M
+			world_size = self.world_size
+			if _G5M._bucket_bufs:
+				# Bucket ntps derived from pre-allocated buffers.
+				bucket_ntps = sorted(
+					max(1, mtp // world_size) for mtp in _G5M._bucket_bufs.keys()
+				)
+				bucketing = BatchSizeBucketing(bucket_ntps)
+				manager = CUDAGraphManager(bucketing, device=self.torch_device)
+				logging.info(
+					f"Rank {self.rank}: GLM-5 MoE bucketing (bucket_ntps): "
+					f"{bucket_ntps} (from BATCHGEN_GLM5_MTP_BUCKETS)"
+				)
+			else:
+				logging.warning(
+					f"Rank {self.rank}: GLM-5 CUDA graph enabled but "
+					"BATCHGEN_GLM5_MTP_BUCKETS not set — MoE bucket buffers "
+					"were not pre-allocated; capture would hit the singleton "
+					"resize path. Skipping capture."
+				)
+				return
+
+			dsa_count = 0
+			moe_count = 0
+			moe_layers: list[tuple[int, "torch.nn.Module"]] = []
+			hidden_size = self.model.config.hidden_size
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				if _glm5_dsa_enabled:
+					attn_wrapper = decoder_layer.self_attn
+					for variant in ("short", "long"):
+						seg = Glm5DsaAttnSegment(
+							decoder_layer=decoder_layer,
+							attn_wrapper=attn_wrapper,
+							layer_idx=layer_idx,
+							variant=variant,
+							max_seq_len=max_seq_len,
+							max_pages_per_seq=max_pages,
+							max_aux_pages_per_seq=max_aux_pages,
+							page_size_tokens=page_size_tokens,
+							aux_page_size_tokens=aux_page_size_tokens,
+						)
+						manager.register_segment(f"layer_{layer_idx}_dsa_{variant}", seg)
+						dsa_count += 1
+
+				# Register MoE segment for MoE layers only (first few are dense FFN).
+				mlp = getattr(decoder_layer, "mlp", None)
+				if isinstance(mlp, Glm5MoE) and mlp.use_3d_moe:
+					moe_seg = Glm5MoeSegment(
+						decoder_layer=decoder_layer,
+						moe_module=mlp,
+						layer_idx=layer_idx,
+						hidden_size=hidden_size,
+					)
+					manager.register_segment(f"layer_{layer_idx}_moe", moe_seg)
+					moe_layers.append((layer_idx, decoder_layer))
+					moe_count += 1
+
+			logging.info(
+				f"Rank {self.rank}: GLM-5 CUDA graph — registered "
+				f"{dsa_count} DSA + {moe_count} MoE segments across "
+				f"{len(bucket_ntps)} buckets {bucket_ntps}. "
+				"Starting capture..."
+			)
+
+			# All ranks must participate in NCCL collectives during capture.
+			torch.cuda.synchronize(self.torch_device)
+			dist.barrier()
+
+			manager.warmup_and_capture_all()
+
+			# Swap in replay proxies for each MoE layer. After this point,
+			# Glm5DecoderLayer.forward's `self.mlp(hidden_states)` routes
+			# through graph replay instead of eager _forward_decode_3d.
+			#
+			# Diagnostic: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 captures the
+			# graphs but leaves decoder_layer.mlp pointing at the original
+			# eager Glm5MoE. Used to bisect "is the bug in capture-time
+			# state poisoning or in replay path?": if decode output is
+			# correct with skip_swap=1, the issue is in proxy/replay; if
+			# still garbage, capture is poisoning shared state.
+			_skip_swap = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP", "0") == "1"
+			if _skip_swap:
+				logging.warning(
+					f"Rank {self.rank}: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 — "
+					"graphs captured but proxies NOT installed. Decode uses "
+					"eager Glm5MoE. (Diagnostic mode)"
+				)
+			else:
+				for layer_idx, decoder_layer in moe_layers:
+					original_mlp = decoder_layer.mlp
+					proxy = Glm5MoeReplayProxy(
+						moe_module=original_mlp,
+						layer_idx=layer_idx,
+						graph_manager=manager,
+						bucketing=bucketing,
+					)
+					decoder_layer.mlp = proxy
+
+			self._cuda_graph_manager = manager
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"GLM-5 MoE graph capture ready: "
+					f"{stats.get('total_capture_time_ms', 0):.0f}ms total, "
+					f"{moe_count} MoE layers × {len(bucket_ntps)} buckets = "
+					f"{moe_count * len(bucket_ntps)} graphs. "
+					+ ("SKIP_SWAP=1, proxies NOT installed." if _skip_swap
+					   else "Proxies installed — decoder_layer.mlp now replays.")
+				)
+			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
 		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
@@ -8145,6 +8423,14 @@ class BatchGenWorker:
 				if (hasattr(moe_decode, 'persistent_expert_indices')
 						and len(moe_decode.persistent_expert_indices) > 0
 						and hasattr(moe_decode, 'comm') and moe_decode.comm is not None):
+					# In-graph all_reduce / all_gather require the PyNccl
+					# communicator (explicit stream, no torch.distributed host
+					# ops). A silent fallback to torch.distributed would either
+					# fail capture or corrupt replay state.
+					assert isinstance(moe_decode.comm, PyNcclCommunicator), (
+						f"Layer {layer_idx}: MoE comm is {type(moe_decode.comm).__name__}, "
+						"expected PyNcclCommunicator for CUDA graph capture."
+					)
 					# Create shared pool once from first MoE layer's params
 					if moe_pool is None:
 						moe_pool = SharedMoEBufferPool(
@@ -8723,13 +9009,30 @@ class BatchGenWorker:
 					# indexer scoring. Computing once here instead of inside
 					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
 					# per decode step on DSA models (GLM-5).
+					#
+					# Fallback to loaded_model_config: Glm5Initializer's stripped
+					# ModelConfig historically didn't carry index_topk, which
+					# silently disabled this hoist and made the per-layer
+					# .sum().item() fallback in wrappers.py:846 fire anyway
+					# (78 × 5 = 390 DtoHs per run). Checking loaded_model_config
+					# as a backup keeps the hoist alive even on older workers.
 					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
+					if _dsa_index_topk is None:
+						_dsa_index_topk = getattr(
+							getattr(self, "loaded_model_config", None),
+							"index_topk", None,
+						)
 					if _dsa_index_topk is not None:
 						AttnWrapperBase._dsa_short_count = int(
 							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
 						)
 					else:
 						AttnWrapperBase._dsa_short_count = None
+
+					# Slot-indices hoist moved below — must run AFTER cur_batch
+					# is set for THIS step (line 8958-8959) and AFTER any
+					# page-table rebuild (line 8970-8972) that could change
+					# seq_id_to_slot.
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -8854,6 +9157,38 @@ class BatchGenWorker:
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
 
+				# Per-step slot_indices hoist. build_batch_slot_indices() used
+				# to run inside every layer's _forward_decode_dsa (wrappers.py:
+				# 666, :673), producing two small int32 HtoD copies per layer.
+				# The mapping depends only on cur_batch + page-table
+				# seq_id_to_slot, both step-constant AFTER the page-table
+				# rebuild above. Compute once here; wrappers.py reads the
+				# cached tensors. Placed here (post-rebuild, pre-forward) so
+				# seq_id_to_slot is the post-rebuild mapping.
+				_primary_mgr = AttnWrapperBase.gpu_paged_kv_manager
+				_aux_mgr = AttnWrapperBase.gpu_paged_kv_manager_aux
+				_cur_batch_hoist = AttnWrapperBase.cur_batch or []
+				if _primary_mgr is not None and len(_cur_batch_hoist) > 0:
+					from batchgen.models.glm.glm5.decode_utils import build_batch_slot_indices
+					AttnWrapperBase.primary_slot_indices = build_batch_slot_indices(
+						_cur_batch_hoist,
+						_primary_mgr._gpu_page_table_manager.seq_id_to_slot,
+						len(_cur_batch_hoist),
+						_primary_mgr.device,
+					)
+					if _aux_mgr is not None:
+						AttnWrapperBase.aux_slot_indices = build_batch_slot_indices(
+							_cur_batch_hoist,
+							_aux_mgr._gpu_page_table_manager.seq_id_to_slot,
+							len(_cur_batch_hoist),
+							_aux_mgr.device,
+						)
+					else:
+						AttnWrapperBase.aux_slot_indices = None
+				else:
+					AttnWrapperBase.primary_slot_indices = None
+					AttnWrapperBase.aux_slot_indices = None
+
 				# Forward
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
@@ -8919,15 +9254,54 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
-						new_tokens,
-						attention_mask=Attn_Wrapper.attention_mask,
-						position_ids=Attn_Wrapper.position_ids,
-						use_cache=False
-					)
-					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+					from batchgen.timing import get_decode_timer as _get_dt_fwd
+					_dt_fwd = _get_dt_fwd()
+					_fwd_ctx = _dt_fwd.timed("forward_total", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
+					with _fwd_ctx:
+						outputs = self.model(
+							new_tokens,
+							attention_mask=Attn_Wrapper.attention_mask,
+							position_ids=Attn_Wrapper.position_ids,
+							use_cache=False
+						)
+					_sample_ctx = _dt_fwd.timed("sampling", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
+					with _sample_ctx:
+						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
 
 			new_tokens = new_tokens_out
+
+			# Step boundary for per-invocation timing. Drains queued
+			# CUDA events, resolves elapsed_ms, advances step counter,
+			# periodically flushes CSV (BATCHGEN_DECODE_TIMING_CSV).
+			_dt_step = get_decode_timer() if 'get_decode_timer' in dir() else None
+			if _dt_step is None:
+				from batchgen.timing import get_decode_timer as _get_dt_step
+				_dt_step = _get_dt_step()
+			if _dt_step is not None and _dt_step.enabled:
+				_dt_step.step_done()
+
+			# cudaProfilerApi surgical bracket for `nsys profile
+			# --capture-range=cudaProfilerApi`. Start/Stop keyed on a decode
+			# step counter so we skip warmup + prefill. Rank-0-guarded so we
+			# only toggle once per process-tree; nsys collects across all
+			# ranks in the tree during the window. No behavior when env vars
+			# unset. Matches existing pattern at batchgen/gemm/w8a8.py:1244.
+			if self.rank == 0:
+				_nsys_start = getattr(self, "_nsys_profile_start_step", None)
+				if _nsys_start is None:
+					_nsys_start = int(os.environ.get(
+						"BATCHGEN_NSYS_PROFILE_START_STEP", "-1"))
+					self._nsys_profile_start_step = _nsys_start
+					self._nsys_profile_end_step = int(os.environ.get(
+						"BATCHGEN_NSYS_PROFILE_END_STEP", "-1"))
+					self._nsys_profile_decode_step = 0
+				if _nsys_start >= 0:
+					_cur = self._nsys_profile_decode_step
+					if _cur == _nsys_start:
+						torch.cuda.cudart().cudaProfilerStart()
+					elif _cur == self._nsys_profile_end_step:
+						torch.cuda.cudart().cudaProfilerStop()
+					self._nsys_profile_decode_step = _cur + 1
 
 			# Flush deferred KV entries — single sync for all layers
 			self._flush_deferred_kv_to_host()
