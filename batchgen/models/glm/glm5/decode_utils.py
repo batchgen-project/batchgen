@@ -58,20 +58,21 @@ def reorder_block_table_to_batch_slots(
     block_table: torch.Tensor,
     slot_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Reorder page-table rows into current-batch order."""
+    """Reorder page-table rows into current-batch order.
+
+    Previously guarded the index_select by a `torch.equal(row_indices,
+    arange)` identity-permutation fast-path; nsys showed this produced a
+    1-byte DtoH sync every layer per step (bool `.all().item()` under
+    the hood). The index_select on an identity permutation is only
+    O(batch × max_pages) bytes of D2D copy — cheaper than the sync the
+    fast-path was trying to skip. Always do the reorder.
+    """
     row_indices = slot_indices.to(device=block_table.device, dtype=torch.long)
     if block_table.shape[0] < row_indices.shape[0]:
         raise RuntimeError(
             "GLM-5 decode block-table row mismatch: "
             f"rows={block_table.shape[0]}, batch={row_indices.shape[0]}"
         )
-    expected = torch.arange(
-        row_indices.shape[0], device=block_table.device, dtype=torch.long
-    )
-    if block_table.shape[0] == row_indices.shape[0] and torch.equal(
-        row_indices, expected
-    ):
-        return block_table
     return block_table.index_select(0, row_indices)
 
 
