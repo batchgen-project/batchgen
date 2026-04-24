@@ -87,6 +87,30 @@ def _node_cpus(node: int) -> List[int]:
         return _parse_cpulist(f.read())
 
 
+def _physical_core_groups(node_cpus: List[int]) -> List[List[int]]:
+    """Group CPUs of a NUMA node by physical core (SMT siblings stay together).
+
+    Returns a list where each element is the list of logical CPU ids that
+    share one physical core (1 entry if no SMT, 2 entries with SMT2, etc.).
+    Order of groups matches the order primary CPUs appear in node_cpus, so
+    slicing this list gives contiguous-physical-core slices."""
+    node_set = set(node_cpus)
+    seen: set = set()
+    groups: List[List[int]] = []
+    for cpu in node_cpus:
+        if cpu in seen:
+            continue
+        try:
+            with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+                siblings = [c for c in _parse_cpulist(f.read()) if c in node_set]
+        except OSError:
+            siblings = [cpu]
+        for c in siblings:
+            seen.add(c)
+        groups.append(sorted(siblings))
+    return groups
+
+
 def _set_mempolicy_bind(node: int) -> bool:
     """MPOL_BIND to the given NUMA node. Affects allocations made after
     this call in the current thread/process. Returns True on success."""
@@ -172,16 +196,21 @@ def bind_worker_to_gpu_numa(local_rank: int,
         slot, n_on_node = 0, 1
 
     all_cpus = _node_cpus(node)
-    # Split the local CPU list into n_on_node contiguous, disjoint slices.
-    # This keeps physical cores + their SMT siblings together because Linux
-    # emits them in a `phys-cores..., smt-siblings...` layout in `cpulist`.
-    chunk = len(all_cpus) // max(n_on_node, 1)
-    if chunk == 0:
-        my_cpus = all_cpus
+    # Split by PHYSICAL CORE so each rank owns both SMT siblings of every core
+    # it gets. A naive "split the flat cpulist" slice puts half the ranks on
+    # primary-only cores and the other half on SMT-sibling-only cores — the
+    # SMT-sibling-only ranks compete with the primary ranks for the same
+    # physical execution units and ran 10-20× slower in our nsys trace.
+    groups = _physical_core_groups(all_cpus)
+    n_groups = len(groups)
+    chunk_g = n_groups // max(n_on_node, 1)
+    if chunk_g == 0:
+        my_groups = groups
     else:
-        start = slot * chunk
-        end = start + chunk if slot < n_on_node - 1 else len(all_cpus)
-        my_cpus = all_cpus[start:end]
+        start_g = slot * chunk_g
+        end_g = start_g + chunk_g if slot < n_on_node - 1 else n_groups
+        my_groups = groups[start_g:end_g]
+    my_cpus = sorted(c for g in my_groups for c in g)
 
     try:
         os.sched_setaffinity(0, set(my_cpus))
@@ -192,8 +221,24 @@ def bind_worker_to_gpu_numa(local_rank: int,
 
     ok_mem = _set_mempolicy_bind(node)
     logging.info(
-        "[numa] rank %d → node %d, cpus[%d:%d]=%d..%d (n=%d), membind=%s",
-        local_rank, node, slot * chunk,
-        (slot * chunk) + len(my_cpus), my_cpus[0], my_cpus[-1],
-        len(my_cpus), "ok" if ok_mem else "failed",
+        "[numa] rank %d → node %d, %d phys-cores, cpus=%s (n=%d), membind=%s",
+        local_rank, node, len(my_groups),
+        _compact_cpulist(my_cpus), len(my_cpus),
+        "ok" if ok_mem else "failed",
     )
+
+
+def _compact_cpulist(cpus: List[int]) -> str:
+    """Format a sorted CPU list like '0-11,192-203' for log readability."""
+    if not cpus:
+        return ""
+    runs: List[str] = []
+    start = prev = cpus[0]
+    for c in cpus[1:]:
+        if c == prev + 1:
+            prev = c
+            continue
+        runs.append(f"{start}" if start == prev else f"{start}-{prev}")
+        start = prev = c
+    runs.append(f"{start}" if start == prev else f"{start}-{prev}")
+    return ",".join(runs)
