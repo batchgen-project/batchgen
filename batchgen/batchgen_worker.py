@@ -10636,18 +10636,75 @@ class BatchGenWorker:
 		try:
 			reload_deps = msg.get("reload_deps", True) if isinstance(msg, dict) else True
 
-			# Reload commonly-changed dependent modules first
+			# Reload commonly-changed dependent modules first.
+			# Order matters: deeper deps before modules that from-import from them,
+			# so the dependent module re-captures the fresh function references
+			# during its own re-execution.
 			if reload_deps:
 				dep_modules = [
 					"batchgen.server.batch_scheduler",
 					"batchgen.server.intake_pool",
 					"batchgen.server.scheduling_pool",
 					"batchgen.kv_cache.gpu_paged_kv_manager",
+					# Model hot-path modules — dep order matters here too.
+					"batchgen.timing",
+					"batchgen.models.glm.glm5.decode_utils",
+					"batchgen.models.glm.glm5.configuration_glm5",
+					"batchgen.models.glm.glm5.model",
+					"batchgen.models.glm.glm5.wrappers",
 				]
+				# Modules whose classes have live instances we can't re-instantiate
+				# (model layers, attn wrappers, timing singleton). For these we
+				# reload-and-patch: rebind the NEW class's methods onto the OLD
+				# class object, so existing instances pick up the new code
+				# automatically on next method lookup.
+				patch_class_modules = {
+					"batchgen.timing",
+					"batchgen.models.glm.glm5.model",
+					"batchgen.models.glm.glm5.wrappers",
+				}
+				# Module-level singletons to preserve across reload (reload re-
+				# executes the module top-level, which would re-assign these to
+				# their initial values). Mapping: module -> list[attr_name].
+				preserve_globals = {
+					"batchgen.timing": ["_decode_timer", "_prefill_timer"],
+				}
 				for mod_name in dep_modules:
-					if mod_name in sys.modules:
-						importlib.reload(sys.modules[mod_name])
-						_log.info(f"Rank {self.rank}: Reloaded dependency {mod_name}")
+					if mod_name not in sys.modules:
+						continue
+					mod = sys.modules[mod_name]
+					# Snapshot state to restore / patch after reload.
+					old_classes = {}
+					if mod_name in patch_class_modules:
+						for name, cls in inspect.getmembers(mod, inspect.isclass):
+							if getattr(cls, "__module__", None) == mod_name:
+								old_classes[name] = cls
+					preserved = {}
+					for attr in preserve_globals.get(mod_name, []):
+						if hasattr(mod, attr):
+							preserved[attr] = getattr(mod, attr)
+					importlib.reload(mod)
+					for attr, val in preserved.items():
+						setattr(mod, attr, val)
+					methods_patched = 0
+					for name, old_cls in old_classes.items():
+						new_cls = getattr(mod, name, None)
+						if new_cls is None or new_cls is old_cls:
+							continue
+						for meth_name, new_meth in inspect.getmembers(new_cls, inspect.isfunction):
+							if meth_name.startswith("__") and meth_name != "__init__":
+								continue
+							try:
+								setattr(old_cls, meth_name, new_meth)
+								methods_patched += 1
+							except (AttributeError, TypeError):
+								pass
+					_log.info(
+						f"Rank {self.rank}: Reloaded {mod_name}"
+						+ (f" (patched {len(old_classes)} classes, "
+						   f"{methods_patched} methods; preserved {list(preserved)})"
+						   if old_classes or preserved else "")
+					)
 
 			# Reload the worker module itself
 			import batchgen.batchgen_worker as worker_module
