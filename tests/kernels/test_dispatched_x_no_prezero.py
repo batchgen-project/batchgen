@@ -90,36 +90,42 @@ def test_dispatch_scatter_only_writes_valid_rows():
 
 def test_act_quant_3d_ignores_padded_rows():
     """act_quant_3d output at rows [0, count) must match regardless of
-    what garbage lives in the padded rows."""
+    what garbage lives in the padded rows.
+
+    Test strategy: run dispatch_scatter_3d ONCE (its atomic-add ordering is
+    non-deterministic, so running it twice can permute tokens inside valid
+    rows). Then clone the dispatched buffer twice and only alter the padded
+    tail in one copy. Running act_quant_3d on both copies must produce
+    identical output at rows [0, count)."""
     ctx = _setup()
     E, mtp, H = ctx["E_local"], ctx["mtp"], ctx["H"]
 
-    # Reference: zero-init dispatched_x, then scatter → act_quant_3d.
-    dx_ref = torch.zeros(E * mtp, H, dtype=torch.bfloat16, device=ctx["device"])
-    counts_ref, _ = _run_dispatch(ctx, dx_ref)
-    torch.cuda.synchronize()
-    x_ref_3d = dx_ref.view(E, mtp, H)
-    q_ref, s_ref = ctx["act_quant_3d"](x_ref_3d, counts_ref)
-
-    # Under test: garbage-init dispatched_x, scatter writes only valid rows,
-    # padded rows remain garbage; act_quant_3d runs over the whole tensor.
-    dx_gar = torch.full((E * mtp, H), 12345.0, dtype=torch.bfloat16, device=ctx["device"])
-    # Include NaN / Inf in the garbage to provoke propagation bugs.
-    dx_gar.view(E, mtp, H)[:, mtp // 2 + 1, :] = float('nan')
-    dx_gar.view(E, mtp, H)[:, mtp // 2 + 2, :] = float('inf')
-    counts_gar, _ = _run_dispatch(ctx, dx_gar)
-    torch.cuda.synchronize()
-    assert torch.equal(counts_ref, counts_gar), "routing non-determinism — test setup bug"
-    x_gar_3d = dx_gar.view(E, mtp, H)
-    q_gar, s_gar = ctx["act_quant_3d"](x_gar_3d, counts_gar)
+    dx = torch.zeros(E * mtp, H, dtype=torch.bfloat16, device=ctx["device"])
+    counts, _ = _run_dispatch(ctx, dx)
     torch.cuda.synchronize()
 
-    counts_cpu = counts_ref.cpu().tolist()
+    dx_ref = dx.clone()
+    dx_gar = dx.clone()
+    # Poison the padded tail of dx_gar with large finite, NaN, and Inf.
+    counts_cpu = counts.cpu().tolist()
+    dx_gar_3d = dx_gar.view(E, mtp, H)
+    for e in range(E):
+        c = counts_cpu[e]
+        if c < mtp:
+            dx_gar_3d[e, c:mtp] = 12345.0
+            if c + 1 < mtp:
+                dx_gar_3d[e, c + 1] = float('nan')
+            if c + 2 < mtp:
+                dx_gar_3d[e, c + 2] = float('inf')
+
+    q_ref, s_ref = ctx["act_quant_3d"](dx_ref.view(E, mtp, H), counts)
+    q_gar, s_gar = ctx["act_quant_3d"](dx_gar.view(E, mtp, H), counts)
+    torch.cuda.synchronize()
+
     for e in range(E):
         c = counts_cpu[e]
         if c == 0:
             continue
-        # FP8 quant output bit-exact on valid rows.
         assert torch.equal(q_ref[e, :c], q_gar[e, :c]), \
             f"expert {e}: FP8 quant differs on valid rows (count={c}) — padded garbage leaked in"
         assert torch.equal(s_ref[e, :c], s_gar[e, :c]), \
