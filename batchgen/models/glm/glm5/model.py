@@ -1613,9 +1613,10 @@ class Glm5MoE(nn.Module):
                 topk_idx[padding_mask] = -1
                 topk_weight[padding_mask] = 0.0
 
-        # 3) 3D dispatch
+        # 3) 3D dispatch — no pre-zero: downstream act_quant_3d and the
+        # adaptive-tile FP8 GEMM both respect `expert_counts[e]` and never
+        # read rows [count, mtp); stale data in padded rows is invisible.
         with (dt.timed("dispatch_3d", li) if dt else _nullctx()):
-            buf.dispatched_x.zero_()
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
                 buf.dispatched_x,
