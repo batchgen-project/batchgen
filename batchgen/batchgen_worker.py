@@ -8907,36 +8907,10 @@ class BatchGenWorker:
 					else:
 						AttnWrapperBase._dsa_short_count = None
 
-					# Per-step slot_indices hoist. build_batch_slot_indices()
-					# used to run inside every layer's _forward_decode_dsa
-					# (wrappers.py:666, :673), producing two 32-byte HtoD
-					# copies per layer → 156 HtoDs/step at 78 layers. The
-					# mapping depends only on cur_batch + page-table
-					# seq_id_to_slot, both step-constant. Compute once here;
-					# wrappers.py reads the cached tensors.
-					_primary_mgr = AttnWrapperBase.gpu_paged_kv_manager
-					_aux_mgr = AttnWrapperBase.gpu_paged_kv_manager_aux
-					_cur_batch = AttnWrapperBase.cur_batch or []
-					if _primary_mgr is not None and len(_cur_batch) > 0:
-						from batchgen.models.glm.glm5.decode_utils import build_batch_slot_indices
-						AttnWrapperBase.primary_slot_indices = build_batch_slot_indices(
-							_cur_batch,
-							_primary_mgr._gpu_page_table_manager.seq_id_to_slot,
-							len(_cur_batch),
-							_primary_mgr.device,
-						)
-						if _aux_mgr is not None:
-							AttnWrapperBase.aux_slot_indices = build_batch_slot_indices(
-								_cur_batch,
-								_aux_mgr._gpu_page_table_manager.seq_id_to_slot,
-								len(_cur_batch),
-								_aux_mgr.device,
-							)
-						else:
-							AttnWrapperBase.aux_slot_indices = None
-					else:
-						AttnWrapperBase.primary_slot_indices = None
-						AttnWrapperBase.aux_slot_indices = None
+					# Slot-indices hoist moved below — must run AFTER cur_batch
+					# is set for THIS step (line 8958-8959) and AFTER any
+					# page-table rebuild (line 8970-8972) that could change
+					# seq_id_to_slot.
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -9060,6 +9034,38 @@ class BatchGenWorker:
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
+
+				# Per-step slot_indices hoist. build_batch_slot_indices() used
+				# to run inside every layer's _forward_decode_dsa (wrappers.py:
+				# 666, :673), producing two small int32 HtoD copies per layer.
+				# The mapping depends only on cur_batch + page-table
+				# seq_id_to_slot, both step-constant AFTER the page-table
+				# rebuild above. Compute once here; wrappers.py reads the
+				# cached tensors. Placed here (post-rebuild, pre-forward) so
+				# seq_id_to_slot is the post-rebuild mapping.
+				_primary_mgr = AttnWrapperBase.gpu_paged_kv_manager
+				_aux_mgr = AttnWrapperBase.gpu_paged_kv_manager_aux
+				_cur_batch_hoist = AttnWrapperBase.cur_batch or []
+				if _primary_mgr is not None and len(_cur_batch_hoist) > 0:
+					from batchgen.models.glm.glm5.decode_utils import build_batch_slot_indices
+					AttnWrapperBase.primary_slot_indices = build_batch_slot_indices(
+						_cur_batch_hoist,
+						_primary_mgr._gpu_page_table_manager.seq_id_to_slot,
+						len(_cur_batch_hoist),
+						_primary_mgr.device,
+					)
+					if _aux_mgr is not None:
+						AttnWrapperBase.aux_slot_indices = build_batch_slot_indices(
+							_cur_batch_hoist,
+							_aux_mgr._gpu_page_table_manager.seq_id_to_slot,
+							len(_cur_batch_hoist),
+							_aux_mgr.device,
+						)
+					else:
+						AttnWrapperBase.aux_slot_indices = None
+				else:
+					AttnWrapperBase.primary_slot_indices = None
+					AttnWrapperBase.aux_slot_indices = None
 
 				# Forward
 				_use_graph = (
