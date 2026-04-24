@@ -60,7 +60,7 @@ pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen_kernels-0.3.1+sm90a-cp311-cp311-linux_x86_64.whl" \
+  "${RELEASE_URL}/batchgen_kernels-0.3.1-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/batchgen-1.0.9-py3-none-any.whl"
 ```
 
