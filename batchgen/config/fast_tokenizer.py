@@ -255,6 +255,29 @@ class FastTokenizer(BaseTokenizer):
         input_ids = [e.ids for e in encodings]
         attention_masks = [e.attention_mask for e in encodings]
 
+        # CRITICAL: the underlying Rust tokenizer was configured with
+        # `enable_padding(...)` in `_setup_padding` (called once at __init__),
+        # so `encode_batch` ALWAYS right-pads each result to the max length
+        # in the current call's batch — regardless of the Python-level
+        # `padding=` arg. When the caller asked for `padding=False`, we must
+        # strip that pad ourselves, or every per-sequence length recorded
+        # downstream is silently inflated by however much the longest
+        # sibling in the same call needed. (This is the root cause of the
+        # GLM-5 multi-seq prefill slot-0 corruption: when the worker
+        # tokenizes 2 admitted prompts at once with `padding=False`, the
+        # shorter one's input_ids comes back inflated with pad tokens, the
+        # inflated count flows into seq.prompt_length, then into
+        # cu_seqlens[1]-cu_seqlens[0], and finally
+        # last_token_indices = batch_cu_seqlens[1:] - 1 picks a pad-token
+        # hidden state for lm_head → garbage output for that sequence.)
+        if not padding:
+            for i in range(len(input_ids)):
+                # attention_mask is 1 for valid tokens, 0 for Rust-added pad
+                valid = sum(attention_masks[i])
+                if valid != len(input_ids[i]):
+                    input_ids[i] = input_ids[i][:valid]
+                    attention_masks[i] = attention_masks[i][:valid]
+
         # Pad if requested (tokenizers library handles this automatically if enabled)
         if padding and len(texts) > 1:
             max_len = max(len(ids) for ids in input_ids)
@@ -310,17 +333,30 @@ class FastTokenizer(BaseTokenizer):
                 "Cannot apply chat template formatting."
             )
 
-        try:
-            from jinja2 import Template, Undefined
-        except ImportError:
-            raise ImportError(
-                "jinja2 is required for apply_chat_template. "
-                "Install it with: pip install jinja2"
+        # Lazily build + cache the Jinja Template. Template() is ~10 ms per
+        # construction; render() is ~30 µs. Rebuilding every call is the
+        # reason scheduler admission of 3361 L4 prompts took ~90 s.
+        template = getattr(self, "_jinja_template", None)
+        if template is None:
+            try:
+                from jinja2 import Template, Undefined
+            except ImportError:
+                raise ImportError(
+                    "jinja2 is required for apply_chat_template. "
+                    "Install it with: pip install jinja2"
+                )
+            # Match HuggingFace transformers' rendering: permissive Undefined
+            # + trim_blocks=True + lstrip_blocks=True (HF uses
+            # ImmutableSandboxedEnvironment which sets both to True). Without
+            # these, raw newlines/whitespace from block tags leak into the
+            # rendered prompt.
+            template = Template(
+                self.chat_template,
+                undefined=Undefined,
+                trim_blocks=True,
+                lstrip_blocks=True,
             )
-
-        # Create Jinja2 template (use permissive Undefined like HuggingFace transformers,
-        # since chat templates may access optional attributes like current_date)
-        template = Template(self.chat_template, undefined=Undefined)
+            self._jinja_template = template
 
         # Render the template with messages and special tokens
         rendered = template.render(

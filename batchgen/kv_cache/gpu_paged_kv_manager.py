@@ -356,6 +356,10 @@ class _GPUPageTableManager:
 		self._slot_to_seq_id_tensor: Optional[torch.Tensor] = None
 		# Flattened list of active page indices ordered by slot_to_seq_id.
 		self._active_page_indices_cpu: Optional[torch.Tensor] = None
+		# Monotonic version bumped on every logical page-table rebuild/clear so
+		# decode-side gather caches can invalidate even when the GPU tensor is
+		# reused in place and keeps the same data_ptr().
+		self.rebuild_version: int = 0
 
 	def rebuild(
 		self,
@@ -436,9 +440,12 @@ class _GPUPageTableManager:
 		fill_region = table[:num_slots, :new_max]
 
 		# Fill table rows from sequence state pages.
+		# Always clear unused columns to prevent stale page IDs from
+		# polluting page 0 (the first allocated page).
 		for slot, seq_id in enumerate(wanted_order):
 			state = sequences.get(seq_id)
 			if state is None or state.pages.numel() == 0:
+				fill_region[slot, :] = -1
 				continue
 			pages = state.pages.to(self.device, dtype=torch.int32)
 			count = int(pages.numel())
@@ -454,6 +461,8 @@ class _GPUPageTableManager:
 				count = new_max
 				pages = pages[:count]
 			fill_region[slot, :count] = pages[:count]
+			if count < new_max:
+				fill_region[slot, count:] = -1
 
 		if not reuse_existing:
 			self.gpu_table = table
@@ -462,6 +471,7 @@ class _GPUPageTableManager:
 			self.slot_to_seq_id
 		)
 		self._active_page_indices_cpu = flat_pages_cpu
+		self.rebuild_version += 1
 		
 		# DEBUG: Log final state after rebuild
 		if BATCHGEN_CB_DEBUG:
@@ -818,6 +828,7 @@ class GPUPagedKVCacheManager:
 		mgr._slot_index_tensor = None
 		mgr._slot_to_seq_id_tensor = None
 		mgr._active_page_indices_cpu = None
+		mgr.rebuild_version += 1
 		
 		# Clear active page pointer tables
 		self._clear_active_page_pointer_tables()
@@ -966,6 +977,7 @@ class GPUPagedKVCacheManager:
 		sequence_lengths: torch.Tensor,
 		layer_idx: int,
 		batch_slice: Optional[tuple] = None,  # (start_idx, end_idx) for micro-batching
+		slot_indices: Optional[torch.Tensor] = None,
 	) -> None:
 		"""Writes single-position KV tokens for ``layer_idx`` using the cached
 		GPU page table order.
@@ -978,6 +990,8 @@ class GPUPagedKVCacheManager:
 			batch_slice: Optional tuple (start_idx, end_idx) indicating which slice 
 				of the full batch this call represents. When provided, the page table 
 				and slot_indices will be sliced accordingly.
+			slot_indices: Optional explicit page-table slot indices aligned with
+				``k_tensor`` / ``sequence_lengths`` batch order.
 		"""
 		# op_name = "update_layer_decode_new_token"
 		# self._ensure_initialized()
@@ -999,7 +1013,10 @@ class GPUPagedKVCacheManager:
 
 		# all the tensors are continuous
 		# slot_indices = self._gpu_page_table_manager.get_slot_index_tensor()
-		slot_indices = self._gpu_page_table_manager._slot_index_tensor
+		if slot_indices is None:
+			slot_indices = self._gpu_page_table_manager._slot_index_tensor
+		else:
+			slot_indices = slot_indices.to(device=page_table.device, dtype=torch.int32)
 		token_indices = sequence_lengths
 
 		# Apply batch slice if provided (for micro-batching)
@@ -1011,8 +1028,21 @@ class GPUPagedKVCacheManager:
 			start_idx, end_idx = batch_slice
 			# slot_indices[start_idx:end_idx] gives us [start_idx, start_idx+1, ..., end_idx-1]
 			# which correctly maps micro-batch tokens to full page table rows
-			slot_indices = slot_indices[start_idx:end_idx]
+			if slot_indices.shape[0] != batch_size:
+				slot_indices = slot_indices[start_idx:end_idx]
+			if token_indices.shape[0] != batch_size:
+				token_indices = token_indices[start_idx:end_idx]
 		page_table_view = page_table  # Always use full page table
+		if slot_indices.shape[0] != batch_size:
+			raise ValueError(
+				"update_layer_decode_new_token: slot_indices must align with k_tensor batch, "
+				f"got slot_indices.shape[0]={slot_indices.shape[0]}, batch_size={batch_size}"
+			)
+		if token_indices.shape[0] != batch_size:
+			raise ValueError(
+				"update_layer_decode_new_token: sequence_lengths must align with k_tensor batch, "
+				f"got sequence_lengths.shape[0]={token_indices.shape[0]}, batch_size={batch_size}"
+			)
 		k_tokens = k_tensor.view(batch_size, -1)
 
 		if v_tensor is not None and self._v_cache is not None:
@@ -1098,47 +1128,6 @@ class GPUPagedKVCacheManager:
 							print(f"[GPU KV WRITE L0] V head0 MISMATCH at dim {i}: written={w}, read={r}")
 							break
 
-			# CHECK FOR PAGE TABLE CONFLICTS - are different sequences writing to the same gpu_page?
-			print(f"[GPU KV WRITE L0] === PAGE TABLE CONFLICT CHECK ===")
-			print(f"[GPU KV WRITE L0] page_table_view.shape={page_table_view.shape}")
-			gpu_pages_used = {}  # gpu_page -> list of (slot, page_idx)
-			num_seqs_to_check = min(batch_size, 10)
-			for i in range(num_seqs_to_check):
-				slot_i = int(slot_indices[i].item())
-				pos_i = int(token_indices[i].item())
-				page_idx_i = pos_i // self.config.page_size_tokens
-				offset_i = pos_i % self.config.page_size_tokens
-				gpu_page_i = int(page_table_view[slot_i, page_idx_i].item())
-				if gpu_page_i not in gpu_pages_used:
-					gpu_pages_used[gpu_page_i] = []
-				gpu_pages_used[gpu_page_i].append((slot_i, page_idx_i, pos_i, offset_i))
-				print(f"[GPU KV WRITE L0] seq{i}: slot={slot_i}, pos={pos_i}, page_idx={page_idx_i}, offset={offset_i}, gpu_page={gpu_page_i}")
-
-			# Report conflicts
-			conflicts_found = False
-			for gpu_page_id, users in gpu_pages_used.items():
-				if len(users) > 1:
-					conflicts_found = True
-					print(f"[GPU KV WRITE L0] CONFLICT: gpu_page={gpu_page_id} used by {len(users)} sequences: {users}")
-			if not conflicts_found:
-				print(f"[GPU KV WRITE L0] No page conflicts detected among first {num_seqs_to_check} sequences")
-
-			# Also check: Are all sequences using SAME page_idx (and thus potentially same cache)?
-			# This could happen if cache_seqlens are all the same (from same prefill)
-			unique_positions = set(int(token_indices[i].item()) for i in range(min(batch_size, 10)))
-			print(f"[GPU KV WRITE L0] Unique token positions among first 10 seqs: {sorted(unique_positions)}")
-
-			# Print full page table for first 3 sequences to see their page allocations
-			print(f"[GPU KV WRITE L0] === FULL PAGE TABLE FOR FIRST 3 SEQUENCES ===")
-			for i in range(min(3, batch_size)):
-				slot_i = int(slot_indices[i].item())
-				# Get all pages for this slot up to page_idx + 1
-				max_page_idx = (int(token_indices[i].item()) // self.config.page_size_tokens) + 1
-				pages_for_seq = []
-				for p in range(min(max_page_idx, page_table_view.shape[1])):
-					pages_for_seq.append(int(page_table_view[slot_i, p].item()))
-				print(f"[GPU KV WRITE L0] seq{i} (slot={slot_i}): pages[:10]={pages_for_seq[:10]}")
-
 	def get_layer_kv_with_page_table(
 		self, layer_idx: int
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -1161,6 +1150,11 @@ class GPUPagedKVCacheManager:
 				"get_layer_kv_with_page_table: GPU page table is not initialized; "
 				"call allocate_pages_for_sequences and build_page_table before using this method"
 			)
+
+	def get_page_table_version(self) -> int:
+		"""Return a monotonic version for the active page-table contents."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.rebuild_version
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 		"""Exposes the raw K/V cache tensors."""

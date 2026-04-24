@@ -159,10 +159,7 @@ class ExpertWrapperBase(BaseModuleWrapper):
         result = self.micro_batch_forward(hidden_states, "expert")
 
         if not self.persistent:
-            # Sync and cleanup (non-persistent experts)
-            torch.cuda.current_stream(
-                self.engine_config.Basic_Config.device_torch
-            ).synchronize()
+            torch.cuda.current_stream().synchronize()
             self.free_weights(self.module_key)
             self.clear_weights()
 

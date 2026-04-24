@@ -91,35 +91,40 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     out_stride0, out_stride1, out_stride2
 ):
     # Constants matching C++ implementation
-    FP8_SAFE_MAX: tl.constexpr = 440.0  # Leave headroom
+    FP8_SAFE_MAX: tl.constexpr = 448.0  # Leave headroom
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0  # Precomputed reciprocal.
     FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
     EPSILON: tl.constexpr = 1e-12
-    
+
     pid_seq = tl.program_id(0)
     pid_token = tl.program_id(1)
     pid_block = tl.program_id(2)
-    
+
     # Calculate offsets
     block_start = pid_block * block_size
     block_offsets = pid_seq * q_stride0 + pid_token * q_stride1 + \
                     (block_start + tl.arange(0, block_size)) * q_stride2
-    
+
     # Load with masking for partial blocks
     mask = (block_start + tl.arange(0, block_size)) < dim
     q_bf16 = tl.load(q_ptr + block_offsets, mask=mask, other=0.0)
-    
+
     # Convert to float32 for computation
     q_float = q_bf16.to(tl.float32)
-    
+
     # Compute absolute maximum (symmetric quantization)
     q_abs = tl.abs(q_float)
     amax = tl.max(q_abs, axis=0)
-    
+
     # Apply minimum threshold (matching C++)
     amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
-    
-    # Compute scale factor
-    scale = tl.maximum(amax / FP8_SAFE_MAX, EPSILON)
+
+    # Compute scale factor. Use the SGLang formula ``amax * (1/448)``
+    # instead of ``amax / 448`` — Triton's FP32 division vs multiplication
+    # produce different sub-ULP bit patterns, which propagates into
+    # ``q/scale`` and yields different FP8 rounding on ~0.1% of elements
+    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
     
     # Quantize with explicit clamping
     q_scaled = q_float / scale
@@ -129,17 +134,232 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     # Handle NaN/Inf (set to 0)
     is_finite = tl.abs(q_scaled) < 1e30  # Triton doesn't have isfinite
     q_scaled = tl.where(is_finite, q_scaled, 0.0)
-    
-    # Convert to FP8
-    q_fp8 = q_scaled.to(tl.float8e4nv)
-    
-    # Store results
+
+    # Store directly to FP8 output pointer — the typed pointer's dtype
+    # drives the implicit FP32→FP8 cast inside ``tl.store`` and uses
+    # round-to-nearest-even, matching SGLang's ``_act_quant_kernel``
+    # (triton_kernel.py:76-77). The prior explicit ``.to(tl.float8e4nv)``
+    # used a different rounding mode and produced FP8 bytes that differed
+    # from SGLang at ~0.03-0.20% of elements across typical GLM-5 shapes
+    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
     out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + \
                   (block_start + tl.arange(0, block_size)) * out_stride2
-    tl.store(out_ptr + out_offsets, q_fp8, mask=mask)
+    tl.store(out_ptr + out_offsets, q_scaled, mask=mask)
     tl.store(scale_ptr + pid_seq * scale_stride0 + pid_token * scale_stride1 + \
              pid_block * scale_stride2, scale)
 
+
+
+@triton.jit
+def per_token_blocked_quantize_bf16_to_fp8_flat_kernel(
+    q_ptr, scale_ptr, out_ptr,
+    M, dim: tl.constexpr, block_size: tl.constexpr, num_blocks: tl.constexpr,
+    q_stride_m, q_stride_d,
+    scale_stride_m, scale_stride_b,
+    out_stride_m, out_stride_d,
+):
+    """1D-grid variant. grid = (M * num_blocks,). Decodes (row, block) inside.
+
+    Motivation: the 3D kernel uses grid (bsz, seq_len, num_blocks). In
+    prepacked prefill with concatenated sequences, total M = sum(seq_len)
+    can reach hundreds of thousands → exceeds CUDA's 65 535-per-dim cap on
+    the Y axis → 'Triton Error [CUDA]: invalid argument'. The 1D grid on X
+    caps at 2^31-1 (~2.1B), sufficient for every GLM-5 prepacked prefill
+    shape and beyond. Per-CTA overhead: one constexpr-divisor divmod
+    (~2-3 cycles), negligible vs the ~100-cycle quant body.
+
+    IMPORTANT: use int64 for the row-major offset computation. Triton's
+    default program_id() / stride arithmetic is int32, and `pid_m *
+    q_stride_m` overflows when M × hidden_dim > 2^31 (e.g. M=500K, N=6144
+    → 3.07B). That overflow silently wraps, corrupting every load/store
+    address past the first ~350K rows and producing NaN/garbage FP8. The
+    3D kernel has the same issue at this scale but hits the grid-cap
+    failure first.
+    """
+    FP8_SAFE_MAX: tl.constexpr = 448.0
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+
+    pid = tl.program_id(0).to(tl.int64)
+    pid_m = pid // num_blocks
+    pid_b = pid % num_blocks
+
+    block_start = pid_b * block_size
+    cols = block_start + tl.arange(0, block_size).to(tl.int64)
+    col_mask = cols < dim
+
+    q_stride_m_i64 = tl.cast(q_stride_m, tl.int64)
+    out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
+    q_offsets = pid_m * q_stride_m_i64 + cols * q_stride_d
+    q_bf16 = tl.load(q_ptr + q_offsets, mask=col_mask, other=0.0)
+    q_float = q_bf16.to(tl.float32)
+
+    amax = tl.max(tl.abs(q_float), axis=0)
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    # SGLang formula: amax * (1/448). See 3D kernel above for rationale.
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
+
+    q_scaled = q_float / scale
+    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
+    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
+    is_finite = tl.abs(q_scaled) < 1e30
+    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+
+    # Implicit FP32 -> FP8 cast via typed pointer (round-to-nearest-even).
+    # See 3D-grid variant above for rationale.
+    scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
+    out_offsets = pid_m * out_stride_m_i64 + cols * out_stride_d
+    tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
+    tl.store(scale_ptr + pid_m * scale_stride_m_i64 + pid_b * scale_stride_b, scale)
+
+
+def per_token_blocked_quantize_bf16_to_fp8_flat(
+    x: torch.Tensor, block_size: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """2D-input variant of per_token_blocked_quantize_bf16_to_fp8.
+
+    Accepts x of shape [M, dim] where M can be arbitrarily large (up to
+    2^31-1). Launches a 1D Triton grid of size M * num_blocks. Used by
+    the MLA prefill path in `fa3_backend.act_quant` to handle prepacked
+    prefill with ~hundreds of thousands of concatenated tokens, which
+    blows past the Y-dim cap on the 3D kernel's (bsz, seq_len, num_blocks)
+    grid.
+
+    Returns:
+        out:   [M, dim]                 dtype=float8_e4m3fn
+        scale: [M, num_blocks]          dtype=float32
+    """
+    assert x.dtype == torch.bfloat16
+    assert x.is_contiguous()
+    assert x.dim() == 2, f"Expected 2D tensor got {x.dim()}D with shape {x.shape}"
+
+    M, dim = x.shape
+    num_blocks = (dim + block_size - 1) // block_size
+
+    out = torch.empty((M, dim), device=x.device, dtype=torch.float8_e4m3fn)
+    scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
+
+    grid = (M * num_blocks,)
+    per_token_blocked_quantize_bf16_to_fp8_flat_kernel[grid](
+        x, scale, out,
+        M, dim, block_size, num_blocks,
+        x.stride(0), x.stride(1),
+        scale.stride(0), scale.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    return out, scale
+
+
+@triton.jit
+def _per_token_blocked_quantize_1d_kernel(
+    q_ptr, scale_ptr, out_ptr,
+    M,
+    dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,       # 128 — fp8 blockwise scale block
+    NUM_BLOCKS: tl.constexpr,        # ceil(dim / BLOCK_SIZE)
+    NUM_BLOCKS_P2: tl.constexpr,     # pow-2 pad of NUM_BLOCKS (Triton needs pow-2 tile dim)
+    q_stride_m, q_stride_d,
+    scale_stride_m, scale_stride_b,
+    out_stride_m, out_stride_d,
+):
+    """1 CTA per token. 2D tile [NUM_BLOCKS_P2, BLOCK_SIZE] loaded in one shot,
+    per-block amax reduced along axis=1, then quantized + stored.
+
+    CTA count drops to M (matches the CUDA `act_quant_3d` kernel's grid).
+    Amortizes all NUM_BLOCKS K-blocks for a given token into a single CTA
+    lifetime, eliminating the per-K-block CTA launch/setup overhead that made
+    the (M * num_blocks)-grid flat variant 3× slower at large M.
+
+    Grid cap: M ≤ 2^31-1 on CUDA CC ≥ 3.0 (H20 = 9.0). No grid-Y used.
+    """
+    FP8_SAFE_MAX: tl.constexpr = 448.0
+    FP8_SAFE_MAX_INV: tl.constexpr = 1.0 / 448.0
+    FP8_E4M3_MIN_NORMAL: tl.constexpr = 1.52587890625e-05
+    EPSILON: tl.constexpr = 1e-12
+
+    pid_m = tl.program_id(0).to(tl.int64)
+
+    # Block-id axis (rows of the 2D tile) and col-in-block axis (cols).
+    # NUM_BLOCKS_P2 is the padded-to-pow2 block count; valid blocks are
+    # [0, NUM_BLOCKS). Padded rows get loaded with mask=0 so they contribute
+    # nothing to amax and never store back.
+    block_ids = tl.arange(0, NUM_BLOCKS_P2)
+    col_in_block = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+
+    # cols_2d: [NUM_BLOCKS_P2, BLOCK_SIZE] — absolute column indices.
+    cols_2d = block_ids[:, None].to(tl.int64) * BLOCK_SIZE + col_in_block[None, :]
+    col_mask = cols_2d < dim  # also filters padded rows (block_id >= NUM_BLOCKS)
+
+    # int64 offsets: pid_m * q_stride_m can exceed 2^31 when M * dim > 2B.
+    q_stride_m_i64 = tl.cast(q_stride_m, tl.int64)
+    out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
+    scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
+
+    q_offsets = pid_m * q_stride_m_i64 + cols_2d * q_stride_d
+    q_bf16 = tl.load(q_ptr + q_offsets, mask=col_mask, other=0.0)
+    q_float = q_bf16.to(tl.float32)
+
+    # Per-block amax via axis-1 reduction — one reduction call reduces
+    # NUM_BLOCKS_P2 rows simultaneously (padded rows reduce to 0).
+    amax = tl.max(tl.abs(q_float), axis=1)
+    amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
+    # SGLang formula: scale = amax * (1 / 448). Matches the 3D-grid kernel.
+    scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)   # [NUM_BLOCKS_P2]
+
+    # Quantize — broadcast scale across the BLOCK_SIZE axis.
+    q_scaled = q_float / scale[:, None]
+    q_scaled = tl.minimum(q_scaled, FP8_SAFE_MAX)
+    q_scaled = tl.maximum(q_scaled, -FP8_SAFE_MAX)
+    is_finite = tl.abs(q_scaled) < 1e30
+    q_scaled = tl.where(is_finite, q_scaled, 0.0)
+
+    out_offsets = pid_m * out_stride_m_i64 + cols_2d * out_stride_d
+    tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
+
+    # Store scales, masking padded block rows.
+    block_valid = block_ids < NUM_BLOCKS
+    scale_offsets = pid_m * scale_stride_m_i64 + block_ids.to(tl.int64) * scale_stride_b
+    tl.store(scale_ptr + scale_offsets, scale, mask=block_valid)
+
+
+def per_token_blocked_quantize_bf16_to_fp8_1d(
+    x: torch.Tensor, block_size: int = 128,
+    num_warps: int = 4, num_stages: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fast Triton 1D-grid variant: 1 CTA per token (matches the CUDA
+    act_quant_3d kernel's partitioning). At M=100k, K=6144 this is ~3× faster
+    than `per_token_blocked_quantize_bf16_to_fp8_flat` (which uses 1 CTA per
+    (token, K-block), running 48× more CTAs).
+
+    Returns:
+        out:   [M, dim]          dtype=float8_e4m3fn
+        scale: [M, num_blocks]   dtype=float32
+    """
+    assert x.dtype == torch.bfloat16
+    assert x.is_contiguous()
+    assert x.dim() == 2, f"Expected 2D tensor got {x.dim()}D with shape {x.shape}"
+
+    M, dim = x.shape
+    num_blocks = (dim + block_size - 1) // block_size
+    # Pad to next pow2 for Triton tile-dim requirement.
+    num_blocks_p2 = 1
+    while num_blocks_p2 < num_blocks:
+        num_blocks_p2 *= 2
+
+    out = torch.empty((M, dim), device=x.device, dtype=torch.float8_e4m3fn)
+    scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
+
+    grid = (M,)
+    _per_token_blocked_quantize_1d_kernel[grid](
+        x, scale, out,
+        M, dim, block_size, num_blocks, num_blocks_p2,
+        x.stride(0), x.stride(1),
+        scale.stride(0), scale.stride(1),
+        out.stride(0), out.stride(1),
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return out, scale
 
 
 def per_token_blocked_quantize_bf16_to_fp8(x: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
@@ -172,6 +392,51 @@ def per_token_blocked_quantize_bf16_to_fp8(x: torch.Tensor, block_size: int = 12
 		scale.stride(0), scale.stride(1), scale.stride(2),
 		out.stride(0), out.stride(1), out.stride(2)
 	)
+	return out, scale
+
+
+def per_token_blocked_quantize_bf16_to_fp8_chunked(
+	x_2d: torch.Tensor,
+	block_size: int = 128,
+	chunk_rows: int = 32768,
+) -> tuple[torch.Tensor, torch.Tensor]:
+	"""Chunked 2D wrapper that calls the validated 3D kernel.
+
+	Loops the proven per_token_blocked_quantize_bf16_to_fp8 (3D Triton)
+	over M-axis chunks ≤ chunk_rows so the (bsz=1, chunk_rows, num_blocks)
+	grid stays under the 65535 Y-cap. Used as a drop-in replacement for
+	the 1D flat kernel when we suspect it of producing wrong values.
+
+	Args:
+		x_2d: [M, dim] bf16, contiguous
+		block_size: per-token quant block (default 128)
+		chunk_rows: rows per kernel launch; must keep grid_y ≤ 65535
+
+	Returns:
+		out:   [M, dim]                 dtype=float8_e4m3fn
+		scale: [M, num_blocks]          dtype=float32
+	"""
+	assert x_2d.dtype == torch.bfloat16
+	assert x_2d.is_contiguous()
+	assert x_2d.dim() == 2, f"Expected 2D got {x_2d.dim()}D shape {x_2d.shape}"
+	assert chunk_rows > 0 and chunk_rows <= 65535
+
+	M, dim = x_2d.shape
+	num_blocks = (dim + block_size - 1) // block_size
+
+	out = torch.empty((M, dim), device=x_2d.device, dtype=torch.float8_e4m3fn)
+	scale = torch.empty((M, num_blocks), device=x_2d.device, dtype=torch.float32)
+
+	for start in range(0, M, chunk_rows):
+		end = min(start + chunk_rows, M)
+		# Reshape to [1, chunk_M, dim]; .contiguous() guards against any
+		# stride surprise though slicing a contiguous 2D on dim 0 stays
+		# contiguous.
+		x_chunk = x_2d[start:end].unsqueeze(0)
+		y_c, s_c = per_token_blocked_quantize_bf16_to_fp8(x_chunk, block_size)
+		out[start:end].copy_(y_c.squeeze(0))
+		scale[start:end].copy_(s_c.squeeze(0))
+
 	return out, scale
 
 

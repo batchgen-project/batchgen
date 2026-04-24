@@ -318,6 +318,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
                             tokenize: bool = False,
                             add_generation_prompt: bool = True,
                             thinking: bool = True,
+                            preserve_thinking: bool = False,
                             **kwargs):
 
         tools = deep_sort_dict(tools)
@@ -341,6 +342,7 @@ class TikTokenTokenizer(PreTrainedTokenizer):
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
             thinking=thinking,
+            preserve_thinking=preserve_thinking,
             **kwargs)
 
 

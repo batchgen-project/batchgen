@@ -44,6 +44,8 @@ Usage:
 from typing import Dict, Type, Optional, TYPE_CHECKING
 import logging
 
+from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
+
 if TYPE_CHECKING:
     from .base_tokenizer import BaseTokenizer
 
@@ -63,12 +65,22 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "Mixtral-8x22B": "mixtral",
     "Mixtral-8x7B": "mixtral",
     "gpt-oss": "gpt_oss",
-    "Kimi-K2.5": "kimi_k25",
+    # GLM-5 and GLM-5.1 share tokenizer.json (vocab_size=154880, identical
+    # EOS/pad), but GLM-5.1 ships a richer chat template (tool_to_json macro,
+    # thinking_indices tracking, tool_reference responses). We route them to
+    # separate tokenizer types so each loads its own Jinja template.
+    # More-specific patterns first so `GLM-5.1-FP8` doesn't get swallowed by
+    # `GLM-5`.
+    "GLM-5.1-FP8": "glm_moe_dsa_5_1",
+    "GLM-5.1": "glm_moe_dsa_5_1",
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
 }
+
+for model_id in KIMI_K25_BACKEND_MODEL_IDS:
+    TOKENIZER_NAME_PATTERNS[model_id] = "kimi_k25"
 
 
 def register_tokenizer(tokenizer_type: str):
@@ -171,6 +183,11 @@ def _import_tokenizers():
 
     try:
         from batchgen.models.minimax.minimax_m25 import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 

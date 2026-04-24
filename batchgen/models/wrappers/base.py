@@ -147,12 +147,17 @@ class BaseModuleWrapper(nn.Module):
         """
         return self.core_engine.get_weights(module_key, self.phase)
 
+    def _sync_device_before_release(self) -> None:
+        """Drain the current compute stream before releasing weight storage."""
+        torch.cuda.current_stream().synchronize()
+
     def free_weights(self, module_key: str):
         """Free weights buffer after use.
 
         Args:
             module_key: Key identifying the module weights to free
         """
+        self._sync_device_before_release()
         self.core_engine.free_weights_buffer(module_key)
 
     def apply_weights(self, weights_dict: Dict[str, torch.Tensor]):
@@ -161,14 +166,28 @@ class BaseModuleWrapper(nn.Module):
         Args:
             weights_dict: Dict mapping parameter names to weight tensors
         """
+        applied = set()
         for name, param in self.module.named_parameters():
             if name in weights_dict:
                 param.data = weights_dict[name]
+                applied.add(name)
+        # Track which parameter names we populated so clear_weights only wipes
+        # buffer-backed ones. Skeleton-loaded params (q_a/kv_a_layernorm,
+        # indexer.*) are never in weights_dict; wiping them would leave the
+        # module with empty(0) params and fail the next forward.
+        self._applied_param_keys = applied
 
     def clear_weights(self):
-        """Clear module parameter data to free GPU memory."""
+        """Clear only the buffer-loaded module parameters populated by the
+        most recent apply_weights call; preserve skeleton-loaded params.
+        """
+        applied = getattr(self, "_applied_param_keys", None)
+        self._sync_device_before_release()
         for name, param in self.module.named_parameters():
+            if applied is not None and name not in applied:
+                continue
             param.data = torch.empty(0, device=param.data.device)
+        self._applied_param_keys = None
 
     def get_batch_size(self, batch_size_key: str) -> int:
         """Get micro-batch size from config.

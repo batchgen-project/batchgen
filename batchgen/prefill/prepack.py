@@ -216,6 +216,66 @@ def prepack_sequences(
     )
 
 
+def build_prefill_micro_batches(
+    seq_lengths: List[int],
+    token_cap: int,
+    *,
+    l2_balance: bool = True,
+    l2_slack: float = 1.2,
+    single_sequence_only: bool = False,
+) -> Tuple[List[Tuple[int, int]], int]:
+    """Plan contiguous sequence-index micro-batches for prefill.
+
+    Returns:
+        A pair ``(micro_batches, l2_cap)`` where each micro-batch is a
+        ``(seq_start, seq_end)`` half-open range over the original sequence
+        order. When ``single_sequence_only`` is set, each sequence gets its own
+        micro-batch and ``l2_cap`` is reported as 0 because no balancing is
+        applied.
+    """
+    if token_cap <= 0:
+        raise ValueError(f"token_cap must be positive, got {token_cap}")
+
+    num_sequences = len(seq_lengths)
+    if num_sequences == 0:
+        return [], 0
+
+    if single_sequence_only:
+        return [(seq_idx, seq_idx + 1) for seq_idx in range(num_sequences)], 0
+
+    total_tokens_all = sum(seq_lengths)
+    total_l2_all = sum(seq_len * seq_len for seq_len in seq_lengths)
+    est_num_mb = max(1, (total_tokens_all + token_cap - 1) // token_cap)
+    l2_cap = (
+        int(l2_slack * total_l2_all / est_num_mb)
+        if (l2_balance and est_num_mb > 0)
+        else 0
+    )
+
+    micro_batches: List[Tuple[int, int]] = []
+    current_batch_start = 0
+    current_batch_tokens = 0
+    current_batch_l2 = 0
+
+    for seq_idx, seq_len in enumerate(seq_lengths):
+        seq_l2 = seq_len * seq_len
+        over_tokens = current_batch_tokens + seq_len > token_cap
+        over_l2 = (l2_cap > 0) and (current_batch_l2 + seq_l2 > l2_cap)
+        if (over_tokens or over_l2) and current_batch_tokens > 0:
+            micro_batches.append((current_batch_start, seq_idx))
+            current_batch_start = seq_idx
+            current_batch_tokens = 0
+            current_batch_l2 = 0
+
+        current_batch_tokens += seq_len
+        current_batch_l2 += seq_l2
+
+    if current_batch_start < num_sequences:
+        micro_batches.append((current_batch_start, num_sequences))
+
+    return micro_batches, l2_cap
+
+
 def unpack_outputs(
     packed_outputs: torch.Tensor,
     metadata: PrepackMetadata,

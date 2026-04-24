@@ -18,6 +18,7 @@ import torch
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorkerArgs
+from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
@@ -197,30 +198,53 @@ class WorkerManager:
             self._config_hugepages(byte_size)
             self._hugepages_enabled = True
 
+        import sys as _diag_sys
+        def _diag(msg):
+            print(f"[DIAG {_time.time():.3f}] {msg}", flush=True)
+            _diag_sys.stdout.flush()
+
+        _diag(">>> config_torch_module_initializer")
         config_torch_module_initializer()
+        _diag("<<< config_torch_module_initializer")
         if self.args.host_kv_cache_size:
             kv_start = _time.monotonic()
             try:
-                self.host_kv_manager = self.allocate_host_kv_cache(
+                _diag(">>> allocate_host_kv_cache")
+                result = self.allocate_host_kv_cache(
                     self.args.host_kv_cache_size, self.args.model,
                     enable_prefix_cache=self.args.enable_prefix_cache,
                     enable_memfd=self.args.fast_init,
                 )
+                _diag("<<< allocate_host_kv_cache")
+                if isinstance(result, tuple):
+                    self.host_kv_manager, self.host_kv_aux_manager = result
+                else:
+                    self.host_kv_manager = result
+                    self.host_kv_aux_manager = None
             except Exception as exc:
                 logger.warning("Host KV cache allocation failed: %s", exc)
                 self.host_kv_manager = None
+                self.host_kv_aux_manager = None
             logger.info("[startup] Host KV cache allocated in %.2fs",
                         _time.monotonic() - kv_start)
 
         model_start = _time.monotonic()
+        _diag(">>> _load_model_resources")
         self._load_model_resources()
+        _diag("<<< _load_model_resources")
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
 
         spawn_start = _time.monotonic()
+        _diag(">>> _spawn_workers")
         self._spawn_workers()
+        _diag("<<< _spawn_workers")
+        _diag(">>> _start_worker_monitor")
         self._start_worker_monitor()
+        _diag("<<< _start_worker_monitor")
+        _diag(">>> _wait_for_workers_ready")
         self._wait_for_workers_ready()
+        _diag("<<< _wait_for_workers_ready")
         logger.info("[startup] Workers ready in %.2fs",
                     _time.monotonic() - spawn_start)
 
@@ -502,6 +526,12 @@ class WorkerManager:
                 )
 
     def _load_model_resources(self) -> None:
+        import sys as _diag_sys, time as _diag_time
+        def _diag(msg):
+            print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
+            _diag_sys.stdout.flush()
+
+        _diag(f"  _load_model_resources entered, model={self.args.model}")
         logger.info("Loading model resources for %s", self.args.model)
         endpoint = os.getenv(PARAMETER_SERVER_ENDPOINT_ENV)
         hf_cache_dir = self.args.hf_cache_dir or Path(
@@ -513,18 +543,27 @@ class WorkerManager:
             or Path(self.args.cache_dir or ".") / "converted_ckpt"
         )
         self.args.converted_ckpt_dir = converted_ckpt_dir
+        _diag(f"  paths resolved: endpoint={endpoint!r}, cache_dir={self.args.cache_dir!r}")
 
         if not endpoint and self.args.cache_dir is None:
+            _diag("  >>> _download_model_snapshot")
             self.args.cache_dir = self._download_model_snapshot(hf_cache_dir)
+            _diag("  <<< _download_model_snapshot")
 
         if endpoint:
+            _diag("  >>> _load_model_from_remote_server")
             self._load_model_from_remote_server(
                 endpoint, hf_cache_dir, converted_ckpt_dir
             )
+            _diag("  <<< _load_model_from_remote_server")
         else:
+            _diag("  >>> _load_model_locally")
             self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
+            _diag("  <<< _load_model_locally")
 
+        _diag("  >>> _configure_host_kv_cache_budget")
         self._configure_host_kv_cache_budget()
+        _diag("  <<< _configure_host_kv_cache_budget")
         logger.info("Model Loaded. SHM: %s", self.model_info.get("shm_name"))
 
     def _spawn_workers(self) -> None:
@@ -600,6 +639,7 @@ class WorkerManager:
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
             enable_prefix_cache=self.args.enable_prefix_cache,
+            detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
             host_kv_chunk_size=self.args.host_kv_chunk_size,
             enable_host_kv_eviction=self.args.enable_host_kv_eviction,
             host_kv_eviction_watermark=self.args.host_kv_eviction_watermark,
@@ -612,9 +652,11 @@ class WorkerManager:
             max_pool_size=self.args.max_pool_size,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
+            kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
         )
+        from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
             _load_server_worker_main(),
             args=(
@@ -636,6 +678,11 @@ class WorkerManager:
     def _get_kv_memfd_fd(self) -> int:
         if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
             return self.host_kv_manager.memfd_fd()
+        return -1
+
+    def _get_kv_aux_memfd_fd(self) -> int:
+        if self.args.fast_init and getattr(self, 'host_kv_aux_manager', None) is not None:
+            return self.host_kv_aux_manager.memfd_fd()
         return -1
 
     def _get_weights_memfd_pid(self) -> int:
@@ -781,7 +828,7 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
-        elif "moonshotai" in self.args.model.lower() or "kimi" in self.args.model.lower():
+        elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
                 KimiK25_Parameter_Server,
             )
@@ -805,13 +852,38 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
+        elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+            import sys as _diag_sys, time as _diag_time
+            def _diag(msg):
+                print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
+                _diag_sys.stdout.flush()
+            _diag("    glm5: importing GLM5_Parameter_Server")
+            from batchgen.models.glm.glm5.glm5_parameter_server import (
+                GLM5_Parameter_Server,
+            )
+            _diag("    glm5: constructing GLM5_Parameter_Server")
+            parameter_server = GLM5_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
+            )
+            _diag("    glm5: GLM5_Parameter_Server constructed")
         else:
             raise NotImplementedError(
                 f"Model type for {self.args.model} not supported"
             )
 
+        import sys as _diag_sys2, time as _diag_time2
+        def _diag2(msg):
+            print(f"[DIAG {_diag_time2.time():.3f}] {msg}", flush=True)
+            _diag_sys2.stdout.flush()
+        _diag2("    >>> parameter_server.Init()")
         shm_name, tensor_meta_shm_name = parameter_server.Init()
+        _diag2("    <<< parameter_server.Init() returned")
         ps_size = parameter_server.parameter_server.byte_size()
+        _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
 
         # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
         skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
@@ -946,6 +1018,22 @@ class WorkerManager:
         enable_prefix_cache: bool = True,
         enable_memfd: bool = False,
     ) -> Any:
+        from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+
+        # DSA models: split budget into primary + auxiliary
+        dual = DualHostKVCoordinator.create_managers(
+            model_name=model_name,
+            host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+            enable_prefix_reuse=enable_prefix_cache,
+            enable_memfd=enable_memfd,
+        )
+        if dual is not None:
+            primary_mgr, aux_mgr = dual
+            logger.info(
+                "Allocated dual host KV cache: primary + auxiliary (DSA indexer)"
+            )
+            return primary_mgr, aux_mgr
+
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,

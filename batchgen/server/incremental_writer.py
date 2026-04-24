@@ -272,14 +272,21 @@ class IncrementalWriter:
         return self._tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
 
     def _count_valid_tokens(self, tokens: torch.Tensor) -> int:
-        """Count non-padding tokens up to first EOS."""
+        """Count non-padding tokens up to first EOS.
+
+        Both EOS and pad checks need the `i >= 1` guard. For models where
+        pad_token_id is in eos_token_ids (e.g. GLM-5: pad=154820 is also the
+        first EOS), the asymmetric guard caused ctok=0 when the model
+        emitted token 154820 at position 0 (pad-check fires) vs ctok=1 when
+        the model emitted 154827/154829 (eos-check skipped at i=0, pad found
+        at i=1). The decoded behavior is identical — the inconsistency was
+        purely in the reported completion_tokens.
+        """
         if tokens.dim() > 1:
             tokens = tokens.squeeze(0)
         tokens_list = tokens.tolist()
         for i, t in enumerate(tokens_list):
-            if t in self._eos_token_ids and i >= 1:
-                return i
-            if t == self._pad_token_id:
+            if i >= 1 and (t in self._eos_token_ids or t == self._pad_token_id):
                 return i
         return len(tokens_list)
 

@@ -385,6 +385,40 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
            py::arg("sequence_lengths"),
            py::arg("decode_token_ids") = py::none())
+       .def("async_append_decode_kv_to_host_batched_kernel",
+           [](WorkerView& self,
+              py::list entries_py,
+              std::vector<std::int64_t> sequence_ids,
+              batchgen::kv::SequenceLengths sequence_lengths,
+              std::optional<std::vector<std::int32_t>> decode_token_ids) {
+               std::vector<typename WorkerView::BatchedKVEntry> entries;
+               entries.reserve(entries_py.size());
+               for (auto item : entries_py) {
+                   auto tup = py::cast<py::tuple>(item);
+                   if (py::len(tup) != 3) {
+                       throw std::invalid_argument(
+                           "async_append_decode_kv_to_host_batched_kernel "
+                           "entries must be (layer_idx, k_tensor, v_tensor|None)");
+                   }
+                   typename WorkerView::BatchedKVEntry e;
+                   e.layer_idx = py::cast<std::size_t>(tup[0]);
+                   e.k_tensor = py::cast<torch::Tensor>(tup[1]);
+                   if (!tup[2].is_none()) {
+                       e.v_tensor = py::cast<torch::Tensor>(tup[2]);
+                   }
+                   entries.emplace_back(std::move(e));
+               }
+               return self.AsyncAppendDecodeKVToHostBatchedKernel(
+                   std::move(entries), std::move(sequence_ids),
+                   std::move(sequence_lengths), std::move(decode_token_ids));
+           },
+           py::arg("entries"), py::arg("sequence_ids"),
+           py::arg("sequence_lengths"),
+           py::arg("decode_token_ids") = py::none(),
+           "Batched variant: all (layer × seq) host-KV writes issued by "
+           "one UVA kernel launch on the DtoH stream. Replaces the "
+           "per-layer async_append_decode_kv_to_host loop of 78×bsz "
+           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs.")
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -617,6 +651,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
+        .def_readwrite("logger_name", &kv::HostPagedKVConfig::logger_name)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
                  return kv::ToString(self);

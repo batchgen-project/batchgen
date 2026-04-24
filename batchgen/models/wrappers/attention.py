@@ -66,8 +66,25 @@ class AttnWrapperBase(BaseModuleWrapper):
     position_ids: ClassVar[Optional[torch.Tensor]] = None
     kv_quantization_factor: ClassVar[Optional[List]] = None
     kv_append_callback: ClassVar[Optional[callable]] = None
+    kv_append_callback_aux: ClassVar[Optional[callable]] = None
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
+
+    # Pending prefill-offload tasks. async_offload_layer_kv_to_host returns
+    # KVAsyncTask futures; if Python discards them (fire-and-forget), the
+    # CPU thread that queues cudaMemcpyAsync may not have run yet by the
+    # time decode starts reading the host KV. Capture each task here and
+    # .wait() on them before exiting prefill.
+    pending_prefill_offload_tasks: ClassVar[list] = []
+    # Tensor references kept alive for the duration of the async offload.
+    # Mirrors the decode side's `_pending_kv_append_tensors`. The C++ async
+    # lambda captures the tensor by value, but the underlying STORAGE may be
+    # released back to PyTorch's caching allocator if no Python reference is
+    # held — and with `expandable_segments:True` plus multi-seq packed prefill
+    # the allocator may then hand the same physical pages to a later layer's
+    # K/V tensor while the d2h memcpy is still in flight. Holding the source
+    # tensors here pins the storage until the wait at end-of-prefill.
+    pending_prefill_offload_tensors: ClassVar[list] = []
 
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
@@ -82,6 +99,17 @@ class AttnWrapperBase(BaseModuleWrapper):
     scale: ClassVar[Optional[List[torch.Tensor]]] = None
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
+    # DSA per-step dispatch hint: count of rows with cache_seqlen <= index_topk.
+    # Set once per decode step by the worker so per-layer _forward_decode_dsa
+    # branches on it without doing a D2H .sum().item() 78 times per step.
+    _dsa_short_count: ClassVar[Optional[int]] = None
+    # DSA per-step slot-index hoists: build_batch_slot_indices() used to run
+    # per-layer inside _forward_decode_dsa, producing two tiny int32 HtoD
+    # copies per layer (×78 → 156 HtoDs/step). Inputs (cur_batch +
+    # seq_id_to_slot mapping) are step-constant, so the worker fills these
+    # once before the model forward and wrappers read them back.
+    primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)
@@ -221,12 +249,10 @@ class AttnWrapperBase(BaseModuleWrapper):
         else:
             result = self._forward_decode(hidden_states, **kwargs)
 
-        # Release buffer for non-persistent attention (following DeepSeek pattern)
-        # This allows the H2D worker to load the next layer's weights
+        # Release buffer for non-persistent attention so the H2D worker can
+        # load the next layer's weights.
         if not self.persistent:
-            torch.cuda.current_stream(
-                self.engine_config.Basic_Config.device_torch
-            ).synchronize()
+            torch.cuda.current_stream().synchronize()
             self.free_weights(self.module_key)
             self.clear_weights()
 

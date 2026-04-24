@@ -25,6 +25,12 @@
 // Each CTA processes one expert, loops over valid tokens only.
 // Each warp handles one K-block (128 elements) at a time, warps stride.
 // ============================================================================
+// v2: grid = (E, mtp), one CTA per (expert, token).
+// v1 (grid=(E,) with serial outer token loop) was launch-limited at
+// E=16 → only 16 CTAs on H20's ~132 SMs, ~12% occupancy, ~594 µs per
+// call at K=6144. v2 saturates the GPU with E×mtp=2048 CTAs and
+// runs in ~22 µs (27× faster, validated in
+// tests/kernels/test_act_quant_3d_v2.py bit-exact vs v1).
 __global__ void act_quant_3d_kernel(
     const __nv_bfloat16* __restrict__ x,   // [E, mtp, K]
     uint8_t* __restrict__ y,                // [E, mtp, K] FP8
@@ -33,62 +39,69 @@ __global__ void act_quant_3d_kernel(
     int mtp, int K, int num_k_blocks
 ) {
     const int expert = blockIdx.x;
+    const int token  = blockIdx.y;
     const int valid_tokens = tokens_per_expert[expert];
-    if (valid_tokens == 0) return;
+    if (token >= valid_tokens) return;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int num_warps = blockDim.x / 32;
 
-    const __nv_bfloat16* x_expert = x + (int64_t)expert * mtp * K;
-    uint8_t* y_expert = y + (int64_t)expert * mtp * K;
-    float* scale_expert = scale + (int64_t)expert * mtp * num_k_blocks;
+    const __nv_bfloat16* x_row =
+        x + ((int64_t)expert * mtp + token) * K;
+    uint8_t* y_row =
+        y + ((int64_t)expert * mtp + token) * K;
+    float* scale_row =
+        scale + ((int64_t)expert * mtp + token) * num_k_blocks;
 
-    for (int m = 0; m < valid_tokens; m++) {
-        const __nv_bfloat16* x_row = x_expert + (int64_t)m * K;
-        uint8_t* y_row = y_expert + (int64_t)m * K;
-        float* scale_row = scale_expert + (int64_t)m * num_k_blocks;
+    for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
+        int col_base = kb * BLOCK_SIZE_QUANT;
 
-        for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
-            int col_base = kb * BLOCK_SIZE_QUANT;
+        float vals[4];
+        float local_max = 0.0f;
 
-            float vals[4];
-            float local_max = 0.0f;
-
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int col = col_base + lane_id * 4 + i;
-                if (col < K) {
-                    vals[i] = __bfloat162float(x_row[col]);
-                } else {
-                    vals[i] = 0.0f;
-                }
-                local_max = fmaxf(local_max, fabsf(vals[i]));
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                vals[i] = __bfloat162float(x_row[col]);
+            } else {
+                vals[i] = 0.0f;
             }
+            local_max = fmaxf(local_max, fabsf(vals[i]));
+        }
 
-            #pragma unroll
-            for (int offset = 16; offset >= 1; offset >>= 1) {
-                float other = __shfl_xor_sync(0xffffffff, local_max, offset);
-                local_max = fmaxf(local_max, other);
+        #pragma unroll
+        for (int offset = 16; offset >= 1; offset >>= 1) {
+            float other = __shfl_xor_sync(0xffffffff, local_max, offset);
+            local_max = fmaxf(local_max, other);
+        }
+
+        // Match SGLang's FP32 op sequence (`scale = amax * (1/448)`,
+        // `scaled = x / scale`) so the CUDA kernel produces byte-exact
+        // FP8 vs SGLang's Triton `_act_quant_kernel`. Previously we did
+        //     s = fmax(local_max, eps) / FP8_MAX_VAL;  // FP32 division
+        //     inv_s = 1.0f / s;                        // FP32 reciprocal
+        //     scaled = vals[i] * inv_s;                // FP32 mul
+        // which introduces an extra FP32 rounding step and flips the
+        // final FP8 cast on ~0.1% of elements (see
+        // tests/test_glm5_act_quant_triton_vs_triton.py).
+        constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
+        float s = fmaxf(local_max, QUANT_EPS) * FP8_MAX_VAL_INV;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                float scaled = vals[i] / s;
+                scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
             }
+        }
 
-            float s = fmaxf(local_max, QUANT_EPS) / FP8_MAX_VAL;
-            float inv_s = 1.0f / s;
-
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int col = col_base + lane_id * 4 + i;
-                if (col < K) {
-                    float scaled = vals[i] * inv_s;
-                    scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
-                    y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
-                }
-            }
-
-            if (lane_id == 0) {
-                scale_row[kb] = s;
-            }
+        if (lane_id == 0) {
+            scale_row[kb] = s;
         }
     }
 }
@@ -242,7 +255,10 @@ std::tuple<torch::Tensor, torch::Tensor> act_quant_3d(
     auto scale = torch::empty({E, mtp, num_k_blocks}, torch::dtype(torch::kFloat32).device(x.device()));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    act_quant_3d_kernel<<<E, 128, 0, stream>>>(
+    // 2D grid: one CTA per (expert, token). Padded tokens early-return
+    // inside the kernel so no compute wasted on expert_count < mtp.
+    dim3 grid(E, mtp);
+    act_quant_3d_kernel<<<grid, 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         y.data_ptr<uint8_t>(),
         scale.data_ptr<float>(),

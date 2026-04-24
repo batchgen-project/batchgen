@@ -165,6 +165,20 @@ class CUDAGraphManager:
         # Shared memory pool across all graphs to minimize HBM usage.
         self._pool = torch.cuda.graph_pool_handle()
 
+        # Dedicated capture/replay stream. Required for CUDA-graph-captured
+        # NCCL collectives: PyNccl (ctypes) bakes the submission stream
+        # handle into the recorded NCCL kernel args at capture time. At
+        # replay, those args use the SAME handle — so replay MUST also run
+        # on this exact stream or NCCL deadlocks waiting on peer coordination
+        # that never arrives (peers are using their own graph streams on the
+        # handles recorded into their respective graphs).
+        #
+        # By using one persistent stream for both capture and every replay,
+        # the captured stream handle stays valid at every replay. Callers
+        # sync the active stream with this one via wait_stream before/after
+        # the actual graph.replay() call (handled inside replay()).
+        self._graph_stream = torch.cuda.Stream(device=self.device)
+
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
         self._segments: Dict[str, CapturableSegment] = {}
@@ -235,16 +249,32 @@ class CUDAGraphManager:
         if hasattr(segment, 'setup_static_buffers'):
             segment.setup_static_buffers(bucket_size)
 
-        # 2. Warmup on current stream
-        for _ in range(self.WARMUP_ITERATIONS):
-            with torch.inference_mode():
-                segment.forward(**static_inputs)
+        # 2. Warmup + 3. Capture on the dedicated graph stream.
+        # Warmup must run on the same stream as capture so any lazy JIT /
+        # cuBLAS workspace init happens with the correct stream context;
+        # capture must run on the graph stream so NCCL's baked-in stream
+        # handle matches what we'll use at every replay (see __init__).
+        #
+        # Sync _graph_stream with the caller's current stream before
+        # warmup so any pre-existing work the segment needs (e.g. weight
+        # loads on default stream) is visible on _graph_stream.
+        caller_stream = torch.cuda.current_stream(self.device)
+        self._graph_stream.wait_stream(caller_stream)
 
-        # 3. Capture on current stream with shared pool
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
-            with torch.inference_mode():
-                static_outputs = segment.forward(**static_inputs)
+        with torch.cuda.stream(self._graph_stream):
+            for _ in range(self.WARMUP_ITERATIONS):
+                with torch.inference_mode():
+                    segment.forward(**static_inputs)
+            torch.cuda.synchronize(self.device)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._pool, stream=self._graph_stream):
+                with torch.inference_mode():
+                    static_outputs = segment.forward(**static_inputs)
+
+        # Caller's stream waits for graph stream so captured outputs are
+        # visible on default stream when this function returns.
+        caller_stream.wait_stream(self._graph_stream)
 
         # Normalize outputs to dict
         if not isinstance(static_outputs, dict):
@@ -285,7 +315,19 @@ class CUDAGraphManager:
                 f"Available: {list(self._graphs[name].keys())}"
             )
 
-        # Copy inputs to static buffers
+        # Replay runs on the CALLER'S CURRENT STREAM (vLLM / SGLang pattern).
+        # Earlier versions wrapped this in `torch.cuda.stream(_graph_stream)`,
+        # but that broke ordering with the eager NCCL ops issued by the
+        # attention path (which resolve to `current_stream()` at call time).
+        # When captured collectives ran on `_graph_stream` while eager
+        # collectives ran on the caller stream, cross-rank NCCL interleave
+        # desynchronized → peer coordination hang.
+        #
+        # `torch.cuda.CUDAGraph.replay()` re-emits the captured kernels on
+        # the currently-active stream; the capture stream chosen at record
+        # time is irrelevant at replay. Keep capture on `_graph_stream`
+        # (a CUDA restriction forbids capturing on the default stream), but
+        # let replay inherit the caller's stream.
         for key, tensor in inputs.items():
             static_tensor = captured.static_inputs.get(key)
             if static_tensor is None:
@@ -309,7 +351,6 @@ class CUDAGraphManager:
                     f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
                 )
 
-        # Replay on current stream — no cross-stream sync needed
         captured.graph.replay()
 
         # Return unpadded outputs

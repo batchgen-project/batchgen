@@ -513,14 +513,18 @@ class SequenceBatch:
         return sorted(self._status_index[status])
 
     def get_sequences_for_rank(self, rank: int) -> List[str]:
-        return list(self._rank_index.get(rank, set()))
+        rank_seqs = self._rank_index.get(rank, set())
+        return sorted(rank_seqs, key=lambda uuid: self.sequences[uuid].global_idx)
 
     def get_sequences_for_rank_with_status(
         self, rank: int, status: SequenceStatus
     ) -> List[str]:
         rank_seqs = self._rank_index.get(rank, set())
         status_seqs = self._status_index[status]
-        return list(rank_seqs & status_seqs)
+        return sorted(
+            rank_seqs & status_seqs,
+            key=lambda uuid: self.sequences[uuid].global_idx,
+        )
 
     def get_resumable_sequences(self) -> List[str]:
         """
