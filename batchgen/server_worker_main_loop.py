@@ -215,6 +215,12 @@ def _server_worker_main_impl(
 	# Reconfigure logging with actual global rank for clearer log output
 	_setup_worker_logging(rank_idx, args.global_rank)
 
+	# Step 1.5: Pin this worker to its GPU's local NUMA node (CPU + memory)
+	# BEFORE any CUDA / pinned-host allocation happens. Without this, some
+	# ranks land on cross-socket CPUs and pay 10+ms cudaLaunchKernel gaps.
+	from batchgen.numa_bind import bind_worker_to_gpu_numa
+	bind_worker_to_gpu_numa(args.local_rank, num_gpus_per_node)
+
 	# 2. Initialize Process Group
 	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
 
