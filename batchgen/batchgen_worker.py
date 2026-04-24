@@ -8899,7 +8899,19 @@ class BatchGenWorker:
 					# indexer scoring. Computing once here instead of inside
 					# every layer's _forward_decode_dsa drops 77 of 78 D2H syncs
 					# per decode step on DSA models (GLM-5).
+					#
+					# Fallback to loaded_model_config: Glm5Initializer's stripped
+					# ModelConfig historically didn't carry index_topk, which
+					# silently disabled this hoist and made the per-layer
+					# .sum().item() fallback in wrappers.py:846 fire anyway
+					# (78 × 5 = 390 DtoHs per run). Checking loaded_model_config
+					# as a backup keeps the hoist alive even on older workers.
 					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
+					if _dsa_index_topk is None:
+						_dsa_index_topk = getattr(
+							getattr(self, "loaded_model_config", None),
+							"index_topk", None,
+						)
 					if _dsa_index_topk is not None:
 						AttnWrapperBase._dsa_short_count = int(
 							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
