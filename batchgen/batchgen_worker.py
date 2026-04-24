@@ -9121,6 +9121,29 @@ class BatchGenWorker:
 			if _dt_step is not None and _dt_step.enabled:
 				_dt_step.step_done()
 
+			# cudaProfilerApi surgical bracket for `nsys profile
+			# --capture-range=cudaProfilerApi`. Start/Stop keyed on a decode
+			# step counter so we skip warmup + prefill. Rank-0-guarded so we
+			# only toggle once per process-tree; nsys collects across all
+			# ranks in the tree during the window. No behavior when env vars
+			# unset. Matches existing pattern at batchgen/gemm/w8a8.py:1244.
+			if self.rank == 0:
+				_nsys_start = getattr(self, "_nsys_profile_start_step", None)
+				if _nsys_start is None:
+					_nsys_start = int(os.environ.get(
+						"BATCHGEN_NSYS_PROFILE_START_STEP", "-1"))
+					self._nsys_profile_start_step = _nsys_start
+					self._nsys_profile_end_step = int(os.environ.get(
+						"BATCHGEN_NSYS_PROFILE_END_STEP", "-1"))
+					self._nsys_profile_decode_step = 0
+				if _nsys_start >= 0:
+					_cur = self._nsys_profile_decode_step
+					if _cur == _nsys_start:
+						torch.cuda.cudart().cudaProfilerStart()
+					elif _cur == self._nsys_profile_end_step:
+						torch.cuda.cudart().cudaProfilerStop()
+					self._nsys_profile_decode_step = _cur + 1
+
 			# Flush deferred KV entries — single sync for all layers
 			self._flush_deferred_kv_to_host()
 
