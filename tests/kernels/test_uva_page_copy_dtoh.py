@@ -121,9 +121,10 @@ def run_correctness(ext, num_layers: int, batch: int, token_bytes: int):
     # which "page row" each seq writes to, so dst pointers are truly scattered).
     # We allocate a single big CPU buffer and hand out scattered slots.
     total_bytes = num_pages * token_bytes * 4  # 4x slop so we can scatter
+    # torch pin_memory=True already cudaHostRegisters internally — UVA-mapped.
     cpu_buf = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
     cpu_ptr_base = cpu_buf.data_ptr()
-    _register_host(cpu_ptr_base, total_bytes)
+    assert cpu_buf.is_pinned(), "pin_memory=True did not pin the allocation"
     try:
         # Build per-(layer, seq) dst offsets — intentionally non-contiguous
         torch.manual_seed(0)
@@ -183,7 +184,7 @@ def run_correctness(ext, num_layers: int, batch: int, token_bytes: int):
             f"{num_layers} layers × {batch} seqs — all bit-exact ✓"
         )
     finally:
-        _unregister_host(cpu_ptr_base)
+        pass  # torch pinned allocation auto-unregisters on dealloc
 
 
 def run_perf(ext, num_layers: int, batch: int, token_bytes: int,
@@ -201,7 +202,7 @@ def run_perf(ext, num_layers: int, batch: int, token_bytes: int,
     total_bytes = num_pages * token_bytes * 4
     cpu_buf = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
     cpu_ptr_base = cpu_buf.data_ptr()
-    _register_host(cpu_ptr_base, total_bytes)
+    assert cpu_buf.is_pinned()
     try:
         torch.manual_seed(0)
         dst_offsets = (torch.randperm(num_pages) * (token_bytes * 3) + 128).tolist()
@@ -277,7 +278,7 @@ def run_perf(ext, num_layers: int, batch: int, token_bytes: int,
               f"({num_pages} calls)")
         print(f"[PERF] speedup            : {speedup:6.1f}×")
     finally:
-        _unregister_host(cpu_ptr_base)
+        pass
 
 
 def main():
