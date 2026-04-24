@@ -118,11 +118,25 @@ def _setup_nccl_env():
 	if "NCCL_BUFFSIZE" not in os.environ:
 		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
 
-	# NCCL_ALGO: Force deterministic tree algorithm for all-reduce/reduce-scatter.
-	# The default (ring/auto) varies reduction order between runs, causing
-	# non-deterministic FP rounding that leads to batch-dependent repetition.
-	# Tree algorithm has fixed reduction order. All-gather is unaffected (already deterministic).
-	os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
+	# NCCL_ALGO: force deterministic tree algorithm only when
+	# BATCHGEN_DETERMINISTIC is set. Tree has fixed reduction order but
+	# ~1.3-2× slower than ring on intra-node NVLink for the ~1.5 MiB MoE
+	# allreduce payloads we issue per layer. Default (unset) lets NCCL
+	# auto-select per payload size — measured 49 ms/step → expected
+	# 20-30 ms/step on the MoE allreduce tail.
+	# Enable BATCHGEN_DETERMINISTIC=1 to re-pin tree for repetition-
+	# regression reproductions.
+	_deterministic = os.environ.get("BATCHGEN_DETERMINISTIC", "0").lower() in (
+		"1", "true", "yes", "on")
+	if _deterministic:
+		os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
+		logging.info(
+			"BATCHGEN_DETERMINISTIC=1 → NCCL_ALGO=allreduce:tree "
+			"(deterministic reductions)")
+	else:
+		logging.info(
+			"NCCL_ALGO not forced — NCCL auto-select "
+			"(ring/tree per payload; ~1.3-2× faster than pinned tree)")
 
 
 def server_worker_main(
