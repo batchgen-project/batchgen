@@ -767,6 +767,24 @@ class FP8IndexerWeightsCUDA:
         # Create TMA descriptor for weight [N, K] with box (32, 128)
         self.tma_desc = module.create_tma_desc(self.w_fp8, N, K, 32, 128)
 
+        # Persistent activation buffer + TMA descriptor (lazy, hoisted from
+        # per-call allocation to eliminate the 128 B HtoD per layer per step).
+        self._act_buf_B_padded = 0
+        self.x_fp8_buf = None
+        self.x_scale_buf = None
+        self.a_tma_desc = None
+
+    def _ensure_act_buf(self, B_padded: int, device, module):
+        if B_padded <= self._act_buf_B_padded:
+            return
+        self.x_fp8_buf = torch.zeros(
+            B_padded, self.K, dtype=torch.float8_e4m3fn, device=device)
+        self.x_scale_buf = torch.empty(
+            B_padded, dtype=torch.float32, device=device)
+        self.a_tma_desc = module.create_tma_desc(
+            self.x_fp8_buf, B_padded, self.K, 64, 128)
+        self._act_buf_B_padded = B_padded
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # High-level API
@@ -813,20 +831,19 @@ def cuda_wk_proj_gemm_only(
     B, K = hidden_states.shape
     N = weights.N
 
-    x_fp8 = torch.empty(B, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
-    x_scale = torch.empty(B, dtype=torch.float32, device=hidden_states.device)
-    module.run_act_quant(hidden_states, x_fp8, x_scale)
-
     B_padded = max(B, 64)
-    if B < 64:
-        x_fp8_padded = torch.zeros(B_padded, K, dtype=torch.float8_e4m3fn, device=x_fp8.device)
-        x_fp8_padded[:B] = x_fp8
-        x_fp8 = x_fp8_padded
-    a_tma_desc = module.create_tma_desc(x_fp8, B_padded, K, 64, 128)
+    weights._ensure_act_buf(B_padded, hidden_states.device, module)
+
+    # Quant directly into persistent FP8 buffer; descriptor is already cached.
+    x_fp8 = weights.x_fp8_buf[:B]
+    x_scale = weights.x_scale_buf[:B]
+    module.run_act_quant(hidden_states, x_fp8, x_scale)
+    if B < B_padded:
+        weights.x_fp8_buf[B:B_padded].zero_()
 
     return module.indexer_kv_proj_gemm_only(
-        a_tma_desc, weights.tma_desc,
-        weights.w_scale, x_scale,
+        weights.a_tma_desc, weights.tma_desc,
+        weights.w_scale, weights.x_scale_buf[:B_padded],
         B, N, K,
     )
 
