@@ -152,6 +152,38 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
            py::arg("sequence_lengths"))
+       .def("async_append_decode_kv_to_host_batched_kernel",
+           [](WorkerView& self,
+              py::list entries_py,
+              std::vector<std::int64_t> sequence_ids,
+              batchgen::kv::SequenceLengths sequence_lengths) {
+               std::vector<typename WorkerView::BatchedKVEntry> entries;
+               entries.reserve(entries_py.size());
+               for (auto item : entries_py) {
+                   auto tup = py::cast<py::tuple>(item);
+                   if (py::len(tup) != 3) {
+                       throw std::invalid_argument(
+                           "async_append_decode_kv_to_host_batched_kernel "
+                           "entries must be (layer_idx, k_tensor, v_tensor|None)");
+                   }
+                   typename WorkerView::BatchedKVEntry e;
+                   e.layer_idx = py::cast<std::size_t>(tup[0]);
+                   e.k_tensor = py::cast<torch::Tensor>(tup[1]);
+                   if (!tup[2].is_none()) {
+                       e.v_tensor = py::cast<torch::Tensor>(tup[2]);
+                   }
+                   entries.emplace_back(std::move(e));
+               }
+               return self.AsyncAppendDecodeKVToHostBatchedKernel(
+                   std::move(entries), std::move(sequence_ids),
+                   std::move(sequence_lengths));
+           },
+           py::arg("entries"), py::arg("sequence_ids"),
+           py::arg("sequence_lengths"),
+           "Batched variant: all (layer × seq) host-KV writes issued by "
+           "one UVA kernel launch on the DtoH stream. Replaces the "
+           "per-layer async_append_decode_kv_to_host loop of 78×bsz "
+           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs.")
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,

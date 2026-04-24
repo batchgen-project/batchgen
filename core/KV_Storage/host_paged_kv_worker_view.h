@@ -1092,6 +1092,197 @@ class HostPagedKVWorkerView {
     }
 
     // ================================================================
+    // Batched decode KV offload — one UVA kernel launch for all
+    // (layer × seq) token writes instead of 1248 cudaMemcpyAsync.
+    // ================================================================
+
+    struct BatchedKVEntry {
+        std::size_t layer_idx;
+        torch::Tensor k_tensor;
+        std::optional<torch::Tensor> v_tensor;
+    };
+
+    /**
+     * Collapse all per-(layer × seq) host-KV appends for this decode step
+     * into a single kernel launch per cache. Reuses
+     * `worker_detail::LaunchUvaPageCopyKernel` (direction-agnostic): src
+     * ptrs are GPU-resident K/V token slots, dst ptrs are UVA-mapped host
+     * pinned pages. GPU issues PCIe writes directly — no cudaMemcpyAsync
+     * per copy pair. Replaces 78×batch_size cudaMemcpyAsync launches +
+     * per-layer thread-pool task + per-task producer-stream wait with:
+     *   - 2 small HtoD of ptr arrays (~KiB each)
+     *   - 1 UvaPageCopyKernel launch
+     *   - 1 event record
+     */
+    KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(
+        std::vector<BatchedKVEntry> entries,
+        std::vector<std::int64_t> sequence_ids,
+        SequenceLengths sequence_lengths) {
+        if (entries.empty() || sequence_ids.empty()) {
+            return LaunchAsyncTask([] {});
+        }
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+
+        // Validate each entry and detect V presence
+        bool has_v = false;
+        for (const auto& e : entries) {
+            geometry_.EnsureLayerBounds(e.layer_idx,
+                                        "AsyncAppendDecodeKVToHostBatchedKernel");
+            const std::size_t tokens_per_seq =
+                ValidateKTensorShape(e.k_tensor, batch);
+            if (tokens_per_seq != 1) {
+                throw std::invalid_argument(
+                    "AsyncAppendDecodeKVToHostBatchedKernel expects 1 token "
+                    "per sequence");
+            }
+            if (e.v_tensor.has_value()) {
+                if constexpr (kHasVCache) {
+                    ValidateVTensorShape(*e.v_tensor, batch, tokens_per_seq);
+                    has_v = true;
+                } else {
+                    throw std::invalid_argument(
+                        "V tensor provided but V cache is disabled");
+                }
+            }
+        }
+        ValidateSequenceLengthsInput(
+            sequence_lengths, batch,
+            "AsyncAppendDecodeKVToHostBatchedKernel");
+
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+
+        // Resolve per-seq page locations ONCE (shared across all layers).
+        struct SeqLoc {
+            std::size_t page_idx;
+            std::size_t page_offset_tokens;
+        };
+        std::vector<SeqLoc> seq_locs;
+        seq_locs.reserve(batch);
+        for (std::size_t b = 0; b < batch; ++b) {
+            const std::int64_t sid = sequence_ids[b];
+            const std::size_t start_token = ResolveSequenceLength(
+                sequence_lengths, b, sid, std::nullopt,
+                "AsyncAppendDecodeKVToHostBatchedKernel");
+            const auto pages = page_table_.Pages(sid);
+            geometry_.ValidatePageCapacity(
+                pages, start_token + 1,
+                "AsyncAppendDecodeKVToHostBatchedKernel");
+            const auto loc = ResolvePageLocation(
+                pages, sid, start_token,
+                "AsyncAppendDecodeKVToHostBatchedKernel");
+            seq_locs.push_back({loc.page_idx, loc.page_offset_tokens});
+        }
+
+        const std::size_t k_token_bytes = geometry_.KTokenBytes();
+        std::size_t v_token_bytes = 0;
+        if constexpr (kHasVCache) {
+            if (has_v) {
+                v_token_bytes = geometry_.template VTokenBytes<kHasVCache>();
+            }
+        }
+
+        const std::size_t k_total = entries.size() * batch;
+        const std::size_t v_total = has_v ? k_total : 0;
+
+        // Build src/dst ptr arrays on host (pinned unnecessary — staged
+        // HtoD is one-shot per cache per step, bandwidth insignificant).
+        std::vector<uint8_t*> k_src_host(k_total), k_dst_host(k_total);
+        std::vector<uint8_t*> v_src_host(v_total), v_dst_host(v_total);
+
+        std::byte* host_base = backend_.DataBase();
+        for (std::size_t li = 0; li < entries.size(); ++li) {
+            const auto& e = entries[li];
+            auto* k_base = static_cast<uint8_t*>(e.k_tensor.data_ptr());
+            uint8_t* v_base = nullptr;
+            if constexpr (kHasVCache) {
+                if (e.v_tensor.has_value()) {
+                    v_base =
+                        static_cast<uint8_t*>(e.v_tensor->data_ptr());
+                }
+            }
+            for (std::size_t b = 0; b < batch; ++b) {
+                const auto& loc = seq_locs[b];
+                const std::size_t idx = li * batch + b;
+                k_src_host[idx] = k_base + b * k_token_bytes;
+                k_dst_host[idx] = reinterpret_cast<uint8_t*>(
+                    layout_.KPageAddress(host_base, e.layer_idx, loc.page_idx)
+                    + loc.page_offset_tokens * k_token_bytes);
+                if constexpr (kHasVCache) {
+                    if (v_base != nullptr) {
+                        v_src_host[idx] = v_base + b * v_token_bytes;
+                        v_dst_host[idx] = reinterpret_cast<uint8_t*>(
+                            layout_.template VPageAddress<>(
+                                host_base, e.layer_idx, loc.page_idx)
+                            + loc.page_offset_tokens * v_token_bytes);
+                    }
+                }
+            }
+        }
+
+        return LaunchAsyncTask([this, k_src_host = std::move(k_src_host),
+                                 k_dst_host = std::move(k_dst_host),
+                                 v_src_host = std::move(v_src_host),
+                                 v_dst_host = std::move(v_dst_host),
+                                 k_token_bytes, v_token_bytes, k_total,
+                                 v_total, producer_cuda_stream]() mutable {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+
+            // Ensure scratch device buffers are sized.
+            if (uva_append_k_src_buf_.size() < k_total) {
+                uva_append_k_src_buf_.Allocate(k_total);
+                uva_append_k_dst_buf_.Allocate(k_total);
+            }
+            if constexpr (kHasVCache) {
+                if (v_total > uva_append_v_src_buf_.size()) {
+                    uva_append_v_src_buf_.Allocate(v_total);
+                    uva_append_v_dst_buf_.Allocate(v_total);
+                }
+            }
+
+            const std::size_t ptr_bytes_k = k_total * sizeof(uint8_t*);
+            EnqueueCopy(
+                reinterpret_cast<const std::byte*>(k_src_host.data()),
+                reinterpret_cast<std::byte*>(uva_append_k_src_buf_.get()),
+                ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
+            EnqueueCopy(
+                reinterpret_cast<const std::byte*>(k_dst_host.data()),
+                reinterpret_cast<std::byte*>(uva_append_k_dst_buf_.get()),
+                ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
+
+            worker_detail::LaunchUvaPageCopyKernel(
+                uva_append_k_src_buf_.get(), uva_append_k_dst_buf_.get(),
+                k_token_bytes, static_cast<int>(k_total), cuda_stream);
+
+            if constexpr (kHasVCache) {
+                if (v_total > 0) {
+                    const std::size_t ptr_bytes_v = v_total * sizeof(uint8_t*);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(v_src_host.data()),
+                        reinterpret_cast<std::byte*>(
+                            uva_append_v_src_buf_.get()),
+                        ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(v_dst_host.data()),
+                        reinterpret_cast<std::byte*>(
+                            uva_append_v_dst_buf_.get()),
+                        ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
+                    worker_detail::LaunchUvaPageCopyKernel(
+                        uva_append_v_src_buf_.get(),
+                        uva_append_v_dst_buf_.get(), v_token_bytes,
+                        static_cast<int>(v_total), cuda_stream);
+                }
+            }
+
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
+    // ================================================================
     // Direct host→CPU read/write for migration (no GPU staging)
     // ================================================================
 
@@ -2111,6 +2302,15 @@ class HostPagedKVWorkerView {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
+
+    // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
+    // pointer arrays (src + dst) uploaded once per batched call. Sized
+    // lazily (grow-only) on first use; typical steady-state usage is
+    // num_layers × max_batch_size entries per cache (~few KiB).
+    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_src_buf_;
+    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_k_dst_buf_;
+    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_src_buf_;
+    mutable worker_detail::DeviceBuffer<uint8_t*> uva_append_v_dst_buf_;
 
     inline static std::atomic<std::uint64_t> task_id_counter_{0};
 };

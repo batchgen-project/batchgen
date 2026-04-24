@@ -1797,44 +1797,90 @@ class BatchGenWorker:
 		if not hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors = []
 
-		if entries and worker_view is not None and sequence_ids is not None:
-			for layer_idx, k_tensor, v_tensor in entries:
-				if k_tensor.dim() == 3:
-					k_tensor = k_tensor.unsqueeze(2)
-				if v_tensor is not None and v_tensor.dim() == 3:
-					v_tensor = v_tensor.unsqueeze(2)
+		# Phase A: collapse all (layer × seq) DtoH copies into a single UVA
+		# kernel launch per cache. Gated by BATCHGEN_KV_OFFLOAD_UVA_KERNEL=1
+		# until validated. Default path (per-layer loop) stays behind the
+		# fallback for safety.
+		_use_uva_kernel = os.environ.get(
+			"BATCHGEN_KV_OFFLOAD_UVA_KERNEL", "0") == "1"
 
-				task = worker_view.async_append_decode_kv_to_host(
-					layer_idx=layer_idx,
+		if _use_uva_kernel and hasattr(worker_view,
+			"async_append_decode_kv_to_host_batched_kernel"):
+			# Primary cache — one batched call
+			if entries and worker_view is not None and sequence_ids is not None:
+				_prepared_entries = []
+				for layer_idx, k_tensor, v_tensor in entries:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					if v_tensor is not None and v_tensor.dim() == 3:
+						v_tensor = v_tensor.unsqueeze(2)
+					_prepared_entries.append((layer_idx, k_tensor, v_tensor))
+					self._pending_kv_append_tensors.append(k_tensor)
+					if v_tensor is not None:
+						self._pending_kv_append_tensors.append(v_tensor)
+				task = worker_view.async_append_decode_kv_to_host_batched_kernel(
+					entries=_prepared_entries,
 					sequence_ids=sequence_ids,
-					k_tensor=k_tensor,
-					v_tensor=v_tensor,
 					sequence_lengths=sequence_lengths,
 				)
-
-				self._pending_kv_append_tensors.append(k_tensor)
-				if v_tensor is not None:
-					self._pending_kv_append_tensors.append(v_tensor)
 				if task is not None:
 					self._pending_kv_append_tasks.append(task)
 
-		# Aux (DSA indexer) cache — shares the same post-forward sync
-		if entries_aux and aux_view is not None and sequence_ids is not None:
-			for layer_idx, k_tensor, v_tensor in entries_aux:
-				if k_tensor.dim() == 3:
-					k_tensor = k_tensor.unsqueeze(2)
-
-				task = aux_view.async_append_decode_kv_to_host(
-					layer_idx=layer_idx,
+			# Aux (DSA indexer) cache — one batched call
+			if entries_aux and aux_view is not None and sequence_ids is not None:
+				_prepared_aux = []
+				for layer_idx, k_tensor, v_tensor in entries_aux:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					_prepared_aux.append((layer_idx, k_tensor, None))
+					self._pending_kv_append_tensors.append(k_tensor)
+				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
+					entries=_prepared_aux,
 					sequence_ids=sequence_ids,
-					k_tensor=k_tensor,
-					v_tensor=None,
 					sequence_lengths=sequence_lengths,
 				)
-
-				self._pending_kv_append_tensors.append(k_tensor)
 				if task is not None:
 					self._pending_kv_append_tasks.append(task)
+		else:
+			# Fallback: per-layer loop (current production path)
+			if entries and worker_view is not None and sequence_ids is not None:
+				for layer_idx, k_tensor, v_tensor in entries:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+					if v_tensor is not None and v_tensor.dim() == 3:
+						v_tensor = v_tensor.unsqueeze(2)
+
+					task = worker_view.async_append_decode_kv_to_host(
+						layer_idx=layer_idx,
+						sequence_ids=sequence_ids,
+						k_tensor=k_tensor,
+						v_tensor=v_tensor,
+						sequence_lengths=sequence_lengths,
+					)
+
+					self._pending_kv_append_tensors.append(k_tensor)
+					if v_tensor is not None:
+						self._pending_kv_append_tensors.append(v_tensor)
+					if task is not None:
+						self._pending_kv_append_tasks.append(task)
+
+			# Aux (DSA indexer) cache — shares the same post-forward sync
+			if entries_aux and aux_view is not None and sequence_ids is not None:
+				for layer_idx, k_tensor, v_tensor in entries_aux:
+					if k_tensor.dim() == 3:
+						k_tensor = k_tensor.unsqueeze(2)
+
+					task = aux_view.async_append_decode_kv_to_host(
+						layer_idx=layer_idx,
+						sequence_ids=sequence_ids,
+						k_tensor=k_tensor,
+						v_tensor=None,
+						sequence_lengths=sequence_lengths,
+					)
+
+					self._pending_kv_append_tensors.append(k_tensor)
+					if task is not None:
+						self._pending_kv_append_tasks.append(task)
 
 		# Throttle: prevent thread exhaustion from std::async
 		if len(self._pending_kv_append_tasks) >= 256:
