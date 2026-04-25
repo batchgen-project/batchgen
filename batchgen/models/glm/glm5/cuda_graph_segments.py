@@ -479,8 +479,15 @@ class Glm5MoeReplayProxy(torch.nn.Module):
         # `_forward_decode_3d` — all 16 ranks see the same oversize and fall
         # back together. Eager path uses the singleton `_3d_buf`
         # (resize_if_needed permitted there), independent of bucket buffers.
+        # Bucket selection is driven ONLY by synced_ntp (cross-rank-identical).
+        # Local actual_ntp can be 0 on some ranks while peers have work; if
+        # we keyed bucket on actual_ntp here, those ranks would replay a
+        # different captured graph than peers → NCCL byte-count mismatch.
+        # Even with actual_ntp=0, the captured graph still fires its NCCL
+        # collectives with the bucket-sized payload (the static input is
+        # zero-filled by graph_manager.replay's input-padding path).
         synced_ntp = int(self.moe.num_tokens_per_rank or 0)
-        if synced_ntp == 0 or actual_ntp == 0:
+        if synced_ntp == 0:
             bucket = min(self.bucketing.bucket_sizes)
         else:
             try:
