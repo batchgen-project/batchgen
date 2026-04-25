@@ -24,9 +24,14 @@ so the follow-up implementation is a straight port — no re-planning needed.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from typing import Dict, Literal
 
 import torch
+
+# Hang-debug instrumentation gate; mirrors the env in wrappers.py + worker.
+_MOE_HANG_DEBUG = os.environ.get("BATCHGEN_GLM5_HANG_DEBUG", "0") == "1"
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.models.wrappers.attention import AttnWrapperBase
@@ -458,6 +463,12 @@ class Glm5MoeReplayProxy(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         actual_ntp = hidden_states.shape[0]
+        if _MOE_HANG_DEBUG and self.layer_idx == 0:
+            logging.warning(
+                "[HANG] MOE_PROXY_ENTER L%d actual_ntp=%d synced_ntp=%s",
+                self.layer_idx, actual_ntp, self.moe.num_tokens_per_rank,
+            )
+            sys.stdout.flush()
 
         # Bucket selection MUST be globally consistent across all ranks.
         # Drive it from `self.moe.num_tokens_per_rank`, which the worker
@@ -502,11 +513,20 @@ class Glm5MoeReplayProxy(torch.nn.Module):
 
         # Dispatch. graph_manager.replay handles bucket padding: copies
         # input[:actual_ntp] into static[:actual_ntp] and zeros the tail.
+        if _MOE_HANG_DEBUG and self.layer_idx == 0:
+            logging.warning(
+                "[HANG] MOE_REPLAY_ENTER L%d bucket=%d replay_bs=%d",
+                self.layer_idx, bucket, replay_bs,
+            )
+            sys.stdout.flush()
         out = self.graph_manager.replay(
             self._segment_name,
             replay_bs,
             hidden_states=hidden_states,
         )
+        if _MOE_HANG_DEBUG and self.layer_idx == 0:
+            logging.warning("[HANG] MOE_REPLAY_EXIT L%d", self.layer_idx)
+            sys.stdout.flush()
         # Slice back to actual batch.
         return out["moe_output"][:actual_ntp]
 

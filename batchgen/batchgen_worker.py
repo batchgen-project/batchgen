@@ -122,6 +122,23 @@ from batchgen.sampling import sample_tokens
 # Migration data structures for KV cache migration between nodes
 from batchgen.migration import MigrationOp, HostKVStats
 
+# Hang-debug worker-level instrumentation. Enable with BATCHGEN_GLM5_HANG_DEBUG=1.
+# Emits flushed log lines around the major synchronization points (barriers,
+# all_gather of local batch sizes, prefill→decode transition) so we can pinpoint
+# which rank is stuck where during a stress hang.
+_WORKER_HANG_DEBUG = os.environ.get("BATCHGEN_GLM5_HANG_DEBUG", "0") == "1"
+
+
+def _worker_hang_log(rank: int, stage: str, *, extra: str = "") -> None:
+	if not _WORKER_HANG_DEBUG:
+		return
+	msg = f"[HANG][r{rank}] {stage}"
+	if extra:
+		msg += f" {extra}"
+	logging.warning(msg)
+	sys.stdout.flush()
+
+
 BATCHGEN_ENABLE_ALL_TO_ALL = os.environ.get("BATCHGEN_ENABLE_ALL_TO_ALL")
 if BATCHGEN_ENABLE_ALL_TO_ALL == "1":
 	try:
@@ -5453,7 +5470,10 @@ class BatchGenWorker:
 						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
 							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					_worker_hang_log(self.rank, "PREFILL_BARRIER_ENTER",
+						extra=f"n_prefilled={len(prefill_uuids)}")
 					dist.barrier()
+					_worker_hang_log(self.rank, "PREFILL_BARRIER_EXIT")
 
 				# After prefill completes, poll for newly arrived sequences.
 				# If more QUEUEING sequences exist and host KV has capacity,
@@ -5472,10 +5492,13 @@ class BatchGenWorker:
 			# =================================================================
 			# 2. DECODE PHASE: Continuous Batching (Host -> GPU Streaming)
 			# =================================================================
+			_worker_hang_log(self.rank, "DECODE_LOOP_ENTER",
+				extra=f"prefilled={len(self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED))}")
 			while (self.global_batch.has_prefilled() or
 			   self.global_batch.has_in_decode() or
 			   self.global_batch.has_on_hold()):
 				# NOTE: Barrier removed - tensor sync operations below provide synchronization
+				_worker_hang_log(self.rank, "DECODE_ITER_TOP")
 
 				# ============ STEP A: Load model FIRST (needed for accurate GPU KV size) ============
 				# Estimate max sequences per rank for buffer allocation
@@ -5489,7 +5512,10 @@ class BatchGenWorker:
 				# Ensure at least some minimum
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
 
+				_worker_hang_log(self.rank, "LOAD_DECODE_MODEL_ENTER",
+					extra=f"max_num_seq={max_num_seq_estimate}")
 				self._load_decode_model(max_num_seq_estimate, self.comm)
+				_worker_hang_log(self.rank, "LOAD_DECODE_MODEL_EXIT")
 
 				if torch.cuda.is_available():
 					free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -5522,11 +5548,19 @@ class BatchGenWorker:
 
 				# Step 1: Sync decode_uuids across ranks using tensor operations
 				# This ensures all ranks have the same decode candidates
+				_worker_hang_log(self.rank, "SYNC_DECODE_UUIDS_ENTER",
+					extra=f"local_uuids={len(decode_uuids)}")
 				decode_uuids = self._sync_decode_uuids_tensor(decode_uuids)
+				_worker_hang_log(self.rank, "SYNC_DECODE_UUIDS_EXIT",
+					extra=f"global_uuids={len(decode_uuids)}")
 
 				# Step 2: Sync completion status using tensor-based all_reduce
 				# Returns (completed_set, active_list) - active_list is already sorted by global_idx
+				_worker_hang_log(self.rank, "SYNC_COMPLETION_ENTER",
+					extra=f"in={len(decode_uuids)}")
 				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
+				_worker_hang_log(self.rank, "SYNC_COMPLETION_EXIT",
+					extra=f"completed={len(global_completed)} active={len(decode_uuids)}")
 
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
@@ -9034,8 +9068,15 @@ class BatchGenWorker:
 				if _have_captured_graph:
 					_local_bs_buf.fill_(len(batch))
 					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+					if _WORKER_HANG_DEBUG and getattr(self, "_decode_step_idx", 0) < 3:
+						_worker_hang_log(self.rank, "DECODE_AG_ENTER",
+							extra=f"step={getattr(self, '_decode_step_idx', 0)} local_bs={len(batch)}")
 					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
 					_max_bs = max(_all_rank_counts.max().item(), 1)
+					if _WORKER_HANG_DEBUG and getattr(self, "_decode_step_idx", 0) < 3:
+						_worker_hang_log(self.rank, "DECODE_AG_EXIT",
+							extra=f"step={getattr(self, '_decode_step_idx', 0)} max_bs={_max_bs}")
+					self._decode_step_idx = getattr(self, "_decode_step_idx", 0) + 1
 					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
@@ -9208,12 +9249,17 @@ class BatchGenWorker:
 					_dt_fwd = _get_dt_fwd()
 					_fwd_ctx = _dt_fwd.timed("forward_total", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
 					with _fwd_ctx:
+						if _WORKER_HANG_DEBUG and getattr(self, "_decode_step_idx", 0) <= 3:
+							_worker_hang_log(self.rank, "MODEL_FWD_ENTER",
+								extra=f"step={getattr(self, '_decode_step_idx', 0)} ntok={new_tokens.shape[0]}")
 						outputs = self.model(
 							new_tokens,
 							attention_mask=Attn_Wrapper.attention_mask,
 							position_ids=Attn_Wrapper.position_ids,
 							use_cache=False
 						)
+						if _WORKER_HANG_DEBUG and getattr(self, "_decode_step_idx", 0) <= 3:
+							_worker_hang_log(self.rank, "MODEL_FWD_EXIT")
 					_sample_ctx = _dt_fwd.timed("sampling", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
 					with _sample_ctx:
 						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])

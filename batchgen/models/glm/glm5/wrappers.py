@@ -18,8 +18,25 @@ Key differences from DeepSeek:
 
 import logging
 import os
+import sys
 from contextlib import nullcontext as _nullctx
 from typing import Dict, Optional, Tuple
+
+# Hang-debug instrumentation: when BATCHGEN_GLM5_HANG_DEBUG=1, every major
+# stage in the DSA decode path logs ENTER/EXIT with the rank's layer index.
+# When the cluster hangs, the LAST log line from each rank tells us exactly
+# which stage they got stuck at. Limited to layer 0 to keep log volume low.
+_HANG_DEBUG = os.environ.get("BATCHGEN_GLM5_HANG_DEBUG", "0") == "1"
+
+
+def _hang_log(stage: str, layer_idx: int, *, only_first_layer: bool = True) -> None:
+    """Emit a flushed log line for hang localization. No-op unless debug env set."""
+    if not _HANG_DEBUG:
+        return
+    if only_first_layer and layer_idx != 0:
+        return
+    logging.warning("[HANG] L%d %s", layer_idx, stage)
+    sys.stdout.flush()
 
 import torch
 import torch.nn as nn
@@ -609,8 +626,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         dt = get_decode_timer()
         li = self.layer_idx
 
+        _hang_log(f"dsa_enter bsz={bsz} max_seqlen={max_seqlen}", li)
+
         # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
         if bsz == 0:
+            _hang_log("dsa_empty_batch_return", li)
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
         # --- Shared FP8 activation quantization ---
@@ -1019,6 +1039,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
+        _hang_log("dsa_pre_sparse_attn", li)
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
             # Sparse seqlens: min(topk, actual cache length).
             # DSA safety: FA needs seqlen >= 1 per row to avoid the kernel
@@ -1056,5 +1077,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             attn_output = attn_output.view(bsz, 1, -1)
 
+        _hang_log("dsa_exit", li)
         return attn_output
 
