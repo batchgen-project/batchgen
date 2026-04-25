@@ -459,35 +459,40 @@ class Glm5MoeReplayProxy(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         actual_ntp = hidden_states.shape[0]
 
-        # Pick the replay bucket. We MUST always take the captured path
-        # here — falling back to eager on some ranks (e.g. zero-batch or
-        # oversize) while other ranks replay creates mismatched NCCL
-        # collective counts across ranks → cross-rank peer deadlock
-        # observed in run #7/8: rank 4 went eager _forward_decode_3d
-        # while rank 0 replayed captured, their NCCL calls failed to
-        # pair up.
+        # Pick the replay bucket. Cross-rank consistency is guaranteed by the
+        # upstream all_gather of `_max_bs` in `batchgen_worker.py:9020` (run
+        # under `_whole_model_graph=True`): every rank ends up with the same
+        # `actual_ntp` per step, so the eager-vs-replay decision is identical
+        # across the 16 ranks. No NCCL collective-count mismatch possible.
         #
         # Zero-batch: pass smallest bucket, slice [:0] post-replay.
         # Captured graph handles zero real input correctly because it
         # was captured with fill_value=0 static input (every replay
         # zeros the tail anyway).
         #
-        # Oversize: would require a larger bucket than we have. There's
-        # no safe way to handle this without cross-rank coordination —
-        # raise loudly so the bucket list can be extended.
+        # Oversize: actual_ntp > largest captured bucket. Fall back to eager
+        # `_forward_decode_3d` — all 16 ranks see the same oversize and fall
+        # back together (per upstream invariant above). Eager path uses the
+        # singleton `_3d_buf` (which `set_num_tokens_per_rank` already grew
+        # to fit), independent of the captured bucket buffers.
         if actual_ntp == 0:
             bucket = min(self.bucketing.bucket_sizes)
             replay_bs = bucket
         else:
             try:
                 bucket = self.bucketing.get_padded_size(actual_ntp)
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
-                    f"actual_ntp={actual_ntp} exceeds max bucket "
-                    f"{max(self.bucketing.bucket_sizes)}. Increase "
-                    "BATCHGEN_GLM5_MTP_BUCKETS or disable CUDA graph."
-                ) from exc
+            except ValueError:
+                # Oversize: log once and route to eager.
+                if not getattr(Glm5MoeReplayProxy, "_warned_oversize", False):
+                    logging.warning(
+                        f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
+                        f"actual_ntp={actual_ntp} exceeds max bucket "
+                        f"{max(self.bucketing.bucket_sizes)}; falling back "
+                        "to eager _forward_decode_3d. Increase "
+                        "BATCHGEN_GLM5_MTP_BUCKETS to capture this size."
+                    )
+                    Glm5MoeReplayProxy._warned_oversize = True
+                return self.moe._forward_decode_3d(hidden_states)
             replay_bs = actual_ntp
 
         # Align moe.num_tokens_per_rank so _forward_decode_3d inside the
