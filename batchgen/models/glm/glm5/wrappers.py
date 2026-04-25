@@ -957,6 +957,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         f"contains position {_tk_max} >= block_table_cols*page_size="
                         f"{_expected_max_valid_tok}; block_table row gather will wrap"
                     )
+            # DSA safety: top_k_indices may carry -1 sentinels for masked /
+            # padded rows (paged indexer torch.topk on -inf-masked tail).
+            # sparse_gather_from_paged_kv would clamp those to 0 and gather
+            # whatever page lives at slot 0 — non-deterministic, can feed
+            # stale / out-of-context KV to FA. Replace negatives with 0
+            # explicitly so gather + downstream FA see deterministic input.
+            if (top_k_indices < 0).any():
+                top_k_indices = top_k_indices.clamp(min=0)
             sparse_mla_kv = sparse_gather_from_paged_kv(
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
             )
@@ -1012,9 +1020,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            # Sparse seqlens: min(topk, actual cache length)
+            # Sparse seqlens: min(topk, actual cache length).
+            # DSA safety: FA needs seqlen >= 1 per row to avoid the kernel
+            # entering a degenerate / spinning state on zero-length inputs.
+            # Production decode should never produce updated_seqlens=0
+            # (decode runs only after first token is prefilled), but a
+            # defensive min=1 is cheap. Investigation plan in
+            # ~/.claude/plans/the-task-for-this-soft-shell.md.
             topk = top_k_indices.shape[1]
-            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
+            sparse_seqlens = torch.clamp(updated_seqlens, min=1, max=topk)
 
             attn_out = sparse_flash_mla_decode(
                 query_states, sparse_mla_kv, sparse_seqlens,
