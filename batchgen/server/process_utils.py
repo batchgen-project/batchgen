@@ -39,6 +39,8 @@ MODEL_BYTE_SIZES = {
     "deepseek-ai/DeepSeek-V2": 472 * 1024**3,
     "deepseek-ai/DeepSeek-V3": 675 * 1024**3,
     "deepseek-ai/DeepSeek-R1": 675 * 1024**3,  # Same as V3
+    "deepseek-ai/DeepSeek-V4-Flash": 180 * 1024**3,
+    "deepseek-ai/DeepSeek-V4-Pro": 700 * 1024**3,
     # Mixtral models
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 96 * 1024**3,
     "mistralai/Mixtral-8x22B-Instruct-v0.1": 286 * 1024**3,

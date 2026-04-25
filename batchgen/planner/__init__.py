@@ -39,7 +39,10 @@ def get_planner(model_name: str) -> Type[BasePlanner]:
     """
     model_lower = model_name.lower()
 
-    if model_lower in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
+    if (
+        model_lower in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]
+        or "deepseek-v4" in model_lower
+    ):
         from batchgen.models.deepseek.deepseekv3.planner import DeepSeekV3Planner
         return DeepSeekV3Planner
 

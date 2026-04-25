@@ -58,6 +58,8 @@ TOKENIZER_REGISTRY: Dict[str, Type["BaseTokenizer"]] = {}
 # Model name/identifier patterns for tokenizer detection
 # Maps patterns found in model names to tokenizer_type
 TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
+    "DeepSeek-V4-Flash": "deepseek_v4",
+    "DeepSeek-V4-Pro": "deepseek_v4",
     "DeepSeek-R1": "deepseek_v3",
     "DeepSeek-V3": "deepseek_v3",
     "DeepSeek-V2-Lite": "deepseek_v2",
@@ -151,6 +153,11 @@ def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
 # These imports trigger the @register_tokenizer decorators
 def _import_tokenizers():
     """Import all model-specific tokenizer modules to register them."""
+    try:
+        from batchgen.models.deepseek.deepseekv4_flash import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
     try:
         from batchgen.models.deepseek.deepseekv3 import tokenizer as _  # noqa: F401
     except ImportError:

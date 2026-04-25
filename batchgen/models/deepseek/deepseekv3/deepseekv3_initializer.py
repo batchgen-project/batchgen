@@ -47,6 +47,7 @@ from .set_basic_config import set_basic_config
 from .planner import DeepSeekV3Planner
 
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
+from batchgen.server.process_utils import get_model_byte_size
 
 def ceil_div(x: int, y: int) -> int:
     """
@@ -260,14 +261,8 @@ class DeepseekV3Initializer:
 
             logging.info("Core engine created")
             logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
-            if (
-                "deepseek-ai/DeepSeek-V3" in self.loaded_model_config._name_or_path
-                or "deepseek-ai/DeepSeek-R1"
-                in self.loaded_model_config._name_or_path
-            ):
-                param_byte_size = 675 * 1024 * 1024 * 1024
-            else:
-                raise ValueError("Unknown huggingface model card")
+            param_byte_size = get_model_byte_size(self.loaded_model_config._name_or_path)
+            logging.info(f"Model byte size estimate: {param_byte_size / (1024**3):.1f} GB")
             # self.core_engine.Init(
             #     self.shm_name,
             #     self.tensor_meta_shm_name,
