@@ -482,7 +482,6 @@ class Glm5MoeReplayProxy(torch.nn.Module):
         synced_ntp = int(self.moe.num_tokens_per_rank or 0)
         if synced_ntp == 0 or actual_ntp == 0:
             bucket = min(self.bucketing.bucket_sizes)
-            replay_bs = bucket
         else:
             try:
                 bucket = self.bucketing.get_padded_size(synced_ntp)
@@ -498,7 +497,15 @@ class Glm5MoeReplayProxy(torch.nn.Module):
                     )
                     Glm5MoeReplayProxy._warned_oversize = True
                 return self.moe._forward_decode_3d(hidden_states)
-            replay_bs = max(actual_ntp, 1)
+
+        # Pass `bucket` (not actual_ntp) as graph_manager.replay's batch_size
+        # so all 16 ranks select the SAME captured graph for this step. The
+        # replay function re-derives `bucket = get_padded_size(batch_size)`
+        # internally; if we pass per-rank actual_ntp, ranks with smaller
+        # batches pick a smaller bucket → different captured NCCL kernels →
+        # mismatched payloads → cluster-wide hang.
+        # (Root cause of the 2026-04-25 stress hang.)
+        replay_bs = bucket
 
         # Dispatch. graph_manager.replay handles bucket padding: copies
         # input[:actual_ntp] into static[:actual_ntp] and zeros the tail.
