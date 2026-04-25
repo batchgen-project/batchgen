@@ -9076,12 +9076,27 @@ class BatchGenWorker:
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
 
-				# MoE buffer sync: only needed at decision boundaries (batch size changes).
-				# Between boundaries, batch size is constant — skip the all_reduce + .item()
-				# CPU-GPU sync that drains the GPU pipeline every step.
-				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				if getattr(self, '_whole_model_graph', False):
-					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
+				# MoE buffer sync — required whenever any captured graph contains
+				# NCCL collectives (whole-model OR per-layer MoE graphs). All
+				# ranks must agree on `_max_bs` so they replay the same bucket
+				# and the captured all_gather/all_reduce kernels see matching
+				# byte counts. Without this, ranks with different local
+				# batches replay different captured graphs → NCCL byte-count
+				# mismatch → cluster-wide hang (root cause of the long-context
+				# stress hang debugged 2026-04-25).
+				#
+				# Cost: 16-byte all_gather + .item() per step ≈ 70 µs on this
+				# H20 cluster (per nccl-tests). On a ~200 ms decode step
+				# that's <0.04% — acceptable for the correctness it gives us.
+				#
+				# Eager-only path (no captured graph at all) keeps the local-
+				# only fast path: each rank uses local len(batch), no NCCL
+				# needed since eager MoE allocates buffers from the singleton
+				# `_3d_buf` which can resize freely.
+				_have_captured_graph = (
+					getattr(self, '_cuda_graph_manager', None) is not None
+				)
+				if _have_captured_graph:
 					_local_bs_buf.fill_(len(batch))
 					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
@@ -9092,7 +9107,7 @@ class BatchGenWorker:
 						if hasattr(self.parallel_manager, 'set_rank_token_counts'):
 							self.parallel_manager.set_rank_token_counts(_all_rank_counts)
 				else:
-					# Per-layer graph or eager: no NCCL in graph, use local batch size
+					# Pure eager: no captured graph, no per-step sync needed.
 					_max_bs = max(len(batch), 1)
 
 				# KV append callback — deferred: accumulate during forward, single sync after
