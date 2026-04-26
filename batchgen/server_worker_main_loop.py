@@ -31,10 +31,13 @@ def _reload_worker_module(reload_deps=False):
 	"""
 	if reload_deps:
 		dep_modules = [
+			"batchgen.runtime_debug",
 			"batchgen.server.batch_scheduler",
 			"batchgen.server.intake_pool",
 			"batchgen.server.scheduling_pool",
 			"batchgen.kv_cache.gpu_paged_kv_manager",
+			"batchgen.models.glm.glm5.cuda_graph_segments",
+			"batchgen.models.glm.glm5.model",
 		]
 		for mod_name in dep_modules:
 			if mod_name in sys.modules:
@@ -455,11 +458,14 @@ def _server_worker_main_impl(
 			top_p = task_data.get("top_p", None)
 			sampling_params = task_data.get("sampling_params", None)
 			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
+			batchgen_debug = task_data.get("batchgen_debug", {}) or {}
 			if global_rank == 0:
 				if sampling_params:
 					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
 				else:
 					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
+				if batchgen_debug:
+					logging.warning(f"[PAYLOAD] batchgen_debug={batchgen_debug}")
 
 			incr_output_dir = task_data.get("incremental_output_dir")
 			incr_custom_ids = task_data.get("custom_id_map")
@@ -473,6 +479,7 @@ def _server_worker_main_impl(
 					"prompt_texts": task_data.get("prompt_text_map", {}),
 					"parse_thinking": task_data.get("parse_thinking", False),
 					"parse_tool_call": task_data.get("parse_tool_call", False),
+					"batchgen_debug": batchgen_debug,
 				}
 
 			if hasattr(worker, 'reset_runtime_state'):
@@ -481,6 +488,7 @@ def _server_worker_main_impl(
 			if len(global_prompts) > 0:
 				worker.Init(current_max_input, current_max_output, len(global_prompts),
 					max_context_length=max_context_length)
+				worker.set_batchgen_debug(batchgen_debug)
 				worker.set_ignore_eos(ignore_eos)
 				if sampling_params:
 					worker.set_per_sequence_sampling_params(sampling_params)

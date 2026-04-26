@@ -160,11 +160,42 @@ class BatchStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class BatchGenDebugOptions(BaseModel):
+    """Batch-level BatchGen-defined runtime debug options."""
+
+    glm5_moe_mode: Optional[Literal["graph", "eager"]] = Field(
+        default=None,
+        description="GLM-5 MoE execution path for CUDA-graph diagnostics.",
+    )
+    glm5_dispatch_headroom_diag: Optional[bool] = Field(
+        default=None,
+        description="Enable GLM-5 MoE dispatch headroom diagnostics.",
+    )
+    glm5_dispatch_headroom_warn_frac: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Warn when expert-count headroom exceeds this fraction.",
+    )
+    repetition_diag: Optional[bool] = Field(
+        default=None,
+        description="Enable extra repetition diagnostics for this batch.",
+    )
+    lifespan_dump_on_repetition: Optional[bool] = Field(
+        default=None,
+        description="Dump sequence lifespan when repetition is detected.",
+    )
+
+    class Config:
+        extra = "forbid"
+
+
 class CreateBatchRequest(BaseModel):
     input_file_id: str
     endpoint: BatchEndpoint = BatchEndpoint.CHAT_COMPLETIONS
     completion_window: CompletionWindow = CompletionWindow.ONE_DAY
     metadata: Optional[Dict[str, Any]] = None
+    batchgen_debug: Optional[BatchGenDebugOptions] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = Field(default=None, ge=1)
     max_context_length: Optional[int] = Field(default=None, ge=1)  # Max total context (prompt + decode). None = use model max.
@@ -189,6 +220,7 @@ class BatchObject(BaseModel):
     cancelling_at: Optional[int] = None
     error: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    batchgen_debug: Optional[Dict[str, Any]] = None
     # Inference parameters (serve as defaults when per-request values are None)
     max_decoding_length: Optional[int] = None
     max_context_length: Optional[int] = None  # None = use model max
@@ -295,6 +327,7 @@ class BatchResultItem(BaseModel):
     custom_id: str
     response: Optional[BatchResponse] = None
     error: Optional[BatchError] = None
+    batchgen_debug: Optional[Dict[str, Any]] = None
 
 
 class BatchRequestItem(BaseModel):
@@ -309,6 +342,11 @@ class BatchRequestItem(BaseModel):
     def parse_body(
         cls, value: Dict[str, Any], values: Dict[str, Any]
     ) -> Union[ChatCompletionRequest, CompletionRequest]:
+        if isinstance(value, dict) and "batchgen_debug" in value:
+            raise ValueError(
+                "Per-request batchgen_debug is not supported. "
+                "Set batchgen_debug on the /v1/batches request instead."
+            )
         url = values.get("url")
         if url == BatchEndpoint.CHAT_COMPLETIONS:
             return ChatCompletionRequest(**value)

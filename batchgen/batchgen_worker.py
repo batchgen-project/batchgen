@@ -613,6 +613,7 @@ class BatchGenWorker:
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
 		# Per-request sampling parameters (list of dicts, one per prompt in batch order)
 		self._per_sequence_sampling_params: Optional[list] = None
+		self._batchgen_debug: Dict[str, object] = {}
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -895,6 +896,29 @@ class BatchGenWorker:
 				f"{n_greedy} greedy, {n_sampling} sampling"
 			)
 
+	def set_batchgen_debug(self, options: Optional[Dict[str, object]]) -> None:
+		"""Set BatchGen-defined batch-level runtime debug flags."""
+		from batchgen.runtime_debug import set_current_batchgen_debug
+		self._batchgen_debug = dict(options or {})
+		set_current_batchgen_debug(self._batchgen_debug)
+		if self.rank == 0 and self._batchgen_debug:
+			logging.warning(f"[BATCHGEN_DEBUG] {self._batchgen_debug}")
+
+	def _set_batchgen_debug_for_sequences(self, sequences: List[SequenceEntry]) -> None:
+		if not sequences:
+			self.set_batchgen_debug({})
+			return
+		debug_options = [dict(getattr(seq, "batchgen_debug", {}) or {}) for seq in sequences]
+		first = debug_options[0]
+		for opts in debug_options[1:]:
+			if opts != first:
+				raise RuntimeError(
+					"Mixed batchgen_debug configs in one decode microbatch are not supported: "
+					f"{first} vs {opts}"
+				)
+		if first != getattr(self, "_batchgen_debug", {}):
+			self.set_batchgen_debug(first)
+
 	# ============ Request Pool: Admission Queue ============
 
 	def set_admission_queue(self, queue) -> None:
@@ -981,6 +1005,7 @@ class BatchGenWorker:
 				text=entry.get("text", ""),
 			)
 			seq.batch_id = entry.get("batch_id")
+			seq.batchgen_debug = dict(entry.get("batchgen_debug") or {})
 			seq.priority = entry.get("priority", 0)
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
@@ -3470,6 +3495,7 @@ class BatchGenWorker:
 			pad_token_id=self.pad_token_id,
 			parse_thinking=cfg.get("parse_thinking", False),
 			parse_tool_call=cfg.get("parse_tool_call", False),
+			batchgen_debug=cfg.get("batchgen_debug"),
 		)
 
 	def process_new_batch(
@@ -3503,6 +3529,7 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 				text=text,
 			)
+			seq.batchgen_debug = dict(self._batchgen_debug or {})
 			seq.log_event(SeqEvent.CREATED, self.rank, f"max_dec={max_dec}")
 			self.global_batch.add_sequence(seq)
 
@@ -8372,31 +8399,25 @@ class BatchGenWorker:
 
 			# Swap in replay proxies for each MoE layer. After this point,
 			# Glm5DecoderLayer.forward's `self.mlp(hidden_states)` routes
-			# through graph replay instead of eager _forward_decode_3d.
-			#
-			# Diagnostic: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 captures the
-			# graphs but leaves decoder_layer.mlp pointing at the original
-			# eager Glm5MoE. Used to bisect "is the bug in capture-time
-			# state poisoning or in replay path?": if decode output is
-			# correct with skip_swap=1, the issue is in proxy/replay; if
-			# still garbage, capture is poisoning shared state.
+			# through graph replay by default. Batch-level
+			# batchgen_debug.glm5_moe_mode can select eager MoE without a
+			# cold restart because the proxy retains the original Glm5MoE.
 			_skip_swap = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP", "0") == "1"
 			if _skip_swap:
 				logging.warning(
 					f"Rank {self.rank}: BATCHGEN_GLM5_CUDA_GRAPH_SKIP_SWAP=1 — "
-					"graphs captured but proxies NOT installed. Decode uses "
-					"eager Glm5MoE. (Diagnostic mode)"
+					"deprecated and ignored. Use batchgen_debug.glm5_moe_mode='eager' "
+					"on /v1/batches instead."
 				)
-			else:
-				for layer_idx, decoder_layer in moe_layers:
-					original_mlp = decoder_layer.mlp
-					proxy = Glm5MoeReplayProxy(
-						moe_module=original_mlp,
-						layer_idx=layer_idx,
-						graph_manager=manager,
-						bucketing=bucketing,
-					)
-					decoder_layer.mlp = proxy
+			for layer_idx, decoder_layer in moe_layers:
+				original_mlp = decoder_layer.mlp
+				proxy = Glm5MoeReplayProxy(
+					moe_module=original_mlp,
+					layer_idx=layer_idx,
+					graph_manager=manager,
+					bucketing=bucketing,
+				)
+				decoder_layer.mlp = proxy
 
 			self._cuda_graph_manager = manager
 			if self.rank == 0:
@@ -8406,8 +8427,7 @@ class BatchGenWorker:
 					f"{stats.get('total_capture_time_ms', 0):.0f}ms total, "
 					f"{moe_count} MoE layers × {len(bucket_ntps)} buckets = "
 					f"{moe_count * len(bucket_ntps)} graphs. "
-					+ ("SKIP_SWAP=1, proxies NOT installed." if _skip_swap
-					   else "Proxies installed — decoder_layer.mlp now replays.")
+					+ "Proxies installed — batchgen_debug.glm5_moe_mode selects graph/eager."
 				)
 			return
 
@@ -8968,6 +8988,12 @@ class BatchGenWorker:
 
 			# Pre-compute batch_sequences for use in both forward setup and update loop
 			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+			active_sequences = [
+				self.global_batch.get_sequence(uuid)
+				for uuid in decode_uuids
+				if self.global_batch.get_sequence(uuid) is not None
+			]
+			self._set_batchgen_debug_for_sequences(active_sequences)
 
 			# Invariant check: cache_seqlens must not exceed allocated pages.
 			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
@@ -10899,10 +10925,13 @@ class BatchGenWorker:
 			# Reload commonly-changed dependent modules first
 			if reload_deps:
 				dep_modules = [
+					"batchgen.runtime_debug",
 					"batchgen.server.batch_scheduler",
 					"batchgen.server.intake_pool",
 					"batchgen.server.scheduling_pool",
 					"batchgen.kv_cache.gpu_paged_kv_manager",
+					"batchgen.models.glm.glm5.cuda_graph_segments",
+					"batchgen.models.glm.glm5.model",
 				]
 				for mod_name in dep_modules:
 					if mod_name in sys.modules:
@@ -11053,6 +11082,7 @@ class BatchGenWorker:
 		# Synchronize all ranks before cleanup
 		dist.barrier()
 		self._ignore_eos = False
+		self.set_batchgen_debug({})
 		# Reset logging flags for new batch (to log sampling mode once per batch)
 		self._logged_greedy = False
 		self._logged_sampling = False

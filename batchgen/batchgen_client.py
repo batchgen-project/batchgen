@@ -287,6 +287,7 @@ class BatchGenHttpClient:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        batchgen_debug: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a batch job.
 
@@ -300,6 +301,7 @@ class BatchGenHttpClient:
             temperature: Default sampling temperature (None = greedy). Per-request values override.
             top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
             top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.
+            batchgen_debug: BatchGen-defined batch-level runtime debug flags.
 
         Returns:
             Batch object with id, status, etc.
@@ -321,6 +323,8 @@ class BatchGenHttpClient:
             payload["top_p"] = top_p
         if top_k is not None:
             payload["top_k"] = top_k
+        if batchgen_debug:
+            payload["batchgen_debug"] = batchgen_debug
         return self.post_json("/v1/batches", payload)
 
     def get_batch(self, batch_id: str) -> Dict[str, Any]:
@@ -419,6 +423,7 @@ class BatchGenHttpClient:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
+        batchgen_debug: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Submit a batch job and wait for completion.
 
@@ -439,6 +444,7 @@ class BatchGenHttpClient:
             temperature: Default sampling temperature (None = greedy). Per-request values override.
             top_p: Default nucleus sampling threshold (None = disabled). Per-request values override.
             top_k: Default top-k filtering (None or 0 = disabled). Per-request values override.
+            batchgen_debug: BatchGen-defined batch-level runtime debug flags.
 
         Returns:
             Final batch object with output_file_id
@@ -459,6 +465,7 @@ class BatchGenHttpClient:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            batchgen_debug=batchgen_debug,
         )
         batch_id = batch["id"]
         logger.info(f"Created batch: {batch_id}")

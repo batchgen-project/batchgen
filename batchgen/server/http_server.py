@@ -356,6 +356,11 @@ def create_app(
             created_at=now,
             expires_at=expires_at,
             metadata=body.metadata,
+            batchgen_debug=(
+                body.batchgen_debug.dict(exclude_none=True)
+                if body.batchgen_debug is not None
+                else None
+            ),
             # Inference parameters (override per-request values)
             max_decoding_length=body.max_decoding_length,
             max_context_length=body.max_context_length,

@@ -260,6 +260,12 @@ class BatchScheduler:
                 f"serve as defaults only; per-request values take priority"
             )
 
+        batchgen_debug = batch.batchgen_debug or {}
+        if batchgen_debug:
+            logger.warning(
+                f"Batch {batch_id}: batchgen_debug={batchgen_debug}"
+            )
+
         # Build incremental writer metadata
         incremental_output_dir = (
             self.server_args.incremental_output_dir
@@ -277,6 +283,7 @@ class BatchScheduler:
                 incremental_output_dir=incremental_output_dir,
                 parse_thinking=self.server_args.parse_thinking,
                 parse_tool_call=self.server_args.parse_tool_call,
+                batchgen_debug=batchgen_debug,
             )
 
         # --- Pool mode: send admission messages instead of blocking infer() ---
@@ -300,6 +307,7 @@ class BatchScheduler:
                 max_context_length=batch.max_context_length,
                 sampling_params=sampling_params,
                 per_sequence_max_tokens=per_request_max_tokens,
+                batchgen_debug=batchgen_debug,
                 **incremental_kwargs,
             )
         except Exception as exc:
@@ -893,6 +901,7 @@ class BatchScheduler:
                     "max_tokens": per_request_max_tokens[idx],
                     "priority": 0,  # TODO: support per-batch priority from API
                     "sampling_params": sampling_params[idx] if sampling_params else {},
+                    "batchgen_debug": batch.batchgen_debug or {},
                 },
                 priority=Priority.NORMAL,
             ))
@@ -926,6 +935,7 @@ class BatchScheduler:
                 "url": req.url.value,
                 "model": req.body.model,
                 "prompt_text": prompts[idx],
+                "batchgen_debug": batch.batchgen_debug or {},
             }
 
         # Ensure incremental output directory exists
@@ -1040,6 +1050,7 @@ class BatchScheduler:
                     "batch_id": entry.batch_id,
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
+                    "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
                 })
 
             admission_msg = {
@@ -1153,6 +1164,7 @@ class BatchScheduler:
         model = meta["model"]
         custom_id = meta["custom_id"]
         url = meta["url"]
+        batchgen_debug = meta.get("batchgen_debug") or None
         created_at = int(time.time())
 
         # Build response body based on endpoint type
@@ -1205,6 +1217,7 @@ class BatchScheduler:
                 "body": body,
             },
             "error": None,
+            "batchgen_debug": batchgen_debug,
         }
 
         # Append to JSONL file

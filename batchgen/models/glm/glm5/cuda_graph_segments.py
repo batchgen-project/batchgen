@@ -35,6 +35,7 @@ _MOE_HANG_DEBUG = os.environ.get("BATCHGEN_GLM5_HANG_DEBUG", "0") == "1"
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.models.wrappers.attention import AttnWrapperBase
+from batchgen.runtime_debug import get_glm5_moe_mode
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +473,23 @@ class Glm5MoeReplayProxy(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         actual_ntp = hidden_states.shape[0]
+        moe_mode = get_glm5_moe_mode()
+        if moe_mode == "eager":
+            if not getattr(self, "_warned_eager_debug", False):
+                logging.warning(
+                    "Glm5MoeReplayProxy(layer=%d): batchgen_debug.glm5_moe_mode=eager — "
+                    "bypassing CUDA-graph replay for this batch.",
+                    self.layer_idx,
+                )
+                self._warned_eager_debug = True
+            return self.moe._forward_decode_3d(hidden_states)
+        if moe_mode != "graph" and not getattr(self, "_warned_unknown_mode", False):
+            logging.warning(
+                "Glm5MoeReplayProxy(layer=%d): unknown glm5_moe_mode=%r; using graph replay.",
+                self.layer_idx,
+                moe_mode,
+            )
+            self._warned_unknown_mode = True
         if _MOE_HANG_DEBUG and self.layer_idx == 0:
             logging.warning(
                 "[HANG] MOE_PROXY_ENTER L%d actual_ntp=%d synced_ntp=%s",

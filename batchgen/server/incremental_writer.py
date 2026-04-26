@@ -58,6 +58,7 @@ class IncrementalWriter:
         pad_token_id: int = 0,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
+        batchgen_debug: Optional[Dict[str, Any]] = None,
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,7 @@ class IncrementalWriter:
         self._pad_token_id = pad_token_id
         self._parse_thinking = parse_thinking
         self._parse_tool_call = parse_tool_call
+        self._batchgen_debug = dict(batchgen_debug or {})
 
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
@@ -230,6 +232,7 @@ class IncrementalWriter:
                 body=body,
             ),
             error=None,
+            batchgen_debug=self._batchgen_debug or None,
         )
 
         return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
@@ -242,6 +245,7 @@ class IncrementalWriter:
             custom_id=custom_id,
             response=None,
             error=BatchError(code=error_code, message=error_message),
+            batchgen_debug=self._batchgen_debug or None,
         )
         return json.dumps(result_item.dict(), default=str, ensure_ascii=False)
 

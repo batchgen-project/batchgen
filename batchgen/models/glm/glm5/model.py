@@ -25,6 +25,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from batchgen.timing import get_decode_timer
+from batchgen.runtime_debug import (
+    glm5_dispatch_headroom_diag_enabled,
+    glm5_dispatch_headroom_warn_frac,
+)
 from batchgen.models.glm.glm5.decode_utils import (
 	build_flat_paged_gather_indices,
 	build_paged_gather_cache_key,
@@ -1657,9 +1661,13 @@ class Glm5MoE(nn.Module):
             )
             # Diagnostic-only: .item() is intentionally forbidden during capture.
             # Use with eager MoE / SKIP_SWAP to inspect per-expert slab headroom.
-            if _GLM5_DISPATCH_HEADROOM_DIAG and not torch.cuda.is_current_stream_capturing():
+            if (
+                glm5_dispatch_headroom_diag_enabled(_GLM5_DISPATCH_HEADROOM_DIAG)
+                and not torch.cuda.is_current_stream_capturing()
+            ):
                 max_count = int(expert_counts.max().item()) if expert_counts.numel() else 0
-                warn_at = int(buf.max_tokens_padded * _GLM5_DISPATCH_HEADROOM_WARN_FRAC)
+                warn_frac = glm5_dispatch_headroom_warn_frac(_GLM5_DISPATCH_HEADROOM_WARN_FRAC)
+                warn_at = int(buf.max_tokens_padded * warn_frac)
                 warn_key = (li, buf.max_tokens_padded)
                 if max_count >= warn_at and not Glm5MoE._warned_dispatch_headroom.get(warn_key, False):
                     Glm5MoE._warned_dispatch_headroom[warn_key] = True
@@ -1667,7 +1675,7 @@ class Glm5MoE(nn.Module):
                         f"[DISPATCH_HEADROOM] L{li} rank={self.rank} "
                         f"max_expert_count={max_count} mtp={buf.max_tokens_padded} "
                         f"num_global={num_global} ntp={ntp} topk={topk} "
-                        f"warn_frac={_GLM5_DISPATCH_HEADROOM_WARN_FRAC}"
+                        f"warn_frac={warn_frac}"
                     )
 
         # 4) FP8 blockwise GEMM on 3D buffer (per-sub-op timing inside)
