@@ -1078,7 +1078,8 @@ class Glm5MoE(nn.Module):
     _warned_k25_path = False
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
-    _warned_rt_check: bool = False  # one-time probe: log rank_counts state at first _forward_decode_3d invocation
+    _warned_rt_check_warmup: bool = False  # one-time probe before graph capture
+    _warned_rt_check_capture: bool = False  # one-time probe during graph capture
     _warned_dispatch_headroom: Dict[Tuple[int, int], bool] = {}
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
@@ -1606,20 +1607,28 @@ class Glm5MoE(nn.Module):
             # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
             # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
             rank_counts = Glm5MoE._rank_token_counts
-            # One-time probe: prove the masking branch is recorded by capture.
-            # Logged at the very first invocation per process (capture or eager).
+            # One-time probes: the first invocation is graph warmup, not capture,
+            # so keep separate warmup/capture flags to prove the branch is
+            # present in the recorded graph body.
             # No `.item()` so capture-safe.
-            if not Glm5MoE._warned_rt_check:
-                Glm5MoE._warned_rt_check = True
-                _is_capturing = torch.cuda.is_current_stream_capturing()
+            _is_capturing = torch.cuda.is_current_stream_capturing()
+            _should_log_rt = False
+            _rt_phase = "CAPTURE" if _is_capturing else "WARMUP"
+            if _is_capturing and not Glm5MoE._warned_rt_check_capture:
+                Glm5MoE._warned_rt_check_capture = True
+                _should_log_rt = True
+            elif not _is_capturing and not Glm5MoE._warned_rt_check_warmup:
+                Glm5MoE._warned_rt_check_warmup = True
+                _should_log_rt = True
+            if _should_log_rt:
                 if rank_counts is None:
                     logging.warning(
-                        f"[RT_CHECK] L{li} _forward_decode_3d: rank_counts=NONE "
+                        f"[RT_CHECK] {_rt_phase} L{li} _forward_decode_3d: rank_counts=NONE "
                         f"capturing={_is_capturing} ntp={ntp} num_global={num_global}"
                     )
                 else:
                     logging.warning(
-                        f"[RT_CHECK] L{li} _forward_decode_3d: rank_counts shape={tuple(rank_counts.shape)} "
+                        f"[RT_CHECK] {_rt_phase} L{li} _forward_decode_3d: rank_counts shape={tuple(rank_counts.shape)} "
                         f"dtype={rank_counts.dtype} device={rank_counts.device} "
                         f"capturing={_is_capturing} ntp={ntp} num_global={num_global}"
                     )
