@@ -168,9 +168,13 @@ def _fused_score_kernel(
 
 def compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim):
     """Compute GLM-5 indexer head gates. Pure GPU, no sync."""
-    gates = torch.nn.functional.linear(hidden_states.float(), weights_proj_weight.float())
+    # Match the PyTorch fallback/model path: BF16 hidden_states and BF16
+    # weights are multiplied in the module's dtype, then promoted for the
+    # downstream FP32 aggregation. Forcing FP32 here changes borderline top-k
+    # ordering relative to score_and_select_relu_gated().
+    gates = torch.nn.functional.linear(hidden_states, weights_proj_weight).float()
     scale = n_heads ** -0.5
-    return (gates * scale).to(torch.float32)
+    return gates * scale
 
 
 def fused_score_and_topk(
