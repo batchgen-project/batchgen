@@ -533,7 +533,7 @@ def create_app(
             # off to generate_persistent and is no longer servicing the
             # request_queue/response_queue sync path.
             scheduler = getattr(request.app.state, "scheduler", None)
-            pool_mode = bool(getattr(scheduler, "_pool_initialized", False)) if scheduler else False
+            pool_mode = bool(getattr(scheduler, "_pool_mode", False)) if scheduler else False
 
         if pool_mode:
             result = await asyncio.to_thread(
