@@ -440,7 +440,9 @@ class WorkerManager:
 
         # Poll for status files
         if expected_ranks is None:
-            expected_ranks = self.args.world_size if self.args.world_size else 1
+            nnodes = max(int(self.args.nnodes or 1), 1)
+            world_size = int(self.args.world_size or 1)
+            expected_ranks = max(world_size // nnodes, 1)
         deadline = _time.monotonic() + timeout
         results: List[dict] = []
         seen_ranks: set = set()
