@@ -375,8 +375,17 @@ class Glm5MoeSegment:
         the singleton) — those tensors are only used by the non-3D path
         (`_triton_compute` / `expert_compute_mixed`), never by the 3D
         decode path this segment captures.
+
+        Also bakes "all rows valid" into the static padding-mask buffer for
+        this bucket. The captured masking ops then record as effective
+        no-ops at warmup; per-step replay overrides via the static buffer's
+        contents (in-place .copy_() in PSM.set_rank_token_counts).
         """
+        from .model import Glm5MoE
         self.moe.num_tokens_per_rank = bucket_size
+        rt_counts = Glm5MoE._rank_token_counts
+        if rt_counts is not None:
+            rt_counts.fill_(bucket_size)
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
