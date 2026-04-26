@@ -1529,6 +1529,51 @@ class BatchGenWorker:
 			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, f"COMPLETE_{finish.upper()}")
 		return finish
 
+	def _format_repetition_context(
+		self,
+		seq,
+		kind: str,
+		local_iteration: int,
+		batch: List[int],
+		decode_uuids: List[str],
+		local_idx: Optional[int],
+		max_bs: Optional[int],
+		gpu_manager: Optional[GPUPagedKVCacheManager],
+		token_id: Optional[int] = None,
+		count: Optional[int] = None,
+	) -> str:
+		"""Compact failure-onset context for delayed long-context repetition."""
+		parts = [
+			f"kind={kind}",
+			f"iter={local_iteration}",
+			f"cum_iter={getattr(self, '_cumulative_decode_iterations', 0)}",
+			f"ctx={seq.current_context_length}",
+			f"prompt={seq.prompt_length}",
+			f"decoded={seq.decoded_length}",
+			f"page_off={seq.current_context_length % seq.PAGE_SIZE}",
+			f"gpu_pages={seq.gpu_pages_allocated}",
+			f"host_pages={seq.host_pages_allocated}",
+			f"batch_size={len(batch)}",
+			f"decode_uuids={len(decode_uuids)}",
+			f"max_bs={max_bs}",
+		]
+		if token_id is not None:
+			parts.append(f"token={token_id}")
+		if count is not None:
+			parts.append(f"count={count}")
+		if local_idx is not None:
+			parts.append(f"local_idx={local_idx}")
+			parts.append(f"batch_pos={batch.index(local_idx) if local_idx in batch else -1}")
+
+		page_mgr = getattr(gpu_manager, "_gpu_page_table_manager", None) if gpu_manager is not None else None
+		slot_order = list(page_mgr.slot_to_seq_id) if page_mgr is not None and page_mgr.slot_to_seq_id else None
+		if slot_order is not None:
+			slot_pos = slot_order.index(seq.global_idx) if seq.global_idx in slot_order else -1
+			parts.append(f"slot_pos={slot_pos}")
+			parts.append(f"slot_len={len(slot_order)}")
+
+		return ", ".join(parts)
+
 	def _compute_two_page_buffer_allocation(
 		self, 
 		uuids: List[str]
@@ -3728,8 +3773,13 @@ class BatchGenWorker:
 		max_idx = max(idx_to_uuid.keys())
 
 		# Create completion tensor: 1 = completed, 0 = not completed
-		# Each rank marks its LOCAL sequences' completion status
+		# Each rank marks its LOCAL sequences' completion status.
+		# Repetition is tracked separately because _rep_detected is stored on
+		# the owner rank's local Sequence object, while rank 0 is the only rank
+		# that writes responses. Without syncing this flag, rep-killed
+		# sequences can be globally completed but reported as finish_reason=stop.
 		completion_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
+		repetition_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
 
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
@@ -3738,9 +3788,12 @@ class BatchGenWorker:
 					is_completed = (seq.status == SequenceStatus.COMPLETED or seq.eos_reached)
 					if is_completed:
 						completion_tensor[uuid_to_idx[uuid]] = 1
+					if seq._rep_detected:
+						repetition_tensor[uuid_to_idx[uuid]] = 1
 
 		# all_reduce with MAX: if ANY rank marks a sequence complete, result is 1
 		dist.all_reduce(completion_tensor, op=dist.ReduceOp.MAX)
+		dist.all_reduce(repetition_tensor, op=dist.ReduceOp.MAX)
 
 		# Decode back to UUIDs
 		global_completed = set()
@@ -3749,11 +3802,14 @@ class BatchGenWorker:
 		# Sort by global_idx for deterministic ordering
 		for global_idx in sorted(idx_to_uuid.keys()):
 			uuid = idx_to_uuid[global_idx]
-			if completion_tensor[global_idx].item() == 1:
+			is_repetition = repetition_tensor[global_idx].item() == 1
+			if completion_tensor[global_idx].item() == 1 or is_repetition:
 				global_completed.add(uuid)
 				# Update local sequence status
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
+					if is_repetition:
+						seq._rep_detected = True
 					seq.eos_reached = True
 					if seq.status != SequenceStatus.COMPLETED:
 						try:
@@ -8761,6 +8817,17 @@ class BatchGenWorker:
 					if post_boundary_slot_order != post_boundary_batch_global_ids:
 						# Fix: Rebuild page table to match batch
 						gpu_manager.rebuild_page_table(post_boundary_batch_global_ids)
+						for batch_local_idx in batch:
+							uuid = self._local_to_uuid_map.get(batch_local_idx)
+							seq = self.global_batch.get_sequence(uuid) if uuid else None
+							if seq is not None:
+								seq.log_event(
+									SeqEvent.PAGE_REBUILD,
+									self.rank,
+									f"post_boundary batch_size={len(batch)} "
+									f"slot_head={post_boundary_slot_order[:4]} "
+									f"batch_head={post_boundary_batch_global_ids[:4]}",
+								)
 
 				# Page table is now verified for this batch
 				_page_table_verified_this_batch = True
@@ -9352,13 +9419,19 @@ class BatchGenWorker:
 						if seq._rep_count >= 32:
 							seq._rep_detected = True
 							seq.eos_reached = True
+							_rep_ctx = self._format_repetition_context(
+								seq, "single-token", local_iteration, batch,
+								decode_uuids, local_idx, _max_bs, gpu_manager,
+								token_id=token_id, count=seq._rep_count,
+							)
 							seq.log_event(SeqEvent.REPETITION, self.rank,
-								f"token={token_id}, count={seq._rep_count}")
+								_rep_ctx)
 							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
 								seq._lifespan_log, "REPETITION")
 							logging.warning(
 								f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
-								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
+								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}; "
+								f"{_rep_ctx}"
 							)
 					else:
 						seq._rep_last_token = token_id
@@ -9370,9 +9443,18 @@ class BatchGenWorker:
 						if _check_repeating_pattern(_tokens, _dl):
 							seq._rep_detected = True
 							seq.eos_reached = True
+							_rep_ctx = self._format_repetition_context(
+								seq, "ngram", local_iteration, batch,
+								decode_uuids, local_idx, _max_bs, gpu_manager,
+							)
+							seq.log_event(SeqEvent.REPETITION, self.rank,
+								_rep_ctx)
+							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
+								seq._lifespan_log, "REPETITION_NGRAM")
 							logging.warning(
 								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
-								f"gid={seq.global_idx} at decoded_len={_dl}"
+								f"gid={seq.global_idx} at decoded_len={_dl}; "
+								f"{_rep_ctx}"
 							)
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000

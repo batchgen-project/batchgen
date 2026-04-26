@@ -73,6 +73,8 @@ except ImportError:
 
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
+_GLM5_DISPATCH_HEADROOM_DIAG = os.environ.get("BATCHGEN_GLM5_DISPATCH_HEADROOM_DIAG", "0") == "1"
+_GLM5_DISPATCH_HEADROOM_WARN_FRAC = float(os.environ.get("BATCHGEN_GLM5_DISPATCH_HEADROOM_WARN_FRAC", "0.90"))
 
 
 def _parse_mtp_buckets() -> list[int]:
@@ -1077,6 +1079,7 @@ class Glm5MoE(nn.Module):
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
     _warned_rt_check: bool = False  # one-time probe: log rank_counts state at first _forward_decode_3d invocation
+    _warned_dispatch_headroom: Dict[Tuple[int, int], bool] = {}
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
         super().__init__()
@@ -1643,6 +1646,20 @@ class Glm5MoE(nn.Module):
                 buf.expert_counts, buf.expert_counters,
                 buf.topk_pos[:num_global * topk],
             )
+            # Diagnostic-only: .item() is intentionally forbidden during capture.
+            # Use with eager MoE / SKIP_SWAP to inspect per-expert slab headroom.
+            if _GLM5_DISPATCH_HEADROOM_DIAG and not torch.cuda.is_current_stream_capturing():
+                max_count = int(expert_counts.max().item()) if expert_counts.numel() else 0
+                warn_at = int(buf.max_tokens_padded * _GLM5_DISPATCH_HEADROOM_WARN_FRAC)
+                warn_key = (li, buf.max_tokens_padded)
+                if max_count >= warn_at and not Glm5MoE._warned_dispatch_headroom.get(warn_key, False):
+                    Glm5MoE._warned_dispatch_headroom[warn_key] = True
+                    logging.warning(
+                        f"[DISPATCH_HEADROOM] L{li} rank={self.rank} "
+                        f"max_expert_count={max_count} mtp={buf.max_tokens_padded} "
+                        f"num_global={num_global} ntp={ntp} topk={topk} "
+                        f"warn_frac={_GLM5_DISPATCH_HEADROOM_WARN_FRAC}"
+                    )
 
         # 4) FP8 blockwise GEMM on 3D buffer (per-sub-op timing inside)
         self._fp8_blockwise_gemm_3d(buf, expert_counts)
