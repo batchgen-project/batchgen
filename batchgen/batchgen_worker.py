@@ -630,6 +630,7 @@ class BatchGenWorker:
 		# 9. Initialization Flags
 		self._core_initialized = False
 		self._batch_completed = False
+		self._completed_result_cache: Dict[int, str] = {}
 		self._nvshmem_initialized_this_run = False
 		
 		# 10. Distributed Communication Info
@@ -1361,6 +1362,20 @@ class BatchGenWorker:
 		if seq is None:
 			return
 
+		# Legacy /v1/inference returns after the decode loop. Completion
+		# reporting releases local maps below, so keep the decoded result before
+		# that cleanup makes final detokenization unable to find the sequence.
+		text = gathered_text if gathered_text is not None else ""
+		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
+			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
+			try:
+				text = self.tokenizer.decode(token_ids)
+			except Exception:
+				text = ""
+		if not hasattr(self, "_completed_result_cache"):
+			self._completed_result_cache = {}
+		self._completed_result_cache[seq.global_idx] = text
+
 		# Free buffer slot (all ranks do this to keep state consistent)
 		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
 			if seq._buffer_slot >= 0:
@@ -1387,14 +1402,6 @@ class BatchGenWorker:
 		if self.rank != 0 or self._response_queue is None:
 			return
 
-		# Use gathered text if provided, otherwise read from local buffer
-		text = gathered_text if gathered_text is not None else ""
-		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
-			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
-			try:
-				text = self.tokenizer.decode(token_ids)
-			except Exception:
-				text = ""
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
@@ -3657,6 +3664,7 @@ class BatchGenWorker:
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
+		self._completed_result_cache = {}
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
@@ -5945,13 +5953,16 @@ class BatchGenWorker:
 		# Detokenize locally on each rank to avoid gathering large token tensors.
 		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
 		# Gathering strings (~KB each) instead reduces memory by ~100x.
-		local_results = []
+		local_results = list(getattr(self, "_completed_result_cache", {}).items())
+		recorded_global_indices = {global_idx for global_idx, _ in local_results}
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch during result gathering")
 				continue
 			global_idx = seq.global_idx
+			if global_idx in recorded_global_indices:
+				continue
 			if local_idx not in self.query_book:
 				logging.warning(f"Rank {self.rank}: query_book missing for local_idx={local_idx}, uuid={uuid[:8]}...")
 				continue
@@ -5962,7 +5973,10 @@ class BatchGenWorker:
 		all_results = [None] * self.world_size
 		dist.all_gather_object(all_results, local_results)
 		all_results = [item for sublist in all_results for item in sublist]
-		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
+		result_dict = {}
+		for global_idx, decoded_str in all_results:
+			if global_idx not in result_dict or (not result_dict[global_idx] and decoded_str):
+				result_dict[global_idx] = decoded_str
 
 		if self.rank == 0:
 			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
@@ -7240,6 +7254,12 @@ class BatchGenWorker:
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
+			# Prefix reuse prefill has asymmetric Q/K lengths: Q is the suffix,
+			# K is cached prefix + suffix. Keep this path sequence-isolated until
+			# the multi-sequence suffix attention path is validated end-to-end;
+			# otherwise exact duplicate prompts can drift when mixed with other
+			# suffixes in the same micro-batch.
+			single_sequence_only=(prefix_reuse_plan is not None),
 		)
 		total_tokens_all = sum(seq_lengths_list)
 
@@ -11631,6 +11651,7 @@ class BatchGenWorker:
 		
 		# 2. Reset batch completion flag
 		self._batch_completed = False
+		self._completed_result_cache = {}
 		
 		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
 		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
