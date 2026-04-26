@@ -34,7 +34,9 @@ def _try_set_logger_name(config, name: str) -> bool:
 		return False
 
 
-def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> Any:
+def _build_host_config_from_profile(
+	profile, shm_name: str, num_pages: int, enable_prefix_reuse: bool = True
+) -> Any:
 	"""Build a bg_lib.HostPagedKVConfig from a _HostKVModelProfile."""
 	from batchgen.kv_cache.host_kv_mananger_config import _dtype_size_bytes
 
@@ -55,6 +57,9 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	config.enable_prefix_reuse = bool(enable_prefix_reuse)
+	config.prefix_min_reuse_pages = 1
+	config.prefix_min_store_pages = 2
 	return config
 
 
@@ -107,6 +112,7 @@ class DualHostKVCoordinator:
 		model_name: str,
 		host_kv_cache_size: int,
 		core_engine_module,
+		enable_prefix_reuse: bool = True,
 		enable_memfd: bool = False,
 		memfd_creator_pid: int = -1,
 		memfd_fd: int = -1,
@@ -127,10 +133,10 @@ class DualHostKVCoordinator:
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile, HOST_KV_SHM_NAME, num_pages, enable_prefix_reuse,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages, enable_prefix_reuse,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision
@@ -177,6 +183,7 @@ class DualHostKVCoordinator:
 		cls,
 		model_name: str,
 		host_kv_cache_size: int,
+		enable_prefix_reuse: bool = True,
 		enable_memfd: bool = False,
 	) -> Optional[Tuple[Any, Any]]:
 		"""Server-side factory: create and initialize both host KV managers.
@@ -194,10 +201,10 @@ class DualHostKVCoordinator:
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile, HOST_KV_SHM_NAME, num_pages, enable_prefix_reuse,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages, enable_prefix_reuse,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision

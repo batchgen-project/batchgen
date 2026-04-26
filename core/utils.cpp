@@ -292,6 +292,50 @@ HostPagedKVConfig parse_host_paged_kv_config(
         cfg.attr("v_head_dim").cast<long long>(),
         "Host_Paged_KV_Config.v_head_dim");
     config.kv_dtype = cfg.attr("kv_dtype").cast<std::string>();
+    if (py::hasattr(cfg, "enable_prefix_reuse")) {
+        config.enable_prefix_reuse =
+            cfg.attr("enable_prefix_reuse").cast<bool>();
+    }
+    if (py::hasattr(cfg, "prefix_min_reuse_pages")) {
+        config.prefix_min_reuse_pages = CheckedSize(
+            cfg.attr("prefix_min_reuse_pages").cast<long long>(),
+            "Host_Paged_KV_Config.prefix_min_reuse_pages");
+    }
+    if (py::hasattr(cfg, "prefix_min_store_pages")) {
+        config.prefix_min_store_pages = CheckedSize(
+            cfg.attr("prefix_min_store_pages").cast<long long>(),
+            "Host_Paged_KV_Config.prefix_min_store_pages");
+    }
+    if (py::hasattr(cfg, "sequence_page_node_capacity")) {
+        config.sequence_page_node_capacity = CheckedSize(
+            cfg.attr("sequence_page_node_capacity").cast<long long>(),
+            "Host_Paged_KV_Config.sequence_page_node_capacity");
+    }
+    if (py::hasattr(cfg, "radix_node_capacity")) {
+        config.radix_node_capacity = CheckedSize(
+            cfg.attr("radix_node_capacity").cast<long long>(),
+            "Host_Paged_KV_Config.radix_node_capacity");
+    }
+    if (py::hasattr(cfg, "radix_edge_capacity")) {
+        config.radix_edge_capacity = CheckedSize(
+            cfg.attr("radix_edge_capacity").cast<long long>(),
+            "Host_Paged_KV_Config.radix_edge_capacity");
+    }
+    if (py::hasattr(cfg, "prefix_entry_capacity")) {
+        config.prefix_entry_capacity = CheckedSize(
+            cfg.attr("prefix_entry_capacity").cast<long long>(),
+            "Host_Paged_KV_Config.prefix_entry_capacity");
+    }
+    if (py::hasattr(cfg, "prefix_page_ref_capacity")) {
+        config.prefix_page_ref_capacity = CheckedSize(
+            cfg.attr("prefix_page_ref_capacity").cast<long long>(),
+            "Host_Paged_KV_Config.prefix_page_ref_capacity");
+    }
+    if (py::hasattr(cfg, "prefix_page_budget")) {
+        config.prefix_page_budget = CheckedSize(
+            cfg.attr("prefix_page_budget").cast<long long>(),
+            "Host_Paged_KV_Config.prefix_page_budget");
+    }
     std::cout << "Host Paged KV Config Parsed Successfully" << std::endl;
     return config;
 }
@@ -376,10 +420,16 @@ ModelConfig parse_model_config(const py::object& model_config) {
 std::shared_ptr<spdlog::logger> init_logger(const std::string& log_level,
                                             const std::string& logger_name) {
     auto logger = spdlog::get(logger_name);
-    if (logger) {
-        return logger;
+    if (!logger) {
+        try {
+            logger = spdlog::stdout_color_mt(logger_name);
+        } catch (const spdlog::spdlog_ex&) {
+            logger = spdlog::get(logger_name);
+            if (!logger) {
+                throw;
+            }
+        }
     }
-    logger = spdlog::stdout_color_mt(logger_name);
 
     // Set colors for all five standard levels
     auto console_sink = dynamic_cast<spdlog::sinks::stdout_color_sink_mt*>(

@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -265,6 +266,70 @@ class HostPagedKVWorkerView {
         return allocated_pages;
     }
 
+    std::pair<std::vector<std::vector<std::int32_t>>, std::vector<std::size_t>>
+    AllocatePagesForSequencesWithPrefix(
+        const std::vector<std::int64_t>& sequence_ids,
+        const std::vector<std::size_t>& num_tokens,
+        const std::vector<std::int32_t>& flat_prompt_tokens,
+        const std::vector<std::size_t>& prompt_offsets) {
+        if (sequence_ids.size() != num_tokens.size()) {
+            throw std::invalid_argument(
+                "sequence_ids and num_tokens must have the same length");
+        }
+        if (prompt_offsets.size() != sequence_ids.size() + 1) {
+            throw std::invalid_argument(
+                "prompt_offsets size must equal sequence_ids size + 1");
+        }
+        if (prompt_offsets.empty() || prompt_offsets.front() != 0 ||
+            prompt_offsets.back() != flat_prompt_tokens.size()) {
+            throw std::invalid_argument(
+                "prompt_offsets boundaries do not match flat_prompt_tokens");
+        }
+        EnsureSequencesRegistered(sequence_ids);
+        for (std::size_t i = 0; i < num_tokens.size(); ++i) {
+            if (num_tokens[i] == 0) {
+                throw std::invalid_argument(
+                    "num_tokens must be greater than zero");
+            }
+        }
+
+        auto alloc_result = backend_.AcquirePagesForSequencesWithPrefix(
+            sequence_ids, num_tokens, flat_prompt_tokens, prompt_offsets);
+
+        std::size_t reused_sequence_count = 0;
+        std::size_t reused_token_total = 0;
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            AppendAllocatedPages(sequence_ids[i], alloc_result.allocated_pages[i]);
+            const std::size_t begin = prompt_offsets[i];
+            const std::size_t end = prompt_offsets[i + 1];
+            UpdatePrefixState(sequence_ids[i],
+                              std::vector<std::int32_t>(
+                                  flat_prompt_tokens.begin() + begin,
+                                  flat_prompt_tokens.begin() + end),
+                              alloc_result.reused_prefix_tokens[i]);
+            reused_token_total += alloc_result.reused_prefix_tokens[i];
+            if (alloc_result.reused_prefix_tokens[i] > 0) {
+                ++reused_sequence_count;
+            }
+        }
+        if (config_.enable_prefix_reuse) {
+            if (reused_sequence_count > 0) {
+                logger_->info(
+                    "PrefixCache allocation completed (sequences={}, reused_sequences={}, reused_tokens={}, reused_pages={})",
+                    sequence_ids.size(), reused_sequence_count,
+                    reused_token_total,
+                    reused_token_total / config_.page_size_tokens);
+            } else {
+                logger_->debug(
+                    "PrefixCache allocation completed (sequences={}, reused_sequences=0, reused_tokens=0, reused_pages=0)",
+                    sequence_ids.size());
+            }
+        }
+
+        return {std::move(alloc_result.allocated_pages),
+                std::move(alloc_result.reused_prefix_tokens)};
+    }
+
     std::vector<std::int32_t> GrowSequencePages(
         std::int64_t sequence_id, std::size_t num_pages) {
         if (num_pages == 0) {
@@ -309,6 +374,7 @@ class HostPagedKVWorkerView {
         ResetCopyStreams();
         UnregisterPinnedMemory();
         page_table_.Clear();
+        ClearPrefixStates();
     }
 
     KVAsyncTask AsyncLoadLayerKVToDevice(
@@ -838,16 +904,17 @@ class HostPagedKVWorkerView {
 
     void UnregisterSequence(std::int64_t sequence_id) {
         page_table_.Remove(sequence_id);
+        RemovePrefixState(sequence_id);
     }
 
     void UnregisterSequences(const std::vector<std::int64_t>& sequence_ids) {
         if (sequence_ids.empty()) {
             return;
         }
-        std::for_each(sequence_ids.begin(), sequence_ids.end(),
-                      [this](std::int64_t sequence_id) {
-                          UnregisterSequence(sequence_id);
-                      });
+        for (std::int64_t sequence_id : sequence_ids) {
+            page_table_.Remove(sequence_id);
+        }
+        RemovePrefixStates(sequence_ids);
     }
 
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
@@ -899,11 +966,28 @@ class HostPagedKVWorkerView {
         const auto producer_cuda_stream =
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
+        std::vector<std::size_t> prefix_skip_tokens(sequence_ids.size(), 0);
+        std::size_t skipped_sequence_count = 0;
+        std::size_t skipped_token_total = 0;
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            prefix_skip_tokens[i] = PrefixTokensToSkip(sequence_ids[i]);
+            skipped_token_total += prefix_skip_tokens[i];
+            if (prefix_skip_tokens[i] > 0) {
+                ++skipped_sequence_count;
+            }
+        }
+        if (config_.enable_prefix_reuse && skipped_sequence_count > 0) {
+            logger_->debug(
+                "PrefixCache prefill skip planned (layer={}, sequences={}, skipped_sequences={}, skipped_tokens={})",
+                layer_idx, sequence_ids.size(), skipped_sequence_count,
+                skipped_token_total);
+        }
+
         return LaunchAsyncTask([this, layer_idx,
-                                 sequence_ids = std::move(sequence_ids),
-                                 sequence_lengths = std::move(sequence_lengths),
-                                 prepared_k, prepared_v, tokens_per_sequence,
-                                 producer_cuda_stream]() {
+                                sequence_ids = std::move(sequence_ids),
+                                sequence_lengths = std::move(sequence_lengths),
+                                prepared_k, prepared_v, tokens_per_sequence,
+                                prefix_skip_tokens, producer_cuda_stream]() {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
@@ -939,13 +1023,19 @@ class HostPagedKVWorkerView {
                 if (tokens_to_copy == 0) {
                     continue;
                 }
+                const std::size_t skip_tokens =
+                    std::min(prefix_skip_tokens[batch_idx], tokens_to_copy);
+                const std::size_t remaining_tokens = tokens_to_copy - skip_tokens;
+                if (remaining_tokens == 0) {
+                    continue;
+                }
                 geometry_.ValidatePageCapacity(pages, tokens_to_copy,
                                                "AsyncOffloadLayerKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
 
                 ForEachPageChunk(
-                    pages, 0, tokens_to_copy,
+                    pages, skip_tokens, remaining_tokens,
                     [&](std::int32_t page_idx, std::size_t page_offset_tokens,
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
@@ -953,7 +1043,9 @@ class HostPagedKVWorkerView {
                                              host_base, layer_idx, page_idx) +
                                          page_offset_tokens * k_token_bytes;
                         const std::byte* src =
-                            seq_k_src + relative_token_offset * k_token_bytes;
+                            seq_k_src +
+                            (skip_tokens + relative_token_offset) *
+                                k_token_bytes;
                         EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
                     });
@@ -962,7 +1054,7 @@ class HostPagedKVWorkerView {
                         const auto* seq_v_src =
                             v_base + batch_idx * v_seq_stride;
                         ForEachPageChunk(
-                            pages, 0, tokens_to_copy,
+                            pages, skip_tokens, remaining_tokens,
                             [&](std::int32_t page_idx,
                                 std::size_t page_offset_tokens,
                                 std::size_t chunk_tokens,
@@ -973,7 +1065,8 @@ class HostPagedKVWorkerView {
                                     page_offset_tokens * v_token_bytes;
                                 const std::byte* src =
                                     seq_v_src +
-                                    relative_token_offset * v_token_bytes;
+                                    (skip_tokens + relative_token_offset) *
+                                        v_token_bytes;
                                 EnqueueCopy(
                                     src, dst, chunk_tokens * v_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
@@ -983,6 +1076,7 @@ class HostPagedKVWorkerView {
             }
 
             this->SynchronizeWithEvent(cuda_stream);
+            this->MaybeCommitPrefix(layer_idx, sequence_ids);
             // LogFirstTokenPerPage(layer_idx, sequence_ids, sequence_lengths,
             //                      tokens_per_sequence, host_base);
         });
@@ -991,7 +1085,9 @@ class HostPagedKVWorkerView {
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        std::optional<std::vector<std::int32_t>> decode_token_ids =
+            std::nullopt) {
         geometry_.EnsureLayerBounds(layer_idx, "AsyncAppendDecodeKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
@@ -1002,6 +1098,12 @@ class HostPagedKVWorkerView {
             ValidateKTensorShape(k_tensor, batch);
         ValidateSequenceLengthsInput(sequence_lengths, batch,
                                      "AsyncAppendDecodeKVToHost");
+        if (decode_token_ids.has_value() &&
+            decode_token_ids->size() != batch) {
+            throw std::invalid_argument(
+                "AsyncAppendDecodeKVToHost: decode_token_ids size must match "
+                "sequence_ids size");
+        }
         torch::Tensor prepared_k = k_tensor;
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
@@ -1024,10 +1126,11 @@ class HostPagedKVWorkerView {
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
         return LaunchAsyncTask([this, layer_idx,
-                                 sequence_ids = std::move(sequence_ids),
-                                 sequence_lengths = std::move(sequence_lengths),
-                                 prepared_k, prepared_v,
-                                 producer_cuda_stream]() mutable {
+                                sequence_ids = std::move(sequence_ids),
+                                sequence_lengths = std::move(sequence_lengths),
+                                prepared_k, prepared_v,
+                                decode_token_ids = std::move(decode_token_ids),
+                                producer_cuda_stream]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
@@ -1088,6 +1191,11 @@ class HostPagedKVWorkerView {
             }
 
             this->SynchronizeWithEvent(cuda_stream);
+            if (decode_token_ids.has_value() &&
+                layer_idx + 1 == config_.num_layers) {
+                this->AppendDecodeTokens(sequence_ids, *decode_token_ids);
+            }
+            this->MaybeCommitPrefix(layer_idx, sequence_ids);
         });
     }
 
@@ -1117,18 +1225,29 @@ class HostPagedKVWorkerView {
     KVAsyncTask AsyncAppendDecodeKVToHostBatchedKernel(
         std::vector<BatchedKVEntry> entries,
         std::vector<std::int64_t> sequence_ids,
-        SequenceLengths sequence_lengths) {
+        SequenceLengths sequence_lengths,
+        std::optional<std::vector<std::int32_t>> decode_token_ids =
+            std::nullopt) {
         if (entries.empty() || sequence_ids.empty()) {
             return LaunchAsyncTask([] {});
         }
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
+        if (decode_token_ids.has_value() &&
+            decode_token_ids->size() != batch) {
+            throw std::invalid_argument(
+                "AsyncAppendDecodeKVToHostBatchedKernel: decode_token_ids "
+                "size must match sequence_ids size");
+        }
 
         // Validate each entry and detect V presence
         bool has_v = false;
+        bool has_last_layer = false;
         for (const auto& e : entries) {
             geometry_.EnsureLayerBounds(e.layer_idx,
                                         "AsyncAppendDecodeKVToHostBatchedKernel");
+            has_last_layer =
+                has_last_layer || (e.layer_idx + 1 == config_.num_layers);
             const std::size_t tokens_per_seq =
                 ValidateKTensorShape(e.k_tensor, batch);
             if (tokens_per_seq != 1) {
@@ -1227,7 +1346,10 @@ class HostPagedKVWorkerView {
                                  v_src_host = std::move(v_src_host),
                                  v_dst_host = std::move(v_dst_host),
                                  k_token_bytes, v_token_bytes, k_total,
-                                 v_total, producer_cuda_stream]() mutable {
+                                 v_total, producer_cuda_stream,
+                                 sequence_ids = std::move(sequence_ids),
+                                 decode_token_ids = std::move(decode_token_ids),
+                                 has_last_layer]() mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
@@ -1279,6 +1401,12 @@ class HostPagedKVWorkerView {
             }
 
             this->SynchronizeWithEvent(cuda_stream);
+            if (has_last_layer) {
+                if (decode_token_ids.has_value()) {
+                    this->AppendDecodeTokens(sequence_ids, *decode_token_ids);
+                }
+                this->MaybeCommitPrefix(config_.num_layers - 1, sequence_ids);
+            }
         });
     }
 
@@ -1564,6 +1692,128 @@ class HostPagedKVWorkerView {
         for (std::int64_t sequence_id : sequence_ids) {
             EnsureSequenceRegistered(sequence_id);
         }
+    }
+
+    struct PrefixSequenceState {
+        std::vector<std::int32_t> tokens;
+        std::size_t reused_prefix_tokens = 0;
+        std::size_t committed_token_count = 0;
+    };
+
+    void UpdatePrefixState(std::int64_t sequence_id,
+                           std::vector<std::int32_t> prompt_tokens,
+                           std::size_t reused_prefix_tokens) {
+        if (!config_.enable_prefix_reuse) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        auto& state = prefix_states_[sequence_id];
+        state.tokens = std::move(prompt_tokens);
+        state.reused_prefix_tokens = reused_prefix_tokens;
+        state.committed_token_count = 0;
+        logger_->debug(
+            "PrefixCache state initialized (sequence_id={}, token_count={}, reused_tokens={})",
+            sequence_id, state.tokens.size(), reused_prefix_tokens);
+    }
+
+    void AppendDecodeTokens(const std::vector<std::int64_t>& sequence_ids,
+                            const std::vector<std::int32_t>& decode_token_ids) {
+        if (!config_.enable_prefix_reuse) {
+            return;
+        }
+        if (sequence_ids.size() != decode_token_ids.size()) {
+            throw std::invalid_argument(
+                "AppendDecodeTokens: decode_token_ids size must match "
+                "sequence_ids size");
+        }
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            auto it = prefix_states_.find(sequence_ids[i]);
+            if (it == prefix_states_.end()) {
+                continue;
+            }
+            it->second.tokens.push_back(decode_token_ids[i]);
+        }
+    }
+
+    std::size_t PrefixTokensToSkip(std::int64_t sequence_id) const {
+        if (!config_.enable_prefix_reuse) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        auto it = prefix_states_.find(sequence_id);
+        if (it == prefix_states_.end()) {
+            return 0;
+        }
+        return it->second.reused_prefix_tokens;
+    }
+
+    void MaybeCommitPrefix(std::size_t layer_idx,
+                           const std::vector<std::int64_t>& sequence_ids) {
+        if (!config_.enable_prefix_reuse || layer_idx + 1 != config_.num_layers) {
+            return;
+        }
+
+        struct CacheCommitItem {
+            std::int64_t sequence_id = 0;
+            std::vector<std::int32_t> tokens;
+            std::size_t token_count = 0;
+        };
+
+        std::vector<CacheCommitItem> commit_items;
+        std::size_t committed_token_total = 0;
+        {
+            std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+            for (std::int64_t sequence_id : sequence_ids) {
+                auto it = prefix_states_.find(sequence_id);
+                if (it == prefix_states_.end()) {
+                    continue;
+                }
+                const std::size_t token_count = it->second.tokens.size();
+                const std::size_t full_prompt_pages =
+                    token_count / config_.page_size_tokens;
+                if (full_prompt_pages < config_.prefix_min_store_pages) {
+                    continue;
+                }
+                const std::size_t full_page_token_count =
+                    full_prompt_pages * config_.page_size_tokens;
+                if (full_page_token_count <= it->second.committed_token_count) {
+                    continue;
+                }
+                commit_items.push_back(
+                    {sequence_id, it->second.tokens, full_page_token_count});
+                it->second.committed_token_count = full_page_token_count;
+                committed_token_total += full_page_token_count;
+            }
+        }
+        if (!commit_items.empty()) {
+            logger_->info(
+                "PrefixCache commit scheduled (layer={}, commit_count={}, committed_tokens={}, committed_pages={})",
+                layer_idx, commit_items.size(), committed_token_total,
+                committed_token_total / config_.page_size_tokens);
+        }
+
+        for (const auto& item : commit_items) {
+            backend_.CommitSequencePrefix(item.sequence_id, item.tokens,
+                                          item.token_count);
+        }
+    }
+
+    void RemovePrefixState(std::int64_t sequence_id) {
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        prefix_states_.erase(sequence_id);
+    }
+
+    void RemovePrefixStates(const std::vector<std::int64_t>& sequence_ids) {
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        for (std::int64_t sequence_id : sequence_ids) {
+            prefix_states_.erase(sequence_id);
+        }
+    }
+
+    void ClearPrefixStates() {
+        std::lock_guard<std::mutex> guard(prefix_state_mutex_);
+        prefix_states_.clear();
     }
 
     void AppendAllocatedPages(std::int64_t sequence_id,
@@ -2302,6 +2552,8 @@ class HostPagedKVWorkerView {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
+    mutable std::mutex prefix_state_mutex_;
+    std::unordered_map<std::int64_t, PrefixSequenceState> prefix_states_;
 
     // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
     // pointer arrays (src + dst) uploaded once per batched call. Sized

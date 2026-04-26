@@ -4,6 +4,7 @@
 log_*.log
 log
 *.log
+tmp/
 
 *.pt
 runner.sh

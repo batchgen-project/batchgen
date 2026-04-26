@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -19,6 +20,12 @@ struct HostPagedKVStats {
     std::size_t num_active_sequences = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t total_bytes = 0;
+    std::size_t num_prefix_entries = 0;
+    std::size_t num_prefix_hits = 0;
+    std::size_t num_prefix_misses = 0;
+    std::size_t num_prefix_evictions = 0;
+    std::size_t num_cache_entry_pages = 0;
+    std::size_t num_shared_pages = 0;
 };
 
 struct HostPagedKVConfig {
@@ -34,10 +41,24 @@ struct HostPagedKVConfig {
     std::size_t v_element_size_bytes = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t alignment_bytes = 64;
+    bool enable_prefix_reuse = false;
+    std::size_t prefix_min_reuse_pages = 1;
+    std::size_t prefix_min_store_pages = 2;
+    std::size_t sequence_page_node_capacity = 0;
+    std::size_t radix_node_capacity = 0;
+    std::size_t radix_edge_capacity = 0;
+    std::size_t prefix_entry_capacity = 0;
+    std::size_t prefix_page_ref_capacity = 0;
+    std::size_t prefix_page_budget = 0;
     bool enable_memfd = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
     std::string logger_name;  // Custom logger name (empty = use default)
+};
+
+struct PrefixAllocationBatchResult {
+    std::vector<std::vector<std::int32_t>> allocated_pages;
+    std::vector<std::size_t> reused_prefix_tokens;
 };
 
 inline std::uint64_t HashCombine(std::uint64_t seed, std::uint64_t value) {
@@ -95,6 +116,37 @@ inline HostPagedKVConfig SanitizeConfig(HostPagedKVConfig config) {
             config.v_element_size_bytes = config.k_element_size_bytes;
         }
     }
+    if (config.sequence_page_node_capacity == 0) {
+        config.sequence_page_node_capacity = std::max(
+            config.num_pages, static_cast<std::size_t>(config.num_pages * 4));
+    }
+    if (config.radix_node_capacity == 0) {
+        config.radix_node_capacity =
+            std::max<std::size_t>(4096, config.num_pages / 2);
+    }
+    if (config.radix_edge_capacity == 0) {
+        config.radix_edge_capacity =
+            std::max<std::size_t>(config.radix_node_capacity * 2,
+                                  config.radix_node_capacity + 1);
+    }
+    if (config.prefix_entry_capacity == 0) {
+        config.prefix_entry_capacity =
+            std::max<std::size_t>(1024, config.num_pages / 64);
+    }
+    if (config.prefix_page_budget == 0) {
+        config.prefix_page_budget =
+            std::max<std::size_t>(128, config.num_pages / 2);
+    }
+    if (config.prefix_page_ref_capacity == 0) {
+        config.prefix_page_ref_capacity = std::max<std::size_t>(
+            config.num_pages, config.prefix_entry_capacity * 8);
+    }
+    if (config.prefix_min_reuse_pages == 0) {
+        config.prefix_min_reuse_pages = 1;
+    }
+    if (config.prefix_min_store_pages == 0) {
+        config.prefix_min_store_pages = 1;
+    }
     return config;
 }
 
@@ -124,7 +176,20 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", k_element_size_bytes=" << config.k_element_size_bytes
         << ", v_element_size_bytes=" << config.v_element_size_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
-        << ", alignment_bytes=" << config.alignment_bytes << ")";
+        << ", alignment_bytes=" << config.alignment_bytes
+        << ", enable_prefix_reuse=" << config.enable_prefix_reuse
+        << ", prefix_min_reuse_pages=" << config.prefix_min_reuse_pages
+        << ", prefix_min_store_pages=" << config.prefix_min_store_pages
+        << ", sequence_page_node_capacity="
+        << config.sequence_page_node_capacity
+        << ", radix_node_capacity=" << config.radix_node_capacity
+        << ", radix_edge_capacity=" << config.radix_edge_capacity
+        << ", prefix_entry_capacity=" << config.prefix_entry_capacity
+        << ", prefix_page_ref_capacity=" << config.prefix_page_ref_capacity
+        << ", prefix_page_budget=" << config.prefix_page_budget
+        << ", enable_memfd=" << config.enable_memfd
+        << ", memfd_creator_pid=" << config.memfd_creator_pid
+        << ", memfd_fd=" << config.memfd_fd << ")";
     return oss.str();
 }
 
@@ -135,7 +200,13 @@ inline std::string ToString(const HostPagedKVStats& stats) {
         << ", used_pages=" << stats.num_used_pages
         << ", active_sequences=" << stats.num_active_sequences
         << ", sequence_table_capacity=" << stats.sequence_table_capacity
-        << ", total_bytes=" << stats.total_bytes << ")";
+        << ", total_bytes=" << stats.total_bytes
+        << ", prefix_entries=" << stats.num_prefix_entries
+        << ", prefix_hits=" << stats.num_prefix_hits
+        << ", prefix_misses=" << stats.num_prefix_misses
+        << ", prefix_evictions=" << stats.num_prefix_evictions
+        << ", cache_entry_pages=" << stats.num_cache_entry_pages
+        << ", shared_pages=" << stats.num_shared_pages << ")";
     return oss.str();
 }
 
@@ -153,6 +224,15 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.v_element_size_bytes);
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
+    seed = HashCombine(seed, sanitized.enable_prefix_reuse ? 1ULL : 0ULL);
+    seed = HashCombine(seed, sanitized.prefix_min_reuse_pages);
+    seed = HashCombine(seed, sanitized.prefix_min_store_pages);
+    seed = HashCombine(seed, sanitized.sequence_page_node_capacity);
+    seed = HashCombine(seed, sanitized.radix_node_capacity);
+    seed = HashCombine(seed, sanitized.radix_edge_capacity);
+    seed = HashCombine(seed, sanitized.prefix_entry_capacity);
+    seed = HashCombine(seed, sanitized.prefix_page_ref_capacity);
+    seed = HashCombine(seed, sanitized.prefix_page_budget);
     seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
     return seed;
 }
@@ -176,12 +256,22 @@ class HostPagedKVBackend {
         const std::vector<std::int64_t>& sequence_ids,
         const std::vector<std::size_t>& num_tokens);
 
+    PrefixAllocationBatchResult AcquirePagesForSequencesWithPrefix(
+        const std::vector<std::int64_t>& sequence_ids,
+        const std::vector<std::size_t>& num_tokens,
+        const std::vector<std::int32_t>& flat_prompt_tokens,
+        const std::vector<std::size_t>& prompt_offsets);
+
     void ReleaseSequence(std::int64_t sequence_id);
 
     void ReleaseSequences(const std::vector<std::int64_t>& sequence_ids);
 
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
+
+    void CommitSequencePrefix(std::int64_t sequence_id,
+                              const std::vector<std::int32_t>& prompt_tokens,
+                              std::size_t prompt_token_count);
 
     HostPagedKVStats CollectStats() const;
 

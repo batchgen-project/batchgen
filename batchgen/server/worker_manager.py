@@ -35,6 +35,14 @@ logger = logging.getLogger(__name__)
 PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 
 
+def _load_server_worker_main():
+    # Delay this import to avoid a package-init cycle when worker subprocesses
+    # import `batchgen.server.process_utils` via `batchgen.server_worker_main_loop`.
+    from batchgen.server_worker_main_loop import server_worker_main
+
+    return server_worker_main
+
+
 def _validate_shmem_enabled() -> None:
     """Check that THP shmem is enabled for --fast-init. Raises RuntimeError if not."""
     import re
@@ -204,6 +212,7 @@ class WorkerManager:
                 _diag(">>> allocate_host_kv_cache")
                 result = self.allocate_host_kv_cache(
                     self.args.host_kv_cache_size, self.args.model,
+                    enable_prefix_cache=self.args.enable_prefix_cache,
                     enable_memfd=self.args.fast_init,
                 )
                 _diag("<<< allocate_host_kv_cache")
@@ -629,6 +638,7 @@ class WorkerManager:
             disable_cuda_graphs=self.args.disable_cuda_graphs,
             cuda_graph_max_bucket_size=self.args.cuda_graph_max_bucket_size,
             cuda_graph_num_buckets=self.args.cuda_graph_num_buckets,
+            enable_prefix_cache=self.args.enable_prefix_cache,
             detokenization_include_special_tokens=self.args.detokenization_include_special_tokens,
             host_kv_chunk_size=self.args.host_kv_chunk_size,
             enable_host_kv_eviction=self.args.enable_host_kv_eviction,
@@ -648,7 +658,7 @@ class WorkerManager:
         )
         from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
-            server_worker_main,
+            _load_server_worker_main(),
             args=(
                 self.request_queue,
                 self.response_queue,
@@ -1005,6 +1015,7 @@ class WorkerManager:
     @staticmethod
     def allocate_host_kv_cache(
         host_kv_cache_size_gb: int, model_name: str,
+        enable_prefix_cache: bool = True,
         enable_memfd: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
@@ -1013,6 +1024,7 @@ class WorkerManager:
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+            enable_prefix_reuse=enable_prefix_cache,
             enable_memfd=enable_memfd,
         )
         if dual is not None:
@@ -1025,6 +1037,7 @@ class WorkerManager:
         config = build_host_kv_config(
             host_kv_cache_size=host_kv_cache_size_gb * (1024**3),
             model_name=model_name,
+            enable_prefix_reuse=enable_prefix_cache,
         )
         if enable_memfd:
             config.enable_memfd = True

@@ -359,6 +359,7 @@ class BatchGenWorkerArgs:
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
+	enable_prefix_cache: bool = True  # Enable host KV prefix cache reuse
 	detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
 	# Dynamic host KV reservation
 	host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens
@@ -420,6 +421,7 @@ class BatchGenWorker:
 		if args.global_rank == 0:
 			logging.info(
 				f"Dynamic Host KV Config: chunk_size={args.host_kv_chunk_size}, "
+				f"prefix_cache={args.enable_prefix_cache}, "
 				f"eviction_watermark={args.host_kv_eviction_watermark}%, "
 				f"eviction_enabled={args.enable_host_kv_eviction}, "
 				f"adaptive_chunk={args.adaptive_chunk}"
@@ -526,6 +528,7 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			host_kv_cache_size=host_budget_bytes,
 			core_engine_module=core_engine,
+			enable_prefix_reuse=args.enable_prefix_cache,
 			enable_memfd=args.fast_init,
 			memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
 			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
@@ -540,7 +543,9 @@ class BatchGenWorker:
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
 				host_kv_cache_size=host_budget_bytes,
+				enable_prefix_reuse=args.enable_prefix_cache,
 			)
+			self._worker_host_kv_config = worker_kv_config
 			if args.fast_init:
 				worker_kv_config.enable_memfd = True
 				worker_kv_config.memfd_creator_pid = args.kv_memfd_pid
@@ -601,6 +606,7 @@ class BatchGenWorker:
 		self._core_initialized = False
 		self._batch_completed = False
 		self._nvshmem_initialized_this_run = False
+		self._prefix_cache_stats_at_batch_start = None
 		
 		# 10. Distributed Communication Info
 		self.dist_init_addr = args.dist_init_addr
@@ -1846,7 +1852,12 @@ class BatchGenWorker:
 			self._deferred_kv_entries_aux = []
 			return
 
-		sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
+		sequence_ids = sequence_lengths = decode_token_ids = None
+		if batch_info is not None:
+			if len(batch_info) == 3:
+				sequence_ids, sequence_lengths, decode_token_ids = batch_info
+			else:
+				sequence_ids, sequence_lengths = batch_info
 
 		# ONE sync for ALL layers across BOTH caches — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
@@ -1882,6 +1893,7 @@ class BatchGenWorker:
 					entries=_prepared_entries,
 					sequence_ids=sequence_ids,
 					sequence_lengths=sequence_lengths,
+					decode_token_ids=decode_token_ids,
 				)
 				if task is not None:
 					self._pending_kv_append_tasks.append(task)
@@ -1916,6 +1928,7 @@ class BatchGenWorker:
 						k_tensor=k_tensor,
 						v_tensor=v_tensor,
 						sequence_lengths=sequence_lengths,
+						decode_token_ids=decode_token_ids,
 					)
 
 					self._pending_kv_append_tensors.append(k_tensor)
@@ -1984,6 +1997,8 @@ class BatchGenWorker:
 		# Build sequence info
 		sequence_ids = []
 		sequence_lengths = []
+		decode_token_ids = []
+		has_decode_tokens = True
 		
 		# DIAGNOSTIC: Track host KV append positions for debugging
 		append_diag = []
@@ -1995,6 +2010,31 @@ class BatchGenWorker:
 			# Write position is current position (0-indexed)
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
+			decode_pos = write_pos - seq.prompt_length
+			if decode_pos >= 0:
+				query_entry = self.query_book.get(local_idx)
+				decoded_tokens = (
+					None if query_entry is None else query_entry.decoded_tokens
+				)
+				if (
+					decode_pos >= seq.decoded_length
+					or decoded_tokens is None
+					or decoded_tokens.dim() < 2
+					or decode_pos >= decoded_tokens.shape[1]
+				):
+					has_decode_tokens = False
+				else:
+					decode_token_ids.append(
+						int(decoded_tokens[0, decode_pos].item())
+					)
+			elif (
+				seq.input_ids is None
+				or write_pos < 0
+				or write_pos >= seq.input_ids.shape[1]
+			):
+				has_decode_tokens = False
+			else:
+				decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
 			
 			# Track for debugging (only first few sequences)
 			if len(append_diag) < 3 and seq.decoded_length > 1:
@@ -2004,6 +2044,11 @@ class BatchGenWorker:
 					'decoded_len': seq.decoded_length,
 					'write_pos': write_pos,
 				})
+		if not has_decode_tokens:
+			logging.debug(
+				f"Rank {self.rank}: PrefixCache decode token capture unavailable "
+				f"(layer={layer_idx}, batch_size={len(batch)}), skip decode token cache update"
+			)
 		
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
 		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
@@ -2038,17 +2083,16 @@ class BatchGenWorker:
 				f"Rank {self.rank}: NaN detected in k_tensor BEFORE host append (layer={layer_idx}) - affected_seqs={nan_seq_info}"
 			)
 		
-		# Launch async D2H append — no CPU-side sync needed here.
-		# The C++ side runs on a background thread with its own D2H stream.
-		# Tensor references are kept alive in _pending_kv_append_tensors to
-		# prevent GC/memory reuse. All tasks are waited at decision boundary
-		# via _wait_pending_kv_append_tasks().
+		# Launch async D2H append. The C++ side waits for the producer
+		# stream and keeps tensor references alive through the task lifetime.
+		decode_token_ids_arg = decode_token_ids if has_decode_tokens else None
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
 			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
+			decode_token_ids=decode_token_ids_arg,
 		)
 
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -2209,6 +2253,13 @@ class BatchGenWorker:
 			self.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view.auxiliary
 		else:
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view
+		host_kv_runtime_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+		if host_kv_runtime_cfg is not None:
+			host_kv_runtime_cfg.enable_prefix_reuse = bool(getattr(self.args, "enable_prefix_cache", False))
+			host_view_config = getattr(self.core_engine.host_paged_kv_worker_view, "config", None)
+			host_kv_runtime_cfg.page_size = int(
+				getattr(host_view_config, "page_size_tokens", host_kv_runtime_cfg.page_size)
+			)
 		self.engine_config.Basic_Config.num_queries = num_queries
 
 		# Set CUDA graph config from command-line args
@@ -2621,6 +2672,93 @@ class BatchGenWorker:
 		"""Get current free pages from host KV cache."""
 		stats = self.host_paged_kv_worker_view.get_stats()
 		return stats.num_free_pages
+
+	def _snapshot_prefix_cache_stats(self) -> Optional[Dict[str, float]]:
+		"""Capture shared PrefixCache counters for batch-level reporting."""
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			return None
+
+		try:
+			stats = worker_view.get_stats()
+		except Exception as exc:
+			logging.warning(
+				f"Rank {self.rank}: Failed to read PrefixCache stats: {exc}"
+			)
+			return None
+
+		hits = int(stats.num_prefix_hits)
+		misses = int(stats.num_prefix_misses)
+		lookups = hits + misses
+		return {
+			"num_total_pages": int(stats.num_total_pages),
+			"num_free_pages": int(stats.num_free_pages),
+			"num_used_pages": int(stats.num_used_pages),
+			"num_prefix_entries": int(stats.num_prefix_entries),
+			"num_prefix_hits": hits,
+			"num_prefix_misses": misses,
+			"num_prefix_evictions": int(stats.num_prefix_evictions),
+			"num_cache_entry_pages": int(stats.num_cache_entry_pages),
+			"num_shared_pages": int(stats.num_shared_pages),
+			"hit_rate": (hits / lookups) if lookups > 0 else 0.0,
+		}
+
+	def _log_prefix_cache_batch_report(self) -> None:
+		"""Log PrefixCache cumulative and per-batch deltas after batch completion."""
+		if self.rank != 0:
+			return
+
+		after = self._snapshot_prefix_cache_stats()
+		before = self._prefix_cache_stats_at_batch_start
+		if after is None:
+			logging.info("[PrefixCache] Stats unavailable after batch completion")
+			return
+
+		if before is None:
+			logging.info(
+				"[PrefixCache] cumulative: entries=%d hits=%d misses=%d "
+				"hit_rate=%.2f%% evictions=%d cache_entry_pages=%d shared_pages=%d "
+				"host_used_pages=%d/%d",
+				after["num_prefix_entries"],
+				after["num_prefix_hits"],
+				after["num_prefix_misses"],
+				after["hit_rate"] * 100.0,
+				after["num_prefix_evictions"],
+				after["num_cache_entry_pages"],
+				after["num_shared_pages"],
+				after["num_used_pages"],
+				after["num_total_pages"],
+			)
+			return
+
+		batch_hits = after["num_prefix_hits"] - before["num_prefix_hits"]
+		batch_misses = after["num_prefix_misses"] - before["num_prefix_misses"]
+		batch_evictions = after["num_prefix_evictions"] - before["num_prefix_evictions"]
+		batch_lookup_total = batch_hits + batch_misses
+		batch_hit_rate = (batch_hits / batch_lookup_total) if batch_lookup_total > 0 else 0.0
+
+		logging.info(
+			"[PrefixCache] batch: hits=%d misses=%d hit_rate=%.2f%% "
+			"entries_delta=%d cache_pages_delta=%d shared_pages_delta=%d evictions_delta=%d; "
+			"cumulative: entries=%d hits=%d misses=%d hit_rate=%.2f%% "
+			"evictions=%d cache_entry_pages=%d shared_pages=%d host_used_pages=%d/%d",
+			batch_hits,
+			batch_misses,
+			batch_hit_rate * 100.0,
+			after["num_prefix_entries"] - before["num_prefix_entries"],
+			after["num_cache_entry_pages"] - before["num_cache_entry_pages"],
+			after["num_shared_pages"] - before["num_shared_pages"],
+			batch_evictions,
+			after["num_prefix_entries"],
+			after["num_prefix_hits"],
+			after["num_prefix_misses"],
+			after["hit_rate"] * 100.0,
+			after["num_prefix_evictions"],
+			after["num_cache_entry_pages"],
+			after["num_shared_pages"],
+			after["num_used_pages"],
+			after["num_total_pages"],
+		)
 
 	def _get_or_create_gloo_group(self):
 		"""Get or create a Gloo process group for CPU tensor migrations.
@@ -3485,6 +3623,7 @@ class BatchGenWorker:
 			per_sequence_max_tokens: Optional per-sequence max output token limits.
 				Falls back to self.max_decoding_length if None or if individual entry is None.
 		"""
+		self._prefix_cache_stats_at_batch_start = self._snapshot_prefix_cache_stats()
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
@@ -5770,6 +5909,7 @@ class BatchGenWorker:
 
 			# Compute and log batch statistics
 			self._log_batch_statistics()
+			self._log_prefix_cache_batch_report()
 
 		# ============ Gather Results in Original Order ============
 		# Detokenize locally on each rank to avoid gathering large token tensors.
@@ -6064,6 +6204,8 @@ class BatchGenWorker:
 		if my_prefill_uuids:
 			global_sequence_ids = []
 			sequence_tokens = []
+			flat_prompt_tokens = []
+			prompt_offsets = [0]
 			chunk_size = self._get_effective_chunk_size()
 
 			for uuid in my_prefill_uuids:
@@ -6083,6 +6225,10 @@ class BatchGenWorker:
 				sequence_tokens.append(initial_capacity)
 				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+
+				prompt_ids = seq.input_ids[0, :seq.prompt_length].tolist()
+				flat_prompt_tokens.extend(int(t) for t in prompt_ids)
+				prompt_offsets.append(len(flat_prompt_tokens))
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
@@ -6113,9 +6259,38 @@ class BatchGenWorker:
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
-				list(zip(global_sequence_ids, sequence_tokens))
-			)
+			host_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+			enable_prefix_reuse = bool(getattr(self.args, "enable_prefix_cache", False))
+			page_size = seq.PAGE_SIZE
+			if host_cfg is not None:
+				enable_prefix_reuse = (
+					enable_prefix_reuse
+					or bool(getattr(host_cfg, "enable_prefix_reuse", False))
+				)
+				page_size = max(1, int(getattr(host_cfg, "page_size", page_size)))
+			if enable_prefix_reuse:
+				_, reused_prefix_tokens = self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
+					list(zip(global_sequence_ids, sequence_tokens)),
+					flat_prompt_tokens,
+					prompt_offsets,
+				)
+				reused_sequences = sum(1 for tokens in reused_prefix_tokens if tokens > 0)
+				reused_tokens_total = sum(int(tokens) for tokens in reused_prefix_tokens)
+				if reused_sequences > 0:
+					logging.info(
+						f"Rank {self.rank}: PrefixCache allocation summary "
+						f"(batch={len(global_sequence_ids)}, reused_sequences={reused_sequences}, "
+						f"reused_tokens={reused_tokens_total}, reused_pages={reused_tokens_total // page_size})"
+					)
+				else:
+					logging.debug(
+						f"Rank {self.rank}: PrefixCache allocation summary "
+						f"(batch={len(global_sequence_ids)}, reused_sequences=0, reused_tokens=0, reused_pages=0)"
+					)
+			else:
+				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
+					list(zip(global_sequence_ids, sequence_tokens))
+				)
 			# DSA: mirror registration on auxiliary host KV
 			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
@@ -6364,6 +6539,11 @@ class BatchGenWorker:
 					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
 				)
 				local_decode_indices.clear()
+		else:
+			# Idle ranks still participate in CUDA graph warmup/capture. Keep an
+			# explicit empty page table so graph segments can access KV caches
+			# without tripping over an uninitialized gpu_table.
+			self.gpu_paged_kv_cache_manager.clear_page_table()
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
@@ -9102,12 +9282,37 @@ class BatchGenWorker:
 				if _kv_worker_view is not None:
 					_kv_seq_ids = []
 					_kv_seq_lengths = []
+					_kv_decode_token_ids = []
+					_kv_has_decode_tokens = True
 					for local_idx in current_batch:
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
 						_kv_seq_ids.append(seq.global_idx)
-						_kv_seq_lengths.append(seq.current_context_length - 1)
-					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths)
+						write_pos = seq.current_context_length - 1
+						_kv_seq_lengths.append(write_pos)
+						decode_pos = write_pos - seq.prompt_length
+						if decode_pos >= 0:
+							query_entry = self.query_book.get(local_idx) if self.query_book is not None else None
+							decoded_tokens = None if query_entry is None else query_entry.decoded_tokens
+							if (
+								decode_pos >= seq.decoded_length
+								or decoded_tokens is None
+								or decoded_tokens.dim() < 2
+								or decode_pos >= decoded_tokens.shape[1]
+							):
+								_kv_has_decode_tokens = False
+							else:
+								_kv_decode_token_ids.append(int(decoded_tokens[0, decode_pos].item()))
+						elif (
+							seq.input_ids is None
+							or write_pos < 0
+							or write_pos >= seq.input_ids.shape[1]
+						):
+							_kv_has_decode_tokens = False
+						else:
+							_kv_decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
+					_kv_decode_token_ids_arg = _kv_decode_token_ids if _kv_has_decode_tokens else None
+					self._deferred_kv_batch = (_kv_seq_ids, _kv_seq_lengths, _kv_decode_token_ids_arg)
 					self._deferred_kv_entries = []
 					self._deferred_kv_entries_aux = []
 					self._deferred_kv_worker_view = _kv_worker_view
@@ -9117,6 +9322,7 @@ class BatchGenWorker:
 					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
 					_sync_kv_seq_ids = _kv_seq_ids
 					_sync_kv_seq_lengths = _kv_seq_lengths
+					_sync_kv_decode_token_ids = _kv_decode_token_ids_arg
 					_sync_kv_worker_view = _kv_worker_view
 					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 						if k_tensor.dim() == 3:
@@ -9130,6 +9336,7 @@ class BatchGenWorker:
 							k_tensor=k_tensor,
 							v_tensor=v_tensor,
 							sequence_lengths=_sync_kv_seq_lengths,
+							decode_token_ids=_sync_kv_decode_token_ids,
 						)
 						if task is not None:
 							task.wait()
@@ -9530,12 +9737,45 @@ class BatchGenWorker:
 		
 		sequence_ids = []
 		sequence_lengths = []
+		decode_token_ids = []
+		has_decode_tokens = True
 		
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
-			sequence_lengths.append(seq.current_context_length - 1)
+			write_pos = seq.current_context_length - 1
+			sequence_lengths.append(write_pos)
+			decode_pos = write_pos - seq.prompt_length
+			if decode_pos >= 0:
+				query_entry = self.query_book.get(local_idx)
+				decoded_tokens = (
+					None if query_entry is None else query_entry.decoded_tokens
+				)
+				if (
+					decode_pos >= seq.decoded_length
+					or decoded_tokens is None
+					or decoded_tokens.dim() < 2
+					or decode_pos >= decoded_tokens.shape[1]
+				):
+					has_decode_tokens = False
+				else:
+					decode_token_ids.append(
+						int(decoded_tokens[0, decode_pos].item())
+					)
+			elif (
+				seq.input_ids is None
+				or write_pos < 0
+				or write_pos >= seq.input_ids.shape[1]
+			):
+				has_decode_tokens = False
+			else:
+				decode_token_ids.append(int(seq.input_ids[0, write_pos].item()))
+		if not has_decode_tokens:
+			logging.debug(
+				f"Rank {self.rank}: PrefixCache decode token capture unavailable "
+				f"(layer={layer_idx}, batch_size={len(batch)}), skip decode token cache update"
+			)
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
@@ -9566,15 +9806,16 @@ class BatchGenWorker:
 				f"affected_seqs={nan_seq_info}"
 			)
 		
-		# Launch async D2H append — no CPU-side sync needed.
-		# Tensor references kept alive in _pending_kv_append_tensors.
-		# All tasks waited at decision boundary via _wait_pending_kv_append_tasks().
+		# Launch async D2H append. The C++ side waits for the producer stream;
+		# tensor references are kept alive until pending tasks are flushed.
+		decode_token_ids_arg = decode_token_ids if has_decode_tokens else None
 		task = worker_view.async_append_decode_kv_to_host(
 			layer_idx=layer_idx,
 			sequence_ids=sequence_ids,
 			k_tensor=k_tensor,
 			v_tensor=v_tensor,  # GQA models (GPT-OSS) have separate V; MLA models pass None
 			sequence_lengths=sequence_lengths,
+			decode_token_ids=decode_token_ids_arg,
 		)
 
 		# Store tensor references alongside task to prevent GC/memory reuse
