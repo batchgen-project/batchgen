@@ -134,3 +134,17 @@ def test_paged_gather_cache_key_invalidates_in_place_page_table_rebuild():
     assert key_v1 != key_v2
     assert flat_v1.tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
     assert flat_v2.tolist() == [4, 5, 6, 7, 0, 1, 2, 3]
+
+
+def test_flat_paged_gather_indices_clamp_invalid_pages_with_mask():
+    block_table = torch.tensor([[0, -1], [2, 3]], dtype=torch.int64)
+
+    flat, invalid = build_flat_paged_gather_indices(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+        return_invalid_mask=True,
+    )
+
+    assert flat.tolist() == [0, 1, 0, 1, 4, 5, 6, 7]
+    assert invalid.tolist() == [[False, False, True, True], [False, False, False, False]]

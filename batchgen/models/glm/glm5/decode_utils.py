@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+from typing import Union
 
 import torch
 
@@ -103,7 +104,9 @@ def build_flat_paged_gather_indices(
     block_table: torch.Tensor,
     max_seqlen: int,
     page_size: int,
-) -> torch.Tensor:
+    *,
+    return_invalid_mask: bool = False,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Flatten paged block-table lookups into token gather indices."""
     device = block_table.device
     batch_size = block_table.shape[0]
@@ -121,4 +124,9 @@ def build_flat_paged_gather_indices(
     page_indices = (token_positions // page_size).unsqueeze(0).expand(batch_size, -1)
     page_offsets = token_positions % page_size
     physical_pages = torch.gather(block_table, 1, page_indices)
-    return (physical_pages * page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
+    invalid_mask = physical_pages < 0
+    physical_pages = physical_pages.clamp(min=0)
+    flat_idx = (physical_pages * page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
+    if return_invalid_mask:
+        return flat_idx, invalid_mask
+    return flat_idx

@@ -609,10 +609,11 @@ class Glm5Indexer(nn.Module):
             page_table_version=indexer_kv_manager.get_page_table_version(),
         )
         if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
-            self._gather_cache = build_flat_paged_gather_indices(
+            self._gather_cache, self._gather_cache_invalid_mask = build_flat_paged_gather_indices(
                 block_table,
                 max_seqlen,
                 page_size,
+                return_invalid_mask=True,
             )
             self._gather_cache_key = cache_key
             self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
@@ -620,6 +621,10 @@ class Glm5Indexer(nn.Module):
         flat_idx = self._gather_cache
         blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
         gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
+        gathered = gathered.masked_fill(
+            self._gather_cache_invalid_mask.unsqueeze(-1).unsqueeze(-1),
+            0,
+        )
 
         gathered_k = gathered.squeeze(2)
 
