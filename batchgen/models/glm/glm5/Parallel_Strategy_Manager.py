@@ -278,16 +278,33 @@ class GLM5ParallelStrategyManager:
                 layer.set_num_tokens_per_rank(num_tokens_per_rank)
 
     def set_rank_token_counts(self, counts: torch.Tensor):
-        """Store per-rank real-token counts [world_size] on GPU for 3D-MoE padding masking.
+        """Update the static [world_size] padding-mask buffer in-place.
 
-        Mirrors KimiK25ParallelStrategyManager.set_rank_token_counts
-        (moonshotai/kimi_k25/Parallel_Strategy_Manager.py:590). Worker
-        (batchgen_worker.py ~line 7805) calls this each decode iter when the
+        The captured 3D-MoE graph holds a fixed reference to
+        `Glm5MoE._rank_token_counts` (allocated in `_init_decoding_padding_bsz`).
+        Reassigning the class attribute would silently leave the captured graph
+        pointing at the old tensor; contents must update through the same
+        address so the captured masking ops re-read the new per-step values
+        at every replay.
+
+        Worker (batchgen_worker.py) calls this each decode iter when the
         active batch has mixed real/padded rows, so the 3D-MoE path can
         mask topk_idx for padded positions before dispatch_scatter_3d.
         """
         from .model import Glm5MoE
-        Glm5MoE._rank_token_counts = counts
+        if Glm5MoE._rank_token_counts is None:
+            # Defensive: pre-CUDA-graph paths (eager smoke tests, unit tests)
+            # may call this before `_init_decoding_padding_bsz`. Allocate
+            # lazily; subsequent calls go down the in-place branch.
+            Glm5MoE._rank_token_counts = counts.to(
+                dtype=torch.int64, device=counts.device,
+            ).clone()
+        else:
+            Glm5MoE._rank_token_counts.copy_(counts.to(
+                dtype=Glm5MoE._rank_token_counts.dtype,
+                device=Glm5MoE._rank_token_counts.device,
+                non_blocking=True,
+            ))
 
     def _init_decoding_padding_bsz(self, padding_bsz):
         env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
@@ -304,6 +321,24 @@ class GLM5ParallelStrategyManager:
         device = self.engine_config.Basic_Config.device_torch
         Glm5MoE.init_buffer_manager(
             max_rank_bsz, self.world_size, self.HIDDEN_SIZE, device,
+        )
+        # Static [world_size] buffer for the 3D-MoE padding mask. MUST exist
+        # before `_warmup_cuda_graphs` runs, otherwise the captured
+        # `_forward_decode_3d` sees `Glm5MoE._rank_token_counts is None` at
+        # capture time and silently omits the masking block from the recorded
+        # graph (root cause of the 2026-04-26 stress loop regression: padded
+        # zeros went unmasked, flooded K experts, overflowed mtp via the
+        # unguarded atomicAdd in dispatch_scatter_3d.cu, and corrupted real-
+        # token rows → ~0.5% n-gram-loop completions).
+        #
+        # Initial value `max_rank_bsz` makes every position a "valid" slot
+        # during capture (mask all-False), so the captured graph runs the
+        # masking ops as no-ops at warmup time. `set_rank_token_counts` writes
+        # per-step values in-place; the captured graph re-reads through the
+        # static reference at every replay.
+        Glm5MoE._rank_token_counts = torch.full(
+            (self.world_size,), max_rank_bsz,
+            dtype=torch.int64, device=device,
         )
 
     def _init_mode_decoding(self):
