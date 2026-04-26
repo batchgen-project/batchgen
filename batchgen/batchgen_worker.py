@@ -3774,6 +3774,7 @@ class BatchGenWorker:
 		# Create completion tensor: 1 = completed, 0 = not completed
 		# Each rank marks its LOCAL sequences' completion status
 		completion_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
+		rep_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
 
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
@@ -3782,9 +3783,12 @@ class BatchGenWorker:
 					is_completed = (seq.status == SequenceStatus.COMPLETED or seq.eos_reached)
 					if is_completed:
 						completion_tensor[uuid_to_idx[uuid]] = 1
+					if getattr(seq, '_rep_detected', False):
+						rep_tensor[uuid_to_idx[uuid]] = 1
 
 		# all_reduce with MAX: if ANY rank marks a sequence complete, result is 1
 		dist.all_reduce(completion_tensor, op=dist.ReduceOp.MAX)
+		dist.all_reduce(rep_tensor, op=dist.ReduceOp.MAX)
 
 		# Decode back to UUIDs
 		global_completed = set()
@@ -3798,6 +3802,8 @@ class BatchGenWorker:
 				# Update local sequence status
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None:
+					if rep_tensor[global_idx].item() == 1:
+						seq._rep_detected = True
 					seq.eos_reached = True
 					if seq.status != SequenceStatus.COMPLETED:
 						try:
@@ -5960,11 +5966,11 @@ class BatchGenWorker:
 			seq.decoded_length = n_old
 			seq.reentry_decoded_baseline = n_old
 
-			# Remaining decode budget for this re-entry
-			seq.max_decode_length = max(
-				0,
-				seq.original_max_decode_length - seq.total_decoded_before_eviction,
-			)
+			# decoded_length is cumulative across re-entry cycles, so
+			# max_decode_length must remain in the same cumulative unit. A
+			# remaining-budget value here would make later checks compare
+			# cumulative decoded_length against a per-cycle remainder.
+			seq.max_decode_length = seq.original_max_decode_length
 
 			# Reset completion flags — the sequence may have hit EOS in its
 			# previous decode cycle before being evicted. Without this reset,
@@ -7780,6 +7786,7 @@ class BatchGenWorker:
 		new_load_uuids = decisions.new_load_uuids
 		new_load_local = []
 		new_load_global = []
+		confirmed_local_payload = []
 
 		if new_load_uuids and decode_uuids:
 			my_new_uuids = [u for u in new_load_uuids
@@ -7849,6 +7856,10 @@ class BatchGenWorker:
 							'active_page_counts': active_page_counts,
 						}
 					timing.load_launch_ms = (time.perf_counter() - t_launch) * 1000
+					if new_async_task is not None:
+						for local_idx, global_idx in zip(new_load_local, new_load_global):
+							uuid = self._local_to_uuid_map[local_idx]
+							confirmed_local_payload.append((uuid, local_idx, global_idx))
 				else:
 					new_load_local = []
 					new_load_global = []
@@ -7856,6 +7867,44 @@ class BatchGenWorker:
 						f"Rank {self.rank}: All load candidates dropped due to insufficient pages, "
 						f"actual_free={actual_free}"
 					)
+
+			all_confirmed_payloads = [None] * self.world_size
+			dist.all_gather_object(all_confirmed_payloads, confirmed_local_payload)
+			confirmed_by_uuid = {}
+			for rank_payload in all_confirmed_payloads:
+				if not rank_payload:
+					continue
+				for uuid, _local_idx, global_idx in rank_payload:
+					confirmed_by_uuid[uuid] = global_idx
+
+			proposed_count = len(new_load_uuids)
+			new_load_uuids = sorted(
+				confirmed_by_uuid.keys(),
+				key=lambda u: confirmed_by_uuid[u],
+			)
+			confirmed_set = set(new_load_uuids)
+			new_load_local = [
+				idx for idx in new_load_local
+				if self._local_to_uuid_map.get(idx) in confirmed_set
+			]
+			new_load_global = [
+				self.global_batch.get_sequence(self._local_to_uuid_map[idx]).global_idx
+				for idx in new_load_local
+			]
+			if self.rank == 0 and proposed_count != len(new_load_uuids):
+				missing = [
+					u for u in decisions.new_load_uuids
+					if u not in confirmed_set
+				]
+				logging.warning(
+					f"[LOAD_CONFIRM] Proposed {proposed_count} loads but only "
+					f"{len(new_load_uuids)} were owner-confirmed; deferred={len(missing)} "
+					f"sample={[self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else u for u in missing[:8]]}"
+				)
+			elif self.rank == 0 and proposed_count:
+				logging.info(
+					f"[LOAD_CONFIRM] Proposed and confirmed {proposed_count} async loads"
+				)
 		
 		timing.num_loaded = len(new_load_uuids)
 		
@@ -7991,7 +8040,15 @@ class BatchGenWorker:
 		if hasattr(self, '_async_load_tensors'):
 			self._async_load_tensors = None
 
-		# VALIDATION: Verify all pending_uuids exist and have assigned ranks
+		pending_local_uuid_set = {
+			self._local_to_uuid_map[idx]
+			for idx in pending_local_indices
+			if idx in self._local_to_uuid_map
+		}
+
+		# VALIDATION: Verify all pending_uuids exist, have assigned ranks,
+		# and are owner-confirmed. pending_uuids must be the all-gathered set
+		# of successful owner-local load launches, not merely rank-0 proposals.
 		valid_pending_uuids = []
 		for uuid in pending_uuids:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8000,6 +8057,12 @@ class BatchGenWorker:
 				continue
 			if seq.assigned_rank is None:
 				logging.error(f"Rank {self.rank}: pending_uuid {uuid} has no assigned_rank!")
+				continue
+			if seq.assigned_rank == self.rank and uuid not in pending_local_uuid_set:
+				logging.error(
+					f"Rank {self.rank}: owner did not confirm local load for "
+					f"pending_uuid {uuid[:8]} gid={seq.global_idx}; keeping it out of IN_DECODE"
+				)
 				continue
 			valid_pending_uuids.append(uuid)
 
@@ -8027,6 +8090,11 @@ class BatchGenWorker:
 				seq.current_context_length = expected_ctx
 			seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
 				f"gpu_pages={seq.gpu_pages_allocated}")
+			logging.info(
+				f"[LOAD_CONFIRM] Rank {self.rank}: finalized uuid={uuid[:8]} "
+				f"gid={seq.global_idx} status=IN_DECODE gpu_pages={seq.gpu_pages_allocated} "
+				f"ctx={seq.current_context_length} host_pages={seq.host_pages_allocated}"
+			)
 			# Refresh query_book entry for resumed ON_HOLD sequences to prevent stale references
 			if local_idx in self.query_book:
 				self.query_book[local_idx] = make_query_book_entry(seq)
