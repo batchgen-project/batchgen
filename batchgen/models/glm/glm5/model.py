@@ -303,15 +303,42 @@ class Glm5Indexer(nn.Module):
         k_nope = k[..., self.rope_head_dim:]
         seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
         cos, sin = self.rotary_emb(k_rope, seq_len)
-        # Index cos/sin by position: positions may be [batch] (decode) or [batch, seq] (prefill)
+
+        # Normalize to [batch, seq]. Prepacked prefill passes bare [seq],
+        # while decode passes [batch] for one token per sequence.
+        if positions.dim() == 1:
+            if positions.numel() == k.shape[1]:
+                positions = positions.unsqueeze(0).expand(k.shape[0], -1)
+            elif positions.numel() == k.shape[0]:
+                positions = positions.unsqueeze(1)
+            else:
+                raise ValueError(
+                    "positions must be [seq], [batch], or [batch, seq] for "
+                    f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
+                )
+        elif positions.dim() != 2:
+            raise ValueError(
+                "positions must be [seq], [batch], or [batch, seq] for "
+                f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
+            )
+
+        if positions.shape != k.shape[:2]:
+            raise ValueError(
+                "positions shape must match k batch/seq dims after normalization: "
+                f"positions={tuple(positions.shape)}, k={tuple(k.shape)}"
+            )
+
+        # Index cos/sin by position: [batch, seq, rope_dim].
         cos = cos[positions]  # [batch, ...rope_dim*2]
         sin = sin[positions]
-        if cos.dim() == 2:
-            cos = cos.unsqueeze(1)  # [batch, 1, rope_dim*2]
-            sin = sin.unsqueeze(1)
-        k_rope = k_rope.unsqueeze(2)  # [batch, seq, 1, rope_dim]
-        k_rope, _ = apply_rotary_pos_emb_interleaved(k_rope, k_rope, cos, sin)
-        k_rope = k_rope.squeeze(2)
+        cos_half = cos[..., : cos.shape[-1] // 2]
+        sin_half = sin[..., : sin.shape[-1] // 2]
+
+        k1, k2 = k_rope[..., 0::2], k_rope[..., 1::2]
+        k_rope = torch.stack(
+            [k1 * cos_half - k2 * sin_half, k2 * cos_half + k1 * sin_half],
+            dim=-1,
+        ).flatten(-2)
         return torch.cat([k_rope, k_nope], dim=-1)
 
     def _apply_rope_to_q(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
