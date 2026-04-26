@@ -432,7 +432,11 @@ class WorkerManager:
         os.makedirs(status_dir, exist_ok=True)
 
         # Send the command (no lock — pool admission queue is fire-and-forget)
-        self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+        self.request_queue.put({
+            "command": "reload",
+            "reload_deps": reload_deps,
+            "pool_mode": True,
+        })
 
         # Poll for status files
         if expected_ranks is None:

@@ -93,6 +93,21 @@ def _validate_reload(worker, NewClass):
 	return missing
 
 
+def _write_reload_status(result: dict) -> None:
+	"""Write reload status for pool-mode HTTP polling."""
+	import json
+	import tempfile
+	try:
+		status_dir = "/tmp/batchgen_reload_status"
+		os.makedirs(status_dir, exist_ok=True)
+		fd, tmp_path = tempfile.mkstemp(dir=status_dir, suffix=".json")
+		with os.fdopen(fd, "w") as f:
+			json.dump(result, f)
+		os.replace(tmp_path, os.path.join(status_dir, f"rank_{result['rank']}.json"))
+	except Exception as exc:
+		logging.warning("Failed to write reload status: %s", exc)
+
+
 def _setup_nccl_env():
 	"""
 	Set up NCCL environment variables for better reliability in multi-node setups.
@@ -386,6 +401,7 @@ def _server_worker_main_impl(
 		# --- STEP 3.5: Hot Reload Command ---
 		if isinstance(task_data, dict) and task_data.get("command") == "reload":
 			reload_deps = task_data.get("reload_deps", True)
+			pool_mode = bool(task_data.get("pool_mode", False))
 			logging.info(f"Rank {global_rank}: Received reload command (reload_deps={reload_deps}), hot-reloading...")
 			try:
 				new_module = _reload_worker_module(reload_deps=reload_deps)
@@ -397,7 +413,16 @@ def _server_worker_main_impl(
 					f"Rebound {rebound} methods, skipped {skipped}"
 					+ (f", {len(missing)} missing attrs" if missing else "")
 				)
-				if global_rank == 0:
+				result = {
+					"status": "reload_success",
+					"rank": global_rank,
+					"rebound": rebound,
+					"skipped": skipped,
+					"missing_attrs": missing,
+				}
+				if pool_mode:
+					_write_reload_status(result)
+				elif global_rank == 0:
 					response_queue.put({
 						"status": "reload_success",
 						"rebound": rebound,
@@ -406,7 +431,10 @@ def _server_worker_main_impl(
 					})
 			except Exception as e:
 				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
-				if global_rank == 0:
+				result = {"status": "reload_failed", "rank": global_rank, "error": str(e)}
+				if pool_mode:
+					_write_reload_status(result)
+				elif global_rank == 0:
 					response_queue.put({"status": "reload_failed", "error": str(e)})
 			continue
 
