@@ -19,6 +19,14 @@ struct HostPagedKVStats {
     std::size_t num_active_sequences = 0;
     std::size_t sequence_table_capacity = 0;
     std::size_t total_bytes = 0;
+    std::size_t num_sequence_ref_pages = 0;
+    std::size_t num_prefix_pinned_pages = 0;
+    std::size_t num_pages_with_sequence_refs = 0;
+    std::size_t num_pages_with_prefix_pins = 0;
+    std::size_t sequence_ref_increments = 0;
+    std::size_t sequence_ref_decrements = 0;
+    std::size_t prefix_pin_increments = 0;
+    std::size_t prefix_pin_decrements = 0;
 };
 
 struct HostPagedKVConfig {
@@ -135,7 +143,15 @@ inline std::string ToString(const HostPagedKVStats& stats) {
         << ", used_pages=" << stats.num_used_pages
         << ", active_sequences=" << stats.num_active_sequences
         << ", sequence_table_capacity=" << stats.sequence_table_capacity
-        << ", total_bytes=" << stats.total_bytes << ")";
+        << ", total_bytes=" << stats.total_bytes
+        << ", sequence_ref_pages=" << stats.num_sequence_ref_pages
+        << ", prefix_pinned_pages=" << stats.num_prefix_pinned_pages
+        << ", pages_with_sequence_refs=" << stats.num_pages_with_sequence_refs
+        << ", pages_with_prefix_pins=" << stats.num_pages_with_prefix_pins
+        << ", sequence_ref_increments=" << stats.sequence_ref_increments
+        << ", sequence_ref_decrements=" << stats.sequence_ref_decrements
+        << ", prefix_pin_increments=" << stats.prefix_pin_increments
+        << ", prefix_pin_decrements=" << stats.prefix_pin_decrements << ")";
     return oss.str();
 }
 
@@ -179,6 +195,17 @@ class HostPagedKVBackend {
     void ReleaseSequence(std::int64_t sequence_id);
 
     void ReleaseSequences(const std::vector<std::int64_t>& sequence_ids);
+
+    void AttachSequencePages(const std::vector<std::int32_t>& pages);
+
+    void DetachSequencePages(const std::vector<std::int32_t>& pages);
+
+    void PinPrefixPage(std::int32_t page);
+
+    void UnpinPrefixPage(std::int32_t page);
+
+    void ReleaseSequenceLogical(std::int64_t sequence_id,
+                                const std::vector<std::int32_t>& logical_pages);
 
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;

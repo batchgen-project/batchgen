@@ -29,11 +29,12 @@ Timing instrumentation:
     Or call PrefillTimingStats.enable() programmatically.
 """
 
+import ctypes
 import logging
 import math
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1659,6 +1660,205 @@ class GptOssAttnWrapper(AttnWrapperBase):
         from batchgen.attention.fused_kernels import cuda_rope
         return cuda_rope(query, key, cos, sin)
 
+    def _host_prefix_page_size(self) -> int:
+        host_cfg = getattr(self.engine_config, "Host_Paged_KV_Config", None)
+        if host_cfg is None:
+            host_cfg = getattr(self.engine_config, "host_paged_kv_config", None)
+        return int(getattr(host_cfg, "page_size", 64))
+
+    def _load_host_prefix_tensor(
+        self,
+        page_ptrs: List[int],
+        num_tokens: int,
+        *,
+        num_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if num_tokens == 0:
+            return torch.empty((0, num_heads, head_dim), dtype=dtype, device=device)
+        if dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError(
+                f"Prefix reuse host KV loader supports 16-bit KV only, got {dtype}"
+            )
+
+        page_size = self._host_prefix_page_size()
+        elems_per_page = page_size * num_heads * head_dim
+        remaining = num_tokens
+        chunks = []
+        for ptr in page_ptrs:
+            if remaining <= 0:
+                break
+            take = min(page_size, remaining)
+            array_type = ctypes.c_uint16 * elems_per_page
+            host_array = array_type.from_address(int(ptr))
+            host_uint16 = torch.frombuffer(host_array, dtype=torch.uint16)
+            page_tensor = host_uint16.view(dtype).reshape(
+                page_size, num_heads, head_dim
+            )
+            # Clone before leaving this scope so the tensor no longer depends on
+            # the transient ctypes object that exposes the host page buffer.
+            chunks.append(page_tensor[:take].clone())
+            remaining -= take
+
+        if remaining != 0:
+            raise RuntimeError(
+                f"Host prefix KV page list is short by {remaining} tokens "
+                f"(requested={num_tokens})"
+            )
+
+        return torch.cat(chunks, dim=0).to(
+            device=device, dtype=dtype, non_blocking=True
+        )
+
+    def _load_host_prefix_kv(
+        self,
+        sequence_id: int,
+        prefix_tokens: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+        if worker_view is None:
+            raise RuntimeError("Prefix reuse requires host_paged_kv_worker_view")
+
+        k_ptrs, v_ptrs = worker_view.get_sequence_layer_page_pointers(
+            int(sequence_id),
+            self.layer_idx,
+            prefix_tokens,
+        )
+        if v_ptrs is None:
+            raise RuntimeError("GPT-OSS prefix reuse requires host V cache pages")
+
+        prefix_k = self._load_host_prefix_tensor(
+            list(k_ptrs),
+            prefix_tokens,
+            num_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        prefix_v = self._load_host_prefix_tensor(
+            list(v_ptrs),
+            prefix_tokens,
+            num_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        return prefix_k, prefix_v
+
+    def _build_prefix_reuse_attention_kv(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_lengths: List[int],
+        global_sequence_ids: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        prefix_tokens_by_seq = AttnWrapperBase.prepack_prefix_shared_tokens
+        full_lengths = AttnWrapperBase.prepack_full_seq_lengths
+        if prefix_tokens_by_seq is None or full_lengths is None:
+            raise RuntimeError("Prefix reuse prepack metadata is incomplete")
+        if len(prefix_tokens_by_seq) != len(seq_lengths):
+            raise RuntimeError("Prefix reuse metadata length does not match batch")
+        if global_sequence_ids is None or len(global_sequence_ids) != len(seq_lengths):
+            raise RuntimeError("Prefix reuse requires global sequence ids")
+
+        device = key.device
+        k_segments = []
+        v_segments = []
+        cu_k = [0]
+        max_seqlen_k = 0
+        cu_cpu = cu_seqlens.detach().cpu().tolist()
+
+        for seq_idx, suffix_len in enumerate(seq_lengths):
+            start_idx = int(cu_cpu[seq_idx])
+            end_idx = int(cu_cpu[seq_idx + 1])
+            if end_idx - start_idx != int(suffix_len):
+                raise RuntimeError("Prepack cu_seqlens does not match sequence lengths")
+
+            prefix_tokens = int(prefix_tokens_by_seq[seq_idx])
+            expected_full_len = int(full_lengths[seq_idx])
+            if prefix_tokens + int(suffix_len) != expected_full_len:
+                raise RuntimeError(
+                    "Prefix reuse full length mismatch: "
+                    f"prefix={prefix_tokens}, suffix={suffix_len}, "
+                    f"full={expected_full_len}"
+                )
+
+            suffix_k = key[start_idx:end_idx]
+            suffix_v = value[start_idx:end_idx]
+            if prefix_tokens > 0:
+                prefix_k, prefix_v = self._load_host_prefix_kv(
+                    global_sequence_ids[seq_idx],
+                    prefix_tokens,
+                    dtype=key.dtype,
+                    device=device,
+                )
+                seq_k = torch.cat([prefix_k, suffix_k], dim=0)
+                seq_v = torch.cat([prefix_v, suffix_v], dim=0)
+            else:
+                seq_k = suffix_k
+                seq_v = suffix_v
+
+            k_segments.append(seq_k)
+            v_segments.append(seq_v)
+            cu_k.append(cu_k[-1] + seq_k.shape[0])
+            max_seqlen_k = max(max_seqlen_k, seq_k.shape[0])
+
+        return (
+            torch.cat(k_segments, dim=0),
+            torch.cat(v_segments, dim=0),
+            torch.tensor(cu_k, dtype=torch.int32, device=device),
+            max_seqlen_k,
+        )
+
+    def _build_full_hit_attention_kv(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+        seq_lengths: List[int],
+        global_sequence_ids: List[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        full_lengths = AttnWrapperBase.prepack_full_seq_lengths
+        if full_lengths is None:
+            raise RuntimeError("Full-hit prefix reuse metadata is incomplete")
+        if len(full_lengths) != len(seq_lengths):
+            raise RuntimeError("Full-hit metadata length does not match batch")
+        if global_sequence_ids is None or len(global_sequence_ids) != len(seq_lengths):
+            raise RuntimeError("Full-hit prefix reuse requires global sequence ids")
+
+        k_segments = []
+        v_segments = []
+        cu_k = [0]
+        max_seqlen_k = 0
+        for seq_idx, q_len in enumerate(seq_lengths):
+            if int(q_len) != 1:
+                raise RuntimeError("Full-hit prefix reuse expects one query token per sequence")
+            full_length = int(full_lengths[seq_idx])
+            prefix_k, prefix_v = self._load_host_prefix_kv(
+                global_sequence_ids[seq_idx],
+                full_length,
+                dtype=dtype,
+                device=device,
+            )
+            k_segments.append(prefix_k)
+            v_segments.append(prefix_v)
+            cu_k.append(cu_k[-1] + full_length)
+            max_seqlen_k = max(max_seqlen_k, full_length)
+
+        return (
+            torch.cat(k_segments, dim=0),
+            torch.cat(v_segments, dim=0),
+            torch.tensor(cu_k, dtype=torch.int32, device=device),
+            max_seqlen_k,
+        )
+
     def _forward_prefill_prepacked(
         self,
         hidden_states: torch.Tensor,
@@ -1695,6 +1895,14 @@ class GptOssAttnWrapper(AttnWrapperBase):
         max_seqlen = AttnWrapperBase.prepack_max_seqlen
         num_sequences = AttnWrapperBase.prepack_num_sequences
         seq_lengths = AttnWrapperBase.prepack_seq_lengths
+        prefix_reuse_mode = bool(AttnWrapperBase.prepack_prefix_reuse_mode)
+        full_hit_mode = bool(AttnWrapperBase.prepack_full_hit_mode)
+        global_sequence_ids = AttnWrapperBase.cur_batch
+        full_seq_lengths = AttnWrapperBase.prepack_full_seq_lengths
+        if (prefix_reuse_mode or full_hit_mode) and full_seq_lengths:
+            rotary_seq_len = max(max(int(length) for length in full_seq_lengths), int(max_seqlen))
+        else:
+            rotary_seq_len = int(max_seqlen)
 
         # DEBUG: Check input hidden_states before projection
         if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
@@ -1766,8 +1974,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # hidden_states_2d: [total_tokens, hidden_size]
         if self._use_wgmma and position_ids is not None:
             from batchgen.attention.fused_kernels import cuda_qkv_wgmma
-            cos_table = self.module.rotary_emb.cos_cached[:max_seqlen].to(hidden_states_2d.dtype)
-            sin_table = self.module.rotary_emb.sin_cached[:max_seqlen].to(hidden_states_2d.dtype)
+            cos_table = self.module.rotary_emb.cos_cached[:rotary_seq_len].to(hidden_states_2d.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:rotary_seq_len].to(hidden_states_2d.dtype)
             rope_cos = cos_table[position_ids]  # [total_tokens, head_dim]
             rope_sin = sin_table[position_ids]
             query, key, value = cuda_qkv_wgmma(
@@ -1787,7 +1995,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
             # Apply RoPE per sequence using position_ids
             if position_ids is not None:
-                cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+                cos, sin = self.module.rotary_emb(value, seq_len=rotary_seq_len)
                 cos = cos[position_ids]  # [total_tokens, head_dim]
                 sin = sin[position_ids]  # [total_tokens, head_dim]
 
@@ -1808,16 +2016,41 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     k2 * cos_half + k1 * sin_half
                 ], dim=-1)
 
+        if full_hit_mode:
+            key_for_attn, value_for_attn, cu_seqlens_k, max_seqlen_k = (
+                self._build_full_hit_attention_kv(
+                    dtype=key.dtype,
+                    device=key.device,
+                    seq_lengths=seq_lengths,
+                    global_sequence_ids=global_sequence_ids,
+                )
+            )
+        elif prefix_reuse_mode:
+            key_for_attn, value_for_attn, cu_seqlens_k, max_seqlen_k = (
+                self._build_prefix_reuse_attention_kv(
+                    key=key,
+                    value=value,
+                    cu_seqlens=cu_seqlens,
+                    seq_lengths=seq_lengths,
+                    global_sequence_ids=global_sequence_ids,
+                )
+            )
+        else:
+            key_for_attn = key
+            value_for_attn = value
+            cu_seqlens_k = cu_seqlens.to(hidden_states_2d.device)
+            max_seqlen_k = max_seqlen
+
         # Use gqa_prefill_fa for varlen attention with sink correction
         # q, k, v: [total_tokens, num_heads, head_dim]
         attn_output, lse = gqa_prefill_fa(
             q=query,
-            k=key,
-            v=value,
+            k=key_for_attn,
+            v=value_for_attn,
             cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
-            cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_k=max_seqlen_k,
             sinks=self.sinks,
             softmax_scale=self.scale,
             sliding_window=self.sliding_window,
@@ -1829,9 +2062,6 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Output projection
         attn_output = self.module.o_proj(attn_output)  # [total_tokens, hidden_size]
-
-        # Offload KV cache per sequence to host
-        global_sequence_ids = AttnWrapperBase.cur_batch
 
         torch.cuda.current_stream().synchronize()  # Make sure KV is ready
 
@@ -1865,6 +2095,15 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 else:
                     print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT K at position 0")
 
+        if full_hit_mode:
+            logging.debug(
+                f"[Layer {self.layer_idx}] GPT-OSS exact full-hit prefill "
+                f"used cached host KV for {num_sequences} sequences"
+            )
+            if input_was_3d:
+                attn_output = attn_output.unsqueeze(0)
+            return attn_output, None, None
+
         # For GQA, we store both K and V (unlike MLA which only stores K)
         # Split by cu_seqlens and offload each sequence
         for seq_idx in range(num_sequences):
@@ -1881,19 +2120,37 @@ class GptOssAttnWrapper(AttnWrapperBase):
             seq_value = seq_value.unsqueeze(0)
 
             seq_global_id = [global_sequence_ids[seq_idx]]
+            destination_start = 0
+            if prefix_reuse_mode:
+                prefix_tokens_by_seq = AttnWrapperBase.prepack_prefix_shared_tokens
+                destination_start = int(prefix_tokens_by_seq[seq_idx])
 
             # DEBUG: Print what's being offloaded per sequence
             if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1" and seq_idx < 3:
                 k_sample = seq_key[0, 0, 0, :4].cpu().tolist()  # [1, seq_len, heads, dim] -> position 0, head 0
                 print(f"[PREFILL L0 OFFLOAD] seq{seq_idx}: global_id={seq_global_id[0]}, seq_len={seq_len}, K[0,0,:4]={k_sample}")
 
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_key,
-                v_tensor=seq_value,
-                sequence_lengths=[seq_len],
-            )
+            if prefix_reuse_mode:
+                task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host_with_offsets(
+                    layer_idx=self.layer_idx,
+                    sequence_ids=seq_global_id,
+                    k_tensor=seq_key,
+                    v_tensor=seq_value,
+                    sequence_lengths=[seq_len],
+                    source_token_starts=[0],
+                    destination_token_starts=[destination_start],
+                )
+            else:
+                task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+                    layer_idx=self.layer_idx,
+                    sequence_ids=seq_global_id,
+                    k_tensor=seq_key,
+                    v_tensor=seq_value,
+                    sequence_lengths=[seq_len],
+                )
+            AttnWrapperBase.pending_prefill_offload_tensors.extend([seq_key, seq_value])
+            if task is not None:
+                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
         logging.debug(
             f"[Layer {self.layer_idx}] GPT-OSS prepacked prefill complete. "

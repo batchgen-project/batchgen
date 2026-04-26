@@ -35,6 +35,7 @@
 #include "host_paged_kv_config_utils.h"
 #include "host_paged_kv_geometry.h"
 #include "host_paged_kv_layout.h"
+#include "host_prefix_cache.h"
 #include "spdlog/spdlog.h"
 #include "util_measure_time.h"
 
@@ -174,6 +175,25 @@ using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
 using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
 using SequenceLengths = batchgen::kv::SequenceLengths;
 
+struct PrefixAllocationRequest {
+    std::int64_t sequence_id = 0;
+    std::vector<std::int64_t> token_ids;
+    std::size_t capacity_tokens = 0;
+    std::uint64_t namespace_hash = 0;
+};
+
+struct PrefixAllocationResult {
+    std::int64_t sequence_id = 0;
+    std::vector<std::int32_t> shared_prefix_pages;
+    std::vector<std::int32_t> private_pages;
+    std::size_t shared_prefix_tokens = 0;
+    std::size_t private_start_token = 0;
+    std::size_t logical_page_count = 0;
+    std::size_t physical_pages_allocated = 0;
+    bool full_hit = false;
+    std::string miss_reason;
+};
+
 template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>>
 class HostPagedKVWorkerView {
    public:
@@ -202,6 +222,7 @@ class HostPagedKVWorkerView {
 
     ~HostPagedKVWorkerView() {
         try {
+            ClearPrefixCache();
             ResetCopyStreams();
             UnregisterPinnedMemory();
         } catch (const std::exception& ex) {
@@ -265,6 +286,100 @@ class HostPagedKVWorkerView {
         return allocated_pages;
     }
 
+    std::vector<PrefixAllocationResult> AllocatePagesForSequencesWithPrefix(
+        const std::vector<PrefixAllocationRequest>& requests) {
+        std::vector<std::int64_t> sequence_ids;
+        sequence_ids.reserve(requests.size());
+        for (const auto& request : requests) {
+            sequence_ids.push_back(request.sequence_id);
+        }
+        EnsureSequencesRegistered(sequence_ids);
+
+        std::vector<PrefixAllocationResult> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            if (request.token_ids.empty()) {
+                throw std::invalid_argument(
+                    "Prefix allocation requires at least one prompt token");
+            }
+            if (request.capacity_tokens < request.token_ids.size()) {
+                throw std::invalid_argument(
+                    "capacity_tokens must be >= token_ids.size()");
+            }
+
+            const PrefixLookupResult hit = prefix_cache_.Lookup(
+                request.namespace_hash,
+                static_cast<std::int32_t>(config_.page_size_tokens),
+                request.token_ids);
+            const std::size_t private_tokens =
+                request.capacity_tokens - hit.matched_tokens;
+            const std::size_t private_pages_required =
+                private_tokens == 0 ? 0 : geometry_.RequiredPages(private_tokens);
+
+            std::vector<std::int32_t> private_pages;
+            bool attached_shared_pages = false;
+            try {
+                if (private_pages_required > 0) {
+                    private_pages = backend_.AcquirePages(
+                        request.sequence_id, private_pages_required);
+                }
+                if (!hit.host_pages.empty()) {
+                    backend_.AttachSequencePages(hit.host_pages);
+                    attached_shared_pages = true;
+                    prefix_cache_.RecordAttachedPages(hit.host_pages.size());
+                }
+                page_table_.RegisterOrUpdate(
+                    request.sequence_id, hit.host_pages, private_pages,
+                    static_cast<std::int64_t>(hit.matched_tokens),
+                    static_cast<std::int64_t>(hit.matched_tokens),
+                    static_cast<std::int64_t>(request.capacity_tokens));
+            } catch (...) {
+                if (attached_shared_pages) {
+                    backend_.DetachSequencePages(hit.host_pages);
+                }
+                if (!private_pages.empty()) {
+                    backend_.ReleaseSequence(request.sequence_id);
+                }
+                throw;
+            }
+
+            PrefixAllocationResult result;
+            result.sequence_id = request.sequence_id;
+            result.shared_prefix_pages = hit.host_pages;
+            result.private_pages = private_pages;
+            result.shared_prefix_tokens = hit.matched_tokens;
+            result.private_start_token = hit.matched_tokens;
+            result.logical_page_count =
+                hit.host_pages.size() + private_pages.size();
+            result.physical_pages_allocated = private_pages.size();
+            result.full_hit = hit.full_hit;
+            result.miss_reason = hit.miss_reason;
+            results.emplace_back(std::move(result));
+        }
+        return results;
+    }
+
+    std::size_t CommitSequencePrefixPages(
+        std::int64_t sequence_id,
+        const std::vector<std::int64_t>& token_ids,
+        std::uint64_t namespace_hash = 0) {
+        EnsureSequenceRegistered(sequence_id);
+        const auto logical_pages = page_table_.Pages(sequence_id);
+        return prefix_cache_.CommitPages(
+            namespace_hash, static_cast<std::int32_t>(config_.page_size_tokens),
+            token_ids, logical_pages,
+            [this](std::int32_t page) { backend_.PinPrefixPage(page); });
+    }
+
+    PrefixCacheStats GetPrefixCacheStats() const {
+        return prefix_cache_.Stats();
+    }
+
+    void ClearPrefixCache() {
+        prefix_cache_.Clear(
+            [this](std::int32_t page) { backend_.UnpinPrefixPage(page); });
+    }
+
     std::vector<std::int32_t> GrowSequencePages(
         std::int64_t sequence_id, std::size_t num_pages) {
         if (num_pages == 0) {
@@ -306,6 +421,7 @@ class HostPagedKVWorkerView {
     void Shutdown() {
         logger_->info("Shutting down HostPagedKVWorkerView (device_index={})",
                       device_index_);
+        ClearPrefixCache();
         ResetCopyStreams();
         UnregisterPinnedMemory();
         page_table_.Clear();
@@ -785,6 +901,19 @@ class HostPagedKVWorkerView {
         return table;
     }
 
+    std::vector<std::int32_t> SharedPrefixPages(
+        std::int64_t sequence_id) const {
+        return page_table_.SharedPrefixPages(sequence_id);
+    }
+
+    std::vector<std::int32_t> PrivatePages(std::int64_t sequence_id) const {
+        return page_table_.PrivatePages(sequence_id);
+    }
+
+    std::int64_t SharedPrefixTokens(std::int64_t sequence_id) const {
+        return page_table_.SharedPrefixTokens(sequence_id);
+    }
+
     std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
@@ -795,7 +924,18 @@ class HostPagedKVWorkerView {
         if (max_tokens.has_value()) {
             max_pages = geometry_.RequiredPages(max_tokens.value());
         }
-        auto page_indices = backend_.SequencePages(sequence_id, max_pages);
+        auto page_indices = page_table_.Contains(sequence_id)
+                                ? page_table_.Pages(sequence_id)
+                                : backend_.SequencePages(sequence_id,
+                                                         std::nullopt);
+        if (max_pages.has_value()) {
+            if (max_pages.value() > page_indices.size()) {
+                throw std::out_of_range(
+                    "HostPagedKVWorkerView::GetSequenceLayerPagePointers: "
+                    "requested more pages than allocated");
+            }
+            page_indices.resize(max_pages.value());
+        }
         std::vector<void*> k_ptrs;
         k_ptrs.reserve(page_indices.size());
         std::optional<std::vector<void*>> v_ptrs;
@@ -865,7 +1005,10 @@ class HostPagedKVWorkerView {
             }
         }
         EnsureSequencesRegistered(sequence_ids);
-        backend_.ReleaseSequences(sequence_ids);
+        for (std::int64_t sequence_id : sequence_ids) {
+            backend_.ReleaseSequenceLogical(sequence_id,
+                                            page_table_.Pages(sequence_id));
+        }
         UnregisterSequences(sequence_ids);
     }
 
@@ -936,16 +1079,21 @@ class HostPagedKVWorkerView {
                 const std::size_t tokens_to_copy = ResolveSequenceLength(
                     sequence_lengths, batch_idx, sequence_id,
                     tokens_per_sequence, "AsyncOffloadLayerKVToHost");
-                if (tokens_to_copy == 0) {
+                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
+                    page_table_.SharedPrefixTokens(sequence_id));
+                if (tokens_to_copy <= shared_prefix_tokens) {
                     continue;
                 }
+                const std::size_t destination_token_start = shared_prefix_tokens;
+                const std::size_t suffix_tokens_to_copy =
+                    tokens_to_copy - shared_prefix_tokens;
                 geometry_.ValidatePageCapacity(pages, tokens_to_copy,
                                                "AsyncOffloadLayerKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
 
                 ForEachPageChunk(
-                    pages, 0, tokens_to_copy,
+                    pages, destination_token_start, suffix_tokens_to_copy,
                     [&](std::int32_t page_idx, std::size_t page_offset_tokens,
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
@@ -953,7 +1101,9 @@ class HostPagedKVWorkerView {
                                              host_base, layer_idx, page_idx) +
                                          page_offset_tokens * k_token_bytes;
                         const std::byte* src =
-                            seq_k_src + relative_token_offset * k_token_bytes;
+                            seq_k_src +
+                            (shared_prefix_tokens + relative_token_offset) *
+                                k_token_bytes;
                         EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
                     });
@@ -962,7 +1112,8 @@ class HostPagedKVWorkerView {
                         const auto* seq_v_src =
                             v_base + batch_idx * v_seq_stride;
                         ForEachPageChunk(
-                            pages, 0, tokens_to_copy,
+                            pages, destination_token_start,
+                            suffix_tokens_to_copy,
                             [&](std::int32_t page_idx,
                                 std::size_t page_offset_tokens,
                                 std::size_t chunk_tokens,
@@ -973,7 +1124,9 @@ class HostPagedKVWorkerView {
                                     page_offset_tokens * v_token_bytes;
                                 const std::byte* src =
                                     seq_v_src +
-                                    relative_token_offset * v_token_bytes;
+                                    (shared_prefix_tokens +
+                                     relative_token_offset) *
+                                        v_token_bytes;
                                 EnqueueCopy(
                                     src, dst, chunk_tokens * v_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
@@ -985,6 +1138,173 @@ class HostPagedKVWorkerView {
             this->SynchronizeWithEvent(cuda_stream);
             // LogFirstTokenPerPage(layer_idx, sequence_ids, sequence_lengths,
             //                      tokens_per_sequence, host_base);
+        });
+    }
+
+    KVAsyncTask AsyncOffloadLayerKVToHostWithOffsets(
+        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
+        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
+        SequenceLengths sequence_lengths,
+        std::vector<std::size_t> source_token_starts,
+        std::vector<std::size_t> destination_token_starts) {
+        constexpr std::string_view kOpName =
+            "AsyncOffloadLayerKVToHostWithOffsets";
+        geometry_.EnsureLayerBounds(layer_idx, kOpName);
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+        if (source_token_starts.size() != batch ||
+            destination_token_starts.size() != batch) {
+            std::ostringstream oss;
+            oss << kOpName
+                << ": source_token_starts and destination_token_starts must "
+                   "match sequence_ids size ("
+                << batch << ")";
+            throw std::invalid_argument(oss.str());
+        }
+        if (batch == 0) {
+            return LaunchAsyncTask([] {});
+        }
+
+        const std::size_t tokens_per_sequence =
+            ValidateKTensorShape(k_tensor, batch);
+        ValidateSequenceLengthsInput(sequence_lengths, batch, kOpName);
+        torch::Tensor prepared_k = k_tensor;
+        std::optional<torch::Tensor> prepared_v;
+        if (v_tensor.has_value()) {
+            if constexpr (kHasVCache) {
+                ValidateVTensorShape(*v_tensor, batch, tokens_per_sequence);
+                prepared_v = *v_tensor;
+            } else {
+                throw std::invalid_argument(
+                    "V tensor provided but V cache is disabled");
+            }
+        }
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        const std::string op_name(kOpName);
+
+        return LaunchAsyncTask([this, layer_idx,
+                                 sequence_ids = std::move(sequence_ids),
+                                 sequence_lengths = std::move(sequence_lengths),
+                                 source_token_starts =
+                                     std::move(source_token_starts),
+                                 destination_token_starts =
+                                     std::move(destination_token_starts),
+                                 op_name,
+                                 prepared_k, prepared_v, tokens_per_sequence,
+                                 producer_cuda_stream]() {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+
+            const auto* k_base =
+                static_cast<const std::byte*>(prepared_k.data_ptr());
+            const std::size_t k_token_bytes = geometry_.KTokenBytes();
+            const std::size_t k_seq_stride =
+                tokens_per_sequence * k_token_bytes;
+
+            const std::byte* v_base = nullptr;
+            std::size_t v_token_bytes = 0;
+            std::size_t v_seq_stride = 0;
+            if (prepared_v.has_value()) {
+                if constexpr (kHasVCache) {
+                    v_base =
+                        static_cast<const std::byte*>(prepared_v->data_ptr());
+                    v_token_bytes =
+                        geometry_.template VTokenBytes<kHasVCache>();
+                    v_seq_stride = tokens_per_sequence * v_token_bytes;
+                }
+            }
+
+            std::byte* host_base = backend_.DataBase();
+
+            for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
+                 ++batch_idx) {
+                const std::int64_t sequence_id = sequence_ids[batch_idx];
+                const auto pages = page_table_.Pages(sequence_id);
+                const std::size_t tokens_to_copy = ResolveSequenceLength(
+                    sequence_lengths, batch_idx, sequence_id,
+                    tokens_per_sequence, op_name);
+                if (tokens_to_copy == 0) {
+                    continue;
+                }
+
+                const std::size_t source_token_start =
+                    source_token_starts[batch_idx];
+                const std::size_t destination_token_start =
+                    destination_token_starts[batch_idx];
+                if (source_token_start + tokens_to_copy >
+                    tokens_per_sequence) {
+                    std::ostringstream oss;
+                    oss << op_name << ": source range exceeds tensor capacity "
+                        << "for sequence " << sequence_id
+                        << " (source_start=" << source_token_start
+                        << ", tokens=" << tokens_to_copy
+                        << ", tensor_tokens=" << tokens_per_sequence << ")";
+                    throw std::out_of_range(oss.str());
+                }
+
+                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
+                    page_table_.SharedPrefixTokens(sequence_id));
+                if (destination_token_start < shared_prefix_tokens) {
+                    std::ostringstream oss;
+                    oss << op_name << ": refusing to write into shared prefix "
+                        << "for sequence " << sequence_id
+                        << " (destination_start=" << destination_token_start
+                        << ", shared_prefix_tokens="
+                        << shared_prefix_tokens << ")";
+                    throw std::invalid_argument(oss.str());
+                }
+
+                geometry_.ValidatePageCapacity(
+                    pages, destination_token_start + tokens_to_copy, op_name);
+
+                const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
+                ForEachPageChunk(
+                    pages, destination_token_start, tokens_to_copy,
+                    [&](std::int32_t page_idx, std::size_t page_offset_tokens,
+                        std::size_t chunk_tokens,
+                        std::size_t relative_token_offset) {
+                        std::byte* dst = layout_.KPageAddress(
+                                             host_base, layer_idx, page_idx) +
+                                         page_offset_tokens * k_token_bytes;
+                        const std::byte* src =
+                            seq_k_src +
+                            (source_token_start + relative_token_offset) *
+                                k_token_bytes;
+                        EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                    });
+
+                if constexpr (kHasVCache) {
+                    if (v_base != nullptr) {
+                        const auto* seq_v_src =
+                            v_base + batch_idx * v_seq_stride;
+                        ForEachPageChunk(
+                            pages, destination_token_start, tokens_to_copy,
+                            [&](std::int32_t page_idx,
+                                std::size_t page_offset_tokens,
+                                std::size_t chunk_tokens,
+                                std::size_t relative_token_offset) {
+                                std::byte* dst =
+                                    layout_.template VPageAddress<>(
+                                        host_base, layer_idx, page_idx) +
+                                    page_offset_tokens * v_token_bytes;
+                                const std::byte* src =
+                                    seq_v_src +
+                                    (source_token_start +
+                                     relative_token_offset) *
+                                        v_token_bytes;
+                                EnqueueCopy(
+                                    src, dst, chunk_tokens * v_token_bytes,
+                                    CopyDirection::kDeviceToHost, cuda_stream);
+                            });
+                    }
+                }
+            }
+
+            this->SynchronizeWithEvent(cuda_stream);
         });
     }
 
@@ -1058,6 +1378,13 @@ class HostPagedKVWorkerView {
                 const std::size_t start_token = ResolveSequenceLength(
                     sequence_lengths, batch_idx, sequence_id, std::nullopt,
                     "AsyncAppendDecodeKVToHost");
+                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
+                    page_table_.SharedPrefixTokens(sequence_id));
+                if (start_token < shared_prefix_tokens) {
+                    throw std::runtime_error(
+                        "AsyncAppendDecodeKVToHost: refusing to write into "
+                        "shared prefix pages");
+                }
                 const auto pages = page_table_.Pages(sequence_id);
                 geometry_.ValidatePageCapacity(pages, start_token + 1,
                                                "AsyncAppendDecodeKVToHost");
@@ -1166,6 +1493,13 @@ class HostPagedKVWorkerView {
             const std::size_t start_token = ResolveSequenceLength(
                 sequence_lengths, b, sid, std::nullopt,
                 "AsyncAppendDecodeKVToHostBatchedKernel");
+            const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
+                page_table_.SharedPrefixTokens(sid));
+            if (start_token < shared_prefix_tokens) {
+                throw std::runtime_error(
+                    "AsyncAppendDecodeKVToHostBatchedKernel: refusing to write "
+                    "into shared prefix pages");
+            }
             const auto pages = page_table_.Pages(sid);
             geometry_.ValidatePageCapacity(
                 pages, start_token + 1,
@@ -1847,10 +2181,11 @@ class HostPagedKVWorkerView {
                                         ": device pointer tensor is null");
         }
         PageCopyPlan plan;
-        plan.host_sources.resize(total_entries);
-        plan.device_dests.resize(total_entries);
+        plan.host_sources.reserve(total_entries);
+        plan.device_dests.reserve(total_entries);
+        std::unordered_set<std::uintptr_t> seen_copies;
+        seen_copies.reserve(total_entries);
         auto&& provider = std::forward<HostPtrProvider>(host_ptr_provider);
-        std::size_t cursor = 0;
         for (std::size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
             const std::size_t layer_offset = layer_idx * row_stride;
             for (std::size_t seq_idx = 0; seq_idx < page_table.size();
@@ -1886,17 +2221,18 @@ class HostPagedKVWorkerView {
                         static_cast<uint8_t*>(provider(layer_idx, page_idx));
                     auto* device_ptr = reinterpret_cast<uint8_t*>(
                         static_cast<std::uintptr_t>(dest_raw));
-                    plan.host_sources[cursor] = host_ptr;
-                    plan.device_dests[cursor] = device_ptr;
-                    ++cursor;
+                    const auto host_key =
+                        reinterpret_cast<std::uintptr_t>(host_ptr);
+                    const auto device_key =
+                        reinterpret_cast<std::uintptr_t>(device_ptr);
+                    const auto copy_key =
+                        HashCombine(host_key, device_key);
+                    if (seen_copies.insert(copy_key).second) {
+                        plan.host_sources.emplace_back(host_ptr);
+                        plan.device_dests.emplace_back(device_ptr);
+                    }
                 }
             }
-        }
-        if (cursor != total_entries) {
-            std::ostringstream oss;
-            oss << op_name << ": expected " << total_entries
-                << " entries but prepared " << cursor;
-            throw std::logic_error(oss.str());
         }
         return plan;
     }
@@ -2302,6 +2638,7 @@ class HostPagedKVWorkerView {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
+    HostPrefixCache prefix_cache_;
 
     // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
     // pointer arrays (src + dst) uploaded once per batched call. Sized

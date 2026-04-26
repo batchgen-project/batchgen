@@ -97,6 +97,7 @@ class ServerArgs:
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
     host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
     enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
+    enable_prefix_reuse: bool = False  # Opt-in page-level prefix KV reuse
     adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
     adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
     adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
@@ -375,6 +376,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="[Deprecated] Host KV eviction is now always enabled. This flag is ignored.",
     )
     parser.add_argument(
+        "--enable-prefix-reuse",
+        action="store_true",
+        default=False,
+        help="Enable experimental page-level prefix KV reuse. Currently gated to GPT-OSS/GQA.",
+    )
+    parser.add_argument(
         "--adaptive-chunk",
         action="store_true",
         default=True,
@@ -489,6 +496,12 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("host_kv_chunk_size must be positive")
     if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
         raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
+    if args.enable_prefix_reuse:
+        model_lower = args.model.lower()
+        if "gpt-oss" not in model_lower:
+            raise ValueError(
+                "--enable-prefix-reuse is currently supported only for GPT-OSS/GQA models"
+            )
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
     if args.adaptive_chunk_max < args.adaptive_chunk_min:
@@ -549,6 +562,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
         enable_host_kv_eviction=parsed.enable_host_kv_eviction,
+        enable_prefix_reuse=parsed.enable_prefix_reuse,
         adaptive_chunk=not getattr(parsed, 'no_adaptive_chunk', False),
         adaptive_chunk_min=parsed.adaptive_chunk_min,
         adaptive_chunk_max=parsed.adaptive_chunk_max,

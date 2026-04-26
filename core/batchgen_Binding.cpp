@@ -126,6 +126,12 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
               return self.BuildPageTable(sequence_ids);
            },
            py::arg("sequence_ids"))
+       .def("shared_prefix_pages", &WorkerView::SharedPrefixPages,
+            py::arg("sequence_id"))
+       .def("private_pages", &WorkerView::PrivatePages,
+            py::arg("sequence_id"))
+       .def("shared_prefix_tokens", &WorkerView::SharedPrefixTokens,
+            py::arg("sequence_id"))
        .def("register_sequences", &WorkerView::RegisterSequences,
            py::arg("sequence_ids"))
        .def("unregister_sequence", &WorkerView::UnregisterSequence,
@@ -147,6 +153,12 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
            py::arg("sequence_lengths"))
+       .def("async_offload_layer_kv_to_host_with_offsets",
+           &WorkerView::AsyncOffloadLayerKVToHostWithOffsets,
+           py::arg("layer_idx"), py::arg("sequence_ids"),
+           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+           py::arg("sequence_lengths"), py::arg("source_token_starts"),
+           py::arg("destination_token_starts"))
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
@@ -229,6 +241,57 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 return self.AllocatePagesForSequences(sequence_ids,
                                                       num_tokens);
             })
+        .def(
+            "allocate_pages_for_sequences_with_prefix",
+            [](WorkerView& self, py::list requests_py) {
+                std::vector<kv::PrefixAllocationRequest> requests;
+                requests.reserve(py::len(requests_py));
+                for (auto item : requests_py) {
+                    auto tup = py::cast<py::tuple>(item);
+                    if (py::len(tup) != 3 && py::len(tup) != 4) {
+                        throw std::invalid_argument(
+                            "prefix allocation requests must be "
+                            "(sequence_id, token_ids, capacity_tokens[, "
+                            "namespace_hash])");
+                    }
+                    kv::PrefixAllocationRequest request;
+                    request.sequence_id = py::cast<std::int64_t>(tup[0]);
+                    request.token_ids =
+                        py::cast<std::vector<std::int64_t>>(tup[1]);
+                    request.capacity_tokens = py::cast<std::size_t>(tup[2]);
+                    if (py::len(tup) == 4) {
+                        request.namespace_hash =
+                            py::cast<std::uint64_t>(tup[3]);
+                    }
+                    requests.emplace_back(std::move(request));
+                }
+                auto results =
+                    self.AllocatePagesForSequencesWithPrefix(requests);
+                py::list out;
+                for (const auto& result : results) {
+                    py::dict item;
+                    item["sequence_id"] = result.sequence_id;
+                    item["shared_prefix_pages"] = result.shared_prefix_pages;
+                    item["private_pages"] = result.private_pages;
+                    item["shared_prefix_tokens"] =
+                        result.shared_prefix_tokens;
+                    item["private_start_token"] = result.private_start_token;
+                    item["logical_page_count"] = result.logical_page_count;
+                    item["physical_pages_allocated"] =
+                        result.physical_pages_allocated;
+                    item["full_hit"] = result.full_hit;
+                    item["miss_reason"] = result.miss_reason;
+                    out.append(std::move(item));
+                }
+                return out;
+            },
+            py::arg("requests"))
+        .def("commit_sequence_prefix_pages",
+             &WorkerView::CommitSequencePrefixPages,
+             py::arg("sequence_id"), py::arg("token_ids"),
+             py::arg("namespace_hash") = 0)
+        .def("get_prefix_cache_stats", &WorkerView::GetPrefixCacheStats)
+        .def("clear_prefix_cache", &WorkerView::ClearPrefixCache)
         .def("grow_sequence_pages",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t num_pages) {
@@ -394,10 +457,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("sequence_table_capacity",
                        &kv::HostPagedKVStats::sequence_table_capacity)
         .def_readwrite("total_bytes", &kv::HostPagedKVStats::total_bytes)
+        .def_readwrite("num_sequence_ref_pages",
+                       &kv::HostPagedKVStats::num_sequence_ref_pages)
+        .def_readwrite("num_prefix_pinned_pages",
+                       &kv::HostPagedKVStats::num_prefix_pinned_pages)
+        .def_readwrite("num_pages_with_sequence_refs",
+                       &kv::HostPagedKVStats::num_pages_with_sequence_refs)
+        .def_readwrite("num_pages_with_prefix_pins",
+                       &kv::HostPagedKVStats::num_pages_with_prefix_pins)
+        .def_readwrite("sequence_ref_increments",
+                       &kv::HostPagedKVStats::sequence_ref_increments)
+        .def_readwrite("sequence_ref_decrements",
+                       &kv::HostPagedKVStats::sequence_ref_decrements)
+        .def_readwrite("prefix_pin_increments",
+                       &kv::HostPagedKVStats::prefix_pin_increments)
+        .def_readwrite("prefix_pin_decrements",
+                       &kv::HostPagedKVStats::prefix_pin_decrements)
         .def("__repr__",
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
+
+    py::class_<kv::PrefixCacheStats>(m, "PrefixCacheStats")
+        .def(py::init<>())
+        .def_readwrite("entries", &kv::PrefixCacheStats::entries)
+        .def_readwrite("lookup_hits", &kv::PrefixCacheStats::lookup_hits)
+        .def_readwrite("lookup_misses", &kv::PrefixCacheStats::lookup_misses)
+        .def_readwrite("shared_pages_attached",
+                       &kv::PrefixCacheStats::shared_pages_attached)
+        .def_readwrite("prefix_pin_increments",
+                       &kv::PrefixCacheStats::prefix_pin_increments)
+        .def_readwrite("prefix_pin_decrements",
+                       &kv::PrefixCacheStats::prefix_pin_decrements)
+        .def_readwrite("host_pages_saved",
+                       &kv::PrefixCacheStats::host_pages_saved);
 
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)
