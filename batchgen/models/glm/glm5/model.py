@@ -1076,6 +1076,7 @@ class Glm5MoE(nn.Module):
     _warned_k25_path = False
     _warned_gemm_3d = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
+    _warned_rt_check: bool = False  # one-time probe: log rank_counts state at first _forward_decode_3d invocation
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
         super().__init__()
@@ -1602,6 +1603,23 @@ class Glm5MoE(nn.Module):
             # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
             # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
             rank_counts = Glm5MoE._rank_token_counts
+            # One-time probe: prove the masking branch is recorded by capture.
+            # Logged at the very first invocation per process (capture or eager).
+            # No `.item()` so capture-safe.
+            if not Glm5MoE._warned_rt_check:
+                Glm5MoE._warned_rt_check = True
+                _is_capturing = torch.cuda.is_current_stream_capturing()
+                if rank_counts is None:
+                    logging.warning(
+                        f"[RT_CHECK] L{li} _forward_decode_3d: rank_counts=NONE "
+                        f"capturing={_is_capturing} ntp={ntp} num_global={num_global}"
+                    )
+                else:
+                    logging.warning(
+                        f"[RT_CHECK] L{li} _forward_decode_3d: rank_counts shape={tuple(rank_counts.shape)} "
+                        f"dtype={rank_counts.dtype} device={rank_counts.device} "
+                        f"capturing={_is_capturing} ntp={ntp} num_global={num_global}"
+                    )
             if rank_counts is not None:
                 positions = torch.arange(num_global, device=self.device)
                 rank_ids = positions // ntp

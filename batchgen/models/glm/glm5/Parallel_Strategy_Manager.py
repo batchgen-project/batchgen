@@ -299,7 +299,26 @@ class GLM5ParallelStrategyManager:
             Glm5MoE._rank_token_counts = counts.to(
                 dtype=torch.int64, device=counts.device,
             ).clone()
+            # One-time probe: prove this lazy-init path took
+            if not getattr(GLM5ParallelStrategyManager, '_warned_set_rt', False):
+                GLM5ParallelStrategyManager._warned_set_rt = True
+                logging.warning(
+                    f"[RT_CHECK] set_rank_token_counts LAZY-INIT path: "
+                    f"buf_id={id(Glm5MoE._rank_token_counts)} "
+                    f"counts shape={tuple(counts.shape)} dtype={counts.dtype}"
+                )
         else:
+            # One-time probe BEFORE the in-place op: confirm we're hitting
+            # the in-place branch and that the buffer pointer is stable.
+            if not getattr(GLM5ParallelStrategyManager, '_warned_set_rt', False):
+                GLM5ParallelStrategyManager._warned_set_rt = True
+                logging.warning(
+                    f"[RT_CHECK] set_rank_token_counts IN-PLACE: "
+                    f"buf_id={id(Glm5MoE._rank_token_counts)} "
+                    f"buf_shape={tuple(Glm5MoE._rank_token_counts.shape)} "
+                    f"buf_dtype={Glm5MoE._rank_token_counts.dtype} "
+                    f"counts_shape={tuple(counts.shape)} counts_dtype={counts.dtype}"
+                )
             Glm5MoE._rank_token_counts.copy_(counts.to(
                 dtype=Glm5MoE._rank_token_counts.dtype,
                 device=Glm5MoE._rank_token_counts.device,
