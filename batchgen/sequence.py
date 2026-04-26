@@ -95,6 +95,7 @@ class SequenceEntry:
         'batch_id',              # Which batch this sequence belongs to (for result routing)
         'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
         'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
+        'sampling_params',       # Per-request sampling params for this sequence
         # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
         '_lifespan_log',   # List[SeqEventRecord], ring buffer
         '_lifespan_idx',   # int, next write position
@@ -167,6 +168,7 @@ class SequenceEntry:
         self.batch_id: Optional[str] = None
         self.pool_slot_index: int = -1
         self.priority: int = 0  # 0=NORMAL, 1=HIGH
+        self.sampling_params: Optional[Dict] = None
 
         # Lifespan monitoring
         self._lifespan_log: list = []

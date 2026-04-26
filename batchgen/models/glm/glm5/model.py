@@ -541,9 +541,7 @@ class Glm5Indexer(nn.Module):
         # Q·K^T: [B, H, T] = einsum('bhd,btd->bht', q, k)
         scores = torch.einsum("bhd,btd->bht", q_f, k_f) * self.softmax_scale
 
-        # Mask invalid positions BEFORE ReLU so they become 0 after F.relu(-inf).
-        # Using a very-negative (not -inf) sentinel would still pass ReLU as 0; -inf
-        # is the safe choice because subsequent ops are sums (not softmaxes).
+        # Mask invalid positions before ReLU to keep them out of per-head scoring.
         position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
         mask = position_indices >= cache_seqlens.unsqueeze(1)    # [B, T]
         scores = scores.masked_fill(mask.unsqueeze(1), float("-inf"))
@@ -557,6 +555,9 @@ class Glm5Indexer(nn.Module):
 
         # Weighted sum over heads: [B, T]
         aggregated = torch.einsum("bht,bh->bt", scores, head_gates)
+        # Head gates can be negative, so invalid positions that became zero after
+        # ReLU must be masked again before top-k. This matches the fused path.
+        aggregated = aggregated.masked_fill(mask, float("-inf"))
 
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
