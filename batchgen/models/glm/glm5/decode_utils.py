@@ -107,10 +107,18 @@ def build_flat_paged_gather_indices(
     """Flatten paged block-table lookups into token gather indices."""
     device = block_table.device
     batch_size = block_table.shape[0]
+    max_pages = block_table.shape[1]
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    required_pages = (int(max_seqlen) + int(page_size) - 1) // int(page_size)
+    if required_pages > max_pages:
+        raise RuntimeError(
+            "GLM-5 paged gather block-table capacity mismatch: "
+            f"max_seqlen={max_seqlen} requires {required_pages} pages, "
+            f"but block_table has {max_pages} columns"
+        )
     token_positions = torch.arange(max_seqlen, device=device)
     page_indices = (token_positions // page_size).unsqueeze(0).expand(batch_size, -1)
     page_offsets = token_positions % page_size
-    max_pages = block_table.shape[1]
-    page_indices_clamped = page_indices.clamp(max=max_pages - 1)
-    physical_pages = torch.gather(block_table, 1, page_indices_clamped)
+    physical_pages = torch.gather(block_table, 1, page_indices)
     return (physical_pages * page_size + page_offsets.unsqueeze(0)).reshape(-1).long()
