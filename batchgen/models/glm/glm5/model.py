@@ -638,8 +638,8 @@ class Glm5Indexer(nn.Module):
                 cache_seqlens=cache_seqlens.int(),
                 wq_b_weights=self._fused_score_weights,
                 weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
-                cos_table=cos.to(torch.bfloat16),
-                sin_table=sin.to(torch.bfloat16),
+                cos_table=cos.float(),
+                sin_table=sin.float(),
                 positions=positions,
                 module=self._fused_score_module,
                 n_heads=self.index_n_heads,
@@ -653,9 +653,9 @@ class Glm5Indexer(nn.Module):
                 self._warned_fused_score_fallback = True
                 logging.warning(
                     f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
-                    "falling back to PyTorch score_and_select"
+                    "falling back to PyTorch score_and_select_relu_gated"
                 )
-            return self.score_and_select(
+            return self.score_and_select_relu_gated(
                 q_a, hidden_states, gathered_k, cache_seqlens,
                 positions=positions, max_seqlen=max_seqlen,
             )
@@ -1634,11 +1634,12 @@ class Glm5MoE(nn.Module):
                 rank_ids = positions // ntp
                 local_pos = positions % ntp
                 max_valid = rank_counts[rank_ids]
-                padding_mask = local_pos >= max_valid
-                # Unconditional mask application; skipping the .any() gate removes
-                # a per-layer D2H sync and the fancy-index op is a no-op when empty.
-                topk_idx[padding_mask] = -1
-                topk_weight[padding_mask] = 0.0
+                row_valid = (local_pos < max_valid).unsqueeze(1)
+                # Use fixed-shape elementwise masking so CUDA graph replay re-reads
+                # rank_counts values instead of baking in capture-time all-valid
+                # boolean-index cardinality.
+                topk_idx = torch.where(row_valid, topk_idx, -1)
+                topk_weight = torch.where(row_valid, topk_weight, 0.0)
 
         # 3) 3D dispatch
         with (dt.timed("dispatch_3d", li) if dt else _nullctx()):
