@@ -1621,10 +1621,21 @@ class BatchGenWorker:
 			True if allocation succeeded, False otherwise.
 		"""
 		if not local_sequence_ids:
+			if load_from_host:
+				self._wait_async_kv_task_distributed(
+					None,
+					"during synchronous host KV load",
+				)
 			return True
 		
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
+			if load_from_host:
+				self._wait_async_kv_task_distributed(
+					None,
+					"during synchronous host KV load",
+					pre_errors=["RuntimeError: GPU KV manager is not initialized"],
+				)
 			return False
 		
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
@@ -1663,10 +1674,30 @@ class BatchGenWorker:
 				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
 				f"only {free_pages} free"
 			)
+			if load_from_host:
+				self._wait_async_kv_task_distributed(
+					None,
+					"during synchronous host KV load",
+					pre_errors=[
+						f"RuntimeError: insufficient GPU KV pages: need {total_pages}, free {free_pages}"
+					],
+				)
 			# Don't set gpu_pages_allocated since we're failing
 			return False
 		
-		# Now safe to update tracking (allocation will succeed)
+		try:
+			manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
+			manager.rebuild_page_table(global_ids)
+		except Exception as e:
+			if load_from_host:
+				self._wait_async_kv_task_distributed(
+					None,
+					"during synchronous host KV load",
+					pre_errors=[f"{type(e).__name__}: {e}"],
+				)
+			return False
+
+		# Now safe to update tracking.
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
@@ -1674,9 +1705,6 @@ class BatchGenWorker:
 			seq.gpu_pages_allocated = pages
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
-		
-		manager.allocate_pages_for_sequences(global_ids, pages_per_seq)
-		manager.rebuild_page_table(global_ids)
 
 		if load_from_host:
 			self._load_host_kv_to_gpu(manager, global_ids)
@@ -1869,6 +1897,8 @@ class BatchGenWorker:
 			return
 
 		sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
+		if sequence_ids is not None and sequence_lengths is not None:
+			self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
 
 		# ONE sync for ALL layers across BOTH caches — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
@@ -1966,10 +1996,38 @@ class BatchGenWorker:
 
 		# Throttle: prevent thread exhaustion from std::async
 		if len(self._pending_kv_append_tasks) >= 256:
-			self._wait_pending_kv_append_tasks()
+			self._wait_pending_kv_append_tasks(defer_errors=True)
 
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
+
+	def _assert_host_kv_append_capacity(
+		self,
+		sequence_ids: List[int],
+		sequence_lengths: List[int],
+	) -> None:
+		if len(sequence_ids) != len(sequence_lengths):
+			raise RuntimeError(
+				f"host KV append metadata mismatch: ids={len(sequence_ids)} lengths={len(sequence_lengths)}"
+			)
+		if self.global_batch is None:
+			return
+		by_gid = {seq.global_idx: seq for seq in self.global_batch}
+		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
+			seq = by_gid.get(int(global_idx))
+			if seq is None:
+				raise RuntimeError(f"host KV append for unknown global_idx={global_idx}")
+			if int(write_pos) < 0:
+				raise RuntimeError(
+					f"host KV append negative write position for gid={global_idx}: {write_pos}"
+				)
+			if int(write_pos) >= int(seq.host_token_capacity):
+				raise RuntimeError(
+					f"host KV append would exceed capacity for gid={global_idx}: "
+					f"write_pos={write_pos}, host_token_capacity={seq.host_token_capacity}, "
+					f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
+					f"status={seq.status.name}"
+				)
 
 	def _append_decode_kv_to_host_async(
 		self,
@@ -2026,6 +2084,8 @@ class BatchGenWorker:
 					'decoded_len': seq.decoded_length,
 					'write_pos': write_pos,
 				})
+
+		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
 		
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
 		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
@@ -2089,7 +2149,7 @@ class BatchGenWorker:
 		# Wait and clear when threshold is reached to avoid exhausting system thread limits.
 		MAX_PENDING_KV_TASKS = 256
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+			self._wait_pending_kv_append_tasks(defer_errors=True)
 
 	def _append_decode_kv_to_host_aux_async(
 		self,
@@ -2116,6 +2176,8 @@ class BatchGenWorker:
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
 
+		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
+
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
 
@@ -2137,7 +2199,7 @@ class BatchGenWorker:
 
 		MAX_PENDING_KV_TASKS = 256
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+			self._wait_pending_kv_append_tasks(defer_errors=True)
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
@@ -2430,6 +2492,10 @@ class BatchGenWorker:
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
 		"""Allocate GPU KV pages and load host-resident KV for the batch."""
 		if not local_sequence_ids:
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+			)
 			return
 		
 		# Convert local indices to global_idx (consistent with host KV registration)
@@ -2532,7 +2598,12 @@ class BatchGenWorker:
 			else getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		)
 		if worker_view is None:
-			raise RuntimeError("Host paged KV worker view is not bound to the core engine")
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+				pre_errors=["RuntimeError: Host paged KV worker view is not bound to the core engine"],
+			)
+			return
 		
 		# DIAGNOSTIC: Check if these are resuming sequences (have decoded tokens)
 		resuming_seq_info = []
@@ -2554,14 +2625,22 @@ class BatchGenWorker:
 			)
 		
 		if isinstance(manager, DualKVCacheCoordinator):
-			pointers = self._prepare_dual_kv_load_pointers(
-				manager,
-				global_sequence_ids,
-				existing_global_ids=global_sequence_ids,
+			load_task = None
+			setup_errors = []
+			try:
+				pointers = self._prepare_dual_kv_load_pointers(
+					manager,
+					global_sequence_ids,
+					existing_global_ids=global_sequence_ids,
+				)
+				load_task = self._launch_dual_host_kv_load(pointers)
+			except Exception as e:
+				setup_errors.append(f"{type(e).__name__}: {e}")
+			self._wait_async_kv_task_distributed(
+				load_task,
+				"during synchronous dual host KV load",
+				pre_errors=setup_errors,
 			)
-			load_task = self._launch_dual_host_kv_load(pointers)
-			load_task.wait()
-			torch.cuda.synchronize(self.torch_device)
 			load_duration = time.perf_counter() - copy_start
 			logging.debug(
 				"Rank %s Loaded dual host KV for %d sequences into GPU cache in %.3fs",
@@ -2569,26 +2648,33 @@ class BatchGenWorker:
 			)
 			return
 
-		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-		active_sequence_page_counts = manager.export_active_sequence_page_counts()
+		load_task = None
+		setup_errors = []
+		try:
+			sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
+			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+			active_sequence_page_counts = manager.export_active_sequence_page_counts()
 
-		logging.debug(
-			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
-			f"{len(global_sequence_ids)} sequences..."
-		)
+			logging.debug(
+				f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
+				f"{len(global_sequence_ids)} sequences..."
+			)
 
-		load_task = worker_view.async_load_layer_paged_kv_to_device(
-			sequence_ids=sequence_tensor,
-			active_page_counts=active_sequence_page_counts,
-			k_device_ptrs=k_ptrs,
-			v_device_ptrs=v_ptrs,
-		)
+			load_task = worker_view.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_tensor,
+				active_page_counts=active_sequence_page_counts,
+				k_device_ptrs=k_ptrs,
+				v_device_ptrs=v_ptrs,
+			)
+		except Exception as e:
+			setup_errors.append(f"{type(e).__name__}: {e}")
 		
-		# Wait for load to complete (this is synchronous load path used during prefill)
-		load_task.wait()
-		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
-		torch.cuda.synchronize(self.torch_device)
+		# Wait for load to complete (this is synchronous load path used during prefill).
+		self._wait_async_kv_task_distributed(
+			load_task,
+			"during synchronous host KV load",
+			pre_errors=setup_errors,
+		)
 
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
@@ -2598,6 +2684,8 @@ class BatchGenWorker:
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
+		if getattr(self, "_pending_kv_append_tasks", None):
+			self._wait_pending_kv_append_tasks(defer_errors=True)
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None or not local_sequence_ids:
 			return
@@ -2628,6 +2716,7 @@ class BatchGenWorker:
 
 	def _destroy_gpu_paged_kv_cache(self, *, empty_cuda_cache: bool = False) -> None:
 		"""Destroy the GPU paged KV cache manager if it is present."""
+		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			return
@@ -3069,6 +3158,12 @@ class BatchGenWorker:
 		# We create it here so all ranks participate, not just sender/receiver.
 		self._get_or_create_gloo_group()
 		dist.barrier()  # Ensure all ranks have created the group
+
+		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			raise RuntimeError(
+				"DSA dual host KV migration is not implemented safely; "
+				"refusing primary-only migration"
+			)
 
 		# Group migrations into parallel rounds
 		# Each round contains migrations that can execute concurrently (no shared ranks)
@@ -3754,6 +3849,7 @@ class BatchGenWorker:
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
+					'rep_detected': getattr(seq, '_rep_detected', False),
 					'prompt_length': seq.prompt_length,  # Include for validation
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
@@ -3778,6 +3874,8 @@ class BatchGenWorker:
 							seq.current_context_length = state['current_context_length']
 							seq.gpu_pages_allocated = state['gpu_pages_allocated']
 							seq.eos_reached = state['eos_reached']
+							if state.get('rep_detected', False):
+								seq._rep_detected = True
 							# Sync prompt_length too. For EVICTED sequences the
 							# owner rewrites prompt_length at eviction time to
 							# the reconstructed re-entry length; non-owners must
@@ -4381,6 +4479,8 @@ class BatchGenWorker:
 		if not uuids:
 			return
 
+		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+
 		if self.rank == 0:
 			logging.info(
 				f"[WATERMARK] Putting {len(uuids)} sequences ON_HOLD"
@@ -4976,9 +5076,9 @@ class BatchGenWorker:
 		# Get local indices for sequences belonging to THIS rank
 		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
 		
-		if new_local_indices:
-			# Allocate and load (without final rebuild)
-			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
+		# Allocate and load (without final rebuild). All ranks enter so the
+		# synchronous host-load wait has matching collective participation.
+		self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
 
 		# Update status AFTER load completes
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
@@ -5034,11 +5134,20 @@ class BatchGenWorker:
 		Allocates GPU pages using TWO-PAGE BUFFER strategy and triggers blocking load from Host.
 		"""
 		if not local_sequence_ids:
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+			)
 			return
 		
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
 			logging.warning("GPU KV manager not initialized, cannot load new sequences")
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+				pre_errors=["RuntimeError: GPU KV manager is not initialized"],
+			)
 			return
 		
 		global_ids = self._local_indices_to_global_seq_ids(local_sequence_ids)
@@ -5070,13 +5179,28 @@ class BatchGenWorker:
 				f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages_needed} pages, "
 				f"only {free_pages} free. Skipping load for {len(global_ids)} sequences."
 			)
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+				pre_errors=[
+					f"RuntimeError: insufficient GPU KV pages: need {total_pages_needed}, free {free_pages}"
+				],
+			)
 			return
 		
-		# 1. Allocate GPU Pages
-		manager.allocate_pages_for_sequences(global_ids, tokens)
+		try:
+			# 1. Allocate GPU Pages
+			manager.allocate_pages_for_sequences(global_ids, tokens)
 
-		# 2. Rebuild Page Table
-		manager.rebuild_page_table(global_ids)
+			# 2. Rebuild Page Table
+			manager.rebuild_page_table(global_ids)
+		except Exception as e:
+			self._wait_async_kv_task_distributed(
+				None,
+				"during synchronous host KV load",
+				pre_errors=[f"{type(e).__name__}: {e}"],
+			)
+			return
 
 		# 3. Load Host -> GPU (BLOCKING)
 		self._load_host_kv_to_gpu(manager, global_ids)
@@ -5552,32 +5676,41 @@ class BatchGenWorker:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
 
-						# CRITICAL: Wait for all async KV offloads to complete before decode.
-						# async_offload_layer_kv_to_host returns a future backed by a
-						# std::async CPU thread that issues cudaMemcpyAsync on a d2h
-						# stream. Discarding the future (fire-and-forget) is unsafe —
-						# the CPU thread may not have run yet, so torch.cuda.synchronize
-						# would have nothing to wait for. Wait on every captured future
-						# first, then sync the device to flush the d2h stream.
-						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-						pending = _AWB.pending_prefill_offload_tasks
-						if pending:
-							for _t in pending:
-								try:
-									_t.wait()
-								except Exception as _e:
-									logging.warning(f"prefill offload task wait failed: {_e}")
-							if self.rank == 0:
-								logging.info(
-									f"[PREFILL_SYNC] waited on {len(pending)} async KV offload tasks"
-								)
-							pending.clear()
-						torch.cuda.synchronize(self.torch_device)
-						# Release the pinned source tensors only AFTER wait() +
-						# device sync confirm the d2h memcpy has fully retired.
-						# Mirrors decode-side `_pending_kv_append_tensors` cleanup
-						# in `_wait_pending_kv_append_tasks`.
-						_AWB.pending_prefill_offload_tensors.clear()
+					# CRITICAL: Wait for all async KV offloads to complete before decode.
+					# All ranks participate in the error sync even when a rank had no local
+					# prefill work; otherwise one failed D2H task can strand peers at the
+					# following barrier.
+					from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+					pending = _AWB.pending_prefill_offload_tasks
+					prefill_wait_errors = []
+					for _t in pending:
+						try:
+							_t.wait()
+						except Exception as _e:
+							prefill_wait_errors.append(f"{type(_e).__name__}: {_e}")
+					if pending and not prefill_wait_errors:
+						try:
+							torch.cuda.synchronize(self.torch_device)
+						except Exception as _e:
+							prefill_wait_errors.append(f"{type(_e).__name__}: {_e}")
+					pending_count = len(pending)
+					pending.clear()
+					_AWB.pending_prefill_offload_tensors.clear()
+					error_payload = {
+						"rank": self.rank,
+						"errors": prefill_wait_errors,
+					} if prefill_wait_errors else None
+					all_prefill_errors = [None] * self.world_size
+					dist.all_gather_object(all_prefill_errors, error_payload)
+					flat_prefill_errors = [e for e in all_prefill_errors if e is not None]
+					if self.rank == 0 and pending_count:
+						logging.info(
+							f"[PREFILL_SYNC] waited on {pending_count} async KV offload tasks"
+						)
+					if flat_prefill_errors:
+						raise RuntimeError(
+							f"prefill KV offload failed on at least one rank: {flat_prefill_errors[:8]}"
+						)
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -5946,8 +6079,7 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank {self.rank}: Flushing {len(self._pending_kv_append_tasks)} pending KV append tasks before prefill config"
 			)
-			self._wait_pending_kv_append_tasks()
-			torch.cuda.synchronize(self.torch_device)
+		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
@@ -6408,32 +6540,33 @@ class BatchGenWorker:
 			"Ensure _init_gpu_kv_with_actual_size() was called first."
 		)
 
-		# Allocate GPU KV for sequences
-		if local_decode_indices:
-			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			if alloc_ok:
-				# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
-				# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
-				# Keep these for safety / idempotence.
-				for local_idx in local_decode_indices:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					# Mark initial reservation done
-					seq.mark_initial_gpu_reservation_done()
-					self._sequences_with_gpu_kv.add(uuid)
-			else:
-				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
-				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
-				# do NOT add these sequences to tracking. Otherwise subsequent
-				# rebuild_page_table() calls will crash with KeyError because the
-				# sequences exist in _sequences_with_gpu_kv / batch but were never
-				# registered in gpu_manager._sequences.
-				logging.error(
-					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
-					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
-				)
-				local_decode_indices.clear()
+		# Allocate/load GPU KV on all ranks so synchronous host-load error
+		# synchronization has matching collective participation.
+		alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
+		if alloc_ok:
+			# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
+			# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
+			# Keep these for safety / idempotence.
+			for local_idx in local_decode_indices:
+				uuid = self._local_to_uuid_map[local_idx]
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
+				# Mark initial reservation done
+				seq.mark_initial_gpu_reservation_done()
+				self._sequences_with_gpu_kv.add(uuid)
+		else:
+			# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
+			# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
+			# fail closed before any sequence is allowed to remain globally
+			# IN_DECODE without owner-local GPU pages.
+			logging.error(
+				f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
+				f"sequences."
+			)
+			raise RuntimeError(
+				f"Rank {self.rank}: GPU KV allocation failed during decode config; "
+				"refusing to enter decode with unloaded IN_DECODE sequences"
+			)
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
@@ -6537,8 +6670,7 @@ class BatchGenWorker:
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
-		if new_local_indices:
-			self._allocate_gpu_kv_two_page_buffer(new_local_indices, load_from_host=True)
+		self._allocate_gpu_kv_two_page_buffer(new_local_indices, load_from_host=True)
 		
 		# Step 5: Update status
 		self._update_batch_status(new_uuids, SequenceStatus.IN_DECODE)
@@ -7041,6 +7173,8 @@ class BatchGenWorker:
 		global_seq_state: Dict[str, Dict],
 		global_candidate_info: Dict[str, Dict],
 		per_rank_free: List[int],
+		per_node_host_free: List[int],
+		per_node_host_total: List[int],
 		chunk_size: int,
 		worker_view: Optional[object],
 	) -> 'BoundaryDecisions':
@@ -7061,46 +7195,60 @@ class BatchGenWorker:
 			else:
 				active_uuids.append(uuid)
 
-		# Host KV growth decisions
-		host_growth_uuids = []
-		host_growth_pages_list = []
-		total_growth_needed = 0
+		num_nodes = max(1, len(per_node_host_free))
+		host_growth_requests = []
+		total_growth_by_node = [0] * num_nodes
 		for uuid in active_uuids:
 			state = global_seq_state.get(uuid)
 			if state and state.get('needs_host_growth'):
 				growth_pages = state.get('host_growth_pages', 0)
 				if growth_pages > 0:
-					host_growth_uuids.append(uuid)
-					host_growth_pages_list.append(growth_pages)
-					total_growth_needed += growth_pages
+					node = self._get_node_for_rank(state['assigned_rank'])
+					host_growth_requests.append((uuid, growth_pages, node))
+					total_growth_by_node[node] += growth_pages
 
-		growth_feasible = False
-		if total_growth_needed > 0 and worker_view is not None:
-			host_stats = worker_view.get_stats()
-			safety_margin = int(host_stats.num_total_pages * 0.05)
-			growth_feasible = total_growth_needed <= (host_stats.num_free_pages - safety_margin)
-			if not growth_feasible:
-				logging.warning(
-					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
-					f"but only {host_stats.num_free_pages} free "
-					f"({safety_margin} reserved). Will rely on eviction or sequence completions to free pages."
-				)
+		host_growth_uuids = []
+		host_growth_pages_list = []
+		forced_host_evictions = []
+		growth_feasible_by_node = [False] * num_nodes
+		if worker_view is not None:
+			for node in range(num_nodes):
+				total = per_node_host_total[node] if node < len(per_node_host_total) else 0
+				free = per_node_host_free[node] if node < len(per_node_host_free) else 0
+				safety_margin = int(total * 0.05)
+				growth_feasible_by_node[node] = total_growth_by_node[node] <= max(0, free - safety_margin)
+				if total_growth_by_node[node] > 0 and not growth_feasible_by_node[node]:
+					logging.warning(
+						f"[HOST_KV_GROWTH] Node {node} cannot grow {total_growth_by_node[node]} pages "
+						f"with free={free}, safety={safety_margin}; evicting growth-needed active sequences"
+					)
+		for uuid, growth_pages, node in host_growth_requests:
+			if growth_feasible_by_node[node]:
+				host_growth_uuids.append(uuid)
+				host_growth_pages_list.append(growth_pages)
+			else:
+				forced_host_evictions.append(uuid)
+
+		growth_feasible = bool(host_growth_uuids) or not host_growth_requests
 
 		# Host KV eviction decisions
-		host_evicted_uuids = []
-		decode_after_eviction = list(active_uuids)
+		host_evicted_uuids = list(dict.fromkeys(forced_host_evictions))
 		if self.enable_host_kv_eviction and active_uuids and worker_view is not None:
-			host_stats = worker_view.get_stats()
-			total_pages = host_stats.num_total_pages
-			free_pages = host_stats.num_free_pages
-			free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+			completed_set = set(completed_uuids)
+			already_evicted = set(host_evicted_uuids)
+			for node in range(num_nodes):
+				total_pages = per_node_host_total[node] if node < len(per_node_host_total) else 0
+				free_pages = per_node_host_free[node] if node < len(per_node_host_free) else 0
+				free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+				if free_pct >= self.host_kv_eviction_watermark:
+					continue
 
-			if free_pct < self.host_kv_eviction_watermark:
 				eviction_candidates = []
-				completed_set = set(completed_uuids)
 				for uuid in active_uuids:
+					if uuid in completed_set or uuid in already_evicted:
+						continue
 					state = global_seq_state.get(uuid)
-					if state and uuid not in completed_set:
+					if state and self._get_node_for_rank(state['assigned_rank']) == node:
 						seq = self.global_batch.get_sequence(uuid)
 						eviction_candidates.append((uuid, {
 							'decoded_length': state['decoded_length'],
@@ -7113,14 +7261,16 @@ class BatchGenWorker:
 				pages_to_free = max(0, target_free - free_pages)
 
 				if pages_to_free > 0 and eviction_candidates:
-					host_evicted_uuids, _ = select_host_kv_eviction(
+					node_evicted, _ = select_host_kv_eviction(
 						eviction_candidates, pages_to_free,
 						strategy=EvictionStrategy.SHORTEST_FIRST,
 						page_key='host_pages_allocated',
 					)
-					if host_evicted_uuids:
-						evicted_set = set(host_evicted_uuids)
-						decode_after_eviction = [u for u in active_uuids if u not in evicted_set]
+					host_evicted_uuids.extend(node_evicted)
+					already_evicted.update(node_evicted)
+		host_evicted_uuids = list(dict.fromkeys(host_evicted_uuids))
+		evicted_set_for_decode = set(host_evicted_uuids)
+		decode_after_eviction = [u for u in active_uuids if u not in evicted_set_for_decode]
 
 		# GPU page extension / on-hold decisions
 		seqs_needing_extension = []
@@ -7256,7 +7406,7 @@ class BatchGenWorker:
 		
 		# ========== PHASE 0: Wait for pending async operations ==========
 		t0 = time.perf_counter()
-		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks()
+		timing.num_kv_append_tasks = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 		timing.wait_kv_append_ms = (time.perf_counter() - t0) * 1000
 		
 		# decode_uuids sync: only run in debug mode for desync detection.
@@ -7391,6 +7541,7 @@ class BatchGenWorker:
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
 					'eos_reached': seq.eos_reached,
+					'rep_detected': getattr(seq, '_rep_detected', False),
 					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
@@ -7523,6 +7674,8 @@ class BatchGenWorker:
 					seq.current_context_length = state['current_context_length']
 					seq.gpu_pages_allocated = state['gpu_pages_allocated']
 					seq.eos_reached = state['eos_reached']
+					if state.get('rep_detected', False):
+						seq._rep_detected = True
 					# Sync host KV fields to keep all ranks consistent for migration planning
 					seq.host_pages_allocated = state['host_pages_allocated']
 					seq.host_token_capacity = state['host_token_capacity']
@@ -7550,11 +7703,28 @@ class BatchGenWorker:
 			if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator)
 			else getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		)
+		gpus_per_node = torch.cuda.device_count()
+		num_nodes = self._get_num_nodes()
+		if worker_view is not None and self.rank % gpus_per_node == 0:
+			host_stats = worker_view.get_stats()
+			host_report = [host_stats.num_free_pages, host_stats.num_total_pages]
+		else:
+			host_report = [0, 0]
+		host_tensor = torch.tensor(host_report, dtype=torch.int64, device=self.torch_device)
+		host_gathered = [torch.zeros_like(host_tensor) for _ in range(self.world_size)]
+		dist.all_gather(host_gathered, host_tensor)
+		per_node_host_free = []
+		per_node_host_total = []
+		for node in range(num_nodes):
+			first_rank = node * gpus_per_node
+			per_node_host_free.append(int(host_gathered[first_rank][0].item()))
+			per_node_host_total.append(int(host_gathered[first_rank][1].item()))
 
 		if self.rank == 0:
 			decisions = self._compute_boundary_decisions(
 				decode_uuids, global_seq_state, global_candidate_info,
-				per_rank_free, chunk_size, worker_view,
+				per_rank_free, per_node_host_free, per_node_host_total,
+				chunk_size, worker_view,
 			)
 		else:
 			decisions = None
@@ -7585,6 +7755,11 @@ class BatchGenWorker:
 		# server at a collective timeout.
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
+			for uuid in completed_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				state = global_seq_state.get(uuid, {})
+				if seq is not None and state.get('rep_detected', False):
+					seq._rep_detected = True
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Rank-0 distribution log — every 100 completions. Placed here
 			# (before _report_completion) so seqs are guaranteed still in
@@ -7840,37 +8015,44 @@ class BatchGenWorker:
 		seqs_needing_extension = decisions.seqs_needing_extension
 		remaining_needing_ext = [u for u in seqs_needing_extension if u not in onhold_set]
 		my_remaining_ext = [u for u in remaining_needing_ext if u in self._uuid_to_local_map]
+		local_extension_failed = []
 		if my_remaining_ext:
 			success = self._extend_gpu_kv_allocation(my_remaining_ext)
 			if not success:
-				# Extension failed — put failed sequences ON_HOLD to prevent
-				# cache_seqlens from exceeding gpu_pages_allocated × PAGE_SIZE,
-				# which would cause FlashAttention to read -1 sentinel page
-				# indices and trigger CUDA illegal memory access.
 				logging.warning(
 					f"Rank {self.rank}: GPU page extension FAILED for "
 					f"{len(my_remaining_ext)} sequences at boundary — "
 					f"moving to ON_HOLD to prevent illegal memory access"
 				)
-				# Owner: release GPU pages
-				ext_failed_local = self._get_local_indices_for_uuids(my_remaining_ext)
-				ext_failed_global = self._local_indices_to_global_seq_ids(ext_failed_local)
+				local_extension_failed = list(my_remaining_ext)
+
+		all_extension_failed_payloads = [None] * self.world_size
+		dist.all_gather_object(all_extension_failed_payloads, local_extension_failed)
+		global_extension_failed = sorted({
+			u for payload in all_extension_failed_payloads if payload for u in payload
+		}, key=lambda u: self.global_batch.get_sequence(u).global_idx)
+		if global_extension_failed:
+			ext_failed_set = set(global_extension_failed)
+			my_failed = [u for u in global_extension_failed if u in self._uuid_to_local_map]
+			if my_failed:
+				ext_failed_local = self._get_local_indices_for_uuids(my_failed)
+				ext_failed_global = [
+					gid for gid in self._local_indices_to_global_seq_ids(ext_failed_local)
+					if gid in gpu_manager._sequences
+				]
 				if ext_failed_global:
 					gpu_manager.free_pages_for_sequences(ext_failed_global)
-				for uuid in my_remaining_ext:
+				for uuid in my_failed:
 					self._sequences_with_gpu_kv.discard(uuid)
 
-				# All ranks: zero scalars and update status for ALL failed seqs
-				# (remaining_needing_ext is the globally-consistent list)
-				ext_failed_set = set(remaining_needing_ext)
-				for uuid in remaining_needing_ext:
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = 0
-					seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
-					self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
+			for uuid in global_extension_failed:
+				seq = self.global_batch.get_sequence(uuid)
+				seq.gpu_pages_allocated = 0
+				seq.log_event(SeqEvent.ON_HOLD, self.rank, "trigger=extension_failed")
+				self.global_batch.update_status(uuid, SequenceStatus.ON_HOLD)
 
-				decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
-				batch = self._get_local_indices_for_uuids(decode_uuids)
+			decode_uuids = [u for u in decode_uuids if u not in ext_failed_set]
+			batch = self._get_local_indices_for_uuids(decode_uuids)
 
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
 
@@ -8986,7 +9168,7 @@ class BatchGenWorker:
 					# CRITICAL FIX: Wait for pending KV append tasks BEFORE going ON_HOLD!
 					# Without this, KV data may not be fully written to host when sequences
 					# are later resumed, causing KV corruption and gibberish output.
-					num_waited = self._wait_pending_kv_append_tasks()
+					num_waited = self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 					if num_waited > 0:
 						logging.info(
 							f"[WATERMARK-KV-SYNC] Rank {self.rank}: Waited for {num_waited} pending KV append tasks "
@@ -9080,9 +9262,10 @@ class BatchGenWorker:
 				if not decode_uuids:
 					# Check for pending loads
 					if pending_load_uuids:
-						if pending_async_task is not None:
-							pending_async_task.wait()
-							torch.cuda.synchronize(self.torch_device)
+						self._wait_async_kv_task_distributed(
+							pending_async_task,
+							"before decode finalize",
+						)
 						dist.barrier()
 						
 						decode_uuids, batch = self._finalize_async_load_minimal(
@@ -9338,16 +9521,21 @@ class BatchGenWorker:
 							k_tensor = k_tensor.unsqueeze(2)
 						if v_tensor is not None and v_tensor.dim() == 3:
 							v_tensor = v_tensor.unsqueeze(2)
-						torch.cuda.synchronize(self.torch_device)
-						task = _sync_kv_worker_view.async_append_decode_kv_to_host(
-							layer_idx=layer_idx,
-							sequence_ids=_sync_kv_seq_ids,
-							k_tensor=k_tensor,
-							v_tensor=v_tensor,
-							sequence_lengths=_sync_kv_seq_lengths,
-						)
-						if task is not None:
-							task.wait()
+						try:
+							torch.cuda.synchronize(self.torch_device)
+							task = _sync_kv_worker_view.async_append_decode_kv_to_host(
+								layer_idx=layer_idx,
+								sequence_ids=_sync_kv_seq_ids,
+								k_tensor=k_tensor,
+								v_tensor=v_tensor,
+								sequence_lengths=_sync_kv_seq_lengths,
+							)
+							if task is not None:
+								task.wait()
+						except Exception as _e:
+							if not hasattr(self, "_deferred_kv_append_wait_errors"):
+								self._deferred_kv_append_wait_errors = []
+							self._deferred_kv_append_wait_errors.append(f"{type(_e).__name__}: {_e}")
 				else:
 					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 						self._deferred_kv_entries.append((layer_idx, k_tensor, v_tensor))
@@ -9364,7 +9552,23 @@ class BatchGenWorker:
 				if aux_view is not None:
 					if BATCHGEN_SYNC_KV:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
-							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
+							if k_tensor.dim() == 3:
+								k_tensor = k_tensor.unsqueeze(2)
+							try:
+								torch.cuda.synchronize(self.torch_device)
+								task = aux_view.async_append_decode_kv_to_host(
+									layer_idx=layer_idx,
+									sequence_ids=_sync_kv_seq_ids,
+									k_tensor=k_tensor,
+									v_tensor=None,
+									sequence_lengths=_sync_kv_seq_lengths,
+								)
+								if task is not None:
+									task.wait()
+							except Exception as _e:
+								if not hasattr(self, "_deferred_kv_append_wait_errors"):
+									self._deferred_kv_append_wait_errors = []
+								self._deferred_kv_append_wait_errors.append(f"{type(_e).__name__}: {_e}")
 					else:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
@@ -9609,10 +9813,12 @@ class BatchGenWorker:
 				_dt.reset()
 
 		# Cleanup
-		self._wait_pending_kv_append_tasks()
-		if pending_async_task is not None:
-			pending_async_task.wait()
-			torch.cuda.synchronize(self.torch_device)
+		self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+		if pending_load_uuids:
+			self._wait_async_kv_task_distributed(
+				pending_async_task,
+				"during decode cleanup",
+			)
 			if pending_load_global:
 				logging.warning(
 					f"Rank {self.rank}: rolling back {len(pending_load_global)} "
@@ -9669,7 +9875,49 @@ class BatchGenWorker:
 		self.disable_decode_watchdog()
 		return decode_uuids, batch
 
-	def _wait_pending_kv_append_tasks(self) -> int:
+	def _wait_async_kv_task_distributed(
+		self,
+		task,
+		context: str,
+		pre_errors: Optional[List[str]] = None,
+	) -> None:
+		"""Wait for one async KV task and synchronize failures across ranks."""
+		wait_errors = list(pre_errors or [])
+		if task is not None:
+			try:
+				task.wait()
+			except Exception as e:
+				wait_errors.append(f"{type(e).__name__}: {e}")
+		if task is not None and not wait_errors:
+			try:
+				torch.cuda.synchronize(self.torch_device)
+			except Exception as e:
+				wait_errors.append(f"{type(e).__name__}: {e}")
+
+		fail_tensor = torch.tensor(
+			1 if wait_errors else 0,
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
+		dist.all_reduce(fail_tensor, op=dist.ReduceOp.MAX)
+		if int(fail_tensor.item()) != 0:
+			payload = {
+				"rank": self.rank,
+				"errors": wait_errors,
+			} if wait_errors else None
+			all_payloads = [None] * self.world_size
+			dist.all_gather_object(all_payloads, payload)
+			failures = [p for p in all_payloads if p is not None]
+			raise RuntimeError(
+				f"Async KV task failed {context}: {failures[:8]}"
+			)
+
+	def _wait_pending_kv_append_tasks(
+		self,
+		*,
+		sync_distributed_errors: bool = False,
+		defer_errors: bool = False,
+	) -> int:
 		"""
 		Wait for all pending KV append tasks at page boundary.
 		Returns the number of tasks that were waited for.
@@ -9678,21 +9926,49 @@ class BatchGenWorker:
 		Without this, KV data may not be fully written to host memory when
 		sequences are later resumed, causing KV corruption.
 		"""
+		deferred_errors = getattr(self, "_deferred_kv_append_wait_errors", [])
 		if not hasattr(self, '_pending_kv_append_tasks'):
+			if sync_distributed_errors:
+				error_payload = {
+					"rank": self.rank,
+					"errors": list(deferred_errors),
+				} if deferred_errors else None
+				all_errors = [None] * self.world_size
+				dist.all_gather_object(all_errors, error_payload)
+				if hasattr(self, "_deferred_kv_append_wait_errors"):
+					self._deferred_kv_append_wait_errors.clear()
+				flat_errors = [e for e in all_errors if e is not None]
+				if flat_errors:
+					raise RuntimeError(
+						f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
+					)
+			elif deferred_errors and not defer_errors:
+				raise RuntimeError(
+					f"Rank {self.rank}: KV append/offload failed: {deferred_errors[:4]}"
+				)
 			return 0
 		
 		num_tasks = len(self._pending_kv_append_tasks)
+		wait_errors = list(deferred_errors)
+		if deferred_errors and hasattr(self, "_deferred_kv_append_wait_errors"):
+			self._deferred_kv_append_wait_errors.clear()
 		for task in self._pending_kv_append_tasks:
 			if task is not None:
-				task.wait()
+				try:
+					task.wait()
+				except Exception as e:
+					wait_errors.append(f"{type(e).__name__}: {e}")
 		
 		# CRITICAL FIX: Sync CUDA after waiting for tasks
 		# The async tasks use a separate CUDA stream for D2H copies.
 		# Even though each task internally syncs its stream via cudaEventSynchronize,
 		# we need a full device sync to ensure ALL pending operations complete
 		# before we allow GPU pages to be freed/reused.
-		if num_tasks > 0:
-			torch.cuda.synchronize(self.torch_device)
+		if num_tasks > 0 and not wait_errors:
+			try:
+				torch.cuda.synchronize(self.torch_device)
+			except Exception as e:
+				wait_errors.append(f"{type(e).__name__}: {e}")
 		
 		self._pending_kv_append_tasks.clear()
 		
@@ -9700,6 +9976,27 @@ class BatchGenWorker:
 		# Tensors can now be safely garbage collected / memory reused
 		if hasattr(self, '_pending_kv_append_tensors'):
 			self._pending_kv_append_tensors.clear()
+
+		if sync_distributed_errors:
+			error_payload = {
+				"rank": self.rank,
+				"errors": wait_errors,
+			} if wait_errors else None
+			all_errors = [None] * self.world_size
+			dist.all_gather_object(all_errors, error_payload)
+			flat_errors = [e for e in all_errors if e is not None]
+			if flat_errors:
+				raise RuntimeError(
+					f"KV append/offload failed on at least one rank: {flat_errors[:8]}"
+				)
+		elif wait_errors and defer_errors:
+			if not hasattr(self, "_deferred_kv_append_wait_errors"):
+				self._deferred_kv_append_wait_errors = []
+			self._deferred_kv_append_wait_errors.extend(wait_errors)
+		elif wait_errors:
+			raise RuntimeError(
+				f"Rank {self.rank}: KV append/offload failed: {wait_errors[:4]}"
+			)
 		
 		return num_tasks
 
@@ -9775,6 +10072,8 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			sequence_ids.append(seq.global_idx)
 			sequence_lengths.append(seq.current_context_length - 1)
+
+		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
@@ -9833,7 +10132,7 @@ class BatchGenWorker:
 		# Threshold: 256 tasks (conservative to leave room for other threads)
 		MAX_PENDING_KV_TASKS = 256
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+			self._wait_pending_kv_append_tasks(defer_errors=True)
 
 	def _launch_async_load_new_sequences(
 		self,
@@ -10341,8 +10640,8 @@ class BatchGenWorker:
 					if self.global_batch.get_sequence(u).assigned_rank == self.rank]
 		new_local_indices = self._get_local_indices_for_uuids(my_new_uuids)
 		
+		self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
 		if new_local_indices:
-			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
 			logging.info(
 				f"Rank {self.rank} (node {my_node}): Loaded {len(my_new_uuids)} sequences, "
 				f"{rank_pages_used[self.rank]}/{per_rank_free[self.rank]} GPU pages"

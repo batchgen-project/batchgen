@@ -334,6 +334,12 @@ class DualKVCacheCoordinator:
 				f"{op_name}: primary/auxiliary page-count mismatch for seq {sequence_id}: "
 				f"primary={primary_pages}, auxiliary={aux_pages}"
 			)
+		if not torch.equal(primary_state.pages, aux_state.pages):
+			raise RuntimeError(
+				f"{op_name}: primary/auxiliary page-vector mismatch for seq {sequence_id}: "
+				f"primary={primary_state.pages.tolist()[:10]}, "
+				f"auxiliary={aux_state.pages.tolist()[:10]}"
+			)
 
 	def assert_mirrored_state(
 		self, op_name: str, sequence_ids: Optional[Sequence[int]] = None
@@ -369,4 +375,14 @@ class DualKVCacheCoordinator:
 			raise RuntimeError(
 				f"{op_name}: primary/auxiliary page-table shape mismatch: "
 				f"primary={primary_shape}, auxiliary={aux_shape}"
+			)
+		if primary_mgr.gpu_table is None or aux_mgr.gpu_table is None:
+			if primary_mgr.gpu_table is not aux_mgr.gpu_table:
+				raise RuntimeError(
+					f"{op_name}: primary/auxiliary page-table presence mismatch"
+				)
+			return
+		if not torch.equal(primary_mgr.gpu_table, aux_mgr.gpu_table):
+			raise RuntimeError(
+				f"{op_name}: primary/auxiliary page-table contents mismatch"
 			)

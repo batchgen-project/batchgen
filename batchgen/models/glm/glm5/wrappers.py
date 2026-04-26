@@ -414,14 +414,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # unwritten memory. `_offload_prepacked_indexer_kv` fails fast if
             # host_paged_kv_worker_view_aux is missing.
             if not hasattr(self.module, 'indexer'):
-                indexer_kv = None
-            else:
-                indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0),
-                    positions=self.position_ids.to(hidden_states_2d.device),
+                raise RuntimeError(
+                    "GLM-5 DSA prefill requires indexer KV; refusing primary-only host offload"
                 )
-            if indexer_kv is not None:
-                self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
+            indexer_kv = self.module.indexer.compute_indexer_kv(
+                hidden_states_2d.unsqueeze(0),
+                positions=self.position_ids.to(hidden_states_2d.device),
+            )
+            if indexer_kv is None:
+                raise RuntimeError(
+                    "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
+                )
+            self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)

@@ -340,7 +340,10 @@ class DualHostKVCoordinator:
 	# -- Migration / load helpers --
 
 	def async_load_layer_paged_kv_to_device(self, **kwargs):
-		return self.primary.async_load_layer_paged_kv_to_device(**kwargs)
+		raise RuntimeError(
+			"DSA dual host KV load must use async_load_layer_paged_kv_to_device_dual(); "
+			"primary-only loads can leave auxiliary/indexer KV stale"
+		)
 
 	def async_load_layer_paged_kv_to_device_dual(
 		self,
@@ -386,4 +389,7 @@ class DualHostKVCoordinator:
 		return DualAsyncKVTask(primary_task, aux_task, tensors=tensors)
 
 	def async_offload_layer_kv_to_host(self, **kwargs):
-		return self.primary.async_offload_layer_kv_to_host(**kwargs)
+		raise RuntimeError(
+			"DSA dual host KV offload must explicitly offload both primary and auxiliary KV; "
+			"primary-only offload is unsafe"
+		)
