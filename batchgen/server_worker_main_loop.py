@@ -53,15 +53,23 @@ def _rebind_all_methods(worker, NewClass):
 
 	Skips __init__ and dunder methods. Returns (rebound, skipped) counts.
 	"""
-	import inspect
 	rebound = 0
 	skipped = 0
-	for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
+	for name, descriptor in NewClass.__dict__.items():
+		if name.startswith("__") and name.endswith("__"):
+			continue
 		if name == "__init__":
 			skipped += 1
 			continue
 		try:
-			setattr(worker, name, method.__get__(worker, type(worker)))
+			if isinstance(descriptor, staticmethod):
+				setattr(worker, name, descriptor.__func__)
+			elif isinstance(descriptor, classmethod):
+				setattr(worker, name, descriptor.__get__(type(worker), type(worker)))
+			elif callable(descriptor):
+				setattr(worker, name, descriptor.__get__(worker, type(worker)))
+			else:
+				continue
 			rebound += 1
 		except Exception:
 			skipped += 1
