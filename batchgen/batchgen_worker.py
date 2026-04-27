@@ -4847,29 +4847,38 @@ class BatchGenWorker:
 		
 		# Greedily fill
 		rank_pages_used = [0] * self.world_size
-		rank_counts = [0] * self.world_size
-		rank_has_reused_prefix = [False] * self.world_size
 		decode_batch = []
-		
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			assigned_rank = seq.assigned_rank
-			req_pages = seq.get_gpu_pages_for_two_page_buffer()
-			uses_reused_prefix = self._sequence_uses_reused_prefix(seq)
-			if self._prefix_reuse_decode_rank_blocked(
-				rank_counts,
-				rank_has_reused_prefix,
-				assigned_rank,
-				uses_reused_prefix,
-			):
-				continue
-			
-			if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
-				decode_batch.append(uuid)
-				rank_pages_used[assigned_rank] += req_pages
-				rank_counts[assigned_rank] += 1
-				if uses_reused_prefix:
-					rank_has_reused_prefix[assigned_rank] = True
+		if not self.enable_prefix_reuse:
+			for uuid in all_candidates:
+				seq = self.global_batch.get_sequence(uuid)
+				assigned_rank = seq.assigned_rank
+				req_pages = seq.get_gpu_pages_for_two_page_buffer()
+				if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
+					decode_batch.append(uuid)
+					rank_pages_used[assigned_rank] += req_pages
+		else:
+			rank_counts = [0] * self.world_size
+			rank_has_reused_prefix = [False] * self.world_size
+
+			for uuid in all_candidates:
+				seq = self.global_batch.get_sequence(uuid)
+				assigned_rank = seq.assigned_rank
+				req_pages = seq.get_gpu_pages_for_two_page_buffer()
+				uses_reused_prefix = self._sequence_uses_reused_prefix(seq)
+				if self._prefix_reuse_decode_rank_blocked(
+					rank_counts,
+					rank_has_reused_prefix,
+					assigned_rank,
+					uses_reused_prefix,
+				):
+					continue
+
+				if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
+					decode_batch.append(uuid)
+					rank_pages_used[assigned_rank] += req_pages
+					rank_counts[assigned_rank] += 1
+					if uses_reused_prefix:
+						rank_has_reused_prefix[assigned_rank] = True
 
 		if self.rank == 0:
 			logging.info(
