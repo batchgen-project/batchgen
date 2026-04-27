@@ -648,7 +648,7 @@ class Attn_Wrapper(torch.nn.Module):
 				# FULL GPU DECODING.
 				# Single Batch. 
 				# past_value_states = Attn_Wrapper.past_value_states[self.layer_idx]
-				if self.model_config.model_type == "deepseek_v3":
+				if self.model_config.model_type.startswith("deepseek_v"):
 					past_value_states = None
 				else:
 					# TODO:

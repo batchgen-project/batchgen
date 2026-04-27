@@ -32,6 +32,7 @@ from .deepseekv2.configuration_deepseek_v2 import DeepseekV2Config as HFDeepseek
 from .deepseekv3.configuration_deepseek_v3 import DeepseekV3Config as HFDeepseekV3Config
 from ...ckpt_converter.ckpt_converter import ckpt_converter
 from batchgen.config.model_registry import load_config
+from batchgen.server.process_utils import get_model_byte_size
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -54,7 +55,10 @@ class DeepSeek_Parameter_Server:
         self.model_config = load_config(huggingface_ckpt_name)
 
         # Create HuggingFace config for model instantiation (local config classes, NOT AutoConfig)
-        if self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
+        if self.model_config.architectures[0] in {
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+        }:
             self.hf_config = HFDeepseekV3Config()
         elif self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
             self.hf_config = HFDeepseekV2Config()
@@ -92,8 +96,11 @@ class DeepSeek_Parameter_Server:
                 byte_size = 32 * 1024 * 1024 * 1024
             else:
                 byte_size = 236 * 1024 * 1024 * 1024 * 2
-        elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
-            byte_size = 675 * 1024 * 1024 * 1024
+        elif self.model_config.architectures[0] in {
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+        }:
+            byte_size = get_model_byte_size(self.huggingface_ckpt_name)
         else:
             raise ValueError("Unknown huggingface model card")
 
@@ -141,7 +148,10 @@ class DeepSeek_Parameter_Server:
         self.hf_config._attn_implementation = "eager"
         if self.model_config.architectures[0] == "DeepseekV2ForCausalLM":
             model = DeepseekV2ForCausalLM._from_config(self.hf_config).to('cpu')
-        elif self.model_config.architectures[0] == "DeepseekV3ForCausalLM":
+        elif self.model_config.architectures[0] in {
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+        }:
             model = DeepseekV3ForCausalLM._from_config(self.hf_config).to('cpu')
         else:
             raise ValueError("Unknown model architecture")

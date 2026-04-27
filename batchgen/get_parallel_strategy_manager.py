@@ -11,7 +11,12 @@ def get_parallel_strategy_manager(model_name:str):
 		return MiniMaxM25ParallelStrategyManager
 	elif is_kimi_k25_backend_model(model_name):
 		return KimiK25ParallelStrategyManager
-	elif model_lower in ["deepseek-ai/deepseek-r1", "deepseek-ai/deepseek-v3"]:
+	elif model_lower in [
+		"deepseek-ai/deepseek-r1",
+		"deepseek-ai/deepseek-v3",
+		"deepseek-ai/deepseek-v4-flash",
+		"deepseek-ai/deepseek-v4-pro",
+	] or "deepseek-v4" in model_lower:
 		return DeepseekV3ParallelStrategyManager
 	elif "gpt-oss-120b" in model_lower:
 		return GptOssParallelStrategyManager

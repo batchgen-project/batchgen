@@ -57,6 +57,7 @@ CONFIG_REGISTRY: Dict[str, Type["BaseModelConfig"]] = {}
 
 # Architecture name patterns for fallback detection
 ARCH_PATTERNS: Dict[str, str] = {
+    "DeepseekV4": "deepseek_v4",
     "DeepseekV3": "deepseek_v3",
     "DeepseekV2": "deepseek_v2",
     "Mixtral": "mixtral",
@@ -69,6 +70,8 @@ ARCH_PATTERNS: Dict[str, str] = {
 # Model name/identifier patterns for detection from HuggingFace model IDs
 # Maps patterns found in model names to model_type
 MODEL_NAME_PATTERNS: Dict[str, str] = {
+    "DeepSeek-V4-Flash": "deepseek_v4",
+    "DeepSeek-V4-Pro": "deepseek_v4",
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
     "DeepSeek-R1": "deepseek_v3",
@@ -224,6 +227,11 @@ def _import_model_configs():
     """Import all model-specific config modules to register them."""
     try:
         from batchgen.models.openai.gpt_oss_120b import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.deepseek.deepseekv4_flash import config as _  # noqa: F401
     except ImportError:
         pass
 

@@ -94,7 +94,7 @@ class Generate():
 				# self.core_engine.copy_kv_to_worker(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 				if self.engine_config.Basic_Config.attn_mode == 3:
 					# FULL GPU DECODING MODE.
-					if self.model_config.model_type == "deepseek_v3":
+					if self.model_config.model_type.startswith("deepseek_v"):
 						past_key_states= self.core_engine.get_past_key_states(self.model_batches[model_batch_idx], self.max_input_length + self.max_decoding_length)
 						past_value_states = None
 						# scale_dict = self.core_engine.get_kv_scale(self.model_batches[model_batch_idx], self.max_input_length)
