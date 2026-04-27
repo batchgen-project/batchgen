@@ -84,20 +84,30 @@ _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
 
-# ── Multi-architecture flag sets ──
+# ── Architecture flag sets ──
 
 _sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v",
                 "-lineinfo", "--threads", _nvcc_threads]
 
-_sm80_gencode = ["-gencode", "arch=compute_80,code=sm_80",
-                 "-gencode", "arch=compute_90,code=sm_90"]
-
-# Add SM100 gencode if CUDA toolkit >= 12.8
-_cuda_version = getattr(torch.version, "cuda", None)
-if _cuda_version:
-    _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
-    if (_cuda_major, _cuda_minor) >= (12, 8):
-        _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
+if _build_arch == "sm90a":
+    _sm80_gencode = ["-gencode", "arch=compute_90a,code=sm_90a"]
+elif _build_arch == "sm100":
+    _sm80_gencode = ["-gencode", "arch=compute_100,code=sm_100"]
+elif _build_arch == "all":
+    _sm80_gencode = [
+        "-gencode", "arch=compute_80,code=sm_80",
+        "-gencode", "arch=compute_90,code=sm_90",
+    ]
+    # Add SM100 gencode if CUDA toolkit >= 12.8
+    _cuda_version = getattr(torch.version, "cuda", None)
+    if _cuda_version:
+        _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
+        if (_cuda_major, _cuda_minor) >= (12, 8):
+            _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
+else:
+    raise RuntimeError(
+        f"Unsupported BUILD_ARCH={_build_arch!r}; expected sm90a, sm100, or all"
+    )
 
 _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
@@ -376,14 +386,25 @@ setup(
     package_dir={
         "batchgen_kernels": ".",
         "batchgen_kernels.attention": "attention",
+        "batchgen_kernels.attention.dsa": "attention/dsa",
+        "batchgen_kernels.attention.dsa.indexer": "attention/dsa/indexer",
         "batchgen_kernels.moe": "moe",
         "batchgen_kernels.common": "common",
         "batchgen_kernels.triton": "triton",
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
+              "batchgen_kernels.attention.dsa",
+              "batchgen_kernels.attention.dsa.indexer",
               "batchgen_kernels.moe", "batchgen_kernels.common",
               "batchgen_kernels.triton"],
-    package_data={"batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"]},
+    package_data={
+        "batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"],
+        "batchgen_kernels.attention.dsa.indexer": [
+            "csrc/*.cpp",
+            "csrc/*.cu",
+            "csrc/*.h",
+        ],
+    },
     ext_modules=_ext_modules,
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.10",

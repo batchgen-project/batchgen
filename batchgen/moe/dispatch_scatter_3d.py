@@ -43,7 +43,7 @@ def _load_dispatch_reduce_module():
         _dispatch_reduce_module = batchgen_kernels.load_extension(
             "batchgen_kernels.moe._C_dispatch_scatter_3d"
         )
-        logging.info("Loaded pre-compiled dispatch_scatter_3d + reduce_weighted_scatter kernels")
+        logging.debug("Loaded pre-compiled dispatch_scatter_3d + reduce_weighted_scatter kernels")
         return _dispatch_reduce_module
     except Exception as e:
         logging.warning(f"Failed to load dispatch_scatter_3d kernels: {e}")

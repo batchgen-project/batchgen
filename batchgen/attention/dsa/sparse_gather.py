@@ -39,6 +39,37 @@ def sparse_gather_from_paged_kv(
 		gathered_kv: [batch, topk, num_k_heads, k_head_dim]
 			KV entries at the requested positions.
 	"""
+	if blocked_k.dim() != 4:
+		raise RuntimeError(
+			f"sparse_gather_from_paged_kv: blocked_k must be 4D "
+			f"[num_pages,page_size,num_heads,head_dim], got shape={tuple(blocked_k.shape)}"
+		)
+	if block_table.dim() != 2:
+		raise RuntimeError(
+			f"sparse_gather_from_paged_kv: block_table must be 2D [B,pages], "
+			f"got shape={tuple(block_table.shape)}"
+		)
+	if token_indices.dim() != 2:
+		raise RuntimeError(
+			f"sparse_gather_from_paged_kv: token_indices must be 2D [B,topk], "
+			f"got shape={tuple(token_indices.shape)}"
+		)
+	if block_table.dtype not in (torch.int32, torch.int64):
+		raise RuntimeError(f"sparse_gather_from_paged_kv: block_table must be int32/int64, got {block_table.dtype}")
+	if token_indices.dtype not in (torch.int32, torch.int64):
+		raise RuntimeError(f"sparse_gather_from_paged_kv: token_indices must be int32/int64, got {token_indices.dtype}")
+	if int(page_size) <= 0:
+		raise ValueError(f"sparse_gather_from_paged_kv: page_size must be positive, got {page_size}")
+	if blocked_k.shape[1] != int(page_size):
+		raise RuntimeError(
+			f"sparse_gather_from_paged_kv: blocked_k page dimension {blocked_k.shape[1]} "
+			f"!= page_size={page_size}"
+		)
+	if token_indices.shape[0] != block_table.shape[0]:
+		raise RuntimeError(
+			f"sparse_gather_from_paged_kv: batch mismatch: token_indices={tuple(token_indices.shape)}, "
+			f"block_table={tuple(block_table.shape)}"
+		)
 	batch_size, topk = token_indices.shape
 	num_k_heads = blocked_k.shape[2]
 	k_head_dim = blocked_k.shape[3]

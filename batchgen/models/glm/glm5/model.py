@@ -28,6 +28,8 @@ from batchgen.timing import get_decode_timer
 from batchgen.models.glm.glm5.decode_utils import (
 	build_flat_paged_gather_indices,
 	build_paged_gather_cache_key,
+	validate_gather_invalid_mask_is_padding_only,
+	validate_token_indices_within_seqlens,
 )
 
 import torch
@@ -303,15 +305,42 @@ class Glm5Indexer(nn.Module):
         k_nope = k[..., self.rope_head_dim:]
         seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
         cos, sin = self.rotary_emb(k_rope, seq_len)
-        # Index cos/sin by position: positions may be [batch] (decode) or [batch, seq] (prefill)
+
+        # Normalize to [batch, seq]. Prepacked prefill passes bare [seq],
+        # while decode passes [batch] for one token per sequence.
+        if positions.dim() == 1:
+            if positions.numel() == k.shape[1]:
+                positions = positions.unsqueeze(0).expand(k.shape[0], -1)
+            elif positions.numel() == k.shape[0]:
+                positions = positions.unsqueeze(1)
+            else:
+                raise ValueError(
+                    "positions must be [seq], [batch], or [batch, seq] for "
+                    f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
+                )
+        elif positions.dim() != 2:
+            raise ValueError(
+                "positions must be [seq], [batch], or [batch, seq] for "
+                f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
+            )
+
+        if positions.shape != k.shape[:2]:
+            raise ValueError(
+                "positions shape must match k batch/seq dims after normalization: "
+                f"positions={tuple(positions.shape)}, k={tuple(k.shape)}"
+            )
+
+        # Index cos/sin by position: [batch, seq, rope_dim].
         cos = cos[positions]  # [batch, ...rope_dim*2]
         sin = sin[positions]
-        if cos.dim() == 2:
-            cos = cos.unsqueeze(1)  # [batch, 1, rope_dim*2]
-            sin = sin.unsqueeze(1)
-        k_rope = k_rope.unsqueeze(2)  # [batch, seq, 1, rope_dim]
-        k_rope, _ = apply_rotary_pos_emb_interleaved(k_rope, k_rope, cos, sin)
-        k_rope = k_rope.squeeze(2)
+        cos_half = cos[..., : cos.shape[-1] // 2]
+        sin_half = sin[..., : sin.shape[-1] // 2]
+
+        k1, k2 = k_rope[..., 0::2], k_rope[..., 1::2]
+        k_rope = torch.stack(
+            [k1 * cos_half - k2 * sin_half, k2 * cos_half + k1 * sin_half],
+            dim=-1,
+        ).flatten(-2)
         return torch.cat([k_rope, k_nope], dim=-1)
 
     def _apply_rope_to_q(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -514,9 +543,7 @@ class Glm5Indexer(nn.Module):
         # Q·K^T: [B, H, T] = einsum('bhd,btd->bht', q, k)
         scores = torch.einsum("bhd,btd->bht", q_f, k_f) * self.softmax_scale
 
-        # Mask invalid positions BEFORE ReLU so they become 0 after F.relu(-inf).
-        # Using a very-negative (not -inf) sentinel would still pass ReLU as 0; -inf
-        # is the safe choice because subsequent ops are sums (not softmaxes).
+        # Mask invalid positions before ReLU to keep them out of per-head scoring.
         position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
         mask = position_indices >= cache_seqlens.unsqueeze(1)    # [B, T]
         scores = scores.masked_fill(mask.unsqueeze(1), float("-inf"))
@@ -530,6 +557,9 @@ class Glm5Indexer(nn.Module):
 
         # Weighted sum over heads: [B, T]
         aggregated = torch.einsum("bht,bh->bt", scores, head_gates)
+        # Head gates can be negative, so invalid positions that became zero after
+        # ReLU must be masked again before top-k. This matches the fused path.
+        aggregated = aggregated.masked_fill(mask, float("-inf"))
 
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
@@ -567,9 +597,74 @@ class Glm5Indexer(nn.Module):
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
         """
+        if q_a.dim() != 3 or q_a.shape[1] != 1:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: q_a must be [B,1,q_lora_rank], got {tuple(q_a.shape)}"
+            )
+        if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: hidden_states must be [B,1,hidden_size], "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        if indexer_blocked_k.dim() != 4:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: indexer_blocked_k must be "
+                f"[num_pages,page_size,num_heads,head_dim], got {tuple(indexer_blocked_k.shape)}"
+            )
+        if block_table.dim() != 2:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: block_table must be [B,pages], got {tuple(block_table.shape)}"
+            )
+        if cache_seqlens.dim() != 1:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be [B], got {tuple(cache_seqlens.shape)}"
+            )
+        if block_table.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: block_table must be int32/int64, got {block_table.dtype}"
+            )
+        if cache_seqlens.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be int32/int64, got {cache_seqlens.dtype}"
+            )
+        batch_size = block_table.shape[0]
+        if q_a.shape[0] != batch_size or hidden_states.shape[0] != batch_size or cache_seqlens.shape[0] != batch_size:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: batch mismatch: "
+                f"q_a={tuple(q_a.shape)}, hidden_states={tuple(hidden_states.shape)}, "
+                f"block_table={tuple(block_table.shape)}, cache_seqlens={tuple(cache_seqlens.shape)}"
+            )
+        if int(page_size) <= 0:
+            raise ValueError(f"GLM-5 DSA score_and_select_paged: page_size must be positive, got {page_size}")
+        if indexer_blocked_k.shape[1] != int(page_size):
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: indexer_blocked_k page dimension "
+                f"{indexer_blocked_k.shape[1]} != page_size={page_size}"
+            )
+        if positions is not None and (positions.dim() != 1 or positions.shape[0] != batch_size):
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: positions must be [B] when provided, "
+                f"got {tuple(positions.shape)} for B={batch_size}"
+            )
+        _debug_validate = os.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
         batch_size = block_table.shape[0]
         if max_seqlen is None:
             max_seqlen = int(cache_seqlens.max().item())
+        if int(max_seqlen) <= 0:
+            raise ValueError(f"GLM-5 DSA score_and_select_paged: max_seqlen must be positive, got {max_seqlen}")
+        if _debug_validate:
+            validate_token_indices_within_seqlens(
+                torch.zeros(batch_size, 1, dtype=torch.long, device=cache_seqlens.device),
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/cache_seqlens",
+                effective_lengths=torch.zeros(batch_size, dtype=torch.long, device=cache_seqlens.device),
+                debug_sync=True,
+            )
+            if int(cache_seqlens.max().item()) > int(max_seqlen):
+                raise RuntimeError(
+                    "GLM-5 DSA score_and_select_paged: max_seqlen smaller than cache_seqlens.max(): "
+                    f"max_seqlen={max_seqlen}, cache_max={int(cache_seqlens.max().item())}"
+                )
         num_k_heads = indexer_blocked_k.shape[2]
         k_head_dim = indexer_blocked_k.shape[3]
 
@@ -581,17 +676,29 @@ class Glm5Indexer(nn.Module):
             page_table_version=indexer_kv_manager.get_page_table_version(),
         )
         if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
-            self._gather_cache = build_flat_paged_gather_indices(
+            self._gather_cache, self._gather_cache_invalid_mask = build_flat_paged_gather_indices(
                 block_table,
                 max_seqlen,
                 page_size,
+                return_invalid_mask=True,
             )
             self._gather_cache_key = cache_key
             self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
 
         flat_idx = self._gather_cache
+        validate_gather_invalid_mask_is_padding_only(
+            self._gather_cache_invalid_mask,
+            cache_seqlens,
+            max_seqlen,
+            context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/aux_gather",
+            debug_sync=_debug_validate,
+        )
         blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
         gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
+        gathered = gathered.masked_fill(
+            self._gather_cache_invalid_mask.unsqueeze(-1).unsqueeze(-1),
+            0,
+        )
 
         gathered_k = gathered.squeeze(2)
 
@@ -611,8 +718,8 @@ class Glm5Indexer(nn.Module):
                 cache_seqlens=cache_seqlens.int(),
                 wq_b_weights=self._fused_score_weights,
                 weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
-                cos_table=cos.to(torch.bfloat16),
-                sin_table=sin.to(torch.bfloat16),
+                cos_table=cos.float(),
+                sin_table=sin.float(),
                 positions=positions,
                 module=self._fused_score_module,
                 n_heads=self.index_n_heads,
@@ -620,18 +727,37 @@ class Glm5Indexer(nn.Module):
                 rope_dim=self.rope_head_dim,
                 topk=min(self.index_topk, max_seqlen),
             )
-            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
+            validate_token_indices_within_seqlens(
+                top_k_indices,
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fused_topk",
+                debug_sync=_debug_validate,
+            )
+            return top_k_indices.to(torch.long)
         else:
+            from batchgen.models.glm.glm5.wrappers import _allow_dsa_fallback, _raise_required_dsa_kernel
+            if not _allow_dsa_fallback():
+                _raise_required_dsa_kernel(
+                    "WP4 fused indexer scoring",
+                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
+                )
             if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
                 self._warned_fused_score_fallback = True
                 logging.warning(
                     f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
-                    "falling back to PyTorch score_and_select"
+                    "falling back to PyTorch score_and_select_relu_gated"
                 )
-            return self.score_and_select(
+            top_k_indices = self.score_and_select_relu_gated(
                 q_a, hidden_states, gathered_k, cache_seqlens,
                 positions=positions, max_seqlen=max_seqlen,
             )
+            validate_token_indices_within_seqlens(
+                top_k_indices,
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fallback_topk",
+                debug_sync=_debug_validate,
+            )
+            return top_k_indices.to(torch.long)
 
 
 # ============================================================================
@@ -1224,7 +1350,7 @@ class Glm5MoE(nn.Module):
                         cls._warned_bucket_select[mtp] = True
                     return buf
             # Oversize — fall through to singleton (which will resize_if_needed).
-            logging.warning(
+            logging.debug(
                 f"[Glm5MoE] global_num_tokens={global_num_tokens} exceeds all "
                 f"pre-allocated buckets {sorted(cls._bucket_bufs)}; "
                 "falling back to singleton (will resize)"
@@ -1570,7 +1696,7 @@ class Glm5MoE(nn.Module):
             )
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
-            logging.warning(
+            logging.debug(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
             Glm5MoE._warned_k25_path = True
 
@@ -1607,11 +1733,12 @@ class Glm5MoE(nn.Module):
                 rank_ids = positions // ntp
                 local_pos = positions % ntp
                 max_valid = rank_counts[rank_ids]
-                padding_mask = local_pos >= max_valid
-                # Unconditional mask application; skipping the .any() gate removes
-                # a per-layer D2H sync and the fancy-index op is a no-op when empty.
-                topk_idx[padding_mask] = -1
-                topk_weight[padding_mask] = 0.0
+                row_valid = (local_pos < max_valid).unsqueeze(1)
+                # Use fixed-shape elementwise masking so CUDA graph replay re-reads
+                # rank_counts values instead of baking in capture-time all-valid
+                # boolean-index cardinality.
+                topk_idx = torch.where(row_valid, topk_idx, -1)
+                topk_weight = torch.where(row_valid, topk_weight, 0.0)
 
         # 3) 3D dispatch
         with (dt.timed("dispatch_3d", li) if dt else _nullctx()):
@@ -1663,7 +1790,7 @@ class Glm5MoE(nn.Module):
         Reads buf.dispatched_x, writes buf.expert_out.
         """
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
-            logging.warning(
+            logging.debug(
                 f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
                 f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
             Glm5MoE._warned_gemm_3d = True

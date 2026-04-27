@@ -23,6 +23,7 @@ Architecture: 1 warpgroup (128 threads) per CTA
 Grid: (cdiv(B, 64), cdiv(N, 32)) = typically (1, 4)
 """
 
+import logging
 import os
 import torch
 from torch.utils.cpp_extension import load_inline
@@ -710,9 +711,13 @@ def build_module(num_stages=4):
     if cache_key in _module_cache:
         return _module_cache[cache_key]
 
-    print(f"Building indexer KV proj CUDA kernel v3 (NUM_STAGES={num_stages})...")
+    logging.debug(
+        "Building indexer KV proj CUDA kernel v3 (NUM_STAGES=%s)...",
+        num_stages,
+    )
     os.environ["MAX_JOBS"] = "8"
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+    verbose = os.environ.get("BATCHGEN_KERNEL_LOAD_TRACE", "0") == "1"
 
     module = load_inline(
         name=f"indexer_kv_proj_v3_s{num_stages}",
@@ -724,9 +729,12 @@ def build_module(num_stages=4):
             "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
             f"-DNUM_STAGES={num_stages}",
         ],
-        verbose=True,
+        verbose=verbose,
     )
-    print(f"Build complete (indexer_kv_proj v3, NUM_STAGES={num_stages}).")
+    logging.debug(
+        "Build complete (indexer_kv_proj v3, NUM_STAGES=%s).",
+        num_stages,
+    )
     _module_cache[cache_key] = module
     return module
 
