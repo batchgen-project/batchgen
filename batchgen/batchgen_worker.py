@@ -8132,6 +8132,13 @@ class BatchGenWorker:
 		timing.extension_ms = (time.perf_counter() - t0) * 1000
 
 		# E. Async load (using rank-0 decisions)
+		#
+		# Watermark preemption means "stop this decode round and go admit
+		# queued prefill work." Do not launch speculative host->GPU loads in
+		# the same boundary when we already know the decode round is about to
+		# be interrupted; those loads would be rolled back in cleanup and can
+		# leave transient page-table/load state during the ON_HOLD transition.
+		watermark_triggered = self._check_host_kv_watermark_trigger()
 		t0 = time.perf_counter()
 		new_async_task = None
 		new_load_uuids = decisions.new_load_uuids
@@ -8139,7 +8146,9 @@ class BatchGenWorker:
 		new_load_global = []
 		confirmed_local_payload = []
 
-		if new_load_uuids and decode_uuids:
+		if watermark_triggered:
+			new_load_uuids = []
+		elif new_load_uuids and decode_uuids:
 			my_new_uuids = [u for u in new_load_uuids
 						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
 			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
@@ -8385,9 +8394,6 @@ class BatchGenWorker:
 					f"chunk_size={chunk_val} | {status_counts} | "
 					f"per_seq_host_pages: min={hp_min} max={hp_max} avg={hp_avg:.0f}"
 				)
-
-		# Check watermark trigger for dynamic prefill switching
-		watermark_triggered = self._check_host_kv_watermark_trigger()
 
 		return decode_uuids, batch, new_async_task, new_load_uuids, new_load_local, new_load_global, timing, watermark_triggered
 
