@@ -5949,10 +5949,18 @@ class BatchGenWorker:
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 				self._sync_sequence_metadata(decode_uuids)
 
-				# CUDA Graph Warmup (lazy, one-time) — only capture for final batch
-				# (all sequences prefilled, no more queueing). Earlier iterations
-				# have dynamic batch sizes from prefill/decode interleaving.
-				if self._cuda_graph_manager is None and not self.global_batch.has_queueing():
+				# CUDA Graph Warmup (lazy, one-time). GLM-5 MoE replay uses
+				# rank-synced bucketed graphs, so it is safe to capture at the first
+				# decode phase instead of waiting for the final no-queue iteration.
+				# Keep the older final-batch gate for other graph backends.
+				_glm5_graph_requested = (
+					is_glm5_backend_model(getattr(self, "model_name", "") or "")
+					and os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+				)
+				if (
+					self._cuda_graph_manager is None
+					and (_glm5_graph_requested or not self.global_batch.has_queueing())
+				):
 					self._warmup_cuda_graphs()
 
 				# C. Execute Continuous Decode
