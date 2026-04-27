@@ -3980,7 +3980,10 @@ class BatchGenWorker:
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
 							
-							seq.validate_metadata(f"rank {self.rank} _sync_sequence_metadata/recv")
+							seq.validate_metadata(
+								f"rank {self.rank} _sync_sequence_metadata/recv",
+								require_owner_tensors=False,
+							)
 
 	def _sync_completion_status_tensor(
 		self,
@@ -7732,7 +7735,10 @@ class BatchGenWorker:
 						seq.original_max_decode_length = state['original_max_decode_length']
 					if 'total_decoded_before_eviction' in state:
 						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
-					seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/gathered_state")
+					seq.validate_metadata(
+						f"rank {self.rank} _page_boundary_fast/gathered_state",
+						require_owner_tensors=False,
+					)
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.

@@ -214,7 +214,7 @@ class SequenceEntry:
             f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
         )
 
-    def validate_metadata(self, context: str) -> None:
+    def validate_metadata(self, context: str, require_owner_tensors: bool = True) -> None:
         """Reject inconsistent per-sequence metadata at module boundaries."""
         prefix = f"{context}: sequence {self.uuid} gid={self.global_idx}"
 
@@ -302,7 +302,17 @@ class SequenceEntry:
             require(self.assigned_rank is not None, "EVICTED requires assigned_rank for deterministic re-entry")
             require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
             require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
-            require(self.evicted_token_ids is not None, "EVICTED requires evicted_token_ids")
+            if require_owner_tensors:
+                require(self.evicted_token_ids is not None, "EVICTED owner requires evicted_token_ids")
+            else:
+                require(
+                    self.evicted_token_ids is None,
+                    "non-owner EVICTED replica must not retain owner-only evicted_token_ids",
+                )
+                require(
+                    self.total_decoded_before_eviction > 0,
+                    "non-owner EVICTED replica requires total_decoded_before_eviction > 0",
+                )
 
         if self.input_ids is not None:
             if self.input_ids.dim() == 1:
