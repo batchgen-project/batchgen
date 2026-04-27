@@ -1008,9 +1008,19 @@ class HostPagedKVWorkerView {
             }
         }
         EnsureSequencesRegistered(sequence_ids);
-        for (std::int64_t sequence_id : sequence_ids) {
-            backend_.ReleaseSequenceLogical(sequence_id,
-                                            page_table_.Pages(sequence_id));
+        const bool has_any_shared_prefix =
+            std::any_of(sequence_ids.begin(), sequence_ids.end(),
+                        [this](std::int64_t sequence_id) {
+                            return !page_table_.SharedPrefixPages(sequence_id)
+                                        .empty();
+                        });
+        if (!has_any_shared_prefix) {
+            backend_.ReleaseSequences(sequence_ids);
+        } else {
+            for (std::int64_t sequence_id : sequence_ids) {
+                backend_.ReleaseSequenceLogical(sequence_id,
+                                                page_table_.Pages(sequence_id));
+            }
         }
         UnregisterSequences(sequence_ids);
     }
