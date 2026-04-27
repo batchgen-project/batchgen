@@ -1,3 +1,4 @@
+import logging
 import os
 
 from batchgen.op_builder.core_engine import CoreEngineBuilder
@@ -6,7 +7,7 @@ use_jit = False
 try:
     from batchgen import core_engine
 except ImportError:
-    print("Do not detect pre-installed core engine, use JIT mode.")
+    logging.debug("Do not detect pre-installed core engine, use JIT mode.")
     use_jit = True
 
 # print("run core engine importer")

@@ -152,7 +152,7 @@ struct KVAsyncTask {
 
     void wait() const {
         if (future_.valid()) {
-            future_.wait();
+            future_.get();
         }
     }
 
@@ -1566,48 +1566,41 @@ class HostPagedKVWorkerView {
             const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
             this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
 
-            // Ensure scratch device buffers are sized.
-            if (uva_append_k_src_buf_.size() < k_total) {
-                uva_append_k_src_buf_.Allocate(k_total);
-                uva_append_k_dst_buf_.Allocate(k_total);
-            }
-            if constexpr (kHasVCache) {
-                if (v_total > uva_append_v_src_buf_.size()) {
-                    uva_append_v_src_buf_.Allocate(v_total);
-                    uva_append_v_dst_buf_.Allocate(v_total);
-                }
-            }
+            worker_detail::DeviceBuffer<uint8_t*> k_src_buf(k_total);
+            worker_detail::DeviceBuffer<uint8_t*> k_dst_buf(k_total);
 
             const std::size_t ptr_bytes_k = k_total * sizeof(uint8_t*);
             EnqueueCopy(
                 reinterpret_cast<const std::byte*>(k_src_host.data()),
-                reinterpret_cast<std::byte*>(uva_append_k_src_buf_.get()),
+                reinterpret_cast<std::byte*>(k_src_buf.get()),
                 ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
             EnqueueCopy(
                 reinterpret_cast<const std::byte*>(k_dst_host.data()),
-                reinterpret_cast<std::byte*>(uva_append_k_dst_buf_.get()),
+                reinterpret_cast<std::byte*>(k_dst_buf.get()),
                 ptr_bytes_k, CopyDirection::kHostToDevice, cuda_stream);
 
             worker_detail::LaunchUvaPageCopyKernel(
-                uva_append_k_src_buf_.get(), uva_append_k_dst_buf_.get(),
+                k_src_buf.get(), k_dst_buf.get(),
                 k_token_bytes, static_cast<int>(k_total), cuda_stream);
 
             if constexpr (kHasVCache) {
                 if (v_total > 0) {
+                    worker_detail::DeviceBuffer<uint8_t*> v_src_buf(v_total);
+                    worker_detail::DeviceBuffer<uint8_t*> v_dst_buf(v_total);
                     const std::size_t ptr_bytes_v = v_total * sizeof(uint8_t*);
                     EnqueueCopy(
                         reinterpret_cast<const std::byte*>(v_src_host.data()),
                         reinterpret_cast<std::byte*>(
-                            uva_append_v_src_buf_.get()),
+                            v_src_buf.get()),
                         ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
                     EnqueueCopy(
                         reinterpret_cast<const std::byte*>(v_dst_host.data()),
                         reinterpret_cast<std::byte*>(
-                            uva_append_v_dst_buf_.get()),
+                            v_dst_buf.get()),
                         ptr_bytes_v, CopyDirection::kHostToDevice, cuda_stream);
                     worker_detail::LaunchUvaPageCopyKernel(
-                        uva_append_v_src_buf_.get(),
-                        uva_append_v_dst_buf_.get(), v_token_bytes,
+                        v_src_buf.get(),
+                        v_dst_buf.get(), v_token_bytes,
                         static_cast<int>(v_total), cuda_stream);
                 }
             }

@@ -9,17 +9,53 @@ all lifecycle operations to both, keeping them synchronized. It duck-types
 the worker view API so callers can use it as a drop-in replacement.
 
 For operations that require different data per pool (offload, load-to-device),
-callers access .primary / .auxiliary directly.
+callers must use explicit dual APIs. Primary-only operations are invalid for
+DSA because they can leave the indexer KV stale while the sequence remains
+marked GPU/host-resident.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
 from batchgen.models.engine_loader import core_engine as bg_lib
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DualAsyncKVTask:
+	"""Composite async task that owns both primary and auxiliary KV work."""
+
+	primary_task: Any
+	aux_task: Any
+	tensors: Any = None
+
+	def __post_init__(self) -> None:
+		if self.primary_task is None or self.aux_task is None:
+			raise RuntimeError(
+				"DualAsyncKVTask requires both primary and auxiliary tasks"
+			)
+
+	def wait(self) -> None:
+		errors = []
+		for name, task in (
+			("primary", self.primary_task),
+			("auxiliary", self.aux_task),
+		):
+			try:
+				task.wait()
+			except Exception as e:
+				errors.append((name, e))
+		if errors:
+			if len(errors) == 1:
+				raise errors[0][1]
+			names = ", ".join(name for name, _ in errors)
+			raise RuntimeError(
+				f"DualAsyncKVTask wait failed for both KV loads: {names}"
+			) from errors[0][1]
 
 
 def _try_set_logger_name(config, name: str) -> bool:
@@ -71,6 +107,11 @@ def _compute_dual_page_count(
 	)
 	primary_profile = _resolve_profile(model_name)
 	aux_profile = _resolve_indexer_profile(model_name)
+	if primary_profile.page_size != aux_profile.page_size:
+		raise ValueError(
+			f"DSA primary/aux host KV page size mismatch: "
+			f"primary={primary_profile.page_size}, aux={aux_profile.page_size}"
+		)
 
 	primary_layer_bytes = primary_profile.bytes_per_page() * primary_profile.num_layers
 	aux_layer_bytes = aux_profile.bytes_per_page() * aux_profile.num_layers
@@ -98,6 +139,8 @@ class DualHostKVCoordinator:
 	"""
 
 	def __init__(self, primary, auxiliary) -> None:
+		if auxiliary is None:
+			raise RuntimeError("DualHostKVCoordinator requires auxiliary host KV for DSA")
 		self.primary = primary
 		self.auxiliary = auxiliary
 
@@ -149,20 +192,10 @@ class DualHostKVCoordinator:
 		try:
 			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
 		except RuntimeError as e:
-			if "logger" in str(e) and "already exists" in str(e):
-				logger.warning(
-					"Cannot create auxiliary KV view (duplicate C++ logger). "
-					"Using primary-only mode. DSA indexer KV will "
-					"be unavailable. Error: %s", e
-				)
-				coordinator = cls(primary_view, None)
-				logger.info(
-					"DualHostKVCoordinator created (primary-only): %d pages, "
-					"primary k_dim=%d",
-					num_pages, primary_profile.k_head_dim,
-				)
-				return coordinator
-			raise
+			raise RuntimeError(
+				"Cannot create auxiliary KV worker view for DSA model; "
+				"primary-only DSA mode is invalid"
+			) from e
 
 		coordinator = cls(primary_view, aux_view)
 		logger.info(
@@ -214,13 +247,10 @@ class DualHostKVCoordinator:
 			aux_mgr = bg_lib.MLAHostPagedKVManager(aux_config)
 			aux_mgr.initialize(True)
 		except RuntimeError as e:
-			if "logger" in str(e) and "already exists" in str(e):
-				logger.warning(
-					"Cannot create auxiliary KV manager (duplicate C++ logger). "
-					"Using primary-only mode. Error: %s", e
-				)
-				return primary_mgr, None
-			raise
+			raise RuntimeError(
+				"Cannot create auxiliary KV manager for DSA model; "
+				"primary-only DSA mode is invalid"
+			) from e
 
 		logger.info(
 			"DualHostKVCoordinator managers created: %d pages, "
@@ -233,33 +263,78 @@ class DualHostKVCoordinator:
 
 	def initialize(self, **kwargs) -> None:
 		self.primary.initialize(**kwargs)
-		if self.auxiliary is not None:
-			self.auxiliary.initialize(**kwargs)
+		self.require_auxiliary("initialize").initialize(**kwargs)
+
+	def require_auxiliary(self, context: str):
+		if self.auxiliary is None:
+			raise RuntimeError(f"{context}: auxiliary host KV is required for DSA")
+		return self.auxiliary
 
 	# -- Sequence management (mirrored) --
 
 	def register_sequences(self, sequence_ids) -> None:
 		self.primary.register_sequences(sequence_ids)
-		if self.auxiliary is not None:
-			self.auxiliary.register_sequences(sequence_ids)
+		try:
+			self.require_auxiliary("register_sequences").register_sequences(sequence_ids)
+		except Exception:
+			try:
+				self.primary.unregister_sequences(sequence_ids)
+			except Exception:
+				logger.exception(
+					"Failed to rollback primary host KV registration for %s",
+					list(sequence_ids)[:10],
+				)
+			raise
 
 	def allocate_pages_for_sequences(self, seq_token_pairs) -> None:
+		seq_token_pairs = list(seq_token_pairs)
+		sequence_ids = [seq_id for seq_id, _ in seq_token_pairs]
 		self.primary.allocate_pages_for_sequences(seq_token_pairs)
-		if self.auxiliary is not None:
-			self.auxiliary.allocate_pages_for_sequences(seq_token_pairs)
+		try:
+			self.require_auxiliary("allocate_pages_for_sequences").allocate_pages_for_sequences(seq_token_pairs)
+		except Exception:
+			try:
+				self.primary.release_sequence_pages(sequence_ids)
+			except Exception:
+				logger.exception(
+					"Failed to rollback primary host KV allocation for %s",
+					sequence_ids[:10],
+				)
+			raise
+
+	def grow_pages_for_sequences(self, seq_page_pairs) -> None:
+		seq_page_pairs = list(seq_page_pairs)
+		needed = sum(int(pages) for _, pages in seq_page_pairs)
+		primary_stats = self.primary.get_stats()
+		aux = self.require_auxiliary("grow_pages_for_sequences")
+		aux_stats = aux.get_stats()
+		if needed > primary_stats.num_free_pages or needed > aux_stats.num_free_pages:
+			raise RuntimeError(
+				"grow_pages_for_sequences: insufficient mirrored host KV free pages: "
+				f"need={needed}, primary_free={primary_stats.num_free_pages}, "
+				f"aux_free={aux_stats.num_free_pages}"
+			)
+		self.primary.grow_pages_for_sequences(seq_page_pairs)
+		aux.grow_pages_for_sequences(seq_page_pairs)
 
 	def release_sequence_pages(self, sequence_ids) -> None:
 		self.primary.release_sequence_pages(sequence_ids)
-		if self.auxiliary is not None:
-			self.auxiliary.release_sequence_pages(sequence_ids)
+		self.require_auxiliary("release_sequence_pages").release_sequence_pages(sequence_ids)
+
+	def unregister_sequences(self, sequence_ids) -> None:
+		self.primary.unregister_sequences(sequence_ids)
+		self.require_auxiliary("unregister_sequences").unregister_sequences(sequence_ids)
 
 	# -- Query: report the capacity-tighter of {primary, auxiliary} --
 
 	def get_stats(self):
 		primary_stats = self.primary.get_stats()
-		if self.auxiliary is None:
-			return primary_stats
-		aux_stats = self.auxiliary.get_stats()
+		aux_stats = self.require_auxiliary("get_stats").get_stats()
+		if primary_stats.num_total_pages != aux_stats.num_total_pages:
+			raise RuntimeError(
+				"primary/auxiliary host KV total-page mismatch: "
+				f"primary={primary_stats.num_total_pages}, aux={aux_stats.num_total_pages}"
+			)
 		# Both views share num_pages (see _compute_dual_page_count), but they
 		# can drift if mirroring ever fails partway (e.g. aux register raises
 		# after primary succeeds). Report whichever side has fewer free pages
@@ -268,10 +343,59 @@ class DualHostKVCoordinator:
 			return aux_stats
 		return primary_stats
 
-	# -- Migration (primary only, aux rebuilt during prefill) --
+	# -- Migration / load helpers --
 
 	def async_load_layer_paged_kv_to_device(self, **kwargs):
-		return self.primary.async_load_layer_paged_kv_to_device(**kwargs)
+		raise RuntimeError(
+			"DSA dual host KV load must use async_load_layer_paged_kv_to_device_dual(); "
+			"primary-only loads can leave auxiliary/indexer KV stale"
+		)
+
+	def async_load_layer_paged_kv_to_device_dual(
+		self,
+		*,
+		sequence_ids,
+		primary_active_page_counts,
+		primary_k_device_ptrs,
+		primary_v_device_ptrs,
+		aux_active_page_counts,
+		aux_k_device_ptrs,
+		aux_v_device_ptrs,
+		tensors=None,
+	) -> DualAsyncKVTask:
+		aux = self.require_auxiliary("async_load_layer_paged_kv_to_device_dual")
+		if primary_active_page_counts.tolist() != aux_active_page_counts.tolist():
+			raise RuntimeError(
+				"primary/auxiliary host load page-count mismatch: "
+				f"primary={primary_active_page_counts.tolist()}, "
+				f"auxiliary={aux_active_page_counts.tolist()}"
+			)
+		primary_task = self.primary.async_load_layer_paged_kv_to_device(
+			sequence_ids=sequence_ids,
+			active_page_counts=primary_active_page_counts,
+			k_device_ptrs=primary_k_device_ptrs,
+			v_device_ptrs=primary_v_device_ptrs,
+		)
+		try:
+			aux_task = aux.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_ids,
+				active_page_counts=aux_active_page_counts,
+				k_device_ptrs=aux_k_device_ptrs,
+				v_device_ptrs=aux_v_device_ptrs,
+			)
+		except Exception as aux_launch_error:
+			try:
+				primary_task.wait()
+			except Exception as primary_wait_error:
+				raise RuntimeError(
+					"Auxiliary KV load launch failed after primary launch, "
+					"and primary load did not drain cleanly"
+				) from primary_wait_error
+			raise aux_launch_error
+		return DualAsyncKVTask(primary_task, aux_task, tensors=tensors)
 
 	def async_offload_layer_kv_to_host(self, **kwargs):
-		return self.primary.async_offload_layer_kv_to_host(**kwargs)
+		raise RuntimeError(
+			"DSA dual host KV offload must explicitly offload both primary and auxiliary KV; "
+			"primary-only offload is unsafe"
+		)

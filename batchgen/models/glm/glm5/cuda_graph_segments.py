@@ -24,6 +24,7 @@ so the follow-up implementation is a straight port — no re-planning needed.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, Literal
 
 import torch
@@ -370,8 +371,17 @@ class Glm5MoeSegment:
         the singleton) — those tensors are only used by the non-3D path
         (`_triton_compute` / `expert_compute_mixed`), never by the 3D
         decode path this segment captures.
+
+        Also bakes "all rows valid" into the static padding-mask buffer for
+        this bucket. The captured masking ops then record as effective
+        no-ops at warmup; per-step replay overrides via the static buffer's
+        contents (in-place .copy_() in PSM.set_rank_token_counts).
         """
+        from .model import Glm5MoE
         self.moe.num_tokens_per_rank = bucket_size
+        rt_counts = Glm5MoE._rank_token_counts
+        if rt_counts is not None:
+            rt_counts.fill_(bucket_size)
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -457,42 +467,119 @@ class Glm5MoeReplayProxy(torch.nn.Module):
         object.__setattr__(self, "_segment_name", f"layer_{layer_idx}_moe")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.dim() != 3:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states must be "
+                f"[B,1,H], got shape={tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[1] != 1:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states.shape[1] "
+                f"must be 1, got {hidden_states.shape[1]}"
+            )
+        hidden_size = int(getattr(self.moe, "hidden_size", hidden_states.shape[2]))
+        if hidden_states.shape[2] != hidden_size:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden size mismatch: "
+                f"input={hidden_states.shape[2]}, moe.hidden_size={hidden_size}"
+            )
+        if hidden_states.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states dtype must be "
+                f"torch.bfloat16, got {hidden_states.dtype}"
+            )
         actual_ntp = hidden_states.shape[0]
 
-        # Pick the replay bucket. We MUST always take the captured path
-        # here — falling back to eager on some ranks (e.g. zero-batch or
-        # oversize) while other ranks replay creates mismatched NCCL
-        # collective counts across ranks → cross-rank peer deadlock
-        # observed in run #7/8: rank 4 went eager _forward_decode_3d
-        # while rank 0 replayed captured, their NCCL calls failed to
-        # pair up.
+        # Bucket selection MUST be globally consistent across all ranks.
+        # Drive it from `self.moe.num_tokens_per_rank`, which the worker
+        # propagates via `parallel_manager.set_num_tokens_per_rank(_max_bs)`
+        # using a per-step all_gather of local batch sizes (see
+        # batchgen_worker.py:9018-9028). Every rank then reads the same
+        # value, so all 16 ranks pick the same bucket and replay the same
+        # captured graph (matching NCCL collective payloads = no deadlock).
         #
-        # Zero-batch: pass smallest bucket, slice [:0] post-replay.
-        # Captured graph handles zero real input correctly because it
-        # was captured with fill_value=0 static input (every replay
-        # zeros the tail anyway).
+        # Earlier bug: this code keyed on `actual_ntp = hidden_states.shape[0]`
+        # which is per-rank and varies as sequences complete mid-window.
+        # That caused different ranks to replay different buckets → NCCL
+        # all_gather byte-count mismatch → cluster-wide hang.
         #
-        # Oversize: would require a larger bucket than we have. There's
-        # no safe way to handle this without cross-rank coordination —
-        # raise loudly so the bucket list can be extended.
-        if actual_ntp == 0:
+        # Zero-batch: pass smallest bucket, slice [:0] post-replay. Captured
+        # graph handles zero real input correctly (replay zeros the tail).
+        #
+        # Oversize: synced_ntp > largest captured bucket. Fall back to eager
+        # `_forward_decode_3d` — all 16 ranks see the same oversize and fall
+        # back together. Eager path uses the singleton `_3d_buf`
+        # (resize_if_needed permitted there), independent of bucket buffers.
+        # Bucket selection is driven ONLY by synced_ntp (cross-rank-identical).
+        # Local actual_ntp can be 0 on some ranks while peers have work; if
+        # we keyed bucket on actual_ntp here, those ranks would replay a
+        # different captured graph than peers → NCCL byte-count mismatch.
+        # Even with actual_ntp=0, the captured graph still fires its NCCL
+        # collectives with the bucket-sized payload (the static input is
+        # zero-filled by graph_manager.replay's input-padding path).
+        synced_ntp = int(self.moe.num_tokens_per_rank or 0)
+        if synced_ntp == 0:
             bucket = min(self.bucketing.bucket_sizes)
-            replay_bs = bucket
         else:
             try:
-                bucket = self.bucketing.get_padded_size(actual_ntp)
-            except ValueError as exc:
+                bucket = self.bucketing.get_padded_size(synced_ntp)
+            except ValueError:
+                # Oversize: log once and route to eager.
+                if not getattr(Glm5MoeReplayProxy, "_warned_oversize", False):
+                    logging.warning(
+                        f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
+                        f"synced_ntp={synced_ntp} exceeds max bucket "
+                        f"{max(self.bucketing.bucket_sizes)}; falling back "
+                        "to eager _forward_decode_3d. Increase "
+                        "BATCHGEN_GLM5_MTP_BUCKETS to capture this size."
+                    )
+                    Glm5MoeReplayProxy._warned_oversize = True
+                return self.moe._forward_decode_3d(hidden_states)
+        if actual_ntp > bucket:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): local actual_ntp={actual_ntp} "
+                f"exceeds selected synced bucket={bucket}; synced_ntp={synced_ntp}"
+            )
+
+        if os.environ.get("BATCHGEN_GLM5_VERIFY_MOE_GRAPH", "0") == "1":
+            from .model import Glm5MoE
+            rank_counts = Glm5MoE._rank_token_counts
+            if rank_counts is None:
                 raise RuntimeError(
                     f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
-                    f"actual_ntp={actual_ntp} exceeds max bucket "
-                    f"{max(self.bucketing.bucket_sizes)}. Increase "
-                    "BATCHGEN_GLM5_MTP_BUCKETS or disable CUDA graph."
-                ) from exc
-            replay_bs = actual_ntp
+                    "Glm5MoE._rank_token_counts is None under MoE graph replay"
+                )
+            world_size = int(getattr(self.moe, "world_size", 0) or 0)
+            if world_size > 0 and tuple(rank_counts.shape) != (world_size,):
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts shape "
+                    f"{tuple(rank_counts.shape)} != ({world_size},)"
+                )
+            if rank_counts.dtype != torch.int64:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts dtype "
+                    f"must be int64, got {rank_counts.dtype}"
+                )
+            if rank_counts.device != hidden_states.device:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts device "
+                    f"{rank_counts.device} != hidden_states device {hidden_states.device}"
+                )
+            if bool((rank_counts > bucket).any().item()):
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts exceed "
+                    f"bucket={bucket}; max={int(rank_counts.max().item())}, "
+                    f"counts={rank_counts.detach().cpu().tolist()}"
+                )
 
-        # Align moe.num_tokens_per_rank so _forward_decode_3d inside the
-        # captured graph reads the bucket-matched value.
-        self.moe.num_tokens_per_rank = bucket
+        # Pass `bucket` (not actual_ntp) as graph_manager.replay's batch_size
+        # so all 16 ranks select the SAME captured graph for this step. The
+        # replay function re-derives `bucket = get_padded_size(batch_size)`
+        # internally; if we pass per-rank actual_ntp, ranks with smaller
+        # batches pick a smaller bucket → different captured NCCL kernels →
+        # mismatched payloads → cluster-wide hang.
+        # (Root cause of the 2026-04-25 stress hang.)
+        replay_bs = bucket
 
         # Dispatch. graph_manager.replay handles bucket padding: copies
         # input[:actual_ntp] into static[:actual_ntp] and zeros the tail.

@@ -125,6 +125,7 @@ def _fused_score_kernel(
     B: tl.constexpr,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    softmax_scale: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -153,7 +154,8 @@ def _fused_score_kernel(
         q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
         q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
         gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
-        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        scores = tl.sum(k_tile * q_vec[None, :], axis=1) * softmax_scale
+        scores = tl.maximum(scores, 0.0)
         agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
 
     agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
@@ -165,10 +167,14 @@ def _fused_score_kernel(
 # ============================================================
 
 def compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim):
-    """Compute pre-scaled head gates. Pure GPU, no sync."""
-    gates = torch.nn.functional.linear(hidden_states.float(), weights_proj_weight.float())
-    scale = (n_heads ** -0.5) * (head_dim ** -0.5)
-    return (gates * scale).to(torch.float32)
+    """Compute GLM-5 indexer head gates. Pure GPU, no sync."""
+    # Match the PyTorch fallback/model path: BF16 hidden_states and BF16
+    # weights are multiplied in the module's dtype, then promoted for the
+    # downstream FP32 aggregation. Forcing FP32 here changes borderline top-k
+    # ordering relative to score_and_select_relu_gated().
+    gates = torch.nn.functional.linear(hidden_states, weights_proj_weight).float()
+    scale = n_heads ** -0.5
+    return gates * scale
 
 
 def fused_score_and_topk(
@@ -192,6 +198,7 @@ def fused_score_and_topk(
         q, cached_k, head_gates, cache_seqlens,
         agg, max_seqlen,
         B=B, n_heads=n_heads, head_dim=head_dim,
+        softmax_scale=head_dim ** -0.5,
         BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
     )
 
@@ -298,7 +305,7 @@ def fused_score_pipeline(
     cache_seqlens,          # [B] int32
     wq_b_weights,           # FP8WqbWeightsCUDA
     weights_proj_weight,    # [32, 6144] BF16
-    cos_table, sin_table,   # [max_pos, 64] BF16 — RoPE tables
+    cos_table, sin_table,   # [max_pos, 64] FP32 — RoPE tables
     positions,              # [B] int64
     module,                 # CUDA module from build_module()
     n_heads=32,
@@ -350,14 +357,16 @@ def reference_score_and_select(
     # RoPE + Hadamard (PyTorch reference)
     q = rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim)
 
-    # Head gates
+    # Head gates: weights_proj(hidden) * n_heads^-0.5.
     head_gates = compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim)
 
-    # Q×K scoring — chunked per-head to avoid OOM at large seqlens
+    # Q×K scoring — chunked per-head to avoid OOM at large seqlens.
+    # Match GLM-5 indexer semantics: ReLU(QK * head_dim^-0.5) before head gating.
     aggregated = torch.zeros(B, max_seqlen, dtype=torch.float32, device=q.device)
     q_f = q.float()
     for h in range(n_heads):
-        s = torch.bmm(q_f[:, h:h+1, :], cached_k.float().transpose(1, 2))
+        s = torch.bmm(q_f[:, h:h+1, :], cached_k.float().transpose(1, 2)) * (head_dim ** -0.5)
+        s = torch.relu(s)
         aggregated += s.squeeze(1) * head_gates[:, h:h+1]
     pos_idx = torch.arange(max_seqlen, device=q.device).unsqueeze(0)
     mask = pos_idx >= cache_seqlens.unsqueeze(1)

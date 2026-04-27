@@ -8,6 +8,9 @@ from batchgen.models.glm.glm5.decode_utils import (
     build_clamped_dense_token_indices,
     clamp_token_indices_to_seqlens,
     reorder_block_table_to_batch_slots,
+    validate_effective_block_table_pages,
+    validate_gather_invalid_mask_is_padding_only,
+    validate_token_indices_within_seqlens,
 )
 
 
@@ -134,3 +137,155 @@ def test_paged_gather_cache_key_invalidates_in_place_page_table_rebuild():
     assert key_v1 != key_v2
     assert flat_v1.tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
     assert flat_v2.tolist() == [4, 5, 6, 7, 0, 1, 2, 3]
+
+
+def test_flat_paged_gather_indices_clamp_invalid_pages_with_mask():
+    block_table = torch.tensor([[0, -1], [2, 3]], dtype=torch.int64)
+
+    flat, invalid = build_flat_paged_gather_indices(
+        block_table,
+        max_seqlen=4,
+        page_size=2,
+        return_invalid_mask=True,
+    )
+
+    assert flat.tolist() == [0, 1, 0, 1, 4, 5, 6, 7]
+    assert invalid.tolist() == [[False, False, True, True], [False, False, False, False]]
+
+
+def test_validate_token_indices_within_seqlens_fails_effective_oob():
+    token_indices = torch.tensor([[0, 1, 2], [3, 4, 4]], dtype=torch.long)
+    cache_seqlens = torch.tensor([3, 5], dtype=torch.int32)
+
+    validate_token_indices_within_seqlens(
+        token_indices,
+        cache_seqlens,
+        context="test",
+        debug_sync=True,
+    )
+
+    bad = torch.tensor([[0, 1, 3], [3, 4, 5]], dtype=torch.long)
+    try:
+        validate_token_indices_within_seqlens(
+            bad,
+            cache_seqlens,
+            context="test",
+            debug_sync=True,
+        )
+    except RuntimeError as exc:
+        assert "effective token index out of range" in str(exc)
+    else:
+        raise AssertionError("expected out-of-range token index to fail")
+
+
+def test_validate_token_indices_allows_padded_tail():
+    token_indices = torch.tensor([[0, 1, 999], [3, 4, 999]], dtype=torch.long)
+    cache_seqlens = torch.tensor([2, 5], dtype=torch.int32)
+    effective_lengths = torch.tensor([2, 2], dtype=torch.int64)
+
+    validate_token_indices_within_seqlens(
+        token_indices,
+        cache_seqlens,
+        context="test",
+        effective_lengths=effective_lengths,
+        debug_sync=True,
+    )
+
+
+def test_validate_gather_invalid_mask_is_padding_only():
+    cache_seqlens = torch.tensor([2, 4], dtype=torch.int32)
+    invalid = torch.tensor(
+        [[False, False, True, True], [False, False, False, False]],
+        dtype=torch.bool,
+    )
+    validate_gather_invalid_mask_is_padding_only(
+        invalid,
+        cache_seqlens,
+        max_seqlen=4,
+        context="test",
+        debug_sync=True,
+    )
+
+    bad = invalid.clone()
+    bad[1, 2] = True
+    try:
+        validate_gather_invalid_mask_is_padding_only(
+            bad,
+            cache_seqlens,
+            max_seqlen=4,
+            context="test",
+            debug_sync=True,
+        )
+    except RuntimeError as exc:
+        assert "inside effective cache" in str(exc)
+    else:
+        raise AssertionError("expected invalid page inside cache to fail")
+
+
+def test_validate_effective_block_table_pages_fails_missing_effective_page():
+    block_table = torch.tensor([[0, -1], [2, 3]], dtype=torch.int64)
+    token_indices = torch.tensor([[0, 2], [1, 3]], dtype=torch.long)
+    effective_lengths = torch.tensor([1, 2], dtype=torch.int64)
+
+    validate_effective_block_table_pages(
+        block_table,
+        token_indices,
+        effective_lengths,
+        page_size=2,
+        context="test",
+        debug_sync=True,
+    )
+
+    try:
+        validate_effective_block_table_pages(
+            block_table,
+            token_indices,
+            torch.tensor([2, 2], dtype=torch.int64),
+            page_size=2,
+            context="test",
+            debug_sync=True,
+        )
+    except RuntimeError as exc:
+        assert "selected page-table entry is -1" in str(exc)
+    else:
+        raise AssertionError("expected missing effective page to fail")
+
+
+def test_validate_effective_block_table_pages_fails_logical_oob():
+    block_table = torch.tensor([[0]], dtype=torch.int64)
+    token_indices = torch.tensor([[2]], dtype=torch.long)
+    effective_lengths = torch.tensor([1], dtype=torch.int64)
+
+    try:
+        validate_effective_block_table_pages(
+            block_table,
+            token_indices,
+            effective_lengths,
+            page_size=2,
+            context="test",
+            debug_sync=True,
+        )
+    except RuntimeError as exc:
+        assert "logical page out of range" in str(exc)
+    else:
+        raise AssertionError("expected logical page OOB to fail")
+
+
+def test_sparse_gather_rejects_bad_entry_contracts():
+    blocked_k = torch.zeros(2, 2, 1, 1)
+    block_table = torch.tensor([[0]], dtype=torch.int64)
+    token_indices = torch.tensor([[0]], dtype=torch.long)
+
+    try:
+        sparse_gather_from_paged_kv(blocked_k.reshape(4, 1, 1), block_table, token_indices, 2)
+    except RuntimeError as exc:
+        assert "blocked_k must be 4D" in str(exc)
+    else:
+        raise AssertionError("expected malformed blocked_k to fail")
+
+    try:
+        sparse_gather_from_paged_kv(blocked_k, block_table, token_indices.float(), 2)
+    except RuntimeError as exc:
+        assert "token_indices must be int32/int64" in str(exc)
+    else:
+        raise AssertionError("expected non-integer token_indices to fail")

@@ -966,32 +966,18 @@ class GPUPagedKVCacheManager:
 				"rebuild_page_table: sequence_ids must be non-empty"
 			)
 
-		# DEFENSIVE: Filter unallocated sequences instead of raising KeyError.
-		# During mid-decode admission (decode→prefill→decode transition with a
-		# mix of old ON_HOLD + new PREFILLED sequences), callers can occasionally
-		# pass sequence IDs that are not yet registered in self._sequences. A
-		# hard KeyError crashes the entire server. Filtering + logging lets the
-		# decode continue with the sequences that ARE allocated — the unallocated
-		# ones will be picked up on the next page boundary rebuild.
+		# Do not silently filter active sequences. The decode batch, page-table
+		# rows, cache_seqlens, and GLM-5 DSA slot indices must have identical
+		# order and length; filtering here would shift page-table rows under
+		# still-active batch entries and silently corrupt survivor sequences.
 		missing = [
 			seq_id for seq_id in ordered_ids if seq_id not in self._sequences
 		]
 		if missing:
-			logging.error(
-				"rebuild_page_table: filtering %d unallocated sequences out of %d "
-				"(first 20 missing: %s)",
-				len(missing), len(ordered_ids),
-				", ".join(str(seq_id) for seq_id in missing[:20]),
+			raise KeyError(
+				"rebuild_page_table: unallocated active sequence ids: "
+				+ ", ".join(str(seq_id) for seq_id in missing[:20])
 			)
-			ordered_ids = [
-				seq_id for seq_id in ordered_ids if seq_id in self._sequences
-			]
-			if not ordered_ids:
-				logging.error(
-					"rebuild_page_table: no valid sequences remaining after filter; "
-					"returning existing page table unchanged"
-				)
-				return self._gpu_page_table_manager.gpu_table
 
 		# DEBUG: Log before rebuild
 		old_shape = self._gpu_page_table_manager.gpu_table.shape if self._gpu_page_table_manager.gpu_table is not None else None
@@ -1819,5 +1805,6 @@ class GPUPagedKVCacheManager:
 			self._sequences[sequence_id] = _SequenceState(pages=new_pages)
 		else:
 			state.append_pages(new_pages)
+		self._clear_active_page_pointer_tables()
 		
 		return additional_pages
