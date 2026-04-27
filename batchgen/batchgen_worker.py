@@ -6359,9 +6359,9 @@ class BatchGenWorker:
 				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
-				sequence_tokens.append(initial_capacity)
-				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
+				sequence_tokens.append(seq.host_token_capacity)
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —

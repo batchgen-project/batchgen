@@ -305,10 +305,24 @@ class SequenceEntry:
             require(self.evicted_token_ids is not None, "EVICTED requires evicted_token_ids")
 
         if self.input_ids is not None:
-            require(self.input_ids.dim() == 1, f"input_ids must be per-sequence 1D, got shape={tuple(self.input_ids.shape)}")
+            if self.input_ids.dim() == 1:
+                input_capacity = int(self.input_ids.numel())
+            elif self.input_ids.dim() == 2 and int(self.input_ids.shape[0]) == 1:
+                # QueryBookBufferPool exposes per-sequence storage as a
+                # singleton-batch view; any batch dimension >1 is invalid.
+                input_capacity = int(self.input_ids.shape[1])
+            else:
+                require(
+                    False,
+                    f"input_ids must be a per-sequence tensor or singleton view, got shape={tuple(self.input_ids.shape)}",
+                )
             require(
-                int(self.input_ids.numel()) == self.prompt_length,
-                f"input_ids length={int(self.input_ids.numel())} must equal prompt_length={self.prompt_length}",
+                input_capacity >= self.prompt_length,
+                f"input_ids capacity={input_capacity} is smaller than prompt_length={self.prompt_length}",
+            )
+            require(
+                input_capacity <= self.kv_token_budget,
+                f"input_ids capacity={input_capacity} exceeds kv_token_budget={self.kv_token_budget}",
             )
         if self.decoded_tokens is not None:
             require(
