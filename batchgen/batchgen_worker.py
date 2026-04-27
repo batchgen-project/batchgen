@@ -1172,7 +1172,7 @@ class BatchGenWorker:
 
 			pending_uuids = set(uuids)
 			prefix_assigned: Set[str] = set()
-			if self.enable_prefix_reuse:
+			if self._prefix_reuse_runtime_enabled():
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
 					if seq is None:
@@ -1227,7 +1227,7 @@ class BatchGenWorker:
 
 		pending_uuids = set(uuids)
 		prefix_assigned: Set[str] = set()
-		if self.enable_prefix_reuse:
+		if self._prefix_reuse_runtime_enabled():
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is None:
@@ -1692,7 +1692,7 @@ class BatchGenWorker:
 		tokens: List[int],
 		manager: GPUPagedKVCacheManager,
 	) -> List[List[int]]:
-		if not self.enable_prefix_reuse:
+		if not self._prefix_reuse_runtime_enabled():
 			return [[] for _ in global_ids]
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
@@ -1712,7 +1712,7 @@ class BatchGenWorker:
 		tokens: List[int],
 		shared_prefix_pages: List[List[int]],
 	) -> int:
-		if not self.enable_prefix_reuse:
+		if not self._prefix_reuse_runtime_enabled():
 			return sum(t // self.PAGE_SIZE for t in tokens)
 		materialized_shared = getattr(manager, "_shared_prefix_gpu_pages", {})
 		missing_shared = {
@@ -1733,7 +1733,7 @@ class BatchGenWorker:
 		global_ids: List[int],
 		tokens: List[int],
 	) -> None:
-		if self.enable_prefix_reuse:
+		if self._prefix_reuse_runtime_enabled():
 			shared_pages = self._gpu_shared_prefix_pages_for_allocation(
 				global_ids,
 				tokens,
@@ -1783,7 +1783,7 @@ class BatchGenWorker:
 			page_counts_per_seq.append(pages)
 			pages_per_seq.append(pages * self.PAGE_SIZE)  # tokens for API
 			total_pages += pages
-			if self.enable_prefix_reuse and worker_view is not None:
+			if self._prefix_reuse_runtime_enabled() and worker_view is not None:
 				shared_pages = list(worker_view.shared_prefix_pages(seq.global_idx))
 				if len(shared_pages) > pages:
 					shared_pages = shared_pages[:pages]
@@ -1807,7 +1807,7 @@ class BatchGenWorker:
 				f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
 			)
 
-		if self.enable_prefix_reuse:
+		if self._prefix_reuse_runtime_enabled():
 			materialized_shared = getattr(manager, "_shared_prefix_gpu_pages", {})
 			missing_shared = {
 				page
@@ -3868,6 +3868,7 @@ class BatchGenWorker:
 					'prompt_length': seq.prompt_length,  # Include for validation
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
+					'prefix_shared_tokens': seq.prefix_shared_tokens,
 					# total_decoded_before_eviction: needed so non-owning ranks
 					# sort eviction candidates consistently in _prepare_prefill_batch.
 					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
@@ -3900,6 +3901,8 @@ class BatchGenWorker:
 								seq.host_pages_allocated = state['host_pages_allocated']
 							if 'host_token_capacity' in state:
 								seq.host_token_capacity = state['host_token_capacity']
+							if 'prefix_shared_tokens' in state:
+								seq.prefix_shared_tokens = int(state['prefix_shared_tokens'])
 							# Eviction-related fields
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
@@ -4567,16 +4570,29 @@ class BatchGenWorker:
 		
 		# Greedily fill
 		rank_pages_used = [0] * self.world_size
+		rank_counts = [0] * self.world_size
+		rank_has_reused_prefix = [False] * self.world_size
 		decode_batch = []
 		
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
 			req_pages = seq.get_gpu_pages_for_two_page_buffer()
+			uses_reused_prefix = self._sequence_uses_reused_prefix(seq)
+			if self._prefix_reuse_decode_rank_blocked(
+				rank_counts,
+				rank_has_reused_prefix,
+				assigned_rank,
+				uses_reused_prefix,
+			):
+				continue
 			
 			if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
 				decode_batch.append(uuid)
 				rank_pages_used[assigned_rank] += req_pages
+				rank_counts[assigned_rank] += 1
+				if uses_reused_prefix:
+					rank_has_reused_prefix[assigned_rank] = True
 
 		if self.rank == 0:
 			logging.info(
@@ -5657,32 +5673,7 @@ class BatchGenWorker:
 								self.prefill(local_prefill_indices)
 						prefill_time += time.perf_counter() - prefill_start
 
-						# CRITICAL: Wait for all async KV offloads to complete before decode.
-						# async_offload_layer_kv_to_host returns a future backed by a
-						# std::async CPU thread that issues cudaMemcpyAsync on a d2h
-						# stream. Discarding the future (fire-and-forget) is unsafe —
-						# the CPU thread may not have run yet, so torch.cuda.synchronize
-						# would have nothing to wait for. Wait on every captured future
-						# first, then sync the device to flush the d2h stream.
-						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-						pending = _AWB.pending_prefill_offload_tasks
-						if pending:
-							for _t in pending:
-								try:
-									_t.wait()
-								except Exception as _e:
-									logging.warning(f"prefill offload task wait failed: {_e}")
-							if self.rank == 0:
-								logging.info(
-									f"[PREFILL_SYNC] waited on {len(pending)} async KV offload tasks"
-								)
-							pending.clear()
-						torch.cuda.synchronize(self.torch_device)
-						# Release the pinned source tensors only AFTER wait() +
-						# device sync confirm the d2h memcpy has fully retired.
-						# Mirrors decode-side `_pending_kv_append_tensors` cleanup
-						# in `_wait_pending_kv_append_tasks`.
-						_AWB.pending_prefill_offload_tensors.clear()
+						self._drain_pending_prefill_offloads(log=True)
 						self._commit_prefix_reuse_pages(prefill_uuids)
 
 					# Cleanup & Status Update
@@ -5741,6 +5732,18 @@ class BatchGenWorker:
 				# ============ STEP B: Init GPU KV with ACTUAL size ============
 				# Only initializes if not already done; subsequent iterations skip
 				self._init_gpu_kv_with_actual_size()
+
+				# Prefix-reuse decode selection needs owner-computed
+				# prefix_shared_tokens on every rank before rank-local candidate
+				# filtering. Otherwise rank 0 may over-select rank 1 reused-prefix
+				# sequences and the later tensor union reintroduces mixed decode.
+				decode_selection_uuids = (
+					self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+					+ self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
+					+ self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
+				)
+				if decode_selection_uuids:
+					self._sync_sequence_metadata(decode_selection_uuids)
 
 				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
 				decode_uuids = self._prepare_decode_batch()
@@ -6090,6 +6093,8 @@ class BatchGenWorker:
 	def _commit_prefix_reuse_pages(self, prefill_uuids: List[str]) -> None:
 		if not self.enable_prefix_reuse:
 			return
+		if self._prefix_reuse_exact_full_prefill_fallback_enabled():
+			return
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
 		if worker_view is None:
 			return
@@ -6123,7 +6128,35 @@ class BatchGenWorker:
 				stats.host_pages_saved,
 			)
 
+	def _drain_pending_prefill_offloads(
+		self,
+		*,
+		log: bool = False,
+	) -> int:
+		"""Wait for pending prefill D2H KV copies and release source tensors."""
+		from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+
+		pending = _AWB.pending_prefill_offload_tasks
+		count = len(pending)
+		if pending:
+			for task in pending:
+				try:
+					task.wait()
+				except Exception as exc:
+					logging.warning(f"prefill offload task wait failed: {exc}")
+			pending.clear()
+		torch.cuda.synchronize(self.torch_device)
+		_AWB.pending_prefill_offload_tensors.clear()
+		if log and count and self.rank == 0:
+			logging.info("[PREFILL_SYNC] waited on %d async KV offload tasks", count)
+		return count
+
 	def _prefix_reuse_shared_tokens_for_sequence(self, seq: SequenceEntry) -> int:
+		if self._prefix_reuse_exact_full_prefill_fallback_enabled():
+			return 0
+		cached_value = int(getattr(seq, "prefix_shared_tokens", 0) or 0)
+		if cached_value > 0:
+			return cached_value
 		allocation = self._prefix_reuse_allocations_by_global_id.get(seq.global_idx)
 		if allocation is not None:
 			return int(allocation.get("shared_prefix_tokens", 0))
@@ -6134,6 +6167,57 @@ class BatchGenWorker:
 			return int(worker_view.shared_prefix_tokens(seq.global_idx))
 		except Exception:
 			return 0
+
+	def _prefix_reuse_exact_full_prefill_fallback_enabled(self) -> bool:
+		"""Force full private prefill compute instead of prefix-reuse replay.
+
+		This is an explicit correctness guard for backends where suffix-only
+		prefix reuse is not numerically exact yet. It disables prefix page sharing
+		for the request, prevents prefill compute from skipping prefix tokens, and
+		prevents decode isolation from treating the sequence as a suffix-only
+		replay.
+		"""
+		explicit = os.environ.get("BATCHGEN_PREFIX_REUSE_EXACT_FULL_PREFILL_FALLBACK")
+		if explicit is not None:
+			return explicit == "1"
+		if os.environ.get("BATCHGEN_PREFIX_REUSE_ALLOW_UNSAFE_SUFFIX_COMPUTE", "0") == "1":
+			return False
+		if not torch.cuda.is_available():
+			return False
+		try:
+			major, _minor = torch.cuda.get_device_capability(self.torch_device)
+		except Exception:
+			major, _minor = torch.cuda.get_device_capability()
+		# Current SM120/Blackwell path falls back to vanilla attention and
+		# per-expert matmul kernels; suffix-only replay is numerically unstable
+		# enough to flip greedy choices, so default to correctness.
+		return major >= 12
+
+	def _prefix_reuse_runtime_enabled(self) -> bool:
+		return bool(
+			self.enable_prefix_reuse
+			and not self._prefix_reuse_exact_full_prefill_fallback_enabled()
+		)
+
+	def _sequence_uses_reused_prefix(self, seq: SequenceEntry) -> bool:
+		return bool(
+			self._prefix_reuse_runtime_enabled()
+			and self._prefix_reuse_shared_tokens_for_sequence(seq) > 0
+		)
+
+	@staticmethod
+	def _prefix_reuse_decode_rank_blocked(
+		rank_counts: List[int],
+		rank_has_reused_prefix: List[bool],
+		assigned_rank: int,
+		uses_reused_prefix: bool,
+	) -> bool:
+		"""Keep reused-prefix decode isolated per rank for exact replay stability."""
+		if rank_has_reused_prefix[assigned_rank]:
+			return True
+		if uses_reused_prefix and rank_counts[assigned_rank] > 0:
+			return True
+		return False
 
 	def _build_prefix_reuse_prefill_plan_for_batch(
 		self,
@@ -6175,6 +6259,8 @@ class BatchGenWorker:
 		except RuntimeError:
 			self._prefix_reuse_prefill_stats["full_hit_guarded_errors"] += 1
 			raise
+		if plan.saved_prefill_tokens <= 0:
+			return None
 
 		if record_stats:
 			self._prefix_reuse_prefill_stats["total_prompt_tokens"] += plan.total_prompt_tokens
@@ -6477,7 +6563,11 @@ class BatchGenWorker:
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			if self.enable_prefix_reuse:
+			use_prefix_reuse_allocation = (
+				self.enable_prefix_reuse
+				and not self._prefix_reuse_exact_full_prefill_fallback_enabled()
+			)
+			if use_prefix_reuse_allocation:
 				prefix_requests = []
 				for uuid, global_idx, capacity_tokens in zip(my_prefill_uuids, global_sequence_ids, sequence_tokens):
 					seq = self.global_batch.get_sequence(uuid)
@@ -6493,9 +6583,17 @@ class BatchGenWorker:
 					prefix_requests
 				)
 				for allocation in allocations:
+					sequence_id = int(allocation["sequence_id"])
 					self._prefix_reuse_allocations_by_global_id[
-						int(allocation["sequence_id"])
+						sequence_id
 					] = dict(allocation)
+					for uuid in my_prefill_uuids:
+						seq = self.global_batch.get_sequence(uuid)
+						if seq is not None and seq.global_idx == sequence_id:
+							seq.prefix_shared_tokens = int(
+								allocation.get("shared_prefix_tokens", 0)
+							)
+							break
 				shared_pages = sum(len(item["shared_prefix_pages"]) for item in allocations)
 				private_pages = sum(len(item["private_pages"]) for item in allocations)
 				if self.rank == 0:
@@ -6510,6 +6608,10 @@ class BatchGenWorker:
 				self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 					list(zip(global_sequence_ids, sequence_tokens))
 				)
+				for uuid in my_prefill_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is not None:
+						seq.prefix_shared_tokens = 0
 			# DSA: mirror registration on auxiliary host KV
 			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 			if aux_view is not None:
@@ -6786,12 +6888,21 @@ class BatchGenWorker:
 		
 		# Select based on two-page buffer requirements
 		rank_counts = [0] * self.world_size
+		rank_has_reused_prefix = [False] * self.world_size
 		decode_batch = []
 		total_pages_needed = 0
 		
 		for uuid in candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
+			uses_reused_prefix = self._sequence_uses_reused_prefix(seq)
+			if self._prefix_reuse_decode_rank_blocked(
+				rank_counts,
+				rank_has_reused_prefix,
+				assigned_rank,
+				uses_reused_prefix,
+			):
+				continue
 			
 			if rank_counts[assigned_rank] >= max_seqs_per_rank:
 				continue
@@ -6804,6 +6915,8 @@ class BatchGenWorker:
 			
 			decode_batch.append(uuid)
 			rank_counts[assigned_rank] += 1
+			if uses_reused_prefix:
+				rank_has_reused_prefix[assigned_rank] = True
 			total_pages_needed += pages
 
 		if self.rank == 0:
@@ -7242,6 +7355,15 @@ class BatchGenWorker:
 		# This prevents OOM when sequences have varying lengths
 		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
 		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		token_cap_override = os.environ.get("BATCHGEN_PREFILL_MICRO_BATCH_TOKEN_CAP")
+		if token_cap_override:
+			try:
+				MAX_TOKENS_PER_MICRO_BATCH = int(token_cap_override)
+			except ValueError as exc:
+				raise ValueError(
+					"BATCHGEN_PREFILL_MICRO_BATCH_TOKEN_CAP must be an integer, "
+					f"got {token_cap_override!r}"
+				) from exc
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 
@@ -7254,11 +7376,12 @@ class BatchGenWorker:
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
-			# Prefix reuse prefill has asymmetric Q/K lengths: Q is the suffix,
-			# K is cached prefix + suffix. Keep this path sequence-isolated until
-			# the multi-sequence suffix attention path is validated end-to-end;
-			# otherwise exact duplicate prompts can drift when mixed with other
-			# suffixes in the same micro-batch.
+			# Prefix-reuse suffix prefill must preserve exact duplicate semantics.
+			# Mixing different suffixes in one BF16 prefill micro-batch changes
+			# downstream GEMM/MoE batch shapes enough to flip greedy boundary
+			# cases, even when the cached KV is correct. Isolate reused suffixes
+			# so each request follows the same compute shape as a single-request
+			# reuse replay.
 			single_sequence_only=(prefix_reuse_plan is not None),
 		)
 		total_tokens_all = sum(seq_lengths_list)
@@ -7419,6 +7542,7 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
+				self._drain_pending_prefill_offloads(log=False)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
@@ -7763,17 +7887,41 @@ class BatchGenWorker:
 			]
 
 			rank_pages_used = [0] * self.world_size
+			rank_counts = [0] * self.world_size
+			rank_has_reused_prefix = [False] * self.world_size
+			for active_uuid in decode_uuids_final:
+				state = global_seq_state.get(active_uuid)
+				if not state:
+					continue
+				assigned_rank = state.get('assigned_rank')
+				if assigned_rank is None:
+					continue
+				rank_counts[assigned_rank] += 1
+				if int(state.get('prefix_shared_tokens', 0)) > 0:
+					rank_has_reused_prefix[assigned_rank] = True
+
 			for uuid in load_candidates_synced:
 				info = global_candidate_info.get(uuid)
 				if info is None:
 					continue
 				req_pages = info['pages_needed']
 				assigned_rank = info['assigned_rank']
+				uses_reused_prefix = int(info.get('prefix_shared_tokens', 0)) > 0
 				if req_pages == 0:
+					continue
+				if self._prefix_reuse_decode_rank_blocked(
+					rank_counts,
+					rank_has_reused_prefix,
+					assigned_rank,
+					uses_reused_prefix,
+				):
 					continue
 				if rank_pages_used[assigned_rank] + req_pages <= adjusted_per_rank_free[assigned_rank]:
 					new_load_uuids.append(uuid)
 					rank_pages_used[assigned_rank] += req_pages
+					rank_counts[assigned_rank] += 1
+					if uses_reused_prefix:
+						rank_has_reused_prefix[assigned_rank] = True
 
 		return BoundaryDecisions(
 			completed_uuids=completed_uuids,
@@ -7929,6 +8077,7 @@ class BatchGenWorker:
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
+					'prefix_shared_tokens': self._prefix_reuse_shared_tokens_for_sequence(seq),
 					# prompt_length: required so Phase 4.C can compute the
 					# re-entry reconstruction length on ALL ranks deterministically,
 					# not just the owner. Without this, non-owning ranks have a
@@ -7966,6 +8115,7 @@ class BatchGenWorker:
 				'assigned_rank': seq.assigned_rank,
 				'status': seq.status.name,  # Include status for debugging
 				'decoded_length': seq.decoded_length,  # For prioritized loading
+				'prefix_shared_tokens': self._prefix_reuse_shared_tokens_for_sequence(seq),
 			}
 		
 		# Pack everything into one dict for single all_gather
