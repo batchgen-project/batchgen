@@ -2148,9 +2148,10 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     v_tensor=seq_value,
                     sequence_lengths=[seq_len],
                 )
-            AttnWrapperBase.pending_prefill_offload_tensors.extend([seq_key, seq_value])
-            if task is not None:
-                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
+            if prefix_reuse_mode:
+                AttnWrapperBase.pending_prefill_offload_tensors.extend([seq_key, seq_value])
+                if task is not None:
+                    AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
         logging.debug(
             f"[Layer {self.layer_idx}] GPT-OSS prepacked prefill complete. "
