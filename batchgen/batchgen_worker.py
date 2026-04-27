@@ -1922,7 +1922,7 @@ class BatchGenWorker:
 
 		sequence_ids, sequence_lengths = batch_info if batch_info is not None else (None, None)
 		if sequence_ids is not None and sequence_lengths is not None:
-			self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
+			self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 
 		# ONE sync for ALL layers across BOTH caches — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
@@ -2025,7 +2025,7 @@ class BatchGenWorker:
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
 
-	def _assert_host_kv_append_capacity(
+	def _ensure_host_kv_append_capacity(
 		self,
 		sequence_ids: List[int],
 		sequence_lengths: List[int],
@@ -2037,6 +2037,8 @@ class BatchGenWorker:
 		if self.global_batch is None:
 			return
 		by_gid = {seq.global_idx: seq for seq in self.global_batch}
+		grow_requests = []
+		grow_metadata = []
 		for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
 			seq = by_gid.get(int(global_idx))
 			if seq is None:
@@ -2045,13 +2047,52 @@ class BatchGenWorker:
 				raise RuntimeError(
 					f"host KV append negative write position for gid={global_idx}: {write_pos}"
 				)
-			if int(write_pos) >= int(seq.host_token_capacity):
+			required_tokens = int(write_pos) + 1
+			if int(seq.host_token_capacity) <= 0:
 				raise RuntimeError(
-					f"host KV append would exceed capacity for gid={global_idx}: "
+					f"host KV append for unallocated gid={global_idx}: "
 					f"write_pos={write_pos}, host_token_capacity={seq.host_token_capacity}, "
 					f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
 					f"status={seq.status.name}"
 				)
+			if required_tokens > int(seq.kv_token_budget):
+				raise RuntimeError(
+					f"host KV append would exceed token budget for gid={global_idx}: "
+					f"required_tokens={required_tokens}, kv_token_budget={seq.kv_token_budget}, "
+					f"ctx={seq.current_context_length}, decoded={seq.decoded_length}, "
+					f"status={seq.status.name}"
+				)
+			if required_tokens > int(seq.host_token_capacity):
+				growth_pages = math.ceil(
+					(required_tokens - int(seq.host_token_capacity)) / seq.PAGE_SIZE
+				)
+				grow_requests.append((int(global_idx), growth_pages))
+				grow_metadata.append((seq, growth_pages, int(seq.host_token_capacity), required_tokens))
+
+		if not grow_requests:
+			return
+
+		worker_view = getattr(self, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			raise RuntimeError(
+				f"host KV append needs growth but no host KV worker is available: "
+				f"requests={grow_requests[:8]}"
+			)
+
+		waited = self._wait_pending_kv_append_tasks(defer_errors=False)
+		worker_view.grow_pages_for_sequences(grow_requests)
+		for seq, growth_pages, old_capacity, required_tokens in grow_metadata:
+			seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+			seq.host_pages_allocated += growth_pages
+			logging.warning(
+				f"Rank {self.rank}: [HOST_KV_APPEND_GROW] grew gid={seq.global_idx} "
+				f"old_cap={old_capacity} new_cap={seq.host_token_capacity} "
+				f"required={required_tokens} pages={growth_pages} waited_tasks={waited} "
+				f"ctx={seq.current_context_length} decoded={seq.decoded_length} "
+				f"status={seq.status.name}"
+			)
 
 	def _append_decode_kv_to_host_async(
 		self,
@@ -2109,7 +2150,7 @@ class BatchGenWorker:
 					'write_pos': write_pos,
 				})
 
-		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
+		self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 		
 		# Log append positions for resumed sequences (layer 0 only to reduce spam)
 		if layer_idx == 0 and append_diag and BATCHGEN_CB_DEBUG:
@@ -2200,7 +2241,7 @@ class BatchGenWorker:
 			write_pos = seq.current_context_length - 1
 			sequence_lengths.append(write_pos)
 
-		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
+		self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
@@ -9550,6 +9591,7 @@ class BatchGenWorker:
 					_sync_kv_seq_ids = _kv_seq_ids
 					_sync_kv_seq_lengths = _kv_seq_lengths
 					_sync_kv_worker_view = _kv_worker_view
+					self._ensure_host_kv_append_capacity(_sync_kv_seq_ids, _sync_kv_seq_lengths)
 					def kv_append_callback(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
 						if k_tensor.dim() == 3:
 							k_tensor = k_tensor.unsqueeze(2)
@@ -10107,7 +10149,7 @@ class BatchGenWorker:
 			sequence_ids.append(seq.global_idx)
 			sequence_lengths.append(seq.current_context_length - 1)
 
-		self._assert_host_kv_append_capacity(sequence_ids, sequence_lengths)
+		self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 		
 		if k_tensor.dim() == 3:
 			k_tensor = k_tensor.unsqueeze(2)
