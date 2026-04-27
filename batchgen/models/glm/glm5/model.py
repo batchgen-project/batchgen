@@ -655,6 +655,12 @@ class Glm5Indexer(nn.Module):
             )
             return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
         else:
+            from batchgen.models.glm.glm5.wrappers import _allow_dsa_fallback, _raise_required_dsa_kernel
+            if not _allow_dsa_fallback():
+                _raise_required_dsa_kernel(
+                    "WP4 fused indexer scoring",
+                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
+                )
             if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
                 self._warned_fused_score_fallback = True
                 logging.warning(

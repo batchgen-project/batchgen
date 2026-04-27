@@ -27,7 +27,12 @@ import torch
 import torch.distributed as dist
 
 from .model import Glm5ForCausalLM, Glm5MoE
-from .wrappers import GLM5ExpertWrapper, GLM5AttnWrapper
+from .wrappers import (
+    GLM5ExpertWrapper,
+    GLM5AttnWrapper,
+    _allow_dsa_fallback,
+    _raise_required_dsa_kernel,
+)
 
 
 class GLM5ParallelStrategyManager:
@@ -771,6 +776,11 @@ class GLM5ParallelStrategyManager:
             logging.info(
                 f"[DSA kernels] init={inited}/{total} layers, "
                 f"WP2={wp2_ok}/{inited}, WP4={wp4_ok}/{inited}"
+            )
+        if inited and not _allow_dsa_fallback() and (wp2_ok != inited or wp4_ok != inited):
+            _raise_required_dsa_kernel(
+                "WP2/WP4 fused DSA kernels",
+                RuntimeError(f"initialized WP2={wp2_ok}/{inited}, WP4={wp4_ok}/{inited}"),
             )
 
     def _lm_head_forward_pre_hook(self, module, input):

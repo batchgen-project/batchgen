@@ -42,8 +42,10 @@ try:
         FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb,
     )
     _HAS_FP8_ABSORB = True
+    _FP8_ABSORB_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FP8_ABSORB = False
+    _FP8_ABSORB_IMPORT_ERROR = _e
     logging.debug(f"[WP5] FP8 absorb import failed: {_e}")
 
 # Try importing fused indexer KV proj (WP2)
@@ -53,8 +55,10 @@ try:
         FP8IndexerWeightsCUDA,
     )
     _HAS_FUSED_INDEXER_KV = True
+    _FUSED_INDEXER_KV_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_INDEXER_KV = False
+    _FUSED_INDEXER_KV_IMPORT_ERROR = _e
     logging.debug(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
 # Try importing fused scoring pipeline (WP4)
@@ -64,8 +68,10 @@ try:
         fused_score_pipeline,
     )
     _HAS_FUSED_SCORE = True
+    _FUSED_SCORE_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_SCORE = False
+    _FUSED_SCORE_IMPORT_ERROR = _e
     logging.debug(f"[WP4] Fused scoring import failed: {_e}")
 
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
@@ -81,6 +87,21 @@ _GLM5_MOE_CATEGORIES = [
 _glm5_decode_timer = init_decode_timer(
     "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
 )
+
+
+def _allow_dsa_fallback() -> bool:
+    return os.environ.get("BATCHGEN_GLM5_ALLOW_DSA_FALLBACK", "0") == "1"
+
+
+def _raise_required_dsa_kernel(name: str, error: Optional[BaseException] = None) -> None:
+    msg = (
+        f"GLM-5 DSA requires {name}; silent fallback is disabled. "
+        "Install the repaired batchgen_kernels package or set "
+        "BATCHGEN_GLM5_ALLOW_DSA_FALLBACK=1 only for explicit debug fallback."
+    )
+    if error is not None:
+        msg = f"{msg} Import/init error: {error}"
+    raise RuntimeError(msg)
 
 
 def glm5_fp8_dequantization(
@@ -343,7 +364,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
-        if _HAS_FUSED_INDEXER_KV:
+        if not _HAS_FUSED_INDEXER_KV:
+            if not _allow_dsa_fallback():
+                _raise_required_dsa_kernel("WP2 fused indexer KV projection", _FUSED_INDEXER_KV_IMPORT_ERROR)
+        else:
             try:
                 self._indexer_cuda_module = _build_indexer_module()
                 # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
@@ -357,6 +381,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
                 )
             except Exception as e:
+                if not _allow_dsa_fallback():
+                    _raise_required_dsa_kernel("WP2 fused indexer KV projection", e)
                 logging.warning(
                     f"[layer {self.layer_idx}] WP2 init failed: {e}"
                 )
@@ -364,7 +390,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = None
 
         # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
+        if not _HAS_FUSED_SCORE:
+            if not _allow_dsa_fallback():
+                _raise_required_dsa_kernel("WP4 fused indexer scoring", _FUSED_SCORE_IMPORT_ERROR)
+        elif self._indexer_cuda_module is None:
+            if not _allow_dsa_fallback():
+                _raise_required_dsa_kernel("WP4 fused indexer scoring", RuntimeError("WP2 module is unavailable"))
+        elif hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
@@ -380,6 +412,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
                 )
             except Exception as e:
+                if not _allow_dsa_fallback():
+                    _raise_required_dsa_kernel("WP4 fused indexer scoring", e)
                 logging.warning(
                     f"[layer {self.layer_idx}] WP4 init failed: {e}"
                 )
@@ -795,6 +829,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
                     ).unsqueeze(2)  # [B, 1, 1, 128]
                 else:
+                    if not _allow_dsa_fallback():
+                        _raise_required_dsa_kernel(
+                            "WP2 fused indexer KV projection",
+                            RuntimeError(f"layer {self.layer_idx} was not initialized"),
+                        )
                     if not self._warned_indexer_kv_fallback:
                         self._warned_indexer_kv_fallback = True
                         logging.warning(
