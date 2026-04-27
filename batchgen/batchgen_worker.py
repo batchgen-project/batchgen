@@ -7458,6 +7458,127 @@ class BatchGenWorker:
 		"""
 		timing = FastBoundaryTimingStats()
 		boundary_start = time.perf_counter()
+		transition_detail = (
+			os.environ.get("BATCHGEN_SEQ_TRANSITION_TRACE", "0") == "1"
+			or BATCHGEN_CB_DEBUG
+		)
+		transition_before = {}
+
+		def _transition_snapshot(uuid: str, seq, state: Optional[dict] = None) -> dict:
+			state = state or {}
+			status = getattr(seq, "status", None) if seq is not None else None
+			return {
+				"gid": getattr(seq, "global_idx", None) if seq is not None else None,
+				"uuid": uuid,
+				"status": status.name if status is not None else state.get("status", "UNKNOWN"),
+				"assigned_rank": state.get("assigned_rank", getattr(seq, "assigned_rank", None) if seq is not None else None),
+				"decoded_length": state.get("decoded_length", getattr(seq, "decoded_length", 0) if seq is not None else 0),
+				"current_context_length": state.get("current_context_length", getattr(seq, "current_context_length", 0) if seq is not None else 0),
+				"prompt_length": state.get("prompt_length", getattr(seq, "prompt_length", 0) if seq is not None else 0),
+				"original_prompt_length": getattr(seq, "original_prompt_length", getattr(seq, "prompt_length", 0) if seq is not None else 0),
+				"reentry_decoded_baseline": state.get("reentry_decoded_baseline", getattr(seq, "reentry_decoded_baseline", 0) if seq is not None else 0),
+				"total_decoded_before_eviction": state.get("total_decoded_before_eviction", getattr(seq, "total_decoded_before_eviction", 0) if seq is not None else 0),
+				"host_pages_allocated": state.get("host_pages_allocated", getattr(seq, "host_pages_allocated", 0) if seq is not None else 0),
+				"host_token_capacity": state.get("host_token_capacity", getattr(seq, "host_token_capacity", 0) if seq is not None else 0),
+				"gpu_pages_allocated": state.get("gpu_pages_allocated", getattr(seq, "gpu_pages_allocated", 0) if seq is not None else 0),
+				"had_initial_gpu_reservation": getattr(seq, "had_initial_gpu_reservation", False) if seq is not None else False,
+				"rep_detected": state.get("rep_detected", getattr(seq, "_rep_detected", False) if seq is not None else False),
+				"rep_count": getattr(seq, "_rep_count", None) if seq is not None else None,
+				"rep_last_token": getattr(seq, "_rep_last_token", None) if seq is not None else None,
+			}
+
+		def _transition_cause(uuid: str, *, watermark: bool, confirmed: set, deferred: set, extension_failed: set) -> str:
+			if uuid in set(decisions.completed_uuids):
+				return "completed"
+			if uuid in set(decisions.host_evicted_uuids):
+				return "host_evicted"
+			if uuid in extension_failed:
+				return "extension_failed"
+			if uuid in set(decisions.onhold_uuids):
+				return "on_hold"
+			if uuid in confirmed:
+				return "load_confirmed"
+			if uuid in deferred:
+				return "load_deferred"
+			if uuid in set(decisions.new_load_uuids):
+				return "load_proposed"
+			if uuid in set(decisions.host_growth_uuids):
+				return "host_growth"
+			if uuid in set(decisions.seqs_needing_extension):
+				return "extension"
+			if watermark:
+				return "watermark_interrupt"
+			return "unchanged"
+
+		def _log_transition_summary(
+			*,
+			watermark: bool,
+			confirmed: set,
+			deferred: set,
+			extension_failed: set,
+		) -> None:
+			if self.rank == 0:
+				logging.info(
+					f"[SEQ_TRANSITION_SUMMARY] boundary={self._boundary_count} "
+					f"completed={len(decisions.completed_uuids)} "
+					f"on_hold={len(decisions.onhold_uuids)} "
+					f"extension_failed={len(extension_failed)} "
+					f"host_evicted={len(decisions.host_evicted_uuids)} "
+					f"host_growth={len(decisions.host_growth_uuids)} "
+					f"proposed_load={len(decisions.new_load_uuids)} "
+					f"confirmed_load={len(confirmed)} "
+					f"deferred_load={len(deferred)} "
+					f"active={len(decode_uuids)} watermark={watermark}"
+				)
+			if not transition_detail:
+				return
+			interesting = (
+				set(decisions.completed_uuids)
+				| set(decisions.onhold_uuids)
+				| set(decisions.host_evicted_uuids)
+				| set(decisions.host_growth_uuids)
+				| set(decisions.seqs_needing_extension)
+				| set(decisions.new_load_uuids)
+				| confirmed
+				| deferred
+				| extension_failed
+			)
+			for uuid in sorted(interesting, key=lambda u: (transition_before.get(u, {}).get("gid") is None, transition_before.get(u, {}).get("gid", 0), u)):
+				seq = self.global_batch.get_sequence(uuid)
+				before = transition_before.get(uuid, _transition_snapshot(uuid, seq))
+				after = _transition_snapshot(uuid, seq)
+				if seq is not None and seq.assigned_rank != self.rank:
+					continue
+				cause = _transition_cause(
+					uuid,
+					watermark=watermark,
+					confirmed=confirmed,
+					deferred=deferred,
+					extension_failed=extension_failed,
+				)
+				manager_pages = None
+				if seq is not None and gpu_manager is not None and hasattr(gpu_manager, "_sequences"):
+					entry = gpu_manager._sequences.get(seq.global_idx)
+					if entry is not None and hasattr(entry, "pages"):
+						manager_pages = len(entry.pages)
+				logging.info(
+					f"[SEQ_TRANSITION] boundary={self._boundary_count} gid={after['gid']} "
+					f"uuid={uuid[:8]} rank={self.rank} cause={cause} "
+					f"status={before['status']}->{after['status']} "
+					f"decoded={before['decoded_length']}->{after['decoded_length']} "
+					f"ctx={before['current_context_length']}->{after['current_context_length']} "
+					f"prompt={before['prompt_length']}->{after['prompt_length']} "
+					f"orig_prompt={after['original_prompt_length']} "
+					f"host_pages={before['host_pages_allocated']}->{after['host_pages_allocated']} "
+					f"host_cap={before['host_token_capacity']}->{after['host_token_capacity']} "
+					f"gpu_pages={before['gpu_pages_allocated']}->{after['gpu_pages_allocated']} "
+					f"manager_pages={manager_pages} "
+					f"had_initial={after['had_initial_gpu_reservation']} "
+					f"reentry_baseline={after['reentry_decoded_baseline']} "
+					f"total_before_eviction={after['total_decoded_before_eviction']} "
+					f"rep_detected={after['rep_detected']} rep_count={after['rep_count']} "
+					f"rep_last_token={after['rep_last_token']}"
+				)
 		
 		# ========== PHASE 0: Wait for pending async operations ==========
 		t0 = time.perf_counter()
@@ -7593,6 +7714,7 @@ class BatchGenWorker:
 				seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/decode_state")
 				is_completed = self._is_sequence_completed(seq)
 				local_seq_state[uuid] = {
+					'status': seq.status.name,
 					'decoded_length': seq.decoded_length,
 					'current_context_length': seq.current_context_length,
 					'gpu_pages_allocated': seq.gpu_pages_allocated,
@@ -7680,6 +7802,21 @@ class BatchGenWorker:
 		for payload in all_payloads:
 			if payload and payload['candidate_state']:
 				global_candidate_info.update(payload['candidate_state'])
+
+		transition_before = {}
+		for uuid, state in global_seq_state.items():
+			transition_before[uuid] = _transition_snapshot(
+				uuid,
+				self.global_batch.get_sequence(uuid),
+				state,
+			)
+		for uuid, state in global_candidate_info.items():
+			if uuid not in transition_before:
+				transition_before[uuid] = _transition_snapshot(
+					uuid,
+					self.global_batch.get_sequence(uuid),
+					state,
+				)
 
 		# VALIDATION: Check that all decode_uuids have state reported
 		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
@@ -8017,6 +8154,12 @@ class BatchGenWorker:
 		timing.total_completed_cumulative = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
 
 		if not decode_uuids:
+			_log_transition_summary(
+				watermark=False,
+				confirmed=set(),
+				deferred=set(),
+				extension_failed=set(),
+			)
 			timing.total_ms = (time.perf_counter() - boundary_start) * 1000
 			return decode_uuids, batch, None, [], [], [], timing, False
 
@@ -8115,8 +8258,11 @@ class BatchGenWorker:
 		new_load_local = []
 		new_load_global = []
 		confirmed_local_payload = []
+		confirmed_set = set()
+		deferred_set = set()
 
 		if watermark_triggered:
+			deferred_set = set(new_load_uuids)
 			new_load_uuids = []
 		elif new_load_uuids and decode_uuids:
 			my_new_uuids = [u for u in new_load_uuids
@@ -8230,6 +8376,7 @@ class BatchGenWorker:
 				key=lambda u: confirmed_by_uuid[u],
 			)
 			confirmed_set = set(new_load_uuids)
+			deferred_set = set(decisions.new_load_uuids) - confirmed_set
 			new_load_local = [
 				idx for idx in new_load_local
 				if self._local_to_uuid_map.get(idx) in confirmed_set
@@ -8332,6 +8479,12 @@ class BatchGenWorker:
 					)
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
+		_log_transition_summary(
+			watermark=watermark_triggered,
+			confirmed=confirmed_set,
+			deferred=deferred_set,
+			extension_failed=set(global_extension_failed),
+		)
 
 		# Periodic host KV diagnostic summary
 		self._boundary_count += 1

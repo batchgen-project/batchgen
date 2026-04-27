@@ -28,6 +28,8 @@ from batchgen.timing import get_decode_timer
 from batchgen.models.glm.glm5.decode_utils import (
 	build_flat_paged_gather_indices,
 	build_paged_gather_cache_key,
+	validate_gather_invalid_mask_is_padding_only,
+	validate_token_indices_within_seqlens,
 )
 
 import torch
@@ -595,9 +597,74 @@ class Glm5Indexer(nn.Module):
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
         """
+        if q_a.dim() != 3 or q_a.shape[1] != 1:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: q_a must be [B,1,q_lora_rank], got {tuple(q_a.shape)}"
+            )
+        if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: hidden_states must be [B,1,hidden_size], "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        if indexer_blocked_k.dim() != 4:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: indexer_blocked_k must be "
+                f"[num_pages,page_size,num_heads,head_dim], got {tuple(indexer_blocked_k.shape)}"
+            )
+        if block_table.dim() != 2:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: block_table must be [B,pages], got {tuple(block_table.shape)}"
+            )
+        if cache_seqlens.dim() != 1:
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be [B], got {tuple(cache_seqlens.shape)}"
+            )
+        if block_table.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: block_table must be int32/int64, got {block_table.dtype}"
+            )
+        if cache_seqlens.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be int32/int64, got {cache_seqlens.dtype}"
+            )
+        batch_size = block_table.shape[0]
+        if q_a.shape[0] != batch_size or hidden_states.shape[0] != batch_size or cache_seqlens.shape[0] != batch_size:
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: batch mismatch: "
+                f"q_a={tuple(q_a.shape)}, hidden_states={tuple(hidden_states.shape)}, "
+                f"block_table={tuple(block_table.shape)}, cache_seqlens={tuple(cache_seqlens.shape)}"
+            )
+        if int(page_size) <= 0:
+            raise ValueError(f"GLM-5 DSA score_and_select_paged: page_size must be positive, got {page_size}")
+        if indexer_blocked_k.shape[1] != int(page_size):
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: indexer_blocked_k page dimension "
+                f"{indexer_blocked_k.shape[1]} != page_size={page_size}"
+            )
+        if positions is not None and (positions.dim() != 1 or positions.shape[0] != batch_size):
+            raise RuntimeError(
+                "GLM-5 DSA score_and_select_paged: positions must be [B] when provided, "
+                f"got {tuple(positions.shape)} for B={batch_size}"
+            )
+        _debug_validate = os.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
         batch_size = block_table.shape[0]
         if max_seqlen is None:
             max_seqlen = int(cache_seqlens.max().item())
+        if int(max_seqlen) <= 0:
+            raise ValueError(f"GLM-5 DSA score_and_select_paged: max_seqlen must be positive, got {max_seqlen}")
+        if _debug_validate:
+            validate_token_indices_within_seqlens(
+                torch.zeros(batch_size, 1, dtype=torch.long, device=cache_seqlens.device),
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/cache_seqlens",
+                effective_lengths=torch.zeros(batch_size, dtype=torch.long, device=cache_seqlens.device),
+                debug_sync=True,
+            )
+            if int(cache_seqlens.max().item()) > int(max_seqlen):
+                raise RuntimeError(
+                    "GLM-5 DSA score_and_select_paged: max_seqlen smaller than cache_seqlens.max(): "
+                    f"max_seqlen={max_seqlen}, cache_max={int(cache_seqlens.max().item())}"
+                )
         num_k_heads = indexer_blocked_k.shape[2]
         k_head_dim = indexer_blocked_k.shape[3]
 
@@ -619,6 +686,13 @@ class Glm5Indexer(nn.Module):
             self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
 
         flat_idx = self._gather_cache
+        validate_gather_invalid_mask_is_padding_only(
+            self._gather_cache_invalid_mask,
+            cache_seqlens,
+            max_seqlen,
+            context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/aux_gather",
+            debug_sync=_debug_validate,
+        )
         blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
         gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
         gathered = gathered.masked_fill(
@@ -653,7 +727,13 @@ class Glm5Indexer(nn.Module):
                 rope_dim=self.rope_head_dim,
                 topk=min(self.index_topk, max_seqlen),
             )
-            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
+            validate_token_indices_within_seqlens(
+                top_k_indices,
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fused_topk",
+                debug_sync=_debug_validate,
+            )
+            return top_k_indices.to(torch.long)
         else:
             from batchgen.models.glm.glm5.wrappers import _allow_dsa_fallback, _raise_required_dsa_kernel
             if not _allow_dsa_fallback():
@@ -667,10 +747,17 @@ class Glm5Indexer(nn.Module):
                     f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
                     "falling back to PyTorch score_and_select_relu_gated"
                 )
-            return self.score_and_select_relu_gated(
+            top_k_indices = self.score_and_select_relu_gated(
                 q_a, hidden_states, gathered_k, cache_seqlens,
                 positions=positions, max_seqlen=max_seqlen,
             )
+            validate_token_indices_within_seqlens(
+                top_k_indices,
+                cache_seqlens,
+                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fallback_topk",
+                debug_sync=_debug_validate,
+            )
+            return top_k_indices.to(torch.long)
 
 
 # ============================================================================

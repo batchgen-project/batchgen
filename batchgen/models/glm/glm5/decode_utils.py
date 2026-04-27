@@ -1,7 +1,232 @@
+from __future__ import annotations
+
 from collections.abc import Mapping, Sequence
 from typing import Union
 
 import torch
+
+
+_INT_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+
+
+def _require_integer_tensor(tensor: torch.Tensor, name: str) -> None:
+    if tensor.dtype not in _INT_DTYPES:
+        raise RuntimeError(f"{name} must have integer dtype, got {tensor.dtype}")
+
+
+def _first_true(mask: torch.Tensor) -> tuple[int, ...]:
+    coords = mask.nonzero(as_tuple=False)
+    if coords.numel() == 0:
+        return ()
+    return tuple(int(v) for v in coords[0].detach().cpu().tolist())
+
+
+def validate_token_indices_within_seqlens(
+    token_indices: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    context: str,
+    effective_lengths: torch.Tensor | None = None,
+    debug_sync: bool = False,
+) -> None:
+    """Validate effective token indices without repairing them.
+
+    Shape/dtype/rank checks are lightweight and always run. Value checks can
+    force GPU-host sync and should be enabled only for diagnostic runs.
+    """
+    if token_indices.dim() != 2:
+        raise RuntimeError(
+            f"{context}: token_indices must be 2D [B,K], got shape={tuple(token_indices.shape)}"
+        )
+    _require_integer_tensor(token_indices, f"{context}: token_indices")
+    if cache_seqlens.dim() != 1:
+        raise RuntimeError(
+            f"{context}: cache_seqlens must be 1D [B], got shape={tuple(cache_seqlens.shape)}"
+        )
+    _require_integer_tensor(cache_seqlens, f"{context}: cache_seqlens")
+    if token_indices.shape[0] != cache_seqlens.shape[0]:
+        raise RuntimeError(
+            f"{context}: token_indices/cache_seqlens batch mismatch: "
+            f"token_indices.shape[0]={token_indices.shape[0]}, "
+            f"cache_seqlens.shape[0]={cache_seqlens.shape[0]}"
+        )
+    if effective_lengths is not None:
+        if effective_lengths.dim() != 1:
+            raise RuntimeError(
+                f"{context}: effective_lengths must be 1D [B], got shape={tuple(effective_lengths.shape)}"
+            )
+        _require_integer_tensor(effective_lengths, f"{context}: effective_lengths")
+        if effective_lengths.shape[0] != token_indices.shape[0]:
+            raise RuntimeError(
+                f"{context}: effective_lengths batch mismatch: "
+                f"effective_lengths.shape[0]={effective_lengths.shape[0]}, "
+                f"token_indices.shape[0]={token_indices.shape[0]}"
+            )
+    if not debug_sync:
+        return
+
+    cache = cache_seqlens.to(device=token_indices.device, dtype=torch.long)
+    if bool((cache <= 0).any().item()):
+        row = _first_true(cache <= 0)
+        value = int(cache[row[0]].item()) if row else None
+        raise RuntimeError(f"{context}: cache_seqlens must be positive; row={row}, value={value}")
+
+    topk = token_indices.shape[1]
+    if effective_lengths is None:
+        effective = torch.minimum(
+            cache,
+            torch.full_like(cache, topk),
+        )
+    else:
+        effective = effective_lengths.to(device=token_indices.device, dtype=torch.long)
+        if bool((effective < 0).any().item()):
+            row = _first_true(effective < 0)
+            value = int(effective[row[0]].item()) if row else None
+            raise RuntimeError(f"{context}: effective_lengths must be non-negative; row={row}, value={value}")
+        if bool((effective > topk).any().item()):
+            row = _first_true(effective > topk)
+            value = int(effective[row[0]].item()) if row else None
+            raise RuntimeError(
+                f"{context}: effective_lengths exceeds token_indices width; "
+                f"row={row}, value={value}, topk={topk}"
+            )
+        if bool((effective > cache).any().item()):
+            row = _first_true(effective > cache)
+            raise RuntimeError(
+                f"{context}: effective_lengths exceeds cache_seqlens; "
+                f"row={row}, effective={int(effective[row[0]].item())}, "
+                f"cache_seqlen={int(cache[row[0]].item())}"
+            )
+
+    cols = torch.arange(topk, device=token_indices.device).unsqueeze(0)
+    effective_mask = cols < effective.unsqueeze(1)
+    values = token_indices.to(torch.long)
+    invalid = effective_mask & ((values < 0) | (values >= cache.unsqueeze(1)))
+    if bool(invalid.any().item()):
+        row, col = _first_true(invalid)
+        value = int(values[row, col].item())
+        seqlen = int(cache[row].item())
+        raise RuntimeError(
+            f"{context}: effective token index out of range at row={row}, col={col}: "
+            f"value={value}, cache_seqlen={seqlen}, shape={tuple(token_indices.shape)}"
+        )
+
+
+def validate_effective_block_table_pages(
+    block_table: torch.Tensor,
+    token_indices: torch.Tensor,
+    effective_lengths: torch.Tensor,
+    page_size: int,
+    *,
+    context: str,
+    debug_sync: bool = False,
+) -> None:
+    """Validate that effective sparse-token indices map to present pages."""
+    if block_table.dim() != 2:
+        raise RuntimeError(
+            f"{context}: block_table must be 2D [B,pages], got shape={tuple(block_table.shape)}"
+        )
+    _require_integer_tensor(block_table, f"{context}: block_table")
+    if token_indices.dim() != 2:
+        raise RuntimeError(
+            f"{context}: token_indices must be 2D [B,K], got shape={tuple(token_indices.shape)}"
+        )
+    _require_integer_tensor(token_indices, f"{context}: token_indices")
+    if effective_lengths.dim() != 1:
+        raise RuntimeError(
+            f"{context}: effective_lengths must be 1D [B], got shape={tuple(effective_lengths.shape)}"
+        )
+    _require_integer_tensor(effective_lengths, f"{context}: effective_lengths")
+    if token_indices.shape[0] != block_table.shape[0] or token_indices.shape[0] != effective_lengths.shape[0]:
+        raise RuntimeError(
+            f"{context}: batch mismatch: block_table={tuple(block_table.shape)}, "
+            f"token_indices={tuple(token_indices.shape)}, effective_lengths={tuple(effective_lengths.shape)}"
+        )
+    if int(page_size) <= 0:
+        raise ValueError(f"{context}: page_size must be positive, got {page_size}")
+    if not debug_sync:
+        return
+
+    topk = token_indices.shape[1]
+    effective = effective_lengths.to(device=token_indices.device, dtype=torch.long)
+    if bool((effective < 0).any().item()) or bool((effective > topk).any().item()):
+        bad = (effective < 0) | (effective > topk)
+        row = _first_true(bad)
+        value = int(effective[row[0]].item()) if row else None
+        raise RuntimeError(
+            f"{context}: effective_lengths out of [0,{topk}] at row={row}, value={value}"
+        )
+
+    values = token_indices.to(torch.long)
+    logical_pages = values // int(page_size)
+    cols = torch.arange(topk, device=token_indices.device).unsqueeze(0)
+    effective_mask = cols < effective.unsqueeze(1)
+    logical_oob = effective_mask & ((values < 0) | (logical_pages >= block_table.shape[1]))
+    if bool(logical_oob.any().item()):
+        row, col = _first_true(logical_oob)
+        value = int(values[row, col].item())
+        logical_page = int(logical_pages[row, col].item())
+        raise RuntimeError(
+            f"{context}: selected logical page out of range at row={row}, col={col}: "
+            f"token={value}, logical_page={logical_page}, page_table_width={block_table.shape[1]}, "
+            f"page_size={page_size}"
+        )
+
+    gather_pages = logical_pages.clamp(min=0, max=block_table.shape[1] - 1).to(block_table.device)
+    physical_pages = torch.gather(block_table, 1, gather_pages.long()).to(token_indices.device)
+    missing = effective_mask & (physical_pages < 0)
+    if bool(missing.any().item()):
+        row, col = _first_true(missing)
+        token = int(values[row, col].item())
+        logical_page = int(logical_pages[row, col].item())
+        raise RuntimeError(
+            f"{context}: selected page-table entry is -1 at row={row}, col={col}: "
+            f"token={token}, logical_page={logical_page}, page_table_width={block_table.shape[1]}"
+        )
+
+
+def validate_gather_invalid_mask_is_padding_only(
+    invalid_mask: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    *,
+    context: str,
+    debug_sync: bool = False,
+) -> None:
+    """Ensure invalid paged-gather slots occur only at padded positions."""
+    if invalid_mask.dim() != 2:
+        raise RuntimeError(
+            f"{context}: invalid_mask must be 2D [B,T], got shape={tuple(invalid_mask.shape)}"
+        )
+    if invalid_mask.dtype != torch.bool:
+        raise RuntimeError(f"{context}: invalid_mask must be bool, got {invalid_mask.dtype}")
+    if cache_seqlens.dim() != 1:
+        raise RuntimeError(
+            f"{context}: cache_seqlens must be 1D [B], got shape={tuple(cache_seqlens.shape)}"
+        )
+    _require_integer_tensor(cache_seqlens, f"{context}: cache_seqlens")
+    if invalid_mask.shape[0] != cache_seqlens.shape[0]:
+        raise RuntimeError(
+            f"{context}: invalid_mask/cache_seqlens batch mismatch: "
+            f"invalid_mask.shape[0]={invalid_mask.shape[0]}, cache_seqlens.shape[0]={cache_seqlens.shape[0]}"
+        )
+    if invalid_mask.shape[1] != int(max_seqlen):
+        raise RuntimeError(
+            f"{context}: invalid_mask width mismatch: width={invalid_mask.shape[1]}, max_seqlen={max_seqlen}"
+        )
+    if not debug_sync:
+        return
+
+    cache = cache_seqlens.to(device=invalid_mask.device, dtype=torch.long)
+    cols = torch.arange(int(max_seqlen), device=invalid_mask.device).unsqueeze(0)
+    valid_positions = cols < cache.unsqueeze(1)
+    bad = invalid_mask & valid_positions
+    if bool(bad.any().item()):
+        row, col = _first_true(bad)
+        raise RuntimeError(
+            f"{context}: invalid page-table entry inside effective cache at row={row}, col={col}, "
+            f"cache_seqlen={int(cache[row].item())}, max_seqlen={max_seqlen}"
+        )
 
 
 def clamp_token_indices_to_seqlens(

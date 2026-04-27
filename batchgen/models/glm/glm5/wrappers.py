@@ -31,6 +31,8 @@ from batchgen.models.glm.glm5.decode_utils import (
     build_paged_gather_cache_key,
     build_clamped_dense_token_indices,
     reorder_block_table_to_batch_slots,
+    validate_effective_block_table_pages,
+    validate_token_indices_within_seqlens,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
@@ -919,12 +921,31 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     "GLM-5 DSA requires worker-hoisted _dsa_short_count; "
                     "per-layer recomputation is not a valid production fallback"
                 )
+            if _short_count < 0 or _short_count > _bsz:
+                raise RuntimeError(
+                    f"GLM-5 DSA layer {li}: _dsa_short_count out of range: "
+                    f"{_short_count} for bsz={_bsz}"
+                )
+            if _VERIFY and self.layer_idx <= 4:
+                _actual_short_count = int(_short_mask.sum().item())
+                if _actual_short_count != _short_count:
+                    raise RuntimeError(
+                        f"GLM-5 DSA layer {li}: _dsa_short_count mismatch: "
+                        f"hoisted={_short_count}, actual={_actual_short_count}, bsz={_bsz}"
+                    )
             _any_short = _short_count > 0
             _any_long = _short_count < _bsz
             if not _any_long:
                 # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
                 top_k_indices = build_clamped_dense_token_indices(
                     updated_seqlens, max_seqlen, hidden_states.device,
+                )
+                validate_token_indices_within_seqlens(
+                    top_k_indices,
+                    updated_seqlens,
+                    context=f"GLM-5 DSA L{li}/dense_topk",
+                    effective_lengths=torch.clamp(updated_seqlens, max=top_k_indices.shape[1]),
+                    debug_sync=_VERIFY and self.layer_idx <= 4,
                 )
             elif not _any_short:
                 # All rows > index_topk: full-batch indexer scoring (topk = index_topk).
@@ -987,6 +1008,25 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     max_seqlen=_long_max_seqlen,
                 )  # [num_long, min(index_topk, _long_max_seqlen)] = [num_long, index_topk]
                 top_k_indices[_long_mask] = _long_top_k
+                validate_token_indices_within_seqlens(
+                    top_k_indices,
+                    updated_seqlens,
+                    context=f"GLM-5 DSA L{li}/mixed_topk",
+                    effective_lengths=torch.clamp(updated_seqlens, max=top_k_indices.shape[1]),
+                    debug_sync=_VERIFY and self.layer_idx <= 4,
+                )
+
+            # Sparse seqlens define which top-k columns are semantically consumed
+            # by sparse_flash_mla_decode. Padded tail entries may be clamped, but
+            # every effective entry must map to a valid cache token and page.
+            sparse_seqlens = torch.clamp(updated_seqlens, max=top_k_indices.shape[1])
+            validate_token_indices_within_seqlens(
+                top_k_indices,
+                updated_seqlens,
+                context=f"GLM-5 DSA L{li}/effective_topk",
+                effective_lengths=sparse_seqlens,
+                debug_sync=_VERIFY and self.layer_idx <= 4,
+            )
 
         # --- Step 4: Sparse gather MLA KV at top-K positions ---
         with (dt.timed("sparse_gather", li) if dt else _nullctx()):
@@ -997,11 +1037,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
 
-            # Index-OOB diagnostic for sparse_gather_from_paged_kv. top_k_indices
-            # max must be < num_cached_tokens (approximated by max(cache_seqlens))
-            # so the page_idx=tok_idx//page_size stays within the block_table's
-            # column range. If this fires, the indexer returned stale positions
-            # past the valid cache range — the main suspected OOB cause.
+            validate_effective_block_table_pages(
+                mla_block_table,
+                top_k_indices,
+                sparse_seqlens,
+                mla_page_size,
+                context=f"GLM-5 DSA L{li}/mla_sparse_gather",
+                debug_sync=_VERIFY and self.layer_idx <= 4,
+            )
+
             if _VERIFY and self.layer_idx <= 4:
                 _rk = AttnWrapperBase.get_rank_safe()
                 _tk_max = int(top_k_indices.max().item())
@@ -1022,15 +1066,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"which branch: "
                     f"{'dense-short-circuit' if not _any_long else ('full-indexer' if not _any_short else 'mixed')}"
                 )
-                # If top_k_indices has any value >= _expected_max_valid_tok, the
-                # gather will clamp to the last page column — if that column has
-                # garbage, physical_pages * page_size + offset can land past
-                # num_pages * page_size → illegal access.
                 if _tk_max >= _expected_max_valid_tok:
-                    logging.error(
+                    raise RuntimeError(
                         f"[VERIFY-GATHER rank={_rk} L{self.layer_idx}] top_k_indices "
                         f"contains position {_tk_max} >= block_table_cols*page_size="
-                        f"{_expected_max_valid_tok}; block_table row gather will wrap"
+                        f"{_expected_max_valid_tok}; refusing sparse gather"
                     )
             sparse_mla_kv = sparse_gather_from_paged_kv(
                 mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
@@ -1077,10 +1117,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
 
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            # Sparse seqlens: min(topk, actual cache length)
-            topk = top_k_indices.shape[1]
-            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
-
             attn_out = sparse_flash_mla_decode(
                 query_states, sparse_mla_kv, sparse_seqlens,
                 attn.num_heads, attn.softmax_scale,

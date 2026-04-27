@@ -24,6 +24,7 @@ so the follow-up implementation is a straight port — no re-planning needed.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, Literal
 
 import torch
@@ -466,6 +467,27 @@ class Glm5MoeReplayProxy(torch.nn.Module):
         object.__setattr__(self, "_segment_name", f"layer_{layer_idx}_moe")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.dim() != 3:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states must be "
+                f"[B,1,H], got shape={tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[1] != 1:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states.shape[1] "
+                f"must be 1, got {hidden_states.shape[1]}"
+            )
+        hidden_size = int(getattr(self.moe, "hidden_size", hidden_states.shape[2]))
+        if hidden_states.shape[2] != hidden_size:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden size mismatch: "
+                f"input={hidden_states.shape[2]}, moe.hidden_size={hidden_size}"
+            )
+        if hidden_states.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): hidden_states dtype must be "
+                f"torch.bfloat16, got {hidden_states.dtype}"
+            )
         actual_ntp = hidden_states.shape[0]
 
         # Bucket selection MUST be globally consistent across all ranks.
@@ -513,6 +535,42 @@ class Glm5MoeReplayProxy(torch.nn.Module):
                     )
                     Glm5MoeReplayProxy._warned_oversize = True
                 return self.moe._forward_decode_3d(hidden_states)
+        if actual_ntp > bucket:
+            raise RuntimeError(
+                f"Glm5MoeReplayProxy(layer={self.layer_idx}): local actual_ntp={actual_ntp} "
+                f"exceeds selected synced bucket={bucket}; synced_ntp={synced_ntp}"
+            )
+
+        if os.environ.get("BATCHGEN_GLM5_VERIFY_MOE_GRAPH", "0") == "1":
+            from .model import Glm5MoE
+            rank_counts = Glm5MoE._rank_token_counts
+            if rank_counts is None:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): "
+                    "Glm5MoE._rank_token_counts is None under MoE graph replay"
+                )
+            world_size = int(getattr(self.moe, "world_size", 0) or 0)
+            if world_size > 0 and tuple(rank_counts.shape) != (world_size,):
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts shape "
+                    f"{tuple(rank_counts.shape)} != ({world_size},)"
+                )
+            if rank_counts.dtype != torch.int64:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts dtype "
+                    f"must be int64, got {rank_counts.dtype}"
+                )
+            if rank_counts.device != hidden_states.device:
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts device "
+                    f"{rank_counts.device} != hidden_states device {hidden_states.device}"
+                )
+            if bool((rank_counts > bucket).any().item()):
+                raise RuntimeError(
+                    f"Glm5MoeReplayProxy(layer={self.layer_idx}): rank_counts exceed "
+                    f"bucket={bucket}; max={int(rank_counts.max().item())}, "
+                    f"counts={rank_counts.detach().cpu().tolist()}"
+                )
 
         # Pass `bucket` (not actual_ntp) as graph_manager.replay's batch_size
         # so all 16 ranks select the SAME captured graph for this step. The
