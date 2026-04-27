@@ -924,10 +924,13 @@ class HostPagedKVWorkerView {
         if (max_tokens.has_value()) {
             max_pages = geometry_.RequiredPages(max_tokens.value());
         }
-        auto page_indices = page_table_.Contains(sequence_id)
-                                ? page_table_.Pages(sequence_id)
-                                : backend_.SequencePages(sequence_id,
-                                                         std::nullopt);
+        const bool has_shared_prefix =
+            page_table_.Contains(sequence_id) &&
+            !page_table_.SharedPrefixPages(sequence_id).empty();
+        auto page_indices =
+            has_shared_prefix
+                ? page_table_.Pages(sequence_id)
+                : backend_.SequencePages(sequence_id, max_pages);
         if (max_pages.has_value()) {
             if (max_pages.value() > page_indices.size()) {
                 throw std::out_of_range(
