@@ -1006,14 +1006,8 @@ class HostPagedKVWorkerView {
         }
         EnsureSequencesRegistered(sequence_ids);
         for (std::int64_t sequence_id : sequence_ids) {
-            const auto shared_prefix_pages =
-                page_table_.SharedPrefixPages(sequence_id);
-            if (shared_prefix_pages.empty()) {
-                backend_.ReleaseSequence(sequence_id);
-            } else {
-                backend_.ReleaseSequenceLogical(sequence_id,
-                                                page_table_.Pages(sequence_id));
-            }
+            backend_.ReleaseSequenceLogical(sequence_id,
+                                            page_table_.Pages(sequence_id));
         }
         UnregisterSequences(sequence_ids);
     }

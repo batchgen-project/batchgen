@@ -6049,7 +6049,7 @@ class BatchGenWorker:
 					+ self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 					+ self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 				)
-				if decode_selection_uuids:
+				if self.enable_prefix_reuse and decode_selection_uuids:
 					self._sync_sequence_metadata(decode_selection_uuids)
 
 				# ============ STEP C: Prepare decode batch (uses real GPU KV capacity) ============
@@ -6468,6 +6468,8 @@ class BatchGenWorker:
 		return count
 
 	def _prefix_reuse_shared_tokens_for_sequence(self, seq: SequenceEntry) -> int:
+		if not self.enable_prefix_reuse:
+			return 0
 		if self._prefix_reuse_exact_full_prefill_fallback_enabled():
 			return 0
 		cached_value = int(getattr(seq, "prefix_shared_tokens", 0) or 0)
