@@ -2043,18 +2043,32 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Use gqa_prefill_fa for varlen attention with sink correction
         # q, k, v: [total_tokens, num_heads, head_dim]
-        attn_output, lse = gqa_prefill_fa(
-            q=query,
-            k=key_for_attn,
-            v=value_for_attn,
-            cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen_k,
-            sinks=self.sinks,
-            softmax_scale=self.scale,
-            sliding_window=self.sliding_window,
-        )
+        if prefix_reuse_mode or full_hit_mode:
+            attn_output, lse = gqa_prefill_fa(
+                q=query,
+                k=key_for_attn,
+                v=value_for_attn,
+                cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen_k,
+                sinks=self.sinks,
+                softmax_scale=self.scale,
+                sliding_window=self.sliding_window,
+            )
+        else:
+            attn_output, lse = gqa_prefill_fa(
+                q=query,
+                k=key,
+                v=value,
+                cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
+                cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                sinks=self.sinks,
+                softmax_scale=self.scale,
+                sliding_window=self.sliding_window,
+            )
 
         # attn_output: [total_tokens, num_heads, head_dim]
         # Reshape for output projection
