@@ -3224,12 +3224,6 @@ class BatchGenWorker:
 		self._get_or_create_gloo_group()
 		dist.barrier()  # Ensure all ranks have created the group
 
-		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
-			raise RuntimeError(
-				"DSA dual host KV migration is not implemented safely; "
-				"refusing primary-only migration"
-			)
-
 		# Group migrations into parallel rounds
 		# Each round contains migrations that can execute concurrently (no shared ranks)
 		rounds = self._group_migrations_for_parallel_execution(migrations)
@@ -3336,13 +3330,16 @@ class BatchGenWorker:
 			logging.error(f"Rank {self.rank}: Cannot migrate {uuid[:8]}... - no host pages allocated")
 			return
 
-		# Use the unwrapped primary view for migration. Aux (DSA indexer) KV is
-		# mirrored explicitly below — the coordinator does not implement
-		# read/write_sequence_kv_to_cpu, so go direct on primary and aux.
-		worker_view = self.core_engine.host_paged_kv_worker_view
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator) and aux_view is None:
-			raise RuntimeError("DSA migration requires auxiliary host KV view")
+		# Use unwrapped views for migration. DSA must migrate both the primary
+		# MLA KV and auxiliary indexer KV; primary-only migration corrupts resume.
+		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			worker_view = self.host_paged_kv_worker_view.primary
+			aux_view = self.host_paged_kv_worker_view.require_auxiliary(
+				"_execute_single_kv_migration"
+			)
+		else:
+			worker_view = self.core_engine.host_paged_kv_worker_view
+			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
