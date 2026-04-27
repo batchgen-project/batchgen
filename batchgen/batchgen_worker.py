@@ -966,9 +966,28 @@ class BatchGenWorker:
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
+			self._reset_completed_pool_batch_group()
 			self._admit_sequences_from_message(msg_data)
 
 		return has_new
+
+	def _reset_completed_pool_batch_group(self) -> None:
+		"""Drop completed pool-batch state before admitting the next group.
+
+		The host prefix cache is intentionally preserved; this only removes
+		completed SequenceEntry objects and transient active-sequence maps.
+		"""
+		if self.global_batch is None or not self.global_batch.all_completed():
+			return
+		if len(self.global_batch) == 0:
+			return
+		self.global_batch = SequenceBatch()
+		self._completed_result_cache = {}
+		self._prefix_reuse_allocations_by_global_id.clear()
+		self._local_to_uuid_map.clear()
+		self._uuid_to_local_map.clear()
+		if self.rank == 0:
+			logging.debug("[POOL] Cleared completed batch group before admission")
 
 	def _admit_sequences_from_message(self, msg: dict) -> None:
 		"""Admit new sequences from an admission message into the live global_batch.
@@ -5801,6 +5820,7 @@ class BatchGenWorker:
 							dist.broadcast(status, src=0)
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
+							self._reset_completed_pool_batch_group()
 							self._admit_sequences_from_message(msg)
 							# Reset per-batch-group timing so each admission cycle
 							# emits its own "Pool batch group completed" summary.
@@ -5839,6 +5859,7 @@ class BatchGenWorker:
 					if has_new:
 						container = [None]
 						dist.broadcast_object_list(container, src=0)
+						self._reset_completed_pool_batch_group()
 						self._admit_sequences_from_message(container[0])
 						# Reset per-batch-group timing (matches rank-0 branch).
 						prefill_time = 0.0
