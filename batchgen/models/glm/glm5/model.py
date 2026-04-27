@@ -1350,7 +1350,7 @@ class Glm5MoE(nn.Module):
                         cls._warned_bucket_select[mtp] = True
                     return buf
             # Oversize — fall through to singleton (which will resize_if_needed).
-            logging.warning(
+            logging.debug(
                 f"[Glm5MoE] global_num_tokens={global_num_tokens} exceeds all "
                 f"pre-allocated buckets {sorted(cls._bucket_bufs)}; "
                 "falling back to singleton (will resize)"
@@ -1696,7 +1696,7 @@ class Glm5MoE(nn.Module):
             )
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
-            logging.warning(
+            logging.debug(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
             Glm5MoE._warned_k25_path = True
 
@@ -1790,7 +1790,7 @@ class Glm5MoE(nn.Module):
         Reads buf.dispatched_x, writes buf.expert_out.
         """
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
-            logging.warning(
+            logging.debug(
                 f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
                 f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
             Glm5MoE._warned_gemm_3d = True

@@ -8593,7 +8593,7 @@ class BatchGenWorker:
 			seq.validate_metadata(f"rank {self.rank} _finalize_async_load_minimal")
 			seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
 				f"gpu_pages={seq.gpu_pages_allocated}")
-			logging.info(
+			logging.debug(
 				f"[LOAD_CONFIRM] Rank {self.rank}: finalized uuid={uuid[:8]} "
 				f"gid={seq.global_idx} status=IN_DECODE gpu_pages={seq.gpu_pages_allocated} "
 				f"ctx={seq.current_context_length} host_pages={seq.host_pages_allocated}"
