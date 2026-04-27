@@ -996,6 +996,7 @@ class BatchGenWorker:
 			)
 			seq.batch_id = entry.get("batch_id")
 			seq.priority = entry.get("priority", 0)
+			seq.sampling_params = entry.get("sampling_params")
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
 
@@ -1453,18 +1454,32 @@ class BatchGenWorker:
 
 	# ============ End Request Pool Methods ============
 
-	def _build_sampling_tensors(self, batch_size: int) -> tuple:
-		"""Build [B] sampling param tensors from per-sequence params for current batch.
+	def _build_sampling_tensors(self, batch_sequences: list) -> tuple:
+		"""Build [B] sampling param tensors for the active decode batch.
 
 		Returns:
 			(temps, top_ps, top_ks) tensors on the model's device, or (None, None, None)
 			if using global scalar params.
 		"""
-		if self._per_sequence_sampling_params is None:
+		if not batch_sequences:
+			return None, None, None
+
+		has_sequence_params = any(
+			getattr(seq, "sampling_params", None) is not None
+			for seq in batch_sequences
+		)
+		if self._per_sequence_sampling_params is None and not has_sequence_params:
 			return None, None, None
 
 		device = next(self.model.parameters()).device
-		params = self._per_sequence_sampling_params[:batch_size]
+		params = []
+		for seq in batch_sequences:
+			seq_params = getattr(seq, "sampling_params", None)
+			if seq_params is None and self._per_sequence_sampling_params is not None:
+				global_idx = getattr(seq, "global_idx", -1)
+				if 0 <= global_idx < len(self._per_sequence_sampling_params):
+					seq_params = self._per_sequence_sampling_params[global_idx]
+			params.append(seq_params or {})
 
 		temps = torch.tensor(
 			[p.get('temperature', 0.0) or 0.0 for p in params],
@@ -1480,7 +1495,11 @@ class BatchGenWorker:
 		)
 		return temps, top_ps, top_ks
 
-	def _select_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+	def _select_tokens(
+		self,
+		logits: torch.Tensor,
+		batch_sequences: Optional[list] = None,
+	) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
 		Supports both global params and per-sequence params.
@@ -1493,14 +1512,23 @@ class BatchGenWorker:
 		"""
 		from batchgen.sampling import sample_tokens
 
-		# Per-sequence sampling path
-		if self._per_sequence_sampling_params is not None:
-			batch_size = logits.shape[0]
-			temps, top_ps, top_ks = self._build_sampling_tensors(batch_size)
+		# Per-sequence sampling path. In pool mode, sampling params are attached
+		# to SequenceEntry objects; in legacy mode, fall back to global_idx lookup
+		# in the original per-prompt list.
+		if (
+			self._per_sequence_sampling_params is not None
+			or (
+				batch_sequences is not None
+				and any(getattr(seq, "sampling_params", None) is not None for seq in batch_sequences)
+			)
+		):
+			active_sequences = batch_sequences or []
+			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
-				logging.info(f"Using PER-SEQUENCE sampling for {batch_size} sequences")
+				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
 				self._logged_sampling = True
-			return sample_tokens(logits, temperature=temps, top_p=top_ps, top_k=top_ks)
+			if temps is not None:
+				return sample_tokens(logits, temperature=temps, top_p=top_ps, top_k=top_ks)
 
 		# Global sampling path (legacy)
 		# Fast path: greedy decoding (default)
@@ -3679,6 +3707,8 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 				text=text,
 			)
+			if self._per_sequence_sampling_params is not None and idx < len(self._per_sequence_sampling_params):
+				seq.sampling_params = self._per_sequence_sampling_params[idx]
 			seq.log_event(SeqEvent.CREATED, self.rank, f"max_dec={max_dec}")
 			self.global_batch.add_sequence(seq)
 
@@ -7152,7 +7182,11 @@ class BatchGenWorker:
 					attention_mask=prefill_micro_batch_attention_masks[micro_batch_idx].to(self.torch_device),
 					use_cache=False,
 				)
-				new_tokens = self._select_tokens(outputs.logits[:, -1, :])
+				cur_batch_sequences = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+					for local_idx in cur_batch_local
+				]
+				new_tokens = self._select_tokens(outputs.logits[:, -1, :], cur_batch_sequences)
 				output_tokens.append(new_tokens)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
@@ -7535,7 +7569,11 @@ class BatchGenWorker:
 						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					).float()
 
-				batch_new_tokens = self._select_tokens(logits)
+				batch_sequences = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+					for local_idx in batch_local_indices
+				]
+				batch_new_tokens = self._select_tokens(logits, batch_sequences)
 				if batch_new_tokens.shape[0] != batch_num_seqs:
 					raise RuntimeError(
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
@@ -7717,7 +7755,11 @@ class BatchGenWorker:
 						self.model.lm_head.weight,
 						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					).float()
-				return self._select_tokens(logits)
+				full_hit_sequences = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+					for local_idx in batch
+				]
+				return self._select_tokens(logits, full_hit_sequences)
 		finally:
 			_reset_full_hit_state()
 
@@ -9855,23 +9897,28 @@ class BatchGenWorker:
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
 
-				# MoE buffer sync: only needed at decision boundaries (batch size changes).
-				# Between boundaries, batch size is constant — skip the all_reduce + .item()
-				# CPU-GPU sync that drains the GPU pipeline every step.
-				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				if getattr(self, '_whole_model_graph', False):
-					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
+				# MoE buffer sync is required for any captured graph with NCCL
+				# collectives, not only whole-model graph replay. All ranks must
+				# agree on _max_bs/rank counts before forward.
+				_have_captured_graph = (
+					getattr(self, '_cuda_graph_manager', None) is not None
+				)
+				_pm = getattr(self, 'parallel_manager', None)
+				_needs_rank_token_counts = (
+					_pm is not None and hasattr(_pm, 'set_rank_token_counts')
+				)
+				if _have_captured_graph or _needs_rank_token_counts:
 					_local_bs_buf.fill_(len(batch))
 					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
 					_max_bs = max(_all_rank_counts.max().item(), 1)
-					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
-						if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-							self.parallel_manager.set_rank_token_counts(_all_rank_counts)
+					if _pm is not None:
+						if hasattr(_pm, 'set_num_tokens_per_rank'):
+							_pm.set_num_tokens_per_rank(_max_bs)
+						if hasattr(_pm, 'set_rank_token_counts'):
+							_pm.set_rank_token_counts(_all_rank_counts)
 				else:
-					# Per-layer graph or eager: no NCCL in graph, use local batch size
+					# Non-graph eager path with no rank-count-sensitive MoE.
 					_max_bs = max(len(batch), 1)
 
 				# KV append callback — deferred: accumulate during forward, single sync after
@@ -10010,7 +10057,7 @@ class BatchGenWorker:
 					)
 
 					logits = graph_out["logits"][:batch_size]
-					new_tokens_out = self._select_tokens(logits)
+					new_tokens_out = self._select_tokens(logits, batch_sequences)
 
 					# Fire KV host offload callbacks for all layers.
 					# KV buffers are static-address tensors written inside the graph;
@@ -10045,7 +10092,7 @@ class BatchGenWorker:
 						)
 					_sample_ctx = _dt_fwd.timed("sampling", 0) if (_dt_fwd and _dt_fwd.enabled) else _nullctx()
 					with _sample_ctx:
-						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :])
+						new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
 
 			new_tokens = new_tokens_out
 
@@ -11032,7 +11079,11 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
+					batch_sequences = [
+						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+						for local_idx in batch
+					]
+					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
@@ -11125,7 +11176,11 @@ class BatchGenWorker:
 						attention_mask=attention_mask.to(self.torch_device),
 						use_cache=False,
 					)
-					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :])
+					batch_sequences = [
+						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+						for local_idx in batch
+					]
+					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
 					self.update_new_token(new_tokens, batch, new_token_idx)
 
 					# Update sequence state
