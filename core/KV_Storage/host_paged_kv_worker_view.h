@@ -1079,21 +1079,16 @@ class HostPagedKVWorkerView {
                 const std::size_t tokens_to_copy = ResolveSequenceLength(
                     sequence_lengths, batch_idx, sequence_id,
                     tokens_per_sequence, "AsyncOffloadLayerKVToHost");
-                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
-                    page_table_.SharedPrefixTokens(sequence_id));
-                if (tokens_to_copy <= shared_prefix_tokens) {
+                if (tokens_to_copy == 0) {
                     continue;
                 }
-                const std::size_t destination_token_start = shared_prefix_tokens;
-                const std::size_t suffix_tokens_to_copy =
-                    tokens_to_copy - shared_prefix_tokens;
                 geometry_.ValidatePageCapacity(pages, tokens_to_copy,
                                                "AsyncOffloadLayerKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
 
                 ForEachPageChunk(
-                    pages, destination_token_start, suffix_tokens_to_copy,
+                    pages, 0, tokens_to_copy,
                     [&](std::int32_t page_idx, std::size_t page_offset_tokens,
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
@@ -1101,9 +1096,7 @@ class HostPagedKVWorkerView {
                                              host_base, layer_idx, page_idx) +
                                          page_offset_tokens * k_token_bytes;
                         const std::byte* src =
-                            seq_k_src +
-                            (shared_prefix_tokens + relative_token_offset) *
-                                k_token_bytes;
+                            seq_k_src + relative_token_offset * k_token_bytes;
                         EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
                     });
@@ -1112,8 +1105,7 @@ class HostPagedKVWorkerView {
                         const auto* seq_v_src =
                             v_base + batch_idx * v_seq_stride;
                         ForEachPageChunk(
-                            pages, destination_token_start,
-                            suffix_tokens_to_copy,
+                            pages, 0, tokens_to_copy,
                             [&](std::int32_t page_idx,
                                 std::size_t page_offset_tokens,
                                 std::size_t chunk_tokens,
@@ -1124,9 +1116,7 @@ class HostPagedKVWorkerView {
                                     page_offset_tokens * v_token_bytes;
                                 const std::byte* src =
                                     seq_v_src +
-                                    (shared_prefix_tokens +
-                                     relative_token_offset) *
-                                        v_token_bytes;
+                                    relative_token_offset * v_token_bytes;
                                 EnqueueCopy(
                                     src, dst, chunk_tokens * v_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
