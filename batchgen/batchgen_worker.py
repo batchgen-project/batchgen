@@ -238,6 +238,12 @@ class QueryBookBufferPool:
 	def free_slot(self, slot: int):
 		self._free_slots.add(slot)
 
+	def reset(self):
+		self._free_slots.clear()
+		self._next_slot = 0
+		self.input_ids_buffer.zero_()
+		self.decoded_tokens_buffer.fill_(self.pad_token_id)
+
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
 		return self.input_ids_buffer[slot:slot+1, :seq_extended_size]
 
@@ -989,6 +995,13 @@ class BatchGenWorker:
 		self.query_book = {}
 		self._free_local_indices = set()
 		self._next_local_idx = 0
+		if hasattr(self, "_buffer_pool") and self._buffer_pool is not None:
+			self._buffer_pool.reset()
+		self._sequences_with_gpu_kv.clear()
+		self.num_global_queries = 0
+		self.num_local_queries = 0
+		self._rejected_sequences = []
+		self._batch_completed = False
 		if self.rank == 0:
 			logging.debug("[POOL] Cleared completed batch group before admission")
 
