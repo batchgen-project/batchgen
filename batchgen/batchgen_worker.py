@@ -986,6 +986,9 @@ class BatchGenWorker:
 		self._prefix_reuse_allocations_by_global_id.clear()
 		self._local_to_uuid_map.clear()
 		self._uuid_to_local_map.clear()
+		self.query_book = {}
+		self._free_local_indices = set()
+		self._next_local_idx = 0
 		if self.rank == 0:
 			logging.debug("[POOL] Cleared completed batch group before admission")
 
