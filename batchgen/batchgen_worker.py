@@ -1375,16 +1375,17 @@ class BatchGenWorker:
 		# Legacy /v1/inference returns after the decode loop. Completion
 		# reporting releases local maps below, so keep the decoded result before
 		# that cleanup makes final detokenization unable to find the sequence.
-		text = gathered_text if gathered_text is not None else ""
-		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
-			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
-			try:
-				text = self.tokenizer.decode(token_ids)
-			except Exception:
-				text = ""
-		if not hasattr(self, "_completed_result_cache"):
-			self._completed_result_cache = {}
-		self._completed_result_cache[seq.global_idx] = text
+		if self._response_queue is None:
+			text = gathered_text if gathered_text is not None else ""
+			if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
+				token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
+				try:
+					text = self.tokenizer.decode(token_ids)
+				except Exception:
+					text = ""
+			if not hasattr(self, "_completed_result_cache"):
+				self._completed_result_cache = {}
+			self._completed_result_cache[seq.global_idx] = text
 
 		# Free buffer slot (all ranks do this to keep state consistent)
 		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
@@ -1412,6 +1413,14 @@ class BatchGenWorker:
 		if self.rank != 0 or self._response_queue is None:
 			return
 
+		# Use gathered text if provided, otherwise read from local buffer
+		text = gathered_text if gathered_text is not None else ""
+		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
+			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
+			try:
+				text = self.tokenizer.decode(token_ids)
+			except Exception:
+				text = ""
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
