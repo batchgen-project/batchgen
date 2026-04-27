@@ -238,12 +238,6 @@ class QueryBookBufferPool:
 	def free_slot(self, slot: int):
 		self._free_slots.add(slot)
 
-	def reset(self):
-		self._free_slots.clear()
-		self._next_slot = 0
-		self.input_ids_buffer.zero_()
-		self.decoded_tokens_buffer.fill_(self.pad_token_id)
-
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
 		return self.input_ids_buffer[slot:slot+1, :seq_extended_size]
 
@@ -624,6 +618,7 @@ class BatchGenWorker:
 		self._uuid_to_local_map: Dict[str, int] = {}
 		self._free_local_indices: Set[int] = set()  # Track freed indices for O(1) allocation
 		self._next_local_idx: int = 0  # Next index if free list is empty
+		self._next_pool_global_idx: int = 0  # Monotonic sequence IDs for pool-mode admissions
 		
 		# 8. Runtime State
 		self.eos_token_id: Optional[int] = None
@@ -995,8 +990,6 @@ class BatchGenWorker:
 		self.query_book = {}
 		self._free_local_indices = set()
 		self._next_local_idx = 0
-		if hasattr(self, "_buffer_pool") and self._buffer_pool is not None:
-			self._buffer_pool.reset()
 		self._sequences_with_gpu_kv.clear()
 		self.num_global_queries = 0
 		self.num_local_queries = 0
@@ -1020,11 +1013,15 @@ class BatchGenWorker:
 		if not entries:
 			return
 
-		# Determine starting global_idx (continue from existing batch)
-		existing_max_idx = max(
-			(seq.global_idx for seq in self.global_batch), default=-1
-		)
-		start_idx = existing_max_idx + 1
+		# Pool-mode sequence IDs must remain unique for the lifetime of the
+		# worker process because host KV/page-table state is keyed by global_idx.
+		if not hasattr(self, "_next_pool_global_idx"):
+			existing_max_idx = max(
+				(seq.global_idx for seq in self.global_batch), default=-1
+			)
+			self._next_pool_global_idx = existing_max_idx + 1
+		start_idx = self._next_pool_global_idx
+		self._next_pool_global_idx += len(entries)
 
 		# Step 1: Create SequenceEntry objects
 		new_uuids = []
@@ -5662,6 +5659,7 @@ class BatchGenWorker:
 		self._uuid_to_local_map = {}
 		self._free_local_indices = set()
 		self._next_local_idx = 0
+		self._next_pool_global_idx = 0
 		self.num_global_queries = 0
 		self.num_local_queries = 0
 		self._rejected_sequences = []
