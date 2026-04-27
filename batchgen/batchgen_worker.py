@@ -978,6 +978,8 @@ class BatchGenWorker:
 		The host prefix cache is intentionally preserved; this only removes
 		completed SequenceEntry objects and transient active-sequence maps.
 		"""
+		if not self.enable_prefix_reuse:
+			return
 		if self.global_batch is None or not self.global_batch.all_completed():
 			return
 		if len(self.global_batch) == 0:
