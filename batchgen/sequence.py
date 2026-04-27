@@ -214,6 +214,113 @@ class SequenceEntry:
             f"host_pg={self.host_pages_allocated} {detail}{mismatch}"
         )
 
+    def validate_metadata(self, context: str) -> None:
+        """Reject inconsistent per-sequence metadata at module boundaries."""
+        prefix = f"{context}: sequence {self.uuid} gid={self.global_idx}"
+
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise RuntimeError(f"{prefix}: {message}")
+
+        require(self.global_idx >= 0, f"global_idx must be non-negative, got {self.global_idx}")
+        require(self.prompt_length >= 0, f"prompt_length must be non-negative, got {self.prompt_length}")
+        require(
+            self.original_prompt_length >= 0,
+            f"original_prompt_length must be non-negative, got {self.original_prompt_length}",
+        )
+        require(self.max_decode_length >= 0, f"max_decode_length must be non-negative, got {self.max_decode_length}")
+        require(
+            self.original_max_decode_length >= 0,
+            f"original_max_decode_length must be non-negative, got {self.original_max_decode_length}",
+        )
+        require(self.decoded_length >= 0, f"decoded_length must be non-negative, got {self.decoded_length}")
+        require(
+            self.total_decoded_before_eviction >= 0,
+            f"total_decoded_before_eviction must be non-negative, got {self.total_decoded_before_eviction}",
+        )
+        require(
+            self.reentry_decoded_baseline >= 0,
+            f"reentry_decoded_baseline must be non-negative, got {self.reentry_decoded_baseline}",
+        )
+        require(
+            self.reentry_decoded_baseline <= self.decoded_length,
+            f"reentry_decoded_baseline={self.reentry_decoded_baseline} exceeds decoded_length={self.decoded_length}",
+        )
+        require(
+            self.total_decoded_before_eviction <= self.decoded_length,
+            f"total_decoded_before_eviction={self.total_decoded_before_eviction} exceeds decoded_length={self.decoded_length}",
+        )
+
+        expected_ctx = self.original_prompt_length + self.decoded_length
+        require(
+            self.current_context_length == expected_ctx,
+            f"current_context_length={self.current_context_length} must equal "
+            f"original_prompt_length + decoded_length = {expected_ctx}",
+        )
+
+        expected_budget = self.original_prompt_length + self.original_max_decode_length
+        require(
+            self.kv_token_budget == expected_budget,
+            f"kv_token_budget={self.kv_token_budget} must equal "
+            f"original_prompt_length + original_max_decode_length = {expected_budget}",
+        )
+
+        require(self.host_pages_allocated >= 0, f"host_pages_allocated must be non-negative, got {self.host_pages_allocated}")
+        require(self.host_token_capacity >= 0, f"host_token_capacity must be non-negative, got {self.host_token_capacity}")
+        require(self.gpu_pages_allocated >= 0, f"gpu_pages_allocated must be non-negative, got {self.gpu_pages_allocated}")
+        if self.host_pages_allocated:
+            expected_host_capacity = self.host_pages_allocated * self.PAGE_SIZE
+            require(
+                self.host_token_capacity == expected_host_capacity,
+                f"host_token_capacity={self.host_token_capacity} must equal "
+                f"host_pages_allocated * PAGE_SIZE = {expected_host_capacity}",
+            )
+
+        host_required_statuses = {
+            SequenceStatus.PREFILLED,
+            SequenceStatus.IN_DECODE,
+            SequenceStatus.ON_HOLD,
+        }
+        if self.status in host_required_statuses:
+            require(self.assigned_rank is not None, f"{self.status.name} requires assigned_rank")
+            require(self.host_pages_allocated > 0, f"{self.status.name} requires host_pages_allocated > 0")
+            require(
+                self.host_token_capacity >= self.current_context_length,
+                f"host_token_capacity={self.host_token_capacity} is smaller than current_context_length={self.current_context_length}",
+            )
+
+        if self.status == SequenceStatus.IN_DECODE:
+            require(self.gpu_pages_allocated > 0, "IN_DECODE requires gpu_pages_allocated > 0")
+            require(
+                self.gpu_pages_allocated * self.PAGE_SIZE >= self.current_context_length,
+                f"gpu allocation tokens={self.gpu_pages_allocated * self.PAGE_SIZE} "
+                f"is smaller than current_context_length={self.current_context_length}",
+            )
+        elif self.status == SequenceStatus.ON_HOLD:
+            require(self.gpu_pages_allocated == 0, f"ON_HOLD requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
+        elif self.status == SequenceStatus.EVICTED:
+            require(self.assigned_rank is not None, "EVICTED requires assigned_rank for deterministic re-entry")
+            require(self.gpu_pages_allocated == 0, f"EVICTED requires gpu_pages_allocated=0, got {self.gpu_pages_allocated}")
+            require(self.host_pages_allocated == 0, f"EVICTED requires host_pages_allocated=0, got {self.host_pages_allocated}")
+            require(self.evicted_token_ids is not None, "EVICTED requires evicted_token_ids")
+
+        if self.input_ids is not None:
+            require(self.input_ids.dim() == 1, f"input_ids must be per-sequence 1D, got shape={tuple(self.input_ids.shape)}")
+            require(
+                int(self.input_ids.numel()) == self.prompt_length,
+                f"input_ids length={int(self.input_ids.numel())} must equal prompt_length={self.prompt_length}",
+            )
+        if self.decoded_tokens is not None:
+            require(
+                self.decoded_tokens.dim() >= 1,
+                f"decoded_tokens must have at least one dimension, got shape={tuple(self.decoded_tokens.shape)}",
+            )
+            require(
+                int(self.decoded_tokens.shape[-1]) >= self.decoded_length,
+                f"decoded_tokens last dimension={int(self.decoded_tokens.shape[-1])} "
+                f"is smaller than decoded_length={self.decoded_length}",
+            )
+
     def status_transition(self, new_status: SequenceStatus) -> None:
         if new_status in self.VALID_TRANSITIONS[self.status]:
             self.status = new_status

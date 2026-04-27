@@ -9,7 +9,9 @@ all lifecycle operations to both, keeping them synchronized. It duck-types
 the worker view API so callers can use it as a drop-in replacement.
 
 For operations that require different data per pool (offload, load-to-device),
-callers access .primary / .auxiliary directly.
+callers must use explicit dual APIs. Primary-only operations are invalid for
+DSA because they can leave the indexer KV stale while the sequence remains
+marked GPU/host-resident.
 """
 
 from __future__ import annotations
@@ -137,6 +139,8 @@ class DualHostKVCoordinator:
 	"""
 
 	def __init__(self, primary, auxiliary) -> None:
+		if auxiliary is None:
+			raise RuntimeError("DualHostKVCoordinator requires auxiliary host KV for DSA")
 		self.primary = primary
 		self.auxiliary = auxiliary
 
@@ -259,8 +263,7 @@ class DualHostKVCoordinator:
 
 	def initialize(self, **kwargs) -> None:
 		self.primary.initialize(**kwargs)
-		if self.auxiliary is not None:
-			self.auxiliary.initialize(**kwargs)
+		self.require_auxiliary("initialize").initialize(**kwargs)
 
 	def require_auxiliary(self, context: str):
 		if self.auxiliary is None:
@@ -326,9 +329,12 @@ class DualHostKVCoordinator:
 
 	def get_stats(self):
 		primary_stats = self.primary.get_stats()
-		if self.auxiliary is None:
-			return primary_stats
-		aux_stats = self.auxiliary.get_stats()
+		aux_stats = self.require_auxiliary("get_stats").get_stats()
+		if primary_stats.num_total_pages != aux_stats.num_total_pages:
+			raise RuntimeError(
+				"primary/auxiliary host KV total-page mismatch: "
+				f"primary={primary_stats.num_total_pages}, aux={aux_stats.num_total_pages}"
+			)
 		# Both views share num_pages (see _compute_dual_page_count), but they
 		# can drift if mirroring ever fails partway (e.g. aux register raises
 		# after primary succeeds). Report whichever side has fewer free pages

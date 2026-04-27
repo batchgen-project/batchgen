@@ -3882,22 +3882,26 @@ class BatchGenWorker:
 	# 	for uuid in uuids:
 	# 		self.global_batch.update_status(uuid, new_status)
 	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus):
-		"""Update status for sequences, skipping if already in target status."""
+		"""Update status for sequences; reject invalid state instead of masking it."""
 		if isinstance(uuids, str):
 			uuids = [uuids]
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
-				logging.warning(f"Rank {self.rank}: Sequence {uuid} not found in global_batch")
-				continue
+				raise RuntimeError(
+					f"Rank {self.rank}: cannot update missing sequence {uuid} to {new_status.name}"
+				)
 			if seq.status == new_status:
-				continue  # Skip redundant transition
+				raise RuntimeError(
+					f"Rank {self.rank}: redundant status transition for {uuid[:8]} "
+					f"gid={seq.global_idx}: already {new_status.name}"
+				)
 			if seq.status == SequenceStatus.COMPLETED:
-				continue  # Don't change completed sequences
-			try:
-				self.global_batch.update_status(uuid, new_status)
-			except ValueError as e:
-				logging.warning(f"Rank {self.rank}: Invalid status transition for {uuid}: {e}")
+				raise RuntimeError(
+					f"Rank {self.rank}: cannot transition completed sequence {uuid[:8]} "
+					f"gid={seq.global_idx} to {new_status.name}"
+				)
+			self.global_batch.update_status(uuid, new_status)
 
 	def _sync_sequence_metadata(self, decode_uuids: List[str]) -> None:
 		"""
@@ -3918,17 +3922,7 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
-				# CRITICAL: Ensure current_context_length is consistent before sending
-				# The invariant is: current_context_length = prompt_length + decoded_length
-				expected_ctx = seq.original_prompt_length + seq.decoded_length
-				if seq.current_context_length != expected_ctx:
-					logging.warning(
-						f"Rank {self.rank}: Correcting ctx_len for {uuid[:8]} before sync: "
-						f"{seq.current_context_length} → {expected_ctx}"
-					)
-					seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
-						f"old={seq.current_context_length}, new={expected_ctx}")
-					seq.current_context_length = expected_ctx
+				seq.validate_metadata(f"rank {self.rank} _sync_sequence_metadata/send")
 
 				local_state[uuid] = {
 					'decoded_length': seq.decoded_length,
@@ -3986,17 +3980,7 @@ class BatchGenWorker:
 							if 'total_decoded_before_eviction' in state:
 								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
 							
-							# VALIDATION: Ensure received ctx_len is consistent
-							expected_ctx = seq.original_prompt_length + seq.decoded_length
-							if seq.current_context_length != expected_ctx:
-								logging.error(
-									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
-									f"received={seq.current_context_length}, expected={expected_ctx} "
-									f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-								)
-								seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
-									f"sync_recv old={seq.current_context_length}, new={expected_ctx}")
-								seq.current_context_length = expected_ctx
+							seq.validate_metadata(f"rank {self.rank} _sync_sequence_metadata/recv")
 
 	def _sync_completion_status_tensor(
 		self,
@@ -4065,12 +4049,7 @@ class BatchGenWorker:
 						seq._rep_detected = True
 					seq.eos_reached = True
 					if seq.status != SequenceStatus.COMPLETED:
-						try:
-							self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
-						except ValueError as e:
-							logging.debug(
-								f"Rank {self.rank}: Could not update {uuid[:8]} to COMPLETED: {e}"
-							)
+						self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
 			else:
 				active_uuids.append(uuid)
 
@@ -5945,7 +5924,6 @@ class BatchGenWorker:
 					prev_status = "ON_HOLD" if seq.had_initial_gpu_reservation else "PREFILLED"
 					seq.log_event(SeqEvent.DECODE_START, self.rank,
 						f"from={prev_status}")
-				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 
 				# ============ CRITICAL: Sync metadata before decode config ============
 				# After decode→prefill→decode transitions, sequence metadata
@@ -5965,6 +5943,8 @@ class BatchGenWorker:
 				config_start = time.perf_counter()
 				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
+				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+				self._sync_sequence_metadata(decode_uuids)
 
 				# CUDA Graph Warmup (lazy, one-time) — only capture for final batch
 				# (all sequences prefilled, no more queueing). Earlier iterations
@@ -6525,50 +6505,18 @@ class BatchGenWorker:
 
 		NOTE: This method is SIMPLIFIED - model loading and GPU KV manager init
 		now happen earlier in generate() via _load_decode_model() and
-		_init_gpu_kv_with_actual_size(). This method only handles:
-		1. Context length repair
-		2. Validation/diagnostics
-		3. GPU KV page allocation
+		_init_gpu_kv_with_actual_size(). This method validates metadata before
+		allocating GPU KV pages.
 		"""
 		start_time = time.perf_counter()
 
-		# ============ CRITICAL FIX: Repair current_context_length for ALL sequences FIRST ============
-		# This must happen BEFORE any validation or diagnostics that read current_context_length.
-		# The root cause of ctx_len=0 bug is that current_context_length can become stale during
-		# decode→prefill→decode transitions, especially after migrations.
-		# The fix: current_context_length = prompt_length + decoded_length is ALWAYS the correct value
-		# for sequences that have started decoding (decoded_length > 0 or have been prefilled).
-		ctx_len_repaired_count = 0
 		for uuid in decode_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
-				continue
-			
-			# Compute the correct context length
-			# For sequences with decoded tokens: ctx_len = prompt_length + decoded_length
-			# For freshly prefilled sequences: ctx_len should equal prompt_length (decoded_length=0)
-			expected_ctx = seq.original_prompt_length + seq.decoded_length
-			
-			# Repair if mismatched
-			if seq.current_context_length != expected_ctx:
-				old_ctx = seq.current_context_length
-				seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
-					f"config_decode old={old_ctx}, new={expected_ctx}")
-				seq.current_context_length = expected_ctx
-				ctx_len_repaired_count += 1
-				if old_ctx == 0 or abs(old_ctx - expected_ctx) > 100:
-					# Only log significant mismatches to avoid log spam
-					logging.warning(
-						f"Rank {self.rank}: Repaired {uuid[:8]} gid={seq.global_idx}: "
-						f"ctx_len {old_ctx} → {expected_ctx} (prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-					)
-		
-		if ctx_len_repaired_count > 0:
-			logging.info(
-				f"Rank {self.rank}: Repaired current_context_length for {ctx_len_repaired_count}/{len(decode_uuids)} sequences"
-			)
-		
-		# ============ END CRITICAL FIX ============
+				raise RuntimeError(
+					f"Rank {self.rank}: decode uuid {uuid[:8]} missing at _config_decoding_for_batch entry"
+				)
+			seq.validate_metadata(f"rank {self.rank} _config_decoding_for_batch/entry")
 		
 		# VALIDATION: Verify decode_uuids consistency across all ranks
 		local_uuid_count = torch.tensor([len(decode_uuids)], dtype=torch.int64, device=self.torch_device)
@@ -6577,8 +6525,9 @@ class BatchGenWorker:
 		uuid_counts = [int(t.item()) for t in all_uuid_counts]
 		
 		if len(set(uuid_counts)) > 1:
-			logging.error(
-				f"Rank {self.rank}: CRITICAL - decode_uuids count mismatch at _config_decoding_for_batch entry! Counts: {uuid_counts}."
+			raise RuntimeError(
+				f"Rank {self.rank}: decode_uuids count mismatch at "
+				f"_config_decoding_for_batch entry: counts={uuid_counts}"
 			)
 		
 		# DIAGNOSTIC: Log sequence states at decode config entry
@@ -7638,6 +7587,7 @@ class BatchGenWorker:
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
+				seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/decode_state")
 				is_completed = self._is_sequence_completed(seq)
 				local_seq_state[uuid] = {
 					'decoded_length': seq.decoded_length,
@@ -7687,6 +7637,7 @@ class BatchGenWorker:
 				continue  # Don't load completed sequences
 			if seq.status not in valid_load_statuses:
 				continue  # Only load PREFILLED/ON_HOLD (not QUEUEING/IN_PREFILL)
+			seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/load_candidate")
 			# Report this as a potential load candidate
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
@@ -7730,46 +7681,27 @@ class BatchGenWorker:
 		# VALIDATION: Check that all decode_uuids have state reported
 		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
 		if missing_uuids:
+			missing_details = []
 			for missing_uuid in missing_uuids[:10]:
 				seq = self.global_batch.get_sequence(missing_uuid)
-				expected_rank = seq.assigned_rank if seq else "N/A"
-				in_local_map = missing_uuid in self._uuid_to_local_map
-				seq_status = seq.status.name if seq else "NOT_FOUND"
-				rank_reported = [r for r, p in enumerate(all_payloads)
-								if p and p.get('seq_state', {}).get(missing_uuid)]
-				logging.error(
-					f"Rank {self.rank}: Missing UUID={missing_uuid}, assigned_rank={expected_rank}, "
-					f"in_local_map={in_local_map}, status={seq_status}, reported_by_ranks={rank_reported}"
-				)
-			logging.error(
-				f"Rank {self.rank}: CRITICAL - {len(missing_uuids)} sequences missing from gathered state! "
-				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
-				f"Missing first 5: {missing_uuids[:5]}"
+				rank_reported = [
+					r for r, p in enumerate(all_payloads)
+					if p and p.get('seq_state', {}).get(missing_uuid)
+				]
+				missing_details.append({
+					"uuid": missing_uuid[:8],
+					"gid": seq.global_idx if seq else None,
+					"assigned_rank": seq.assigned_rank if seq else None,
+					"in_local_map": missing_uuid in self._uuid_to_local_map,
+					"status": seq.status.name if seq else "NOT_FOUND",
+					"reported_by": rank_reported,
+				})
+			raise RuntimeError(
+				f"Rank {self.rank}: missing decode UUID state at page boundary; "
+				f"decode_uuids_len={len(decode_uuids)}, "
+				f"global_seq_state_len={len(global_seq_state)}, "
+				f"missing_count={len(missing_uuids)}, details={missing_details}"
 			)
-			# DEFENSIVE: mark orphaned sequences as COMPLETED on all ranks so
-			# they stop coming back to this filter every boundary and eventually
-			# desync a collective. These sequences are unrecoverable — their
-			# local_map entry on the owner was lost, so their decoded_tokens /
-			# input_ids buffers are no longer reachable. Force-terminating them
-			# contains the damage to the affected sequences rather than
-			# crashing the whole server after a 1-hour NCCL timeout.
-			for orphan_uuid in missing_uuids:
-				orphan_seq = self.global_batch.get_sequence(orphan_uuid)
-				if orphan_seq is None:
-					continue
-				orphan_seq.gpu_pages_allocated = 0
-				orphan_seq.host_pages_allocated = 0
-				orphan_seq.host_token_capacity = 0
-				self._sequences_with_gpu_kv.discard(orphan_uuid)
-				if orphan_seq.status != SequenceStatus.COMPLETED:
-					try:
-						self.global_batch.update_status(orphan_uuid, SequenceStatus.COMPLETED)
-					except ValueError:
-						# If current status doesn't allow direct transition to
-						# COMPLETED (e.g., QUEUEING), at least drop it from
-						# active tracking.
-						pass
-			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
 
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
 		for uuid, state in global_seq_state.items():
@@ -7800,12 +7732,7 @@ class BatchGenWorker:
 						seq.original_max_decode_length = state['original_max_decode_length']
 					if 'total_decoded_before_eviction' in state:
 						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
-					# Validate gathered ctx_len
-					expected_ctx = seq.original_prompt_length + seq.decoded_length
-					if seq.current_context_length != expected_ctx:
-						seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-							f"gathered_ctx={seq.current_context_length}, expected={expected_ctx}")
-						seq.current_context_length = expected_ctx
+					seq.validate_metadata(f"rank {self.rank} _page_boundary_fast/gathered_state")
 
 		# ========== RANK 0 COMPUTES ALL DECISIONS ==========
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
@@ -8464,26 +8391,27 @@ class BatchGenWorker:
 		# and are owner-confirmed. pending_uuids must be the all-gathered set
 		# of successful owner-local load launches, not merely rank-0 proposals.
 		valid_pending_uuids = []
+		invalid_pending = []
 		for uuid in pending_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
-				logging.error(f"Rank {self.rank}: pending_uuid {uuid} not found in global_batch!")
+				invalid_pending.append(f"{uuid[:8]} missing from global_batch")
 				continue
 			if seq.assigned_rank is None:
-				logging.error(f"Rank {self.rank}: pending_uuid {uuid} has no assigned_rank!")
+				invalid_pending.append(f"{uuid[:8]} gid={seq.global_idx} has no assigned_rank")
 				continue
 			if seq.assigned_rank == self.rank and uuid not in pending_local_uuid_set:
-				logging.error(
-					f"Rank {self.rank}: owner did not confirm local load for "
-					f"pending_uuid {uuid[:8]} gid={seq.global_idx}; keeping it out of IN_DECODE"
+				invalid_pending.append(
+					f"{uuid[:8]} gid={seq.global_idx} owner rank {self.rank} "
+					"did not confirm local load"
 				)
 				continue
 			valid_pending_uuids.append(uuid)
 
-		if len(valid_pending_uuids) != len(pending_uuids):
-			logging.warning(
-				f"Rank {self.rank}: Filtered {len(pending_uuids) - len(valid_pending_uuids)} invalid "
-				f"pending_uuids out of {len(pending_uuids)}"
+		if invalid_pending:
+			raise RuntimeError(
+				f"Rank {self.rank}: invalid async-load pending UUIDs; "
+				f"pending_count={len(pending_uuids)}, invalid={invalid_pending[:10]}"
 			)
 
 		self._update_batch_status(valid_pending_uuids, SequenceStatus.IN_DECODE)
@@ -8495,13 +8423,7 @@ class BatchGenWorker:
 			# Mark that this sequence has received its initial GPU reservation
 			seq.mark_initial_gpu_reservation_done()
 			self._sequences_with_gpu_kv.add(uuid)
-			# Validate context length after async load finalize
-			expected_ctx = seq.original_prompt_length + seq.decoded_length
-			if seq.current_context_length != expected_ctx:
-				seq.log_event(SeqEvent.CTX_MISMATCH, self.rank,
-					f"finalize_ctx={seq.current_context_length}, expected={expected_ctx}")
-				lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CTX_MISMATCH_FINALIZE")
-				seq.current_context_length = expected_ctx
+			seq.validate_metadata(f"rank {self.rank} _finalize_async_load_minimal")
 			seq.log_event(SeqEvent.KV_LOAD_DONE, self.rank,
 				f"gpu_pages={seq.gpu_pages_allocated}")
 			logging.info(
@@ -10580,62 +10502,16 @@ class BatchGenWorker:
 		current_batch: List[int],
 		gpu_manager: GPUPagedKVCacheManager
 	) -> Tuple[List[str], List[int]]:
-		"""
-		Integrate new sequences after async load completes.
-		
-		NOTE: Caller is responsible for waiting on async_task before calling this.
-		NOTE: Does NOT rebuild page table - caller must rebuild after.
-		"""
-		# Clear async load flag and task reference - load is complete
-		Attn_Wrapper.async_kv_load_active = False
-		Attn_Wrapper.async_kv_load_task = None
-		
-		# Clear tensor references (task is complete)
-		if hasattr(self, '_async_load_tensors'):
-			self._async_load_tensors = None
-		
-		# Log completion
-		if pending_global_ids:
-			logging.info(
-				f"Rank {self.rank}: Async load completed for {len(pending_global_ids)} sequences"
-			)
-		
-		# Update status for ALL new sequences (globally consistent)
-		self._update_batch_status(pending_uuids, SequenceStatus.IN_DECODE)
-		
-		# Update tracking for THIS RANK's sequences
-		for local_idx in pending_local_indices:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-			# Mark that this sequence has received its initial GPU reservation
-			seq.mark_initial_gpu_reservation_done()
-			self._sequences_with_gpu_kv.add(uuid)
-		
-		# Merge into decode batch with deterministic ordering
-		updated_uuids = current_decode_uuids + pending_uuids
-		updated_uuids.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
-		
-		# Derive updated local batch
-		uuid_to_local = {}
-		for idx in current_batch:
-			uuid = self._local_to_uuid_map.get(idx)
-			if uuid:
-				uuid_to_local[uuid] = idx
-		for idx in pending_local_indices:
-			uuid = self._local_to_uuid_map.get(idx)
-			if uuid:
-				uuid_to_local[uuid] = idx
-		
-		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
-		
-		logging.info(
-			f"Rank {self.rank}: Integrated {len(pending_uuids)} loaded sequences, "
-			f"decode batch: {len(current_decode_uuids)} -> {len(updated_uuids)}, "
-			f"local batch: {len(current_batch)} -> {len(updated_batch)}"
+		"""Integrate owner-confirmed async loads after the caller waits."""
+		return self._finalize_async_load_minimal(
+			async_task=async_task,
+			pending_uuids=pending_uuids,
+			pending_local_indices=pending_local_indices,
+			pending_global_ids=pending_global_ids,
+			current_decode_uuids=current_decode_uuids,
+			current_batch=current_batch,
+			gpu_manager=gpu_manager,
 		)
-		
-		return updated_uuids, updated_batch
 
 	def _sync_completion_status_at_boundary(
 		self, 

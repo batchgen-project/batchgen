@@ -17,7 +17,6 @@ Key differences from DeepSeek:
 """
 
 import logging
-import os
 from contextlib import nullcontext as _nullctx
 from typing import Dict, Optional, Tuple
 
@@ -90,14 +89,14 @@ _glm5_decode_timer = init_decode_timer(
 
 
 def _allow_dsa_fallback() -> bool:
-    return os.environ.get("BATCHGEN_GLM5_ALLOW_DSA_FALLBACK", "0") == "1"
+    return False
 
 
 def _raise_required_dsa_kernel(name: str, error: Optional[BaseException] = None) -> None:
     msg = (
         f"GLM-5 DSA requires {name}; silent fallback is disabled. "
-        "Install the repaired batchgen_kernels package or set "
-        "BATCHGEN_GLM5_ALLOW_DSA_FALLBACK=1 only for explicit debug fallback."
+        "Install the repaired batchgen_kernels package; production GLM-5 "
+        "DSA does not support runtime fallback."
     )
     if error is not None:
         msg = f"{msg} Import/init error: {error}"
@@ -648,9 +647,55 @@ class GLM5AttnWrapper(AttnWrapperBase):
         dt = get_decode_timer()
         li = self.layer_idx
 
-        # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
+        # Some DP ranks have 0 sequences at late decode stages. Empty rows are
+        # valid only as a fully empty local batch; avoid reductions such as
+        # cache_seqlens.max() below.
         if bsz == 0:
+            if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
+                raise RuntimeError(
+                    f"GLM-5 DSA layer {li}: empty hidden_states must be [0,1,H], got {tuple(hidden_states.shape)}"
+                )
             return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: hidden_states must be [B,1,H], got {tuple(hidden_states.shape)}"
+            )
+        if hidden_states.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: hidden_states dtype must be bf16, got {hidden_states.dtype}"
+            )
+        if position_ids is None or position_ids.dim() != 2 or position_ids.shape != (bsz, 1):
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: position_ids must be [B,1], got "
+                f"{None if position_ids is None else tuple(position_ids.shape)}"
+            )
+        if cache_seqlens is None or cache_seqlens.dim() != 1 or cache_seqlens.shape[0] != bsz:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: cache_seqlens must be [B], got "
+                f"{None if cache_seqlens is None else tuple(cache_seqlens.shape)} for bsz={bsz}"
+            )
+        if not cache_seqlens.is_cuda or not position_ids.is_cuda:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: cache_seqlens and position_ids must be CUDA tensors"
+            )
+        if gpu_paged_kv_manager is None or gpu_paged_kv_manager_aux is None:
+            raise RuntimeError(f"GLM-5 DSA layer {li}: primary and auxiliary GPU KV managers are required")
+        if gpu_paged_kv_manager.config.page_size_tokens != gpu_paged_kv_manager_aux.config.page_size_tokens:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: primary/aux page-size mismatch: "
+                f"primary={gpu_paged_kv_manager.config.page_size_tokens}, "
+                f"aux={gpu_paged_kv_manager_aux.config.page_size_tokens}"
+            )
+        if max_seqlen != int(cache_seqlens.max().item()):
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: max_seqlen={max_seqlen} must equal "
+                f"cache_seqlens.max()={int(cache_seqlens.max().item())}"
+            )
+        if not torch.equal(position_ids.squeeze(-1).to(cache_seqlens.device), cache_seqlens - 1):
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: position_ids must equal cache_seqlens - 1 for every row"
+            )
 
         # --- Shared FP8 activation quantization ---
         with (dt.timed("act_quant", li) if dt else _nullctx()):
@@ -710,29 +755,31 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # performs HtoD + sync, which capture can't express).
         primary_slot_indices = AttnWrapperBase.primary_slot_indices
         if primary_slot_indices is None:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                "AttnWrapperBase.primary_slot_indices must be populated by "
-                "the worker before CUDA graph capture; see batchgen_worker.py "
-                "per-step hoist."
-            )
-            primary_slot_indices = build_batch_slot_indices(
-                current_batch,
-                gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
-                bsz,
-                manager_device,
+            raise RuntimeError(
+                "GLM-5 DSA requires worker-hoisted primary_slot_indices; "
+                "per-layer reconstruction is not a valid production fallback"
             )
         aux_device = gpu_paged_kv_manager_aux.device
         aux_slot_indices = AttnWrapperBase.aux_slot_indices
         if aux_slot_indices is None:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                "AttnWrapperBase.aux_slot_indices must be populated by the "
-                "worker before CUDA graph capture."
+            raise RuntimeError(
+                "GLM-5 DSA requires worker-hoisted aux_slot_indices; "
+                "per-layer reconstruction is not a valid production fallback"
             )
-            aux_slot_indices = build_batch_slot_indices(
-                current_batch,
-                gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
-                bsz,
-                aux_device,
+        if primary_slot_indices.shape != (bsz,) or aux_slot_indices.shape != (bsz,):
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: slot index shape mismatch: "
+                f"primary={tuple(primary_slot_indices.shape)}, aux={tuple(aux_slot_indices.shape)}, bsz={bsz}"
+            )
+        if primary_slot_indices.dtype not in (torch.int32, torch.int64) or aux_slot_indices.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: slot indices must be int32/int64, "
+                f"primary={primary_slot_indices.dtype}, aux={aux_slot_indices.dtype}"
+            )
+        if primary_slot_indices.device != manager_device or aux_slot_indices.device != aux_device:
+            raise RuntimeError(
+                f"GLM-5 DSA layer {li}: slot index device mismatch: "
+                f"primary={primary_slot_indices.device}/{manager_device}, aux={aux_slot_indices.device}/{aux_device}"
             )
 
         # Index-OOB diagnostic (BATCHGEN_GLM5_VERIFY_INDICES=1). Logs the
@@ -829,19 +876,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
                     ).unsqueeze(2)  # [B, 1, 1, 128]
                 else:
-                    if not _allow_dsa_fallback():
-                        _raise_required_dsa_kernel(
-                            "WP2 fused indexer KV projection",
-                            RuntimeError(f"layer {self.layer_idx} was not initialized"),
-                        )
-                    if not self._warned_indexer_kv_fallback:
-                        self._warned_indexer_kv_fallback = True
-                        logging.warning(
-                            f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
-                            "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
-                        )
-                    indexer_kv = indexer.compute_indexer_kv(
-                        hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
+                    _raise_required_dsa_kernel(
+                        "WP2 fused indexer KV projection",
+                        RuntimeError(f"layer {self.layer_idx} was not initialized"),
                     )
                 indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
                 seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
@@ -876,18 +913,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # Dispatch hint is precomputed once per decode step by the worker
             # (batchgen_worker.py decode loop) so the per-layer .sum().item()
             # here — which would fire 78x per step — becomes a plain int read.
-            # Fallback recomputes locally if the hint wasn't populated (legacy
-            # forward paths / tests). The fallback MUST NOT run inside a CUDA
-            # graph capture region: .item() requires a completed reduce, which
-            # the capture cannot produce until after it ends.
             _short_count = AttnWrapperBase._dsa_short_count
             if _short_count is None:
-                assert not torch.cuda.is_current_stream_capturing(), (
-                    "DSA _short_count hint must be populated before CUDA "
-                    "graph capture; set AttnWrapperBase._dsa_short_count in "
-                    "the worker decode loop (see batchgen_worker.py)."
+                raise RuntimeError(
+                    "GLM-5 DSA requires worker-hoisted _dsa_short_count; "
+                    "per-layer recomputation is not a valid production fallback"
                 )
-                _short_count = int(_short_mask.sum().item())
             _any_short = _short_count > 0
             _any_long = _short_count < _bsz
             if not _any_long:
@@ -1037,19 +1068,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     bsz, attn.num_heads, 1, attn.kv_lora_rank
                 )
             else:
-                if not self._warned_fp8_absorb_fallback:
-                    self._warned_fp8_absorb_fallback = True
-                    logging.warning(
-                        f"[layer {self.layer_idx}] WP5 FP8 absorb unavailable, "
-                        "falling back to SGLang-aligned BF16 BMM "
-                        "(bmm(q_nope.T, w_kc)) — see wrappers.initialize_decode_absorb"
-                    )
-                # Matches SGLang's forward_mla.py:298 exactly.
-                q_nope_out = torch.bmm(
-                    q_nope_squeezed.transpose(0, 1), self.w_kc,
-                ).transpose(0, 1)  # [B, H, kv_lora_rank]
-                query_states[:, :, :, :attn.kv_lora_rank] = q_nope_out.view(
-                    bsz, attn.num_heads, 1, attn.kv_lora_rank,
+                _raise_required_dsa_kernel(
+                    "WP5 FP8 q_absorb",
+                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
                 )
 
             query_states[:, :, :, attn.kv_lora_rank:] = q_pe
@@ -1073,11 +1094,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
             if self._fp8_absorb_weights is not None:
                 attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             else:
-                # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
-                attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
-                attn_output = torch.bmm(
-                    attn_out_3d.transpose(0, 1), self.w_vc,
-                ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
+                _raise_required_dsa_kernel(
+                    "WP5 FP8 out_absorb",
+                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
+                )
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(

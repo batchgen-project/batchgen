@@ -175,16 +175,26 @@ class DualKVCacheCoordinator:
 	# -- Query (primary only) --
 
 	def get_stats(self) -> GPUPagedKVStats:
+		self.assert_mirrored_state("get_stats")
 		return self.primary.get_stats()
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-		return self.primary.get_kv_tensors()
+		raise RuntimeError(
+			"DualKVCacheCoordinator.get_kv_tensors() is primary-only and invalid for DSA; "
+			"use explicit primary/auxiliary managers"
+		)
 
 	def get_layer_kv_with_page_table(self, layer_idx: int):
-		return self.primary.get_layer_kv_with_page_table(layer_idx)
+		raise RuntimeError(
+			"DualKVCacheCoordinator.get_layer_kv_with_page_table() is primary-only and invalid for DSA; "
+			"use explicit primary/auxiliary managers"
+		)
 
 	def update_layer_decode_new_token(self, *args, **kwargs):
-		return self.primary.update_layer_decode_new_token(*args, **kwargs)
+		raise RuntimeError(
+			"DualKVCacheCoordinator.update_layer_decode_new_token() is primary-only and invalid for DSA; "
+			"write primary and auxiliary KV explicitly"
+		)
 
 	def get_page_table_version(self) -> int:
 		return self.primary.get_page_table_version()
@@ -224,10 +234,16 @@ class DualKVCacheCoordinator:
 		return self.primary.export_layer_page_pointer_table(*args, **kwargs)
 
 	def export_active_sequence_page_counts(self) -> torch.Tensor:
-		return self.primary.export_active_sequence_page_counts()
+		raise RuntimeError(
+			"DualKVCacheCoordinator.export_active_sequence_page_counts() is primary-only and invalid for DSA; "
+			"use explicit primary/auxiliary managers"
+		)
 
 	def get_padded_3d_page_pointers(self, *args, **kwargs):
-		return self.primary.get_padded_3d_page_pointers(*args, **kwargs)
+		raise RuntimeError(
+			"DualKVCacheCoordinator.get_padded_3d_page_pointers() is primary-only and invalid for DSA; "
+			"use explicit primary/auxiliary managers"
+		)
 
 	def _preflight_allocate(
 		self, sequence_ids: Sequence[int], num_tokens: Sequence[int], op_name: str
