@@ -7542,7 +7542,6 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
-				self._drain_pending_prefill_offloads(log=False)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
