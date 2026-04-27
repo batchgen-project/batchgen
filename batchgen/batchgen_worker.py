@@ -1924,6 +1924,17 @@ class BatchGenWorker:
 		if sequence_ids is not None and sequence_lengths is not None:
 			self._ensure_host_kv_append_capacity(sequence_ids, sequence_lengths)
 
+		def _assert_deferred_kv_rows(cache_name: str, layer_idx: int, tensor: torch.Tensor) -> None:
+			if sequence_ids is None:
+				return
+			if tensor.shape[0] != len(sequence_ids):
+				raise RuntimeError(
+					f"{cache_name} deferred KV row mismatch at layer {layer_idx}: "
+					f"tensor_rows={tensor.shape[0]}, sequence_ids={len(sequence_ids)}, "
+					f"gids={sequence_ids[:8] if sequence_ids is not None else []}, "
+					f"write_pos={sequence_lengths[:8] if sequence_lengths is not None else []}"
+				)
+
 		# ONE sync for ALL layers across BOTH caches — the key optimization
 		if not hasattr(self, '_kv_offload_event'):
 			self._kv_offload_event = torch.cuda.Event()
@@ -1950,6 +1961,9 @@ class BatchGenWorker:
 						k_tensor = k_tensor.unsqueeze(2)
 					if v_tensor is not None and v_tensor.dim() == 3:
 						v_tensor = v_tensor.unsqueeze(2)
+					_assert_deferred_kv_rows("primary", layer_idx, k_tensor)
+					if v_tensor is not None:
+						_assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
 					_prepared_entries.append((layer_idx, k_tensor, v_tensor))
 					self._pending_kv_append_tensors.append(k_tensor)
 					if v_tensor is not None:
@@ -1968,6 +1982,7 @@ class BatchGenWorker:
 				for layer_idx, k_tensor, v_tensor in entries_aux:
 					if k_tensor.dim() == 3:
 						k_tensor = k_tensor.unsqueeze(2)
+					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
 					_prepared_aux.append((layer_idx, k_tensor, None))
 					self._pending_kv_append_tensors.append(k_tensor)
 				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
@@ -1985,6 +2000,9 @@ class BatchGenWorker:
 						k_tensor = k_tensor.unsqueeze(2)
 					if v_tensor is not None and v_tensor.dim() == 3:
 						v_tensor = v_tensor.unsqueeze(2)
+					_assert_deferred_kv_rows("primary", layer_idx, k_tensor)
+					if v_tensor is not None:
+						_assert_deferred_kv_rows("primary_v", layer_idx, v_tensor)
 
 					task = worker_view.async_append_decode_kv_to_host(
 						layer_idx=layer_idx,
@@ -2005,6 +2023,7 @@ class BatchGenWorker:
 				for layer_idx, k_tensor, v_tensor in entries_aux:
 					if k_tensor.dim() == 3:
 						k_tensor = k_tensor.unsqueeze(2)
+					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
 
 					task = aux_view.async_append_decode_kv_to_host(
 						layer_idx=layer_idx,
@@ -2024,6 +2043,9 @@ class BatchGenWorker:
 
 		self._deferred_kv_entries = []
 		self._deferred_kv_entries_aux = []
+		self._deferred_kv_batch = None
+		self._deferred_kv_worker_view = None
+		self._deferred_kv_worker_view_aux = None
 
 	def _ensure_host_kv_append_capacity(
 		self,
@@ -3915,6 +3937,9 @@ class BatchGenWorker:
 					'eos_reached': seq.eos_reached,
 					'rep_detected': getattr(seq, '_rep_detected', False),
 					'prompt_length': seq.prompt_length,  # Include for validation
+					'reentry_decoded_baseline': seq.reentry_decoded_baseline,
+					'max_decode_length': seq.max_decode_length,
+					'original_max_decode_length': seq.original_max_decode_length,
 					'host_pages_allocated': seq.host_pages_allocated,
 					'host_token_capacity': seq.host_token_capacity,
 					# total_decoded_before_eviction: needed so non-owning ranks
@@ -3946,6 +3971,12 @@ class BatchGenWorker:
 							# pick that up or prefill selection under-counts.
 							if 'prompt_length' in state:
 								seq.prompt_length = state['prompt_length']
+							if 'reentry_decoded_baseline' in state:
+								seq.reentry_decoded_baseline = state['reentry_decoded_baseline']
+							if 'max_decode_length' in state:
+								seq.max_decode_length = state['max_decode_length']
+							if 'original_max_decode_length' in state:
+								seq.original_max_decode_length = state['original_max_decode_length']
 							# Sync host KV fields for consistent migration planning
 							if 'host_pages_allocated' in state:
 								seq.host_pages_allocated = state['host_pages_allocated']
@@ -7629,6 +7660,9 @@ class BatchGenWorker:
 					# owner has already rewritten prompt_length in a prior
 					# eviction). See Phase 4.C.
 					'prompt_length': seq.prompt_length,
+					'reentry_decoded_baseline': seq.reentry_decoded_baseline,
+					'max_decode_length': seq.max_decode_length,
+					'original_max_decode_length': seq.original_max_decode_length,
 					# total_decoded_before_eviction: propagated here so the
 					# next _prepare_prefill_batch's eviction priority sort is
 					# consistent across ranks.
@@ -7758,6 +7792,12 @@ class BatchGenWorker:
 					# priority sort is consistent.
 					if 'prompt_length' in state:
 						seq.prompt_length = state['prompt_length']
+					if 'reentry_decoded_baseline' in state:
+						seq.reentry_decoded_baseline = state['reentry_decoded_baseline']
+					if 'max_decode_length' in state:
+						seq.max_decode_length = state['max_decode_length']
+					if 'original_max_decode_length' in state:
+						seq.original_max_decode_length = state['original_max_decode_length']
 					if 'total_decoded_before_eviction' in state:
 						seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
 					# Validate gathered ctx_len
