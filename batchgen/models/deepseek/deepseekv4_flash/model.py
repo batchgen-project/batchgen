@@ -560,6 +560,31 @@ class DeepSeekV4FlashMoE(nn.Module):
         )
         self.enable_ep_offloading = world_size > 1
 
+    @staticmethod
+    def _all_reduce_routed(routed: torch.Tensor) -> torch.Tensor:
+        local_tokens = torch.tensor(
+            [routed.shape[0]],
+            dtype=torch.int64,
+            device=routed.device,
+        )
+        all_tokens = torch.empty(
+            dist.get_world_size(),
+            dtype=torch.int64,
+            device=routed.device,
+        )
+        dist.all_gather_into_tensor(all_tokens, local_tokens)
+        max_tokens = int(all_tokens.max().item())
+        if max_tokens == 0:
+            return routed
+        if routed.shape[0] == max_tokens:
+            reduced = routed
+        else:
+            reduced = routed.new_zeros(max_tokens, routed.shape[1])
+            if routed.shape[0] > 0:
+                reduced[: routed.shape[0]] = routed
+        dist.all_reduce(reduced)
+        return reduced[: routed.shape[0]]
+
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, self.hidden_size)
@@ -579,7 +604,7 @@ class DeepSeekV4FlashMoE(nn.Module):
             routed[token_idx] += expert_out.float()
 
         if self.enable_ep_offloading and dist.is_initialized():
-            dist.all_reduce(routed)
+            routed = self._all_reduce_routed(routed)
 
         shared = self.shared_experts(flat_states).float()
         return (routed + shared).to(hidden_states.dtype).view(shape)
