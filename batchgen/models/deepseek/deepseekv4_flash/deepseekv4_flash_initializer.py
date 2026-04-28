@@ -85,7 +85,7 @@ class DeepSeekV4FlashInitializer:
         )
         self.engine_config.KV_Storage_Config.host_kv_cache_config = build_host_kv_config(
             input_arguments.huggingface_ckpt_name,
-            self.host_kv_cache_size,
+            self.host_kv_cache_byte_size,
         )
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
