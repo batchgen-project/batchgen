@@ -84,6 +84,18 @@ struct PrefixEvictionResult {
     std::uint64_t eviction_epoch = 0;
 };
 
+struct PrefixDebugEntry {
+    std::uint64_t namespace_hash = 0;
+    std::int32_t page_index = 0;
+    std::int32_t host_page_id = -1;
+    std::uint64_t page_chain_hash = 0;
+    std::uint64_t parent_page_hash = 0;
+    std::uint64_t insert_epoch = 0;
+    std::uint64_t last_access_epoch = 0;
+    std::uint64_t hit_count = 0;
+    std::uint32_t child_count = 0;
+};
+
 class HostPrefixCache {
    public:
     using PinCallback = std::function<void(std::int32_t)>;
@@ -111,6 +123,8 @@ class HostPrefixCache {
         const FreePageCountCallback& free_pages);
 
     PrefixCacheStats Stats() const;
+    std::vector<PrefixDebugEntry> DebugEntries(std::size_t limit = 0,
+                                               bool cold_first = true) const;
 
     void Clear(const UnpinCallback& on_unpin);
 

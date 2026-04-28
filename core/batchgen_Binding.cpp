@@ -292,6 +292,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
              py::arg("sequence_id"), py::arg("token_ids"),
              py::arg("namespace_hash") = 0)
         .def("get_prefix_cache_stats", &WorkerView::GetPrefixCacheStats)
+        .def("prefix_cache_debug_entries",
+             &WorkerView::PrefixCacheDebugEntries,
+             py::arg("limit") = 0, py::arg("cold_first") = true)
         .def("clear_prefix_cache", &WorkerView::ClearPrefixCache)
         .def(
             "evict_prefix_cache_until_free",
@@ -551,6 +554,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::PrefixEvictionResult::reached_target)
         .def_readwrite("eviction_epoch",
                        &kv::PrefixEvictionResult::eviction_epoch);
+
+    py::class_<kv::PrefixDebugEntry>(m, "PrefixDebugEntry")
+        .def(py::init<>())
+        .def_readwrite("namespace_hash", &kv::PrefixDebugEntry::namespace_hash)
+        .def_readwrite("page_index", &kv::PrefixDebugEntry::page_index)
+        .def_readwrite("host_page_id", &kv::PrefixDebugEntry::host_page_id)
+        .def_readwrite("page_chain_hash",
+                       &kv::PrefixDebugEntry::page_chain_hash)
+        .def_readwrite("parent_page_hash",
+                       &kv::PrefixDebugEntry::parent_page_hash)
+        .def_readwrite("insert_epoch", &kv::PrefixDebugEntry::insert_epoch)
+        .def_readwrite("last_access_epoch",
+                       &kv::PrefixDebugEntry::last_access_epoch)
+        .def_readwrite("hit_count", &kv::PrefixDebugEntry::hit_count)
+        .def_readwrite("child_count", &kv::PrefixDebugEntry::child_count);
 
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)

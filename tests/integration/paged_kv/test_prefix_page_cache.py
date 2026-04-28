@@ -265,6 +265,53 @@ def test_prefix_cache_eviction_unblocks_allocation_pressure():
         _shm_unlink(shm_name)
 
 
+def test_prefix_cache_allocation_failure_keeps_protected_refs_balanced():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name, num_pages=3)
+        tokens = [1, 1, 1, 1, 2, 2, 2, 2]
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 8)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+        worker.release_sequence_pages([1])
+
+        protected_page = first[0]["private_pages"][1]
+        before_stats = worker.get_stats()
+        before_prefix_stats = worker.get_prefix_cache_stats()
+        before_ref = worker.page_ref_state(protected_page)
+
+        worker.register_sequences([2])
+        with pytest.raises(RuntimeError, match="insufficient free pages"):
+            worker.allocate_pages_for_sequences_with_prefix(
+                [(2, tokens, 16, 0)]
+            )
+
+        after_stats = worker.get_stats()
+        after_prefix_stats = worker.get_prefix_cache_stats()
+        after_ref = worker.page_ref_state(protected_page)
+        assert after_stats.num_sequence_ref_pages == before_stats.num_sequence_ref_pages
+        assert after_stats.num_prefix_pinned_pages <= before_stats.num_prefix_pinned_pages
+        assert after_prefix_stats.prefix_pin_increments == (
+            before_prefix_stats.prefix_pin_increments
+        )
+        assert after_prefix_stats.prefix_pin_decrements >= (
+            before_prefix_stats.prefix_pin_decrements
+        )
+        assert after_ref.sequence_refs == before_ref.sequence_refs
+        assert after_ref.prefix_pins == before_ref.prefix_pins
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
 def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
     shm_name = _random_shm_name()
     worker = None
@@ -324,6 +371,50 @@ def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
         assert final_ref_state.sequence_refs == 0
         assert final_ref_state.prefix_pins == 0
         assert final_ref_state.is_free
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_shared_prefix_release_is_idempotent_and_order_safe():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        tokens = [8, 8, 8, 8]
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 4)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+        prefix_page = first[0]["private_pages"][0]
+        worker.release_sequence_pages([1])
+
+        worker.register_sequences([2])
+        second = worker.allocate_pages_for_sequences_with_prefix([(2, tokens, 8)])[0]
+        assert second["shared_prefix_pages"] == [prefix_page]
+
+        worker.release_sequence_pages([2])
+        # Releasing the same sequence again must not double-decrement shared
+        # page refs or throw after the page-table row has been removed.
+        worker.release_sequence_pages([2])
+        after_release = worker.page_ref_state(prefix_page)
+        assert after_release.sequence_refs == 0
+        assert after_release.prefix_pins == 1
+        assert not after_release.is_free
+
+        eviction = worker.evict_prefix_cache_until_free(worker.free_page_count() + 1)
+        assert eviction.reached_target
+        assert eviction.entries_removed == 1
+        final_ref = worker.page_ref_state(prefix_page)
+        assert final_ref.sequence_refs == 0
+        assert final_ref.prefix_pins == 0
+        assert final_ref.is_free
     finally:
         if worker is not None:
             try:
@@ -401,6 +492,45 @@ def test_suffix_offload_uses_explicit_source_and_destination_offsets():
         if worker is not None:
             try:
                 worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_prefix_cache_debug_entries_report_cold_and_hot_pages():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        first_tokens = [1, 1, 1, 1]
+        second_tokens = [2, 2, 2, 2]
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, first_tokens, 4)])
+        worker.commit_sequence_prefix_pages(1, first_tokens)
+        worker.release_sequence_pages([1])
+
+        worker.register_sequences([2])
+        second = worker.allocate_pages_for_sequences_with_prefix([(2, second_tokens, 4)])
+        worker.commit_sequence_prefix_pages(2, second_tokens)
+        worker.release_sequence_pages([2])
+
+        worker.register_sequences([3])
+        worker.allocate_pages_for_sequences_with_prefix([(3, second_tokens, 4)])
+
+        cold = worker.prefix_cache_debug_entries(limit=1, cold_first=True)
+        hot = worker.prefix_cache_debug_entries(limit=1, cold_first=False)
+        assert len(cold) == 1
+        assert len(hot) == 1
+        assert cold[0].host_page_id == first[0]["private_pages"][0]
+        assert hot[0].host_page_id == second[0]["private_pages"][0]
+        assert hot[0].hit_count >= cold[0].hit_count
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2, 3])
             except Exception:
                 pass
             worker.clear_prefix_cache()

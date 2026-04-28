@@ -463,6 +463,11 @@ class HostPagedKVWorkerView {
         return prefix_cache_.Stats();
     }
 
+    std::vector<PrefixDebugEntry> PrefixCacheDebugEntries(
+        std::size_t limit = 0, bool cold_first = true) const {
+        return prefix_cache_.DebugEntries(limit, cold_first);
+    }
+
     void ClearPrefixCache() {
         prefix_cache_.Clear(
             [this](std::int32_t page) { backend_.UnpinPrefixPage(page); });
@@ -1134,22 +1139,32 @@ class HostPagedKVWorkerView {
                 throw std::runtime_error(oss.str());
             }
         }
-        EnsureSequencesRegistered(sequence_ids);
+        std::vector<std::int64_t> registered_sequence_ids;
+        registered_sequence_ids.reserve(sequence_ids.size());
+        for (std::int64_t sequence_id : sequence_ids) {
+            if (page_table_.Contains(sequence_id)) {
+                registered_sequence_ids.push_back(sequence_id);
+            }
+        }
+        if (registered_sequence_ids.empty()) {
+            return;
+        }
         const bool has_any_shared_prefix =
-            std::any_of(sequence_ids.begin(), sequence_ids.end(),
+            std::any_of(registered_sequence_ids.begin(),
+                        registered_sequence_ids.end(),
                         [this](std::int64_t sequence_id) {
                             return !page_table_.SharedPrefixPages(sequence_id)
                                         .empty();
                         });
         if (!has_any_shared_prefix) {
-            backend_.ReleaseSequences(sequence_ids);
+            backend_.ReleaseSequences(registered_sequence_ids);
         } else {
-            for (std::int64_t sequence_id : sequence_ids) {
+            for (std::int64_t sequence_id : registered_sequence_ids) {
                 backend_.ReleaseSequenceLogical(sequence_id,
                                                 page_table_.Pages(sequence_id));
             }
         }
-        UnregisterSequences(sequence_ids);
+        UnregisterSequences(registered_sequence_ids);
     }
 
     KVAsyncTask AsyncOffloadLayerKVToHost(

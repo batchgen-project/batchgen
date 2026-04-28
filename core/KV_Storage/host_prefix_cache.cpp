@@ -401,6 +401,49 @@ PrefixCacheStats HostPrefixCache::Stats() const {
     return stats;
 }
 
+std::vector<PrefixDebugEntry> HostPrefixCache::DebugEntries(
+    std::size_t limit, bool cold_first) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<PrefixDebugEntry> entries;
+    entries.reserve(entries_.size());
+    for (const auto& item : entries_) {
+        const PrefixPageEntry& entry = item.second;
+        entries.push_back(PrefixDebugEntry{
+            entry.key.namespace_hash,
+            entry.key.page_index,
+            entry.host_page_id,
+            entry.page_chain_hash,
+            entry.key.parent_page_hash,
+            entry.insert_epoch,
+            entry.last_access_epoch,
+            entry.hit_count,
+            entry.child_count,
+        });
+    }
+    std::sort(entries.begin(), entries.end(),
+              [cold_first](const PrefixDebugEntry& lhs,
+                           const PrefixDebugEntry& rhs) {
+                  if (lhs.last_access_epoch != rhs.last_access_epoch) {
+                      return cold_first
+                                 ? lhs.last_access_epoch < rhs.last_access_epoch
+                                 : lhs.last_access_epoch > rhs.last_access_epoch;
+                  }
+                  if (lhs.hit_count != rhs.hit_count) {
+                      return cold_first ? lhs.hit_count < rhs.hit_count
+                                        : lhs.hit_count > rhs.hit_count;
+                  }
+                  if (lhs.insert_epoch != rhs.insert_epoch) {
+                      return cold_first ? lhs.insert_epoch < rhs.insert_epoch
+                                        : lhs.insert_epoch > rhs.insert_epoch;
+                  }
+                  return lhs.host_page_id < rhs.host_page_id;
+              });
+    if (limit != 0 && entries.size() > limit) {
+        entries.resize(limit);
+    }
+    return entries;
+}
+
 void HostPrefixCache::Clear(const UnpinCallback& on_unpin) {
     std::lock_guard<std::mutex> lock(mutex_);
     const bool had_entries = !entries_.empty();
