@@ -220,14 +220,24 @@ def apply_rotary_pos_emb_split(
 # Resolve hadamard kernels once at import time (triggers JIT compilation)
 try:
     from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
-except (ImportError, Exception):
+except Exception as _e:
     _hadamard_cuda_fn = None
+    logging.warning(
+        f"[GLM-5] hadamard_transform import failed: {_e!r}; "
+        "falling back to non-fused Hadamard (slower)."
+    )
 
 # Fused RoPE+Hadamard kernel — validated: 99/99 tests passed, 16.5x speedup over separate ops.
 try:
     from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
-except (ImportError, Exception):
+except Exception as _e:
     _fused_rope_hadamard_fn = None
+    logging.warning(
+        f"[GLM-5] fused_rope_hadamard import failed: {_e!r}; "
+        "falling back to separate RoPE+Hadamard. The fallback returns the input "
+        "dtype after k_norm — if k_norm yields FP32 the indexer K tensor will be "
+        "FP32 and trip aux KV's k_element_size_bytes=2 (BF16) check."
+    )
 
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 
