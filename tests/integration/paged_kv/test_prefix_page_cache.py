@@ -216,6 +216,10 @@ def test_prefix_cache_eviction_skips_protected_leaf_pages():
         assert worker.get_prefix_cache_stats().entries == 2
     finally:
         if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
             worker.clear_prefix_cache()
             worker.shutdown()
         _shm_unlink(shm_name)
@@ -270,9 +274,32 @@ def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
 
         worker.register_sequences([1])
         first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 4)])
+        full_k = torch.arange(
+            1,
+            5,
+            dtype=torch.bfloat16,
+            device="cuda:0",
+        ).view(1, 4, 1, 1)
+        task = worker.async_offload_layer_kv_to_host(
+            layer_idx=0,
+            sequence_ids=[1],
+            k_tensor=full_k,
+            v_tensor=None,
+            sequence_lengths=[4],
+        )
+        task.result()
         worker.commit_sequence_prefix_pages(1, tokens)
         leaf_page = first[0]["private_pages"][0]
-        page_table_before = worker.build_page_table([1])[0]
+        worker.release_sequence_pages([1])
+
+        worker.register_sequences([2])
+        second = worker.allocate_pages_for_sequences_with_prefix([(2, tokens, 8)])[0]
+        assert second["shared_prefix_tokens"] == 4
+        assert second["shared_prefix_pages"] == [leaf_page]
+        assert len(second["private_pages"]) == 1
+
+        page_table_before = worker.build_page_table([2])[0]
+        prefix_tokens_before = worker.shared_prefix_tokens(2)
 
         free_before = worker.free_page_count()
         eviction = worker.evict_prefix_cache_until_free(free_before + 1)
@@ -280,19 +307,29 @@ def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
         assert eviction.entries_removed == 1
         assert eviction.pages_immediately_freed == 0
         assert eviction.active_ref_entries_removed == 1
-        assert worker.build_page_table([1])[0] == page_table_before
+        assert worker.build_page_table([2])[0] == page_table_before
+        assert worker.shared_prefix_tokens(2) == prefix_tokens_before
+
+        k_cpu, _ = worker.read_sequence_kv_to_cpu(2)
+        logical_tokens = k_cpu[0, :4, :, 0, 0].reshape(-1).float().tolist()
+        assert logical_tokens == pytest.approx([1, 2, 3, 4])
 
         ref_state = worker.page_ref_state(leaf_page)
         assert ref_state.sequence_refs == 1
         assert ref_state.prefix_pins == 0
         assert not ref_state.is_free
 
-        worker.release_sequence_pages([1])
+        worker.release_sequence_pages([2])
         final_ref_state = worker.page_ref_state(leaf_page)
         assert final_ref_state.sequence_refs == 0
         assert final_ref_state.prefix_pins == 0
+        assert final_ref_state.is_free
     finally:
         if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
             worker.clear_prefix_cache()
             worker.shutdown()
         _shm_unlink(shm_name)

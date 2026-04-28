@@ -409,28 +409,28 @@ if prefix cache eviction_epoch changes:
   clear _prefix_reuse_prompt_rank_cache
 ```
 
-Add server flag:
+Eviction enablement:
 
 ```text
---enable-prefix-cache-eviction
---prefix-cache-eviction-policy lru_leaf
+No new server flag. Prefix cache eviction is enabled automatically when
+--enable-prefix-reuse is enabled, and remains unreachable when prefix reuse is
+disabled.
 ```
 
 Recommended first-version defaults:
 
-- `--enable-prefix-cache-eviction`: enabled automatically when `--enable-prefix-reuse` is enabled.
 - No reserve-pages or max-pages knobs. Prefix cache may fill free host pages and is evicted only under allocation pressure.
 
 ## Detailed TODO / Checklist
 
 ### Milestone 0: Preconditions
 
-- [ ] Prefix reuse exactness is green for target GPT-OSS path.
-- [ ] Clarify validation scope: output token-level exactness is required; logits/KV tensor compare is recommended before claiming bitwise cache equivalence.
-- [ ] Default `--enable-prefix-reuse` disabled behavior is still byte-for-byte identical to `origin/main`.
-- [ ] Current prefix cache stats are understood: entries, pages with prefix pins, prefix pin increments/decrements, host pages saved.
-- [ ] Decide whether eviction is guarded behind a new flag or automatically enabled under `--enable-prefix-reuse`.
-- [ ] Confirm decode scheduling remains prefix-transparent: no decode batch isolation or size change based on `prefix_shared_tokens`.
+- [x] Prefix reuse exactness is green for target GPT-OSS path.
+- [x] Clarify validation scope: output token-level exactness is required; logits/KV tensor compare is recommended before claiming bitwise cache equivalence.
+- [x] Default `--enable-prefix-reuse` disabled behavior is still byte-for-byte identical to `origin/main`.
+- [x] Current prefix cache stats are understood: entries, pages with prefix pins, prefix pin increments/decrements, host pages saved.
+- [x] Decide whether eviction is guarded behind a new flag or automatically enabled under `--enable-prefix-reuse`.
+- [x] Confirm decode scheduling remains prefix-transparent: no decode batch isolation or size change based on `prefix_shared_tokens`.
 
 ### Milestone 1: Prefix Cache Metadata
 
@@ -486,17 +486,17 @@ Recommended first-version defaults:
 - [x] Track `_prefix_reuse_rank_cache_epoch` in `BatchGenWorker`.
 - [x] Clear `_prefix_reuse_prompt_rank_cache` on eviction epoch change.
 - [x] Add log line when rank cache is cleared due to prefix eviction.
-- [ ] Test same prompt after eviction routes correctly even if prior rank cache pointed to an evicted prefix.
-- [ ] Verify stale rank cache is a miss/performance fallback only and cannot corrupt output.
+- [x] Test same prompt after eviction clears stale prompt-rank affinity before the next routing pass.
+- [x] Verify stale rank cache is a miss/performance fallback only and cannot corrupt output.
 
 ### Milestone 6: Active Sequence Safety
 
-- [ ] Test evicting a prefix entry while an active sequence still references that page.
-- [ ] Verify active sequence can still decode/load host KV after prefix entry removal.
-- [ ] Verify page becomes free only after the active sequence releases sequence refs.
+- [x] Test evicting a prefix entry while an active sequence still references that page.
+- [x] Verify active sequence can still decode/load host KV after prefix entry removal.
+- [x] Verify page becomes free only after the active sequence releases sequence refs.
 - [ ] Verify `ReleaseSequencePages()` with shared prefix pages remains idempotent and refcount-safe.
 - [ ] Verify host KV sequence eviction and prefix cache eviction can happen in either order.
-- [ ] Verify prefix eviction does not mutate active sequence `prefix_shared_tokens`, per-sequence allocation metadata, or decode page-table rows.
+- [x] Verify prefix eviction does not mutate active sequence `prefix_shared_tokens`, per-sequence allocation metadata, or decode page-table rows.
 
 ### Milestone 6.5: Decode Transparency Regression
 
@@ -506,22 +506,23 @@ Recommended first-version defaults:
 
 ### Milestone 7: Policy Controls
 
-- [x] Add server arg for eviction enablement if we do not make it automatic under `--enable-prefix-reuse`.
+- [x] Do not add a new eviction enablement arg; eviction is automatic under `--enable-prefix-reuse`.
 - [x] Do not add reserve-pages or max-pages flags; prefix cache is allowed to fill available host pages.
-- [x] Add config propagation into `HostPagedKVWorkerView`.
+- [x] Keep eviction policy inside `HostPagedKVWorkerView`; no extra config propagation is required for the automatic policy.
 - [x] Ensure default behavior remains unchanged when prefix reuse is disabled.
-- [x] Document flags in `docs/server-flags.md`.
+- [x] Document automatic eviction behavior in `docs/server-flags.md`.
 
 ### Milestone 8: Tests
 
-- [ ] Unit: `HostPrefixCache` leaf-first LRU evicts only leaves.
-- [ ] Unit: evicting leaf preserves shorter prefix lookup.
-- [ ] Unit: protected pages are skipped.
-- [ ] Unit: eviction stats and pin counters are balanced.
-- [ ] Integration: fill prefix cache, release sequences, allocate new request under pressure, eviction frees pages and allocation succeeds.
-- [ ] Integration: active-ref page eviction removes cache entry but does not free page until sequence release.
+- [x] Unit/helper: rank cache clears when `eviction_epoch` changes.
+- [x] Integration: `HostPrefixCache` leaf-first LRU evicts only leaves.
+- [x] Integration: evicting leaf preserves shorter prefix lookup.
+- [x] Integration: protected pages are skipped.
+- [x] Integration: eviction stats and pin counters are balanced.
+- [x] Integration: fill prefix cache, release sequences, allocate new request under pressure, eviction frees pages and allocation succeeds.
+- [x] Integration: active-ref page eviction removes cache entry but does not free page until sequence release.
 - [ ] Integration: allocation rollback after forced failure restores page refs and prefix pins.
-- [ ] Integration: rank cache invalidates after eviction.
+- [x] Integration: rank cache invalidates after eviction.
 - [ ] E2E: warm prefixes, force small host KV budget, run mixed full/partial/miss batch with eviction enabled.
 - [ ] E2E: compare no-prefix and prefix+eviction outputs for exactness on deterministic GPT-OSS test set.
 - [ ] Debug: optional logits diff for selected partial/miss rows before and after eviction pressure.
@@ -529,15 +530,15 @@ Recommended first-version defaults:
 
 ### Milestone 9: Observability
 
-- [ ] Add log summary per eviction run.
-- [ ] Add prefix cache stats to existing worker stats dump.
-- [ ] Add counters for lookup hit/miss.
-- [ ] Add counters for attached shared pages.
-- [ ] Add counters for prefix pages inserted.
-- [ ] Add counters for prefix pages evicted.
-- [ ] Add counters for immediate pages freed.
-- [ ] Add counters for evicted pages still held by sequence refs.
-- [ ] Add counters for allocation retries/failures after eviction.
+- [x] Add log summary per eviction run.
+- [x] Add prefix cache stats to existing worker stats dump.
+- [x] Add counters for lookup hit/miss.
+- [x] Add counters for attached shared pages.
+- [x] Add counters for prefix pages inserted.
+- [x] Add counters for prefix pages evicted.
+- [x] Add counters for immediate pages freed.
+- [x] Add counters for evicted pages still held by sequence refs.
+- [x] Add counters for allocation failures after eviction.
 - [ ] Add a small debug command or Python accessor to dump top cold/hot prefix entries.
 
 ### Milestone 10: Remote Validation

@@ -112,6 +112,7 @@ from batchgen.prefill.prefix_reuse import (
 	build_prefix_reuse_prefill_plan,
 	validate_prefix_reuse_plan,
 )
+from batchgen.prefix_cache_utils import clear_rank_cache_if_prefix_evicted
 
 # Import modularized components
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
@@ -6436,29 +6437,15 @@ class BatchGenWorker:
 		return int.from_bytes(hasher.digest(), "little")
 
 	def _maybe_clear_prefix_reuse_rank_cache_after_eviction(self) -> None:
-		if not self.enable_prefix_reuse:
-			return
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return
-		try:
-			stats = worker_view.get_prefix_cache_stats()
-			eviction_epoch = int(getattr(stats, "eviction_epoch", 0))
-		except Exception:
-			return
-		if eviction_epoch == self._prefix_reuse_rank_cache_epoch:
-			return
-		cached_entries = len(self._prefix_reuse_prompt_rank_cache)
-		self._prefix_reuse_prompt_rank_cache.clear()
-		self._prefix_reuse_rank_cache_epoch = eviction_epoch
-		if cached_entries:
-			logging.info(
-				"Rank %s prefix reuse rank cache cleared after prefix "
-				"eviction (eviction_epoch=%d, entries=%d)",
-				self.rank,
-				eviction_epoch,
-				cached_entries,
-			)
+		self._prefix_reuse_rank_cache_epoch = clear_rank_cache_if_prefix_evicted(
+			enable_prefix_reuse=self.enable_prefix_reuse,
+			worker_view=worker_view,
+			prompt_rank_cache=self._prefix_reuse_prompt_rank_cache,
+			current_epoch=self._prefix_reuse_rank_cache_epoch,
+			rank=self.rank,
+			logger=logging.getLogger(__name__),
+		)
 
 	def _prefix_reuse_cached_rank_for_sequence(
 		self,
