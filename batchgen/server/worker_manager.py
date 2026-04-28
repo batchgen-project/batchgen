@@ -785,7 +785,20 @@ class WorkerManager:
     def _load_model_locally(
         self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
-        if "deepseek" in self.args.model.lower():
+        model_lower = self.args.model.lower()
+        if "deepseek-v4" in model_lower:
+            from batchgen.models.deepseek.deepseekv4_flash.deepseekv4_flash_parameter_server import (
+                DeepSeekV4Flash_Parameter_Server,
+            )
+
+            parameter_server = DeepSeekV4Flash_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
+            )
+        elif "deepseek" in model_lower:
             from batchgen.models.deepseek.deepseek_parameter_server import (
                 DeepSeek_Parameter_Server,
             )

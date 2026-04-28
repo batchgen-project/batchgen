@@ -77,6 +77,24 @@ _DEEPSEEK_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+_DEEPSEEK_V4_FLASH_PROFILE = _HostKVModelProfile(
+	num_layers=43,
+	num_k_heads=1,
+	k_head_dim=512,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
+_DEEPSEEK_V4_PRO_PROFILE = _HostKVModelProfile(
+	num_layers=61,
+	num_k_heads=1,
+	k_head_dim=512,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
 # GPT-OSS-120B: GQA with 8 KV heads, head_dim=64, 36 layers
 _GPT_OSS_GQA_PROFILE = _HostKVModelProfile(
 	num_layers=36,
@@ -129,6 +147,8 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
+	"deepseek_v4_flash": _DEEPSEEK_V4_FLASH_PROFILE,
+	"deepseek_v4_pro": _DEEPSEEK_V4_PRO_PROFILE,
 	"deepseek_v3_2_indexer": _DEEPSEEK_V3_2_INDEXER_PROFILE,
 	"gpt_oss_gqa": _GPT_OSS_GQA_PROFILE,
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
@@ -148,12 +168,6 @@ for canonical, aliases in {
 		"deepseek-ai/deepseek-v3.2",
 		"deepseek/deepseek-v3.2",
 		"deepseek-v3.2",
-		"deepseek-ai/deepseek-v4-flash",
-		"deepseek/deepseek-v4-flash",
-		"deepseek-v4-flash",
-		"deepseek-ai/deepseek-v4-pro",
-		"deepseek/deepseek-v4-pro",
-		"deepseek-v4-pro",
 		"moonshotai/kimi-k2.5",
 		"moonshotai/kimi-k2.6",
 		"moonshotai/kimi-k25",
@@ -167,6 +181,16 @@ for canonical, aliases in {
 	"gpt_oss_gqa": (
 		"openai/gpt-oss-120b",
 		"gpt-oss-120b",
+	),
+	"deepseek_v4_flash": (
+		"deepseek-ai/deepseek-v4-flash",
+		"deepseek/deepseek-v4-flash",
+		"deepseek-v4-flash",
+	),
+	"deepseek_v4_pro": (
+		"deepseek-ai/deepseek-v4-pro",
+		"deepseek/deepseek-v4-pro",
+		"deepseek-v4-pro",
 	),
 	"minimax_m25_gqa": (
 		"minimaxai/minimax-m2.5",

@@ -1,4 +1,5 @@
 from batchgen.models.deepseek.deepseekv3.Parallel_Strategy_Manager import DeepseekV3ParallelStrategyManager
+from batchgen.models.deepseek.deepseekv4_flash.Parallel_Strategy_Manager import DeepSeekV4FlashParallelStrategyManager
 from batchgen.models.openai.gpt_oss_120b.Parallel_Strategy_Manager import GptOssParallelStrategyManager
 from batchgen.models.moonshotai.kimi_k25.Parallel_Strategy_Manager import KimiK25ParallelStrategyManager
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
@@ -11,12 +12,12 @@ def get_parallel_strategy_manager(model_name:str):
 		return MiniMaxM25ParallelStrategyManager
 	elif is_kimi_k25_backend_model(model_name):
 		return KimiK25ParallelStrategyManager
+	elif "deepseek-v4" in model_lower:
+		return DeepSeekV4FlashParallelStrategyManager
 	elif model_lower in [
 		"deepseek-ai/deepseek-r1",
 		"deepseek-ai/deepseek-v3",
-		"deepseek-ai/deepseek-v4-flash",
-		"deepseek-ai/deepseek-v4-pro",
-	] or "deepseek-v4" in model_lower:
+	]:
 		return DeepseekV3ParallelStrategyManager
 	elif "gpt-oss-120b" in model_lower:
 		return GptOssParallelStrategyManager
