@@ -501,6 +501,7 @@ class BatchGenWorker:
 		self._prefix_reuse_namespace_hash = self._build_prefix_reuse_namespace_hash()
 		self._prefix_reuse_allocations_by_global_id: Dict[int, dict] = {}
 		self._prefix_reuse_prompt_rank_cache: Dict[int, int] = {}
+		self._prefix_reuse_rank_cache_epoch = 0
 		self._prefix_reuse_prefill_stats = {
 			"total_prompt_tokens": 0,
 			"total_suffix_tokens": 0,
@@ -1217,6 +1218,7 @@ class BatchGenWorker:
 			pending_uuids = set(uuids)
 			prefix_assigned: Set[str] = set()
 			if self._prefix_reuse_runtime_enabled():
+				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
 					if seq is None:
@@ -1272,6 +1274,7 @@ class BatchGenWorker:
 		pending_uuids = set(uuids)
 		prefix_assigned: Set[str] = set()
 		if self._prefix_reuse_runtime_enabled():
+			self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is None:
@@ -6432,6 +6435,31 @@ class BatchGenWorker:
 			hasher.update(int(token).to_bytes(8, "little", signed=True))
 		return int.from_bytes(hasher.digest(), "little")
 
+	def _maybe_clear_prefix_reuse_rank_cache_after_eviction(self) -> None:
+		if not self.enable_prefix_reuse:
+			return
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			return
+		try:
+			stats = worker_view.get_prefix_cache_stats()
+			eviction_epoch = int(getattr(stats, "eviction_epoch", 0))
+		except Exception:
+			return
+		if eviction_epoch == self._prefix_reuse_rank_cache_epoch:
+			return
+		cached_entries = len(self._prefix_reuse_prompt_rank_cache)
+		self._prefix_reuse_prompt_rank_cache.clear()
+		self._prefix_reuse_rank_cache_epoch = eviction_epoch
+		if cached_entries:
+			logging.info(
+				"Rank %s prefix reuse rank cache cleared after prefix "
+				"eviction (eviction_epoch=%d, entries=%d)",
+				self.rank,
+				eviction_epoch,
+				cached_entries,
+			)
+
 	def _prefix_reuse_cached_rank_for_sequence(
 		self,
 		seq: SequenceEntry,
@@ -6958,6 +6986,7 @@ class BatchGenWorker:
 				allocations = self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
 					prefix_requests
 				)
+				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
 				for allocation in allocations:
 					sequence_id = int(allocation["sequence_id"])
 					self._prefix_reuse_allocations_by_global_id[

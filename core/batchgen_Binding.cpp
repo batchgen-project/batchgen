@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <unordered_set>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -292,6 +293,21 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
              py::arg("namespace_hash") = 0)
         .def("get_prefix_cache_stats", &WorkerView::GetPrefixCacheStats)
         .def("clear_prefix_cache", &WorkerView::ClearPrefixCache)
+        .def(
+            "evict_prefix_cache_until_free",
+            [](WorkerView& self, std::size_t target_free_pages,
+               std::vector<std::int32_t> protected_pages) {
+                std::unordered_set<std::int32_t> protected_set(
+                    protected_pages.begin(), protected_pages.end());
+                return self.EvictPrefixCacheUntilFree(target_free_pages,
+                                                      protected_set);
+            },
+            py::arg("target_free_pages"),
+            py::arg("protected_pages") = std::vector<std::int32_t>{})
+        .def("free_page_count", &WorkerView::FreePageCount)
+        .def("page_ref_state", &WorkerView::PageRefState, py::arg("page"))
+        .def("page_ref_states", &WorkerView::PageRefStates,
+             py::arg("pages"))
         .def("grow_sequence_pages",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t num_pages) {
@@ -478,6 +494,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  return kv::ToString(self);
              });
 
+    py::class_<kv::HostPageRefState>(m, "HostPageRefState")
+        .def(py::init<>())
+        .def_readwrite("page", &kv::HostPageRefState::page)
+        .def_readwrite("sequence_refs", &kv::HostPageRefState::sequence_refs)
+        .def_readwrite("prefix_pins", &kv::HostPageRefState::prefix_pins)
+        .def_readwrite("free_if_unpinned_once",
+                       &kv::HostPageRefState::free_if_unpinned_once)
+        .def_readwrite("is_free", &kv::HostPageRefState::is_free);
+
     py::class_<kv::PrefixCacheStats>(m, "PrefixCacheStats")
         .def(py::init<>())
         .def_readwrite("entries", &kv::PrefixCacheStats::entries)
@@ -490,7 +515,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("prefix_pin_decrements",
                        &kv::PrefixCacheStats::prefix_pin_decrements)
         .def_readwrite("host_pages_saved",
-                       &kv::PrefixCacheStats::host_pages_saved);
+                       &kv::PrefixCacheStats::host_pages_saved)
+        .def_readwrite("eviction_epoch",
+                       &kv::PrefixCacheStats::eviction_epoch)
+        .def_readwrite("eviction_runs",
+                       &kv::PrefixCacheStats::eviction_runs)
+        .def_readwrite("evicted_entries",
+                       &kv::PrefixCacheStats::evicted_entries)
+        .def_readwrite("evicted_prefix_pins",
+                       &kv::PrefixCacheStats::evicted_prefix_pins)
+        .def_readwrite("evicted_pages_immediately_freed",
+                       &kv::PrefixCacheStats::evicted_pages_immediately_freed)
+        .def_readwrite("evicted_active_ref_entries",
+                       &kv::PrefixCacheStats::evicted_active_ref_entries)
+        .def_readwrite("eviction_protected_skips",
+                       &kv::PrefixCacheStats::eviction_protected_skips)
+        .def_readwrite("eviction_target_failures",
+                       &kv::PrefixCacheStats::eviction_target_failures);
+
+    py::class_<kv::PrefixEvictionResult>(m, "PrefixEvictionResult")
+        .def(py::init<>())
+        .def_readwrite("requested_free_pages",
+                       &kv::PrefixEvictionResult::requested_free_pages)
+        .def_readwrite("entries_removed",
+                       &kv::PrefixEvictionResult::entries_removed)
+        .def_readwrite("prefix_pins_released",
+                       &kv::PrefixEvictionResult::prefix_pins_released)
+        .def_readwrite("pages_immediately_freed",
+                       &kv::PrefixEvictionResult::pages_immediately_freed)
+        .def_readwrite("protected_entries_skipped",
+                       &kv::PrefixEvictionResult::protected_entries_skipped)
+        .def_readwrite("active_ref_entries_removed",
+                       &kv::PrefixEvictionResult::active_ref_entries_removed)
+        .def_readwrite("reached_target",
+                       &kv::PrefixEvictionResult::reached_target)
+        .def_readwrite("eviction_epoch",
+                       &kv::PrefixEvictionResult::eviction_epoch);
 
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)

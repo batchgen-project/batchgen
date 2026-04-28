@@ -214,6 +214,10 @@ struct HostPagedKVBackend::SharedState {
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
     HostPagedKVStats CollectStats() const;
+    HostPageRefState PageRefState(std::int32_t page) const;
+    std::vector<HostPageRefState> PageRefStates(
+        const std::vector<std::int32_t>& pages) const;
+    std::size_t FreePageCount() const;
 
     std::byte* DataBase() { return data_base; }
     const std::byte* DataBase() const { return data_base; }
@@ -987,6 +991,44 @@ HostPagedKVStats HostPagedKVBackend::SharedState::CollectStats() const {
     return stats;
 }
 
+HostPageRefState HostPagedKVBackend::SharedState::PageRefState(
+    std::int32_t page) const {
+    ScopedMutexLock lock(&header->allocation_mutex);
+    EnsurePageIndex(page, "PageRefState");
+    HostPageRefState state;
+    state.page = page;
+    state.sequence_refs = page_sequence_refs[page];
+    state.prefix_pins = page_prefix_pins[page];
+    state.free_if_unpinned_once =
+        state.sequence_refs == 0 && state.prefix_pins == 1;
+    state.is_free = state.sequence_refs == 0 && state.prefix_pins == 0;
+    return state;
+}
+
+std::vector<HostPageRefState> HostPagedKVBackend::SharedState::PageRefStates(
+    const std::vector<std::int32_t>& pages) const {
+    std::vector<HostPageRefState> states;
+    states.reserve(pages.size());
+    ScopedMutexLock lock(&header->allocation_mutex);
+    for (std::int32_t page : pages) {
+        EnsurePageIndex(page, "PageRefStates");
+        HostPageRefState state;
+        state.page = page;
+        state.sequence_refs = page_sequence_refs[page];
+        state.prefix_pins = page_prefix_pins[page];
+        state.free_if_unpinned_once =
+            state.sequence_refs == 0 && state.prefix_pins == 1;
+        state.is_free = state.sequence_refs == 0 && state.prefix_pins == 0;
+        states.push_back(state);
+    }
+    return states;
+}
+
+std::size_t HostPagedKVBackend::SharedState::FreePageCount() const {
+    ScopedMutexLock lock(&header->allocation_mutex);
+    return header->free_stack_top.load(std::memory_order_relaxed);
+}
+
 // HostPagedKVBackend public API
 
 HostPagedKVBackend::HostPagedKVBackend(HostPagedKVConfig config,
@@ -1129,6 +1171,19 @@ std::vector<std::int32_t> HostPagedKVBackend::SequencePages(
 
 HostPagedKVStats HostPagedKVBackend::CollectStats() const {
     return state_->CollectStats();
+}
+
+HostPageRefState HostPagedKVBackend::PageRefState(std::int32_t page) const {
+    return state_->PageRefState(page);
+}
+
+std::vector<HostPageRefState> HostPagedKVBackend::PageRefStates(
+    const std::vector<std::int32_t>& pages) const {
+    return state_->PageRefStates(pages);
+}
+
+std::size_t HostPagedKVBackend::FreePageCount() const {
+    return state_->FreePageCount();
 }
 
 std::byte* HostPagedKVBackend::DataBase() { return state_->DataBase(); }

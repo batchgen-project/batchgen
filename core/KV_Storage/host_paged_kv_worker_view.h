@@ -288,6 +288,9 @@ class HostPagedKVWorkerView {
 
     std::vector<PrefixAllocationResult> AllocatePagesForSequencesWithPrefix(
         const std::vector<PrefixAllocationRequest>& requests) {
+        if (requests.empty()) {
+            return {};
+        }
         std::vector<std::int64_t> sequence_ids;
         sequence_ids.reserve(requests.size());
         for (const auto& request : requests) {
@@ -295,8 +298,19 @@ class HostPagedKVWorkerView {
         }
         EnsureSequencesRegistered(sequence_ids);
 
-        std::vector<PrefixAllocationResult> results;
-        results.reserve(requests.size());
+        struct AllocationPlan {
+            const PrefixAllocationRequest* request = nullptr;
+            PrefixLookupResult hit;
+            std::size_t private_pages_required = 0;
+            std::vector<std::int32_t> private_pages;
+            bool attached_shared_pages = false;
+        };
+
+        std::vector<AllocationPlan> plans;
+        plans.reserve(requests.size());
+        std::unordered_set<std::int32_t> protected_pages;
+        std::size_t total_private_pages_required = 0;
+
         for (const auto& request : requests) {
             if (request.token_ids.empty()) {
                 throw std::invalid_argument(
@@ -315,45 +329,119 @@ class HostPagedKVWorkerView {
                 request.capacity_tokens - hit.matched_tokens;
             const std::size_t private_pages_required =
                 private_tokens == 0 ? 0 : geometry_.RequiredPages(private_tokens);
-
-            std::vector<std::int32_t> private_pages;
-            bool attached_shared_pages = false;
-            try {
-                if (private_pages_required > 0) {
-                    private_pages = backend_.AcquirePages(
-                        request.sequence_id, private_pages_required);
-                }
-                if (!hit.host_pages.empty()) {
-                    backend_.AttachSequencePages(hit.host_pages);
-                    attached_shared_pages = true;
-                    prefix_cache_.RecordAttachedPages(hit.host_pages.size());
-                }
-                page_table_.RegisterOrUpdate(
-                    request.sequence_id, hit.host_pages, private_pages,
-                    static_cast<std::int64_t>(hit.matched_tokens),
-                    static_cast<std::int64_t>(hit.matched_tokens),
-                    static_cast<std::int64_t>(request.capacity_tokens));
-            } catch (...) {
-                if (attached_shared_pages) {
-                    backend_.DetachSequencePages(hit.host_pages);
-                }
-                if (!private_pages.empty()) {
-                    backend_.ReleaseSequence(request.sequence_id);
-                }
-                throw;
+            total_private_pages_required += private_pages_required;
+            for (std::int32_t page : hit.host_pages) {
+                protected_pages.insert(page);
             }
+            AllocationPlan plan;
+            plan.request = &request;
+            plan.hit = std::move(hit);
+            plan.private_pages_required = private_pages_required;
+            plans.emplace_back(std::move(plan));
+        }
 
+        if (backend_.FreePageCount() < total_private_pages_required) {
+            PrefixEvictionResult eviction = EvictPrefixCacheUntilFree(
+                total_private_pages_required, protected_pages);
+            if (!eviction.reached_target &&
+                backend_.FreePageCount() < total_private_pages_required) {
+                std::ostringstream oss;
+                oss << "AllocatePagesForSequencesWithPrefix: insufficient "
+                       "free pages after prefix cache eviction "
+                    << "(required=" << total_private_pages_required
+                    << ", available=" << backend_.FreePageCount()
+                    << ", evicted_entries=" << eviction.entries_removed
+                    << ", protected_skips="
+                    << eviction.protected_entries_skipped << ")";
+                throw std::runtime_error(oss.str());
+            }
+        }
+
+        std::vector<std::size_t> allocated_plan_indices;
+        std::vector<std::size_t> attached_plan_indices;
+        try {
+            for (std::size_t i = 0; i < plans.size(); ++i) {
+                AllocationPlan& plan = plans[i];
+                if (plan.private_pages_required == 0) {
+                    continue;
+                }
+                plan.private_pages = backend_.AcquirePages(
+                    plan.request->sequence_id, plan.private_pages_required);
+                allocated_plan_indices.push_back(i);
+            }
+            for (std::size_t i = 0; i < plans.size(); ++i) {
+                AllocationPlan& plan = plans[i];
+                if (plan.hit.host_pages.empty()) {
+                    continue;
+                }
+                backend_.AttachSequencePages(plan.hit.host_pages);
+                plan.attached_shared_pages = true;
+                attached_plan_indices.push_back(i);
+            }
+            for (const AllocationPlan& plan : plans) {
+                page_table_.RegisterOrUpdate(
+                    plan.request->sequence_id, plan.hit.host_pages,
+                    plan.private_pages,
+                    static_cast<std::int64_t>(plan.hit.matched_tokens),
+                    static_cast<std::int64_t>(plan.hit.matched_tokens),
+                    static_cast<std::int64_t>(plan.request->capacity_tokens));
+                if (!plan.hit.host_pages.empty()) {
+                    prefix_cache_.RecordAttachedPages(
+                        plan.hit.host_pages.size());
+                }
+            }
+        } catch (...) {
+            for (auto it = attached_plan_indices.rbegin();
+                 it != attached_plan_indices.rend(); ++it) {
+                const AllocationPlan& plan = plans[*it];
+                try {
+                    backend_.DetachSequencePages(plan.hit.host_pages);
+                } catch (const std::exception& ex) {
+                    logger_->error(
+                        "Failed to roll back attached prefix pages for "
+                        "sequence {}: {}",
+                        plan.request->sequence_id, ex.what());
+                }
+            }
+            for (auto it = allocated_plan_indices.rbegin();
+                 it != allocated_plan_indices.rend(); ++it) {
+                const AllocationPlan& plan = plans[*it];
+                try {
+                    backend_.ReleaseSequence(plan.request->sequence_id);
+                } catch (const std::exception& ex) {
+                    logger_->error(
+                        "Failed to roll back private pages for sequence {}: {}",
+                        plan.request->sequence_id, ex.what());
+                }
+            }
+            for (const auto& request : requests) {
+                try {
+                    page_table_.RegisterOrUpdate(
+                        request.sequence_id, std::vector<std::int32_t>{});
+                } catch (const std::exception& ex) {
+                    logger_->error(
+                        "Failed to reset page table for sequence {} after "
+                        "allocation rollback: {}",
+                        request.sequence_id, ex.what());
+                }
+            }
+            throw;
+        }
+
+        std::vector<PrefixAllocationResult> results;
+        results.reserve(plans.size());
+        for (const AllocationPlan& plan : plans) {
             PrefixAllocationResult result;
-            result.sequence_id = request.sequence_id;
-            result.shared_prefix_pages = hit.host_pages;
-            result.private_pages = private_pages;
-            result.shared_prefix_tokens = hit.matched_tokens;
-            result.private_start_token = hit.matched_tokens;
+            result.sequence_id = plan.request->sequence_id;
+            result.shared_prefix_pages = plan.hit.host_pages;
+            result.private_pages = plan.private_pages;
+            result.shared_prefix_tokens = plan.hit.matched_tokens;
+            result.private_start_token = plan.hit.matched_tokens;
             result.logical_page_count =
-                hit.host_pages.size() + private_pages.size();
-            result.physical_pages_allocated = private_pages.size();
-            result.full_hit = hit.full_hit;
-            result.miss_reason = hit.miss_reason;
+                plan.hit.host_pages.size() + plan.private_pages.size();
+            result.physical_pages_allocated = plan.private_pages.size();
+            result.full_hit = plan.hit.full_hit;
+            result.miss_reason = plan.hit.miss_reason;
             results.emplace_back(std::move(result));
         }
         return results;
@@ -378,6 +466,37 @@ class HostPagedKVWorkerView {
     void ClearPrefixCache() {
         prefix_cache_.Clear(
             [this](std::int32_t page) { backend_.UnpinPrefixPage(page); });
+    }
+
+    PrefixEvictionResult EvictPrefixCacheUntilFree(
+        std::size_t target_free_pages,
+        const std::unordered_set<std::int32_t>& protected_pages = {}) {
+        PrefixEvictionOptions options;
+        options.target_free_pages = target_free_pages;
+        options.protected_pages = protected_pages;
+        PrefixEvictionResult result = prefix_cache_.EvictLeafPages(
+            options, [this](std::int32_t page) {
+                backend_.UnpinPrefixPage(page);
+            },
+            [this]() { return backend_.FreePageCount(); });
+        if (result.entries_removed > 0 || !result.reached_target) {
+            logger_->info(
+                "[PREFIX_EVICT] target_free={} entries_removed={} "
+                "pins_released={} immediate_free={} active_ref_removed={} "
+                "protected_skips={} reached_target={} free_pages={}",
+                target_free_pages, result.entries_removed,
+                result.prefix_pins_released, result.pages_immediately_freed,
+                result.active_ref_entries_removed,
+                result.protected_entries_skipped, result.reached_target,
+                backend_.FreePageCount());
+        }
+        if (result.active_ref_entries_removed > 0) {
+            logger_->debug(
+                "[PREFIX_EVICT] {} evicted prefix entries remain held by "
+                "active sequence refs",
+                result.active_ref_entries_removed);
+        }
+        return result;
     }
 
     std::vector<std::int32_t> GrowSequencePages(
@@ -868,6 +987,14 @@ class HostPagedKVWorkerView {
     const HostPagedKVConfig& config() const { return config_; }
     const Layout& layout() const { return layout_; }
     HostPagedKVStats GetStats() const { return backend_.CollectStats(); }
+    std::size_t FreePageCount() const { return backend_.FreePageCount(); }
+    HostPageRefState PageRefState(std::int32_t page) const {
+        return backend_.PageRefState(page);
+    }
+    std::vector<HostPageRefState> PageRefStates(
+        const std::vector<std::int32_t>& pages) const {
+        return backend_.PageRefStates(pages);
+    }
     int device_index() const { return device_index_; }
 
     std::string DebugString() const {

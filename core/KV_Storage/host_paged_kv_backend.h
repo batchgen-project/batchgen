@@ -29,6 +29,14 @@ struct HostPagedKVStats {
     std::size_t prefix_pin_decrements = 0;
 };
 
+struct HostPageRefState {
+    std::int32_t page = -1;
+    std::uint32_t sequence_refs = 0;
+    std::uint32_t prefix_pins = 0;
+    bool free_if_unpinned_once = false;
+    bool is_free = false;
+};
+
 struct HostPagedKVConfig {
     std::string shm_name;
     std::size_t num_layers = 0;
@@ -211,6 +219,13 @@ class HostPagedKVBackend {
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
 
     HostPagedKVStats CollectStats() const;
+
+    HostPageRefState PageRefState(std::int32_t page) const;
+
+    std::vector<HostPageRefState> PageRefStates(
+        const std::vector<std::int32_t>& pages) const;
+
+    std::size_t FreePageCount() const;
 
     std::byte* DataBase();
     const std::byte* DataBase() const;

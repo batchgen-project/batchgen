@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace batchgen::kv {
@@ -34,6 +35,10 @@ struct PrefixPageEntry {
     std::int32_t page_size = 0;
     std::uint64_t token_validation_hash = 0;
     std::uint32_t pin_count = 0;
+    std::uint64_t insert_epoch = 0;
+    std::uint64_t last_access_epoch = 0;
+    std::uint64_t hit_count = 0;
+    std::uint32_t child_count = 0;
 };
 
 struct PrefixLookupResult {
@@ -52,12 +57,38 @@ struct PrefixCacheStats {
     std::size_t prefix_pin_increments = 0;
     std::size_t prefix_pin_decrements = 0;
     std::size_t host_pages_saved = 0;
+    std::uint64_t eviction_epoch = 0;
+    std::size_t eviction_runs = 0;
+    std::size_t evicted_entries = 0;
+    std::size_t evicted_prefix_pins = 0;
+    std::size_t evicted_pages_immediately_freed = 0;
+    std::size_t evicted_active_ref_entries = 0;
+    std::size_t eviction_protected_skips = 0;
+    std::size_t eviction_target_failures = 0;
+};
+
+struct PrefixEvictionOptions {
+    std::size_t target_free_pages = 0;
+    std::size_t max_entries_to_scan = 0;
+    std::unordered_set<std::int32_t> protected_pages;
+};
+
+struct PrefixEvictionResult {
+    std::size_t requested_free_pages = 0;
+    std::size_t entries_removed = 0;
+    std::size_t prefix_pins_released = 0;
+    std::size_t pages_immediately_freed = 0;
+    std::size_t protected_entries_skipped = 0;
+    std::size_t active_ref_entries_removed = 0;
+    bool reached_target = false;
+    std::uint64_t eviction_epoch = 0;
 };
 
 class HostPrefixCache {
    public:
     using PinCallback = std::function<void(std::int32_t)>;
     using UnpinCallback = std::function<void(std::int32_t)>;
+    using FreePageCountCallback = std::function<std::size_t()>;
 
     HostPrefixCache() = default;
     HostPrefixCache(const HostPrefixCache&) = delete;
@@ -75,6 +106,10 @@ class HostPrefixCache {
 
     void RecordAttachedPages(std::size_t pages);
 
+    PrefixEvictionResult EvictLeafPages(
+        const PrefixEvictionOptions& options, const UnpinCallback& on_unpin,
+        const FreePageCountCallback& free_pages);
+
     PrefixCacheStats Stats() const;
 
     void Clear(const UnpinCallback& on_unpin);
@@ -91,10 +126,21 @@ class HostPrefixCache {
     };
 
     static std::uint64_t BuildPageChainHash(const PrefixPageKey& key);
+    std::uint64_t NextAccessEpochLocked();
+    void RefreshAccessLocked(PrefixPageEntry& entry);
+    void IncrementParentChildCountLocked(std::uint64_t parent_hash);
+    void DecrementParentChildCountLocked(std::uint64_t parent_hash);
+    PrefixEvictionResult RemoveLeafEntriesLocked(
+        const std::vector<PrefixPageKey>& victim_keys,
+        const PrefixEvictionOptions& options, const UnpinCallback& on_unpin,
+        const FreePageCountCallback& free_pages);
 
     mutable std::mutex mutex_;
     std::unordered_map<PrefixPageKey, PrefixPageEntry, KeyHasher> entries_;
+    std::unordered_map<std::uint64_t, PrefixPageKey> chain_hash_to_key_;
     PrefixCacheStats stats_;
+    std::uint64_t access_epoch_ = 0;
+    std::uint64_t eviction_epoch_ = 0;
 };
 
 }  // namespace batchgen::kv

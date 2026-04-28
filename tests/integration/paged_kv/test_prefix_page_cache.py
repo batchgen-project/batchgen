@@ -24,11 +24,13 @@ def _shm_unlink(name: str) -> None:
             raise OSError(err, f"shm_unlink({name}) failed")
 
 
-def _make_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore[name-defined]
+def _make_config(
+    shm_name: str, num_pages: int = 32
+) -> bg.HostPagedKVConfig:  # type: ignore[name-defined]
     cfg = bg.HostPagedKVConfig()
     cfg.shm_name = shm_name
     cfg.num_layers = 1
-    cfg.num_pages = 32
+    cfg.num_pages = num_pages
     cfg.page_size_tokens = 4
     cfg.num_k_heads = 1
     cfg.k_head_dim = 1
@@ -41,8 +43,8 @@ def _make_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore[name-de
     return cfg
 
 
-def _make_worker(shm_name: str):
-    worker = bg.MLAHostPagedKVWorkerView(_make_config(shm_name))
+def _make_worker(shm_name: str, num_pages: int = 32):
+    worker = bg.MLAHostPagedKVWorkerView(_make_config(shm_name, num_pages=num_pages))
     worker.initialize(device_index=0, create_region=True)
     return worker
 
@@ -152,6 +154,146 @@ def test_prefix_pins_and_sequence_refs_release_independently():
         assert final_stats.num_sequence_ref_pages == 0
     finally:
         if worker is not None:
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_prefix_cache_leaf_eviction_preserves_shorter_prefix():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        tokens = list(range(12))  # three full pages
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 12)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+        worker.release_sequence_pages([1])
+
+        free_before = worker.free_page_count()
+        eviction = worker.evict_prefix_cache_until_free(free_before + 1)
+        assert eviction.reached_target
+        assert eviction.entries_removed == 1
+        assert worker.get_prefix_cache_stats().entries == 2
+
+        worker.register_sequences([2])
+        second = worker.allocate_pages_for_sequences_with_prefix([(2, tokens, 12)])[0]
+        assert second["shared_prefix_tokens"] == 8
+        assert len(second["shared_prefix_pages"]) == 2
+        assert len(second["private_pages"]) == 1
+        assert second["shared_prefix_pages"] == first[0]["private_pages"][:2]
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([2])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_prefix_cache_eviction_skips_protected_leaf_pages():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 8)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+        worker.release_sequence_pages([1])
+
+        leaf_page = first[0]["private_pages"][1]
+        free_before = worker.free_page_count()
+        eviction = worker.evict_prefix_cache_until_free(
+            free_before + 1, protected_pages=[leaf_page]
+        )
+        assert not eviction.reached_target
+        assert eviction.entries_removed == 0
+        assert eviction.protected_entries_skipped >= 1
+        assert worker.get_prefix_cache_stats().entries == 2
+    finally:
+        if worker is not None:
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_prefix_cache_eviction_unblocks_allocation_pressure():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name, num_pages=5)
+        first_tokens = [1, 1, 1, 1, 2, 2, 2, 2]
+        second_tokens = [3, 3, 3, 3, 4, 4, 4, 4]
+        miss_tokens = [9, 9, 9, 9, 10, 10, 10, 10]
+
+        worker.register_sequences([1])
+        worker.allocate_pages_for_sequences_with_prefix([(1, first_tokens, 8)])
+        worker.commit_sequence_prefix_pages(1, first_tokens)
+        worker.release_sequence_pages([1])
+
+        worker.register_sequences([2])
+        worker.allocate_pages_for_sequences_with_prefix([(2, second_tokens, 8)])
+        worker.commit_sequence_prefix_pages(2, second_tokens)
+        worker.release_sequence_pages([2])
+
+        assert worker.free_page_count() == 1
+        worker.register_sequences([3])
+        result = worker.allocate_pages_for_sequences_with_prefix([(3, miss_tokens, 8)])[0]
+        assert result["shared_prefix_tokens"] == 0
+        assert len(result["private_pages"]) == 2
+
+        stats = worker.get_prefix_cache_stats()
+        assert stats.eviction_runs >= 1
+        assert stats.evicted_entries >= 1
+        assert stats.evicted_prefix_pins >= 1
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([3])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
+def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        tokens = [7, 7, 7, 7]
+
+        worker.register_sequences([1])
+        first = worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 4)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+        leaf_page = first[0]["private_pages"][0]
+        page_table_before = worker.build_page_table([1])[0]
+
+        free_before = worker.free_page_count()
+        eviction = worker.evict_prefix_cache_until_free(free_before + 1)
+        assert not eviction.reached_target
+        assert eviction.entries_removed == 1
+        assert eviction.pages_immediately_freed == 0
+        assert eviction.active_ref_entries_removed == 1
+        assert worker.build_page_table([1])[0] == page_table_before
+
+        ref_state = worker.page_ref_state(leaf_page)
+        assert ref_state.sequence_refs == 1
+        assert ref_state.prefix_pins == 0
+        assert not ref_state.is_free
+
+        worker.release_sequence_pages([1])
+        final_ref_state = worker.page_ref_state(leaf_page)
+        assert final_ref_state.sequence_refs == 0
+        assert final_ref_state.prefix_pins == 0
+    finally:
+        if worker is not None:
+            worker.clear_prefix_cache()
             worker.shutdown()
         _shm_unlink(shm_name)
 
