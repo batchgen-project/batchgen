@@ -21,7 +21,7 @@ import time
 import torch
 
 from .model import DeepSeekV4FlashForCausalLM
-from .tensor_contract import build_v4_weight_contract
+from .tensor_contract import build_v4_weight_contract, model_key_to_checkpoint_key
 from .wrappers import DeepSeekV4FlashAttnWrapper, DeepSeekV4FlashExpertWrapper
 
 
@@ -89,41 +89,12 @@ class DeepSeekV4FlashParallelStrategyManager:
             )
         return self.model, self.weight_copy_task
 
-    def _model_key_to_ckpt_key(self, key: str) -> str:
-        if key == "model.embed_tokens.weight":
-            return "embed.weight"
-        if key == "model.norm.weight":
-            return "norm.weight"
-        if key == "lm_head.weight":
-            return "head.weight"
-        if key.startswith("model.hc_head_"):
-            return key.removeprefix("model.")
-        if key.startswith("model.layers."):
-            parts = key.split(".")
-            layer_idx = parts[2]
-            rest = ".".join(parts[3:])
-            if rest.startswith("self_attn."):
-                return f"layers.{layer_idx}.attn.{rest.removeprefix('self_attn.')}"
-            if rest.startswith("attn."):
-                return f"layers.{layer_idx}.attn.{rest.removeprefix('attn.')}"
-            if rest.startswith("mlp.gate."):
-                return f"layers.{layer_idx}.ffn.gate.{rest.removeprefix('mlp.gate.')}"
-            if rest.startswith("ffn.gate."):
-                return f"layers.{layer_idx}.ffn.gate.{rest.removeprefix('ffn.gate.')}"
-            if rest.startswith("attn_norm."):
-                return f"layers.{layer_idx}.attn_norm.{rest.removeprefix('attn_norm.')}"
-            if rest.startswith("ffn_norm."):
-                return f"layers.{layer_idx}.ffn_norm.{rest.removeprefix('ffn_norm.')}"
-            if rest.startswith("hc_"):
-                return f"layers.{layer_idx}.{rest}"
-        return key
-
     def _load_model_skeleton(self):
         loaded = 0
         skipped = 0
         missing = []
         for key, param in self.model.named_parameters():
-            ckpt_key = self._model_key_to_ckpt_key(key)
+            ckpt_key = model_key_to_checkpoint_key(key)
             if ckpt_key in self.state_dict_name_map:
                 skipped += 1
                 continue
