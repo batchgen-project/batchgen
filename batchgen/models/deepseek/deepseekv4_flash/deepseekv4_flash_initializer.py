@@ -158,11 +158,26 @@ class DeepSeekV4FlashInitializer:
         self.engine_config.EP_Config.num_local_expert_per_layer = experts_per_rank
 
     def Init(self, weights_storage):
-        torch.cuda.set_device(self.local_rank)
-        self.core_engine = core_engine(
+        try:
+            torch.cuda.set_device(self.local_rank)
+            if self.global_rank == 0:
+                logging.info("Engine config: %s", self.engine_config)
+            self.core_engine = core_engine(
+                self.engine_config,
+                self.model_config,
+                weights_storage,
+            )
+            logging.info("Core engine created")
+            self.core_engine.Init()
+            logging.info("Core engine initialized")
+        except Exception:
+            logging.exception("Failed to initialize DeepSeek-V4-Flash core engine")
+            raise
+        return (
+            self.core_engine,
             self.engine_config,
             self.model_config,
-            weights_storage,
+            self.loaded_model_config,
         )
 
     def get_configs(self):
