@@ -87,6 +87,7 @@ class DeepSeekV4FlashInitializer:
             input_arguments.huggingface_ckpt_name,
             self.host_kv_cache_byte_size,
         )
+        self._set_batching_and_buffer_config()
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             "attn": {
                 "attn_sink": [64],
@@ -124,6 +125,37 @@ class DeepSeekV4FlashInitializer:
             "DeepSeek-V4-Flash engine metadata initialized: host_slots=%s",
             self.engine_config.KV_Storage_Config.num_host_slots,
         )
+
+    def _set_batching_and_buffer_config(self):
+        reserved_length = self.engine_config.KV_Storage_Config.reserved_length
+        world_size = max(1, int(self.world_size))
+        experts_per_rank = self.model_config.num_local_experts // world_size
+
+        self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 8
+        self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 8
+        self.engine_config.Module_Batching_Config.expert_prefill_batch_size_upper_bound = 4096
+        self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size = 128
+        self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size = 128
+        self.engine_config.Module_Batching_Config.expert_decoding_batch_size_upper_bound = 2048
+
+        self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
+            "attn": 1,
+            "routed_expert": experts_per_rank,
+            "shared_expert": 1,
+        }
+        self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
+            "attn": 1,
+            "routed_expert": max(experts_per_rank, 1),
+            "shared_expert": 1,
+        }
+        self.engine_config.GPU_Buffer_Config.num_k_buffer = 6
+        self.engine_config.GPU_Buffer_Config.num_v_buffer = 0
+        self.engine_config.GPU_Buffer_Config.kv_buffer_num_tokens = (
+            self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
+            * reserved_length
+        )
+        self.engine_config.EP_Config.enable = True
+        self.engine_config.EP_Config.num_local_expert_per_layer = experts_per_rank
 
     def Init(self, weights_storage):
         torch.cuda.set_device(self.local_rank)
