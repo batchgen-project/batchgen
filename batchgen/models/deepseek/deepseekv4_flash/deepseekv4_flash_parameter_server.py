@@ -28,7 +28,7 @@ from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 from batchgen.config.model_registry import load_config
 from batchgen.server.process_utils import get_model_byte_size
 
-from .tensor_contract import build_v4_weight_contract
+from .tensor_contract import ATTN_TASK_NAMES, build_v4_weight_contract
 
 try:
     from batchgen.core_engine import Parameter_Server
@@ -111,11 +111,15 @@ class DeepSeekV4Flash_Parameter_Server:
         self.state_dict_name_map, self.weight_copy_task = build_v4_weight_contract(
             self.model_config
         )
+        attn_modules = sum(
+            len(self.weight_copy_task.get(task_name, []))
+            for task_name in ATTN_TASK_NAMES
+        )
         logging.info(
             "DeepSeek-V4 weight contract: %d mapped tensors, %d attn modules, "
             "%d routed expert modules, %d shared expert modules",
             len(self.state_dict_name_map),
-            len(self.weight_copy_task["attn"]),
+            attn_modules,
             len(self.weight_copy_task["routed_expert"]),
             len(self.weight_copy_task["shared_expert"]),
         )

@@ -62,6 +62,12 @@ class DeepSeekV4FlashInitializer:
         model_config.num_key_value_heads = 1
         model_config.head_dim = 512
         model_config.compressed_kv_dim = 512
+        model_config.compress_ratios = [
+            0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+            128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+            128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+            0,
+        ]
         return model_config
 
     def _default_engine_config(self, input_arguments):
@@ -88,22 +94,46 @@ class DeepSeekV4FlashInitializer:
             self.host_kv_cache_byte_size,
         )
         self._set_batching_and_buffer_config()
+        base_attn_shapes = {
+            "attn_sink": [64],
+            "wq_a.weight": [1024, 4096],
+            "wq_a.scale": [8, 32],
+            "q_norm.weight": [1024],
+            "wq_b.weight": [32768, 1024],
+            "wq_b.scale": [256, 8],
+            "wkv.weight": [512, 4096],
+            "wkv.scale": [4, 32],
+            "kv_norm.weight": [512],
+            "wo_a.weight": [8192, 4096],
+            "wo_a.scale": [64, 32],
+            "wo_b.weight": [4096, 8192],
+            "wo_b.scale": [32, 64],
+        }
+        attn_cr4_shapes = {
+            **base_attn_shapes,
+            "compressor.ape": [4, 1024],
+            "compressor.norm.weight": [512],
+            "compressor.wgate.weight": [1024, 4096],
+            "compressor.wkv.weight": [1024, 4096],
+            "indexer.compressor.ape": [4, 256],
+            "indexer.compressor.norm.weight": [128],
+            "indexer.compressor.wgate.weight": [256, 4096],
+            "indexer.compressor.wkv.weight": [256, 4096],
+            "indexer.weights_proj.weight": [64, 4096],
+            "indexer.wq_b.weight": [8192, 1024],
+            "indexer.wq_b.scale": [64, 8],
+        }
+        attn_cr128_shapes = {
+            **base_attn_shapes,
+            "compressor.ape": [128, 512],
+            "compressor.norm.weight": [512],
+            "compressor.wgate.weight": [512, 4096],
+            "compressor.wkv.weight": [512, 4096],
+        }
         self.engine_config.GPU_Buffer_Config.module_shapes = {
-            "attn": {
-                "attn_sink": [64],
-                "wq_a.weight": [1024, 4096],
-                "wq_a.scale": [8, 32],
-                "q_norm.weight": [1024],
-                "wq_b.weight": [32768, 1024],
-                "wq_b.scale": [256, 8],
-                "wkv.weight": [512, 4096],
-                "wkv.scale": [4, 32],
-                "kv_norm.weight": [512],
-                "wo_a.weight": [8192, 4096],
-                "wo_a.scale": [64, 32],
-                "wo_b.weight": [4096, 8192],
-                "wo_b.scale": [32, 64],
-            },
+            "attn": base_attn_shapes,
+            "attn_cr4": attn_cr4_shapes,
+            "attn_cr128": attn_cr128_shapes,
             "routed_expert": {
                 "w1.weight": [2048, 2048],
                 "w1.scale": [2048, 128],
@@ -140,11 +170,15 @@ class DeepSeekV4FlashInitializer:
 
         self.engine_config.GPU_Buffer_Config.num_prefill_module_buffer = {
             "attn": 1,
+            "attn_cr4": 1,
+            "attn_cr128": 1,
             "routed_expert": experts_per_rank,
             "shared_expert": 1,
         }
         self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer = {
             "attn": 1,
+            "attn_cr4": 1,
+            "attn_cr128": 1,
             "routed_expert": max(experts_per_rank, 1),
             "shared_expert": 1,
         }

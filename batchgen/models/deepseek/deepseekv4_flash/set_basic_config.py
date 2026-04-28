@@ -86,7 +86,13 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
         raise ValueError("Currently attn_mode must be 1, 2, or 3")
     engine_config.Basic_Config.attn_mode = attn_mode
 
-    engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
+    engine_config.Basic_Config.module_types = [
+        "attn",
+        "attn_cr4",
+        "attn_cr128",
+        "routed_expert",
+        "shared_expert",
+    ]
     engine_config.Basic_Config.num_threads = 0
 
     padding_length = _get_arg(input_arguments, "padding_length")

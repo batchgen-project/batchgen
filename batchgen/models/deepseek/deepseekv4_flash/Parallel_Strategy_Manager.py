@@ -21,7 +21,11 @@ import time
 import torch
 
 from .model import DeepSeekV4FlashForCausalLM
-from .tensor_contract import build_v4_weight_contract, model_key_to_checkpoint_key
+from .tensor_contract import (
+    ATTN_TASK_NAMES,
+    build_v4_weight_contract,
+    model_key_to_checkpoint_key,
+)
 from .wrappers import DeepSeekV4FlashAttnWrapper, DeepSeekV4FlashExpertWrapper
 
 
@@ -123,9 +127,13 @@ class DeepSeekV4FlashParallelStrategyManager:
         for layer in self.model.model.layers:
             layer.mlp.configure_ep(rank, world_size, comm=comm)
 
+    def _is_dynamic_module(self, module_key: str, task_names) -> bool:
+        return any(module_key in self.weight_copy_task.get(name, []) for name in task_names)
+
     def _config_attn_module(self) -> None:
         for layer_idx, layer in enumerate(self.model.model.layers):
-            persistent = f"attn_{layer_idx}" not in self.weight_copy_task.get("attn", [])
+            module_key = f"attn_{layer_idx}"
+            persistent = not self._is_dynamic_module(module_key, ATTN_TASK_NAMES)
             layer.self_attn = DeepSeekV4FlashAttnWrapper(
                 layer.self_attn,
                 layer_idx,

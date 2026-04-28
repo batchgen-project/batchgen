@@ -95,6 +95,15 @@ EXPERT_TENSORS: Tuple[str, ...] = (
     "w3.weight",
 )
 
+ATTN_TASK_BASE = "attn"
+ATTN_TASK_CR4 = "attn_cr4"
+ATTN_TASK_CR128 = "attn_cr128"
+ATTN_TASK_NAMES: Tuple[str, ...] = (
+    ATTN_TASK_BASE,
+    ATTN_TASK_CR4,
+    ATTN_TASK_CR128,
+)
+
 MTP_BASE_TENSORS: Tuple[str, ...] = (
     "attn.attn_sink",
     "attn.kv_norm.weight",
@@ -180,6 +189,16 @@ def _get_config_value(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
+def attention_task_name(compress_ratio: int) -> str:
+    if compress_ratio == 0:
+        return ATTN_TASK_BASE
+    if compress_ratio == 4:
+        return ATTN_TASK_CR4
+    if compress_ratio == 128:
+        return ATTN_TASK_CR128
+    raise ValueError(f"Unsupported DeepSeek-V4 attention compress_ratio={compress_ratio}")
+
+
 def build_v4_weight_contract(
     config: Any,
 ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, List[str]]]:
@@ -198,19 +217,23 @@ def build_v4_weight_contract(
 
     state_dict_name_map: Dict[str, Dict[str, str]] = {}
     weight_copy_task: Dict[str, List[str]] = {
-        "attn": [],
+        task_name: []
+        for task_name in ATTN_TASK_NAMES
+    }
+    weight_copy_task.update({
         "routed_expert": [],
         "shared_expert": [],
-    }
+    })
 
     for layer_idx in range(num_layers):
+        compress_ratio = int(compress_ratios[layer_idx])
         attn_key = f"attn_{layer_idx}"
-        for tensor_name in iter_attention_tensor_names(int(compress_ratios[layer_idx])):
+        for tensor_name in iter_attention_tensor_names(compress_ratio):
             state_dict_name_map[f"layers.{layer_idx}.attn.{tensor_name}"] = {
                 "module_key": attn_key,
                 "tensor_key": tensor_name,
             }
-        weight_copy_task["attn"].append(attn_key)
+        weight_copy_task[attention_task_name(compress_ratio)].append(attn_key)
 
         shared_key = f"shared_expert_{layer_idx}"
         for tensor_name in EXPERT_TENSORS:
