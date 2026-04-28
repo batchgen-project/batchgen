@@ -6586,11 +6586,13 @@ class BatchGenWorker:
 		assigned_rank: int,
 		uses_reused_prefix: bool,
 	) -> bool:
-		"""Keep reused-prefix decode isolated per rank for exact replay stability."""
-		if rank_has_reused_prefix[assigned_rank]:
-			return True
-		if uses_reused_prefix and rank_counts[assigned_rank] > 0:
-			return True
+		"""Return whether prefix reuse requires excluding this decode candidate.
+
+		Decode runs on a fully materialized GPU KV view. Whether part of that KV
+		came from prefix cache should be invisible to decode scheduling; otherwise
+		the same request can use a different decode micro-batch shape from the
+		non-prefix baseline and drift on BF16 boundary cases.
+		"""
 		return False
 
 	def _build_prefix_reuse_prefill_plan_for_batch(
