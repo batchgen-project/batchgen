@@ -77,24 +77,42 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 
 
+# Default per-rank mtp bucket coverage when BATCHGEN_GLM5_MTP_BUCKETS is
+# unset. Validated end-to-end on H20 with 2K MMLU + 2K LongBench through the
+# full 128K-decode regime; covers the typical MoE working set without
+# blowing HBM on giant buckets. Operators can override (or set to empty)
+# via the env var.
+_GLM5_MTP_BUCKETS_DEFAULT = (128, 256, 512, 768)
+
+
 def _parse_mtp_buckets() -> list[int]:
     """Parse BATCHGEN_GLM5_MTP_BUCKETS="128,256,512,1024,2048,4096" into a
     sorted deduped list of mtp values.
 
-    When unset, returns [] — callers fall back to the legacy single-buffer
-    path (buf grows to worst-case global_bsz and stays there). When set,
-    each listed value becomes a pre-allocated `Glm5MoE3DBuffers` instance;
-    decode picks the smallest that fits the current global_bsz, cutting
-    the 770 MiB/layer zero-fill + result-copy waste.
+    When unset, returns the validated default `_GLM5_MTP_BUCKETS_DEFAULT`
+    so the Phase-2a CUDA graph capture path (default-on for GLM-5) has a
+    bucket set to capture against. Set the env var to an empty string
+    (`BATCHGEN_GLM5_MTP_BUCKETS=`) to fall back to the legacy single-buffer
+    path (buf grows to worst-case global_bsz and stays there).
+
+    When set, each listed value becomes a pre-allocated `Glm5MoE3DBuffers`
+    instance; decode picks the smallest that fits the current global_bsz,
+    cutting the 770 MiB/layer zero-fill + result-copy waste.
 
     Each value is rounded up to `_GLM5_MTP_BLOCK` alignment.
     """
-    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS", "").strip()
-    if not raw:
-        return []
+    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS")
+    if raw is None:
+        # Unset → use the validated default.
+        tokens = [str(v) for v in _GLM5_MTP_BUCKETS_DEFAULT]
+    else:
+        raw = raw.strip()
+        if not raw:
+            # Explicitly empty → caller wants the legacy single-buffer path.
+            return []
+        tokens = [tok.strip() for tok in raw.split(",")]
     out: set[int] = set()
-    for tok in raw.split(","):
-        tok = tok.strip()
+    for tok in tokens:
         if not tok:
             continue
         v = int(tok)
@@ -220,14 +238,24 @@ def apply_rotary_pos_emb_split(
 # Resolve hadamard kernels once at import time (triggers JIT compilation)
 try:
     from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
-except (ImportError, Exception):
+except Exception as _e:
     _hadamard_cuda_fn = None
+    logging.warning(
+        f"[GLM-5] hadamard_transform import failed: {_e!r}; "
+        "falling back to non-fused Hadamard (slower)."
+    )
 
 # Fused RoPE+Hadamard kernel — validated: 99/99 tests passed, 16.5x speedup over separate ops.
 try:
     from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
-except (ImportError, Exception):
+except Exception as _e:
     _fused_rope_hadamard_fn = None
+    logging.warning(
+        f"[GLM-5] fused_rope_hadamard import failed: {_e!r}; "
+        "falling back to separate RoPE+Hadamard. The fallback returns the input "
+        "dtype after k_norm — if k_norm yields FP32 the indexer K tensor will be "
+        "FP32 and trip aux KV's k_element_size_bytes=2 (BF16) check."
+    )
 
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 

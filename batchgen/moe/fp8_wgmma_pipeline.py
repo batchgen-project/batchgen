@@ -979,9 +979,16 @@ FAST_CUDA_SOURCE = r'''
 #define BLOCK_SIZE_QUANT 128
 
 // ============================================================================
-// act_quant_3d — FP8 quantization with transposed scale output
+// act_quant_3d — FP8 quantization with transposed scale output (v2 layout).
 // Input:  x [E, mtp, K] BF16
 // Output: y [E, mtp, K] uint8 (FP8), scale_t [num_k_blocks, E*mtp] F32
+//
+// v2: grid = (E, mtp), one CTA per (expert, token). Padded slots
+// (token >= tokens_per_expert[expert]) early-exit. Same numerics as v1
+// but parallelizes the token axis instead of serializing the
+// `for m in 0..valid_tokens` loop, raising occupancy from ~12%
+// (v1: 16 CTAs at GLM-5 EP=16 on 132 SMs) to fully populating the SMs.
+// Bit-exact match against v1 — see tests/kernels/test_act_quant_3d_v2.py.
 // ============================================================================
 __global__ void act_quant_3d_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -991,63 +998,59 @@ __global__ void act_quant_3d_kernel(
     int E, int mtp, int K, int num_k_blocks
 ) {
     const int expert = blockIdx.x;
+    const int token  = blockIdx.y;
     const int valid_tokens = tokens_per_expert[expert];
-    if (valid_tokens == 0) return;
+    if (token >= valid_tokens) return;
 
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
     const int num_warps = blockDim.x / 32;
 
-    const __nv_bfloat16* x_expert = x + (int64_t)expert * mtp * K;
-    uint8_t* y_expert = y + (int64_t)expert * mtp * K;
+    const int64_t m_global = (int64_t)expert * mtp + token;
     const int64_t total_m = (int64_t)E * mtp;
+    const __nv_bfloat16* x_row = x + m_global * K;
+    uint8_t* y_row = y + m_global * K;
 
-    for (int m = 0; m < valid_tokens; m++) {
-        const __nv_bfloat16* x_row = x_expert + (int64_t)m * K;
-        uint8_t* y_row = y_expert + (int64_t)m * K;
-        const int64_t m_global = (int64_t)expert * mtp + m;
+    for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
+        int col_base = kb * BLOCK_SIZE_QUANT;
 
-        for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
-            int col_base = kb * BLOCK_SIZE_QUANT;
+        float vals[4];
+        float local_max = 0.0f;
 
-            float vals[4];
-            float local_max = 0.0f;
-
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int col = col_base + lane_id * 4 + i;
-                if (col < K) {
-                    vals[i] = __bfloat162float(x_row[col]);
-                } else {
-                    vals[i] = 0.0f;
-                }
-                local_max = fmaxf(local_max, fabsf(vals[i]));
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                vals[i] = __bfloat162float(x_row[col]);
+            } else {
+                vals[i] = 0.0f;
             }
+            local_max = fmaxf(local_max, fabsf(vals[i]));
+        }
 
-            #pragma unroll
-            for (int offset = 16; offset >= 1; offset >>= 1) {
-                float other = __shfl_xor_sync(0xffffffff, local_max, offset);
-                local_max = fmaxf(local_max, other);
+        #pragma unroll
+        for (int offset = 16; offset >= 1; offset >>= 1) {
+            float other = __shfl_xor_sync(0xffffffff, local_max, offset);
+            local_max = fmaxf(local_max, other);
+        }
+
+        float s = fmaxf(local_max, QUANT_EPS) / FP8_MAX_VAL;
+        float inv_s = 1.0f / s;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                float scaled = vals[i] * inv_s;
+                scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
             }
+        }
 
-            float s = fmaxf(local_max, QUANT_EPS) / FP8_MAX_VAL;
-            float inv_s = 1.0f / s;
-
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int col = col_base + lane_id * 4 + i;
-                if (col < K) {
-                    float scaled = vals[i] * inv_s;
-                    scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
-                    y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
-                }
-            }
-
-            // Store scale in transposed layout: scale_t[kb, m_global]
-            if (lane_id == 0) {
-                scale_t[(int64_t)kb * total_m + m_global] = s;
-            }
+        // Store scale in transposed layout: scale_t[kb, m_global]
+        if (lane_id == 0) {
+            scale_t[(int64_t)kb * total_m + m_global] = s;
         }
     }
 }
@@ -1147,7 +1150,9 @@ void act_quant_3d(
     int num_k_blocks = (K + BLOCK_SIZE_QUANT - 1) / BLOCK_SIZE_QUANT;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    act_quant_3d_kernel<<<E, 128, 0, stream>>>(
+    // v2: grid = (E, mtp) — one CTA per (expert, token).
+    dim3 grid_act(E, mtp);
+    act_quant_3d_kernel<<<grid_act, 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
         out_fp8.data_ptr<uint8_t>(),
         out_scale_t.data_ptr<float>(),

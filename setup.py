@@ -134,7 +134,7 @@ print(f"find_packages: {find_packages()}")
 # install all files in the package, rather than just the egg
 setup(
     name="batchgen",
-    version=os.getenv("BATCHGEN_VERSION", "1.0.9.post1"),
+    version=os.getenv("BATCHGEN_VERSION", "1.0.9.post3"),
     packages=find_packages(
         include=[
             "batchgen",
@@ -154,6 +154,15 @@ setup(
             "external/**/*.cpp",
             "external/**/*.cc",
             "external/**/*.rst",
+            # JIT-compiled kernel sources under batchgen/other_kernels/*/csrc/
+            # (e.g. hadamard_transform/csrc/* — required for runtime
+            # torch.utils.cpp_extension.load on the wheel-only install path).
+            "other_kernels/**/*.cpp",
+            "other_kernels/**/*.cu",
+            "other_kernels/**/*.cuh",
+            "other_kernels/**/*.h",
+            "other_kernels/**/*.hpp",
+            "other_kernels/**/*.cc",
             # Op builder Python files
             "op_builder/**/*.py",
             # Data files (tokenizers, configs, etc.)
