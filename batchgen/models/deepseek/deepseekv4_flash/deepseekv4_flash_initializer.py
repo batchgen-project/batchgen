@@ -151,6 +151,54 @@ class DeepSeekV4FlashInitializer:
                 "w3.scale": [16, 32],
             },
         }
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
+        base_attn_dtypes = {
+            "attn_sink": torch.float32,
+            "wq_a.scale": e8m0_dtype,
+            "q_norm.weight": torch.bfloat16,
+            "wq_b.scale": e8m0_dtype,
+            "wkv.scale": e8m0_dtype,
+            "kv_norm.weight": torch.bfloat16,
+            "wo_a.scale": e8m0_dtype,
+            "wo_b.scale": e8m0_dtype,
+        }
+        attn_cr4_dtypes = {
+            **base_attn_dtypes,
+            "compressor.ape": torch.float32,
+            "compressor.norm.weight": torch.bfloat16,
+            "compressor.wgate.weight": torch.bfloat16,
+            "compressor.wkv.weight": torch.bfloat16,
+            "indexer.compressor.ape": torch.float32,
+            "indexer.compressor.norm.weight": torch.bfloat16,
+            "indexer.compressor.wgate.weight": torch.bfloat16,
+            "indexer.compressor.wkv.weight": torch.bfloat16,
+            "indexer.weights_proj.weight": torch.bfloat16,
+            "indexer.wq_b.scale": e8m0_dtype,
+        }
+        attn_cr128_dtypes = {
+            **base_attn_dtypes,
+            "compressor.ape": torch.float32,
+            "compressor.norm.weight": torch.bfloat16,
+            "compressor.wgate.weight": torch.bfloat16,
+            "compressor.wkv.weight": torch.bfloat16,
+        }
+        expert_scale_dtypes = {
+            "w1.scale": e8m0_dtype,
+            "w2.scale": e8m0_dtype,
+            "w3.scale": e8m0_dtype,
+        }
+        self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
+            "attn": base_attn_dtypes,
+            "attn_cr4": attn_cr4_dtypes,
+            "attn_cr128": attn_cr128_dtypes,
+            "routed_expert": {
+                "w1.weight": torch.int8,
+                "w2.weight": torch.int8,
+                "w3.weight": torch.int8,
+                **expert_scale_dtypes,
+            },
+            "shared_expert": expert_scale_dtypes,
+        }
         logging.info(
             "DeepSeek-V4-Flash engine metadata initialized: host_slots=%s",
             self.engine_config.KV_Storage_Config.num_host_slots,
