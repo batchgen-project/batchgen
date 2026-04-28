@@ -77,24 +77,42 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 
 
+# Default per-rank mtp bucket coverage when BATCHGEN_GLM5_MTP_BUCKETS is
+# unset. Validated end-to-end on H20 with 2K MMLU + 2K LongBench through the
+# full 128K-decode regime; covers the typical MoE working set without
+# blowing HBM on giant buckets. Operators can override (or set to empty)
+# via the env var.
+_GLM5_MTP_BUCKETS_DEFAULT = (128, 256, 512, 768)
+
+
 def _parse_mtp_buckets() -> list[int]:
     """Parse BATCHGEN_GLM5_MTP_BUCKETS="128,256,512,1024,2048,4096" into a
     sorted deduped list of mtp values.
 
-    When unset, returns [] — callers fall back to the legacy single-buffer
-    path (buf grows to worst-case global_bsz and stays there). When set,
-    each listed value becomes a pre-allocated `Glm5MoE3DBuffers` instance;
-    decode picks the smallest that fits the current global_bsz, cutting
-    the 770 MiB/layer zero-fill + result-copy waste.
+    When unset, returns the validated default `_GLM5_MTP_BUCKETS_DEFAULT`
+    so the Phase-2a CUDA graph capture path (default-on for GLM-5) has a
+    bucket set to capture against. Set the env var to an empty string
+    (`BATCHGEN_GLM5_MTP_BUCKETS=`) to fall back to the legacy single-buffer
+    path (buf grows to worst-case global_bsz and stays there).
+
+    When set, each listed value becomes a pre-allocated `Glm5MoE3DBuffers`
+    instance; decode picks the smallest that fits the current global_bsz,
+    cutting the 770 MiB/layer zero-fill + result-copy waste.
 
     Each value is rounded up to `_GLM5_MTP_BLOCK` alignment.
     """
-    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS", "").strip()
-    if not raw:
-        return []
+    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS")
+    if raw is None:
+        # Unset → use the validated default.
+        tokens = [str(v) for v in _GLM5_MTP_BUCKETS_DEFAULT]
+    else:
+        raw = raw.strip()
+        if not raw:
+            # Explicitly empty → caller wants the legacy single-buffer path.
+            return []
+        tokens = [tok.strip() for tok in raw.split(",")]
     out: set[int] = set()
-    for tok in raw.split(","):
-        tok = tok.strip()
+    for tok in tokens:
         if not tok:
             continue
         v = int(tok)

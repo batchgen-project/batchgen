@@ -5953,9 +5953,10 @@ class BatchGenWorker:
 				# rank-synced bucketed graphs, so it is safe to capture at the first
 				# decode phase instead of waiting for the final no-queue iteration.
 				# Keep the older final-batch gate for other graph backends.
+				# Default for GLM-5: ON. Opt out with BATCHGEN_GLM5_CUDA_GRAPH=0.
 				_glm5_graph_requested = (
 					is_glm5_backend_model(getattr(self, "model_name", "") or "")
-					and os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+					and os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "1") != "0"
 				)
 				if (
 					self._cuda_graph_manager is None
@@ -8628,12 +8629,13 @@ class BatchGenWorker:
 		Called from generate() after model and GPU KV manager are ready.
 		Only captures graphs for supported models (currently GPT-OSS-120B).
 		"""
-		# Env-override: BATCHGEN_GLM5_CUDA_GRAPH=1 on a GLM-5 model implies
-		# the user wants graphs on; flip enable_cuda_graphs. Without this
-		# the default disable_cuda_graphs=True blocks capture before the
-		# model guard below would allow it.
+		# GLM-5 MoE Phase-2a graph capture is on by default. Opt out by
+		# setting BATCHGEN_GLM5_CUDA_GRAPH=0 (keeps the eager MoE path). The
+		# explicit flip of enable_cuda_graphs is required because the engine's
+		# Basic_Config still defaults to disable_cuda_graphs=True for non-GLM-5
+		# models; we override only when the model is GLM-5.
 		model_name = getattr(self, 'model_name', '') or ''
-		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "0") == "1"
+		_glm5_cg_enabled = os.environ.get("BATCHGEN_GLM5_CUDA_GRAPH", "1") != "0"
 		_model_is_glm5 = is_glm5_backend_model(model_name)
 		if _model_is_glm5 and _glm5_cg_enabled:
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
@@ -8650,8 +8652,8 @@ class BatchGenWorker:
 		if not _supported:
 			if _model_is_glm5 and not _glm5_cg_enabled:
 				logging.info(
-					f"Rank {self.rank}: GLM-5 CUDA graphs gated off "
-					"(set BATCHGEN_GLM5_CUDA_GRAPH=1 to enable Phase 2a)"
+					f"Rank {self.rank}: GLM-5 CUDA graphs explicitly disabled "
+					"(BATCHGEN_GLM5_CUDA_GRAPH=0); using eager MoE path"
 				)
 			else:
 				logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -8864,10 +8866,12 @@ class BatchGenWorker:
 				)
 			else:
 				logging.warning(
-					f"Rank {self.rank}: GLM-5 CUDA graph enabled but "
-					"BATCHGEN_GLM5_MTP_BUCKETS not set — MoE bucket buffers "
-					"were not pre-allocated; capture would hit the singleton "
-					"resize path. Skipping capture."
+					f"Rank {self.rank}: GLM-5 CUDA graph enabled but no MoE "
+					"bucket buffers are pre-allocated. Either "
+					"BATCHGEN_GLM5_MTP_BUCKETS was explicitly set to an empty "
+					"string (legacy single-buffer opt-out) or model init "
+					"happened before _GLM5_MTP_BUCKETS resolved. Capture "
+					"would hit the singleton resize path. Skipping capture."
 				)
 				return
 
