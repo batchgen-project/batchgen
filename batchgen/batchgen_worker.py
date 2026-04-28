@@ -4675,6 +4675,80 @@ class BatchGenWorker:
 		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
 		return chunk
 
+	def _maybe_evict_prefix_cache_for_prefill_admission(
+		self,
+		all_candidates: List[str],
+		chunk_size: int,
+	) -> None:
+		"""Release prefix-only pages before host-KV admission can deadlock.
+
+		C++ allocation-time eviction handles the precise protected-page case,
+		but prefill admission runs before allocation. If prefix pins drive free
+		pages below the next request's minimum reservation, admission would
+		select zero sequences and never reach the allocator. This pressure path
+		evicts only enough unprotected prefix cache entries to admit at least
+		one candidate on the local node.
+		"""
+		if not self._prefix_reuse_runtime_enabled():
+			return
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		if worker_view is None:
+			return
+		try:
+			stats = worker_view.get_stats()
+			local_free = int(stats.num_free_pages)
+		except Exception:
+			return
+
+		my_node = self._get_node_for_rank(self.rank)
+		target_free_pages = 0
+		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
+		for uuid in all_candidates:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.assigned_rank is None:
+				continue
+			if self._get_node_for_rank(seq.assigned_rank) != my_node:
+				continue
+			post_prefill_length = seq.prompt_length + 1
+			gpu_initial_pages = (
+				math.ceil(post_prefill_length / seq.PAGE_SIZE)
+				+ INITIAL_GPU_PAGE_BUFFER
+			)
+			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
+			initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
+			initial_capacity = min(initial_capacity, seq.kv_token_budget)
+			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
+			if req_pages > local_free:
+				target_free_pages = (
+					req_pages
+					if target_free_pages == 0
+					else min(target_free_pages, req_pages)
+				)
+
+		if target_free_pages == 0:
+			return
+		try:
+			eviction = worker_view.evict_prefix_cache_until_free(target_free_pages)
+		except Exception as exc:
+			logging.warning(
+				"Rank %s prefix cache prefill-admission eviction failed: %s",
+				self.rank,
+				exc,
+			)
+			return
+		self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
+		if self.rank == 0 and (
+			getattr(eviction, "entries_removed", 0) > 0
+			or not getattr(eviction, "reached_target", True)
+		):
+			logging.info(
+				"[PREFIX_EVICT] prefill admission target_free=%d "
+				"entries_removed=%d reached_target=%s",
+				target_free_pages,
+				getattr(eviction, "entries_removed", 0),
+				getattr(eviction, "reached_target", False),
+			)
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on HOST KV cache capacity.
@@ -4712,6 +4786,11 @@ class BatchGenWorker:
 		num_nodes = self._get_num_nodes()
 		my_node = self._get_node_for_rank(self.rank)
 		chunk_size = self._get_effective_chunk_size()
+
+		self._maybe_evict_prefix_cache_for_prefill_admission(
+			all_candidates,
+			chunk_size,
+		)
 
 		# Step 1: Get this node's host KV free pages
 		local_host_free = self._get_host_kv_free_pages()
