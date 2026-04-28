@@ -11,7 +11,14 @@ logger = logging.getLogger(__name__)
 
 # Minimum batchgen_kernels version required by this batchgen release.
 # Bump this when batchgen starts using new kernel APIs.
-MIN_KERNELS_VERSION = (0, 2, 0)
+MIN_KERNELS_VERSION = (0, 3, 1, "post", 2)
+
+
+def _format_version_info(version_info):
+    parts = list(version_info)
+    if len(parts) >= 5 and parts[3] == "post":
+        return ".".join(str(part) for part in parts[:3]) + f".post{parts[4]}"
+    return ".".join(str(part) for part in parts)
 
 
 def check_kernels_version():
@@ -30,7 +37,7 @@ def check_kernels_version():
 
     installed = batchgen_kernels.version_info
     if installed < MIN_KERNELS_VERSION:
-        min_str = ".".join(str(x) for x in MIN_KERNELS_VERSION)
+        min_str = _format_version_info(MIN_KERNELS_VERSION)
         cur_str = batchgen_kernels.__version__
         raise RuntimeError(
             f"batchgen requires batchgen_kernels >= {min_str}, "

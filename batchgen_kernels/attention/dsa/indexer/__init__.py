@@ -1,6 +1,6 @@
+import os
 import torch
 from torch.utils.cpp_extension import load
-import os
 
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _csrc_dir = os.path.join(_current_dir, "csrc")
@@ -17,8 +17,11 @@ _cuda_flags = [
     '--expt-extended-lambda',
 ]
 
+# Keep these names package-scoped. The BatchGen wheel used to ship another
+# JIT loader with the generic names below; reusing those names lets PyTorch
+# bump one import to *_v1 and race in multi-rank shared extension caches.
 _hadamard_cuda = load(
-    name="fast_hadamard_transform_cuda",
+    name="batchgen_dsa_fast_hadamard_transform_cuda",
     sources=[
         os.path.join(_csrc_dir, "hadamard_binding.cpp"),
         os.path.join(_csrc_dir, "fast_hadamard_transform_cuda.cu"),
@@ -30,7 +33,7 @@ _hadamard_cuda = load(
 )
 
 _fused_rope_hadamard_cuda = load(
-    name="fused_rope_hadamard_cuda",
+    name="batchgen_dsa_fused_rope_hadamard_cuda",
     sources=[
         os.path.join(_csrc_dir, "fused_rope_hadamard_binding.cpp"),
         os.path.join(_csrc_dir, "fused_rope_hadamard.cu"),
@@ -65,4 +68,9 @@ def fused_rope_hadamard(
     Returns:
         [batch, 128] bf16 tensor
     """
-    return _fused_rope_hadamard_cuda.fused_rope_hadamard(x, cos_cache, sin_cache, positions, scale)
+    return _fused_rope_hadamard_cuda.fused_rope_hadamard(
+        x, cos_cache, sin_cache, positions, scale
+    )
+
+
+__all__ = ["hadamard_transform", "fused_rope_hadamard"]

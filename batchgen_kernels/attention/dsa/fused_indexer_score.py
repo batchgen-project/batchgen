@@ -25,14 +25,13 @@ v2: CUDA WGMMA wq_b + PyTorch RoPE/Hadamard — 8-17× full pipeline
 import torch
 import triton
 import triton.language as tl
-import math
-
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
     build_module, FP8IndexerWeightsCUDA,
 )
 
-# Import existing CUDA fused RoPE+Hadamard kernel
-from batchgen_kernels.attention.dsa.indexer import fused_rope_hadamard as _cuda_fused_rope_hadamard
+from batchgen_kernels.attention.dsa.indexer import (
+    fused_rope_hadamard as _cuda_fused_rope_hadamard,
+)
 
 
 # ============================================================
@@ -228,7 +227,7 @@ def get_hadamard_matrix(dim, device, dtype=torch.bfloat16):
 
 
 # ============================================================
-# RoPE + Hadamard — CUDA fused kernel (from attention/dsa/indexer)
+# RoPE + Hadamard — CUDA fused kernel
 # ============================================================
 
 def apply_rope_interleaved(x, cos, sin):
@@ -250,7 +249,7 @@ def apply_rope_interleaved(x, cos, sin):
 def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
     """Apply fused CUDA RoPE + Hadamard to Q [B, n_heads, head_dim].
 
-    Uses the existing CUDA kernel from attention/dsa/indexer.
+    Uses the canonical CUDA kernel from batchgen_kernels.attention.dsa.indexer.
     The kernel handles [batch, 128] with 1 block/row.
     For multi-head Q [B, 32, 128], we reshape to [B*32, 128]
     and expand positions from [B] to [B*32].
