@@ -311,8 +311,8 @@ def test_prefix_cache_eviction_keeps_active_sequence_pages_alive():
         assert worker.shared_prefix_tokens(2) == prefix_tokens_before
 
         k_cpu, _ = worker.read_sequence_kv_to_cpu(2)
-        logical_tokens = k_cpu[0, :4, :, 0, 0].reshape(-1).float().tolist()
-        assert logical_tokens == pytest.approx([1, 2, 3, 4])
+        logical_tokens = k_cpu[0, :, :, 0, 0].reshape(-1).float().tolist()
+        assert logical_tokens[:4] == pytest.approx([1, 2, 3, 4])
 
         ref_state = worker.page_ref_state(leaf_page)
         assert ref_state.sequence_refs == 1
