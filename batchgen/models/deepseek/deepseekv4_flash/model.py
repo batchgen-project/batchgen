@@ -442,8 +442,9 @@ class DeepSeekV4FlashGate(nn.Module):
         raw_scores = scores
         if self.is_hash_layer:
             if input_ids is None:
-                raise RuntimeError("DeepSeek-V4 hash routing requires input_ids.")
-            topk_indices = self.tid2eid[input_ids].long()
+                topk_indices = torch.topk(scores, k=self.topk, dim=-1)[1]
+            else:
+                topk_indices = self.tid2eid[input_ids].long()
         else:
             select_scores = scores + self.bias.float().unsqueeze(0)
             topk_indices = torch.topk(select_scores, k=self.topk, dim=-1)[1]
@@ -508,12 +509,14 @@ class DeepSeekV4FlashMoE(nn.Module):
         self.num_experts_per_tok = int(_cfg(config, "num_experts_per_tok", _cfg(config, "n_activated_experts", 6)))
         self.swiglu_limit = float(_cfg(config, "swiglu_limit", 10.0))
         self.gate = DeepSeekV4FlashGate(config, layer_idx)
-        self.experts = [
-            DeepSeekV4FlashExpertPlaceholder(
-                self.hidden_size, self.intermediate_size, self.swiglu_limit
-            )
-            for _ in range(self.total_experts)
-        ]
+        self.experts = nn.ModuleList(
+            [
+                DeepSeekV4FlashExpertPlaceholder(
+                    self.hidden_size, self.intermediate_size, self.swiglu_limit
+                )
+                for _ in range(self.total_experts)
+            ]
+        )
         self.shared_experts = DeepSeekV4FlashExpertPlaceholder(
             self.hidden_size, self.intermediate_size, 0.0
         )
@@ -652,8 +655,17 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, ...]] = None,
         cache_seqlens: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
         use_cache: bool = False,
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
+        del output_attentions, kwargs
+        collapse_hc_state = hidden_states.dim() == 3
+        if collapse_hc_state:
+            hidden_states = hidden_states.unsqueeze(2).expand(
+                -1, -1, self.hc_mult, -1
+            ).contiguous()
+
         residual = hidden_states
         attn_input, post, comb = self._hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -676,6 +688,8 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         mlp_input = self.ffn_norm(mlp_input)
         mlp_out = self.mlp(mlp_input, input_ids)
         hidden_states = self._hc_post(mlp_out, residual, post, comb)
+        if collapse_hc_state:
+            hidden_states = hidden_states.mean(dim=2)
         return hidden_states, attn_weights, present
 
 
@@ -725,8 +739,12 @@ class DeepSeekV4FlashModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, ...], ...]] = None,
+        output_attentions: Optional[bool] = None,
         use_cache: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
+        del return_dict, kwargs
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
@@ -744,6 +762,7 @@ class DeepSeekV4FlashModel(nn.Module):
                 position_ids=position_ids,
                 input_ids=input_ids,
                 past_key_value=past_kv,
+                output_attentions=bool(output_attentions),
                 use_cache=bool(use_cache),
             )
             if use_cache:
@@ -771,15 +790,21 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, ...], ...]] = None,
+        output_attentions: Optional[bool] = None,
         use_cache: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> _CausalLMOutput:
+        del kwargs
         outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            output_attentions=output_attentions,
             use_cache=use_cache,
+            return_dict=return_dict,
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
