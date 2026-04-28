@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import uuid
+from pathlib import Path
 
 import torch
 
@@ -78,9 +79,22 @@ class DeepSeekV4Flash_Parameter_Server:
         logging.info("V4 tensor meta shared memory name: %s", self.tensor_meta_shm_name)
         logging.info("V4 parameter-server byte size: %.2f GB", byte_size / 1024**3)
 
-        if self.converted_ckpt_dir is None:
+        converted_path = (
+            Path(self.converted_ckpt_dir)
+            if self.converted_ckpt_dir is not None
+            else None
+        )
+        if converted_path is None or not converted_path.is_dir():
+            if converted_path is not None:
+                logging.info(
+                    "V4 converted checkpoint directory missing; converting raw checkpoint to %s",
+                    converted_path,
+                )
             converter = ckpt_converter()
-            self.converted_ckpt_dir = converter.convert_model_directory(self.cache_dir)
+            self.converted_ckpt_dir = converter.convert_model_directory(
+                self.cache_dir,
+                output_dir=str(converted_path) if converted_path is not None else None,
+            )
         else:
             logging.info("Using pre-converted V4 checkpoint: %s", self.converted_ckpt_dir)
 
