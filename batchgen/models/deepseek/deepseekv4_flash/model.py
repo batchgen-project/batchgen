@@ -318,6 +318,15 @@ class DeepSeekV4FlashAttention(nn.Module):
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
             getattr(self, name).clear_runtime_tensors()
 
+    def empty_forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        bsz, q_len, _ = hidden_states.shape
+        attn_output = hidden_states.new_empty(bsz, q_len, self.hidden_size)
+        kv = hidden_states.new_empty(bsz, q_len, self.head_dim)
+        return attn_output, None, kv
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -588,6 +597,12 @@ class DeepSeekV4FlashMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, self.hidden_size)
+        if flat_states.shape[0] == 0:
+            routed = torch.zeros_like(flat_states, dtype=torch.float32)
+            if self.enable_ep_offloading and dist.is_initialized():
+                routed = self._all_reduce_routed(routed)
+            return routed.to(hidden_states.dtype).view(shape)
+
         flat_ids = input_ids.reshape(-1) if input_ids is not None else None
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 

@@ -56,6 +56,8 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             past_key_states = AttnWrapperBase.past_key_states
             if past_key_states is not None:
                 kwargs["past_key_value"] = past_key_states[self.layer_idx]
+            if args and isinstance(args[0], torch.Tensor) and args[0].shape[0] == 0:
+                return self.module.empty_forward(args[0])
         self._load_runtime_tensors()
         try:
             result = self.module(*args, **kwargs)
