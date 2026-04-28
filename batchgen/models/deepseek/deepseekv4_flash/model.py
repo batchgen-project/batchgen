@@ -60,7 +60,15 @@ def _linear_from_weight(
     this path in production.
     """
 
+    raw_weight_shape = tuple(weight.shape)
     weight = _dequant_weight(weight, scale, x.dtype)
+    if x.shape[-1] != weight.shape[-1]:
+        scale_shape = None if scale is None else tuple(scale.shape)
+        raise RuntimeError(
+            "DeepSeek-V4 linear shape mismatch: "
+            f"input={tuple(x.shape)}, weight={tuple(weight.shape)}, "
+            f"raw_weight={raw_weight_shape}, scale={scale_shape}"
+        )
     return F.linear(x, weight, bias)
 
 
@@ -69,7 +77,7 @@ def _dequant_weight(
     scale: Optional[torch.Tensor],
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if _is_fp4_e2m1_weight(weight):
+    if _is_fp4_e2m1_weight(weight, scale):
         return _dequant_fp4_e2m1_weight(weight, scale, dtype)
     if scale is not None and scale.ndim == 2 and weight.ndim == 2:
         row_block = max(weight.shape[0] // scale.shape[0], 1)
@@ -82,11 +90,28 @@ def _dequant_weight(
     return weight.to(dtype)
 
 
-def _is_fp4_e2m1_weight(weight: torch.Tensor) -> bool:
+def _is_fp4_e2m1_weight(
+    weight: torch.Tensor,
+    scale: Optional[torch.Tensor],
+) -> bool:
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    return weight.dtype in (torch.int8, torch.uint8) or (
-        fp4_dtype is not None and weight.dtype == fp4_dtype
+    if fp4_dtype is not None and weight.dtype == fp4_dtype:
+        return True
+    if weight.dtype in (torch.int8, torch.uint8):
+        return True
+    return (
+        scale is not None
+        and weight.ndim == 2
+        and scale.ndim == 2
+        and weight.shape[0] == scale.shape[0]
+        and weight.shape[1] == scale.shape[1] * 16
     )
+
+
+def _fp4_packed_bytes(weight: torch.Tensor) -> torch.Tensor:
+    if weight.element_size() == 1:
+        return weight.contiguous().view(torch.uint8)
+    return weight.contiguous().to(torch.uint8)
 
 
 def _dequant_fp4_e2m1_weight(
@@ -96,7 +121,7 @@ def _dequant_fp4_e2m1_weight(
 ) -> torch.Tensor:
     if scale is None:
         raise RuntimeError("DeepSeek-V4 FP4 weight is missing its E8M0 scale tensor.")
-    packed = weight.contiguous().view(torch.uint8)
+    packed = _fp4_packed_bytes(weight)
     table = torch.tensor(
         _FP4_E2M1_TABLE_VALUES,
         dtype=torch.float32,
