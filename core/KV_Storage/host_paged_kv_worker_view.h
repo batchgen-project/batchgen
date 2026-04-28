@@ -1762,6 +1762,21 @@ class HostPagedKVWorkerView {
         std::vector<uint8_t*> device_dests;
     };
 
+    struct CopyPointerPair {
+        std::uintptr_t host = 0;
+        std::uintptr_t device = 0;
+
+        bool operator==(const CopyPointerPair& other) const {
+            return host == other.host && device == other.device;
+        }
+    };
+
+    struct CopyPointerPairHash {
+        std::size_t operator()(const CopyPointerPair& pair) const {
+            return static_cast<std::size_t>(HashCombine(pair.host, pair.device));
+        }
+    };
+
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
 
@@ -2179,7 +2194,7 @@ class HostPagedKVWorkerView {
         PageCopyPlan plan;
         plan.host_sources.reserve(total_entries);
         plan.device_dests.reserve(total_entries);
-        std::unordered_set<std::uintptr_t> seen_copies;
+        std::unordered_set<CopyPointerPair, CopyPointerPairHash> seen_copies;
         seen_copies.reserve(total_entries);
         auto&& provider = std::forward<HostPtrProvider>(host_ptr_provider);
         for (std::size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -2221,8 +2236,7 @@ class HostPagedKVWorkerView {
                         reinterpret_cast<std::uintptr_t>(host_ptr);
                     const auto device_key =
                         reinterpret_cast<std::uintptr_t>(device_ptr);
-                    const auto copy_key =
-                        HashCombine(host_key, device_key);
+                    const CopyPointerPair copy_key{host_key, device_key};
                     if (seen_copies.insert(copy_key).second) {
                         plan.host_sources.emplace_back(host_ptr);
                         plan.device_dests.emplace_back(device_ptr);
