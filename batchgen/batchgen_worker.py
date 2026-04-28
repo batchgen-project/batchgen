@@ -8866,10 +8866,12 @@ class BatchGenWorker:
 				)
 			else:
 				logging.warning(
-					f"Rank {self.rank}: GLM-5 CUDA graph enabled but "
-					"BATCHGEN_GLM5_MTP_BUCKETS not set — MoE bucket buffers "
-					"were not pre-allocated; capture would hit the singleton "
-					"resize path. Skipping capture."
+					f"Rank {self.rank}: GLM-5 CUDA graph enabled but no MoE "
+					"bucket buffers are pre-allocated. Either "
+					"BATCHGEN_GLM5_MTP_BUCKETS was explicitly set to an empty "
+					"string (legacy single-buffer opt-out) or model init "
+					"happened before _GLM5_MTP_BUCKETS resolved. Capture "
+					"would hit the singleton resize path. Skipping capture."
 				)
 				return
 
