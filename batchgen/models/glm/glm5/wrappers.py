@@ -26,13 +26,6 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
-from batchgen.models.glm.glm5.decode_utils import (
-    build_flat_paged_gather_indices,
-    build_batch_slot_indices,
-    build_paged_gather_cache_key,
-    build_clamped_dense_token_indices,
-    reorder_block_table_to_batch_slots,
-)
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
 
@@ -592,19 +585,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Computes MLA KV and writes to primary cache first, then runs indexer
         scoring on aux cache, gathers sparse MLA KV, and runs sparse FlashMLA.
         """
-        from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.attention.mla.fused_rmsnorm_rope import (
-            fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_flashmla_inputs,
         )
-        from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
-        from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
-        from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
+        from batchgen.attention.dsa.sparse_decode_mla import (
+            run_prepared_sparse_flash_mla_decode,
+        )
+        from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
 
         weight_scale = self.weight_dequant_scale
         attn = self.module
-        indexer = attn.indexer
         bsz = hidden_states.shape[0]
         dt = get_decode_timer()
         li = self.layer_idx
@@ -613,380 +605,17 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if bsz == 0:
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
-        # --- Shared FP8 activation quantization ---
-        with (dt.timed("act_quant", li) if dt else _nullctx()):
-            hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
-            hidden_fp8, hidden_scale = act_quant(hidden_flat)
-
-        # --- Q path: q_a_proj → layernorm → q_b_proj → split → RoPE ---
-        with (dt.timed("q_proj", li) if dt else _nullctx()):
-            q_a = w8a8_deepgemm(
-                hidden_fp8, hidden_scale,
-                attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
-            )
-            q_a_normed = attn.q_a_layernorm(q_a)
-            q_a_fp8, q_a_scale = act_quant(q_a_normed)
-            q = w8a8_deepgemm(
-                q_a_fp8, q_a_scale,
-                attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
-            )
-            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-            q_nope, q_pe = torch.split(
-                q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
-            )
-            q_pe = q_pe.contiguous()
-
-        # --- KV path: kv_a_proj → fused_rmsnorm_rope → compressed KV ---
-        with (dt.timed("kv_proj", li) if dt else _nullctx()):
-            new_compressed_kv = w8a8_deepgemm(
-                hidden_fp8, hidden_scale,
-                attn.kv_a_proj_with_mqa.weight,
-                weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-            ).view(bsz, 1, -1)
-
-            cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
-            # Explicitly pass the module's RMSNorm eps (config.rms_norm_eps=1e-5
-            # for GLM-5). The kernel default is 1e-6; without this override the
-            # decode-side new-KV gets normalized with a 10× tighter regularizer
-            # than the prefill-cached KV, creating a slow drift that compounds
-            # across 78 layers × decode steps and manifests as ngram loops /
-            # off-topic generation after ~hundreds of tokens.
-            offload_kv = _fused_rmsnorm_rope(
-                new_compressed_kv, q_pe, cos, sin, position_ids,
-                attn.kv_a_layernorm.weight,
-                attn.kv_lora_rank, attn.qk_rope_head_dim,
-                eps=attn.kv_a_layernorm.eps,
-            )
-
-        # Pre-compute seq_lengths_i32 once (shared by kv_write and indexer_k)
-        new_token_pos = position_ids.squeeze(-1)  # [batch]
-        manager_device = gpu_paged_kv_manager.device
-        seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
-        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-        primary_slot_indices = build_batch_slot_indices(
-            current_batch,
-            gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
-            bsz,
-            manager_device,
+        selector_inputs = build_glm5_dsa_flashmla_inputs(
+            self,
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
         )
-        aux_device = gpu_paged_kv_manager_aux.device
-        aux_slot_indices = build_batch_slot_indices(
-            current_batch,
-            gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
-            bsz,
-            aux_device,
-        )
-
-        # Index-OOB diagnostic (BATCHGEN_GLM5_VERIFY_INDICES=1). Logs the
-        # bounds relevant to every OOB-able op on the DSA decode path and
-        # asserts the pre-conditions. Fires only on layers 0..4 so we catch
-        # the first-decode-step crash without spamming every layer. The
-        # .item()s force a sync so the assertion traceback points at the
-        # true violator instead of a downstream H2D copy.
-        import os as _os_verify
-        _VERIFY = _os_verify.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
-        if _VERIFY and self.layer_idx <= 4:
-            _rk = AttnWrapperBase.get_rank_safe()
-            # Slot indices must index into their respective page tables.
-            _prim_pt = gpu_paged_kv_manager._gpu_page_table_manager.gpu_table
-            _aux_pt = gpu_paged_kv_manager_aux._gpu_page_table_manager.gpu_table
-            _prim_rows = 0 if _prim_pt is None else int(_prim_pt.shape[0])
-            _aux_rows = 0 if _aux_pt is None else int(_aux_pt.shape[0])
-            _prim_cols = 0 if _prim_pt is None else int(_prim_pt.shape[1])
-            _aux_cols = 0 if _aux_pt is None else int(_aux_pt.shape[1])
-            _prim_max = int(primary_slot_indices.max().item())
-            _prim_min = int(primary_slot_indices.min().item())
-            _aux_max = int(aux_slot_indices.max().item())
-            _aux_min = int(aux_slot_indices.min().item())
-            _cs_max = int(updated_seqlens.max().item()) if 'updated_seqlens' in dir() else int(cache_seqlens.max().item())
-            _cs_min = int(cache_seqlens.min().item())
-            _pos_max = int(new_token_pos.max().item())
-            _pos_min = int(new_token_pos.min().item())
-            _prim_pages = int(gpu_paged_kv_manager.config.num_pages)
-            _aux_pages = int(gpu_paged_kv_manager_aux.config.num_pages)
-            _prim_psz = int(gpu_paged_kv_manager.config.page_size_tokens)
-            _aux_psz = int(gpu_paged_kv_manager_aux.config.page_size_tokens)
-            logging.warning(
-                f"[VERIFY-DSA rank={_rk} L{self.layer_idx} bsz={bsz}] "
-                f"prim_slot=[{_prim_min},{_prim_max}] max_rows={_prim_rows} cols={_prim_cols} "
-                f"num_pages={_prim_pages} page_sz={_prim_psz} | "
-                f"aux_slot=[{_aux_min},{_aux_max}] max_rows={_aux_rows} cols={_aux_cols} "
-                f"num_pages={_aux_pages} page_sz={_aux_psz} | "
-                f"cache_seq=[{_cs_min},{_cs_max}] pos=[{_pos_min},{_pos_max}] "
-                f"max_seqlen={max_seqlen}"
-            )
-            assert _prim_max < _prim_rows, (
-                f"primary_slot_indices.max()={_prim_max} >= page_table.shape[0]={_prim_rows}"
-            )
-            assert _aux_max < _aux_rows, (
-                f"aux_slot_indices.max()={_aux_max} >= aux page_table.shape[0]={_aux_rows}"
-            )
-            _expected_prim_pages_for_ctx = (max_seqlen + _prim_psz - 1) // _prim_psz
-            _expected_aux_pages_for_ctx = (max_seqlen + _aux_psz - 1) // _aux_psz
-            if _expected_prim_pages_for_ctx > _prim_cols:
-                logging.warning(
-                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
-                    f"max_seqlen={max_seqlen} needs {_expected_prim_pages_for_ctx} primary pages "
-                    f"but page_table only has {_prim_cols} cols — gather will wrap"
-                )
-            if _expected_aux_pages_for_ctx > _aux_cols:
-                logging.warning(
-                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
-                    f"max_seqlen={max_seqlen} needs {_expected_aux_pages_for_ctx} aux pages "
-                    f"but aux page_table only has {_aux_cols} cols — gather will wrap"
-                )
-
-        # --- Step 1: Write new MLA KV to primary cache ---
-        with (dt.timed("kv_write", li) if dt else _nullctx()):
-            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
-            if k_tensor.device != manager_device:
-                k_tensor = k_tensor.to(manager_device)
-            gpu_paged_kv_manager.update_layer_decode_new_token(
-                k_tensor=k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32,
-                layer_idx=li,
-                slot_indices=primary_slot_indices,
-            )
-            if AttnWrapperBase.kv_append_callback is not None:
-                AttnWrapperBase.kv_append_callback(li, k_tensor, None)
-
-        # --- Step 2: Write indexer K to auxiliary cache ---
-        if gpu_paged_kv_manager_aux is not None:
-            with (dt.timed("indexer_k", li) if dt else _nullctx()):
-                # WP2: Fused CUDA WGMMA wk_proj (GEMM only) + PyTorch LayerNorm + RoPE + Hadamard
-                if self._indexer_cuda_weights is not None:
-                    from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import cuda_wk_proj_gemm_only
-                    # CUDA kernel: hidden_states → FP8 act_quant → WGMMA wk_proj
-                    k_raw = cuda_wk_proj_gemm_only(
-                        hidden_flat,  # [B, hidden_size] — already squeezed above
-                        self._indexer_cuda_weights,
-                        self._indexer_cuda_module,
-                    )  # [B, index_head_dim=128]
-                    # LayerNorm (model uses nn.LayerNorm with bias, not RMSNorm)
-                    k_normed = indexer.k_norm(k_raw)
-                    # Apply RoPE + Hadamard (reuse indexer's fused op)
-                    k_normed_3d = k_normed.unsqueeze(1)  # [B, 1, 128]
-                    indexer_kv = indexer._fused_rope_hadamard_or_fallback(
-                        k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
-                    ).unsqueeze(2)  # [B, 1, 1, 128]
-                else:
-                    if not self._warned_indexer_kv_fallback:
-                        self._warned_indexer_kv_fallback = True
-                        logging.warning(
-                            f"[layer {self.layer_idx}] WP2 fused indexer KV proj unavailable, "
-                            "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
-                        )
-                    indexer_kv = indexer.compute_indexer_kv(
-                        hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
-                    )
-                indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-                seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
-                gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                    k_tensor=indexer_k_tensor,
-                    v_tensor=None,
-                    sequence_lengths=seq_lengths_i32_aux,
-                    layer_idx=li,
-                    slot_indices=aux_slot_indices,
-                )
-                # Offload indexer K to auxiliary host cache
-                if AttnWrapperBase.kv_append_callback_aux is not None:
-                    AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
-
-        # --- Step 3: Score all cached tokens (including new), select top-K ---
-        with (dt.timed("indexer_score", li) if dt else _nullctx()):
-            # cache_seqlens already includes the new token (pre-incremented in worker)
-            updated_seqlens = cache_seqlens
-
-            # Per-seq dispatch between the dense short-circuit and the indexer
-            # scoring path. Previously dispatched at the batch level using
-            # max(cache_seqlens), which dragged short rows (cache_seqlen <=
-            # index_topk) through the indexer whenever any row in the batch
-            # exceeded index_topk. Now:
-            #   - all rows <= index_topk  : dense (topk = max_seqlen)
-            #   - all rows >  index_topk  : indexer (topk = index_topk)
-            #   - mixed                   : per-row dispatch, unified to
-            #     [batch, index_topk] via row-mask assignment.
-            _idx_topk = indexer.index_topk
-            _short_mask = updated_seqlens <= _idx_topk  # [batch] bool
-            _bsz = _short_mask.shape[0]
-            # Dispatch hint is precomputed once per decode step by the worker
-            # (batchgen_worker.py decode loop) so the per-layer .sum().item()
-            # here — which would fire 78x per step — becomes a plain int read.
-            # Fallback recomputes locally if the hint wasn't populated (legacy
-            # forward paths / tests).
-            _short_count = AttnWrapperBase._dsa_short_count
-            if _short_count is None:
-                _short_count = int(_short_mask.sum().item())
-            _any_short = _short_count > 0
-            _any_long = _short_count < _bsz
-            if not _any_long:
-                # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
-                top_k_indices = build_clamped_dense_token_indices(
-                    updated_seqlens, max_seqlen, hidden_states.device,
-                )
-            elif not _any_short:
-                # All rows > index_topk: full-batch indexer scoring (topk = index_topk).
-                q_a_for_indexer = q_a_normed.unsqueeze(1)
-                indexer_blocked_k, _, idx_block_table = \
-                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-                idx_block_table = reorder_block_table_to_batch_slots(
-                    idx_block_table, aux_slot_indices,
-                )
-                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-                top_k_indices = indexer.score_and_select_paged(
-                    q_a_for_indexer, hidden_states,
-                    indexer_blocked_k, idx_block_table,
-                    updated_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
-                    positions=new_token_pos,
-                    max_seqlen=max_seqlen,
-                )
-            else:
-                # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
-                _device = hidden_states.device
-                _long_mask = ~_short_mask
-                top_k_indices = torch.empty(
-                    _bsz, _idx_topk, dtype=torch.long, device=_device,
-                )
-                # Short rows: dense indices padded to index_topk via clamp.
-                _short_indices = build_clamped_dense_token_indices(
-                    updated_seqlens[_short_mask], _idx_topk, _device,
-                )  # [num_short, index_topk]
-                top_k_indices[_short_mask] = _short_indices
-                # Long rows: indexer scoring on the subset.
-                _long_cache_seqlens = updated_seqlens[_long_mask]
-                _long_max_seqlen = int(_long_cache_seqlens.max().item())
-                _q_a_long = q_a_normed[_long_mask].unsqueeze(1)
-                _hidden_long = hidden_states[_long_mask]
-                _new_token_pos_long = (
-                    new_token_pos[_long_mask] if new_token_pos is not None else None
-                )
-                _long_mask_aux = _long_mask.to(aux_slot_indices.device)
-                _aux_slot_indices_long = aux_slot_indices[_long_mask_aux]
-                indexer_blocked_k, _, idx_block_table = \
-                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-                _idx_block_table_long = reorder_block_table_to_batch_slots(
-                    idx_block_table, _aux_slot_indices_long,
-                )
-                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-                _long_top_k = indexer.score_and_select_paged(
-                    _q_a_long, _hidden_long,
-                    indexer_blocked_k, _idx_block_table_long,
-                    _long_cache_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
-                    positions=_new_token_pos_long,
-                    max_seqlen=_long_max_seqlen,
-                )  # [num_long, min(index_topk, _long_max_seqlen)] = [num_long, index_topk]
-                top_k_indices[_long_mask] = _long_top_k
-
-        # --- Step 4: Sparse gather MLA KV at top-K positions ---
-        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
-            mla_blocked_k, _, mla_block_table = \
-                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
-            mla_block_table = reorder_block_table_to_batch_slots(
-                mla_block_table, primary_slot_indices,
-            )
-            mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
-
-            # Index-OOB diagnostic for sparse_gather_from_paged_kv. top_k_indices
-            # max must be < num_cached_tokens (approximated by max(cache_seqlens))
-            # so the page_idx=tok_idx//page_size stays within the block_table's
-            # column range. If this fires, the indexer returned stale positions
-            # past the valid cache range — the main suspected OOB cause.
-            if _VERIFY and self.layer_idx <= 4:
-                _rk = AttnWrapperBase.get_rank_safe()
-                _tk_max = int(top_k_indices.max().item())
-                _tk_min = int(top_k_indices.min().item())
-                _tk_shape = tuple(top_k_indices.shape)
-                _bt_shape = tuple(mla_block_table.shape)
-                _bk_shape = tuple(mla_blocked_k.shape)  # [num_pages, page_sz, heads, dim]
-                _num_pages_loaded = _bk_shape[0]
-                _max_flat_idx = _num_pages_loaded * mla_page_size
-                _expected_max_valid_tok = _bt_shape[1] * mla_page_size
-                logging.warning(
-                    f"[VERIFY-GATHER rank={_rk} L{self.layer_idx} bsz={bsz}] "
-                    f"top_k=[{_tk_min},{_tk_max}] shape={_tk_shape} | "
-                    f"mla_block_table.shape={_bt_shape} mla_blocked_k.shape={_bk_shape} "
-                    f"page_size={mla_page_size} "
-                    f"max_flat_idx_if_clean={_max_flat_idx} "
-                    f"max_tok_pos_in_bt_cols={_expected_max_valid_tok} | "
-                    f"which branch: "
-                    f"{'dense-short-circuit' if not _any_long else ('full-indexer' if not _any_short else 'mixed')}"
-                )
-                # If top_k_indices has any value >= _expected_max_valid_tok, the
-                # gather will clamp to the last page column — if that column has
-                # garbage, physical_pages * page_size + offset can land past
-                # num_pages * page_size → illegal access.
-                if _tk_max >= _expected_max_valid_tok:
-                    logging.error(
-                        f"[VERIFY-GATHER rank={_rk} L{self.layer_idx}] top_k_indices "
-                        f"contains position {_tk_max} >= block_table_cols*page_size="
-                        f"{_expected_max_valid_tok}; block_table row gather will wrap"
-                    )
-            sparse_mla_kv = sparse_gather_from_paged_kv(
-                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
-            )
-            # sparse_mla_kv: [batch, topk, 1, 576]
-
-        # --- Step 5: Absorbed Q → sparse FlashMLA ---
-        with (dt.timed("q_absorb", li) if dt else _nullctx()):
-            if self._cached_q_absorb is not None:
-                q_absorb = self._cached_q_absorb
-                out_absorb = self._cached_out_absorb
-            else:
-                kv_b_proj = deepseek_v3_dequantization(
-                    attn.kv_b_proj.weight.data,
-                    weight_scale["kv_b_proj.weight_scale_inv"],
-                ).view(attn.num_heads, -1, attn.kv_lora_rank)
-                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
-                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
-                # JIT SGLang-layout weights for the BMM fallback path.
-                if self.w_kc is None:
-                    self.w_kc = q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-                    self.w_vc = out_absorb.contiguous().transpose(1, 2)
-
-            qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-            query_states = torch.empty(
-                bsz, attn.num_heads, 1, qk_head_dim,
-                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
-            )
-            q_nope_squeezed = q_nope.squeeze(2)  # [B, H, qk_nope_head_dim]
-
-            # WP5: FP8 absorb kernel or SGLang-aligned BF16 BMM fallback
-            if self._fp8_absorb_weights is not None:
-                absorbed_q = fp8_q_absorb(q_nope_squeezed, self._fp8_absorb_weights)
-                query_states[:, :, :, :attn.kv_lora_rank] = absorbed_q.view(
-                    bsz, attn.num_heads, 1, attn.kv_lora_rank
-                )
-            else:
-                if not self._warned_fp8_absorb_fallback:
-                    self._warned_fp8_absorb_fallback = True
-                    logging.warning(
-                        f"[layer {self.layer_idx}] WP5 FP8 absorb unavailable, "
-                        "falling back to SGLang-aligned BF16 BMM "
-                        "(bmm(q_nope.T, w_kc)) — see wrappers.initialize_decode_absorb"
-                    )
-                # Matches SGLang's forward_mla.py:298 exactly.
-                q_nope_out = torch.bmm(
-                    q_nope_squeezed.transpose(0, 1), self.w_kc,
-                ).transpose(0, 1)  # [B, H, kv_lora_rank]
-                query_states[:, :, :, :attn.kv_lora_rank] = q_nope_out.view(
-                    bsz, attn.num_heads, 1, attn.kv_lora_rank,
-                )
-
-            query_states[:, :, :, attn.kv_lora_rank:] = q_pe
-            query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
-
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            # Sparse seqlens: min(topk, actual cache length)
-            topk = top_k_indices.shape[1]
-            sparse_seqlens = torch.clamp(updated_seqlens, max=topk)
-
-            attn_out = sparse_flash_mla_decode(
-                query_states, sparse_mla_kv, sparse_seqlens,
-                attn.num_heads, attn.softmax_scale,
-                head_dim_v=attn.kv_lora_rank,
-                page_size=mla_page_size,
-            )
+            attn_out = run_prepared_sparse_flash_mla_decode(selector_inputs.flashmla)
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
@@ -1008,4 +637,3 @@ class GLM5AttnWrapper(AttnWrapperBase):
             attn_output = attn_output.view(bsz, 1, -1)
 
         return attn_output
-
