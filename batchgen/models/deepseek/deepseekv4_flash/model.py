@@ -76,6 +76,83 @@ def _cfg(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
+def _cfg_rope(config: Any, name: str, default: Any) -> Any:
+    rope_scaling = _cfg(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict) and name in rope_scaling:
+        return rope_scaling[name]
+    return _cfg(config, name, default)
+
+
+def _linear_ramp_factor(start: int, stop: int, dim: int, device: torch.device) -> torch.Tensor:
+    if start == stop:
+        stop += 1
+    ramp = (torch.arange(dim, dtype=torch.float32, device=device) - start) / (stop - start)
+    return torch.clamp(ramp, 0, 1)
+
+
+def _find_yarn_correction_dim(
+    num_rotations: float,
+    dim: int,
+    base: float,
+    max_seq_len: int,
+) -> float:
+    return dim * math.log(max_seq_len / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+
+def _find_yarn_correction_range(
+    low_rot: float,
+    high_rot: float,
+    dim: int,
+    base: float,
+    max_seq_len: int,
+) -> Tuple[int, int]:
+    low = math.floor(_find_yarn_correction_dim(low_rot, dim, base, max_seq_len))
+    high = math.ceil(_find_yarn_correction_dim(high_rot, dim, base, max_seq_len))
+    return max(low, 0), min(high, dim - 1)
+
+
+def _build_rope_freqs_cis(
+    positions: torch.Tensor,
+    dim: int,
+    base: float,
+    factor: float,
+    beta_fast: float,
+    beta_slow: float,
+    original_seq_len: int,
+) -> torch.Tensor:
+    device = positions.device
+    freqs = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+    )
+    if original_seq_len > 0:
+        low, high = _find_yarn_correction_range(
+            beta_fast, beta_slow, dim, base, original_seq_len
+        )
+        smooth = 1 - _linear_ramp_factor(low, high, dim // 2, device)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    phase = positions.to(torch.float32).unsqueeze(-1) * freqs.unsqueeze(0)
+    return torch.polar(torch.ones_like(phase), phase)
+
+
+def _apply_rotary_emb_inplace(x: torch.Tensor, freqs_cis: torch.Tensor) -> None:
+    rope_dim = x.shape[-1]
+    x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if x.dim() == 4:
+        if freqs_cis.dim() == 2:
+            freqs_view = freqs_cis.view(1, freqs_cis.size(0), 1, freqs_cis.size(1))
+        else:
+            freqs_view = freqs_cis.unsqueeze(2)
+    elif x.dim() == 3:
+        if freqs_cis.dim() == 2:
+            freqs_view = freqs_cis.view(1, freqs_cis.size(0), freqs_cis.size(1))
+        else:
+            freqs_view = freqs_cis
+    else:
+        raise RuntimeError(f"Unsupported V4 rotary tensor rank: {x.dim()}")
+    rotated = torch.view_as_real(x_complex * freqs_view).flatten(-2)
+    x.copy_(rotated.to(dtype=x.dtype).view(*x.shape[:-1], rope_dim))
+
+
 def _linear_from_weight(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -318,11 +395,25 @@ class DeepSeekV4FlashAttention(nn.Module):
         self.q_lora_rank = int(_cfg(config, "q_lora_rank", 1024))
         self.o_groups = int(_cfg(config, "o_groups", 8))
         self.o_lora_rank = int(_cfg(config, "o_lora_rank", 1024))
+        self.rope_head_dim = int(_cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64)))
         self.eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
         self.softmax_scale = self.head_dim ** -0.5
 
         ratios = list(_cfg(config, "compress_ratios", []))
         self.compress_ratio = int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
+        self.rope_theta = float(
+            _cfg(config, "compress_rope_theta", 40000.0)
+            if self.compress_ratio
+            else _cfg(config, "rope_theta", 10000.0)
+        )
+        self.rope_factor = float(_cfg_rope(config, "factor", 1.0))
+        self.beta_fast = float(_cfg_rope(config, "beta_fast", 32))
+        self.beta_slow = float(_cfg_rope(config, "beta_slow", 1))
+        self.original_seq_len = (
+            int(_cfg_rope(config, "original_max_position_embeddings", 0))
+            if self.compress_ratio
+            else 0
+        )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self.wq_a = DeepSeekV4FlashLinearSlot(self.hidden_size, self.q_lora_rank)
@@ -358,6 +449,56 @@ class DeepSeekV4FlashAttention(nn.Module):
         else:
             self.compressor = None
             self.indexer = None
+
+    def _positions_for_rope(
+        self,
+        *,
+        bsz: int,
+        q_len: int,
+        position_ids: Optional[torch.Tensor],
+        cache_seqlens: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if position_ids is not None:
+            positions = position_ids.to(device=device, dtype=torch.long)
+            if positions.dim() == 1:
+                positions = positions.unsqueeze(0).expand(bsz, -1)
+            return positions[:, -q_len:]
+        if cache_seqlens is not None and q_len == 1:
+            return (cache_seqlens.to(device=device, dtype=torch.long) - 1).clamp_min(0).view(bsz, 1)
+        return torch.arange(q_len, device=device, dtype=torch.long).view(1, q_len).expand(bsz, q_len)
+
+    def _apply_rope(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        *,
+        position_ids: Optional[torch.Tensor],
+        cache_seqlens: Optional[torch.Tensor],
+    ) -> None:
+        if self.rope_head_dim <= 0:
+            return
+        positions = self._positions_for_rope(
+            bsz=q.size(0),
+            q_len=q.size(1),
+            position_ids=position_ids,
+            cache_seqlens=cache_seqlens,
+            device=q.device,
+        )
+        flat_positions = positions.reshape(-1)
+        freqs = _build_rope_freqs_cis(
+            flat_positions,
+            self.rope_head_dim,
+            self.rope_theta,
+            self.rope_factor,
+            self.beta_fast,
+            self.beta_slow,
+            self.original_seq_len,
+        ).view(*positions.shape, self.rope_head_dim // 2)
+        if positions.size(0) == 1 and q.size(0) != 1:
+            freqs = freqs.expand(q.size(0), -1, -1)
+        _apply_rotary_emb_inplace(q[..., -self.rope_head_dim:], freqs)
+        _apply_rotary_emb_inplace(kv[..., -self.rope_head_dim:], freqs)
 
     def set_runtime_tensors(self, tensors: Dict[str, torch.Tensor]) -> None:
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
@@ -395,7 +536,7 @@ class DeepSeekV4FlashAttention(nn.Module):
         cache_seqlens: Optional[torch.Tensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
-        del position_ids, use_cache
+        del use_cache
         bsz, q_len, _ = hidden_states.shape
         is_decode = past_key_value is not None
         if is_decode:
@@ -409,6 +550,12 @@ class DeepSeekV4FlashAttention(nn.Module):
             _v4_diag(f"attn L{self.layer_idx} q done")
 
         kv = self.kv_norm(self.wkv(hidden_states))
+        self._apply_rope(
+            q,
+            kv,
+            position_ids=position_ids,
+            cache_seqlens=cache_seqlens,
+        )
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} wkv done")
         kv_for_attn = kv
