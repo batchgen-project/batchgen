@@ -170,11 +170,11 @@ def _topk_from_scores_kernel(
 ):
     """Select top-k indices from one row of scores.
 
-    This first custom top-k kernel is intentionally simple: one Triton program
-    owns one batch row, loads the full static score row, and repeatedly selects
-    the current maximum. It replaces ``torch.topk`` in the production path and
-    is suitable for current DSA selected windows / seqlen buckets. For very long
-    contexts, replace this with a hierarchical tile-topk + merge kernel.
+    One Triton program owns one batch row. It first finds a score threshold whose
+    greater-than set is smaller than ``topk``, compacts that set to the output,
+    then repairs the remaining slots with exact repeated maxima from the residual
+    values. This keeps the common GLM case near O(log(score_range) * N) instead
+    of O(topk * N), while preserving the exact top-k set.
     """
 
     pid_b = tl.program_id(0)
@@ -187,13 +187,31 @@ def _topk_from_scores_kernel(
     )
     idxs = offs
 
-    k = 0
-    while k < topk:
+    lo = tl.min(tl.where(mask, vals, float("inf")), axis=0)
+    hi = tl.max(vals, axis=0)
+
+    for _ in range(32):
+        mid = (lo + hi) * 0.5
+        n_ge = tl.sum(tl.where(vals >= mid, 1, 0), axis=0)
+        lo = tl.where(n_ge >= topk, mid, lo)
+        hi = tl.where(n_ge >= topk, hi, mid)
+
+    selected_hi = vals > hi
+    ranks = tl.cumsum(tl.where(selected_hi, 1, 0), 0) - 1
+    tl.store(
+        OUT_ptr + pid_b * topk + ranks,
+        idxs,
+        mask=selected_hi & (ranks < topk),
+    )
+
+    vals = tl.where(selected_hi, float("-inf"), vals)
+    out_pos = tl.sum(tl.where(selected_hi, 1, 0), axis=0)
+    while out_pos < topk:
         best_val = tl.max(vals, axis=0)
         best_idx = tl.max(tl.where(vals == best_val, idxs, 0), axis=0)
-        tl.store(OUT_ptr + pid_b * topk + k, best_idx)
+        tl.store(OUT_ptr + pid_b * topk + out_pos, best_idx)
         vals = tl.where(idxs == best_idx, float("-inf"), vals)
-        k += 1
+        out_pos += 1
 
 
 # ============================================================
