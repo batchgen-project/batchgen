@@ -490,7 +490,7 @@ def test_fused_selector_flashmla_matches_current_glm_hot_path(cache_values):
 
     query_states = _make_query(batch_size, seed=41 + batch_size)
     softmax_scale = D_QK**-0.5
-    current_out, _ = _run_flashmla_dense(
+    current_ref_out, _ = _selected_attention_reference(
         query_states,
         current_selected,
         current_lengths,
@@ -502,7 +502,7 @@ def test_fused_selector_flashmla_matches_current_glm_hot_path(cache_values):
         fused_lengths,
         softmax_scale=softmax_scale,
     )
-    _assert_flashmla_close(fused_out, current_out)
+    _assert_flashmla_close(fused_out, current_ref_out)
 
 
 @pytest.mark.parametrize(
