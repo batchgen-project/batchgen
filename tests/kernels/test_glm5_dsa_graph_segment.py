@@ -140,7 +140,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     )
     segment_name = make_glm5_dsa_graph_segment_name(0)
     manager = CUDAGraphManager(
-        BatchSizeBucketing([batch_size]),
+        BatchSizeBucketing([1, batch_size]),
         device=torch.device("cuda"),
     )
     manager.register_segment(segment_name, segment)
@@ -165,4 +165,20 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     )
     torch.testing.assert_close(
         actual["selected_mla_kv"], expected["selected_mla_kv"], atol=0, rtol=0
+    )
+
+    small_inputs = _make_inputs(1, max_seqlen)
+    small_inputs["primary_page_table"] = primary_page_table[:1]
+    small_expected = {
+        key: value.clone()
+        for key, value in segment.forward(**small_inputs).items()
+    }
+    small_actual = manager.replay(segment_name, 1, **small_inputs)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        small_actual["attn_heads"], small_expected["attn_heads"], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        small_actual["top_k_indices"], small_expected["top_k_indices"], atol=0, rtol=0
     )
