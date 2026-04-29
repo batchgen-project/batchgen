@@ -6586,12 +6586,16 @@ class BatchGenWorker:
 			stats = worker_view.get_prefix_cache_stats()
 			logging.info(
 				"Rank %s prefix reuse commit: sequences=%d inserted_pages=%d "
-				"entries=%d saved_pages=%d",
+				"entries=%d saved_pages=%d lookup_hits=%d lookup_misses=%d "
+				"shared_pages_attached=%d",
 				self.rank,
 				committed_sequences,
 				inserted_pages,
 				stats.entries,
 				stats.host_pages_saved,
+				stats.lookup_hits,
+				stats.lookup_misses,
+				stats.shared_pages_attached,
 			)
 
 	def _drain_pending_prefill_offloads(
