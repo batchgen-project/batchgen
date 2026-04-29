@@ -11,6 +11,7 @@ from batchgen.models.glm.glm5.decode_utils import (
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.glm.glm5.wrappers import (
+    GLM5AttnWrapper,
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 
@@ -145,3 +146,51 @@ def test_glm5_dsa_cuda_graph_required_fast_fails_without_replay(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Refusing to silently fall back"):
         _fail_if_glm5_dsa_cuda_graph_required_without_replay()
+
+
+def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.module = type("Attn", (), {"hidden_size": 16})()
+    wrapper.layer_idx = 0
+    expected = torch.ones(2, 1, 16)
+
+    def fake_graph_route(self, hidden_states, position_ids, cache_seqlens, max_seqlen, primary, aux):
+        assert hidden_states.shape == (2, 1, 16)
+        assert position_ids.dtype == torch.int64
+        assert cache_seqlens.dtype == torch.int32
+        assert max_seqlen == 4096
+        assert primary == "primary"
+        assert aux == "aux"
+        return expected
+
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph_route)
+
+    actual = wrapper._forward_decode_dsa(
+        torch.zeros(2, 1, 16),
+        torch.tensor([[7], [8]], dtype=torch.int64),
+        torch.tensor([8, 9], dtype=torch.int32),
+        4096,
+        "primary",
+        "aux",
+    )
+
+    assert actual is expected
+
+
+def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
+    wrapper._dsa_cuda_graph_manager = None
+    wrapper._dsa_cuda_graph_segment_name = None
+
+    with pytest.raises(RuntimeError, match="no registered DSA CUDA graph segment"):
+        wrapper._forward_decode_dsa_graph(
+            torch.zeros(1, 1, 16),
+            torch.tensor([[1]], dtype=torch.int64),
+            torch.tensor([2], dtype=torch.int32),
+            128,
+            object(),
+            object(),
+        )

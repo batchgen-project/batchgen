@@ -260,6 +260,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Fallback warning guards
         self._warned_fp8_absorb_fallback = False
         self._warned_indexer_kv_fallback = False
+        self._dsa_cuda_graph_manager = None
+        self._dsa_cuda_graph_segment_name = None
+        self._dsa_cuda_graph_max_seqlen = 0
+        self._dsa_cuda_graph_max_primary_pages = 0
+        self._dsa_cuda_graph_max_aux_pages = 0
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -399,6 +404,21 @@ class GLM5AttnWrapper(AttnWrapperBase):
     ) -> Dict[str, torch.Tensor]:
         """Return FP8 weights unchanged — deepgemm handles FP8 directly."""
         return weights_dict
+
+    def enable_dsa_cuda_graph(
+        self,
+        manager,
+        segment_name: str,
+        *,
+        max_seqlen: int,
+        max_primary_pages_per_seq: int,
+        max_aux_pages_per_seq: int,
+    ) -> None:
+        self._dsa_cuda_graph_manager = manager
+        self._dsa_cuda_graph_segment_name = segment_name
+        self._dsa_cuda_graph_max_seqlen = max_seqlen
+        self._dsa_cuda_graph_max_primary_pages = max_primary_pages_per_seq
+        self._dsa_cuda_graph_max_aux_pages = max_aux_pages_per_seq
 
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward with DSA auxiliary cache population.
@@ -587,6 +607,84 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             return (attn_output, updated_past_key, updated_scale)
 
+    def _forward_decode_dsa_graph(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+    ) -> torch.Tensor:
+        if self._dsa_cuda_graph_manager is None or self._dsa_cuda_graph_segment_name is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] BATCHGEN_GLM5_DSA_CUDA_GRAPH=1 was requested, "
+                "but this attention wrapper has no registered DSA CUDA graph segment"
+            )
+        if max_seqlen > self._dsa_cuda_graph_max_seqlen:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph max_seqlen={max_seqlen} "
+                f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
+            )
+
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_graph_segment_inputs,
+        )
+        from batchgen.attention.mla.fa3_backend import act_quant
+        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+
+        attn = self.module
+        bsz = hidden_states.shape[0]
+        graph_inputs = build_glm5_dsa_graph_segment_inputs(
+            self,
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            max_primary_pages_per_seq=self._dsa_cuda_graph_max_primary_pages,
+            max_aux_pages_per_seq=self._dsa_cuda_graph_max_aux_pages,
+        )
+        if AttnWrapperBase.kv_append_callback is not None:
+            AttnWrapperBase.kv_append_callback(
+                self.layer_idx,
+                graph_inputs.primary_k_tensor,
+                None,
+            )
+        if AttnWrapperBase.kv_append_callback_aux is not None:
+            AttnWrapperBase.kv_append_callback_aux(
+                self.layer_idx,
+                graph_inputs.indexer_k_tensor,
+                None,
+            )
+
+        graph_outputs = self._dsa_cuda_graph_manager.replay(
+            self._dsa_cuda_graph_segment_name,
+            bsz,
+            q_a=graph_inputs.q_a,
+            q_nope=graph_inputs.q_nope,
+            q_rope=graph_inputs.q_rope,
+            head_gates=graph_inputs.head_gates,
+            cache_seqlens=graph_inputs.cache_seqlens,
+            positions_expanded=graph_inputs.positions_expanded,
+            primary_page_table=graph_inputs.primary_page_table,
+            aux_page_table=graph_inputs.aux_page_table,
+        )
+
+        attn_heads = graph_outputs["attn_heads"].reshape(
+            bsz,
+            attn.num_heads * attn.v_head_dim,
+        )
+        attn_output_fp8, attn_output_scale = act_quant(attn_heads)
+        attn_output = w8a8_deepgemm(
+            attn_output_fp8,
+            attn_output_scale,
+            attn.o_proj.weight,
+            self.weight_dequant_scale["o_proj.weight_scale_inv"],
+        )
+        return attn_output.view(bsz, 1, -1)
+
     def _forward_decode_dsa(
         self,
         hidden_states: torch.Tensor,
@@ -601,6 +699,24 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Computes MLA KV and writes to primary cache first, then runs indexer
         scoring on aux cache, gathers sparse MLA KV, and runs sparse FlashMLA.
         """
+        attn = self.module
+        bsz = hidden_states.shape[0]
+        li = self.layer_idx
+
+        # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
+        if bsz == 0:
+            return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        if _glm5_dsa_cuda_graph_required():
+            return self._forward_decode_dsa_graph(
+                hidden_states,
+                position_ids,
+                cache_seqlens,
+                max_seqlen,
+                gpu_paged_kv_manager,
+                gpu_paged_kv_manager_aux,
+            )
+
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_flashmla_inputs,
         )
@@ -612,17 +728,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         from batchgen.timing import get_decode_timer
 
         weight_scale = self.weight_dequant_scale
-        attn = self.module
-        bsz = hidden_states.shape[0]
         dt = get_decode_timer()
-        li = self.layer_idx
-
-        # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
-        if bsz == 0:
-            return hidden_states.new_empty(0, 1, attn.hidden_size)
-
-        _fail_if_glm5_dsa_cuda_graph_required_without_replay()
-
         selector_inputs = build_glm5_dsa_flashmla_inputs(
             self,
             hidden_states,

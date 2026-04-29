@@ -241,7 +241,7 @@ def build_glm5_dsa_graph_segment_inputs(
         q_nope=q_nope,
         q_rope=q_rope,
         head_gates=head_gates,
-        cache_seqlens=cache_seqlens,
+        cache_seqlens=cache_seqlens.to(dtype=torch.int32, device=manager_device),
         positions_expanded=positions_expanded,
         primary_page_table=primary_page_table,
         aux_page_table=aux_page_table,

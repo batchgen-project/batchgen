@@ -7942,7 +7942,16 @@ class BatchGenWorker:
 
 		# Model guard: only capture for supported models
 		model_name = getattr(self, 'model_name', '') or ''
-		if "gpt-oss-120b" not in model_name.lower() and not is_kimi_k25_backend_model(model_name):
+		model_name_l = model_name.lower()
+		glm5_dsa_graph_enabled = (
+			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			and "glm" in model_name_l
+		)
+		if (
+			"gpt-oss-120b" not in model_name_l
+			and not is_kimi_k25_backend_model(model_name)
+			and not glm5_dsa_graph_enabled
+		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
 
@@ -8042,6 +8051,95 @@ class BatchGenWorker:
 		# Use model's max_position_embeddings (not max_context_length) so the
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
+		model_name_l = (getattr(self, 'model_name', '') or '').lower()
+		glm5_dsa_graph_enabled = (
+			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			and "glm" in model_name_l
+		)
+		if glm5_dsa_graph_enabled:
+			from batchgen.models.glm.glm5.cuda_graph_segments import (
+				Glm5DsaAttnSegment,
+				make_glm5_dsa_graph_segment_name,
+			)
+
+			primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+			aux_manager = getattr(
+				gpu_manager,
+				"auxiliary",
+				getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+			)
+			if aux_manager is None:
+				raise RuntimeError("GLM-5 DSA CUDA graph requested but auxiliary GPU KV manager is missing")
+
+			graph_max_seqlen = int(os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN", "8192"))
+			if graph_max_seqlen <= 0:
+				raise RuntimeError("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN must be positive")
+			primary_page_size = int(primary_manager.config.page_size_tokens)
+			aux_page_size = int(aux_manager.config.page_size_tokens)
+			max_primary_pages = (graph_max_seqlen + primary_page_size - 1) // primary_page_size
+			max_aux_pages = (graph_max_seqlen + aux_page_size - 1) // aux_page_size
+
+			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
+			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				wrapper = decoder_layer.self_attn
+				attn = wrapper.module
+				indexer = getattr(attn, "indexer", None)
+				if indexer is None:
+					raise RuntimeError(f"GLM-5 DSA CUDA graph requested but layer {layer_idx} has no indexer")
+				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+					wrapper.initialize_decode_absorb()
+				if getattr(wrapper, "_fused_wqb_weights", None) is None or getattr(wrapper, "_indexer_cuda_module", None) is None:
+					wrapper.initialize_fused_kernels()
+				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+					raise RuntimeError(f"Layer {layer_idx}: GLM-5 DSA CUDA graph requires FP8 absorb weights")
+				if getattr(wrapper, "_fused_wqb_weights", None) is None:
+					raise RuntimeError(f"Layer {layer_idx}: GLM-5 DSA CUDA graph requires fused WQB weights")
+				if getattr(wrapper, "_indexer_cuda_module", None) is None:
+					raise RuntimeError(f"Layer {layer_idx}: GLM-5 DSA CUDA graph requires fused indexer CUDA module")
+
+				primary_blocked_k, _, _ = primary_manager.get_layer_kv_with_page_table(layer_idx)
+				aux_blocked_k, _, _ = aux_manager.get_layer_kv_with_page_table(layer_idx)
+				dummy = torch.empty(
+					1,
+					1,
+					indexer.rope_head_dim,
+					device=primary_blocked_k.device,
+					dtype=torch.bfloat16,
+				)
+				cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
+				segment = Glm5DsaAttnSegment(
+					primary_blocked_k=primary_blocked_k,
+					aux_blocked_k=aux_blocked_k,
+					wq_b_weights=wrapper._fused_wqb_weights,
+					absorb_weights=wrapper._fp8_absorb_weights,
+					cuda_module=wrapper._indexer_cuda_module,
+					cos_table=cos_table,
+					sin_table=sin_table,
+					max_seqlen=graph_max_seqlen,
+					index_topk=indexer.index_topk,
+					page_size=primary_page_size,
+					aux_page_size=aux_page_size,
+					softmax_scale=attn.softmax_scale,
+				)
+				segment_name = make_glm5_dsa_graph_segment_name(layer_idx)
+				manager.register_segment(segment_name, segment)
+				wrapper.enable_dsa_cuda_graph(
+					manager,
+					segment_name,
+					max_seqlen=graph_max_seqlen,
+					max_primary_pages_per_seq=max_primary_pages,
+					max_aux_pages_per_seq=max_aux_pages,
+				)
+
+			logging.info(
+				f"Rank {self.rank}: capturing GLM-5 DSA CUDA graph segments for "
+				f"{len(self.model.model.layers)} layers with max_seqlen={graph_max_seqlen}"
+			)
+			manager.warmup_and_capture_all()
+			self._cuda_graph_manager = manager
+			self._whole_model_graph = False
+			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
 		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
