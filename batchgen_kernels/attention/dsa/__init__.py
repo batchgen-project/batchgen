@@ -9,10 +9,11 @@ __all__ = []
 # WP3: Fused paged gather (Triton)
 try:
     from batchgen_kernels.attention.dsa.fused_paged_gather import (
+        fused_dense_paged_gather,
         fused_paged_gather,
         fused_indexer_gather,
     )
-    __all__ += ["fused_paged_gather", "fused_indexer_gather"]
+    __all__ += ["fused_dense_paged_gather", "fused_paged_gather", "fused_indexer_gather"]
 except (ImportError, Exception):
     pass
 
@@ -20,8 +21,18 @@ except (ImportError, Exception):
 try:
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
         fused_select_mla_kv_bf16,
+        fused_select_mla_kv_bf16_out,
     )
-    __all__ += ["fused_select_mla_kv_bf16"]
+    __all__ += ["fused_select_mla_kv_bf16", "fused_select_mla_kv_bf16_out"]
+except (ImportError, Exception):
+    pass
+
+# Synthetic selected-KV FlashMLA block-table fill (Triton)
+try:
+    from batchgen_kernels.attention.dsa.selected_block_table import (
+        make_selected_block_table,
+    )
+    __all__ += ["make_selected_block_table"]
 except (ImportError, Exception):
     pass
 

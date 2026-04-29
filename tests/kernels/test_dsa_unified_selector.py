@@ -24,6 +24,7 @@ from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.attention.dsa.unified_selector import (
     make_flashmla_selected_block_table,
     select_mla_kv_for_flashmla_bf16,
+    select_mla_kv_for_flashmla_bf16_out,
     view_selected_mla_kv_as_flashmla_pages,
 )
 
@@ -503,6 +504,81 @@ def test_fused_selector_flashmla_matches_current_glm_hot_path(cache_values):
         softmax_scale=softmax_scale,
     )
     _assert_flashmla_close(fused_out, current_ref_out)
+
+
+def test_fused_selector_cuda_graph_replay_matches_eager():
+    torch.cuda.set_device(0)
+    batch_size = 4
+    max_tokens = 4096
+    cache_seqlens = torch.tensor(
+        [64, INDEX_TOPK, 2049, max_tokens],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    _, primary_blocked_k, primary_page_table = _make_paged_primary_cache(
+        batch_size=batch_size,
+        max_tokens=max_tokens,
+        seed=53,
+    )
+    long_topk_indices = torch.full(
+        (batch_size, INDEX_TOPK),
+        -1,
+        device="cuda",
+        dtype=torch.long,
+    )
+    long_topk_indices[2] = torch.randperm(2049, device="cuda")[:INDEX_TOPK]
+    long_topk_indices[3] = torch.randperm(max_tokens, device="cuda")[:INDEX_TOPK]
+
+    eager = select_mla_kv_for_flashmla_bf16(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        index_topk=INDEX_TOPK,
+        page_size=PAGE_SIZE,
+        return_indices=False,
+    )
+    selected_out = torch.empty_like(eager[0])
+    lengths_out = torch.empty_like(eager[1])
+    row_modes_out = torch.empty_like(eager[3])
+
+    for _ in range(3):
+        select_mla_kv_for_flashmla_bf16_out(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            PAGE_SIZE,
+            selected_out,
+            lengths_out,
+            None,
+            row_modes_out,
+            index_topk=INDEX_TOPK,
+            return_indices=False,
+        )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select_mla_kv_for_flashmla_bf16_out(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            PAGE_SIZE,
+            selected_out,
+            lengths_out,
+            None,
+            row_modes_out,
+            index_topk=INDEX_TOPK,
+            return_indices=False,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(selected_out, eager[0])
+    torch.testing.assert_close(lengths_out, eager[1])
+    torch.testing.assert_close(row_modes_out, eager[3])
 
 
 @pytest.mark.parametrize(

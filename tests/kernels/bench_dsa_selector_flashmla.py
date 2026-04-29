@@ -32,6 +32,7 @@ from batchgen.attention.dsa.sparse_decode_mla import (
 )
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16
+from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16_out
 from batchgen.models.glm.glm5.decode_utils import build_clamped_dense_token_indices
 
 
@@ -206,6 +207,77 @@ def _selector_prepare(
     )
 
 
+def _selector_only(
+    blocked_k: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    token_indices: torch.Tensor,
+):
+    return select_mla_kv_for_flashmla_bf16(
+        blocked_k,
+        page_table,
+        cache_seqlens,
+        token_indices,
+        index_topk=INDEX_TOPK,
+        page_size=PAGE_SIZE,
+        return_indices=False,
+    )
+
+
+def _make_selector_graph_fn(
+    blocked_k: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    token_indices: torch.Tensor,
+):
+    selected = torch.empty(
+        token_indices.shape[0],
+        INDEX_TOPK,
+        H_KV,
+        D_QK,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    selected_lengths = torch.empty(
+        token_indices.shape[0],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_modes = torch.empty(
+        token_indices.shape[0],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def run_out():
+        return select_mla_kv_for_flashmla_bf16_out(
+            blocked_k,
+            page_table,
+            cache_seqlens,
+            token_indices,
+            PAGE_SIZE,
+            selected,
+            selected_lengths,
+            None,
+            row_modes,
+            index_topk=INDEX_TOPK,
+            return_indices=False,
+        )
+
+    for _ in range(3):
+        run_out()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_out()
+
+    def replay():
+        graph.replay()
+        return selected, selected_lengths, None, row_modes
+
+    return replay
+
+
 def _time_cuda(fn, *, warmup: int, iters: int) -> list[float]:
     for _ in range(warmup):
         fn()
@@ -269,6 +341,7 @@ def main() -> None:
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--include-flashmla", action="store_true")
     parser.add_argument("--include-rope-hadamard", action="store_true")
+    parser.add_argument("--include-cudagraph", action="store_true")
     args = parser.parse_args()
 
     torch.cuda.set_device(0)
@@ -331,6 +404,45 @@ def main() -> None:
                     f"p90_ms={summary[2]:.4f},p99_ms={summary[3]:.4f},"
                     f"min_ms={summary[4]:.4f},{comparison}"
                 )
+
+            if args.include_cudagraph:
+                eager_selector_times = _time_cuda(
+                    lambda: _selector_only(
+                        blocked_k,
+                        page_table,
+                        cache_seqlens,
+                        fixed_indices,
+                    ),
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                graph_selector_fn = _make_selector_graph_fn(
+                    blocked_k,
+                    page_table,
+                    cache_seqlens,
+                    fixed_indices,
+                )
+                graph_selector_times = _time_cuda(
+                    graph_selector_fn,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                eager_selector_summary = _summarize(eager_selector_times)
+                graph_selector_summary = _summarize(graph_selector_times)
+                graph_comparison = _compare_label(
+                    eager_selector_summary[0],
+                    graph_selector_summary[0],
+                )
+                for path, summary in (
+                    ("fused_selector_eager", eager_selector_summary),
+                    ("fused_selector_cudagraph", graph_selector_summary),
+                ):
+                    print(
+                        f"{case.name},b={batch_size},{path},"
+                        f"median_ms={summary[0]:.4f},p50_ms={summary[1]:.4f},"
+                        f"p90_ms={summary[2]:.4f},p99_ms={summary[3]:.4f},"
+                        f"min_ms={summary[4]:.4f},{graph_comparison}"
+                    )
 
         if args.include_rope_hadamard:
             _bench_rope_hadamard(batch_size, 8192, args.warmup, args.iters)

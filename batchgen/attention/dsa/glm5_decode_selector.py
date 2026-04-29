@@ -27,7 +27,6 @@ from batchgen.attention.mla.fused_rmsnorm_rope import (
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
 from batchgen.models.glm.glm5.decode_utils import (
     build_batch_slot_indices,
-    build_clamped_dense_token_indices,
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.wrappers import AttnWrapperBase
@@ -281,81 +280,28 @@ def _select_glm5_dsa_indices(
 ) -> tuple[torch.Tensor, str, torch.Tensor]:
     indexer = wrapper.module.indexer
     index_topk = indexer.index_topk
-    short_mask = cache_seqlens <= index_topk
-    batch_size = short_mask.shape[0]
-    short_count = AttnWrapperBase._dsa_short_count
-    if short_count is None:
-        short_count = int(short_mask.sum().item())
-    any_short = short_count > 0
-    any_long = short_count < batch_size
-    row_modes = (~short_mask).to(torch.int32)
-
-    if not any_long:
-        return (
-            build_clamped_dense_token_indices(
-                cache_seqlens, index_topk, hidden_states.device,
-            ),
-            "dense-short-circuit",
-            row_modes,
-        )
-
-    if not any_short:
-        indexer_blocked_k, _, idx_block_table = (
-            gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(wrapper.layer_idx)
-        )
-        idx_block_table = reorder_block_table_to_batch_slots(
-            idx_block_table, aux_slot_indices,
-        )
-        aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-        return (
-            indexer.score_and_select_paged(
-                q_a_normed.unsqueeze(1),
-                hidden_states,
-                indexer_blocked_k,
-                idx_block_table,
-                cache_seqlens,
-                gpu_paged_kv_manager_aux,
-                aux_page_size,
-                positions=new_token_pos,
-                max_seqlen=max_seqlen,
-            ),
-            "full-indexer",
-            row_modes,
-        )
-
-    device = hidden_states.device
-    long_mask = ~short_mask
-    top_k_indices = torch.empty(
-        batch_size, index_topk, dtype=torch.long, device=device,
-    )
-    top_k_indices[short_mask] = build_clamped_dense_token_indices(
-        cache_seqlens[short_mask], index_topk, device,
-    )
-
-    long_cache_seqlens = cache_seqlens[long_mask]
-    long_max_seqlen = int(long_cache_seqlens.max().item())
-    long_mask_aux = long_mask.to(aux_slot_indices.device)
-    aux_slot_indices_long = aux_slot_indices[long_mask_aux]
+    row_modes = (cache_seqlens > index_topk).to(torch.int32)
     indexer_blocked_k, _, idx_block_table = (
         gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(wrapper.layer_idx)
     )
-    idx_block_table_long = reorder_block_table_to_batch_slots(
-        idx_block_table, aux_slot_indices_long,
+    idx_block_table = reorder_block_table_to_batch_slots(
+        idx_block_table, aux_slot_indices,
     )
     aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-    top_k_indices[long_mask] = indexer.score_and_select_paged(
-        q_a_normed[long_mask].unsqueeze(1),
-        hidden_states[long_mask],
+    score_max_seqlen = max(max_seqlen, index_topk)
+    top_k_indices = indexer.score_and_select_paged(
+        q_a_normed.unsqueeze(1),
+        hidden_states,
         indexer_blocked_k,
-        idx_block_table_long,
-        long_cache_seqlens,
+        idx_block_table,
+        cache_seqlens,
         gpu_paged_kv_manager_aux,
         aux_page_size,
-        positions=new_token_pos[long_mask],
-        max_seqlen=long_max_seqlen,
+        positions=new_token_pos,
+        max_seqlen=score_max_seqlen,
     )
 
-    return top_k_indices, "mixed", row_modes
+    return top_k_indices, "unified-indexer", row_modes
 
 
 def _build_query_states(
@@ -437,32 +383,21 @@ def _log_dsa_bounds(
     aux_rows = 0 if aux_pt is None else int(aux_pt.shape[0])
     prim_cols = 0 if prim_pt is None else int(prim_pt.shape[1])
     aux_cols = 0 if aux_pt is None else int(aux_pt.shape[1])
-    prim_max = int(primary_slot_indices.max().item())
-    prim_min = int(primary_slot_indices.min().item())
-    aux_max = int(aux_slot_indices.max().item())
-    aux_min = int(aux_slot_indices.min().item())
-    cs_max = int(cache_seqlens.max().item())
-    cs_min = int(cache_seqlens.min().item())
-    pos_max = int(new_token_pos.max().item())
-    pos_min = int(new_token_pos.min().item())
     prim_pages = int(gpu_paged_kv_manager.config.num_pages)
     aux_pages = int(gpu_paged_kv_manager_aux.config.num_pages)
     prim_psz = int(gpu_paged_kv_manager.config.page_size_tokens)
     aux_psz = int(gpu_paged_kv_manager_aux.config.page_size_tokens)
     logging.warning(
         f"[VERIFY-DSA rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
-        f"prim_slot=[{prim_min},{prim_max}] max_rows={prim_rows} cols={prim_cols} "
+        f"primary_slot_shape={tuple(primary_slot_indices.shape)} "
+        f"max_rows={prim_rows} cols={prim_cols} "
         f"num_pages={prim_pages} page_sz={prim_psz} | "
-        f"aux_slot=[{aux_min},{aux_max}] max_rows={aux_rows} cols={aux_cols} "
+        f"aux_slot_shape={tuple(aux_slot_indices.shape)} "
+        f"max_rows={aux_rows} cols={aux_cols} "
         f"num_pages={aux_pages} page_sz={aux_psz} | "
-        f"cache_seq=[{cs_min},{cs_max}] pos=[{pos_min},{pos_max}] "
+        f"cache_seq_shape={tuple(cache_seqlens.shape)} "
+        f"pos_shape={tuple(new_token_pos.shape)} "
         f"max_seqlen={max_seqlen}"
-    )
-    assert prim_max < prim_rows, (
-        f"primary_slot_indices.max()={prim_max} >= page_table.shape[0]={prim_rows}"
-    )
-    assert aux_max < aux_rows, (
-        f"aux_slot_indices.max()={aux_max} >= aux page_table.shape[0]={aux_rows}"
     )
     expected_prim_pages = (max_seqlen + prim_psz - 1) // prim_psz
     expected_aux_pages = (max_seqlen + aux_psz - 1) // aux_psz
@@ -490,8 +425,6 @@ def _log_gather_bounds(
     branch_label: str,
 ) -> None:
     rk = AttnWrapperBase.get_rank_safe()
-    tk_max = int(top_k_indices.max().item())
-    tk_min = int(top_k_indices.min().item())
     tk_shape = tuple(top_k_indices.shape)
     bt_shape = tuple(mla_block_table.shape)
     bk_shape = tuple(mla_blocked_k.shape)
@@ -500,15 +433,9 @@ def _log_gather_bounds(
     expected_max_valid_tok = bt_shape[1] * mla_page_size
     logging.warning(
         f"[VERIFY-GATHER rank={rk} L{wrapper.layer_idx} bsz={bsz}] "
-        f"top_k=[{tk_min},{tk_max}] shape={tk_shape} | "
+        f"top_k_shape={tk_shape} | "
         f"mla_block_table.shape={bt_shape} mla_blocked_k.shape={bk_shape} "
         f"page_size={mla_page_size} max_flat_idx_if_clean={max_flat_idx} "
         f"max_tok_pos_in_bt_cols={expected_max_valid_tok} | "
         f"which branch: {branch_label}"
     )
-    if tk_max >= expected_max_valid_tok:
-        logging.error(
-            f"[VERIFY-GATHER rank={rk} L{wrapper.layer_idx}] top_k_indices "
-            f"contains position {tk_max} >= block_table_cols*page_size="
-            f"{expected_max_valid_tok}; block_table row gather will wrap"
-        )

@@ -128,6 +128,54 @@ def fused_select_mla_kv_bf16(
         device=primary_blocked_k.device,
     )
 
+    fused_select_mla_kv_bf16_out(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        page_size,
+        selected_flat.view(batch_size, index_topk, num_heads, head_dim),
+        selected_lengths,
+        selected_indices,
+        row_modes,
+        return_indices=return_indices,
+    )
+
+    return (
+        selected_flat.view(batch_size, index_topk, num_heads, head_dim),
+        selected_lengths,
+        selected_indices,
+        row_modes,
+    )
+
+
+def fused_select_mla_kv_bf16_out(
+    primary_blocked_k: torch.Tensor,
+    primary_page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    long_topk_indices: torch.Tensor,
+    page_size: int,
+    selected_mla_kv: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    selected_indices: torch.Tensor | None,
+    row_modes: torch.Tensor,
+    *,
+    return_indices: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Out-buffer variant for CUDA graph capture."""
+
+    primary_blocked_k = primary_blocked_k.contiguous()
+    primary_page_table = primary_page_table.contiguous()
+    cache_seqlens = cache_seqlens.contiguous()
+    long_topk_indices = long_topk_indices.contiguous()
+
+    batch_size, index_topk = long_topk_indices.shape
+    num_heads = primary_blocked_k.shape[2]
+    head_dim = primary_blocked_k.shape[3]
+    dim = num_heads * head_dim
+    max_pages_per_seq = primary_page_table.shape[1]
+    selected_flat = selected_mla_kv.view(batch_size, index_topk, dim)
+
     block_d = triton.next_power_of_2(dim)
     total_work = batch_size * index_topk
     if total_work <= 4096:
@@ -156,7 +204,7 @@ def fused_select_mla_kv_bf16(
     )
 
     return (
-        selected_flat.view(batch_size, index_topk, num_heads, head_dim),
+        selected_mla_kv,
         selected_lengths,
         selected_indices,
         row_modes,

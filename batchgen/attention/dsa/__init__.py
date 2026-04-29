@@ -16,6 +16,7 @@ from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.attention.dsa.unified_selector import (
 	make_flashmla_selected_block_table,
 	select_mla_kv_for_flashmla_bf16,
+	select_mla_kv_for_flashmla_bf16_out,
 	view_selected_mla_kv_as_flashmla_pages,
 )
 
@@ -23,6 +24,7 @@ __all__ = [
 	"LightningIndexer",
 	"make_flashmla_selected_block_table",
 	"select_mla_kv_for_flashmla_bf16",
+	"select_mla_kv_for_flashmla_bf16_out",
 	"sparse_gather_from_paged_kv",
 	"view_selected_mla_kv_as_flashmla_pages",
 ]

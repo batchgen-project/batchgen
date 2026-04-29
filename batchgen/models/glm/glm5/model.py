@@ -24,11 +24,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from batchgen.models.glm.glm5.decode_utils import (
-	build_flat_paged_gather_indices,
-	build_paged_gather_cache_key,
-)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -543,25 +538,15 @@ class Glm5Indexer(nn.Module):
         num_k_heads = indexer_blocked_k.shape[2]
         k_head_dim = indexer_blocked_k.shape[3]
 
-        # Cache gather indices — same block_table and seqlens across all 78 layers
-        cache_key = build_paged_gather_cache_key(
+        from batchgen_kernels.attention.dsa import fused_dense_paged_gather
+
+        # Gather dense logical range [0, max_seqlen) without building token indices.
+        gathered = fused_dense_paged_gather(
+            indexer_blocked_k,
             block_table,
             max_seqlen,
             page_size,
-            page_table_version=indexer_kv_manager.get_page_table_version(),
-        )
-        if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
-            self._gather_cache = build_flat_paged_gather_indices(
-                block_table,
-                max_seqlen,
-                page_size,
-            )
-            self._gather_cache_key = cache_key
-            self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
-
-        flat_idx = self._gather_cache
-        blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
-        gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
+        ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
 
         gathered_k = gathered.squeeze(2)
 

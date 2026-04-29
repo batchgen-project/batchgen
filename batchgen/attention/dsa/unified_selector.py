@@ -11,9 +11,15 @@ import torch
 try:
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
         fused_select_mla_kv_bf16 as _fused_select_mla_kv_bf16,
+        fused_select_mla_kv_bf16_out as _fused_select_mla_kv_bf16_out,
+    )
+    from batchgen_kernels.attention.dsa.selected_block_table import (
+        make_selected_block_table as _make_selected_block_table,
     )
 except Exception as exc:
     _fused_select_mla_kv_bf16 = None
+    _fused_select_mla_kv_bf16_out = None
+    _make_selected_block_table = None
     _fused_selector_import_error = exc
 else:
     _fused_selector_import_error = None
@@ -81,6 +87,48 @@ def select_mla_kv_for_flashmla_bf16(
     )
 
 
+def select_mla_kv_for_flashmla_bf16_out(
+    primary_blocked_k: torch.Tensor,
+    primary_page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    long_topk_indices: torch.Tensor,
+    page_size: int,
+    selected_mla_kv: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    selected_indices: torch.Tensor | None,
+    row_modes: torch.Tensor,
+    *,
+    index_topk: int = 2048,
+    return_indices: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Out-buffer fused selector for CUDA graph capture."""
+
+    _validate_selector_inputs(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        index_topk=index_topk,
+        page_size=page_size,
+    )
+    if _fused_select_mla_kv_bf16_out is None:
+        raise RuntimeError(
+            "GLM-5 BF16 DSA unified selector requires the fused Triton out kernel"
+        ) from _fused_selector_import_error
+    return _fused_select_mla_kv_bf16_out(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        page_size,
+        selected_mla_kv,
+        selected_lengths,
+        selected_indices,
+        row_modes,
+        return_indices=return_indices,
+    )
+
+
 def view_selected_mla_kv_as_flashmla_pages(
     selected_mla_kv: torch.Tensor,
     *,
@@ -128,11 +176,11 @@ def make_flashmla_selected_block_table(
             f"index_topk must be divisible by page_size, got {index_topk=} {page_size=}"
         )
     pages_per_row = index_topk // page_size
-    return torch.arange(
-        batch_size * pages_per_row,
-        dtype=torch.int32,
-        device=device,
-    ).view(batch_size, pages_per_row)
+    if _make_selected_block_table is None:
+        raise RuntimeError(
+            "selected-KV FlashMLA block table requires the Triton fill kernel"
+        ) from _fused_selector_import_error
+    return _make_selected_block_table(batch_size, pages_per_row, device)
 
 
 def _validate_selector_inputs(

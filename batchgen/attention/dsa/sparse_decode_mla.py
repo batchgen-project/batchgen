@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from batchgen.attention.dsa.unified_selector import make_flashmla_selected_block_table
+
 
 @dataclass(frozen=True)
 class PreparedSparseFlashMlaDecode:
@@ -53,9 +55,12 @@ def prepare_sparse_flash_mla_decode_inputs(
 
     total_pages = batch * num_pages_per_seq
     blocked_k = sparse_mla_kv.reshape(total_pages, page_size, 1, kv_dim)
-    block_table = torch.arange(
-        total_pages, dtype=torch.int32, device=sparse_mla_kv.device
-    ).view(batch, num_pages_per_seq)
+    block_table = make_flashmla_selected_block_table(
+        batch,
+        index_topk=padded_topk,
+        page_size=page_size,
+        device=sparse_mla_kv.device,
+    )
     sparse_seqlens = sparse_seqlens.to(dtype=torch.int32, device=sparse_mla_kv.device)
 
     _, get_mla_metadata = _flash_mla_ops()
