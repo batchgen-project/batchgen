@@ -87,6 +87,8 @@ def _glm5_dsa_cuda_graph_can_replay(
     cache_seqlens: torch.Tensor,
     max_seqlen: int,
     index_topk: int,
+    *,
+    captured_max_seqlen: Optional[int] = None,
 ) -> bool:
     """The current graph segment is valid only for all-long DSA rows.
 
@@ -97,6 +99,8 @@ def _glm5_dsa_cuda_graph_can_replay(
 
     if max_seqlen <= index_topk:
         return False
+    if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
+        return False
     return bool((cache_seqlens > index_topk).all().item())
 
 
@@ -104,15 +108,16 @@ def _log_glm5_dsa_graph_eager_fallback_once(
     layer_idx: int,
     cache_seqlens: torch.Tensor,
     index_topk: int,
+    reason: str = "rows are not all graph-safe",
 ) -> None:
     global _glm5_dsa_graph_eager_fallback_logged
     if _glm5_dsa_graph_eager_fallback_logged or layer_idx != 0:
         return
     _glm5_dsa_graph_eager_fallback_logged = True
     logging.warning(
-        "GLM-5 DSA CUDA graph requested but current decode rows are not all "
-        "longer than index_topk=%s; using eager DSA until all rows are graph-safe "
-        "(min_cache_seqlen=%s).",
+        "GLM-5 DSA CUDA graph requested but %s; using eager DSA "
+        "(index_topk=%s, min_cache_seqlen=%s).",
+        reason,
         index_topk,
         int(cache_seqlens.min().item()),
     )
@@ -752,7 +757,21 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         if _glm5_dsa_cuda_graph_required():
             index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)
-            if _glm5_dsa_cuda_graph_can_replay(cache_seqlens, max_seqlen, index_topk):
+            graph_can_replay = _glm5_dsa_cuda_graph_can_replay(
+                cache_seqlens,
+                max_seqlen,
+                index_topk,
+                captured_max_seqlen=self._dsa_cuda_graph_max_seqlen,
+            )
+            graph_has_bucket = (
+                self._dsa_cuda_graph_manager is not None
+                and self._dsa_cuda_graph_segment_name is not None
+                and self._dsa_cuda_graph_manager.has_graph(
+                    self._dsa_cuda_graph_segment_name,
+                    bsz,
+                )
+            )
+            if graph_can_replay and graph_has_bucket:
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -761,10 +780,21 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     gpu_paged_kv_manager,
                     gpu_paged_kv_manager_aux,
                 )
+            if not graph_can_replay:
+                if max_seqlen > self._dsa_cuda_graph_max_seqlen:
+                    reason = (
+                        f"max_seqlen={max_seqlen} exceeds captured cap "
+                        f"{self._dsa_cuda_graph_max_seqlen}"
+                    )
+                else:
+                    reason = "current decode rows are not all longer than index_topk"
+            else:
+                reason = f"batch size {bsz} has no captured graph bucket"
             _log_glm5_dsa_graph_eager_fallback_once(
                 self.layer_idx,
                 cache_seqlens,
                 index_topk,
+                reason,
             )
 
         from batchgen.attention.dsa.glm5_decode_selector import (

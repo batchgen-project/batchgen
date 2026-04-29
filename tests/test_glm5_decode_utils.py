@@ -158,6 +158,13 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
         {"hidden_size": 16, "indexer": type("Indexer", (), {"index_topk": 4})()},
     )()
     wrapper.layer_idx = 0
+    wrapper._dsa_cuda_graph_max_seqlen = 4096
+    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+    wrapper._dsa_cuda_graph_manager = type(
+        "GraphManager",
+        (),
+        {"has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2},
+    )()
     expected = torch.ones(2, 1, 16)
 
     def fake_graph_route(self, hidden_states, position_ids, cache_seqlens, max_seqlen, primary, aux):
@@ -200,6 +207,12 @@ def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():
         torch.tensor([5, 7], dtype=torch.int32),
         max_seqlen=4,
         index_topk=index_topk,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([5, 7], dtype=torch.int32),
+        max_seqlen=8,
+        index_topk=index_topk,
+        captured_max_seqlen=6,
     )
 
 
