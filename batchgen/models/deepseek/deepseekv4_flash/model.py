@@ -678,6 +678,16 @@ class DeepSeekV4FlashMoE(nn.Module):
         )
         return gathered_ids.reshape(-1).long()
 
+    def _active_local_experts(self, topk_indices: torch.Tensor) -> list[int]:
+        if topk_indices.numel() == 0:
+            return []
+        active = torch.unique(topk_indices.reshape(-1))
+        active = active[
+            (active >= self.routed_expert_start_idx)
+            & (active < self.routed_expert_end_idx)
+        ]
+        return [int(expert_idx) for expert_idx in active.detach().cpu().tolist()]
+
     def _forward_ep(
         self,
         flat_states: torch.Tensor,
@@ -698,13 +708,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         if global_states.shape[0] > 0:
             topk_weights, topk_indices = self.gate(global_states, global_ids)
             _v4_diag(f"moe L{self.layer_idx} gate done")
-            counts = torch.bincount(
-                topk_indices.reshape(-1),
-                minlength=self.total_experts,
-            )
-            for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-                if counts[expert_idx].item() == 0:
-                    continue
+            for expert_idx in self._active_local_experts(topk_indices):
                 token_idx, topk_pos = torch.where(topk_indices == expert_idx)
                 expert_out = self.experts[expert_idx](
                     global_states[token_idx],
@@ -734,10 +738,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 
         routed = torch.zeros_like(flat_states, dtype=torch.float32)
-        counts = torch.bincount(topk_indices.reshape(-1), minlength=self.total_experts)
-        for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
-            if counts[expert_idx].item() == 0:
-                continue
+        for expert_idx in self._active_local_experts(topk_indices):
             token_idx, topk_pos = torch.where(topk_indices == expert_idx)
             expert_out = self.experts[expert_idx](
                 flat_states[token_idx],
