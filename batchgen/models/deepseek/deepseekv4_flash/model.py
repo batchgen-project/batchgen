@@ -129,6 +129,12 @@ def _dequant_fp4_e2m1_weight(
 ) -> torch.Tensor:
     if scale is None:
         raise RuntimeError("DeepSeek-V4 FP4 weight is missing its E8M0 scale tensor.")
+    if (
+        weight.is_cuda
+        and scale.is_cuda
+        and os.environ.get("BATCHGEN_V4_DISABLE_CUTE_FP4_DEQUANT", "0") != "1"
+    ):
+        return _dequant_fp4_e2m1_weight_cute(weight, scale, dtype)
     packed = _fp4_packed_bytes(weight)
     table = torch.tensor(
         _FP4_E2M1_TABLE_VALUES,
@@ -147,6 +153,30 @@ def _dequant_fp4_e2m1_weight(
     ).reshape(*scale.shape[:-1], scale.shape[-1] * 32)
     expanded_scale = expanded_scale[..., : unpacked.shape[-1]]
     return (unpacked * expanded_scale).to(dtype)
+
+
+def _dequant_fp4_e2m1_weight_cute(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    from batchgen.moe.cute_mxfp4_dequant import mxfp4_dequant_single_expert_cute
+
+    packed = _fp4_packed_bytes(weight).contiguous()
+    if scale.element_size() != 1:
+        raise RuntimeError(
+            "DeepSeek-V4 CUTE FP4 dequant expects one-byte E8M0 scales, "
+            f"got dtype={scale.dtype} element_size={scale.element_size()}"
+        )
+    scale_kmajor = scale.contiguous().view(torch.uint8).t().contiguous()
+    output = torch.empty(
+        packed.shape[0],
+        packed.shape[1] * 2,
+        dtype=torch.bfloat16,
+        device=packed.device,
+    )
+    mxfp4_dequant_single_expert_cute(packed, scale_kmajor, output)
+    return output.to(dtype) if output.dtype != dtype else output
 
 
 class DeepSeekV4FlashLinearSlot(nn.Module):
