@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -36,6 +37,26 @@ def _v4_diag(message: str) -> None:
         return
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
     print(f"[V4-DIAG rank={rank}] {message}", flush=True)
+
+
+def _v4_timing_enabled() -> bool:
+    return os.environ.get("BATCHGEN_V4_TIMING", "0") == "1"
+
+
+def _v4_timing(message: str) -> None:
+    if not _v4_timing_enabled():
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(f"[V4-TIMING rank={rank}] {message}", flush=True)
+
+
+def _v4_sync_time(device: torch.device | None = None) -> float:
+    if torch.cuda.is_available():
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        else:
+            torch.cuda.synchronize()
+    return time.perf_counter()
 
 
 _FP4_E2M1_TABLE_VALUES = (
@@ -696,28 +717,46 @@ class DeepSeekV4FlashMoE(nn.Module):
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
         _v4_diag(f"moe L{self.layer_idx} ep start local={flat_states.shape[0]}")
+        timing = _v4_timing_enabled()
+        last_time = _v4_sync_time(flat_states.device) if timing else 0.0
+
+        def mark(label: str) -> None:
+            nonlocal last_time
+            if not timing:
+                return
+            now = _v4_sync_time(flat_states.device)
+            _v4_timing(f"moe L{self.layer_idx} {label} {(now - last_time) * 1000:.2f}ms")
+            last_time = now
+
         global_states, local_start, local_tokens = self._gather_token_rows(flat_states)
+        mark("gather_states")
         _v4_diag(
             f"moe L{self.layer_idx} states gathered global={global_states.shape[0]} "
             f"local_start={local_start} local={local_tokens}"
         )
         global_ids = self._gather_token_ids(flat_ids)
+        mark("gather_ids")
         _v4_diag(f"moe L{self.layer_idx} ids gathered")
         routed_global = torch.zeros_like(global_states, dtype=torch.float32)
 
         if global_states.shape[0] > 0:
             topk_weights, topk_indices = self.gate(global_states, global_ids)
+            mark("gate")
             _v4_diag(f"moe L{self.layer_idx} gate done")
-            for expert_idx in self._active_local_experts(topk_indices):
+            active_experts = self._active_local_experts(topk_indices)
+            mark(f"active_local count={len(active_experts)}")
+            for expert_idx in active_experts:
                 token_idx, topk_pos = torch.where(topk_indices == expert_idx)
                 expert_out = self.experts[expert_idx](
                     global_states[token_idx],
                     topk_weights[token_idx, topk_pos].unsqueeze(-1),
                 )
                 routed_global[token_idx] += expert_out.float()
+            mark("routed_experts")
 
         _v4_diag(f"moe L{self.layer_idx} all_reduce enter")
         dist.all_reduce(routed_global)
+        mark("all_reduce")
         _v4_diag(f"moe L{self.layer_idx} all_reduce done")
         local_routed = routed_global[local_start : local_start + local_tokens]
         if flat_states.shape[0] == 0:
@@ -725,8 +764,11 @@ class DeepSeekV4FlashMoE(nn.Module):
         else:
             _v4_diag(f"moe L{self.layer_idx} shared enter")
             shared = self.shared_experts(flat_states).float()
+            mark("shared")
             _v4_diag(f"moe L{self.layer_idx} shared done")
-        return (local_routed + shared).to(output_dtype).view(output_shape)
+        output = (local_routed + shared).to(output_dtype).view(output_shape)
+        mark("finish")
+        return output
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
@@ -851,6 +893,19 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
         del output_attentions, kwargs
         is_decode = past_key_value is not None
+        timing = is_decode and _v4_timing_enabled()
+        last_time = _v4_sync_time(hidden_states.device) if timing else 0.0
+
+        def mark(label: str) -> None:
+            nonlocal last_time
+            if not timing:
+                return
+            now = _v4_sync_time(hidden_states.device)
+            _v4_timing(
+                f"layer {self.layer_idx} {label} {(now - last_time) * 1000:.2f}ms"
+            )
+            last_time = now
+
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} start hidden={tuple(hidden_states.shape)}")
         collapse_hc_state = hidden_states.dim() == 3
@@ -864,6 +919,7 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         attn_input = self.attn_norm(attn_input)
+        mark("hc_attn")
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} attn enter")
         attn_out, attn_weights, present = self.self_attn(
@@ -876,23 +932,29 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         )
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} attn done")
+        mark("attn")
         hidden_states = self._hc_post(attn_out, residual, post, comb)
+        mark("post_attn")
 
         residual = hidden_states
         mlp_input, post, comb = self._hc_pre(
             hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         mlp_input = self.ffn_norm(mlp_input)
+        mark("hc_moe")
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} moe enter")
         mlp_out = self.mlp(mlp_input, input_ids)
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} moe done")
+        mark("moe")
         hidden_states = self._hc_post(mlp_out, residual, post, comb)
+        mark("post_moe")
         if collapse_hc_state:
             hidden_states = hidden_states.mean(dim=2)
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} done")
+        mark("done")
         return hidden_states, attn_weights, present
 
 

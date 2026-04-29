@@ -16,6 +16,7 @@ slots defined in ``model.py``.
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict
 
 import torch
@@ -30,6 +31,23 @@ def _v4_diag(message: str) -> None:
         return
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
     print(f"[V4-DIAG rank={rank}] {message}", flush=True)
+
+
+def _v4_timing_enabled() -> bool:
+    return os.environ.get("BATCHGEN_V4_TIMING", "0") == "1"
+
+
+def _v4_timing(message: str) -> None:
+    if not _v4_timing_enabled():
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(f"[V4-TIMING rank={rank}] {message}", flush=True)
+
+
+def _v4_sync_time() -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
 
 class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
@@ -59,6 +77,20 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         self.module.clear_runtime_tensors()
 
     def forward(self, *args, **kwargs):
+        timing = self.phase == "decode" and _v4_timing_enabled()
+        last_time = _v4_sync_time() if timing else 0.0
+
+        def mark(label: str) -> None:
+            nonlocal last_time
+            if not timing:
+                return
+            now = _v4_sync_time()
+            _v4_timing(
+                f"wrapper attn L{self.layer_idx} {label} "
+                f"{(now - last_time) * 1000:.2f}ms"
+            )
+            last_time = now
+
         if self.phase == "decode":
             _v4_diag(f"wrapper attn L{self.layer_idx} decode enter")
             kwargs["position_ids"] = AttnWrapperBase.position_ids
@@ -72,12 +104,14 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         if self.phase == "decode":
             _v4_diag(f"wrapper attn L{self.layer_idx} load enter")
         self._load_runtime_tensors()
+        mark("load")
         try:
             if self.phase == "decode":
                 _v4_diag(f"wrapper attn L{self.layer_idx} forward enter")
             result = self.module(*args, **kwargs)
             if self.phase == "decode":
                 _v4_diag(f"wrapper attn L{self.layer_idx} forward done")
+            mark("forward")
             if self.phase == "prefill":
                 self._offload_prefill_kv(result[2], kwargs.get("attention_mask"))
             return result
@@ -85,6 +119,7 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             if self.phase == "decode":
                 _v4_diag(f"wrapper attn L{self.layer_idx} release enter")
             self._release_runtime_tensors()
+            mark("release")
             if self.phase == "decode":
                 _v4_diag(f"wrapper attn L{self.layer_idx} release done")
 
@@ -161,19 +196,36 @@ class DeepSeekV4FlashExpertWrapper(ExpertWrapperBase):
         self.module.clear_runtime_tensors()
 
     def forward(self, *args, **kwargs):
+        timing = getattr(self, "phase", None) == "decode" and _v4_timing_enabled()
+        last_time = _v4_sync_time() if timing else 0.0
+
+        def mark(label: str) -> None:
+            nonlocal last_time
+            if not timing:
+                return
+            now = _v4_sync_time()
+            _v4_timing(
+                f"wrapper expert {self.module_key} {label} "
+                f"{(now - last_time) * 1000:.2f}ms"
+            )
+            last_time = now
+
         if getattr(self, "phase", None) == "decode":
             _v4_diag(f"wrapper expert {self.module_key} load enter")
         self._load_runtime_tensors()
+        mark("load")
         try:
             if getattr(self, "phase", None) == "decode":
                 _v4_diag(f"wrapper expert {self.module_key} forward enter")
             result = self.module(*args, **kwargs)
             if getattr(self, "phase", None) == "decode":
                 _v4_diag(f"wrapper expert {self.module_key} forward done")
+            mark("forward")
             return result
         finally:
             if getattr(self, "phase", None) == "decode":
                 _v4_diag(f"wrapper expert {self.module_key} release enter")
             self._release_runtime_tensors()
+            mark("release")
             if getattr(self, "phase", None) == "decode":
                 _v4_diag(f"wrapper expert {self.module_key} release done")
