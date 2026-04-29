@@ -134,8 +134,14 @@ def _build_rope_freqs_cis(
     return torch.polar(torch.ones_like(phase), phase)
 
 
-def _apply_rotary_emb_inplace(x: torch.Tensor, freqs_cis: torch.Tensor) -> None:
+def _apply_rotary_emb_inplace(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+) -> None:
     rope_dim = x.shape[-1]
+    if inverse:
+        freqs_cis = freqs_cis.conj()
     x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if x.dim() == 4:
         if freqs_cis.dim() == 2:
@@ -475,9 +481,9 @@ class DeepSeekV4FlashAttention(nn.Module):
         *,
         position_ids: Optional[torch.Tensor],
         cache_seqlens: Optional[torch.Tensor],
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         if self.rope_head_dim <= 0:
-            return
+            return None
         positions = self._positions_for_rope(
             bsz=q.size(0),
             q_len=q.size(1),
@@ -499,6 +505,16 @@ class DeepSeekV4FlashAttention(nn.Module):
             freqs = freqs.expand(q.size(0), -1, -1)
         _apply_rotary_emb_inplace(q[..., -self.rope_head_dim:], freqs)
         _apply_rotary_emb_inplace(kv[..., -self.rope_head_dim:], freqs)
+        return freqs
+
+    def _softmax_with_sink(self, attn_scores: torch.Tensor) -> torch.Tensor:
+        scores = attn_scores.float()
+        sink = self.attn_sink.float().view(1, self.n_heads, 1, 1).to(scores.device)
+        scores_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink)
+        exp_scores = torch.exp(scores - scores_max)
+        sink_exp = torch.exp(sink - scores_max)
+        denom = exp_scores.sum(dim=-1, keepdim=True) + sink_exp
+        return (exp_scores / denom).to(attn_scores.dtype)
 
     def set_runtime_tensors(self, tensors: Dict[str, torch.Tensor]) -> None:
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
@@ -550,7 +566,7 @@ class DeepSeekV4FlashAttention(nn.Module):
             _v4_diag(f"attn L{self.layer_idx} q done")
 
         kv = self.kv_norm(self.wkv(hidden_states))
-        self._apply_rope(
+        freqs_cis = self._apply_rope(
             q,
             kv,
             position_ids=position_ids,
@@ -574,8 +590,14 @@ class DeepSeekV4FlashAttention(nn.Module):
             kv_for_attn.size(1),
             past_key_value is not None,
         )
-        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = self._softmax_with_sink(attn_scores).to(q.dtype)
         attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
+        if freqs_cis is not None:
+            _apply_rotary_emb_inplace(
+                attn_output[..., -self.rope_head_dim:],
+                freqs_cis,
+                inverse=True,
+            )
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} fallback attention done")
 
