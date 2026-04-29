@@ -2,10 +2,10 @@
 
 This is a synthetic microbenchmark for the pre-integration gate. It compares:
 
-1. previous dispatcher width:
+1. current GLM hot path:
    - all-short rows gather only ``max_seqlen`` selected tokens;
    - mixed/all-long rows gather 2048 selected tokens.
-2. fixed selector width:
+2. fused unified selector:
    - every row gathers 2048 selected tokens and uses ``selected_lengths`` to
      tell FlashMLA the valid prefix.
 
@@ -183,6 +183,7 @@ def _selector_prepare(
             token_indices,
             index_topk=INDEX_TOPK,
             page_size=PAGE_SIZE,
+            return_indices=False,
         )
     else:
         selected = sparse_gather_from_paged_kv(
@@ -233,8 +234,8 @@ def _summarize(times_ms: list[float]) -> tuple[float, float, float, float, float
 
 def _compare_label(previous_ms: float, fixed_ms: float) -> str:
     if fixed_ms <= previous_ms:
-        return f"fixed {previous_ms / fixed_ms:.2f}x faster"
-    return f"previous {fixed_ms / previous_ms:.2f}x faster"
+        return f"fused_unified {previous_ms / fixed_ms:.2f}x faster"
+    return f"current_glm_hot {fixed_ms / previous_ms:.2f}x faster"
 
 
 def _bench_rope_hadamard(batch_size: int, max_seqlen: int, warmup: int, iters: int) -> None:
@@ -321,8 +322,8 @@ def main() -> None:
             fixed_summary = _summarize(fixed_times)
             comparison = _compare_label(previous_summary[0], fixed_summary[0])
             for path, summary in (
-                ("previous", previous_summary),
-                ("fixed", fixed_summary),
+                ("current_glm_hot", previous_summary),
+                ("fused_unified", fixed_summary),
             ):
                 print(
                     f"{case.name},b={batch_size},{path},"

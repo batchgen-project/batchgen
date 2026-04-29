@@ -1,9 +1,7 @@
 """Unified BF16 selected-KV helpers for GLM-5 DSA decode.
 
-This eager implementation is the correctness contract for the future CUDA
-selector kernel. It accepts a mixed local batch and produces one FlashMLA-ready
-selected MLA KV tensor where short rows use dense prefix tokens and long rows
-use indexer-selected top-k tokens.
+The production path is fused-only. Tests keep a separate PyTorch reference for
+sanity checks, but this module does not silently fall back to PyTorch.
 """
 
 from __future__ import annotations
@@ -11,11 +9,14 @@ from __future__ import annotations
 import torch
 
 try:
-    from batchgen_kernels.attention.dsa import (
+    from batchgen_kernels.attention.dsa.fused_unified_selector import (
         fused_select_mla_kv_bf16 as _fused_select_mla_kv_bf16,
     )
-except (ImportError, Exception):
+except Exception as exc:
     _fused_select_mla_kv_bf16 = None
+    _fused_selector_import_error = exc
+else:
+    _fused_selector_import_error = None
 
 
 def select_mla_kv_for_flashmla_bf16(
@@ -26,7 +27,8 @@ def select_mla_kv_for_flashmla_bf16(
     *,
     index_topk: int = 2048,
     page_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_indices: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Select BF16 MLA KV for one dense FlashMLA call.
 
     Args:
@@ -48,7 +50,8 @@ def select_mla_kv_for_flashmla_bf16(
         - selected_mla_kv: ``[B, index_topk, num_k_heads, kv_dim]``.
         - selected_lengths: ``min(cache_seqlens, index_topk)`` as int32.
         - selected_indices: logical indices used per output slot, or ``-1``
-          for ignored/invalid tail positions.
+          for ignored/invalid tail positions. This is ``None`` when
+          ``return_indices`` is disabled by a lower-level caller.
         - row_modes: int32 ``0`` for dense-short rows and ``1`` for long rows.
     """
 
@@ -61,70 +64,21 @@ def select_mla_kv_for_flashmla_bf16(
         page_size=page_size,
     )
 
-    if _fused_select_mla_kv_bf16 is not None:
-        return _fused_select_mla_kv_bf16(
-            primary_blocked_k,
-            primary_page_table,
-            cache_seqlens,
-            long_topk_indices,
-            page_size,
-        )
+    if _fused_select_mla_kv_bf16 is None:
+        raise RuntimeError(
+            "GLM-5 BF16 DSA unified selector requires the fused Triton kernel. "
+            "Use tests/kernels/test_dsa_unified_selector.py for the PyTorch sanity "
+            "reference; production must not fall back to PyTorch."
+        ) from _fused_selector_import_error
 
-    device = primary_blocked_k.device
-    batch_size = cache_seqlens.shape[0]
-    max_pages = primary_page_table.shape[1]
-    num_k_heads = primary_blocked_k.shape[2]
-    kv_dim = primary_blocked_k.shape[3]
-
-    seqlens_long = cache_seqlens.to(device=device, dtype=torch.long)
-    is_long = seqlens_long > index_topk
-    dense_positions = torch.arange(
-        index_topk,
-        device=device,
-        dtype=torch.long,
-    ).expand(batch_size, index_topk)
-    long_positions = long_topk_indices.to(device=device, dtype=torch.long)
-    logical_indices = torch.where(is_long.unsqueeze(1), long_positions, dense_positions)
-
-    valid = (logical_indices >= 0) & (logical_indices < seqlens_long.unsqueeze(1))
-    safe_logical = logical_indices.clamp_min(0)
-    logical_page = torch.div(safe_logical, page_size, rounding_mode="floor")
-    page_offset = safe_logical - logical_page * page_size
-
-    page_in_table = logical_page < max_pages
-    logical_page_clamped = logical_page.clamp(max=max_pages - 1)
-    physical_page = torch.gather(
-        primary_page_table.to(device=device, dtype=torch.long),
-        1,
-        logical_page_clamped,
+    return _fused_select_mla_kv_bf16(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        page_size,
+        return_indices=return_indices,
     )
-    valid = valid & page_in_table & (physical_page >= 0)
-
-    flat_index = physical_page.clamp_min(0) * page_size + page_offset
-    flat_k = primary_blocked_k.reshape(-1, num_k_heads * kv_dim)
-    gathered = flat_k[flat_index.reshape(-1)].view(
-        batch_size,
-        index_topk,
-        num_k_heads,
-        kv_dim,
-    )
-    selected_mla_kv = torch.where(
-        valid.view(batch_size, index_topk, 1, 1),
-        gathered,
-        torch.zeros((), dtype=gathered.dtype, device=device),
-    )
-    selected_indices = torch.where(
-        valid,
-        logical_indices,
-        torch.full_like(logical_indices, -1),
-    )
-    selected_lengths = torch.minimum(
-        cache_seqlens.to(device=device, dtype=torch.int32),
-        torch.full((batch_size,), index_topk, dtype=torch.int32, device=device),
-    )
-    row_modes = is_long.to(torch.int32)
-
-    return selected_mla_kv, selected_lengths, selected_indices, row_modes
 
 
 def view_selected_mla_kv_as_flashmla_pages(

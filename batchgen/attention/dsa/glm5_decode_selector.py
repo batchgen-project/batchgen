@@ -42,7 +42,7 @@ class Glm5DsaFlashMlaInputs:
     query_states: torch.Tensor
     selected_mla_kv: torch.Tensor
     selected_lengths: torch.Tensor
-    selected_indices: torch.Tensor
+    selected_indices: torch.Tensor | None
     row_modes: torch.Tensor
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor | None
@@ -239,6 +239,7 @@ def build_glm5_dsa_flashmla_inputs(
                 top_k_indices,
                 index_topk=wrapper.module.indexer.index_topk,
                 page_size=mla_page_size,
+                return_indices=verify_indices,
             )
         )
 

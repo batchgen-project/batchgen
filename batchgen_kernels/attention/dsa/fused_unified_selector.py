@@ -26,6 +26,7 @@ def _unified_select_kernel(
     page_size: tl.constexpr,
     max_pages_per_seq: tl.constexpr,
     D: tl.constexpr,
+    STORE_INDICES: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -70,10 +71,11 @@ def _unified_select_kernel(
             vals = tl.where(valid, vals, tl.zeros([BLOCK_D], dtype=vals.dtype))
             dst = selected_ptr + (pid_b * index_topk + t) * D + d_offs
             tl.store(dst, vals, mask=d_mask)
-            tl.store(
-                selected_indices_ptr + pid_b * index_topk + t,
-                tl.where(valid, token_idx, -1),
-            )
+            if STORE_INDICES:
+                tl.store(
+                    selected_indices_ptr + pid_b * index_topk + t,
+                    tl.where(valid, token_idx, -1),
+                )
 
 
 def fused_select_mla_kv_bf16(
@@ -82,7 +84,9 @@ def fused_select_mla_kv_bf16(
     cache_seqlens: torch.Tensor,
     long_topk_indices: torch.Tensor,
     page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_indices: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Gather selected GLM-5 BF16 MLA KV for FlashMLA dense decode."""
 
     primary_blocked_k = primary_blocked_k.contiguous()
@@ -108,11 +112,15 @@ def fused_select_mla_kv_bf16(
         dtype=torch.int32,
         device=primary_blocked_k.device,
     )
-    selected_indices = torch.empty(
-        batch_size,
-        index_topk,
-        dtype=long_topk_indices.dtype,
-        device=primary_blocked_k.device,
+    selected_indices = (
+        torch.empty(
+            batch_size,
+            index_topk,
+            dtype=long_topk_indices.dtype,
+            device=primary_blocked_k.device,
+        )
+        if return_indices
+        else None
     )
     row_modes = torch.empty(
         batch_size,
@@ -136,12 +144,13 @@ def fused_select_mla_kv_bf16(
         long_topk_indices,
         selected_flat,
         selected_lengths,
-        selected_indices,
+        selected_indices if selected_indices is not None else selected_flat,
         row_modes,
         index_topk=index_topk,
         page_size=page_size,
         max_pages_per_seq=max_pages_per_seq,
         D=dim,
+        STORE_INDICES=return_indices,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
     )
