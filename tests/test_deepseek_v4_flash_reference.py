@@ -681,9 +681,11 @@ def test_attention_compressed_decode_matches_reference(
     _assert_close(bg_decode, ref_decode, atol=1e-4, rtol=1e-4)
 
 
-def test_attention_cr0_decode_matches_reference(ref):
-    torch.manual_seed(7)
+@pytest.mark.parametrize("prefill_len", [5, 20])
+def test_attention_cr0_decode_matches_reference(ref, prefill_len):
+    torch.manual_seed(7 + prefill_len)
     args = _tiny_args(ref, compress_ratio=0)
+    args.max_seq_len = max(args.max_seq_len, prefill_len + 4)
     cfg = _tiny_config(args)
     ref_attn = ref.Attention(0, args)
     _init_reference_attention(ref_attn)
@@ -691,7 +693,6 @@ def test_attention_cr0_decode_matches_reference(ref):
     _copy_ref_attention_to_bg(ref_attn, bg_attn)
 
     bsz = 2
-    prefill_len = 5
     x_prefill = torch.randn(bsz, prefill_len, args.dim)
     x_decode = torch.randn(bsz, 1, args.dim)
 
@@ -700,7 +701,7 @@ def test_attention_cr0_decode_matches_reference(ref):
 
     prefill_positions = torch.arange(prefill_len).unsqueeze(0).expand(bsz, -1)
     _, _, bg_prefill_kv = bg_attn(x_prefill, position_ids=prefill_positions)
-    bg_past = x_prefill.new_zeros(bsz, args.window_size, args.head_dim)
+    bg_past = x_prefill.new_zeros(bsz, prefill_len + 1, args.head_dim)
     bg_past[:, :prefill_len] = bg_prefill_kv
     bg_decode, _, _ = bg_attn(
         x_decode,
