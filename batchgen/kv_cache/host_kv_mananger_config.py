@@ -9,7 +9,9 @@ import torch
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.models.engine_loader import core_engine as bg_lib
 
-HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
+HOST_KV_SHM_NAME = os.environ.get(
+	"BATCHGEN_HOST_KV_SHM_NAME", "batchgen_host_kv_cache"
+)
 
 __all__ = [
 	"build_host_kv_config",
@@ -333,7 +335,9 @@ def build_gpu_kv_config(
 	)
 
 
-HOST_KV_AUX_SHM_NAME = "batchgen_host_kv_cache_aux"
+HOST_KV_AUX_SHM_NAME = os.environ.get(
+	"BATCHGEN_HOST_KV_AUX_SHM_NAME", "batchgen_host_kv_cache_aux"
+)
 
 
 def is_dsa_model(model_name: str) -> bool:
