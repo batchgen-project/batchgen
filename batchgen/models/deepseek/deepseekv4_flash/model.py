@@ -184,6 +184,84 @@ def _linear_from_weight(
     return F.linear(x, weight, bias)
 
 
+def _window_topk_idxs(
+    window_size: int,
+    bsz: int,
+    seqlen: int,
+    start_pos: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if start_pos >= window_size - 1:
+        pos = start_pos % window_size
+        matrix = torch.cat(
+            [
+                torch.arange(pos + 1, window_size, device=device),
+                torch.arange(0, pos + 1, device=device),
+            ],
+            dim=0,
+        )
+    elif start_pos > 0:
+        matrix = F.pad(
+            torch.arange(start_pos + 1, device=device),
+            (0, window_size - start_pos - 1),
+            value=-1,
+        )
+    else:
+        base = torch.arange(seqlen, device=device).unsqueeze(1)
+        matrix = (
+            (base - window_size + 1).clamp(0)
+            + torch.arange(min(seqlen, window_size), device=device)
+        )
+        matrix = torch.where(matrix > base, -1, matrix)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def _compress_topk_idxs(
+    ratio: int,
+    bsz: int,
+    seqlen: int,
+    start_pos: int,
+    offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if start_pos > 0:
+        matrix = torch.arange(0, (start_pos + 1) // ratio, device=device) + offset
+    else:
+        matrix = torch.arange(seqlen // ratio, device=device).repeat(seqlen, 1)
+        mask = matrix >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
+        matrix = torch.where(mask, -1, matrix + offset)
+    return matrix.unsqueeze(0).expand(bsz, -1, -1)
+
+
+def _sparse_attn_from_topk(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    if topk_idxs.numel() == 0 or topk_idxs.size(-1) == 0:
+        return torch.zeros_like(q)
+    bsz, seqlen, _, head_dim = q.shape
+    valid = topk_idxs >= 0
+    clamped = topk_idxs.clamp_min(0).long()
+    gather_idx = clamped.unsqueeze(-1).expand(bsz, seqlen, topk_idxs.size(-1), head_dim)
+    kv_rows = torch.gather(
+        kv.unsqueeze(1).expand(-1, seqlen, -1, -1),
+        2,
+        gather_idx,
+    )
+    scores = torch.einsum("bshd,bskd->bhsk", q.float(), kv_rows.float()) * softmax_scale
+    neg_inf = torch.finfo(scores.dtype).min
+    scores = scores.masked_fill(~valid[:, None, :, :], neg_inf)
+    sink = attn_sink.float().view(1, q.size(2), 1, 1).to(scores.device)
+    scores_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink)
+    exp_scores = torch.exp(scores - scores_max).masked_fill(~valid[:, None, :, :], 0)
+    denom = exp_scores.sum(dim=-1, keepdim=True) + torch.exp(sink - scores_max)
+    probs = (exp_scores / denom).to(q.dtype)
+    return torch.einsum("bhsk,bskd->bshd", probs, kv_rows.to(q.dtype))
+
+
 def _dequant_weight(
     weight: torch.Tensor,
     scale: Optional[torch.Tensor],
@@ -356,6 +434,148 @@ class DeepSeekV4FlashCompressor(nn.Module):
         self.wkv = DeepSeekV4FlashLinearSlot(hidden_size, coeff * head_dim)
         self.wgate = DeepSeekV4FlashLinearSlot(hidden_size, coeff * head_dim)
         self.norm = DeepSeekV4FlashRMSNorm(head_dim, eps)
+        self.kv_cache: Optional[torch.Tensor] = None
+        self.kv_state: Optional[torch.Tensor] = None
+        self.score_state: Optional[torch.Tensor] = None
+        self.freqs_cis: Optional[torch.Tensor] = None
+
+    def set_runtime_tensors(self, tensors: Dict[str, torch.Tensor], prefix: str) -> None:
+        self.wkv.set_runtime_tensors(tensors, f"{prefix}.wkv")
+        self.wgate.set_runtime_tensors(tensors, f"{prefix}.wgate")
+        if f"{prefix}.norm.weight" in tensors:
+            self.norm.weight.data = tensors[f"{prefix}.norm.weight"].to(
+                self.norm.weight.device
+            )
+        if f"{prefix}.ape" in tensors:
+            self.ape.data = tensors[f"{prefix}.ape"].to(self.ape.device)
+
+    def clear_runtime_tensors(self) -> None:
+        self.wkv.clear_runtime_tensors()
+        self.wgate.clear_runtime_tensors()
+
+    def _ensure_state(self, bsz: int, device: torch.device) -> None:
+        coeff = 2 if self.overlap else 1
+        shape = (bsz, coeff * self.compress_ratio, coeff * self.head_dim)
+        if (
+            self.kv_state is None
+            or self.kv_state.shape != shape
+            or self.kv_state.device != device
+        ):
+            self.kv_state = torch.zeros(shape, dtype=torch.float32, device=device)
+            self.score_state = torch.full(
+                shape,
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> Optional[torch.Tensor]:
+        if self.kv_cache is None:
+            raise RuntimeError("DeepSeek-V4 compressor KV cache is not initialized.")
+        bsz, seqlen, _ = x.shape
+        ratio = self.compress_ratio
+        coeff = 2 if self.overlap else 1
+        d = self.head_dim
+        rd = self.rope_head_dim
+        dtype = x.dtype
+        self._ensure_state(bsz, x.device)
+
+        kv = self.wkv(x).float()
+        score = self.wgate(x).float()
+        if start_pos == 0:
+            should_compress = seqlen >= ratio
+            remainder = seqlen % ratio
+            cutoff = seqlen - remainder
+            offset = ratio if self.overlap else 0
+            if self.overlap and cutoff >= ratio:
+                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+                self.score_state[:bsz, :ratio] = (
+                    score[:, cutoff - ratio : cutoff] + self.ape.float()
+                )
+            if remainder > 0:
+                kv, kv_remainder = kv.split([cutoff, remainder], dim=1)
+                self.kv_state[:bsz, offset : offset + remainder] = kv_remainder
+                self.score_state[:bsz, offset : offset + remainder] = (
+                    score[:, cutoff:] + self.ape[:remainder].float()
+                )
+                score = score[:, :cutoff]
+            kv = kv.unflatten(1, (-1, ratio))
+            score = score.unflatten(1, (-1, ratio)) + self.ape.float()
+            if self.overlap:
+                kv = self._overlap_transform(kv, 0)
+                score = self._overlap_transform(score, float("-inf"))
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        else:
+            should_compress = (start_pos + 1) % ratio == 0
+            score = score + self.ape[start_pos % ratio].float()
+            if self.overlap:
+                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv_state = torch.cat(
+                        [
+                            self.kv_state[:bsz, :ratio, :d],
+                            self.kv_state[:bsz, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        [
+                            self.score_state[:bsz, :ratio, :d],
+                            self.score_state[:bsz, ratio:, d:],
+                        ],
+                        dim=1,
+                    )
+                    kv = (kv_state * score_state.softmax(dim=1)).sum(
+                        dim=1,
+                        keepdim=True,
+                    )
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+            else:
+                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
+                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+                if should_compress:
+                    kv = (
+                        self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
+                    ).sum(dim=1, keepdim=True)
+        if not should_compress:
+            return None
+
+        kv = self.norm(kv.to(dtype))
+        if self.freqs_cis is None:
+            if start_pos == 0:
+                positions = torch.arange(0, cutoff, ratio, device=x.device)
+            else:
+                positions = torch.tensor([start_pos + 1 - ratio], device=x.device)
+            freqs_cis = _build_rope_freqs_cis(
+                positions,
+                rd,
+                40000.0,
+                1.0,
+                32,
+                1,
+                0,
+            )
+        elif start_pos == 0:
+            freqs_cis = self.freqs_cis[:cutoff:ratio]
+        else:
+            freqs_cis = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+        _apply_rotary_emb_inplace(kv[..., -rd:], freqs_cis)
+        if start_pos == 0:
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
+        else:
+            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        return kv
+
+    def _overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
+        bsz, seqlen, _, _ = tensor.shape
+        ratio = self.compress_ratio
+        d = self.head_dim
+        new_tensor = tensor.new_full((bsz, seqlen, 2 * ratio, d), value)
+        new_tensor[:, :, ratio:] = tensor[:, :, :, d:]
+        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return new_tensor
 
 
 class DeepSeekV4FlashIndexer(nn.Module):
@@ -371,6 +591,8 @@ class DeepSeekV4FlashIndexer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.index_topk = int(_cfg(config, "index_topk", 512))
+        self.compress_ratio = compress_ratio
+        self.softmax_scale = self.head_dim ** -0.5
         self.wq_b = DeepSeekV4FlashLinearSlot(q_lora_rank, n_heads * head_dim)
         self.weights_proj = DeepSeekV4FlashLinearSlot(hidden_size, n_heads)
         self.compressor = DeepSeekV4FlashCompressor(
@@ -381,6 +603,90 @@ class DeepSeekV4FlashIndexer(nn.Module):
             eps,
             overlap=True,
         )
+        self.kv_cache: Optional[torch.Tensor] = None
+        self.freqs_cis: Optional[torch.Tensor] = None
+
+    def set_runtime_tensors(self, tensors: Dict[str, torch.Tensor], prefix: str) -> None:
+        self.wq_b.set_runtime_tensors(tensors, f"{prefix}.wq_b")
+        self.weights_proj.set_runtime_tensors(tensors, f"{prefix}.weights_proj")
+        self.compressor.set_runtime_tensors(tensors, f"{prefix}.compressor")
+
+    def clear_runtime_tensors(self) -> None:
+        self.wq_b.clear_runtime_tensors()
+        self.weights_proj.clear_runtime_tensors()
+        self.compressor.clear_runtime_tensors()
+
+    def _ensure_cache(self, bsz: int, end_pos: int, device: torch.device, dtype: torch.dtype) -> None:
+        cache_len = max(end_pos // self.compress_ratio, 1)
+        if (
+            self.kv_cache is None
+            or self.kv_cache.size(0) < bsz
+            or self.kv_cache.size(1) < cache_len
+            or self.kv_cache.device != device
+            or self.kv_cache.dtype != dtype
+        ):
+            self.kv_cache = torch.zeros(
+                bsz,
+                cache_len,
+                self.head_dim,
+                dtype=dtype,
+                device=device,
+            )
+        self.compressor.kv_cache = self.kv_cache
+        self.compressor.freqs_cis = self.freqs_cis
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        start_pos: int,
+        offset: int,
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+        end_pos = start_pos + seqlen
+        ratio = self.compress_ratio
+        self._ensure_cache(bsz, end_pos, x.device, x.dtype)
+
+        q = self.wq_b(qr).view(bsz, seqlen, self.n_heads, self.head_dim)
+        if self.freqs_cis is None:
+            positions = torch.arange(start_pos, end_pos, device=x.device)
+            freqs_cis = _build_rope_freqs_cis(
+                positions,
+                min(self.head_dim, _cfg(self.compressor, "rope_head_dim", self.head_dim)),
+                40000.0,
+                1.0,
+                32,
+                1,
+                0,
+            )
+        else:
+            freqs_cis = self.freqs_cis[start_pos:end_pos]
+        rd = min(self.compressor.rope_head_dim, self.head_dim)
+        _apply_rotary_emb_inplace(q[..., -rd:], freqs_cis)
+
+        self.compressor(x, start_pos)
+        cache_len = end_pos // ratio
+        if cache_len == 0:
+            return x.new_empty(bsz, seqlen, 0, dtype=torch.long)
+        weights = self.weights_proj(x).float() * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )
+        index_score = torch.einsum(
+            "bshd,btd->bsht",
+            q.float(),
+            self.kv_cache[:bsz, :cache_len].float(),
+        )
+        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+        if start_pos == 0:
+            mask = torch.arange(cache_len, device=x.device).repeat(seqlen, 1)
+            mask = mask >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            index_score = index_score + torch.where(mask, float("-inf"), 0).unsqueeze(0)
+        k = min(self.index_topk, cache_len)
+        topk_idxs = index_score.topk(k, dim=-1)[1]
+        if start_pos == 0:
+            mask = topk_idxs >= torch.arange(1, seqlen + 1, device=x.device).view(1, seqlen, 1) // ratio
+            return torch.where(mask, -1, topk_idxs + offset)
+        return topk_idxs + offset
 
 
 class DeepSeekV4FlashAttention(nn.Module):
@@ -404,6 +710,7 @@ class DeepSeekV4FlashAttention(nn.Module):
         self.rope_head_dim = int(_cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64)))
         self.eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
         self.softmax_scale = self.head_dim ** -0.5
+        self.window_size = int(_cfg(config, "sliding_window", _cfg(config, "window_size", 128)))
 
         ratios = list(_cfg(config, "compress_ratios", []))
         self.compress_ratio = int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
@@ -452,9 +759,13 @@ class DeepSeekV4FlashAttention(nn.Module):
                 if self.compress_ratio == 4
                 else None
             )
+            self._compress_kv_cache: Optional[torch.Tensor] = None
+            self._compress_freqs_cis: Optional[torch.Tensor] = None
         else:
             self.compressor = None
             self.indexer = None
+            self._compress_kv_cache = None
+            self._compress_freqs_cis = None
 
     def _positions_for_rope(
         self,
@@ -529,10 +840,110 @@ class DeepSeekV4FlashAttention(nn.Module):
             self.kv_norm.weight.data = tensors["kv_norm.weight"].to(
                 self.kv_norm.weight.device
             )
+        if self.compressor is not None:
+            self.compressor.set_runtime_tensors(tensors, "compressor")
+        if self.indexer is not None:
+            self.indexer.set_runtime_tensors(tensors, "indexer")
 
     def clear_runtime_tensors(self) -> None:
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
             getattr(self, name).clear_runtime_tensors()
+        if self.compressor is not None:
+            self.compressor.clear_runtime_tensors()
+        if self.indexer is not None:
+            self.indexer.clear_runtime_tensors()
+
+    def _ensure_compress_prefill_state(
+        self,
+        bsz: int,
+        seqlen: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if self.compressor is None:
+            return
+        cache_len = max(seqlen // self.compress_ratio, 1)
+        if (
+            self._compress_kv_cache is None
+            or self._compress_kv_cache.size(0) < bsz
+            or self._compress_kv_cache.size(1) < cache_len
+            or self._compress_kv_cache.device != device
+            or self._compress_kv_cache.dtype != dtype
+        ):
+            self._compress_kv_cache = torch.zeros(
+                bsz,
+                cache_len,
+                self.head_dim,
+                dtype=dtype,
+                device=device,
+            )
+        if (
+            self._compress_freqs_cis is None
+            or self._compress_freqs_cis.size(0) < seqlen
+            or self._compress_freqs_cis.device != device
+        ):
+            positions = torch.arange(max(seqlen, 1), dtype=torch.long, device=device)
+            self._compress_freqs_cis = _build_rope_freqs_cis(
+                positions,
+                self.rope_head_dim,
+                self.rope_theta,
+                self.rope_factor,
+                self.beta_fast,
+                self.beta_slow,
+                self.original_seq_len,
+            )
+        self.compressor.kv_cache = self._compress_kv_cache
+        self.compressor.freqs_cis = self._compress_freqs_cis
+        if self.indexer is not None:
+            self.indexer.freqs_cis = self._compress_freqs_cis
+
+    def _prefill_sparse_attention(
+        self,
+        hidden_states: torch.Tensor,
+        q_low: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        start_pos: int,
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = hidden_states.shape
+        kv_for_attn = kv
+        topk_idxs = _window_topk_idxs(
+            self.window_size,
+            bsz,
+            seqlen,
+            start_pos,
+            hidden_states.device,
+        )
+        if self.compressor is not None:
+            self._ensure_compress_prefill_state(
+                bsz,
+                start_pos + seqlen,
+                hidden_states.device,
+                kv.dtype,
+            )
+            offset = kv.size(1) if start_pos == 0 else self.window_size
+            if self.indexer is not None:
+                compress_topk_idxs = self.indexer(hidden_states, q_low, start_pos, offset)
+            else:
+                compress_topk_idxs = _compress_topk_idxs(
+                    self.compress_ratio,
+                    bsz,
+                    seqlen,
+                    start_pos,
+                    offset,
+                    hidden_states.device,
+                )
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+            kv_compress = self.compressor(hidden_states, start_pos)
+            if kv_compress is not None:
+                kv_for_attn = torch.cat([kv, kv_compress], dim=1)
+        return _sparse_attn_from_topk(
+            q,
+            kv_for_attn,
+            self.attn_sink,
+            topk_idxs.int(),
+            self.softmax_scale,
+        )
 
     def empty_forward(
         self,
@@ -575,23 +986,38 @@ class DeepSeekV4FlashAttention(nn.Module):
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} wkv done")
         kv_for_attn = kv
-        if past_key_value is not None:
-            kv_for_attn = self._normalize_past_kv(past_key_value)
-            if q_len == 1 and cache_seqlens is not None:
-                self._write_current_kv(kv_for_attn, kv, cache_seqlens)
-        k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
-        v = k
-        attn_scores = torch.einsum("bshd,bthd->bhst", q, k) * self.softmax_scale
-        attn_scores = self._apply_fallback_masks(
-            attn_scores,
-            attention_mask,
-            cache_seqlens,
-            q_len,
-            kv_for_attn.size(1),
-            past_key_value is not None,
-        )
-        attn_weights = self._softmax_with_sink(attn_scores).to(q.dtype)
-        attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
+        start_pos = 0
+        if position_ids is not None:
+            pos = position_ids.to(device=hidden_states.device, dtype=torch.long)
+            if pos.dim() == 1:
+                pos = pos.view(1, -1)
+            start_pos = int(pos[0, 0].item())
+        if past_key_value is None and attention_mask is None:
+            attn_output = self._prefill_sparse_attention(
+                hidden_states,
+                q_low,
+                q,
+                kv,
+                start_pos,
+            )
+        else:
+            if past_key_value is not None:
+                kv_for_attn = self._normalize_past_kv(past_key_value)
+                if q_len == 1 and cache_seqlens is not None:
+                    self._write_current_kv(kv_for_attn, kv, cache_seqlens)
+            k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            v = k
+            attn_scores = torch.einsum("bshd,bthd->bhst", q, k) * self.softmax_scale
+            attn_scores = self._apply_fallback_masks(
+                attn_scores,
+                attention_mask,
+                cache_seqlens,
+                q_len,
+                kv_for_attn.size(1),
+                past_key_value is not None,
+            )
+            attn_weights = self._softmax_with_sink(attn_scores).to(q.dtype)
+            attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
         if freqs_cis is not None:
             _apply_rotary_emb_inplace(
                 attn_output[..., -self.rope_head_dim:],

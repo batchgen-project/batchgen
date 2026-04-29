@@ -166,6 +166,8 @@ def _tiny_config(args) -> SimpleNamespace:
         q_lora_rank=args.q_lora_rank,
         o_groups=args.o_groups,
         o_lora_rank=args.o_lora_rank,
+        sliding_window=args.window_size,
+        window_size=args.window_size,
         compress_ratios=list(args.compress_ratios),
         compress_rope_theta=args.compress_rope_theta,
         rope_theta=args.rope_theta,
@@ -195,6 +197,9 @@ def _tiny_config(args) -> SimpleNamespace:
         hc_sinkhorn_iters=args.hc_sinkhorn_iters,
         hc_eps=args.hc_eps,
         pad_token_id=1,
+        index_n_heads=args.index_n_heads,
+        index_head_dim=args.index_head_dim,
+        index_topk=args.index_topk,
     )
 
 
@@ -236,11 +241,23 @@ def _init_reference_attention(ref_attn) -> None:
         _fill_float_param(ref_attn.attn_sink)
         _fill_float_param(ref_attn.q_norm.weight)
         _fill_float_param(ref_attn.kv_norm.weight)
+        if hasattr(ref_attn, "compressor"):
+            _init_reference_compressor(ref_attn.compressor)
+        if getattr(ref_attn, "indexer", None) is not None:
+            _fill_float_param(ref_attn.indexer.wq_b.weight)
+            _fill_float_param(ref_attn.indexer.weights_proj.weight)
+            _init_reference_compressor(ref_attn.indexer.compressor)
+
+
+def _init_reference_compressor(ref_compressor) -> None:
+    _fill_float_param(ref_compressor.ape)
+    _fill_float_param(ref_compressor.norm.weight)
+    _fill_float_param(ref_compressor.wkv.weight)
+    _fill_float_param(ref_compressor.wgate.weight)
 
 
 def _copy_ref_attention_to_bg(ref_attn, bg_attn) -> None:
-    bg_attn.set_runtime_tensors(
-        {
+    tensors = {
             "attn_sink": ref_attn.attn_sink.detach().clone(),
             "q_norm.weight": ref_attn.q_norm.weight.detach().clone(),
             "kv_norm.weight": ref_attn.kv_norm.weight.detach().clone(),
@@ -250,7 +267,26 @@ def _copy_ref_attention_to_bg(ref_attn, bg_attn) -> None:
             "wo_a.weight": ref_attn.wo_a.weight.detach().clone(),
             "wo_b.weight": ref_attn.wo_b.weight.detach().clone(),
         }
-    )
+    if hasattr(ref_attn, "compressor"):
+        tensors.update(_compressor_tensors("compressor", ref_attn.compressor))
+    if getattr(ref_attn, "indexer", None) is not None:
+        tensors["indexer.wq_b.weight"] = ref_attn.indexer.wq_b.weight.detach().clone()
+        tensors["indexer.weights_proj.weight"] = (
+            ref_attn.indexer.weights_proj.weight.detach().clone()
+        )
+        tensors.update(
+            _compressor_tensors("indexer.compressor", ref_attn.indexer.compressor)
+        )
+    bg_attn.set_runtime_tensors(tensors)
+
+
+def _compressor_tensors(prefix: str, ref_compressor) -> dict[str, torch.Tensor]:
+    return {
+        f"{prefix}.ape": ref_compressor.ape.detach().clone(),
+        f"{prefix}.norm.weight": ref_compressor.norm.weight.detach().clone(),
+        f"{prefix}.wkv.weight": ref_compressor.wkv.weight.detach().clone(),
+        f"{prefix}.wgate.weight": ref_compressor.wgate.weight.detach().clone(),
+    }
 
 
 class _RecordingHostView:
@@ -461,6 +497,41 @@ def test_attention_cr0_prefill_matches_reference(ref):
     _copy_ref_attention_to_bg(ref_attn, bg_attn)
 
     x = torch.randn(2, 5, args.dim)
+    position_ids = torch.arange(x.size(1)).unsqueeze(0).expand(x.size(0), -1)
+    ref_out = ref_attn(x, start_pos=0)
+    bg_out, _, _ = bg_attn(x, position_ids=position_ids)
+
+    _assert_close(bg_out, ref_out, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("compress_ratio,seqlen", [(4, 8), (128, 130)])
+def test_attention_compressed_prefill_matches_reference(
+    ref,
+    monkeypatch,
+    compress_ratio,
+    seqlen,
+):
+    torch.manual_seed(60 + compress_ratio)
+    monkeypatch.setattr(ref, "rotate_activation", lambda x: x)
+    monkeypatch.setattr(
+        ref,
+        "linear",
+        lambda x, weight, bias=None: F.linear(
+            x,
+            weight.to(dtype=x.dtype),
+            None if bias is None else bias.to(dtype=x.dtype),
+        ),
+    )
+    args = _tiny_args(ref, compress_ratio=compress_ratio)
+    args.max_seq_len = max(args.max_seq_len, seqlen + 8)
+    args.index_topk = 4
+    cfg = _tiny_config(args)
+    ref_attn = ref.Attention(0, args)
+    _init_reference_attention(ref_attn)
+    bg_attn = bg.DeepSeekV4FlashAttention(cfg, 0)
+    _copy_ref_attention_to_bg(ref_attn, bg_attn)
+
+    x = torch.randn(2, seqlen, args.dim)
     position_ids = torch.arange(x.size(1)).unsqueeze(0).expand(x.size(0), -1)
     ref_out = ref_attn(x, start_pos=0)
     bg_out, _, _ = bg_attn(x, position_ids=position_ids)
