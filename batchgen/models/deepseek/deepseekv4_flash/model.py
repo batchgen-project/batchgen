@@ -863,6 +863,21 @@ class DeepSeekV4FlashAttention(nn.Module):
         if self.compressor is None:
             return
         cache_len = max(seqlen // self.compress_ratio, 1)
+        self._ensure_compress_cache_capacity(bsz, cache_len, device, dtype)
+        positions = torch.arange(max(seqlen, 1), dtype=torch.long, device=device)
+        self._ensure_compress_freqs(positions)
+        self.compressor.kv_cache = self._compress_kv_cache
+        self.compressor.freqs_cis = self._compress_freqs_cis
+        if self.indexer is not None:
+            self.indexer.freqs_cis = self._compress_freqs_cis
+
+    def _ensure_compress_cache_capacity(
+        self,
+        bsz: int,
+        cache_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
         if (
             self._compress_kv_cache is None
             or self._compress_kv_cache.size(0) < bsz
@@ -870,21 +885,45 @@ class DeepSeekV4FlashAttention(nn.Module):
             or self._compress_kv_cache.device != device
             or self._compress_kv_cache.dtype != dtype
         ):
-            self._compress_kv_cache = torch.zeros(
+            old_cache = self._compress_kv_cache
+            new_cache = torch.zeros(
                 bsz,
                 cache_len,
                 self.head_dim,
                 dtype=dtype,
                 device=device,
             )
+            if old_cache is not None:
+                copy_bsz = min(bsz, old_cache.size(0))
+                copy_len = min(cache_len, old_cache.size(1))
+                if (
+                    copy_bsz > 0
+                    and copy_len > 0
+                    and old_cache.device == device
+                    and old_cache.dtype == dtype
+                ):
+                    new_cache[:copy_bsz, :copy_len] = old_cache[
+                        :copy_bsz,
+                        :copy_len,
+                    ]
+            self._compress_kv_cache = new_cache
+
+    def _ensure_compress_freqs(self, positions: torch.Tensor) -> None:
+        if positions.numel() == 0:
+            return
+        seqlen = int(positions.max().item()) + 1
         if (
             self._compress_freqs_cis is None
-            or self._compress_freqs_cis.size(0) < seqlen
-            or self._compress_freqs_cis.device != device
+            or self._compress_freqs_cis.size(0) < max(seqlen, 1)
+            or self._compress_freqs_cis.device != positions.device
         ):
-            positions = torch.arange(max(seqlen, 1), dtype=torch.long, device=device)
+            all_positions = torch.arange(
+                max(seqlen, 1),
+                dtype=torch.long,
+                device=positions.device,
+            )
             self._compress_freqs_cis = _build_rope_freqs_cis(
-                positions,
+                all_positions,
                 self.rope_head_dim,
                 self.rope_theta,
                 self.rope_factor,
@@ -892,10 +931,32 @@ class DeepSeekV4FlashAttention(nn.Module):
                 self.beta_slow,
                 self.original_seq_len,
             )
-        self.compressor.kv_cache = self._compress_kv_cache
-        self.compressor.freqs_cis = self._compress_freqs_cis
-        if self.indexer is not None:
-            self.indexer.freqs_cis = self._compress_freqs_cis
+
+    def _window_cache_from_past(
+        self,
+        past_kv: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, max_len, head_dim = past_kv.shape
+        window_cache = past_kv.new_zeros(bsz, self.window_size, head_dim)
+        lengths = cache_seqlens.to(device=past_kv.device, dtype=torch.long).clamp(
+            min=0,
+            max=max_len,
+        )
+        for batch_idx, valid_len_tensor in enumerate(lengths):
+            valid_len = int(valid_len_tensor.item())
+            if valid_len <= 0:
+                continue
+            if valid_len <= self.window_size:
+                window_cache[batch_idx, :valid_len] = past_kv[batch_idx, :valid_len]
+                continue
+            cutoff = valid_len % self.window_size
+            recent = past_kv[batch_idx, valid_len - self.window_size : valid_len]
+            split = self.window_size - cutoff
+            window_cache[batch_idx, cutoff:] = recent[:split]
+            if cutoff:
+                window_cache[batch_idx, :cutoff] = recent[split:]
+        return window_cache
 
     def _prefill_sparse_attention(
         self,
@@ -937,6 +998,73 @@ class DeepSeekV4FlashAttention(nn.Module):
             kv_compress = self.compressor(hidden_states, start_pos)
             if kv_compress is not None:
                 kv_for_attn = torch.cat([kv, kv_compress], dim=1)
+        return _sparse_attn_from_topk(
+            q,
+            kv_for_attn,
+            self.attn_sink,
+            topk_idxs.int(),
+            self.softmax_scale,
+        )
+
+    def _decode_sparse_attention(
+        self,
+        hidden_states: torch.Tensor,
+        q_low: torch.Tensor,
+        q: torch.Tensor,
+        past_kv: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        start_pos: int,
+    ) -> torch.Tensor:
+        bsz, q_len, _ = hidden_states.shape
+        if q_len != 1:
+            raise RuntimeError(
+                "DeepSeek-V4 sparse decode fallback currently expects q_len=1, "
+                f"got {q_len}."
+            )
+        kv_for_attn = self._window_cache_from_past(past_kv, cache_seqlens)
+        topk_idxs = _window_topk_idxs(
+            self.window_size,
+            bsz,
+            q_len,
+            start_pos,
+            hidden_states.device,
+        )
+        if self.compressor is not None:
+            cache_len = max((start_pos + q_len) // self.compress_ratio, 1)
+            self._ensure_compress_cache_capacity(
+                bsz,
+                cache_len,
+                hidden_states.device,
+                past_kv.dtype,
+            )
+            positions = torch.arange(
+                start_pos,
+                start_pos + q_len,
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            self._ensure_compress_freqs(positions)
+            self.compressor.kv_cache = self._compress_kv_cache
+            self.compressor.freqs_cis = self._compress_freqs_cis
+            offset = self.window_size
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self._compress_freqs_cis
+                compress_topk_idxs = self.indexer(hidden_states, q_low, start_pos, offset)
+            else:
+                compress_topk_idxs = _compress_topk_idxs(
+                    self.compress_ratio,
+                    bsz,
+                    q_len,
+                    start_pos,
+                    offset,
+                    hidden_states.device,
+                )
+            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+            self.compressor(hidden_states, start_pos)
+            kv_for_attn = torch.cat(
+                [kv_for_attn, self._compress_kv_cache[:bsz]],
+                dim=1,
+            )
         return _sparse_attn_from_topk(
             q,
             kv_for_attn,
@@ -1001,23 +1129,33 @@ class DeepSeekV4FlashAttention(nn.Module):
                 start_pos,
             )
         else:
+            attn_output = None
             if past_key_value is not None:
                 kv_for_attn = self._normalize_past_kv(past_key_value)
                 if q_len == 1 and cache_seqlens is not None:
                     self._write_current_kv(kv_for_attn, kv, cache_seqlens)
-            k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
-            v = k
-            attn_scores = torch.einsum("bshd,bthd->bhst", q, k) * self.softmax_scale
-            attn_scores = self._apply_fallback_masks(
-                attn_scores,
-                attention_mask,
-                cache_seqlens,
-                q_len,
-                kv_for_attn.size(1),
-                past_key_value is not None,
-            )
-            attn_weights = self._softmax_with_sink(attn_scores).to(q.dtype)
-            attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
+                    attn_output = self._decode_sparse_attention(
+                        hidden_states,
+                        q_low,
+                        q,
+                        kv_for_attn,
+                        cache_seqlens,
+                        start_pos,
+                    )
+            if attn_output is None:
+                k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+                v = k
+                attn_scores = torch.einsum("bshd,bthd->bhst", q, k) * self.softmax_scale
+                attn_scores = self._apply_fallback_masks(
+                    attn_scores,
+                    attention_mask,
+                    cache_seqlens,
+                    q_len,
+                    kv_for_attn.size(1),
+                    past_key_value is not None,
+                )
+                attn_weights = self._softmax_with_sink(attn_scores).to(q.dtype)
+                attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
         if freqs_cis is not None:
             _apply_rotary_emb_inplace(
                 attn_output[..., -self.rope_head_dim:],
