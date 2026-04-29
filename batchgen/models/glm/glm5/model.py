@@ -298,12 +298,11 @@ class Glm5Indexer(nn.Module):
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Fused interleaved RoPE + Hadamard for DSA decode."""
+        """Fused interleaved RoPE + Hadamard for DSA indexer KV."""
         if _fused_rope_hadamard_fn is None:
             raise RuntimeError("GLM-5 DSA selector requires fused RoPE+Hadamard")
-        if max_seqlen is None:
-            raise RuntimeError("GLM-5 DSA selector requires explicit max_seqlen")
-        cos, sin = self.rotary_emb(k, max_seqlen)
+        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+        cos, sin = self.rotary_emb(k, seq_len)
         return _fused_rope_hadamard_fn(
             k.to(torch.bfloat16), cos.float(), sin.float(),
             positions.reshape(-1), scale=k.shape[-1] ** -0.5,

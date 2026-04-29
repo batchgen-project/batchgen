@@ -196,7 +196,7 @@ def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch)
         )
 
 
-def test_glm5_prefill_indexer_kv_receives_explicit_max_seqlen(monkeypatch):
+def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.prepack_mode = True
     wrapper.position_ids = torch.tensor([[0, 1, 2]], dtype=torch.int64)
@@ -209,7 +209,7 @@ def test_glm5_prefill_indexer_kv_receives_explicit_max_seqlen(monkeypatch):
         def compute_indexer_kv(self, hidden_states, *, positions, max_seqlen=None):
             assert hidden_states.shape == (1, 3, 4)
             assert positions.tolist() == [[0, 1, 2]]
-            assert max_seqlen == 4096
+            assert max_seqlen is None
             return torch.zeros(1, 3, 1, 128)
 
     class FakeModule:
