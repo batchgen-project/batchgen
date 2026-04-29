@@ -7153,13 +7153,21 @@ class BatchGenWorker:
 				# Embed tokens
 				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
-				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-				hidden_states = inputs_embeds.unsqueeze(0)
-
-				v4_input_ids = batch_input_ids_flat.to(self.torch_device).unsqueeze(0)
 				is_deepseek_v4 = "deepseek_v4" in str(
 					getattr(self.model_config, "model_type", "")
 				).lower()
+				if is_deepseek_v4:
+					hidden_states = inputs_embeds.unsqueeze(0).unsqueeze(2).expand(
+						-1,
+						-1,
+						self.model.model.hc_mult,
+						-1,
+					).contiguous()
+					v4_input_ids = batch_input_ids_flat.to(self.torch_device).unsqueeze(0)
+				else:
+					# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
+					hidden_states = inputs_embeds.unsqueeze(0)
+					v4_input_ids = None
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					layer_kwargs = {
 						"attention_mask": None,
@@ -7177,6 +7185,8 @@ class BatchGenWorker:
 					hidden_states = layer_outputs[0]
 
 				# Final norm
+				if is_deepseek_v4 and hidden_states.dim() == 4:
+					hidden_states = self.model.model._hc_head(hidden_states)
 				hidden_states = self.model.model.norm(hidden_states)
 
 				# Extract last token hidden states for each sequence
