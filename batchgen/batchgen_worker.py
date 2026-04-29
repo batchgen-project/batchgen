@@ -2234,6 +2234,15 @@ class BatchGenWorker:
 			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
 				self.core_engine.gpu_paged_kv_manager = manager
 
+	def _get_cuda_graph_gpu_manager(self):
+		"""Return the GPU KV manager object to use for CUDA graph setup."""
+		manager = self.gpu_paged_kv_cache_manager
+		if isinstance(manager, DualKVCacheCoordinator):
+			return manager
+		if manager is not None:
+			return manager
+		return getattr(self.core_engine, "gpu_paged_kv_manager", None)
+
 	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
 		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
 
@@ -7960,7 +7969,7 @@ class BatchGenWorker:
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
 
-		gpu_manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)
+		gpu_manager = self._get_cuda_graph_gpu_manager()
 		if gpu_manager is None:
 			logging.warning(f"Rank {self.rank}: No GPU KV manager, skipping CUDA graph warmup")
 			return
