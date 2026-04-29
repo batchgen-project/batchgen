@@ -47,15 +47,21 @@ try:
 except (ImportError, Exception):
     pass
 
-# WP4: Fused indexer scoring (CUDA WGMMA + CUDA RoPE/Hadamard + Triton)
-try:
-    from batchgen_kernels.attention.dsa.fused_indexer_score import (
-        FP8WqbWeightsCUDA,
-        fused_score_pipeline,
-    )
-    __all__ += ["FP8WqbWeightsCUDA", "fused_score_pipeline"]
-except (ImportError, Exception):
-    pass
+# WP4: Fused indexer scoring (CUDA WGMMA + CUDA RoPE/Hadamard + Triton).
+# This is required by the production GLM-5 DSA path; import failures must
+# preserve the original exception instead of silently disabling the kernel.
+from batchgen_kernels.attention.dsa.fused_indexer_score import (
+    FP8WqbWeightsCUDA,
+    fused_score_pipeline,
+    fused_score_and_topk,
+    fused_score_and_topk_out,
+)
+__all__ += [
+    "FP8WqbWeightsCUDA",
+    "fused_score_and_topk",
+    "fused_score_and_topk_out",
+    "fused_score_pipeline",
+]
 
 # WP5: FP8 absorb (Triton WGMMA)
 try:

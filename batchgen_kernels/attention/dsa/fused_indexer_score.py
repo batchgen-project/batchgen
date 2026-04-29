@@ -160,6 +160,42 @@ def _fused_score_kernel(
     tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
 
 
+@triton.jit
+def _topk_from_scores_kernel(
+    AGG_ptr,           # [B, max_seqlen] FP32
+    OUT_ptr,           # [B, topk] int64/int32
+    max_seqlen: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Select top-k indices from one row of scores.
+
+    This first custom top-k kernel is intentionally simple: one Triton program
+    owns one batch row, loads the full static score row, and repeatedly selects
+    the current maximum. It replaces ``torch.topk`` in the production path and
+    is suitable for current DSA selected windows / seqlen buckets. For very long
+    contexts, replace this with a hierarchical tile-topk + merge kernel.
+    """
+
+    pid_b = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < max_seqlen
+    vals = tl.load(
+        AGG_ptr + pid_b * max_seqlen + offs,
+        mask=mask,
+        other=float("-inf"),
+    )
+    idxs = offs
+
+    k = 0
+    while k < topk:
+        best_val = tl.max(vals, axis=0)
+        best_idx = tl.max(tl.where(vals == best_val, idxs, 0), axis=0)
+        tl.store(OUT_ptr + pid_b * topk + k, best_idx)
+        vals = tl.where(idxs == best_idx, float("-inf"), vals)
+        k += 1
+
+
 # ============================================================
 # Python wrappers (no CPU-GPU syncs)
 # ============================================================
@@ -178,11 +214,56 @@ def fused_score_and_topk(
     cache_seqlens: torch.Tensor,
     topk: int = 2048,
 ) -> torch.Tensor:
-    """Fused scoring + topk. No CPU-GPU sync."""
+    """Fused scoring + custom Triton top-k. No CPU-GPU sync."""
     B, n_heads, head_dim = q.shape
     max_seqlen = cached_k.shape[1]
 
     agg = torch.empty(B, max_seqlen, dtype=torch.float32, device=q.device)
+    effective_topk = min(topk, max_seqlen)
+    top_k_indices = torch.empty(
+        B,
+        effective_topk,
+        dtype=torch.long,
+        device=q.device,
+    )
+    fused_score_and_topk_out(
+        q,
+        cached_k,
+        head_gates,
+        cache_seqlens,
+        agg,
+        top_k_indices,
+        topk=effective_topk,
+    )
+    return top_k_indices
+
+
+def fused_score_and_topk_out(
+    q: torch.Tensor,
+    cached_k: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    topk: int = 2048,
+) -> torch.Tensor:
+    """Out-buffer fused scoring + custom Triton top-k for CUDA graph capture."""
+    B, n_heads, head_dim = q.shape
+    max_seqlen = cached_k.shape[1]
+    if topk > max_seqlen:
+        raise ValueError(f"topk={topk} exceeds max_seqlen={max_seqlen}")
+    if agg.shape != (B, max_seqlen):
+        raise ValueError(
+            f"agg must have shape {(B, max_seqlen)}, got {tuple(agg.shape)}"
+        )
+    if agg.dtype != torch.float32:
+        raise TypeError(f"agg must be float32, got {agg.dtype}")
+    if top_k_indices.shape != (B, topk):
+        raise ValueError(
+            f"top_k_indices must have shape {(B, topk)}, got {tuple(top_k_indices.shape)}"
+        )
+    if top_k_indices.dtype not in (torch.int64, torch.int32):
+        raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
 
     BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
     BLOCK_D = head_dim
@@ -195,10 +276,14 @@ def fused_score_and_topk(
         BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
     )
 
-    # topk — no .item() sync. In production cache_seqlens >= topk always.
-    # Invalid positions are -inf from kernel, so topk naturally picks valid ones.
-    effective_topk = min(topk, max_seqlen)
-    _, top_k_indices = torch.topk(agg, effective_topk, dim=-1)
+    block_n = triton.next_power_of_2(max_seqlen)
+    _topk_from_scores_kernel[(B,)](
+        agg,
+        top_k_indices,
+        max_seqlen=max_seqlen,
+        topk=topk,
+        BLOCK_N=block_n,
+    )
 
     return top_k_indices
 
@@ -311,7 +396,7 @@ def fused_score_pipeline(
     Step 1: CUDA WGMMA wq_b projection [B, 2048] → [B, 4096]
     Step 2-3: RoPE + Hadamard on Q [B, 32, 128]
     Step 4-8: Fused scoring kernel (Triton)
-    Step 9: torch.topk on aggregated [B, max_seqlen]
+    Step 9: custom Triton top-k on aggregated [B, max_seqlen]
     """
     B = q_a.shape[0]
 
