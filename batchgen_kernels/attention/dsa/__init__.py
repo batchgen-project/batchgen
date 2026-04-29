@@ -66,14 +66,16 @@ except (ImportError, Exception):
         fused_score_pipeline,
         fused_score_and_topk,
         fused_score_and_topk_out,
-)
+        rope_hadamard_q_out,
+    )
 __all__ += [
         "FP8WqbWeightsCUDA",
         "cuda_wq_b_proj_out",
         "fused_score_and_topk",
         "fused_score_and_topk_out",
         "fused_score_pipeline",
-]
+        "rope_hadamard_q_out",
+    ]
 
 # WP5: FP8 absorb (Triton WGMMA)
 try:

@@ -65,7 +65,51 @@ at::Tensor fused_rope_hadamard(
     return out.reshape(shapes_og);
 }
 
+void fused_rope_hadamard_out(
+    at::Tensor &x,          // [batch, 128] bf16, after LayerNorm
+    at::Tensor &cos_cache,  // [max_seq, 64] float32
+    at::Tensor &sin_cache,  // [max_seq, 64] float32
+    at::Tensor &positions,  // [batch] int64
+    at::Tensor &out,        // [batch, 128] bf16
+    float scale             // 1/sqrt(128)
+) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16);
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::ScalarType::BFloat16);
+    TORCH_CHECK(x.sizes() == out.sizes(), "out must match x shape");
+    TORCH_CHECK(x.size(-1) == 128, "fused_rope_hadamard requires dim=128");
+    TORCH_CHECK(cos_cache.scalar_type() == at::ScalarType::Float, "cos must be float32");
+    TORCH_CHECK(sin_cache.scalar_type() == at::ScalarType::Float, "sin must be float32");
+    TORCH_CHECK(positions.scalar_type() == at::ScalarType::Long, "positions must be int64");
+    TORCH_CHECK(cos_cache.is_contiguous(), "cos_cache must be contiguous for graph out path");
+    TORCH_CHECK(sin_cache.is_contiguous(), "sin_cache must be contiguous for graph out path");
+    TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous for graph out path");
+
+    auto x_2d = x.reshape({-1, 128});
+    auto out_2d = out.reshape({-1, 128});
+    TORCH_CHECK(x_2d.stride(-1) == 1, "x last dimension must be contiguous");
+    TORCH_CHECK(out_2d.stride(-1) == 1, "out last dimension must be contiguous");
+    const int batch_size = x_2d.size(0);
+    TORCH_CHECK(positions.numel() == batch_size, "positions length must match flattened batch");
+
+    FusedRopeHadamardParams params;
+    memset(&params, 0, sizeof(params));
+    params.x_ptr = x_2d.data_ptr();
+    params.out_ptr = out_2d.data_ptr();
+    params.cos_ptr = cos_cache.data_ptr<float>();
+    params.sin_ptr = sin_cache.data_ptr<float>();
+    params.pos_ptr = positions.data_ptr<int64_t>();
+    params.batch = batch_size;
+    params.cos_stride = cos_cache.stride(0);
+    params.scale = scale;
+
+    at::cuda::CUDAGuard device_guard{(char)x.get_device()};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    fused_rope_hadamard_launch(params, stream);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_rope_hadamard", &fused_rope_hadamard,
           "Fused interleaved RoPE + Hadamard transform (dim=128, bf16)");
+    m.def("fused_rope_hadamard_out", &fused_rope_hadamard_out,
+          "Out-buffer fused interleaved RoPE + Hadamard transform (dim=128, bf16)");
 }

@@ -34,7 +34,10 @@ from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
 )
 
 # Import existing CUDA fused RoPE+Hadamard kernel
-from batchgen_kernels.attention.dsa.indexer import fused_rope_hadamard as _cuda_fused_rope_hadamard
+from batchgen_kernels.attention.dsa.indexer import (
+    fused_rope_hadamard as _cuda_fused_rope_hadamard,
+    fused_rope_hadamard_out as _cuda_fused_rope_hadamard_out,
+)
 
 
 # ============================================================
@@ -408,6 +411,40 @@ def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
         128 ** -0.5,         # Hadamard scale
     )
     return q_out
+
+
+def rope_hadamard_q_out(
+    q: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    positions_expanded: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer CUDA RoPE + Hadamard for graph capture.
+
+    ``positions_expanded`` must already have shape ``[B * n_heads]`` to avoid
+    allocating inside the captured segment.
+    """
+    B, n_heads, head_dim = q.shape
+    if head_dim != 128:
+        raise ValueError(f"GLM-5 DSA RoPE+Hadamard requires head_dim=128, got {head_dim}")
+    if out.shape != q.shape or out.dtype != q.dtype:
+        raise ValueError(f"out must match q shape/dtype, got {out.shape} {out.dtype}")
+    if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
+        raise TypeError("cos_table and sin_table must be float32 for graph-captured RoPE+Hadamard")
+    if positions_expanded.shape != (B * n_heads,) or positions_expanded.dtype != torch.int64:
+        raise ValueError(
+            f"positions_expanded must be int64 with shape {(B * n_heads,)}, "
+            f"got {positions_expanded.shape} {positions_expanded.dtype}"
+        )
+    return _cuda_fused_rope_hadamard_out(
+        q.reshape(B * n_heads, head_dim),
+        cos_table,
+        sin_table,
+        positions_expanded,
+        out.reshape(B * n_heads, head_dim),
+        128 ** -0.5,
+    )
 
 
 def rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim=64):

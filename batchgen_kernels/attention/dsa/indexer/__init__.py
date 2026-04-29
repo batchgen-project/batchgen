@@ -66,3 +66,23 @@ def fused_rope_hadamard(
         [batch, 128] bf16 tensor
     """
     return _fused_rope_hadamard_cuda.fused_rope_hadamard(x, cos_cache, sin_cache, positions, scale)
+
+
+def fused_rope_hadamard_out(
+    x: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    scale: float = 128 ** -0.5,
+) -> torch.Tensor:
+    """Out-buffer fused interleaved RoPE + Hadamard transform for graph capture."""
+    _fused_rope_hadamard_cuda.fused_rope_hadamard_out(
+        x,
+        cos_cache,
+        sin_cache,
+        positions,
+        out,
+        scale,
+    )
+    return out
