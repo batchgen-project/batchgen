@@ -570,40 +570,100 @@ class DeepSeekV4FlashMoE(nn.Module):
         self.enable_ep_offloading = world_size > 1
 
     @staticmethod
-    def _all_reduce_routed(routed: torch.Tensor) -> torch.Tensor:
+    def _gather_token_rows(rows: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         local_tokens = torch.tensor(
-            [routed.shape[0]],
+            [rows.shape[0]],
             dtype=torch.int64,
-            device=routed.device,
+            device=rows.device,
         )
         all_tokens = torch.empty(
             dist.get_world_size(),
             dtype=torch.int64,
-            device=routed.device,
+            device=rows.device,
         )
         dist.all_gather_into_tensor(all_tokens, local_tokens)
         max_tokens = int(all_tokens.max().item())
         if max_tokens == 0:
-            return routed
-        if routed.shape[0] == max_tokens:
-            reduced = routed
+            return rows, 0, 0
+
+        padded_shape = (max_tokens, *rows.shape[1:])
+        if rows.shape[0] == max_tokens:
+            padded = rows
         else:
-            reduced = routed.new_zeros(max_tokens, routed.shape[1])
-            if routed.shape[0] > 0:
-                reduced[: routed.shape[0]] = routed
-        dist.all_reduce(reduced)
-        return reduced[: routed.shape[0]]
+            padded = rows.new_zeros(padded_shape)
+            if rows.shape[0] > 0:
+                padded[: rows.shape[0]] = rows
+
+        gathered_flat = rows.new_empty(
+            (dist.get_world_size() * max_tokens, *rows.shape[1:])
+        )
+        dist.all_gather_into_tensor(gathered_flat, padded.contiguous())
+        gathered = gathered_flat.view(
+            dist.get_world_size(), max_tokens, *rows.shape[1:]
+        )
+        valid_chunks = [
+            gathered[rank, : int(all_tokens[rank].item())]
+            for rank in range(dist.get_world_size())
+            if int(all_tokens[rank].item()) > 0
+        ]
+        if valid_chunks:
+            gathered_rows = torch.cat(valid_chunks, dim=0)
+        else:
+            gathered_rows = rows.new_empty((0, *rows.shape[1:]))
+        local_start = int(all_tokens[: dist.get_rank()].sum().item())
+        return gathered_rows, local_start, int(local_tokens.item())
+
+    @staticmethod
+    def _gather_token_ids(token_ids: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if token_ids is None:
+            return None
+        gathered_ids, _, _ = DeepSeekV4FlashMoE._gather_token_rows(
+            token_ids.reshape(-1, 1)
+        )
+        return gathered_ids.reshape(-1).long()
+
+    def _forward_ep(
+        self,
+        flat_states: torch.Tensor,
+        flat_ids: Optional[torch.Tensor],
+        output_shape: torch.Size,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        global_states, local_start, local_tokens = self._gather_token_rows(flat_states)
+        global_ids = self._gather_token_ids(flat_ids)
+        routed_global = torch.zeros_like(global_states, dtype=torch.float32)
+
+        if global_states.shape[0] > 0:
+            topk_weights, topk_indices = self.gate(global_states, global_ids)
+            counts = torch.bincount(
+                topk_indices.reshape(-1),
+                minlength=self.total_experts,
+            )
+            for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+                if counts[expert_idx].item() == 0:
+                    continue
+                token_idx, topk_pos = torch.where(topk_indices == expert_idx)
+                expert_out = self.experts[expert_idx](
+                    global_states[token_idx],
+                    topk_weights[token_idx, topk_pos].unsqueeze(-1),
+                )
+                routed_global[token_idx] += expert_out.float()
+
+        dist.all_reduce(routed_global)
+        local_routed = routed_global[local_start : local_start + local_tokens]
+        if flat_states.shape[0] == 0:
+            shared = torch.zeros_like(flat_states, dtype=torch.float32)
+        else:
+            shared = self.shared_experts(flat_states).float()
+        return (local_routed + shared).to(output_dtype).view(output_shape)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, self.hidden_size)
-        if flat_states.shape[0] == 0:
-            routed = torch.zeros_like(flat_states, dtype=torch.float32)
-            if self.enable_ep_offloading and dist.is_initialized():
-                routed = self._all_reduce_routed(routed)
-            return routed.to(hidden_states.dtype).view(shape)
-
         flat_ids = input_ids.reshape(-1) if input_ids is not None else None
+        if self.enable_ep_offloading and dist.is_initialized():
+            return self._forward_ep(flat_states, flat_ids, shape, hidden_states.dtype)
+
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 
         routed = torch.zeros_like(flat_states, dtype=torch.float32)
@@ -617,9 +677,6 @@ class DeepSeekV4FlashMoE(nn.Module):
                 topk_weights[token_idx, topk_pos].unsqueeze(-1),
             )
             routed[token_idx] += expert_out.float()
-
-        if self.enable_ep_offloading and dist.is_initialized():
-            routed = self._all_reduce_routed(routed)
 
         shared = self.shared_experts(flat_states).float()
         return (routed + shared).to(hidden_states.dtype).view(shape)
