@@ -21,6 +21,7 @@ strategy manager assigns to per-rank expert-parallel ranges.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -28,6 +29,13 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _v4_diag(message: str) -> None:
+    if os.environ.get("BATCHGEN_V4_DIAG", "0") != "1":
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(f"[V4-DIAG rank={rank}] {message}", flush=True)
 
 
 _FP4_E2M1_TABLE_VALUES = (
@@ -338,11 +346,20 @@ class DeepSeekV4FlashAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
         del position_ids, use_cache
         bsz, q_len, _ = hidden_states.shape
+        is_decode = past_key_value is not None
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} start shape={tuple(hidden_states.shape)}")
         q_low = self.q_norm(self.wq_a(hidden_states))
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} wq_a done")
         q = self.wq_b(q_low).view(bsz, q_len, self.n_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + self.eps)
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} q done")
 
         kv = self.kv_norm(self.wkv(hidden_states))
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} wkv done")
         kv_for_attn = kv
         if past_key_value is not None:
             kv_for_attn = self._normalize_past_kv(past_key_value)
@@ -361,6 +378,8 @@ class DeepSeekV4FlashAttention(nn.Module):
         )
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} fallback attention done")
 
         attn_output = attn_output.reshape(
             bsz, q_len, self.o_groups, self.n_heads // self.o_groups * self.head_dim
@@ -378,6 +397,8 @@ class DeepSeekV4FlashAttention(nn.Module):
         )
         attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
         attn_output = self.wo_b(attn_output.flatten(2))
+        if is_decode:
+            _v4_diag(f"attn L{self.layer_idx} output done")
         return attn_output, None, kv
 
     @staticmethod
@@ -571,6 +592,7 @@ class DeepSeekV4FlashMoE(nn.Module):
 
     @staticmethod
     def _gather_token_rows(rows: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
+        _v4_diag(f"moe gather rows enter local={rows.shape[0]} dtype={rows.dtype}")
         local_tokens = torch.tensor(
             [rows.shape[0]],
             dtype=torch.int64,
@@ -583,6 +605,9 @@ class DeepSeekV4FlashMoE(nn.Module):
         )
         dist.all_gather_into_tensor(all_tokens, local_tokens)
         max_tokens = int(all_tokens.max().item())
+        _v4_diag(
+            f"moe gather counts all={all_tokens.detach().cpu().tolist()} max={max_tokens}"
+        )
         if max_tokens == 0:
             return rows, 0, 0
 
@@ -598,6 +623,7 @@ class DeepSeekV4FlashMoE(nn.Module):
             (dist.get_world_size() * max_tokens, *rows.shape[1:])
         )
         dist.all_gather_into_tensor(gathered_flat, padded.contiguous())
+        _v4_diag("moe gather payload done")
         gathered = gathered_flat.view(
             dist.get_world_size(), max_tokens, *rows.shape[1:]
         )
@@ -629,12 +655,19 @@ class DeepSeekV4FlashMoE(nn.Module):
         output_shape: torch.Size,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        _v4_diag(f"moe L{self.layer_idx} ep start local={flat_states.shape[0]}")
         global_states, local_start, local_tokens = self._gather_token_rows(flat_states)
+        _v4_diag(
+            f"moe L{self.layer_idx} states gathered global={global_states.shape[0]} "
+            f"local_start={local_start} local={local_tokens}"
+        )
         global_ids = self._gather_token_ids(flat_ids)
+        _v4_diag(f"moe L{self.layer_idx} ids gathered")
         routed_global = torch.zeros_like(global_states, dtype=torch.float32)
 
         if global_states.shape[0] > 0:
             topk_weights, topk_indices = self.gate(global_states, global_ids)
+            _v4_diag(f"moe L{self.layer_idx} gate done")
             counts = torch.bincount(
                 topk_indices.reshape(-1),
                 minlength=self.total_experts,
@@ -649,12 +682,16 @@ class DeepSeekV4FlashMoE(nn.Module):
                 )
                 routed_global[token_idx] += expert_out.float()
 
+        _v4_diag(f"moe L{self.layer_idx} all_reduce enter")
         dist.all_reduce(routed_global)
+        _v4_diag(f"moe L{self.layer_idx} all_reduce done")
         local_routed = routed_global[local_start : local_start + local_tokens]
         if flat_states.shape[0] == 0:
             shared = torch.zeros_like(flat_states, dtype=torch.float32)
         else:
+            _v4_diag(f"moe L{self.layer_idx} shared enter")
             shared = self.shared_experts(flat_states).float()
+            _v4_diag(f"moe L{self.layer_idx} shared done")
         return (local_routed + shared).to(output_dtype).view(output_shape)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
@@ -782,6 +819,9 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
         del output_attentions, kwargs
+        is_decode = past_key_value is not None
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} start hidden={tuple(hidden_states.shape)}")
         collapse_hc_state = hidden_states.dim() == 3
         if collapse_hc_state:
             hidden_states = hidden_states.unsqueeze(2).expand(
@@ -793,6 +833,8 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         attn_input = self.attn_norm(attn_input)
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} attn enter")
         attn_out, attn_weights, present = self.self_attn(
             attn_input,
             attention_mask=attention_mask,
@@ -801,6 +843,8 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
             cache_seqlens=cache_seqlens,
             use_cache=use_cache,
         )
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} attn done")
         hidden_states = self._hc_post(attn_out, residual, post, comb)
 
         residual = hidden_states
@@ -808,10 +852,16 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
             hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         mlp_input = self.ffn_norm(mlp_input)
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} moe enter")
         mlp_out = self.mlp(mlp_input, input_ids)
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} moe done")
         hidden_states = self._hc_post(mlp_out, residual, post, comb)
         if collapse_hc_state:
             hidden_states = hidden_states.mean(dim=2)
+        if is_decode:
+            _v4_diag(f"layer {self.layer_idx} done")
         return hidden_states, attn_weights, present
 
 
@@ -872,12 +922,20 @@ class DeepSeekV4FlashModel(nn.Module):
                 raise ValueError("input_ids or inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
 
+        is_decode = past_key_values is not None
+        if is_decode:
+            _v4_diag(
+                f"model forward decode start inputs={tuple(inputs_embeds.shape)} "
+                f"layers={len(self.layers)}"
+            )
         hidden_states = inputs_embeds.unsqueeze(2).expand(
             -1, -1, self.hc_mult, -1
         ).contiguous()
         presents = []
         for idx, layer in enumerate(self.layers):
             past_kv = past_key_values[idx] if past_key_values is not None else None
+            if is_decode:
+                _v4_diag(f"model layer {idx} enter")
             hidden_states, _, present = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -887,9 +945,13 @@ class DeepSeekV4FlashModel(nn.Module):
                 output_attentions=bool(output_attentions),
                 use_cache=bool(use_cache),
             )
+            if is_decode:
+                _v4_diag(f"model layer {idx} exit")
             if use_cache:
                 presents.append(present)
         hidden_states = self.norm(self._hc_head(hidden_states))
+        if is_decode:
+            _v4_diag("model forward decode done")
         if use_cache:
             return hidden_states, tuple(presents)
         return (hidden_states,)

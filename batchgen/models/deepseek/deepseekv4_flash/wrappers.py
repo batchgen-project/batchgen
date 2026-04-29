@@ -15,12 +15,21 @@ slots defined in ``model.py``.
 
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
+
+
+def _v4_diag(message: str) -> None:
+    if os.environ.get("BATCHGEN_V4_DIAG", "0") != "1":
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(f"[V4-DIAG rank={rank}] {message}", flush=True)
 
 
 class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
@@ -51,21 +60,33 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
 
     def forward(self, *args, **kwargs):
         if self.phase == "decode":
+            _v4_diag(f"wrapper attn L{self.layer_idx} decode enter")
             kwargs["position_ids"] = AttnWrapperBase.position_ids
             kwargs["cache_seqlens"] = AttnWrapperBase.cache_seqlens
             past_key_states = AttnWrapperBase.past_key_states
             if past_key_states is not None:
                 kwargs["past_key_value"] = past_key_states[self.layer_idx]
             if args and isinstance(args[0], torch.Tensor) and args[0].shape[0] == 0:
+                _v4_diag(f"wrapper attn L{self.layer_idx} empty skip")
                 return self.module.empty_forward(args[0])
+        if self.phase == "decode":
+            _v4_diag(f"wrapper attn L{self.layer_idx} load enter")
         self._load_runtime_tensors()
         try:
+            if self.phase == "decode":
+                _v4_diag(f"wrapper attn L{self.layer_idx} forward enter")
             result = self.module(*args, **kwargs)
+            if self.phase == "decode":
+                _v4_diag(f"wrapper attn L{self.layer_idx} forward done")
             if self.phase == "prefill":
                 self._offload_prefill_kv(result[2], kwargs.get("attention_mask"))
             return result
         finally:
+            if self.phase == "decode":
+                _v4_diag(f"wrapper attn L{self.layer_idx} release enter")
             self._release_runtime_tensors()
+            if self.phase == "decode":
+                _v4_diag(f"wrapper attn L{self.layer_idx} release done")
 
     def _offload_prefill_kv(
         self,
@@ -140,8 +161,19 @@ class DeepSeekV4FlashExpertWrapper(ExpertWrapperBase):
         self.module.clear_runtime_tensors()
 
     def forward(self, *args, **kwargs):
+        if getattr(self, "phase", None) == "decode":
+            _v4_diag(f"wrapper expert {self.module_key} load enter")
         self._load_runtime_tensors()
         try:
-            return self.module(*args, **kwargs)
+            if getattr(self, "phase", None) == "decode":
+                _v4_diag(f"wrapper expert {self.module_key} forward enter")
+            result = self.module(*args, **kwargs)
+            if getattr(self, "phase", None) == "decode":
+                _v4_diag(f"wrapper expert {self.module_key} forward done")
+            return result
         finally:
+            if getattr(self, "phase", None) == "decode":
+                _v4_diag(f"wrapper expert {self.module_key} release enter")
             self._release_runtime_tensors()
+            if getattr(self, "phase", None) == "decode":
+                _v4_diag(f"wrapper expert {self.module_key} release done")
