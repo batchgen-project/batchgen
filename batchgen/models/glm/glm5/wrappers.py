@@ -448,6 +448,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 indexer_kv = self.module.indexer.compute_indexer_kv(
                     hidden_states_2d.unsqueeze(0),
                     positions=self.position_ids.to(hidden_states_2d.device),
+                    max_seqlen=self.prepack_max_seqlen,
                 )
             if indexer_kv is not None:
                 self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))

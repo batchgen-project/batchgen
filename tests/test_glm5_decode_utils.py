@@ -194,3 +194,43 @@ def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch)
             object(),
             object(),
         )
+
+
+def test_glm5_prefill_indexer_kv_receives_explicit_max_seqlen(monkeypatch):
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.prepack_mode = True
+    wrapper.position_ids = torch.tensor([[0, 1, 2]], dtype=torch.int64)
+    wrapper.prepack_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
+    wrapper.prepack_max_seqlen = 4096
+    wrapper.prepack_num_sequences = 1
+    wrapper.weight_dequant_scale = None
+
+    class FakeIndexer:
+        def compute_indexer_kv(self, hidden_states, *, positions, max_seqlen=None):
+            assert hidden_states.shape == (1, 3, 4)
+            assert positions.tolist() == [[0, 1, 2]]
+            assert max_seqlen == 4096
+            return torch.zeros(1, 3, 1, 128)
+
+    class FakeModule:
+        indexer = FakeIndexer()
+
+        def prefill_attn_w8a16_prepacked(
+            self,
+            hidden_states_2d,
+            position_ids,
+            prepack_cu_seqlens,
+            prepack_max_seqlen,
+            prepack_num_sequences,
+            weight_dequant_scale,
+        ):
+            assert prepack_max_seqlen == 4096
+            return torch.zeros_like(hidden_states_2d), torch.zeros(3, 1, 576)
+
+    wrapper.module = FakeModule()
+    monkeypatch.setattr(GLM5AttnWrapper, "_offload_prepacked_indexer_kv", lambda self, kv: None)
+    monkeypatch.setattr(GLM5AttnWrapper, "_offload_prepacked_kv", lambda self, kv: None)
+
+    attn_output, _, _ = wrapper._forward_prefill(torch.ones(1, 3, 4))
+
+    assert attn_output.shape == (1, 3, 4)
