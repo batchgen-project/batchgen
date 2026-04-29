@@ -13,7 +13,11 @@ try:
         fused_paged_gather,
         fused_indexer_gather,
     )
-    __all__ += ["fused_dense_paged_gather", "fused_paged_gather", "fused_indexer_gather"]
+    __all__ += [
+        "fused_dense_paged_gather",
+        "fused_paged_gather",
+        "fused_indexer_gather",
+    ]
 except (ImportError, Exception):
     pass
 
@@ -66,6 +70,7 @@ except (ImportError, Exception):
         fused_score_pipeline,
         fused_score_and_topk,
         fused_score_and_topk_out,
+        fused_paged_score_and_topk_out,
         rope_hadamard_q_out,
     )
 __all__ += [
@@ -73,6 +78,7 @@ __all__ += [
         "cuda_wq_b_proj_out",
         "fused_score_and_topk",
         "fused_score_and_topk_out",
+        "fused_paged_score_and_topk_out",
         "fused_score_pipeline",
         "rope_hadamard_q_out",
     ]

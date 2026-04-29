@@ -4,7 +4,7 @@ This module contains the first production integration bridge for the GLM-5
 BF16 DSA graph path.  The segment starts at the already validated graph-safe
 boundary:
 
-    q_a, q_nope/q_rope, dense auxiliary indexer K scratch, primary MLA pages
+    q_a, q_nope/q_rope, auxiliary indexer pages, primary MLA pages
       -> fused indexer score/top-k
       -> BF16 selected-KV gather
       -> FlashMLA dense decode over selected pages
@@ -39,7 +39,7 @@ from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
 from batchgen_kernels.attention.dsa.fused_indexer_score import (
     FP8WqbWeightsCUDA,
     cuda_wq_b_proj_out,
-    fused_score_and_topk_out,
+    fused_paged_score_and_topk_out,
     rope_hadamard_q_out,
 )
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
@@ -75,6 +75,7 @@ class Glm5DsaAttnSegment:
         self,
         *,
         primary_blocked_k: torch.Tensor,
+        aux_blocked_k: torch.Tensor,
         wq_b_weights: FP8WqbWeightsCUDA,
         absorb_weights: FP8AbsorbWeights,
         cuda_module,
@@ -83,6 +84,7 @@ class Glm5DsaAttnSegment:
         max_seqlen: int,
         index_topk: int = 2048,
         page_size: int = 64,
+        aux_page_size: int | None = None,
         num_index_heads: int = 32,
         num_attn_heads: int = 64,
         q_lora_rank: int = 2048,
@@ -103,8 +105,16 @@ class Glm5DsaAttnSegment:
             )
         if primary_blocked_k.shape[2] != 1:
             raise ValueError("GLM-5 DSA BF16 path expects one MLA KV head")
+        if aux_blocked_k.ndim != 4:
+            raise ValueError(
+                "aux_blocked_k must have shape [num_pages, page_size, 1, index_head_dim], "
+                f"got {tuple(aux_blocked_k.shape)}"
+            )
+        if aux_blocked_k.shape[2] != 1:
+            raise ValueError("GLM-5 DSA aux cache expects one indexer KV head")
 
         self.primary_blocked_k = primary_blocked_k
+        self.aux_blocked_k = aux_blocked_k
         self.wq_b_weights = wq_b_weights
         self.absorb_weights = absorb_weights
         self.cuda_module = cuda_module
@@ -113,6 +123,7 @@ class Glm5DsaAttnSegment:
         self.max_seqlen = max_seqlen
         self.index_topk = index_topk
         self.page_size = page_size
+        self.aux_page_size = page_size if aux_page_size is None else aux_page_size
         self.num_index_heads = num_index_heads
         self.num_attn_heads = num_attn_heads
         self.q_lora_rank = q_lora_rank
@@ -123,11 +134,22 @@ class Glm5DsaAttnSegment:
         self.kv_dim = primary_blocked_k.shape[3]
         self.softmax_scale = softmax_scale if softmax_scale is not None else self.kv_dim**-0.5
         self.max_pages_per_seq = (max_seqlen + page_size - 1) // page_size
+        self.max_aux_pages_per_seq = (
+            max_seqlen + self.aux_page_size - 1
+        ) // self.aux_page_size
         self._buffers: Dict[int, _Glm5DsaSegmentBuffers] = {}
 
         if self.kv_dim != self.kv_lora_rank + 64:
             raise ValueError(
                 f"GLM-5 DSA selected KV dim must be kv_lora_rank + 64, got {self.kv_dim}"
+            )
+        if aux_blocked_k.shape[1] != self.aux_page_size:
+            raise ValueError(
+                f"aux_blocked_k page size {aux_blocked_k.shape[1]} != {self.aux_page_size}"
+            )
+        if aux_blocked_k.shape[3] != self.index_head_dim:
+            raise ValueError(
+                f"aux_blocked_k head dim {aux_blocked_k.shape[3]} != {self.index_head_dim}"
             )
         if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
             raise TypeError("cos_table and sin_table must be float32 for graph capture")
@@ -142,10 +164,6 @@ class Glm5DsaAttnSegment:
                 torch.bfloat16,
             ),
             "q_rope": TensorSpec(("batch_size", self.num_attn_heads, 64), torch.bfloat16),
-            "aux_cached_k": TensorSpec(
-                ("batch_size", self.max_seqlen, self.index_head_dim),
-                torch.bfloat16,
-            ),
             "head_gates": TensorSpec(("batch_size", self.num_index_heads), torch.float32),
             "cache_seqlens": TensorSpec(
                 ("batch_size",), torch.int32, fill_value=float(self.max_seqlen)
@@ -157,6 +175,9 @@ class Glm5DsaAttnSegment:
             ),
             "primary_page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
+            ),
+            "aux_page_table": TensorSpec(
+                ("batch_size", self.max_aux_pages_per_seq), torch.int32, fill_value=0
             ),
         }
 
@@ -274,11 +295,11 @@ class Glm5DsaAttnSegment:
         q_a: torch.Tensor,
         q_nope: torch.Tensor,
         q_rope: torch.Tensor,
-        aux_cached_k: torch.Tensor,
         head_gates: torch.Tensor,
         cache_seqlens: torch.Tensor,
         positions_expanded: torch.Tensor,
         primary_page_table: torch.Tensor,
+        aux_page_table: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         batch_size = q_a.shape[0]
         buffers = self._buffers.get(batch_size)
@@ -302,14 +323,17 @@ class Glm5DsaAttnSegment:
             positions_expanded.view(-1),
             buffers.q_index,
         )
-        fused_score_and_topk_out(
+        fused_paged_score_and_topk_out(
             buffers.q_index,
-            aux_cached_k,
+            self.aux_blocked_k,
+            aux_page_table,
             head_gates,
             cache_seqlens,
             buffers.agg_scores,
             buffers.top_k_indices,
             topk=self.index_topk,
+            page_size=self.aux_page_size,
+            max_seqlen=self.max_seqlen,
         )
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,

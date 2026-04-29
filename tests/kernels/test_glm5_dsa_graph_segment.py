@@ -69,6 +69,26 @@ def _make_primary_cache(batch_size: int, max_seqlen: int):
     return blocked_k, page_table
 
 
+def _make_aux_cache(batch_size: int, max_seqlen: int):
+    pages_per_seq = (max_seqlen + PAGE_SIZE - 1) // PAGE_SIZE
+    total_pages = batch_size * pages_per_seq
+    blocked_k = (
+        torch.randn(
+            total_pages,
+            PAGE_SIZE,
+            1,
+            INDEX_DIM,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+    ).contiguous()
+    page_table = torch.arange(
+        total_pages, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_seq)
+    return blocked_k, page_table
+
+
 def _make_inputs(batch_size: int, max_seqlen: int):
     positions = torch.arange(
         max_seqlen - batch_size, max_seqlen, device="cuda", dtype=torch.int64
@@ -83,10 +103,6 @@ def _make_inputs(batch_size: int, max_seqlen: int):
         ).contiguous(),
         "q_rope": (
             torch.randn(batch_size, ATTN_HEADS, 64, device="cuda", dtype=torch.bfloat16)
-            * 0.1
-        ).contiguous(),
-        "aux_cached_k": (
-            torch.randn(batch_size, max_seqlen, INDEX_DIM, device="cuda", dtype=torch.bfloat16)
             * 0.1
         ).contiguous(),
         "head_gates": torch.randn(
@@ -111,6 +127,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     index_topk = 128
     module = build_module()
     primary_blocked_k, primary_page_table = _make_primary_cache(batch_size, max_seqlen)
+    aux_blocked_k, aux_page_table = _make_aux_cache(batch_size, max_seqlen)
     cos, sin = _rope_tables(max_seqlen + 8)
 
     wq_b = (
@@ -128,6 +145,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
 
     segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
+        aux_blocked_k=aux_blocked_k,
         wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
         absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
         cuda_module=module,
@@ -148,6 +166,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
 
     inputs = _make_inputs(batch_size, max_seqlen)
     inputs["primary_page_table"] = primary_page_table
+    inputs["aux_page_table"] = aux_page_table
     expected = {
         key: value.clone()
         for key, value in segment.forward(**inputs).items()
@@ -169,6 +188,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
 
     small_inputs = _make_inputs(1, max_seqlen)
     small_inputs["primary_page_table"] = primary_page_table[:1]
+    small_inputs["aux_page_table"] = aux_page_table[:1]
     small_expected = {
         key: value.clone()
         for key, value in segment.forward(**small_inputs).items()
