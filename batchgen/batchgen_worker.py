@@ -7156,14 +7156,23 @@ class BatchGenWorker:
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
 
+				v4_input_ids = batch_input_ids_flat.to(self.torch_device).unsqueeze(0)
+				is_deepseek_v4 = "deepseek_v4" in str(
+					getattr(self.model_config, "model_type", "")
+				).lower()
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					layer_kwargs = {
+						"attention_mask": None,
+						"position_ids": None,
+						"past_key_value": None,
+						"output_attentions": False,
+						"use_cache": False,
+					}
+					if is_deepseek_v4:
+						layer_kwargs["input_ids"] = v4_input_ids
 					layer_outputs = decoder_layer(
 						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
+						**layer_kwargs,
 					)
 					hidden_states = layer_outputs[0]
 
