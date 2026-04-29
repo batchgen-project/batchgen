@@ -177,14 +177,9 @@ def build_glm5_dsa_flashmla_inputs(
                 k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
             ).unsqueeze(2)
         else:
-            if not wrapper._warned_indexer_kv_fallback:
-                wrapper._warned_indexer_kv_fallback = True
-                logging.warning(
-                    f"[layer {wrapper.layer_idx}] WP2 fused indexer KV proj unavailable, "
-                    "falling back to PyTorch w8a16_gemm — check batchgen_kernels import"
-                )
-            indexer_kv = indexer.compute_indexer_kv(
-                hidden_states, positions=new_token_pos, max_seqlen=max_seqlen,
+            raise RuntimeError(
+                f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP2 "
+                "fused indexer KV projection; PyTorch fallback is disabled"
             )
         indexer_k_tensor = indexer_kv
         seq_lengths_i32_aux = (
@@ -347,18 +342,9 @@ def _build_query_states(
             bsz, attn.num_heads, 1, attn.kv_lora_rank,
         )
     else:
-        if not wrapper._warned_fp8_absorb_fallback:
-            wrapper._warned_fp8_absorb_fallback = True
-            logging.warning(
-                f"[layer {wrapper.layer_idx}] WP5 FP8 absorb unavailable, "
-                "falling back to SGLang-aligned BF16 BMM "
-                "(bmm(q_nope.T, w_kc)) — see wrappers.initialize_decode_absorb"
-            )
-        q_nope_out = torch.bmm(
-            q_nope_squeezed.transpose(0, 1), wrapper.w_kc,
-        ).transpose(0, 1)
-        query_states[:, :, :, :attn.kv_lora_rank] = q_nope_out.view(
-            bsz, attn.num_heads, 1, attn.kv_lora_rank,
+        raise RuntimeError(
+            f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP5 FP8 "
+            "q_absorb; PyTorch/BF16 fallback is disabled"
         )
 
     query_states[:, :, :, attn.kv_lora_rank:] = q_pe
