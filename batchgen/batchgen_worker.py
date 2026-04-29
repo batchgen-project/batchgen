@@ -2108,6 +2108,11 @@ class BatchGenWorker:
 		# Set CUDA graph config from command-line args
 		if self.args.disable_cuda_graphs:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
+		elif (
+			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			and "glm" in (getattr(self, "model_name", "") or "").lower()
+		):
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
