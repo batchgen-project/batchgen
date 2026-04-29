@@ -137,7 +137,14 @@ def _run_flashmla_dense(
         D_QK,
     )
     block_table = _make_synthetic_block_table(batch_size)
-    tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata()
+    # BatchGen's production wrapper still targets the older FlashMLA metadata
+    # signature. Newer FlashMLA accepts extra args via *args, so this remains
+    # compatible with both versions.
+    tile_scheduler_metadata, num_splits = flash_mla.get_mla_metadata(
+        selected_lengths.to(device=query_states.device, dtype=torch.int32),
+        H_Q,
+        H_KV,
+    )
 
     return flash_mla.flash_mla_with_kvcache(
         query_states,
