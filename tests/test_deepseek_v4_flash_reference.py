@@ -227,6 +227,56 @@ def _copy_ref_expert_to_bg(ref_expert, bg_expert) -> None:
     )
 
 
+def _set_random_bg_expert(bg_expert, hidden_size: int, intermediate_size: int) -> None:
+    bg_expert.set_runtime_tensors(
+        {
+            "w1.weight": torch.randn(intermediate_size, hidden_size) * 0.2,
+            "w2.weight": torch.randn(hidden_size, intermediate_size) * 0.2,
+            "w3.weight": torch.randn(intermediate_size, hidden_size) * 0.2,
+        }
+    )
+
+
+def _init_bg_causal_lm_for_parity(model, args) -> None:
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.is_floating_point():
+                _fill_float_param(param)
+        for layer in model.model.layers:
+            attn = layer.self_attn
+            attn.set_runtime_tensors(
+                {
+                    "attn_sink": torch.randn(args.n_heads) * 0.2,
+                    "q_norm.weight": torch.randn(args.q_lora_rank) * 0.2,
+                    "kv_norm.weight": torch.randn(args.head_dim) * 0.2,
+                    "wq_a.weight": torch.randn(args.q_lora_rank, args.dim) * 0.2,
+                    "wq_b.weight": torch.randn(
+                        args.n_heads * args.head_dim,
+                        args.q_lora_rank,
+                    )
+                    * 0.2,
+                    "wkv.weight": torch.randn(args.head_dim, args.dim) * 0.2,
+                    "wo_a.weight": torch.randn(
+                        args.o_groups * args.o_lora_rank,
+                        args.n_heads * args.head_dim // args.o_groups,
+                    )
+                    * 0.2,
+                    "wo_b.weight": torch.randn(
+                        args.dim,
+                        args.o_groups * args.o_lora_rank,
+                    )
+                    * 0.2,
+                }
+            )
+            for expert in layer.mlp.experts:
+                _set_random_bg_expert(expert, args.dim, args.moe_inter_dim)
+            _set_random_bg_expert(
+                layer.mlp.shared_experts,
+                args.dim,
+                args.moe_inter_dim,
+            )
+
+
 def _force_reference_attention_fp32(ref_attn) -> None:
     for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
         layer = getattr(ref_attn, name)
@@ -414,6 +464,51 @@ def test_hc_pre_post_matches_reference(ref):
         bg_layer._hc_post(y, x, bg_post, bg_comb),
         ref_block.hc_post(y, x, ref_post, ref_comb),
     )
+
+
+def test_prepacked_hc_head_path_matches_full_forward(ref):
+    torch.manual_seed(11)
+    args = _tiny_args(ref, compress_ratio=0)
+    cfg = _tiny_config(args)
+    model = bg.DeepSeekV4FlashForCausalLM(cfg)
+    _init_bg_causal_lm_for_parity(model, args)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    full_logits = model(input_ids=input_ids).logits[:, -1]
+
+    flat_ids = input_ids.reshape(-1)
+    hidden_states = (
+        model.model.embed_tokens(flat_ids)
+        .unsqueeze(0)
+        .unsqueeze(2)
+        .expand(-1, -1, model.model.hc_mult, -1)
+        .contiguous()
+    )
+    v4_input_ids = flat_ids.unsqueeze(0)
+    for layer in model.model.layers:
+        hidden_states = layer(
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False,
+            input_ids=v4_input_ids,
+        )[0]
+
+    final_hidden = model.model.norm(model.model._hc_head(hidden_states))
+    last_token_hidden = final_hidden[0, [flat_ids.numel() - 1], :]
+    prepacked_logits = F.linear(
+        last_token_hidden,
+        model.lm_head.weight,
+        model.lm_head.bias,
+    )
+    _assert_close(prepacked_logits, full_logits, atol=1e-4, rtol=1e-4)
+
+    synthetic_hc = torch.randn(1, 2, model.model.hc_mult, args.dim)
+    correct_final = model.model.norm(model.model._hc_head(synthetic_hc))
+    collapsed_final = model.model.norm(synthetic_hc.mean(dim=2))
+    assert torch.max((correct_final - collapsed_final).abs()) > 1e-3
 
 
 @pytest.mark.parametrize("n_hash_layers", [0, 1])
