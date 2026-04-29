@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -1154,6 +1155,19 @@ class BatchScheduler:
         custom_id = meta["custom_id"]
         url = meta["url"]
         created_at = int(time.time())
+
+        if os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1":
+            logger.info(
+                "[POOL_DIAG] completion batch=%s request=%s custom_id=%s "
+                "prompt_len=%s decoded_len=%s finish=%s text=%r",
+                batch_id,
+                request_id[:8],
+                custom_id,
+                prompt_length,
+                decoded_length,
+                finish_reason,
+                decoded_text,
+            )
 
         # Build response body based on endpoint type
         if url == "/v1/chat/completions":

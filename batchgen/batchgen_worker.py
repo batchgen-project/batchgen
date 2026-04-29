@@ -1318,12 +1318,13 @@ class BatchGenWorker:
 		if self.rank != 0 or self._response_queue is None:
 			return
 
-		# Use gathered text if provided, otherwise read from local buffer
+		# Use gathered text if provided, otherwise read from local buffer. An
+		# empty gathered string is valid when the only generated token was EOS.
 		text = gathered_text if gathered_text is not None else ""
-		if text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
+		if gathered_text is None and text == "" and seq.decoded_tokens is not None and seq.decoded_length > 0:
 			token_ids = seq.decoded_tokens[0, :seq.decoded_length].tolist()
 			try:
-				text = self.tokenizer.decode(token_ids)
+				text = self._decode_tokens_to_string(seq.decoded_tokens[:, :seq.decoded_length])
 			except Exception:
 				text = ""
 		self._response_queue.put({
@@ -1357,12 +1358,23 @@ class BatchGenWorker:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					token_ids = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
+					decoded_tokens = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
+					token_ids = decoded_tokens[0].tolist()
 					try:
-						text = self.tokenizer.decode(token_ids)
+						text = self._decode_tokens_to_string(decoded_tokens)
 					except Exception:
 						text = ""
 					my_tokens[uuid] = text
+					if os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1":
+						logging.info(
+							"[MULTI_DIAG] completion seq=%s global_idx=%s decoded_len=%s "
+							"tokens=%s text=%r",
+							uuid[:8],
+							getattr(seq, "global_idx", None),
+							seq.decoded_length,
+							token_ids,
+							text,
+						)
 
 		# All ranks participate in gather
 		all_tokens = [None] * self.world_size
