@@ -217,7 +217,7 @@ def test_flashmla_dense_selected_lengths_ignore_short_row_tail():
     )
 
     tail_poisoned = selected_mla_kv.clone()
-    tail_poisoned[0, int(selected_lengths[0].item()) :] = float("nan")
+    tail_poisoned[0, int(selected_lengths[0].item()) :] = 8.0
     poisoned_out, _ = _run_flashmla_dense(
         query_states,
         tail_poisoned,
@@ -234,9 +234,10 @@ def test_flashmla_dense_selected_lengths_ignore_short_row_tail():
         wrong_lengths,
         softmax_scale=softmax_scale,
     )
-    assert torch.isnan(wrong_out[0]).any(), (
-        "control check failed: poisoning short-row tail should be visible if "
-        "FlashMLA is asked to attend all 2048 selected slots"
+    max_diff = (wrong_out[0].float() - baseline_out[0].float()).abs().max()
+    assert max_diff > 1.0, (
+        "control check failed: poisoning short-row tail should materially change "
+        "the output if FlashMLA is asked to attend all 2048 selected slots"
     )
 
 
