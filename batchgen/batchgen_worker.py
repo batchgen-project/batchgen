@@ -9304,6 +9304,8 @@ class BatchGenWorker:
 		local_iteration = 0
 		last_boundary = 0
 		global_batch_size = len(self.global_batch)
+		_steps = self._steps_until_next_length_completion(decode_uuids)
+		length_completion_due_iter = None if _steps is None else local_iteration + _steps
 
 		# ========== INITIAL MOE BUFFER SYNC ==========
 		# Sync buffer size BEFORE first forward pass to prevent overflow.
@@ -9499,6 +9501,8 @@ class BatchGenWorker:
 					break
 				
 				new_tokens = self._rebuild_input_tokens(batch)
+				_steps = self._steps_until_next_length_completion(decode_uuids)
+				length_completion_due_iter = None if _steps is None else local_iteration + _steps
 				# DEBUG: Log tokens rebuild after boundary
 				if new_tokens.shape[0] != len(batch):
 					logging.error(
@@ -10014,6 +10018,16 @@ class BatchGenWorker:
 								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
+
+			if length_completion_due_iter is not None and local_iteration >= length_completion_due_iter:
+				decode_uuids, completed_uuids = self._sync_completion_status_at_boundary(decode_uuids)
+				if completed_uuids:
+					self._finalize_completed_decode_sequences(completed_uuids)
+					batch = self._get_local_indices_for_uuids(decode_uuids)
+					if batch:
+						new_tokens = self._rebuild_input_tokens(batch)
+				_steps = self._steps_until_next_length_completion(decode_uuids)
+				length_completion_due_iter = None if _steps is None else local_iteration + _steps
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
@@ -10720,6 +10734,68 @@ class BatchGenWorker:
 				active.append(uuid)
 		
 		return active, completed
+
+	def _steps_until_next_length_completion(self, decode_uuids: List[str]) -> Optional[int]:
+		"""Return decode steps until the next owner-local length/context limit."""
+		if not decode_uuids:
+			return None
+
+		no_local_limit = 1 << 30
+		local_min_remaining = no_local_limit
+		for uuid in decode_uuids:
+			if uuid not in self._uuid_to_local_map:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			remaining_decode = max(int(seq.max_decode_length) - int(seq.decoded_length), 0)
+			remaining_context = max(int(self.model_context_length) - int(seq.current_context_length), 0)
+			local_min_remaining = min(local_min_remaining, remaining_decode, remaining_context)
+
+		remaining = torch.tensor([local_min_remaining], dtype=torch.int64, device=self.torch_device)
+		dist.all_reduce(remaining, op=dist.ReduceOp.MIN)
+		global_min_remaining = int(remaining.item())
+		if global_min_remaining >= no_local_limit:
+			return None
+		return max(global_min_remaining, 1)
+
+	def _finalize_completed_decode_sequences(self, completed_uuids: List[str]) -> None:
+		"""Finalize completed decode sequences after a distributed completion sync."""
+		if not completed_uuids:
+			return
+
+		completed_lengths = []
+		for uuid in completed_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				completed_lengths.append(seq.decoded_length)
+
+		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+		self._maybe_log_completion_distribution(completed_uuids)
+		self._submit_completed_to_incremental_writer(completed_uuids)
+		gathered_texts = self._gather_completed_tokens(completed_uuids)
+
+		my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+		if my_completed:
+			gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+			if gpu_allocated:
+				self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+			self._release_host_kv_pages_for_batch(my_completed)
+
+		for uuid in completed_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.gpu_pages_allocated = 0
+				seq.host_pages_allocated = 0
+				seq.host_token_capacity = 0
+			self._sequences_with_gpu_kv.discard(uuid)
+
+		for uuid in completed_uuids:
+			self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+
+		if self.adaptive_chunk_sizer is not None:
+			for decoded_length in completed_lengths:
+				self.adaptive_chunk_sizer.report_completion(decoded_length)
 
 	def _try_load_new_sequences_at_boundary(
 		self, 
