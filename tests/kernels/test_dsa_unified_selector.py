@@ -16,6 +16,12 @@ import math
 import pytest
 import torch
 
+from batchgen.attention.dsa.unified_selector import (
+    make_flashmla_selected_block_table,
+    select_mla_kv_for_flashmla_bf16,
+    view_selected_mla_kv_as_flashmla_pages,
+)
+
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -74,14 +80,6 @@ def _make_selected_mla_kv(
     return selected
 
 
-def _make_synthetic_block_table(batch_size: int) -> torch.Tensor:
-    return torch.arange(
-        batch_size * PAGES_PER_SELECTED_ROW,
-        device="cuda",
-        dtype=torch.int32,
-    ).view(batch_size, PAGES_PER_SELECTED_ROW)
-
-
 def _selected_attention_reference(
     query_states: torch.Tensor,
     selected_mla_kv: torch.Tensor,
@@ -130,13 +128,16 @@ def _run_flashmla_dense(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     flash_mla = _require_flash_mla()
     batch_size = query_states.shape[0]
-    blocked_k = selected_mla_kv.view(
-        batch_size * PAGES_PER_SELECTED_ROW,
-        PAGE_SIZE,
-        H_KV,
-        D_QK,
+    blocked_k = view_selected_mla_kv_as_flashmla_pages(
+        selected_mla_kv,
+        page_size=PAGE_SIZE,
     )
-    block_table = _make_synthetic_block_table(batch_size)
+    block_table = make_flashmla_selected_block_table(
+        batch_size,
+        index_topk=INDEX_TOPK,
+        page_size=PAGE_SIZE,
+        device=query_states.device,
+    )
     # BatchGen's production wrapper still targets the older FlashMLA metadata
     # signature. Newer FlashMLA accepts extra args via *args, so this remains
     # compatible with both versions.
@@ -287,75 +288,6 @@ def _make_paged_primary_cache(
     return logical_kv, blocked_k, page_table
 
 
-def _select_mla_kv_reference(
-    primary_blocked_k: torch.Tensor,
-    primary_page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    long_topk_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference selector matching the planned unified BF16 selector contract."""
-
-    batch_size = int(cache_seqlens.numel())
-    flat_k = primary_blocked_k.view(-1, H_KV * D_QK)
-    selected = torch.zeros(
-        batch_size,
-        INDEX_TOPK,
-        H_KV,
-        D_QK,
-        device=primary_blocked_k.device,
-        dtype=primary_blocked_k.dtype,
-    )
-    selected_indices = torch.full(
-        (batch_size, INDEX_TOPK),
-        -1,
-        device=primary_blocked_k.device,
-        dtype=torch.int64,
-    )
-    selected_lengths = torch.minimum(
-        cache_seqlens.to(torch.int32),
-        torch.full_like(cache_seqlens.to(torch.int32), INDEX_TOPK),
-    )
-    row_modes = (cache_seqlens > INDEX_TOPK).to(torch.int32)
-    dense_positions = torch.arange(INDEX_TOPK, device=primary_blocked_k.device)
-
-    for row in range(batch_size):
-        seqlen = int(cache_seqlens[row].item())
-        if seqlen <= INDEX_TOPK:
-            logical = dense_positions
-            valid = logical < seqlen
-        else:
-            logical = long_topk_indices[row].to(torch.long)
-            valid = (logical >= 0) & (logical < seqlen)
-
-        logical_page = torch.div(logical, PAGE_SIZE, rounding_mode="floor")
-        page_offset = logical % PAGE_SIZE
-        logical_page_clamped = logical_page.clamp(
-            min=0,
-            max=primary_page_table.shape[1] - 1,
-        )
-        physical_page = torch.gather(
-            primary_page_table[row].to(torch.long),
-            0,
-            logical_page_clamped,
-        )
-        valid = valid & (physical_page >= 0)
-        flat_index = physical_page.clamp_min(0) * PAGE_SIZE + page_offset
-        gathered = flat_k[flat_index].view(INDEX_TOPK, H_KV, D_QK)
-        gathered = torch.where(
-            valid.view(INDEX_TOPK, 1, 1),
-            gathered,
-            torch.zeros((), dtype=gathered.dtype, device=gathered.device),
-        )
-        selected[row] = gathered
-        selected_indices[row] = torch.where(
-            valid,
-            logical,
-            torch.full_like(logical, -1),
-        )
-
-    return selected, selected_lengths, selected_indices, row_modes
-
-
 def test_reference_selector_output_feeds_flashmla_dense_contract():
     torch.cuda.set_device(0)
     batch_size = 3
@@ -379,17 +311,26 @@ def test_reference_selector_output_feeds_flashmla_dense_contract():
     )
     long_topk_indices[2] = torch.randperm(max_tokens, device="cuda")[:INDEX_TOPK]
 
-    selected, selected_lengths, selected_indices, row_modes = _select_mla_kv_reference(
-        primary_blocked_k,
-        primary_page_table,
-        cache_seqlens,
-        long_topk_indices,
+    selected, selected_lengths, selected_indices, row_modes = (
+        select_mla_kv_for_flashmla_bf16(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            index_topk=INDEX_TOPK,
+            page_size=PAGE_SIZE,
+        )
     )
 
     assert selected.shape == (batch_size, INDEX_TOPK, H_KV, D_QK)
     assert selected_lengths.tolist() == [33, INDEX_TOPK, INDEX_TOPK]
     assert row_modes.tolist() == [0, 0, 1]
     torch.testing.assert_close(selected[0, :33], logical_kv[0, :33])
+    torch.testing.assert_close(
+        selected_indices[0, :33],
+        torch.arange(33, device="cuda"),
+    )
+    assert torch.all(selected_indices[0, 33:] == -1)
     assert torch.count_nonzero(selected[0, 33:]) == 0
     torch.testing.assert_close(selected[1], logical_kv[1, :INDEX_TOPK])
     torch.testing.assert_close(selected[2], logical_kv[2, selected_indices[2]])
