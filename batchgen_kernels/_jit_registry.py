@@ -7,16 +7,31 @@ This mirrors setup.py ext_modules. When adding a new CUDAExtension in
 setup.py, add a corresponding entry here for JIT dev mode support.
 """
 
+import os
+
+
 # Common flag sets (mirror setup.py)
 _SM90A_FLAGS = [
     "-std=c++17", "-arch=sm_90a", "-O3",
     "--ptxas-options=-v", "-lineinfo", "--threads", "4",
 ]
 
-_SM80_GENCODE = [
-    "-gencode", "arch=compute_80,code=sm_80",
-    "-gencode", "arch=compute_90,code=sm_90",
-]
+_BUILD_ARCH = os.environ.get("BUILD_ARCH", "sm90a")
+
+if _BUILD_ARCH == "sm90a":
+    _SM80_GENCODE = ["-gencode", "arch=compute_90a,code=sm_90a"]
+elif _BUILD_ARCH == "sm100":
+    _SM80_GENCODE = ["-gencode", "arch=compute_100,code=sm_100"]
+elif _BUILD_ARCH == "all":
+    _SM80_GENCODE = [
+        "-gencode", "arch=compute_80,code=sm_80",
+        "-gencode", "arch=compute_90,code=sm_90",
+        "-gencode", "arch=compute_100,code=sm_100",
+    ]
+else:
+    raise RuntimeError(
+        f"Unsupported BUILD_ARCH={_BUILD_ARCH!r}; expected sm90a, sm100, or all"
+    )
 
 _SM80_FLAGS = ["-std=c++17", "-O3", "--threads", "4"] + _SM80_GENCODE
 
@@ -121,7 +136,7 @@ def get_registry():
                 "-O3", "-std=c++17",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--threads", "4",
-            ],
+            ] + _SM80_GENCODE,
         },
 
         # ── SM80+ universal kernels ──
@@ -163,14 +178,14 @@ def get_registry():
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-lineinfo",
                 "--threads", "4",
-            ],
+            ] + _SM80_GENCODE,
         },
         "batchgen_kernels.moe._C_mxfp4_dequant": {
             "sources": ["src/moe/mxfp4_dequant.cu"],
             "nvcc_flags": [
                 "-O3", "--use_fast_math", "-lineinfo",
                 "--threads", "4",
-            ],
+            ] + _SM80_GENCODE,
         },
         "batchgen_kernels.common._C_rmsnorm": {
             "sources": ["src/common/rmsnorm.cu"],
@@ -181,7 +196,7 @@ def get_registry():
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--expt-relaxed-constexpr",
                 "--threads", "4",
-            ],
+            ] + _SM80_GENCODE,
         },
         "batchgen_kernels.common._C_cuda_rmsnorm": {
             "sources": ["src/common/cuda_rmsnorm.cu"],
@@ -192,7 +207,7 @@ def get_registry():
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--expt-relaxed-constexpr",
                 "--threads", "4",
-            ],
+            ] + _SM80_GENCODE,
         },
         "batchgen_kernels.common._C_mgn_ops": {
             "sources": [

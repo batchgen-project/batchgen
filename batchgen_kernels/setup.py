@@ -13,7 +13,7 @@ Usage:
 Environment variables:
     MAX_JOBS        — parallel file compilation (default: cpu_count/2)
     NVCC_THREADS    — parallelism within a single .cu file (default: 4)
-    BUILD_ARCH      — "sm90a" (default), "sm100", or "all". Controls which arch kernels to build
+    BUILD_ARCH      — optional override: "sm90a", "sm100", or "all"
     BATCHGEN_KERNELS_DEV — "1" enables JIT fallback at runtime (not build-time)
 """
 
@@ -78,9 +78,26 @@ if not os.environ.get("CUDA_HOME"):
 
 
 # ── Architecture build gating ──
-# BUILD_ARCH: "sm90a" (default), "sm100", "all"
+# BUILD_ARCH: optional override. If unset, detect the visible CUDA device.
 
-_build_arch = os.environ.get("BUILD_ARCH", "sm90a")
+def _detect_build_arch():
+    if torch.cuda.is_available():
+        major, _minor = torch.cuda.get_device_capability()
+        if major >= 10:
+            return "sm100"
+        if major >= 9:
+            return "sm90a"
+        raise RuntimeError(
+            "batchgen_kernels requires SM90+ GPU to build; "
+            f"detected compute capability {major}"
+        )
+    print("[batchgen_kernels] CUDA device not visible; defaulting BUILD_ARCH=sm90a")
+    return "sm90a"
+
+
+_build_arch = os.environ.get("BUILD_ARCH") or _detect_build_arch()
+os.environ["BUILD_ARCH"] = _build_arch
+print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
 
@@ -244,8 +261,8 @@ _sm90a_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "-std=c++17",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads],
+                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                      "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # ── AOT MLA attention kernels (SM90a, BF16-only) ──
@@ -344,7 +361,7 @@ _sm80_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # MXFP4 dequant with shared memory LUT
@@ -354,7 +371,7 @@ _sm80_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # RMSNorm (multi-dtype: BF16/FP16/FP32) — common
@@ -368,7 +385,7 @@ _sm80_extensions = [
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # CUDA RMSNorm + Add+RMSNorm (from cuda_rmsnorm.py)
@@ -382,7 +399,7 @@ _sm80_extensions = [
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # MGN (MoE General Native) ops — token dispatch, fused gate, bincount, rmsnorm

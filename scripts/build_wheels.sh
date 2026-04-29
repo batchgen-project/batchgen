@@ -19,6 +19,7 @@
 #    --skip-deepgemm      Skip DeepGEMM wheel                                  #
 #    --skip-kernels       Skip batchgen_kernels wheel                           #
 #    --only-kernels       Only build batchgen_kernels wheel                     #
+#    --build-arch ARCH    Override batchgen_kernels BUILD_ARCH                  #
 # ---------------------------------------------------------------------------- #
 
 set -e
@@ -48,6 +49,7 @@ SKIP_FLASHMLA=0
 SKIP_DEEPGEMM=0
 SKIP_KERNELS=0
 ONLY_KERNELS=0
+BUILD_ARCH_OVERRIDE=""
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -59,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --skip-deepgemm)   SKIP_DEEPGEMM=1;   shift ;;
         --skip-kernels)    SKIP_KERNELS=1;     shift ;;
         --only-kernels)    ONLY_KERNELS=1;     shift ;;
+        --build-arch)      BUILD_ARCH_OVERRIDE="$2"; shift 2 ;;
         --help) echo "Usage: $0 --output-dir DIR [OPTIONS]"; exit 0 ;;
         *) fail "Unknown option: $1" ;;
     esac
@@ -153,7 +156,12 @@ fi
 if [[ $SKIP_KERNELS -eq 0 ]]; then
     step "Building batchgen_kernels wheel..."
     cd "$BATCHGEN_DIR/batchgen_kernels"
-    pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
+    if [[ -n "$BUILD_ARCH_OVERRIDE" ]]; then
+        BUILD_ARCH="$BUILD_ARCH_OVERRIDE" \
+            pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
+    else
+        pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
+    fi
     ok "batchgen_kernels wheel built"
 else
     warn "Skipping batchgen_kernels"
