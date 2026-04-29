@@ -18,9 +18,13 @@ from __future__ import annotations
 import argparse
 import math
 import statistics
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from batchgen.attention.dsa.sparse_decode_mla import (
     prepare_sparse_flash_mla_decode_inputs,
