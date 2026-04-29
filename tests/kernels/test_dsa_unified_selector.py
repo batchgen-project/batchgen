@@ -1,4 +1,4 @@
-"""Eager BF16 DSA selected-KV contract tests.
+"""Self-contained BF16 DSA selected-KV contract tests.
 
 These tests validate the immediate GLM-5 DSA contract before introducing a
 CUDA-graph-owned selected-KV buffer:
@@ -16,7 +16,6 @@ import math
 import pytest
 import torch
 
-from batchgen.attention.dsa.glm5_decode_selector import _select_glm5_dsa_indices
 from batchgen.attention.dsa.sparse_decode_mla import (
     prepare_sparse_flash_mla_decode_inputs,
     run_prepared_sparse_flash_mla_decode,
@@ -26,7 +25,6 @@ from batchgen.attention.dsa.unified_selector import (
     select_mla_kv_for_flashmla_bf16,
     view_selected_mla_kv_as_flashmla_pages,
 )
-from batchgen.models.wrappers import AttnWrapperBase
 
 
 pytestmark = pytest.mark.skipif(
@@ -175,6 +173,63 @@ def _assert_flashmla_close(actual: torch.Tensor, expected: torch.Tensor) -> None
     )
 
 
+def _reference_select_mla_kv_for_flashmla_bf16(
+    primary_blocked_k: torch.Tensor,
+    primary_page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    long_topk_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Standalone PyTorch reference for the unified selector contract."""
+
+    batch_size, index_topk = long_topk_indices.shape
+    max_pages = primary_page_table.shape[1]
+    num_k_heads = primary_blocked_k.shape[2]
+    kv_dim = primary_blocked_k.shape[3]
+    seqlens = cache_seqlens.to(device=primary_blocked_k.device, dtype=torch.long)
+    dense_positions = torch.arange(
+        index_topk,
+        device=primary_blocked_k.device,
+        dtype=torch.long,
+    ).expand(batch_size, index_topk)
+    is_long = seqlens > index_topk
+    logical_indices = torch.where(
+        is_long.unsqueeze(1),
+        long_topk_indices.to(dtype=torch.long),
+        dense_positions,
+    )
+    valid = (logical_indices >= 0) & (logical_indices < seqlens.unsqueeze(1))
+    safe_logical = logical_indices.clamp_min(0)
+    logical_page = torch.div(safe_logical, PAGE_SIZE, rounding_mode="floor")
+    page_offset = safe_logical - logical_page * PAGE_SIZE
+    page_in_table = logical_page < max_pages
+    physical_page = torch.gather(
+        primary_page_table.to(dtype=torch.long),
+        1,
+        logical_page.clamp(max=max_pages - 1),
+    )
+    valid = valid & page_in_table & (physical_page >= 0)
+    flat_index = physical_page.clamp_min(0) * PAGE_SIZE + page_offset
+    gathered = primary_blocked_k.reshape(-1, num_k_heads * kv_dim)[
+        flat_index.reshape(-1)
+    ].view(batch_size, index_topk, num_k_heads, kv_dim)
+    selected = torch.where(
+        valid.view(batch_size, index_topk, 1, 1),
+        gathered,
+        torch.zeros((), dtype=primary_blocked_k.dtype, device=primary_blocked_k.device),
+    )
+    selected_indices = torch.where(
+        valid,
+        logical_indices,
+        torch.full_like(logical_indices, -1),
+    ).to(dtype=long_topk_indices.dtype)
+    selected_lengths = torch.minimum(
+        cache_seqlens.to(dtype=torch.int32),
+        torch.full((batch_size,), index_topk, dtype=torch.int32, device=cache_seqlens.device),
+    )
+    row_modes = is_long.to(dtype=torch.int32)
+    return selected, selected_lengths, selected_indices, row_modes
+
+
 def test_flashmla_dense_selected_kv_contract_mixed_lengths():
     torch.cuda.set_device(0)
     selected_lengths = torch.tensor(
@@ -290,56 +345,6 @@ def test_flashmla_dense_selected_lengths_ignore_short_row_tail():
     )
 
 
-class _FakeIndexer:
-    index_topk = INDEX_TOPK
-
-
-class _FakeModule:
-    indexer = _FakeIndexer()
-
-
-class _FakeWrapper:
-    module = _FakeModule()
-    layer_idx = 0
-
-
-def test_glm5_dsa_index_selector_all_short_keeps_fixed_topk_shape():
-    torch.cuda.set_device(0)
-    cache_seqlens = torch.tensor(
-        [33, INDEX_TOPK],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    old_short_count = AttnWrapperBase._dsa_short_count
-    AttnWrapperBase._dsa_short_count = None
-    try:
-        top_k_indices, branch_label, row_modes = _select_glm5_dsa_indices(
-            _FakeWrapper(),
-            hidden_states=torch.empty(2, 1, 1, device="cuda"),
-            q_a_normed=torch.empty(2, 1, device="cuda"),
-            cache_seqlens=cache_seqlens,
-            max_seqlen=INDEX_TOPK,
-            new_token_pos=cache_seqlens - 1,
-            gpu_paged_kv_manager_aux=None,
-            aux_slot_indices=torch.empty(2, dtype=torch.int32, device="cuda"),
-        )
-    finally:
-        AttnWrapperBase._dsa_short_count = old_short_count
-
-    assert branch_label == "dense-short-circuit"
-    assert top_k_indices.shape == (2, INDEX_TOPK)
-    assert row_modes.tolist() == [0, 0]
-    torch.testing.assert_close(
-        top_k_indices[0, :33],
-        torch.arange(33, device="cuda"),
-    )
-    assert torch.all(top_k_indices[0, 33:] == 32)
-    torch.testing.assert_close(
-        top_k_indices[1],
-        torch.arange(INDEX_TOPK, device="cuda"),
-    )
-
-
 def _make_paged_primary_cache(
     *,
     batch_size: int,
@@ -384,6 +389,62 @@ def _make_paged_primary_cache(
             blocked_k[physical_page, : end - start] = logical_kv[row, start:end]
 
     return logical_kv, blocked_k, page_table
+
+
+@pytest.mark.parametrize(
+    "cache_values",
+    [
+        [33, INDEX_TOPK],
+        [4096, 3072],
+        [17, INDEX_TOPK, 4096],
+    ],
+)
+def test_unified_selector_matches_standalone_reference(cache_values):
+    torch.cuda.set_device(0)
+    batch_size = len(cache_values)
+    max_tokens = max(max(cache_values), INDEX_TOPK)
+    cache_seqlens = torch.tensor(cache_values, device="cuda", dtype=torch.int32)
+    _, primary_blocked_k, primary_page_table = _make_paged_primary_cache(
+        batch_size=batch_size,
+        max_tokens=max_tokens,
+        seed=19 + batch_size,
+    )
+    for row, seqlen in enumerate(cache_values):
+        valid_pages = math.ceil(seqlen / PAGE_SIZE)
+        primary_page_table[row, valid_pages:] = -1
+
+    long_topk_indices = torch.full(
+        (batch_size, INDEX_TOPK),
+        -1,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    for row, seqlen in enumerate(cache_values):
+        if seqlen > INDEX_TOPK:
+            perm = torch.randperm(seqlen, device="cuda")[:INDEX_TOPK]
+            perm[:8] = torch.tensor(
+                [0, 1, 63, 64, 65, seqlen - 3, seqlen - 2, seqlen - 1],
+                device="cuda",
+            )
+            long_topk_indices[row] = perm
+
+    actual = select_mla_kv_for_flashmla_bf16(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        index_topk=INDEX_TOPK,
+        page_size=PAGE_SIZE,
+    )
+    expected = _reference_select_mla_kv_for_flashmla_bf16(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+    )
+
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
 def test_reference_selector_output_feeds_flashmla_dense_contract():
