@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.models.glm.glm5.decode_utils import (
@@ -8,6 +9,9 @@ from batchgen.models.glm.glm5.decode_utils import (
     build_clamped_dense_token_indices,
     clamp_token_indices_to_seqlens,
     reorder_block_table_to_batch_slots,
+)
+from batchgen.models.glm.glm5.wrappers import (
+    _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 
 
@@ -134,3 +138,10 @@ def test_paged_gather_cache_key_invalidates_in_place_page_table_rebuild():
     assert key_v1 != key_v2
     assert flat_v1.tolist() == [0, 1, 2, 3, 4, 5, 6, 7]
     assert flat_v2.tolist() == [4, 5, 6, 7, 0, 1, 2, 3]
+
+
+def test_glm5_dsa_cuda_graph_required_fast_fails_without_replay(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+
+    with pytest.raises(RuntimeError, match="Refusing to silently fall back"):
+        _fail_if_glm5_dsa_cuda_graph_required_without_replay()

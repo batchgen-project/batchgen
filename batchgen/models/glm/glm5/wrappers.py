@@ -75,6 +75,22 @@ _glm5_decode_timer = init_decode_timer(
     "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
 )
 
+_GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+
+
+def _glm5_dsa_cuda_graph_required() -> bool:
+    return os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+
+
+def _fail_if_glm5_dsa_cuda_graph_required_without_replay() -> None:
+    if not _glm5_dsa_cuda_graph_required():
+        return
+    raise RuntimeError(
+        f"{_GLM5_DSA_CUDA_GRAPH_ENV}=1 requested GLM-5 DSA CUDA graph replay, "
+        "but production hidden-state-to-o_proj graph routing is not wired in this "
+        "integration slice. Refusing to silently fall back to eager DSA decode."
+    )
+
 
 def glm5_fp8_dequantization(
     weight_data_fp8: torch.Tensor,
@@ -604,6 +620,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
         if bsz == 0:
             return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        _fail_if_glm5_dsa_cuda_graph_required_without_replay()
 
         selector_inputs = build_glm5_dsa_flashmla_inputs(
             self,
