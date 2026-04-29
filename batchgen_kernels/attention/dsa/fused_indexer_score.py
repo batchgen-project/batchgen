@@ -72,6 +72,10 @@ class FP8WqbWeightsCUDA:
     def K(self):
         return self.inner.K
 
+    @property
+    def block_k(self):
+        return self.inner.block_k
+
 
 # ============================================================
 # CUDA WGMMA wq_b projection
