@@ -20,6 +20,20 @@ _SM80_GENCODE = [
 
 _SM80_FLAGS = ["-std=c++17", "-O3", "--threads", "4"] + _SM80_GENCODE
 
+_DSA_HADAMARD_FLAGS = [
+    "-O3",
+    "-std=c++17",
+    "--use_fast_math",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--expt-relaxed-constexpr",
+    "--expt-extended-lambda",
+    "--threads",
+    "4",
+] + _SM80_GENCODE
+
 
 def get_registry():
     """Return JIT compilation config for all CUDA extensions."""
@@ -111,6 +125,25 @@ def get_registry():
         },
 
         # ── SM80+ universal kernels ──
+
+        "batchgen_kernels.attention.dsa.indexer.batchgen_dsa_fast_hadamard_transform_cuda": {
+            "sources": [
+                "attention/dsa/indexer/csrc/hadamard_binding.cpp",
+                "attention/dsa/indexer/csrc/fast_hadamard_transform_cuda.cu",
+            ],
+            "nvcc_flags": _DSA_HADAMARD_FLAGS,
+            "cxx_flags": ["-O3", "-std=c++17"],
+            "include_dirs": ["attention/dsa/indexer/csrc"],
+        },
+        "batchgen_kernels.attention.dsa.indexer.batchgen_dsa_fused_rope_hadamard_cuda": {
+            "sources": [
+                "attention/dsa/indexer/csrc/fused_rope_hadamard_binding.cpp",
+                "attention/dsa/indexer/csrc/fused_rope_hadamard.cu",
+            ],
+            "nvcc_flags": _DSA_HADAMARD_FLAGS,
+            "cxx_flags": ["-O3", "-std=c++17"],
+            "include_dirs": ["attention/dsa/indexer/csrc"],
+        },
 
         "batchgen_kernels.attention._C_fused_ops": {
             "sources": [
