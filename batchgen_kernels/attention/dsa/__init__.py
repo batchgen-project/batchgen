@@ -95,3 +95,6 @@ try:
     ]
 except (ImportError, Exception):
     pass
+
+from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
+__all__ += ["pack_flashmla_query_out"]
