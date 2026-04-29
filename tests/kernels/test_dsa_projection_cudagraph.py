@@ -157,3 +157,74 @@ def test_dsa_qk_projection_out_cuda_graph_replay_reads_updated_inputs():
 
     torch.testing.assert_close(q_graph, q_expected, atol=0, rtol=0)
     torch.testing.assert_close(k_graph, k_expected, atol=0, rtol=0)
+
+
+def test_dsa_qk_projection_out_captures_on_non_default_stream():
+    torch.cuda.set_device(0)
+    torch.manual_seed(20260431)
+    module = build_module()
+
+    batch_size = 2
+    q_rank = 2048
+    hidden_size = 6144
+    q_out_dim = 4096
+    k_out_dim = 128
+
+    q_a = (
+        torch.randn(batch_size, q_rank, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).contiguous()
+    hidden = (
+        torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.1
+    ).contiguous()
+    wq_b = (
+        torch.randn(q_out_dim, q_rank, device="cuda", dtype=torch.bfloat16) * 0.01
+    ).contiguous()
+    wk = (
+        torch.randn(k_out_dim, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.01
+    ).contiguous()
+
+    q_weights = FP8WqbWeightsCUDA(wq_b, module)
+    k_weights = FP8IndexerWeightsCUDA(wk, module)
+    q_x_fp8, q_x_scale, q_tma = make_fp8_activation_scratch(
+        batch_size,
+        q_rank,
+        module,
+        device="cuda",
+    )
+    k_x_fp8, k_x_scale, k_tma = make_fp8_activation_scratch(
+        batch_size,
+        hidden_size,
+        module,
+        device="cuda",
+    )
+    q_graph = torch.empty(batch_size, q_out_dim, device="cuda", dtype=torch.bfloat16)
+    k_graph = torch.empty(batch_size, k_out_dim, device="cuda", dtype=torch.bfloat16)
+
+    def run_graph_path():
+        cuda_wq_b_proj_out(q_a, q_weights, module, q_x_fp8, q_x_scale, q_tma, q_graph)
+        cuda_wk_proj_gemm_only_out(hidden, k_weights, module, k_x_fp8, k_x_scale, k_tma, k_graph)
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            run_graph_path()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(graph):
+            run_graph_path()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    q_expected = cuda_wq_b_proj(q_a, q_weights, module)
+    k_expected = cuda_wk_proj_gemm_only(hidden, k_weights, module)
+    q_graph.zero_()
+    k_graph.zero_()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        graph.replay()
+    capture_stream.synchronize()
+
+    torch.testing.assert_close(q_graph, q_expected, atol=0, rtol=0)
+    torch.testing.assert_close(k_graph, k_expected, atol=0, rtol=0)

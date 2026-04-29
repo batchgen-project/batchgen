@@ -48,6 +48,208 @@ class Glm5DsaFlashMlaInputs:
     branch_label: str
 
 
+@dataclass(frozen=True)
+class Glm5DsaGraphSegmentInputs:
+    """Inputs for `Glm5DsaAttnSegment` plus KV tensors for host callbacks."""
+
+    q_a: torch.Tensor
+    q_nope: torch.Tensor
+    q_rope: torch.Tensor
+    head_gates: torch.Tensor
+    cache_seqlens: torch.Tensor
+    positions_expanded: torch.Tensor
+    primary_page_table: torch.Tensor
+    aux_page_table: torch.Tensor
+    primary_k_tensor: torch.Tensor
+    indexer_k_tensor: torch.Tensor
+
+
+def build_glm5_dsa_graph_segment_inputs(
+    wrapper,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    gpu_paged_kv_manager,
+    gpu_paged_kv_manager_aux,
+    *,
+    max_primary_pages_per_seq: int,
+    max_aux_pages_per_seq: int,
+) -> Glm5DsaGraphSegmentInputs:
+    """Build graph-segment inputs and update primary/aux KV caches.
+
+    This is the graph-route prefix for GLM-5 DSA decode. It intentionally stops
+    before scoring/selection/FlashMLA so those operations can be replayed by
+    `Glm5DsaAttnSegment` using static graph buffers and the persistent paged
+    primary/aux KV tensors.
+    """
+
+    weight_scale = wrapper.weight_dequant_scale
+    attn = wrapper.module
+    indexer = attn.indexer
+    bsz = hidden_states.shape[0]
+    dt = get_decode_timer()
+    li = wrapper.layer_idx
+
+    if bsz == 0:
+        raise ValueError("empty GLM-5 DSA batches must be handled before graph prep")
+
+    with (dt.timed("act_quant", li) if dt else nullcontext()):
+        hidden_flat = hidden_states.squeeze(1)
+        hidden_fp8, hidden_scale = act_quant(hidden_flat)
+
+    with (dt.timed("q_proj", li) if dt else nullcontext()):
+        q_a = w8a8_deepgemm(
+            hidden_fp8,
+            hidden_scale,
+            attn.q_a_proj.weight,
+            weight_scale["q_a_proj.weight_scale_inv"],
+        )
+        q_a_normed = attn.q_a_layernorm(q_a).contiguous()
+        q_a_fp8, q_a_scale = act_quant(q_a_normed)
+        q = w8a8_deepgemm(
+            q_a_fp8,
+            q_a_scale,
+            attn.q_b_proj.weight,
+            weight_scale["q_b_proj.weight_scale_inv"],
+        )
+        q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(
+            q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1,
+        )
+        q_nope = q_nope.squeeze(2).contiguous()
+        q_rope = q_pe.squeeze(2).contiguous()
+
+    with (dt.timed("kv_proj", li) if dt else nullcontext()):
+        new_compressed_kv = w8a8_deepgemm(
+            hidden_fp8,
+            hidden_scale,
+            attn.kv_a_proj_with_mqa.weight,
+            weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+        ).view(bsz, 1, -1)
+        cos, sin = attn.rotary_emb(q_pe.contiguous(), seq_len=max_seqlen)
+        offload_kv = _fused_rmsnorm_rope(
+            new_compressed_kv,
+            q_pe.contiguous(),
+            cos,
+            sin,
+            position_ids,
+            attn.kv_a_layernorm.weight,
+            attn.kv_lora_rank,
+            attn.qk_rope_head_dim,
+            eps=attn.kv_a_layernorm.eps,
+        )
+
+    new_token_pos = position_ids.squeeze(-1)
+    manager_device = gpu_paged_kv_manager.device
+    seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
+    current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+    primary_slot_indices = build_batch_slot_indices(
+        current_batch,
+        gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+        bsz,
+        manager_device,
+    )
+    aux_device = gpu_paged_kv_manager_aux.device
+    aux_slot_indices = build_batch_slot_indices(
+        current_batch,
+        gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
+        bsz,
+        aux_device,
+    )
+
+    with (dt.timed("kv_write", li) if dt else nullcontext()):
+        k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+        if k_tensor.device != manager_device:
+            k_tensor = k_tensor.to(manager_device)
+        gpu_paged_kv_manager.update_layer_decode_new_token(
+            k_tensor=k_tensor,
+            v_tensor=None,
+            sequence_lengths=seq_lengths_i32,
+            layer_idx=li,
+            slot_indices=primary_slot_indices,
+        )
+
+    with (dt.timed("indexer_k", li) if dt else nullcontext()):
+        if wrapper._indexer_cuda_weights is None:
+            raise RuntimeError(
+                f"[layer {wrapper.layer_idx}] GLM-5 DSA graph route requires WP2 "
+                "fused indexer KV projection; PyTorch fallback is disabled"
+            )
+        from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
+            cuda_wk_proj_gemm_only,
+        )
+
+        k_raw = cuda_wk_proj_gemm_only(
+            hidden_flat,
+            wrapper._indexer_cuda_weights,
+            wrapper._indexer_cuda_module,
+        )
+        k_normed = indexer.k_norm(k_raw)
+        indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
+            k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
+        ).unsqueeze(2)
+        seq_lengths_i32_aux = (
+            seq_lengths_i32
+            if aux_device == manager_device
+            else new_token_pos.to(dtype=torch.int32, device=aux_device)
+        )
+        gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+            k_tensor=indexer_k_tensor,
+            v_tensor=None,
+            sequence_lengths=seq_lengths_i32_aux,
+            layer_idx=li,
+            slot_indices=aux_slot_indices,
+        )
+
+    with (dt.timed("indexer_score", li) if dt else nullcontext()):
+        from batchgen_kernels.attention.dsa.fused_indexer_score import compute_head_gates
+
+        head_gates = compute_head_gates(
+            hidden_flat,
+            indexer.weights_proj.weight.data,
+            indexer.index_n_heads,
+            indexer.index_head_dim,
+        )
+        positions_expanded = new_token_pos[:, None].expand(
+            bsz,
+            indexer.index_n_heads,
+        ).contiguous()
+
+    primary_blocked_k, _, primary_page_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
+    aux_blocked_k, _, aux_page_table = gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
+    del primary_blocked_k, aux_blocked_k
+    primary_page_table = reorder_block_table_to_batch_slots(
+        primary_page_table,
+        primary_slot_indices,
+    )
+    aux_page_table = reorder_block_table_to_batch_slots(
+        aux_page_table,
+        aux_slot_indices,
+    )
+    primary_page_table = _fit_page_table_width(
+        primary_page_table,
+        max_primary_pages_per_seq,
+    )
+    aux_page_table = _fit_page_table_width(
+        aux_page_table,
+        max_aux_pages_per_seq,
+    )
+
+    return Glm5DsaGraphSegmentInputs(
+        q_a=q_a_normed,
+        q_nope=q_nope,
+        q_rope=q_rope,
+        head_gates=head_gates,
+        cache_seqlens=cache_seqlens,
+        positions_expanded=positions_expanded,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        primary_k_tensor=k_tensor,
+        indexer_k_tensor=indexer_k_tensor,
+    )
+
+
 def build_glm5_dsa_flashmla_inputs(
     wrapper,
     hidden_states: torch.Tensor,
@@ -297,6 +499,21 @@ def _select_glm5_dsa_indices(
     )
 
     return top_k_indices, "unified-indexer", row_modes
+
+
+def _fit_page_table_width(
+    page_table: torch.Tensor,
+    target_cols: int,
+) -> torch.Tensor:
+    if page_table.shape[1] == target_cols:
+        return page_table
+    if page_table.shape[1] > target_cols:
+        return page_table[:, :target_cols].contiguous()
+    return torch.nn.functional.pad(
+        page_table,
+        (0, target_cols - page_table.shape[1]),
+        value=0,
+    )
 
 
 def _build_query_states(

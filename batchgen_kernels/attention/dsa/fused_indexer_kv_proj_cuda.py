@@ -43,6 +43,7 @@ CUDA_SOURCE = r'''
 #include <cstdint>
 #include <cstdio>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 // ============================================================================
 // Constants
@@ -576,6 +577,7 @@ torch::Tensor create_tma_desc(
     int outer_dim, int inner_dim,
     int box_outer, int box_inner
 ) {
+    at::cuda::CUDAGuard device_guard{data.device()};
     static auto encode_func = get_cuTensorMapEncodeTiled();
     CUtensorMap* stage = get_pinned_tma_stage();
     *stage = make_2d_tma_desc_fp8(
@@ -594,6 +596,7 @@ void run_act_quant(
     torch::Tensor X_fp8,     // [B, K] FP8 (output)
     torch::Tensor X_scale    // [B] FP32 (output)
 ) {
+    at::cuda::CUDAGuard device_guard{X.device()};
     int B = X.size(0);
     int K = X.size(1);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -612,6 +615,7 @@ torch::Tensor indexer_kv_proj_forward(
     torch::Tensor rmsnorm_weight,
     int B, int N, int K, float eps
 ) {
+    at::cuda::CUDAGuard device_guard{a_tma_desc.device()};
     auto OUT_gemm = torch::empty({B, N}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
 
     const CUtensorMap* a_desc = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
@@ -653,6 +657,7 @@ void indexer_kv_proj_forward_out(
     torch::Tensor OUT,
     int B, int N, int K, float eps
 ) {
+    at::cuda::CUDAGuard device_guard{OUT.device()};
     const CUtensorMap* a_desc = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
     const CUtensorMap* w_desc = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
     int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
@@ -685,6 +690,7 @@ torch::Tensor indexer_kv_proj_gemm_only(
     torch::Tensor a_scale,
     int B, int N, int K
 ) {
+    at::cuda::CUDAGuard device_guard{a_tma_desc.device()};
     auto OUT = torch::empty({B, N}, torch::dtype(torch::kBFloat16).device(torch::kCUDA));
 
     const CUtensorMap* a_d = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
@@ -716,6 +722,7 @@ void indexer_kv_proj_gemm_only_out(
     torch::Tensor OUT,
     int B, int N, int K
 ) {
+    at::cuda::CUDAGuard device_guard{OUT.device()};
     const CUtensorMap* a_d = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
     const CUtensorMap* w_d = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
     int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
