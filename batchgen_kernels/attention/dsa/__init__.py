@@ -82,8 +82,16 @@ try:
     from batchgen_kernels.attention.dsa.fp8_absorb import (
         FP8AbsorbWeights,
         fp8_q_absorb,
+        fp8_q_absorb_out,
         fp8_out_absorb,
+        fp8_out_absorb_out,
     )
-    __all__ += ["FP8AbsorbWeights", "fp8_q_absorb", "fp8_out_absorb"]
+    __all__ += [
+        "FP8AbsorbWeights",
+        "fp8_q_absorb",
+        "fp8_q_absorb_out",
+        "fp8_out_absorb",
+        "fp8_out_absorb_out",
+    ]
 except (ImportError, Exception):
     pass
