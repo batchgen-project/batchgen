@@ -58,6 +58,7 @@ class IncrementalWriter:
         pad_token_id: int = 0,
         parse_thinking: bool = False,
         parse_tool_call: bool = False,
+        include_special_tokens: bool = False,
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +72,7 @@ class IncrementalWriter:
         self._pad_token_id = pad_token_id
         self._parse_thinking = parse_thinking
         self._parse_tool_call = parse_tool_call
+        self._include_special_tokens = include_special_tokens
 
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
@@ -269,7 +271,10 @@ class IncrementalWriter:
             non_pad = [i for i, t in enumerate(tokens_list) if t != self._pad_token_id]
             end_pos = non_pad[-1] + 1 if non_pad else len(tokens_list)
 
-        return self._tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=False)
+        return self._tokenizer.decode(
+            tokens_list[:end_pos],
+            skip_special_tokens=(not self._include_special_tokens),
+        )
 
     def _count_valid_tokens(self, tokens: torch.Tensor) -> int:
         """Count non-padding tokens up to first EOS.

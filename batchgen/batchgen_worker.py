@@ -3714,6 +3714,7 @@ class BatchGenWorker:
 			pad_token_id=self.pad_token_id,
 			parse_thinking=cfg.get("parse_thinking", False),
 			parse_tool_call=cfg.get("parse_tool_call", False),
+			include_special_tokens=self.detokenization_include_special_tokens,
 		)
 
 	def process_new_batch(
