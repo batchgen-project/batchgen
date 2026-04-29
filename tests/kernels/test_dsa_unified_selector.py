@@ -20,6 +20,7 @@ from batchgen.attention.dsa.sparse_decode_mla import (
     prepare_sparse_flash_mla_decode_inputs,
     run_prepared_sparse_flash_mla_decode,
 )
+from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
 from batchgen.attention.dsa.unified_selector import (
     make_flashmla_selected_block_table,
     select_mla_kv_for_flashmla_bf16,
@@ -389,6 +390,119 @@ def _make_paged_primary_cache(
             blocked_k[physical_page, : end - start] = logical_kv[row, start:end]
 
     return logical_kv, blocked_k, page_table
+
+
+def _build_clamped_dense_token_indices(
+    cache_seqlens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    base = torch.arange(
+        width,
+        device=cache_seqlens.device,
+        dtype=torch.long,
+    ).unsqueeze(0).expand(cache_seqlens.numel(), -1)
+    cap = (cache_seqlens.to(dtype=torch.long) - 1).clamp(min=0).unsqueeze(1)
+    return torch.minimum(base, cap)
+
+
+def _current_glm_hot_indices(
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    long_topk_indices: torch.Tensor,
+) -> torch.Tensor:
+    short_mask = cache_seqlens <= INDEX_TOPK
+    if bool(short_mask.all().item()):
+        return _build_clamped_dense_token_indices(cache_seqlens, max_seqlen)
+    if not bool(short_mask.any().item()):
+        return long_topk_indices
+
+    out = torch.empty_like(long_topk_indices)
+    out[short_mask] = _build_clamped_dense_token_indices(
+        cache_seqlens[short_mask],
+        INDEX_TOPK,
+    )
+    out[~short_mask] = long_topk_indices[~short_mask]
+    return out
+
+
+@pytest.mark.parametrize(
+    "cache_values",
+    [
+        [512, 512],
+        [INDEX_TOPK, INDEX_TOPK],
+        [4096, 3072],
+        [64, 2047, INDEX_TOPK, 4096],
+    ],
+)
+def test_fused_selector_flashmla_matches_current_glm_hot_path(cache_values):
+    torch.cuda.set_device(0)
+    batch_size = len(cache_values)
+    max_tokens = max(max(cache_values), INDEX_TOPK)
+    cache_seqlens = torch.tensor(cache_values, device="cuda", dtype=torch.int32)
+    _, primary_blocked_k, primary_page_table = _make_paged_primary_cache(
+        batch_size=batch_size,
+        max_tokens=max_tokens,
+        seed=37 + batch_size,
+    )
+
+    long_topk_indices = torch.full(
+        (batch_size, INDEX_TOPK),
+        -1,
+        device="cuda",
+        dtype=torch.long,
+    )
+    for row, seqlen in enumerate(cache_values):
+        if seqlen > INDEX_TOPK:
+            long_topk_indices[row] = torch.randperm(seqlen, device="cuda")[:INDEX_TOPK]
+
+    current_indices = _current_glm_hot_indices(
+        cache_seqlens,
+        max(cache_values),
+        long_topk_indices,
+    )
+    current_selected = sparse_gather_from_paged_kv(
+        primary_blocked_k,
+        primary_page_table,
+        current_indices,
+        PAGE_SIZE,
+    )
+    current_lengths = torch.clamp(
+        cache_seqlens,
+        max=current_indices.shape[1],
+    ).to(dtype=torch.int32)
+
+    fused_selected, fused_lengths, _, fused_row_modes = select_mla_kv_for_flashmla_bf16(
+        primary_blocked_k,
+        primary_page_table,
+        cache_seqlens,
+        long_topk_indices,
+        index_topk=INDEX_TOPK,
+        page_size=PAGE_SIZE,
+        return_indices=False,
+    )
+
+    assert fused_selected.shape == (batch_size, INDEX_TOPK, H_KV, D_QK)
+    torch.testing.assert_close(fused_lengths, torch.clamp(cache_seqlens, max=INDEX_TOPK))
+    torch.testing.assert_close(
+        fused_row_modes,
+        (cache_seqlens > INDEX_TOPK).to(dtype=torch.int32),
+    )
+
+    query_states = _make_query(batch_size, seed=41 + batch_size)
+    softmax_scale = D_QK**-0.5
+    current_out, _ = _run_flashmla_dense(
+        query_states,
+        current_selected,
+        current_lengths,
+        softmax_scale=softmax_scale,
+    )
+    fused_out, _ = _run_flashmla_dense(
+        query_states,
+        fused_selected,
+        fused_lengths,
+        softmax_scale=softmax_scale,
+    )
+    _assert_flashmla_close(fused_out, current_out)
 
 
 @pytest.mark.parametrize(
