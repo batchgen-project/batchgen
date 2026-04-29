@@ -16,6 +16,15 @@ try:
 except (ImportError, Exception):
     pass
 
+# Unified selected-KV selector (Triton)
+try:
+    from batchgen_kernels.attention.dsa.fused_unified_selector import (
+        fused_select_mla_kv_bf16,
+    )
+    __all__ += ["fused_select_mla_kv_bf16"]
+except (ImportError, Exception):
+    pass
+
 # WP2: Fused indexer KV proj (CUDA WGMMA)
 try:
     from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (

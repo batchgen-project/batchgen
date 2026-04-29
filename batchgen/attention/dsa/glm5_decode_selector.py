@@ -18,7 +18,7 @@ from batchgen.attention.dsa.sparse_decode_mla import (
     PreparedSparseFlashMlaDecode,
     prepare_sparse_flash_mla_decode_inputs,
 )
-from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
+from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
 from batchgen.attention.mla.fused_rmsnorm_rope import (
@@ -231,16 +231,20 @@ def build_glm5_dsa_flashmla_inputs(
                 mla_page_size,
                 branch_label,
             )
-        selected_mla_kv = sparse_gather_from_paged_kv(
-            mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
+        selected_mla_kv, selected_lengths, selected_indices, row_modes = (
+            select_mla_kv_for_flashmla_bf16(
+                mla_blocked_k,
+                mla_block_table,
+                cache_seqlens,
+                top_k_indices,
+                index_topk=wrapper.module.indexer.index_topk,
+                page_size=mla_page_size,
+            )
         )
 
     with (dt.timed("q_absorb", li) if dt else nullcontext()):
         query_states = _build_query_states(wrapper, q_nope, q_pe, selected_mla_kv)
 
-    selected_lengths = torch.clamp(cache_seqlens, max=top_k_indices.shape[1]).to(
-        dtype=torch.int32, device=selected_mla_kv.device,
-    )
     flashmla = prepare_sparse_flash_mla_decode_inputs(
         query_states,
         selected_mla_kv,
@@ -256,7 +260,7 @@ def build_glm5_dsa_flashmla_inputs(
         query_states=query_states,
         selected_mla_kv=selected_mla_kv,
         selected_lengths=selected_lengths,
-        selected_indices=top_k_indices,
+        selected_indices=selected_indices,
         row_modes=row_modes,
         primary_k_tensor=k_tensor,
         indexer_k_tensor=indexer_k_tensor,

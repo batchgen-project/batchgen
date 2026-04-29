@@ -10,6 +10,13 @@ from __future__ import annotations
 
 import torch
 
+try:
+    from batchgen_kernels.attention.dsa import (
+        fused_select_mla_kv_bf16 as _fused_select_mla_kv_bf16,
+    )
+except (ImportError, Exception):
+    _fused_select_mla_kv_bf16 = None
+
 
 def select_mla_kv_for_flashmla_bf16(
     primary_blocked_k: torch.Tensor,
@@ -53,6 +60,15 @@ def select_mla_kv_for_flashmla_bf16(
         index_topk=index_topk,
         page_size=page_size,
     )
+
+    if _fused_select_mla_kv_bf16 is not None:
+        return _fused_select_mla_kv_bf16(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            page_size,
+        )
 
     device = primary_blocked_k.device
     batch_size = cache_seqlens.shape[0]

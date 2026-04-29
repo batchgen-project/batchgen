@@ -31,6 +31,7 @@ from batchgen.attention.dsa.sparse_decode_mla import (
     run_prepared_sparse_flash_mla_decode,
 )
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
+from batchgen.attention.dsa.unified_selector import select_mla_kv_for_flashmla_bf16
 from batchgen.models.glm.glm5.decode_utils import build_clamped_dense_token_indices
 
 
@@ -171,16 +172,28 @@ def _selector_prepare(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     token_indices: torch.Tensor,
+    *,
+    unified: bool,
 ):
-    selected = sparse_gather_from_paged_kv(
-        blocked_k,
-        page_table,
-        token_indices,
-        PAGE_SIZE,
-    )
-    selected_lengths = torch.clamp(cache_seqlens, max=token_indices.shape[1]).to(
-        dtype=torch.int32,
-    )
+    if unified:
+        selected, selected_lengths, _, _ = select_mla_kv_for_flashmla_bf16(
+            blocked_k,
+            page_table,
+            cache_seqlens,
+            token_indices,
+            index_topk=INDEX_TOPK,
+            page_size=PAGE_SIZE,
+        )
+    else:
+        selected = sparse_gather_from_paged_kv(
+            blocked_k,
+            page_table,
+            token_indices,
+            PAGE_SIZE,
+        )
+        selected_lengths = torch.clamp(cache_seqlens, max=token_indices.shape[1]).to(
+            dtype=torch.int32,
+        )
     return prepare_sparse_flash_mla_decode_inputs(
         query_states,
         selected,
@@ -274,12 +287,22 @@ def main() -> None:
 
             def previous_prepare():
                 return _selector_prepare(
-                    query_states, blocked_k, page_table, cache_seqlens, previous_indices,
+                    query_states,
+                    blocked_k,
+                    page_table,
+                    cache_seqlens,
+                    previous_indices,
+                    unified=False,
                 )
 
             def fixed_prepare():
                 return _selector_prepare(
-                    query_states, blocked_k, page_table, cache_seqlens, fixed_indices,
+                    query_states,
+                    blocked_k,
+                    page_table,
+                    cache_seqlens,
+                    fixed_indices,
+                    unified=True,
                 )
 
             if args.include_flashmla:
