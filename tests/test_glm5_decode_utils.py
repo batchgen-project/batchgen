@@ -12,6 +12,7 @@ from batchgen.models.glm.glm5.decode_utils import (
 )
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
+    _glm5_dsa_cuda_graph_can_replay,
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 
@@ -151,7 +152,11 @@ def test_glm5_dsa_cuda_graph_required_fast_fails_without_replay(monkeypatch):
 def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
     wrapper = object.__new__(GLM5AttnWrapper)
-    wrapper.module = type("Attn", (), {"hidden_size": 16})()
+    wrapper.module = type(
+        "Attn",
+        (),
+        {"hidden_size": 16, "indexer": type("Indexer", (), {"index_topk": 4})()},
+    )()
     wrapper.layer_idx = 0
     expected = torch.ones(2, 1, 16)
 
@@ -176,6 +181,26 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     )
 
     assert actual is expected
+
+
+def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():
+    index_topk = 4
+
+    assert _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([5, 7], dtype=torch.int32),
+        max_seqlen=8,
+        index_topk=index_topk,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([4, 7], dtype=torch.int32),
+        max_seqlen=8,
+        index_topk=index_topk,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([5, 7], dtype=torch.int32),
+        max_seqlen=4,
+        index_topk=index_topk,
+    )
 
 
 def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch):

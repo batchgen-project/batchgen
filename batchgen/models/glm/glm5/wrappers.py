@@ -76,10 +76,46 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 _GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+_glm5_dsa_graph_eager_fallback_logged = False
 
 
 def _glm5_dsa_cuda_graph_required() -> bool:
     return os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+
+
+def _glm5_dsa_cuda_graph_can_replay(
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    index_topk: int,
+) -> bool:
+    """The current graph segment is valid only for all-long DSA rows.
+
+    `Glm5DsaAttnSegment` captures FlashMLA metadata for `index_topk` selected
+    tokens. Short rows need per-step metadata for their actual selected length,
+    so they must stay on the eager path until length-bucketed metadata is added.
+    """
+
+    if max_seqlen <= index_topk:
+        return False
+    return bool((cache_seqlens > index_topk).all().item())
+
+
+def _log_glm5_dsa_graph_eager_fallback_once(
+    layer_idx: int,
+    cache_seqlens: torch.Tensor,
+    index_topk: int,
+) -> None:
+    global _glm5_dsa_graph_eager_fallback_logged
+    if _glm5_dsa_graph_eager_fallback_logged or layer_idx != 0:
+        return
+    _glm5_dsa_graph_eager_fallback_logged = True
+    logging.warning(
+        "GLM-5 DSA CUDA graph requested but current decode rows are not all "
+        "longer than index_topk=%s; using eager DSA until all rows are graph-safe "
+        "(min_cache_seqlen=%s).",
+        index_topk,
+        int(cache_seqlens.min().item()),
+    )
 
 
 def _fail_if_glm5_dsa_cuda_graph_required_without_replay() -> None:
@@ -626,6 +662,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph max_seqlen={max_seqlen} "
                 f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
             )
+        index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
+        if not _glm5_dsa_cuda_graph_can_replay(cache_seqlens, max_seqlen, index_topk):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is only "
+                f"valid when every row has cache_seqlens > index_topk={index_topk}; "
+                "short or mixed rows require eager DSA FlashMLA metadata"
+            )
 
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_graph_segment_inputs,
@@ -708,13 +751,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
         if _glm5_dsa_cuda_graph_required():
-            return self._forward_decode_dsa_graph(
-                hidden_states,
-                position_ids,
+            index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)
+            if _glm5_dsa_cuda_graph_can_replay(cache_seqlens, max_seqlen, index_topk):
+                return self._forward_decode_dsa_graph(
+                    hidden_states,
+                    position_ids,
+                    cache_seqlens,
+                    max_seqlen,
+                    gpu_paged_kv_manager,
+                    gpu_paged_kv_manager_aux,
+                )
+            _log_glm5_dsa_graph_eager_fallback_once(
+                self.layer_idx,
                 cache_seqlens,
-                max_seqlen,
-                gpu_paged_kv_manager,
-                gpu_paged_kv_manager_aux,
+                index_topk,
             )
 
         from batchgen.attention.dsa.glm5_decode_selector import (
