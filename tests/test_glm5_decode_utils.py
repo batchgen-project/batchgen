@@ -15,6 +15,7 @@ from batchgen.models.glm.glm5.wrappers import (
     _glm5_dsa_cuda_graph_can_replay,
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
+from batchgen.models.wrappers import AttnWrapperBase
 
 
 def test_build_clamped_dense_token_indices_caps_each_row():
@@ -104,6 +105,155 @@ def test_reordered_block_table_prevents_cross_sequence_reads():
 
     assert wrong.tolist() == [[200.0, 201.0], [100.0, 101.0]]
     assert fixed.tolist() == [[100.0, 101.0], [200.0, 201.0]]
+
+
+def test_glm5_dsa_selector_preserves_dense_short_circuit():
+    pytest.importorskip("flash_attn_interface")
+    from batchgen.attention.dsa.glm5_decode_selector import _select_glm5_dsa_indices
+
+    class FakeIndexer:
+        index_topk = 8
+
+        def __init__(self):
+            self.calls = []
+
+        def score_and_select_paged(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise AssertionError("short rows must not run indexer scoring")
+
+    class FakeManager:
+        config = type("Config", (), {"page_size_tokens": 4})()
+
+        def get_layer_kv_with_page_table(self, layer_idx):
+            raise AssertionError("short rows must not fetch aux page tables")
+
+    indexer = FakeIndexer()
+    wrapper = type(
+        "Wrapper",
+        (),
+        {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
+    )()
+    old_short_count = AttnWrapperBase._dsa_short_count
+    AttnWrapperBase._dsa_short_count = None
+    try:
+        top_k, branch, row_modes = _select_glm5_dsa_indices(
+            wrapper,
+            hidden_states=torch.zeros(3, 1, 4),
+            q_a_normed=torch.zeros(3, 4),
+            cache_seqlens=torch.tensor([2, 4, 6], dtype=torch.int32),
+            max_seqlen=128,
+            new_token_pos=torch.tensor([1, 3, 5], dtype=torch.int64),
+            gpu_paged_kv_manager_aux=FakeManager(),
+            aux_slot_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+    finally:
+        AttnWrapperBase._dsa_short_count = old_short_count
+
+    assert branch == "dense-short-circuit"
+    assert row_modes.tolist() == [0, 0, 0]
+    assert top_k.tolist() == [
+        [0, 1, 1, 1, 1, 1, 1, 1],
+        [0, 1, 2, 3, 3, 3, 3, 3],
+        [0, 1, 2, 3, 4, 5, 5, 5],
+    ]
+    assert indexer.calls == []
+
+
+def test_glm5_dsa_selector_scores_only_long_rows_in_mixed_batch():
+    pytest.importorskip("flash_attn_interface")
+    from batchgen.attention.dsa.glm5_decode_selector import _select_glm5_dsa_indices
+
+    class FakeIndexer:
+        index_topk = 8
+
+        def __init__(self):
+            self.seen = None
+
+        def score_and_select_paged(
+            self,
+            q_a,
+            hidden_states,
+            indexer_blocked_k,
+            idx_block_table,
+            cache_seqlens,
+            manager,
+            page_size,
+            *,
+            positions,
+            max_seqlen,
+        ):
+            self.seen = {
+                "q_a_shape": tuple(q_a.shape),
+                "hidden_shape": tuple(hidden_states.shape),
+                "block_table": idx_block_table.clone(),
+                "cache_seqlens": cache_seqlens.clone(),
+                "positions": positions.clone(),
+                "page_size": page_size,
+                "max_seqlen": max_seqlen,
+            }
+            return torch.tensor(
+                [
+                    [10, 11, 12, 13, 14, 15, 16, 17],
+                    [20, 21, 22, 23, 24, 25, 26, 27],
+                ],
+                dtype=torch.long,
+            )
+
+    class FakeManager:
+        config = type("Config", (), {"page_size_tokens": 4})()
+
+        def get_layer_kv_with_page_table(self, layer_idx):
+            blocked_k = torch.empty(1)
+            block_table = torch.tensor(
+                [
+                    [100, 101, 102],
+                    [200, 201, 202],
+                    [300, 301, 302],
+                    [400, 401, 402],
+                ],
+                dtype=torch.int32,
+            )
+            return blocked_k, None, block_table
+
+    indexer = FakeIndexer()
+    wrapper = type(
+        "Wrapper",
+        (),
+        {"module": type("Module", (), {"indexer": indexer})(), "layer_idx": 0},
+    )()
+    old_short_count = AttnWrapperBase._dsa_short_count
+    AttnWrapperBase._dsa_short_count = 2
+    try:
+        top_k, branch, row_modes = _select_glm5_dsa_indices(
+            wrapper,
+            hidden_states=torch.zeros(4, 1, 4),
+            q_a_normed=torch.zeros(4, 4),
+            cache_seqlens=torch.tensor([3, 10, 5, 12], dtype=torch.int32),
+            max_seqlen=128,
+            new_token_pos=torch.tensor([2, 9, 4, 11], dtype=torch.int64),
+            gpu_paged_kv_manager_aux=FakeManager(),
+            aux_slot_indices=torch.tensor([3, 1, 2, 0], dtype=torch.int32),
+        )
+    finally:
+        AttnWrapperBase._dsa_short_count = old_short_count
+
+    assert branch == "mixed"
+    assert row_modes.tolist() == [0, 1, 0, 1]
+    assert top_k.tolist() == [
+        [0, 1, 2, 2, 2, 2, 2, 2],
+        [10, 11, 12, 13, 14, 15, 16, 17],
+        [0, 1, 2, 3, 4, 4, 4, 4],
+        [20, 21, 22, 23, 24, 25, 26, 27],
+    ]
+    assert indexer.seen["q_a_shape"] == (2, 1, 4)
+    assert indexer.seen["hidden_shape"] == (2, 1, 4)
+    assert indexer.seen["cache_seqlens"].tolist() == [10, 12]
+    assert indexer.seen["positions"].tolist() == [9, 11]
+    assert indexer.seen["max_seqlen"] == 12
+    assert indexer.seen["block_table"].tolist() == [
+        [200, 201, 202],
+        [100, 101, 102],
+    ]
 
 
 def test_paged_gather_cache_key_invalidates_in_place_page_table_rebuild():
