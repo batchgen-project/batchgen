@@ -643,6 +643,41 @@ torch::Tensor indexer_kv_proj_forward(
     return OUT;
 }
 
+void indexer_kv_proj_forward_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor rmsnorm_weight,
+    torch::Tensor OUT_gemm,
+    torch::Tensor OUT,
+    int B, int N, int K, float eps
+) {
+    const CUtensorMap* a_desc = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
+    const CUtensorMap* w_desc = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
+    int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_m_tiles, num_n_tiles);
+
+    constexpr int smem_bytes = TOTAL_SMEM_BYTES;
+    cudaFuncSetAttribute(indexer_kv_proj_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    indexer_kv_proj_kernel<<<grid, THREADS, smem_bytes, stream>>>(
+        a_desc, w_desc,
+        w_scale.data_ptr<float>(),
+        a_scale.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(OUT_gemm.data_ptr()),
+        B, K, N);
+
+    rmsnorm_kernel<<<B, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(OUT_gemm.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(rmsnorm_weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        B, N, eps);
+}
+
 torch::Tensor indexer_kv_proj_gemm_only(
     torch::Tensor a_tma_desc,
     torch::Tensor w_tma_desc,
@@ -672,6 +707,33 @@ torch::Tensor indexer_kv_proj_gemm_only(
 
     return OUT;
 }
+
+void indexer_kv_proj_gemm_only_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
+    int B, int N, int K
+) {
+    const CUtensorMap* a_d = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
+    const CUtensorMap* w_d = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
+    int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_m_tiles, num_n_tiles);
+
+    constexpr int smem_bytes = TOTAL_SMEM_BYTES;
+    cudaFuncSetAttribute(indexer_kv_proj_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    indexer_kv_proj_kernel<<<grid, THREADS, smem_bytes, stream>>>(
+        a_d, w_d,
+        w_scale.data_ptr<float>(),
+        a_scale.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        B, K, N);
+}
 ''';
 
 CPP_SOURCE = r'''
@@ -692,11 +754,29 @@ torch::Tensor indexer_kv_proj_forward(
     torch::Tensor rmsnorm_weight,
     int B, int N, int K, float eps);
 
+void indexer_kv_proj_forward_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor rmsnorm_weight,
+    torch::Tensor OUT_gemm,
+    torch::Tensor OUT,
+    int B, int N, int K, float eps);
+
 torch::Tensor indexer_kv_proj_gemm_only(
     torch::Tensor a_tma_desc,
     torch::Tensor w_tma_desc,
     torch::Tensor w_scale,
     torch::Tensor a_scale,
+    int B, int N, int K);
+
+void indexer_kv_proj_gemm_only_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
     int B, int N, int K);
 ''';
 
@@ -718,8 +798,14 @@ def build_module(num_stages=4):
         name=f"indexer_kv_proj_v3_s{num_stages}",
         cpp_sources=[CPP_SOURCE],
         cuda_sources=[CUDA_SOURCE],
-        functions=["create_tma_desc", "run_act_quant",
-                    "indexer_kv_proj_forward", "indexer_kv_proj_gemm_only"],
+        functions=[
+            "create_tma_desc",
+            "run_act_quant",
+            "indexer_kv_proj_forward",
+            "indexer_kv_proj_forward_out",
+            "indexer_kv_proj_gemm_only",
+            "indexer_kv_proj_gemm_only_out",
+        ],
         extra_cuda_cflags=[
             "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
             f"-DNUM_STAGES={num_stages}",
@@ -804,6 +890,43 @@ def cuda_wk_proj_rmsnorm(
     )
 
 
+def cuda_wk_proj_rmsnorm_out(
+    hidden_states: torch.Tensor,
+    weights: FP8IndexerWeightsCUDA,
+    rmsnorm_weight: torch.Tensor,
+    module,
+    x_fp8_padded: torch.Tensor,
+    x_scale: torch.Tensor,
+    a_tma_desc: torch.Tensor,
+    out_gemm: torch.Tensor,
+    out: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be contiguous for graph-captured WK projection")
+    B, K = hidden_states.shape
+    N = weights.N
+    _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
+    if out_gemm.shape != (B, N) or out_gemm.dtype != torch.bfloat16:
+        raise ValueError(f"out_gemm must be BF16 with shape {(B, N)}, got {out_gemm.shape} {out_gemm.dtype}")
+
+    module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
+    module.indexer_kv_proj_forward_out(
+        a_tma_desc,
+        weights.tma_desc,
+        weights.w_scale,
+        x_scale,
+        rmsnorm_weight,
+        out_gemm,
+        out,
+        B,
+        N,
+        K,
+        eps,
+    )
+    return out
+
+
 def cuda_wk_proj_gemm_only(
     hidden_states: torch.Tensor,
     weights: FP8IndexerWeightsCUDA,
@@ -829,6 +952,80 @@ def cuda_wk_proj_gemm_only(
         weights.w_scale, x_scale,
         B, N, K,
     )
+
+
+def cuda_wk_proj_gemm_only_out(
+    hidden_states: torch.Tensor,
+    weights: FP8IndexerWeightsCUDA,
+    module,
+    x_fp8_padded: torch.Tensor,
+    x_scale: torch.Tensor,
+    a_tma_desc: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    if not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be contiguous for graph-captured WK projection")
+    B, K = hidden_states.shape
+    N = weights.N
+    _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
+
+    module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
+    module.indexer_kv_proj_gemm_only_out(
+        a_tma_desc,
+        weights.tma_desc,
+        weights.w_scale,
+        x_scale,
+        out,
+        B,
+        N,
+        K,
+    )
+    return out
+
+
+def make_fp8_activation_scratch(
+    batch_size: int,
+    hidden_size: int,
+    module,
+    *,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    padded_batch = max(batch_size, _BLOCK_M)
+    x_fp8_padded = torch.empty(
+        padded_batch,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    x_scale = torch.empty(batch_size, dtype=torch.float32, device=device)
+    a_tma_desc = module.create_tma_desc(
+        x_fp8_padded,
+        padded_batch,
+        hidden_size,
+        _BLOCK_M,
+        _BLOCK_K,
+    )
+    return x_fp8_padded, x_scale, a_tma_desc
+
+
+def _validate_projection_out_buffers(
+    B: int,
+    K: int,
+    N: int,
+    x_fp8_padded: torch.Tensor,
+    x_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    padded_batch = max(B, _BLOCK_M)
+    if x_fp8_padded.shape != (padded_batch, K) or x_fp8_padded.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"x_fp8_padded must be FP8 with shape {(padded_batch, K)}, "
+            f"got {x_fp8_padded.shape} {x_fp8_padded.dtype}"
+        )
+    if x_scale.shape != (B,) or x_scale.dtype != torch.float32:
+        raise ValueError(f"x_scale must be FP32 with shape {(B,)}, got {x_scale.shape} {x_scale.dtype}")
+    if out.shape != (B, N) or out.dtype != torch.bfloat16:
+        raise ValueError(f"out must be BF16 with shape {(B, N)}, got {out.shape} {out.dtype}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

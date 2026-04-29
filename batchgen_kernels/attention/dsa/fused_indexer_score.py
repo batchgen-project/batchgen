@@ -28,7 +28,9 @@ import triton.language as tl
 import math
 
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
-    build_module, FP8IndexerWeightsCUDA,
+    build_module,
+    FP8IndexerWeightsCUDA,
+    _validate_projection_out_buffers,
 )
 
 # Import existing CUDA fused RoPE+Hadamard kernel
@@ -108,6 +110,36 @@ def cuda_wq_b_proj(
         wq_b_weights.w_scale, x_scale,
         B, N, K,
     )
+
+
+def cuda_wq_b_proj_out(
+    q_a: torch.Tensor,
+    wq_b_weights: FP8WqbWeightsCUDA,
+    module,
+    x_fp8_padded: torch.Tensor,
+    x_scale: torch.Tensor,
+    a_tma_desc: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer FP8 WGMMA q_b projection for CUDA graph capture."""
+    if not q_a.is_contiguous():
+        raise ValueError("q_a must be contiguous for graph-captured q_b projection")
+    B, K = q_a.shape
+    N = wq_b_weights.N
+    _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
+
+    module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
+    module.indexer_kv_proj_gemm_only_out(
+        a_tma_desc,
+        wq_b_weights.tma_desc,
+        wq_b_weights.w_scale,
+        x_scale,
+        out,
+        B,
+        N,
+        K,
+    )
+    return out
 
 
 # ============================================================
