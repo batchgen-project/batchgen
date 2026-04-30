@@ -120,7 +120,7 @@ def build_glm5_dsa_graph_segment_inputs(
             q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1,
         )
         q_nope = q_nope.squeeze(2).contiguous()
-        q_rope = q_pe.squeeze(2).contiguous()
+        q_pe = q_pe.contiguous()
 
     with (dt.timed("kv_proj", li) if dt else nullcontext()):
         new_compressed_kv = w8a8_deepgemm(
@@ -129,10 +129,10 @@ def build_glm5_dsa_graph_segment_inputs(
             attn.kv_a_proj_with_mqa.weight,
             weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
         ).view(bsz, 1, -1)
-        cos, sin = attn.rotary_emb(q_pe.contiguous(), seq_len=max_seqlen)
+        cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
         offload_kv = _fused_rmsnorm_rope(
             new_compressed_kv,
-            q_pe.contiguous(),
+            q_pe,
             cos,
             sin,
             position_ids,
@@ -141,6 +141,7 @@ def build_glm5_dsa_graph_segment_inputs(
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
         )
+        q_rope = q_pe.squeeze(2).contiguous()
 
     new_token_pos = position_ids.squeeze(-1)
     manager_device = gpu_paged_kv_manager.device

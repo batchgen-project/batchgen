@@ -1,3 +1,6 @@
+import sys
+import types
+
 import torch
 import pytest
 
@@ -409,6 +412,199 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
 
     assert actual is expected
     assert calls == {"return_debug": True, "compare": True}
+
+
+def test_glm5_dsa_graph_segment_inputs_expose_rotated_q_rope(monkeypatch):
+    flash_attn_mod = types.ModuleType("flash_attn_interface")
+    flash_attn_mod.flash_attn_varlen_func = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "flash_attn_interface", flash_attn_mod)
+    fa3_mod = types.ModuleType("batchgen.attention.mla.fa3_backend")
+    fa3_mod.act_quant = lambda x: (x, torch.ones(x.shape[0], 1, dtype=torch.float32, device=x.device))
+    flashmla_backend_mod = types.ModuleType("batchgen.attention.mla.flashmla_backend")
+    flashmla_backend_mod.deepseek_v3_dequantization = lambda weight, scale: weight
+    rope_mod = types.ModuleType("batchgen.attention.mla.fused_rmsnorm_rope")
+    rope_mod.fused_rmsnorm_rope_with_q_native = lambda *args, **kwargs: None
+    gemm_mod = types.ModuleType("batchgen.gemm.w8a8_deepgemm")
+    gemm_mod.w8a8_deepgemm = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "batchgen.attention.mla.fa3_backend", fa3_mod)
+    monkeypatch.setitem(sys.modules, "batchgen.attention.mla.flashmla_backend", flashmla_backend_mod)
+    monkeypatch.setitem(sys.modules, "batchgen.attention.mla.fused_rmsnorm_rope", rope_mod)
+    monkeypatch.setitem(sys.modules, "batchgen.gemm.w8a8_deepgemm", gemm_mod)
+
+    from batchgen.attention.dsa import glm5_decode_selector as selector
+
+    batch_size = 2
+    num_heads = 2
+    qk_nope = 3
+    qk_rope = 2
+    q_head_dim = qk_nope + qk_rope
+    kv_lora_rank = 4
+    q_rank = 4
+    index_heads = 2
+    index_dim = 4
+
+    def fake_act_quant(x):
+        return x, torch.ones(x.shape[0], 1, dtype=torch.float32, device=x.device)
+
+    def fake_w8a8(x, x_scale, weight, weight_scale):
+        if weight == "q_a":
+            return torch.arange(
+                x.shape[0] * q_rank, dtype=torch.float32, device=x.device,
+            ).view(x.shape[0], q_rank).to(torch.bfloat16)
+        if weight == "q_b":
+            return torch.arange(
+                x.shape[0] * num_heads * q_head_dim,
+                dtype=torch.float32,
+                device=x.device,
+            ).view(x.shape[0], num_heads * q_head_dim).to(torch.bfloat16)
+        if weight == "kv_a":
+            return torch.zeros(
+                x.shape[0],
+                kv_lora_rank + qk_rope,
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+        raise AssertionError(weight)
+
+    def fake_fused_rmsnorm_rope(
+        new_compressed_kv,
+        q_pe,
+        cos,
+        sin,
+        position_ids,
+        weight,
+        kv_lora,
+        rope_dim,
+        *,
+        eps,
+    ):
+        q_pe.add_(100)
+        return torch.zeros_like(new_compressed_kv)
+
+    monkeypatch.setattr(selector, "act_quant", fake_act_quant)
+    monkeypatch.setattr(selector, "w8a8_deepgemm", fake_w8a8)
+    monkeypatch.setattr(selector, "_fused_rmsnorm_rope", fake_fused_rmsnorm_rope)
+
+    kv_proj_mod = types.ModuleType("batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda")
+    kv_proj_mod.cuda_wk_proj_gemm_only = lambda hidden_flat, weights, module: torch.zeros(
+        hidden_flat.shape[0],
+        index_dim,
+        dtype=torch.bfloat16,
+        device=hidden_flat.device,
+    )
+    score_mod = types.ModuleType("batchgen_kernels.attention.dsa.fused_indexer_score")
+    score_mod.compute_head_gates = lambda hidden_flat, weight, heads, dim: torch.ones(
+        hidden_flat.shape[0],
+        heads,
+        dtype=torch.float32,
+        device=hidden_flat.device,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda",
+        kv_proj_mod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "batchgen_kernels.attention.dsa.fused_indexer_score",
+        score_mod,
+    )
+
+    class FakeLayerNorm:
+        weight = torch.ones(kv_lora_rank)
+        eps = 1e-6
+
+        def __call__(self, x):
+            return x
+
+    class FakeIndexer:
+        index_n_heads = index_heads
+        index_head_dim = index_dim
+        weights_proj = type("WeightsProj", (), {"weight": torch.ones(index_heads, index_dim)})()
+
+        def k_norm(self, x):
+            return x
+
+        def _fused_rope_hadamard_or_fallback(self, x, positions, *, max_seqlen):
+            return x
+
+    class FakeAttn:
+        def __init__(self):
+            self.qk_nope_head_dim = qk_nope
+            self.qk_rope_head_dim = qk_rope
+            self.q_head_dim = q_head_dim
+            self.num_heads = num_heads
+            self.kv_lora_rank = kv_lora_rank
+            self.q_a_proj = type("Proj", (), {"weight": "q_a"})()
+            self.q_b_proj = type("Proj", (), {"weight": "q_b"})()
+            self.kv_a_proj_with_mqa = type("Proj", (), {"weight": "kv_a"})()
+            self.q_a_layernorm = FakeLayerNorm()
+            self.kv_a_layernorm = FakeLayerNorm()
+            self.indexer = FakeIndexer()
+
+        def rotary_emb(self, q_pe, *, seq_len):
+            return torch.ones(1), torch.zeros(1)
+
+    class FakePageTableManager:
+        seq_id_to_slot = {101: 1, 102: 0}
+
+    class FakeManager:
+        device = torch.device("cpu")
+        _gpu_page_table_manager = FakePageTableManager()
+
+        def update_layer_decode_new_token(self, *args, **kwargs):
+            raise AssertionError("write_kv=False should not update caches")
+
+    wrapper = type(
+        "Wrapper",
+        (),
+        {
+            "weight_dequant_scale": {
+                "q_a_proj.weight_scale_inv": None,
+                "q_b_proj.weight_scale_inv": None,
+                "kv_a_proj_with_mqa.weight_scale_inv": None,
+            },
+            "module": FakeAttn(),
+            "layer_idx": 0,
+            "_indexer_cuda_weights": object(),
+            "_indexer_cuda_module": object(),
+        },
+    )()
+    hidden_states = torch.zeros(batch_size, 1, q_rank, dtype=torch.bfloat16)
+    position_ids = torch.tensor([[7], [8]], dtype=torch.int64)
+    cache_seqlens = torch.tensor([8, 9], dtype=torch.int32)
+
+    old_batch = AttnWrapperBase.cur_batch
+    AttnWrapperBase.cur_batch = [101, 102]
+    try:
+        graph_inputs = selector.build_glm5_dsa_graph_segment_inputs(
+            wrapper,
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen=16,
+            gpu_paged_kv_manager=FakeManager(),
+            gpu_paged_kv_manager_aux=FakeManager(),
+            write_kv=False,
+        )
+    finally:
+        AttnWrapperBase.cur_batch = old_batch
+
+    raw_q = fake_w8a8(
+        torch.empty(batch_size, q_rank),
+        None,
+        "q_b",
+        None,
+    ).view(batch_size, 1, num_heads, q_head_dim).transpose(1, 2)
+    expected_q_rope = raw_q[..., qk_nope:].squeeze(2).contiguous() + 100
+
+    torch.testing.assert_close(graph_inputs.q_rope, expected_q_rope)
+    torch.testing.assert_close(
+        graph_inputs.q_nope,
+        raw_q[..., :qk_nope].squeeze(2).contiguous(),
+    )
+    assert graph_inputs.primary_slot_indices.tolist() == [1, 0]
+    assert graph_inputs.aux_slot_indices.tolist() == [1, 0]
 
 
 def test_glm5_dsa_graph_compare_layer_filter(monkeypatch):
