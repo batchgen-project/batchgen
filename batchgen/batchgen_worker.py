@@ -5604,7 +5604,10 @@ class BatchGenWorker:
 				# B. Config Decode
 				config_start = time.perf_counter()
 				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
-				self._current_decode_local_batch_size = len(local_decode_indices)
+				self._sync_decode_moe_rank_counts(
+					local_decode_indices,
+					reason="pre_decode_warmup",
+				)
 				config_decode_time += time.perf_counter() - config_start
 
 				# CUDA Graph Warmup (lazy, one-time). Whole-model graph paths wait
@@ -7840,19 +7843,7 @@ class BatchGenWorker:
 		# ========== UPDATE MOE BUFFER SIZE ==========
 		# Find max batch size across all ranks to minimize all-gather/all-reduce communication
 		t0 = time.perf_counter()
-		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
-		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
-		max_batch_size = _all_rank_counts.max().item()
-		self._current_decode_max_rank_batch_size = int(max_batch_size)
-		self._current_decode_rank_token_counts = _all_rank_counts
-
-		# Update MoE layers with the actual max batch size for this page
-		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
-			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
+		self._sync_decode_moe_rank_counts(batch, reason="page_boundary")
 		timing.moe_buffer_update_ms = (time.perf_counter() - t0) * 1000
 		
 		# ========== SINGLE FINAL BARRIER ==========
@@ -8010,6 +8001,35 @@ class BatchGenWorker:
 		updated_batch = [uuid_to_local[u] for u in updated_uuids if u in uuid_to_local]
 		
 		return updated_uuids, updated_batch
+
+	def _sync_decode_moe_rank_counts(self, batch: List[int], *, reason: str) -> int:
+		"""Synchronize per-rank decode row counts for 3D MoE padding masks."""
+		local_count = int(len(batch))
+		local_count_tensor = torch.tensor([local_count], dtype=torch.int64, device=self.torch_device)
+		all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+		dist.all_gather_into_tensor(all_rank_counts, local_count_tensor)
+		max_batch_size = int(all_rank_counts.max().item())
+
+		self._current_decode_local_batch_size = local_count
+		self._current_decode_max_rank_batch_size = max_batch_size
+		self._current_decode_rank_token_counts = all_rank_counts
+
+		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
+				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
+				self.parallel_manager.set_rank_token_counts(all_rank_counts)
+
+		if BATCHGEN_MULTI_BATCH_DIAG:
+			try:
+				counts_list = all_rank_counts.detach().cpu().tolist()
+			except RuntimeError:
+				counts_list = ["<unavailable>"]
+			logging.info(
+				f"[GLM5_MOE_COUNTS] Rank {self.rank}: reason={reason} "
+				f"local={local_count} max={max_batch_size} counts={counts_list}"
+			)
+		return max_batch_size
 
 	def _warmup_cuda_graphs(self):
 		"""One-time CUDA graph warmup phase with model guard.
@@ -8903,18 +8923,7 @@ class BatchGenWorker:
 		# iterations, but the first forward pass runs immediately. Without this sync,
 		# if one rank has more tokens than the initial estimate (ceil(total/world_size)),
 		# we get buffer overflow.
-		local_batch_size = torch.tensor([len(batch)], dtype=torch.int64, device=self.torch_device)
-		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
-		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
-		max_batch_size = _all_rank_counts.max().item()
-		self._current_decode_max_rank_batch_size = int(max_batch_size)
-		self._current_decode_rank_token_counts = _all_rank_counts
-
-		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
-			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-				self.parallel_manager.set_rank_token_counts(_all_rank_counts)
+		max_batch_size = self._sync_decode_moe_rank_counts(batch, reason="decode_entry")
 
 		# OPTIMIZATION: Track if page table was verified since last batch change
 		# Avoids redundant page table checks between boundaries
@@ -9078,6 +9087,10 @@ class BatchGenWorker:
 							decode_uuids, batch, gpu_manager
 						)
 						self._rebuild_page_table_for_batch(batch, gpu_manager)
+						self._sync_decode_moe_rank_counts(
+							batch,
+							reason="post_pending_load_finalize",
+						)
 						
 						if batch:
 							new_tokens = self._rebuild_input_tokens(batch)
@@ -9252,6 +9265,7 @@ class BatchGenWorker:
 					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
 					_max_bs = max(_all_rank_counts.max().item(), 1)
+					self._current_decode_local_batch_size = len(batch)
 					self._current_decode_max_rank_batch_size = int(_max_bs)
 					self._current_decode_rank_token_counts = _all_rank_counts
 					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
