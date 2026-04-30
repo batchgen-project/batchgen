@@ -5389,24 +5389,14 @@ class BatchGenWorker:
 						# would have nothing to wait for. Wait on every captured future
 						# first, then sync the device to flush the d2h stream.
 						from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-						pending = _AWB.pending_prefill_offload_tasks
-						if pending:
-							for _t in pending:
-								try:
-									_t.wait()
-								except Exception as _e:
-									logging.warning(f"prefill offload task wait failed: {_e}")
-							if self.rank == 0:
-								logging.info(
-									f"[PREFILL_SYNC] waited on {len(pending)} async KV offload tasks"
-								)
-							pending.clear()
-						torch.cuda.synchronize(self.torch_device)
-						# Release the pinned source tensors only AFTER wait() +
-						# device sync confirm the d2h memcpy has fully retired.
-						# Mirrors decode-side `_pending_kv_append_tensors` cleanup
-						# in `_wait_pending_kv_append_tasks`.
-						_AWB.pending_prefill_offload_tensors.clear()
+						num_retired = _AWB.retire_pending_prefill_offloads(
+							device=self.torch_device,
+							reason="end of prefill",
+						)
+						if num_retired and self.rank == 0:
+							logging.info(
+								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
+							)
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()

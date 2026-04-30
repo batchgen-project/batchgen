@@ -388,6 +388,7 @@ def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch)
 
 def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
     wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
     wrapper.prepack_mode = True
     wrapper.position_ids = torch.tensor([[0, 1, 2]], dtype=torch.int64)
     wrapper.prepack_cu_seqlens = torch.tensor([0, 3], dtype=torch.int32)
@@ -428,6 +429,7 @@ def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
 
 def test_glm5_prefill_requires_indexer_and_prepack_mode():
     wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
     wrapper.prepack_mode = True
     wrapper.position_ids = torch.tensor([[0, 1]], dtype=torch.int64)
     wrapper.prepack_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
@@ -463,3 +465,55 @@ def test_glm5_prefill_indexer_offload_requires_aux_host_view(monkeypatch):
 
     with pytest.raises(RuntimeError, match="auxiliary host KV worker view is required"):
         wrapper._offload_prepacked_indexer_kv(torch.zeros(2, 1, 128))
+
+
+def test_prefill_offload_lifetime_retires_previous_layer(monkeypatch):
+    class DummyTask:
+        def __init__(self):
+            self.waited = False
+
+        def wait(self):
+            self.waited = True
+
+    task = DummyTask()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tasks", [task])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tensors", [torch.zeros(1)])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_layer_idx", 3)
+
+    retired = AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+        4,
+        device=torch.device("cpu"),
+    )
+
+    assert retired == 1
+    assert task.waited
+    assert AttnWrapperBase.pending_prefill_offload_tasks == []
+    assert AttnWrapperBase.pending_prefill_offload_tensors == []
+    assert AttnWrapperBase.pending_prefill_offload_layer_idx is None
+
+
+def test_prefill_offload_lifetime_keeps_current_layer_refs(monkeypatch):
+    class DummyTask:
+        def __init__(self):
+            self.waited = False
+
+        def wait(self):
+            self.waited = True
+
+    task = DummyTask()
+    tensor = torch.zeros(1)
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tasks", [task])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_tensors", [tensor])
+    monkeypatch.setattr(AttnWrapperBase, "pending_prefill_offload_layer_idx", 4)
+
+    retired = AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+        4,
+        device=torch.device("cpu"),
+    )
+
+    assert retired == 0
+    assert not task.waited
+    assert AttnWrapperBase.pending_prefill_offload_tasks == [task]
+    assert AttnWrapperBase.pending_prefill_offload_tensors == [tensor]
+    assert AttnWrapperBase.pending_prefill_offload_layer_idx == 4

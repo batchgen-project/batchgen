@@ -467,6 +467,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
         1. Standard MLA prefill via FA3 (full attention)
         2. Compute indexer K and write to auxiliary cache
         """
+        AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+            self.layer_idx,
+            device=hidden_states.device,
+        )
         if self.prepack_mode:
             hidden_states_2d = hidden_states.squeeze(0)
             attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
@@ -525,7 +529,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # source tensor (and the parent `offload_kv`) in the class-level list
         # so PyTorch's caching allocator cannot re-hand the same physical
         # pages to a later layer's K/V tensor while the d2h is in flight.
-        AttnWrapperBase.pending_prefill_offload_tensors.append(offload_kv)
+        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
         evt = torch.cuda.Event()
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
@@ -551,9 +555,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             # Pin both the per-seq view AND the parent offload_kv (already
             # pinned outside the loop) so neither's storage is reclaimed.
-            AttnWrapperBase.pending_prefill_offload_tensors.append(seq_kv)
-            if task is not None:
-                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
+            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload KV cache per-sequence to host memory."""
@@ -562,7 +565,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         global_sequence_ids = self.cur_batch
 
         # See _offload_prepacked_indexer_kv for rationale.
-        AttnWrapperBase.pending_prefill_offload_tensors.append(offload_kv)
+        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
         evt = torch.cuda.Event()
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
@@ -582,9 +585,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
-            AttnWrapperBase.pending_prefill_offload_tensors.append(seq_kv)
-            if task is not None:
-                AttnWrapperBase.pending_prefill_offload_tasks.append(task)
+            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
+            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward with DSA sparse attention.
