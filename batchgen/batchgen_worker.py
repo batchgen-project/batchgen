@@ -1418,10 +1418,7 @@ class BatchGenWorker:
 				if seq is None:
 					continue
 				st["prompt_lens"].append(int(seq.prompt_length))
-				st["decoded_lens"].append(
-					int(seq.decoded_length)
-					+ int(getattr(seq, "total_decoded_before_eviction", 0))
-				)
+				st["decoded_lens"].append(int(seq.decoded_length))
 				n_new += 1
 			if n_new == 0:
 				return
@@ -6931,13 +6928,28 @@ class BatchGenWorker:
 			# eviction boundary and synced to all ranks.
 
 			# Baseline = accumulated historical output length carried forward
-			# into decoded_tokens. With the Phase 4.C cascade fix, this is
-			# exactly (prompt_length - original_prompt_length) = sum of new
-			# decoded counts across all past cycles.
-			baseline_candidate = seq.prompt_length - seq.original_prompt_length
-			n_old = min(baseline_candidate, self.max_decoding_length)
-			if n_old < 0:
-				n_old = 0
+			# into decoded_tokens. The normal invariant is:
+			#   prompt_length - original_prompt_length == total_decoded_before_eviction
+			# Use the cumulative eviction counter as the source of truth so a
+			# stale reconstructed prompt scalar cannot shrink decoded_length
+			# from e.g. 128 back to the current re-entry cycle's local token count.
+			prompt_delta = max(0, seq.prompt_length - seq.original_prompt_length)
+			cumulative_decoded = max(
+				prompt_delta,
+				int(seq.total_decoded_before_eviction),
+			)
+			n_old = min(cumulative_decoded, self.max_decoding_length)
+			expected_prompt_len = seq.original_prompt_length + n_old
+			if seq.prompt_length != expected_prompt_len:
+				logging.warning(
+					f"Rank {self.rank}: re-entry prompt/decode mismatch for "
+					f"{uuid[:8]}: prompt_len={seq.prompt_length}, "
+					f"orig_prompt={seq.original_prompt_length}, "
+					f"total_before_eviction={seq.total_decoded_before_eviction}. "
+					f"Using reconstructed prompt_len={expected_prompt_len}."
+				)
+				seq.prompt_length = expected_prompt_len
+				seq.current_context_length = expected_prompt_len
 			seq.decoded_length = n_old
 			seq.reentry_decoded_baseline = n_old
 
@@ -6985,6 +6997,10 @@ class BatchGenWorker:
 				)
 				seq.prompt_length = new_prompt_len
 				seq.current_context_length = new_prompt_len
+				tensor_decoded = max(0, new_prompt_len - seq.original_prompt_length)
+				n_old = min(tensor_decoded, self.max_decoding_length)
+				seq.decoded_length = n_old
+				seq.reentry_decoded_baseline = n_old
 
 			# Rebuild input_ids with new prompt — reuse buffer pool slot
 			seq_extended_size = seq.kv_token_budget
@@ -12016,17 +12032,19 @@ class BatchGenWorker:
 						for local_idx in batch
 					]
 					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
-					self.update_new_token(new_tokens, batch, new_token_idx)
+					new_tokens_cpu = new_tokens.to("cpu")
 
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
-						seq.decoded_length = new_token_idx + 1
-						seq.current_context_length = seq.prompt_length + new_token_idx + 1
+						token_pos = seq.decoded_length
+						self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+						seq.decoded_length = token_pos + 1
+						seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 						# Only mark eos_reached if we should stop at EOS
-						token_id = new_tokens[i].item()
+						token_id = new_tokens_cpu[i].item()
 						if self._should_stop_at_eos(token_id):
 							seq.eos_reached = True
 
@@ -12113,17 +12131,19 @@ class BatchGenWorker:
 						for local_idx in batch
 					]
 					new_tokens = self._select_tokens(new_tokens.logits[:, -1, :], batch_sequences)
-					self.update_new_token(new_tokens, batch, new_token_idx)
+					new_tokens_cpu = new_tokens.to("cpu")
 
 					# Update sequence state
 					for i, local_idx in enumerate(batch):
 						uuid = self._local_to_uuid_map[local_idx]
 						seq = self.global_batch.get_sequence(uuid)
-						seq.decoded_length = new_token_idx + 1
-						seq.current_context_length = seq.prompt_length + new_token_idx + 1
+						token_pos = seq.decoded_length
+						self.query_book[local_idx].decoded_tokens[:, token_pos] = new_tokens_cpu[i]
+						seq.decoded_length = token_pos + 1
+						seq.current_context_length = seq.original_prompt_length + seq.decoded_length
 
 						# Only mark eos_reached if we should stop at EOS
-						token_id = new_tokens[i].item()
+						token_id = new_tokens_cpu[i].item()
 						if self._should_stop_at_eos(token_id):
 							seq.eos_reached = True
 
