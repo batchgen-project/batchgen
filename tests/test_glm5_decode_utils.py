@@ -46,22 +46,23 @@ def test_clamp_token_indices_to_seqlens_caps_topk_tail():
 
 
 def test_clamped_dense_indices_prevent_stale_tail_reads():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     page_size = 64
-    blocked_k = torch.zeros(4, page_size, 1, 1, dtype=torch.float32)
+    blocked_k = torch.zeros(4, page_size, 1, 1, dtype=torch.float32, device=device)
 
-    blocked_k[0, :, 0, 0] = 1000 + torch.arange(page_size)
+    blocked_k[0, :, 0, 0] = 1000 + torch.arange(page_size, device=device)
     blocked_k[1, 0, 0, 0] = 2000
-    blocked_k[1, 1:, 0, 0] = 9000 + torch.arange(page_size - 1)
-    blocked_k[2, :, 0, 0] = 3000 + torch.arange(page_size)
-    blocked_k[3, :, 0, 0] = 4000 + torch.arange(page_size)
+    blocked_k[1, 1:, 0, 0] = 9000 + torch.arange(page_size - 1, device=device)
+    blocked_k[2, :, 0, 0] = 3000 + torch.arange(page_size, device=device)
+    blocked_k[3, :, 0, 0] = 4000 + torch.arange(page_size, device=device)
 
-    block_table = torch.tensor([[0, 1, -1], [2, 3, -1]], dtype=torch.int64)
-    cache_seqlens = torch.tensor([65, 128], dtype=torch.int32)
+    block_table = torch.tensor([[0, 1, -1], [2, 3, -1]], dtype=torch.int64, device=device)
+    cache_seqlens = torch.tensor([65, 128], dtype=torch.int32, device=device)
 
     clamped_indices = build_clamped_dense_token_indices(
         cache_seqlens,
         max_seqlen=128,
-        device=torch.device("cpu"),
+        device=device,
     )
     gathered = sparse_gather_from_paged_kv(
         blocked_k, block_table, clamped_indices, page_size
@@ -83,13 +84,14 @@ def test_build_batch_slot_indices_uses_explicit_slot_mapping():
 
 
 def test_reordered_block_table_prevents_cross_sequence_reads():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     page_size = 4
-    blocked_k = torch.zeros(2, page_size, 1, 1, dtype=torch.float32)
-    blocked_k[0, :, 0, 0] = torch.tensor([100.0, 101.0, 102.0, 103.0])
-    blocked_k[1, :, 0, 0] = torch.tensor([200.0, 201.0, 202.0, 203.0])
+    blocked_k = torch.zeros(2, page_size, 1, 1, dtype=torch.float32, device=device)
+    blocked_k[0, :, 0, 0] = torch.tensor([100.0, 101.0, 102.0, 103.0], device=device)
+    blocked_k[1, :, 0, 0] = torch.tensor([200.0, 201.0, 202.0, 203.0], device=device)
 
-    slot_order_block_table = torch.tensor([[1, -1], [0, -1]], dtype=torch.int64)
-    top_k_indices = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+    slot_order_block_table = torch.tensor([[1, -1], [0, -1]], dtype=torch.int64, device=device)
+    top_k_indices = torch.tensor([[0, 1], [0, 1]], dtype=torch.long, device=device)
 
     wrong = sparse_gather_from_paged_kv(
         blocked_k, slot_order_block_table, top_k_indices, page_size
@@ -97,7 +99,7 @@ def test_reordered_block_table_prevents_cross_sequence_reads():
 
     reordered = reorder_block_table_to_batch_slots(
         slot_order_block_table,
-        torch.tensor([1, 0], dtype=torch.int32),
+        torch.tensor([1, 0], dtype=torch.int32, device=device),
     )
     fixed = sparse_gather_from_paged_kv(
         blocked_k, reordered, top_k_indices, page_size
