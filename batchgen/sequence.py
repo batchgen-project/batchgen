@@ -543,6 +543,24 @@ class SequenceEntry:
     def remaining_decode_tokens(self) -> int:
         return self.max_decode_length - self.decoded_length
 
+    def clamp_reentry_decoded_length(self, decoded_length: int) -> int:
+        """Clamp reconstructed decoded progress using this request's limit."""
+        return min(max(0, int(decoded_length)), int(self.original_max_decode_length))
+
+    def compute_reentry_decoded_length(self, reconstructed_prompt_length: int) -> int:
+        """Return cumulative decoded progress after host-KV eviction re-entry.
+
+        Pool-mode workers can process batches with different request-level
+        max_tokens. Re-entry accounting must therefore use the sequence's own
+        original_max_decode_length, not the worker's current batch default.
+        """
+        prompt_delta = max(
+            0,
+            int(reconstructed_prompt_length) - int(self.original_prompt_length),
+        )
+        cumulative_decoded = max(prompt_delta, int(self.total_decoded_before_eviction))
+        return self.clamp_reentry_decoded_length(cumulative_decoded)
+
     def should_check_completion(self) -> bool:
         """Check if we're at a page boundary (every PAGE_SIZE tokens in decoding)."""
         return self.decoded_length > 0 and self.decoded_length % self.PAGE_SIZE == 0

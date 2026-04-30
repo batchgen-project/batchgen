@@ -6933,12 +6933,7 @@ class BatchGenWorker:
 			# Use the cumulative eviction counter as the source of truth so a
 			# stale reconstructed prompt scalar cannot shrink decoded_length
 			# from e.g. 128 back to the current re-entry cycle's local token count.
-			prompt_delta = max(0, seq.prompt_length - seq.original_prompt_length)
-			cumulative_decoded = max(
-				prompt_delta,
-				int(seq.total_decoded_before_eviction),
-			)
-			n_old = min(cumulative_decoded, self.max_decoding_length)
+			n_old = seq.compute_reentry_decoded_length(seq.prompt_length)
 			expected_prompt_len = seq.original_prompt_length + n_old
 			if seq.prompt_length != expected_prompt_len:
 				logging.warning(
@@ -6997,8 +6992,7 @@ class BatchGenWorker:
 				)
 				seq.prompt_length = new_prompt_len
 				seq.current_context_length = new_prompt_len
-				tensor_decoded = max(0, new_prompt_len - seq.original_prompt_length)
-				n_old = min(tensor_decoded, self.max_decoding_length)
+				n_old = seq.compute_reentry_decoded_length(new_prompt_len)
 				seq.decoded_length = n_old
 				seq.reentry_decoded_baseline = n_old
 
@@ -7015,7 +7009,7 @@ class BatchGenWorker:
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			if prev_decoded > 0:
 				old_decoded = evicted_ids[seq.original_prompt_length:]
-				n_old = min(len(old_decoded), self.max_decoding_length)
+				n_old = seq.clamp_reentry_decoded_length(len(old_decoded))
 				seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
 				# decoded_length and reentry_decoded_baseline are already set
 				# by loop (a); setting them here is redundant but harmless and

@@ -600,6 +600,26 @@ class TestFullLifecycle:
         # Old tokens still intact
         assert torch.equal(seq.decoded_tokens[0, :200], old_decoded)
 
+    def test_reentry_uses_sequence_decode_limit_not_stale_worker_limit(self):
+        """Re-entry accounting must not clamp to a previous pool batch max_tokens."""
+        seq = make_seq(
+            uuid="s1",
+            prompt_length=1000,
+            max_decode_length=512,
+            decoded_length=128,
+            status=SequenceStatus.EVICTED,
+        )
+        seq.original_prompt_length = 1000
+        seq.original_max_decode_length = 512
+        seq.total_decoded_before_eviction = 128
+        reconstructed_prompt_len = seq.original_prompt_length + seq.total_decoded_before_eviction
+
+        stale_worker_max_decoding_length = 1
+
+        assert min(seq.total_decoded_before_eviction, stale_worker_max_decoding_length) == 1
+        assert seq.compute_reentry_decoded_length(reconstructed_prompt_len) == 128
+        assert seq.clamp_reentry_decoded_length(128) == 128
+
     def test_adaptive_chunk_reduces_waste(self):
         """Demonstrate that adaptive sizing reduces over-reservation."""
         sizer = AdaptiveChunkSizer(
