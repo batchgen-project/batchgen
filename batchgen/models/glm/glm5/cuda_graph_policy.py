@@ -74,6 +74,16 @@ def glm5_any_cuda_graph_requested_for_model(
     )
 
 
+def glm5_effective_decode_attn_mode(
+    model_type: str | None,
+    configured_attn_mode: int,
+) -> int:
+    """GLM-5 decode uses the modern continuous path even on single-node runs."""
+    if _is_glm_model(model_type):
+        return 3
+    return configured_attn_mode
+
+
 def should_warmup_cuda_graphs_before_decode(
     *,
     graph_manager_is_initialized: bool,

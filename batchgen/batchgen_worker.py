@@ -9145,7 +9145,14 @@ class BatchGenWorker:
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
-		RUNTIME_ATTN_MODE = self.engine_config.Basic_Config.attn_mode
+		from batchgen.models.glm.glm5.cuda_graph_policy import (
+			glm5_effective_decode_attn_mode,
+		)
+
+		RUNTIME_ATTN_MODE = glm5_effective_decode_attn_mode(
+			getattr(self.model_config, "model_type", None),
+			self.engine_config.Basic_Config.attn_mode,
+		)
 		if RUNTIME_ATTN_MODE != 3:
 			self._decoding_legacy_modes(new_tokens, decode_uuids, batch, 1)
 			return decode_uuids, batch
