@@ -197,7 +197,7 @@ def test_glm5_moe_graph_segment_captures_world_size1_smoke():
     hidden_size = 128
     intermediate_size = 128
     num_local_experts = 2
-    topk = 1
+    topk = 8
     bucket = 2
     gate_w, gate_s = _fake_fp8_weight(num_local_experts, intermediate_size, hidden_size, device)
     up_w, up_s = _fake_fp8_weight(num_local_experts, intermediate_size, hidden_size, device)
