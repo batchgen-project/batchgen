@@ -13,6 +13,18 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+def _greedy_argmax(logits: torch.Tensor, chunk_rows: int = 256) -> torch.Tensor:
+	"""Run greedy fp32 argmax without materializing a full-batch fp32 logits copy."""
+	if logits.shape[0] <= chunk_rows:
+		return logits.float().argmax(dim=-1, keepdim=True)
+
+	result = torch.empty((logits.shape[0], 1), dtype=torch.long, device=logits.device)
+	for start in range(0, logits.shape[0], chunk_rows):
+		end = min(start + chunk_rows, logits.shape[0])
+		result[start:end] = logits[start:end].float().argmax(dim=-1, keepdim=True)
+	return result
+
+
 def greedy_decode(logits: torch.Tensor) -> torch.Tensor:
 	"""
 	Greedily decode the next token from logits.
@@ -23,7 +35,7 @@ def greedy_decode(logits: torch.Tensor) -> torch.Tensor:
 	Returns:
 		Tensor of shape [batch_size, 1] containing the indices of the selected tokens
 	"""
-	return torch.argmax(logits.float(), dim=-1, keepdim=True)
+	return _greedy_argmax(logits)
 
 
 @torch.inference_mode()
@@ -54,7 +66,7 @@ def sample_tokens(
 	# --- Determine greedy mask ---
 	# Scalar fast path: all greedy or all same params
 	if temperature is None or (isinstance(temperature, (int, float)) and temperature <= 0):
-		return logits.float().argmax(dim=-1, keepdim=True)
+		return _greedy_argmax(logits)
 
 	# Convert scalars to [B] tensors for uniform code path
 	if isinstance(temperature, (int, float)):
@@ -82,7 +94,10 @@ def sample_tokens(
 
 	# Handle greedy sequences
 	if greedy_mask.any():
-		result[greedy_mask] = logits[greedy_mask].float().argmax(dim=-1, keepdim=True)
+		greedy_indices = torch.nonzero(greedy_mask, as_tuple=False).flatten()
+		for start in range(0, greedy_indices.numel(), 256):
+			chunk_indices = greedy_indices[start:start + 256]
+			result[chunk_indices] = logits[chunk_indices].float().argmax(dim=-1, keepdim=True)
 
 	# Handle sampling sequences
 	if not sampling_mask.any():
