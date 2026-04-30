@@ -23,6 +23,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     should_warmup_cuda_graphs_before_decode,
 )
 from batchgen.models.glm.glm5.model import (
+    _glm5_moe_3d_blockwise_supported,
     _glm5_moe_graph_compare_active,
     _glm5_moe_graph_compare_layer_enabled,
 )
@@ -84,6 +85,24 @@ def test_glm5_moe_graph_compare_defaults_to_layer3(monkeypatch):
 
     assert _glm5_moe_graph_compare_layer_enabled(3)
     assert not _glm5_moe_graph_compare_layer_enabled(20)
+
+
+def test_glm5_moe_3d_blockwise_requires_all_persistent_experts():
+    assert _glm5_moe_3d_blockwise_supported(
+        experts_per_rank=16,
+        num_persistent_local_experts=16,
+        enable_ep_offloading=False,
+    )
+    assert not _glm5_moe_3d_blockwise_supported(
+        experts_per_rank=32,
+        num_persistent_local_experts=24,
+        enable_ep_offloading=False,
+    )
+    assert not _glm5_moe_3d_blockwise_supported(
+        experts_per_rank=32,
+        num_persistent_local_experts=32,
+        enable_ep_offloading=True,
+    )
 
 
 def test_clamp_token_indices_to_seqlens_caps_topk_tail():

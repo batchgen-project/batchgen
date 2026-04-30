@@ -473,6 +473,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_signature = None
+		self._glm5_whole_model_graph_unavailable_reason = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -8386,6 +8387,8 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
+		if getattr(self, "_glm5_whole_model_graph_unavailable_reason", None):
+			return False
 		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 		if max_bsz <= 0 or local_bsz <= 0:
@@ -8603,6 +8606,24 @@ class BatchGenWorker:
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_indexer_cuda_module", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused indexer CUDA module")
+			moe_not_ready = []
+			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+				mlp = getattr(decoder_layer, "mlp", None)
+				if hasattr(mlp, "experts_per_rank") and not getattr(mlp, "_fp8_blockwise_ready", False):
+					moe_not_ready.append(layer_idx)
+			if moe_not_ready:
+				reason = (
+					"GLM-5 whole-model CUDA graph requires all local MoE experts "
+					"to be persistent and stacked for the 3D FP8 path; unavailable "
+					f"for layers {moe_not_ready[:5]}{'...' if len(moe_not_ready) > 5 else ''}. "
+					"Single-node partial-persistent expert configs can run eager/mixed "
+					"decode, but cannot validate the real whole-model graph."
+				)
+				self._glm5_whole_model_graph_unavailable_reason = reason
+				if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1":
+					raise RuntimeError(reason)
+				logging.warning("%s Using eager decode without whole-model graph compare.", reason)
+				return
 
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
@@ -11538,6 +11559,7 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_signature = None
+		self._glm5_whole_model_graph_unavailable_reason = None
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
 		# (INT4 contiguous weight buffers, MoE class-level buffers)

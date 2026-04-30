@@ -1060,6 +1060,18 @@ class Glm5MoE3DBuffers:
 # MoE Layer (Decode with EP) — standalone nn.Module (K2.5 pattern)
 # ============================================================================
 
+def _glm5_moe_3d_blockwise_supported(
+    experts_per_rank: int,
+    num_persistent_local_experts: int,
+    enable_ep_offloading: bool,
+) -> bool:
+    """3D blockwise MoE requires every local routed expert resident on GPU."""
+    return (
+        int(num_persistent_local_experts) == int(experts_per_rank)
+        and not bool(enable_ep_offloading)
+    )
+
+
 class Glm5MoE(nn.Module):
     """GLM-5 MoE layer (unified prefill + EP decode).
 
@@ -1082,6 +1094,7 @@ class Glm5MoE(nn.Module):
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
     _warned_k25_path = False
     _warned_gemm_3d = False
+    _warned_partial_3d_disabled = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
@@ -1150,7 +1163,16 @@ class Glm5MoE(nn.Module):
         ).repeat(global_num_tokens)
 
         # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
-        if self.use_3d_moe and _GLM5_HAS_DISPATCH_3D and Glm5MoE._3d_buf is None:
+        if (
+            self.use_3d_moe
+            and _GLM5_HAS_DISPATCH_3D
+            and Glm5MoE._3d_buf is None
+            and _glm5_moe_3d_blockwise_supported(
+                self.experts_per_rank,
+                self.num_persistent_local_experts,
+                self.enable_ep_offloading,
+            )
+        ):
             Glm5MoE._3d_buf = Glm5MoE3DBuffers(
                 E_local=self.experts_per_rank,
                 max_global_bsz=global_num_tokens,
@@ -1240,6 +1262,24 @@ class Glm5MoE(nn.Module):
         # K2.5 3D-MoE weight stacking (per-layer) — mirror
         # MiniMaxM25MoE._init_fp8_blockwise_weights at model.py:874-926.
         if self.use_3d_moe and _GLM5_HAS_FP8_BLOCKWISE:
+            if not _glm5_moe_3d_blockwise_supported(
+                self.experts_per_rank,
+                n_persistent,
+                self.enable_ep_offloading,
+            ):
+                self._fp8_blockwise_ready = False
+                if not Glm5MoE._warned_partial_3d_disabled:
+                    logging.warning(
+                        "[Glm5MoE] 3D FP8 MoE disabled: persistent experts "
+                        "%s/%s, ep_offloading=%s. Falling back to mixed expert "
+                        "decode; GLM-5 MoE/whole-model CUDA graph requires all "
+                        "local experts to be persistent.",
+                        n_persistent,
+                        self.experts_per_rank,
+                        self.enable_ep_offloading,
+                    )
+                    Glm5MoE._warned_partial_3d_disabled = True
+                return
             self._init_fp8_blockwise_weights()
 
     def _init_fp8_blockwise_weights(self):
@@ -1258,6 +1298,21 @@ class Glm5MoE(nn.Module):
         n_blocks = N // scale_block
         k_blocks_pad4 = (k_blocks + 3) // 4 * 4
         n_blocks_pad4 = (n_blocks + 3) // 4 * 4
+
+        if not (
+            len(self.gate_list) == E
+            and len(self.up_list) == E
+            and len(self.down_list) == E
+            and len(self.gate_scale_list) == E
+            and len(self.up_scale_list) == E
+            and len(self.down_scale_list) == E
+        ):
+            raise RuntimeError(
+                "GLM-5 3D FP8 MoE requires all local experts to be resident "
+                f"before stacking weights; experts_per_rank={E}, "
+                f"gate/up/down={len(self.gate_list)}/{len(self.up_list)}/{len(self.down_list)}, "
+                "use mixed expert decode for partial-persistent single-node configs."
+            )
 
         # GLM-5 has ~4x larger MoE projections than minimax (6144x2048 vs
         # 3072x1536). Each MoE-layer weight has THREE live references:
