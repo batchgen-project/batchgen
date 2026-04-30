@@ -67,6 +67,71 @@ except ImportError:
 
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
+_GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
+_GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
+
+
+def _debug_flag_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _glm5_moe_cuda_graph_required() -> bool:
+    return os.environ.get(_GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
+
+
+def _glm5_moe_debug_dict() -> dict:
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return {}
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return debug if isinstance(debug, dict) else {}
+
+
+def _glm5_moe_graph_compare_active() -> bool:
+    debug = _glm5_moe_debug_dict()
+    return (
+        _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
+        or os.environ.get(_GLM5_MOE_GRAPH_COMPARE_ENV, "0") == "1"
+    )
+
+
+def _glm5_moe_graph_compare_layer_enabled(layer_idx: int) -> bool:
+    if not _glm5_moe_graph_compare_active():
+        return False
+    debug = _glm5_moe_debug_dict()
+    layers = debug.get("glm5_moe_graph_compare_layers")
+    if layers is None:
+        layers = os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_LAYERS", "3")
+    if layers in ("all", "*"):
+        return True
+    if isinstance(layers, int):
+        return layer_idx == layers
+    if isinstance(layers, str):
+        return str(layer_idx) in {
+            item.strip() for item in layers.split(",") if item.strip()
+        }
+    if isinstance(layers, (list, tuple, set)):
+        try:
+            return layer_idx in {int(item) for item in layers}
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring invalid glm5_moe_graph_compare_layers=%r; defaulting to layer 3",
+                layers,
+            )
+            return layer_idx == 3
+    return layer_idx == 3
+
+
+def _glm5_moe_graph_compare_fail_on_mismatch() -> bool:
+    debug = _glm5_moe_debug_dict()
+    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare_fail_on_mismatch"))
 
 
 # ============================================================================
@@ -1051,6 +1116,10 @@ class Glm5MoE(nn.Module):
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
         self._fp8_blockwise_ready = False
+        self._moe_cuda_graph_manager = None
+        self._moe_cuda_graph_segment_name = None
+        self._moe_cuda_graph_segment = None
+        self._moe_cuda_graph_bucketing = None
 
     # ── Token count management (called by PSM) ──
 
@@ -1285,6 +1354,12 @@ class Glm5MoE(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
+    def enable_moe_cuda_graph(self, manager, segment_name: str, segment, bucketing) -> None:
+        self._moe_cuda_graph_manager = manager
+        self._moe_cuda_graph_segment_name = segment_name
+        self._moe_cuda_graph_segment = segment
+        self._moe_cuda_graph_bucketing = bucketing
+
     # ── Forward ──
 
     @torch.inference_mode()
@@ -1300,6 +1375,12 @@ class Glm5MoE(nn.Module):
         # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
+            compare = _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
+            graph_required = _glm5_moe_cuda_graph_required()
+            if compare:
+                return self._forward_decode_3d_graph_compare(hidden_states)
+            if graph_required:
+                return self._forward_decode_3d_graph(hidden_states)
             return self._forward_decode_3d(hidden_states)
 
         import torch.distributed as dist
@@ -1372,6 +1453,122 @@ class Glm5MoE(nn.Module):
         out = global_results[start:start + num_tokens].to(hidden_states.dtype)
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
+
+    def _moe_cuda_graph_available(self) -> bool:
+        if not (
+            self._moe_cuda_graph_manager is not None
+            and self._moe_cuda_graph_segment_name is not None
+            and self._moe_cuda_graph_segment is not None
+            and self._moe_cuda_graph_bucketing is not None
+            and self.num_tokens_per_rank is not None
+            and self.num_tokens_per_rank > 0
+        ):
+            return False
+        try:
+            return self._moe_cuda_graph_manager.has_graph(
+                self._moe_cuda_graph_segment_name,
+                self.num_tokens_per_rank,
+            )
+        except ValueError:
+            return False
+
+    @torch.inference_mode()
+    def _forward_decode_3d_graph(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._moe_cuda_graph_available():
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
+            )
+
+        import torch.distributed as dist
+
+        orig_shape = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_flat
+        num_tokens, _ = hidden_flat.shape
+        ntp = self.num_tokens_per_rank
+        if ntp is None or ntp <= 0:
+            raise RuntimeError(f"Layer {self.layer_idx}: num_tokens_per_rank is not initialized")
+        if num_tokens > ntp:
+            raise RuntimeError(
+                f"MoE graph buffer overflow: num_tokens={num_tokens} > "
+                f"num_tokens_per_rank={ntp}"
+            )
+
+        bucket = self._moe_cuda_graph_bucketing.get_padded_size(ntp)
+        bufs = self._moe_cuda_graph_segment.pool.get(bucket)
+        padded = bufs.padded
+        padded.zero_()
+        if num_tokens > 0:
+            padded[:num_tokens].copy_(hidden_flat)
+
+        rank_counts = Glm5MoE._rank_token_counts
+        if rank_counts is None:
+            if not hasattr(self, "_moe_graph_rank_counts_full"):
+                self._moe_graph_rank_counts_full = torch.empty(
+                    self.world_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            self._moe_graph_rank_counts_full.fill_(ntp)
+            rank_counts = self._moe_graph_rank_counts_full
+        elif rank_counts.dtype != torch.int64:
+            rank_counts = rank_counts.to(torch.int64)
+
+        graph_out = self._moe_cuda_graph_manager.replay(
+            self._moe_cuda_graph_segment_name,
+            bucket,
+            padded=padded,
+            rank_token_counts=rank_counts,
+        )
+        routed_global = graph_out["routed_global_output"]
+
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                routed_global,
+                op=dist.ReduceOp.SUM,
+                stream=torch.cuda.current_stream(self.device),
+            )
+
+        if num_tokens == 0:
+            return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
+        start = self.rank * bucket
+        routed_local = routed_global[start:start + num_tokens].to(hidden_flat.dtype)
+        out = routed_local + self.shared_expert_forward(identity)
+        return out.view(*orig_shape)
+
+    @torch.inference_mode()
+    def _forward_decode_3d_graph_compare(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        eager_out = self._forward_decode_3d(hidden_states)
+        if not self._moe_cuda_graph_available():
+            logging.warning(
+                "[GLM5_MOE_GRAPH_COMPARE][L%d] graph unavailable; returning eager output",
+                self.layer_idx,
+            )
+            return eager_out
+
+        graph_out = self._forward_decode_3d_graph(hidden_states)
+        diff = (graph_out.to(torch.float32) - eager_out.to(torch.float32)).abs()
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        atol = float(os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL", "1e-2"))
+        ok = max_abs <= atol
+        logging.info(
+            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d] %s max_abs=%.6g mean_abs=%.6g "
+            "shape=%s ntp=%s",
+            self.layer_idx,
+            self.rank,
+            "OK" if ok else "FAIL",
+            max_abs,
+            mean_abs,
+            tuple(int(x) for x in eager_out.shape),
+            self.num_tokens_per_rank,
+        )
+        if not ok and _glm5_moe_graph_compare_fail_on_mismatch():
+            raise RuntimeError(
+                f"GLM-5 MoE graph compare mismatch at layer {self.layer_idx}: "
+                f"max_abs={max_abs:.6g} > atol={atol:.6g}"
+            )
+        return eager_out
 
     # ── K2.5 3D MoE decode path (minimax/Kimi parity) ──
 

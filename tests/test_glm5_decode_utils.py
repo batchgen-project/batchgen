@@ -17,6 +17,10 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     glm5_dsa_cuda_graph_requested_for_model,
     should_warmup_cuda_graphs_before_decode,
 )
+from batchgen.models.glm.glm5.model import (
+    _glm5_moe_graph_compare_active,
+    _glm5_moe_graph_compare_layer_enabled,
+)
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
     _glm5_dsa_graph_compare_active,
@@ -35,6 +39,38 @@ def test_build_clamped_dense_token_indices_caps_each_row():
         max_seqlen=128,
         device=torch.device("cpu"),
     )
+
+
+def test_glm5_moe_graph_compare_layer_selection(monkeypatch):
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {
+            "glm5_moe_graph_compare": True,
+            "glm5_moe_graph_compare_layers": "3,20,77",
+        },
+        raising=False,
+    )
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", raising=False)
+
+    assert _glm5_moe_graph_compare_active()
+    assert _glm5_moe_graph_compare_layer_enabled(3)
+    assert _glm5_moe_graph_compare_layer_enabled(20)
+    assert _glm5_moe_graph_compare_layer_enabled(77)
+    assert not _glm5_moe_graph_compare_layer_enabled(4)
+
+
+def test_glm5_moe_graph_compare_defaults_to_layer3(monkeypatch):
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_moe_graph_compare": True},
+        raising=False,
+    )
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_LAYERS", raising=False)
+
+    assert _glm5_moe_graph_compare_layer_enabled(3)
+    assert not _glm5_moe_graph_compare_layer_enabled(20)
 
     assert indices.shape == (3, 128)
     assert indices[0, :6].tolist() == [0, 0, 0, 0, 0, 0]

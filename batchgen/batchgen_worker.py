@@ -467,6 +467,8 @@ class BatchGenWorker:
 
 		# CUDA graph state
 		self._cuda_graph_manager = None
+		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 
 		# 2. Set Device immediately
@@ -2135,7 +2137,11 @@ class BatchGenWorker:
 		if self.args.disable_cuda_graphs:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
-			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			(
+				os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+				or os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
+			)
 			and "glm" in (getattr(self, "model_name", "") or "").lower()
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
@@ -5603,7 +5609,10 @@ class BatchGenWorker:
 
 				has_queueing = self.global_batch.has_queueing()
 				glm5_debug_graph_requested = (
-					self._glm5_dsa_graph_requested_for_current_batch()
+					(
+						self._glm5_dsa_graph_requested_for_current_batch()
+						or self._glm5_moe_graph_requested_for_current_batch()
+					)
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
 				if should_warmup_cuda_graphs_before_decode(
@@ -5612,7 +5621,7 @@ class BatchGenWorker:
 					model_name=getattr(self, "model_name", None),
 				) or (
 					glm5_debug_graph_requested and self._cuda_graph_manager is None
-				) or self._glm5_dsa_graph_current_bucket_missing():
+				) or self._glm5_dsa_graph_current_bucket_missing() or self._glm5_moe_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 DSA CUDA graph with queued "
@@ -7828,6 +7837,8 @@ class BatchGenWorker:
 		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
 		max_batch_size = _all_rank_counts.max().item()
+		self._current_decode_max_rank_batch_size = int(max_batch_size)
+		self._current_decode_rank_token_counts = _all_rank_counts
 
 		# Update MoE layers with the actual max batch size for this page
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
@@ -7999,9 +8010,6 @@ class BatchGenWorker:
 		Called from generate() after model and GPU KV manager are ready.
 		Only captures graphs for supported models (currently GPT-OSS-120B).
 		"""
-		if not self.engine_config.Basic_Config.enable_cuda_graphs:
-			return
-
 		# Model guard: only capture for supported models
 		model_name = getattr(self, 'model_name', '') or ''
 		model_name_l = model_name.lower()
@@ -8009,10 +8017,20 @@ class BatchGenWorker:
 			self._glm5_dsa_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		glm5_moe_graph_enabled = (
+			self._glm5_moe_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
+		if not self.engine_config.Basic_Config.enable_cuda_graphs:
+			if glm5_dsa_graph_enabled or glm5_moe_graph_enabled:
+				self.engine_config.Basic_Config.enable_cuda_graphs = True
+			else:
+				return
 		if (
 			"gpt-oss-120b" not in model_name_l
 			and not is_kimi_k25_backend_model(model_name)
 			and not glm5_dsa_graph_enabled
+			and not glm5_moe_graph_enabled
 		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
 			return
@@ -8023,6 +8041,114 @@ class BatchGenWorker:
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
+
+	def _setup_glm5_moe_cuda_graphs(self, bucket_sizes):
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l or not self._glm5_moe_graph_requested_for_current_batch():
+			return
+		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+		if max_bsz <= 0:
+			logging.info(f"Rank {self.rank}: no GLM-5 MoE decode rows globally; skipping MoE graph capture")
+			return
+
+		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+			Glm5MoEGraphBufferPool,
+			Glm5MoEGraphSegment,
+			make_glm5_moe_graph_segment_name,
+		)
+
+		bucketing = BatchSizeBucketing(bucket_sizes)
+		try:
+			capture_bucket = bucketing.get_padded_size(max_bsz)
+		except ValueError:
+			logging.info(
+				f"Rank {self.rank}: GLM-5 MoE max rank batch size {max_bsz} exceeds "
+				"CUDA graph max bucket; using eager MoE"
+			)
+			return
+		if capture_bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
+			return
+
+		if self._glm5_moe_cuda_graph_manager is not None:
+			if self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz):
+				return
+			logging.info(
+				f"Rank {self.rank}: lazily capturing GLM-5 MoE CUDA graph bucket "
+				f"BS={capture_bucket} for max rank batch size {max_bsz}"
+			)
+			try:
+				self._glm5_moe_cuda_graph_manager.warmup_and_capture_buckets([capture_bucket])
+			except torch.OutOfMemoryError as exc:
+				self._glm5_moe_cuda_graph_manager.drop_bucket(capture_bucket)
+				self._glm5_moe_graph_failed_buckets.add(capture_bucket)
+				torch.cuda.empty_cache()
+				if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
+					raise
+				logging.error(
+					f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for bucket "
+					f"BS={capture_bucket} ran out of memory; using eager MoE: {exc}"
+				)
+			return
+
+		moe_layers = [
+			layer.mlp for layer in self.model.model.layers
+			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
+		]
+		if not moe_layers:
+			return
+		first_moe = moe_layers[0]
+		pool = Glm5MoEGraphBufferPool(
+			world_size=self.world_size,
+			hidden_size=first_moe.hidden_size,
+			num_experts_per_tok=first_moe.num_experts_per_tok,
+			num_local_experts=first_moe.experts_per_rank,
+			intermediate_size=first_moe.config.moe_intermediate_size,
+			device=self.torch_device,
+			bucket_sizes=bucket_sizes,
+			base_mtp=_GLM5_3D_MTP,
+		)
+		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		registered = 0
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			moe = getattr(decoder_layer, "mlp", None)
+			if not isinstance(moe, Glm5MoE):
+				continue
+			if not getattr(moe, "_fp8_blockwise_ready", False):
+				raise RuntimeError(f"Layer {layer_idx}: GLM-5 MoE graph requires FP8 blockwise weights")
+			segment = Glm5MoEGraphSegment(
+				moe,
+				pool,
+				moe.comm,
+				world_size=self.world_size,
+				rank=self.rank,
+				device=self.torch_device,
+			)
+			segment_name = make_glm5_moe_graph_segment_name(layer_idx)
+			manager.register_segment(segment_name, segment)
+			moe.enable_moe_cuda_graph(manager, segment_name, segment, bucketing)
+			registered += 1
+		if registered == 0:
+			return
+		logging.info(
+			f"Rank {self.rank}: capturing GLM-5 MoE CUDA graph segments for "
+			f"{registered} layers with bucket BS={capture_bucket} "
+			f"(max rank batch size {max_bsz})"
+		)
+		self._glm5_moe_cuda_graph_manager = manager
+		try:
+			manager.warmup_and_capture_buckets([capture_bucket])
+		except torch.OutOfMemoryError as exc:
+			manager.drop_bucket(capture_bucket)
+			self._glm5_moe_graph_failed_buckets.add(capture_bucket)
+			torch.cuda.empty_cache()
+			if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
+				raise
+			logging.error(
+				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for bucket "
+				f"BS={capture_bucket} ran out of memory; using eager MoE: {exc}"
+			)
 
 	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
@@ -8112,6 +8238,46 @@ class BatchGenWorker:
 		if isinstance(value, str):
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
+
+	def _debug_flag_enabled(self, value) -> bool:
+		if isinstance(value, bool):
+			return value
+		if isinstance(value, (int, float)):
+			return value != 0
+		if isinstance(value, str):
+			return value.strip().lower() in {"1", "true", "yes", "on"}
+		return False
+
+	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
+		if (
+			os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+			or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
+		):
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
+
+	def _glm5_moe_graph_current_bucket_missing(self) -> bool:
+		model_name_l = (getattr(self, 'model_name', '') or '').lower()
+		if (
+			not self._glm5_moe_graph_requested_for_current_batch()
+			or "glm" not in model_name_l
+		):
+			return False
+		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+		if max_bsz <= 0:
+			return False
+		if self._glm5_moe_cuda_graph_manager is None:
+			return True
+		try:
+			bucket = self._glm5_moe_cuda_graph_manager.bucketing.get_padded_size(max_bsz)
+		except ValueError:
+			return False
+		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
+			return False
+		return not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
 
 	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
 		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
@@ -8214,12 +8380,18 @@ class BatchGenWorker:
 			self._glm5_dsa_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		glm5_moe_graph_enabled = (
+			self._glm5_moe_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
 		if glm5_dsa_graph_enabled:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			if local_bsz <= 0:
 				logging.info(
 					f"Rank {self.rank}: no local GLM-5 decode rows; skipping DSA CUDA graph capture"
 				)
+				if glm5_moe_graph_enabled:
+					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
 			if self._cuda_graph_manager is not None:
 				try:
@@ -8229,8 +8401,12 @@ class BatchGenWorker:
 						f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
 						"CUDA graph max bucket; using eager DSA"
 					)
+					if glm5_moe_graph_enabled:
+						self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 					return
 				if self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz):
+					if glm5_moe_graph_enabled:
+						self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 					return
 				logging.info(
 					f"Rank {self.rank}: lazily capturing GLM-5 DSA CUDA graph bucket "
@@ -8246,6 +8422,8 @@ class BatchGenWorker:
 						f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
 						f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
 					)
+				if glm5_moe_graph_enabled:
+					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
 
 			from batchgen.models.glm.glm5.cuda_graph_segments import (
@@ -8280,6 +8458,8 @@ class BatchGenWorker:
 					f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
 					"CUDA graph max bucket; using eager DSA"
 				)
+				if glm5_moe_graph_enabled:
+					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
 
 			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
@@ -8356,6 +8536,12 @@ class BatchGenWorker:
 					f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
 					f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
 				)
+			if glm5_moe_graph_enabled:
+				self._setup_glm5_moe_cuda_graphs(bucket_sizes)
+			return
+
+		if glm5_moe_graph_enabled:
+			self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration
@@ -8701,6 +8887,8 @@ class BatchGenWorker:
 		_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 		dist.all_gather_into_tensor(_all_rank_counts, local_batch_size)
 		max_batch_size = _all_rank_counts.max().item()
+		self._current_decode_max_rank_batch_size = int(max_batch_size)
+		self._current_decode_rank_token_counts = _all_rank_counts
 
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
@@ -9034,6 +9222,8 @@ class BatchGenWorker:
 					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
 					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
 					_max_bs = max(_all_rank_counts.max().item(), 1)
+					self._current_decode_max_rank_batch_size = int(_max_bs)
+					self._current_decode_rank_token_counts = _all_rank_counts
 					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
 							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
@@ -10830,6 +11020,8 @@ class BatchGenWorker:
 		del self.model
 		self.model = None
 		self._cuda_graph_manager = None
+		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 
 		# Defense-in-depth: free PSM-owned GPU buffers that survive model deletion
@@ -10939,6 +11131,8 @@ class BatchGenWorker:
 				logging.warning(f"Rank {self.rank}: Failed to cleanup model: {e}")
 		self.model = None
 		self._cuda_graph_manager = None
+		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 
 		# 9. Clear CUDA cache
