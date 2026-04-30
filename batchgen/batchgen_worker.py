@@ -8309,12 +8309,42 @@ class BatchGenWorker:
 		return self._debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
 
 	def _glm5_whole_model_graph_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1":
+		if (
+			os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1"
+			or os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1"
+		):
 			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
 			return False
-		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph"))
+		return (
+			self._debug_flag_enabled(debug.get("glm5_whole_model_graph"))
+			or self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
+		)
+
+	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
+
+	def _glm5_whole_model_graph_timing_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_TIMING", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_whole_model_graph_timing")):
+			return True
+		return self._glm5_whole_model_graph_compare_requested_for_current_batch()
+
+	def _glm5_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
 	def _glm5_whole_model_graph_capture_signature(self, batch_size: int):
 		gpu_manager = self._get_cuda_graph_gpu_manager()
@@ -8676,6 +8706,13 @@ class BatchGenWorker:
 				f"Rank {self.rank}: GLM-5 whole-model CUDA graph ready in "
 				f"{stats['total_capture_time_ms']:.0f}ms"
 			)
+			if self._glm5_whole_model_graph_timing_requested_for_current_batch():
+				logging.info(
+					"[GLM5_WHOLE_GRAPH_TIMING] rank=%s bucket=%s capture_ms=%.3f",
+					self.rank,
+					capture_bucket,
+					stats["total_capture_time_ms"],
+				)
 			return
 		if glm5_dsa_graph_enabled:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
@@ -9632,6 +9669,16 @@ class BatchGenWorker:
 					)
 				)
 				if _use_graph:
+					_glm5_whole_compare = bool(
+						getattr(self, "_glm5_whole_model_graph", False)
+						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
+					)
+					_glm5_whole_timing = bool(
+						getattr(self, "_glm5_whole_model_graph", False)
+						and self._glm5_whole_model_graph_timing_requested_for_current_batch()
+					)
+					_glm5_whole_timing_items = {}
+					_glm5_skip_graph_kv_offload = False
 					# Whole-model CUDA graph replay.
 					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
 					# computation, NOT local len(batch). The graph has NCCL all_reduce
@@ -9678,6 +9725,9 @@ class BatchGenWorker:
 							dtype=torch.int32,
 							device=self.torch_device,
 						)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_replay_start = time.perf_counter()
 						graph_out = self._cuda_graph_manager.replay(
 							"glm5_whole_model", bucket,
 							input_ids=new_tokens,
@@ -9690,6 +9740,11 @@ class BatchGenWorker:
 							rank_token_counts=_all_rank_counts,
 							num_valid_tokens=num_valid_tokens,
 						)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_whole_timing_items["replay_ms"] = (
+								time.perf_counter() - _glm5_replay_start
+							) * 1000.0
 					else:
 						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
@@ -9719,33 +9774,99 @@ class BatchGenWorker:
 						)
 
 					logits = graph_out["logits"][:batch_size]
-					new_tokens_out = self._select_tokens(logits)
+					if _glm5_whole_compare:
+						graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_eager_start = time.perf_counter()
+						eager_outputs = self.model(
+							new_tokens,
+							attention_mask=Attn_Wrapper.attention_mask,
+							position_ids=Attn_Wrapper.position_ids,
+							use_cache=False,
+						)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_whole_timing_items["eager_ms"] = (
+								time.perf_counter() - _glm5_eager_start
+							) * 1000.0
+						eager_logits = eager_outputs.logits[:, -1, :]
+						eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
+						new_tokens_out = self._select_tokens(eager_logits)
+						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
+							compare_glm5_whole_model_graph_logits,
+						)
+						compare = compare_glm5_whole_model_graph_logits(
+							eager_logits=eager_logits,
+							graph_logits=logits,
+							eager_tokens=eager_tokens_for_compare,
+							graph_tokens=graph_tokens_for_compare,
+							atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
+							rtol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
+						)
+						_log = logging.info if compare["ok"] else logging.error
+						_log(
+							"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
+							"max_abs=%.6g mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
+							self.rank,
+							bucket,
+							batch_size,
+							"OK" if compare["ok"] else "MISMATCH",
+							compare["max_abs"],
+							compare["mean_abs"],
+							compare["argmax_mismatch"],
+							compare["token_mismatch"],
+						)
+						if not compare["ok"] and self._glm5_whole_model_graph_compare_fail_on_mismatch():
+							raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
+						_glm5_skip_graph_kv_offload = True
+					else:
+						new_tokens_out = self._select_tokens(logits)
 
-					# Fire KV host offload callbacks for all layers.
-					# KV buffers are static-address tensors written inside the graph;
-					# clone before passing to async D2H to protect tensor lifespan.
-					kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
-					wm_seg = getattr(self, '_whole_model_segment', None)
-					if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
-						for layer_idx in range(wm_seg.num_layers):
-							kv_buf = wm_seg._kv_buffers[layer_idx]
-							# K2.5 MLA has no separate V cache — pass None for v_tensor
-							v_buf = kv_buf.get("value")
-							v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
-							kv_cb(
-								layer_idx,
-								kv_buf["key"][:batch_size].clone(),
-								v_clone,
-							)
-					aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
-					aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
-					if aux_cb is not None and aux_buffers is not None:
-						for layer_idx in range(wm_seg.num_layers):
-							aux_cb(
-								layer_idx,
-								aux_buffers[layer_idx]["key"][:batch_size].clone(),
-								None,
-							)
+					if not _glm5_skip_graph_kv_offload:
+						if _glm5_whole_timing:
+							_glm5_offload_start = time.perf_counter()
+						# Fire KV host offload callbacks for all layers.
+						# KV buffers are static-address tensors written inside the graph;
+						# clone before passing to async D2H to protect tensor lifespan.
+						kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
+						wm_seg = getattr(self, '_whole_model_segment', None)
+						if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
+							for layer_idx in range(wm_seg.num_layers):
+								kv_buf = wm_seg._kv_buffers[layer_idx]
+								# K2.5 MLA has no separate V cache — pass None for v_tensor
+								v_buf = kv_buf.get("value")
+								v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
+								kv_cb(
+									layer_idx,
+									kv_buf["key"][:batch_size].clone(),
+									v_clone,
+								)
+						aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
+						aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
+						if aux_cb is not None and aux_buffers is not None:
+							for layer_idx in range(wm_seg.num_layers):
+								aux_cb(
+									layer_idx,
+									aux_buffers[layer_idx]["key"][:batch_size].clone(),
+									None,
+								)
+						if _glm5_whole_timing:
+							_glm5_whole_timing_items["offload_callback_ms"] = (
+								time.perf_counter() - _glm5_offload_start
+							) * 1000.0
+					if _glm5_whole_timing:
+						logging.info(
+							"[GLM5_WHOLE_GRAPH_TIMING] rank=%s bucket=%s batch=%s replay_ms=%.3f "
+							"eager_ms=%.3f offload_callback_ms=%.3f compare=%s",
+							self.rank,
+							bucket,
+							batch_size,
+							_glm5_whole_timing_items.get("replay_ms", -1.0),
+							_glm5_whole_timing_items.get("eager_ms", -1.0),
+							_glm5_whole_timing_items.get("offload_callback_ms", -1.0),
+							_glm5_whole_compare,
+						)
 				else:
 					# Per-layer graph or eager forward
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.

@@ -18,6 +18,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     glm5_dsa_cuda_graph_requested_for_model,
     glm5_moe_cuda_graph_requested_for_model,
     glm5_segmented_cuda_graph_requested_for_model,
+    glm5_whole_model_cuda_graph_compare_requested_for_model,
     glm5_whole_model_cuda_graph_requested_for_model,
     should_warmup_cuda_graphs_before_decode,
 )
@@ -739,10 +740,31 @@ def test_glm5_whole_model_graph_policy_is_opt_in_and_glm_only():
     )
 
 
+def test_glm5_whole_model_compare_policy_requests_warmup():
+    env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
+    model_name = "zai-org/GLM-5-FP8"
+
+    assert glm5_whole_model_cuda_graph_compare_requested_for_model(
+        model_name, environ=env
+    )
+    assert not glm5_whole_model_cuda_graph_compare_requested_for_model(
+        "gpt-oss-120b", environ=env
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(model_name, environ=env)
+    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=env)
+    assert should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=True,
+        model_name=model_name,
+        environ=env,
+    )
+
+
 def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     dsa_env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
     moe_env = {"BATCHGEN_GLM5_MOE_CUDA_GRAPH": "1"}
     whole_env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
+    compare_env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
     model_name = "zai-org/GLM-5-FP8"
 
     assert glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
@@ -755,6 +777,7 @@ def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
+    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 

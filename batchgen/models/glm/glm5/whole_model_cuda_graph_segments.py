@@ -269,3 +269,55 @@ class Glm5WholeModelSegment:
 
 def make_glm5_whole_model_graph_segment_name() -> str:
     return "glm5_whole_model"
+
+
+def compare_glm5_whole_model_graph_logits(
+    *,
+    eager_logits: torch.Tensor,
+    graph_logits: torch.Tensor,
+    eager_tokens: torch.Tensor | None = None,
+    graph_tokens: torch.Tensor | None = None,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare eager and graph logits without changing decode control flow."""
+    if eager_logits.shape != graph_logits.shape:
+        return {
+            "ok": False,
+            "shape_match": False,
+            "eager_shape": tuple(int(dim) for dim in eager_logits.shape),
+            "graph_shape": tuple(int(dim) for dim in graph_logits.shape),
+            "max_abs": float("inf"),
+            "mean_abs": float("inf"),
+            "argmax_mismatch": -1,
+            "token_mismatch": -1,
+        }
+
+    eager_f = eager_logits.detach().to(torch.float32)
+    graph_f = graph_logits.detach().to(torch.float32)
+    diff = (eager_f - graph_f).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    logits_ok = bool(torch.allclose(eager_f, graph_f, atol=atol, rtol=rtol))
+    argmax_mismatch = int(
+        (torch.argmax(eager_f, dim=-1) != torch.argmax(graph_f, dim=-1)).sum().item()
+    )
+
+    token_mismatch = 0
+    token_shape_match = True
+    if eager_tokens is not None and graph_tokens is not None:
+        token_shape_match = eager_tokens.shape == graph_tokens.shape
+        if token_shape_match:
+            token_mismatch = int((eager_tokens != graph_tokens).sum().item())
+        else:
+            token_mismatch = -1
+
+    return {
+        "ok": bool(logits_ok and argmax_mismatch == 0 and token_shape_match and token_mismatch == 0),
+        "shape_match": True,
+        "max_abs": max_abs,
+        "mean_abs": mean_abs,
+        "argmax_mismatch": argmax_mismatch,
+        "token_mismatch": token_mismatch,
+        "token_shape_match": token_shape_match,
+    }

@@ -3,6 +3,7 @@ import pytest
 
 from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
     Glm5WholeModelSegment,
+    compare_glm5_whole_model_graph_logits,
     make_glm5_whole_model_graph_segment_name,
 )
 
@@ -93,3 +94,46 @@ def test_glm5_whole_model_segment_rejects_hidden_state_boundary_until_hardened()
 def test_glm5_whole_model_segment_rejects_hidden_output_until_hardened():
     with pytest.raises(NotImplementedError, match="returns logits"):
         _make_segment(include_lm_head=False)
+
+
+def test_glm5_whole_model_compare_reports_match_and_token_mismatch():
+    eager = torch.tensor([[1.0, 3.0], [4.0, 2.0]], dtype=torch.float32)
+    graph = eager + torch.tensor([[0.0, 0.001], [0.001, 0.0]], dtype=torch.float32)
+
+    match = compare_glm5_whole_model_graph_logits(
+        eager_logits=eager,
+        graph_logits=graph,
+        eager_tokens=torch.tensor([[1], [0]]),
+        graph_tokens=torch.tensor([[1], [0]]),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+    assert match["ok"]
+    assert match["shape_match"]
+    assert match["argmax_mismatch"] == 0
+    assert match["token_mismatch"] == 0
+
+    mismatch = compare_glm5_whole_model_graph_logits(
+        eager_logits=eager,
+        graph_logits=graph,
+        eager_tokens=torch.tensor([[1], [0]]),
+        graph_tokens=torch.tensor([[0], [0]]),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+    assert not mismatch["ok"]
+    assert mismatch["token_mismatch"] == 1
+
+
+def test_glm5_whole_model_compare_reports_shape_mismatch():
+    result = compare_glm5_whole_model_graph_logits(
+        eager_logits=torch.zeros(2, 3),
+        graph_logits=torch.zeros(2, 4),
+    )
+
+    assert not result["ok"]
+    assert not result["shape_match"]
+    assert result["eager_shape"] == (2, 3)
+    assert result["graph_shape"] == (2, 4)

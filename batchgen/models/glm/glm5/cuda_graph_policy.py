@@ -8,6 +8,7 @@ from collections.abc import Mapping
 GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
 GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"
+GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
 
 
 def _is_glm_model(model_name: str | None) -> bool:
@@ -41,6 +42,15 @@ def glm5_whole_model_cuda_graph_requested_for_model(
     return env.get(GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV, "0") == "1" and _is_glm_model(model_name)
 
 
+def glm5_whole_model_cuda_graph_compare_requested_for_model(
+    model_name: str | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    env = os.environ if environ is None else environ
+    return env.get(GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV, "0") == "1" and _is_glm_model(model_name)
+
+
 def glm5_segmented_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
@@ -59,6 +69,7 @@ def glm5_any_cuda_graph_requested_for_model(
 ) -> bool:
     return (
         glm5_whole_model_cuda_graph_requested_for_model(model_name, environ=environ)
+        or glm5_whole_model_cuda_graph_compare_requested_for_model(model_name, environ=environ)
         or glm5_segmented_cuda_graph_requested_for_model(model_name, environ=environ)
     )
 
