@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -79,52 +80,120 @@ def _make_manager(num_pages: int = 32) -> GPUPagedKVCacheManager:
     return manager
 
 
-def test_gpu_page_table_storage_is_stable_across_rebuilds():
+def test_rebuild_page_table_preserves_active_dynamic_api():
     manager = _make_manager()
     manager.allocate_pages_for_sequences([10, 20, 30], [4, 12, 8])
 
     first_view = manager.rebuild_page_table([10, 20])
-    backing = manager._gpu_page_table_manager.gpu_table
-    assert backing is not None
-    data_ptr = backing.data_ptr()
-    shape = tuple(backing.shape)
-
-    assert first_view.shape == (2, shape[1])
+    assert first_view.shape == (2, 4)
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == tuple(first_view.shape)
+    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == first_view.data_ptr()
     assert manager._gpu_page_table_manager.seq_id_to_slot == {10: 0, 20: 1}
     torch.testing.assert_close(first_view[0, :1], manager._sequences[10].pages)
     torch.testing.assert_close(first_view[1, :3], manager._sequences[20].pages)
 
     second_view = manager.rebuild_page_table([30])
-    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == data_ptr
-    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == shape
-    assert second_view.shape == (1, shape[1])
+    assert second_view.shape == (1, 3)
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == tuple(second_view.shape)
+    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == second_view.data_ptr()
     assert manager._gpu_page_table_manager.seq_id_to_slot == {30: 0}
     torch.testing.assert_close(second_view[0, :2], manager._sequences[30].pages)
-    assert torch.all(manager._gpu_page_table_manager.gpu_table[1:, :] == -1)
 
     third_view = manager.rebuild_page_table([20, 10, 30])
-    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == data_ptr
-    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == shape
-    assert third_view.shape == (3, shape[1])
+    assert third_view.shape == (3, 4)
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == tuple(third_view.shape)
+    assert manager._gpu_page_table_manager.gpu_table.data_ptr() == third_view.data_ptr()
     assert manager._gpu_page_table_manager.seq_id_to_slot == {20: 0, 10: 1, 30: 2}
 
 
-def test_clear_page_table_preserves_backing_storage():
+def test_cuda_graph_page_table_storage_is_stable_across_rebuilds():
+    manager = _make_manager()
+    manager.allocate_pages_for_sequences([10, 20, 30], [4, 12, 8])
+
+    manager.rebuild_page_table([10, 20])
+    first_state = manager.get_cuda_graph_page_table_state()
+    backing = first_state.table
+    data_ptr = backing.data_ptr()
+    shape = tuple(backing.shape)
+    expected_shape = (
+        manager._gpu_page_table_manager.max_slots,
+        manager._gpu_page_table_manager.graph_max_pages_per_sequence,
+    )
+
+    assert shape == expected_shape
+    assert first_state.num_valid_slots == 2
+    torch.testing.assert_close(first_state.slot_indices, torch.tensor([0, 1], dtype=torch.int32))
+    torch.testing.assert_close(first_state.slot_to_seq_id, torch.tensor([10, 20], dtype=torch.int64))
+    torch.testing.assert_close(backing[0, :1], manager._sequences[10].pages)
+    torch.testing.assert_close(backing[1, :3], manager._sequences[20].pages)
+
+    manager.rebuild_page_table([30])
+    second_state = manager.get_cuda_graph_page_table_state()
+    assert second_state.table.data_ptr() == data_ptr
+    assert tuple(second_state.table.shape) == shape
+    assert second_state.num_valid_slots == 1
+    torch.testing.assert_close(second_state.slot_indices, torch.tensor([0], dtype=torch.int32))
+    torch.testing.assert_close(second_state.slot_to_seq_id, torch.tensor([30], dtype=torch.int64))
+    torch.testing.assert_close(second_state.table[0, :2], manager._sequences[30].pages)
+    assert torch.all(second_state.table[0, 2:] == -1)
+    assert torch.all(second_state.table[1:, :] == -1)
+
+    manager.rebuild_page_table([20, 10, 30])
+    third_table = manager.get_cuda_graph_page_table()
+    assert third_table.data_ptr() == data_ptr
+    assert tuple(third_table.shape) == shape
+    torch.testing.assert_close(third_table[0, :3], manager._sequences[20].pages)
+    torch.testing.assert_close(third_table[1, :1], manager._sequences[10].pages)
+    torch.testing.assert_close(third_table[2, :2], manager._sequences[30].pages)
+
+
+def test_clear_page_table_preserves_graph_storage_and_active_empty_api():
     manager = _make_manager()
     manager.allocate_pages_for_sequences([1], [4])
     manager.rebuild_page_table([1])
 
-    backing = manager._gpu_page_table_manager.gpu_table
-    assert backing is not None
-    data_ptr = backing.data_ptr()
-    shape = tuple(backing.shape)
+    graph_table = manager.get_cuda_graph_page_table()
+    graph_data_ptr = graph_table.data_ptr()
+    graph_shape = tuple(graph_table.shape)
 
     manager.clear_page_table()
 
     cleared = manager._gpu_page_table_manager.gpu_table
     assert cleared is not None
-    assert cleared.data_ptr() == data_ptr
-    assert tuple(cleared.shape) == shape
+    assert tuple(cleared.shape) == (0, manager._gpu_page_table_manager.max_pages_per_sequence)
     assert manager._gpu_page_table_manager.seq_id_to_slot == {}
     assert manager._gpu_page_table_manager.slot_to_seq_id == []
     assert torch.all(cleared == -1)
+
+    cleared_graph_state = manager.get_cuda_graph_page_table_state()
+    assert cleared_graph_state.table.data_ptr() == graph_data_ptr
+    assert tuple(cleared_graph_state.table.shape) == graph_shape
+    assert cleared_graph_state.num_valid_slots == 0
+    assert torch.all(cleared_graph_state.table == -1)
+    assert cleared_graph_state.slot_indices.numel() == 0
+    assert cleared_graph_state.slot_to_seq_id.numel() == 0
+
+
+def test_cuda_graph_capacity_errors_do_not_break_active_dynamic_table(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS", "2")
+    manager = _make_manager(num_pages=8)
+    manager.allocate_pages_for_sequences([1, 2, 3], [4, 4, 4])
+
+    manager.rebuild_page_table([1, 2])
+    first_state = manager.get_cuda_graph_page_table_state()
+    graph_ptr = first_state.table.data_ptr()
+
+    active_over_capacity = manager.rebuild_page_table([1, 2, 3])
+    assert active_over_capacity.shape == (3, 2)
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == (3, 2)
+    with pytest.raises(RuntimeError, match="CUDA graph page table is not valid"):
+        manager.get_cuda_graph_page_table()
+
+    active_valid_again = manager.rebuild_page_table([3])
+    graph_state = manager.get_cuda_graph_page_table_state()
+    assert active_valid_again.shape == (1, 2)
+    assert graph_state.table.data_ptr() == graph_ptr
+    assert graph_state.num_valid_slots == 1
+    torch.testing.assert_close(graph_state.table[0, :1], manager._sequences[3].pages)
+    assert torch.all(graph_state.table[0, 1:] == -1)
+    assert torch.all(graph_state.table[1:, :] == -1)

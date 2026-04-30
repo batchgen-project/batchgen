@@ -191,8 +191,13 @@ def _log_glm5_dsa_graph_compare_unavailable_once(
 
 
 def _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager) -> Optional[torch.Tensor]:
-    page_table_manager = getattr(gpu_paged_kv_manager, "_gpu_page_table_manager", None)
-    return getattr(page_table_manager, "gpu_table", None)
+    get_graph_table = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table", None)
+    if get_graph_table is None:
+        return None
+    try:
+        return get_graph_table()
+    except RuntimeError:
+        return None
 
 
 def _glm5_dsa_page_table_signature(

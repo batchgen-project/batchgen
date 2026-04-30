@@ -102,6 +102,19 @@ class GPUPagedKVStats:
 
 
 @dataclass(frozen=True)
+class CUDAGraphPageTableState:
+	"""Fixed-capacity page-table state for CUDA graph consumers."""
+
+	table: torch.Tensor
+	slot_indices: torch.Tensor
+	slot_to_seq_id: torch.Tensor
+	num_valid_slots: int
+	max_slots: int
+	max_pages_per_sequence: int
+	rebuild_version: int
+
+
+@dataclass(frozen=True)
 class GPUPagedKVConfig:
 	num_layers: int
 	num_pages: int
@@ -330,13 +343,12 @@ class GPUPagedKVLayout:
 
 
 class _GPUPageTableManager:
-	"""Maintains graph-stable GPU page-table storage.
+	"""Maintains active and CUDA-graph page-table views.
 
-	The backing tensor is reserved once as
-	``[max_slots, max_pages_per_sequence]`` and updated in-place.  Rebuilds
-	change only contents and the host-side ``seq_id <-> slot`` mappings, so
-	CUDA graphs can safely capture the page-table pointer and use runtime
-	slot indices to select active rows.
+	``gpu_table`` preserves the historical active-table semantics:
+	``[current_slots, current_max_pages]`` aligned to the latest rebuild.
+	CUDA graph consumers must use ``get_cuda_graph_table()``, which exposes
+	separate fixed-capacity storage updated in-place by rebuilds.
 	"""
 
 	def __init__(
@@ -346,14 +358,19 @@ class _GPUPageTableManager:
 		max_slots: int,
 	):
 		self.device = device
+		self.graph_max_pages_per_sequence = int(max_pages_per_sequence)
 		self.max_pages_per_sequence = int(max_pages_per_sequence)
 		self.max_slots = int(max_slots)
 		self.seq_id_to_slot: Dict[int, int] = {}
 		self.slot_to_seq_id: List[
 			Optional[int]
 		] = []  # this is also sequence order
-		# GPU tensor of shape [max_slots, max_pages_per_sequence]
+		# Active GPU tensor of shape [current_slots, current_max_pages].
 		self.gpu_table: Optional[torch.Tensor] = None
+		# Stable graph tensor of shape [max_slots, graph_max_pages_per_sequence].
+		self._cuda_graph_table: Optional[torch.Tensor] = None
+		self._cuda_graph_table_valid: bool = False
+		self._cuda_graph_slot_count: int = 0
 		# Small cached 1-D slot_ids,like [0, 1, 2, ...] total length is len(sequence_ids)
 		self._slot_index_tensor: Optional[torch.Tensor] = None
 		# Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
@@ -372,16 +389,11 @@ class _GPUPageTableManager:
 	) -> torch.Tensor:
 		"""(Re)build the GPU page table for the provided sequence order.
 
-		The backing tensor keeps a stable capacity and pointer; this method
-		rewrites active rows in-place and returns the active-row view.
+		This preserves the original active-table API while also refreshing
+		the separate graph-stable backing table when the active batch fits
+		within reserved CUDA graph metadata capacity.
 		"""
 		wanted_order = list(sequence_ids)
-
-		if len(wanted_order) > self.max_slots:
-			raise RuntimeError(
-				f"GPU page table capacity exceeded: requested {len(wanted_order)} "
-				f"slots, reserved {self.max_slots}"
-			)
 
 		# Compute the maximum number of pages required by the provided sequences.
 		max_required = 0
@@ -390,11 +402,7 @@ class _GPUPageTableManager:
 			if state is None:
 				continue
 			max_required = max(max_required, int(state.pages.numel()))
-		if max_required > self.max_pages_per_sequence:
-			raise RuntimeError(
-				f"GPU page table page capacity exceeded: sequence needs {max_required} "
-				f"pages, reserved {self.max_pages_per_sequence}"
-			)
+		desired_pages = max_required + 1
 
 		num_slots = len(wanted_order)
 		flat_pages_cpu = self._build_flat_page_index_tensor(
@@ -402,32 +410,34 @@ class _GPUPageTableManager:
 		)
 
 		old_shape = self.gpu_table.shape if self.gpu_table is not None else None
-		old_slot_count = len(self.slot_to_seq_id) if self.slot_to_seq_id else 0
+		shape_match = self.gpu_table is not None and self.gpu_table.shape[0] == num_slots
+		cols_sufficient = self.gpu_table is not None and self.gpu_table.shape[1] >= desired_pages
 		order_match = self.slot_to_seq_id == wanted_order
-		reuse_existing = self.gpu_table is not None
+		reuse_existing = (
+			self.gpu_table is not None
+			and shape_match
+			and cols_sufficient
+			and order_match
+		)
 		
 		# DEBUG: Log detailed rebuild info
 		if BATCHGEN_CB_DEBUG:
 			logging.info(
 				f"GPUPageTableManager.rebuild: "
-				f"num_slots={num_slots}, max_required={max_required}, "
-				f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
-				f"capacity=({self.max_slots}, {self.max_pages_per_sequence}), "
+				f"num_slots={num_slots}, new_max={desired_pages}, "
+				f"old_shape={old_shape}, "
+				f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, "
 				f"order_match={order_match}, "
 				f"reuse_existing={reuse_existing}"
 			)
 
-		if self.gpu_table is None:
-			self.gpu_table = torch.full(
-				(self.max_slots, self.max_pages_per_sequence),
-				-1,
-				dtype=torch.int32,
-				device=self.device,
+		table = (
+			self.gpu_table
+			if reuse_existing
+			else torch.full(
+				(num_slots, desired_pages), -1, dtype=torch.int32, device=self.device
 			)
-		table = self.gpu_table
-		rows_to_clear = max(old_slot_count, num_slots)
-		if rows_to_clear:
-			table[:rows_to_clear, :].fill_(-1)
+		)
 
 		# Replace mappings with exactly the requested order. This keeps
 		# the slot mapping deterministic and equal in length to num_slots.
@@ -435,8 +445,9 @@ class _GPUPageTableManager:
 			seq_id: idx for idx, seq_id in enumerate(wanted_order)
 		}
 		self.slot_to_seq_id = list(wanted_order)
+		self.max_pages_per_sequence = int(desired_pages)
 
-		fill_region = table[:num_slots, :]
+		fill_region = table[:num_slots, :desired_pages]
 
 		# Fill table rows from sequence state pages.
 		# Always clear unused columns to prevent stale page IDs from
@@ -449,6 +460,11 @@ class _GPUPageTableManager:
 			pages = state.pages.to(self.device, dtype=torch.int32)
 			count = int(pages.numel())
 			fill_region[slot, :count] = pages[:count]
+			if count < desired_pages:
+				fill_region[slot, count:] = -1
+		if not reuse_existing:
+			self.gpu_table = table
+		self._update_cuda_graph_table(wanted_order, sequences, max_required)
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
@@ -467,6 +483,63 @@ class _GPUPageTableManager:
 			)
 		
 		return table[:num_slots, :]
+
+	def _update_cuda_graph_table(
+		self,
+		sequence_ids: Sequence[int],
+		sequences: Dict[int, _SequenceState],
+		max_required: int,
+	) -> None:
+		num_slots = len(sequence_ids)
+		if num_slots > self.max_slots or max_required > self.graph_max_pages_per_sequence:
+			self._cuda_graph_table_valid = False
+			return
+		self._ensure_cuda_graph_table()
+		rows_to_clear = max(self._cuda_graph_slot_count, num_slots)
+		if rows_to_clear:
+			self._cuda_graph_table[:rows_to_clear, :].fill_(-1)
+		for slot, seq_id in enumerate(sequence_ids):
+			state = sequences.get(seq_id)
+			if state is None or state.pages.numel() == 0:
+				continue
+			pages = state.pages.to(self.device, dtype=torch.int32)
+			count = int(pages.numel())
+			self._cuda_graph_table[slot, :count] = pages[:count]
+		self._cuda_graph_slot_count = num_slots
+		self._cuda_graph_table_valid = True
+
+	def _ensure_cuda_graph_table(self) -> torch.Tensor:
+		if self._cuda_graph_table is None:
+			self._cuda_graph_table = torch.full(
+				(self.max_slots, self.graph_max_pages_per_sequence),
+				-1,
+				dtype=torch.int32,
+				device=self.device,
+			)
+		return self._cuda_graph_table
+
+	def get_cuda_graph_table(self) -> torch.Tensor:
+		table = self._ensure_cuda_graph_table()
+		if not self._cuda_graph_table_valid:
+			raise RuntimeError(
+				"CUDA graph page table is not valid for the active rebuild; "
+				f"capacity=({self.max_slots}, {self.graph_max_pages_per_sequence})"
+			)
+		return table
+
+	def get_cuda_graph_state(self) -> CUDAGraphPageTableState:
+		table = self.get_cuda_graph_table()
+		slot_indices = self.get_slot_index_tensor()
+		slot_to_seq_id = self.get_slot_to_seq_id_tensor()
+		return CUDAGraphPageTableState(
+			table=table,
+			slot_indices=slot_indices,
+			slot_to_seq_id=slot_to_seq_id,
+			num_valid_slots=self._cuda_graph_slot_count,
+			max_slots=self.max_slots,
+			max_pages_per_sequence=self.graph_max_pages_per_sequence,
+			rebuild_version=self.rebuild_version,
+		)
 
 	def get_slot_index_tensor(self) -> torch.Tensor:
 		"""Returns a cached 1-D tensor mapping logical batch order to slots."""
@@ -797,17 +870,13 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		mgr = self._gpu_page_table_manager
 		
-		# Preserve the graph-visible storage pointer. The live batch is
-		# represented by slot metadata, not by resizing this tensor.
-		if mgr.gpu_table is None:
-			mgr.gpu_table = torch.full(
-				(mgr.max_slots, mgr.max_pages_per_sequence),
-				-1,
-				dtype=torch.int32,
-				device=mgr.device,
-			)
-		else:
-			mgr.gpu_table.fill_(-1)
+		max_pages = mgr.max_pages_per_sequence if mgr.max_pages_per_sequence > 0 else 1
+		mgr.gpu_table = torch.full(
+			(0, max_pages), -1, dtype=torch.int32, device=mgr.device
+		)
+		mgr._ensure_cuda_graph_table().fill_(-1)
+		mgr._cuda_graph_table_valid = True
+		mgr._cuda_graph_slot_count = 0
 		
 		# Clear the slot mappings
 		mgr.seq_id_to_slot = {}
@@ -1142,6 +1211,16 @@ class GPUPagedKVCacheManager:
 		"""Return a monotonic version for the active page-table contents."""
 		self._ensure_initialized()
 		return self._gpu_page_table_manager.rebuild_version
+
+	def get_cuda_graph_page_table(self) -> torch.Tensor:
+		"""Return the fixed-capacity page table for CUDA graph consumers."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.get_cuda_graph_table()
+
+	def get_cuda_graph_page_table_state(self) -> CUDAGraphPageTableState:
+		"""Return graph-stable page table plus active-slot metadata."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.get_cuda_graph_state()
 
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 		"""Exposes the raw K/V cache tensors."""

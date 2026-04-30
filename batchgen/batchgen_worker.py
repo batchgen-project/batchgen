@@ -8074,8 +8074,13 @@ class BatchGenWorker:
 			return False
 
 		def _sig(manager):
-			page_table_manager = getattr(manager, "_gpu_page_table_manager", None)
-			table = getattr(page_table_manager, "gpu_table", None)
+			get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
+			if get_graph_table is None:
+				return None
+			try:
+				table = get_graph_table()
+			except RuntimeError:
+				return None
 			if table is None:
 				return None
 			return (
@@ -8262,8 +8267,8 @@ class BatchGenWorker:
 				raise RuntimeError("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN must be positive")
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
-			primary_page_table = primary_manager._gpu_page_table_manager.gpu_table
-			aux_page_table = aux_manager._gpu_page_table_manager.gpu_table
+			primary_page_table = primary_manager.get_cuda_graph_page_table()
+			aux_page_table = aux_manager.get_cuda_graph_page_table()
 			if primary_page_table is None or aux_page_table is None:
 				raise RuntimeError(
 					"GLM-5 DSA CUDA graph requested but GPU page-table storage is not initialized"
