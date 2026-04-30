@@ -8052,7 +8052,12 @@ class BatchGenWorker:
 			return
 
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+		from batchgen.models.glm.glm5.model import (
+			Glm5MoE,
+			_GLM5_3D_MTP,
+			_glm5_moe_graph_compare_active,
+			_glm5_moe_graph_compare_layer_enabled,
+		)
 		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
 			Glm5MoEGraphBufferPool,
 			Glm5MoEGraphSegment,
@@ -8111,9 +8116,17 @@ class BatchGenWorker:
 		)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 		registered = 0
+		graph_output_required = os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+		compare_active = _glm5_moe_graph_compare_active()
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			moe = getattr(decoder_layer, "mlp", None)
 			if not isinstance(moe, Glm5MoE):
+				continue
+			if (
+				compare_active
+				and not graph_output_required
+				and not _glm5_moe_graph_compare_layer_enabled(layer_idx)
+			):
 				continue
 			if not getattr(moe, "_fp8_blockwise_ready", False):
 				raise RuntimeError(f"Layer {layer_idx}: GLM-5 MoE graph requires FP8 blockwise weights")
