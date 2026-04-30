@@ -298,15 +298,16 @@ class Glm5Indexer(nn.Module):
     def _fused_rope_hadamard_or_fallback(
         self, k: torch.Tensor, positions: torch.Tensor, max_seqlen: Optional[int] = None,
     ) -> torch.Tensor:
-        """Fused interleaved RoPE + Hadamard for DSA indexer KV."""
-        if _fused_rope_hadamard_fn is None:
-            raise RuntimeError("GLM-5 DSA selector requires fused RoPE+Hadamard")
-        seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
-        cos, sin = self.rotary_emb(k, seq_len)
-        return _fused_rope_hadamard_fn(
-            k.to(torch.bfloat16), cos.float(), sin.float(),
-            positions.reshape(-1), scale=k.shape[-1] ** -0.5,
-        )
+        """Fused interleaved RoPE + Hadamard, falling back to separate ops."""
+        if _fused_rope_hadamard_fn is not None:
+            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
+            cos, sin = self.rotary_emb(k, seq_len)
+            return _fused_rope_hadamard_fn(
+                k.to(torch.bfloat16), cos.float(), sin.float(),
+                positions.reshape(-1), scale=k.shape[-1] ** -0.5,
+            )
+        k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
+        return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
 
     def compute_indexer_kv(
         self, hidden_states: torch.Tensor, positions: Optional[torch.Tensor] = None,

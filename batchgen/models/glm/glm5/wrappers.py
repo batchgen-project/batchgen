@@ -481,34 +481,39 @@ class GLM5AttnWrapper(AttnWrapperBase):
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
             # aux cache is unpopulated and any later decode past 2048 tokens reads
-            # unwritten memory. `_offload_prepacked_indexer_kv` early-returns if
-            # host_paged_kv_worker_view_aux is None, so that guard is sufficient.
+            # unwritten memory. `_offload_prepacked_indexer_kv` fails fast if
+            # host_paged_kv_worker_view_aux is missing.
             if not hasattr(self.module, 'indexer'):
-                indexer_kv = None
-            else:
-                indexer_kv = self.module.indexer.compute_indexer_kv(
-                    hidden_states_2d.unsqueeze(0),
-                    positions=self.position_ids.to(hidden_states_2d.device),
+                raise RuntimeError(
+                    "GLM-5 DSA prefill requires indexer KV; refusing primary-only host offload"
                 )
-            if indexer_kv is not None:
-                self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
+            indexer_kv = self.module.indexer.compute_indexer_kv(
+                hidden_states_2d.unsqueeze(0),
+                positions=self.position_ids.to(hidden_states_2d.device),
+            )
+            if indexer_kv is None:
+                raise RuntimeError(
+                    "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
+                )
+            self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
         else:
-            attention_mask = kwargs.get("attention_mask", None)
-            position_ids = kwargs.get("position_ids", None)
-            attn_output, offload_kv = self.module.prefill_attn_w8a16(
-                hidden_states, attention_mask, position_ids,
-                self.weight_dequant_scale
+            raise RuntimeError(
+                "GLM-5 DSA prefill requires prepack_mode so primary and "
+                "auxiliary/indexer KV are offloaded with identical sequence "
+                "boundaries"
             )
-            return (attn_output, None, offload_kv)
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
         """Offload indexer KV cache per-sequence to auxiliary host memory."""
         if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
-            return
+            raise RuntimeError(
+                "GLM-5 DSA auxiliary host KV worker view is required for "
+                "indexer KV offload"
+            )
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch

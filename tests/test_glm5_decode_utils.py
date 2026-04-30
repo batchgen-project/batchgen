@@ -422,3 +422,42 @@ def test_glm5_prefill_indexer_kv_uses_legacy_dynamic_max_seqlen(monkeypatch):
     attn_output, _, _ = wrapper._forward_prefill(torch.ones(1, 3, 4))
 
     assert attn_output.shape == (1, 3, 4)
+
+
+def test_glm5_prefill_requires_indexer_and_prepack_mode():
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.prepack_mode = True
+    wrapper.position_ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    wrapper.prepack_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    wrapper.prepack_max_seqlen = 2
+    wrapper.prepack_num_sequences = 1
+    wrapper.weight_dequant_scale = None
+
+    class NoIndexerModule:
+        def prefill_attn_w8a16_prepacked(
+            self,
+            hidden_states_2d,
+            position_ids,
+            prepack_cu_seqlens,
+            prepack_max_seqlen,
+            prepack_num_sequences,
+            weight_dequant_scale,
+        ):
+            return torch.zeros_like(hidden_states_2d), torch.zeros(2, 1, 576)
+
+    wrapper.module = NoIndexerModule()
+
+    with pytest.raises(RuntimeError, match="requires indexer KV"):
+        wrapper._forward_prefill(torch.ones(1, 2, 4))
+
+    wrapper.prepack_mode = False
+    with pytest.raises(RuntimeError, match="requires prepack_mode"):
+        wrapper._forward_prefill(torch.ones(1, 2, 4))
+
+
+def test_glm5_prefill_indexer_offload_requires_aux_host_view(monkeypatch):
+    wrapper = object.__new__(GLM5AttnWrapper)
+    monkeypatch.setattr(AttnWrapperBase, "host_paged_kv_worker_view_aux", None)
+
+    with pytest.raises(RuntimeError, match="auxiliary host KV worker view is required"):
+        wrapper._offload_prepacked_indexer_kv(torch.zeros(2, 1, 128))
