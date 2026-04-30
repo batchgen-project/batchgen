@@ -361,6 +361,7 @@ def create_app(
             max_context_length=body.max_context_length,
             temperature=body.temperature,
             top_p=body.top_p,
+            batchgen_debug=body.batchgen_debug,
         )
         storage.save_batch(batch)
         await scheduler.enqueue(batch_id)

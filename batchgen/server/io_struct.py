@@ -171,6 +171,7 @@ class CreateBatchRequest(BaseModel):
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
+    batchgen_debug: Optional[Dict[str, Any]] = None
 
 
 class BatchObject(BaseModel):
@@ -195,6 +196,7 @@ class BatchObject(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
+    batchgen_debug: Optional[Dict[str, Any]] = None
 
     @root_validator(pre=True)
     def default_timestamps(cls, values: Dict[str, Any]) -> Dict[str, Any]:

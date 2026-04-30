@@ -19,7 +19,7 @@ Key differences from DeepSeek:
 import logging
 import os
 from contextlib import nullcontext as _nullctx
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,11 +76,63 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 _GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+_GLM5_DSA_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_DSA_GRAPH_COMPARE"
 _glm5_dsa_graph_eager_fallback_logged = False
+_glm5_dsa_graph_compare_unavailable_logged = False
 
 
 def _glm5_dsa_cuda_graph_required() -> bool:
     return os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+
+
+def _debug_flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _glm5_dsa_graph_compare_active() -> bool:
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return (
+        _debug_flag_enabled(debug.get("glm5_dsa_graph_compare"))
+        or os.environ.get(_GLM5_DSA_GRAPH_COMPARE_ENV, "0") == "1"
+    )
+
+
+def _glm5_dsa_graph_compare_layer_enabled(layer_idx: int) -> bool:
+    if not _glm5_dsa_graph_compare_active():
+        return False
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    layers = debug.get("glm5_dsa_graph_compare_layers")
+    if layers is None:
+        layers = os.environ.get("BATCHGEN_GLM5_DSA_GRAPH_COMPARE_LAYERS", "0")
+    if layers in ("all", "*"):
+        return True
+    if isinstance(layers, int):
+        return layer_idx == layers
+    if isinstance(layers, str):
+        return str(layer_idx) in {
+            item.strip() for item in layers.split(",") if item.strip()
+        }
+    if isinstance(layers, (list, tuple, set)):
+        try:
+            return layer_idx in {int(item) for item in layers}
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring invalid glm5_dsa_graph_compare_layers=%r; defaulting to layer 0",
+                layers,
+            )
+            return layer_idx == 0
+    return layer_idx == 0
+
+
+def _glm5_dsa_graph_compare_fail_on_mismatch() -> bool:
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return _debug_flag_enabled(debug.get("glm5_dsa_graph_compare_fail_on_mismatch"))
 
 
 def _glm5_dsa_cuda_graph_can_replay(
@@ -120,6 +172,21 @@ def _log_glm5_dsa_graph_eager_fallback_once(
         reason,
         index_topk,
         int(cache_seqlens.min().item()),
+    )
+
+
+def _log_glm5_dsa_graph_compare_unavailable_once(
+    layer_idx: int,
+    reason: str,
+) -> None:
+    global _glm5_dsa_graph_compare_unavailable_logged
+    if _glm5_dsa_graph_compare_unavailable_logged or layer_idx != 0:
+        return
+    _glm5_dsa_graph_compare_unavailable_logged = True
+    logging.warning(
+        "GLM-5 DSA graph/eager compare requested but graph side-channel is "
+        "unavailable (%s); returning eager DSA output.",
+        reason,
     )
 
 
@@ -685,10 +752,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_graph_segment_inputs,
         )
-        from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
-
-        attn = self.module
         bsz = hidden_states.shape[0]
         graph_inputs = build_glm5_dsa_graph_segment_inputs(
             self,
@@ -727,11 +790,19 @@ class GLM5AttnWrapper(AttnWrapperBase):
             aux_page_table=graph_inputs.aux_page_table,
         )
 
-        attn_heads = graph_outputs["attn_heads"].reshape(
+        return self._project_dsa_attn_heads(graph_outputs["attn_heads"])
+
+    def _project_dsa_attn_heads(self, attn_heads: torch.Tensor) -> torch.Tensor:
+        from batchgen.attention.mla.fa3_backend import act_quant
+        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+
+        attn = self.module
+        bsz = attn_heads.shape[0]
+        attn_heads_flat = attn_heads.reshape(
             bsz,
             attn.num_heads * attn.v_head_dim,
         )
-        attn_output_fp8, attn_output_scale = act_quant(attn_heads)
+        attn_output_fp8, attn_output_scale = act_quant(attn_heads_flat)
         attn_output = w8a8_deepgemm(
             attn_output_fp8,
             attn_output_scale,
@@ -739,6 +810,163 @@ class GLM5AttnWrapper(AttnWrapperBase):
             self.weight_dequant_scale["o_proj.weight_scale_inv"],
         )
         return attn_output.view(bsz, 1, -1)
+
+    @staticmethod
+    def _compare_tensor_summary(
+        name: str,
+        graph_tensor: Optional[torch.Tensor],
+        eager_tensor: Optional[torch.Tensor],
+        *,
+        exact: bool = False,
+        atol: float = 5e-2,
+        rtol: float = 5e-2,
+    ) -> Tuple[bool, str]:
+        if graph_tensor is None or eager_tensor is None:
+            return False, f"{name}: skipped"
+        if tuple(graph_tensor.shape) != tuple(eager_tensor.shape):
+            return True, (
+                f"{name}: shape_mismatch graph={tuple(graph_tensor.shape)} "
+                f"eager={tuple(eager_tensor.shape)}"
+            )
+        if graph_tensor.numel() == 0:
+            return False, f"{name}: empty"
+
+        if exact or not graph_tensor.is_floating_point():
+            graph_i = graph_tensor.to(dtype=torch.int64)
+            eager_i = eager_tensor.to(dtype=torch.int64, device=graph_tensor.device)
+            mismatch = int((graph_i != eager_i).sum().item())
+            if mismatch == 0:
+                return False, f"{name}: exact"
+            max_abs = int((graph_i - eager_i).abs().max().item())
+            return True, f"{name}: mismatch={mismatch}/{graph_i.numel()} max_abs={max_abs}"
+
+        graph_f = graph_tensor.float()
+        eager_f = eager_tensor.to(device=graph_tensor.device).float()
+        diff = (graph_f - eager_f).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        close = bool(torch.allclose(graph_f, eager_f, atol=atol, rtol=rtol))
+        return (
+            not close,
+            f"{name}: max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+            f"atol={atol:g} rtol={rtol:g}",
+        )
+
+    def _forward_decode_dsa_graph_compare(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+        *,
+        eager_output: torch.Tensor,
+        eager_debug: Dict[str, Any],
+    ) -> None:
+        """Run graph replay as a side-channel and return/log eager-vs-graph diffs."""
+
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_graph_segment_inputs,
+        )
+
+        fail_on_mismatch = _glm5_dsa_graph_compare_fail_on_mismatch()
+        try:
+            bsz = hidden_states.shape[0]
+            graph_inputs = build_glm5_dsa_graph_segment_inputs(
+                self,
+                hidden_states,
+                position_ids,
+                cache_seqlens,
+                max_seqlen,
+                gpu_paged_kv_manager,
+                gpu_paged_kv_manager_aux,
+                max_primary_pages_per_seq=self._dsa_cuda_graph_max_primary_pages,
+                max_aux_pages_per_seq=self._dsa_cuda_graph_max_aux_pages,
+                write_kv=False,
+            )
+            graph_outputs = self._dsa_cuda_graph_manager.replay(
+                self._dsa_cuda_graph_segment_name,
+                bsz,
+                q_a=graph_inputs.q_a,
+                q_nope=graph_inputs.q_nope,
+                q_rope=graph_inputs.q_rope,
+                head_gates=graph_inputs.head_gates,
+                cache_seqlens=graph_inputs.cache_seqlens,
+                positions_expanded=graph_inputs.positions_expanded,
+                primary_page_table=graph_inputs.primary_page_table,
+                aux_page_table=graph_inputs.aux_page_table,
+            )
+            graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
+
+            selector_inputs = eager_debug.get("selector_inputs")
+            eager_attn_heads = eager_debug.get("attn_heads")
+            checks = [
+                self._compare_tensor_summary(
+                    "final_o_proj", graph_output, eager_output,
+                ),
+                self._compare_tensor_summary(
+                    "attn_heads", graph_outputs.get("attn_heads"), eager_attn_heads,
+                ),
+            ]
+            if selector_inputs is not None:
+                checks.extend(
+                    [
+                        self._compare_tensor_summary(
+                            "primary_k_tensor",
+                            graph_inputs.primary_k_tensor,
+                            selector_inputs.primary_k_tensor,
+                        ),
+                        self._compare_tensor_summary(
+                            "indexer_k_tensor",
+                            graph_inputs.indexer_k_tensor,
+                            selector_inputs.indexer_k_tensor,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_lengths",
+                            graph_outputs.get("selected_lengths"),
+                            selector_inputs.selected_lengths,
+                            exact=True,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_indices",
+                            graph_outputs.get("top_k_indices"),
+                            selector_inputs.selected_indices,
+                            exact=True,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_mla_kv",
+                            graph_outputs.get("selected_mla_kv"),
+                            selector_inputs.selected_mla_kv,
+                            atol=0.0,
+                            rtol=0.0,
+                        ),
+                    ]
+                )
+
+            failed = any(item[0] for item in checks)
+            log_fn = logging.error if failed else logging.info
+            log_fn(
+                "[GLM5_DSA_GRAPH_COMPARE] layer=%s status=%s bsz=%s "
+                "max_seqlen=%s min_cache=%s %s",
+                self.layer_idx,
+                "FAIL" if failed else "OK",
+                bsz,
+                max_seqlen,
+                int(cache_seqlens.min().item()),
+                "; ".join(message for _, message in checks),
+            )
+            if failed and fail_on_mismatch:
+                raise RuntimeError(
+                    f"GLM-5 DSA graph/eager compare failed on layer {self.layer_idx}"
+                )
+        except Exception:
+            logging.exception(
+                "[GLM5_DSA_GRAPH_COMPARE] layer=%s side-channel graph replay failed",
+                self.layer_idx,
+            )
+            if fail_on_mismatch:
+                raise
 
     def _forward_decode_dsa(
         self,
@@ -756,19 +984,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """
         attn = self.module
         bsz = hidden_states.shape[0]
-        li = self.layer_idx
 
         # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
         if bsz == 0:
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
-        if _glm5_dsa_cuda_graph_required():
+        compare_active = _glm5_dsa_graph_compare_active()
+        compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
+        graph_requested = _glm5_dsa_cuda_graph_required() or compare_active
+        compare_after_eager = False
+        if graph_requested:
             index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)
             graph_can_replay = _glm5_dsa_cuda_graph_can_replay(
                 cache_seqlens,
                 max_seqlen,
                 index_topk,
-                captured_max_seqlen=self._dsa_cuda_graph_max_seqlen,
+                captured_max_seqlen=getattr(self, "_dsa_cuda_graph_max_seqlen", None),
             )
             graph_has_bucket = (
                 self._dsa_cuda_graph_manager is not None
@@ -778,7 +1009,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     bsz,
                 )
             )
-            if graph_can_replay and graph_has_bucket:
+            if graph_can_replay and graph_has_bucket and not compare_active:
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -787,22 +1018,73 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     gpu_paged_kv_manager,
                     gpu_paged_kv_manager_aux,
                 )
+            compare_after_eager = bool(
+                compare_active and compare_this_layer and graph_can_replay and graph_has_bucket
+            )
             if not graph_can_replay:
-                if max_seqlen > self._dsa_cuda_graph_max_seqlen:
+                captured_cap = getattr(self, "_dsa_cuda_graph_max_seqlen", None)
+                if captured_cap is not None and max_seqlen > captured_cap:
                     reason = (
                         f"max_seqlen={max_seqlen} exceeds captured cap "
-                        f"{self._dsa_cuda_graph_max_seqlen}"
+                        f"{captured_cap}"
                     )
                 else:
                     reason = "current decode rows are not all longer than index_topk"
-            else:
+            elif not graph_has_bucket:
                 reason = f"batch size {bsz} has no captured graph bucket"
+            else:
+                reason = "graph/eager compare mode is returning eager output"
             _log_glm5_dsa_graph_eager_fallback_once(
                 self.layer_idx,
                 cache_seqlens,
                 index_topk,
                 reason,
             )
+            if compare_active and compare_this_layer and not compare_after_eager:
+                _log_glm5_dsa_graph_compare_unavailable_once(
+                    self.layer_idx,
+                    reason,
+                )
+
+        eager_result = self._forward_decode_dsa_eager(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            return_debug=compare_after_eager,
+        )
+        if not compare_after_eager:
+            return eager_result
+
+        eager_output, eager_debug = eager_result
+        self._forward_decode_dsa_graph_compare(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            eager_output=eager_output,
+            eager_debug=eager_debug,
+        )
+        return eager_output
+
+    def _forward_decode_dsa_eager(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+        *,
+        return_debug: bool = False,
+    ):
+        attn = self.module
+        bsz = hidden_states.shape[0]
+        li = self.layer_idx
 
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_flashmla_inputs,
@@ -824,6 +1106,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             max_seqlen,
             gpu_paged_kv_manager,
             gpu_paged_kv_manager_aux,
+            return_selected_indices=return_debug,
         )
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
             attn_out = run_prepared_sparse_flash_mla_decode(selector_inputs.flashmla)
@@ -832,14 +1115,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
         with (dt.timed("o_proj", li) if dt else _nullctx()):
             # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
             if self._fp8_absorb_weights is not None:
-                attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+                attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             else:
                 # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
                 attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
-                attn_output = torch.bmm(
+                attn_heads = torch.bmm(
                     attn_out_3d.transpose(0, 1), self.w_vc,
                 ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
-            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
+            attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
                 attn_output_fp8, attn_output_scale,
@@ -847,4 +1130,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             attn_output = attn_output.view(bsz, 1, -1)
 
+        if return_debug:
+            return attn_output, {
+                "selector_inputs": selector_inputs,
+                "attn_heads": attn_heads,
+            }
         return attn_output

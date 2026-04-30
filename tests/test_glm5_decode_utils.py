@@ -16,6 +16,8 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 )
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
+    _glm5_dsa_graph_compare_active,
+    _glm5_dsa_graph_compare_layer_enabled,
     _glm5_dsa_cuda_graph_can_replay,
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
@@ -344,6 +346,74 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     )
 
     assert actual is expected
+
+
+def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch):
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.module = type(
+        "Attn",
+        (),
+        {"hidden_size": 16, "indexer": type("Indexer", (), {"index_topk": 4})()},
+    )()
+    wrapper.layer_idx = 0
+    wrapper._dsa_cuda_graph_max_seqlen = 4096
+    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+    wrapper._dsa_cuda_graph_manager = type(
+        "GraphManager",
+        (),
+        {"has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2},
+    )()
+    expected = torch.ones(2, 1, 16)
+    calls = {}
+
+    def fake_eager(self, *args, return_debug=False, **kwargs):
+        calls["return_debug"] = return_debug
+        assert return_debug
+        return expected, {"selector_inputs": None, "attn_heads": None}
+
+    def fake_graph(self, *args, **kwargs):
+        raise AssertionError("compare mode must not return graph output")
+
+    def fake_compare(self, *args, eager_output, eager_debug, **kwargs):
+        calls["compare"] = True
+        assert eager_output is expected
+        assert eager_debug["selector_inputs"] is None
+
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_eager", fake_eager)
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph)
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph_compare", fake_compare)
+
+    old_debug = AttnWrapperBase.batchgen_debug
+    AttnWrapperBase.batchgen_debug = {"glm5_dsa_graph_compare": True}
+    try:
+        actual = wrapper._forward_decode_dsa(
+            torch.zeros(2, 1, 16),
+            torch.tensor([[7], [8]], dtype=torch.int64),
+            torch.tensor([8, 9], dtype=torch.int32),
+            4096,
+            "primary",
+            "aux",
+        )
+    finally:
+        AttnWrapperBase.batchgen_debug = old_debug
+
+    assert actual is expected
+    assert calls == {"return_debug": True, "compare": True}
+
+
+def test_glm5_dsa_graph_compare_layer_filter(monkeypatch):
+    old_debug = AttnWrapperBase.batchgen_debug
+    AttnWrapperBase.batchgen_debug = {
+        "glm5_dsa_graph_compare": True,
+        "glm5_dsa_graph_compare_layers": [1, 3],
+    }
+    try:
+        assert _glm5_dsa_graph_compare_active()
+        assert not _glm5_dsa_graph_compare_layer_enabled(0)
+        assert _glm5_dsa_graph_compare_layer_enabled(1)
+        assert _glm5_dsa_graph_compare_layer_enabled(3)
+    finally:
+        AttnWrapperBase.batchgen_debug = old_debug
 
 
 def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():

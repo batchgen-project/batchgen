@@ -603,6 +603,7 @@ class BatchGenWorker:
 		self._logged_sampling: bool = False  # Track if we've logged sampling mode this batch
 		# Per-request sampling parameters (list of dicts, one per prompt in batch order)
 		self._per_sequence_sampling_params: Optional[list] = None
+		self._batchgen_debug: Optional[dict] = None
 
 		# 9. Initialization Flags
 		self._core_initialized = False
@@ -885,6 +886,23 @@ class BatchGenWorker:
 				f"{n_greedy} greedy, {n_sampling} sampling"
 			)
 
+	def set_batchgen_debug(self, debug: Optional[dict]) -> None:
+		self._batchgen_debug = debug if isinstance(debug, dict) and debug else None
+		if self.rank == 0 and self._batchgen_debug:
+			logging.warning(f"[BATCHGEN_DEBUG] enabled flags: {sorted(self._batchgen_debug.keys())}")
+
+	def _active_batchgen_debug_for_sequences(self, batch_sequences) -> Optional[dict]:
+		if self._batchgen_debug:
+			return self._batchgen_debug
+		merged = {}
+		for seq in batch_sequences or []:
+			seq_debug = getattr(seq, "batchgen_debug", None)
+			if isinstance(seq_debug, dict):
+				for key, value in seq_debug.items():
+					if value is not None and key not in merged:
+						merged[key] = value
+		return merged or None
+
 	# ============ Request Pool: Admission Queue ============
 
 	def set_admission_queue(self, queue) -> None:
@@ -971,6 +989,7 @@ class BatchGenWorker:
 				text=entry.get("text", ""),
 			)
 			seq.batch_id = entry.get("batch_id")
+			seq.batchgen_debug = entry.get("batchgen_debug")
 			seq.priority = entry.get("priority", 0)
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
@@ -3412,6 +3431,7 @@ class BatchGenWorker:
 				max_decode_length=max_dec,
 				text=text,
 			)
+			seq.batchgen_debug = self._batchgen_debug
 			seq.log_event(SeqEvent.CREATED, self.rank, f"max_dec={max_dec}")
 			self.global_batch.add_sequence(seq)
 
@@ -5560,6 +5580,13 @@ class BatchGenWorker:
 					self._sync_sequence_metadata(decode_uuids)
 
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
+				local_decode_sequences = [
+					self.global_batch.get_sequence(self._local_to_uuid_map[idx])
+					for idx in local_decode_indices
+				] if local_decode_indices else []
+				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
+					local_decode_sequences
+				)
 
 				# B. Config Decode
 				config_start = time.perf_counter()
@@ -5575,10 +5602,16 @@ class BatchGenWorker:
 				)
 
 				has_queueing = self.global_batch.has_queueing()
+				glm5_debug_graph_requested = (
+					self._glm5_dsa_graph_requested_for_current_batch()
+					and "glm" in (getattr(self, "model_name", "") or "").lower()
+				)
 				if should_warmup_cuda_graphs_before_decode(
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
+				) or (
+					glm5_debug_graph_requested and self._cuda_graph_manager is None
 				) or self._glm5_dsa_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
@@ -7993,7 +8026,7 @@ class BatchGenWorker:
 	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
 		if (
-			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") != "1"
+			not self._glm5_dsa_graph_requested_for_current_batch()
 			or "glm" not in model_name_l
 			or self._cuda_graph_manager is None
 		):
@@ -8008,6 +8041,21 @@ class BatchGenWorker:
 		if bucket in getattr(self, "_glm5_dsa_graph_failed_buckets", set()):
 			return False
 		return not self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz)
+
+	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		value = debug.get("glm5_dsa_graph_compare")
+		if isinstance(value, bool):
+			return value
+		if isinstance(value, (int, float)):
+			return value != 0
+		if isinstance(value, str):
+			return value.strip().lower() in {"1", "true", "yes", "on"}
+		return False
 
 	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
 		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
@@ -8107,7 +8155,7 @@ class BatchGenWorker:
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
 		glm5_dsa_graph_enabled = (
-			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			self._glm5_dsa_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		if glm5_dsa_graph_enabled:
@@ -8786,6 +8834,7 @@ class BatchGenWorker:
 
 			# Pre-compute batch_sequences for use in both forward setup and update loop
 			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
+			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(batch_sequences)
 
 			# Invariant check: cache_seqlens must not exceed allocated pages.
 			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
@@ -9178,6 +9227,7 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		AttnWrapperBase.batchgen_debug = None
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
 

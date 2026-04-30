@@ -93,6 +93,7 @@ class SequenceEntry:
         '_buffer_slot',  # Index into QueryBookBufferPool buffers
         # Request pool fields
         'batch_id',              # Which batch this sequence belongs to (for result routing)
+        'batchgen_debug',        # Batch-level debug flags inherited by this sequence
         'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
         'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
         # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
@@ -165,6 +166,7 @@ class SequenceEntry:
 
         # Request pool fields (set externally when using pool-based scheduling)
         self.batch_id: Optional[str] = None
+        self.batchgen_debug: Optional[dict] = None
         self.pool_slot_index: int = -1
         self.priority: int = 0  # 0=NORMAL, 1=HIGH
 

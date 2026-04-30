@@ -76,6 +76,7 @@ def build_glm5_dsa_graph_segment_inputs(
     *,
     max_primary_pages_per_seq: int,
     max_aux_pages_per_seq: int,
+    write_kv: bool = True,
 ) -> Glm5DsaGraphSegmentInputs:
     """Build graph-segment inputs and update primary/aux KV caches.
 
@@ -159,17 +160,18 @@ def build_glm5_dsa_graph_segment_inputs(
         aux_device,
     )
 
-    with (dt.timed("kv_write", li) if dt else nullcontext()):
-        k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
-        if k_tensor.device != manager_device:
-            k_tensor = k_tensor.to(manager_device)
-        gpu_paged_kv_manager.update_layer_decode_new_token(
-            k_tensor=k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32,
-            layer_idx=li,
-            slot_indices=primary_slot_indices,
-        )
+    k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
+    if k_tensor.device != manager_device:
+        k_tensor = k_tensor.to(manager_device)
+    if write_kv:
+        with (dt.timed("kv_write", li) if dt else nullcontext()):
+            gpu_paged_kv_manager.update_layer_decode_new_token(
+                k_tensor=k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32,
+                layer_idx=li,
+                slot_indices=primary_slot_indices,
+            )
 
     with (dt.timed("indexer_k", li) if dt else nullcontext()):
         if wrapper._indexer_cuda_weights is None:
@@ -195,13 +197,15 @@ def build_glm5_dsa_graph_segment_inputs(
             if aux_device == manager_device
             else new_token_pos.to(dtype=torch.int32, device=aux_device)
         )
-        gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-            k_tensor=indexer_k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32_aux,
-            layer_idx=li,
-            slot_indices=aux_slot_indices,
-        )
+        if write_kv:
+            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+                k_tensor=indexer_k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32_aux,
+                layer_idx=li,
+                slot_indices=aux_slot_indices,
+            )
+
 
     with (dt.timed("indexer_score", li) if dt else nullcontext()):
         from batchgen_kernels.attention.dsa.fused_indexer_score import compute_head_gates
@@ -259,6 +263,8 @@ def build_glm5_dsa_flashmla_inputs(
     max_seqlen: int,
     gpu_paged_kv_manager,
     gpu_paged_kv_manager_aux,
+    *,
+    return_selected_indices: bool = False,
 ) -> Glm5DsaFlashMlaInputs:
     """Build GLM-5 BF16 DSA inputs up to the FlashMLA invocation boundary."""
 
@@ -436,7 +442,7 @@ def build_glm5_dsa_flashmla_inputs(
                 top_k_indices,
                 index_topk=wrapper.module.indexer.index_topk,
                 page_size=mla_page_size,
-                return_indices=verify_indices,
+                return_indices=verify_indices or return_selected_indices,
             )
         )
 

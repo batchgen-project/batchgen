@@ -25,7 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
-from typing import ClassVar, Dict, List, Optional, Sequence
+from typing import Any, ClassVar, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     kv_quantization_factor: ClassVar[Optional[List]] = None
     kv_append_callback: ClassVar[Optional[callable]] = None
     kv_append_callback_aux: ClassVar[Optional[callable]] = None
+    batchgen_debug: ClassVar[Optional[Dict[str, Any]]] = None
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
