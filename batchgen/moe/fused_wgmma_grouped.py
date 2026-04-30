@@ -324,6 +324,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     gate_bias_ptrs: torch.Tensor = None,
     up_bias_ptrs: torch.Tensor = None,
     down_bias_ptrs: torch.Tensor = None,
+    output: torch.Tensor = None,
 ) -> torch.Tensor:
     """End-to-end grouped MXFP4 MoE forward using WGMMA + CUDA routing.
 
@@ -346,6 +347,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
         gate_bias_ptrs: Gate bias pointer array [num_experts] int64, or None
         up_bias_ptrs: Up bias pointer array [num_experts] int64, or None
         down_bias_ptrs: Down bias pointer array [num_experts] int64, or None
+        output: Optional pre-allocated output buffer [batch*seq, hidden] BF16
 
     Returns:
         Output [batch*seq, hidden] BF16
@@ -410,6 +412,7 @@ def fused_mxfp4_grouped_moe_forward_cuda_routing(
     output = reduce_weighted_scatter_cuda(
         sorted_output, topk_pos, topk_weights,
         num_tokens, hidden_size, K_topk,
+        output=output,
     )
 
     return output

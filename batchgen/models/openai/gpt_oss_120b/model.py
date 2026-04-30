@@ -844,10 +844,11 @@ class GptOssMoEDecode(nn.Module):
         # Phase 1: Grouped kernel for persistent experts
         num_persistent = len(self.persistent_expert_indices)
         if num_persistent > 0:
-            output = self._grouped_forward(
+            self._grouped_forward(
                 hidden_flat, topk_indices, topk_weights,
                 expert_start=self.expert_start,
                 num_local_experts=num_persistent,
+                output=output,
             )
 
         # Phase 2: Single-expert kernel for non-persistent experts
@@ -902,21 +903,23 @@ class GptOssMoEDecode(nn.Module):
         global_results = self.global_results_buffer
         global_results.zero_()
         num_global_tokens = all_tokens.shape[0]
+        global_results_view = global_results[:num_global_tokens]
 
         # Phase 1: Grouped kernel for persistent experts
         num_persistent = len(self.persistent_expert_indices)
         if num_persistent > 0:
-            global_results[:num_global_tokens] = self._grouped_forward(
+            self._grouped_forward(
                 all_tokens, topk_indices, topk_weights,
                 expert_start=self.expert_start,
                 num_local_experts=num_persistent,
+                output=global_results_view,
             )
 
         # Phase 2: Single-expert kernel for non-persistent experts
         if self.non_persistent_expert_indices:
             self._single_expert_forward(
                 all_tokens, topk_indices, topk_weights,
-                global_results[:num_global_tokens],
+                global_results_view,
             )
 
         # 4) AllReduce
@@ -938,6 +941,7 @@ class GptOssMoEDecode(nn.Module):
         topk_weights: torch.Tensor,
         expert_start: int,
         num_local_experts: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Grouped kernel for persistent experts."""
         if self.weight_format == "mxfp4":
@@ -959,6 +963,7 @@ class GptOssMoEDecode(nn.Module):
                 gate_bias_ptrs=self.gate_bias_ptrs,
                 up_bias_ptrs=self.up_bias_ptrs,
                 down_bias_ptrs=self.down_bias_ptrs,
+                output=output,
             )
         elif self.weight_format == "bf16":
             # Placeholder: grouped BF16 kernel to be ported from
