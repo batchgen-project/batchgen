@@ -657,6 +657,7 @@ class BatchGenWorker:
 		# Store gpu_memory_frac, actual size calculated later right before GPU KV manager init
 		self.gpu_memory_frac = args.gpu_memory_frac
 		self.gpu_kv_cache_size_gb: Optional[float] = None  # Calculated in _calculate_gpu_kv_cache_size()
+		self._decode_gpu_kv_scratch_reserve_gb: float = 0.0
 		
 		# Track sequences currently with GPU KV allocated
 		self._sequences_with_gpu_kv: Set[str] = set()
@@ -716,6 +717,51 @@ class BatchGenWorker:
 		
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
+	def _estimate_decode_gpu_kv_scratch_reserve_gb(self, max_num_seq_per_rank: int) -> float:
+		"""
+		Estimate the non-KV HBM reserve needed by decode kernels.
+
+		GPT-OSS decode allocates MoE routing/intermediate buffers plus logits and
+		sampling scratch after the decode model is loaded. If GPU KV consumes the
+		entire ``total * gpu_memory_frac - used`` budget, large batches can OOM in
+		those transient decode allocations even though the KV pool itself fits.
+		"""
+		model_type = getattr(self.model_config, "model_type", "")
+		if "gpt_oss" not in model_type:
+			return 0.0
+
+		max_num_seq_per_rank = max(int(max_num_seq_per_rank), 1)
+		global_tokens = max_num_seq_per_rank * max(int(self.world_size), 1)
+		hidden_size = int(getattr(self.model_config, "hidden_size", 2880))
+		intermediate_size = int(getattr(self.model_config, "intermediate_size", hidden_size))
+		num_experts_per_tok = int(getattr(self.model_config, "num_experts_per_tok", 4))
+		num_local_experts = int(getattr(self.model_config, "num_local_experts", 128))
+		vocab_size = int(getattr(self.model_config, "vocab_size", 201088))
+
+		bytes_per_bf16 = 2
+		bytes_per_fp32 = 4
+		moe_activation_bytes = (
+			3
+			* global_tokens
+			* num_experts_per_tok
+			* max(hidden_size, intermediate_size)
+			* bytes_per_bf16
+		)
+		router_bytes = global_tokens * num_local_experts * (bytes_per_bf16 + bytes_per_fp32)
+		topk_bytes = global_tokens * num_experts_per_tok * (bytes_per_fp32 + bytes_per_fp32)
+		logits_bytes = max_num_seq_per_rank * vocab_size * bytes_per_bf16
+		sampling_bytes = min(max_num_seq_per_rank, 64) * vocab_size * bytes_per_fp32
+
+		estimated_gb = (
+			moe_activation_bytes
+			+ router_bytes
+			+ topk_bytes
+			+ logits_bytes
+			+ sampling_bytes
+		) / (1024 ** 3)
+
+		return max(2.0, estimated_gb * 1.5)
+
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
 		Calculate GPU KV cache size based on actual GPU memory usage.
@@ -749,22 +795,26 @@ class BatchGenWorker:
 			total_mem_gb = total_mem_bytes / (1024 ** 3)
 			used_mem_gb = total_mem_gb - free_mem_gb
 
-			# Formula: gpu_kv_cache = total * frac - used
+			scratch_reserve_gb = self._decode_gpu_kv_scratch_reserve_gb
+
+			# Formula: gpu_kv_cache = total * frac - used - decode_scratch
 			# This reserves (1-frac) of GPU memory for activations and overhead
-			gpu_kv_cache_gb = total_mem_gb * self.gpu_memory_frac - used_mem_gb
+			gpu_kv_cache_gb = total_mem_gb * self.gpu_memory_frac - used_mem_gb - scratch_reserve_gb
 
 			# Ensure positive value
 			if gpu_kv_cache_gb <= 0:
 				logging.warning(
 					f"[GPU-KV] Calculated size is non-positive ({gpu_kv_cache_gb:.2f} GB). "
-					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB. "
+					f"Total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB "
+					f"- scratch: {scratch_reserve_gb:.2f} GB. "
 					f"Using minimum 1 GB."
 				)
 				gpu_kv_cache_gb = 1.0
 
 			logging.info(
 				f"[GPU-KV] Size calculated: {gpu_kv_cache_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} "
+				f"- used: {used_mem_gb:.2f} GB - scratch: {scratch_reserve_gb:.2f} GB)"
 			)
 		else:
 			gpu_kv_cache_gb = 0.0
@@ -7129,6 +7179,7 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		self._decode_gpu_kv_scratch_reserve_gb = self._estimate_decode_gpu_kv_scratch_reserve_gb(max_num_seq)
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
@@ -7141,7 +7192,10 @@ class BatchGenWorker:
 			self.core_engine.start_h2d_worker()
 
 		if self.rank == 0:
-			logging.info(f"[DECODE] Model loaded for decoding phase")
+			logging.info(
+				f"[DECODE] Model loaded for decoding phase "
+				f"(gpu_kv_scratch_reserve={self._decode_gpu_kv_scratch_reserve_gb:.2f} GB)"
+			)
 
 	def _init_gpu_kv_with_actual_size(self) -> None:
 		"""
@@ -7164,8 +7218,10 @@ class BatchGenWorker:
 		total_mem_gb = total_mem_bytes / (1024 ** 3)
 		used_mem_gb = total_mem_gb - free_mem_gb
 
-		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
+		scratch_reserve_gb = self._decode_gpu_kv_scratch_reserve_gb
+
+		# Formula: gpu_kv_cache = total * frac - used - decode_scratch
+		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb - scratch_reserve_gb
 		if new_gpu_kv_cache_size > 0:
 			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
 		else:
@@ -7174,13 +7230,15 @@ class BatchGenWorker:
 			if self.rank == 0:
 				logging.warning(
 					f"[GPU-KV] Calculated size non-positive ({new_gpu_kv_cache_size:.2f} GB). "
+					f"Scratch reserve: {scratch_reserve_gb:.2f} GB. "
 					f"Using minimum 1 GB."
 				)
 
 		if self.rank == 0:
 			logging.info(
 				f"[GPU-KV] Actual size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} "
+				f"- used: {used_mem_gb:.2f} GB - scratch: {scratch_reserve_gb:.2f} GB)"
 			)
 
 		# Broadcast to ensure all ranks use same value
