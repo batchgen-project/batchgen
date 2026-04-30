@@ -14,7 +14,11 @@ from batchgen.models.glm.glm5.decode_utils import (
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
+    glm5_any_cuda_graph_requested_for_model,
     glm5_dsa_cuda_graph_requested_for_model,
+    glm5_moe_cuda_graph_requested_for_model,
+    glm5_segmented_cuda_graph_requested_for_model,
+    glm5_whole_model_cuda_graph_requested_for_model,
     should_warmup_cuda_graphs_before_decode,
 )
 from batchgen.models.glm.glm5.model import (
@@ -718,6 +722,56 @@ def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
         global_batch_has_queueing=False,
         model_name="gpt-oss-120b",
         environ={},
+    )
+
+
+def test_glm5_whole_model_graph_policy_is_opt_in_and_glm_only():
+    env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
+
+    assert glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8", environ=env
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "gpt-oss-120b", environ=env
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8", environ={}
+    )
+
+
+def test_glm5_graph_policy_tracks_segmented_and_any_requests():
+    dsa_env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
+    moe_env = {"BATCHGEN_GLM5_MOE_CUDA_GRAPH": "1"}
+    whole_env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
+    model_name = "zai-org/GLM-5-FP8"
+
+    assert glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert glm5_moe_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert not glm5_segmented_cuda_graph_requested_for_model(
+        model_name, environ=whole_env
+    )
+    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
+    assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
+
+
+def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
+    env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
+
+    assert should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=True,
+        model_name="zai-org/GLM-5-FP8",
+        environ=env,
+    )
+    assert not should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=True,
+        global_batch_has_queueing=True,
+        model_name="zai-org/GLM-5-FP8",
+        environ=env,
     )
 
 

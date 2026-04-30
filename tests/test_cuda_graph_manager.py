@@ -75,3 +75,44 @@ def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():
 
     manager.drop_bucket(2)
     assert not manager.is_captured
+
+
+def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):
+    import torch
+
+    manager = _make_uninitialized_manager([2])
+    manager.device = torch.device("cpu")
+    manager._pool = object()
+    calls = []
+
+    class Segment:
+        def get_static_input_specs(self, bucket_size):
+            from batchgen.cuda_graph.graph_manager import TensorSpec
+
+            return {"x": TensorSpec(("batch_size",), torch.int64, fill_value=0)}
+
+        def initialize_static_inputs(self, static_inputs, bucket_size):
+            static_inputs["x"].fill_(7)
+            calls.append(("init", static_inputs["x"].clone()))
+
+        def forward(self, **inputs):
+            calls.append(("forward", inputs["x"].clone()))
+            return {"y": inputs["x"]}
+
+    manager._segments = {"seg": Segment()}
+    manager._graphs = {"seg": {}}
+
+    class FakeGraph:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: FakeGraph())
+
+    manager._capture_one("seg", manager._segments["seg"], 2)
+
+    assert calls[0][0] == "init"
+    assert all(torch.equal(call[1], torch.tensor([7, 7])) for call in calls)

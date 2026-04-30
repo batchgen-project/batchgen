@@ -252,6 +252,8 @@ class CUDAGraphManager:
         #  created before graph capture since these are CPU-side operations)
         if hasattr(segment, 'setup_static_buffers'):
             segment.setup_static_buffers(bucket_size)
+        if hasattr(segment, 'initialize_static_inputs'):
+            segment.initialize_static_inputs(static_inputs, bucket_size)
 
         # 2. Warmup on current stream
         for _ in range(self.WARMUP_ITERATIONS):
