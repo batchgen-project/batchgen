@@ -13,7 +13,7 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-def _greedy_argmax(logits: torch.Tensor, chunk_rows: int = 256) -> torch.Tensor:
+def _greedy_argmax(logits: torch.Tensor, chunk_rows: int = 64) -> torch.Tensor:
 	"""Run greedy fp32 argmax without materializing a full-batch fp32 logits copy."""
 	if logits.shape[0] <= chunk_rows:
 		return logits.float().argmax(dim=-1, keepdim=True)
@@ -95,8 +95,8 @@ def sample_tokens(
 	# Handle greedy sequences
 	if greedy_mask.any():
 		greedy_indices = torch.nonzero(greedy_mask, as_tuple=False).flatten()
-		for start in range(0, greedy_indices.numel(), 256):
-			chunk_indices = greedy_indices[start:start + 256]
+		for start in range(0, greedy_indices.numel(), 64):
+			chunk_indices = greedy_indices[start:start + 64]
 			result[chunk_indices] = logits[chunk_indices].float().argmax(dim=-1, keepdim=True)
 
 	# Handle sampling sequences
