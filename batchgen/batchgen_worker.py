@@ -1252,6 +1252,51 @@ class BatchGenWorker:
 			seq.kv_token_budget = seq_extended_size
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
+		"""Assign newly admitted sequences with rank-0 as the authority.
+
+		Pool mode admits requests while each worker process carries local
+		prefix-cache bookkeeping. In particular, the prompt->rank hint cache can
+		differ after prefix eviction, so letting every rank independently run
+		the assignment heuristic can make ``assigned_rank`` diverge. Once that
+		happens, the next prefill may be selected as a single global request but
+		multiple ranks believe they own it and race host KV allocation.
+		"""
+		if not uuids:
+			return
+		if self.world_size <= 1 or not dist.is_initialized():
+			self._assign_admitted_sequences_to_ranks_local(uuids)
+			return
+
+		assignments: Optional[List[Tuple[str, int]]] = None
+		if self.rank == 0:
+			self._assign_admitted_sequences_to_ranks_local(uuids)
+			assignments = []
+			for uuid in uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None or seq.assigned_rank is None:
+					continue
+				assignments.append((uuid, int(seq.assigned_rank)))
+
+		container = [assignments]
+		dist.broadcast_object_list(container, src=0)
+		assignments = container[0] or []
+
+		if self.rank != 0:
+			for uuid, assigned_rank in assignments:
+				if self.global_batch.get_sequence(uuid) is None:
+					continue
+				self.global_batch.assign_rank(uuid, assigned_rank)
+
+		if self.rank == 0 and len(assignments) != len(
+			[u for u in uuids if self.global_batch.get_sequence(u) is not None]
+		):
+			logging.warning(
+				"[ADMIT] Broadcast %d rank assignments for %d admitted UUIDs",
+				len(assignments),
+				len(uuids),
+			)
+
+	def _assign_admitted_sequences_to_ranks_local(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
 
 		Default (BATCHGEN_L2_BALANCE=1, default): least-sum(L²) argmin with
@@ -4901,6 +4946,28 @@ class BatchGenWorker:
 			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
+
+		if self.world_size > 1 and dist.is_initialized():
+			container = [prefill_batch if self.rank == 0 else None]
+			dist.broadcast_object_list(container, src=0)
+			rank0_prefill_batch = container[0] or []
+			if self.rank != 0 and prefill_batch != rank0_prefill_batch:
+				logging.warning(
+					"Rank %s prefill admission diverged from rank 0 "
+					"(local=%s, rank0=%s); using rank 0 selection",
+					self.rank,
+					[
+						self.global_batch.get_sequence(u).global_idx
+						for u in prefill_batch[:8]
+						if self.global_batch.get_sequence(u) is not None
+					],
+					[
+						self.global_batch.get_sequence(u).global_idx
+						for u in rank0_prefill_batch[:8]
+						if self.global_batch.get_sequence(u) is not None
+					],
+				)
+			prefill_batch = rank0_prefill_batch
 
 		if self.rank == 0:
 			n_evicted = sum(1 for u in prefill_batch if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED)
