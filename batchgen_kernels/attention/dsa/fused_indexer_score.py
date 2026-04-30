@@ -27,6 +27,10 @@ import triton
 import triton.language as tl
 import math
 
+from batchgen_kernels.attention.dsa.fast_topk_cuda import (
+    fast_topk_2048,
+    fast_topk_2048_out,
+)
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
     build_module,
     FP8IndexerWeightsCUDA,
@@ -333,6 +337,36 @@ def compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim):
     return (gates * scale).to(torch.float32)
 
 
+def _score_into_dense_agg(
+    q: torch.Tensor,
+    cached_k: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+) -> torch.Tensor:
+    B, n_heads, head_dim = q.shape
+    max_seqlen = cached_k.shape[1]
+    if agg.shape != (B, max_seqlen):
+        raise ValueError(
+            f"agg must have shape {(B, max_seqlen)}, got {tuple(agg.shape)}"
+        )
+    if agg.dtype != torch.float32:
+        raise TypeError(f"agg must be float32, got {agg.dtype}")
+
+    BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
+    BLOCK_D = head_dim
+    grid = (triton.cdiv(max_seqlen, BLOCK_S), B)
+
+    _fused_score_kernel[grid](
+        q, cached_k, head_gates, cache_seqlens,
+        agg, max_seqlen,
+        B=B, n_heads=n_heads, head_dim=head_dim,
+        BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
+    )
+
+    return agg
+
+
 def fused_score_and_topk(
     q: torch.Tensor,
     cached_k: torch.Tensor,
@@ -340,27 +374,21 @@ def fused_score_and_topk(
     cache_seqlens: torch.Tensor,
     topk: int = 2048,
 ) -> torch.Tensor:
-    """Fused scoring + custom Triton top-k. No CPU-GPU sync."""
-    B, n_heads, head_dim = q.shape
-    max_seqlen = cached_k.shape[1]
+    """Fused scoring + eager top-k.
 
-    agg = torch.empty(B, max_seqlen, dtype=torch.float32, device=q.device)
+    The allocation-returning path is used by eager GLM-5 decode.  Keep the
+    expensive score computation fused, then use the radix CUDA top-k path for
+    production-sized ``index_topk=2048`` contexts; smaller test shapes fall back
+    to PyTorch top-k.
+    """
+    B = q.shape[0]
+    max_seqlen = cached_k.shape[1]
     effective_topk = min(topk, max_seqlen)
-    top_k_indices = torch.empty(
-        B,
-        effective_topk,
-        dtype=torch.long,
-        device=q.device,
-    )
-    fused_score_and_topk_out(
-        q,
-        cached_k,
-        head_gates,
-        cache_seqlens,
-        agg,
-        top_k_indices,
-        topk=effective_topk,
-    )
+    agg = torch.empty(B, max_seqlen, dtype=torch.float32, device=q.device)
+    _score_into_dense_agg(q, cached_k, head_gates, cache_seqlens, agg)
+    if effective_topk == 2048 and cache_seqlens.dtype == torch.int32 and q.is_cuda:
+        return fast_topk_2048(agg, cache_seqlens)
+    _, top_k_indices = torch.topk(agg, effective_topk, dim=-1)
     return top_k_indices
 
 
@@ -391,25 +419,19 @@ def fused_score_and_topk_out(
     if top_k_indices.dtype not in (torch.int64, torch.int32):
         raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
 
-    BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
-    BLOCK_D = head_dim
-    grid = (triton.cdiv(max_seqlen, BLOCK_S), B)
+    _score_into_dense_agg(q, cached_k, head_gates, cache_seqlens, agg)
 
-    _fused_score_kernel[grid](
-        q, cached_k, head_gates, cache_seqlens,
-        agg, max_seqlen,
-        B=B, n_heads=n_heads, head_dim=head_dim,
-        BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
-    )
-
-    block_n = triton.next_power_of_2(max_seqlen)
-    _topk_from_scores_kernel[(B,)](
-        agg,
-        top_k_indices,
-        max_seqlen=max_seqlen,
-        topk=topk,
-        BLOCK_N=block_n,
-    )
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
 
     return top_k_indices
 
@@ -488,14 +510,17 @@ def fused_paged_score_and_topk_out(
         BLOCK_D=BLOCK_D,
     )
 
-    block_n = triton.next_power_of_2(max_seqlen)
-    _topk_from_scores_kernel[(B,)](
-        agg,
-        top_k_indices,
-        max_seqlen=max_seqlen,
-        topk=topk,
-        BLOCK_N=block_n,
-    )
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
     return top_k_indices
 
 

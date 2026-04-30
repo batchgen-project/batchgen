@@ -10,6 +10,7 @@ from batchgen_kernels.attention.dsa.fused_indexer_score import (
     fused_score_and_topk_out,
     fused_paged_score_and_topk_out,
 )
+from batchgen_kernels.attention.dsa.fast_topk_cuda import fast_topk_2048
 
 
 pytestmark = pytest.mark.skipif(
@@ -97,7 +98,7 @@ def test_fused_score_and_topk_matches_torch_topk_values(batch_size, max_seqlen, 
     )
     ref_scores = _reference_scores(q, cached_k, head_gates, cache_seqlens)
     ref_values, _ = torch.topk(ref_scores, topk, dim=-1)
-    actual_values = torch.gather(ref_scores, 1, actual_indices)
+    actual_values = torch.gather(ref_scores, 1, actual_indices.long())
 
     torch.testing.assert_close(
         torch.sort(actual_values, dim=-1).values,
@@ -162,7 +163,13 @@ def test_fused_score_and_topk_cuda_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(graph_out, eager)
+    ref_scores = _reference_scores(q, cached_k, head_gates, cache_seqlens)
+    torch.testing.assert_close(
+        torch.sort(torch.gather(ref_scores, 1, graph_out.long()), dim=-1).values,
+        torch.sort(torch.gather(ref_scores, 1, eager.long()), dim=-1).values,
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,10 +224,32 @@ def test_fused_paged_score_and_topk_matches_dense_scorer(
     )
     ref_scores = _reference_scores(q, dense_k, head_gates, cache_seqlens)
     torch.testing.assert_close(
-        torch.sort(torch.gather(ref_scores, 1, paged_topk), dim=-1).values,
-        torch.sort(torch.gather(ref_scores, 1, dense_topk), dim=-1).values,
+        torch.sort(torch.gather(ref_scores, 1, paged_topk.long()), dim=-1).values,
+        torch.sort(torch.gather(ref_scores, 1, dense_topk.long()), dim=-1).values,
         atol=2e-2,
         rtol=2e-2,
+    )
+
+
+def test_fast_topk_2048_cuda_matches_torch_topk_values():
+    torch.cuda.set_device(0)
+    torch.manual_seed(20260430)
+    batch_size = 3
+    max_seqlen = 4096
+    scores = torch.randn(batch_size, max_seqlen, device="cuda", dtype=torch.float32)
+    lengths = torch.tensor([4096, 3072, 2057], device="cuda", dtype=torch.int32)
+    pos = torch.arange(max_seqlen, device="cuda")
+    masked_scores = scores.masked_fill(pos.unsqueeze(0) >= lengths.unsqueeze(1), -float("inf"))
+
+    actual = fast_topk_2048(masked_scores, lengths)
+    ref_values, _ = torch.topk(masked_scores, 2048, dim=-1)
+    actual_values = torch.gather(masked_scores, 1, actual.long())
+
+    torch.testing.assert_close(
+        torch.sort(actual_values, dim=-1).values,
+        torch.sort(ref_values, dim=-1).values,
+        atol=0,
+        rtol=0,
     )
 
 

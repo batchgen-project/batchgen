@@ -10,6 +10,10 @@ from batchgen.models.glm.glm5.decode_utils import (
     clamp_token_indices_to_seqlens,
     reorder_block_table_to_batch_slots,
 )
+from batchgen.models.glm.glm5.cuda_graph_policy import (
+    glm5_dsa_cuda_graph_requested_for_model,
+    should_warmup_cuda_graphs_before_decode,
+)
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
     _glm5_dsa_cuda_graph_can_replay,
@@ -365,6 +369,36 @@ def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():
         max_seqlen=8,
         index_topk=index_topk,
         captured_max_seqlen=6,
+    )
+
+
+def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
+    env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
+
+    assert glm5_dsa_cuda_graph_requested_for_model("zai-org/GLM-5-FP8", environ=env)
+    assert should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=True,
+        model_name="zai-org/GLM-5-FP8",
+        environ=env,
+    )
+    assert not should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=True,
+        global_batch_has_queueing=True,
+        model_name="zai-org/GLM-5-FP8",
+        environ=env,
+    )
+    assert not should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=True,
+        model_name="gpt-oss-120b",
+        environ=env,
+    )
+    assert should_warmup_cuda_graphs_before_decode(
+        graph_manager_is_initialized=False,
+        global_batch_has_queueing=False,
+        model_name="gpt-oss-120b",
+        environ={},
     )
 
 

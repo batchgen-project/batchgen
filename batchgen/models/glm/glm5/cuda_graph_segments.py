@@ -187,7 +187,7 @@ class Glm5DsaAttnSegment:
                 ("batch_size", 1, self.num_attn_heads, self.attn_out_dim),
                 torch.bfloat16,
             ),
-            "top_k_indices": TensorSpec(("batch_size", self.index_topk), torch.int64),
+            "top_k_indices": TensorSpec(("batch_size", self.index_topk), torch.int32),
             "selected_lengths": TensorSpec(("batch_size",), torch.int32),
             "selected_mla_kv": TensorSpec(
                 ("batch_size", self.index_topk, 1, self.kv_dim), torch.bfloat16
@@ -226,7 +226,7 @@ class Glm5DsaAttnSegment:
         top_k_indices = torch.empty(
             bucket_size,
             self.index_topk,
-            dtype=torch.long,
+            dtype=torch.int32,
             device=device,
         )
         selected_mla_kv = torch.empty(

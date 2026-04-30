@@ -5557,10 +5557,24 @@ class BatchGenWorker:
 				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
 
-				# CUDA Graph Warmup (lazy, one-time) — only capture for final batch
-				# (all sequences prefilled, no more queueing). Earlier iterations
-				# have dynamic batch sizes from prefill/decode interleaving.
-				if self._cuda_graph_manager is None and not self.global_batch.has_queueing():
+				# CUDA Graph Warmup (lazy, one-time). Whole-model graph paths wait
+				# until the final admitted batch; GLM-5 DSA graph captures only the
+				# per-DP-rank decode segment, so queued prefill work must not block it.
+				from batchgen.models.glm.glm5.cuda_graph_policy import (
+					should_warmup_cuda_graphs_before_decode,
+				)
+
+				has_queueing = self.global_batch.has_queueing()
+				if should_warmup_cuda_graphs_before_decode(
+					graph_manager_is_initialized=self._cuda_graph_manager is not None,
+					global_batch_has_queueing=has_queueing,
+					model_name=getattr(self, "model_name", None),
+				):
+					if has_queueing:
+						logging.info(
+							f"Rank {self.rank}: warming GLM-5 DSA CUDA graph with queued "
+							"prefill work still pending; capture is decode-segment-only"
+						)
 					self._warmup_cuda_graphs()
 
 				# C. Execute Continuous Decode
