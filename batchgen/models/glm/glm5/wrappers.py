@@ -980,6 +980,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
 
+            attn = self.module
             selector_inputs = eager_debug.get("selector_inputs")
             eager_attn_heads = eager_debug.get("attn_heads")
             checks = [
@@ -993,6 +994,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
             if selector_inputs is not None:
                 checks.extend(
                     [
+                        self._compare_tensor_summary(
+                            "q_nope",
+                            graph_inputs.q_nope,
+                            selector_inputs.q_nope,
+                        ),
+                        self._compare_tensor_summary(
+                            "q_rope",
+                            graph_inputs.q_rope,
+                            selector_inputs.q_rope,
+                        ),
                         self._compare_tensor_summary(
                             "primary_k_tensor",
                             graph_inputs.primary_k_tensor,
@@ -1021,6 +1032,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
                             selector_inputs.selected_mla_kv,
                             atol=0.0,
                             rtol=0.0,
+                        ),
+                        self._compare_tensor_summary(
+                            "absorbed_q",
+                            graph_outputs.get("absorbed_q"),
+                            selector_inputs.query_states[:, 0, :, : attn.kv_lora_rank],
+                        ),
+                        self._compare_tensor_summary(
+                            "query_states",
+                            graph_outputs.get("query_states"),
+                            selector_inputs.query_states,
+                            atol=0.0,
+                            rtol=0.0,
+                        ),
+                        self._compare_tensor_summary(
+                            "raw_attn_out",
+                            graph_outputs.get("raw_attn_out"),
+                            eager_debug.get("raw_attn_out"),
                         ),
                     ]
                 )
@@ -1229,6 +1257,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if return_debug:
             return attn_output, {
                 "selector_inputs": selector_inputs,
+                "raw_attn_out": attn_out,
                 "attn_heads": attn_heads,
             }
         return attn_output

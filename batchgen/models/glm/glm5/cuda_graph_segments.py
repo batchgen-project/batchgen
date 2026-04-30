@@ -204,6 +204,18 @@ class Glm5DsaAttnSegment:
             "selected_mla_kv": TensorSpec(
                 ("batch_size", self.index_topk, 1, self.kv_dim), torch.bfloat16
             ),
+            "absorbed_q": TensorSpec(
+                ("batch_size", self.num_attn_heads, self.kv_lora_rank),
+                torch.bfloat16,
+            ),
+            "query_states": TensorSpec(
+                ("batch_size", 1, self.num_attn_heads, self.kv_dim),
+                torch.bfloat16,
+            ),
+            "raw_attn_out": TensorSpec(
+                ("batch_size", 1, self.num_attn_heads, self.kv_lora_rank),
+                torch.bfloat16,
+            ),
         }
 
     def setup_static_buffers(self, bucket_size: int) -> None:
@@ -375,6 +387,9 @@ class Glm5DsaAttnSegment:
             "top_k_indices": buffers.top_k_indices,
             "selected_lengths": buffers.selected_lengths,
             "selected_mla_kv": buffers.selected_mla_kv,
+            "absorbed_q": buffers.absorbed_q,
+            "query_states": buffers.query_states,
+            "raw_attn_out": attn_out,
         }
 
 

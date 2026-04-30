@@ -40,6 +40,8 @@ class Glm5DsaFlashMlaInputs:
 
     flashmla: PreparedSparseFlashMlaDecode
     query_states: torch.Tensor
+    q_nope: torch.Tensor
+    q_rope: torch.Tensor
     selected_mla_kv: torch.Tensor
     selected_lengths: torch.Tensor
     selected_indices: torch.Tensor | None
@@ -440,6 +442,8 @@ def build_glm5_dsa_flashmla_inputs(
     return Glm5DsaFlashMlaInputs(
         flashmla=flashmla,
         query_states=query_states,
+        q_nope=q_nope.squeeze(2).contiguous(),
+        q_rope=q_pe.squeeze(2).contiguous(),
         selected_mla_kv=selected_mla_kv,
         selected_lengths=selected_lengths,
         selected_indices=selected_indices,
