@@ -40,6 +40,14 @@ def test_build_clamped_dense_token_indices_caps_each_row():
         device=torch.device("cpu"),
     )
 
+    assert indices.shape == (3, 128)
+    assert indices[0, :6].tolist() == [0, 0, 0, 0, 0, 0]
+    assert indices[1, 60:68].tolist() == [60, 61, 62, 63, 64, 64, 64, 64]
+    assert indices[2, 124:128].tolist() == [124, 125, 126, 127]
+    assert bool(
+        (indices <= (cache_seqlens.to(torch.long) - 1).unsqueeze(-1)).all().item()
+    )
+
 
 def test_glm5_moe_graph_compare_layer_selection(monkeypatch):
     monkeypatch.setattr(
@@ -71,14 +79,6 @@ def test_glm5_moe_graph_compare_defaults_to_layer3(monkeypatch):
 
     assert _glm5_moe_graph_compare_layer_enabled(3)
     assert not _glm5_moe_graph_compare_layer_enabled(20)
-
-    assert indices.shape == (3, 128)
-    assert indices[0, :6].tolist() == [0, 0, 0, 0, 0, 0]
-    assert indices[1, 60:68].tolist() == [60, 61, 62, 63, 64, 64, 64, 64]
-    assert indices[2, 124:128].tolist() == [124, 125, 126, 127]
-    assert bool(
-        (indices <= (cache_seqlens.to(torch.long) - 1).unsqueeze(-1)).all().item()
-    )
 
 
 def test_clamp_token_indices_to_seqlens_caps_topk_tail():
