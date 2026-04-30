@@ -190,6 +190,24 @@ def _log_glm5_dsa_graph_compare_unavailable_once(
     )
 
 
+def _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager) -> Optional[torch.Tensor]:
+    page_table_manager = getattr(gpu_paged_kv_manager, "_gpu_page_table_manager", None)
+    return getattr(page_table_manager, "gpu_table", None)
+
+
+def _glm5_dsa_page_table_signature(
+    page_table: Optional[torch.Tensor],
+) -> Optional[Tuple[int, Tuple[int, ...], str, str]]:
+    if page_table is None:
+        return None
+    return (
+        int(page_table.data_ptr()),
+        tuple(int(dim) for dim in page_table.shape),
+        str(page_table.dtype),
+        str(page_table.device),
+    )
+
+
 def _fail_if_glm5_dsa_cuda_graph_required_without_replay() -> None:
     if not _glm5_dsa_cuda_graph_required():
         return
@@ -373,6 +391,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._dsa_cuda_graph_max_seqlen = 0
         self._dsa_cuda_graph_max_primary_pages = 0
         self._dsa_cuda_graph_max_aux_pages = 0
+        self._dsa_cuda_graph_primary_page_table_signature = None
+        self._dsa_cuda_graph_aux_page_table_signature = None
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -519,14 +539,56 @@ class GLM5AttnWrapper(AttnWrapperBase):
         segment_name: str,
         *,
         max_seqlen: int,
-        max_primary_pages_per_seq: int,
-        max_aux_pages_per_seq: int,
+        max_primary_pages_per_seq: Optional[int] = None,
+        max_aux_pages_per_seq: Optional[int] = None,
+        primary_page_table: Optional[torch.Tensor] = None,
+        aux_page_table: Optional[torch.Tensor] = None,
     ) -> None:
         self._dsa_cuda_graph_manager = manager
         self._dsa_cuda_graph_segment_name = segment_name
         self._dsa_cuda_graph_max_seqlen = max_seqlen
-        self._dsa_cuda_graph_max_primary_pages = max_primary_pages_per_seq
-        self._dsa_cuda_graph_max_aux_pages = max_aux_pages_per_seq
+        self._dsa_cuda_graph_max_primary_pages = (
+            primary_page_table.shape[1]
+            if primary_page_table is not None
+            else int(max_primary_pages_per_seq or 0)
+        )
+        self._dsa_cuda_graph_max_aux_pages = (
+            aux_page_table.shape[1]
+            if aux_page_table is not None
+            else int(max_aux_pages_per_seq or 0)
+        )
+        self._dsa_cuda_graph_primary_page_table_signature = _glm5_dsa_page_table_signature(
+            primary_page_table
+        )
+        self._dsa_cuda_graph_aux_page_table_signature = _glm5_dsa_page_table_signature(
+            aux_page_table
+        )
+
+    def _dsa_cuda_graph_page_tables_match(
+        self,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+    ) -> bool:
+        primary_expected = getattr(
+            self,
+            "_dsa_cuda_graph_primary_page_table_signature",
+            None,
+        )
+        aux_expected = getattr(
+            self,
+            "_dsa_cuda_graph_aux_page_table_signature",
+            None,
+        )
+        if primary_expected is None or aux_expected is None:
+            return False
+        return (
+            _glm5_dsa_page_table_signature(
+                _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager)
+            ) == primary_expected
+            and _glm5_dsa_page_table_signature(
+                _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager_aux)
+            ) == aux_expected
+        )
 
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward with DSA auxiliary cache population.
@@ -748,6 +810,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"valid when every row has cache_seqlens > index_topk={index_topk}; "
                 "short or mixed rows require eager DSA FlashMLA metadata"
             )
+        if not self._dsa_cuda_graph_page_tables_match(
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+        ):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph captured page-table "
+                "storage no longer matches the active GPU page-table storage"
+            )
 
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_graph_segment_inputs,
@@ -761,8 +831,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
             max_seqlen,
             gpu_paged_kv_manager,
             gpu_paged_kv_manager_aux,
-            max_primary_pages_per_seq=self._dsa_cuda_graph_max_primary_pages,
-            max_aux_pages_per_seq=self._dsa_cuda_graph_max_aux_pages,
         )
         if AttnWrapperBase.kv_append_callback is not None:
             AttnWrapperBase.kv_append_callback(
@@ -786,8 +854,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             head_gates=graph_inputs.head_gates,
             cache_seqlens=graph_inputs.cache_seqlens,
             positions_expanded=graph_inputs.positions_expanded,
-            primary_page_table=graph_inputs.primary_page_table,
-            aux_page_table=graph_inputs.aux_page_table,
+            primary_slot_indices=graph_inputs.primary_slot_indices,
+            aux_slot_indices=graph_inputs.aux_slot_indices,
         )
 
         return self._project_dsa_attn_heads(graph_outputs["attn_heads"])
@@ -881,8 +949,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 max_seqlen,
                 gpu_paged_kv_manager,
                 gpu_paged_kv_manager_aux,
-                max_primary_pages_per_seq=self._dsa_cuda_graph_max_primary_pages,
-                max_aux_pages_per_seq=self._dsa_cuda_graph_max_aux_pages,
                 write_kv=False,
             )
             graph_outputs = self._dsa_cuda_graph_manager.replay(
@@ -894,8 +960,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 head_gates=graph_inputs.head_gates,
                 cache_seqlens=graph_inputs.cache_seqlens,
                 positions_expanded=graph_inputs.positions_expanded,
-                primary_page_table=graph_inputs.primary_page_table,
-                aux_page_table=graph_inputs.aux_page_table,
+                primary_slot_indices=graph_inputs.primary_slot_indices,
+                aux_slot_indices=graph_inputs.aux_slot_indices,
             )
             graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
 
@@ -1009,7 +1075,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     bsz,
                 )
             )
-            if graph_can_replay and graph_has_bucket and not compare_active:
+            graph_page_tables_match = graph_has_bucket and self._dsa_cuda_graph_page_tables_match(
+                gpu_paged_kv_manager,
+                gpu_paged_kv_manager_aux,
+            )
+            if graph_can_replay and graph_has_bucket and graph_page_tables_match and not compare_active:
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -1019,7 +1089,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     gpu_paged_kv_manager_aux,
                 )
             compare_after_eager = bool(
-                compare_active and compare_this_layer and graph_can_replay and graph_has_bucket
+                compare_active
+                and compare_this_layer
+                and graph_can_replay
+                and graph_has_bucket
+                and graph_page_tables_match
             )
             if not graph_can_replay:
                 captured_cap = getattr(self, "_dsa_cuda_graph_max_seqlen", None)
@@ -1032,6 +1106,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     reason = "current decode rows are not all longer than index_topk"
             elif not graph_has_bucket:
                 reason = f"batch size {bsz} has no captured graph bucket"
+            elif not graph_page_tables_match:
+                reason = "captured page-table storage no longer matches active storage"
             else:
                 reason = "graph/eager compare mode is returning eager output"
             _log_glm5_dsa_graph_eager_fallback_once(

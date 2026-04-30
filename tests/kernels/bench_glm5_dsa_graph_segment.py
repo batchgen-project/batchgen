@@ -92,8 +92,6 @@ def _make_aux_cache(batch_size: int, max_seqlen: int):
 def _make_inputs(
     batch_size: int,
     max_seqlen: int,
-    primary_page_table: torch.Tensor,
-    aux_page_table: torch.Tensor,
 ):
     positions = torch.randint(
         0,
@@ -129,8 +127,8 @@ def _make_inputs(
         "positions_expanded": positions[:, None]
         .expand(batch_size, INDEX_HEADS)
         .contiguous(),
-        "primary_page_table": primary_page_table,
-        "aux_page_table": aux_page_table,
+        "primary_slot_indices": torch.arange(batch_size, device="cuda", dtype=torch.int32),
+        "aux_slot_indices": torch.arange(batch_size, device="cuda", dtype=torch.int32),
     }
 
 
@@ -153,6 +151,8 @@ def _make_segment(batch_size: int, max_seqlen: int, index_topk: int, module):
     segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
         aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
         wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
         absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
         cuda_module=module,
@@ -210,12 +210,7 @@ def main() -> None:
                 topk,
                 module,
             )
-            inputs = _make_inputs(
-                batch_size,
-                max_seqlen,
-                primary_page_table,
-                aux_page_table,
-            )
+            inputs = _make_inputs(batch_size, max_seqlen)
             segment_name = make_glm5_dsa_graph_segment_name(0)
             manager = CUDAGraphManager(
                 BatchSizeBucketing([batch_size]),

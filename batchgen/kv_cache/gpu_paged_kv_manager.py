@@ -330,25 +330,29 @@ class GPUPagedKVLayout:
 
 
 class _GPUPageTableManager:
-	"""Lightweight manager that maintains a 2-D GPU tensor acting as a
-	page table. The table layout is [num_slots, max_pages_per_sequence]
-	and uses -1 as the padding value for sequences with fewer pages.
+	"""Maintains graph-stable GPU page-table storage.
 
-	The manager also keeps two small host-side mappings to translate
-	sequence ids <-> slot indices: ``seq_id_to_slot`` and
-	``slot_to_seq_id``. The table is rebuilt (on device) on demand when
-	`rebuild` is called. The rebuild operation is intentionally simple and
-	safe because it is expected to be infrequent.
+	The backing tensor is reserved once as
+	``[max_slots, max_pages_per_sequence]`` and updated in-place.  Rebuilds
+	change only contents and the host-side ``seq_id <-> slot`` mappings, so
+	CUDA graphs can safely capture the page-table pointer and use runtime
+	slot indices to select active rows.
 	"""
 
-	def __init__(self, device: torch.device, max_pages_per_sequence: int):
+	def __init__(
+		self,
+		device: torch.device,
+		max_pages_per_sequence: int,
+		max_slots: int,
+	):
 		self.device = device
 		self.max_pages_per_sequence = int(max_pages_per_sequence)
+		self.max_slots = int(max_slots)
 		self.seq_id_to_slot: Dict[int, int] = {}
 		self.slot_to_seq_id: List[
 			Optional[int]
 		] = []  # this is also sequence order
-		# GPU tensor of shape [num_slots, max_pages_per_sequence]
+		# GPU tensor of shape [max_slots, max_pages_per_sequence]
 		self.gpu_table: Optional[torch.Tensor] = None
 		# Small cached 1-D slot_ids,like [0, 1, 2, ...] total length is len(sequence_ids)
 		self._slot_index_tensor: Optional[torch.Tensor] = None
@@ -368,66 +372,62 @@ class _GPUPageTableManager:
 	) -> torch.Tensor:
 		"""(Re)build the GPU page table for the provided sequence order.
 
-		Optimization: if the requested `sequence_ids` exactly matches the
-		current `slot_to_seq_id` prefix and a GPU table already exists,
-		return a view into the existing tensor instead of rebuilding.
+		The backing tensor keeps a stable capacity and pointer; this method
+		rewrites active rows in-place and returns the active-row view.
 		"""
 		wanted_order = list(sequence_ids)
 
-		# Compute the maximum number of pages required by the provided
-		# sequences. If any sequence requires more than the current
-		# max_pages_per_sequence, expand the table size by at least one
-		# extra page (leave an extra slot) to reduce immediate re-resize.
+		if len(wanted_order) > self.max_slots:
+			raise RuntimeError(
+				f"GPU page table capacity exceeded: requested {len(wanted_order)} "
+				f"slots, reserved {self.max_slots}"
+			)
+
+		# Compute the maximum number of pages required by the provided sequences.
 		max_required = 0
 		for seq_id in wanted_order:
 			state = sequences.get(seq_id)
 			if state is None:
 				continue
 			max_required = max(max_required, int(state.pages.numel()))
-
-		# Ensure at least one extra page margin.
-		desired_pages = max_required + 1
-		# new_max = max(self.max_pages_per_sequence, desired_pages)
-		new_max = desired_pages
+		if max_required > self.max_pages_per_sequence:
+			raise RuntimeError(
+				f"GPU page table page capacity exceeded: sequence needs {max_required} "
+				f"pages, reserved {self.max_pages_per_sequence}"
+			)
 
 		num_slots = len(wanted_order)
 		flat_pages_cpu = self._build_flat_page_index_tensor(
 			wanted_order, sequences
 		)
 
-		# Fast-path: if an existing GPU table already matches the exact
-		# shape we need and the order is identical, return a view into it.
 		old_shape = self.gpu_table.shape if self.gpu_table is not None else None
 		old_slot_count = len(self.slot_to_seq_id) if self.slot_to_seq_id else 0
-		
-		shape_match = self.gpu_table is not None and self.gpu_table.shape[0] == num_slots
-		cols_sufficient = self.gpu_table is not None and self.gpu_table.shape[1] >= new_max
 		order_match = self.slot_to_seq_id == wanted_order
-		
-		reuse_existing = (
-			self.gpu_table is not None
-			and shape_match
-			and cols_sufficient
-			and order_match
-		)
+		reuse_existing = self.gpu_table is not None
 		
 		# DEBUG: Log detailed rebuild info
 		if BATCHGEN_CB_DEBUG:
 			logging.info(
 				f"GPUPageTableManager.rebuild: "
-				f"num_slots={num_slots}, new_max={new_max}, "
+				f"num_slots={num_slots}, max_required={max_required}, "
 				f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
-				f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, order_match={order_match}, "
+				f"capacity=({self.max_slots}, {self.max_pages_per_sequence}), "
+				f"order_match={order_match}, "
 				f"reuse_existing={reuse_existing}"
 			)
 
-		table = (
-			self.gpu_table
-			if reuse_existing
-			else torch.full(
-				(num_slots, new_max), -1, dtype=torch.int32, device=self.device
+		if self.gpu_table is None:
+			self.gpu_table = torch.full(
+				(self.max_slots, self.max_pages_per_sequence),
+				-1,
+				dtype=torch.int32,
+				device=self.device,
 			)
-		)
+		table = self.gpu_table
+		rows_to_clear = max(old_slot_count, num_slots)
+		if rows_to_clear:
+			table[:rows_to_clear, :].fill_(-1)
 
 		# Replace mappings with exactly the requested order. This keeps
 		# the slot mapping deterministic and equal in length to num_slots.
@@ -435,9 +435,8 @@ class _GPUPageTableManager:
 			seq_id: idx for idx, seq_id in enumerate(wanted_order)
 		}
 		self.slot_to_seq_id = list(wanted_order)
-		self.max_pages_per_sequence = int(new_max)
 
-		fill_region = table[:num_slots, :new_max]
+		fill_region = table[:num_slots, :]
 
 		# Fill table rows from sequence state pages.
 		# Always clear unused columns to prevent stale page IDs from
@@ -449,23 +448,7 @@ class _GPUPageTableManager:
 				continue
 			pages = state.pages.to(self.device, dtype=torch.int32)
 			count = int(pages.numel())
-			# pages should fit into new_max because we ensured desired_pages
-			if count > new_max:
-				# As a last-resort safety: truncate to new_max and log.
-				logging.warning(
-					"Sequence %s has %d pages > new_max %d; truncating",
-					seq_id,
-					count,
-					new_max,
-				)
-				count = new_max
-				pages = pages[:count]
 			fill_region[slot, :count] = pages[:count]
-			if count < new_max:
-				fill_region[slot, count:] = -1
-
-		if not reuse_existing:
-			self.gpu_table = table
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
@@ -483,8 +466,6 @@ class _GPUPageTableManager:
 				f"slot_to_seq_id_len={len(self.slot_to_seq_id)}"
 			)
 		
-		# If table has more columns than needed, return a view with
-		# the requested number of rows and the existing columns.
 		return table[:num_slots, :]
 
 	def get_slot_index_tensor(self) -> torch.Tensor:
@@ -816,18 +797,24 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		mgr = self._gpu_page_table_manager
 		
-		# Clear the GPU table to empty shape [0, max_pages]
-		max_pages = mgr.max_pages_per_sequence if mgr.max_pages_per_sequence > 0 else 1
-		mgr.gpu_table = torch.full(
-			(0, max_pages), -1, dtype=torch.int32, device=mgr.device
-		)
+		# Preserve the graph-visible storage pointer. The live batch is
+		# represented by slot metadata, not by resizing this tensor.
+		if mgr.gpu_table is None:
+			mgr.gpu_table = torch.full(
+				(mgr.max_slots, mgr.max_pages_per_sequence),
+				-1,
+				dtype=torch.int32,
+				device=mgr.device,
+			)
+		else:
+			mgr.gpu_table.fill_(-1)
 		
 		# Clear the slot mappings
 		mgr.seq_id_to_slot = {}
 		mgr.slot_to_seq_id = []
-		mgr._slot_index_tensor = None
-		mgr._slot_to_seq_id_tensor = None
-		mgr._active_page_indices_cpu = None
+		mgr._slot_index_tensor = torch.empty(0, dtype=torch.int32, device=mgr.device)
+		mgr._slot_to_seq_id_tensor = torch.empty(0, dtype=torch.int64, device=mgr.device)
+		mgr._active_page_indices_cpu = torch.empty(0, dtype=torch.int64)
 		mgr.rebuild_version += 1
 		
 		# Clear active page pointer tables
@@ -1466,13 +1453,65 @@ class GPUPagedKVCacheManager:
 		self._v_active_page_ptr_table = None
 		self._free_pages = _TensorStack(self.config.num_pages)
 		self._sequences: Dict[int, _SequenceState] = {}
-		max_pages_per_seq = _ceil_div(
-			DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
-		)
+		max_pages_per_seq = self._resolve_page_table_max_pages_per_sequence()
+		max_slots = self._resolve_page_table_max_slots()
 		self._gpu_page_table_manager = _GPUPageTableManager(
-			device=self.device, max_pages_per_sequence=max_pages_per_seq
+			device=self.device,
+			max_pages_per_sequence=max_pages_per_seq,
+			max_slots=max_slots,
 		)
 		self._is_initialized = False
+
+	def _resolve_page_table_max_slots(self) -> int:
+		env_value = _positive_or_none(
+			int(os.environ["BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS"])
+			if "BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS" in os.environ
+			else None
+		)
+		if env_value is not None:
+			return min(env_value, self.config.num_pages)
+
+		candidates: List[int] = []
+		if self._engine_config is not None:
+			basic = self._engine_config.Basic_Config
+			module_batching = self._engine_config.Module_Batching_Config
+			for value in (
+				module_batching.global_batch_size,
+				module_batching.attn_decoding_micro_batch_size,
+				basic.num_queries,
+			):
+				normalized = _positive_or_none(value)
+				if normalized is not None:
+					candidates.append(normalized)
+		if not candidates:
+			candidates.append(self.config.num_pages)
+		return max(1, min(max(candidates), self.config.num_pages))
+
+	def _resolve_page_table_max_pages_per_sequence(self) -> int:
+		env_value = _positive_or_none(
+			int(os.environ["BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE"])
+			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
+			else None
+		)
+		if env_value is not None:
+			return min(env_value, self.config.num_pages)
+
+		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
+		if self._engine_config is not None:
+			basic = self._engine_config.Basic_Config
+			max_prompt = basic.get_max_prompt_length()
+			max_decode = basic.max_decoding_length
+			if max_prompt is not None and max_decode is not None:
+				token_capacity = max(token_capacity, int(max_prompt) + int(max_decode))
+			elif max_prompt is not None:
+				token_capacity = max(token_capacity, int(max_prompt))
+			elif max_decode is not None:
+				token_capacity = max(token_capacity, int(max_decode))
+			prepack_capacity = self._engine_config.Module_Batching_Config.prepack_row_capacity
+			if prepack_capacity is not None and prepack_capacity > 0:
+				token_capacity = max(token_capacity, int(prepack_capacity))
+		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
+		return max(1, min(page_capacity, self.config.num_pages))
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":

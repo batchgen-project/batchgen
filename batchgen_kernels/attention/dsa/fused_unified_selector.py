@@ -16,6 +16,7 @@ import triton.language as tl
 def _unified_select_kernel(
     blocked_kv_ptr,
     block_table_ptr,
+    slot_indices_ptr,
     cache_seqlens_ptr,
     long_topk_ptr,
     selected_ptr,
@@ -27,11 +28,15 @@ def _unified_select_kernel(
     max_pages_per_seq: tl.constexpr,
     D: tl.constexpr,
     STORE_INDICES: tl.constexpr,
+    USE_SLOT_INDICES: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
+    slot = pid_b
+    if USE_SLOT_INDICES:
+        slot = tl.load(slot_indices_ptr + pid_b).to(tl.int64)
 
     t_start = pid_t * BLOCK_T
     d_offs = tl.arange(0, BLOCK_D)
@@ -60,7 +65,7 @@ def _unified_select_kernel(
             logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
 
             physical_page = tl.load(
-                block_table_ptr + pid_b * max_pages_per_seq + logical_page,
+                block_table_ptr + slot * max_pages_per_seq + logical_page,
             ).to(tl.int64)
             valid = valid & page_in_table & (physical_page >= 0)
             physical_page = tl.maximum(physical_page, 0)
@@ -86,6 +91,7 @@ def fused_select_mla_kv_bf16(
     page_size: int,
     *,
     return_indices: bool = True,
+    primary_slot_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Gather selected GLM-5 BF16 MLA KV for FlashMLA dense decode."""
 
@@ -139,6 +145,7 @@ def fused_select_mla_kv_bf16(
         selected_indices,
         row_modes,
         return_indices=return_indices,
+        primary_slot_indices=primary_slot_indices,
     )
 
     return (
@@ -161,11 +168,14 @@ def fused_select_mla_kv_bf16_out(
     row_modes: torch.Tensor,
     *,
     return_indices: bool = True,
+    primary_slot_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Out-buffer variant for CUDA graph capture."""
 
     primary_blocked_k = primary_blocked_k.contiguous()
     primary_page_table = primary_page_table.contiguous()
+    if primary_slot_indices is not None:
+        primary_slot_indices = primary_slot_indices.contiguous()
     cache_seqlens = cache_seqlens.contiguous()
     long_topk_indices = long_topk_indices.contiguous()
 
@@ -175,6 +185,17 @@ def fused_select_mla_kv_bf16_out(
     dim = num_heads * head_dim
     max_pages_per_seq = primary_page_table.shape[1]
     selected_flat = selected_mla_kv.view(batch_size, index_topk, dim)
+    if primary_slot_indices is not None:
+        if primary_slot_indices.shape != (batch_size,):
+            raise ValueError(
+                "primary_slot_indices must have shape [B], "
+                f"got {tuple(primary_slot_indices.shape)}"
+            )
+        if primary_slot_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "primary_slot_indices must be int32/int64, "
+                f"got {primary_slot_indices.dtype}"
+            )
 
     block_d = triton.next_power_of_2(dim)
     total_work = batch_size * index_topk
@@ -188,6 +209,7 @@ def fused_select_mla_kv_bf16_out(
     _unified_select_kernel[grid](
         primary_blocked_k.reshape(-1, dim),
         primary_page_table,
+        primary_slot_indices if primary_slot_indices is not None else cache_seqlens,
         cache_seqlens,
         long_topk_indices,
         selected_flat,
@@ -199,6 +221,7 @@ def fused_select_mla_kv_bf16_out(
         max_pages_per_seq=max_pages_per_seq,
         D=dim,
         STORE_INDICES=return_indices,
+        USE_SLOT_INDICES=primary_slot_indices is not None,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
     )

@@ -273,6 +273,75 @@ def _fused_paged_score_kernel(
 
 
 @triton.jit
+def _fused_paged_score_with_slots_kernel(
+    Q_ptr,             # [B, n_heads, head_dim] BF16
+    K_ptr,             # [num_pages, page_size, 1, head_dim] BF16
+    BLOCK_TABLE_ptr,   # [num_slots, max_pages_per_seq] int32/int64
+    SLOT_INDICES_ptr,  # [B] int32/int64
+    GATES_ptr,         # [B, n_heads] FP32
+    SEQLENS_ptr,       # [B] int32
+    AGG_ptr,           # [B, max_seqlen] FP32
+    max_seqlen,
+    B: tl.constexpr,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages_per_seq: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Score Q against paged aux K using runtime slot indices."""
+
+    pid_s = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    slot = tl.load(SLOT_INDICES_ptr + pid_b).to(tl.int64)
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    seqlen = tl.load(SEQLENS_ptr + pid_b)
+    s_mask = s_offs < seqlen
+    page_in_range = s_offs < max_seqlen
+
+    logical_page = s_offs // page_size
+    page_offset = s_offs - logical_page * page_size
+    page_in_table = logical_page < max_pages_per_seq
+    safe_logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
+    physical_page = tl.load(
+        BLOCK_TABLE_ptr + slot * max_pages_per_seq + safe_logical_page,
+        mask=page_in_range,
+        other=-1,
+    ).to(tl.int64)
+    k_valid = page_in_table & (physical_page >= 0)
+    physical_page = tl.maximum(physical_page, 0)
+
+    agg = tl.where(
+        s_mask,
+        tl.zeros([BLOCK_S], dtype=tl.float32),
+        float("-inf") + tl.zeros([BLOCK_S], dtype=tl.float32),
+    )
+
+    d_offs = tl.arange(0, BLOCK_D)
+    k_ptrs = K_ptr + (physical_page[:, None] * page_size + page_offset[:, None]) * head_dim + d_offs[None, :]
+    k_tile = tl.load(
+        k_ptrs,
+        mask=page_in_range[:, None] & (d_offs[None, :] < head_dim) & k_valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    q_base = pid_b * n_heads * head_dim
+    gates_base = pid_b * n_heads
+
+    for h in range(n_heads):
+        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
+        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
+        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
+        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+
+    agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
+    tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
+
+
+@triton.jit
 def _topk_from_scores_kernel(
     AGG_ptr,           # [B, max_seqlen] FP32
     OUT_ptr,           # [B, topk] int64/int32
@@ -497,6 +566,97 @@ def fused_paged_score_and_topk_out(
         q,
         aux_blocked_k.reshape(-1, head_dim),
         aux_page_table,
+        head_gates,
+        cache_seqlens,
+        agg,
+        max_seqlen,
+        B=B,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        max_pages_per_seq=aux_page_table.shape[1],
+        BLOCK_S=BLOCK_S,
+        BLOCK_D=BLOCK_D,
+    )
+
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
+    return top_k_indices
+
+
+def fused_paged_score_and_topk_with_slots_out(
+    q: torch.Tensor,
+    aux_blocked_k: torch.Tensor,
+    aux_page_table: torch.Tensor,
+    aux_slot_indices: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    *,
+    topk: int = 2048,
+    page_size: int = 64,
+    max_seqlen: int | None = None,
+) -> torch.Tensor:
+    """Out-buffer score+top-k from full aux page table plus slot indices."""
+
+    B, n_heads, head_dim = q.shape
+    if max_seqlen is None:
+        max_seqlen = agg.shape[1]
+    if aux_blocked_k.ndim != 4:
+        raise ValueError(
+            "aux_blocked_k must have shape [num_pages, page_size, 1, head_dim], "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_blocked_k.shape[1] != page_size:
+        raise ValueError(f"aux page size mismatch: {aux_blocked_k.shape[1]} != {page_size}")
+    if aux_blocked_k.shape[2] != 1 or aux_blocked_k.shape[3] != head_dim:
+        raise ValueError(
+            f"aux_blocked_k must have one head and dim {head_dim}, "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_page_table.ndim != 2:
+        raise ValueError(f"aux_page_table must be 2-D, got {tuple(aux_page_table.shape)}")
+    if aux_slot_indices.shape != (B,):
+        raise ValueError(
+            f"aux_slot_indices must have shape {(B,)}, got {tuple(aux_slot_indices.shape)}"
+        )
+    if aux_slot_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"aux_slot_indices must be int32/int64, got {aux_slot_indices.dtype}")
+    if head_gates.shape != (B, n_heads):
+        raise ValueError(f"head_gates must have shape {(B, n_heads)}, got {tuple(head_gates.shape)}")
+    if cache_seqlens.shape != (B,):
+        raise ValueError(f"cache_seqlens must have shape {(B,)}, got {tuple(cache_seqlens.shape)}")
+    if agg.shape != (B, max_seqlen) or agg.dtype != torch.float32:
+        raise ValueError(
+            f"agg must be float32 with shape {(B, max_seqlen)}, got {tuple(agg.shape)} {agg.dtype}"
+        )
+    if topk > max_seqlen:
+        raise ValueError(f"topk={topk} exceeds max_seqlen={max_seqlen}")
+    if top_k_indices.shape != (B, topk):
+        raise ValueError(
+            f"top_k_indices must have shape {(B, topk)}, got {tuple(top_k_indices.shape)}"
+        )
+    if top_k_indices.dtype not in (torch.int64, torch.int32):
+        raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
+
+    BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
+    BLOCK_D = head_dim
+    grid = (triton.cdiv(max_seqlen, BLOCK_S), B)
+    _fused_paged_score_with_slots_kernel[grid](
+        q,
+        aux_blocked_k.reshape(-1, head_dim),
+        aux_page_table,
+        aux_slot_indices,
         head_gates,
         cache_seqlens,
         agg,

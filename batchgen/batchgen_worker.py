@@ -7873,10 +7873,11 @@ class BatchGenWorker:
 		if batch and gpu_manager and gpu_manager.is_initialized:
 			mgr = gpu_manager._gpu_page_table_manager
 			if mgr and mgr.gpu_table is not None:
-				if mgr.gpu_table.shape[0] != len(batch):
+				if len(mgr.slot_to_seq_id) != len(batch):
 					logging.error(
 						f"Rank {self.rank}: CRITICAL - Page table STILL mismatched at function return! "
-						f"gpu_table.shape[0]={mgr.gpu_table.shape[0]}, batch_size={len(batch)}"
+						f"active_slots={len(mgr.slot_to_seq_id)}, batch_size={len(batch)}, "
+						f"gpu_table.shape={tuple(mgr.gpu_table.shape)}"
 					)
 		
 		timing.total_ms = (time.perf_counter() - boundary_start) * 1000
@@ -8005,7 +8006,7 @@ class BatchGenWorker:
 		model_name = getattr(self, 'model_name', '') or ''
 		model_name_l = model_name.lower()
 		glm5_dsa_graph_enabled = (
-			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
+			self._glm5_dsa_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		if (
@@ -8028,12 +8029,16 @@ class BatchGenWorker:
 		if (
 			not self._glm5_dsa_graph_requested_for_current_batch()
 			or "glm" not in model_name_l
-			or self._cuda_graph_manager is None
 		):
 			return False
 		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 		if local_bsz <= 0:
 			return False
+		if self._glm5_dsa_graph_page_table_storage_changed():
+			self._cuda_graph_manager = None
+			return True
+		if self._cuda_graph_manager is None:
+			return True
 		try:
 			bucket = self._cuda_graph_manager.bucketing.get_padded_size(local_bsz)
 		except ValueError:
@@ -8041,6 +8046,52 @@ class BatchGenWorker:
 		if bucket in getattr(self, "_glm5_dsa_graph_failed_buckets", set()):
 			return False
 		return not self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz)
+
+	def _glm5_dsa_graph_page_table_storage_changed(self) -> bool:
+		if self._cuda_graph_manager is None:
+			return False
+		model_name_l = (getattr(self, 'model_name', '') or '').lower()
+		if "glm" not in model_name_l:
+			return False
+		try:
+			wrapper = self.model.model.layers[0].self_attn
+		except Exception:
+			return False
+		expected_primary = getattr(wrapper, "_dsa_cuda_graph_primary_page_table_signature", None)
+		expected_aux = getattr(wrapper, "_dsa_cuda_graph_aux_page_table_signature", None)
+		if expected_primary is None or expected_aux is None:
+			return False
+		gpu_manager = self._get_cuda_graph_gpu_manager()
+		if gpu_manager is None:
+			return False
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			return False
+
+		def _sig(manager):
+			page_table_manager = getattr(manager, "_gpu_page_table_manager", None)
+			table = getattr(page_table_manager, "gpu_table", None)
+			if table is None:
+				return None
+			return (
+				int(table.data_ptr()),
+				tuple(int(dim) for dim in table.shape),
+				str(table.dtype),
+				str(table.device),
+			)
+
+		if _sig(primary_manager) == expected_primary and _sig(aux_manager) == expected_aux:
+			return False
+		logging.warning(
+			f"Rank {self.rank}: GLM-5 DSA CUDA graph page-table storage changed; "
+			"discarding captured graphs and recapturing before replay"
+		)
+		return True
 
 	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1":
@@ -8211,8 +8262,12 @@ class BatchGenWorker:
 				raise RuntimeError("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN must be positive")
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
-			max_primary_pages = (graph_max_seqlen + primary_page_size - 1) // primary_page_size
-			max_aux_pages = (graph_max_seqlen + aux_page_size - 1) // aux_page_size
+			primary_page_table = primary_manager._gpu_page_table_manager.gpu_table
+			aux_page_table = aux_manager._gpu_page_table_manager.gpu_table
+			if primary_page_table is None or aux_page_table is None:
+				raise RuntimeError(
+					"GLM-5 DSA CUDA graph requested but GPU page-table storage is not initialized"
+				)
 			try:
 				capture_bucket = bucketing.get_padded_size(local_bsz)
 			except ValueError:
@@ -8256,6 +8311,8 @@ class BatchGenWorker:
 				segment = Glm5DsaAttnSegment(
 					primary_blocked_k=primary_blocked_k,
 					aux_blocked_k=aux_blocked_k,
+					primary_page_table=primary_page_table,
+					aux_page_table=aux_page_table,
 					wq_b_weights=wrapper._fused_wqb_weights,
 					absorb_weights=wrapper._fp8_absorb_weights,
 					cuda_module=wrapper._indexer_cuda_module,
@@ -8273,8 +8330,8 @@ class BatchGenWorker:
 					manager,
 					segment_name,
 					max_seqlen=graph_max_seqlen,
-					max_primary_pages_per_seq=max_primary_pages,
-					max_aux_pages_per_seq=max_aux_pages,
+					primary_page_table=primary_page_table,
+					aux_page_table=aux_page_table,
 				)
 
 			logging.info(

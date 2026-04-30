@@ -335,6 +335,11 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
         return expected
 
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph_route)
+    monkeypatch.setattr(
+        GLM5AttnWrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda self, primary, aux: True,
+    )
 
     actual = wrapper._forward_decode_dsa(
         torch.zeros(2, 1, 16),
@@ -382,6 +387,11 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_eager", fake_eager)
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph)
     monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph_compare", fake_compare)
+    monkeypatch.setattr(
+        GLM5AttnWrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda self, primary, aux: True,
+    )
 
     old_debug = AttnWrapperBase.batchgen_debug
     AttnWrapperBase.batchgen_debug = {"glm5_dsa_graph_compare": True}

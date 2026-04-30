@@ -49,9 +49,9 @@ def _rope_tables(max_pos: int, rope_dim: int = 64):
     )
 
 
-def _make_primary_cache(batch_size: int, max_seqlen: int):
+def _make_primary_cache(num_slots: int, max_seqlen: int):
     pages_per_seq = (max_seqlen + PAGE_SIZE - 1) // PAGE_SIZE
-    total_pages = batch_size * pages_per_seq
+    total_pages = num_slots * pages_per_seq
     blocked_k = (
         torch.randn(
             total_pages,
@@ -65,13 +65,13 @@ def _make_primary_cache(batch_size: int, max_seqlen: int):
     ).contiguous()
     page_table = torch.arange(
         total_pages, device="cuda", dtype=torch.int32
-    ).view(batch_size, pages_per_seq)
+    ).view(num_slots, pages_per_seq)
     return blocked_k, page_table
 
 
-def _make_aux_cache(batch_size: int, max_seqlen: int):
+def _make_aux_cache(num_slots: int, max_seqlen: int):
     pages_per_seq = (max_seqlen + PAGE_SIZE - 1) // PAGE_SIZE
-    total_pages = batch_size * pages_per_seq
+    total_pages = num_slots * pages_per_seq
     blocked_k = (
         torch.randn(
             total_pages,
@@ -85,7 +85,7 @@ def _make_aux_cache(batch_size: int, max_seqlen: int):
     ).contiguous()
     page_table = torch.arange(
         total_pages, device="cuda", dtype=torch.int32
-    ).view(batch_size, pages_per_seq)
+    ).view(num_slots, pages_per_seq)
     return blocked_k, page_table
 
 
@@ -123,11 +123,14 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     torch.manual_seed(20260430)
 
     batch_size = 2
+    num_slots = 4
     max_seqlen = 1024
     index_topk = 128
+    primary_slot_indices = torch.tensor([2, 0], device="cuda", dtype=torch.int32)
+    aux_slot_indices = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     module = build_module()
-    primary_blocked_k, primary_page_table = _make_primary_cache(batch_size, max_seqlen)
-    aux_blocked_k, aux_page_table = _make_aux_cache(batch_size, max_seqlen)
+    primary_blocked_k, primary_page_table = _make_primary_cache(num_slots, max_seqlen)
+    aux_blocked_k, aux_page_table = _make_aux_cache(num_slots, max_seqlen)
     cos, sin = _rope_tables(max_seqlen + 8)
 
     wq_b = (
@@ -146,6 +149,8 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
         aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
         wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
         absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
         cuda_module=module,
@@ -165,8 +170,8 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     manager.warmup_and_capture_all()
 
     inputs = _make_inputs(batch_size, max_seqlen)
-    inputs["primary_page_table"] = primary_page_table
-    inputs["aux_page_table"] = aux_page_table
+    inputs["primary_slot_indices"] = primary_slot_indices
+    inputs["aux_slot_indices"] = aux_slot_indices
     expected = {
         key: value.clone()
         for key, value in segment.forward(**inputs).items()
@@ -187,8 +192,8 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     )
 
     small_inputs = _make_inputs(1, max_seqlen)
-    small_inputs["primary_page_table"] = primary_page_table[:1]
-    small_inputs["aux_page_table"] = aux_page_table[:1]
+    small_inputs["primary_slot_indices"] = primary_slot_indices[:1]
+    small_inputs["aux_slot_indices"] = aux_slot_indices[:1]
     small_expected = {
         key: value.clone()
         for key, value in segment.forward(**small_inputs).items()

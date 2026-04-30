@@ -34,14 +34,16 @@ def select_mla_kv_for_flashmla_bf16(
     index_topk: int = 2048,
     page_size: int = 64,
     return_indices: bool = True,
+    primary_slot_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Select BF16 MLA KV for one dense FlashMLA call.
 
     Args:
         primary_blocked_k: Primary MLA paged KV cache with shape
             ``[num_pages, page_size, num_k_heads, kv_dim]``.
-        primary_page_table: Batch-aligned logical-to-physical page table with
-            shape ``[B, max_pages]`` and ``-1`` for missing pages.
+        primary_page_table: Logical-to-physical page table with shape
+            ``[B, max_pages]`` for batch-aligned calls, or
+            ``[num_slots, max_pages]`` when ``primary_slot_indices`` is passed.
         cache_seqlens: Per-row cache lengths, including the new decode token,
             shape ``[B]``.
         long_topk_indices: Indexer-selected logical token indices for rows with
@@ -68,6 +70,7 @@ def select_mla_kv_for_flashmla_bf16(
         long_topk_indices,
         index_topk=index_topk,
         page_size=page_size,
+        primary_slot_indices=primary_slot_indices,
     )
 
     if _fused_select_mla_kv_bf16 is None:
@@ -84,6 +87,7 @@ def select_mla_kv_for_flashmla_bf16(
         long_topk_indices,
         page_size,
         return_indices=return_indices,
+        primary_slot_indices=primary_slot_indices,
     )
 
 
@@ -100,6 +104,7 @@ def select_mla_kv_for_flashmla_bf16_out(
     *,
     index_topk: int = 2048,
     return_indices: bool = True,
+    primary_slot_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Out-buffer fused selector for CUDA graph capture."""
 
@@ -110,6 +115,7 @@ def select_mla_kv_for_flashmla_bf16_out(
         long_topk_indices,
         index_topk=index_topk,
         page_size=page_size,
+        primary_slot_indices=primary_slot_indices,
     )
     if _fused_select_mla_kv_bf16_out is None:
         raise RuntimeError(
@@ -126,6 +132,7 @@ def select_mla_kv_for_flashmla_bf16_out(
         selected_indices,
         row_modes,
         return_indices=return_indices,
+        primary_slot_indices=primary_slot_indices,
     )
 
 
@@ -191,6 +198,7 @@ def _validate_selector_inputs(
     *,
     index_topk: int,
     page_size: int,
+    primary_slot_indices: torch.Tensor | None = None,
 ) -> None:
     if primary_blocked_k.ndim != 4:
         raise ValueError(
@@ -222,11 +230,23 @@ def _validate_selector_inputs(
             f"got {tuple(long_topk_indices.shape)}"
         )
     batch_size = cache_seqlens.shape[0]
-    if primary_page_table.shape[0] != batch_size:
+    if primary_slot_indices is None and primary_page_table.shape[0] != batch_size:
         raise ValueError(
             "primary_page_table rows must match cache_seqlens, "
             f"got {primary_page_table.shape[0]} vs {batch_size}"
         )
+    if primary_slot_indices is not None:
+        if primary_slot_indices.shape != (batch_size,):
+            raise ValueError(
+                "primary_slot_indices must have shape [B], "
+                f"got {tuple(primary_slot_indices.shape)}"
+            )
+        if primary_slot_indices.device != primary_page_table.device:
+            raise ValueError("primary_slot_indices and primary_page_table must share device")
+        if primary_slot_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                f"primary_slot_indices must be int32/int64, got {primary_slot_indices.dtype}"
+            )
     if long_topk_indices.shape != (batch_size, index_topk):
         raise ValueError(
             "long_topk_indices must have shape [B, index_topk], "

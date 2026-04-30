@@ -39,7 +39,7 @@ from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
 from batchgen_kernels.attention.dsa.fused_indexer_score import (
     FP8WqbWeightsCUDA,
     cuda_wq_b_proj_out,
-    fused_paged_score_and_topk_out,
+    fused_paged_score_and_topk_with_slots_out,
     rope_hadamard_q_out,
 )
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
@@ -76,6 +76,8 @@ class Glm5DsaAttnSegment:
         *,
         primary_blocked_k: torch.Tensor,
         aux_blocked_k: torch.Tensor,
+        primary_page_table: torch.Tensor,
+        aux_page_table: torch.Tensor,
         wq_b_weights: FP8WqbWeightsCUDA,
         absorb_weights: FP8AbsorbWeights,
         cuda_module,
@@ -112,9 +114,24 @@ class Glm5DsaAttnSegment:
             )
         if aux_blocked_k.shape[2] != 1:
             raise ValueError("GLM-5 DSA aux cache expects one indexer KV head")
+        if primary_page_table.ndim != 2 or aux_page_table.ndim != 2:
+            raise ValueError(
+                "GLM-5 DSA graph requires 2-D primary/aux page tables, "
+                f"got {tuple(primary_page_table.shape)} and {tuple(aux_page_table.shape)}"
+            )
+        if primary_page_table.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"primary_page_table must be int32/int64, got {primary_page_table.dtype}")
+        if aux_page_table.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"aux_page_table must be int32/int64, got {aux_page_table.dtype}")
+        if primary_page_table.device != primary_blocked_k.device:
+            raise ValueError("primary_page_table and primary_blocked_k must share device")
+        if aux_page_table.device != aux_blocked_k.device:
+            raise ValueError("aux_page_table and aux_blocked_k must share device")
 
         self.primary_blocked_k = primary_blocked_k
         self.aux_blocked_k = aux_blocked_k
+        self.primary_page_table = primary_page_table
+        self.aux_page_table = aux_page_table
         self.wq_b_weights = wq_b_weights
         self.absorb_weights = absorb_weights
         self.cuda_module = cuda_module
@@ -133,10 +150,8 @@ class Glm5DsaAttnSegment:
         self.attn_out_dim = attn_out_dim
         self.kv_dim = primary_blocked_k.shape[3]
         self.softmax_scale = softmax_scale if softmax_scale is not None else self.kv_dim**-0.5
-        self.max_pages_per_seq = (max_seqlen + page_size - 1) // page_size
-        self.max_aux_pages_per_seq = (
-            max_seqlen + self.aux_page_size - 1
-        ) // self.aux_page_size
+        self.max_pages_per_seq = primary_page_table.shape[1]
+        self.max_aux_pages_per_seq = aux_page_table.shape[1]
         self._buffers: Dict[int, _Glm5DsaSegmentBuffers] = {}
 
         if self.kv_dim != self.kv_lora_rank + 64:
@@ -173,12 +188,8 @@ class Glm5DsaAttnSegment:
                 torch.int64,
                 fill_value=float(self.max_seqlen - 1),
             ),
-            "primary_page_table": TensorSpec(
-                ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
-            ),
-            "aux_page_table": TensorSpec(
-                ("batch_size", self.max_aux_pages_per_seq), torch.int32, fill_value=0
-            ),
+            "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -301,8 +312,8 @@ class Glm5DsaAttnSegment:
         head_gates: torch.Tensor,
         cache_seqlens: torch.Tensor,
         positions_expanded: torch.Tensor,
-        primary_page_table: torch.Tensor,
-        aux_page_table: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         batch_size = q_a.shape[0]
         buffers = self._buffers.get(batch_size)
@@ -326,10 +337,11 @@ class Glm5DsaAttnSegment:
             positions_expanded.view(-1),
             buffers.q_index,
         )
-        fused_paged_score_and_topk_out(
+        fused_paged_score_and_topk_with_slots_out(
             buffers.q_index,
             self.aux_blocked_k,
-            aux_page_table,
+            self.aux_page_table,
+            aux_slot_indices,
             head_gates,
             cache_seqlens,
             buffers.agg_scores,
@@ -340,7 +352,7 @@ class Glm5DsaAttnSegment:
         )
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,
-            primary_page_table,
+            self.primary_page_table,
             cache_seqlens,
             buffers.top_k_indices,
             self.page_size,
@@ -350,6 +362,7 @@ class Glm5DsaAttnSegment:
             buffers.row_modes,
             index_topk=self.index_topk,
             return_indices=False,
+            primary_slot_indices=primary_slot_indices,
         )
         fp8_q_absorb_out(q_nope, self.absorb_weights, buffers.absorbed_q)
         pack_flashmla_query_out(buffers.absorbed_q, q_rope, buffers.query_states)

@@ -59,8 +59,8 @@ class Glm5DsaGraphSegmentInputs:
     head_gates: torch.Tensor
     cache_seqlens: torch.Tensor
     positions_expanded: torch.Tensor
-    primary_page_table: torch.Tensor
-    aux_page_table: torch.Tensor
+    primary_slot_indices: torch.Tensor
+    aux_slot_indices: torch.Tensor
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor
 
@@ -74,8 +74,6 @@ def build_glm5_dsa_graph_segment_inputs(
     gpu_paged_kv_manager,
     gpu_paged_kv_manager_aux,
     *,
-    max_primary_pages_per_seq: int,
-    max_aux_pages_per_seq: int,
     write_kv: bool = True,
 ) -> Glm5DsaGraphSegmentInputs:
     """Build graph-segment inputs and update primary/aux KV caches.
@@ -221,26 +219,6 @@ def build_glm5_dsa_graph_segment_inputs(
             indexer.index_n_heads,
         ).contiguous()
 
-    primary_blocked_k, _, primary_page_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
-    aux_blocked_k, _, aux_page_table = gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-    del primary_blocked_k, aux_blocked_k
-    primary_page_table = reorder_block_table_to_batch_slots(
-        primary_page_table,
-        primary_slot_indices,
-    )
-    aux_page_table = reorder_block_table_to_batch_slots(
-        aux_page_table,
-        aux_slot_indices,
-    )
-    primary_page_table = _fit_page_table_width(
-        primary_page_table,
-        max_primary_pages_per_seq,
-    )
-    aux_page_table = _fit_page_table_width(
-        aux_page_table,
-        max_aux_pages_per_seq,
-    )
-
     return Glm5DsaGraphSegmentInputs(
         q_a=q_a_normed,
         q_nope=q_nope,
@@ -248,8 +226,8 @@ def build_glm5_dsa_graph_segment_inputs(
         head_gates=head_gates,
         cache_seqlens=cache_seqlens.to(dtype=torch.int32, device=manager_device),
         positions_expanded=positions_expanded,
-        primary_page_table=primary_page_table,
-        aux_page_table=aux_page_table,
+        primary_slot_indices=primary_slot_indices.to(dtype=torch.int32, device=manager_device),
+        aux_slot_indices=aux_slot_indices.to(dtype=torch.int32, device=manager_device),
         primary_k_tensor=k_tensor,
         indexer_k_tensor=indexer_k_tensor,
     )
@@ -563,22 +541,6 @@ def _select_glm5_dsa_indices(
     )
     top_k_indices[long_mask] = long_top_k
     return top_k_indices, "mixed", row_modes
-
-
-def _fit_page_table_width(
-    page_table: torch.Tensor,
-    target_cols: int,
-) -> torch.Tensor:
-    if page_table.shape[1] == target_cols:
-        return page_table
-    if page_table.shape[1] > target_cols:
-        return page_table[:, :target_cols].contiguous()
-    return torch.nn.functional.pad(
-        page_table,
-        (0, target_cols - page_table.shape[1]),
-        value=0,
-    )
-
 
 def _build_query_states(
     wrapper,
