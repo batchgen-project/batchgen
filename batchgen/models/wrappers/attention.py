@@ -25,6 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
+import os
 from typing import ClassVar, Dict, List, Optional, Sequence
 
 import torch
@@ -81,6 +82,49 @@ class AttnWrapperBase(BaseModuleWrapper):
     # until end-of-prefill; doing so makes large prefix-reuse prefill grow HBM
     # monotonically.
     pending_prefill_offload_tensors: ClassVar[list] = []
+
+    @classmethod
+    def _max_pending_prefill_offload_tasks(cls) -> int:
+        raw = os.environ.get("BATCHGEN_MAX_PENDING_PREFILL_OFFLOAD_TASKS", "256")
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logging.warning(
+                "Invalid BATCHGEN_MAX_PENDING_PREFILL_OFFLOAD_TASKS=%r; using 256",
+                raw,
+            )
+            return 256
+
+    @classmethod
+    def track_prefill_offload_task(cls, task: object) -> None:
+        """Track a prefill D2H task and apply bounded backpressure.
+
+        Prefix reuse can create one D2H copy task per sequence per layer. If
+        those tasks are only drained after the whole prefill, their captured
+        source K/V tensors can keep HBM alive long enough to OOM later MoE
+        layers. Prune completed tasks first, and only wait when offload falls
+        behind the configured bound.
+        """
+        if task is None:
+            return
+
+        pending = cls.pending_prefill_offload_tasks
+        pending.append(task)
+        max_pending = cls._max_pending_prefill_offload_tasks()
+        if len(pending) < max_pending:
+            return
+
+        keep = []
+        for pending_task in pending:
+            if pending_task.done():
+                pending_task.wait()
+            else:
+                keep.append(pending_task)
+        pending[:] = keep
+
+        while len(pending) >= max_pending:
+            oldest = pending.pop(0)
+            oldest.wait()
 
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
