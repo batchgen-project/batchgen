@@ -195,14 +195,32 @@ class CUDAGraphManager:
         This should be called once during config_decode(), before the first
         decode step. Blocks until all graphs are captured.
         """
+        self.warmup_and_capture_buckets(self.bucketing.bucket_sizes)
+
+    def warmup_and_capture_buckets(self, bucket_sizes: List[int]) -> None:
+        """Capture all registered segments for the requested bucket sizes.
+
+        This is used by memory-heavy model-specific segments that should be
+        captured lazily only for buckets observed in live decode traffic.
+        """
         if not self._segments:
             return
 
-        total_start = time.perf_counter()
-        num_buckets = len(self.bucketing.bucket_sizes)
+        unknown = [b for b in bucket_sizes if b not in self.bucketing.bucket_sizes]
+        if unknown:
+            raise ValueError(
+                f"Cannot capture unknown CUDA graph buckets {unknown}; "
+                f"available buckets are {self.bucketing.bucket_sizes}"
+            )
 
-        for i, bucket_size in enumerate(self.bucketing.bucket_sizes):
+        total_start = time.perf_counter()
+        capture_sizes = list(dict.fromkeys(bucket_sizes))
+        num_buckets = len(capture_sizes)
+
+        for i, bucket_size in enumerate(capture_sizes):
             for seg_name, segment in self._segments.items():
+                if bucket_size in self._graphs.get(seg_name, {}):
+                    continue
                 self._capture_one(seg_name, segment, bucket_size)
             done = i + 1
             bar = "█" * done + "░" * (num_buckets - done)
@@ -212,8 +230,8 @@ class CUDAGraphManager:
             )
 
         elapsed_ms = (time.perf_counter() - total_start) * 1000
-        self._total_capture_time_ms = elapsed_ms
-        self._is_captured = True
+        self._total_capture_time_ms += elapsed_ms
+        self._is_captured = any(self._graphs[name] for name in self._segments)
 
     def _capture_one(
         self, name: str, segment: CapturableSegment, bucket_size: int
@@ -343,6 +361,21 @@ class CUDAGraphManager:
         except ValueError:
             return False
         return bucket in self._graphs.get(name, {})
+
+    def has_bucket_for_all_segments(self, batch_size: int) -> bool:
+        """Check whether every registered segment has the bucket for batch_size."""
+        bucket = self.bucketing.get_padded_size(batch_size)
+        return all(bucket in self._graphs.get(name, {}) for name in self._segments)
+
+    def drop_bucket(self, bucket_size: int) -> None:
+        """Release captured graphs and segment-owned static buffers for a bucket."""
+        for graphs in self._graphs.values():
+            graphs.pop(bucket_size, None)
+        for segment in self._segments.values():
+            release = getattr(segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
+        self._is_captured = any(self._graphs[name] for name in self._segments)
 
     def __repr__(self) -> str:
         seg_info = ", ".join(

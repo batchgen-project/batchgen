@@ -5555,6 +5555,7 @@ class BatchGenWorker:
 				# B. Config Decode
 				config_start = time.perf_counter()
 				self._config_decoding_for_batch(decode_uuids, local_decode_indices)
+				self._current_decode_local_batch_size = len(local_decode_indices)
 				config_decode_time += time.perf_counter() - config_start
 
 				# CUDA Graph Warmup (lazy, one-time). Whole-model graph paths wait
@@ -5569,7 +5570,7 @@ class BatchGenWorker:
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
-				):
+				) or self._glm5_dsa_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 DSA CUDA graph with queued "
@@ -7980,6 +7981,32 @@ class BatchGenWorker:
 
 		self._setup_cuda_graphs(gpu_manager)
 
+	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
+		model_name_l = (getattr(self, 'model_name', '') or '').lower()
+		if (
+			os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") != "1"
+			or "glm" not in model_name_l
+			or self._cuda_graph_manager is None
+		):
+			return False
+		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
+		if local_bsz <= 0:
+			return False
+		try:
+			bucket = self._cuda_graph_manager.bucketing.get_padded_size(local_bsz)
+		except ValueError:
+			return False
+		if bucket in getattr(self, "_glm5_dsa_graph_failed_buckets", set()):
+			return False
+		return not self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz)
+
+	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
+		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
+		if failed is None:
+			failed = set()
+			self._glm5_dsa_graph_failed_buckets = failed
+		failed.add(bucket_size)
+
 	@staticmethod
 	def _generate_bucket_sizes(max_bucket: int, num_buckets: int) -> list:
 		"""Generate exactly num_buckets bucket sizes from 1 to max_bucket.
@@ -8075,6 +8102,39 @@ class BatchGenWorker:
 			and "glm" in model_name_l
 		)
 		if glm5_dsa_graph_enabled:
+			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
+			if local_bsz <= 0:
+				logging.info(
+					f"Rank {self.rank}: no local GLM-5 decode rows; skipping DSA CUDA graph capture"
+				)
+				return
+			if self._cuda_graph_manager is not None:
+				try:
+					capture_bucket = self._cuda_graph_manager.bucketing.get_padded_size(local_bsz)
+				except ValueError:
+					logging.info(
+						f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
+						"CUDA graph max bucket; using eager DSA"
+					)
+					return
+				if self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz):
+					return
+				logging.info(
+					f"Rank {self.rank}: lazily capturing GLM-5 DSA CUDA graph bucket "
+					f"BS={capture_bucket} for local batch size {local_bsz}"
+				)
+				try:
+					self._cuda_graph_manager.warmup_and_capture_buckets([capture_bucket])
+				except torch.OutOfMemoryError as exc:
+					self._cuda_graph_manager.drop_bucket(capture_bucket)
+					self._mark_glm5_dsa_graph_bucket_failed(capture_bucket)
+					torch.cuda.empty_cache()
+					logging.error(
+						f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
+						f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
+					)
+				return
+
 			from batchgen.models.glm.glm5.cuda_graph_segments import (
 				Glm5DsaAttnSegment,
 				make_glm5_dsa_graph_segment_name,
@@ -8096,9 +8156,19 @@ class BatchGenWorker:
 			aux_page_size = int(aux_manager.config.page_size_tokens)
 			max_primary_pages = (graph_max_seqlen + primary_page_size - 1) // primary_page_size
 			max_aux_pages = (graph_max_seqlen + aux_page_size - 1) // aux_page_size
+			try:
+				capture_bucket = bucketing.get_padded_size(local_bsz)
+			except ValueError:
+				logging.info(
+					f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
+					"CUDA graph max bucket; using eager DSA"
+				)
+				return
 
 			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+			primary_k_cache, _ = primary_manager.get_kv_tensors()
+			aux_k_cache, _ = aux_manager.get_kv_tensors()
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				wrapper = decoder_layer.self_attn
 				attn = wrapper.module
@@ -8116,8 +8186,8 @@ class BatchGenWorker:
 				if getattr(wrapper, "_indexer_cuda_module", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 DSA CUDA graph requires fused indexer CUDA module")
 
-				primary_blocked_k, _, _ = primary_manager.get_layer_kv_with_page_table(layer_idx)
-				aux_blocked_k, _, _ = aux_manager.get_layer_kv_with_page_table(layer_idx)
+				primary_blocked_k = primary_k_cache[layer_idx]
+				aux_blocked_k = aux_k_cache[layer_idx]
 				dummy = torch.empty(
 					1,
 					1,
@@ -8152,11 +8222,21 @@ class BatchGenWorker:
 
 			logging.info(
 				f"Rank {self.rank}: capturing GLM-5 DSA CUDA graph segments for "
-				f"{len(self.model.model.layers)} layers with max_seqlen={graph_max_seqlen}"
+				f"{len(self.model.model.layers)} layers with max_seqlen={graph_max_seqlen}, "
+				f"bucket BS={capture_bucket} (local batch size {local_bsz})"
 			)
-			manager.warmup_and_capture_all()
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = False
+			try:
+				manager.warmup_and_capture_buckets([capture_bucket])
+			except torch.OutOfMemoryError as exc:
+				manager.drop_bucket(capture_bucket)
+				self._mark_glm5_dsa_graph_bucket_failed(capture_bucket)
+				torch.cuda.empty_cache()
+				logging.error(
+					f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
+					f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
+				)
 			return
 
 		# GPT-OSS-specific pre-warm and per-layer segment registration

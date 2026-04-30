@@ -289,6 +289,9 @@ class Glm5DsaAttnSegment:
             prepared_flashmla=prepared_flashmla,
         )
 
+    def release_static_buffers(self, bucket_size: int) -> None:
+        self._buffers.pop(bucket_size, None)
+
     def forward(
         self,
         *,
