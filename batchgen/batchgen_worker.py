@@ -10730,15 +10730,26 @@ class BatchGenWorker:
 			except (OSError, TypeError):
 				pass
 
-			# Rebind all methods (skip __init__ and dunders)
+			# Rebind methods (skip __init__ and dunders). Preserve descriptor
+			# semantics so hot reload does not turn staticmethods into bound
+			# instance methods.
 			rebound = 0
 			skipped = 0
-			for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
+			for name, descriptor in NewClass.__dict__.items():
 				if name == "__init__":
 					skipped += 1
 					continue
+				if name.startswith("__") and name.endswith("__"):
+					continue
 				try:
-					setattr(self, name, method.__get__(self, type(self)))
+					if isinstance(descriptor, staticmethod):
+						setattr(self, name, descriptor.__func__)
+					elif isinstance(descriptor, classmethod):
+						setattr(self, name, descriptor.__func__.__get__(type(self), type(self)))
+					elif inspect.isfunction(descriptor):
+						setattr(self, name, descriptor.__get__(self, type(self)))
+					else:
+						continue
 					rebound += 1
 				except Exception:
 					skipped += 1
