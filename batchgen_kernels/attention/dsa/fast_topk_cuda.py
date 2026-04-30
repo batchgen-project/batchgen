@@ -9,6 +9,13 @@ _MODULE = None
 _TOPK = 2048
 
 
+CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+void fast_topk_2048_out(torch::Tensor score, torch::Tensor lengths, torch::Tensor indices);
+"""
+
+
 CUDA_SOURCE = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -257,7 +264,7 @@ def _get_module():
     if _MODULE is None:
         _MODULE = load_inline(
             name="batchgen_dsa_fast_topk_cuda",
-            cpp_sources="",
+            cpp_sources=CPP_SOURCE,
             cuda_sources=CUDA_SOURCE,
             functions=["fast_topk_2048_out"],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
