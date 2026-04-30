@@ -10,18 +10,24 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -133,6 +139,110 @@ class ScopedCudaEvent final {
 void LaunchUvaPageCopyKernel(uint8_t** src_ptrs, uint8_t** dst_ptrs,
                              std::size_t page_size_bytes, int num_pages,
                              cudaStream_t stream);
+
+inline std::size_t ReadEnvSize(const char* name, std::size_t fallback,
+                               std::size_t min_value,
+                               std::size_t max_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(raw, &end, 10);
+    if (end == raw || parsed == 0) {
+        return fallback;
+    }
+    return std::min<std::size_t>(
+        max_value, std::max<std::size_t>(min_value, parsed));
+}
+
+class BoundedAsyncExecutor {
+   public:
+    static BoundedAsyncExecutor& Instance() {
+        static BoundedAsyncExecutor executor;
+        return executor;
+    }
+
+    template <typename Fn>
+    std::shared_future<void> Submit(Fn&& fn) {
+        auto task =
+            std::make_shared<std::packaged_task<void()>>(std::forward<Fn>(fn));
+        auto future = task->get_future().share();
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            queue_space_cv_.wait(lock, [this]() {
+                return stopping_ || queue_.size() < max_queue_depth_;
+            });
+            if (stopping_) {
+                throw std::runtime_error(
+                    "Host KV async executor is shutting down");
+            }
+            queue_.emplace_back([task = std::move(task)]() { (*task)(); });
+        }
+        queue_cv_.notify_one();
+        return future;
+    }
+
+   private:
+    BoundedAsyncExecutor()
+        : max_queue_depth_(ReadEnvSize("BATCHGEN_HOST_KV_ASYNC_QUEUE_DEPTH",
+                                       2048, 1, 1 << 20)) {
+        const unsigned int hw = std::max(1u, std::thread::hardware_concurrency());
+        const std::size_t default_threads =
+            std::min<std::size_t>(16, std::max<std::size_t>(4, hw / 8));
+        const std::size_t num_threads =
+            ReadEnvSize("BATCHGEN_HOST_KV_ASYNC_THREADS", default_threads, 1,
+                        256);
+        workers_.reserve(num_threads);
+        for (std::size_t idx = 0; idx < num_threads; ++idx) {
+            workers_.emplace_back([this]() { WorkerLoop(); });
+        }
+    }
+
+    ~BoundedAsyncExecutor() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        queue_cv_.notify_all();
+        queue_space_cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    BoundedAsyncExecutor(const BoundedAsyncExecutor&) = delete;
+    BoundedAsyncExecutor& operator=(const BoundedAsyncExecutor&) = delete;
+
+    void WorkerLoop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                queue_cv_.wait(lock, [this]() {
+                    return stopping_ || !queue_.empty();
+                });
+                if (stopping_ && queue_.empty()) {
+                    return;
+                }
+                task = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            queue_space_cv_.notify_one();
+            task();
+        }
+    }
+
+    const std::size_t max_queue_depth_;
+    std::mutex mutex_;
+    std::condition_variable queue_cv_;
+    std::condition_variable queue_space_cv_;
+    std::deque<std::function<void()>> queue_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
 }  // namespace worker_detail
 
 struct KVAsyncTask {
@@ -2754,8 +2864,8 @@ class HostPagedKVWorkerView {
 
     template <typename Fn>
     KVAsyncTask LaunchAsyncTask(Fn&& fn) const {
-        auto future =
-            std::async(std::launch::async, std::forward<Fn>(fn)).share();
+        auto future = worker_detail::BoundedAsyncExecutor::Instance().Submit(
+            std::forward<Fn>(fn));
         const std::uint64_t id =
             task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
         return KVAsyncTask{id, std::move(future)};

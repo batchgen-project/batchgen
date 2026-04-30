@@ -76,14 +76,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     # time decode starts reading the host KV. Capture each task here and
     # .wait() on them before exiting prefill.
     pending_prefill_offload_tasks: ClassVar[list] = []
-    # Tensor references kept alive for the duration of the async offload.
-    # Mirrors the decode side's `_pending_kv_append_tensors`. The C++ async
-    # lambda captures the tensor by value, but the underlying STORAGE may be
-    # released back to PyTorch's caching allocator if no Python reference is
-    # held — and with `expandable_segments:True` plus multi-seq packed prefill
-    # the allocator may then hand the same physical pages to a later layer's
-    # K/V tensor while the d2h memcpy is still in flight. Holding the source
-    # tensors here pins the storage until the wait at end-of-prefill.
+    # Kept for compatibility with older drains. Source tensors are held by the
+    # C++ async task itself, so Python must not retain every prefill K/V tensor
+    # until end-of-prefill; doing so makes large prefix-reuse prefill grow HBM
+    # monotonically.
     pending_prefill_offload_tensors: ClassVar[list] = []
 
     # Prepack mode state
