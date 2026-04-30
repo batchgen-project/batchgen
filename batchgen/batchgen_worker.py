@@ -10703,6 +10703,7 @@ class BatchGenWorker:
 					"batchgen.server.intake_pool",
 					"batchgen.server.scheduling_pool",
 					"batchgen.kv_cache.gpu_paged_kv_manager",
+					"batchgen.attention.dsa.glm5_decode_selector",
 				]
 				for mod_name in dep_modules:
 					if mod_name in sys.modules:
