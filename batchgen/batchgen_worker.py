@@ -986,6 +986,14 @@ class BatchGenWorker:
 			return
 		if len(self.global_batch) == 0:
 			return
+		# Preserve host prefix pages across pool groups, but do not preserve
+		# GPU KV. The next group can have a larger decode batch than the warmup
+		# group that first initialized GPU KV; keeping the old manager would
+		# reuse an over-large page pool that did not reserve HBM for the larger
+		# decode/MoE buffers.
+		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
+		self.gpu_paged_kv_cache_manager = None
+		self.gpu_kv_cache_size_gb = None
 		self.global_batch = SequenceBatch()
 		self._completed_result_cache = {}
 		self._prefix_reuse_allocations_by_global_id.clear()
