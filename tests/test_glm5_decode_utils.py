@@ -344,7 +344,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     actual = wrapper._forward_decode_dsa(
         torch.zeros(2, 1, 16),
         torch.tensor([[7], [8]], dtype=torch.int64),
-        torch.tensor([8, 9], dtype=torch.int32),
+        torch.tensor([2, 9], dtype=torch.int32),
         4096,
         "primary",
         "aux",
@@ -399,7 +399,7 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
         actual = wrapper._forward_decode_dsa(
             torch.zeros(2, 1, 16),
             torch.tensor([[7], [8]], dtype=torch.int64),
-            torch.tensor([8, 9], dtype=torch.int32),
+            torch.tensor([2, 9], dtype=torch.int32),
             4096,
             "primary",
             "aux",
@@ -426,7 +426,7 @@ def test_glm5_dsa_graph_compare_layer_filter(monkeypatch):
         AttnWrapperBase.batchgen_debug = old_debug
 
 
-def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():
+def test_glm5_dsa_cuda_graph_replay_gate_allows_unified_selected_lengths():
     index_topk = 4
 
     assert _glm5_dsa_cuda_graph_can_replay(
@@ -434,14 +434,21 @@ def test_glm5_dsa_cuda_graph_replay_gate_requires_all_long_rows():
         max_seqlen=8,
         index_topk=index_topk,
     )
-    assert not _glm5_dsa_cuda_graph_can_replay(
-        torch.tensor([4, 7], dtype=torch.int32),
-        max_seqlen=8,
+    assert _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([1, 4], dtype=torch.int32),
+        max_seqlen=4,
         index_topk=index_topk,
+        captured_max_seqlen=8,
+    )
+    assert _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([2, 4, 7], dtype=torch.int32),
+        max_seqlen=7,
+        index_topk=index_topk,
+        captured_max_seqlen=8,
     )
     assert not _glm5_dsa_cuda_graph_can_replay(
-        torch.tensor([5, 7], dtype=torch.int32),
-        max_seqlen=4,
+        torch.tensor([1, 4], dtype=torch.int32),
+        max_seqlen=0,
         index_topk=index_topk,
     )
     assert not _glm5_dsa_cuda_graph_can_replay(

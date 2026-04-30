@@ -66,9 +66,10 @@ class _Glm5DsaSegmentBuffers:
 class Glm5DsaAttnSegment:
     """Graph-capturable GLM-5 DSA attention subsegment.
 
-    The segment is full-indexer-only in this first integration slice.  Dense
-    short rows and mixed dispatch remain outside graph routing until their
-    production policy is separately validated.
+    The segment uses the unified selected-KV API: every row writes a fixed
+    ``index_topk`` selected-token buffer, while ``selected_lengths`` carries the
+    runtime valid length into FlashMLA. This keeps short, boundary, mixed, and
+    long decode rows on the same graph-safe path.
     """
 
     def __init__(

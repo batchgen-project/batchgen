@@ -142,18 +142,23 @@ def _glm5_dsa_cuda_graph_can_replay(
     *,
     captured_max_seqlen: Optional[int] = None,
 ) -> bool:
-    """The current graph segment is valid only for all-long DSA rows.
+    """Return whether the fixed selected-KV graph contract can replay.
 
-    `Glm5DsaAttnSegment` captures FlashMLA metadata for `index_topk` selected
-    tokens. Short rows need per-step metadata for their actual selected length,
-    so they must stay on the eager path until length-bucketed metadata is added.
+    The unified selector always writes the same fixed selected-KV buffer
+    ``[B, index_topk, 1, kv_dim]``. Runtime ``selected_lengths`` carry
+    ``min(cache_seqlens, index_topk)`` into FlashMLA, so short, boundary, mixed,
+    and long rows are all graph-safe as long as the captured sequence cap covers
+    the live batch.
     """
 
-    if max_seqlen <= index_topk:
+    if max_seqlen <= 0:
         return False
     if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
         return False
-    return bool((cache_seqlens > index_topk).all().item())
+    graph_max_seqlen = captured_max_seqlen if captured_max_seqlen is not None else max_seqlen
+    if graph_max_seqlen < index_topk:
+        return False
+    return cache_seqlens.ndim == 1
 
 
 def _log_glm5_dsa_graph_eager_fallback_once(
@@ -218,8 +223,8 @@ def _fail_if_glm5_dsa_cuda_graph_required_without_replay() -> None:
         return
     raise RuntimeError(
         f"{_GLM5_DSA_CUDA_GRAPH_ENV}=1 requested GLM-5 DSA CUDA graph replay, "
-        "but production hidden-state-to-o_proj graph routing is not wired in this "
-        "integration slice. Refusing to silently fall back to eager DSA decode."
+        "but no replayable graph is available for this decode step. Refusing to "
+        "silently fall back to eager DSA decode."
     )
 
 
@@ -809,11 +814,16 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
             )
         index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
-        if not _glm5_dsa_cuda_graph_can_replay(cache_seqlens, max_seqlen, index_topk):
+        if not _glm5_dsa_cuda_graph_can_replay(
+            cache_seqlens,
+            max_seqlen,
+            index_topk,
+            captured_max_seqlen=getattr(self, "_dsa_cuda_graph_max_seqlen", None),
+        ):
             raise RuntimeError(
-                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is only "
-                f"valid when every row has cache_seqlens > index_topk={index_topk}; "
-                "short or mixed rows require eager DSA FlashMLA metadata"
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is not "
+                f"valid for max_seqlen={max_seqlen}, captured cap "
+                f"{self._dsa_cuda_graph_max_seqlen}, index_topk={index_topk}"
             )
         if not self._dsa_cuda_graph_page_tables_match(
             gpu_paged_kv_manager,
@@ -1107,8 +1117,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         f"max_seqlen={max_seqlen} exceeds captured cap "
                         f"{captured_cap}"
                     )
+                elif captured_cap is not None and captured_cap < index_topk:
+                    reason = (
+                        f"captured cap {captured_cap} is smaller than "
+                        f"index_topk={index_topk}"
+                    )
                 else:
-                    reason = "current decode rows are not all longer than index_topk"
+                    reason = "current decode metadata is not graph-compatible"
             elif not graph_has_bucket:
                 reason = f"batch size {bsz} has no captured graph bucket"
             elif not graph_page_tables_match:

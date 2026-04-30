@@ -6,11 +6,15 @@ import pytest
 import torch
 
 from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+from batchgen.attention.dsa.sparse_decode_mla import (
+    prepare_sparse_flash_mla_decode_inputs,
+    run_prepared_sparse_flash_mla_decode,
+)
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5DsaAttnSegment,
     make_glm5_dsa_graph_segment_name,
 )
-from batchgen_kernels.attention.dsa.fp8_absorb import FP8AbsorbWeights
+from batchgen_kernels.attention.dsa.fp8_absorb import FP8AbsorbWeights, fp8_out_absorb_out
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import build_module
 from batchgen_kernels.attention.dsa.fused_indexer_score import FP8WqbWeightsCUDA
 
@@ -89,10 +93,18 @@ def _make_aux_cache(num_slots: int, max_seqlen: int):
     return blocked_k, page_table
 
 
-def _make_inputs(batch_size: int, max_seqlen: int):
-    positions = torch.arange(
-        max_seqlen - batch_size, max_seqlen, device="cuda", dtype=torch.int64
-    ).contiguous()
+def _make_inputs(
+    batch_size: int,
+    max_seqlen: int,
+    cache_seqlens: torch.Tensor | None = None,
+):
+    if cache_seqlens is None:
+        cache_seqlens = torch.full(
+            (batch_size,), max_seqlen, device="cuda", dtype=torch.int32
+        )
+    else:
+        cache_seqlens = cache_seqlens.to(device="cuda", dtype=torch.int32).contiguous()
+    positions = (cache_seqlens.to(torch.int64) - 1).clamp_min_(0).contiguous()
     return {
         "q_a": (
             torch.randn(batch_size, Q_RANK, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -108,9 +120,7 @@ def _make_inputs(batch_size: int, max_seqlen: int):
         "head_gates": torch.randn(
             batch_size, INDEX_HEADS, device="cuda", dtype=torch.float32
         ).contiguous(),
-        "cache_seqlens": torch.full(
-            (batch_size,), max_seqlen, device="cuda", dtype=torch.int32
-        ),
+        "cache_seqlens": cache_seqlens,
         "positions_expanded": positions[:, None]
         .expand(batch_size, INDEX_HEADS)
         .contiguous(),
@@ -146,13 +156,14 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
         * 0.01
     ).contiguous()
 
+    absorb = FP8AbsorbWeights(q_absorb, out_absorb)
     segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
         aux_blocked_k=aux_blocked_k,
         primary_page_table=primary_page_table,
         aux_page_table=aux_page_table,
         wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
-        absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
+        absorb_weights=absorb,
         cuda_module=module,
         cos_table=cos,
         sin_table=sin,
@@ -207,3 +218,94 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     torch.testing.assert_close(
         small_actual["top_k_indices"], small_expected["top_k_indices"], atol=0, rtol=0
     )
+
+
+def test_glm5_dsa_segment_replay_supports_unified_short_and_mixed_rows():
+    _require_flash_mla()
+    torch.cuda.set_device(0)
+    torch.manual_seed(20260430)
+
+    batch_size = 3
+    num_slots = 5
+    max_seqlen = 256
+    index_topk = 128
+    primary_slot_indices = torch.tensor([4, 0, 2], device="cuda", dtype=torch.int32)
+    aux_slot_indices = torch.tensor([3, 1, 4], device="cuda", dtype=torch.int32)
+    cache_seqlens = torch.tensor([17, 128, 129], device="cuda", dtype=torch.int32)
+    module = build_module()
+    primary_blocked_k, primary_page_table = _make_primary_cache(num_slots, max_seqlen)
+    aux_blocked_k, aux_page_table = _make_aux_cache(num_slots, max_seqlen)
+    cos, sin = _rope_tables(max_seqlen + 8)
+
+    wq_b = (
+        torch.randn(INDEX_HEADS * INDEX_DIM, Q_RANK, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    q_absorb = (
+        torch.randn(ATTN_HEADS, Q_NOPE, KV_LORA, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    out_absorb = (
+        torch.randn(ATTN_HEADS, ATTN_OUT, KV_LORA, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    absorb = FP8AbsorbWeights(q_absorb, out_absorb)
+
+    segment = Glm5DsaAttnSegment(
+        primary_blocked_k=primary_blocked_k,
+        aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
+        absorb_weights=absorb,
+        cuda_module=module,
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=max_seqlen,
+        index_topk=index_topk,
+        page_size=PAGE_SIZE,
+        softmax_scale=KV_DIM**-0.5,
+    )
+    segment_name = make_glm5_dsa_graph_segment_name(0)
+    manager = CUDAGraphManager(
+        BatchSizeBucketing([batch_size]),
+        device=torch.device("cuda"),
+    )
+    manager.register_segment(segment_name, segment)
+    manager.warmup_and_capture_all()
+
+    inputs = _make_inputs(batch_size, max_seqlen, cache_seqlens)
+    inputs["primary_slot_indices"] = primary_slot_indices
+    inputs["aux_slot_indices"] = aux_slot_indices
+    expected = {
+        key: value.clone()
+        for key, value in segment.forward(**inputs).items()
+    }
+    buffers = segment._buffers[batch_size]
+    assert buffers.prepared_flashmla.cache_seqlens.data_ptr() == buffers.selected_lengths.data_ptr()
+    assert expected["selected_lengths"].tolist() == [17, 128, 128]
+    assert buffers.row_modes.tolist() == [0, 0, 1]
+
+    fresh_prepared = prepare_sparse_flash_mla_decode_inputs(
+        buffers.query_states.clone(),
+        expected["selected_mla_kv"].clone(),
+        expected["selected_lengths"].clone(),
+        ATTN_HEADS,
+        KV_DIM**-0.5,
+        head_dim_v=KV_LORA,
+        page_size=PAGE_SIZE,
+    )
+    fresh_attn = run_prepared_sparse_flash_mla_decode(fresh_prepared)
+    fresh_heads = torch.empty_like(expected["attn_heads"])
+    fp8_out_absorb_out(fresh_attn, absorb, fresh_heads)
+    torch.testing.assert_close(
+        expected["attn_heads"], fresh_heads, atol=5e-2, rtol=5e-2
+    )
+
+    actual = manager.replay(segment_name, batch_size, **inputs)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual["selected_lengths"], expected["selected_lengths"], atol=0, rtol=0)
+    torch.testing.assert_close(actual["top_k_indices"], expected["top_k_indices"], atol=0, rtol=0)
+    torch.testing.assert_close(actual["selected_mla_kv"], expected["selected_mla_kv"], atol=0, rtol=0)
+    torch.testing.assert_close(actual["attn_heads"], expected["attn_heads"], atol=0, rtol=0)
