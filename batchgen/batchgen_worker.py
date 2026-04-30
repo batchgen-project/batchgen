@@ -905,6 +905,16 @@ class BatchGenWorker:
 						merged[key] = value
 		return merged or None
 
+	def _debug_sequences_for_decode_uuids(self, decode_uuids) -> list:
+		if self.global_batch is None:
+			return []
+		sequences = []
+		for uuid in decode_uuids or []:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				sequences.append(seq)
+		return sequences
+
 	# ============ Request Pool: Admission Queue ============
 
 	def set_admission_queue(self, queue) -> None:
@@ -5586,12 +5596,9 @@ class BatchGenWorker:
 					self._sync_sequence_metadata(decode_uuids)
 
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
-				local_decode_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[idx])
-					for idx in local_decode_indices
-				] if local_decode_indices else []
+				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
-					local_decode_sequences
+					global_decode_sequences
 				)
 
 				# B. Config Decode
@@ -9097,7 +9104,17 @@ class BatchGenWorker:
 
 			# Pre-compute batch_sequences for use in both forward setup and update loop
 			batch_sequences = [self.global_batch.get_sequence(self._local_to_uuid_map[idx]) for idx in batch] if batch else []
-			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(batch_sequences)
+			global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
+			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
+				global_decode_sequences
+			)
+
+			if self._glm5_moe_graph_current_bucket_missing():
+				logging.info(
+					f"Rank {self.rank}: warming GLM-5 MoE CUDA graph at decode entry "
+					"after global batch debug flags and rank counts are synchronized"
+				)
+				self._warmup_cuda_graphs()
 
 			# Invariant check: cache_seqlens must not exceed allocated pages.
 			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
