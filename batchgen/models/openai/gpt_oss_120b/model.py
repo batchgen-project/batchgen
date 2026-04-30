@@ -1742,13 +1742,13 @@ class GptOss(nn.Module):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states).float()
+        logits = self.lm_head(hidden_states)
 
         # Debug logging for logits analysis
         if os.environ.get("BATCHGEN_DEBUG_LOGITS", "0") == "1":
             with torch.no_grad():
                 # Get stats for last token position (for autoregressive generation)
-                last_logits = logits[:, -1, :]  # [batch, vocab_size]
+                last_logits = logits[:, -1, :].float()  # [batch, vocab_size]
                 top_vals, top_ids = torch.topk(last_logits, k=10, dim=-1)
                 print(f"\n[LOGITS DEBUG] Shape: {logits.shape}")
                 print(f"[LOGITS DEBUG] Last token logits: min={last_logits.min():.4f}, max={last_logits.max():.4f}, mean={last_logits.mean():.4f}")
@@ -1763,7 +1763,7 @@ class GptOss(nn.Module):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
+            shift_logits = logits[..., :-1, :].float().contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
