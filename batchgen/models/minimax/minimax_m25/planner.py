@@ -20,8 +20,6 @@ class MiniMaxM25Planner:
     def generate_config(self, engine_config: EngineConfig) -> EngineConfig:
         """Generate engine configuration for M2.5."""
         # Module batching config
-        padding_length = engine_config.Basic_Config.padding_length
-        max_decoding_length = engine_config.Basic_Config.max_decoding_length
         world_size = engine_config.Basic_Config.world_size
 
         # Prefill micro-batch: process full sequence at once

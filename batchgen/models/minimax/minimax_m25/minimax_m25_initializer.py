@@ -94,7 +94,10 @@ class MiniMaxM25Initializer:
         engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
 
         # Standard planner inputs
-        engine_config.Basic_Config.padding_length = args.padding_length
+        engine_config.Basic_Config.set_max_prompt_length(
+            getattr(args, "max_prompt_length", None)
+            or getattr(args, "padding_length", None)
+        )
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
@@ -125,7 +128,7 @@ class MiniMaxM25Initializer:
         # kv_buffer_num_tokens depends on attn_decoding_micro_batch_size (set by planner)
         ec.GPU_Buffer_Config.kv_buffer_num_tokens = (
             ec.Module_Batching_Config.attn_decoding_micro_batch_size
-            * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
+            * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.get_max_prompt_length())
         )
 
         # attn_mode: always 3 for MiniMax-M2.5 (uses decoding_continuous path)
@@ -160,9 +163,10 @@ class MiniMaxM25Initializer:
         cfg = self.batchgen_config
         kv_dim_per_token = cfg.num_key_value_heads * cfg.head_dim * 2  # K + V
         kv_dtype_bytes = torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits // 8
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
 
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (

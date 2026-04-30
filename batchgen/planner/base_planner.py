@@ -49,13 +49,15 @@ class BasePlanner(ABC):
 
         Args:
             config: EngineConfig with Basic_Config already populated
-                   (device, dtypes, padding_length, etc. from set_basic_config)
+                   (device, dtypes, max_prompt_length, etc. from set_basic_config)
 
         Returns:
             EngineConfig with all sections populated
         """
         self.config = config
-        self.max_prompt_length = config.Basic_Config.padding_length
+        self.max_prompt_length = config.Basic_Config.get_max_prompt_length()
+        if self.max_prompt_length is None:
+            raise ValueError("Basic_Config.max_prompt_length must be set before planning")
         self.max_response_length = config.Basic_Config.max_decoding_length
         self.max_context_length = self.max_prompt_length + self.max_response_length
         self.world_size = config.Basic_Config.world_size

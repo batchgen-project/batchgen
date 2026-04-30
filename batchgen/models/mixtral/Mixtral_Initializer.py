@@ -290,6 +290,7 @@ class Mixtral_Initializer:
         )
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
 
         if "8x7B" in self.loaded_model_config._name_or_path:
             self.engine_config.Basic_Config.log_level = "info"
@@ -307,7 +308,7 @@ class Mixtral_Initializer:
 
             # Determine the number of host kv slots.
             self.engine_config.KV_Storage_Config.reserved_length = (
-                self.engine_config.Basic_Config.padding_length
+                max_prompt_length
                 + self.engine_config.Basic_Config.max_decoding_length
             )
             self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -334,7 +335,7 @@ class Mixtral_Initializer:
             )
             context_length = (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
             if context_length > 544:
                 self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = math.floor(
@@ -391,7 +392,7 @@ class Mixtral_Initializer:
                 self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
                 * (
                     self.engine_config.Basic_Config.max_decoding_length
-                    + self.engine_config.Basic_Config.padding_length
+                    + max_prompt_length
                 )
             )
             self.engine_config.GPU_Buffer_Config.module_shapes = {
@@ -422,7 +423,7 @@ class Mixtral_Initializer:
             self.engine_config.Basic_Config.num_threads = 16
             # Determine the number of host kv slots.
             self.engine_config.KV_Storage_Config.reserved_length = (
-                self.engine_config.Basic_Config.padding_length
+                max_prompt_length
                 + self.engine_config.Basic_Config.max_decoding_length
             )
             self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -449,7 +450,7 @@ class Mixtral_Initializer:
             )
             context_length = (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
             if context_length > 544:
                 self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = math.floor(
@@ -506,7 +507,7 @@ class Mixtral_Initializer:
                 self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
                 * (
                     self.engine_config.Basic_Config.max_decoding_length
-                    + self.engine_config.Basic_Config.padding_length
+                    + max_prompt_length
                 )
             )
 

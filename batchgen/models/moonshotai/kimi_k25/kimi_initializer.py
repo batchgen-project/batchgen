@@ -118,7 +118,10 @@ class KimiK25Initializer:
         engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
 
         # Standard planner inputs
-        engine_config.Basic_Config.padding_length = args.padding_length
+        engine_config.Basic_Config.set_max_prompt_length(
+            getattr(args, "max_prompt_length", None)
+            or getattr(args, "padding_length", None)
+        )
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
@@ -157,8 +160,9 @@ class KimiK25Initializer:
 
         # KV cache: MLA compressed KV (same as DeepSeek-V3)
         # compressed_kv_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -182,7 +186,7 @@ class KimiK25Initializer:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
         )
 

@@ -176,17 +176,18 @@ class DeepseekV3Initializer:
         )
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
 
         # Determine the number of host kv slots.
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (
             self.engine_config.KV_Storage_Config.reserved_length
             * self.model_config.compressed_kv_dim
             * torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits // 8
-        )  
+        )
         self.engine_config.KV_Storage_Config.num_host_slots = (
             self.host_kv_cache_byte_size
             // self.engine_config.KV_Storage_Config.slot_byte_size
@@ -204,7 +205,7 @@ class DeepseekV3Initializer:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
         )
         self.engine_config.GPU_Buffer_Config.module_shapes = {
@@ -285,8 +286,3 @@ class DeepseekV3Initializer:
             self.model_config,
             self.loaded_model_config
         )
-
-
-        
-        
-                

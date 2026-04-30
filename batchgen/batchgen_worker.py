@@ -239,7 +239,8 @@ class InputArguments:
 	cache_dir: Optional[str] = None
 	converted_ckpt_dir: Optional[str] = None
 	queries: Optional[List[str]] = None
-	padding_length: int = 512
+	max_prompt_length: Optional[int] = None
+	padding_length: Optional[int] = None  # Deprecated alias for older initializers.
 	max_decoding_length: int = 128
 	device: int = 0
 	num_queries: int = 0
@@ -260,6 +261,12 @@ class InputArguments:
 	enable_ep_with_offloading: bool = False
 	ep_offloading_ratio: float = 0.0
 	pre_dequantize_weights: bool = False
+
+	def __post_init__(self):
+		if self.max_prompt_length is None and self.padding_length is not None:
+			self.max_prompt_length = self.padding_length
+		elif self.max_prompt_length is not None:
+			self.padding_length = self.max_prompt_length
 
 	def get(self, key, default=None):
 		return getattr(self, key, default)
@@ -2068,7 +2075,7 @@ class BatchGenWorker:
 			"hf_cache_dir": self.hf_cache_dir,
 			"cache_dir": self.cache_dir,
 			"converted_ckpt_dir": self.converted_ckpt_dir,
-			"padding_length": self.max_input_length,
+			"max_prompt_length": self.max_input_length,
 			"max_decoding_length": self.max_decoding_length,
 			"device": self.device,
 			"skeleton_state_dict": self.skeleton_state_dict,
@@ -2154,11 +2161,12 @@ class BatchGenWorker:
 		
 		# Update engine config with new batch parameters
 		self.engine_config.Basic_Config.max_decoding_length = self.max_decoding_length
-		self.engine_config.Basic_Config.padding_length = self.max_input_length
+		self.engine_config.Basic_Config.set_max_prompt_length(self.max_input_length)
 		self.engine_config.Basic_Config.num_queries = num_queries
 		
 		# Update input_arguments for any components that might reference them
 		if hasattr(self, 'input_arguments'):
+			self.input_arguments.max_prompt_length = self.max_input_length
 			self.input_arguments.padding_length = self.max_input_length
 			self.input_arguments.max_decoding_length = self.max_decoding_length
 			self.input_arguments.num_queries = num_queries
@@ -2178,15 +2186,16 @@ class BatchGenWorker:
 		if self.engine_config is None:
 			return
 			
-		old_padding_length = self.engine_config.Basic_Config.padding_length
-		if old_padding_length != self.max_input_length:
+		old_max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
+		if old_max_prompt_length != self.max_input_length:
 			logging.info(
-				f"Rank {self.rank}: Updating padding_length from {old_padding_length} to {self.max_input_length} "
+				f"Rank {self.rank}: Updating max_prompt_length from {old_max_prompt_length} to {self.max_input_length} "
 				f"(based on actual longest prompt)"
 			)
-			self.engine_config.Basic_Config.padding_length = self.max_input_length
+			self.engine_config.Basic_Config.set_max_prompt_length(self.max_input_length)
 			
 			if hasattr(self, 'input_arguments') and self.input_arguments is not None:
+				self.input_arguments.max_prompt_length = self.max_input_length
 				self.input_arguments.padding_length = self.max_input_length
 
 	# ============ KV Cache Helper Methods ============
@@ -5051,11 +5060,11 @@ class BatchGenWorker:
 		# Reset max_input_length from Init's 8192 default to 0.
 		# In legacy mode, _tokenize_global_batch sets max_input_length to the
 		# actual longest prompt, then _update_config_after_tokenization propagates
-		# it to padding_length and engine config BEFORE prefill/decode.
+		# it to max_prompt_length in engine config BEFORE prefill/decode.
 		# In pool mode, Init(None,...) defaults max_input_length to 8192 for the
 		# initializer, but once core components are ready we must reset it so the
 		# first admission batch correctly sets it from actual prompt lengths.
-		# Without this, padding_length stays at 8192 which causes wrong
+		# Without this, max_prompt_length stays at 8192 which causes wrong
 		# KV_Storage_Config.reserved_length and GPU buffer sizing.
 		self.max_input_length = 0
 

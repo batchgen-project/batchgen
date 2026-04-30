@@ -111,7 +111,10 @@ class GptOssInitializer:
         """Set basic engine configuration from arguments."""
         engine_config.Basic_Config.device = args.device
         engine_config.Basic_Config.device_torch = torch.device(args.device)
-        engine_config.Basic_Config.padding_length = args.padding_length
+        engine_config.Basic_Config.set_max_prompt_length(
+            getattr(args, "max_prompt_length", None)
+            or getattr(args, "padding_length", None)
+        )
         engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
 
         # GPT-OSS uses BF16 for attention (not quantized)
@@ -146,9 +149,10 @@ class GptOssInitializer:
         # KV cache configuration for GQA (8 KV heads, head_dim=64)
         # KV dim per layer = 2 * num_kv_heads * head_dim = 2 * 8 * 64 = 1024
         kv_dim = 2 * self.model_config.num_key_value_heads * self.model_config.head_dim
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
 
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -173,7 +177,7 @@ class GptOssInitializer:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
         )
 

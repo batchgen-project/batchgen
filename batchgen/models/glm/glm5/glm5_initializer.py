@@ -72,8 +72,9 @@ class GLM5Initializer:
         logging.info(f"Current device total memory: {total_memory} GB")
 
         # KV storage config
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -97,7 +98,7 @@ class GLM5Initializer:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
         )
 

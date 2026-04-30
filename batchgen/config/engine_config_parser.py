@@ -105,6 +105,11 @@ def _parse_basic_config(basic_config: BasicConfig, config_dict: Dict[str, Any]) 
             raise ValueError(f"Unknown key in Basic_Config: {key}")
         
         setattr(basic_config, key, value)
+
+    if basic_config.max_prompt_length is None and basic_config.padding_length is not None:
+        basic_config.max_prompt_length = basic_config.padding_length
+    elif basic_config.max_prompt_length is not None:
+        basic_config.padding_length = basic_config.max_prompt_length
     
     # Convert string dtypes to torch dtypes if applicable
     if basic_config.weight_dtype:

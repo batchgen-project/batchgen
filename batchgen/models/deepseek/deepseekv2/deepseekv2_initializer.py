@@ -515,6 +515,7 @@ class DeepSeek_Initializer:
         )
         total_memory = props.total_memory / (1024**3)
         logging.info(f"Current device total memory: {total_memory} GB")
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
         if (
             self.loaded_model_config._name_or_path
             == "deepseek-ai/DeepSeek-V2-Lite-Chat" or
@@ -533,7 +534,7 @@ class DeepSeek_Initializer:
             self.engine_config.Basic_Config.num_threads = 16
 
             self.engine_config.KV_Storage_Config.reserved_length = (
-                self.engine_config.Basic_Config.padding_length
+                max_prompt_length
                 + self.engine_config.Basic_Config.max_decoding_length
             )
             self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -559,7 +560,7 @@ class DeepSeek_Initializer:
             )
             context_length = (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
             if context_length > 544:
                 self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = math.floor(
@@ -608,7 +609,7 @@ class DeepSeek_Initializer:
                 self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
                 * (
                     self.engine_config.Basic_Config.max_decoding_length
-                    + self.engine_config.Basic_Config.padding_length
+                    + max_prompt_length
                 )
             )
             self.engine_config.GPU_Buffer_Config.module_shapes = {
@@ -653,7 +654,7 @@ class DeepSeek_Initializer:
             # self.engine_config.Module_Batching_Config.expert_prefill_batch_size_upper_bound = 8192
             # self.engine_config.Module_Batching_Config.expert_decoding_batch_size_upper_bound = 8192
             self.engine_config.KV_Storage_Config.reserved_length = (
-                self.engine_config.Basic_Config.padding_length
+                max_prompt_length
                 + self.engine_config.Basic_Config.max_decoding_length
             )
             self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -679,7 +680,7 @@ class DeepSeek_Initializer:
             )
             context_length = (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
             if context_length > 768:
                 self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = math.floor(
@@ -738,7 +739,7 @@ class DeepSeek_Initializer:
                 self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
                 * (
                     self.engine_config.Basic_Config.max_decoding_length
-                    + self.engine_config.Basic_Config.padding_length
+                    + max_prompt_length
                 )
             )
             self.engine_config.GPU_Buffer_Config.module_shapes = {
