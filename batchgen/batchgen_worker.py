@@ -502,6 +502,9 @@ class BatchGenWorker:
 		self._prefix_reuse_namespace_hash = self._build_prefix_reuse_namespace_hash()
 		self._prefix_reuse_allocations_by_global_id: Dict[int, dict] = {}
 		self._prefix_reuse_prompt_rank_cache: Dict[int, int] = {}
+		self._prefix_reuse_prompt_rank_key_cache: Dict[
+			int, Tuple[int, int, int, int]
+		] = {}
 		self._prefix_reuse_rank_cache_epoch = 0
 		self._prefix_reuse_prefill_stats = {
 			"total_prompt_tokens": 0,
@@ -1047,6 +1050,7 @@ class BatchGenWorker:
 		self.global_batch = SequenceBatch()
 		self._completed_result_cache = {}
 		self._prefix_reuse_allocations_by_global_id.clear()
+		self._prefix_reuse_prompt_rank_key_cache.clear()
 		self._local_to_uuid_map.clear()
 		self._uuid_to_local_map.clear()
 		self.query_book = {}
@@ -1323,12 +1327,14 @@ class BatchGenWorker:
 			prefix_assigned: Set[str] = set()
 			if self._prefix_reuse_runtime_enabled():
 				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
+				rank_hint_index = self._build_prefix_reuse_rank_hint_index(pending_uuids)
+				prefix_assigned_by_rank = [0] * self.world_size
 				for uuid in uuids:
 					seq = self.global_batch.get_sequence(uuid)
 					if seq is None:
 						continue
 					cached_rank = self._prefix_reuse_cached_rank_for_sequence(
-						seq, pending_uuids
+						seq, pending_uuids, rank_hint_index
 					)
 					if cached_rank is None:
 						continue
@@ -1336,12 +1342,14 @@ class BatchGenWorker:
 					L = getattr(seq, "prompt_length", 0) or 0
 					rank_load[cached_rank] += float(L) * float(L)
 					prefix_assigned.add(uuid)
-					if self.rank == 0:
-						logging.info(
-							"[PREFIX_REUSE] Assigned sequence %s to cached rank %d",
-							uuid[:8],
-							cached_rank,
-						)
+					prefix_assigned_by_rank[cached_rank] += 1
+				if self.rank == 0 and prefix_assigned:
+					logging.info(
+						"[PREFIX_REUSE] Assigned %d admitted sequences to cached "
+						"ranks %s",
+						len(prefix_assigned),
+						prefix_assigned_by_rank,
+					)
 
 			# Resolve uuids → seqs and sort by length DESC (FFD).
 			pending = []
@@ -1379,24 +1387,28 @@ class BatchGenWorker:
 		prefix_assigned: Set[str] = set()
 		if self._prefix_reuse_runtime_enabled():
 			self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
+			rank_hint_index = self._build_prefix_reuse_rank_hint_index(pending_uuids)
+			prefix_assigned_by_rank = [0] * self.world_size
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is None:
 					continue
 				cached_rank = self._prefix_reuse_cached_rank_for_sequence(
-					seq, pending_uuids
+					seq, pending_uuids, rank_hint_index
 				)
 				if cached_rank is None:
 					continue
 				self.global_batch.assign_rank(uuid, cached_rank)
 				rank_counts[cached_rank] += 1
 				prefix_assigned.add(uuid)
-				if self.rank == 0:
-					logging.info(
-						"[PREFIX_REUSE] Assigned sequence %s to cached rank %d",
-						uuid[:8],
-						cached_rank,
-					)
+				prefix_assigned_by_rank[cached_rank] += 1
+			if self.rank == 0 and prefix_assigned:
+				logging.info(
+					"[PREFIX_REUSE] Assigned %d admitted sequences to cached "
+					"ranks %s",
+					len(prefix_assigned),
+					prefix_assigned_by_rank,
+				)
 
 		for uuid in uuids:
 			if uuid in prefix_assigned:
@@ -6625,6 +6637,15 @@ class BatchGenWorker:
 		page_tokens = (prompt_len // self.PAGE_SIZE) * self.PAGE_SIZE
 		if page_tokens <= 0:
 			return None
+		cache_entry = self._prefix_reuse_prompt_rank_key_cache.get(seq.global_idx)
+		if cache_entry is not None:
+			cached_page_tokens, cached_page_size, cached_namespace, cached_key = cache_entry
+			if (
+				cached_page_tokens == page_tokens
+				and cached_page_size == self.PAGE_SIZE
+				and cached_namespace == self._prefix_reuse_namespace_hash
+			):
+				return cached_key
 
 		import hashlib
 
@@ -6635,7 +6656,14 @@ class BatchGenWorker:
 		hasher.update(int(page_tokens // self.PAGE_SIZE).to_bytes(4, "little"))
 		for token in prompt:
 			hasher.update(int(token).to_bytes(8, "little", signed=True))
-		return int.from_bytes(hasher.digest(), "little")
+		key = int.from_bytes(hasher.digest(), "little")
+		self._prefix_reuse_prompt_rank_key_cache[seq.global_idx] = (
+			page_tokens,
+			self.PAGE_SIZE,
+			self._prefix_reuse_namespace_hash,
+			key,
+		)
+		return key
 
 	def _maybe_clear_prefix_reuse_rank_cache_after_eviction(self) -> None:
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
@@ -6652,6 +6680,7 @@ class BatchGenWorker:
 		self,
 		seq: SequenceEntry,
 		pending_uuids: Set[str],
+		rank_hint_index: Optional[Dict[int, int]] = None,
 	) -> Optional[int]:
 		"""Return the rank that already owns a compatible prefix cache entry."""
 		key = self._prefix_reuse_prompt_rank_key(seq)
@@ -6661,6 +6690,11 @@ class BatchGenWorker:
 		cached_rank = self._prefix_reuse_prompt_rank_cache.get(key)
 		if cached_rank is not None and 0 <= cached_rank < self.world_size:
 			return int(cached_rank)
+		if rank_hint_index is not None:
+			cached_rank = rank_hint_index.get(key)
+			if cached_rank is not None and 0 <= cached_rank < self.world_size:
+				self._prefix_reuse_prompt_rank_cache[key] = int(cached_rank)
+				return int(cached_rank)
 
 		for existing in self.global_batch:
 			if (
@@ -6677,6 +6711,31 @@ class BatchGenWorker:
 			except Exception:
 				continue
 		return None
+
+	def _build_prefix_reuse_rank_hint_index(
+		self,
+		pending_uuids: Set[str],
+	) -> Dict[int, int]:
+		"""Build a per-admission prefix-key -> rank hint index.
+
+		Without this index, rank-affinity assignment scans the full global batch
+		for every newly admitted request. In pool mode that becomes expensive
+		during large MMLU runs because admission happens repeatedly while the
+		scheduling pool is near capacity.
+		"""
+		rank_hint_index: Dict[int, int] = {}
+		for key, rank in self._prefix_reuse_prompt_rank_cache.items():
+			if 0 <= rank < self.world_size:
+				rank_hint_index[key] = int(rank)
+
+		for existing in self.global_batch:
+			if existing.uuid in pending_uuids or existing.assigned_rank is None:
+				continue
+			key = self._prefix_reuse_prompt_rank_key(existing)
+			if key is None or key in rank_hint_index:
+				continue
+			rank_hint_index[key] = int(existing.assigned_rank)
+		return rank_hint_index
 
 	def _commit_prefix_reuse_pages(self, prefill_uuids: List[str]) -> None:
 		if not self.enable_prefix_reuse:
