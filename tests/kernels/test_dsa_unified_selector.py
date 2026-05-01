@@ -673,6 +673,49 @@ def test_unified_selector_skips_negative_slot_padding_rows():
     assert torch.all(selected_indices[1] == -1)
 
 
+def test_unified_selector_skips_negative_slot_with_empty_page_table():
+    torch.cuda.set_device(0)
+    primary_blocked_k = torch.randn(
+        1,
+        PAGE_SIZE,
+        1,
+        KV_DIM,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).contiguous()
+    primary_page_table = torch.empty(
+        0,
+        1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cache_seqlens = torch.tensor([1], device="cuda", dtype=torch.int32)
+    long_topk_indices = torch.zeros(
+        1,
+        INDEX_TOPK,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    slot_indices = torch.tensor([-1], device="cuda", dtype=torch.int32)
+
+    selected, selected_lengths, selected_indices, row_modes = (
+        select_mla_kv_for_flashmla_bf16(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            index_topk=INDEX_TOPK,
+            page_size=PAGE_SIZE,
+            primary_slot_indices=slot_indices,
+        )
+    )
+
+    assert torch.count_nonzero(selected) == 0
+    assert selected_lengths.tolist() == [1]
+    assert row_modes.tolist() == [2]
+    assert torch.all(selected_indices == -1)
+
+
 def test_reference_selector_output_feeds_flashmla_dense_contract():
     torch.cuda.set_device(0)
     batch_size = 3

@@ -68,6 +68,8 @@ def _unified_select_kernel(
 
             physical_page = tl.load(
                 block_table_ptr + safe_slot * max_pages_per_seq + logical_page,
+                mask=slot_valid & page_in_table,
+                other=-1,
             ).to(tl.int64)
             valid = valid & slot_valid & page_in_table & (physical_page >= 0)
             physical_page = tl.maximum(physical_page, 0)

@@ -309,7 +309,7 @@ def _fused_paged_score_with_slots_kernel(
     safe_logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
     physical_page = tl.load(
         BLOCK_TABLE_ptr + safe_slot * max_pages_per_seq + safe_logical_page,
-        mask=page_in_range,
+        mask=page_in_range & slot_valid & page_in_table,
         other=-1,
     ).to(tl.int64)
     k_valid = slot_valid & page_in_table & (physical_page >= 0)

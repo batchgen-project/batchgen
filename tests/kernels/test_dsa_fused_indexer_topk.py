@@ -9,6 +9,7 @@ from batchgen_kernels.attention.dsa.fused_indexer_score import (
     fused_score_and_topk,
     fused_score_and_topk_out,
     fused_paged_score_and_topk_out,
+    fused_paged_score_and_topk_with_slots_out,
 )
 from batchgen_kernels.attention.dsa.fast_topk_cuda import fast_topk_2048
 
@@ -229,6 +230,53 @@ def test_fused_paged_score_and_topk_matches_dense_scorer(
         atol=2e-2,
         rtol=2e-2,
     )
+
+
+def test_fused_paged_score_with_slots_skips_empty_page_table_padding_row():
+    torch.cuda.set_device(0)
+    batch_size = 1
+    max_seqlen = 256
+    topk = 32
+    n_heads = 4
+    head_dim = 32
+    page_size = 64
+    q = torch.randn(
+        batch_size,
+        n_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    aux_blocked_k = torch.randn(
+        1,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    aux_page_table = torch.empty(0, 1, device="cuda", dtype=torch.int32)
+    aux_slot_indices = torch.tensor([-1], device="cuda", dtype=torch.int32)
+    head_gates = torch.randn(batch_size, n_heads, device="cuda", dtype=torch.float32)
+    cache_seqlens = torch.tensor([max_seqlen], device="cuda", dtype=torch.int32)
+    agg = torch.empty(batch_size, max_seqlen, device="cuda", dtype=torch.float32)
+    top_k_indices = torch.empty(batch_size, topk, device="cuda", dtype=torch.long)
+
+    fused_paged_score_and_topk_with_slots_out(
+        q,
+        aux_blocked_k,
+        aux_page_table,
+        aux_slot_indices,
+        head_gates,
+        cache_seqlens,
+        agg,
+        top_k_indices,
+        topk=topk,
+        page_size=page_size,
+        max_seqlen=max_seqlen,
+    )
+
+    torch.testing.assert_close(agg, torch.full_like(agg, -float("inf")))
 
 
 def test_fast_topk_2048_cuda_matches_torch_topk_values():
