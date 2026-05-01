@@ -1685,10 +1685,17 @@ class Glm5MoE(nn.Module):
             local_pos = positions % ntp
             max_valid = rank_counts[rank_ids]
             padding_mask = local_pos >= max_valid
-            # Unconditional mask application; skipping the .any() gate removes
-            # a per-layer D2H sync and the fancy-index op is a no-op when empty.
-            topk_idx[padding_mask] = -1
-            topk_weight[padding_mask] = 0.0
+            padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
+            topk_idx = torch.where(
+                padding_mask_2d,
+                torch.full_like(topk_idx, -1),
+                topk_idx,
+            )
+            topk_weight = torch.where(
+                padding_mask_2d,
+                torch.zeros_like(topk_weight),
+                topk_weight,
+            )
 
         # 3) 3D dispatch
         buf.dispatched_x.zero_()
