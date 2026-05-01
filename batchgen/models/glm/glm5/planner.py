@@ -24,7 +24,6 @@ class GLM5Planner(BasePlanner):
     MAGIC_NUM = 672_000
     DEFAULT_MEM_FRAC = 0.85
     NUM_EXPERTS = 256
-    SINGLE_NODE_RUNTIME_RESERVE_GB = 5.5
 
     # GLM-5 specific constants
     NUM_LAYERS = 78
@@ -77,19 +76,7 @@ class GLM5Planner(BasePlanner):
         cuda_page_table_default_size = 5
         nccl_default_buffer_usage = 2.5
 
-        # Single-node GLM-5 keeps more CUDA/NCCL/runtime state resident than
-        # the coarse expert-size model accounts for. Reserve it before choosing
-        # partial-persistent experts so GPU-KV initialization has real headroom.
-        runtime_decode_reserve = 0.0
-        if self.world_size <= 8 and not self.config.EP_Config.enable_offloading:
-            runtime_decode_reserve = self.SINGLE_NODE_RUNTIME_RESERVE_GB
-
-        non_static_memory_usage = (
-            k_buffer_size
-            + model_skeleton_size
-            + cuda_page_table_default_size
-            + runtime_decode_reserve
-        )
+        non_static_memory_usage = k_buffer_size + model_skeleton_size + cuda_page_table_default_size
         available_memory_for_expert_cache = available_gpu_mem - non_static_memory_usage
 
         if self.config.EP_Config.enable_offloading and self.config.EP_Config.offloading_ratio > 0:
@@ -108,6 +95,9 @@ class GLM5Planner(BasePlanner):
             num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
 
         if self.config.Basic_Config.attn_mode == 3:
+            if not self.config.EP_Config.enable_offloading:
+                num_local_expert_per_layer = expert_per_rank
+
             expert_size = num_local_expert_per_layer * self.EXPERT_SIZE_GB
             per_seq_size = (
                 self.max_context_length * self.NUM_LAYERS * self.COMPRESSED_KV_DIM
@@ -115,7 +105,7 @@ class GLM5Planner(BasePlanner):
             )
             self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = int(
                 (available_gpu_mem - model_skeleton_size - cuda_page_table_default_size -
-                 expert_size - nccl_default_buffer_usage - runtime_decode_reserve) / per_seq_size
+                 expert_size - nccl_default_buffer_usage) / per_seq_size
             )
             logging.info(
                 f"Max Available MoE decoding micro batch size: "
@@ -129,6 +119,9 @@ class GLM5Planner(BasePlanner):
         self.config.GPU_Buffer_Config.num_k_buffer = num_k_buffer
         self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
         self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
+
+        if self.config.Basic_Config.attn_mode == 3 and not self.config.EP_Config.enable_offloading:
+            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
     def get_module_shapes(self) -> dict:
         """Return GLM-5 specific tensor shapes."""

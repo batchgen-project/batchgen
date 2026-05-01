@@ -26,12 +26,12 @@ def _plan(world_size: int) -> EngineConfig:
     return GLM5Planner("zai-org/GLM-5-FP8").generate_config(config)
 
 
-def test_glm5_planner_uses_continuous_decode_for_single_node():
+def test_glm5_planner_mode3_uses_full_local_experts_single_node():
     config = _plan(world_size=8)
 
     assert config.Basic_Config.attn_mode == 3
-    assert config.EP_Config.num_local_expert_per_layer == 22
-    assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 12
+    assert config.EP_Config.num_local_expert_per_layer == 32
+    assert config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] == 0
 
 
 def test_glm5_planner_keeps_full_persistent_two_node_decode():
