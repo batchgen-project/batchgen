@@ -1217,6 +1217,26 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		return self._gpu_page_table_manager.get_cuda_graph_table()
 
+	def ensure_cuda_graph_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
+		"""Refresh and return graph-stable page-table storage for a capture.
+
+		Some prefill/temporary rebuilds can intentionally exceed the reserved
+		CUDA-graph metadata capacity, leaving the graph table marked invalid while
+		the active dynamic table remains usable. Decode graph capture should
+		refresh the fixed graph table from the current decode slot order before
+		reading it.
+		"""
+		self._ensure_initialized()
+		ordered_ids = list(sequence_ids)
+		mgr = self._gpu_page_table_manager
+		if mgr._cuda_graph_table_valid and mgr.slot_to_seq_id == ordered_ids:
+			return mgr.get_cuda_graph_table()
+		if ordered_ids:
+			self.rebuild_page_table(ordered_ids)
+		else:
+			self.clear_page_table()
+		return self.get_cuda_graph_page_table()
+
 	def get_cuda_graph_page_table_state(self) -> CUDAGraphPageTableState:
 		"""Return graph-stable page table plus active-slot metadata."""
 		self._ensure_initialized()

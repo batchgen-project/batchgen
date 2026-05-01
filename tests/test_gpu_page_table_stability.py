@@ -197,3 +197,33 @@ def test_cuda_graph_capacity_errors_do_not_break_active_dynamic_table(monkeypatc
     torch.testing.assert_close(graph_state.table[0, :1], manager._sequences[3].pages)
     assert torch.all(graph_state.table[0, 1:] == -1)
     assert torch.all(graph_state.table[1:, :] == -1)
+
+
+def test_ensure_cuda_graph_page_table_recovers_invalid_graph_storage(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS", "2")
+    manager = _make_manager(num_pages=8)
+    manager.allocate_pages_for_sequences([1, 2, 3], [4, 4, 4])
+
+    manager.rebuild_page_table([1, 2])
+    first_state = manager.get_cuda_graph_page_table_state()
+    graph_ptr = first_state.table.data_ptr()
+
+    manager.rebuild_page_table([1, 2, 3])
+    with pytest.raises(RuntimeError, match="CUDA graph page table is not valid"):
+        manager.get_cuda_graph_page_table()
+
+    refreshed = manager.ensure_cuda_graph_page_table([3])
+    assert refreshed.data_ptr() == graph_ptr
+    torch.testing.assert_close(refreshed[0, :1], manager._sequences[3].pages)
+    assert torch.all(refreshed[0, 1:] == -1)
+    assert torch.all(refreshed[1:] == -1)
+
+    emptied = manager.ensure_cuda_graph_page_table([])
+    assert emptied.data_ptr() == graph_ptr
+    empty_state = manager.get_cuda_graph_page_table_state()
+    assert empty_state.num_valid_slots == 0
+    assert empty_state.slot_indices.numel() == 0
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == (
+        0,
+        manager._gpu_page_table_manager.max_pages_per_sequence,
+    )
