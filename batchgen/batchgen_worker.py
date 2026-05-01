@@ -8762,6 +8762,9 @@ class BatchGenWorker:
 				manager.drop_bucket(capture_bucket)
 				self._glm5_whole_model_graph_failed_buckets.add(capture_bucket)
 				self._cuda_graph_manager = None
+				self._whole_model_segment = None
+				self._whole_model_bucketing = None
+				self._glm5_whole_model_capture_input_ids = None
 				self._whole_model_graph = False
 				self._glm5_whole_model_graph = False
 				torch.cuda.empty_cache()
@@ -11692,6 +11695,9 @@ class BatchGenWorker:
 		self.model = None
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._whole_model_segment = None
+		self._whole_model_bucketing = None
+		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
@@ -11807,6 +11813,9 @@ class BatchGenWorker:
 		self.model = None
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._whole_model_segment = None
+		self._whole_model_bucketing = None
+		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
