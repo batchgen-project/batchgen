@@ -4991,6 +4991,54 @@ class BatchGenWorker:
 
 		return prefill_batch
 
+	def _min_back_to_back_prefill_batch_size(self) -> int:
+		"""Minimum useful prefill batch size when decode-ready work exists."""
+		raw_value = os.environ.get("BATCHGEN_MIN_BACK_TO_BACK_PREFILL_BATCH")
+		if raw_value is not None:
+			try:
+				return max(1, int(raw_value))
+			except ValueError:
+				if self.rank == 0:
+					logging.warning(
+						"Invalid BATCHGEN_MIN_BACK_TO_BACK_PREFILL_BATCH=%r; "
+						"using default",
+						raw_value,
+					)
+		return max(4, 2 * self.world_size)
+
+	def _should_continue_back_to_back_prefill(self, next_prefill: List[str]) -> bool:
+		"""Avoid spending full prefill/model-swap cycles on tiny batches.
+
+		Back-to-back prefill is useful while we can add a material number of
+		requests to host KV before decode. Once host KV is nearly full, prefix
+		cache eviction can make room for only one or a few requests at a time.
+		If there is already decode-ready work, entering decode is better: it
+		drains completions and scheduling slots instead of repeatedly paying
+		prefill setup cost for tiny batches.
+		"""
+		if not next_prefill:
+			return False
+		has_decode_ready = (
+			self.global_batch.has_prefilled()
+			or self.global_batch.has_in_decode()
+			or self.global_batch.has_on_hold()
+		)
+		if not has_decode_ready:
+			return True
+
+		min_batch = self._min_back_to_back_prefill_batch_size()
+		if len(next_prefill) >= min_batch:
+			return True
+
+		if self.rank == 0:
+			logging.info(
+				"[PREFILL] Entering decode instead of tiny back-to-back prefill: "
+				"next=%d min=%d",
+				len(next_prefill),
+				min_batch,
+			)
+		return False
+
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
 		if not uuids:
@@ -6271,7 +6319,7 @@ class BatchGenWorker:
 					self._poll_admissions()
 				if self.global_batch.has_queueing():
 					next_prefill = self._prepare_prefill_batch()
-					if next_prefill:
+					if self._should_continue_back_to_back_prefill(next_prefill):
 						if self.rank == 0:
 							logging.info(
 								f"[PREFILL] Back-to-back prefill: {len(next_prefill)} new sequences ready"
