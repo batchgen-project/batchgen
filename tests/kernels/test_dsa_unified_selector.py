@@ -679,7 +679,7 @@ def test_unified_selector_skips_negative_slot_with_empty_page_table():
         1,
         PAGE_SIZE,
         1,
-        KV_DIM,
+        D_QK,
         device="cuda",
         dtype=torch.bfloat16,
     ).contiguous()
