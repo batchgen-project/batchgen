@@ -1476,7 +1476,7 @@ class Glm5MoE(nn.Module):
             with self.comm.change_state(enable=True):
                 self.comm.all_gather(
                     all_tokens, padded,
-                    stream=torch.cuda.default_stream(self.device),
+                    stream=torch.cuda.current_stream(self.device),
                 )
 
         # 2) Gate
@@ -1500,7 +1500,7 @@ class Glm5MoE(nn.Module):
             with self.comm.change_state(enable=True):
                 self.comm.all_reduce(
                     global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.default_stream(self.device),
+                    stream=torch.cuda.current_stream(self.device),
                 )
 
         # 6) Extract local slice + shared expert
@@ -1667,7 +1667,7 @@ class Glm5MoE(nn.Module):
         with self.comm.change_state(enable=True):
             self.comm.all_gather(
                 all_tokens, padded,
-                stream=torch.cuda.default_stream(self.device),
+                stream=torch.cuda.current_stream(self.device),
             )
 
         # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
@@ -1724,7 +1724,7 @@ class Glm5MoE(nn.Module):
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(
                 global_results, op=dist.ReduceOp.SUM,
-                stream=torch.cuda.default_stream(self.device),
+                stream=torch.cuda.current_stream(self.device),
             )
 
         # 7) Slice local + add shared expert
