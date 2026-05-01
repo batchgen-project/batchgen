@@ -55,13 +55,9 @@ class GLM5Planner(BasePlanner):
         expert_per_rank = self.NUM_EXPERTS // self.world_size
         assert expert_per_rank > 0, "EXPERT_PER_RANK must be greater than 0"
 
-        if self.world_size > 8:
-            self.config.Basic_Config.attn_mode = 3
-        elif self.config.EP_Config.enable_offloading:
-            self.config.Basic_Config.attn_mode = 3
-            logging.info("EP offloading enabled on single-node: setting attn_mode=3 for decoding_continuous()")
-        else:
-            self.config.Basic_Config.attn_mode = 1
+        # GLM-5 decode must always use the continuous attention path; legacy
+        # attn modes do not support the DSA architecture.
+        self.config.Basic_Config.attn_mode = 3
 
         attn_decoding_micro_batch_size = self.MAGIC_NUM // self.max_prompt_length
         attn_decoding_micro_batch_size = 2 ** (attn_decoding_micro_batch_size.bit_length() - 1)
@@ -99,9 +95,6 @@ class GLM5Planner(BasePlanner):
             num_decoding_module_buffer_routed_expert = expert_per_rank - num_local_expert_per_layer + 2
 
         if self.config.Basic_Config.attn_mode == 3:
-            if not self.config.EP_Config.enable_offloading:
-                num_local_expert_per_layer = expert_per_rank
-
             expert_size = num_local_expert_per_layer * self.EXPERT_SIZE_GB
             per_seq_size = (
                 self.max_context_length * self.NUM_LAYERS * self.COMPRESSED_KV_DIM
@@ -123,9 +116,6 @@ class GLM5Planner(BasePlanner):
         self.config.GPU_Buffer_Config.num_k_buffer = num_k_buffer
         self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = num_decoding_module_buffer_routed_expert
         self.config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
-
-        if self.config.Basic_Config.attn_mode == 3 and not self.config.EP_Config.enable_offloading:
-            self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
     def get_module_shapes(self) -> dict:
         """Return GLM-5 specific tensor shapes."""
