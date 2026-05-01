@@ -8622,6 +8622,17 @@ class BatchGenWorker:
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 			vocab_size = getattr(self.model, 'vocab_size', None) or self.model.config.vocab_size
 			hidden_size = self.model.config.hidden_size
+			probe_layers_env = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_PROBE_LAYERS", "")
+			if probe_layers_env.strip().lower() == "all":
+				compare_probe_layers = tuple(range(len(self.model.model.layers)))
+			elif probe_layers_env.strip():
+				compare_probe_layers = tuple(
+					int(part.strip())
+					for part in probe_layers_env.split(",")
+					if part.strip()
+				)
+			else:
+				compare_probe_layers = ()
 			whole_seg = Glm5WholeModelSegment(
 				model=self.model,
 				device=self.torch_device,
@@ -8634,6 +8645,7 @@ class BatchGenWorker:
 				max_seqlen=graph_max_seqlen,
 				include_embedding=True,
 				include_lm_head=True,
+				compare_probe_layers=compare_probe_layers,
 			)
 			capture_input_ids = getattr(self, "_glm5_whole_model_capture_input_ids", None)
 			if capture_input_ids is None or capture_input_ids.shape[0] < local_bsz:
@@ -9889,18 +9901,38 @@ class BatchGenWorker:
 					if graph_hidden_states is not None:
 						graph_hidden_states = graph_hidden_states[:batch_size]
 					if _glm5_whole_compare:
+						graph_probe_hidden_states = {
+							key: value[:batch_size]
+							for key, value in graph_out.items()
+							if key.startswith("probe_layer_")
+						}
 						graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_eager_start = time.perf_counter()
-						eager_model_outputs = self.model.model(
-							input_ids=new_tokens,
-							attention_mask=Attn_Wrapper.attention_mask,
-							position_ids=Attn_Wrapper.position_ids,
-							use_cache=False,
-						)
-						eager_hidden_states = eager_model_outputs[0][:, -1, :]
-						eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
+						if getattr(self._whole_model_segment, "compare_probe_layers", ()):
+							eager_probe_outputs = self._whole_model_segment.run_model_with_probes(
+								input_ids=new_tokens,
+								attention_mask=Attn_Wrapper.attention_mask,
+								position_ids=Attn_Wrapper.position_ids,
+							)
+							eager_hidden_states = eager_probe_outputs["hidden_states"]
+							eager_logits = eager_probe_outputs["logits"]
+							eager_probe_hidden_states = {
+								key: value
+								for key, value in eager_probe_outputs.items()
+								if key.startswith("probe_layer_")
+							}
+						else:
+							eager_model_outputs = self.model.model(
+								input_ids=new_tokens,
+								attention_mask=Attn_Wrapper.attention_mask,
+								position_ids=Attn_Wrapper.position_ids,
+								use_cache=False,
+							)
+							eager_hidden_states = eager_model_outputs[0][:, -1, :]
+							eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
+							eager_probe_hidden_states = {}
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["eager_ms"] = (
@@ -9916,6 +9948,8 @@ class BatchGenWorker:
 							graph_logits=logits,
 							eager_hidden_states=eager_hidden_states,
 							graph_hidden_states=graph_hidden_states,
+							eager_probe_hidden_states=eager_probe_hidden_states,
+							graph_probe_hidden_states=graph_probe_hidden_states,
 							eager_tokens=eager_tokens_for_compare,
 							graph_tokens=graph_tokens_for_compare,
 							atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
@@ -9925,7 +9959,9 @@ class BatchGenWorker:
 						_log(
 							"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
 							"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
-							"hidden_mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
+							"hidden_mean_abs=%.6g probe_first_mismatch=%s "
+							"probe_max_abs=%.6g probe_mean_abs=%.6g "
+							"argmax_mismatch=%s token_mismatch=%s",
 							self.rank,
 							bucket,
 							batch_size,
@@ -9934,6 +9970,9 @@ class BatchGenWorker:
 							compare["mean_abs"],
 							compare["hidden_max_abs"],
 							compare["hidden_mean_abs"],
+							compare["probe_first_mismatch"],
+							compare["probe_max_abs"],
+							compare["probe_mean_abs"],
 							compare["argmax_mismatch"],
 							compare["token_mismatch"],
 						)

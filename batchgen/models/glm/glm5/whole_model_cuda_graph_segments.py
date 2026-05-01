@@ -14,7 +14,7 @@ can participate in NCCL graph capture/replay even when a rank has no local rows.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Dict
+from typing import Dict, Iterable
 
 import torch
 
@@ -39,6 +39,7 @@ class Glm5WholeModelSegment:
         max_seqlen: int,
         include_embedding: bool = True,
         include_lm_head: bool = True,
+        compare_probe_layers: Iterable[int] | None = None,
     ) -> None:
         if not include_embedding:
             raise NotImplementedError(
@@ -79,6 +80,15 @@ class Glm5WholeModelSegment:
         self.num_layers = len(layers)
         if self.num_layers <= 0:
             raise ValueError("Glm5WholeModelSegment requires at least one decoder layer")
+        probes = sorted({int(layer_idx) for layer_idx in (compare_probe_layers or [])})
+        invalid_probes = [layer_idx for layer_idx in probes if layer_idx < 0 or layer_idx >= self.num_layers]
+        if invalid_probes:
+            raise ValueError(
+                f"GLM-5 whole-model probe layers out of range: {invalid_probes}; "
+                f"num_layers={self.num_layers}"
+            )
+        self.compare_probe_layers = tuple(probes)
+        self._compare_probe_layer_set = set(self.compare_probe_layers)
 
         attn0 = layers[0].self_attn.module
         indexer0 = getattr(attn0, "indexer", None)
@@ -188,10 +198,15 @@ class Glm5WholeModelSegment:
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
+        specs = {
             "hidden_states": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
             "logits": TensorSpec(("batch_size", self.vocab_size), torch.bfloat16),
         }
+        for layer_idx in self.compare_probe_layers:
+            specs[self._probe_output_name(layer_idx)] = TensorSpec(
+                ("batch_size", self.hidden_size), torch.bfloat16
+            )
+        return specs
 
     def _copy_primary_kv(self, layer_idx: int, k_tensor: torch.Tensor, _v_tensor=None) -> None:
         if self._kv_buffers is None:
@@ -229,6 +244,36 @@ class Glm5WholeModelSegment:
             if isinstance(mlp, Glm5MoE):
                 mlp.set_num_tokens_per_rank(int(bucket_size))
 
+    @staticmethod
+    def _probe_output_name(layer_idx: int) -> str:
+        return f"probe_layer_{int(layer_idx):03d}_hidden"
+
+    def run_model_with_probes(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        hidden_states = self.model.model.embed_tokens(input_ids)
+        outputs: dict[str, torch.Tensor] = {}
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            hidden_states, _, _ = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=None,
+                use_cache=False,
+            )
+            if layer_idx in self._compare_probe_layer_set:
+                outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
+
+        hidden_states = self.model.model.norm(hidden_states)
+        logits = self.model.lm_head(hidden_states)
+        outputs["hidden_states"] = hidden_states[:, -1, :]
+        outputs["logits"] = logits[:, -1, :]
+        return outputs
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -264,13 +309,10 @@ class Glm5WholeModelSegment:
             AttnWrapperBase._dsa_short_count = self._capture_dsa_short_count
             AttnWrapperBase.glm5_decode_primary_slot_indices = primary_slot_indices
             AttnWrapperBase.glm5_decode_aux_slot_indices = aux_slot_indices
-            model_outputs = self.model.model(
+            outputs = self.run_model_with_probes(
                 input_ids=input_ids,
                 position_ids=position_ids,
-                use_cache=False,
             )
-            hidden_states = model_outputs[0]
-            logits = self.model.lm_head(hidden_states)
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens
             AttnWrapperBase.position_ids = old_position_ids
@@ -281,9 +323,7 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.glm5_decode_primary_slot_indices = old_primary_slots
             AttnWrapperBase.glm5_decode_aux_slot_indices = old_aux_slots
 
-        hidden_states = hidden_states[:, -1, :]
-        logits = logits[:, -1, :]
-        return {"hidden_states": hidden_states, "logits": logits}
+        return outputs
 
 
 def make_glm5_whole_model_graph_segment_name() -> str:
@@ -296,6 +336,8 @@ def compare_glm5_whole_model_graph_logits(
     graph_logits: torch.Tensor,
     eager_hidden_states: torch.Tensor | None = None,
     graph_hidden_states: torch.Tensor | None = None,
+    eager_probe_hidden_states: Mapping[str, torch.Tensor] | None = None,
+    graph_probe_hidden_states: Mapping[str, torch.Tensor] | None = None,
     eager_tokens: torch.Tensor | None = None,
     graph_tokens: torch.Tensor | None = None,
     atol: float = 1e-2,
@@ -357,10 +399,48 @@ def compare_glm5_whole_model_graph_logits(
                 hidden_max_abs = float("inf")
                 hidden_mean_abs = float("inf")
 
+    probe_first_mismatch = ""
+    probe_max_abs = 0.0
+    probe_mean_abs = 0.0
+    probe_shape_match = True
+    probe_ok = True
+    if eager_probe_hidden_states is not None or graph_probe_hidden_states is not None:
+        eager_probe_hidden_states = eager_probe_hidden_states or {}
+        graph_probe_hidden_states = graph_probe_hidden_states or {}
+        if set(eager_probe_hidden_states) != set(graph_probe_hidden_states):
+            probe_ok = False
+            probe_shape_match = False
+            probe_first_mismatch = "probe_key_set"
+            probe_max_abs = float("inf")
+            probe_mean_abs = float("inf")
+        else:
+            for name in sorted(eager_probe_hidden_states):
+                eager_probe = eager_probe_hidden_states[name]
+                graph_probe = graph_probe_hidden_states[name]
+                if eager_probe.shape != graph_probe.shape:
+                    probe_ok = False
+                    probe_shape_match = False
+                    probe_first_mismatch = name
+                    probe_max_abs = float("inf")
+                    probe_mean_abs = float("inf")
+                    break
+                eager_p = eager_probe.detach().to(torch.float32)
+                graph_p = graph_probe.detach().to(torch.float32)
+                probe_diff = (eager_p - graph_p).abs()
+                cur_max = float(probe_diff.max().item()) if probe_diff.numel() else 0.0
+                cur_mean = float(probe_diff.mean().item()) if probe_diff.numel() else 0.0
+                probe_max_abs = max(probe_max_abs, cur_max)
+                probe_mean_abs = max(probe_mean_abs, cur_mean)
+                cur_ok = bool(torch.allclose(eager_p, graph_p, atol=atol, rtol=rtol))
+                if not cur_ok and not probe_first_mismatch:
+                    probe_first_mismatch = name
+                    probe_ok = False
+
     return {
         "ok": bool(
             logits_ok
             and hidden_ok
+            and probe_ok
             and argmax_mismatch == 0
             and token_shape_match
             and token_mismatch == 0
@@ -371,6 +451,10 @@ def compare_glm5_whole_model_graph_logits(
         "hidden_shape_match": hidden_shape_match,
         "hidden_max_abs": hidden_max_abs,
         "hidden_mean_abs": hidden_mean_abs,
+        "probe_shape_match": probe_shape_match,
+        "probe_first_mismatch": probe_first_mismatch,
+        "probe_max_abs": probe_max_abs,
+        "probe_mean_abs": probe_mean_abs,
         "argmax_mismatch": argmax_mismatch,
         "token_mismatch": token_mismatch,
         "token_shape_match": token_shape_match,

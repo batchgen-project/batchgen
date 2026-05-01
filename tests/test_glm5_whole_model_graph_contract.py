@@ -74,6 +74,15 @@ def test_glm5_whole_model_segment_static_contract():
     assert outputs["logits"].resolve_shape(2) == (2, 151552)
 
 
+def test_glm5_whole_model_segment_probe_output_contract():
+    segment = _make_segment(compare_probe_layers=(0, 1))
+
+    outputs = segment.get_static_output_specs(bucket_size=2)
+
+    assert outputs["probe_layer_000_hidden"].resolve_shape(2) == (2, 6144)
+    assert outputs["probe_layer_001_hidden"].resolve_shape(2) == (2, 6144)
+
+
 def test_glm5_whole_model_segment_allocates_primary_and_aux_offload_buffers():
     segment = _make_segment(max_bucket_size=4)
 
