@@ -637,6 +637,42 @@ def test_unified_selector_matches_standalone_reference(cache_values):
         torch.testing.assert_close(actual_tensor, expected_tensor)
 
 
+def test_unified_selector_skips_negative_slot_padding_rows():
+    torch.cuda.set_device(0)
+    logical_kv, primary_blocked_k, primary_page_table = _make_paged_primary_cache(
+        batch_size=2,
+        max_tokens=INDEX_TOPK,
+        seed=71,
+    )
+    cache_seqlens = torch.tensor([64, 1], device="cuda", dtype=torch.int32)
+    long_topk_indices = torch.zeros(
+        2,
+        INDEX_TOPK,
+        device="cuda",
+        dtype=torch.int64,
+    )
+    slot_indices = torch.tensor([0, -1], device="cuda", dtype=torch.int32)
+
+    selected, selected_lengths, selected_indices, row_modes = (
+        select_mla_kv_for_flashmla_bf16(
+            primary_blocked_k,
+            primary_page_table,
+            cache_seqlens,
+            long_topk_indices,
+            index_topk=INDEX_TOPK,
+            page_size=PAGE_SIZE,
+            primary_slot_indices=slot_indices,
+        )
+    )
+
+    torch.testing.assert_close(selected[0, :64], logical_kv[0, :64])
+    assert torch.count_nonzero(selected[0, 64:]) == 0
+    assert torch.count_nonzero(selected[1]) == 0
+    assert selected_lengths.tolist() == [64, 1]
+    assert row_modes.tolist() == [0, 2]
+    assert torch.all(selected_indices[1] == -1)
+
+
 def test_reference_selector_output_feeds_flashmla_dense_contract():
     torch.cuda.set_device(0)
     batch_size = 3

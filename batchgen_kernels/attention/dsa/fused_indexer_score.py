@@ -295,10 +295,12 @@ def _fused_paged_score_with_slots_kernel(
     pid_s = tl.program_id(0)
     pid_b = tl.program_id(1)
     slot = tl.load(SLOT_INDICES_ptr + pid_b).to(tl.int64)
+    slot_valid = slot >= 0
+    safe_slot = tl.maximum(slot, 0)
 
     s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     seqlen = tl.load(SEQLENS_ptr + pid_b)
-    s_mask = s_offs < seqlen
+    s_mask = (s_offs < seqlen) & slot_valid
     page_in_range = s_offs < max_seqlen
 
     logical_page = s_offs // page_size
@@ -306,11 +308,11 @@ def _fused_paged_score_with_slots_kernel(
     page_in_table = logical_page < max_pages_per_seq
     safe_logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
     physical_page = tl.load(
-        BLOCK_TABLE_ptr + slot * max_pages_per_seq + safe_logical_page,
+        BLOCK_TABLE_ptr + safe_slot * max_pages_per_seq + safe_logical_page,
         mask=page_in_range,
         other=-1,
     ).to(tl.int64)
-    k_valid = page_in_table & (physical_page >= 0)
+    k_valid = slot_valid & page_in_table & (physical_page >= 0)
     physical_page = tl.maximum(physical_page, 0)
 
     agg = tl.where(

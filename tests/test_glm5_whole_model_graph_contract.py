@@ -10,6 +10,7 @@ from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
 
 class _FakeIndexer:
     index_head_dim = 128
+    index_topk = 2048
 
 
 class _FakeAttnModule:
@@ -84,6 +85,37 @@ def test_glm5_whole_model_segment_allocates_primary_and_aux_offload_buffers():
     assert segment._kv_buffers[0]["key"].shape == (4, 1, 1, 576)
     assert segment._aux_kv_buffers[0]["key"].shape == (4, 1, 1, 128)
     assert segment._no_v_cache
+
+
+def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
+    segment = _make_segment(max_bucket_size=2)
+    specs = segment.get_static_input_specs(bucket_size=2)
+    static_inputs = {
+        name: torch.full(
+            spec.resolve_shape(2),
+            spec.fill_value,
+            dtype=spec.dtype,
+            device="cpu",
+        )
+        for name, spec in specs.items()
+    }
+    segment.set_capture_inputs(
+        input_ids=torch.tensor([[7], [0]], dtype=torch.int64),
+        cache_seqlens=torch.tensor([128, 1], dtype=torch.int32),
+        position_ids=torch.tensor([[127], [0]], dtype=torch.int64),
+        primary_page_table=torch.zeros(2, 128, dtype=torch.int32),
+        aux_page_table=torch.zeros(2, 64, dtype=torch.int32),
+        primary_slot_indices=torch.tensor([3, -1], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([3, -1], dtype=torch.int32),
+        rank_token_counts=torch.tensor([1] + [0] * 15, dtype=torch.int64),
+        num_valid_tokens=torch.tensor([1], dtype=torch.int32),
+    )
+
+    segment.initialize_static_inputs(static_inputs, bucket_size=2)
+
+    assert segment._capture_dsa_short_count == 2
+    assert static_inputs["primary_slot_indices"].tolist() == [3, -1]
+    assert static_inputs["cache_seqlens"].tolist() == [128, 1]
 
 
 def test_glm5_whole_model_segment_rejects_hidden_state_boundary_until_hardened():

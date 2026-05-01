@@ -170,6 +170,11 @@ class AttnWrapperBase(BaseModuleWrapper):
     # Set once per decode step by the worker so per-layer _forward_decode_dsa
     # branches on it without doing a D2H .sum().item() 78 times per step.
     _dsa_short_count: ClassVar[Optional[int]] = None
+    # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
+    # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
+    # rows instead of deriving slot count from cur_batch.
+    glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)

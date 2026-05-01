@@ -1,15 +1,14 @@
 """GLM-5 decode CUDA graph segment.
 
 This first whole-model milestone captures the existing GLM-5 decode forward as
-one CUDA graph for stable, exact-bucket decode batches. It deliberately keeps
+one CUDA graph for stable, globally bucketed decode batches. It deliberately keeps
 host KV offload outside the graph by redirecting per-layer decode KV callbacks
 to static GPU buffers during capture; the worker clones and appends those
 buffers after replay.
 
 The segment is intentionally strict: it is an opt-in sanity/performance path,
-not a silent fallback. General padded-bucket support still needs the planned
-explicit slot/page-table inputs to replace the current wrapper-side Python batch
-bookkeeping.
+not a silent fallback. Padded rows use explicit -1 slot sentinels so all ranks
+can participate in NCCL graph capture/replay even when a rank has no local rows.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from batchgen.models.wrappers import AttnWrapperBase
 
 
 class Glm5WholeModelSegment:
-    """Graph-capturable GLM-5 decode forward for exact local buckets."""
+    """Graph-capturable GLM-5 decode forward for global padded buckets."""
 
     def __init__(
         self,
@@ -87,6 +86,7 @@ class Glm5WholeModelSegment:
             raise ValueError("GLM-5 whole-model graph requires DSA indexer modules")
         self.primary_kv_dim = int(attn0.kv_lora_rank + attn0.qk_rope_head_dim)
         self.aux_kv_dim = int(indexer0.index_head_dim)
+        self.index_topk = int(indexer0.index_topk)
 
         self._kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._aux_kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
@@ -94,6 +94,7 @@ class Glm5WholeModelSegment:
         self.aux_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._no_v_cache = True
         self._capture_inputs: dict[str, torch.Tensor] | None = None
+        self._capture_dsa_short_count: int | None = None
 
     def set_capture_inputs(self, **inputs: torch.Tensor) -> None:
         required = set(self.get_static_input_specs(self.max_bucket_size))
@@ -120,6 +121,11 @@ class Glm5WholeModelSegment:
                     f"does not match static shape {tuple(target.shape)} for bucket {bucket_size}"
                 )
             target.copy_(source.to(device=target.device, dtype=target.dtype), non_blocking=True)
+        cache_seqlens = static_inputs.get("cache_seqlens")
+        if cache_seqlens is not None:
+            self._capture_dsa_short_count = int(
+                (cache_seqlens <= self.index_topk).sum().item()
+            )
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size > self.max_bucket_size:
@@ -234,7 +240,7 @@ class Glm5WholeModelSegment:
         rank_token_counts: torch.Tensor,
         num_valid_tokens: torch.Tensor,
     ) -> Mapping[str, torch.Tensor]:
-        del primary_page_table, aux_page_table, primary_slot_indices, aux_slot_indices
+        del primary_page_table, aux_page_table
         del num_valid_tokens
 
         bucket_size = int(input_ids.shape[0])
@@ -245,12 +251,18 @@ class Glm5WholeModelSegment:
         old_max_seqlen = AttnWrapperBase.max_seqlen
         old_kv_cb = AttnWrapperBase.kv_append_callback
         old_aux_cb = AttnWrapperBase.kv_append_callback_aux
+        old_dsa_short_count = AttnWrapperBase._dsa_short_count
+        old_primary_slots = AttnWrapperBase.glm5_decode_primary_slot_indices
+        old_aux_slots = AttnWrapperBase.glm5_decode_aux_slot_indices
         try:
             AttnWrapperBase.cache_seqlens = cache_seqlens
             AttnWrapperBase.position_ids = position_ids
             AttnWrapperBase.max_seqlen = self.max_seqlen
             AttnWrapperBase.kv_append_callback = self._copy_primary_kv
             AttnWrapperBase.kv_append_callback_aux = self._copy_aux_kv
+            AttnWrapperBase._dsa_short_count = self._capture_dsa_short_count
+            AttnWrapperBase.glm5_decode_primary_slot_indices = primary_slot_indices
+            AttnWrapperBase.glm5_decode_aux_slot_indices = aux_slot_indices
             outputs = self.model(
                 input_ids,
                 position_ids=position_ids,
@@ -262,6 +274,9 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.max_seqlen = old_max_seqlen
             AttnWrapperBase.kv_append_callback = old_kv_cb
             AttnWrapperBase.kv_append_callback_aux = old_aux_cb
+            AttnWrapperBase._dsa_short_count = old_dsa_short_count
+            AttnWrapperBase.glm5_decode_primary_slot_indices = old_primary_slots
+            AttnWrapperBase.glm5_decode_aux_slot_indices = old_aux_slots
 
         logits = outputs.logits[:, -1, :]
         return {"logits": logits}

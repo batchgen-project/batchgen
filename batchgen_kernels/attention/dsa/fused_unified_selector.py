@@ -37,6 +37,8 @@ def _unified_select_kernel(
     slot = pid_b
     if USE_SLOT_INDICES:
         slot = tl.load(slot_indices_ptr + pid_b).to(tl.int64)
+    slot_valid = slot >= 0
+    safe_slot = tl.maximum(slot, 0)
 
     t_start = pid_t * BLOCK_T
     d_offs = tl.arange(0, BLOCK_D)
@@ -48,7 +50,7 @@ def _unified_select_kernel(
     if pid_t == 0:
         selected_len = tl.minimum(seqlen, index_topk).to(tl.int32)
         tl.store(selected_lengths_ptr + pid_b, selected_len)
-        tl.store(row_modes_ptr + pid_b, is_long.to(tl.int32))
+        tl.store(row_modes_ptr + pid_b, tl.where(slot_valid, is_long.to(tl.int32), 2))
 
     for ti in range(BLOCK_T):
         t = t_start + ti
@@ -65,9 +67,9 @@ def _unified_select_kernel(
             logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
 
             physical_page = tl.load(
-                block_table_ptr + slot * max_pages_per_seq + logical_page,
+                block_table_ptr + safe_slot * max_pages_per_seq + logical_page,
             ).to(tl.int64)
-            valid = valid & page_in_table & (physical_page >= 0)
+            valid = valid & slot_valid & page_in_table & (physical_page >= 0)
             physical_page = tl.maximum(physical_page, 0)
             flat_idx = physical_page * page_size + page_offset
 
