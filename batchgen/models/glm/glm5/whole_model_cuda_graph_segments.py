@@ -189,6 +189,7 @@ class Glm5WholeModelSegment:
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
+            "hidden_states": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
             "logits": TensorSpec(("batch_size", self.vocab_size), torch.bfloat16),
         }
 
@@ -263,11 +264,13 @@ class Glm5WholeModelSegment:
             AttnWrapperBase._dsa_short_count = self._capture_dsa_short_count
             AttnWrapperBase.glm5_decode_primary_slot_indices = primary_slot_indices
             AttnWrapperBase.glm5_decode_aux_slot_indices = aux_slot_indices
-            outputs = self.model(
-                input_ids,
+            model_outputs = self.model.model(
+                input_ids=input_ids,
                 position_ids=position_ids,
                 use_cache=False,
             )
+            hidden_states = model_outputs[0]
+            logits = self.model.lm_head(hidden_states)
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens
             AttnWrapperBase.position_ids = old_position_ids
@@ -278,8 +281,9 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.glm5_decode_primary_slot_indices = old_primary_slots
             AttnWrapperBase.glm5_decode_aux_slot_indices = old_aux_slots
 
-        logits = outputs.logits[:, -1, :]
-        return {"logits": logits}
+        hidden_states = hidden_states[:, -1, :]
+        logits = logits[:, -1, :]
+        return {"hidden_states": hidden_states, "logits": logits}
 
 
 def make_glm5_whole_model_graph_segment_name() -> str:
@@ -290,6 +294,8 @@ def compare_glm5_whole_model_graph_logits(
     *,
     eager_logits: torch.Tensor,
     graph_logits: torch.Tensor,
+    eager_hidden_states: torch.Tensor | None = None,
+    graph_hidden_states: torch.Tensor | None = None,
     eager_tokens: torch.Tensor | None = None,
     graph_tokens: torch.Tensor | None = None,
     atol: float = 1e-2,
@@ -327,11 +333,44 @@ def compare_glm5_whole_model_graph_logits(
         else:
             token_mismatch = -1
 
+    hidden_ok = True
+    hidden_shape_match = True
+    hidden_max_abs = 0.0
+    hidden_mean_abs = 0.0
+    if eager_hidden_states is not None or graph_hidden_states is not None:
+        if eager_hidden_states is None or graph_hidden_states is None:
+            hidden_ok = False
+            hidden_shape_match = False
+            hidden_max_abs = float("inf")
+            hidden_mean_abs = float("inf")
+        else:
+            hidden_shape_match = eager_hidden_states.shape == graph_hidden_states.shape
+            if hidden_shape_match:
+                eager_h = eager_hidden_states.detach().to(torch.float32)
+                graph_h = graph_hidden_states.detach().to(torch.float32)
+                hidden_diff = (eager_h - graph_h).abs()
+                hidden_max_abs = float(hidden_diff.max().item()) if hidden_diff.numel() else 0.0
+                hidden_mean_abs = float(hidden_diff.mean().item()) if hidden_diff.numel() else 0.0
+                hidden_ok = bool(torch.allclose(eager_h, graph_h, atol=atol, rtol=rtol))
+            else:
+                hidden_ok = False
+                hidden_max_abs = float("inf")
+                hidden_mean_abs = float("inf")
+
     return {
-        "ok": bool(logits_ok and argmax_mismatch == 0 and token_shape_match and token_mismatch == 0),
+        "ok": bool(
+            logits_ok
+            and hidden_ok
+            and argmax_mismatch == 0
+            and token_shape_match
+            and token_mismatch == 0
+        ),
         "shape_match": True,
         "max_abs": max_abs,
         "mean_abs": mean_abs,
+        "hidden_shape_match": hidden_shape_match,
+        "hidden_max_abs": hidden_max_abs,
+        "hidden_mean_abs": hidden_mean_abs,
         "argmax_mismatch": argmax_mismatch,
         "token_mismatch": token_mismatch,
         "token_shape_match": token_shape_match,

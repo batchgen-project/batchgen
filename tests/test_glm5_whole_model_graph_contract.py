@@ -70,6 +70,7 @@ def test_glm5_whole_model_segment_static_contract():
     assert inputs["num_valid_tokens"].resolve_shape(2) == (1,)
 
     outputs = segment.get_static_output_specs(bucket_size=2)
+    assert outputs["hidden_states"].resolve_shape(2) == (2, 6144)
     assert outputs["logits"].resolve_shape(2) == (2, 151552)
 
 

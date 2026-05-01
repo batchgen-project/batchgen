@@ -9885,23 +9885,27 @@ class BatchGenWorker:
 						)
 
 					logits = graph_out["logits"][:batch_size]
+					graph_hidden_states = graph_out.get("hidden_states")
+					if graph_hidden_states is not None:
+						graph_hidden_states = graph_hidden_states[:batch_size]
 					if _glm5_whole_compare:
 						graph_tokens_for_compare = torch.argmax(logits, dim=-1, keepdim=True)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_eager_start = time.perf_counter()
-						eager_outputs = self.model(
-							new_tokens,
+						eager_model_outputs = self.model.model(
+							input_ids=new_tokens,
 							attention_mask=Attn_Wrapper.attention_mask,
 							position_ids=Attn_Wrapper.position_ids,
 							use_cache=False,
 						)
+						eager_hidden_states = eager_model_outputs[0][:, -1, :]
+						eager_logits = self.model.lm_head(eager_model_outputs[0])[:, -1, :]
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["eager_ms"] = (
 								time.perf_counter() - _glm5_eager_start
 							) * 1000.0
-						eager_logits = eager_outputs.logits[:, -1, :]
 						eager_tokens_for_compare = torch.argmax(eager_logits, dim=-1, keepdim=True)
 						new_tokens_out = self._select_tokens(eager_logits)
 						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
@@ -9910,6 +9914,8 @@ class BatchGenWorker:
 						compare = compare_glm5_whole_model_graph_logits(
 							eager_logits=eager_logits,
 							graph_logits=logits,
+							eager_hidden_states=eager_hidden_states,
+							graph_hidden_states=graph_hidden_states,
 							eager_tokens=eager_tokens_for_compare,
 							graph_tokens=graph_tokens_for_compare,
 							atol=float(os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
@@ -9918,13 +9924,16 @@ class BatchGenWorker:
 						_log = logging.info if compare["ok"] else logging.error
 						_log(
 							"[GLM5_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
-							"max_abs=%.6g mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
+							"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
+							"hidden_mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
 							self.rank,
 							bucket,
 							batch_size,
 							"OK" if compare["ok"] else "MISMATCH",
 							compare["max_abs"],
 							compare["mean_abs"],
+							compare["hidden_max_abs"],
+							compare["hidden_mean_abs"],
 							compare["argmax_mismatch"],
 							compare["token_mismatch"],
 						)
