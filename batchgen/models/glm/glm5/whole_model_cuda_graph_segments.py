@@ -226,7 +226,7 @@ class Glm5WholeModelSegment:
         for layer in self.model.model.layers:
             mlp = getattr(layer, "mlp", None)
             if isinstance(mlp, Glm5MoE):
-                mlp.num_tokens_per_rank = int(bucket_size)
+                mlp.set_num_tokens_per_rank(int(bucket_size))
 
     def forward(
         self,

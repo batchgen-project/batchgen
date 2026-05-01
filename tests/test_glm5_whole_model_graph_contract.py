@@ -118,6 +118,52 @@ def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
     assert static_inputs["cache_seqlens"].tolist() == [128, 1]
 
 
+def test_glm5_whole_model_segment_uses_moe_bucket_resizer(monkeypatch):
+    import types
+
+    class _FakeGlm5MoE(torch.nn.Module):
+        _rank_token_counts = None
+
+    fake_model_module = types.ModuleType("batchgen.models.glm.glm5.model")
+    fake_model_module.Glm5MoE = _FakeGlm5MoE
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "batchgen.models.glm.glm5.model",
+        fake_model_module,
+    )
+
+    mlp = _FakeGlm5MoE()
+    resize_calls = []
+
+    def _record_resize(bucket_size):
+        resize_calls.append(bucket_size)
+        mlp.num_tokens_per_rank = bucket_size
+
+    mlp.set_num_tokens_per_rank = _record_resize
+
+    class _FakeLayerWithMlp(_FakeLayer):
+        def __init__(self, mlp):
+            self.self_attn = _FakeSelfAttn()
+            self.mlp = mlp
+
+    class _FakeInnerModelWithMlp:
+        def __init__(self, mlp):
+            self.layers = [_FakeLayerWithMlp(mlp)]
+
+    class _FakeModelWithMlp:
+        def __init__(self, mlp):
+            self.model = _FakeInnerModelWithMlp(mlp)
+
+    segment = _make_segment(model=_FakeModelWithMlp(mlp), max_bucket_size=4)
+    rank_counts = torch.tensor([3] + [0] * 15, dtype=torch.int64)
+
+    segment._set_moe_bucket_state(3, rank_counts)
+
+    assert resize_calls == [3]
+    assert mlp.num_tokens_per_rank == 3
+    assert _FakeGlm5MoE._rank_token_counts is rank_counts
+
+
 def test_glm5_whole_model_segment_rejects_hidden_state_boundary_until_hardened():
     with pytest.raises(NotImplementedError, match="input_ids -> embedding"):
         _make_segment(include_embedding=False)
