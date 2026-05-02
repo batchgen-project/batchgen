@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -26,12 +24,50 @@ class _FakeSelfAttn:
     module = _FakeAttnModule()
 
 
-class _FakeLayer:
-    self_attn = _FakeSelfAttn()
+class _FakeLayer(torch.nn.Module):
+    def __init__(self, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.self_attn = _FakeSelfAttn()
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        use_cache=False,
+    ):
+        del attention_mask, position_ids, past_key_value, use_cache
+        bsz = hidden_states.shape[0]
+        values = hidden_states[:, :, :1].view(bsz, 1, 1, 1)
+        primary = values.expand(bsz, 1, 1, 576)
+        aux = (values + 1).expand(bsz, 1, 1, 128)
+        AttnWrapperBase.kv_append_callback(
+            self.layer_idx,
+            primary + self.layer_idx,
+            None,
+        )
+        AttnWrapperBase.kv_append_callback_aux(
+            self.layer_idx,
+            aux + self.layer_idx,
+            None,
+        )
+        return hidden_states, None, None
 
 
-class _FakeInnerModel:
-    layers = [_FakeLayer(), _FakeLayer()]
+class _FakeInnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_FakeLayer(0), _FakeLayer(1)])
+        self.norm = torch.nn.Identity()
+
+    def embed_tokens(self, input_ids):
+        return input_ids.to(torch.bfloat16).view(input_ids.shape[0], 1, 1).expand(
+            input_ids.shape[0],
+            1,
+            16,
+        )
 
 
 class _FakeGlm5Model(torch.nn.Module):
@@ -39,19 +75,12 @@ class _FakeGlm5Model(torch.nn.Module):
         super().__init__()
         self.model = _FakeInnerModel()
 
-    def forward(self, input_ids, position_ids=None, use_cache=False):
-        del position_ids, use_cache
-        bsz = input_ids.shape[0]
-        values = input_ids.to(torch.bfloat16).view(bsz, 1, 1, 1)
-        primary = values.expand(bsz, 1, 1, 576)
-        aux = (values + 1).expand(bsz, 1, 1, 128)
-        for layer_idx in range(2):
-            AttnWrapperBase.kv_append_callback(layer_idx, primary + layer_idx, None)
-            AttnWrapperBase.kv_append_callback_aux(layer_idx, aux + layer_idx, None)
-        logits = torch.zeros(bsz, 1, 8, dtype=torch.bfloat16, device=input_ids.device)
-        logits[:, 0, 0] = input_ids[:, 0].to(torch.bfloat16)
-        logits[:, 0, 1] = (input_ids[:, 0] + 10).to(torch.bfloat16)
-        return SimpleNamespace(logits=logits)
+    def lm_head(self, hidden_states):
+        bsz = hidden_states.shape[0]
+        logits = torch.zeros(bsz, 1, 8, dtype=torch.bfloat16, device=hidden_states.device)
+        logits[:, 0, 0] = hidden_states[:, 0, 0]
+        logits[:, 0, 1] = hidden_states[:, 0, 0] + 10
+        return logits
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph smoke requires CUDA")
