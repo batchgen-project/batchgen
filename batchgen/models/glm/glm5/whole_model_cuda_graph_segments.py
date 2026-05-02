@@ -100,6 +100,8 @@ class Glm5WholeModelSegment:
 
         self._kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._aux_kv_buffers: list[dict[str, torch.Tensor | None]] | None = None
+        self._kv_key_buffer: torch.Tensor | None = None
+        self._aux_kv_key_buffer: torch.Tensor | None = None
         self.primary_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self.aux_kv_offload_buffers: list[dict[str, torch.Tensor | None]] | None = None
         self._no_v_cache = True
@@ -146,35 +148,32 @@ class Glm5WholeModelSegment:
             return
 
         alloc_size = self.max_bucket_size
-        self._kv_buffers = []
-        self._aux_kv_buffers = []
-        for _ in range(self.num_layers):
-            self._kv_buffers.append(
-                {
-                    "key": torch.zeros(
-                        alloc_size,
-                        1,
-                        1,
-                        self.primary_kv_dim,
-                        dtype=torch.bfloat16,
-                        device=self.device,
-                    ),
-                    "value": None,
-                }
-            )
-            self._aux_kv_buffers.append(
-                {
-                    "key": torch.zeros(
-                        alloc_size,
-                        1,
-                        1,
-                        self.aux_kv_dim,
-                        dtype=torch.bfloat16,
-                        device=self.device,
-                    ),
-                    "value": None,
-                }
-            )
+        self._kv_key_buffer = torch.zeros(
+            self.num_layers,
+            alloc_size,
+            1,
+            1,
+            self.primary_kv_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._aux_kv_key_buffer = torch.zeros(
+            self.num_layers,
+            alloc_size,
+            1,
+            1,
+            self.aux_kv_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._kv_buffers = [
+            {"key": self._kv_key_buffer[layer_idx], "value": None}
+            for layer_idx in range(self.num_layers)
+        ]
+        self._aux_kv_buffers = [
+            {"key": self._aux_kv_key_buffer[layer_idx], "value": None}
+            for layer_idx in range(self.num_layers)
+        ]
         self.primary_kv_offload_buffers = self._kv_buffers
         self.aux_kv_offload_buffers = self._aux_kv_buffers
 

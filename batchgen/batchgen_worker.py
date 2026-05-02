@@ -9302,11 +9302,7 @@ class BatchGenWorker:
 		# Avoids redundant page table checks between boundaries
 		_page_table_verified_this_batch = True  # Start True after entry check
 
-		# P0: Pre-allocate tensor for per-token all_reduce batch-size sync
-		# (avoids torch.tensor allocation every token)
-		_local_bs_buf = torch.tensor([max_batch_size], dtype=torch.int64, device=self.torch_device)
-
-		# P1: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
+		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 
 		# Main decode loop — enable decode watchdog for monitoring
@@ -9634,19 +9630,20 @@ class BatchGenWorker:
 				# CPU-GPU sync that drains the GPU pipeline every step.
 				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
 				if getattr(self, '_whole_model_graph', False) or self._glm5_whole_model_graph_requested_for_current_batch():
-					# Whole-model graph needs globally-synced _max_bs for NCCL bucket matching
-					_local_bs_buf.fill_(len(batch))
-					_all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
-					dist.all_gather_into_tensor(_all_rank_counts, _local_bs_buf)
-					_max_bs = max(_all_rank_counts.max().item(), 1)
-					self._current_decode_local_batch_size = len(batch)
-					self._current_decode_max_rank_batch_size = int(_max_bs)
-					self._current_decode_rank_token_counts = _all_rank_counts
-					if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
-						if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-							self.parallel_manager.set_num_tokens_per_rank(_max_bs)
-						if hasattr(self.parallel_manager, 'set_rank_token_counts'):
-							self.parallel_manager.set_rank_token_counts(_all_rank_counts)
+					# Whole-model graph needs globally synced counts for NCCL bucket
+					# matching, but the count vector only changes at decode-entry,
+					# page-boundary, and async-load-finalize sync points. Reusing it
+					# avoids a per-token NCCL all_gather + D2H .item() sync.
+					_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
+					_cached_local_bsz = int(getattr(self, "_current_decode_local_batch_size", -1))
+					_max_bs = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+					if _all_rank_counts is None or _max_bs <= 0 or _cached_local_bsz != len(batch):
+						_max_bs = self._sync_decode_moe_rank_counts(
+							batch,
+							reason="decode_step_batch_change",
+						)
+						_all_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
+					_max_bs = max(int(_max_bs), 1)
 				else:
 					# Per-layer graph or eager: no NCCL in graph, use local batch size
 					_max_bs = max(len(batch), 1)
@@ -9989,28 +9986,50 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							_glm5_offload_start = time.perf_counter()
 						# Fire KV host offload callbacks for all layers.
-						# KV buffers are static-address tensors written inside the graph;
-						# clone before passing to async D2H to protect tensor lifespan.
+						# KV buffers are static-address tensors written inside the graph.
+						# Stage primary and aux as two contiguous clones before async
+						# D2H; cloning per layer adds 156 small GPU copies per decode
+						# token on GLM-5 and dominates the whole-graph replay overhead.
 						kv_cb = getattr(AttnWrapperBase, 'kv_append_callback', None)
 						wm_seg = getattr(self, '_whole_model_segment', None)
-						if kv_cb is not None and wm_seg is not None and wm_seg._kv_buffers is not None:
+						if (
+							batch_size > 0
+							and kv_cb is not None
+							and wm_seg is not None
+							and wm_seg._kv_buffers is not None
+						):
+							primary_stage = None
+							primary_key_buffer = getattr(wm_seg, "_kv_key_buffer", None)
+							if primary_key_buffer is not None:
+								primary_stage = primary_key_buffer[:, :batch_size].clone()
 							for layer_idx in range(wm_seg.num_layers):
 								kv_buf = wm_seg._kv_buffers[layer_idx]
 								# K2.5 MLA has no separate V cache — pass None for v_tensor
 								v_buf = kv_buf.get("value")
 								v_clone = v_buf[:batch_size].clone() if v_buf is not None and v_buf.numel() > 0 and not getattr(wm_seg, '_no_v_cache', False) else None
+								k_tensor = (
+									primary_stage[layer_idx]
+									if primary_stage is not None
+									else kv_buf["key"][:batch_size].clone()
+								)
 								kv_cb(
 									layer_idx,
-									kv_buf["key"][:batch_size].clone(),
+									k_tensor,
 									v_clone,
 								)
 						aux_cb = getattr(AttnWrapperBase, 'kv_append_callback_aux', None)
 						aux_buffers = getattr(wm_seg, "_aux_kv_buffers", None) if wm_seg is not None else None
-						if aux_cb is not None and aux_buffers is not None:
+						if batch_size > 0 and aux_cb is not None and aux_buffers is not None:
+							aux_stage = None
+							aux_key_buffer = getattr(wm_seg, "_aux_kv_key_buffer", None)
+							if aux_key_buffer is not None:
+								aux_stage = aux_key_buffer[:, :batch_size].clone()
 							for layer_idx in range(wm_seg.num_layers):
 								aux_cb(
 									layer_idx,
-									aux_buffers[layer_idx]["key"][:batch_size].clone(),
+									aux_stage[layer_idx]
+									if aux_stage is not None
+									else aux_buffers[layer_idx]["key"][:batch_size].clone(),
 									None,
 								)
 						if _glm5_whole_timing:
