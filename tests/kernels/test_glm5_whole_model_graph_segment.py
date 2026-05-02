@@ -13,6 +13,7 @@ from batchgen.models.wrappers import AttnWrapperBase
 
 class _FakeIndexer:
     index_head_dim = 128
+    index_topk = 2048
 
 
 class _FakeAttnModule:
