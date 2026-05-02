@@ -8849,6 +8849,7 @@ class BatchGenWorker:
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
 			primary_k_cache, _ = primary_manager.get_kv_tensors()
 			aux_k_cache, _ = aux_manager.get_kv_tensors()
+			shared_dsa_buffers = {}
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				wrapper = decoder_layer.self_attn
 				attn = wrapper.module
@@ -8891,6 +8892,7 @@ class BatchGenWorker:
 					page_size=primary_page_size,
 					aux_page_size=aux_page_size,
 					softmax_scale=attn.softmax_scale,
+					shared_buffers=shared_dsa_buffers,
 				)
 				segment_name = make_glm5_dsa_graph_segment_name(layer_idx)
 				manager.register_segment(segment_name, segment)

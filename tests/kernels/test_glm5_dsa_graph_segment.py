@@ -127,6 +127,78 @@ def _make_inputs(
     }
 
 
+def test_glm5_dsa_segments_share_static_buffers_by_bucket():
+    _require_flash_mla()
+    torch.cuda.set_device(0)
+    torch.manual_seed(20260502)
+
+    batch_size = 2
+    max_seqlen = 256
+    index_topk = 128
+    module = build_module()
+    primary_blocked_k, primary_page_table = _make_primary_cache(4, max_seqlen)
+    aux_blocked_k, aux_page_table = _make_aux_cache(4, max_seqlen)
+    cos, sin = _rope_tables(max_seqlen + 8)
+    wq_b = (
+        torch.randn(INDEX_HEADS * INDEX_DIM, Q_RANK, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    q_absorb = (
+        torch.randn(ATTN_HEADS, Q_NOPE, KV_LORA, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    out_absorb = (
+        torch.randn(ATTN_HEADS, ATTN_OUT, KV_LORA, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    ).contiguous()
+    shared_buffers = {}
+
+    segment_a = Glm5DsaAttnSegment(
+        primary_blocked_k=primary_blocked_k,
+        aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
+        absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
+        cuda_module=module,
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=max_seqlen,
+        index_topk=index_topk,
+        page_size=PAGE_SIZE,
+        softmax_scale=KV_DIM**-0.5,
+        shared_buffers=shared_buffers,
+    )
+    segment_b = Glm5DsaAttnSegment(
+        primary_blocked_k=primary_blocked_k,
+        aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
+        absorb_weights=FP8AbsorbWeights(q_absorb, out_absorb),
+        cuda_module=module,
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=max_seqlen,
+        index_topk=index_topk,
+        page_size=PAGE_SIZE,
+        softmax_scale=KV_DIM**-0.5,
+        shared_buffers=shared_buffers,
+    )
+
+    segment_a.setup_static_buffers(batch_size)
+    segment_b.setup_static_buffers(batch_size)
+
+    assert len(shared_buffers) == 1
+    assert segment_a._buffers[batch_size] is segment_b._buffers[batch_size]
+    assert (
+        segment_a._buffers[batch_size].selected_mla_kv.data_ptr()
+        == segment_b._buffers[batch_size].selected_mla_kv.data_ptr()
+    )
+    segment_a.release_static_buffers(batch_size)
+    assert batch_size not in shared_buffers
+
+
 def test_glm5_dsa_segment_replay_matches_eager_forward():
     _require_flash_mla()
     torch.cuda.set_device(0)

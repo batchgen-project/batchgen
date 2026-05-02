@@ -18,7 +18,7 @@ preconditions should fast-fail before replay rather than silently falling back.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -96,6 +96,7 @@ class Glm5DsaAttnSegment:
         kv_lora_rank: int = 512,
         attn_out_dim: int = 256,
         softmax_scale: float | None = None,
+        shared_buffers: Optional[Dict[int, _Glm5DsaSegmentBuffers]] = None,
     ) -> None:
         if primary_blocked_k.ndim != 4:
             raise ValueError(
@@ -153,7 +154,7 @@ class Glm5DsaAttnSegment:
         self.softmax_scale = softmax_scale if softmax_scale is not None else self.kv_dim**-0.5
         self.max_pages_per_seq = primary_page_table.shape[1]
         self.max_aux_pages_per_seq = aux_page_table.shape[1]
-        self._buffers: Dict[int, _Glm5DsaSegmentBuffers] = {}
+        self._buffers = shared_buffers if shared_buffers is not None else {}
 
         if self.kv_dim != self.kv_lora_rank + 64:
             raise ValueError(
