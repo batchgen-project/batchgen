@@ -411,7 +411,7 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     actual = wrapper._forward_decode_dsa(
         torch.zeros(2, 1, 16),
         torch.tensor([[7], [8]], dtype=torch.int64),
-        torch.tensor([2, 9], dtype=torch.int32),
+        torch.tensor([4, 9], dtype=torch.int32),
         4096,
         "primary",
         "aux",
@@ -466,7 +466,7 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
         actual = wrapper._forward_decode_dsa(
             torch.zeros(2, 1, 16),
             torch.tensor([[7], [8]], dtype=torch.int64),
-            torch.tensor([2, 9], dtype=torch.int32),
+            torch.tensor([4, 9], dtype=torch.int32),
             4096,
             "primary",
             "aux",
