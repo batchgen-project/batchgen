@@ -145,10 +145,9 @@ def _glm5_dsa_cuda_graph_can_replay(
     """Return whether the fixed selected-KV graph contract can replay.
 
     The unified selector always writes the same fixed selected-KV buffer
-    ``[B, index_topk, 1, kv_dim]``. Runtime ``selected_lengths`` carry
-    ``min(cache_seqlens, index_topk)`` into FlashMLA, so short, boundary, mixed,
-    and long rows are all graph-safe as long as the captured sequence cap covers
-    the live batch.
+    ``[B, index_topk, 1, kv_dim]``, but FlashMLA scheduler metadata is still
+    captured for the fixed selected length. Rows shorter than ``index_topk``
+    must stay on eager DSA until length-bucketed graph metadata exists.
     """
 
     if max_seqlen <= 0:
@@ -158,7 +157,9 @@ def _glm5_dsa_cuda_graph_can_replay(
     graph_max_seqlen = captured_max_seqlen if captured_max_seqlen is not None else max_seqlen
     if graph_max_seqlen < index_topk:
         return False
-    return cache_seqlens.ndim == 1
+    if cache_seqlens.ndim != 1:
+        return False
+    return bool(torch.all(cache_seqlens >= index_topk).item())
 
 
 def _log_glm5_dsa_graph_eager_fallback_once(

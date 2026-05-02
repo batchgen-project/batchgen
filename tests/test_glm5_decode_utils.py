@@ -686,7 +686,7 @@ def test_glm5_dsa_graph_compare_layer_filter(monkeypatch):
         AttnWrapperBase.batchgen_debug = old_debug
 
 
-def test_glm5_dsa_cuda_graph_replay_gate_allows_unified_selected_lengths():
+def test_glm5_dsa_cuda_graph_replay_gate_requires_fixed_flashmla_length():
     index_topk = 4
 
     assert _glm5_dsa_cuda_graph_can_replay(
@@ -695,12 +695,18 @@ def test_glm5_dsa_cuda_graph_replay_gate_allows_unified_selected_lengths():
         index_topk=index_topk,
     )
     assert _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([4, 4], dtype=torch.int32),
+        max_seqlen=4,
+        index_topk=index_topk,
+        captured_max_seqlen=8,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([1, 4], dtype=torch.int32),
         max_seqlen=4,
         index_topk=index_topk,
         captured_max_seqlen=8,
     )
-    assert _glm5_dsa_cuda_graph_can_replay(
+    assert not _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([2, 4, 7], dtype=torch.int32),
         max_seqlen=7,
         index_topk=index_topk,
