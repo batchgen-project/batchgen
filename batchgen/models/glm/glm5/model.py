@@ -1435,6 +1435,17 @@ class Glm5MoE(nn.Module):
             if compare:
                 return self._forward_decode_3d_graph_compare(hidden_states)
             if graph_required:
+                if self._moe_cuda_graph_exceeds_max_bucket():
+                    if not getattr(self, "_moe_cuda_graph_over_bucket_warned", False):
+                        logging.warning(
+                            "Layer %d: GLM-5 MoE CUDA graph requested but "
+                            "num_tokens_per_rank=%s exceeds max graph bucket; "
+                            "using eager MoE for this decode batch",
+                            self.layer_idx,
+                            self.num_tokens_per_rank,
+                        )
+                        self._moe_cuda_graph_over_bucket_warned = True
+                    return self._forward_decode_3d(hidden_states)
                 return self._forward_decode_3d_graph(hidden_states)
             return self._forward_decode_3d(hidden_states)
 
@@ -1508,6 +1519,15 @@ class Glm5MoE(nn.Module):
         out = global_results[start:start + num_tokens].to(hidden_states.dtype)
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
+
+    def _moe_cuda_graph_exceeds_max_bucket(self) -> bool:
+        if self._moe_cuda_graph_bucketing is None or self.num_tokens_per_rank is None:
+            return False
+        try:
+            self._moe_cuda_graph_bucketing.get_padded_size(int(self.num_tokens_per_rank))
+        except ValueError:
+            return True
+        return False
 
     def _moe_cuda_graph_available(self) -> bool:
         if not (

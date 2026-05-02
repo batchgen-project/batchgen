@@ -5,6 +5,7 @@ import torch
 import pytest
 
 from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
+from batchgen.cuda_graph import BatchSizeBucketing
 from batchgen.models.glm.glm5.decode_utils import (
     build_flat_paged_gather_indices,
     build_batch_slot_indices,
@@ -24,10 +25,12 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
     should_warmup_cuda_graphs_before_decode,
 )
 from batchgen.models.glm.glm5.model import (
+    Glm5MoE,
     _glm5_moe_3d_blockwise_supported,
     _glm5_moe_graph_compare_active,
     _glm5_moe_graph_compare_layer_enabled,
 )
+import batchgen.models.glm.glm5.model as glm5_model
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
     _glm5_dsa_graph_compare_active,
@@ -805,6 +808,36 @@ def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
+
+
+def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(glm5_model, "_GLM5_HAS_DISPATCH_3D", True)
+    monkeypatch.setattr(Glm5MoE, "_3d_buf", object())
+
+    moe = object.__new__(Glm5MoE)
+    moe.layer_idx = 3
+    moe.use_3d_moe = True
+    moe._fp8_blockwise_ready = True
+    moe.num_tokens_per_rank = 70
+    moe._moe_cuda_graph_bucketing = BatchSizeBucketing([1, 2])
+    moe._moe_cuda_graph_manager = object()
+    moe._moe_cuda_graph_segment_name = "glm5_moe_layer_3"
+    moe._moe_cuda_graph_segment = object()
+
+    def eager(self, hidden_states):
+        return hidden_states + 1
+
+    def graph(self, hidden_states):
+        raise AssertionError("graph path should not be used for over-bucket MoE")
+
+    monkeypatch.setattr(Glm5MoE, "_forward_decode_3d", eager)
+    monkeypatch.setattr(Glm5MoE, "_forward_decode_3d_graph", graph)
+
+    hidden = torch.zeros(1, 1, 2)
+    out = moe._forward_decode(hidden)
+
+    assert torch.equal(out, hidden + 1)
 
 
 def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
