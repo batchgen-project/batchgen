@@ -8668,32 +8668,18 @@ class BatchGenWorker:
 					out[:tensor.shape[0]].copy_(tensor)
 				return out
 
-			def _capture_table_and_slots(manager, width):
+			def _capture_slots(manager):
 				ensure_graph_table = getattr(manager, "ensure_cuda_graph_page_table", None)
 				if ensure_graph_table is not None:
-					page_table = ensure_graph_table(list(cur_batch))
-				else:
-					get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
-					page_table = get_graph_table() if get_graph_table is not None else manager._gpu_page_table_manager.gpu_table
+					ensure_graph_table(list(cur_batch))
 				slot_indices = manager._gpu_page_table_manager._slot_index_tensor
 				if slot_indices is None:
 					slot_indices = torch.arange(
-						page_table.shape[0], dtype=torch.int32, device=self.torch_device,
+						local_bsz, dtype=torch.int32, device=self.torch_device,
 					)
 				real_slots = slot_indices[:local_bsz].to(dtype=torch.int32)
-				if local_bsz > 0:
-					pt = page_table.index_select(0, real_slots.to(dtype=torch.long).clamp_min(0))
-				else:
-					pt = torch.empty(
-						(0, page_table.shape[1]),
-						dtype=page_table.dtype,
-						device=page_table.device,
-					)
-				if pt.shape[1] < width:
-					pt = torch.nn.functional.pad(pt, (0, width - pt.shape[1]), value=0)
-				elif pt.shape[1] > width:
-					pt = pt[:, :width]
-				pt = _pad_first_dim(pt, capture_bucket, 0)
+				if real_slots.shape[0] == capture_bucket:
+					return real_slots
 				slots = torch.full(
 					(capture_bucket,),
 					-1,
@@ -8702,16 +8688,10 @@ class BatchGenWorker:
 				)
 				if local_bsz > 0:
 					slots[:local_bsz].copy_(real_slots)
-				return pt, slots
+				return slots
 
-			capture_primary_pt, capture_primary_slots = _capture_table_and_slots(
-				primary_manager,
-				whole_seg.max_pages_per_seq,
-			)
-			capture_aux_pt, capture_aux_slots = _capture_table_and_slots(
-				aux_manager,
-				whole_seg.max_aux_pages_per_seq,
-			)
+			capture_primary_slots = _capture_slots(primary_manager)
+			capture_aux_slots = _capture_slots(aux_manager)
 			rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
 			if rank_counts is None:
 				rank_counts = torch.full(
@@ -8735,12 +8715,9 @@ class BatchGenWorker:
 				input_ids=capture_input_ids,
 				cache_seqlens=capture_cache_seqlens,
 				position_ids=capture_position_ids,
-				primary_page_table=capture_primary_pt,
-				aux_page_table=capture_aux_pt,
 				primary_slot_indices=capture_primary_slots,
 				aux_slot_indices=capture_aux_slots,
 				rank_token_counts=rank_counts,
-				num_valid_tokens=torch.tensor([local_bsz], dtype=torch.int32, device=self.torch_device),
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
 			manager.register_segment(segment_name, whole_seg)
@@ -9786,34 +9763,20 @@ class BatchGenWorker:
 								out[:tensor.shape[0]].copy_(tensor)
 							return out
 
-						def _graph_table_and_slots(manager, width):
+						def _graph_slots(manager):
 							active_sequence_ids = list(Attn_Wrapper.cur_batch or [])
 							ensure_graph_table = getattr(manager, "ensure_cuda_graph_page_table", None)
 							if ensure_graph_table is not None:
-								page_table = ensure_graph_table(active_sequence_ids)
-							else:
-								get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
-								page_table = get_graph_table() if get_graph_table is not None else manager._gpu_page_table_manager.gpu_table
+								ensure_graph_table(active_sequence_ids)
 							slot_indices = manager._gpu_page_table_manager._slot_index_tensor
 							if slot_indices is None:
 								slot_indices = torch.arange(
-									page_table.shape[0], dtype=torch.int32,
+									batch_size, dtype=torch.int32,
 									device=self.torch_device,
 								)
 							real_slots = slot_indices[:batch_size].to(dtype=torch.int32)
-							if batch_size > 0:
-								pt = page_table.index_select(0, real_slots.to(dtype=torch.long).clamp_min(0))
-							else:
-								pt = torch.empty(
-									(0, page_table.shape[1]),
-									dtype=page_table.dtype,
-									device=page_table.device,
-								)
-							if pt.shape[1] < width:
-								pt = torch.nn.functional.pad(pt, (0, width - pt.shape[1]), value=0)
-							elif pt.shape[1] > width:
-								pt = pt[:, :width]
-							pt = _pad_graph_input(pt, bucket, 0)
+							if real_slots.shape[0] == bucket:
+								return real_slots
 							slots = torch.full(
 								(bucket,),
 								-1,
@@ -9822,21 +9785,10 @@ class BatchGenWorker:
 							)
 							if batch_size > 0:
 								slots[:batch_size].copy_(real_slots)
-							return pt, slots
+							return slots
 
-						primary_pt, primary_slots = _graph_table_and_slots(
-							primary_manager,
-							self._whole_model_segment.max_pages_per_seq,
-						)
-						aux_pt, aux_slots = _graph_table_and_slots(
-							aux_manager,
-							self._whole_model_segment.max_aux_pages_per_seq,
-						)
-						num_valid_tokens = torch.tensor(
-							[batch_size],
-							dtype=torch.int32,
-							device=self.torch_device,
-						)
+						primary_slots = _graph_slots(primary_manager)
+						aux_slots = _graph_slots(aux_manager)
 						graph_input_ids = _pad_graph_input(new_tokens[:batch_size], bucket, 0)
 						graph_cache_seqlens = _pad_graph_input(
 							AttnWrapperBase.cache_seqlens[:batch_size].to(dtype=torch.int32),
@@ -9856,12 +9808,9 @@ class BatchGenWorker:
 							input_ids=graph_input_ids,
 							cache_seqlens=graph_cache_seqlens,
 							position_ids=graph_position_ids,
-							primary_page_table=primary_pt,
-							aux_page_table=aux_pt,
 							primary_slot_indices=primary_slots,
 							aux_slot_indices=aux_slots,
 							rank_token_counts=_all_rank_counts,
-							num_valid_tokens=num_valid_tokens,
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)

@@ -101,12 +101,9 @@ def test_glm5_whole_model_segment_captures_logits_and_kv_callbacks():
         input_ids=torch.tensor([[1], [2]], dtype=torch.int64, device=device),
         cache_seqlens=torch.tensor([4, 5], dtype=torch.int32, device=device),
         position_ids=torch.tensor([[3], [4]], dtype=torch.int64, device=device),
-        primary_page_table=torch.zeros(2, 4, dtype=torch.int32, device=device),
-        aux_page_table=torch.zeros(2, 4, dtype=torch.int32, device=device),
         primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         rank_token_counts=torch.tensor([2], dtype=torch.int64, device=device),
-        num_valid_tokens=torch.tensor([2], dtype=torch.int32, device=device),
     )
 
     manager = CUDAGraphManager(BatchSizeBucketing([2]), device=device)
@@ -119,12 +116,9 @@ def test_glm5_whole_model_segment_captures_logits_and_kv_callbacks():
         input_ids=torch.tensor([[5], [6]], dtype=torch.int64, device=device),
         cache_seqlens=torch.tensor([8, 9], dtype=torch.int32, device=device),
         position_ids=torch.tensor([[7], [8]], dtype=torch.int64, device=device),
-        primary_page_table=torch.zeros(2, 4, dtype=torch.int32, device=device),
-        aux_page_table=torch.zeros(2, 4, dtype=torch.int32, device=device),
         primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
         rank_token_counts=torch.tensor([2], dtype=torch.int64, device=device),
-        num_valid_tokens=torch.tensor([2], dtype=torch.int32, device=device),
     )
     torch.cuda.synchronize()
 

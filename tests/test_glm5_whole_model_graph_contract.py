@@ -62,12 +62,12 @@ def test_glm5_whole_model_segment_static_contract():
     assert inputs["input_ids"].resolve_shape(2) == (2, 1)
     assert inputs["cache_seqlens"].resolve_shape(2) == (2,)
     assert inputs["position_ids"].resolve_shape(2) == (2, 1)
-    assert inputs["primary_page_table"].resolve_shape(2) == (2, 128)
-    assert inputs["aux_page_table"].resolve_shape(2) == (2, 64)
+    assert "primary_page_table" not in inputs
+    assert "aux_page_table" not in inputs
     assert inputs["primary_slot_indices"].fill_value == -1
     assert inputs["aux_slot_indices"].fill_value == -1
     assert inputs["rank_token_counts"].resolve_shape(2) == (16,)
-    assert inputs["num_valid_tokens"].resolve_shape(2) == (1,)
+    assert "num_valid_tokens" not in inputs
 
     outputs = segment.get_static_output_specs(bucket_size=2)
     assert outputs["hidden_states"].resolve_shape(2) == (2, 6144)
@@ -113,12 +113,9 @@ def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
         input_ids=torch.tensor([[7], [0]], dtype=torch.int64),
         cache_seqlens=torch.tensor([128, 1], dtype=torch.int32),
         position_ids=torch.tensor([[127], [0]], dtype=torch.int64),
-        primary_page_table=torch.zeros(2, 128, dtype=torch.int32),
-        aux_page_table=torch.zeros(2, 64, dtype=torch.int32),
         primary_slot_indices=torch.tensor([3, -1], dtype=torch.int32),
         aux_slot_indices=torch.tensor([3, -1], dtype=torch.int32),
         rank_token_counts=torch.tensor([1] + [0] * 15, dtype=torch.int64),
-        num_valid_tokens=torch.tensor([1], dtype=torch.int32),
     )
 
     segment.initialize_static_inputs(static_inputs, bucket_size=2)

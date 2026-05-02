@@ -184,16 +184,9 @@ class Glm5WholeModelSegment:
                 ("batch_size",), torch.int32, fill_value=float(self.max_seqlen)
             ),
             "position_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),
-            "primary_page_table": TensorSpec(
-                ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
-            ),
-            "aux_page_table": TensorSpec(
-                ("batch_size", self.max_aux_pages_per_seq), torch.int32, fill_value=0
-            ),
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
-            "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=0),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -278,16 +271,10 @@ class Glm5WholeModelSegment:
         input_ids: torch.Tensor,
         cache_seqlens: torch.Tensor,
         position_ids: torch.Tensor,
-        primary_page_table: torch.Tensor,
-        aux_page_table: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
         rank_token_counts: torch.Tensor,
-        num_valid_tokens: torch.Tensor,
     ) -> Mapping[str, torch.Tensor]:
-        del primary_page_table, aux_page_table
-        del num_valid_tokens
-
         bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
 
