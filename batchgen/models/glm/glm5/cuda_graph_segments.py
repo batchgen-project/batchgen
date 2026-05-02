@@ -154,7 +154,9 @@ class Glm5DsaAttnSegment:
         self.softmax_scale = softmax_scale if softmax_scale is not None else self.kv_dim**-0.5
         self.max_pages_per_seq = primary_page_table.shape[1]
         self.max_aux_pages_per_seq = aux_page_table.shape[1]
+        self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
+        self._attn_head_outputs: Dict[int, torch.Tensor] = {}
 
         if self.kv_dim != self.kv_lora_rank + 64:
             raise ValueError(
@@ -221,6 +223,7 @@ class Glm5DsaAttnSegment:
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._buffers:
+            self._setup_static_output_buffers(bucket_size)
             return
         device = self.primary_blocked_k.device
         q_x_fp8, q_x_scale, q_tma_desc = make_fp8_activation_scratch(
@@ -313,9 +316,23 @@ class Glm5DsaAttnSegment:
             attn_heads=attn_heads,
             prepared_flashmla=prepared_flashmla,
         )
+        self._setup_static_output_buffers(bucket_size)
+
+    def _setup_static_output_buffers(self, bucket_size: int) -> None:
+        if not self._uses_shared_buffers or bucket_size in self._attn_head_outputs:
+            return
+        self._attn_head_outputs[bucket_size] = torch.empty(
+            bucket_size,
+            1,
+            self.num_attn_heads,
+            self.attn_out_dim,
+            dtype=torch.bfloat16,
+            device=self.primary_blocked_k.device,
+        )
 
     def release_static_buffers(self, bucket_size: int) -> None:
         self._buffers.pop(bucket_size, None)
+        self._attn_head_outputs.pop(bucket_size, None)
 
     def forward(
         self,
@@ -381,10 +398,11 @@ class Glm5DsaAttnSegment:
         fp8_q_absorb_out(q_nope, self.absorb_weights, buffers.absorbed_q)
         pack_flashmla_query_out(buffers.absorbed_q, q_rope, buffers.query_states)
         attn_out = run_prepared_sparse_flash_mla_decode(buffers.prepared_flashmla)
-        fp8_out_absorb_out(attn_out, self.absorb_weights, buffers.attn_heads)
+        attn_heads = self._attn_head_outputs.get(batch_size, buffers.attn_heads)
+        fp8_out_absorb_out(attn_out, self.absorb_weights, attn_heads)
 
         return {
-            "attn_heads": buffers.attn_heads,
+            "attn_heads": attn_heads,
             "top_k_indices": buffers.top_k_indices,
             "selected_lengths": buffers.selected_lengths,
             "selected_mla_kv": buffers.selected_mla_kv,

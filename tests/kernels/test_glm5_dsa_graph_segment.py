@@ -195,8 +195,13 @@ def test_glm5_dsa_segments_share_static_buffers_by_bucket():
         segment_a._buffers[batch_size].selected_mla_kv.data_ptr()
         == segment_b._buffers[batch_size].selected_mla_kv.data_ptr()
     )
+    assert (
+        segment_a._attn_head_outputs[batch_size].data_ptr()
+        != segment_b._attn_head_outputs[batch_size].data_ptr()
+    )
     segment_a.release_static_buffers(batch_size)
     assert batch_size not in shared_buffers
+    assert batch_size not in segment_a._attn_head_outputs
 
 
 def test_glm5_dsa_segment_replay_matches_eager_forward():
