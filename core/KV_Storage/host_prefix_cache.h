@@ -110,6 +110,10 @@ class HostPrefixCache {
                               std::int32_t page_size,
                               const std::vector<std::int64_t>& token_ids);
 
+    PrefixLookupResult Peek(std::uint64_t namespace_hash,
+                            std::int32_t page_size,
+                            const std::vector<std::int64_t>& token_ids);
+
     std::size_t CommitPages(std::uint64_t namespace_hash,
                             std::int32_t page_size,
                             const std::vector<std::int64_t>& token_ids,
@@ -140,6 +144,9 @@ class HostPrefixCache {
     };
 
     static std::uint64_t BuildPageChainHash(const PrefixPageKey& key);
+    PrefixLookupResult LookupInternal(
+        std::uint64_t namespace_hash, std::int32_t page_size,
+        const std::vector<std::int64_t>& token_ids, bool record_access);
     std::uint64_t NextAccessEpochLocked();
     void RefreshAccessLocked(PrefixPageEntry& entry);
     void IncrementParentChildCountLocked(std::uint64_t parent_hash);

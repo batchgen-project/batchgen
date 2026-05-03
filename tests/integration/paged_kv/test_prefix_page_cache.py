@@ -93,6 +93,51 @@ def test_prefix_lookup_reuses_only_complete_pages():
         _shm_unlink(shm_name)
 
 
+def test_prefix_allocation_estimate_is_side_effect_free():
+    shm_name = _random_shm_name()
+    worker = None
+    try:
+        worker = _make_worker(shm_name)
+        tokens = list(range(10))  # two full pages plus one partial page
+
+        worker.register_sequences([1])
+        worker.allocate_pages_for_sequences_with_prefix([(1, tokens, 12)])
+        worker.commit_sequence_prefix_pages(1, tokens)
+
+        stats_before = worker.get_prefix_cache_stats()
+        estimate = worker.estimate_pages_for_sequences_with_prefix(
+            [(2, tokens, 12)]
+        )[0]
+        stats_after = worker.get_prefix_cache_stats()
+
+        assert estimate["shared_prefix_tokens"] == 8
+        assert len(estimate["shared_prefix_pages"]) == 2
+        assert estimate["physical_pages_allocated"] == 1
+        assert estimate["private_pages"] == []
+        assert stats_after.lookup_hits == stats_before.lookup_hits
+        assert stats_after.lookup_misses == stats_before.lookup_misses
+        assert stats_after.shared_pages_attached == stats_before.shared_pages_attached
+
+        worker.register_sequences([2])
+        allocation = worker.allocate_pages_for_sequences_with_prefix(
+            [(2, tokens, 12)]
+        )[0]
+        assert allocation["shared_prefix_tokens"] == 8
+        assert len(allocation["private_pages"]) == 1
+        assert worker.get_prefix_cache_stats().lookup_hits == (
+            stats_before.lookup_hits + 1
+        )
+    finally:
+        if worker is not None:
+            try:
+                worker.release_sequence_pages([1, 2])
+            except Exception:
+                pass
+            worker.clear_prefix_cache()
+            worker.shutdown()
+        _shm_unlink(shm_name)
+
+
 def test_parent_page_hash_prevents_invalid_reuse():
     shm_name = _random_shm_name()
     worker = None

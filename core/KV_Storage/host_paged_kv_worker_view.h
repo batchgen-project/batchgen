@@ -557,6 +557,45 @@ class HostPagedKVWorkerView {
         return results;
     }
 
+    std::vector<PrefixAllocationResult> EstimatePagesForSequencesWithPrefix(
+        const std::vector<PrefixAllocationRequest>& requests) {
+        std::vector<PrefixAllocationResult> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            if (request.token_ids.empty()) {
+                throw std::invalid_argument(
+                    "Prefix allocation estimate requires at least one prompt "
+                    "token");
+            }
+            if (request.capacity_tokens < request.token_ids.size()) {
+                throw std::invalid_argument(
+                    "capacity_tokens must be >= token_ids.size()");
+            }
+
+            const PrefixLookupResult hit = prefix_cache_.Peek(
+                request.namespace_hash,
+                static_cast<std::int32_t>(config_.page_size_tokens),
+                request.token_ids);
+            const std::size_t private_tokens =
+                request.capacity_tokens - hit.matched_tokens;
+            const std::size_t private_pages_required =
+                private_tokens == 0 ? 0 : geometry_.RequiredPages(private_tokens);
+
+            PrefixAllocationResult result;
+            result.sequence_id = request.sequence_id;
+            result.shared_prefix_pages = hit.host_pages;
+            result.shared_prefix_tokens = hit.matched_tokens;
+            result.private_start_token = hit.matched_tokens;
+            result.logical_page_count =
+                hit.host_pages.size() + private_pages_required;
+            result.physical_pages_allocated = private_pages_required;
+            result.full_hit = hit.full_hit;
+            result.miss_reason = hit.miss_reason;
+            results.emplace_back(std::move(result));
+        }
+        return results;
+    }
+
     std::size_t CommitSequencePrefixPages(
         std::int64_t sequence_id,
         const std::vector<std::int64_t>& token_ids,

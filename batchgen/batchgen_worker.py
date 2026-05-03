@@ -4787,6 +4787,128 @@ class BatchGenWorker:
 		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
 		return chunk
 
+	def _initial_host_pages_for_prefill(
+		self,
+		seq: SequenceEntry,
+		chunk_size: int,
+	) -> int:
+		"""Return the logical host-page capacity used by prefill allocation."""
+		return seq.get_host_pages_for_initial_chunk(chunk_size)
+
+	def _initial_host_tokens_for_prefill(
+		self,
+		seq: SequenceEntry,
+		chunk_size: int,
+	) -> int:
+		return self._initial_host_pages_for_prefill(seq, chunk_size) * seq.PAGE_SIZE
+
+	def _estimate_prefix_allocation_for_admission(
+		self,
+		seq: SequenceEntry,
+		capacity_tokens: int,
+	) -> Tuple[int, List[int]]:
+		"""Estimate private host pages needed for prefix-aware admission.
+
+		The real prefix allocation is owner-rank local because each rank owns its
+		own prefix index. This estimate must therefore only be used on
+		seq.assigned_rank; other ranks fall back to logical pages.
+		"""
+		logical_pages = math.ceil(capacity_tokens / seq.PAGE_SIZE)
+		if (
+			not self._prefix_reuse_runtime_enabled()
+			or seq.assigned_rank != self.rank
+			or seq.input_ids is None
+		):
+			return logical_pages, []
+
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		estimate_fn = getattr(
+			worker_view,
+			"estimate_pages_for_sequences_with_prefix",
+			None,
+		)
+		if estimate_fn is None:
+			return logical_pages, []
+
+		try:
+			estimate = estimate_fn(
+				[
+					(
+						seq.global_idx,
+						self._prefix_reuse_prompt_tokens(seq),
+						capacity_tokens,
+						self._prefix_reuse_namespace_hash,
+					)
+				]
+			)
+			if not estimate:
+				return logical_pages, []
+			item = estimate[0]
+			private_pages = int(
+				item.get("physical_pages_allocated", logical_pages)
+			)
+			shared_pages = [
+				int(page) for page in item.get("shared_prefix_pages", [])
+			]
+			return max(0, private_pages), shared_pages
+		except Exception as exc:
+			logging.debug(
+				"Rank %s prefix admission estimate failed for seq %s: %s",
+				self.rank,
+				getattr(seq, "global_idx", "unknown"),
+				exc,
+			)
+			return logical_pages, []
+
+	def _collect_prefill_admission_pages(
+		self,
+		all_candidates: List[str],
+		chunk_size: int,
+	) -> Dict[str, int]:
+		"""Collect owner-rank private-page estimates for prefill admission."""
+		logical_pages_by_uuid: Dict[str, int] = {}
+		for uuid in all_candidates:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			logical_pages_by_uuid[uuid] = self._initial_host_pages_for_prefill(
+				seq,
+				chunk_size,
+			)
+
+		if not self._prefix_reuse_runtime_enabled():
+			return logical_pages_by_uuid
+
+		local_estimates = torch.full(
+			(len(all_candidates),),
+			-1,
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		for idx, uuid in enumerate(all_candidates):
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.assigned_rank != self.rank:
+				continue
+			capacity_tokens = logical_pages_by_uuid[uuid] * seq.PAGE_SIZE
+			private_pages, _shared_pages = (
+				self._estimate_prefix_allocation_for_admission(
+					seq,
+					capacity_tokens,
+				)
+			)
+			local_estimates[idx] = private_pages
+
+		if self.world_size > 1 and dist.is_initialized():
+			dist.all_reduce(local_estimates, op=dist.ReduceOp.MAX)
+
+		reduced = local_estimates.cpu().tolist()
+		admission_pages = dict(logical_pages_by_uuid)
+		for uuid, private_pages in zip(all_candidates, reduced):
+			if private_pages >= 0:
+				admission_pages[uuid] = int(private_pages)
+
+		return admission_pages
+
 	def _maybe_evict_prefix_cache_for_prefill_admission(
 		self,
 		all_candidates: List[str],
@@ -4814,33 +4936,35 @@ class BatchGenWorker:
 
 		my_node = self._get_node_for_rank(self.rank)
 		target_free_pages = 0
-		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
+		protected_pages: Set[int] = set()
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None or seq.assigned_rank is None:
 				continue
+			if seq.assigned_rank != self.rank:
+				continue
 			if self._get_node_for_rank(seq.assigned_rank) != my_node:
 				continue
-			post_prefill_length = seq.prompt_length + 1
-			gpu_initial_pages = (
-				math.ceil(post_prefill_length / seq.PAGE_SIZE)
-				+ INITIAL_GPU_PAGE_BUFFER
+			capacity_tokens = self._initial_host_tokens_for_prefill(seq, chunk_size)
+			req_pages, shared_pages = self._estimate_prefix_allocation_for_admission(
+				seq,
+				capacity_tokens,
 			)
-			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-			initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-			initial_capacity = min(initial_capacity, seq.kv_token_budget)
-			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
 			if req_pages > local_free:
 				target_free_pages = (
 					req_pages
 					if target_free_pages == 0
 					else min(target_free_pages, req_pages)
 				)
+				protected_pages.update(shared_pages)
 
 		if target_free_pages == 0:
 			return
 		try:
-			eviction = worker_view.evict_prefix_cache_until_free(target_free_pages)
+			eviction = worker_view.evict_prefix_cache_until_free(
+				target_free_pages,
+				protected_pages=list(protected_pages),
+			)
 		except Exception as exc:
 			logging.warning(
 				"Rank %s prefix cache prefill-admission eviction failed: %s",
@@ -4936,11 +5060,27 @@ class BatchGenWorker:
 		per_node_effective_free = list(per_node_host_free)
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
+		admission_pages_by_uuid = self._collect_prefill_admission_pages(
+			all_candidates,
+			chunk_size,
+		)
+		logical_pages_saved = 0
+		if self._prefix_reuse_runtime_enabled():
+			for uuid, private_pages in admission_pages_by_uuid.items():
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					continue
+				logical_pages_saved += max(
+					0,
+					self._initial_host_pages_for_prefill(seq, chunk_size)
+					- private_pages,
+				)
 
-		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
+			if assigned_rank is None:
+				continue
 			seq_node = self._get_node_for_rank(assigned_rank)
 
 			# NOTE: For EVICTED sequences, seq.prompt_length has already been
@@ -4948,12 +5088,10 @@ class BatchGenWorker:
 			# previously-decoded tokens) at eviction time in _page_boundary_fast,
 			# and propagated to all ranks via _sync_sequence_metadata before we
 			# get here. So we can use seq.prompt_length uniformly.
-			post_prefill_length = seq.prompt_length + 1
-			gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-			initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-			initial_capacity = min(initial_capacity, seq.kv_token_budget)
-			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
+			req_pages = admission_pages_by_uuid.get(
+				uuid,
+				self._initial_host_pages_for_prefill(seq, chunk_size),
+			)
 
 			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
 				prefill_batch.append(uuid)
@@ -4983,10 +5121,15 @@ class BatchGenWorker:
 
 		if self.rank == 0:
 			n_evicted = sum(1 for u in prefill_batch if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED)
+			prefix_msg = (
+				f", prefix-admission-saved-pages={logical_pages_saved}"
+				if self._prefix_reuse_runtime_enabled()
+				else ""
+			)
 			logging.info(
 				f"[PREFILL] Selected {len(prefill_batch)} sequences "
 				f"({n_evicted} recompute from eviction), "
-				f"per-node pages: {node_pages_used}"
+				f"per-node pages: {node_pages_used}{prefix_msg}"
 			)
 
 		return prefill_batch
@@ -7234,26 +7377,39 @@ class BatchGenWorker:
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				global_sequence_ids.append(seq.global_idx)
-				# Dynamic reservation: allocate prompt + chunk_size, not full budget.
-				# Must also cover the GPU initial load which needs
-				# ceil((prompt+1)/PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER pages.
-				# The +1 accounts for the first decoded token produced during prefill
-				# (current_context_length = prompt_length + 1 after prefill).
-				from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
-				post_prefill_length = seq.prompt_length + 1  # prefill produces 1 decode token
-				gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-				initial_capacity = min(initial_capacity, seq.kv_token_budget)
-				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+				# Dynamic reservation: allocate prompt + chunk_size, not full
+				# budget. Keep this formula shared with admission.
+				seq.host_pages_allocated = self._initial_host_pages_for_prefill(
+					seq,
+					chunk_size,
+				)
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
 				sequence_tokens.append(seq.host_token_capacity)
+
+			use_prefix_reuse_allocation = (
+				self.enable_prefix_reuse
+				and not self._prefix_reuse_exact_full_prefill_fallback_enabled()
+			)
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
 			# if it fires, there's another selection bug to investigate.
 			kv_stats = self.host_paged_kv_worker_view.get_stats()
-			total_pages_needed = sum(math.ceil(t / seq.PAGE_SIZE) for t in sequence_tokens)
+			if use_prefix_reuse_allocation:
+				total_pages_needed = 0
+				for uuid, capacity_tokens in zip(my_prefill_uuids, sequence_tokens):
+					seq = self.global_batch.get_sequence(uuid)
+					private_pages, _shared_pages = (
+						self._estimate_prefix_allocation_for_admission(
+							seq,
+							capacity_tokens,
+						)
+					)
+					total_pages_needed += private_pages
+			else:
+				total_pages_needed = sum(
+					math.ceil(t / self.PAGE_SIZE) for t in sequence_tokens
+				)
 			if total_pages_needed > kv_stats.num_free_pages:
 				# Log per-sequence breakdown to help diagnose the selection bug.
 				seq_details = []
@@ -7278,10 +7434,6 @@ class BatchGenWorker:
 			)
 
 			seq_token_pairs = list(zip(global_sequence_ids, sequence_tokens))
-			use_prefix_reuse_allocation = (
-				self.enable_prefix_reuse
-				and not self._prefix_reuse_exact_full_prefill_fallback_enabled()
-			)
 			if use_prefix_reuse_allocation:
 				self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
 				prefix_requests = []

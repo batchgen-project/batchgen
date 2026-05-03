@@ -40,6 +40,49 @@ namespace kv = batchgen::kv;
 
 namespace {
 
+std::vector<kv::PrefixAllocationRequest> PrefixAllocationRequestsFromPy(
+    py::list requests_py) {
+    std::vector<kv::PrefixAllocationRequest> requests;
+    requests.reserve(py::len(requests_py));
+    for (auto item : requests_py) {
+        auto tup = py::cast<py::tuple>(item);
+        if (py::len(tup) != 3 && py::len(tup) != 4) {
+            throw std::invalid_argument(
+                "prefix allocation requests must be "
+                "(sequence_id, token_ids, capacity_tokens[, "
+                "namespace_hash])");
+        }
+        kv::PrefixAllocationRequest request;
+        request.sequence_id = py::cast<std::int64_t>(tup[0]);
+        request.token_ids = py::cast<std::vector<std::int64_t>>(tup[1]);
+        request.capacity_tokens = py::cast<std::size_t>(tup[2]);
+        if (py::len(tup) == 4) {
+            request.namespace_hash = py::cast<std::uint64_t>(tup[3]);
+        }
+        requests.emplace_back(std::move(request));
+    }
+    return requests;
+}
+
+py::list PrefixAllocationResultsToPy(
+    const std::vector<kv::PrefixAllocationResult>& results) {
+    py::list out;
+    for (const auto& result : results) {
+        py::dict item;
+        item["sequence_id"] = result.sequence_id;
+        item["shared_prefix_pages"] = result.shared_prefix_pages;
+        item["private_pages"] = result.private_pages;
+        item["shared_prefix_tokens"] = result.shared_prefix_tokens;
+        item["private_start_token"] = result.private_start_token;
+        item["logical_page_count"] = result.logical_page_count;
+        item["physical_pages_allocated"] = result.physical_pages_allocated;
+        item["full_hit"] = result.full_hit;
+        item["miss_reason"] = result.miss_reason;
+        out.append(std::move(item));
+    }
+    return out;
+}
+
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
     py::class_<Manager>(m, name)
@@ -245,48 +288,22 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
         .def(
             "allocate_pages_for_sequences_with_prefix",
             [](WorkerView& self, py::list requests_py) {
-                std::vector<kv::PrefixAllocationRequest> requests;
-                requests.reserve(py::len(requests_py));
-                for (auto item : requests_py) {
-                    auto tup = py::cast<py::tuple>(item);
-                    if (py::len(tup) != 3 && py::len(tup) != 4) {
-                        throw std::invalid_argument(
-                            "prefix allocation requests must be "
-                            "(sequence_id, token_ids, capacity_tokens[, "
-                            "namespace_hash])");
-                    }
-                    kv::PrefixAllocationRequest request;
-                    request.sequence_id = py::cast<std::int64_t>(tup[0]);
-                    request.token_ids =
-                        py::cast<std::vector<std::int64_t>>(tup[1]);
-                    request.capacity_tokens = py::cast<std::size_t>(tup[2]);
-                    if (py::len(tup) == 4) {
-                        request.namespace_hash =
-                            py::cast<std::uint64_t>(tup[3]);
-                    }
-                    requests.emplace_back(std::move(request));
-                }
-                auto results =
-                    self.AllocatePagesForSequencesWithPrefix(requests);
-                py::list out;
-                for (const auto& result : results) {
-                    py::dict item;
-                    item["sequence_id"] = result.sequence_id;
-                    item["shared_prefix_pages"] = result.shared_prefix_pages;
-                    item["private_pages"] = result.private_pages;
-                    item["shared_prefix_tokens"] =
-                        result.shared_prefix_tokens;
-                    item["private_start_token"] = result.private_start_token;
-                    item["logical_page_count"] = result.logical_page_count;
-                    item["physical_pages_allocated"] =
-                        result.physical_pages_allocated;
-                    item["full_hit"] = result.full_hit;
-                    item["miss_reason"] = result.miss_reason;
-                    out.append(std::move(item));
-                }
-                return out;
+                const auto requests = PrefixAllocationRequestsFromPy(requests_py);
+                return PrefixAllocationResultsToPy(
+                    self.AllocatePagesForSequencesWithPrefix(requests));
             },
             py::arg("requests"))
+        .def(
+            "estimate_pages_for_sequences_with_prefix",
+            [](WorkerView& self, py::list requests_py) {
+                const auto requests = PrefixAllocationRequestsFromPy(requests_py);
+                return PrefixAllocationResultsToPy(
+                    self.EstimatePagesForSequencesWithPrefix(requests));
+            },
+            py::arg("requests"),
+            "Estimate prefix allocation without registering sequences, "
+            "attaching pages, allocating private pages, or updating prefix "
+            "lookup statistics.")
         .def("commit_sequence_prefix_pages",
              &WorkerView::CommitSequencePrefixPages,
              py::arg("sequence_id"), py::arg("token_ids"),

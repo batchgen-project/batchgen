@@ -113,12 +113,26 @@ void HostPrefixCache::DecrementParentChildCountLocked(
 PrefixLookupResult HostPrefixCache::Lookup(
     std::uint64_t namespace_hash, std::int32_t page_size,
     const std::vector<std::int64_t>& token_ids) {
+    return LookupInternal(namespace_hash, page_size, token_ids, true);
+}
+
+PrefixLookupResult HostPrefixCache::Peek(
+    std::uint64_t namespace_hash, std::int32_t page_size,
+    const std::vector<std::int64_t>& token_ids) {
+    return LookupInternal(namespace_hash, page_size, token_ids, false);
+}
+
+PrefixLookupResult HostPrefixCache::LookupInternal(
+    std::uint64_t namespace_hash, std::int32_t page_size,
+    const std::vector<std::int64_t>& token_ids, bool record_access) {
     PrefixLookupResult result;
     const std::size_t full_pages = FullPageCount(token_ids.size(), page_size);
     if (full_pages == 0) {
         result.miss_reason = "no_full_prompt_pages";
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++stats_.lookup_misses;
+        if (record_access) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stats_.lookup_misses;
+        }
         return result;
     }
 
@@ -147,7 +161,9 @@ PrefixLookupResult HostPrefixCache::Lookup(
                 result.miss_reason = "token_validation_hash_mismatch";
                 break;
             }
-            RefreshAccessLocked(entry);
+            if (record_access) {
+                RefreshAccessLocked(entry);
+            }
             result.host_pages.push_back(entry.host_page_id);
             parent_hash = entry.page_chain_hash;
         }
@@ -158,10 +174,12 @@ PrefixLookupResult HostPrefixCache::Lookup(
         if (result.matched_pages == full_pages) {
             result.miss_reason.clear();
         }
-        if (result.matched_pages == 0) {
-            ++stats_.lookup_misses;
-        } else {
-            ++stats_.lookup_hits;
+        if (record_access) {
+            if (result.matched_pages == 0) {
+                ++stats_.lookup_misses;
+            } else {
+                ++stats_.lookup_hits;
+            }
         }
     }
     return result;
