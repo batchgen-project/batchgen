@@ -9,6 +9,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.io_struct import (
     BatchEndpoint,
     BatchError,
@@ -31,10 +32,11 @@ from batchgen.server.io_struct import (
     ToolCallFunction,
     Usage,
 )
-from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
 from batchgen.server.scheduling_pool import SchedulingPool
 from batchgen.server.server_args import ServerArgs
 from batchgen.server.storage import StorageManager
+from batchgen.server.usage import build_usage as make_usage
+from batchgen.server.usage import build_usage_dict
 from batchgen.server.worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
@@ -314,8 +316,8 @@ class BatchScheduler:
         # If incremental save was active, use the incremental JSONL as the output
         incremental_path = None
         if incremental_output_dir:
-            from pathlib import Path
             import shutil
+            from pathlib import Path
             incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
 
         if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:
@@ -717,11 +719,7 @@ class BatchScheduler:
             return None
         prompt_tokens = self._count_tokens(tokenizer, prompt_text)
         completion_tokens = self._count_tokens(tokenizer, completion_text)
-        return Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
+        return make_usage(prompt_tokens, completion_tokens)
 
     def _build_usage(
         self, model: str, prompt_text: str, token_ids: List[int]
@@ -731,11 +729,7 @@ class BatchScheduler:
             return None
         prompt_tokens = self._count_tokens(tokenizer, prompt_text)
         completion_tokens = len(token_ids)
-        return Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
+        return make_usage(prompt_tokens, completion_tokens)
 
     def _count_tokens(self, tokenizer: Any, text: str) -> int:
         if not text:
@@ -1149,11 +1143,13 @@ class BatchScheduler:
         decoded_text = result.get("text", "")
         prompt_length = result.get("prompt_length", 0)
         decoded_length = result.get("decoded_length", 0)
+        cached_tokens = result.get("cached_tokens", 0)
         finish_reason = result.get("finish_reason", "stop")
         model = meta["model"]
         custom_id = meta["custom_id"]
         url = meta["url"]
         created_at = int(time.time())
+        usage = build_usage_dict(prompt_length, decoded_length, cached_tokens)
 
         # Build response body based on endpoint type
         if url == "/v1/chat/completions":
@@ -1171,11 +1167,7 @@ class BatchScheduler:
                     "logprobs": None,
                     "finish_reason": finish_reason,
                 }],
-                "usage": {
-                    "prompt_tokens": prompt_length,
-                    "completion_tokens": decoded_length,
-                    "total_tokens": prompt_length + decoded_length,
-                },
+                "usage": usage,
             }
         else:
             body = {
@@ -1189,11 +1181,7 @@ class BatchScheduler:
                     "logprobs": None,
                     "finish_reason": finish_reason,
                 }],
-                "usage": {
-                    "prompt_tokens": prompt_length,
-                    "completion_tokens": decoded_length,
-                    "total_tokens": prompt_length + decoded_length,
-                },
+                "usage": usage,
             }
 
         result_item = {
@@ -1238,8 +1226,8 @@ class BatchScheduler:
             else None
         )
         if incremental_output_dir:
-            from pathlib import Path
             import shutil
+            from pathlib import Path
             incremental_path = Path(incremental_output_dir) / f"{batch_id}.jsonl"
 
         if incremental_path and incremental_path.exists() and incremental_path.stat().st_size > 0:

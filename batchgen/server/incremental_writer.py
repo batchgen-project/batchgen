@@ -31,8 +31,8 @@ from batchgen.server.io_struct import (
     CompletionResponse,
     ToolCall,
     ToolCallFunction,
-    Usage,
 )
+from batchgen.server.usage import build_usage as make_usage
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +90,28 @@ class IncrementalWriter:
             f"output={self._output_path}, sequences={len(custom_id_map)}"
         )
 
-    def submit(self, global_idx: int, decoded_tokens: torch.Tensor, finish_reason: str = "stop") -> None:
+    def submit(
+        self,
+        global_idx: int,
+        decoded_tokens: torch.Tensor,
+        finish_reason: str = "stop",
+        cached_tokens: int = 0,
+    ) -> None:
         """Enqueue a completed sequence for async writing. Thread-safe."""
         if self._closed:
             logger.warning("IncrementalWriter.submit() called after close()")
             return
-        tokens_cpu = decoded_tokens.cpu() if decoded_tokens.is_cuda else decoded_tokens.clone()
-        self._queue.put((global_idx, tokens_cpu, finish_reason))
+        tokens_cpu = (
+            decoded_tokens.cpu()
+            if decoded_tokens.is_cuda
+            else decoded_tokens.clone()
+        )
+        self._queue.put((
+            global_idx,
+            tokens_cpu,
+            finish_reason,
+            cached_tokens,
+        ))
 
     def submit_error(self, global_idx: int, error_code: str, error_message: str) -> None:
         """Enqueue an error result for a rejected sequence. Thread-safe."""
@@ -141,13 +156,30 @@ class IncrementalWriter:
 
                     try:
                         # Error items: ("error", global_idx, error_code, error_message)
-                        if isinstance(item, tuple) and len(item) == 4 and item[0] == "error":
+                        if (
+                            isinstance(item, tuple)
+                            and len(item) == 4
+                            and item[0] == "error"
+                        ):
                             _, global_idx, error_code, error_message = item
-                            line = self._build_error_line(global_idx, error_code, error_message)
+                            line = self._build_error_line(
+                                global_idx,
+                                error_code,
+                                error_message,
+                            )
                         else:
-                            # Normal items: (global_idx, tokens, finish_reason)
-                            global_idx, tokens, finish_reason = item
-                            line = self._build_result_line(global_idx, tokens, finish_reason=finish_reason)
+                            # Normal items: (global_idx, tokens, finish_reason[, cached_tokens])
+                            if len(item) == 4:
+                                global_idx, tokens, finish_reason, cached_tokens = item
+                            else:
+                                global_idx, tokens, finish_reason = item
+                                cached_tokens = 0
+                            line = self._build_result_line(
+                                global_idx,
+                                tokens,
+                                finish_reason=finish_reason,
+                                cached_tokens=cached_tokens,
+                            )
                         fh.write(line)
                         fh.write("\n")
                         fh.flush()
@@ -162,10 +194,19 @@ class IncrementalWriter:
 
     # -------------------- Result building --------------------
 
-    def _build_result_line(self, global_idx: int, tokens: torch.Tensor, finish_reason: str = "stop") -> str:
+    def _build_result_line(
+        self,
+        global_idx: int,
+        tokens: torch.Tensor,
+        finish_reason: str = "stop",
+        cached_tokens: int = 0,
+    ) -> str:
         """Build a BatchResultItem-compatible JSON line."""
         custom_id = self._custom_id_map.get(global_idx, f"unknown_{global_idx}")
-        endpoint_url = self._request_urls.get(global_idx, BatchEndpoint.CHAT_COMPLETIONS.value)
+        endpoint_url = self._request_urls.get(
+            global_idx,
+            BatchEndpoint.CHAT_COMPLETIONS.value,
+        )
         prompt_text = self._prompt_texts.get(global_idx, "")
 
         # Detokenize
@@ -180,11 +221,7 @@ class IncrementalWriter:
         content, reasoning_content, tool_calls = self._parse_output(decoded_text)
 
         created_at = int(time.time())
-        usage = Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        )
+        usage = make_usage(prompt_tokens, completion_tokens, cached_tokens)
 
         if endpoint_url == BatchEndpoint.CHAT_COMPLETIONS.value:
             body = ChatCompletionResponse(
