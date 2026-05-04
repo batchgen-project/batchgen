@@ -21,6 +21,7 @@ from batchgen.sequence import (
 from batchgen.continuous_batching import (
     AdaptiveChunkSizer,
     EvictionStrategy,
+    plan_host_kv_growth_evictions,
     select_sequences_for_eviction,
 )
 
@@ -451,6 +452,166 @@ class TestEvictionWithPageKey:
         assert freed == 100
 
 
+# ============ Host KV Growth-Debt-Aware Eviction Planner ============
+
+class TestHostKVGrowthEvictionPlanner:
+    """Tests for planning host eviction and dynamic host growth together."""
+
+    def test_no_growth_and_enough_free_pages_needs_no_eviction(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["s1", "s2"],
+            completed_uuids=[],
+            host_growth_uuids=[],
+            host_growth_pages=[],
+            eviction_candidates=[
+                ("s1", {"decoded_length": 10, "host_pages_allocated": 100}),
+                ("s2", {"decoded_length": 20, "host_pages_allocated": 100}),
+            ],
+            free_pages=300,
+            total_pages=1000,
+            completed_pages=0,
+            watermark_percent=10,
+            safety_margin=50,
+        )
+
+        assert plan.evicted_uuids == []
+        assert plan.remaining_growth_needed == 0
+        assert plan.growth_feasible_after_eviction
+
+    def test_completed_pages_make_growth_feasible_without_eviction(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["live", "done"],
+            completed_uuids=["done"],
+            host_growth_uuids=["live"],
+            host_growth_pages=[80],
+            eviction_candidates=[
+                ("live", {"decoded_length": 10, "host_pages_allocated": 100}),
+            ],
+            free_pages=10,
+            total_pages=1000,
+            completed_pages=100,
+            watermark_percent=0,
+            safety_margin=20,
+        )
+
+        assert plan.evicted_uuids == []
+        assert plan.expected_free_pages == 110
+        assert plan.required_free_pages == 100
+        assert plan.remaining_growth_uuids == ["live"]
+        assert plan.remaining_growth_pages == [80]
+        assert plan.growth_feasible_after_eviction
+
+    def test_growth_debt_eviction_exceeds_watermark_target(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["a", "b", "c", "d"],
+            completed_uuids=[],
+            host_growth_uuids=["d"],
+            host_growth_pages=[2385],
+            eviction_candidates=[
+                ("a", {"decoded_length": 10, "host_pages_allocated": 800, "global_idx": 0}),
+                ("b", {"decoded_length": 20, "host_pages_allocated": 900, "global_idx": 1}),
+                ("c", {"decoded_length": 30, "host_pages_allocated": 1000, "global_idx": 2}),
+                ("d", {"decoded_length": 100, "host_pages_allocated": 500, "global_idx": 3}),
+            ],
+            free_pages=1074,
+            total_pages=9760,
+            completed_pages=0,
+            watermark_percent=10,
+            safety_margin=488,
+        )
+
+        # Watermark-only target would be satisfied already (976 pages), but
+        # growth debt requires 2385 + 488 pages, so additional eviction is
+        # needed before active decode can safely append again.
+        assert plan.evicted_uuids == ["a", "b", "c"]
+        assert plan.freed_pages == 2700
+        assert plan.remaining_growth_uuids == ["d"]
+        assert plan.expected_free_pages >= plan.required_free_pages
+        assert plan.growth_feasible_after_eviction
+
+    def test_evicting_growth_row_removes_its_growth_debt(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["growth-short", "growth-long"],
+            completed_uuids=[],
+            host_growth_uuids=["growth-short", "growth-long"],
+            host_growth_pages=[500, 500],
+            eviction_candidates=[
+                ("growth-short", {"decoded_length": 1, "host_pages_allocated": 1000, "global_idx": 0}),
+                ("growth-long", {"decoded_length": 1000, "host_pages_allocated": 1000, "global_idx": 1}),
+            ],
+            free_pages=100,
+            total_pages=2000,
+            completed_pages=0,
+            watermark_percent=0,
+            safety_margin=50,
+        )
+
+        assert plan.evicted_uuids == ["growth-short"]
+        assert plan.remaining_growth_uuids == ["growth-long"]
+        assert plan.remaining_growth_needed == 500
+        assert plan.required_free_pages == 550
+        assert plan.growth_feasible_after_eviction
+
+    def test_priority_decoded_and_global_idx_ordering_is_deterministic(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["high-priority", "later", "earlier"],
+            completed_uuids=[],
+            host_growth_uuids=["high-priority"],
+            host_growth_pages=[700],
+            eviction_candidates=[
+                ("later", {
+                    "priority": 0,
+                    "decoded_length": 10,
+                    "host_pages_allocated": 400,
+                    "global_idx": 5,
+                }),
+                ("earlier", {
+                    "priority": 0,
+                    "decoded_length": 10,
+                    "host_pages_allocated": 400,
+                    "global_idx": 2,
+                }),
+                ("high-priority", {
+                    "priority": 1,
+                    "decoded_length": 1,
+                    "host_pages_allocated": 1000,
+                    "global_idx": 0,
+                }),
+            ],
+            free_pages=50,
+            total_pages=2000,
+            completed_pages=0,
+            watermark_percent=0,
+            safety_margin=50,
+        )
+
+        assert plan.evicted_uuids == ["earlier", "later"]
+        assert plan.remaining_growth_uuids == ["high-priority"]
+        assert plan.growth_feasible_after_eviction
+
+    def test_infeasible_when_candidates_cannot_cover_growth_debt(self):
+        plan = plan_host_kv_growth_evictions(
+            active_uuids=["a", "b"],
+            completed_uuids=[],
+            host_growth_uuids=["b"],
+            host_growth_pages=[1000],
+            eviction_candidates=[
+                ("a", {"decoded_length": 10, "host_pages_allocated": 100, "global_idx": 0}),
+            ],
+            free_pages=50,
+            total_pages=2000,
+            completed_pages=0,
+            watermark_percent=0,
+            safety_margin=50,
+        )
+
+        assert plan.evicted_uuids == ["a"]
+        assert plan.remaining_growth_uuids == ["b"]
+        assert plan.expected_free_pages == 150
+        assert plan.required_free_pages == 1050
+        assert not plan.growth_feasible_after_eviction
+
+
 # ============ Integration: Full Lifecycle ============
 
 class TestFullLifecycle:
@@ -531,15 +692,12 @@ class TestFullLifecycle:
         new_prompt_len = len(evicted_ids)
         prev_decoded = seq.total_decoded_before_eviction
 
-        # Rebuild input_ids (2D) and attention_mask
+        # Rebuild input_ids (2D)
         seq_extended_size = seq.kv_token_budget
         input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-        attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
         input_ids_extended[0, :new_prompt_len] = evicted_ids
-        attention_mask_extended[0, :new_prompt_len] = 1
 
         seq.input_ids = input_ids_extended
-        seq.attention_mask = attention_mask_extended
         seq.prompt_length = new_prompt_len
         seq.current_context_length = new_prompt_len
 

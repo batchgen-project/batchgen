@@ -114,7 +114,7 @@ from batchgen.continuous_batching import (
 	AdaptiveChunkSizer,
 	BoundaryDecisions,
 	FastBoundaryTimingStats,
-	select_sequences_for_eviction as select_host_kv_eviction,
+	plan_host_kv_growth_evictions,
 	EvictionStrategy,
 )
 # sample_tokens: Token sampling with temperature/top_p support
@@ -2662,6 +2662,52 @@ class BatchGenWorker:
 			'num_valid_sequences': len(valid_sequences),
 		}
 
+	def _gather_host_kv_stats_by_node(self, worker_view: Optional[object]) -> List[Dict[str, int]]:
+		"""Gather one host-KV pool stat record per node.
+
+		Host KV is shared by ranks on the same node, not globally. Rank 0 uses
+		these per-node stats to plan dynamic host growth against the same pool
+		that each owner rank will later allocate from.
+		"""
+		gpus_per_node = NUM_GPUS_PER_NODE
+		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
+		report_free = 0
+		report_total = 0
+		report_node = -1
+		if worker_view is not None and self.local_rank == 0:
+			stats = worker_view.get_stats()
+			report_node = self.rank // gpus_per_node
+			report_free = int(stats.num_free_pages)
+			report_total = int(stats.num_total_pages)
+
+		stats_tensor = torch.tensor(
+			[report_node, report_free, report_total],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, stats_tensor)
+
+		per_node_stats = []
+		reports_by_node = {}
+		for item in gathered:
+			node_id = int(item[0].item())
+			if node_id >= 0:
+				reports_by_node[node_id] = {
+					'node_id': node_id,
+					'num_free_pages': int(item[1].item()),
+					'num_total_pages': int(item[2].item()),
+				}
+
+		for node in range(num_nodes):
+			per_node_stats.append(reports_by_node.get(node, {
+				'node_id': node,
+				'num_free_pages': 0,
+				'num_total_pages': 0,
+			}))
+
+		return per_node_stats
+
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
 
@@ -4122,16 +4168,14 @@ class BatchGenWorker:
 	# ============ KV-Driven Batch Preparation ============
 
 	def _get_node_for_rank(self, rank: int) -> int:
-		"""Get node ID for a rank. Assumes uniform GPUs per node."""
-		gpus_per_node = torch.cuda.device_count()
-		if self.world_size <= gpus_per_node:
+		"""Get physical host-KV node ID for a rank."""
+		if self.world_size <= NUM_GPUS_PER_NODE:
 			return 0
-		return rank // gpus_per_node
+		return rank // NUM_GPUS_PER_NODE
 
 	def _get_num_nodes(self) -> int:
-		"""Get total number of nodes."""
-		gpus_per_node = torch.cuda.device_count()
-		return max(1, self.world_size // gpus_per_node)
+		"""Get total number of physical host-KV nodes."""
+		return max(1, math.ceil(self.world_size / NUM_GPUS_PER_NODE))
 
 	def _get_effective_chunk_size(self) -> int:
 		"""Return the current host KV chunk size, considering adaptive sizing.
@@ -4184,9 +4228,8 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 
-		gpus_per_node = torch.cuda.device_count()
+		gpus_per_node = NUM_GPUS_PER_NODE
 		num_nodes = self._get_num_nodes()
-		my_node = self._get_node_for_rank(self.rank)
 		chunk_size = self._get_effective_chunk_size()
 
 		# Step 1: Get this node's host KV free pages
@@ -4194,20 +4237,26 @@ class BatchGenWorker:
 
 		# Step 2: Gather host KV free pages from first rank on each node
 		# Only rank 0, 8, 16, ... (first on each node) reports actual value
-		if self.rank % gpus_per_node == 0:
+		if self.local_rank == 0:
+			report_node = self.rank // gpus_per_node
 			report_free = local_host_free
 		else:
+			report_node = -1
 			report_free = 0  # Non-first ranks report 0
 
-		free_tensor = torch.tensor([report_free], dtype=torch.int64, device=self.torch_device)
+		free_tensor = torch.tensor([report_node, report_free], dtype=torch.int64, device=self.torch_device)
 		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
 		dist.all_gather(gathered, free_tensor)
 
 		# Extract per-node host KV free pages
+		reports_by_node = {}
+		for item in gathered:
+			node_id = int(item[0].item())
+			if node_id >= 0:
+				reports_by_node[node_id] = int(item[1].item())
 		per_node_host_free = []
 		for node in range(num_nodes):
-			first_rank = node * gpus_per_node
-			per_node_host_free.append(int(gathered[first_rank].item()))
+			per_node_host_free.append(reports_by_node.get(node, 0))
 
 		if self.rank == 0:
 			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
@@ -6949,7 +6998,7 @@ class BatchGenWorker:
 		global_candidate_info: Dict[str, Dict],
 		per_rank_free: List[int],
 		chunk_size: int,
-		worker_view: Optional[object],
+		per_node_host_stats: Optional[List[Dict[str, int]]],
 	) -> 'BoundaryDecisions':
 		"""Compute ALL batching decisions on rank 0 only.
 
@@ -6968,10 +7017,12 @@ class BatchGenWorker:
 			else:
 				active_uuids.append(uuid)
 
-		# Host KV growth decisions
+		# Host KV growth + eviction decisions. Growth and eviction must be
+		# planned together: if growth is needed, watermark-only eviction is not
+		# enough. The plan reserves enough free pages for remaining growth debt
+		# after completed and evicted rows release their host pages.
 		host_growth_uuids = []
 		host_growth_pages_list = []
-		total_growth_needed = 0
 		for uuid in active_uuids:
 			state = global_seq_state.get(uuid)
 			if state and state.get('needs_host_growth'):
@@ -6979,55 +7030,156 @@ class BatchGenWorker:
 				if growth_pages > 0:
 					host_growth_uuids.append(uuid)
 					host_growth_pages_list.append(growth_pages)
-					total_growth_needed += growth_pages
 
-		growth_feasible = False
-		if total_growth_needed > 0 and worker_view is not None:
-			host_stats = worker_view.get_stats()
-			safety_margin = int(host_stats.num_total_pages * 0.05)
-			growth_feasible = total_growth_needed <= (host_stats.num_free_pages - safety_margin)
-			if not growth_feasible:
-				logging.warning(
-					f"[HOST_KV_GROWTH] Skipped: need {total_growth_needed} pages "
-					f"but only {host_stats.num_free_pages} free "
-					f"({safety_margin} reserved). Will rely on eviction or sequence completions to free pages."
-				)
-
-		# Host KV eviction decisions
 		host_evicted_uuids = []
 		decode_after_eviction = list(active_uuids)
-		if self.enable_host_kv_eviction and active_uuids and worker_view is not None:
-			host_stats = worker_view.get_stats()
-			total_pages = host_stats.num_total_pages
-			free_pages = host_stats.num_free_pages
-			free_pct = (free_pages / total_pages * 100) if total_pages > 0 else 100
+		growth_feasible = False
+		scheduler_error = None
+		per_node_growth_plans = {}
+		growth_pages_by_uuid = dict(zip(host_growth_uuids, host_growth_pages_list))
+		remaining_growth_by_uuid = dict(growth_pages_by_uuid)
+		if per_node_host_stats:
+			host_stats_by_node = {
+				int(stats.get('node_id', idx)): stats
+				for idx, stats in enumerate(per_node_host_stats)
+			}
+			completed_set = set(completed_uuids)
+			active_nodes = {
+				self._get_node_for_rank(global_seq_state[uuid]['assigned_rank'])
+				for uuid in active_uuids
+				if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+			}
+			completed_nodes = {
+				self._get_node_for_rank(global_seq_state[uuid]['assigned_rank'])
+				for uuid in completed_uuids
+				if uuid in global_seq_state and global_seq_state[uuid].get('assigned_rank') is not None
+			}
+			for node in sorted(active_nodes | completed_nodes | set(host_stats_by_node.keys())):
+				node_stats = host_stats_by_node.get(node)
+				node_active_uuids = [
+					uuid for uuid in active_uuids
+					if uuid in global_seq_state
+					and global_seq_state[uuid].get('assigned_rank') is not None
+					and self._get_node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+				]
+				node_completed_uuids = [
+					uuid for uuid in completed_uuids
+					if uuid in global_seq_state
+					and global_seq_state[uuid].get('assigned_rank') is not None
+					and self._get_node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+				]
+				node_growth_uuids = [
+					uuid for uuid in host_growth_uuids
+					if uuid in global_seq_state
+					and global_seq_state[uuid].get('assigned_rank') is not None
+					and self._get_node_for_rank(global_seq_state[uuid]['assigned_rank']) == node
+				]
+				if not node_active_uuids and not node_completed_uuids and not node_growth_uuids:
+					continue
+				if node_stats is None or int(node_stats.get('num_total_pages', 0) or 0) <= 0:
+					if node_growth_uuids:
+						scheduler_error = (
+							f"[HOST_KV_GROWTH_PLAN] node {node} has growth requests but no host KV stats"
+						)
+						logging.error(scheduler_error)
+					continue
 
-			if free_pct < self.host_kv_eviction_watermark:
+				total_pages = int(node_stats.get('num_total_pages', 0) or 0)
+				free_pages = int(node_stats.get('num_free_pages', 0) or 0)
+				safety_margin = int(total_pages * 0.05)
+				completed_host_pages = sum(
+					int(global_seq_state.get(uuid, {}).get('host_pages_allocated', 0) or 0)
+					for uuid in node_completed_uuids
+				)
 				eviction_candidates = []
-				completed_set = set(completed_uuids)
-				for uuid in active_uuids:
-					state = global_seq_state.get(uuid)
-					if state and uuid not in completed_set:
-						seq = self.global_batch.get_sequence(uuid)
-						eviction_candidates.append((uuid, {
-							'decoded_length': state['decoded_length'],
-							'host_pages_allocated': state.get('host_pages_allocated', 0),
-							'global_idx': seq.global_idx,
-							'priority': getattr(seq, 'priority', 0),
-						}))
+				if node_active_uuids and self.enable_host_kv_eviction:
+					for uuid in node_active_uuids:
+						state = global_seq_state.get(uuid)
+						if state and uuid not in completed_set:
+							seq = self.global_batch.get_sequence(uuid)
+							eviction_candidates.append((uuid, {
+								'decoded_length': state['decoded_length'],
+								'host_pages_allocated': state.get('host_pages_allocated', 0),
+								'global_idx': seq.global_idx if seq is not None else float('inf'),
+								'priority': getattr(seq, 'priority', 0) if seq is not None else 0,
+							}))
 
-				target_free = int(total_pages * self.host_kv_eviction_watermark / 100)
-				pages_to_free = max(0, target_free - free_pages)
+				growth_plan = plan_host_kv_growth_evictions(
+					active_uuids=node_active_uuids,
+					completed_uuids=node_completed_uuids,
+					host_growth_uuids=node_growth_uuids,
+					host_growth_pages=[growth_pages_by_uuid[uuid] for uuid in node_growth_uuids],
+					eviction_candidates=eviction_candidates,
+					free_pages=free_pages,
+					total_pages=total_pages,
+					completed_pages=completed_host_pages,
+					watermark_percent=self.host_kv_eviction_watermark if self.enable_host_kv_eviction else 0,
+					safety_margin=safety_margin,
+					strategy=EvictionStrategy.SHORTEST_FIRST,
+					page_key='host_pages_allocated',
+				)
+				host_evicted_uuids.extend(growth_plan.evicted_uuids)
+				for uuid in growth_plan.evicted_uuids:
+					remaining_growth_by_uuid.pop(uuid, None)
+				for uuid in node_growth_uuids:
+					if uuid not in growth_plan.remaining_growth_uuids:
+						remaining_growth_by_uuid.pop(uuid, None)
 
-				if pages_to_free > 0 and eviction_candidates:
-					host_evicted_uuids, _ = select_host_kv_eviction(
-						eviction_candidates, pages_to_free,
-						strategy=EvictionStrategy.SHORTEST_FIRST,
-						page_key='host_pages_allocated',
+				if growth_plan.remaining_growth_needed > 0 or growth_plan.evicted_uuids:
+					growth_eviction_overlap = len(set(growth_plan.evicted_uuids) & set(node_growth_uuids))
+					logging.info(
+						f"[HOST_KV_GROWTH_PLAN] node={node} active={len(node_active_uuids)} "
+						f"growth_rows_total={len(node_growth_uuids)} "
+						f"growth_pages_total={sum(growth_pages_by_uuid[uuid] for uuid in node_growth_uuids)} "
+						f"growth_rows_remaining={len(growth_plan.remaining_growth_uuids)} "
+						f"growth_pages_remaining={growth_plan.remaining_growth_needed} "
+						f"free={free_pages} completed_pages={completed_host_pages} "
+						f"evict_rows={len(growth_plan.evicted_uuids)} evict_pages={growth_plan.freed_pages} "
+						f"growth_rows_evicted={growth_eviction_overlap} "
+						f"expected_free={growth_plan.expected_free_pages} "
+						f"required_free={growth_plan.required_free_pages} "
+						f"safety={safety_margin} feasible={growth_plan.growth_feasible_after_eviction}"
 					)
-					if host_evicted_uuids:
-						evicted_set = set(host_evicted_uuids)
-						decode_after_eviction = [u for u in active_uuids if u not in evicted_set]
+					if node_growth_uuids and (growth_plan.evicted_uuids or not growth_plan.growth_feasible_after_eviction):
+						detail_rows = []
+						for uuid in node_growth_uuids:
+							state = global_seq_state.get(uuid, {})
+							seq = self.global_batch.get_sequence(uuid)
+							context_len = int(state.get('current_context_length', getattr(seq, 'current_context_length', 0)) or 0)
+							capacity = int(state.get('host_token_capacity', getattr(seq, 'host_token_capacity', 0)) or 0)
+							detail_rows.append((
+								capacity - context_len,
+								uuid,
+								getattr(seq, 'global_idx', None),
+								state.get('assigned_rank'),
+								context_len,
+								capacity,
+								int(state.get('host_pages_allocated', getattr(seq, 'host_pages_allocated', 0)) or 0),
+								growth_pages_by_uuid.get(uuid, 0),
+							))
+						detail_rows.sort(key=lambda x: (x[0], str(x[1])))
+						logging.warning(
+							f"[HOST_KV_GROWTH_PLAN_DETAIL] node={node} tightest_rows="
+							+ "; ".join(
+								f"{uuid[:8]}(gid={gid},rank={rank},ctx={ctx},cap={cap},"
+								f"runway={runway},host_pages={host_pages},growth_pages={growth_pages})"
+								for runway, uuid, gid, rank, ctx, cap, host_pages, growth_pages in detail_rows[:8]
+							)
+						)
+				per_node_growth_plans[node] = {
+					'expected_free_pages': growth_plan.expected_free_pages,
+					'safety_margin': safety_margin,
+					'num_candidates': len(eviction_candidates),
+				}
+		elif host_growth_uuids:
+			scheduler_error = (
+				"[HOST_KV_GROWTH_PLAN] host growth requested but per-node host KV stats are missing"
+			)
+			logging.error(scheduler_error)
+
+		evicted_set = set(host_evicted_uuids)
+		host_evicted_uuids = [uuid for uuid in active_uuids if uuid in evicted_set]
+		decode_after_eviction = [u for u in active_uuids if u not in evicted_set]
 
 		# GPU page extension / on-hold decisions
 		seqs_needing_extension = []
@@ -7081,6 +7233,49 @@ class BatchGenWorker:
 					if r is not None:
 						actual_extension_by_rank[r] += state.get('additional_pages_needed', 0)
 
+		# Rows moved ON_HOLD are removed from decode before the next append, so
+		# they no longer need immediate host growth at this boundary.
+		onhold_set = set(onhold_uuids)
+		for uuid in onhold_set:
+			remaining_growth_by_uuid.pop(uuid, None)
+
+		host_growth_uuids = [uuid for uuid in host_growth_uuids if uuid in remaining_growth_by_uuid]
+		host_growth_pages_list = [remaining_growth_by_uuid[uuid] for uuid in host_growth_uuids]
+		total_growth_needed = sum(host_growth_pages_list)
+		if total_growth_needed > 0:
+			remaining_growth_by_node = {}
+			for uuid in host_growth_uuids:
+				state = global_seq_state.get(uuid, {})
+				assigned_rank = state.get('assigned_rank')
+				if assigned_rank is None:
+					continue
+				node = self._get_node_for_rank(assigned_rank)
+				remaining_growth_by_node[node] = (
+					remaining_growth_by_node.get(node, 0)
+					+ remaining_growth_by_uuid[uuid]
+				)
+			for node, node_growth_pages in sorted(remaining_growth_by_node.items()):
+				plan_info = per_node_growth_plans.get(node)
+				if plan_info is None:
+					scheduler_error = (
+						f"[HOST_KV_GROWTH_PLAN] node {node} has remaining growth but no host KV plan"
+					)
+					logging.error(scheduler_error)
+					break
+				required_free = node_growth_pages + int(plan_info['safety_margin'])
+				if int(plan_info['expected_free_pages']) < required_free:
+					scheduler_error = (
+						f"[HOST_KV_GROWTH_PLAN] node {node} infeasible after eviction/on-hold planning; "
+						f"growth_pages={node_growth_pages}, "
+						f"expected_free={plan_info['expected_free_pages']}, "
+						f"safety={plan_info['safety_margin']}, "
+						f"candidates={plan_info['num_candidates']}"
+					)
+					logging.error(scheduler_error)
+					break
+
+		growth_feasible = total_growth_needed > 0 and scheduler_error is None
+
 		# Load candidate selection
 		onhold_set = set(onhold_uuids)
 		completed_set = set(completed_uuids)
@@ -7128,6 +7323,7 @@ class BatchGenWorker:
 			seqs_needing_extension=seqs_needing_extension,
 			new_load_uuids=new_load_uuids,
 			decode_uuids_final=decode_uuids_final,
+			scheduler_error=scheduler_error,
 		)
 
 	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============
@@ -7418,11 +7614,12 @@ class BatchGenWorker:
 		# Only rank 0 makes batching decisions. All other ranks receive via broadcast.
 		# This eliminates desync from independent decision-making.
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		per_node_host_stats = self._gather_host_kv_stats_by_node(worker_view)
 
 		if self.rank == 0:
 			decisions = self._compute_boundary_decisions(
 				decode_uuids, global_seq_state, global_candidate_info,
-				per_rank_free, chunk_size, worker_view,
+				per_rank_free, chunk_size, per_node_host_stats,
 			)
 		else:
 			decisions = None
@@ -7431,6 +7628,8 @@ class BatchGenWorker:
 		decisions_list = [decisions]
 		dist.broadcast_object_list(decisions_list, src=0)
 		decisions = decisions_list[0]
+		if decisions.scheduler_error:
+			raise RuntimeError(f"Rank {self.rank}: {decisions.scheduler_error}")
 
 		timing.num_completed = len(decisions.completed_uuids)
 		timing.num_onhold = len(decisions.onhold_uuids)
@@ -7511,44 +7710,7 @@ class BatchGenWorker:
 		decode_uuids = decisions.active_uuids
 		batch = self._get_local_indices_for_uuids(decode_uuids)
 
-		# B. Host KV growth
-		if decisions.growth_feasible and decisions.host_growth_uuids:
-			host_grow_requests = []
-			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
-				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
-				# This keeps host_pages_allocated consistent across ranks, which is
-				# critical for deterministic migration planning in _plan_kv_migration().
-				seq = self.global_batch.get_sequence(uuid)
-				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
-				seq.host_pages_allocated += growth_pages
-				# Only do actual host page allocation on owner rank
-				if uuid in self._uuid_to_local_map:
-					host_grow_requests.append((seq.global_idx, growth_pages))
-
-			if host_grow_requests and worker_view is not None:
-				worker_view.grow_pages_for_sequences(host_grow_requests)
-				# DSA: mirror growth on auxiliary host KV
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-				if aux_view is not None:
-					aux_view.grow_pages_for_sequences(host_grow_requests)
-				if self.rank == 0:
-					logging.debug(
-						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
-						f"chunk_size={chunk_size}"
-					)
-				if self.rank == 0 and BATCHGEN_CB_DEBUG:
-					for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
-						if uuid in self._uuid_to_local_map:
-							seq = self.global_batch.get_sequence(uuid)
-							old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
-							runway = seq.host_token_capacity - seq.current_context_length
-							logging.debug(
-								f"[HOST_KV_GROWTH_DETAIL] seq={uuid[:8]} "
-								f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
-								f"runway={runway} pages={growth_pages}"
-							)
-
-		# C. Host KV eviction
+		# B. Host KV eviction
 		#
 		# SYNC MODEL: Mutations here must keep every rank consistent without
 		# requiring a follow-up _sync_sequence_metadata call. The only pieces
@@ -7658,6 +7820,45 @@ class BatchGenWorker:
 				logging.info(
 					f"[HOST_KV_EVICT] Evicted {len(host_evicted_uuids)} sequences"
 				)
+
+		# C. Host KV growth. This intentionally runs after completed/evicted
+		# host pages have been released so worker_view free pages match the
+		# growth-debt-aware plan computed on rank 0.
+		if decisions.growth_feasible and decisions.host_growth_uuids:
+			host_grow_requests = []
+			for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
+				# Update metadata on ALL ranks (decisions are broadcast from rank 0).
+				# This keeps host_pages_allocated consistent across ranks, which is
+				# critical for deterministic migration planning in _plan_kv_migration().
+				seq = self.global_batch.get_sequence(uuid)
+				seq.host_token_capacity += growth_pages * seq.PAGE_SIZE
+				seq.host_pages_allocated += growth_pages
+				# Only do actual host page allocation on owner rank
+				if uuid in self._uuid_to_local_map:
+					host_grow_requests.append((seq.global_idx, growth_pages))
+
+			if host_grow_requests and worker_view is not None:
+				worker_view.grow_pages_for_sequences(host_grow_requests)
+				# DSA: mirror growth on auxiliary host KV
+				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+				if aux_view is not None:
+					aux_view.grow_pages_for_sequences(host_grow_requests)
+				if self.rank == 0:
+					logging.debug(
+						f"[HOST_KV_GROWTH] Grew {len(host_grow_requests)} sequences, "
+						f"chunk_size={chunk_size}"
+					)
+				if self.rank == 0 and BATCHGEN_CB_DEBUG:
+					for uuid, growth_pages in zip(decisions.host_growth_uuids, decisions.host_growth_pages):
+						if uuid in self._uuid_to_local_map:
+							seq = self.global_batch.get_sequence(uuid)
+							old_cap = seq.host_token_capacity - growth_pages * seq.PAGE_SIZE
+							runway = seq.host_token_capacity - seq.current_context_length
+							logging.debug(
+								f"[HOST_KV_GROWTH_DETAIL] seq={uuid[:8]} "
+								f"old_cap={old_cap} new_cap={seq.host_token_capacity} "
+								f"runway={runway} pages={growth_pages}"
+							)
 
 		timing.process_ms = (time.perf_counter() - t0) * 1000
 
@@ -10719,7 +10920,7 @@ class BatchGenWorker:
 		Architecture:
 		- Host KV cache is PER NODE
 		- GPU KV cache is PER RANK
-		- A sequence prefilled by rank R has host KV on node (R // gpus_per_node)
+		- A sequence prefilled by rank R has host KV on node (R // NUM_GPUS_PER_NODE)
 		- Only ranks on THAT node can load this sequence to their GPU
 		
 		Sync strategy:
@@ -10728,7 +10929,6 @@ class BatchGenWorker:
 		3. Each rank only loads sequences assigned to it
 		4. All ranks update decode_uuids identically
 		"""
-		gpus_per_node = torch.cuda.device_count()
 		my_node = self._get_node_for_rank(self.rank)
 		
 		# Step 1: All-gather free GPU pages from ALL ranks
