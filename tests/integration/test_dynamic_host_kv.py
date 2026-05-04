@@ -21,8 +21,10 @@ from batchgen.sequence import (
 from batchgen.continuous_batching import (
     AdaptiveChunkSizer,
     EvictionStrategy,
+    LoadingStrategy,
     plan_host_kv_growth_evictions,
     select_sequences_for_eviction,
+    select_sequences_for_loading,
 )
 
 
@@ -610,6 +612,68 @@ class TestHostKVGrowthEvictionPlanner:
         assert plan.expected_free_pages == 150
         assert plan.required_free_pages == 1050
         assert not plan.growth_feasible_after_eviction
+
+
+# ============ Tail ON_HOLD reload selection ============
+
+class TestTailOnHoldReloadSelection:
+    """Regression coverage for loading older ON_HOLD rows into an empty decode set."""
+
+    def test_selects_load_candidate_without_active_decode_rows(self):
+        candidates = {
+            "old-onhold": {
+                "pages_needed": 7,
+                "assigned_rank": 0,
+                "decoded_length": 70000,
+            },
+            "newer-onhold": {
+                "pages_needed": 7,
+                "assigned_rank": 0,
+                "decoded_length": 60000,
+            },
+        }
+
+        selected, pages_used = select_sequences_for_loading(
+            candidates=candidates,
+            per_rank_free_pages=[7],
+            exclude_uuids=set(),
+            strategy=LoadingStrategy.LONGEST_FIRST,
+            get_global_idx_fn=lambda uuid: {
+                "old-onhold": 10,
+                "newer-onhold": 11,
+            }[uuid],
+        )
+
+        assert selected == ["old-onhold"]
+        assert pages_used == {0: 7}
+
+    def test_excludes_rows_newly_moved_on_hold_at_same_boundary(self):
+        candidates = {
+            "older-onhold": {
+                "pages_needed": 4,
+                "assigned_rank": 0,
+                "decoded_length": 65000,
+            },
+            "newly-onhold": {
+                "pages_needed": 4,
+                "assigned_rank": 0,
+                "decoded_length": 80000,
+            },
+        }
+
+        selected, pages_used = select_sequences_for_loading(
+            candidates=candidates,
+            per_rank_free_pages=[4],
+            exclude_uuids={"newly-onhold"},
+            strategy=LoadingStrategy.LONGEST_FIRST,
+            get_global_idx_fn=lambda uuid: {
+                "older-onhold": 20,
+                "newly-onhold": 21,
+            }[uuid],
+        )
+
+        assert selected == ["older-onhold"]
+        assert pages_used == {0: 4}
 
 
 # ============ Integration: Full Lifecycle ============

@@ -116,6 +116,8 @@ from batchgen.continuous_batching import (
 	FastBoundaryTimingStats,
 	plan_host_kv_growth_evictions,
 	EvictionStrategy,
+	LoadingStrategy,
+	select_sequences_for_loading,
 )
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
@@ -7283,34 +7285,25 @@ class BatchGenWorker:
 		decode_uuids_final = [u for u in decode_after_eviction if u not in onhold_set]
 
 		new_load_uuids = []
-		if global_candidate_info and decode_uuids_final:
-			load_candidates_synced = sorted(
-				[u for u in global_candidate_info.keys()
-				 if u not in completed_set and u not in onhold_set and u not in evicted_set],
-				key=lambda u: (
-					-global_candidate_info[u].get('decoded_length', 0),
-					self.global_batch.get_sequence(u).global_idx if self.global_batch.get_sequence(u) else float('inf')
-				)
-			)
-
-			# Compute adjusted free pages after extensions (arithmetic, no collective needed)
+		if global_candidate_info:
+			# Compute adjusted free pages after extensions (arithmetic, no collective needed).
+			# Do not require decode_uuids_final to be non-empty: in the long tail, all
+			# currently decoding rows may move ON_HOLD at the same boundary while older
+			# ON_HOLD rows are still loadable into the now-empty decode set.
 			adjusted_per_rank_free = [
 				per_rank_free[r] - actual_extension_by_rank[r]
 				for r in range(self.world_size)
 			]
-
-			rank_pages_used = [0] * self.world_size
-			for uuid in load_candidates_synced:
-				info = global_candidate_info.get(uuid)
-				if info is None:
-					continue
-				req_pages = info['pages_needed']
-				assigned_rank = info['assigned_rank']
-				if req_pages == 0:
-					continue
-				if rank_pages_used[assigned_rank] + req_pages <= adjusted_per_rank_free[assigned_rank]:
-					new_load_uuids.append(uuid)
-					rank_pages_used[assigned_rank] += req_pages
+			new_load_uuids, _ = select_sequences_for_loading(
+				candidates=global_candidate_info,
+				per_rank_free_pages=adjusted_per_rank_free,
+				exclude_uuids=completed_set | onhold_set | evicted_set,
+				strategy=LoadingStrategy.LONGEST_FIRST,
+				get_global_idx_fn=lambda u: (
+					self.global_batch.get_sequence(u).global_idx
+					if self.global_batch.get_sequence(u) else float('inf')
+				),
+			)
 
 		return BoundaryDecisions(
 			completed_uuids=completed_uuids,
@@ -7950,7 +7943,7 @@ class BatchGenWorker:
 		new_load_local = []
 		new_load_global = []
 
-		if new_load_uuids and decode_uuids:
+		if new_load_uuids:
 			my_new_uuids = [u for u in new_load_uuids
 						if global_candidate_info.get(u, {}).get('assigned_rank') == self.rank]
 			new_load_local = self._get_local_indices_for_uuids(my_new_uuids)
