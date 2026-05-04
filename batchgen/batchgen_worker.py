@@ -107,12 +107,17 @@ from batchgen.prefill.prepack import (
 	PrepackMetadata,
 	build_prefill_micro_batches,
 )
-from batchgen.prefill.prefix_reuse import (
-	PrefixReusePrefillPlan,
-	build_prefix_reuse_prefill_plan,
-	validate_prefix_reuse_plan,
+from batchgen.prefill.prefix_reuse import PrefixReusePrefillPlan
+from batchgen.prefix_reuse.full_hit_runtime import full_hit_attention_state
+from batchgen.prefix_reuse.prefill_admission import (
+	estimate_prefix_allocation_for_admission,
+	maybe_evict_prefix_cache_for_prefill_admission,
 )
-from batchgen.prefix_cache_utils import clear_rank_cache_if_prefix_evicted
+from batchgen.prefix_reuse.rank_affinity import assign_admitted_ranks
+from batchgen.prefix_reuse.runtime_state import PrefixReuseRuntime
+from batchgen.models.openai.gpt_oss_120b.decode_scratch import (
+	estimate_gpt_oss_decode_scratch_reserve_gb,
+)
 
 # Import modularized components
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
@@ -499,22 +504,30 @@ class BatchGenWorker:
 		self.hf_cache_dir = args.hf_cache_dir
 		self.cache_dir = args.cache_dir
 		self.converted_ckpt_dir = args.converted_ckpt_dir
-		self._prefix_reuse_namespace_hash = self._build_prefix_reuse_namespace_hash()
-		self._prefix_reuse_allocations_by_global_id: Dict[int, dict] = {}
-		self._prefix_reuse_prompt_rank_cache: Dict[int, int] = {}
-		self._prefix_reuse_prompt_rank_key_cache: Dict[
-			int, Tuple[int, int, int, int]
-		] = {}
-		self._prefix_reuse_rank_cache_epoch = 0
-		self._prefix_reuse_prefill_stats = {
-			"total_prompt_tokens": 0,
-			"total_suffix_tokens": 0,
-			"prefix_tokens_skipped": 0,
-			"full_hit_guarded_errors": 0,
-			"full_hit_exact_paths": 0,
-			"full_hit_tokens_computed": 0,
-			"fallback_full_prefill_tokens": 0,
-		}
+		self.prefix_reuse_runtime = PrefixReuseRuntime(
+			enabled=self.enable_prefix_reuse,
+			model_name=self.model_name,
+			kv_dtype=self.kv_dtype,
+			page_size=self.PAGE_SIZE,
+			rank=self.rank,
+			world_size=self.world_size,
+			torch_device=self.torch_device,
+		)
+		self._prefix_reuse_namespace_hash = (
+			self.prefix_reuse_runtime.state.namespace_hash
+		)
+		self._prefix_reuse_allocations_by_global_id = (
+			self.prefix_reuse_runtime.state.allocations_by_global_id
+		)
+		self._prefix_reuse_prompt_rank_cache = (
+			self.prefix_reuse_runtime.state.prompt_rank_cache
+		)
+		self._prefix_reuse_prompt_rank_key_cache = (
+			self.prefix_reuse_runtime.state.prompt_rank_key_cache
+		)
+		self._prefix_reuse_prefill_stats = (
+			self.prefix_reuse_runtime.state.prefill_stats
+		)
 
 		# Load skeleton_state_dict from temp file (avoids passing tensors through mp.spawn)
 		if args.skeleton_state_dict_file:
@@ -721,49 +734,11 @@ class BatchGenWorker:
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _estimate_decode_gpu_kv_scratch_reserve_gb(self, max_num_seq_per_rank: int) -> float:
-		"""
-		Estimate the non-KV HBM reserve needed by decode kernels.
-
-		GPT-OSS decode allocates MoE routing/intermediate buffers plus logits and
-		sampling scratch after the decode model is loaded. If GPU KV consumes the
-		entire ``total * gpu_memory_frac - used`` budget, large batches can OOM in
-		those transient decode allocations even though the KV pool itself fits.
-		"""
-		model_type = getattr(self.model_config, "model_type", "")
-		if "gpt_oss" not in model_type:
-			return 0.0
-
-		max_num_seq_per_rank = max(int(max_num_seq_per_rank), 1)
-		global_tokens = max_num_seq_per_rank * max(int(self.world_size), 1)
-		hidden_size = int(getattr(self.model_config, "hidden_size", 2880))
-		intermediate_size = int(getattr(self.model_config, "intermediate_size", hidden_size))
-		num_experts_per_tok = int(getattr(self.model_config, "num_experts_per_tok", 4))
-		num_local_experts = int(getattr(self.model_config, "num_local_experts", 128))
-		vocab_size = int(getattr(self.model_config, "vocab_size", 201088))
-
-		bytes_per_bf16 = 2
-		bytes_per_fp32 = 4
-		moe_activation_bytes = (
-			3
-			* global_tokens
-			* num_experts_per_tok
-			* max(hidden_size, intermediate_size)
-			* bytes_per_bf16
+		return estimate_gpt_oss_decode_scratch_reserve_gb(
+			model_config=self.model_config,
+			world_size=self.world_size,
+			max_num_seq_per_rank=max_num_seq_per_rank,
 		)
-		router_bytes = global_tokens * num_local_experts * (bytes_per_bf16 + bytes_per_fp32)
-		topk_bytes = global_tokens * num_experts_per_tok * (bytes_per_fp32 + bytes_per_fp32)
-		logits_bytes = max_num_seq_per_rank * vocab_size * bytes_per_bf16
-		sampling_bytes = min(max_num_seq_per_rank, 64) * vocab_size * bytes_per_fp32
-
-		estimated_gb = (
-			moe_activation_bytes
-			+ router_bytes
-			+ topk_bytes
-			+ logits_bytes
-			+ sampling_bytes
-		) / (1024 ** 3)
-
-		return max(2.0, estimated_gb * 1.5)
 
 	def _calculate_gpu_kv_cache_size(self) -> float:
 		"""
@@ -1049,8 +1024,7 @@ class BatchGenWorker:
 		self.gpu_kv_cache_size_gb = None
 		self.global_batch = SequenceBatch()
 		self._completed_result_cache = {}
-		self._prefix_reuse_allocations_by_global_id.clear()
-		self._prefix_reuse_prompt_rank_key_cache.clear()
+		self.prefix_reuse_runtime.clear_transient_allocation_state()
 		self._local_to_uuid_map.clear()
 		self._uuid_to_local_map.clear()
 		self.query_book = {}
@@ -1311,114 +1285,45 @@ class BatchGenWorker:
 
 		Fallback (BATCHGEN_L2_BALANCE=0): least-count argmin (legacy).
 		"""
-		import os as _os
-		use_l2 = _os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
-
-		if use_l2:
-			# Per-rank load = sum of (prompt_length ** 2) over already-assigned seqs.
-			rank_load = [0.0] * self.world_size
-			for seq in self.global_batch:
-				if seq.uuid in uuids or seq.assigned_rank is None:
-					continue
-				L = getattr(seq, "prompt_length", 0) or 0
-				rank_load[seq.assigned_rank] += float(L) * float(L)
-
-			pending_uuids = set(uuids)
-			prefix_assigned: Set[str] = set()
-			if self._prefix_reuse_runtime_enabled():
-				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
-				rank_hint_index = self._build_prefix_reuse_rank_hint_index(pending_uuids)
-				prefix_assigned_by_rank = [0] * self.world_size
-				for uuid in uuids:
-					seq = self.global_batch.get_sequence(uuid)
-					if seq is None:
-						continue
-					cached_rank = self._prefix_reuse_cached_rank_for_sequence(
-						seq, pending_uuids, rank_hint_index
-					)
-					if cached_rank is None:
-						continue
-					self.global_batch.assign_rank(uuid, cached_rank)
-					L = getattr(seq, "prompt_length", 0) or 0
-					rank_load[cached_rank] += float(L) * float(L)
-					prefix_assigned.add(uuid)
-					prefix_assigned_by_rank[cached_rank] += 1
-				if self.rank == 0 and prefix_assigned:
-					logging.info(
-						"[PREFIX_REUSE] Assigned %d admitted sequences to cached "
-						"ranks %s",
-						len(prefix_assigned),
-						prefix_assigned_by_rank,
-					)
-
-			# Resolve uuids → seqs and sort by length DESC (FFD).
-			pending = []
-			for uuid in uuids:
-				if uuid in prefix_assigned:
-					continue
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is None:
-					continue
-				L = getattr(seq, "prompt_length", 0) or 0
-				pending.append((L, uuid))
-			pending.sort(key=lambda t: -t[0])
-
-			for L, uuid in pending:
-				min_rank = min(range(self.world_size), key=lambda r: rank_load[r])
-				self.global_batch.assign_rank(uuid, min_rank)
-				rank_load[min_rank] += float(L) * float(L)
-
-			if self.rank == 0 and rank_load:
-				lo = min(rank_load); hi = max(rank_load)
-				ratio = (hi / lo) if lo > 0 else float("inf")
-				logging.info(
-					f"[L2_BALANCE] per-rank sum(L^2): min={lo:.3e} max={hi:.3e} "
-					f"ratio={ratio:.2f} ranks={[f'{x:.2e}' for x in rank_load]}"
-				)
-			return
-
-		# Legacy: round-robin / least-count
-		rank_counts = [0] * self.world_size
-		for seq in self.global_batch:
-			if seq.uuid not in uuids and seq.assigned_rank is not None:
-				rank_counts[seq.assigned_rank] += 1
-
 		pending_uuids = set(uuids)
-		prefix_assigned: Set[str] = set()
+		prefix_rank_lookup = None
 		if self._prefix_reuse_runtime_enabled():
 			self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
 			rank_hint_index = self._build_prefix_reuse_rank_hint_index(pending_uuids)
-			prefix_assigned_by_rank = [0] * self.world_size
-			for uuid in uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is None:
-					continue
-				cached_rank = self._prefix_reuse_cached_rank_for_sequence(
-					seq, pending_uuids, rank_hint_index
-				)
-				if cached_rank is None:
-					continue
-				self.global_batch.assign_rank(uuid, cached_rank)
-				rank_counts[cached_rank] += 1
-				prefix_assigned.add(uuid)
-				prefix_assigned_by_rank[cached_rank] += 1
-			if self.rank == 0 and prefix_assigned:
-				logging.info(
-					"[PREFIX_REUSE] Assigned %d admitted sequences to cached "
-					"ranks %s",
-					len(prefix_assigned),
-					prefix_assigned_by_rank,
+
+			def prefix_rank_lookup(seq: SequenceEntry) -> Optional[int]:
+				return self._prefix_reuse_cached_rank_for_sequence(
+					seq,
+					pending_uuids,
+					rank_hint_index,
 				)
 
-		for uuid in uuids:
-			if uuid in prefix_assigned:
-				continue
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			min_rank = rank_counts.index(min(rank_counts))
-			self.global_batch.assign_rank(uuid, min_rank)
-			rank_counts[min_rank] += 1
+		use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		result = assign_admitted_ranks(
+			uuids=uuids,
+			existing_sequences=self.global_batch,
+			get_sequence=self.global_batch.get_sequence,
+			world_size=self.world_size,
+			use_l2_balance=use_l2,
+			prefix_rank_lookup=prefix_rank_lookup,
+		)
+		for uuid, assigned_rank in result.assignments:
+			self.global_batch.assign_rank(uuid, assigned_rank)
+
+		if self.rank == 0 and result.prefix_assigned_count:
+			logging.info(
+				"[PREFIX_REUSE] Assigned %d admitted sequences to cached ranks %s",
+				result.prefix_assigned_count,
+				result.prefix_assigned_by_rank,
+			)
+		if self.rank == 0 and result.rank_load:
+			lo = min(result.rank_load)
+			hi = max(result.rank_load)
+			ratio = (hi / lo) if lo > 0 else float("inf")
+			logging.info(
+				f"[L2_BALANCE] per-rank sum(L^2): min={lo:.3e} max={hi:.3e} "
+				f"ratio={ratio:.2f} ranks={[f'{x:.2e}' for x in result.rank_load]}"
+			)
 
 	def _bind_local_sequence_to_query_book(
 		self,
@@ -4808,58 +4713,18 @@ class BatchGenWorker:
 		seq: SequenceEntry,
 		capacity_tokens: int,
 	) -> Tuple[int, List[int]]:
-		"""Estimate private host pages needed for prefix-aware admission.
-
-		The real prefix allocation is owner-rank local because each rank owns its
-		own prefix index. This estimate must therefore only be used on
-		seq.assigned_rank; other ranks fall back to logical pages.
-		"""
-		logical_pages = math.ceil(capacity_tokens / seq.PAGE_SIZE)
-		if (
-			not self._prefix_reuse_runtime_enabled()
-			or seq.assigned_rank != self.rank
-			or seq.input_ids is None
-		):
-			return logical_pages, []
-
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		estimate_fn = getattr(
-			worker_view,
-			"estimate_pages_for_sequences_with_prefix",
-			None,
+		estimate = estimate_prefix_allocation_for_admission(
+			seq=seq,
+			capacity_tokens=capacity_tokens,
+			page_size=seq.PAGE_SIZE,
+			prefix_runtime_enabled=self._prefix_reuse_runtime_enabled(),
+			current_rank=self.rank,
+			worker_view=worker_view,
+			namespace_hash=self._prefix_reuse_namespace_hash,
+			prompt_tokens=self._prefix_reuse_prompt_tokens,
 		)
-		if estimate_fn is None:
-			return logical_pages, []
-
-		try:
-			estimate = estimate_fn(
-				[
-					(
-						seq.global_idx,
-						self._prefix_reuse_prompt_tokens(seq),
-						capacity_tokens,
-						self._prefix_reuse_namespace_hash,
-					)
-				]
-			)
-			if not estimate:
-				return logical_pages, []
-			item = estimate[0]
-			private_pages = int(
-				item.get("physical_pages_allocated", logical_pages)
-			)
-			shared_pages = [
-				int(page) for page in item.get("shared_prefix_pages", [])
-			]
-			return max(0, private_pages), shared_pages
-		except Exception as exc:
-			logging.debug(
-				"Rank %s prefix admission estimate failed for seq %s: %s",
-				self.rank,
-				getattr(seq, "global_idx", "unknown"),
-				exc,
-			)
-			return logical_pages, []
+		return estimate.private_pages, estimate.shared_pages
 
 	def _collect_prefill_admission_pages(
 		self,
@@ -4915,56 +4780,19 @@ class BatchGenWorker:
 		all_candidates: List[str],
 		chunk_size: int,
 	) -> None:
-		"""Release prefix-only pages before host-KV admission can deadlock.
-
-		C++ allocation-time eviction handles the precise protected-page case,
-		but prefill admission runs before allocation. If prefix pins drive free
-		pages below the next request's minimum reservation, admission would
-		select zero sequences and never reach the allocator. This pressure path
-		evicts only enough unprotected prefix cache entries to admit at least
-		one candidate on the local node.
-		"""
 		if not self._prefix_reuse_runtime_enabled():
 			return
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return
 		try:
-			stats = worker_view.get_stats()
-			local_free = int(stats.num_free_pages)
-		except Exception:
-			return
-
-		my_node = self._get_node_for_rank(self.rank)
-		target_free_pages = 0
-		protected_pages: Set[int] = set()
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None or seq.assigned_rank is None:
-				continue
-			if seq.assigned_rank != self.rank:
-				continue
-			if self._get_node_for_rank(seq.assigned_rank) != my_node:
-				continue
-			capacity_tokens = self._initial_host_tokens_for_prefill(seq, chunk_size)
-			req_pages, shared_pages = self._estimate_prefix_allocation_for_admission(
-				seq,
-				capacity_tokens,
-			)
-			if req_pages > local_free:
-				target_free_pages = (
-					req_pages
-					if target_free_pages == 0
-					else min(target_free_pages, req_pages)
-				)
-				protected_pages.update(shared_pages)
-
-		if target_free_pages == 0:
-			return
-		try:
-			eviction = worker_view.evict_prefix_cache_until_free(
-				target_free_pages,
-				protected_pages=list(protected_pages),
+			eviction = maybe_evict_prefix_cache_for_prefill_admission(
+				all_candidates=all_candidates,
+				global_batch=self.global_batch,
+				current_rank=self.rank,
+				get_node_for_rank=self._get_node_for_rank,
+				initial_host_tokens_for_prefill=self._initial_host_tokens_for_prefill,
+				estimate_prefix_allocation=self._estimate_prefix_allocation_for_admission,
+				chunk_size=chunk_size,
+				worker_view=worker_view,
 			)
 		except Exception as exc:
 			logging.warning(
@@ -4973,17 +4801,16 @@ class BatchGenWorker:
 				exc,
 			)
 			return
+		if eviction is None:
+			return
 		self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
-		if self.rank == 0 and (
-			getattr(eviction, "entries_removed", 0) > 0
-			or not getattr(eviction, "reached_target", True)
-		):
+		if self.rank == 0 and (eviction.entries_removed > 0 or not eviction.reached_target):
 			logging.info(
 				"[PREFIX_EVICT] prefill admission target_free=%d "
 				"entries_removed=%d reached_target=%s",
-				target_free_pages,
-				getattr(eviction, "entries_removed", 0),
-				getattr(eviction, "reached_target", False),
+				eviction.target_free_pages,
+				eviction.entries_removed,
+				eviction.reached_target,
 			)
 
 	def _prepare_prefill_batch(self) -> List[str]:
@@ -6825,67 +6652,17 @@ class BatchGenWorker:
 		return self.tokenizer.decode(tokens_list[:end_pos], skip_special_tokens=(not self.detokenization_include_special_tokens))
 
 	def _build_prefix_reuse_namespace_hash(self) -> int:
-		"""Stable namespace for KV-compatible prefix cache entries."""
-		import hashlib
-
-		material = (
-			f"model={self.model_name}|kv_dtype={self.kv_dtype}|"
-			f"page_size={self.PAGE_SIZE}"
-		).encode("utf-8")
-		return int.from_bytes(hashlib.blake2b(material, digest_size=8).digest(), "little")
+		return self.prefix_reuse_runtime.state.namespace_hash
 
 	def _prefix_reuse_prompt_tokens(self, seq: SequenceEntry) -> List[int]:
-		if seq.input_ids is None:
-			raise ValueError(f"Sequence {seq.uuid} has no input_ids for prefix reuse")
-		prompt = seq.input_ids[0, :seq.prompt_length].detach().cpu()
-		return [int(token) for token in prompt.tolist()]
+		return self.prefix_reuse_runtime.prompt_tokens(seq)
 
 	def _prefix_reuse_prompt_rank_key(self, seq: SequenceEntry) -> Optional[int]:
-		"""Hash full prefix-cache pages for rank-affinity scheduling."""
-		if not self.enable_prefix_reuse or seq.input_ids is None:
-			return None
-		prompt_len = int(getattr(seq, "prompt_length", 0) or 0)
-		page_tokens = (prompt_len // self.PAGE_SIZE) * self.PAGE_SIZE
-		if page_tokens <= 0:
-			return None
-		cache_entry = self._prefix_reuse_prompt_rank_key_cache.get(seq.global_idx)
-		if cache_entry is not None:
-			cached_page_tokens, cached_page_size, cached_namespace, cached_key = cache_entry
-			if (
-				cached_page_tokens == page_tokens
-				and cached_page_size == self.PAGE_SIZE
-				and cached_namespace == self._prefix_reuse_namespace_hash
-			):
-				return cached_key
-
-		import hashlib
-
-		prompt = seq.input_ids[0, :page_tokens].detach().cpu().tolist()
-		hasher = hashlib.blake2b(digest_size=16)
-		hasher.update(int(self._prefix_reuse_namespace_hash).to_bytes(8, "little"))
-		hasher.update(int(self.PAGE_SIZE).to_bytes(4, "little"))
-		hasher.update(int(page_tokens // self.PAGE_SIZE).to_bytes(4, "little"))
-		for token in prompt:
-			hasher.update(int(token).to_bytes(8, "little", signed=True))
-		key = int.from_bytes(hasher.digest(), "little")
-		self._prefix_reuse_prompt_rank_key_cache[seq.global_idx] = (
-			page_tokens,
-			self.PAGE_SIZE,
-			self._prefix_reuse_namespace_hash,
-			key,
-		)
-		return key
+		return self.prefix_reuse_runtime.prompt_rank_key(seq)
 
 	def _maybe_clear_prefix_reuse_rank_cache_after_eviction(self) -> None:
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		self._prefix_reuse_rank_cache_epoch = clear_rank_cache_if_prefix_evicted(
-			enable_prefix_reuse=self.enable_prefix_reuse,
-			worker_view=worker_view,
-			prompt_rank_cache=self._prefix_reuse_prompt_rank_cache,
-			current_epoch=self._prefix_reuse_rank_cache_epoch,
-			rank=self.rank,
-			logger=logging.getLogger(__name__),
-		)
+		self.prefix_reuse_runtime.maybe_clear_rank_cache_after_eviction(worker_view)
 
 	def _prefix_reuse_cached_rank_for_sequence(
 		self,
@@ -6893,102 +6670,29 @@ class BatchGenWorker:
 		pending_uuids: Set[str],
 		rank_hint_index: Optional[Dict[int, int]] = None,
 	) -> Optional[int]:
-		"""Return the rank that already owns a compatible prefix cache entry."""
-		key = self._prefix_reuse_prompt_rank_key(seq)
-		if key is None:
-			return None
-
-		cached_rank = self._prefix_reuse_prompt_rank_cache.get(key)
-		if cached_rank is not None and 0 <= cached_rank < self.world_size:
-			return int(cached_rank)
-		if rank_hint_index is not None:
-			cached_rank = rank_hint_index.get(key)
-			if cached_rank is not None and 0 <= cached_rank < self.world_size:
-				self._prefix_reuse_prompt_rank_cache[key] = int(cached_rank)
-				return int(cached_rank)
-
-		for existing in self.global_batch:
-			if (
-				existing.uuid == seq.uuid
-				or existing.uuid in pending_uuids
-				or existing.assigned_rank is None
-			):
-				continue
-			try:
-				if self._prefix_reuse_prompt_rank_key(existing) == key:
-					rank = int(existing.assigned_rank)
-					self._prefix_reuse_prompt_rank_cache[key] = rank
-					return rank
-			except Exception:
-				continue
-		return None
+		return self.prefix_reuse_runtime.cached_rank_for_sequence(
+			seq,
+			existing_sequences=self.global_batch,
+			pending_uuids=pending_uuids,
+			rank_hint_index=rank_hint_index,
+		)
 
 	def _build_prefix_reuse_rank_hint_index(
 		self,
 		pending_uuids: Set[str],
 	) -> Dict[int, int]:
-		"""Build a per-admission prefix-key -> rank hint index.
-
-		Without this index, rank-affinity assignment scans the full global batch
-		for every newly admitted request. In pool mode that becomes expensive
-		during large MMLU runs because admission happens repeatedly while the
-		scheduling pool is near capacity.
-		"""
-		rank_hint_index: Dict[int, int] = {}
-		for key, rank in self._prefix_reuse_prompt_rank_cache.items():
-			if 0 <= rank < self.world_size:
-				rank_hint_index[key] = int(rank)
-
-		for existing in self.global_batch:
-			if existing.uuid in pending_uuids or existing.assigned_rank is None:
-				continue
-			key = self._prefix_reuse_prompt_rank_key(existing)
-			if key is None or key in rank_hint_index:
-				continue
-			rank_hint_index[key] = int(existing.assigned_rank)
-		return rank_hint_index
+		return self.prefix_reuse_runtime.build_rank_hint_index(
+			self.global_batch,
+			pending_uuids=pending_uuids,
+		)
 
 	def _commit_prefix_reuse_pages(self, prefill_uuids: List[str]) -> None:
-		if not self.enable_prefix_reuse:
-			return
-		if self._prefix_reuse_exact_full_prefill_fallback_enabled():
-			return
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return
-		inserted_pages = 0
-		committed_sequences = 0
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is None:
-				continue
-			key = self._prefix_reuse_prompt_rank_key(seq)
-			if key is not None and seq.assigned_rank is not None:
-				self._prefix_reuse_prompt_rank_cache[key] = int(seq.assigned_rank)
-			if seq.assigned_rank != self.rank:
-				continue
-			prompt_tokens = self._prefix_reuse_prompt_tokens(seq)
-			inserted_pages += worker_view.commit_sequence_prefix_pages(
-				seq.global_idx,
-				prompt_tokens,
-				self._prefix_reuse_namespace_hash,
-			)
-			committed_sequences += 1
-		if committed_sequences:
-			stats = worker_view.get_prefix_cache_stats()
-			logging.info(
-				"Rank %s prefix reuse commit: sequences=%d inserted_pages=%d "
-				"entries=%d saved_pages=%d lookup_hits=%d lookup_misses=%d "
-				"shared_pages_attached=%d",
-				self.rank,
-				committed_sequences,
-				inserted_pages,
-				stats.entries,
-				stats.host_pages_saved,
-				stats.lookup_hits,
-				stats.lookup_misses,
-				stats.shared_pages_attached,
-			)
+		self.prefix_reuse_runtime.commit_pages(
+			prefill_uuids=prefill_uuids,
+			global_batch=self.global_batch,
+			worker_view=worker_view,
+		)
 
 	def _drain_pending_prefill_offloads(
 		self,
@@ -7014,59 +6718,23 @@ class BatchGenWorker:
 		return count
 
 	def _prefix_reuse_shared_tokens_for_sequence(self, seq: SequenceEntry) -> int:
-		if not self.enable_prefix_reuse:
-			return 0
-		if self._prefix_reuse_exact_full_prefill_fallback_enabled():
-			return 0
-		cached_value = int(getattr(seq, "prefix_shared_tokens", 0) or 0)
-		if cached_value > 0:
-			return cached_value
-		allocation = self._prefix_reuse_allocations_by_global_id.get(seq.global_idx)
-		if allocation is not None:
-			return int(allocation.get("shared_prefix_tokens", 0))
 		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		if worker_view is None:
-			return 0
-		try:
-			return int(worker_view.shared_prefix_tokens(seq.global_idx))
-		except Exception:
-			return 0
-
-	def _prefix_reuse_exact_full_prefill_fallback_enabled(self) -> bool:
-		"""Force full private prefill compute instead of prefix-reuse replay.
-
-		This is an explicit correctness guard for backends where suffix-only
-		prefix reuse is not numerically exact yet. It disables prefix page sharing
-		for the request, prevents prefill compute from skipping prefix tokens, and
-		prevents decode isolation from treating the sequence as a suffix-only
-		replay.
-		"""
-		explicit = os.environ.get("BATCHGEN_PREFIX_REUSE_EXACT_FULL_PREFILL_FALLBACK")
-		if explicit is not None:
-			return explicit == "1"
-		if os.environ.get("BATCHGEN_PREFIX_REUSE_ALLOW_UNSAFE_SUFFIX_COMPUTE", "0") == "1":
-			return False
-		if not torch.cuda.is_available():
-			return False
-		try:
-			major, _minor = torch.cuda.get_device_capability(self.torch_device)
-		except Exception:
-			major, _minor = torch.cuda.get_device_capability()
-		# Current SM120/Blackwell path falls back to vanilla attention and
-		# per-expert matmul kernels; suffix-only replay is numerically unstable
-		# enough to flip greedy choices, so default to correctness.
-		return major >= 12
-
-	def _prefix_reuse_runtime_enabled(self) -> bool:
-		return bool(
-			self.enable_prefix_reuse
-			and not self._prefix_reuse_exact_full_prefill_fallback_enabled()
+		return self.prefix_reuse_runtime.shared_tokens_for_sequence(
+			seq,
+			worker_view=worker_view,
 		)
 
+	def _prefix_reuse_exact_full_prefill_fallback_enabled(self) -> bool:
+		return self.prefix_reuse_runtime.exact_full_prefill_fallback_enabled()
+
+	def _prefix_reuse_runtime_enabled(self) -> bool:
+		return self.prefix_reuse_runtime.runtime_enabled()
+
 	def _sequence_uses_reused_prefix(self, seq: SequenceEntry) -> bool:
-		return bool(
-			self._prefix_reuse_runtime_enabled()
-			and self._prefix_reuse_shared_tokens_for_sequence(seq) > 0
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		return self.prefix_reuse_runtime.sequence_uses_reused_prefix(
+			seq,
+			worker_view=worker_view,
 		)
 
 	@staticmethod
@@ -7076,14 +6744,12 @@ class BatchGenWorker:
 		assigned_rank: int,
 		uses_reused_prefix: bool,
 	) -> bool:
-		"""Return whether prefix reuse requires excluding this decode candidate.
-
-		Decode runs on a fully materialized GPU KV view. Whether part of that KV
-		came from prefix cache should be invisible to decode scheduling; otherwise
-		the same request can use a different decode micro-batch shape from the
-		non-prefix baseline and drift on BF16 boundary cases.
-		"""
-		return False
+		return PrefixReuseRuntime.decode_rank_blocked(
+			rank_counts,
+			rank_has_reused_prefix,
+			assigned_rank,
+			uses_reused_prefix,
+		)
 
 	def _build_prefix_reuse_prefill_plan_for_batch(
 		self,
@@ -7093,65 +6759,16 @@ class BatchGenWorker:
 		allow_full_hits: bool = False,
 		record_stats: bool = True,
 	) -> Optional[PrefixReusePrefillPlan]:
-		"""Build prefix prefill metadata and guard unsupported full-hit cases."""
-		if not self.enable_prefix_reuse or not batch:
-			return None
-
-		local_indices: List[int] = []
-		sequence_ids: List[int] = []
-		input_ids: List[torch.Tensor] = []
-		prompt_lengths: List[int] = []
-		shared_tokens: List[int] = []
-
-		for local_idx in batch:
-			uuid = self._local_to_uuid_map[local_idx]
-			seq = self.global_batch.get_sequence(uuid)
-			local_indices.append(local_idx)
-			sequence_ids.append(seq.global_idx)
-			input_ids.append(seq.input_ids)
-			prompt_lengths.append(seq.prompt_length)
-			shared_tokens.append(self._prefix_reuse_shared_tokens_for_sequence(seq))
-
-		plan = build_prefix_reuse_prefill_plan(
-			local_indices=local_indices,
-			sequence_ids=sequence_ids,
-			input_ids=input_ids,
-			prompt_lengths=prompt_lengths,
-			prefix_shared_tokens=shared_tokens,
-			device=torch.device("cpu"),
+		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		return self.prefix_reuse_runtime.build_prefill_plan_for_batch(
+			batch=batch,
+			local_to_uuid_map=self._local_to_uuid_map,
+			global_batch=self.global_batch,
+			worker_view=worker_view,
+			compute_mode=compute_mode,
+			allow_full_hits=allow_full_hits,
+			record_stats=record_stats,
 		)
-		try:
-			validate_prefix_reuse_plan(plan, allow_full_hits=allow_full_hits)
-		except RuntimeError:
-			self._prefix_reuse_prefill_stats["full_hit_guarded_errors"] += 1
-			raise
-		if plan.saved_prefill_tokens <= 0:
-			return None
-
-		if record_stats:
-			self._prefix_reuse_prefill_stats["total_prompt_tokens"] += plan.total_prompt_tokens
-			self._prefix_reuse_prefill_stats["total_suffix_tokens"] += plan.total_suffix_tokens
-			if compute_mode == "suffix_compute":
-				self._prefix_reuse_prefill_stats["prefix_tokens_skipped"] += (
-					plan.saved_prefill_tokens
-				)
-			else:
-				self._prefix_reuse_prefill_stats["fallback_full_prefill_tokens"] += (
-					plan.total_prompt_tokens
-				)
-
-		if plan.saved_prefill_tokens > 0:
-			logging.info(
-				"Rank %s prefix reuse prefill plan: prompt_tokens=%d "
-				"suffix_tokens=%d prefix_tokens=%d "
-				"mode=%s",
-				self.rank,
-				plan.total_prompt_tokens,
-				plan.total_suffix_tokens,
-				plan.saved_prefill_tokens,
-				compute_mode,
-			)
-		return plan
 
 	# ============ Phase Configuration ============
 
@@ -7471,18 +7088,11 @@ class BatchGenWorker:
 					prefix_requests
 				)
 				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
-				for allocation in allocations:
-					sequence_id = int(allocation["sequence_id"])
-					self._prefix_reuse_allocations_by_global_id[
-						sequence_id
-					] = dict(allocation)
-					for uuid in my_prefill_uuids:
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None and seq.global_idx == sequence_id:
-							seq.prefix_shared_tokens = int(
-								allocation.get("shared_prefix_tokens", 0)
-							)
-							break
+				self.prefix_reuse_runtime.record_allocations(
+					allocations=allocations,
+					prefill_uuids=my_prefill_uuids,
+					global_batch=self.global_batch,
+				)
 				shared_pages = sum(len(item["shared_prefix_pages"]) for item in allocations)
 				private_pages = sum(len(item["private_pages"]) for item in allocations)
 				if self.rank == 0:
@@ -8519,32 +8129,6 @@ class BatchGenWorker:
 			device=self.torch_device,
 		)
 
-		def _set_full_hit_state() -> None:
-			for wrapper_cls in (Attn_Wrapper, AttnWrapperBase):
-				wrapper_cls.prepack_mode = True
-				wrapper_cls.prepack_cu_seqlens = cu_seqlens
-				wrapper_cls.prepack_max_seqlen = 1
-				wrapper_cls.prepack_num_sequences = len(batch)
-				wrapper_cls.prepack_seq_lengths = [1] * len(batch)
-				wrapper_cls.position_ids = position_ids_tensor
-				wrapper_cls.cur_batch = global_sequence_ids
-				wrapper_cls.prepack_prefix_reuse_mode = False
-				wrapper_cls.prepack_prefix_shared_tokens = prompt_lengths
-				wrapper_cls.prepack_full_seq_lengths = prompt_lengths
-				wrapper_cls.prepack_full_hit_mode = True
-
-		def _reset_full_hit_state() -> None:
-			for wrapper_cls in (Attn_Wrapper, AttnWrapperBase):
-				wrapper_cls.prepack_mode = False
-				wrapper_cls.prepack_cu_seqlens = None
-				wrapper_cls.prepack_max_seqlen = None
-				wrapper_cls.prepack_num_sequences = None
-				wrapper_cls.prepack_seq_lengths = None
-				wrapper_cls.prepack_prefix_reuse_mode = False
-				wrapper_cls.prepack_prefix_shared_tokens = None
-				wrapper_cls.prepack_full_seq_lengths = None
-				wrapper_cls.prepack_full_hit_mode = False
-
 		logging.info(
 			"Rank %s exact full prefix-hit prefill: sequences=%d prompt_tokens=%d",
 			self.rank,
@@ -8554,8 +8138,13 @@ class BatchGenWorker:
 		self._prefix_reuse_prefill_stats["full_hit_exact_paths"] += len(batch)
 		self._prefix_reuse_prefill_stats["full_hit_tokens_computed"] += len(batch)
 
-		_set_full_hit_state()
-		try:
+		with full_hit_attention_state(
+			wrapper_classes=(Attn_Wrapper, AttnWrapperBase),
+			cu_seqlens=cu_seqlens,
+			position_ids=position_ids_tensor,
+			global_sequence_ids=global_sequence_ids,
+			prompt_lengths=prompt_lengths,
+		):
 			with torch.inference_mode():
 				inputs_embeds = self.model.model.embed_tokens(input_ids)
 				hidden_states = inputs_embeds.unsqueeze(0)
@@ -8589,8 +8178,6 @@ class BatchGenWorker:
 					for local_idx in batch
 				]
 				return self._select_tokens(logits, full_hit_sequences)
-		finally:
-			_reset_full_hit_state()
 
 	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 
