@@ -36,6 +36,7 @@ from batchgen.models.glm.glm5.decode_utils import (
 )
 from batchgen.models.glm.glm5.prefix_reuse import (
     offload_glm5_prepacked_mla_kv,
+    run_glm5_prefix_aware_prefill,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
@@ -437,14 +438,24 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """
         if self.prepack_mode:
             hidden_states_2d = hidden_states.squeeze(0)
-            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-                self.weight_dequant_scale
-            )
+            metadata = self.prefix_cache_metadata()
+            position_ids = self.position_ids.to(hidden_states_2d.device)
+            if metadata.prefix_reuse_mode:
+                attn_output, offload_kv = run_glm5_prefix_aware_prefill(
+                    wrapper=self,
+                    hidden_states_2d=hidden_states_2d,
+                    position_ids=position_ids,
+                    metadata=metadata,
+                )
+            else:
+                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                    hidden_states_2d,
+                    position_ids,
+                    self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                    self.prepack_max_seqlen,
+                    self.prepack_num_sequences,
+                    self.weight_dequant_scale
+                )
 
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
@@ -457,7 +468,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
             indexer_kv = self.module.indexer.compute_indexer_kv(
                 hidden_states_2d.unsqueeze(0),
-                positions=self.position_ids.to(hidden_states_2d.device),
+                positions=position_ids,
             )
             if indexer_kv is None:
                 raise RuntimeError(
