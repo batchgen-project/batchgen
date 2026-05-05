@@ -87,12 +87,22 @@ class CoreEngineBuilder(CUDAOpBuilder):
                 if os.path.isdir(lib_dir):
                     flags.append(f"-L{lib_dir}")
 
-        # Conda stubs dir (libcuda.so stub for linking in conda envs)
+        # Conda libs. In conda CUDA bundles libnuma is a symlink under
+        # `targets/x86_64-linux/lib`, and the cuda stubs (libcuda.so for
+        # link-time resolution) are under `lib/stubs`. Both need to be on
+        # the linker's search path; without them, ld emits
+        # ``cannot find -lnuma`` or ``cannot find -lcuda`` even though the
+        # .so files are present somewhere in the env.
         conda_prefix = os.environ.get("CONDA_PREFIX")
         if conda_prefix:
-            stubs_dir = os.path.join(conda_prefix, "lib", "stubs")
-            if os.path.isdir(stubs_dir):
-                flags.append(f"-L{stubs_dir}")
+            for rel in (
+                ("lib", "stubs"),
+                ("targets", "x86_64-linux", "lib"),
+                ("lib",),
+            ):
+                lib_dir = os.path.join(conda_prefix, *rel)
+                if os.path.isdir(lib_dir):
+                    flags.append(f"-L{lib_dir}")
 
         flags += [
             '-lnuma',
