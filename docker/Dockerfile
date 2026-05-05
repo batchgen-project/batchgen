@@ -3,10 +3,16 @@ ARG PYTHON_VERSION=3.11.13
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG PYTHON_VERSION
+ARG BUILD_PARALLEL_JOBS=2
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    HF_ENDPOINT=https://hf-mirror.com
+    HF_ENDPOINT=https://hf-mirror.com \
+    TORCH_CUDA_ARCH_LIST=9.0a \
+    MAX_JOBS=${BUILD_PARALLEL_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL_JOBS} \
+    NINJAFLAGS=-j${BUILD_PARALLEL_JOBS} \
+    MAKEFLAGS=-j${BUILD_PARALLEL_JOBS}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # RDMA Python UV
