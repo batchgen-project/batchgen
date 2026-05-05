@@ -1001,6 +1001,58 @@ def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_
     assert worker._cuda_graph_manager is None
 
 
+def test_glm5_segmented_graph_single_capture_per_batch_after_manager_clear(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._current_decode_local_batch_size = 8
+    worker._current_decode_max_rank_batch_size = 8
+    worker._cuda_graph_manager = None
+    worker._glm5_moe_cuda_graph_manager = None
+    worker._glm5_dsa_graph_capture_attempted_for_batch = True
+    worker._glm5_moe_graph_capture_attempted_for_batch = True
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: False,
+    )
+
+    assert not worker._glm5_segmented_graph_initial_capture_missing()
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert not worker._glm5_moe_graph_current_bucket_missing()
+
+
+def test_glm5_dsa_graph_page_table_change_after_capture_falls_back_eager(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._current_decode_local_batch_size = 8
+    worker._cuda_graph_manager = object()
+    worker._glm5_dsa_graph_capture_attempted_for_batch = True
+    worker._glm5_dsa_graph_page_table_change_after_capture_logged = False
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: True,
+    )
+
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert worker._cuda_graph_manager is None
+    assert worker._glm5_dsa_graph_page_table_change_after_capture_logged
+
+
 def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 

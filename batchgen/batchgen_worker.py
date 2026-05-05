@@ -472,6 +472,9 @@ class BatchGenWorker:
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_moe_graph_failed_buckets = set()
+		self._glm5_dsa_graph_capture_attempted_for_batch = False
+		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
@@ -5674,12 +5677,8 @@ class BatchGenWorker:
 				)
 
 				has_queueing = self.global_batch.has_queueing()
-				glm5_debug_graph_requested = (
-					(
-						self._glm5_dsa_graph_requested_for_current_batch()
-						or self._glm5_moe_graph_requested_for_current_batch()
-						or self._glm5_whole_model_graph_requested_for_current_batch()
-					)
+				glm5_whole_graph_requested = (
+					self._glm5_whole_model_graph_requested_for_current_batch()
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
 				if should_warmup_cuda_graphs_before_decode(
@@ -5687,8 +5686,12 @@ class BatchGenWorker:
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
 				) or (
-					glm5_debug_graph_requested and self._cuda_graph_manager is None
-				) or self._glm5_whole_model_graph_current_bucket_missing() or self._glm5_dsa_graph_current_bucket_missing() or self._glm5_moe_graph_current_bucket_missing():
+					glm5_whole_graph_requested and self._cuda_graph_manager is None
+				) or (
+					self._glm5_segmented_graph_initial_capture_missing()
+				) or self._glm5_whole_model_graph_current_bucket_missing() or (
+					self._glm5_dsa_graph_current_bucket_missing()
+				) or self._glm5_moe_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
@@ -8282,6 +8285,7 @@ class BatchGenWorker:
 			if int(bucket) not in getattr(self, "_glm5_moe_graph_failed_buckets", set())
 		]
 		if not capture_buckets:
+			self._glm5_moe_graph_capture_attempted_for_batch = True
 			return
 
 		if self._glm5_moe_cuda_graph_manager is not None:
@@ -8291,11 +8295,13 @@ class BatchGenWorker:
 				if not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(bucket)
 			]
 			if not missing_buckets:
+				self._glm5_moe_graph_capture_attempted_for_batch = True
 				return
 			logging.info(
 				f"Rank {self.rank}: capturing missing GLM-5 MoE CUDA graph buckets "
 				f"{missing_buckets} at decode entry (max rank batch size {max_bsz})"
 			)
+			self._glm5_moe_graph_capture_attempted_for_batch = True
 			try:
 				self._glm5_moe_cuda_graph_manager.warmup_and_capture_buckets(missing_buckets)
 			except torch.OutOfMemoryError as exc:
@@ -8357,6 +8363,7 @@ class BatchGenWorker:
 			moe.enable_moe_cuda_graph(manager, segment_name, segment, bucketing)
 			registered += 1
 		if registered == 0:
+			self._glm5_moe_graph_capture_attempted_for_batch = True
 			return
 		logging.info(
 			f"Rank {self.rank}: capturing GLM-5 MoE CUDA graph segments for "
@@ -8364,6 +8371,7 @@ class BatchGenWorker:
 			f"(max rank batch size {max_bsz})"
 		)
 		self._glm5_moe_cuda_graph_manager = manager
+		self._glm5_moe_graph_capture_attempted_for_batch = True
 		try:
 			manager.warmup_and_capture_buckets(capture_buckets)
 		except torch.OutOfMemoryError as exc:
@@ -8385,15 +8393,58 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
+		capture_attempted = bool(
+			getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False)
+		)
 		if self._glm5_dsa_graph_page_table_storage_changed():
 			self._cuda_graph_manager = None
+			if capture_attempted:
+				if not getattr(
+					self,
+					"_glm5_dsa_graph_page_table_change_after_capture_logged",
+					False,
+				):
+					logging.info(
+						f"Rank {self.rank}: GLM-5 DSA CUDA graph page-table storage "
+						"changed after the configured buckets were already captured; "
+						"using eager DSA for later decode passes instead of recapturing"
+					)
+					self._glm5_dsa_graph_page_table_change_after_capture_logged = True
+				return False
 			return True
 		if self._cuda_graph_manager is None:
-			return True
-		return self._glm5_cuda_graph_manager_missing_configured_buckets(
+			return not capture_attempted
+		missing = self._glm5_cuda_graph_manager_missing_configured_buckets(
 			self._cuda_graph_manager,
 			getattr(self, "_glm5_dsa_graph_failed_buckets", set()),
 		)
+		if not missing:
+			self._glm5_dsa_graph_capture_attempted_for_batch = True
+		return missing
+
+	def _glm5_segmented_graph_initial_capture_missing(self) -> bool:
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l:
+			return False
+		dsa_missing = (
+			self._glm5_dsa_graph_requested_for_current_batch()
+			and self._cuda_graph_manager is None
+			and not getattr(
+				self,
+				"_glm5_dsa_graph_capture_attempted_for_batch",
+				False,
+			)
+		)
+		moe_missing = (
+			self._glm5_moe_graph_requested_for_current_batch()
+			and self._glm5_moe_cuda_graph_manager is None
+			and not getattr(
+				self,
+				"_glm5_moe_graph_capture_attempted_for_batch",
+				False,
+			)
+		)
+		return bool(dsa_missing or moe_missing)
 
 	def _glm5_configured_cuda_graph_bucket_sizes(self) -> list:
 		return self._generate_bucket_sizes(
@@ -8620,11 +8671,18 @@ class BatchGenWorker:
 		if max_bsz <= 0:
 			return False
 		if self._glm5_moe_cuda_graph_manager is None:
-			return True
-		return self._glm5_cuda_graph_manager_missing_configured_buckets(
+			return not getattr(
+				self,
+				"_glm5_moe_graph_capture_attempted_for_batch",
+				False,
+			)
+		missing = self._glm5_cuda_graph_manager_missing_configured_buckets(
 			self._glm5_moe_cuda_graph_manager,
 			getattr(self, "_glm5_moe_graph_failed_buckets", set()),
 		)
+		if not missing:
+			self._glm5_moe_graph_capture_attempted_for_batch = True
+		return missing
 
 	def _glm5_dsa_graph_path_state(self, local_bsz: int, gpu_manager):
 		if not self._glm5_dsa_graph_requested_for_current_batch():
@@ -9112,6 +9170,7 @@ class BatchGenWorker:
 						f"Rank {self.rank}: capturing missing GLM-5 DSA CUDA graph buckets "
 						f"{missing_buckets} at decode entry (current local batch size {local_bsz})"
 					)
+					self._glm5_dsa_graph_capture_attempted_for_batch = True
 					try:
 						self._cuda_graph_manager.warmup_and_capture_buckets(missing_buckets)
 					except torch.OutOfMemoryError as exc:
@@ -9123,6 +9182,8 @@ class BatchGenWorker:
 							f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for buckets "
 							f"{missing_buckets} ran out of memory; using eager DSA for these buckets: {exc}"
 						)
+				else:
+					self._glm5_dsa_graph_capture_attempted_for_batch = True
 				if glm5_moe_graph_enabled:
 					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
@@ -9159,6 +9220,7 @@ class BatchGenWorker:
 				if int(bucket) not in getattr(self, "_glm5_dsa_graph_failed_buckets", set())
 			]
 			if not capture_buckets:
+				self._glm5_dsa_graph_capture_attempted_for_batch = True
 				if glm5_moe_graph_enabled:
 					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
@@ -9229,6 +9291,7 @@ class BatchGenWorker:
 			)
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = False
+			self._glm5_dsa_graph_capture_attempted_for_batch = True
 			try:
 				manager.warmup_and_capture_buckets(capture_buckets)
 			except torch.OutOfMemoryError as exc:
@@ -12113,6 +12176,9 @@ class BatchGenWorker:
 		self._whole_model_bucketing = None
 		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()
+		self._glm5_dsa_graph_capture_attempted_for_batch = False
+		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
