@@ -1191,6 +1191,42 @@ def test_glm5_graph_path_reason_marks_manager_cleared_after_capture(
     )
 
 
+def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeModel:
+        pass
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model = FakeModel()
+    worker.torch_device = torch.device("cpu")
+    worker.parallel_manager = None
+    worker._cuda_graph_manager = object()
+    worker._glm5_moe_cuda_graph_manager = object()
+    worker._glm5_dsa_graph_capture_attempted_for_batch = True
+    worker._glm5_moe_graph_capture_attempted_for_batch = True
+    worker._glm5_dsa_graph_page_table_change_after_capture_logged = True
+    worker._whole_model_segment = object()
+    worker._whole_model_bucketing = object()
+    worker._glm5_whole_model_capture_input_ids = object()
+    worker._glm5_moe_graph_failed_buckets = {64}
+    worker._whole_model_graph = True
+    worker._glm5_whole_model_graph = True
+    worker._glm5_whole_model_graph_failed_buckets = {64}
+    worker._glm5_whole_model_graph_signature = object()
+    worker._glm5_whole_model_graph_unavailable_reason = "stale"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    worker.deep_free_model_memory()
+
+    assert worker.model is None
+    assert worker._cuda_graph_manager is None
+    assert worker._glm5_moe_cuda_graph_manager is None
+    assert not worker._glm5_dsa_graph_capture_attempted_for_batch
+    assert not worker._glm5_moe_graph_capture_attempted_for_batch
+    assert not worker._glm5_dsa_graph_page_table_change_after_capture_logged
+
+
 def test_glm5_dsa_graph_page_table_change_after_capture_falls_back_eager(
     monkeypatch,
 ):

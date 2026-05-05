@@ -12158,6 +12158,9 @@ class BatchGenWorker:
 		self.model = None
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_dsa_graph_capture_attempted_for_batch = False
+		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_segment = None
 		self._whole_model_bucketing = None
 		self._glm5_whole_model_capture_input_ids = None
