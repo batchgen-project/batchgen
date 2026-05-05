@@ -553,6 +553,172 @@ class OpBuilder(ABC):
     def load(self, verbose=True):
         return self.jit_load(verbose)
 
+    def _augment_jit_env(self, verbose: bool = False) -> None:
+        """Make the JIT compile robust to non-curated conda envs.
+
+        Several env-specific quirks make the default torch.utils.cpp_extension.load
+        invocation fail on machines that aren't pre-blessed for BatchGen:
+
+        - deep_gemm + torch's bundled CUDA libs need <site-packages>/nvidia/*/lib
+          and <torch>/lib on LD_LIBRARY_PATH, otherwise downstream imports throw
+          ``libc10.so: cannot open shared object file`` or
+          ``__nvJitLinkCreate_12_8 undefined``.
+        - The conda compiler's sysroot does not put numa.h or the conda env's
+          $CONDA_PREFIX/include on the C preprocessor search path, so #include
+          <numa.h> in posix_shm.cpp fails.
+        - Recent conda builds ship gcc-14, while CUDA 12.x's nvcc caps at gcc-12.
+          The compile fails with ``unsupported GNU version`` or ``identifier
+          '_Float32' is undefined``.
+
+        This helper prepends the right paths to LD_LIBRARY_PATH / CPATH and adds
+        ``-allow-unsupported-compiler`` (and a peer-env -ccbin if the active env
+        has an incompatible host gcc) so a clean ``pip install batchgen``
+        actually JIT-compiles on Hopper-era conda envs without per-machine
+        runbooks. Pre-existing values are preserved (paths are prepended, not
+        replaced).
+
+        No-op if a path is already present or the relevant dir does not exist;
+        always safe to call.
+        """
+
+        def _prepend_unique(varname: str, paths) -> None:
+            current = os.environ.get(varname, "")
+            existing = current.split(os.pathsep) if current else []
+            for p in paths:
+                if not p or p in existing:
+                    continue
+                existing.insert(0, p)
+            os.environ[varname] = os.pathsep.join(existing)
+
+        # 1. LD_LIBRARY_PATH for runtime imports of deep_gemm and friends.
+        ld_paths = []
+        try:
+            import torch  # noqa: F811
+            torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+            if os.path.isdir(torch_lib):
+                ld_paths.append(torch_lib)
+            site_pkg = os.path.dirname(os.path.dirname(torch.__file__))
+            nvidia_root = os.path.join(site_pkg, "nvidia")
+            if os.path.isdir(nvidia_root):
+                for entry in sorted(os.listdir(nvidia_root)):
+                    cand = os.path.join(nvidia_root, entry, "lib")
+                    if os.path.isdir(cand):
+                        ld_paths.append(cand)
+        except Exception:
+            pass
+        _prepend_unique("LD_LIBRARY_PATH", ld_paths)
+
+        # 2. CPATH for headers (cuda.h, numa.h) when the conda compiler's
+        #    sysroot is incomplete.
+        cpath_dirs = []
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        if cuda_home:
+            inc = os.path.join(cuda_home, "include")
+            if os.path.isdir(inc):
+                cpath_dirs.append(inc)
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if conda_prefix:
+            cpath_dirs.append(os.path.join(conda_prefix, "include"))
+        _prepend_unique("CPATH", cpath_dirs)
+
+        # 3. LIBRARY_PATH so ld can find conda-managed libs (including the
+        #    libnuma symlink under targets/x86_64-linux/lib in conda CUDA
+        #    bundles).
+        if conda_prefix:
+            lib_dirs = [
+                os.path.join(conda_prefix, "targets", "x86_64-linux", "lib"),
+                os.path.join(conda_prefix, "lib"),
+            ]
+            _prepend_unique("LIBRARY_PATH",
+                            [d for d in lib_dirs if os.path.isdir(d)])
+
+        # 4. Host-compiler compatibility for nvcc.
+        #    nvcc 12.x rejects gcc > 12. If the active env has a too-new gcc,
+        #    look for a peer conda env with a compatible host compiler and use
+        #    it via -ccbin. Fallback: pass -allow-unsupported-compiler.
+        nvcc_extra = []
+        host_cc = self._detect_host_cc()
+        host_gcc_major = self._gcc_major(host_cc) if host_cc else None
+        nvcc_max_gcc = self._nvcc_max_supported_gcc()
+        if host_gcc_major is not None and nvcc_max_gcc is not None and host_gcc_major > nvcc_max_gcc:
+            peer = self._find_peer_compatible_cc(nvcc_max_gcc)
+            if peer:
+                if verbose:
+                    print(f"{WARNING} active gcc {host_gcc_major} > nvcc max "
+                          f"{nvcc_max_gcc}; using peer env compiler at {peer}")
+                nvcc_extra.append(f"-ccbin {shlex.quote(peer)}")
+            nvcc_extra.append("-allow-unsupported-compiler")
+        if nvcc_extra:
+            existing = os.environ.get("NVCC_PREPEND_FLAGS", "")
+            os.environ["NVCC_PREPEND_FLAGS"] = " ".join(
+                [existing] + nvcc_extra
+            ).strip()
+
+    def _detect_host_cc(self):
+        # Honour CC env first, otherwise rely on the conda compiler the env
+        # was built with (matches what torch.utils.cpp_extension picks up).
+        cc = os.environ.get("CC")
+        if cc:
+            return cc
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if conda_prefix:
+            for cand in (
+                os.path.join(conda_prefix, "bin", "x86_64-conda-linux-gnu-cc"),
+                os.path.join(conda_prefix, "bin", "gcc"),
+            ):
+                if os.path.exists(cand):
+                    return cand
+        return shutil.which("gcc") or shutil.which("cc")
+
+    @staticmethod
+    def _gcc_major(cc):
+        try:
+            out = subprocess.check_output(
+                [cc, "-dumpversion"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            return int(out.split(".", 1)[0])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _nvcc_max_supported_gcc():
+        # Hardcoded by CUDA toolkit version. CUDA 12.x supports up to gcc 12.
+        try:
+            nvcc = shutil.which("nvcc")
+            if not nvcc:
+                return None
+            out = subprocess.check_output(
+                [nvcc, "--version"], text=True, stderr=subprocess.DEVNULL
+            )
+            for line in out.splitlines():
+                if "release" in line:
+                    # e.g. "Cuda compilation tools, release 12.8, V12.8.61"
+                    rel = line.split("release", 1)[1].strip().split(",", 1)[0]
+                    major = int(rel.split(".", 1)[0])
+                    return {11: 11, 12: 12}.get(major, 13)
+        except Exception:
+            return None
+        return None
+
+    def _find_peer_compatible_cc(self, max_gcc_major):
+        conda_prefix = os.environ.get("CONDA_PREFIX")
+        if not conda_prefix:
+            return None
+        envs_root = os.path.dirname(conda_prefix)
+        if not os.path.isdir(envs_root):
+            return None
+        for entry in sorted(os.listdir(envs_root)):
+            cand_env = os.path.join(envs_root, entry)
+            if cand_env == conda_prefix:
+                continue
+            cc = os.path.join(cand_env, "bin", "x86_64-conda-linux-gnu-cc")
+            if not os.path.exists(cc):
+                continue
+            major = self._gcc_major(cc)
+            if major is not None and major <= max_gcc_major:
+                return cc
+        return None
+
     def jit_load(self, verbose=True):
         if not self.is_compatible(verbose):
             raise RuntimeError(
@@ -574,6 +740,11 @@ class OpBuilder(ABC):
 
         self.jit_mode = True
         from torch.utils.cpp_extension import load
+
+        # Make the build robust to non-curated conda envs (Gemini-cluster
+        # nodes, fresh setups, etc.). See _augment_jit_env for the full list
+        # of fixes.
+        self._augment_jit_env(verbose=verbose)
 
         start_build = time.time()
         sources = [self.deepspeed_src_path(path) for path in self.sources()]
