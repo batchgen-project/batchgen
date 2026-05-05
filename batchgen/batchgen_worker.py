@@ -5983,11 +5983,12 @@ class BatchGenWorker:
 			seq.decoded_length = n_old
 			seq.reentry_decoded_baseline = n_old
 
-			# Remaining decode budget for this re-entry
-			seq.max_decode_length = max(
-				0,
-				seq.original_max_decode_length - seq.total_decoded_before_eviction,
-			)
+			# decoded_length is cumulative across eviction/re-entry cycles, so
+			# max_decode_length must remain the absolute per-request completion
+			# cap. Compute remaining budget as
+			# original_max_decode_length - decoded_length at call sites instead
+			# of storing a relative value here.
+			seq.max_decode_length = seq.original_max_decode_length
 
 			# Reset completion flags — the sequence may have hit EOS in its
 			# previous decode cycle before being evicted. Without this reset,

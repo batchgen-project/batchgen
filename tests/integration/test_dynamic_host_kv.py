@@ -774,14 +774,16 @@ class TestFullLifecycle:
         seq.decoded_length = n_old
 
         remaining_decode = seq.original_max_decode_length - prev_decoded
-        seq.max_decode_length = remaining_decode
+        seq.max_decode_length = seq.original_max_decode_length
         # kv_token_budget stays unchanged
         seq.evicted_token_ids = None
         batch.update_status("s1", SequenceStatus.IN_PREFILL)
 
         assert seq.prompt_length == 5512
-        assert seq.max_decode_length == 32768 - 5000
+        assert remaining_decode == 32768 - 5000
+        assert seq.max_decode_length == 32768
         assert seq.decoded_length == 5000  # Pre-filled with old tokens
+        assert seq.remaining_decode_tokens() == 32768 - 5000
         assert seq.kv_token_budget == 512 + 32768  # Unchanged
         assert seq.original_prompt_length == 512  # Original preserved
         assert seq.status == SequenceStatus.IN_PREFILL

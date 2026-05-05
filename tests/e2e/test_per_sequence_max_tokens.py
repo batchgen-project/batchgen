@@ -309,6 +309,21 @@ class TestIsSequenceCompleted:
                         current_context_length=1000)
         assert not self._check(seq, model_context_length=131072)
 
+    def test_reentered_sequence_uses_absolute_decode_cap(self):
+        """decoded_length and max_decode_length stay in the same units after re-entry."""
+        seq = _make_seq("s1", decoded_length=90, max_decode_length=100)
+        seq.original_max_decode_length = 100
+        seq.total_decoded_before_eviction = 90
+        seq.reentry_decoded_baseline = 90
+
+        # Re-entry should preserve the original absolute cap. The remaining
+        # budget is derived, not stored in max_decode_length.
+        seq.max_decode_length = seq.original_max_decode_length
+
+        assert not self._check(seq)
+        seq.decoded_length = 100
+        assert self._check(seq)
+
 
 # ===========================================================================
 # 5. Vectorized completion check
