@@ -286,7 +286,7 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     ).contiguous()
 
     absorb = FP8AbsorbWeights(q_absorb, out_absorb)
-    graph_segment = Glm5DsaAttnSegment(
+    segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
         aux_blocked_k=aux_blocked_k,
         primary_page_table=primary_page_table,
@@ -477,27 +477,12 @@ def test_glm5_dsa_segment_replay_supports_unified_short_and_mixed_rows():
         page_size=PAGE_SIZE,
         softmax_scale=KV_DIM**-0.5,
     )
-    eager_segment = Glm5DsaAttnSegment(
-        primary_blocked_k=primary_blocked_k,
-        aux_blocked_k=aux_blocked_k,
-        primary_page_table=primary_page_table,
-        aux_page_table=aux_page_table,
-        wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
-        absorb_weights=absorb,
-        cuda_module=module,
-        cos_table=cos,
-        sin_table=sin,
-        max_seqlen=max_seqlen,
-        index_topk=index_topk,
-        page_size=PAGE_SIZE,
-        softmax_scale=KV_DIM**-0.5,
-    )
     segment_name = make_glm5_dsa_graph_segment_name(0)
     manager = CUDAGraphManager(
         BatchSizeBucketing([batch_size]),
         device=torch.device("cuda"),
     )
-    manager.register_segment(segment_name, graph_segment)
+    manager.register_segment(segment_name, segment)
     manager.warmup_and_capture_all()
 
     inputs = _make_inputs(batch_size, max_seqlen, cache_seqlens)
@@ -586,7 +571,22 @@ def test_glm5_dsa_segment_replay_uses_external_flashmla_metadata_for_production_
     ).contiguous()
     absorb = FP8AbsorbWeights(q_absorb, out_absorb)
 
-    segment = Glm5DsaAttnSegment(
+    graph_segment = Glm5DsaAttnSegment(
+        primary_blocked_k=primary_blocked_k,
+        aux_blocked_k=aux_blocked_k,
+        primary_page_table=primary_page_table,
+        aux_page_table=aux_page_table,
+        wq_b_weights=FP8WqbWeightsCUDA(wq_b, module),
+        absorb_weights=absorb,
+        cuda_module=module,
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=max_seqlen,
+        index_topk=index_topk,
+        page_size=PAGE_SIZE,
+        softmax_scale=KV_DIM**-0.5,
+    )
+    eager_segment = Glm5DsaAttnSegment(
         primary_blocked_k=primary_blocked_k,
         aux_blocked_k=aux_blocked_k,
         primary_page_table=primary_page_table,
@@ -606,7 +606,7 @@ def test_glm5_dsa_segment_replay_uses_external_flashmla_metadata_for_production_
         BatchSizeBucketing([batch_size]),
         device=torch.device("cuda"),
     )
-    manager.register_segment(segment_name, segment)
+    manager.register_segment(segment_name, graph_segment)
     manager.warmup_and_capture_all()
 
     for cache_values in ([970, 982, 2048], [1024, 1536, 2049]):
