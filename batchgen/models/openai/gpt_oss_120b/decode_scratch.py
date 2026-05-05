@@ -14,7 +14,10 @@ def estimate_gpt_oss_decode_scratch_reserve_gb(
     """Estimate non-KV HBM reserve needed by GPT-OSS decode kernels."""
     model_type = getattr(model_config, "model_type", "")
     if "gpt_oss" not in model_type:
-        return 0.0
+        raise RuntimeError(
+            "GPT-OSS decode scratch estimator received unsupported "
+            f"model_type={model_type!r}"
+        )
 
     max_num_seq_per_rank = max(int(max_num_seq_per_rank), 1)
     global_tokens = max_num_seq_per_rank * max(int(world_size), 1)

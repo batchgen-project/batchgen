@@ -516,26 +516,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
     def _offload_prepacked_kv_gqa(self, k_cache, v_cache):
         """Offload GQA KV cache per-sequence to host memory."""
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
-        global_sequence_ids = self.cur_batch
-
-        for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
-
-            seq_k = k_cache[start_idx:end_idx].unsqueeze(0)
-            seq_v = v_cache[start_idx:end_idx].unsqueeze(0)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_k,
-                v_tensor=seq_v,
-                sequence_lengths=[seq_len],
-            )
+        self.offload_prepacked_gqa_kv(k_cache, v_cache)
 
     def _forward_decode(self, hidden_states, **kwargs):
         """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV attention.

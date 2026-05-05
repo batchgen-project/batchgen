@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _load_decode_scratch():
     repo_root = Path(__file__).resolve().parents[2]
@@ -19,17 +21,16 @@ def _load_decode_scratch():
     return module
 
 
-def test_non_gpt_oss_model_has_no_decode_scratch_reserve():
+def test_non_gpt_oss_model_raises_for_gpt_oss_estimator():
     decode_scratch = _load_decode_scratch()
     config = SimpleNamespace(model_type="glm5")
 
-    reserve = decode_scratch.estimate_gpt_oss_decode_scratch_reserve_gb(
-        model_config=config,
-        world_size=8,
-        max_num_seq_per_rank=32,
-    )
-
-    assert reserve == 0.0
+    with pytest.raises(RuntimeError, match="unsupported"):
+        decode_scratch.estimate_gpt_oss_decode_scratch_reserve_gb(
+            model_config=config,
+            world_size=8,
+            max_num_seq_per_rank=32,
+        )
 
 
 def test_gpt_oss_model_reserves_at_least_two_gb():

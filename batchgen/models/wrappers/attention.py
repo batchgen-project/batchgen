@@ -126,6 +126,74 @@ class AttnWrapperBase(BaseModuleWrapper):
             oldest = pending.pop(0)
             oldest.wait()
 
+    def prefix_cache_metadata(self):
+        """Return validated prepack metadata for prefix-cache helpers."""
+        from .prefix_cache import PrefixCachePrepackMetadata
+
+        return PrefixCachePrepackMetadata.from_wrapper_cls(type(self))
+
+    def host_prefix_reader(self):
+        """Return a host prefix-cache page reader for this layer."""
+        from .prefix_cache import HostPrefixPageReader
+
+        return HostPrefixPageReader(
+            core_engine=self.core_engine,
+            engine_config=self.engine_config,
+            layer_idx=self.layer_idx,
+        )
+
+    def prefix_attention_kv_builder(self):
+        """Return a prefix-cache KV builder for this layer."""
+        from .prefix_cache import PrefixAttentionKvBuilder
+
+        return PrefixAttentionKvBuilder(self.host_prefix_reader())
+
+    def offload_prepacked_gqa_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        metadata=None,
+        track_tasks: bool = False,
+        sequence_callback=None,
+    ) -> None:
+        """Offload prepacked GQA KV with optional prefix-cache offsets."""
+        from .prefix_cache import PrefixAwarePrefillOffloader
+
+        metadata = metadata or self.prefix_cache_metadata()
+        tracker = self.track_prefill_offload_task if track_tasks else None
+        offloader = PrefixAwarePrefillOffloader(
+            worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
+            layer_idx=self.layer_idx,
+            metadata=metadata,
+            track_task=tracker,
+        )
+        offloader.offload_gqa(
+            key=key,
+            value=value,
+            sequence_callback=sequence_callback,
+        )
+
+    def offload_prepacked_mla_kv(
+        self,
+        key: torch.Tensor,
+        *,
+        metadata=None,
+        track_tasks: bool = False,
+    ) -> None:
+        """Offload prepacked MLA primary KV with optional prefix-cache offsets."""
+        from .prefix_cache import PrefixAwarePrefillOffloader
+
+        metadata = metadata or self.prefix_cache_metadata()
+        tracker = self.track_prefill_offload_task if track_tasks else None
+        offloader = PrefixAwarePrefillOffloader(
+            worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
+            layer_idx=self.layer_idx,
+            metadata=metadata,
+            track_task=tracker,
+        )
+        offloader.offload_mla(key=key)
+
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
     prepack_cu_seqlens: ClassVar[Optional[torch.Tensor]] = None

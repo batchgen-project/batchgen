@@ -37,12 +37,22 @@ Usage:
     )
 """
 
+from .attention import AttnWrapperBase
 from .base import BaseModuleWrapper
 from .expert import ExpertWrapperBase
-from .attention import AttnWrapperBase
+from .prefix_cache import (
+    HostPrefixPageReader,
+    PrefixAttentionKvBuilder,
+    PrefixAwarePrefillOffloader,
+    PrefixCachePrepackMetadata,
+)
 
 __all__ = [
     "BaseModuleWrapper",
     "ExpertWrapperBase",
     "AttnWrapperBase",
+    "HostPrefixPageReader",
+    "PrefixAttentionKvBuilder",
+    "PrefixAwarePrefillOffloader",
+    "PrefixCachePrepackMetadata",
 ]

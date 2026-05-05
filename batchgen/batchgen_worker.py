@@ -115,9 +115,7 @@ from batchgen.prefix_reuse.prefill_admission import (
 )
 from batchgen.prefix_reuse.rank_affinity import assign_admitted_ranks
 from batchgen.prefix_reuse.runtime_state import PrefixReuseRuntime
-from batchgen.models.openai.gpt_oss_120b.decode_scratch import (
-	estimate_gpt_oss_decode_scratch_reserve_gb,
-)
+from batchgen.models.wrappers.decode_scratch import estimate_decode_scratch_reserve_gb
 
 # Import modularized components
 # FastBoundaryTimingStats: Timing dataclass for page boundary operations
@@ -734,7 +732,7 @@ class BatchGenWorker:
 		logging.info(f"Engine on device {self.device} initialized/reconfigured.")
 
 	def _estimate_decode_gpu_kv_scratch_reserve_gb(self, max_num_seq_per_rank: int) -> float:
-		return estimate_gpt_oss_decode_scratch_reserve_gb(
+		return estimate_decode_scratch_reserve_gb(
 			model_config=self.model_config,
 			world_size=self.world_size,
 			max_num_seq_per_rank=max_num_seq_per_rank,

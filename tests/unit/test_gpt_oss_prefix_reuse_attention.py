@@ -28,13 +28,25 @@ class _FakeHostPagedKVWorkerView:
 
 @pytest.fixture(autouse=True)
 def _reset_prefix_reuse_metadata():
+    old_cu = AttnWrapperBase.prepack_cu_seqlens
+    old_max = AttnWrapperBase.prepack_max_seqlen
+    old_num = AttnWrapperBase.prepack_num_sequences
+    old_seq_lengths = AttnWrapperBase.prepack_seq_lengths
+    old_batch = AttnWrapperBase.cur_batch
     old_mode = AttnWrapperBase.prepack_prefix_reuse_mode
     old_tokens = AttnWrapperBase.prepack_prefix_shared_tokens
     old_lengths = AttnWrapperBase.prepack_full_seq_lengths
+    old_full_hit = AttnWrapperBase.prepack_full_hit_mode
     yield
+    AttnWrapperBase.prepack_cu_seqlens = old_cu
+    AttnWrapperBase.prepack_max_seqlen = old_max
+    AttnWrapperBase.prepack_num_sequences = old_num
+    AttnWrapperBase.prepack_seq_lengths = old_seq_lengths
+    AttnWrapperBase.cur_batch = old_batch
     AttnWrapperBase.prepack_prefix_reuse_mode = old_mode
     AttnWrapperBase.prepack_prefix_shared_tokens = old_tokens
     AttnWrapperBase.prepack_full_seq_lengths = old_lengths
+    AttnWrapperBase.prepack_full_hit_mode = old_full_hit
 
 
 def _make_wrapper(k_page: torch.Tensor, v_page: torch.Tensor) -> GptOssAttnWrapper:
@@ -77,15 +89,21 @@ def test_build_prefix_reuse_attention_kv_loads_host_prefix_and_appends_suffix():
     suffix_v = suffix_k + 100
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)
 
+    AttnWrapperBase.prepack_cu_seqlens = cu_seqlens
+    AttnWrapperBase.prepack_max_seqlen = 3
+    AttnWrapperBase.prepack_num_sequences = 2
+    AttnWrapperBase.prepack_seq_lengths = [2, 3]
+    AttnWrapperBase.cur_batch = [101, 102]
+    AttnWrapperBase.prepack_prefix_reuse_mode = True
     AttnWrapperBase.prepack_prefix_shared_tokens = [4, 0]
     AttnWrapperBase.prepack_full_seq_lengths = [6, 3]
 
-    key, value, cu_k, max_k = wrapper._build_prefix_reuse_attention_kv(
+    key, value, cu_k, max_k = wrapper.prefix_attention_kv_builder().build_gqa_prefix_kv(
         key=suffix_k,
         value=suffix_v,
-        cu_seqlens=cu_seqlens,
-        seq_lengths=[2, 3],
-        global_sequence_ids=[101, 102],
+        metadata=wrapper.prefix_cache_metadata(),
+        num_heads=wrapper.num_kv_heads,
+        head_dim=wrapper.head_dim,
     )
 
     torch.testing.assert_close(
@@ -104,17 +122,17 @@ def test_build_prefix_reuse_attention_kv_rejects_inconsistent_lengths():
     prefix_k = torch.ones((4, 1, 2), dtype=torch.bfloat16)
     wrapper = _make_wrapper(prefix_k, prefix_k)
 
+    AttnWrapperBase.prepack_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    AttnWrapperBase.prepack_max_seqlen = 2
+    AttnWrapperBase.prepack_num_sequences = 1
+    AttnWrapperBase.prepack_seq_lengths = [2]
+    AttnWrapperBase.cur_batch = [101]
+    AttnWrapperBase.prepack_prefix_reuse_mode = True
     AttnWrapperBase.prepack_prefix_shared_tokens = [4]
     AttnWrapperBase.prepack_full_seq_lengths = [7]
 
     with pytest.raises(RuntimeError, match="full length mismatch"):
-        wrapper._build_prefix_reuse_attention_kv(
-            key=torch.ones((2, 1, 2), dtype=torch.bfloat16),
-            value=torch.ones((2, 1, 2), dtype=torch.bfloat16),
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
-            seq_lengths=[2],
-            global_sequence_ids=[101],
-        )
+        wrapper.prefix_cache_metadata()
 
 
 def test_build_full_hit_attention_kv_uses_cached_full_prompt():
@@ -130,13 +148,21 @@ def test_build_full_hit_attention_kv_uses_cached_full_prompt():
     prefix_v = prefix_k + 10
     wrapper = _make_wrapper(prefix_k, prefix_v)
 
+    AttnWrapperBase.prepack_cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+    AttnWrapperBase.prepack_max_seqlen = 1
+    AttnWrapperBase.prepack_num_sequences = 1
+    AttnWrapperBase.prepack_seq_lengths = [1]
+    AttnWrapperBase.cur_batch = [101]
+    AttnWrapperBase.prepack_full_hit_mode = True
+    AttnWrapperBase.prepack_prefix_shared_tokens = [4]
     AttnWrapperBase.prepack_full_seq_lengths = [4]
 
-    key, value, cu_k, max_k = wrapper._build_full_hit_attention_kv(
+    key, value, cu_k, max_k = wrapper.prefix_attention_kv_builder().build_gqa_full_hit_kv(
+        metadata=wrapper.prefix_cache_metadata(),
+        num_heads=wrapper.num_kv_heads,
+        head_dim=wrapper.head_dim,
         dtype=torch.bfloat16,
         device=torch.device("cpu"),
-        seq_lengths=[1],
-        global_sequence_ids=[101],
     )
 
     torch.testing.assert_close(key, prefix_k)

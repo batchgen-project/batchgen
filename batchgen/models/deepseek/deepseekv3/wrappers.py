@@ -311,31 +311,7 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
-        global_sequence_ids = self.cur_batch
-
-        for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
-
-            # Extract KV for this sequence
-            seq_kv = offload_kv[start_idx:end_idx]  # [seq_len, kv_dim]
-
-            # Reshape to [1, seq_len, 1, kv_dim] for KV cache API
-            seq_kv = seq_kv.unsqueeze(0).unsqueeze(2)
-
-            seq_global_id = [global_sequence_ids[seq_idx]]
-
-            # MLA has no V (K contains compressed KV + k_pe)
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
-                v_tensor=None,
-                sequence_lengths=[seq_len],
-            )
+        self.offload_prepacked_mla_kv(offload_kv)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using FlashMLA backend.
