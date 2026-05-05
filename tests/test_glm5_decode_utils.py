@@ -1061,6 +1061,7 @@ def test_glm5_setup_cuda_graphs_does_not_recapture_after_manager_clear(
         cuda_graph_max_bucket_size=80,
         cuda_graph_num_buckets=8,
     )
+    worker.model_config = types.SimpleNamespace(max_position_embeddings=131072)
     worker.torch_device = torch.device("cpu")
     worker._batchgen_debug = {}
     worker._cuda_graph_manager = None
