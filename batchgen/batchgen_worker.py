@@ -1782,6 +1782,22 @@ class BatchGenWorker:
 			tokens.append(pages * self.PAGE_SIZE)
 		return tokens
 
+	def _host_worker_view_for_prefix_reuse(self) -> Optional[object]:
+		"""Return the host view that owns prefix-cache metadata.
+
+		DSA models keep primary/auxiliary host caches behind
+		DualHostKVCoordinator. Prefix-cache attach/commit/query must go through
+		that coordinator so primary and auxiliary prefix pages stay mirrored.
+		Non-DSA models keep the existing single-view path on core_engine.
+		"""
+		host_view = getattr(self, "host_paged_kv_worker_view", None)
+		if isinstance(host_view, DualHostKVCoordinator):
+			return host_view
+		core_engine_obj = getattr(self, "core_engine", None)
+		if core_engine_obj is None:
+			return None
+		return getattr(core_engine_obj, "host_paged_kv_worker_view", None)
+
 	def _gpu_shared_prefix_pages_for_allocation(
 		self,
 		global_ids: List[int],
@@ -1790,7 +1806,7 @@ class BatchGenWorker:
 	) -> List[List[int]]:
 		if not self._prefix_reuse_runtime_enabled():
 			return [[] for _ in global_ids]
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		if worker_view is None:
 			return [[] for _ in global_ids]
 		shared_pages: List[List[int]] = []
@@ -1879,7 +1895,7 @@ class BatchGenWorker:
 		shared_prefix_pages_per_seq = []
 		total_pages = 0
 		total_physical_pages = 0
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		
 		# DIAGNOSTIC: Log allocation details for KV corruption investigation (debug-only / opt-in)
 		alloc_details = []
@@ -4711,7 +4727,7 @@ class BatchGenWorker:
 		seq: SequenceEntry,
 		capacity_tokens: int,
 	) -> Tuple[int, List[int]]:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		estimate = estimate_prefix_allocation_for_admission(
 			seq=seq,
 			capacity_tokens=capacity_tokens,
@@ -4780,7 +4796,7 @@ class BatchGenWorker:
 	) -> None:
 		if not self._prefix_reuse_runtime_enabled():
 			return
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		try:
 			eviction = maybe_evict_prefix_cache_for_prefill_admission(
 				all_candidates=all_candidates,
@@ -6659,7 +6675,7 @@ class BatchGenWorker:
 		return self.prefix_reuse_runtime.prompt_rank_key(seq)
 
 	def _maybe_clear_prefix_reuse_rank_cache_after_eviction(self) -> None:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		self.prefix_reuse_runtime.maybe_clear_rank_cache_after_eviction(worker_view)
 
 	def _prefix_reuse_cached_rank_for_sequence(
@@ -6685,7 +6701,7 @@ class BatchGenWorker:
 		)
 
 	def _commit_prefix_reuse_pages(self, prefill_uuids: List[str]) -> None:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		self.prefix_reuse_runtime.commit_pages(
 			prefill_uuids=prefill_uuids,
 			global_batch=self.global_batch,
@@ -6716,7 +6732,7 @@ class BatchGenWorker:
 		return count
 
 	def _prefix_reuse_shared_tokens_for_sequence(self, seq: SequenceEntry) -> int:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		return self.prefix_reuse_runtime.shared_tokens_for_sequence(
 			seq,
 			worker_view=worker_view,
@@ -6729,7 +6745,7 @@ class BatchGenWorker:
 		return self.prefix_reuse_runtime.runtime_enabled()
 
 	def _sequence_uses_reused_prefix(self, seq: SequenceEntry) -> bool:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		return self.prefix_reuse_runtime.sequence_uses_reused_prefix(
 			seq,
 			worker_view=worker_view,
@@ -6757,7 +6773,7 @@ class BatchGenWorker:
 		allow_full_hits: bool = False,
 		record_stats: bool = True,
 	) -> Optional[PrefixReusePrefillPlan]:
-		worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+		worker_view = self._host_worker_view_for_prefix_reuse()
 		return self.prefix_reuse_runtime.build_prefill_plan_for_batch(
 			batch=batch,
 			local_to_uuid_map=self._local_to_uuid_map,
@@ -7070,7 +7086,12 @@ class BatchGenWorker:
 
 			seq_token_pairs = list(zip(global_sequence_ids, sequence_tokens))
 			if use_prefix_reuse_allocation:
-				self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
+				prefix_worker_view = self._host_worker_view_for_prefix_reuse()
+				if prefix_worker_view is None:
+					raise RuntimeError(
+						"Prefix reuse allocation requires a host KV worker view"
+					)
+				prefix_worker_view.register_sequences(global_sequence_ids)
 				prefix_requests = []
 				for uuid, global_idx, capacity_tokens in zip(my_prefill_uuids, global_sequence_ids, sequence_tokens):
 					seq = self.global_batch.get_sequence(uuid)
@@ -7082,7 +7103,7 @@ class BatchGenWorker:
 							self._prefix_reuse_namespace_hash,
 						)
 					)
-				allocations = self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences_with_prefix(
+				allocations = prefix_worker_view.allocate_pages_for_sequences_with_prefix(
 					prefix_requests
 				)
 				self._maybe_clear_prefix_reuse_rank_cache_after_eviction()
