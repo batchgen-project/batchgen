@@ -895,15 +895,27 @@ def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
 def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
+    class FakeManager:
+        def __init__(self, buckets):
+            self._buckets = set(buckets)
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return batch_size in self._buckets
+
+    configured_buckets = [1, 2, 3, 7, 12, 24, 40, 80]
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        cuda_graph_max_bucket_size=80,
+        cuda_graph_num_buckets=8,
+    )
     worker._batchgen_debug = {}
     worker._glm5_dsa_graph_failed_buckets = set()
     worker._glm5_moe_graph_failed_buckets = set()
     worker._current_decode_local_batch_size = 17
     worker._current_decode_max_rank_batch_size = 17
-    worker._cuda_graph_manager = object()
-    worker._glm5_moe_cuda_graph_manager = object()
+    worker._cuda_graph_manager = FakeManager(configured_buckets)
+    worker._glm5_moe_cuda_graph_manager = FakeManager(configured_buckets)
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
     monkeypatch.setattr(
@@ -920,6 +932,43 @@ def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatc
 
     assert not worker._glm5_dsa_graph_current_bucket_missing()
     assert not worker._glm5_moe_graph_current_bucket_missing()
+
+
+def test_glm5_segmented_graph_existing_manager_missing_configured_bucket_requests_setup(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        def __init__(self, buckets):
+            self._buckets = set(buckets)
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return batch_size in self._buckets
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        cuda_graph_max_bucket_size=80,
+        cuda_graph_num_buckets=8,
+    )
+    worker._batchgen_debug = {}
+    worker._glm5_dsa_graph_failed_buckets = set()
+    worker._glm5_moe_graph_failed_buckets = set()
+    worker._current_decode_local_batch_size = 17
+    worker._current_decode_max_rank_batch_size = 17
+    worker._cuda_graph_manager = FakeManager([1, 2, 3, 7, 12, 24, 80])
+    worker._glm5_moe_cuda_graph_manager = FakeManager([1, 2, 3, 7, 12, 24, 80])
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: False,
+    )
+
+    assert worker._glm5_dsa_graph_current_bucket_missing()
+    assert worker._glm5_moe_graph_current_bucket_missing()
 
 
 def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_changes(

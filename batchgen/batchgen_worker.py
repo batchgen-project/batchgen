@@ -8385,14 +8385,37 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
-		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
-		if local_bsz <= 0:
-			return False
 		if self._glm5_dsa_graph_page_table_storage_changed():
 			self._cuda_graph_manager = None
 			return True
 		if self._cuda_graph_manager is None:
 			return True
+		return self._glm5_cuda_graph_manager_missing_configured_buckets(
+			self._cuda_graph_manager,
+			getattr(self, "_glm5_dsa_graph_failed_buckets", set()),
+		)
+
+	def _glm5_configured_cuda_graph_bucket_sizes(self) -> list:
+		return self._generate_bucket_sizes(
+			self.args.cuda_graph_max_bucket_size,
+			self.args.cuda_graph_num_buckets,
+		)
+
+	def _glm5_cuda_graph_manager_missing_configured_buckets(
+		self,
+		manager,
+		failed_buckets,
+	) -> bool:
+		if manager is None:
+			return True
+		for bucket in self._glm5_configured_cuda_graph_bucket_sizes():
+			if bucket in failed_buckets:
+				continue
+			try:
+				if not manager.has_bucket_for_all_segments(bucket):
+					return True
+			except ValueError:
+				return True
 		return False
 
 	def _glm5_dsa_graph_page_table_storage_changed(self) -> bool:
@@ -8598,7 +8621,10 @@ class BatchGenWorker:
 			return False
 		if self._glm5_moe_cuda_graph_manager is None:
 			return True
-		return False
+		return self._glm5_cuda_graph_manager_missing_configured_buckets(
+			self._glm5_moe_cuda_graph_manager,
+			getattr(self, "_glm5_moe_graph_failed_buckets", set()),
+		)
 
 	def _glm5_dsa_graph_path_state(self, local_bsz: int, gpu_manager):
 		if not self._glm5_dsa_graph_requested_for_current_batch():
@@ -9071,6 +9097,32 @@ class BatchGenWorker:
 					"DSA CUDA graph buckets for possible later local reloads"
 				)
 			if self._cuda_graph_manager is not None:
+				capture_buckets = [
+					int(bucket)
+					for bucket in self._glm5_configured_cuda_graph_bucket_sizes()
+					if int(bucket) not in getattr(self, "_glm5_dsa_graph_failed_buckets", set())
+				]
+				missing_buckets = [
+					bucket
+					for bucket in capture_buckets
+					if not self._cuda_graph_manager.has_bucket_for_all_segments(bucket)
+				]
+				if missing_buckets:
+					logging.info(
+						f"Rank {self.rank}: capturing missing GLM-5 DSA CUDA graph buckets "
+						f"{missing_buckets} at decode entry (current local batch size {local_bsz})"
+					)
+					try:
+						self._cuda_graph_manager.warmup_and_capture_buckets(missing_buckets)
+					except torch.OutOfMemoryError as exc:
+						for bucket in missing_buckets:
+							self._cuda_graph_manager.drop_bucket(bucket)
+							self._mark_glm5_dsa_graph_bucket_failed(bucket)
+						torch.cuda.empty_cache()
+						logging.error(
+							f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for buckets "
+							f"{missing_buckets} ran out of memory; using eager DSA for these buckets: {exc}"
+						)
 				if glm5_moe_graph_enabled:
 					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
