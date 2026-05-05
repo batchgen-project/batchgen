@@ -431,8 +431,8 @@ class BatchGenWorker:
 		if self.enable_prefix_reuse:
 			if not is_prefix_reuse_supported_model(args.model_name):
 				raise ValueError(
-					"Prefix reuse is currently supported only for GPT-OSS/GQA "
-					"and GLM-5 DSA models"
+					"Prefix reuse is currently supported only for GPT-OSS, GLM-5, "
+					"DeepSeek-R1/V3/V4, Kimi-K2.5/K2.6, and MiniMax-M2.5 models"
 				)
 		# Eviction is always enabled — it's a correctness requirement for chunked host KV
 		self.enable_host_kv_eviction = True

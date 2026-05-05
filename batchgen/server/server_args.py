@@ -381,7 +381,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-prefix-reuse",
         action="store_true",
         default=False,
-        help="Enable experimental page-level prefix KV reuse. Currently gated to GPT-OSS/GQA.",
+        help=(
+            "Enable experimental page-level prefix KV reuse. Supported by "
+            "GPT-OSS, GLM-5, DeepSeek-R1/V3/V4, Kimi-K2.5/K2.6, and MiniMax-M2.5."
+        ),
     )
     parser.add_argument(
         "--adaptive-chunk",
@@ -502,7 +505,8 @@ def validate_server_args(args: ServerArgs) -> None:
         if not is_prefix_reuse_supported_model(args.model):
             raise ValueError(
                 "--enable-prefix-reuse is currently supported only for "
-                "GPT-OSS/GQA and GLM-5 DSA models"
+                "GPT-OSS, GLM-5, DeepSeek-R1/V3/V4, Kimi-K2.5/K2.6, "
+                "and MiniMax-M2.5 models"
             )
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
