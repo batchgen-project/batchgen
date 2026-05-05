@@ -15,9 +15,12 @@ from batchgen.models.glm.glm5.decode_utils import (
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
+    GLM5_POWER_OF_TWO_BUCKETS_32,
     glm5_any_cuda_graph_requested_for_model,
+    glm5_cuda_graph_bucket_for_batch_size,
     glm5_dsa_cuda_graph_requested_for_model,
     glm5_effective_decode_attn_mode,
+    glm5_moe_graph_bucket_capacity,
     glm5_moe_cuda_graph_requested_for_model,
     glm5_segmented_cuda_graph_requested_for_model,
     glm5_whole_model_cuda_graph_compare_requested_for_model,
@@ -814,6 +817,49 @@ def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
+
+
+def test_glm5_power2_graph_buckets_cover_local_batches_to_32():
+    buckets = GLM5_POWER_OF_TWO_BUCKETS_32
+
+    assert buckets == [1, 2, 4, 8, 16, 32]
+    assert [
+        glm5_cuda_graph_bucket_for_batch_size(batch_size, buckets)
+        for batch_size in [0, 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33]
+    ] == [None, 1, 2, 4, 4, 8, 8, 16, 16, 32, 32, None]
+
+
+def test_glm5_moe_power2_bucket_32_represents_global_512_rows():
+    buckets = GLM5_POWER_OF_TWO_BUCKETS_32
+
+    assert glm5_moe_graph_bucket_capacity(
+        max_rank_batch_size=16,
+        world_size=16,
+        bucket_sizes=buckets,
+    ) == (16, 256)
+    assert glm5_moe_graph_bucket_capacity(
+        max_rank_batch_size=17,
+        world_size=16,
+        bucket_sizes=buckets,
+    ) == (32, 512)
+    assert glm5_moe_graph_bucket_capacity(
+        max_rank_batch_size=32,
+        world_size=16,
+        bucket_sizes=buckets,
+    ) == (32, 512)
+    assert glm5_moe_graph_bucket_capacity(
+        max_rank_batch_size=33,
+        world_size=16,
+        bucket_sizes=buckets,
+    ) is None
+
+
+def test_glm5_moe_graph_capacity_validates_world_size():
+    with pytest.raises(ValueError, match="world_size must be positive"):
+        glm5_moe_graph_bucket_capacity(
+            max_rank_batch_size=1,
+            world_size=0,
+        )
 
 
 def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):

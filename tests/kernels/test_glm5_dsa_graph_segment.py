@@ -14,6 +14,7 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5DsaAttnSegment,
     make_glm5_dsa_graph_segment_name,
 )
+from batchgen.models.glm.glm5.cuda_graph_policy import GLM5_POWER_OF_TWO_BUCKETS_32
 from batchgen_kernels.attention.dsa.fp8_absorb import FP8AbsorbWeights, fp8_out_absorb_out
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import build_module
 from batchgen_kernels.attention.dsa.fused_indexer_score import FP8WqbWeightsCUDA
@@ -251,11 +252,15 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     )
     segment_name = make_glm5_dsa_graph_segment_name(0)
     manager = CUDAGraphManager(
-        BatchSizeBucketing([1, batch_size]),
+        BatchSizeBucketing(GLM5_POWER_OF_TWO_BUCKETS_32),
         device=torch.device("cuda"),
     )
     manager.register_segment(segment_name, segment)
     manager.warmup_and_capture_all()
+    assert (
+        manager.get_capture_stats()["graphs_per_segment"][segment_name]
+        == GLM5_POWER_OF_TWO_BUCKETS_32
+    )
 
     inputs = _make_inputs(batch_size, max_seqlen)
     inputs["primary_slot_indices"] = primary_slot_indices
@@ -294,6 +299,27 @@ def test_glm5_dsa_segment_replay_matches_eager_forward():
     )
     torch.testing.assert_close(
         small_actual["top_k_indices"], small_expected["top_k_indices"], atol=0, rtol=0
+    )
+
+    mid_batch_size = 17
+    mid_inputs = _make_inputs(mid_batch_size, max_seqlen)
+    mid_slots = (
+        torch.arange(mid_batch_size, device="cuda", dtype=torch.int32) % num_slots
+    )
+    mid_inputs["primary_slot_indices"] = mid_slots
+    mid_inputs["aux_slot_indices"] = mid_slots
+    mid_expected = {
+        key: value.clone()
+        for key, value in segment.forward(**mid_inputs).items()
+    }
+    mid_actual = manager.replay(segment_name, mid_batch_size, **mid_inputs)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        mid_actual["attn_heads"], mid_expected["attn_heads"], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        mid_actual["top_k_indices"], mid_expected["top_k_indices"], atol=0, rtol=0
     )
 
 

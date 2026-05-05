@@ -33,6 +33,17 @@ def test_warmup_and_capture_buckets_captures_only_requested_buckets():
     assert manager.is_captured
 
 
+def test_power_of_two_bucket_pattern_maps_batches_through_32():
+    bucketing = BatchSizeBucketing([1, 2, 4, 8, 16, 32])
+
+    assert [
+        bucketing.get_padded_size(batch_size)
+        for batch_size in [1, 2, 3, 4, 5, 8, 9, 16, 17, 32]
+    ] == [1, 2, 4, 4, 8, 8, 16, 16, 32, 32]
+    with pytest.raises(ValueError, match="exceeds max bucket 32"):
+        bucketing.get_padded_size(33)
+
+
 def test_warmup_and_capture_buckets_rejects_unknown_bucket():
     manager = _make_uninitialized_manager([1, 2])
     manager._capture_one = types.MethodType(

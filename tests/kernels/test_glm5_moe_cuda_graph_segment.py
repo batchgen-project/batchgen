@@ -144,6 +144,35 @@ def test_glm5_moe_graph_buffer_pool_shapes():
     assert bufs.cu_seqlens.shape == (5,)
 
 
+def test_glm5_moe_graph_bucket_32_represents_512_global_rows():
+    from batchgen.models.glm.glm5.cuda_graph_policy import GLM5_POWER_OF_TWO_BUCKETS_32
+    from batchgen.models.glm.glm5.moe_cuda_graph_segments import Glm5MoEGraphBufferPool
+
+    device = torch.device("cuda")
+    hidden_size = 16
+    topk = 4
+    pool = Glm5MoEGraphBufferPool(
+        world_size=16,
+        hidden_size=hidden_size,
+        num_experts_per_tok=topk,
+        num_local_experts=2,
+        intermediate_size=16,
+        device=device,
+        bucket_sizes=GLM5_POWER_OF_TWO_BUCKETS_32,
+        base_mtp=128,
+    )
+
+    bufs = pool.get(32)
+
+    assert bufs.padded.shape == (32, hidden_size)
+    assert bufs.all_tokens.shape == (512, hidden_size)
+    assert bufs.routed_global_output.shape == (512, hidden_size)
+    assert bufs.topk_indices.shape == (512, topk)
+    assert bufs.rank_ids[:34].tolist() == [0] * 32 + [1, 1]
+    assert bufs.local_pos[:34].tolist() == list(range(32)) + [0, 1]
+    assert 512 not in pool._views
+
+
 class _FakeComm:
     disabled = False
 

@@ -9,6 +9,7 @@ GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
 GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
+GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
 
 
 def _is_glm_model(model_name: str | None) -> bool:
@@ -82,6 +83,47 @@ def glm5_effective_decode_attn_mode(
     if _is_glm_model(model_type):
         return 3
     return configured_attn_mode
+
+
+def glm5_cuda_graph_bucket_for_batch_size(
+    batch_size: int,
+    bucket_sizes: list[int] | tuple[int, ...] = GLM5_POWER_OF_TWO_BUCKETS_32,
+) -> int | None:
+    """Return the smallest configured GLM-5 graph bucket for batch_size.
+
+    ``None`` means no graph bucket can represent the batch and the caller should
+    use eager execution. A zero batch has no graph work to replay.
+    """
+
+    if batch_size <= 0:
+        return None
+    for bucket_size in bucket_sizes:
+        if batch_size <= int(bucket_size):
+            return int(bucket_size)
+    return None
+
+
+def glm5_moe_graph_bucket_capacity(
+    *,
+    max_rank_batch_size: int,
+    world_size: int,
+    bucket_sizes: list[int] | tuple[int, ...] = GLM5_POWER_OF_TWO_BUCKETS_32,
+) -> tuple[int, int] | None:
+    """Return ``(per_rank_bucket, effective_global_rows)`` for MoE graph replay.
+
+    GLM-5 MoE graph buckets are per-rank max batch sizes. The captured global
+    routing domain is ``world_size * per_rank_bucket``.
+    """
+
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    bucket = glm5_cuda_graph_bucket_for_batch_size(
+        max_rank_batch_size,
+        bucket_sizes,
+    )
+    if bucket is None:
+        return None
+    return bucket, int(world_size) * bucket
 
 
 def should_warmup_cuda_graphs_before_decode(
