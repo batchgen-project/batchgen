@@ -8416,7 +8416,7 @@ class BatchGenWorker:
 		aux_manager = getattr(
 			gpu_manager,
 			"auxiliary",
-			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+			getattr(getattr(self, "core_engine", None), "gpu_paged_kv_manager_aux", None),
 		)
 		if aux_manager is None:
 			return False
@@ -8480,6 +8480,14 @@ class BatchGenWorker:
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
+
+	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_GRAPH_PATH_LOG", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
 
 	def _glm5_whole_model_graph_requested_for_current_batch(self) -> bool:
 		if (
@@ -8591,6 +8599,129 @@ class BatchGenWorker:
 		if self._glm5_moe_cuda_graph_manager is None:
 			return True
 		return False
+
+	def _glm5_dsa_graph_path_state(self, local_bsz: int, gpu_manager):
+		if not self._glm5_dsa_graph_requested_for_current_batch():
+			return "disabled", None, "not_requested"
+		if local_bsz <= 0:
+			return "eager", None, "empty_local_batch"
+		manager = self._cuda_graph_manager
+		if manager is None:
+			return "eager", None, "no_manager"
+		try:
+			bucket = manager.bucketing.get_padded_size(local_bsz)
+		except ValueError:
+			return "eager", None, "over_bucket"
+		model = getattr(self, "model", None)
+		layers = getattr(getattr(model, "model", None), "layers", None)
+		if not layers:
+			return "eager", bucket, "no_attention_wrapper"
+		wrapper = layers[0].self_attn
+		segment_name = getattr(wrapper, "_dsa_cuda_graph_segment_name", None)
+		if segment_name is None:
+			return "eager", bucket, "no_segment"
+		if not manager.has_graph(segment_name, local_bsz):
+			return "eager", bucket, "bucket_not_captured"
+		cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
+		max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+		if cache_seqlens is None:
+			return "eager", bucket, "no_decode_metadata"
+		index_topk = getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048)
+		from batchgen.models.glm.glm5.wrappers import _glm5_dsa_cuda_graph_can_replay
+		if not _glm5_dsa_cuda_graph_can_replay(
+			cache_seqlens,
+			max_seqlen,
+			index_topk,
+			captured_max_seqlen=getattr(wrapper, "_dsa_cuda_graph_max_seqlen", None),
+		):
+			return "eager", bucket, "metadata_not_graph_safe"
+		if gpu_manager is None:
+			return "eager", bucket, "no_gpu_manager"
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			return "eager", bucket, "no_aux_manager"
+		if not wrapper._dsa_cuda_graph_page_tables_match(primary_manager, aux_manager):
+			return "eager", bucket, "page_table_storage_changed"
+		return "graph", bucket, "captured"
+
+	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
+		if not self._glm5_moe_graph_requested_for_current_batch():
+			return "disabled", None, "not_requested"
+		if max_rank_bsz <= 0:
+			return "eager", None, "empty_global_batch"
+		manager = self._glm5_moe_cuda_graph_manager
+		if manager is None:
+			return "eager", None, "no_manager"
+		try:
+			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
+		except ValueError:
+			return "eager", None, "over_bucket"
+		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
+			return "eager", bucket, "failed_bucket"
+		if not manager.has_bucket_for_all_segments(max_rank_bsz):
+			return "eager", bucket, "bucket_not_captured"
+		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_HAS_DISPATCH_3D
+		moe_layers = [
+			layer.mlp for layer in self.model.model.layers
+			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
+		]
+		if not moe_layers:
+			return "disabled", bucket, "no_moe_layers"
+		first_moe = moe_layers[0]
+		if not (
+			getattr(first_moe, "use_3d_moe", False)
+			and getattr(first_moe, "_fp8_blockwise_ready", False)
+			and Glm5MoE._3d_buf is not None
+			and _GLM5_HAS_DISPATCH_3D
+		):
+			return "eager", bucket, "3d_graph_path_not_ready"
+		return "graph", bucket, "captured"
+
+	def _log_glm5_graph_path_for_forward(
+		self,
+		*,
+		local_bsz: int,
+		max_rank_bsz: int,
+		rank_counts,
+		gpu_manager,
+		decode_iter: int,
+	) -> None:
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l or not self._glm5_graph_path_log_requested_for_current_batch():
+			return
+		dsa_path, dsa_bucket, dsa_reason = self._glm5_dsa_graph_path_state(
+			local_bsz,
+			gpu_manager,
+		)
+		moe_path, moe_bucket, moe_reason = self._glm5_moe_graph_path_state(max_rank_bsz)
+		if rank_counts is None:
+			counts_repr = None
+		else:
+			try:
+				counts_repr = rank_counts.detach().cpu().tolist()
+			except RuntimeError:
+				counts_repr = "<unavailable>"
+		logging.info(
+			"[GLM5_GRAPH_PATH] rank=%s decode_iter=%s local_bsz=%s "
+			"max_rank_bsz=%s rank_counts=%s dsa=%s dsa_bucket=%s "
+			"dsa_reason=%s moe=%s moe_bucket=%s moe_reason=%s",
+			self.rank,
+			decode_iter,
+			local_bsz,
+			max_rank_bsz,
+			counts_repr,
+			dsa_path,
+			dsa_bucket,
+			dsa_reason,
+			moe_path,
+			moe_bucket,
+			moe_reason,
+		)
 
 	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
 		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
@@ -9833,6 +9964,14 @@ class BatchGenWorker:
 					)
 					self._glm5_whole_model_capture_input_ids = new_tokens[:len(batch)]
 					self._warmup_cuda_graphs()
+
+				self._log_glm5_graph_path_for_forward(
+					local_bsz=len(batch),
+					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+					rank_counts=getattr(self, "_current_decode_rank_token_counts", None),
+					gpu_manager=gpu_manager,
+					decode_iter=self._cumulative_decode_iterations,
+				)
 
 				# Forward
 				_glm5_whole_graph_active = bool(

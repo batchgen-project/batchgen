@@ -952,6 +952,50 @@ def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_
     assert worker._cuda_graph_manager is None
 
 
+def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker._batchgen_debug = {"glm5_graph_path_log": True}
+    monkeypatch.delenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", raising=False)
+
+    assert worker._glm5_graph_path_log_requested_for_current_batch()
+
+    worker._batchgen_debug = {}
+    assert not worker._glm5_graph_path_log_requested_for_current_batch()
+
+    monkeypatch.setenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", "1")
+    assert worker._glm5_graph_path_log_requested_for_current_batch()
+
+
+def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = types.SimpleNamespace(
+        bucketing=BatchSizeBucketing([1, 2]),
+    )
+    worker._glm5_moe_cuda_graph_manager = types.SimpleNamespace(
+        bucketing=BatchSizeBucketing([1, 2]),
+    )
+    worker._glm5_moe_graph_failed_buckets = set()
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+
+    assert worker._glm5_dsa_graph_path_state(3, object()) == (
+        "eager",
+        None,
+        "over_bucket",
+    )
+    assert worker._glm5_moe_graph_path_state(3) == (
+        "eager",
+        None,
+        "over_bucket",
+    )
+
+
 def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
     env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
 
