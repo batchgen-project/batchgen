@@ -11,6 +11,11 @@ from __future__ import annotations
 import torch
 
 from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.models.wrappers.prefix_mla_replay import (
+	MlaReplaySpec,
+	run_prefix_mla_full_hit_prefill,
+	run_prefix_mla_suffix_prefill,
+)
 from batchgen.models.wrappers.prefix_cache import (
 	PrefixAwarePrefillOffloader,
 	PrefixCachePrepackMetadata,
@@ -42,35 +47,23 @@ def run_glm5_prefix_aware_prefill(
 	if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
 		raise RuntimeError("GLM-5 prefix-aware prefill requires prefix metadata")
 
-	attn = wrapper.module
-	q_states, offload_kv = _project_suffix_query_and_kv(
+	return run_prefix_mla_suffix_prefill(
 		wrapper=wrapper,
 		hidden_states_2d=hidden_states_2d,
 		position_ids=position_ids,
-		full_length=max(metadata.full_seq_lengths),
-		weight_scale=wrapper.weight_dequant_scale,
+		metadata=metadata,
+		spec=_mla_replay_spec(wrapper),
+		project_suffix_query_and_kv=lambda hidden, pos, full_len: (
+			_project_suffix_query_and_kv(
+				wrapper=wrapper,
+				hidden_states_2d=hidden,
+				position_ids=pos,
+				full_length=full_len,
+				weight_scale=wrapper.weight_dequant_scale,
+			)
+		),
+		output_projection=lambda attn_out: _output_projection(wrapper, attn_out),
 	)
-	compressed_kv, cu_k, _ = (
-		wrapper.prefix_attention_kv_builder().build_mla_prefix_kv(
-			key=offload_kv,
-			metadata=metadata,
-			kv_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
-		)
-	)
-	blocked_k, block_table, cache_seqlens = _blocked_mla_kv_by_sequence(
-		compressed_kv=compressed_kv,
-		cu_k=cu_k,
-		page_size=wrapper.host_prefix_reader().page_size(),
-	)
-	attn_output = _run_flash_mla_prefix_attention(
-		wrapper=wrapper,
-		query_states=q_states,
-		blocked_k=blocked_k,
-		block_table=block_table,
-		cache_seqlens=cache_seqlens,
-		query_len=int(metadata.seq_lengths[0]),
-	)
-	return attn_output, offload_kv
 
 
 def run_glm5_full_hit_prefill(
@@ -87,71 +80,39 @@ def run_glm5_full_hit_prefill(
 		raise RuntimeError("GLM-5 full-hit prefill requires full sequence lengths")
 	metadata.validate_full_hit_query_lengths()
 
-	attn = wrapper.module
-	q_states = _project_query_states(
+	return run_prefix_mla_full_hit_prefill(
 		wrapper=wrapper,
 		hidden_states_2d=hidden_states_2d,
 		position_ids=position_ids,
-		full_length=max(metadata.full_seq_lengths),
-		weight_scale=wrapper.weight_dequant_scale,
-	)
-	compressed_kv, cu_k, _ = wrapper.prefix_attention_kv_builder().build_mla_full_hit_kv(
 		metadata=metadata,
-		kv_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
-		dtype=q_states.dtype,
-		device=hidden_states_2d.device,
-	)
-	blocked_k, block_table, cache_seqlens = _blocked_mla_kv_by_sequence(
-		compressed_kv=compressed_kv,
-		cu_k=cu_k,
-		page_size=wrapper.host_prefix_reader().page_size(),
-	)
-	return _run_flash_mla_prefix_attention(
-		wrapper=wrapper,
-		query_states=q_states,
-		blocked_k=blocked_k,
-		block_table=block_table,
-		cache_seqlens=cache_seqlens,
-		query_len=1,
+		spec=_mla_replay_spec(wrapper),
+		project_query=lambda hidden, pos, full_len: _project_query_states(
+			wrapper=wrapper,
+			hidden_states_2d=hidden,
+			position_ids=pos,
+			full_length=full_len,
+			weight_scale=wrapper.weight_dequant_scale,
+		),
+		output_projection=lambda attn_out: _output_projection(wrapper, attn_out),
 	)
 
 
-def _run_flash_mla_prefix_attention(
-	*,
-	wrapper: object,
-	query_states: torch.Tensor,
-	blocked_k: torch.Tensor,
-	block_table: torch.Tensor,
-	cache_seqlens: torch.Tensor,
-	query_len: int,
-) -> torch.Tensor:
+def _mla_replay_spec(wrapper: object) -> MlaReplaySpec:
 	attn = wrapper.module
-
-	from batchgen.attention.mla.flashmla_backend import (
-		flash_mla_with_kvcache,
-		get_mla_metadata,
+	return MlaReplaySpec(
+		kv_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
+		num_heads=attn.num_heads,
+		kv_lora_rank=attn.kv_lora_rank,
+		softmax_scale=attn.softmax_scale,
 	)
 
-	tile_scheduler_metadata, num_splits = get_mla_metadata(
-		cache_seqlens,
-		attn.num_heads,
-		int(query_len),
-	)
-	attn_out, _ = flash_mla_with_kvcache(
-		query_states,
-		blocked_k,
-		block_table,
-		cache_seqlens,
-		attn.kv_lora_rank,
-		tile_scheduler_metadata,
-		num_splits,
-		attn.softmax_scale,
-		True,
-	)
+
+def _output_projection(wrapper: object, attn_out: torch.Tensor) -> torch.Tensor:
+	attn = wrapper.module
 	out_absorb = _out_absorb_weights(wrapper)
 	attn_output = torch.einsum("bqhc,hdc->bqhd", attn_out, out_absorb)
 	attn_output = attn_output.reshape(
-		query_states.shape[0] * int(query_len),
+		attn_out.shape[0] * attn_out.shape[1],
 		attn.num_heads * attn.v_head_dim,
 	)
 	attn_output = _w8a16_gemm(
@@ -346,82 +307,6 @@ def _project_query_states(
 		attn.num_heads,
 		attn.kv_lora_rank + attn.qk_rope_head_dim,
 	).contiguous()
-
-
-def _blocked_mla_kv_by_sequence(
-	*,
-	compressed_kv: torch.Tensor,
-	cu_k: torch.Tensor,
-	page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-	if compressed_kv.dim() != 3:
-		raise RuntimeError(
-			f"GLM-5 compressed KV must be [tokens, 1, dim], got "
-			f"{tuple(compressed_kv.shape)}"
-		)
-	page_size = int(page_size)
-	cu_values = [int(value) for value in cu_k.detach().cpu().tolist()]
-	if len(cu_values) < 2:
-		raise RuntimeError("GLM-5 blocked KV build requires at least one sequence")
-
-	page_blocks = []
-	block_rows = []
-	cache_lengths = []
-	next_page_idx = 0
-	for seq_idx in range(len(cu_values) - 1):
-		start = cu_values[seq_idx]
-		end = cu_values[seq_idx + 1]
-		seq_len = end - start
-		if seq_len <= 0:
-			raise RuntimeError(
-				f"GLM-5 blocked KV build got empty sequence at index {seq_idx}"
-			)
-		segment = compressed_kv[start:end]
-		num_pages = (seq_len + page_size - 1) // page_size
-		padded_tokens = num_pages * page_size
-		if padded_tokens != seq_len:
-			padding = torch.zeros(
-				padded_tokens - seq_len,
-				compressed_kv.shape[1],
-				compressed_kv.shape[2],
-				dtype=compressed_kv.dtype,
-				device=compressed_kv.device,
-			)
-			segment = torch.cat([segment, padding], dim=0)
-		page_blocks.append(
-			segment.contiguous().view(
-				num_pages,
-				page_size,
-				compressed_kv.shape[1],
-				compressed_kv.shape[2],
-			)
-		)
-		block_rows.append(
-			torch.arange(
-				next_page_idx,
-				next_page_idx + num_pages,
-				dtype=torch.int32,
-				device=compressed_kv.device,
-			)
-		)
-		cache_lengths.append(seq_len)
-		next_page_idx += num_pages
-
-	blocked_k = torch.cat(page_blocks, dim=0)
-	max_pages = max(int(row.numel()) for row in block_rows)
-	block_table = torch.zeros(
-		(len(block_rows), max_pages),
-		dtype=torch.int32,
-		device=compressed_kv.device,
-	)
-	for row_idx, row in enumerate(block_rows):
-		block_table[row_idx, : row.numel()] = row
-	cache_seqlens = torch.tensor(
-		cache_lengths,
-		dtype=torch.int32,
-		device=compressed_kv.device,
-	)
-	return blocked_k, block_table, cache_seqlens
 
 
 def _q_absorb_weights(wrapper: object) -> torch.Tensor:
