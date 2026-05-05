@@ -806,13 +806,32 @@ class DeepSeekV4FlashIndexer(nn.Module):
             or self.kv_cache.device != device
             or self.kv_cache.dtype != dtype
         ):
-            self.kv_cache = torch.zeros(
+            old_cache = self.kv_cache
+            new_cache = torch.zeros(
                 bsz,
                 cache_len,
                 self.head_dim,
                 dtype=dtype,
                 device=device,
             )
+            # Preserve previously written compressed KV. Without this copy
+            # the indexer's cache is wiped every time cache_len grows (every
+            # compress_ratio decode steps), so top-k scoring sees zeros and
+            # the model degenerates after a handful of tokens.
+            if old_cache is not None:
+                copy_bsz = min(bsz, old_cache.size(0))
+                copy_len = min(cache_len, old_cache.size(1))
+                if (
+                    copy_bsz > 0
+                    and copy_len > 0
+                    and old_cache.device == device
+                    and old_cache.dtype == dtype
+                ):
+                    new_cache[:copy_bsz, :copy_len] = old_cache[
+                        :copy_bsz,
+                        :copy_len,
+                    ]
+            self.kv_cache = new_cache
         self.compressor.kv_cache = self.kv_cache
         self.compressor.freqs_cis = self.freqs_cis
 
