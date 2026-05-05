@@ -556,7 +556,14 @@ class PrefixAwarePrefillOffloader:
                 ),
             )
 
-    def offload_mla(self, *, key: torch.Tensor) -> None:
+    def offload_mla(
+        self,
+        *,
+        key: torch.Tensor,
+        sequence_callback: Optional[
+            Callable[[int, int, int, torch.Tensor], None]
+        ] = None,
+    ) -> None:
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
         for seq_idx, sequence_id in enumerate(self.metadata.global_sequence_ids):
@@ -572,6 +579,8 @@ class PrefixAwarePrefillOffloader:
                 raise RuntimeError(
                     f"MLA prefill offload expects 2D or 3D KV, got {seq_key.dim()}D"
                 )
+            if sequence_callback is not None:
+                sequence_callback(seq_idx, sequence_id, seq_len, seq_key)
             self._offload_one(
                 sequence_id=sequence_id,
                 k_tensor=seq_key,
