@@ -36,6 +36,7 @@ from batchgen.models.glm.glm5.decode_utils import (
 )
 from batchgen.models.glm.glm5.prefix_reuse import (
     offload_glm5_prepacked_mla_kv,
+    run_glm5_full_hit_prefill,
     run_glm5_prefix_aware_prefill,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
@@ -440,6 +441,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
             hidden_states_2d = hidden_states.squeeze(0)
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
+            if metadata.full_hit_mode:
+                attn_output = run_glm5_full_hit_prefill(
+                    wrapper=self,
+                    hidden_states_2d=hidden_states_2d,
+                    position_ids=position_ids,
+                    metadata=metadata,
+                )
+                return (attn_output.unsqueeze(0), None, None)
             if metadata.prefix_reuse_mode:
                 attn_output, offload_kv = run_glm5_prefix_aware_prefill(
                     wrapper=self,
