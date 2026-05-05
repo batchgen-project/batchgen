@@ -80,9 +80,27 @@ def _kernel_sparse_attn(
 
 
 def _install_reference_kernel_stub() -> None:
+    # Reuse the real QAT helpers from the BatchGen module so the reference and
+    # BatchGen apply identical quant. Passthrough stubs would hide divergence
+    # between the two paths (both would skip QAT) and the parity test would
+    # silently miss the V4-Flash decode-corruption bug we just fixed.
+    from batchgen.models.deepseek.deepseekv4_flash.model import (
+        _qat_fp8_act_quant_inplace,
+        _qat_fp4_act_quant_inplace,
+    )
+
     kernel = types.ModuleType("kernel")
-    kernel.act_quant = lambda x, *args, **kwargs: (x, torch.ones((), device=x.device))
-    kernel.fp4_act_quant = lambda x, *args, **kwargs: x
+
+    def _act_quant(x, block_size, scale_fmt=None, scale_dtype=None, inplace=True):
+        _qat_fp8_act_quant_inplace(x, block_size=block_size)
+        return x, torch.ones((), device=x.device)
+
+    def _fp4_act_quant(x, block_size, inplace=True):
+        _qat_fp4_act_quant_inplace(x, block_size=block_size)
+        return x
+
+    kernel.act_quant = _act_quant
+    kernel.fp4_act_quant = _fp4_act_quant
     kernel.fp8_gemm = lambda x, scale, weight, weight_scale, scale_dtype=None: F.linear(
         x, weight.to(dtype=x.dtype)
     )
@@ -104,6 +122,10 @@ def ref():
     module.default_dtype = torch.float32
     module.scale_fmt = None
     module.scale_dtype = torch.float32
+    # Reference's rotate_activation imports `fast_hadamard_transform` (often
+    # CUDA-only). Reuse BatchGen's helper which has a CPU fallback so both
+    # sides compute the same orthonormal transform during parity tests.
+    module.rotate_activation = bg._qat_hadamard_rotate
     return module
 
 

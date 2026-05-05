@@ -159,6 +159,162 @@ def _apply_rotary_emb_inplace(
     x.copy_(rotated.to(dtype=x.dtype).view(*x.shape[:-1], rope_dim))
 
 
+# ---------------------------------------------------------------------------
+# QAT (quantization-aware-training) simulation helpers
+# ---------------------------------------------------------------------------
+#
+# The DeepSeek-V4-Flash reference implementation at
+# `assets/inference/model.py` applies these three operations on K, V, and the
+# indexer's q at every cache write — the comment at line 505 of that file
+# makes the intent explicit:
+#
+#   # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for
+#   # positional precision
+#
+# The model was trained with these QAT simulations applied. Skipping them
+# at inference produces drift from the trained activation distribution that
+# accumulates over decode steps and shows up as "model emits 2-5 valid
+# tokens then degenerates". See the call sites in DeepSeekV4FlashAttention,
+# DeepSeekV4FlashCompressor (rotate=True / rotate=False), and
+# DeepSeekV4FlashIndexer below.
+#
+# Numerical spec is taken from `assets/inference/kernel.py:105-201`. We
+# match: per-block amax, scale = amax / fp_max (with FP4 scales rounded to
+# power-of-2), in-place round-trip dequant via the matching torch FP8 dtype.
+# PyTorch lacks a native FP4 dtype so we enumerate the 15 E2M1FN values.
+
+# matches assets/inference/kernel.py and the call sites at model.py:506, 372
+_QAT_FP8_BLOCK_SIZE = 64
+# matches `fp4_block_size = 32` at assets/inference/model.py:18
+_QAT_FP4_BLOCK_SIZE = 32
+
+# FP4 E2M1FN representable magnitudes; sign added separately. Values are the
+# fixed point set the reference's tilelang fp4_quant_kernel rounds to.
+_QAT_FP4_VALUES = (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+                   0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _qat_fp8_act_quant_inplace(
+    x: torch.Tensor, block_size: int = _QAT_FP8_BLOCK_SIZE
+) -> None:
+    """Per-block FP8 E4M3 round-trip in place, matching the reference's
+    ``act_quant(x, block_size, ..., inplace=True)`` at kernel.py:105-126.
+
+    Computes per-block amax (last dim, blocks of ``block_size``), scale =
+    amax / 448, casts to ``float8_e4m3fn`` (round-to-nearest at FP8
+    boundaries), dequantises by multiplying by scale, casts back to the
+    input dtype, and writes the result back into ``x``. Equivalent to the
+    QAT noise applied during V4-Flash training.
+    """
+    if x.numel() == 0:
+        return
+    last = x.shape[-1]
+    if last % block_size != 0:
+        raise ValueError(
+            f"_qat_fp8_act_quant_inplace: last dim {last} must be a multiple "
+            f"of block_size {block_size}"
+        )
+    orig_dtype = x.dtype
+    *prefix, _ = x.shape
+    blocks = x.view(*prefix, last // block_size, block_size).float()
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = amax / 448.0
+    fp8_max = 448.0
+    quantised = (blocks / scale).clamp_(-fp8_max, fp8_max)
+    quantised = quantised.to(torch.float8_e4m3fn).to(torch.float32)
+    dequantised = (quantised * scale).to(orig_dtype)
+    x.copy_(dequantised.view_as(x))
+
+
+def _qat_fp4_act_quant_inplace(
+    x: torch.Tensor, block_size: int = _QAT_FP4_BLOCK_SIZE
+) -> None:
+    """Per-block FP4 E2M1FN round-trip in place, matching the reference's
+    ``fp4_act_quant(x, block_size, inplace=True)`` at kernel.py:186-201.
+
+    Per-block amax / 6 → scale, scale rounded *up* to the next power-of-2,
+    block elements rounded to the nearest of the 15 FP4 magnitudes (with
+    sign), then multiplied back by scale. PyTorch has no native FP4 dtype,
+    so the round step enumerates representable values explicitly.
+    """
+    if x.numel() == 0:
+        return
+    last = x.shape[-1]
+    if last % block_size != 0:
+        raise ValueError(
+            f"_qat_fp4_act_quant_inplace: last dim {last} must be a multiple "
+            f"of block_size {block_size}"
+        )
+    orig_dtype = x.dtype
+    *prefix, _ = x.shape
+    blocks = x.view(*prefix, last // block_size, block_size).float()
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    raw_scale = amax / 6.0
+    # Round up to the next power-of-2; matches kernel.py:164 fast_round_scale.
+    pow2_scale = torch.pow(2.0, torch.ceil(torch.log2(raw_scale)))
+    scaled = (blocks / pow2_scale).clamp_(-6.0, 6.0)
+    fp4_values = torch.tensor(_QAT_FP4_VALUES, dtype=torch.float32, device=x.device)
+    diffs = (scaled.unsqueeze(-1) - fp4_values).abs()
+    rounded = fp4_values[diffs.argmin(dim=-1)]
+    dequantised = (rounded * pow2_scale).to(orig_dtype)
+    x.copy_(dequantised.view_as(x))
+
+
+def _qat_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard rotation matching the reference's ``rotate_activation`` at
+    assets/inference/model.py:247-251. The reference imports
+    ``fast_hadamard_transform.hadamard_transform``; we prefer that module
+    when available (CPU+GPU, exact same kernel), then fall back to
+    BatchGen's CUDA wrapper (GPU-only), then to a pure-PyTorch Walsh-
+    Hadamard butterfly (CPU) for parity tests.
+    """
+    if x.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"_qat_hadamard_rotate expects bf16; got {x.dtype}"
+        )
+    scale = x.size(-1) ** -0.5
+    try:
+        from fast_hadamard_transform import hadamard_transform as _ext_hadamard
+
+        return _ext_hadamard(x, scale=scale)
+    except ImportError:
+        pass
+    if x.is_cuda:
+        from batchgen.other_kernels.hadamard_transform import (
+            hadamard_transform as _bg_hadamard,
+        )
+
+        return _bg_hadamard(x, scale=scale)
+    return _qat_hadamard_python_cpu(x, scale)
+
+
+def _qat_hadamard_python_cpu(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-PyTorch Walsh-Hadamard along the last dim, multiplied by ``scale``.
+
+    Used only as a CPU fallback for parity tests when neither
+    ``fast_hadamard_transform`` nor BatchGen's CUDA Hadamard kernel is
+    available. Last dim must be a power of two.
+    """
+    last = x.shape[-1]
+    if last & (last - 1):
+        raise ValueError(
+            f"_qat_hadamard_python_cpu requires a power-of-2 last dim, got {last}"
+        )
+    y = x.float().contiguous()
+    h = 1
+    while h < last:
+        # Reshape so the transform pair lives along dim -2.
+        groups = last // (2 * h)
+        view = y.view(*y.shape[:-1], groups, 2, h)
+        a = view[..., 0, :].clone()
+        b = view[..., 1, :].clone()
+        view[..., 0, :] = a + b
+        view[..., 1, :] = a - b
+        y = view.reshape(*y.shape[:-1], last)
+        h *= 2
+    return (y * scale).to(x.dtype)
+
+
 def _linear_from_weight(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -420,6 +576,7 @@ class DeepSeekV4FlashCompressor(nn.Module):
         compress_ratio: int,
         eps: float,
         overlap: bool = False,
+        rotate: bool = False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -427,6 +584,13 @@ class DeepSeekV4FlashCompressor(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.compress_ratio = compress_ratio
         self.overlap = overlap
+        # When rotate=True (only the indexer's compressor sets this), the
+        # reference applies a Hadamard + FP4 round-trip on the compressed
+        # kv before writing to cache (assets/inference/model.py:368-370,
+        # via Compressor(rotate=True)). When False, it applies an FP8
+        # round-trip on the non-rope dims (line 372). See _qat_*_inplace
+        # helpers near the top of this file.
+        self.rotate = rotate
         coeff = 2 if overlap else 1
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, coeff * head_dim, dtype=torch.float32)
@@ -562,6 +726,14 @@ class DeepSeekV4FlashCompressor(nn.Module):
         else:
             freqs_cis = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
         _apply_rotary_emb_inplace(kv[..., -rd:], freqs_cis)
+        # QAT simulation, matching reference assets/inference/model.py:367-372.
+        # rotate=True branch is the indexer's compressor; rotate=False is the
+        # main attention's compressor. See _qat_*_inplace helpers.
+        if self.rotate:
+            kv = _qat_hadamard_rotate(kv)
+            _qat_fp4_act_quant_inplace(kv)
+        else:
+            _qat_fp8_act_quant_inplace(kv[..., :-rd])
         if start_pos == 0:
             self.kv_cache[:bsz, : seqlen // ratio] = kv
         else:
@@ -602,6 +774,9 @@ class DeepSeekV4FlashIndexer(nn.Module):
             compress_ratio,
             eps,
             overlap=True,
+            # The indexer's compressor uses Hadamard + FP4 simulation
+            # (assets/inference/model.py:398 passes True for rotate).
+            rotate=True,
         )
         self.kv_cache: Optional[torch.Tensor] = None
         self.freqs_cis: Optional[torch.Tensor] = None
@@ -663,6 +838,13 @@ class DeepSeekV4FlashIndexer(nn.Module):
             freqs_cis = self.freqs_cis[start_pos:end_pos]
         rd = min(self.compressor.rope_head_dim, self.head_dim)
         _apply_rotary_emb_inplace(q[..., -rd:], freqs_cis)
+        # QAT: Hadamard + FP4 round-trip on q, matching reference
+        # assets/inference/model.py:414-416. Mirrors the indexer's
+        # compressor's rotate=True branch so q · kv stays consistent under
+        # quant noise (the einsum below would otherwise mix un-rotated q
+        # with rotated kv_cache).
+        q = _qat_hadamard_rotate(q)
+        _qat_fp4_act_quant_inplace(q)
 
         self.compressor(x, start_pos)
         cache_len = end_pos // ratio
@@ -1111,6 +1293,12 @@ class DeepSeekV4FlashAttention(nn.Module):
             position_ids=position_ids,
             cache_seqlens=cache_seqlens,
         )
+        # QAT: FP8 round-trip on the non-rope dims of kv before it is fed
+        # to attention and (for the decode path) written to the window
+        # cache. Matches reference assets/inference/model.py:506. Rope dims
+        # stay bf16 for positional precision.
+        if self.rope_head_dim < self.head_dim:
+            _qat_fp8_act_quant_inplace(kv[..., :-self.rope_head_dim])
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} wkv done")
         kv_for_attn = kv
