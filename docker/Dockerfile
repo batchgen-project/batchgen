@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     HF_ENDPOINT=https://hf-mirror.com
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # RDMA Python UV
 RUN apt-get update && apt-get install -y --no-install-recommends \
