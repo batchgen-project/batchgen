@@ -87,7 +87,11 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_glm5_backend_model, is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import (
+	is_glm5_backend_model,
+	is_kimi_k25_backend_model,
+	is_prefix_reuse_supported_model,
+)
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
@@ -425,14 +429,10 @@ class BatchGenWorker:
 		self.host_kv_eviction_watermark = args.host_kv_eviction_watermark
 		self.enable_prefix_reuse = args.enable_prefix_reuse
 		if self.enable_prefix_reuse:
-			model_lower = args.model_name.lower()
-			if is_dsa_model(args.model_name):
+			if not is_prefix_reuse_supported_model(args.model_name):
 				raise ValueError(
-					"Prefix reuse is not implemented for DSA/dual-host-KV models"
-				)
-			if "gpt-oss" not in model_lower:
-				raise ValueError(
-					"Prefix reuse is currently gated to GPT-OSS/GQA models"
+					"Prefix reuse is currently supported only for GPT-OSS/GQA "
+					"and GLM-5 DSA models"
 				)
 		# Eviction is always enabled — it's a correctness requirement for chunked host KV
 		self.enable_host_kv_eviction = True

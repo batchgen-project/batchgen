@@ -41,3 +41,17 @@ GLM5_BACKEND_NAME_PATTERNS = (
 def is_glm5_backend_model(model_name: str | None) -> bool:
     normalized = (model_name or "").strip().lower()
     return any(pattern in normalized for pattern in GLM5_BACKEND_NAME_PATTERNS)
+
+
+PREFIX_REUSE_GPT_OSS_PATTERNS = (
+    "gpt-oss",
+)
+
+
+def is_prefix_reuse_supported_model(model_name: str | None) -> bool:
+    """Return whether the model has a prefix-cache-aware prefill path."""
+    normalized = (model_name or "").strip().lower()
+    return (
+        any(pattern in normalized for pattern in PREFIX_REUSE_GPT_OSS_PATTERNS)
+        or is_glm5_backend_model(model_name)
+    )

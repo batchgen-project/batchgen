@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from batchgen.config.model_name_utils import is_prefix_reuse_supported_model
+
 
 def is_port_available(port: int) -> bool:
     """Return whether a port is available."""
@@ -497,10 +499,10 @@ def validate_server_args(args: ServerArgs) -> None:
     if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
         raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
     if args.enable_prefix_reuse:
-        model_lower = args.model.lower()
-        if "gpt-oss" not in model_lower:
+        if not is_prefix_reuse_supported_model(args.model):
             raise ValueError(
-                "--enable-prefix-reuse is currently supported only for GPT-OSS/GQA models"
+                "--enable-prefix-reuse is currently supported only for "
+                "GPT-OSS/GQA and GLM-5 DSA models"
             )
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
