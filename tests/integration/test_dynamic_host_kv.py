@@ -25,6 +25,7 @@ from batchgen.continuous_batching import (
     plan_host_kv_growth_evictions,
     select_sequences_for_eviction,
     select_sequences_for_loading,
+    validate_boundary_payload_alignment,
 )
 
 
@@ -58,6 +59,94 @@ def make_seq(
             prompt_length + 1, prompt_length + 1 + decoded_length
         )
     return seq
+
+
+class TestBoundaryPayloadAlignment:
+    def test_active_decode_uuids_must_have_owner_metadata(self):
+        payloads = [
+            {
+                "free_pages": 10,
+                "seq_state": {
+                    "seq-a": {"assigned_rank": 0, "decoded_length": 8},
+                },
+                "candidate_state": {},
+            },
+            {
+                "free_pages": 10,
+                "seq_state": {},
+                "candidate_state": {},
+            },
+        ]
+
+        with pytest.raises(RuntimeError, match="decode UUIDs missing"):
+            validate_boundary_payload_alignment(["seq-a", "seq-b"], payloads)
+
+    def test_active_decode_uuids_must_be_reported_by_assigned_rank(self):
+        payloads = [
+            {
+                "free_pages": 10,
+                "seq_state": {
+                    "seq-a": {"assigned_rank": 1, "decoded_length": 8},
+                },
+                "candidate_state": {},
+            },
+            {
+                "free_pages": 10,
+                "seq_state": {},
+                "candidate_state": {},
+            },
+        ]
+
+        with pytest.raises(RuntimeError, match="active UUID owner/rank mismatch"):
+            validate_boundary_payload_alignment(["seq-a"], payloads)
+
+    def test_active_decode_uuids_cannot_also_be_load_candidates(self):
+        payloads = [
+            {
+                "free_pages": 10,
+                "seq_state": {
+                    "seq-a": {"assigned_rank": 0, "decoded_length": 8},
+                },
+                "candidate_state": {
+                    "seq-a": {
+                        "assigned_rank": 0,
+                        "status": "ON_HOLD",
+                        "decoded_length": 8,
+                        "pages_needed": 1,
+                    },
+                },
+            },
+        ]
+
+        with pytest.raises(RuntimeError, match="also reported as load candidates"):
+            validate_boundary_payload_alignment(["seq-a"], payloads)
+
+    def test_aligned_boundary_payload_passes(self):
+        payloads = [
+            {
+                "free_pages": 10,
+                "seq_state": {
+                    "seq-a": {"assigned_rank": 0, "decoded_length": 8},
+                },
+                "candidate_state": {},
+            },
+            {
+                "free_pages": 10,
+                "seq_state": {
+                    "seq-b": {"assigned_rank": 1, "decoded_length": 9},
+                },
+                "candidate_state": {
+                    "seq-c": {
+                        "assigned_rank": 1,
+                        "status": "ON_HOLD",
+                        "decoded_length": 100,
+                        "pages_needed": 2,
+                    },
+                },
+            },
+        ]
+
+        validate_boundary_payload_alignment(["seq-a", "seq-b"], payloads)
 
 
 # ============ SequenceEntry: Host KV Growth ============

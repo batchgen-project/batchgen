@@ -94,6 +94,130 @@ class BoundaryDecisions:
     scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
 
 
+def _format_ranked_reports(reports: Dict[str, List[int]], limit: int = 8) -> str:
+    items = sorted(reports.items(), key=lambda item: item[0])[:limit]
+    return ", ".join(f"{uuid}:{ranks}" for uuid, ranks in items)
+
+
+def validate_boundary_payload_alignment(
+    decode_uuids: List[str],
+    all_payloads: List[Optional[Dict[str, Any]]],
+) -> None:
+    """Fail fast when boundary all-gather ownership metadata is inconsistent.
+
+    Every UUID in the active decode list must be reported exactly once in
+    ``seq_state`` by its assigned rank. Load candidates must be reported exactly
+    once and must not overlap active decode UUIDs. Violations mean scheduler
+    state is already corrupt enough that silently completing or dropping rows
+    would hide data loss and can lead to long-tail stalls.
+    """
+    errors: List[str] = []
+    active_reports: Dict[str, List[int]] = {}
+    candidate_reports: Dict[str, List[int]] = {}
+    active_wrong_owner: List[Tuple[str, int, Any]] = []
+    candidate_wrong_owner: List[Tuple[str, int, Any]] = []
+    candidate_bad_status: List[Tuple[str, int, Any]] = []
+
+    for rank_idx, payload in enumerate(all_payloads):
+        if not isinstance(payload, dict):
+            errors.append(f"rank {rank_idx} payload missing or invalid: {type(payload).__name__}")
+            continue
+
+        seq_state = payload.get("seq_state") or {}
+        candidate_state = payload.get("candidate_state") or {}
+
+        for uuid, state in seq_state.items():
+            active_reports.setdefault(uuid, []).append(rank_idx)
+            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+            if assigned_rank is not None:
+                try:
+                    assigned_rank_int = int(assigned_rank)
+                except (TypeError, ValueError):
+                    active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
+                    if assigned_rank_int != rank_idx:
+                        active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+
+        for uuid, state in candidate_state.items():
+            candidate_reports.setdefault(uuid, []).append(rank_idx)
+            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+            if assigned_rank is not None:
+                try:
+                    assigned_rank_int = int(assigned_rank)
+                except (TypeError, ValueError):
+                    candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
+                    if assigned_rank_int != rank_idx:
+                        candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+            status = state.get("status") if isinstance(state, dict) else None
+            if status not in (None, "PREFILLED", "ON_HOLD"):
+                candidate_bad_status.append((uuid, rank_idx, status))
+
+    missing_active = [uuid for uuid in decode_uuids if uuid not in active_reports]
+    if missing_active:
+        errors.append(
+            "decode UUIDs missing from gathered seq_state: "
+            f"count={len(missing_active)} first={missing_active[:8]}"
+        )
+
+    duplicate_active = {
+        uuid: ranks for uuid, ranks in active_reports.items() if len(ranks) != 1
+    }
+    if duplicate_active:
+        errors.append(
+            "active UUIDs reported by multiple ranks: "
+            f"{_format_ranked_reports(duplicate_active)}"
+        )
+
+    duplicate_candidates = {
+        uuid: ranks for uuid, ranks in candidate_reports.items() if len(ranks) != 1
+    }
+    if duplicate_candidates:
+        errors.append(
+            "load candidates reported by multiple ranks: "
+            f"{_format_ranked_reports(duplicate_candidates)}"
+        )
+
+    active_candidate_overlap = [
+        uuid for uuid in decode_uuids if uuid in candidate_reports
+    ]
+    if active_candidate_overlap:
+        errors.append(
+            "decode UUIDs also reported as load candidates: "
+            f"count={len(active_candidate_overlap)} first={active_candidate_overlap[:8]}"
+        )
+
+    if active_wrong_owner:
+        errors.append(
+            "active UUID owner/rank mismatch: "
+            + ", ".join(
+                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                for uuid, rank, assigned in active_wrong_owner[:8]
+            )
+        )
+
+    if candidate_wrong_owner:
+        errors.append(
+            "candidate UUID owner/rank mismatch: "
+            + ", ".join(
+                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                for uuid, rank, assigned in candidate_wrong_owner[:8]
+            )
+        )
+
+    if candidate_bad_status:
+        errors.append(
+            "load candidates have invalid status: "
+            + ", ".join(
+                f"{uuid}(rank={rank}, status={status})"
+                for uuid, rank, status in candidate_bad_status[:8]
+            )
+        )
+
+    if errors:
+        raise RuntimeError("[SCHED_INVARIANT] boundary gather misalignment: " + " | ".join(errors))
+
+
 class LoadingStrategy(Enum):
     """Strategy for selecting which sequences to load from host."""
 

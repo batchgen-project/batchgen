@@ -118,6 +118,7 @@ from batchgen.continuous_batching import (
 	EvictionStrategy,
 	LoadingStrategy,
 	select_sequences_for_loading,
+	validate_boundary_payload_alignment,
 )
 # sample_tokens: Token sampling with temperature/top_p support
 from batchgen.sampling import sample_tokens
@@ -7509,6 +7510,7 @@ class BatchGenWorker:
 		
 		all_payloads = [None] * self.world_size
 		dist.all_gather_object(all_payloads, local_payload)
+		validate_boundary_payload_alignment(decode_uuids, all_payloads)
 		
 		timing.gather_ms = (time.perf_counter() - t0) * 1000
 		
@@ -7535,6 +7537,7 @@ class BatchGenWorker:
 		# VALIDATION: Check that all decode_uuids have state reported
 		missing_uuids = [u for u in decode_uuids if u not in global_seq_state]
 		if missing_uuids:
+			missing_details = []
 			for missing_uuid in missing_uuids[:10]:
 				seq = self.global_batch.get_sequence(missing_uuid)
 				expected_rank = seq.assigned_rank if seq else "N/A"
@@ -7542,39 +7545,15 @@ class BatchGenWorker:
 				seq_status = seq.status.name if seq else "NOT_FOUND"
 				rank_reported = [r for r, p in enumerate(all_payloads)
 								if p and p.get('seq_state', {}).get(missing_uuid)]
-				logging.error(
-					f"Rank {self.rank}: Missing UUID={missing_uuid}, assigned_rank={expected_rank}, "
-					f"in_local_map={in_local_map}, status={seq_status}, reported_by_ranks={rank_reported}"
+				missing_details.append(
+					f"{missing_uuid}(assigned_rank={expected_rank}, in_local_map={in_local_map}, "
+					f"status={seq_status}, reported_by_ranks={rank_reported})"
 				)
-			logging.error(
-				f"Rank {self.rank}: CRITICAL - {len(missing_uuids)} sequences missing from gathered state! "
-				f"decode_uuids_len={len(decode_uuids)}, global_seq_state_len={len(global_seq_state)}, "
-				f"Missing first 5: {missing_uuids[:5]}"
+			raise RuntimeError(
+				f"Rank {self.rank}: [SCHED_INVARIANT] {len(missing_uuids)} active decode "
+				f"UUIDs missing from gathered seq_state; decode_uuids_len={len(decode_uuids)}, "
+				f"global_seq_state_len={len(global_seq_state)}, details={missing_details}"
 			)
-			# DEFENSIVE: mark orphaned sequences as COMPLETED on all ranks so
-			# they stop coming back to this filter every boundary and eventually
-			# desync a collective. These sequences are unrecoverable — their
-			# local_map entry on the owner was lost, so their decoded_tokens /
-			# input_ids buffers are no longer reachable. Force-terminating them
-			# contains the damage to the affected sequences rather than
-			# crashing the whole server after a 1-hour NCCL timeout.
-			for orphan_uuid in missing_uuids:
-				orphan_seq = self.global_batch.get_sequence(orphan_uuid)
-				if orphan_seq is None:
-					continue
-				orphan_seq.gpu_pages_allocated = 0
-				orphan_seq.host_pages_allocated = 0
-				orphan_seq.host_token_capacity = 0
-				self._sequences_with_gpu_kv.discard(orphan_uuid)
-				if orphan_seq.status != SequenceStatus.COMPLETED:
-					try:
-						self.global_batch.update_status(orphan_uuid, SequenceStatus.COMPLETED)
-					except ValueError:
-						# If current status doesn't allow direct transition to
-						# COMPLETED (e.g., QUEUEING), at least drop it from
-						# active tracking.
-						pass
-			decode_uuids = [u for u in decode_uuids if u in global_seq_state]
 
 		# Update local SequenceEntry with gathered info (for sequences on other ranks)
 		for uuid, state in global_seq_state.items():
