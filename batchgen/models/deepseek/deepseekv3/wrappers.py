@@ -29,6 +29,10 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from batchgen.models.deepseek.deepseekv3.prefix_reuse import (
+    run_deepseek_full_hit_prefill,
+    run_deepseek_prefix_aware_prefill,
+)
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 
@@ -268,15 +272,34 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
             # Prepack mode: hidden_states is [1, total_tokens, hidden_dim]
             # Prepacked attention expects [total_tokens, hidden_dim]
             hidden_states_2d = hidden_states.squeeze(0)
+            metadata = self.prefix_cache_metadata()
+            position_ids = self.position_ids.to(hidden_states_2d.device)
 
-            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
-                self.weight_dequant_scale
-            )
+            if metadata.full_hit_mode:
+                attn_output = run_deepseek_full_hit_prefill(
+                    wrapper=self,
+                    hidden_states_2d=hidden_states_2d,
+                    position_ids=position_ids,
+                    metadata=metadata,
+                )
+                return (attn_output.unsqueeze(0), None, None)
+
+            if metadata.prefix_reuse_mode:
+                attn_output, offload_kv = run_deepseek_prefix_aware_prefill(
+                    wrapper=self,
+                    hidden_states_2d=hidden_states_2d,
+                    position_ids=position_ids,
+                    metadata=metadata,
+                )
+            else:
+                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                    hidden_states_2d,
+                    position_ids,
+                    self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                    self.prepack_max_seqlen,
+                    self.prepack_num_sequences,
+                    self.weight_dequant_scale
+                )
 
             # Offload KV cache per-sequence to host
             # offload_kv is [total_tokens, kv_lora_rank + qk_rope_head_dim]
