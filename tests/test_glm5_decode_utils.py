@@ -689,7 +689,7 @@ def test_glm5_dsa_graph_compare_layer_filter(monkeypatch):
         AttnWrapperBase.batchgen_debug = old_debug
 
 
-def test_glm5_dsa_cuda_graph_replay_gate_requires_fixed_flashmla_length():
+def test_glm5_dsa_cuda_graph_replay_gate_allows_short_rows_with_fixed_selected_kv():
     index_topk = 4
 
     assert _glm5_dsa_cuda_graph_can_replay(
@@ -703,15 +703,21 @@ def test_glm5_dsa_cuda_graph_replay_gate_requires_fixed_flashmla_length():
         index_topk=index_topk,
         captured_max_seqlen=8,
     )
-    assert not _glm5_dsa_cuda_graph_can_replay(
+    assert _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([1, 4], dtype=torch.int32),
         max_seqlen=4,
         index_topk=index_topk,
         captured_max_seqlen=8,
     )
-    assert not _glm5_dsa_cuda_graph_can_replay(
+    assert _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([2, 4, 7], dtype=torch.int32),
         max_seqlen=7,
+        index_topk=index_topk,
+        captured_max_seqlen=8,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([[1, 4]], dtype=torch.int32),
+        max_seqlen=4,
         index_topk=index_topk,
         captured_max_seqlen=8,
     )
@@ -719,6 +725,11 @@ def test_glm5_dsa_cuda_graph_replay_gate_requires_fixed_flashmla_length():
         torch.tensor([1, 4], dtype=torch.int32),
         max_seqlen=0,
         index_topk=index_topk,
+    )
+    assert not _glm5_dsa_cuda_graph_can_replay(
+        torch.tensor([1, 4], dtype=torch.int32),
+        max_seqlen=4,
+        index_topk=0,
     )
     assert not _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([5, 7], dtype=torch.int32),
@@ -890,6 +901,56 @@ def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
     out = moe._forward_decode(hidden)
 
     assert torch.equal(out, hidden + 1)
+
+
+def test_glm5_dsa_graph_path_allows_short_rows_with_fixed_selected_kv(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 40
+
+    class FakeManager:
+        bucketing = FakeBucketing()
+
+        def has_graph(self, segment_name, batch_size):
+            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
+
+    class FakeWrapper:
+        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+        _dsa_cuda_graph_max_seqlen = 8192
+        module = types.SimpleNamespace(
+            indexer=types.SimpleNamespace(index_topk=2048),
+        )
+
+        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
+            return True
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = FakeManager()
+    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=object())
+    worker.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
+        ),
+    )
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "cache_seqlens",
+        torch.tensor([970, 982], dtype=torch.int32),
+        raising=False,
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
+
+    assert worker._glm5_dsa_graph_path_state(2, object()) == (
+        "graph",
+        40,
+        "captured",
+    )
 
 
 def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):

@@ -144,22 +144,18 @@ def _glm5_dsa_cuda_graph_can_replay(
 ) -> bool:
     """Return whether the fixed selected-KV graph contract can replay.
 
-    The unified selector always writes the same fixed selected-KV buffer
-    ``[B, index_topk, 1, kv_dim]``, but FlashMLA scheduler metadata is still
-    captured for the fixed selected length. Rows shorter than ``index_topk``
-    must stay on eager DSA until length-bucketed graph metadata exists.
+    The unified selector always writes a fixed selected-KV buffer
+    ``[B, index_topk, 1, kv_dim]``. Runtime row lengths are carried by
+    ``selected_lengths`` and must not route short rows to eager DSA.
     """
 
-    if max_seqlen <= 0:
+    if max_seqlen <= 0 or index_topk <= 0:
         return False
     if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
         return False
-    graph_max_seqlen = captured_max_seqlen if captured_max_seqlen is not None else max_seqlen
-    if graph_max_seqlen < index_topk:
-        return False
     if cache_seqlens.ndim != 1:
         return False
-    return bool(torch.all(cache_seqlens >= index_topk).item())
+    return True
 
 
 def _log_glm5_dsa_graph_eager_fallback_once(
@@ -1146,11 +1142,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
                         f"max_seqlen={max_seqlen} exceeds captured cap "
                         f"{captured_cap}"
                     )
-                elif captured_cap is not None and captured_cap < index_topk:
-                    reason = (
-                        f"captured cap {captured_cap} is smaller than "
-                        f"index_topk={index_topk}"
-                    )
+                elif index_topk <= 0:
+                    reason = f"invalid index_topk={index_topk}"
+                elif cache_seqlens.ndim != 1:
+                    reason = f"cache_seqlens ndim {cache_seqlens.ndim} is not 1"
                 else:
                     reason = "current decode metadata is not graph-compatible"
             elif not graph_has_bucket:
