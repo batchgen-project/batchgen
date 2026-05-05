@@ -21,6 +21,11 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
 from batchgen.models.engine_loader import core_engine as bg_lib
+from batchgen.prefix_reuse.dual_prefix_cache import (
+	assert_matching_prefix_allocation_results,
+	assert_matching_prefix_eviction_results,
+	assert_matching_prefix_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +75,12 @@ def _try_set_logger_name(config, name: str) -> bool:
 		return False
 
 
-def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> Any:
-	"""Build a bg_lib.HostPagedKVConfig from a _HostKVModelProfile."""
+def _build_host_config_from_profile(
+	profile,
+	shm_name: str,
+	num_pages: int,
+) -> Any:
+	"""Build a HostPagedKVConfig from a _HostKVModelProfile."""
 	from batchgen.kv_cache.host_kv_mananger_config import _dtype_size_bytes
 
 	config = bg_lib.HostPagedKVConfig()
@@ -170,10 +179,14 @@ class DualHostKVCoordinator:
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile,
+			HOST_KV_SHM_NAME,
+			num_pages,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile,
+			HOST_KV_AUX_SHM_NAME,
+			num_pages,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision
@@ -227,10 +240,14 @@ class DualHostKVCoordinator:
 		)
 
 		primary_config = _build_host_config_from_profile(
-			primary_profile, HOST_KV_SHM_NAME, num_pages,
+			primary_profile,
+			HOST_KV_SHM_NAME,
+			num_pages,
 		)
 		aux_config = _build_host_config_from_profile(
-			aux_profile, HOST_KV_AUX_SHM_NAME, num_pages,
+			aux_profile,
+			HOST_KV_AUX_SHM_NAME,
+			num_pages,
 		)
 
 		# Set distinct logger names to avoid C++ logger name collision
@@ -302,6 +319,74 @@ class DualHostKVCoordinator:
 				)
 			raise
 
+	def allocate_pages_for_sequences_with_prefix(self, prefix_requests):
+		"""Allocate primary/aux host pages with identical prefix reuse plans."""
+		prefix_requests = list(prefix_requests)
+		sequence_ids = [int(request[0]) for request in prefix_requests]
+		primary_results = self.primary.allocate_pages_for_sequences_with_prefix(
+			prefix_requests
+		)
+		try:
+			auxiliary_results = self.require_auxiliary(
+				"allocate_pages_for_sequences_with_prefix"
+			).allocate_pages_for_sequences_with_prefix(prefix_requests)
+		except Exception:
+			self._release_primary_prefix_allocation(sequence_ids)
+			raise
+		try:
+			assert_matching_prefix_allocation_results(
+				primary_results,
+				auxiliary_results,
+				"allocate_pages_for_sequences_with_prefix",
+			)
+		except Exception:
+			self._release_dual_prefix_allocation(sequence_ids)
+			raise
+		return primary_results
+
+	def estimate_pages_for_sequences_with_prefix(self, prefix_requests):
+		"""Estimate dual prefix allocations without mutating either view."""
+		prefix_requests = list(prefix_requests)
+		primary_results = self.primary.estimate_pages_for_sequences_with_prefix(
+			prefix_requests
+		)
+		auxiliary_results = self.require_auxiliary(
+			"estimate_pages_for_sequences_with_prefix"
+		).estimate_pages_for_sequences_with_prefix(prefix_requests)
+		assert_matching_prefix_allocation_results(
+			primary_results,
+			auxiliary_results,
+			"estimate_pages_for_sequences_with_prefix",
+		)
+		return primary_results
+
+	def commit_sequence_prefix_pages(
+		self,
+		sequence_id: int,
+		token_ids,
+		namespace_hash: int = 0,
+	):
+		"""Commit one logical prefix page chain to both host prefix caches."""
+		primary_inserted = self.primary.commit_sequence_prefix_pages(
+			sequence_id,
+			token_ids,
+			namespace_hash,
+		)
+		auxiliary_inserted = self.require_auxiliary(
+			"commit_sequence_prefix_pages"
+		).commit_sequence_prefix_pages(
+			sequence_id,
+			token_ids,
+			namespace_hash,
+		)
+		if int(primary_inserted) != int(auxiliary_inserted):
+			raise RuntimeError(
+				"commit_sequence_prefix_pages: primary/auxiliary inserted-page "
+				f"mismatch for seq {sequence_id}: primary={primary_inserted}, "
+				f"auxiliary={auxiliary_inserted}"
+			)
+		return primary_inserted
+
 	def grow_pages_for_sequences(self, seq_page_pairs) -> None:
 		seq_page_pairs = list(seq_page_pairs)
 		needed = sum(int(pages) for _, pages in seq_page_pairs)
@@ -342,6 +427,99 @@ class DualHostKVCoordinator:
 		if aux_stats.num_free_pages < primary_stats.num_free_pages:
 			return aux_stats
 		return primary_stats
+
+	def shared_prefix_pages(self, sequence_id: int):
+		primary_pages = list(self.primary.shared_prefix_pages(sequence_id))
+		auxiliary_pages = list(
+			self.require_auxiliary("shared_prefix_pages").shared_prefix_pages(
+				sequence_id
+			)
+		)
+		if primary_pages != auxiliary_pages:
+			raise RuntimeError(
+				"shared_prefix_pages: primary/auxiliary page mismatch for "
+				f"seq {sequence_id}: primary={primary_pages[:10]}, "
+				f"auxiliary={auxiliary_pages[:10]}"
+			)
+		return primary_pages
+
+	def shared_prefix_tokens(self, sequence_id: int) -> int:
+		primary_tokens = int(self.primary.shared_prefix_tokens(sequence_id))
+		auxiliary_tokens = int(
+			self.require_auxiliary("shared_prefix_tokens").shared_prefix_tokens(
+				sequence_id
+			)
+		)
+		if primary_tokens != auxiliary_tokens:
+			raise RuntimeError(
+				"shared_prefix_tokens: primary/auxiliary token mismatch for "
+				f"seq {sequence_id}: primary={primary_tokens}, "
+				f"auxiliary={auxiliary_tokens}"
+			)
+		return primary_tokens
+
+	def get_prefix_cache_stats(self):
+		primary_stats = self.primary.get_prefix_cache_stats()
+		auxiliary_stats = self.require_auxiliary(
+			"get_prefix_cache_stats"
+		).get_prefix_cache_stats()
+		assert_matching_prefix_stats(
+			primary_stats,
+			auxiliary_stats,
+			"get_prefix_cache_stats",
+		)
+		return primary_stats
+
+	def prefix_cache_debug_entries(self, limit: int = 0, cold_first: bool = True):
+		primary_entries = self.primary.prefix_cache_debug_entries(
+			limit,
+			cold_first,
+		)
+		auxiliary_entries = self.require_auxiliary(
+			"prefix_cache_debug_entries"
+		).prefix_cache_debug_entries(
+			limit,
+			cold_first,
+		)
+		if len(primary_entries) != len(auxiliary_entries):
+			raise RuntimeError(
+				"prefix_cache_debug_entries: primary/auxiliary entry-count "
+				f"mismatch: primary={len(primary_entries)}, "
+				f"auxiliary={len(auxiliary_entries)}"
+			)
+		return primary_entries
+
+	def clear_prefix_cache(self) -> None:
+		self.primary.clear_prefix_cache()
+		self.require_auxiliary("clear_prefix_cache").clear_prefix_cache()
+
+	def evict_prefix_cache_until_free(
+		self,
+		target_free_pages: int,
+		protected_pages=None,
+		max_entries_to_scan: int = 0,
+	):
+		if max_entries_to_scan:
+			raise RuntimeError(
+				"evict_prefix_cache_until_free: max_entries_to_scan is not "
+				"supported by the underlying host prefix cache binding"
+			)
+		primary_result = self.primary.evict_prefix_cache_until_free(
+			target_free_pages,
+			protected_pages=protected_pages,
+		)
+		auxiliary_result = self.require_auxiliary(
+			"evict_prefix_cache_until_free"
+		).evict_prefix_cache_until_free(
+			target_free_pages,
+			protected_pages=protected_pages,
+		)
+		assert_matching_prefix_eviction_results(
+			primary_result,
+			auxiliary_result,
+			"evict_prefix_cache_until_free",
+		)
+		return primary_result
 
 	# -- Migration / load helpers --
 
@@ -399,3 +577,30 @@ class DualHostKVCoordinator:
 			"DSA dual host KV offload must explicitly offload both primary and auxiliary KV; "
 			"primary-only offload is unsafe"
 		)
+
+	def _release_primary_prefix_allocation(self, sequence_ids: Sequence[int]) -> None:
+		if not sequence_ids:
+			return
+		try:
+			self.primary.release_sequence_pages(sequence_ids)
+		except Exception:
+			logger.exception(
+				"Failed to rollback primary host prefix allocation for %s",
+				list(sequence_ids)[:10],
+			)
+
+	def _release_dual_prefix_allocation(self, sequence_ids: Sequence[int]) -> None:
+		if not sequence_ids:
+			return
+		for name, view in (
+			("primary", self.primary),
+			("auxiliary", self.require_auxiliary("_release_dual_prefix_allocation")),
+		):
+			try:
+				view.release_sequence_pages(sequence_ids)
+			except Exception:
+				logger.exception(
+					"Failed to rollback %s host prefix allocation for %s",
+					name,
+					list(sequence_ids)[:10],
+				)

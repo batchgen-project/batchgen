@@ -101,6 +101,40 @@ class DualKVCacheCoordinator:
 		self.assert_mirrored_state("allocate_pages_for_sequences", sequence_ids)
 		return result
 
+	def allocate_pages_for_sequences_with_prefix(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		shared_prefix_pages: Sequence[Sequence[int]],
+	) -> List[List[int]]:
+		"""Allocate mirrored GPU pages with shared host-prefix page mappings."""
+		self._preflight_prefix_allocate(
+			sequence_ids,
+			num_tokens,
+			shared_prefix_pages,
+			"allocate_pages_for_sequences_with_prefix",
+		)
+		result = {}
+		try:
+			result = self.primary.allocate_pages_for_sequences_with_prefix(
+				sequence_ids,
+				num_tokens,
+				shared_prefix_pages,
+			)
+			self.auxiliary.allocate_pages_for_sequences_with_prefix(
+				sequence_ids,
+				num_tokens,
+				shared_prefix_pages,
+			)
+		except Exception:
+			self._rollback_sequence_allocations(sequence_ids)
+			raise
+		self.assert_mirrored_state(
+			"allocate_pages_for_sequences_with_prefix",
+			sequence_ids,
+		)
+		return result
+
 	def grow_sequence_pages(self, sequence_id: int, additional_tokens: int) -> List[int]:
 		self._preflight_grow([sequence_id], [additional_tokens], "grow_sequence_pages")
 		pages = {}
@@ -273,6 +307,68 @@ class DualKVCacheCoordinator:
 					f"need {missing_total}, free {manager._free_pages.size}"
 				)
 
+	def _preflight_prefix_allocate(
+		self,
+		sequence_ids: Sequence[int],
+		num_tokens: Sequence[int],
+		shared_prefix_pages: Sequence[Sequence[int]],
+		op_name: str,
+	) -> None:
+		if not (
+			len(sequence_ids) == len(num_tokens)
+			and len(sequence_ids) == len(shared_prefix_pages)
+		):
+			raise ValueError(
+				f"{op_name}: sequence_ids, num_tokens, and shared_prefix_pages "
+				"must be the same length"
+			)
+		if not sequence_ids:
+			return
+		for manager_name, manager in (
+			("primary", self.primary),
+			("auxiliary", self.auxiliary),
+		):
+			manager._ensure_initialized()
+			existing = [
+				seq_id for seq_id in sequence_ids if seq_id in manager._sequences
+			]
+			if existing:
+				raise KeyError(
+					f"{op_name}: sequences already allocated in {manager_name}: "
+					+ ", ".join(str(seq_id) for seq_id in existing)
+				)
+			required_pages = manager._geometry.required_pages(num_tokens).tolist()
+			new_shared_pages = []
+			private_pages = 0
+			for seq_id, required, pages in zip(
+				sequence_ids,
+				required_pages,
+				shared_prefix_pages,
+			):
+				required_int = int(required)
+				shared_pages_for_seq = tuple(int(page) for page in pages)
+				if required_int <= 0:
+					raise ValueError(
+						f"{op_name}: required pages must be positive for seq "
+						f"{seq_id}, got {required_int}"
+					)
+				if len(shared_pages_for_seq) > required_int:
+					raise ValueError(
+						f"{op_name}: sequence {seq_id} has "
+						f"{len(shared_pages_for_seq)} shared pages but only "
+						f"requires {required_int}"
+					)
+				private_pages += required_int - len(shared_pages_for_seq)
+				for host_page in shared_pages_for_seq:
+					if host_page not in manager._shared_prefix_gpu_pages:
+						new_shared_pages.append(host_page)
+			total_new_pages = len(dict.fromkeys(new_shared_pages)) + private_pages
+			if total_new_pages > manager._free_pages.size:
+				raise RuntimeError(
+					f"{op_name}: insufficient {manager_name} free pages: "
+					f"need {total_new_pages}, free {manager._free_pages.size}"
+				)
+
 	def _preflight_grow(
 		self, sequence_ids: Sequence[int], num_pages: Sequence[int], op_name: str
 	) -> None:
@@ -334,6 +430,25 @@ class DualKVCacheCoordinator:
 		if reclaimed:
 			manager._free_pages.push(torch.cat(reclaimed, dim=0))
 			manager._clear_active_page_pointer_tables()
+
+	def _rollback_sequence_allocations(self, sequence_ids: Sequence[int]) -> None:
+		for name, manager in (
+			("primary", self.primary),
+			("auxiliary", self.auxiliary),
+		):
+			existing = [
+				seq_id for seq_id in sequence_ids if seq_id in manager._sequences
+			]
+			if not existing:
+				continue
+			try:
+				manager.free_pages_for_sequences(existing)
+			except Exception:
+				logger.exception(
+					"Failed to rollback %s GPU prefix allocation for %s",
+					name,
+					existing[:10],
+				)
 
 	def _assert_mirrored_sequence_pages(self, sequence_id: int, op_name: str) -> None:
 		primary_state = self.primary._sequences.get(sequence_id)
