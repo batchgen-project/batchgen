@@ -8276,35 +8276,38 @@ class BatchGenWorker:
 		)
 
 		bucketing = BatchSizeBucketing(bucket_sizes)
-		try:
-			capture_bucket = bucketing.get_padded_size(max_bsz)
-		except ValueError:
-			logging.info(
-				f"Rank {self.rank}: GLM-5 MoE max rank batch size {max_bsz} exceeds "
-				"CUDA graph max bucket; using eager MoE"
-			)
-			return
-		if capture_bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
+		capture_buckets = [
+			int(bucket)
+			for bucket in bucketing.bucket_sizes
+			if int(bucket) not in getattr(self, "_glm5_moe_graph_failed_buckets", set())
+		]
+		if not capture_buckets:
 			return
 
 		if self._glm5_moe_cuda_graph_manager is not None:
-			if self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz):
+			missing_buckets = [
+				bucket
+				for bucket in capture_buckets
+				if not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(bucket)
+			]
+			if not missing_buckets:
 				return
 			logging.info(
-				f"Rank {self.rank}: lazily capturing GLM-5 MoE CUDA graph bucket "
-				f"BS={capture_bucket} for max rank batch size {max_bsz}"
+				f"Rank {self.rank}: capturing missing GLM-5 MoE CUDA graph buckets "
+				f"{missing_buckets} at decode entry (max rank batch size {max_bsz})"
 			)
 			try:
-				self._glm5_moe_cuda_graph_manager.warmup_and_capture_buckets([capture_bucket])
+				self._glm5_moe_cuda_graph_manager.warmup_and_capture_buckets(missing_buckets)
 			except torch.OutOfMemoryError as exc:
-				self._glm5_moe_cuda_graph_manager.drop_bucket(capture_bucket)
-				self._glm5_moe_graph_failed_buckets.add(capture_bucket)
+				for bucket in missing_buckets:
+					self._glm5_moe_cuda_graph_manager.drop_bucket(bucket)
+					self._glm5_moe_graph_failed_buckets.add(bucket)
 				torch.cuda.empty_cache()
 				if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
 					raise
 				logging.error(
-					f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for bucket "
-					f"BS={capture_bucket} ran out of memory; using eager MoE: {exc}"
+					f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
+					f"{missing_buckets} ran out of memory; using eager MoE: {exc}"
 				)
 			return
 
@@ -8357,21 +8360,22 @@ class BatchGenWorker:
 			return
 		logging.info(
 			f"Rank {self.rank}: capturing GLM-5 MoE CUDA graph segments for "
-			f"{registered} layers with bucket BS={capture_bucket} "
+			f"{registered} layers with buckets {capture_buckets} "
 			f"(max rank batch size {max_bsz})"
 		)
 		self._glm5_moe_cuda_graph_manager = manager
 		try:
-			manager.warmup_and_capture_buckets([capture_bucket])
+			manager.warmup_and_capture_buckets(capture_buckets)
 		except torch.OutOfMemoryError as exc:
-			manager.drop_bucket(capture_bucket)
-			self._glm5_moe_graph_failed_buckets.add(capture_bucket)
+			for bucket in capture_buckets:
+				manager.drop_bucket(bucket)
+				self._glm5_moe_graph_failed_buckets.add(bucket)
 			torch.cuda.empty_cache()
 			if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
 				raise
 			logging.error(
-				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for bucket "
-				f"BS={capture_bucket} ran out of memory; using eager MoE: {exc}"
+				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
+				f"{capture_buckets} ran out of memory; using eager MoE: {exc}"
 			)
 
 	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
@@ -8389,13 +8393,7 @@ class BatchGenWorker:
 			return True
 		if self._cuda_graph_manager is None:
 			return True
-		try:
-			bucket = self._cuda_graph_manager.bucketing.get_padded_size(local_bsz)
-		except ValueError:
-			return False
-		if bucket in getattr(self, "_glm5_dsa_graph_failed_buckets", set()):
-			return False
-		return not self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz)
+		return False
 
 	def _glm5_dsa_graph_page_table_storage_changed(self) -> bool:
 		if self._cuda_graph_manager is None:
@@ -8592,13 +8590,7 @@ class BatchGenWorker:
 			return False
 		if self._glm5_moe_cuda_graph_manager is None:
 			return True
-		try:
-			bucket = self._glm5_moe_cuda_graph_manager.bucketing.get_padded_size(max_bsz)
-		except ValueError:
-			return False
-		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
-			return False
-		return not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
+		return False
 
 	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
 		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
@@ -8944,40 +8936,10 @@ class BatchGenWorker:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			if local_bsz <= 0:
 				logging.info(
-					f"Rank {self.rank}: no local GLM-5 decode rows; skipping DSA CUDA graph capture"
+					f"Rank {self.rank}: no local GLM-5 decode rows; still capturing configured "
+					"DSA CUDA graph buckets for possible later local reloads"
 				)
-				if glm5_moe_graph_enabled:
-					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
-				return
 			if self._cuda_graph_manager is not None:
-				try:
-					capture_bucket = self._cuda_graph_manager.bucketing.get_padded_size(local_bsz)
-				except ValueError:
-					logging.info(
-						f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
-						"CUDA graph max bucket; using eager DSA"
-					)
-					if glm5_moe_graph_enabled:
-						self._setup_glm5_moe_cuda_graphs(bucket_sizes)
-					return
-				if self._cuda_graph_manager.has_bucket_for_all_segments(local_bsz):
-					if glm5_moe_graph_enabled:
-						self._setup_glm5_moe_cuda_graphs(bucket_sizes)
-					return
-				logging.info(
-					f"Rank {self.rank}: lazily capturing GLM-5 DSA CUDA graph bucket "
-					f"BS={capture_bucket} for local batch size {local_bsz}"
-				)
-				try:
-					self._cuda_graph_manager.warmup_and_capture_buckets([capture_bucket])
-				except torch.OutOfMemoryError as exc:
-					self._cuda_graph_manager.drop_bucket(capture_bucket)
-					self._mark_glm5_dsa_graph_bucket_failed(capture_bucket)
-					torch.cuda.empty_cache()
-					logging.error(
-						f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
-						f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
-					)
 				if glm5_moe_graph_enabled:
 					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
@@ -9008,13 +8970,12 @@ class BatchGenWorker:
 				raise RuntimeError(
 					"GLM-5 DSA CUDA graph requested but GPU page-table storage is not initialized"
 				)
-			try:
-				capture_bucket = bucketing.get_padded_size(local_bsz)
-			except ValueError:
-				logging.info(
-					f"Rank {self.rank}: local GLM-5 DSA batch size {local_bsz} exceeds "
-					"CUDA graph max bucket; using eager DSA"
-				)
+			capture_buckets = [
+				int(bucket)
+				for bucket in bucketing.bucket_sizes
+				if int(bucket) not in getattr(self, "_glm5_dsa_graph_failed_buckets", set())
+			]
+			if not capture_buckets:
 				if glm5_moe_graph_enabled:
 					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
 				return
@@ -9081,19 +9042,20 @@ class BatchGenWorker:
 			logging.info(
 				f"Rank {self.rank}: capturing GLM-5 DSA CUDA graph segments for "
 				f"{len(self.model.model.layers)} layers with max_seqlen={graph_max_seqlen}, "
-				f"bucket BS={capture_bucket} (local batch size {local_bsz})"
+				f"buckets {capture_buckets} (current local batch size {local_bsz})"
 			)
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = False
 			try:
-				manager.warmup_and_capture_buckets([capture_bucket])
+				manager.warmup_and_capture_buckets(capture_buckets)
 			except torch.OutOfMemoryError as exc:
-				manager.drop_bucket(capture_bucket)
-				self._mark_glm5_dsa_graph_bucket_failed(capture_bucket)
+				for bucket in capture_buckets:
+					manager.drop_bucket(bucket)
+					self._mark_glm5_dsa_graph_bucket_failed(bucket)
 				torch.cuda.empty_cache()
 				logging.error(
-					f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for bucket "
-					f"BS={capture_bucket} ran out of memory; using eager DSA for this bucket: {exc}"
+					f"Rank {self.rank}: GLM-5 DSA CUDA graph capture for buckets "
+					f"{capture_buckets} ran out of memory; using eager DSA for these buckets: {exc}"
 				)
 			if glm5_moe_graph_enabled:
 				self._setup_glm5_moe_cuda_graphs(bucket_sizes)

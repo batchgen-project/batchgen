@@ -33,6 +33,21 @@ def test_warmup_and_capture_buckets_captures_only_requested_buckets():
     assert manager.is_captured
 
 
+def test_warmup_and_capture_all_captures_every_configured_bucket_once():
+    manager = _make_uninitialized_manager([1, 2, 4, 8])
+    captured = []
+
+    def fake_capture_one(self, name, segment, bucket_size):
+        captured.append((name, bucket_size))
+        self._graphs[name][bucket_size] = object()
+
+    manager._capture_one = types.MethodType(fake_capture_one, manager)
+    manager.warmup_and_capture_all()
+
+    assert captured == [("seg", 1), ("seg", 2), ("seg", 4), ("seg", 8)]
+    assert manager.is_captured
+
+
 def test_power_of_two_bucket_pattern_maps_batches_through_32():
     bucketing = BatchSizeBucketing([1, 2, 4, 8, 16, 32])
 

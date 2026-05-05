@@ -892,6 +892,66 @@ def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
     assert torch.equal(out, hidden + 1)
 
 
+def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._glm5_dsa_graph_failed_buckets = set()
+    worker._glm5_moe_graph_failed_buckets = set()
+    worker._current_decode_local_batch_size = 17
+    worker._current_decode_max_rank_batch_size = 17
+    worker._cuda_graph_manager = object()
+    worker._glm5_moe_cuda_graph_manager = object()
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: False,
+    )
+
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert not worker._glm5_moe_graph_current_bucket_missing()
+
+    worker._current_decode_local_batch_size = 33
+    worker._current_decode_max_rank_batch_size = 33
+
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert not worker._glm5_moe_graph_current_bucket_missing()
+
+
+def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_changes(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._current_decode_local_batch_size = 8
+    worker._current_decode_max_rank_batch_size = 8
+    worker._cuda_graph_manager = None
+    worker._glm5_moe_cuda_graph_manager = None
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+
+    assert worker._glm5_dsa_graph_current_bucket_missing()
+    assert worker._glm5_moe_graph_current_bucket_missing()
+
+    worker._cuda_graph_manager = object()
+    worker._glm5_moe_cuda_graph_manager = object()
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: True,
+    )
+
+    assert worker._glm5_dsa_graph_current_bucket_missing()
+    assert worker._cuda_graph_manager is None
+
+
 def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
     env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
 
