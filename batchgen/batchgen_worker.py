@@ -5681,11 +5681,14 @@ class BatchGenWorker:
 					self._glm5_whole_model_graph_requested_for_current_batch()
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
-				if should_warmup_cuda_graphs_before_decode(
+				generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
-				) or (
+				)
+				if self._glm5_segmented_graph_capture_already_attempted_for_requested_paths():
+					generic_cuda_graph_warmup_needed = False
+				if generic_cuda_graph_warmup_needed or (
 					glm5_whole_graph_requested and self._cuda_graph_manager is None
 				) or (
 					self._glm5_segmented_graph_initial_capture_missing()
@@ -8260,6 +8263,16 @@ class BatchGenWorker:
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l or not self._glm5_moe_graph_requested_for_current_batch():
 			return
+		if (
+			self._glm5_moe_cuda_graph_manager is None
+			and getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False)
+		):
+			logging.info(
+				f"Rank {self.rank}: GLM-5 MoE CUDA graph manager is unavailable after "
+				"the configured buckets were already captured for this batch; using eager "
+				"MoE instead of recapturing"
+			)
+			return
 		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 		if max_bsz <= 0:
 			logging.info(f"Rank {self.rank}: no GLM-5 MoE decode rows globally; skipping MoE graph capture")
@@ -8445,6 +8458,24 @@ class BatchGenWorker:
 			)
 		)
 		return bool(dsa_missing or moe_missing)
+
+	def _glm5_segmented_graph_capture_already_attempted_for_requested_paths(self) -> bool:
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l:
+			return False
+		dsa_requested = self._glm5_dsa_graph_requested_for_current_batch()
+		moe_requested = self._glm5_moe_graph_requested_for_current_batch()
+		if not dsa_requested and not moe_requested:
+			return False
+		dsa_done = (
+			not dsa_requested
+			or bool(getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False))
+		)
+		moe_done = (
+			not moe_requested
+			or bool(getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False))
+		)
+		return bool(dsa_done and moe_done)
 
 	def _glm5_configured_cuda_graph_bucket_sizes(self) -> list:
 		return self._generate_bucket_sizes(
@@ -8691,6 +8722,8 @@ class BatchGenWorker:
 			return "eager", None, "empty_local_batch"
 		manager = self._cuda_graph_manager
 		if manager is None:
+			if getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False):
+				return "eager", None, "no_manager_after_initial_capture"
 			return "eager", None, "no_manager"
 		try:
 			bucket = manager.bucketing.get_padded_size(local_bsz)
@@ -8740,6 +8773,8 @@ class BatchGenWorker:
 			return "eager", None, "empty_global_batch"
 		manager = self._glm5_moe_cuda_graph_manager
 		if manager is None:
+			if getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False):
+				return "eager", None, "no_manager_after_initial_capture"
 			return "eager", None, "no_manager"
 		try:
 			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
@@ -9154,6 +9189,18 @@ class BatchGenWorker:
 					f"Rank {self.rank}: no local GLM-5 decode rows; still capturing configured "
 					"DSA CUDA graph buckets for possible later local reloads"
 				)
+			if (
+				self._cuda_graph_manager is None
+				and getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False)
+			):
+				logging.info(
+					f"Rank {self.rank}: GLM-5 DSA CUDA graph manager is unavailable after "
+					"the configured buckets were already captured for this batch; using eager "
+					"DSA instead of recapturing"
+				)
+				if glm5_moe_graph_enabled:
+					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
+				return
 			if self._cuda_graph_manager is not None:
 				capture_buckets = [
 					int(bucket)
