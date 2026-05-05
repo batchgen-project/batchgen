@@ -217,9 +217,15 @@ def _qat_fp8_act_quant_inplace(
     orig_dtype = x.dtype
     *prefix, _ = x.shape
     blocks = x.view(*prefix, last // block_size, block_size).float()
-    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    # Floor at 1e-12 (denormal-style); keeps tiny-norm blocks at full
+    # precision instead of squashing to zero. The reference kernel uses 1e-4
+    # for tilelang numerical stability, not as a QAT spec.
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
     scale = amax / 448.0
     fp8_max = 448.0
+    # Clamp the scaled value into the FP8 representable range *before* the
+    # cast. PyTorch's cast to float8_e4m3fn on an out-of-range FP32 value
+    # can saturate to inf/NaN, silently corrupting cache writes.
     quantised = (blocks / scale).clamp_(-fp8_max, fp8_max)
     quantised = quantised.to(torch.float8_e4m3fn).to(torch.float32)
     dequantised = (quantised * scale).to(orig_dtype)
