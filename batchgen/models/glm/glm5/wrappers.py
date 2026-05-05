@@ -857,6 +857,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 None,
             )
 
+        flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+            self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+        )
         graph_outputs = self._dsa_cuda_graph_manager.replay(
             self._dsa_cuda_graph_segment_name,
             bsz,
@@ -868,6 +871,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
             positions_expanded=graph_inputs.positions_expanded,
             primary_slot_indices=graph_inputs.primary_slot_indices,
             aux_slot_indices=graph_inputs.aux_slot_indices,
+            flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+            flashmla_num_splits=flashmla_num_splits,
         )
 
         return self._project_dsa_attn_heads(graph_outputs["attn_heads"])
@@ -890,6 +895,39 @@ class GLM5AttnWrapper(AttnWrapperBase):
             self.weight_dequant_scale["o_proj.weight_scale_inv"],
         )
         return attn_output.view(bsz, 1, -1)
+
+    def _dsa_cuda_graph_flashmla_metadata_inputs(
+        self,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._dsa_cuda_graph_manager is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata requested "
+                "without a graph manager"
+            )
+        bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
+        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay requires "
+                "per-forward FlashMLA metadata to be prepared before model forward"
+            )
+        if int(metadata.get("bucket_size", -1)) != int(bucket_size):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata bucket "
+                f"{metadata.get('bucket_size')} does not match replay bucket {bucket_size}"
+            )
+        tile_scheduler_metadata = metadata.get("tile_scheduler_metadata")
+        num_splits = metadata.get("num_splits")
+        if not isinstance(tile_scheduler_metadata, torch.Tensor) or not isinstance(
+            num_splits,
+            torch.Tensor,
+        ):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata must be "
+                "tensor FlashMLA metadata buffers"
+            )
+        return tile_scheduler_metadata, num_splits
 
     @staticmethod
     def _compare_tensor_summary(
@@ -963,6 +1001,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager_aux,
                 write_kv=False,
             )
+            flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+                self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+            )
             graph_outputs = self._dsa_cuda_graph_manager.replay(
                 self._dsa_cuda_graph_segment_name,
                 bsz,
@@ -974,6 +1015,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 positions_expanded=graph_inputs.positions_expanded,
                 primary_slot_indices=graph_inputs.primary_slot_indices,
                 aux_slot_indices=graph_inputs.aux_slot_indices,
+                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                flashmla_num_splits=flashmla_num_splits,
             )
             graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
 

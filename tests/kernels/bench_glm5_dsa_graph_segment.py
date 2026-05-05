@@ -12,6 +12,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+from batchgen.attention.dsa.sparse_decode_mla import (
+    prepare_sparse_flash_mla_decode_tensor_metadata,
+)
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5DsaAttnSegment,
     make_glm5_dsa_graph_segment_name,
@@ -132,6 +135,32 @@ def _make_inputs(
     }
 
 
+def _with_flashmla_graph_metadata(
+    manager: CUDAGraphManager,
+    inputs: dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    index_topk: int,
+    max_seqlen: int,
+) -> dict[str, torch.Tensor]:
+    bucket_size = manager.bucketing.get_padded_size(batch_size)
+    selected_lengths = torch.empty(bucket_size, device="cuda", dtype=torch.int32)
+    selected_lengths[:batch_size].copy_(
+        torch.clamp(inputs["cache_seqlens"][:batch_size].to(dtype=torch.int32), max=index_topk)
+    )
+    if batch_size < bucket_size:
+        selected_lengths[batch_size:].fill_(min(max_seqlen, index_topk))
+    tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
+        selected_lengths,
+        ATTN_HEADS,
+    )
+    return {
+        **inputs,
+        "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
+        "flashmla_num_splits": num_splits,
+    }
+
+
 def _make_segment(batch_size: int, max_seqlen: int, index_topk: int, module):
     primary_blocked_k, primary_page_table = _make_primary_cache(batch_size, max_seqlen)
     aux_blocked_k, aux_page_table = _make_aux_cache(batch_size, max_seqlen)
@@ -218,12 +247,19 @@ def main() -> None:
             )
             manager.register_segment(segment_name, segment)
             manager.warmup_and_capture_all()
+            graph_inputs = _with_flashmla_graph_metadata(
+                manager,
+                inputs,
+                batch_size=batch_size,
+                index_topk=topk,
+                max_seqlen=max_seqlen,
+            )
 
             def eager_segment():
-                segment.forward(**inputs)
+                segment.forward(**graph_inputs)
 
             def graph_segment():
-                manager.replay(segment_name, batch_size, **inputs)
+                manager.replay(segment_name, batch_size, **graph_inputs)
 
             eager = _summary(_time_cuda(eager_segment, warmup=args.warmup, iters=args.iters))
             graph = _summary(_time_cuda(graph_segment, warmup=args.warmup, iters=args.iters))

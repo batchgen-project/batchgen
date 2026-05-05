@@ -22,6 +22,7 @@ class PreparedSparseFlashMlaDecode:
     blocked_k: torch.Tensor
     block_table: torch.Tensor
     cache_seqlens: torch.Tensor
+    num_heads: int
     head_dim_v: int
     tile_scheduler_metadata: torch.Tensor
     num_splits: torch.Tensor
@@ -32,6 +33,41 @@ def _flash_mla_ops():
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     return flash_mla_with_kvcache, get_mla_metadata
+
+
+def prepare_sparse_flash_mla_decode_metadata(
+    sparse_seqlens: torch.Tensor,
+    num_heads: int,
+) -> tuple[object, object]:
+    """Build FlashMLA metadata for selected-KV decode lengths."""
+
+    _, get_mla_metadata = _flash_mla_ops()
+    return get_mla_metadata(
+        sparse_seqlens.to(dtype=torch.int32),
+        num_heads,
+        1,
+    )
+
+
+def prepare_sparse_flash_mla_decode_tensor_metadata(
+    sparse_seqlens: torch.Tensor,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build tensor metadata for graph-captured FlashMLA selected-KV decode."""
+
+    tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_metadata(
+        sparse_seqlens,
+        num_heads,
+    )
+    if not isinstance(tile_scheduler_metadata, torch.Tensor) or not isinstance(
+        num_splits,
+        torch.Tensor,
+    ):
+        raise TypeError(
+            "GLM-5 DSA CUDA graph metadata requires the tensor FlashMLA metadata "
+            "API; the installed flash_mla returned non-tensor metadata"
+        )
+    return tile_scheduler_metadata, num_splits
 
 
 def prepare_sparse_flash_mla_decode_inputs(
@@ -63,9 +99,9 @@ def prepare_sparse_flash_mla_decode_inputs(
     )
     sparse_seqlens = sparse_seqlens.to(dtype=torch.int32, device=sparse_mla_kv.device)
 
-    _, get_mla_metadata = _flash_mla_ops()
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        sparse_seqlens, num_heads, 1
+    tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_metadata(
+        sparse_seqlens,
+        num_heads,
     )
 
     return PreparedSparseFlashMlaDecode(
@@ -73,6 +109,7 @@ def prepare_sparse_flash_mla_decode_inputs(
         blocked_k=blocked_k,
         block_table=block_table,
         cache_seqlens=sparse_seqlens,
+        num_heads=num_heads,
         head_dim_v=head_dim_v,
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,
@@ -82,18 +119,25 @@ def prepare_sparse_flash_mla_decode_inputs(
 
 def run_prepared_sparse_flash_mla_decode(
     prepared: PreparedSparseFlashMlaDecode,
+    *,
+    tile_scheduler_metadata: torch.Tensor | None = None,
+    num_splits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Invoke FlashMLA from already prepared selected-KV inputs."""
 
     flash_mla_with_kvcache, _ = _flash_mla_ops()
+    if tile_scheduler_metadata is None:
+        tile_scheduler_metadata = prepared.tile_scheduler_metadata
+    if num_splits is None:
+        num_splits = prepared.num_splits
     attn_out, _ = flash_mla_with_kvcache(
         prepared.query_states,
         prepared.blocked_k,
         prepared.block_table,
         prepared.cache_seqlens,
         prepared.head_dim_v,
-        prepared.tile_scheduler_metadata,
-        prepared.num_splits,
+        tile_scheduler_metadata,
+        num_splits,
         prepared.softmax_scale,
         False,
     )

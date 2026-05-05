@@ -23,6 +23,7 @@ from typing import Dict, Optional
 import torch
 
 from batchgen.attention.dsa.sparse_decode_mla import (
+    prepare_sparse_flash_mla_decode_tensor_metadata,
     prepare_sparse_flash_mla_decode_inputs,
     run_prepared_sparse_flash_mla_decode,
 )
@@ -157,6 +158,10 @@ class Glm5DsaAttnSegment:
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._attn_head_outputs: Dict[int, torch.Tensor] = {}
+        self._flashmla_metadata_specs: Dict[
+            int,
+            tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype],
+        ] = {}
 
         if self.kv_dim != self.kv_lora_rank + 64:
             raise ValueError(
@@ -175,7 +180,39 @@ class Glm5DsaAttnSegment:
         if not cos_table.is_contiguous() or not sin_table.is_contiguous():
             raise ValueError("cos_table and sin_table must be contiguous")
 
+    def _padding_selected_length(self) -> int:
+        return min(int(self.max_seqlen), int(self.index_topk))
+
+    def _flashmla_tensor_metadata_specs(
+        self,
+        bucket_size: int,
+    ) -> tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]:
+        cached = self._flashmla_metadata_specs.get(bucket_size)
+        if cached is not None:
+            return cached
+        lengths = torch.full(
+            (bucket_size,),
+            self._padding_selected_length(),
+            dtype=torch.int32,
+            device=self.primary_blocked_k.device,
+        )
+        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
+            lengths,
+            self.num_attn_heads,
+        )
+        spec = (
+            tuple(tile_scheduler_metadata.shape),
+            tile_scheduler_metadata.dtype,
+            tuple(num_splits.shape),
+            num_splits.dtype,
+        )
+        self._flashmla_metadata_specs[bucket_size] = spec
+        return spec
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
+            self._flashmla_tensor_metadata_specs(bucket_size)
+        )
         return {
             "q_a": TensorSpec(("batch_size", self.q_lora_rank), torch.bfloat16),
             "q_nope": TensorSpec(
@@ -194,6 +231,8 @@ class Glm5DsaAttnSegment:
             ),
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
+            "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -318,6 +357,27 @@ class Glm5DsaAttnSegment:
         )
         self._setup_static_output_buffers(bucket_size)
 
+    def initialize_static_inputs(
+        self,
+        static_inputs: Dict[str, torch.Tensor],
+        bucket_size: int,
+    ) -> None:
+        selected_lengths = torch.full(
+            (bucket_size,),
+            self._padding_selected_length(),
+            dtype=torch.int32,
+            device=self.primary_blocked_k.device,
+        )
+        tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
+            selected_lengths,
+            self.num_attn_heads,
+        )
+        static_inputs["flashmla_tile_scheduler_metadata"].copy_(
+            tile_scheduler_metadata,
+            non_blocking=True,
+        )
+        static_inputs["flashmla_num_splits"].copy_(num_splits, non_blocking=True)
+
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if not self._uses_shared_buffers or bucket_size in self._attn_head_outputs:
             return
@@ -345,6 +405,8 @@ class Glm5DsaAttnSegment:
         positions_expanded: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        flashmla_tile_scheduler_metadata: torch.Tensor,
+        flashmla_num_splits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         batch_size = q_a.shape[0]
         buffers = self._buffers.get(batch_size)
@@ -397,7 +459,11 @@ class Glm5DsaAttnSegment:
         )
         fp8_q_absorb_out(q_nope, self.absorb_weights, buffers.absorbed_q)
         pack_flashmla_query_out(buffers.absorbed_q, q_rope, buffers.query_states)
-        attn_out = run_prepared_sparse_flash_mla_decode(buffers.prepared_flashmla)
+        attn_out = run_prepared_sparse_flash_mla_decode(
+            buffers.prepared_flashmla,
+            tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+            num_splits=flashmla_num_splits,
+        )
         attn_heads = self._attn_head_outputs.get(batch_size, buffers.attn_heads)
         fp8_out_absorb_out(attn_out, self.absorb_weights, attn_heads)
 

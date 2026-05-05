@@ -8766,6 +8766,58 @@ class BatchGenWorker:
 			return "eager", bucket, "page_table_storage_changed"
 		return "graph", bucket, "captured"
 
+	def _prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
+		self,
+		local_bsz: int,
+		gpu_manager,
+	) -> None:
+		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+		path, bucket, _reason = self._glm5_dsa_graph_path_state(local_bsz, gpu_manager)
+		if path != "graph" or bucket is None:
+			return
+		model = getattr(self, "model", None)
+		layers = getattr(getattr(model, "model", None), "layers", None)
+		if not layers:
+			raise RuntimeError("GLM-5 DSA CUDA graph replay requires attention wrappers")
+		wrapper = layers[0].self_attn
+		index_topk = int(getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048))
+		cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
+		if cache_seqlens is None:
+			raise RuntimeError("GLM-5 DSA CUDA graph replay requires cache_seqlens metadata")
+		bucket = int(bucket)
+		if local_bsz <= 0 or local_bsz > bucket:
+			raise RuntimeError(
+				f"GLM-5 DSA CUDA graph invalid local batch size {local_bsz} for bucket {bucket}"
+			)
+		selected_lengths = torch.empty(
+			(bucket,),
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
+		selected_lengths[:local_bsz].copy_(
+			torch.clamp(
+				cache_seqlens[:local_bsz].to(dtype=torch.int32),
+				max=index_topk,
+			),
+			non_blocking=True,
+		)
+		if local_bsz < bucket:
+			captured_max_seqlen = int(getattr(wrapper, "_dsa_cuda_graph_max_seqlen", index_topk))
+			selected_lengths[local_bsz:].fill_(min(captured_max_seqlen, index_topk))
+		from batchgen.attention.dsa.sparse_decode_mla import (
+			prepare_sparse_flash_mla_decode_tensor_metadata,
+		)
+		tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
+			selected_lengths,
+			int(getattr(wrapper.module, "num_heads", 64)),
+		)
+		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+			"bucket_size": bucket,
+			"selected_lengths": selected_lengths,
+			"tile_scheduler_metadata": tile_scheduler_metadata,
+			"num_splits": num_splits,
+		}
+
 	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
 		if not self._glm5_moe_graph_requested_for_current_batch():
 			return "disabled", None, "not_requested"
@@ -10006,6 +10058,7 @@ class BatchGenWorker:
 					AttnWrapperBase.max_seqlen = 0
 					AttnWrapperBase.cur_batch = []
 					AttnWrapperBase._dsa_short_count = 0
+					AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
@@ -10133,6 +10186,10 @@ class BatchGenWorker:
 					rank_counts=getattr(self, "_current_decode_rank_token_counts", None),
 					gpu_manager=gpu_manager,
 					decode_iter=self._cumulative_decode_iterations,
+				)
+				self._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
+					len(batch),
+					gpu_manager,
 				)
 
 				# Forward
@@ -10563,6 +10620,7 @@ class BatchGenWorker:
 		AttnWrapperBase.batchgen_debug = None
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
+		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG
