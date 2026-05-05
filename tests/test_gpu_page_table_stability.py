@@ -227,3 +227,24 @@ def test_ensure_cuda_graph_page_table_recovers_invalid_graph_storage(monkeypatch
         0,
         manager._gpu_page_table_manager.max_pages_per_sequence,
     )
+
+
+def test_cuda_graph_page_table_storage_accessor_does_not_rebuild_active_table(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS", "2")
+    manager = _make_manager(num_pages=8)
+    manager.allocate_pages_for_sequences([1, 2, 3], [4, 4, 4])
+
+    manager.rebuild_page_table([1, 2])
+    graph_ptr = manager.get_cuda_graph_page_table().data_ptr()
+
+    manager.rebuild_page_table([1, 2, 3])
+    with pytest.raises(RuntimeError, match="CUDA graph page table is not valid"):
+        manager.get_cuda_graph_page_table()
+
+    storage = manager.get_cuda_graph_page_table_storage()
+
+    assert storage.data_ptr() == graph_ptr
+    assert manager._gpu_page_table_manager.slot_to_seq_id == [1, 2, 3]
+    assert tuple(manager._gpu_page_table_manager.gpu_table.shape) == (3, 2)
+    with pytest.raises(RuntimeError, match="CUDA graph page table is not valid"):
+        manager.get_cuda_graph_page_table()

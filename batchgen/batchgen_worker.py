@@ -9306,9 +9306,8 @@ class BatchGenWorker:
 				raise RuntimeError("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN must be positive")
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
-			active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
-			primary_page_table = primary_manager.ensure_cuda_graph_page_table(active_sequence_ids)
-			aux_page_table = aux_manager.ensure_cuda_graph_page_table(active_sequence_ids)
+			primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
+			aux_page_table = aux_manager.get_cuda_graph_page_table_storage()
 			if primary_page_table is None or aux_page_table is None:
 				raise RuntimeError(
 					"GLM-5 DSA CUDA graph requested but GPU page-table storage is not initialized"

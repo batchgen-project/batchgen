@@ -1217,6 +1217,17 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		return self._gpu_page_table_manager.get_cuda_graph_table()
 
+	def get_cuda_graph_page_table_storage(self) -> torch.Tensor:
+		"""Return fixed CUDA-graph page-table storage without validating contents.
+
+		Graph capture needs a stable tensor pointer before every future decode row
+		is necessarily allocated in the active GPU manager. Replay paths must use
+		``get_cuda_graph_page_table``/``get_cuda_graph_page_table_state`` so they
+		still require valid active contents.
+		"""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager._ensure_cuda_graph_table()
+
 	def ensure_cuda_graph_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
 		"""Refresh and return graph-stable page-table storage for a capture.
 
