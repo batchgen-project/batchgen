@@ -100,29 +100,29 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 2: Add a Compatibility Binding Layer
 
-- [ ] Add `batchgen/attention/forward_metadata_context.py`.
-- [ ] Store current `ForwardBatchMetadata` in a `contextvars.ContextVar`.
-- [ ] Implement `bind_forward_batch_metadata(metadata)` as a context manager.
-- [ ] Implement `get_current_forward_batch_metadata(required: bool = False)`.
-- [ ] In the context manager, temporarily sync metadata into legacy `AttnWrapperBase` fields.
-- [ ] Sync prepack mode fields.
-- [ ] Sync prepack cu-seqlens.
-- [ ] Sync prepack max seqlen.
-- [ ] Sync prepack sequence count.
-- [ ] Sync prepack sequence lengths.
-- [ ] Sync prefix reuse mode.
-- [ ] Sync prefix shared token counts.
-- [ ] Sync full sequence lengths.
-- [ ] Sync position ids.
-- [ ] Sync current global sequence ids.
-- [ ] Sync decode cache seqlens where applicable.
-- [ ] Restore all previous legacy fields when the context exits.
-- [ ] Restore correctly if an exception is raised inside the context.
-- [ ] `required=True` must raise if metadata is missing.
-- [ ] Add unit tests for normal entry and exit.
-- [ ] Add unit tests for exception exit.
-- [ ] Add unit tests for nested contexts.
-- [ ] Add unit tests that legacy fields do not leak across batches.
+- [x] Add `batchgen/attention/forward_metadata_context.py`.
+- [x] Store current `ForwardBatchMetadata` in a `contextvars.ContextVar`.
+- [x] Implement `bind_forward_batch_metadata(metadata)` as a context manager.
+- [x] Implement `get_current_forward_batch_metadata(required: bool = False)`.
+- [x] In the context manager, temporarily sync metadata into legacy `AttnWrapperBase` fields.
+- [x] Sync prepack mode fields.
+- [x] Sync prepack cu-seqlens.
+- [x] Sync prepack max seqlen.
+- [x] Sync prepack sequence count.
+- [x] Sync prepack sequence lengths.
+- [x] Sync prefix reuse mode.
+- [x] Sync prefix shared token counts.
+- [x] Sync full sequence lengths.
+- [x] Sync position ids.
+- [x] Sync current global sequence ids.
+- [x] Sync decode cache seqlens where applicable.
+- [x] Restore all previous legacy fields when the context exits.
+- [x] Restore correctly if an exception is raised inside the context.
+- [x] `required=True` must raise if metadata is missing.
+- [x] Add unit tests for normal entry and exit.
+- [x] Add unit tests for exception exit.
+- [x] Add unit tests for nested contexts.
+- [x] Add unit tests that legacy fields do not leak across batches.
 
 ## Milestone 3: Move Worker Metadata Construction Into a Builder
 
