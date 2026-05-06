@@ -47,3 +47,21 @@ def test_initial_host_kv_capacity_is_page_rounded_before_metadata_validation():
 
     seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
     seq.validate_metadata("unit")
+
+
+def test_synchronous_host_to_gpu_load_uses_dual_dsa_path():
+    source = WORKER.read_text()
+    start = source.index("\tdef _load_host_kv_to_gpu(")
+    end = source.index("\n\tdef _release_gpu_kv_pages", start)
+    body = source[start:end]
+
+    dual_branch = body.index("if isinstance(manager, DualKVCacheCoordinator):")
+    dual_prepare = body.index(
+        "pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)"
+    )
+    dual_launch = body.index("load_task = self._launch_dual_host_kv_load(pointers)")
+    primary_only_call = body.index("k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()")
+
+    assert dual_branch < dual_prepare < dual_launch < primary_only_call
+    assert "async_load_layer_paged_kv_to_device_dual" not in body
+    assert "host_paged_kv_worker_view_aux" not in body

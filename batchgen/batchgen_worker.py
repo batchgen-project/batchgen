@@ -2700,41 +2700,29 @@ class BatchGenWorker:
 				f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
 			)
 		
-		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-		active_sequence_page_counts = manager.export_active_sequence_page_counts()
-
 		logging.debug(
 			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
 			f"{len(global_sequence_ids)} sequences..."
 		)
 
-		load_task = worker_view.async_load_layer_paged_kv_to_device(
-			sequence_ids=sequence_tensor,
-			active_page_counts=active_sequence_page_counts,
-			k_device_ptrs=k_ptrs,
-			v_device_ptrs=v_ptrs,
-		)
+		if isinstance(manager, DualKVCacheCoordinator):
+			pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)
+			load_task = self._launch_dual_host_kv_load(pointers)
+		else:
+			sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
+			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+			active_sequence_page_counts = manager.export_active_sequence_page_counts()
+			load_task = worker_view.async_load_layer_paged_kv_to_device(
+				sequence_ids=sequence_tensor,
+				active_page_counts=active_sequence_page_counts,
+				k_device_ptrs=k_ptrs,
+				v_device_ptrs=v_ptrs,
+			)
 		
 		# Wait for load to complete (this is synchronous load path used during prefill)
 		load_task.wait()
 		# CRITICAL: Sync CUDA after async task completes to ensure H2D DMA is done
 		torch.cuda.synchronize(self.torch_device)
-
-		# DSA: also load auxiliary (indexer) host KV to GPU
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
-		if aux_view is not None and isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
-			aux_mgr = self.gpu_paged_kv_cache_manager.auxiliary
-			k_ptrs_aux, v_ptrs_aux = aux_mgr.get_padded_3d_page_pointers()
-			page_counts_aux = aux_mgr.export_active_sequence_page_counts()
-			load_task_aux = aux_view.async_load_layer_paged_kv_to_device(
-				sequence_ids=sequence_tensor,
-				active_page_counts=page_counts_aux,
-				k_device_ptrs=k_ptrs_aux,
-				v_device_ptrs=v_ptrs_aux,
-			)
-			load_task_aux.wait()
-			torch.cuda.synchronize(self.torch_device)
 
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
