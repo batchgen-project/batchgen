@@ -953,6 +953,29 @@ def test_glm5_dsa_graph_path_allows_short_rows_with_fixed_selected_kv(monkeypatc
     )
 
 
+def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    primary_page_table = torch.empty(2, 320, dtype=torch.int32)
+    aux_page_table = torch.empty(2, 512, dtype=torch.int32)
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN", "8192")
+
+    assert BatchGenWorker._glm5_dsa_graph_score_capacity_tokens(
+        primary_page_table,
+        64,
+        aux_page_table,
+        64,
+        model_max_position_embeddings=131072,
+    ) == 20480
+    assert BatchGenWorker._glm5_dsa_graph_score_capacity_tokens(
+        primary_page_table,
+        64,
+        aux_page_table,
+        64,
+        model_max_position_embeddings=16889,
+    ) == 16889
+
+
 def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 

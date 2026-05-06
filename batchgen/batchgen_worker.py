@@ -8886,6 +8886,27 @@ class BatchGenWorker:
 				return True
 		return False
 
+	@staticmethod
+	def _glm5_dsa_graph_score_capacity_tokens(
+		primary_page_table,
+		primary_page_size: int,
+		aux_page_table,
+		aux_page_size: int,
+		*,
+		model_max_position_embeddings: int | None = None,
+	) -> int:
+		primary_capacity = int(primary_page_table.shape[1]) * int(primary_page_size)
+		aux_capacity = int(aux_page_table.shape[1]) * int(aux_page_size)
+		capacities = [primary_capacity, aux_capacity]
+		if model_max_position_embeddings is not None and int(model_max_position_embeddings) > 0:
+			capacities.append(int(model_max_position_embeddings))
+		capacity = min(capacities)
+		if capacity <= 0:
+			raise RuntimeError(
+				"GLM-5 DSA CUDA graph requires positive primary/aux page-table capacity"
+			)
+		return capacity
+
 	def _glm5_dsa_graph_page_table_storage_changed(self) -> bool:
 		if self._cuda_graph_manager is None:
 			return False
@@ -9687,9 +9708,6 @@ class BatchGenWorker:
 			if aux_manager is None:
 				raise RuntimeError("GLM-5 DSA CUDA graph requested but auxiliary GPU KV manager is missing")
 
-			graph_max_seqlen = int(os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN", "8192"))
-			if graph_max_seqlen <= 0:
-				raise RuntimeError("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN must be positive")
 			primary_page_size = int(primary_manager.config.page_size_tokens)
 			aux_page_size = int(aux_manager.config.page_size_tokens)
 			primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
@@ -9697,6 +9715,21 @@ class BatchGenWorker:
 			if primary_page_table is None or aux_page_table is None:
 				raise RuntimeError(
 					"GLM-5 DSA CUDA graph requested but GPU page-table storage is not initialized"
+				)
+			graph_max_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
+				primary_page_table,
+				primary_page_size,
+				aux_page_table,
+				aux_page_size,
+				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
+			)
+			legacy_graph_cap = os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN")
+			if legacy_graph_cap is not None and self.rank == 0:
+				logging.info(
+					"BATCHGEN_GLM5_DSA_CUDA_GRAPH_MAX_SEQLEN=%s is ignored for segmented "
+					"GLM-5 DSA graph scoring; using page-table/model capacity %d tokens",
+					legacy_graph_cap,
+					graph_max_seqlen,
 				)
 			capture_buckets = [
 				int(bucket)
