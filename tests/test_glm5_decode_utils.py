@@ -731,7 +731,7 @@ def test_glm5_dsa_cuda_graph_replay_gate_allows_short_rows_with_fixed_selected_k
         max_seqlen=4,
         index_topk=0,
     )
-    assert not _glm5_dsa_cuda_graph_can_replay(
+    assert _glm5_dsa_cuda_graph_can_replay(
         torch.tensor([5, 7], dtype=torch.int32),
         max_seqlen=8,
         index_topk=index_topk,

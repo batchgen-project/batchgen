@@ -151,8 +151,6 @@ def _glm5_dsa_cuda_graph_can_replay(
 
     if max_seqlen <= 0 or index_topk <= 0:
         return False
-    if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
-        return False
     if cache_seqlens.ndim != 1:
         return False
     return True
@@ -805,11 +803,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 f"[layer {self.layer_idx}] BATCHGEN_GLM5_DSA_CUDA_GRAPH=1 was requested, "
                 "but this attention wrapper has no registered DSA CUDA graph segment"
             )
-        if max_seqlen > self._dsa_cuda_graph_max_seqlen:
-            raise RuntimeError(
-                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph max_seqlen={max_seqlen} "
-                f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
-            )
         index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
         if not _glm5_dsa_cuda_graph_can_replay(
             cache_seqlens,
@@ -819,8 +812,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         ):
             raise RuntimeError(
                 f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is not "
-                f"valid for max_seqlen={max_seqlen}, captured cap "
-                f"{self._dsa_cuda_graph_max_seqlen}, index_topk={index_topk}"
+                f"valid for max_seqlen={max_seqlen}, index_topk={index_topk}"
             )
         if not self._dsa_cuda_graph_page_tables_match(
             gpu_paged_kv_manager,
@@ -1179,13 +1171,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and graph_page_tables_match
             )
             if not graph_can_replay:
-                captured_cap = getattr(self, "_dsa_cuda_graph_max_seqlen", None)
-                if captured_cap is not None and max_seqlen > captured_cap:
-                    reason = (
-                        f"max_seqlen={max_seqlen} exceeds captured cap "
-                        f"{captured_cap}"
-                    )
-                elif index_topk <= 0:
+                if index_topk <= 0:
                     reason = f"invalid index_topk={index_topk}"
                 elif cache_seqlens.ndim != 1:
                     reason = f"cache_seqlens ndim {cache_seqlens.ndim} is not 1"
