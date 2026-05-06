@@ -42,44 +42,46 @@ jobs:
             bash -lc 'set -euo pipefail; cd /data2/tairan/workspace/BatchGen; git fetch --quiet --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"; commit="$(git rev-list -n 1 "${RELEASE_TAG}")"; git archive --format=tar "${commit}"' \
             | tar -x -C "${context_dir}"
           mkdir -p "${context_dir}/.docker-build/third_party"
-          download_archive() {
-            local url="$1"
-            local dest="$2"
-            shift 2
+          archive_repo() {
+            local repo="$1"
+            local rev="$2"
+            local dest="$3"
             mkdir -p "${dest}"
-            curl \
-              --fail \
-              --location \
-              --retry 5 \
-              --retry-delay 5 \
-              --connect-timeout 20 \
-              --max-time 600 \
-              --silent \
-              --show-error \
-              "$@" \
-              "${url}" | tar -xz --strip-components=1 -C "${dest}"
+            docker exec \
+              -e REPO="${repo}" \
+              -e REV="${rev}" \
+              tairan-batchgen \
+              bash -lc 'set -euo pipefail; cd "${REPO}"; git archive --format=tar "${REV}"' \
+              | tar -x -C "${dest}"
           }
           third_party="${context_dir}/.docker-build/third_party"
-          download_archive \
-            "https://codeload.github.com/Dao-AILab/flash-attention/tar.gz/v2.8.2" \
+          archive_repo \
+            "/data2/tairan/workspace/flash-attention" \
+            "v2.8.2" \
             "${third_party}/flash-attention"
-          download_archive \
-            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/dc4817921edda44a549197ff3a9dcf5df0636e7b" \
+          archive_repo \
+            "/data2/tairan/workspace/flash-attention/csrc/cutlass" \
+            "dc4817921edda44a549197ff3a9dcf5df0636e7b" \
             "${third_party}/flash-attention/csrc/cutlass"
-          download_archive \
-            "https://codeload.github.com/deepseek-ai/FlashMLA/tar.gz/1408756a88e52a25196b759eaf8db89d2b51b5a1" \
+          archive_repo \
+            "/data2/tairan/workspace/FlashMLA" \
+            "1408756a88e52a25196b759eaf8db89d2b51b5a1" \
             "${third_party}/FlashMLA"
-          download_archive \
-            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/e94e888df3551224738bfa505787b515eae8352f" \
+          archive_repo \
+            "/data2/tairan/workspace/FlashMLA/csrc/cutlass" \
+            "e94e888df3551224738bfa505787b515eae8352f" \
             "${third_party}/FlashMLA/csrc/cutlass"
-          download_archive \
-            "https://codeload.github.com/deepseek-ai/DeepGEMM/tar.gz/v2.1.1.post3" \
+          archive_repo \
+            "/data2/tairan/workspace/DeepGEMM" \
+            "v2.1.1.post3" \
             "${third_party}/DeepGEMM"
-          download_archive \
-            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/f3fde58372d33e9a5650ba7b80fc48b3b49d40c8" \
+          archive_repo \
+            "/data2/tairan/workspace/DeepGEMM/third-party/cutlass" \
+            "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8" \
             "${third_party}/DeepGEMM/third-party/cutlass"
-          download_archive \
-            "https://codeload.github.com/fmtlib/fmt/tar.gz/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28" \
+          archive_repo \
+            "/data2/tairan/workspace/DeepGEMM/third-party/fmt" \
+            "553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28" \
             "${third_party}/DeepGEMM/third-party/fmt"
           echo "context_dir=${context_dir}" >> "${GITHUB_ENV}"
           find "${third_party}" -maxdepth 2 -mindepth 1 -type d | sort
