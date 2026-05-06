@@ -6,60 +6,8 @@ on:
       - 'v*'
 
 jobs:
-  prepare-third-party-sources:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          echo "${GITHUB_TOKEN}" | docker login ghcr.io \
-            --username "${GITHUB_ACTOR}" \
-            --password-stdin
-
-      - name: Extract source context tag
-        id: vars
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          echo "context_image=ghcr.io/${owner}/batchgen-release-context:${tag}" >> "${GITHUB_OUTPUT}"
-
-      - name: Fetch release build sources
-        run: |
-          mkdir -p .docker-build/third_party
-          git clone --recursive https://github.com/Dao-AILab/flash-attention.git .docker-build/third_party/flash-attention
-          git -C .docker-build/third_party/flash-attention checkout v2.8.2
-          git -C .docker-build/third_party/flash-attention submodule update --init --recursive
-          git clone --recursive https://github.com/deepseek-ai/FlashMLA.git .docker-build/third_party/FlashMLA
-          git -C .docker-build/third_party/FlashMLA checkout 1408756a88e52a25196b759eaf8db89d2b51b5a1
-          git -C .docker-build/third_party/FlashMLA submodule update --init --recursive
-          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git .docker-build/third_party/DeepGEMM
-          git -C .docker-build/third_party/DeepGEMM checkout v2.1.1.post3
-          git -C .docker-build/third_party/DeepGEMM submodule update --init --recursive
-          find .docker-build/third_party \( -name .git -o -name .github \) -prune -exec rm -rf {} +
-
-      - name: Push release build context to GHCR
-        env:
-          CONTEXT_IMAGE: ${{ steps.vars.outputs.context_image }}
-        run: |
-          tar \
-            --exclude=.git \
-            -cf - \
-            . | docker import - "${CONTEXT_IMAGE}"
-          docker push "${CONTEXT_IMAGE}"
-
   build-and-push-ghcr:
     runs-on: [self-hosted, gpu, node0]
-    needs: prepare-third-party-sources
     timeout-minutes: 360
 
     permissions:
@@ -81,22 +29,63 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "context_image=ghcr.io/${owner}/batchgen-release-context:${tag}" >> "${GITHUB_OUTPUT}"
           echo "ghcr_image=ghcr.io/${owner}/batchgen-release:${tag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Pull and unpack release build context
+      - name: Download release build context from codeload
         env:
-          CONTEXT_IMAGE: ${{ steps.vars.outputs.context_image }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           context_dir="${RUNNER_TEMP}/batchgen-release-context"
           rm -rf "${context_dir}"
-          mkdir -p "${context_dir}"
-          docker pull "${CONTEXT_IMAGE}"
-          container_id="$(docker create "${CONTEXT_IMAGE}")"
-          trap 'docker rm -f "${container_id}" >/dev/null 2>&1 || true' EXIT
-          docker cp "${container_id}:/." "${context_dir}/"
+          mkdir -p "${context_dir}/.docker-build/third_party"
+          download_archive() {
+            local url="$1"
+            local dest="$2"
+            shift 2
+            mkdir -p "${dest}"
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 5 \
+              --connect-timeout 20 \
+              --max-time 600 \
+              --silent \
+              --show-error \
+              "$@" \
+              "${url}" | tar -xz --strip-components=1 -C "${dest}"
+          }
+          download_archive \
+            "https://codeload.github.com/EfficientMoE/BatchGen/tar.gz/${GITHUB_REF#refs/tags/}" \
+            "${context_dir}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+          third_party="${context_dir}/.docker-build/third_party"
+          download_archive \
+            "https://codeload.github.com/Dao-AILab/flash-attention/tar.gz/v2.8.2" \
+            "${third_party}/flash-attention"
+          download_archive \
+            "https://codeload.github.com/ROCm/composable_kernel/tar.gz/663992e99b412991eab554b0deb89bb916d40161" \
+            "${third_party}/flash-attention/csrc/composable_kernel"
+          download_archive \
+            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/dc4817921edda44a549197ff3a9dcf5df0636e7b" \
+            "${third_party}/flash-attention/csrc/cutlass"
+          download_archive \
+            "https://codeload.github.com/deepseek-ai/FlashMLA/tar.gz/1408756a88e52a25196b759eaf8db89d2b51b5a1" \
+            "${third_party}/FlashMLA"
+          download_archive \
+            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/e94e888df3551224738bfa505787b515eae8352f" \
+            "${third_party}/FlashMLA/csrc/cutlass"
+          download_archive \
+            "https://codeload.github.com/deepseek-ai/DeepGEMM/tar.gz/v2.1.1.post3" \
+            "${third_party}/DeepGEMM"
+          download_archive \
+            "https://codeload.github.com/NVIDIA/cutlass/tar.gz/f3fde58372d33e9a5650ba7b80fc48b3b49d40c8" \
+            "${third_party}/DeepGEMM/third-party/cutlass"
+          download_archive \
+            "https://codeload.github.com/fmtlib/fmt/tar.gz/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28" \
+            "${third_party}/DeepGEMM/third-party/fmt"
           echo "context_dir=${context_dir}" >> "${GITHUB_ENV}"
-          ls -la "${context_dir}/.docker-build/third_party"
+          find "${third_party}" -maxdepth 2 -mindepth 1 -type d | sort
 
       - name: Build and push GHCR image on node0
         env:
