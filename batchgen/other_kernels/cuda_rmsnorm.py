@@ -1,7 +1,5 @@
 """CUDA RMSNorm and fused Add+RMSNorm kernels.
 
-Ported from batchgen_kernel_dev/attention/csrc/rmsnorm.cu.
-
 Two kernels:
   rmsnorm_forward(input, weight, eps) -> output
   add_rmsnorm_forward(residual, hidden, weight, eps) -> (normed, residual)

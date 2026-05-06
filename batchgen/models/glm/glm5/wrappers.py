@@ -17,23 +17,15 @@ Key differences from DeepSeek:
 """
 
 import logging
+import os
 from contextlib import nullcontext as _nullctx
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 import torch.nn.functional as F
 
-from batchgen.models.glm.glm5.decode_utils import (
-    build_flat_paged_gather_indices,
-    build_batch_slot_indices,
-    build_paged_gather_cache_key,
-    build_clamped_dense_token_indices,
-    reorder_block_table_to_batch_slots,
-    validate_effective_block_table_pages,
-    validate_token_indices_within_seqlens,
-)
 from batchgen.models.glm.glm5.prefix_reuse import (
     offload_glm5_prepacked_mla_kv,
     run_glm5_full_hit_prefill,
@@ -48,11 +40,9 @@ try:
         FP8AbsorbWeights, fp8_q_absorb, fp8_out_absorb,
     )
     _HAS_FP8_ABSORB = True
-    _FP8_ABSORB_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FP8_ABSORB = False
-    _FP8_ABSORB_IMPORT_ERROR = _e
-    logging.warning(f"[WP5] FP8 absorb import failed: {_e!r}")
+    logging.debug(f"[WP5] FP8 absorb import failed: {_e}")
 
 # Try importing fused indexer KV proj (WP2)
 try:
@@ -61,11 +51,9 @@ try:
         FP8IndexerWeightsCUDA,
     )
     _HAS_FUSED_INDEXER_KV = True
-    _FUSED_INDEXER_KV_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_INDEXER_KV = False
-    _FUSED_INDEXER_KV_IMPORT_ERROR = _e
-    logging.warning(f"[WP2] Fused indexer KV proj import failed: {_e!r}")
+    logging.debug(f"[WP2] Fused indexer KV proj import failed: {_e}")
 
 # Try importing fused scoring pipeline (WP4)
 try:
@@ -74,11 +62,9 @@ try:
         fused_score_pipeline,
     )
     _HAS_FUSED_SCORE = True
-    _FUSED_SCORE_IMPORT_ERROR = None
 except Exception as _e:
     _HAS_FUSED_SCORE = False
-    _FUSED_SCORE_IMPORT_ERROR = _e
-    logging.warning(f"[WP4] Fused scoring import failed: {_e!r}")
+    logging.debug(f"[WP4] Fused scoring import failed: {_e}")
 
 # Initialize GLM-5 decode timer (activated by BATCHGEN_DECODE_TIMING=1)
 _GLM5_ATTN_CATEGORIES = [
@@ -94,20 +80,154 @@ _glm5_decode_timer = init_decode_timer(
     "GLM-5", _GLM5_ATTN_CATEGORIES + _GLM5_MOE_CATEGORIES
 )
 
+_GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+_GLM5_DSA_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_DSA_GRAPH_COMPARE"
+_glm5_dsa_graph_eager_fallback_logged = False
+_glm5_dsa_graph_compare_unavailable_logged = False
 
-def _allow_dsa_fallback() -> bool:
+
+def _glm5_dsa_cuda_graph_required() -> bool:
+    return os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+
+
+def _debug_flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
 
 
-def _raise_required_dsa_kernel(name: str, error: Optional[BaseException] = None) -> None:
-    msg = (
-        f"GLM-5 DSA requires {name}; silent fallback is disabled. "
-        "Install the repaired batchgen_kernels package; production GLM-5 "
-        "DSA does not support runtime fallback."
+def _glm5_dsa_graph_compare_active() -> bool:
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return (
+        _debug_flag_enabled(debug.get("glm5_dsa_graph_compare"))
+        or os.environ.get(_GLM5_DSA_GRAPH_COMPARE_ENV, "0") == "1"
     )
-    if error is not None:
-        msg = f"{msg} Import/init error: {error}"
-    raise RuntimeError(msg)
+
+
+def _glm5_dsa_graph_compare_layer_enabled(layer_idx: int) -> bool:
+    if not _glm5_dsa_graph_compare_active():
+        return False
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    layers = debug.get("glm5_dsa_graph_compare_layers")
+    if layers is None:
+        layers = os.environ.get("BATCHGEN_GLM5_DSA_GRAPH_COMPARE_LAYERS", "0")
+    if layers in ("all", "*"):
+        return True
+    if isinstance(layers, int):
+        return layer_idx == layers
+    if isinstance(layers, str):
+        return str(layer_idx) in {
+            item.strip() for item in layers.split(",") if item.strip()
+        }
+    if isinstance(layers, (list, tuple, set)):
+        try:
+            return layer_idx in {int(item) for item in layers}
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring invalid glm5_dsa_graph_compare_layers=%r; defaulting to layer 0",
+                layers,
+            )
+            return layer_idx == 0
+    return layer_idx == 0
+
+
+def _glm5_dsa_graph_compare_fail_on_mismatch() -> bool:
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return _debug_flag_enabled(debug.get("glm5_dsa_graph_compare_fail_on_mismatch"))
+
+
+def _glm5_dsa_cuda_graph_can_replay(
+    cache_seqlens: torch.Tensor,
+    max_seqlen: int,
+    index_topk: int,
+    *,
+    captured_max_seqlen: Optional[int] = None,
+) -> bool:
+    """Return whether the fixed selected-KV graph contract can replay.
+
+    The unified selector always writes a fixed selected-KV buffer
+    ``[B, index_topk, 1, kv_dim]``. Runtime row lengths are carried by
+    ``selected_lengths`` and must not route short rows to eager DSA.
+    """
+
+    if max_seqlen <= 0 or index_topk <= 0:
+        return False
+    if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
+        return False
+    if cache_seqlens.ndim != 1:
+        return False
+    return True
+
+
+def _log_glm5_dsa_graph_eager_fallback_once(
+    layer_idx: int,
+    cache_seqlens: torch.Tensor,
+    index_topk: int,
+    reason: str = "rows are not all graph-safe",
+) -> None:
+    global _glm5_dsa_graph_eager_fallback_logged
+    if _glm5_dsa_graph_eager_fallback_logged or layer_idx != 0:
+        return
+    _glm5_dsa_graph_eager_fallback_logged = True
+    logging.warning(
+        "GLM-5 DSA CUDA graph requested but %s; using eager DSA "
+        "(index_topk=%s, min_cache_seqlen=%s).",
+        reason,
+        index_topk,
+        int(cache_seqlens.min().item()),
+    )
+
+
+def _log_glm5_dsa_graph_compare_unavailable_once(
+    layer_idx: int,
+    reason: str,
+) -> None:
+    global _glm5_dsa_graph_compare_unavailable_logged
+    if _glm5_dsa_graph_compare_unavailable_logged or layer_idx != 0:
+        return
+    _glm5_dsa_graph_compare_unavailable_logged = True
+    logging.warning(
+        "GLM-5 DSA graph/eager compare requested but graph side-channel is "
+        "unavailable (%s); returning eager DSA output.",
+        reason,
+    )
+
+
+def _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager) -> Optional[torch.Tensor]:
+    get_graph_table = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table", None)
+    if get_graph_table is None:
+        return None
+    try:
+        return get_graph_table()
+    except RuntimeError:
+        return None
+
+
+def _glm5_dsa_page_table_signature(
+    page_table: Optional[torch.Tensor],
+) -> Optional[Tuple[int, Tuple[int, ...], str, str]]:
+    if page_table is None:
+        return None
+    return (
+        int(page_table.data_ptr()),
+        tuple(int(dim) for dim in page_table.shape),
+        str(page_table.dtype),
+        str(page_table.device),
+    )
+
+
+def _fail_if_glm5_dsa_cuda_graph_required_without_replay() -> None:
+    if not _glm5_dsa_cuda_graph_required():
+        return
+    raise RuntimeError(
+        f"{_GLM5_DSA_CUDA_GRAPH_ENV}=1 requested GLM-5 DSA CUDA graph replay, "
+        "but no replayable graph is available for this decode step. Refusing to "
+        "silently fall back to eager DSA decode."
+    )
 
 
 def glm5_fp8_dequantization(
@@ -278,6 +398,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # Fallback warning guards
         self._warned_fp8_absorb_fallback = False
         self._warned_indexer_kv_fallback = False
+        self._dsa_cuda_graph_manager = None
+        self._dsa_cuda_graph_segment_name = None
+        self._dsa_cuda_graph_max_seqlen = 0
+        self._dsa_cuda_graph_max_primary_pages = 0
+        self._dsa_cuda_graph_max_aux_pages = 0
+        self._dsa_cuda_graph_primary_page_table_signature = None
+        self._dsa_cuda_graph_aux_page_table_signature = None
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -370,10 +497,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
 
         # WP2: Fused indexer KV proj (GEMM-only path, LayerNorm stays in PyTorch)
-        if not _HAS_FUSED_INDEXER_KV:
-            if not _allow_dsa_fallback():
-                _raise_required_dsa_kernel("WP2 fused indexer KV projection", _FUSED_INDEXER_KV_IMPORT_ERROR)
-        else:
+        if _HAS_FUSED_INDEXER_KV:
             try:
                 self._indexer_cuda_module = _build_indexer_module()
                 # Dequantize FP8 wk weight to BF16 (kernel re-quantizes internally for TMA)
@@ -387,8 +511,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] WP2 fused indexer KV proj initialized"
                 )
             except Exception as e:
-                if not _allow_dsa_fallback():
-                    _raise_required_dsa_kernel("WP2 fused indexer KV projection", e)
                 logging.warning(
                     f"[layer {self.layer_idx}] WP2 init failed: {e}"
                 )
@@ -396,13 +518,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self._indexer_cuda_weights = None
 
         # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if not _HAS_FUSED_SCORE:
-            if not _allow_dsa_fallback():
-                _raise_required_dsa_kernel("WP4 fused indexer scoring", _FUSED_SCORE_IMPORT_ERROR)
-        elif self._indexer_cuda_module is None:
-            if not _allow_dsa_fallback():
-                _raise_required_dsa_kernel("WP4 fused indexer scoring", RuntimeError("WP2 module is unavailable"))
-        elif hasattr(indexer, 'wq_b_scale'):
+        if _HAS_FUSED_SCORE and self._indexer_cuda_module is not None and hasattr(indexer, 'wq_b_scale'):
             try:
                 wq_b_bf16 = glm5_fp8_dequantization(
                     indexer.wq_b.weight.data, indexer.wq_b_scale,
@@ -418,8 +534,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] WP4 fused scoring pipeline initialized"
                 )
             except Exception as e:
-                if not _allow_dsa_fallback():
-                    _raise_required_dsa_kernel("WP4 fused indexer scoring", e)
                 logging.warning(
                     f"[layer {self.layer_idx}] WP4 init failed: {e}"
                 )
@@ -431,12 +545,73 @@ class GLM5AttnWrapper(AttnWrapperBase):
         """Return FP8 weights unchanged — deepgemm handles FP8 directly."""
         return weights_dict
 
+    def enable_dsa_cuda_graph(
+        self,
+        manager,
+        segment_name: str,
+        *,
+        max_seqlen: int,
+        max_primary_pages_per_seq: Optional[int] = None,
+        max_aux_pages_per_seq: Optional[int] = None,
+        primary_page_table: Optional[torch.Tensor] = None,
+        aux_page_table: Optional[torch.Tensor] = None,
+    ) -> None:
+        self._dsa_cuda_graph_manager = manager
+        self._dsa_cuda_graph_segment_name = segment_name
+        self._dsa_cuda_graph_max_seqlen = max_seqlen
+        self._dsa_cuda_graph_max_primary_pages = (
+            primary_page_table.shape[1]
+            if primary_page_table is not None
+            else int(max_primary_pages_per_seq or 0)
+        )
+        self._dsa_cuda_graph_max_aux_pages = (
+            aux_page_table.shape[1]
+            if aux_page_table is not None
+            else int(max_aux_pages_per_seq or 0)
+        )
+        self._dsa_cuda_graph_primary_page_table_signature = _glm5_dsa_page_table_signature(
+            primary_page_table
+        )
+        self._dsa_cuda_graph_aux_page_table_signature = _glm5_dsa_page_table_signature(
+            aux_page_table
+        )
+
+    def _dsa_cuda_graph_page_tables_match(
+        self,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+    ) -> bool:
+        primary_expected = getattr(
+            self,
+            "_dsa_cuda_graph_primary_page_table_signature",
+            None,
+        )
+        aux_expected = getattr(
+            self,
+            "_dsa_cuda_graph_aux_page_table_signature",
+            None,
+        )
+        if primary_expected is None or aux_expected is None:
+            return False
+        return (
+            _glm5_dsa_page_table_signature(
+                _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager)
+            ) == primary_expected
+            and _glm5_dsa_page_table_signature(
+                _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager_aux)
+            ) == aux_expected
+        )
+
     def _forward_prefill(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Prefill forward with DSA auxiliary cache population.
 
         1. Standard MLA prefill via FA3 (full attention)
         2. Compute indexer K and write to auxiliary cache
         """
+        AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+            self.layer_idx,
+            device=hidden_states.device,
+        )
         if self.prepack_mode:
             hidden_states_2d = hidden_states.squeeze(0)
             metadata = self.prefix_cache_metadata()
@@ -588,6 +763,332 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             return (attn_output, updated_past_key, updated_scale)
 
+    def _forward_decode_dsa_graph(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+    ) -> torch.Tensor:
+        if self._dsa_cuda_graph_manager is None or self._dsa_cuda_graph_segment_name is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] BATCHGEN_GLM5_DSA_CUDA_GRAPH=1 was requested, "
+                "but this attention wrapper has no registered DSA CUDA graph segment"
+            )
+        if max_seqlen > self._dsa_cuda_graph_max_seqlen:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph max_seqlen={max_seqlen} "
+                f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
+            )
+        index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
+        if not _glm5_dsa_cuda_graph_can_replay(
+            cache_seqlens,
+            max_seqlen,
+            index_topk,
+            captured_max_seqlen=getattr(self, "_dsa_cuda_graph_max_seqlen", None),
+        ):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is not "
+                f"valid for max_seqlen={max_seqlen}, captured cap "
+                f"{self._dsa_cuda_graph_max_seqlen}, index_topk={index_topk}"
+            )
+        if not self._dsa_cuda_graph_page_tables_match(
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+        ):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph captured page-table "
+                "storage no longer matches the active GPU page-table storage"
+            )
+
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_graph_segment_inputs,
+        )
+        bsz = hidden_states.shape[0]
+        graph_inputs = build_glm5_dsa_graph_segment_inputs(
+            self,
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+        )
+        if AttnWrapperBase.kv_append_callback is not None:
+            AttnWrapperBase.kv_append_callback(
+                self.layer_idx,
+                graph_inputs.primary_k_tensor,
+                None,
+            )
+        if AttnWrapperBase.kv_append_callback_aux is not None:
+            AttnWrapperBase.kv_append_callback_aux(
+                self.layer_idx,
+                graph_inputs.indexer_k_tensor,
+                None,
+            )
+
+        flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+            self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+        )
+        graph_outputs = self._dsa_cuda_graph_manager.replay(
+            self._dsa_cuda_graph_segment_name,
+            bsz,
+            q_a=graph_inputs.q_a,
+            q_nope=graph_inputs.q_nope,
+            q_rope=graph_inputs.q_rope,
+            head_gates=graph_inputs.head_gates,
+            cache_seqlens=graph_inputs.cache_seqlens,
+            positions_expanded=graph_inputs.positions_expanded,
+            primary_slot_indices=graph_inputs.primary_slot_indices,
+            aux_slot_indices=graph_inputs.aux_slot_indices,
+            flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+            flashmla_num_splits=flashmla_num_splits,
+        )
+
+        return self._project_dsa_attn_heads(graph_outputs["attn_heads"])
+
+    def _project_dsa_attn_heads(self, attn_heads: torch.Tensor) -> torch.Tensor:
+        from batchgen.attention.mla.fa3_backend import act_quant
+        from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
+
+        attn = self.module
+        bsz = attn_heads.shape[0]
+        attn_heads_flat = attn_heads.reshape(
+            bsz,
+            attn.num_heads * attn.v_head_dim,
+        )
+        attn_output_fp8, attn_output_scale = act_quant(attn_heads_flat)
+        attn_output = w8a8_deepgemm(
+            attn_output_fp8,
+            attn_output_scale,
+            attn.o_proj.weight,
+            self.weight_dequant_scale["o_proj.weight_scale_inv"],
+        )
+        return attn_output.view(bsz, 1, -1)
+
+    def _dsa_cuda_graph_flashmla_metadata_inputs(
+        self,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._dsa_cuda_graph_manager is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata requested "
+                "without a graph manager"
+            )
+        bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
+        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        if not isinstance(metadata, dict):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay requires "
+                "per-forward FlashMLA metadata to be prepared before model forward"
+            )
+        if int(metadata.get("bucket_size", -1)) != int(bucket_size):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata bucket "
+                f"{metadata.get('bucket_size')} does not match replay bucket {bucket_size}"
+            )
+        tile_scheduler_metadata = metadata.get("tile_scheduler_metadata")
+        num_splits = metadata.get("num_splits")
+        if not isinstance(tile_scheduler_metadata, torch.Tensor) or not isinstance(
+            num_splits,
+            torch.Tensor,
+        ):
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph metadata must be "
+                "tensor FlashMLA metadata buffers"
+            )
+        return tile_scheduler_metadata, num_splits
+
+    @staticmethod
+    def _compare_tensor_summary(
+        name: str,
+        graph_tensor: Optional[torch.Tensor],
+        eager_tensor: Optional[torch.Tensor],
+        *,
+        exact: bool = False,
+        atol: float = 5e-2,
+        rtol: float = 5e-2,
+    ) -> Tuple[bool, str]:
+        if graph_tensor is None or eager_tensor is None:
+            return False, f"{name}: skipped"
+        if tuple(graph_tensor.shape) != tuple(eager_tensor.shape):
+            return True, (
+                f"{name}: shape_mismatch graph={tuple(graph_tensor.shape)} "
+                f"eager={tuple(eager_tensor.shape)}"
+            )
+        if graph_tensor.numel() == 0:
+            return False, f"{name}: empty"
+
+        if exact or not graph_tensor.is_floating_point():
+            graph_i = graph_tensor.to(dtype=torch.int64)
+            eager_i = eager_tensor.to(dtype=torch.int64, device=graph_tensor.device)
+            mismatch = int((graph_i != eager_i).sum().item())
+            if mismatch == 0:
+                return False, f"{name}: exact"
+            max_abs = int((graph_i - eager_i).abs().max().item())
+            return True, f"{name}: mismatch={mismatch}/{graph_i.numel()} max_abs={max_abs}"
+
+        graph_f = graph_tensor.float()
+        eager_f = eager_tensor.to(device=graph_tensor.device).float()
+        diff = (graph_f - eager_f).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        close = bool(torch.allclose(graph_f, eager_f, atol=atol, rtol=rtol))
+        return (
+            not close,
+            f"{name}: max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+            f"atol={atol:g} rtol={rtol:g}",
+        )
+
+    def _forward_decode_dsa_graph_compare(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+        *,
+        eager_output: torch.Tensor,
+        eager_debug: Dict[str, Any],
+    ) -> None:
+        """Run graph replay as a side-channel and return/log eager-vs-graph diffs."""
+
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_graph_segment_inputs,
+        )
+
+        fail_on_mismatch = _glm5_dsa_graph_compare_fail_on_mismatch()
+        try:
+            bsz = hidden_states.shape[0]
+            graph_inputs = build_glm5_dsa_graph_segment_inputs(
+                self,
+                hidden_states,
+                position_ids,
+                cache_seqlens,
+                max_seqlen,
+                gpu_paged_kv_manager,
+                gpu_paged_kv_manager_aux,
+                write_kv=False,
+            )
+            flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+                self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+            )
+            graph_outputs = self._dsa_cuda_graph_manager.replay(
+                self._dsa_cuda_graph_segment_name,
+                bsz,
+                q_a=graph_inputs.q_a,
+                q_nope=graph_inputs.q_nope,
+                q_rope=graph_inputs.q_rope,
+                head_gates=graph_inputs.head_gates,
+                cache_seqlens=graph_inputs.cache_seqlens,
+                positions_expanded=graph_inputs.positions_expanded,
+                primary_slot_indices=graph_inputs.primary_slot_indices,
+                aux_slot_indices=graph_inputs.aux_slot_indices,
+                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                flashmla_num_splits=flashmla_num_splits,
+            )
+            graph_output = self._project_dsa_attn_heads(graph_outputs["attn_heads"])
+
+            attn = self.module
+            selector_inputs = eager_debug.get("selector_inputs")
+            eager_attn_heads = eager_debug.get("attn_heads")
+            checks = [
+                self._compare_tensor_summary(
+                    "final_o_proj", graph_output, eager_output,
+                ),
+                self._compare_tensor_summary(
+                    "attn_heads", graph_outputs.get("attn_heads"), eager_attn_heads,
+                ),
+            ]
+            if selector_inputs is not None:
+                checks.extend(
+                    [
+                        self._compare_tensor_summary(
+                            "q_nope",
+                            graph_inputs.q_nope,
+                            selector_inputs.q_nope,
+                        ),
+                        self._compare_tensor_summary(
+                            "q_rope",
+                            graph_inputs.q_rope,
+                            selector_inputs.q_rope,
+                        ),
+                        self._compare_tensor_summary(
+                            "primary_k_tensor",
+                            graph_inputs.primary_k_tensor,
+                            selector_inputs.primary_k_tensor,
+                        ),
+                        self._compare_tensor_summary(
+                            "indexer_k_tensor",
+                            graph_inputs.indexer_k_tensor,
+                            selector_inputs.indexer_k_tensor,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_lengths",
+                            graph_outputs.get("selected_lengths"),
+                            selector_inputs.selected_lengths,
+                            exact=True,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_indices",
+                            graph_outputs.get("top_k_indices"),
+                            selector_inputs.selected_indices,
+                            exact=True,
+                        ),
+                        self._compare_tensor_summary(
+                            "selected_mla_kv",
+                            graph_outputs.get("selected_mla_kv"),
+                            selector_inputs.selected_mla_kv,
+                            atol=0.0,
+                            rtol=0.0,
+                        ),
+                        self._compare_tensor_summary(
+                            "absorbed_q",
+                            graph_outputs.get("absorbed_q"),
+                            selector_inputs.query_states[:, 0, :, : attn.kv_lora_rank],
+                        ),
+                        self._compare_tensor_summary(
+                            "query_states",
+                            graph_outputs.get("query_states"),
+                            selector_inputs.query_states,
+                            atol=0.0,
+                            rtol=0.0,
+                        ),
+                        self._compare_tensor_summary(
+                            "raw_attn_out",
+                            graph_outputs.get("raw_attn_out"),
+                            eager_debug.get("raw_attn_out"),
+                        ),
+                    ]
+                )
+
+            failed = any(item[0] for item in checks)
+            log_fn = logging.error if failed else logging.info
+            log_fn(
+                "[GLM5_DSA_GRAPH_COMPARE] layer=%s status=%s bsz=%s "
+                "max_seqlen=%s min_cache=%s %s",
+                self.layer_idx,
+                "FAIL" if failed else "OK",
+                bsz,
+                max_seqlen,
+                int(cache_seqlens.min().item()),
+                "; ".join(message for _, message in checks),
+            )
+            if failed and fail_on_mismatch:
+                raise RuntimeError(
+                    f"GLM-5 DSA graph/eager compare failed on layer {self.layer_idx}"
+                )
+        except Exception:
+            logging.exception(
+                "[GLM5_DSA_GRAPH_COMPARE] layer=%s side-channel graph replay failed",
+                self.layer_idx,
+            )
+            if fail_on_mismatch:
+                raise
+
     def _forward_decode_dsa(
         self,
         hidden_states: torch.Tensor,
@@ -602,509 +1103,161 @@ class GLM5AttnWrapper(AttnWrapperBase):
         Computes MLA KV and writes to primary cache first, then runs indexer
         scoring on aux cache, gathers sparse MLA KV, and runs sparse FlashMLA.
         """
-        from batchgen.attention.mla.fa3_backend import act_quant
-        from batchgen.attention.mla.fused_rmsnorm_rope import (
-            fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
+        attn = self.module
+        bsz = hidden_states.shape[0]
+
+        # Handle empty batch (some DP ranks have 0 sequences at late decode stages)
+        if bsz == 0:
+            return hidden_states.new_empty(0, 1, attn.hidden_size)
+
+        compare_active = _glm5_dsa_graph_compare_active()
+        compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
+        graph_requested = _glm5_dsa_cuda_graph_required() or compare_active
+        compare_after_eager = False
+        if graph_requested:
+            index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)
+            graph_can_replay = _glm5_dsa_cuda_graph_can_replay(
+                cache_seqlens,
+                max_seqlen,
+                index_topk,
+                captured_max_seqlen=getattr(self, "_dsa_cuda_graph_max_seqlen", None),
+            )
+            graph_has_bucket = (
+                self._dsa_cuda_graph_manager is not None
+                and self._dsa_cuda_graph_segment_name is not None
+                and self._dsa_cuda_graph_manager.has_graph(
+                    self._dsa_cuda_graph_segment_name,
+                    bsz,
+                )
+            )
+            graph_page_tables_match = graph_has_bucket and self._dsa_cuda_graph_page_tables_match(
+                gpu_paged_kv_manager,
+                gpu_paged_kv_manager_aux,
+            )
+            if graph_can_replay and graph_has_bucket and graph_page_tables_match and not compare_active:
+                return self._forward_decode_dsa_graph(
+                    hidden_states,
+                    position_ids,
+                    cache_seqlens,
+                    max_seqlen,
+                    gpu_paged_kv_manager,
+                    gpu_paged_kv_manager_aux,
+                )
+            compare_after_eager = bool(
+                compare_active
+                and compare_this_layer
+                and graph_can_replay
+                and graph_has_bucket
+                and graph_page_tables_match
+            )
+            if not graph_can_replay:
+                captured_cap = getattr(self, "_dsa_cuda_graph_max_seqlen", None)
+                if captured_cap is not None and max_seqlen > captured_cap:
+                    reason = (
+                        f"max_seqlen={max_seqlen} exceeds captured cap "
+                        f"{captured_cap}"
+                    )
+                elif index_topk <= 0:
+                    reason = f"invalid index_topk={index_topk}"
+                elif cache_seqlens.ndim != 1:
+                    reason = f"cache_seqlens ndim {cache_seqlens.ndim} is not 1"
+                else:
+                    reason = "current decode metadata is not graph-compatible"
+            elif not graph_has_bucket:
+                reason = f"batch size {bsz} has no captured graph bucket"
+            elif not graph_page_tables_match:
+                reason = "captured page-table storage no longer matches active storage"
+            else:
+                reason = "graph/eager compare mode is returning eager output"
+            _log_glm5_dsa_graph_eager_fallback_once(
+                self.layer_idx,
+                cache_seqlens,
+                index_topk,
+                reason,
+            )
+            if compare_active and compare_this_layer and not compare_after_eager:
+                _log_glm5_dsa_graph_compare_unavailable_once(
+                    self.layer_idx,
+                    reason,
+                )
+
+        eager_result = self._forward_decode_dsa_eager(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            return_debug=compare_after_eager,
         )
-        from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
-        from batchgen.attention.dsa.sparse_gather import sparse_gather_from_paged_kv
-        from batchgen.attention.dsa.sparse_decode_mla import sparse_flash_mla_decode
+        if not compare_after_eager:
+            return eager_result
+
+        eager_output, eager_debug = eager_result
+        self._forward_decode_dsa_graph_compare(
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            eager_output=eager_output,
+            eager_debug=eager_debug,
+        )
+        return eager_output
+
+    def _forward_decode_dsa_eager(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen: int,
+        gpu_paged_kv_manager,
+        gpu_paged_kv_manager_aux,
+        *,
+        return_debug: bool = False,
+    ):
+        attn = self.module
+        bsz = hidden_states.shape[0]
+        li = self.layer_idx
+
+        from batchgen.attention.dsa.glm5_decode_selector import (
+            build_glm5_dsa_flashmla_inputs,
+        )
+        from batchgen.attention.dsa.sparse_decode_mla import (
+            run_prepared_sparse_flash_mla_decode,
+        )
+        from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
         from batchgen.timing import get_decode_timer
 
         weight_scale = self.weight_dequant_scale
-        attn = self.module
-        indexer = attn.indexer
-        bsz = hidden_states.shape[0]
         dt = get_decode_timer()
-        li = self.layer_idx
-
-        # Some DP ranks have 0 sequences at late decode stages. Empty rows are
-        # valid only as a fully empty local batch; avoid reductions such as
-        # cache_seqlens.max() below.
-        if bsz == 0:
-            if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
-                raise RuntimeError(
-                    f"GLM-5 DSA layer {li}: empty hidden_states must be [0,1,H], got {tuple(hidden_states.shape)}"
-                )
-            return hidden_states.new_empty(0, 1, attn.hidden_size)
-
-        if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: hidden_states must be [B,1,H], got {tuple(hidden_states.shape)}"
-            )
-        if hidden_states.dtype != torch.bfloat16:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: hidden_states dtype must be bf16, got {hidden_states.dtype}"
-            )
-        if position_ids is None or position_ids.dim() != 2 or position_ids.shape != (bsz, 1):
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: position_ids must be [B,1], got "
-                f"{None if position_ids is None else tuple(position_ids.shape)}"
-            )
-        if cache_seqlens is None or cache_seqlens.dim() != 1 or cache_seqlens.shape[0] != bsz:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: cache_seqlens must be [B], got "
-                f"{None if cache_seqlens is None else tuple(cache_seqlens.shape)} for bsz={bsz}"
-            )
-        if not cache_seqlens.is_cuda or not position_ids.is_cuda:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: cache_seqlens and position_ids must be CUDA tensors"
-            )
-        if gpu_paged_kv_manager is None or gpu_paged_kv_manager_aux is None:
-            raise RuntimeError(f"GLM-5 DSA layer {li}: primary and auxiliary GPU KV managers are required")
-        if gpu_paged_kv_manager.config.page_size_tokens != gpu_paged_kv_manager_aux.config.page_size_tokens:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: primary/aux page-size mismatch: "
-                f"primary={gpu_paged_kv_manager.config.page_size_tokens}, "
-                f"aux={gpu_paged_kv_manager_aux.config.page_size_tokens}"
-            )
-        if max_seqlen != int(cache_seqlens.max().item()):
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: max_seqlen={max_seqlen} must equal "
-                f"cache_seqlens.max()={int(cache_seqlens.max().item())}"
-            )
-        if not torch.equal(position_ids.squeeze(-1).to(cache_seqlens.device), cache_seqlens - 1):
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: position_ids must equal cache_seqlens - 1 for every row"
-            )
-
-        # --- Shared FP8 activation quantization ---
-        with (dt.timed("act_quant", li) if dt else _nullctx()):
-            hidden_flat = hidden_states.squeeze(1)  # [batch, hidden_size]
-            hidden_fp8, hidden_scale = act_quant(hidden_flat)
-
-        # --- Q path: q_a_proj → layernorm → q_b_proj → split → RoPE ---
-        with (dt.timed("q_proj", li) if dt else _nullctx()):
-            q_a = w8a8_deepgemm(
-                hidden_fp8, hidden_scale,
-                attn.q_a_proj.weight, weight_scale["q_a_proj.weight_scale_inv"],
-            )
-            q_a_normed = attn.q_a_layernorm(q_a)
-            q_a_fp8, q_a_scale = act_quant(q_a_normed)
-            q = w8a8_deepgemm(
-                q_a_fp8, q_a_scale,
-                attn.q_b_proj.weight, weight_scale["q_b_proj.weight_scale_inv"],
-            )
-            q = q.view(bsz, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-            q_nope, q_pe = torch.split(
-                q, [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
-            )
-            q_pe = q_pe.contiguous()
-
-        # --- KV path: kv_a_proj → fused_rmsnorm_rope → compressed KV ---
-        with (dt.timed("kv_proj", li) if dt else _nullctx()):
-            new_compressed_kv = w8a8_deepgemm(
-                hidden_fp8, hidden_scale,
-                attn.kv_a_proj_with_mqa.weight,
-                weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-            ).view(bsz, 1, -1)
-
-            cos, sin = attn.rotary_emb(q_pe, seq_len=max_seqlen)
-            # Explicitly pass the module's RMSNorm eps (config.rms_norm_eps=1e-5
-            # for GLM-5). The kernel default is 1e-6; without this override the
-            # decode-side new-KV gets normalized with a 10× tighter regularizer
-            # than the prefill-cached KV, creating a slow drift that compounds
-            # across 78 layers × decode steps and manifests as ngram loops /
-            # off-topic generation after ~hundreds of tokens.
-            offload_kv = _fused_rmsnorm_rope(
-                new_compressed_kv, q_pe, cos, sin, position_ids,
-                attn.kv_a_layernorm.weight,
-                attn.kv_lora_rank, attn.qk_rope_head_dim,
-                eps=attn.kv_a_layernorm.eps,
-            )
-
-        # Pre-compute seq_lengths_i32 once (shared by kv_write and indexer_k)
-        new_token_pos = position_ids.squeeze(-1)  # [batch]
-        manager_device = gpu_paged_kv_manager.device
-        seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
-        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-        # Read per-step hoisted tensors populated by the worker (see
-        # batchgen_worker.py near the _dsa_short_count block). Falls back to
-        # the per-layer build only when the hoist wasn't populated — keeps
-        # test paths + CUDA-graph capture paths correct. The fallback MUST
-        # NOT run under graph capture (torch.tensor from a python list
-        # performs HtoD + sync, which capture can't express).
-        primary_slot_indices = AttnWrapperBase.primary_slot_indices
-        if primary_slot_indices is None:
-            raise RuntimeError(
-                "GLM-5 DSA requires worker-hoisted primary_slot_indices; "
-                "per-layer reconstruction is not a valid production fallback"
-            )
-        aux_device = gpu_paged_kv_manager_aux.device
-        aux_slot_indices = AttnWrapperBase.aux_slot_indices
-        if aux_slot_indices is None:
-            raise RuntimeError(
-                "GLM-5 DSA requires worker-hoisted aux_slot_indices; "
-                "per-layer reconstruction is not a valid production fallback"
-            )
-        if primary_slot_indices.shape != (bsz,) or aux_slot_indices.shape != (bsz,):
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: slot index shape mismatch: "
-                f"primary={tuple(primary_slot_indices.shape)}, aux={tuple(aux_slot_indices.shape)}, bsz={bsz}"
-            )
-        if primary_slot_indices.dtype not in (torch.int32, torch.int64) or aux_slot_indices.dtype not in (torch.int32, torch.int64):
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: slot indices must be int32/int64, "
-                f"primary={primary_slot_indices.dtype}, aux={aux_slot_indices.dtype}"
-            )
-        if primary_slot_indices.device != manager_device or aux_slot_indices.device != aux_device:
-            raise RuntimeError(
-                f"GLM-5 DSA layer {li}: slot index device mismatch: "
-                f"primary={primary_slot_indices.device}/{manager_device}, aux={aux_slot_indices.device}/{aux_device}"
-            )
-
-        # Index-OOB diagnostic (BATCHGEN_GLM5_VERIFY_INDICES=1). Logs the
-        # bounds relevant to every OOB-able op on the DSA decode path and
-        # asserts the pre-conditions. Fires only on layers 0..4 so we catch
-        # the first-decode-step crash without spamming every layer. The
-        # .item()s force a sync so the assertion traceback points at the
-        # true violator instead of a downstream H2D copy.
-        import os as _os_verify
-        _VERIFY = _os_verify.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
-        if _VERIFY and self.layer_idx <= 4:
-            _rk = AttnWrapperBase.get_rank_safe()
-            # Slot indices must index into their respective page tables.
-            _prim_pt = gpu_paged_kv_manager._gpu_page_table_manager.gpu_table
-            _aux_pt = gpu_paged_kv_manager_aux._gpu_page_table_manager.gpu_table
-            _prim_rows = 0 if _prim_pt is None else int(_prim_pt.shape[0])
-            _aux_rows = 0 if _aux_pt is None else int(_aux_pt.shape[0])
-            _prim_cols = 0 if _prim_pt is None else int(_prim_pt.shape[1])
-            _aux_cols = 0 if _aux_pt is None else int(_aux_pt.shape[1])
-            _prim_max = int(primary_slot_indices.max().item())
-            _prim_min = int(primary_slot_indices.min().item())
-            _aux_max = int(aux_slot_indices.max().item())
-            _aux_min = int(aux_slot_indices.min().item())
-            _cs_max = int(updated_seqlens.max().item()) if 'updated_seqlens' in dir() else int(cache_seqlens.max().item())
-            _cs_min = int(cache_seqlens.min().item())
-            _pos_max = int(new_token_pos.max().item())
-            _pos_min = int(new_token_pos.min().item())
-            _prim_pages = int(gpu_paged_kv_manager.config.num_pages)
-            _aux_pages = int(gpu_paged_kv_manager_aux.config.num_pages)
-            _prim_psz = int(gpu_paged_kv_manager.config.page_size_tokens)
-            _aux_psz = int(gpu_paged_kv_manager_aux.config.page_size_tokens)
-            logging.warning(
-                f"[VERIFY-DSA rank={_rk} L{self.layer_idx} bsz={bsz}] "
-                f"prim_slot=[{_prim_min},{_prim_max}] max_rows={_prim_rows} cols={_prim_cols} "
-                f"num_pages={_prim_pages} page_sz={_prim_psz} | "
-                f"aux_slot=[{_aux_min},{_aux_max}] max_rows={_aux_rows} cols={_aux_cols} "
-                f"num_pages={_aux_pages} page_sz={_aux_psz} | "
-                f"cache_seq=[{_cs_min},{_cs_max}] pos=[{_pos_min},{_pos_max}] "
-                f"max_seqlen={max_seqlen}"
-            )
-            assert _prim_max < _prim_rows, (
-                f"primary_slot_indices.max()={_prim_max} >= page_table.shape[0]={_prim_rows}"
-            )
-            assert _aux_max < _aux_rows, (
-                f"aux_slot_indices.max()={_aux_max} >= aux page_table.shape[0]={_aux_rows}"
-            )
-            _expected_prim_pages_for_ctx = (max_seqlen + _prim_psz - 1) // _prim_psz
-            _expected_aux_pages_for_ctx = (max_seqlen + _aux_psz - 1) // _aux_psz
-            if _expected_prim_pages_for_ctx > _prim_cols:
-                logging.warning(
-                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
-                    f"max_seqlen={max_seqlen} needs {_expected_prim_pages_for_ctx} primary pages "
-                    f"but page_table only has {_prim_cols} cols — gather will wrap"
-                )
-            if _expected_aux_pages_for_ctx > _aux_cols:
-                logging.warning(
-                    f"[VERIFY-DSA rank={_rk} L{self.layer_idx}] "
-                    f"max_seqlen={max_seqlen} needs {_expected_aux_pages_for_ctx} aux pages "
-                    f"but aux page_table only has {_aux_cols} cols — gather will wrap"
-                )
-
-        # --- Step 1: Write new MLA KV to primary cache ---
-        with (dt.timed("kv_write", li) if dt else _nullctx()):
-            k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
-            if k_tensor.device != manager_device:
-                k_tensor = k_tensor.to(manager_device)
-            gpu_paged_kv_manager.update_layer_decode_new_token(
-                k_tensor=k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32,
-                layer_idx=li,
-                slot_indices=primary_slot_indices,
-            )
-            if AttnWrapperBase.kv_append_callback is not None:
-                AttnWrapperBase.kv_append_callback(li, k_tensor, None)
-
-        # --- Step 2: Write indexer K to auxiliary cache ---
-        if gpu_paged_kv_manager_aux is not None:
-            with (dt.timed("indexer_k", li) if dt else _nullctx()):
-                # WP2: Fused CUDA WGMMA wk_proj (GEMM only) + PyTorch LayerNorm + RoPE + Hadamard
-                if self._indexer_cuda_weights is not None:
-                    from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import cuda_wk_proj_gemm_only
-                    # CUDA kernel: hidden_states → FP8 act_quant → WGMMA wk_proj
-                    k_raw = cuda_wk_proj_gemm_only(
-                        hidden_flat,  # [B, hidden_size] — already squeezed above
-                        self._indexer_cuda_weights,
-                        self._indexer_cuda_module,
-                    )  # [B, index_head_dim=128]
-                    # LayerNorm (model uses nn.LayerNorm with bias, not RMSNorm)
-                    k_normed = indexer.k_norm(k_raw)
-                    # Apply RoPE + Hadamard (reuse indexer's fused op)
-                    k_normed_3d = k_normed.unsqueeze(1)  # [B, 1, 128]
-                    indexer_kv = indexer._fused_rope_hadamard_or_fallback(
-                        k_normed_3d, new_token_pos, max_seqlen=max_seqlen,
-                    ).unsqueeze(2)  # [B, 1, 1, 128]
-                else:
-                    _raise_required_dsa_kernel(
-                        "WP2 fused indexer KV projection",
-                        RuntimeError(f"layer {self.layer_idx} was not initialized"),
-                    )
-                indexer_k_tensor = indexer_kv  # [batch, 1, 1, index_dim]
-                seq_lengths_i32_aux = seq_lengths_i32 if aux_device == manager_device else new_token_pos.to(dtype=torch.int32, device=aux_device)
-                gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                    k_tensor=indexer_k_tensor,
-                    v_tensor=None,
-                    sequence_lengths=seq_lengths_i32_aux,
-                    layer_idx=li,
-                    slot_indices=aux_slot_indices,
-                )
-                # Offload indexer K to auxiliary host cache
-                if AttnWrapperBase.kv_append_callback_aux is not None:
-                    AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
-
-        # --- Step 3: Score all cached tokens (including new), select top-K ---
-        with (dt.timed("indexer_score", li) if dt else _nullctx()):
-            # cache_seqlens already includes the new token (pre-incremented in worker)
-            updated_seqlens = cache_seqlens
-
-            # Per-seq dispatch between the dense short-circuit and the indexer
-            # scoring path. Previously dispatched at the batch level using
-            # max(cache_seqlens), which dragged short rows (cache_seqlen <=
-            # index_topk) through the indexer whenever any row in the batch
-            # exceeded index_topk. Now:
-            #   - all rows <= index_topk  : dense (topk = max_seqlen)
-            #   - all rows >  index_topk  : indexer (topk = index_topk)
-            #   - mixed                   : per-row dispatch, unified to
-            #     [batch, index_topk] via row-mask assignment.
-            _idx_topk = indexer.index_topk
-            _short_mask = updated_seqlens <= _idx_topk  # [batch] bool
-            _bsz = _short_mask.shape[0]
-            # Dispatch hint is precomputed once per decode step by the worker
-            # (batchgen_worker.py decode loop) so the per-layer .sum().item()
-            # here — which would fire 78x per step — becomes a plain int read.
-            _short_count = AttnWrapperBase._dsa_short_count
-            if _short_count is None:
-                raise RuntimeError(
-                    "GLM-5 DSA requires worker-hoisted _dsa_short_count; "
-                    "per-layer recomputation is not a valid production fallback"
-                )
-            if _short_count < 0 or _short_count > _bsz:
-                raise RuntimeError(
-                    f"GLM-5 DSA layer {li}: _dsa_short_count out of range: "
-                    f"{_short_count} for bsz={_bsz}"
-                )
-            if _VERIFY and self.layer_idx <= 4:
-                _actual_short_count = int(_short_mask.sum().item())
-                if _actual_short_count != _short_count:
-                    raise RuntimeError(
-                        f"GLM-5 DSA layer {li}: _dsa_short_count mismatch: "
-                        f"hoisted={_short_count}, actual={_actual_short_count}, bsz={_bsz}"
-                    )
-            _any_short = _short_count > 0
-            _any_long = _short_count < _bsz
-            if not _any_long:
-                # All rows <= index_topk: dense short-circuit (topk = max_seqlen).
-                top_k_indices = build_clamped_dense_token_indices(
-                    updated_seqlens, max_seqlen, hidden_states.device,
-                )
-                validate_token_indices_within_seqlens(
-                    top_k_indices,
-                    updated_seqlens,
-                    context=f"GLM-5 DSA L{li}/dense_topk",
-                    effective_lengths=torch.clamp(updated_seqlens, max=top_k_indices.shape[1]),
-                    debug_sync=_VERIFY and self.layer_idx <= 4,
-                )
-            elif not _any_short:
-                # All rows > index_topk: full-batch indexer scoring (topk = index_topk).
-                q_a_for_indexer = q_a_normed.unsqueeze(1)
-                indexer_blocked_k, _, idx_block_table = \
-                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-                idx_block_table = reorder_block_table_to_batch_slots(
-                    idx_block_table, aux_slot_indices,
-                )
-                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-                top_k_indices = indexer.score_and_select_paged(
-                    q_a_for_indexer, hidden_states,
-                    indexer_blocked_k, idx_block_table,
-                    updated_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
-                    positions=new_token_pos,
-                    max_seqlen=max_seqlen,
-                )
-            else:
-                # Mixed batch: per-seq dispatch, unified to [batch, index_topk].
-                # This branch uses a per-row dispatch with a host-sync on
-                # `_long_cache_seqlens.max().item()` below — not capture-safe.
-                # The scheduler must route mixed batches to the eager fallback
-                # variant (see plan §5: Glm5BatchDescriptor dsa_variant="eager").
-                assert not torch.cuda.is_current_stream_capturing(), (
-                    "Mixed DSA batch (some rows <= index_topk, some >) is "
-                    "not capture-safe; dispatch to eager fallback before "
-                    "graph.replay()."
-                )
-                _device = hidden_states.device
-                _long_mask = ~_short_mask
-                top_k_indices = torch.empty(
-                    _bsz, _idx_topk, dtype=torch.long, device=_device,
-                )
-                # Short rows: dense indices padded to index_topk via clamp.
-                _short_indices = build_clamped_dense_token_indices(
-                    updated_seqlens[_short_mask], _idx_topk, _device,
-                )  # [num_short, index_topk]
-                top_k_indices[_short_mask] = _short_indices
-                # Long rows: indexer scoring on the subset.
-                _long_cache_seqlens = updated_seqlens[_long_mask]
-                _long_max_seqlen = int(_long_cache_seqlens.max().item())
-                _q_a_long = q_a_normed[_long_mask].unsqueeze(1)
-                _hidden_long = hidden_states[_long_mask]
-                _new_token_pos_long = (
-                    new_token_pos[_long_mask] if new_token_pos is not None else None
-                )
-                _long_mask_aux = _long_mask.to(aux_slot_indices.device)
-                _aux_slot_indices_long = aux_slot_indices[_long_mask_aux]
-                indexer_blocked_k, _, idx_block_table = \
-                    gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(li)
-                _idx_block_table_long = reorder_block_table_to_batch_slots(
-                    idx_block_table, _aux_slot_indices_long,
-                )
-                aux_page_size = gpu_paged_kv_manager_aux.config.page_size_tokens
-                _long_top_k = indexer.score_and_select_paged(
-                    _q_a_long, _hidden_long,
-                    indexer_blocked_k, _idx_block_table_long,
-                    _long_cache_seqlens, gpu_paged_kv_manager_aux, aux_page_size,
-                    positions=_new_token_pos_long,
-                    max_seqlen=_long_max_seqlen,
-                )  # [num_long, min(index_topk, _long_max_seqlen)] = [num_long, index_topk]
-                top_k_indices[_long_mask] = _long_top_k
-                validate_token_indices_within_seqlens(
-                    top_k_indices,
-                    updated_seqlens,
-                    context=f"GLM-5 DSA L{li}/mixed_topk",
-                    effective_lengths=torch.clamp(updated_seqlens, max=top_k_indices.shape[1]),
-                    debug_sync=_VERIFY and self.layer_idx <= 4,
-                )
-
-            # Sparse seqlens define which top-k columns are semantically consumed
-            # by sparse_flash_mla_decode. Padded tail entries may be clamped, but
-            # every effective entry must map to a valid cache token and page.
-            sparse_seqlens = torch.clamp(updated_seqlens, max=top_k_indices.shape[1])
-            validate_token_indices_within_seqlens(
-                top_k_indices,
-                updated_seqlens,
-                context=f"GLM-5 DSA L{li}/effective_topk",
-                effective_lengths=sparse_seqlens,
-                debug_sync=_VERIFY and self.layer_idx <= 4,
-            )
-
-        # --- Step 4: Sparse gather MLA KV at top-K positions ---
-        with (dt.timed("sparse_gather", li) if dt else _nullctx()):
-            mla_blocked_k, _, mla_block_table = \
-                gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
-            mla_block_table = reorder_block_table_to_batch_slots(
-                mla_block_table, primary_slot_indices,
-            )
-            mla_page_size = gpu_paged_kv_manager.config.page_size_tokens
-
-            validate_effective_block_table_pages(
-                mla_block_table,
-                top_k_indices,
-                sparse_seqlens,
-                mla_page_size,
-                context=f"GLM-5 DSA L{li}/mla_sparse_gather",
-                debug_sync=_VERIFY and self.layer_idx <= 4,
-            )
-
-            if _VERIFY and self.layer_idx <= 4:
-                _rk = AttnWrapperBase.get_rank_safe()
-                _tk_max = int(top_k_indices.max().item())
-                _tk_min = int(top_k_indices.min().item())
-                _tk_shape = tuple(top_k_indices.shape)
-                _bt_shape = tuple(mla_block_table.shape)
-                _bk_shape = tuple(mla_blocked_k.shape)  # [num_pages, page_sz, heads, dim]
-                _num_pages_loaded = _bk_shape[0]
-                _max_flat_idx = _num_pages_loaded * mla_page_size
-                _expected_max_valid_tok = _bt_shape[1] * mla_page_size
-                logging.warning(
-                    f"[VERIFY-GATHER rank={_rk} L{self.layer_idx} bsz={bsz}] "
-                    f"top_k=[{_tk_min},{_tk_max}] shape={_tk_shape} | "
-                    f"mla_block_table.shape={_bt_shape} mla_blocked_k.shape={_bk_shape} "
-                    f"page_size={mla_page_size} "
-                    f"max_flat_idx_if_clean={_max_flat_idx} "
-                    f"max_tok_pos_in_bt_cols={_expected_max_valid_tok} | "
-                    f"which branch: "
-                    f"{'dense-short-circuit' if not _any_long else ('full-indexer' if not _any_short else 'mixed')}"
-                )
-                if _tk_max >= _expected_max_valid_tok:
-                    raise RuntimeError(
-                        f"[VERIFY-GATHER rank={_rk} L{self.layer_idx}] top_k_indices "
-                        f"contains position {_tk_max} >= block_table_cols*page_size="
-                        f"{_expected_max_valid_tok}; refusing sparse gather"
-                    )
-            sparse_mla_kv = sparse_gather_from_paged_kv(
-                mla_blocked_k, mla_block_table, top_k_indices, mla_page_size,
-            )
-            # sparse_mla_kv: [batch, topk, 1, 576]
-
-        # --- Step 5: Absorbed Q → sparse FlashMLA ---
-        with (dt.timed("q_absorb", li) if dt else _nullctx()):
-            if self._cached_q_absorb is not None:
-                q_absorb = self._cached_q_absorb
-                out_absorb = self._cached_out_absorb
-            else:
-                kv_b_proj = deepseek_v3_dequantization(
-                    attn.kv_b_proj.weight.data,
-                    weight_scale["kv_b_proj.weight_scale_inv"],
-                ).view(attn.num_heads, -1, attn.kv_lora_rank)
-                q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
-                out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
-                # JIT SGLang-layout weights for the BMM fallback path.
-                if self.w_kc is None:
-                    self.w_kc = q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-                    self.w_vc = out_absorb.contiguous().transpose(1, 2)
-
-            qk_head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-            query_states = torch.empty(
-                bsz, attn.num_heads, 1, qk_head_dim,
-                dtype=sparse_mla_kv.dtype, device=sparse_mla_kv.device,
-            )
-            q_nope_squeezed = q_nope.squeeze(2)  # [B, H, qk_nope_head_dim]
-
-            # WP5: FP8 absorb kernel or SGLang-aligned BF16 BMM fallback
-            if self._fp8_absorb_weights is not None:
-                absorbed_q = fp8_q_absorb(q_nope_squeezed, self._fp8_absorb_weights)
-                query_states[:, :, :, :attn.kv_lora_rank] = absorbed_q.view(
-                    bsz, attn.num_heads, 1, attn.kv_lora_rank
-                )
-            else:
-                _raise_required_dsa_kernel(
-                    "WP5 FP8 q_absorb",
-                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
-                )
-
-            query_states[:, :, :, attn.kv_lora_rank:] = q_pe
-            query_states = query_states.view(bsz, 1, attn.num_heads, qk_head_dim)
-
+        selector_inputs = build_glm5_dsa_flashmla_inputs(
+            self,
+            hidden_states,
+            position_ids,
+            cache_seqlens,
+            max_seqlen,
+            gpu_paged_kv_manager,
+            gpu_paged_kv_manager_aux,
+            return_selected_indices=return_debug,
+        )
         with (dt.timed("sparse_attn", li) if dt else _nullctx()):
-            attn_out = sparse_flash_mla_decode(
-                query_states, sparse_mla_kv, sparse_seqlens,
-                attn.num_heads, attn.softmax_scale,
-                head_dim_v=attn.kv_lora_rank,
-                page_size=mla_page_size,
-            )
+            attn_out = run_prepared_sparse_flash_mla_decode(selector_inputs.flashmla)
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
             # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
             if self._fp8_absorb_weights is not None:
-                attn_output = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
+                attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
             else:
-                _raise_required_dsa_kernel(
-                    "WP5 FP8 out_absorb",
-                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
-                )
-            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.v_head_dim)
+                # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
+                attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
+                attn_heads = torch.bmm(
+                    attn_out_3d.transpose(0, 1), self.w_vc,
+                ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
+            attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(
                 attn_output_fp8, attn_output_scale,
@@ -1112,4 +1265,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
             attn_output = attn_output.view(bsz, 1, -1)
 
+        if return_debug:
+            return attn_output, {
+                "selector_inputs": selector_inputs,
+                "raw_attn_out": attn_out,
+                "attn_heads": attn_heads,
+            }
         return attn_output

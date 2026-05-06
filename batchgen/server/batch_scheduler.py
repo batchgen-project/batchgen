@@ -302,6 +302,7 @@ class BatchScheduler:
                 max_context_length=batch.max_context_length,
                 sampling_params=sampling_params,
                 per_sequence_max_tokens=per_request_max_tokens,
+                batchgen_debug=batch.batchgen_debug,
                 **incremental_kwargs,
             )
         except Exception as exc:
@@ -887,6 +888,7 @@ class BatchScheduler:
                     "max_tokens": per_request_max_tokens[idx],
                     "priority": 0,  # TODO: support per-batch priority from API
                     "sampling_params": sampling_params[idx] if sampling_params else {},
+                    "batchgen_debug": batch.batchgen_debug or {},
                 },
                 priority=Priority.NORMAL,
             ))
@@ -1034,6 +1036,7 @@ class BatchScheduler:
                     "batch_id": entry.batch_id,
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
+                    "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
                 })
 
             admission_msg = {

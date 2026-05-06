@@ -16,7 +16,13 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""DeepSeek-V4-Flash model configuration for BatchGen."""
+"""DeepSeek-V4 model configuration for BatchGen.
+
+The defaults in this file are the DeepSeek-V4-Flash contract from the vendored
+``assets/config.json``. Do not derive these values from DeepSeek-V3: V4 uses
+different layer count, attention compression/indexing, HC tensors, and FP4
+routed expert storage.
+"""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -28,7 +34,7 @@ from batchgen.config.model_registry import register_config
 @register_config("deepseek_v4")
 @dataclass
 class DeepSeekV4FlashConfig(BaseModelConfig):
-    """DeepSeek-V4 Flash/Pro configuration entrypoint."""
+    """DeepSeek-V4 Flash configuration entrypoint."""
 
     model_type: str = "deepseek_v4"
     architectures: List[str] = field(default_factory=lambda: ["DeepseekV4ForCausalLM"])
@@ -47,14 +53,31 @@ class DeepSeekV4FlashConfig(BaseModelConfig):
 
     q_lora_rank: int = 1024
     qk_rope_head_dim: int = 64
-    compressed_kv_dim: Optional[int] = None
+    compressed_kv_dim: int = 512
+    o_groups: int = 8
+    o_lora_rank: int = 1024
 
+    index_head_dim: int = 128
+    index_n_heads: int = 64
+    index_topk: int = 512
+
+    compress_rope_theta: int = 160000
+    compress_ratios: List[int] = field(default_factory=lambda: [
+        0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+        128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+        128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,
+        0,
+    ])
+
+    sliding_window: int = 128
     sliding_window_size: Optional[int] = 128
 
     num_local_experts: int = 256
     n_routed_experts: int = 256
     n_shared_experts: int = 1
     num_experts_per_tok: int = 6
+    num_hash_layers: int = 3
+    num_nextn_predict_layers: int = 1
     first_k_dense_replace: int = 0
     moe_intermediate_size: int = 2048
     moe_layer_freq: int = 1
@@ -75,6 +98,9 @@ class DeepSeekV4FlashConfig(BaseModelConfig):
     })
 
     rms_norm_eps: float = 1e-6
+    hc_eps: float = 1e-6
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
     hidden_act: str = "silu"
     swiglu_limit: float = 10.0
 

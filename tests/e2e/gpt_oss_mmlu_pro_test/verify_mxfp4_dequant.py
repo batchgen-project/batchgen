@@ -1,10 +1,13 @@
 """Verify MXFP4 dequantization by checking weight statistics."""
 
+import os
 import sys
 from pathlib import Path
 
-# Add gpt-oss to path
-GPT_OSS_PATH = "/data2/tairan/workspace/gpt-oss"
+# Add gpt-oss reference repo to path
+GPT_OSS_PATH = os.environ.get("GPT_OSS_PATH", "")
+if not GPT_OSS_PATH:
+    raise RuntimeError("Set GPT_OSS_PATH to the gpt-oss reference repo checkout.")
 sys.path.insert(0, GPT_OSS_PATH)
 
 import torch
@@ -44,7 +47,9 @@ def dequant_mxfp4_manual(blocks: torch.Tensor, scales: torch.Tensor, dtype=torch
 
 
 def main():
-    checkpoint_path = "/data2/tairan/modelscope/hub/models/openai/gpt-oss-120b/original"
+    checkpoint_path = os.environ.get("GPT_OSS_CHECKPOINT_PATH", "")
+    if not checkpoint_path:
+        raise RuntimeError("Set GPT_OSS_CHECKPOINT_PATH to the GPT-OSS-120B 'original' checkpoint dir.")
 
     # Find safetensor files
     safetensor_files = list(Path(checkpoint_path).glob("*.safetensors"))

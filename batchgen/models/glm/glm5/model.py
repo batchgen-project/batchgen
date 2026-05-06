@@ -24,14 +24,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from batchgen.timing import get_decode_timer
-from batchgen.models.glm.glm5.decode_utils import (
-	build_flat_paged_gather_indices,
-	build_paged_gather_cache_key,
-	validate_gather_invalid_mask_is_padding_only,
-	validate_token_indices_within_seqlens,
-)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -75,53 +67,71 @@ except ImportError:
 
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
+_GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
+_GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 
 
-# Default per-rank mtp bucket coverage when BATCHGEN_GLM5_MTP_BUCKETS is
-# unset. Validated end-to-end on H20 with 2K MMLU + 2K LongBench through the
-# full 128K-decode regime; covers the typical MoE working set without
-# blowing HBM on giant buckets. Operators can override (or set to empty)
-# via the env var.
-_GLM5_MTP_BUCKETS_DEFAULT = (128, 256, 512, 768)
+def _debug_flag_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
-def _parse_mtp_buckets() -> list[int]:
-    """Parse BATCHGEN_GLM5_MTP_BUCKETS="128,256,512,1024,2048,4096" into a
-    sorted deduped list of mtp values.
-
-    When unset, returns the validated default `_GLM5_MTP_BUCKETS_DEFAULT`
-    so the Phase-2a CUDA graph capture path (default-on for GLM-5) has a
-    bucket set to capture against. Set the env var to an empty string
-    (`BATCHGEN_GLM5_MTP_BUCKETS=`) to fall back to the legacy single-buffer
-    path (buf grows to worst-case global_bsz and stays there).
-
-    When set, each listed value becomes a pre-allocated `Glm5MoE3DBuffers`
-    instance; decode picks the smallest that fits the current global_bsz,
-    cutting the 770 MiB/layer zero-fill + result-copy waste.
-
-    Each value is rounded up to `_GLM5_MTP_BLOCK` alignment.
-    """
-    raw = os.environ.get("BATCHGEN_GLM5_MTP_BUCKETS")
-    if raw is None:
-        # Unset → use the validated default.
-        tokens = [str(v) for v in _GLM5_MTP_BUCKETS_DEFAULT]
-    else:
-        raw = raw.strip()
-        if not raw:
-            # Explicitly empty → caller wants the legacy single-buffer path.
-            return []
-        tokens = [tok.strip() for tok in raw.split(",")]
-    out: set[int] = set()
-    for tok in tokens:
-        if not tok:
-            continue
-        v = int(tok)
-        aligned = ((v + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK) * _GLM5_MTP_BLOCK
-        out.add(aligned)
-    return sorted(out)
+def _glm5_moe_cuda_graph_required() -> bool:
+    return os.environ.get(_GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
 
 
-_GLM5_MTP_BUCKETS = _parse_mtp_buckets()
+def _glm5_moe_debug_dict() -> dict:
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return {}
+    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return debug if isinstance(debug, dict) else {}
+
+
+def _glm5_moe_graph_compare_active() -> bool:
+    debug = _glm5_moe_debug_dict()
+    return (
+        _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
+        or os.environ.get(_GLM5_MOE_GRAPH_COMPARE_ENV, "0") == "1"
+    )
+
+
+def _glm5_moe_graph_compare_layer_enabled(layer_idx: int) -> bool:
+    if not _glm5_moe_graph_compare_active():
+        return False
+    debug = _glm5_moe_debug_dict()
+    layers = debug.get("glm5_moe_graph_compare_layers")
+    if layers is None:
+        layers = os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_LAYERS", "3")
+    if layers in ("all", "*"):
+        return True
+    if isinstance(layers, int):
+        return layer_idx == layers
+    if isinstance(layers, str):
+        return str(layer_idx) in {
+            item.strip() for item in layers.split(",") if item.strip()
+        }
+    if isinstance(layers, (list, tuple, set)):
+        try:
+            return layer_idx in {int(item) for item in layers}
+        except (TypeError, ValueError):
+            logging.warning(
+                "Ignoring invalid glm5_moe_graph_compare_layers=%r; defaulting to layer 3",
+                layers,
+            )
+            return layer_idx == 3
+    return layer_idx == 3
+
+
+def _glm5_moe_graph_compare_fail_on_mismatch() -> bool:
+    debug = _glm5_moe_debug_dict()
+    return _debug_flag_enabled(debug.get("glm5_moe_graph_compare_fail_on_mismatch"))
 
 
 # ============================================================================
@@ -238,24 +248,14 @@ def apply_rotary_pos_emb_split(
 # Resolve hadamard kernels once at import time (triggers JIT compilation)
 try:
     from batchgen.other_kernels.hadamard_transform import hadamard_transform as _hadamard_cuda_fn
-except Exception as _e:
+except (ImportError, Exception):
     _hadamard_cuda_fn = None
-    logging.warning(
-        f"[GLM-5] hadamard_transform import failed: {_e!r}; "
-        "falling back to non-fused Hadamard (slower)."
-    )
 
 # Fused RoPE+Hadamard kernel — validated: 99/99 tests passed, 16.5x speedup over separate ops.
 try:
     from batchgen.other_kernels.hadamard_transform import fused_rope_hadamard as _fused_rope_hadamard_fn
-except Exception as _e:
+except (ImportError, Exception):
     _fused_rope_hadamard_fn = None
-    logging.warning(
-        f"[GLM-5] fused_rope_hadamard import failed: {_e!r}; "
-        "falling back to separate RoPE+Hadamard. The fallback returns the input "
-        "dtype after k_norm — if k_norm yields FP32 the indexer K tensor will be "
-        "FP32 and trip aux KV's k_element_size_bytes=2 (BF16) check."
-    )
 
 _hadamard_matrix_cache: Dict[Tuple, torch.Tensor] = {}
 
@@ -333,42 +333,15 @@ class Glm5Indexer(nn.Module):
         k_nope = k[..., self.rope_head_dim:]
         seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
         cos, sin = self.rotary_emb(k_rope, seq_len)
-
-        # Normalize to [batch, seq]. Prepacked prefill passes bare [seq],
-        # while decode passes [batch] for one token per sequence.
-        if positions.dim() == 1:
-            if positions.numel() == k.shape[1]:
-                positions = positions.unsqueeze(0).expand(k.shape[0], -1)
-            elif positions.numel() == k.shape[0]:
-                positions = positions.unsqueeze(1)
-            else:
-                raise ValueError(
-                    "positions must be [seq], [batch], or [batch, seq] for "
-                    f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
-                )
-        elif positions.dim() != 2:
-            raise ValueError(
-                "positions must be [seq], [batch], or [batch, seq] for "
-                f"k shape {tuple(k.shape)}, got {tuple(positions.shape)}"
-            )
-
-        if positions.shape != k.shape[:2]:
-            raise ValueError(
-                "positions shape must match k batch/seq dims after normalization: "
-                f"positions={tuple(positions.shape)}, k={tuple(k.shape)}"
-            )
-
-        # Index cos/sin by position: [batch, seq, rope_dim].
+        # Index cos/sin by position: positions may be [batch] (decode) or [batch, seq] (prefill)
         cos = cos[positions]  # [batch, ...rope_dim*2]
         sin = sin[positions]
-        cos_half = cos[..., : cos.shape[-1] // 2]
-        sin_half = sin[..., : sin.shape[-1] // 2]
-
-        k1, k2 = k_rope[..., 0::2], k_rope[..., 1::2]
-        k_rope = torch.stack(
-            [k1 * cos_half - k2 * sin_half, k2 * cos_half + k1 * sin_half],
-            dim=-1,
-        ).flatten(-2)
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(1)  # [batch, 1, rope_dim*2]
+            sin = sin.unsqueeze(1)
+        k_rope = k_rope.unsqueeze(2)  # [batch, seq, 1, rope_dim]
+        k_rope, _ = apply_rotary_pos_emb_interleaved(k_rope, k_rope, cos, sin)
+        k_rope = k_rope.squeeze(2)
         return torch.cat([k_rope, k_nope], dim=-1)
 
     def _apply_rope_to_q(self, q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -398,7 +371,6 @@ class Glm5Indexer(nn.Module):
                 k.to(torch.bfloat16), cos.float(), sin.float(),
                 positions.reshape(-1), scale=k.shape[-1] ** -0.5,
             )
-        # Fallback: separate RoPE + Hadamard
         k = self._apply_rope_to_k(k, positions, max_seqlen=max_seqlen)
         return _hadamard_transform(k.to(torch.bfloat16)).to(k.dtype)
 
@@ -571,7 +543,9 @@ class Glm5Indexer(nn.Module):
         # Q·K^T: [B, H, T] = einsum('bhd,btd->bht', q, k)
         scores = torch.einsum("bhd,btd->bht", q_f, k_f) * self.softmax_scale
 
-        # Mask invalid positions before ReLU to keep them out of per-head scoring.
+        # Mask invalid positions BEFORE ReLU so they become 0 after F.relu(-inf).
+        # Using a very-negative (not -inf) sentinel would still pass ReLU as 0; -inf
+        # is the safe choice because subsequent ops are sums (not softmaxes).
         position_indices = torch.arange(max_seqlen, device=scores.device).unsqueeze(0)
         mask = position_indices >= cache_seqlens.unsqueeze(1)    # [B, T]
         scores = scores.masked_fill(mask.unsqueeze(1), float("-inf"))
@@ -585,9 +559,6 @@ class Glm5Indexer(nn.Module):
 
         # Weighted sum over heads: [B, T]
         aggregated = torch.einsum("bht,bh->bt", scores, head_gates)
-        # Head gates can be negative, so invalid positions that became zero after
-        # ReLU must be masked again before top-k. This matches the fused path.
-        aggregated = aggregated.masked_fill(mask, float("-inf"))
 
         effective_topk = min(self.index_topk, max_seqlen)
         _, top_k_indices = torch.topk(aggregated, effective_topk, dim=-1)
@@ -625,108 +596,21 @@ class Glm5Indexer(nn.Module):
         Returns:
             top_k_indices: [batch, index_topk] — absolute token positions
         """
-        if q_a.dim() != 3 or q_a.shape[1] != 1:
-            raise RuntimeError(
-                f"GLM-5 DSA score_and_select_paged: q_a must be [B,1,q_lora_rank], got {tuple(q_a.shape)}"
-            )
-        if hidden_states.dim() != 3 or hidden_states.shape[1] != 1:
-            raise RuntimeError(
-                "GLM-5 DSA score_and_select_paged: hidden_states must be [B,1,hidden_size], "
-                f"got {tuple(hidden_states.shape)}"
-            )
-        if indexer_blocked_k.dim() != 4:
-            raise RuntimeError(
-                "GLM-5 DSA score_and_select_paged: indexer_blocked_k must be "
-                f"[num_pages,page_size,num_heads,head_dim], got {tuple(indexer_blocked_k.shape)}"
-            )
-        if block_table.dim() != 2:
-            raise RuntimeError(
-                f"GLM-5 DSA score_and_select_paged: block_table must be [B,pages], got {tuple(block_table.shape)}"
-            )
-        if cache_seqlens.dim() != 1:
-            raise RuntimeError(
-                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be [B], got {tuple(cache_seqlens.shape)}"
-            )
-        if block_table.dtype not in (torch.int32, torch.int64):
-            raise RuntimeError(
-                f"GLM-5 DSA score_and_select_paged: block_table must be int32/int64, got {block_table.dtype}"
-            )
-        if cache_seqlens.dtype not in (torch.int32, torch.int64):
-            raise RuntimeError(
-                f"GLM-5 DSA score_and_select_paged: cache_seqlens must be int32/int64, got {cache_seqlens.dtype}"
-            )
-        batch_size = block_table.shape[0]
-        if q_a.shape[0] != batch_size or hidden_states.shape[0] != batch_size or cache_seqlens.shape[0] != batch_size:
-            raise RuntimeError(
-                "GLM-5 DSA score_and_select_paged: batch mismatch: "
-                f"q_a={tuple(q_a.shape)}, hidden_states={tuple(hidden_states.shape)}, "
-                f"block_table={tuple(block_table.shape)}, cache_seqlens={tuple(cache_seqlens.shape)}"
-            )
-        if int(page_size) <= 0:
-            raise ValueError(f"GLM-5 DSA score_and_select_paged: page_size must be positive, got {page_size}")
-        if indexer_blocked_k.shape[1] != int(page_size):
-            raise RuntimeError(
-                "GLM-5 DSA score_and_select_paged: indexer_blocked_k page dimension "
-                f"{indexer_blocked_k.shape[1]} != page_size={page_size}"
-            )
-        if positions is not None and (positions.dim() != 1 or positions.shape[0] != batch_size):
-            raise RuntimeError(
-                "GLM-5 DSA score_and_select_paged: positions must be [B] when provided, "
-                f"got {tuple(positions.shape)} for B={batch_size}"
-            )
-        _debug_validate = os.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
         batch_size = block_table.shape[0]
         if max_seqlen is None:
-            max_seqlen = int(cache_seqlens.max().item())
-        if int(max_seqlen) <= 0:
-            raise ValueError(f"GLM-5 DSA score_and_select_paged: max_seqlen must be positive, got {max_seqlen}")
-        if _debug_validate:
-            validate_token_indices_within_seqlens(
-                torch.zeros(batch_size, 1, dtype=torch.long, device=cache_seqlens.device),
-                cache_seqlens,
-                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/cache_seqlens",
-                effective_lengths=torch.zeros(batch_size, dtype=torch.long, device=cache_seqlens.device),
-                debug_sync=True,
-            )
-            if int(cache_seqlens.max().item()) > int(max_seqlen):
-                raise RuntimeError(
-                    "GLM-5 DSA score_and_select_paged: max_seqlen smaller than cache_seqlens.max(): "
-                    f"max_seqlen={max_seqlen}, cache_max={int(cache_seqlens.max().item())}"
-                )
+            raise RuntimeError("GLM-5 DSA paged scoring requires explicit max_seqlen")
         num_k_heads = indexer_blocked_k.shape[2]
         k_head_dim = indexer_blocked_k.shape[3]
 
-        # Cache gather indices — same block_table and seqlens across all 78 layers
-        cache_key = build_paged_gather_cache_key(
+        from batchgen_kernels.attention.dsa import fused_dense_paged_gather
+
+        # Gather dense logical range [0, max_seqlen) without building token indices.
+        gathered = fused_dense_paged_gather(
+            indexer_blocked_k,
             block_table,
             max_seqlen,
             page_size,
-            page_table_version=indexer_kv_manager.get_page_table_version(),
-        )
-        if not hasattr(self, '_gather_cache') or self._gather_cache_key != cache_key:
-            self._gather_cache, self._gather_cache_invalid_mask = build_flat_paged_gather_indices(
-                block_table,
-                max_seqlen,
-                page_size,
-                return_invalid_mask=True,
-            )
-            self._gather_cache_key = cache_key
-            self._gather_cache_shape = (batch_size, max_seqlen, num_k_heads, k_head_dim)
-
-        flat_idx = self._gather_cache
-        validate_gather_invalid_mask_is_padding_only(
-            self._gather_cache_invalid_mask,
-            cache_seqlens,
-            max_seqlen,
-            context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/aux_gather",
-            debug_sync=_debug_validate,
-        )
-        blocked_flat = indexer_blocked_k.reshape(-1, num_k_heads * k_head_dim)
-        gathered = blocked_flat[flat_idx].view(self._gather_cache_shape)
-        gathered = gathered.masked_fill(
-            self._gather_cache_invalid_mask.unsqueeze(-1).unsqueeze(-1),
-            0,
-        )
+        ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
 
         gathered_k = gathered.squeeze(2)
 
@@ -746,8 +630,8 @@ class Glm5Indexer(nn.Module):
                 cache_seqlens=cache_seqlens.int(),
                 wq_b_weights=self._fused_score_weights,
                 weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
-                cos_table=cos.float(),
-                sin_table=sin.float(),
+                cos_table=cos.to(torch.bfloat16),
+                sin_table=sin.to(torch.bfloat16),
                 positions=positions,
                 module=self._fused_score_module,
                 n_heads=self.index_n_heads,
@@ -755,37 +639,12 @@ class Glm5Indexer(nn.Module):
                 rope_dim=self.rope_head_dim,
                 topk=min(self.index_topk, max_seqlen),
             )
-            validate_token_indices_within_seqlens(
-                top_k_indices,
-                cache_seqlens,
-                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fused_topk",
-                debug_sync=_debug_validate,
-            )
-            return top_k_indices.to(torch.long)
+            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
         else:
-            from batchgen.models.glm.glm5.wrappers import _allow_dsa_fallback, _raise_required_dsa_kernel
-            if not _allow_dsa_fallback():
-                _raise_required_dsa_kernel(
-                    "WP4 fused indexer scoring",
-                    RuntimeError(f"layer {self.layer_idx} was not initialized"),
-                )
-            if hasattr(self, '_warned_fused_score_fallback') and not self._warned_fused_score_fallback:
-                self._warned_fused_score_fallback = True
-                logging.warning(
-                    f"[layer {self.layer_idx}] WP4 fused scoring unavailable, "
-                    "falling back to PyTorch score_and_select_relu_gated"
-                )
-            top_k_indices = self.score_and_select_relu_gated(
-                q_a, hidden_states, gathered_k, cache_seqlens,
-                positions=positions, max_seqlen=max_seqlen,
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] GLM-5 DSA selector requires WP4 fused "
+                "indexer scoring; PyTorch fallback is disabled"
             )
-            validate_token_indices_within_seqlens(
-                top_k_indices,
-                cache_seqlens,
-                context=f"GLM-5 DSA score_and_select_paged/L{self.layer_idx}/fallback_topk",
-                debug_sync=_debug_validate,
-            )
-            return top_k_indices.to(torch.long)
 
 
 # ============================================================================
@@ -1201,6 +1060,18 @@ class Glm5MoE3DBuffers:
 # MoE Layer (Decode with EP) — standalone nn.Module (K2.5 pattern)
 # ============================================================================
 
+def _glm5_moe_3d_blockwise_supported(
+    experts_per_rank: int,
+    num_persistent_local_experts: int,
+    enable_ep_offloading: bool,
+) -> bool:
+    """3D blockwise MoE requires every local routed expert resident on GPU."""
+    return (
+        int(num_persistent_local_experts) == int(experts_per_rank)
+        and not bool(enable_ep_offloading)
+    )
+
+
 class Glm5MoE(nn.Module):
     """GLM-5 MoE layer (unified prefill + EP decode).
 
@@ -1221,14 +1092,9 @@ class Glm5MoE(nn.Module):
 
     # K2.5 3D-MoE path (minimax parity).
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
-    # Bucket-aware 3D MoE buffers: smaller-batch decode steps pick a
-    # smaller-mtp buffer to cut the 770 MiB/layer zero-fill + result-copy
-    # HBM traffic. Populated only when BATCHGEN_GLM5_MTP_BUCKETS is set;
-    # otherwise all decode steps use the legacy `_3d_buf` singleton.
-    _bucket_bufs: Dict[int, Glm5MoE3DBuffers] = {}
-    _warned_bucket_select: Dict[int, bool] = {}
     _warned_k25_path = False
     _warned_gemm_3d = False
+    _warned_partial_3d_disabled = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
@@ -1263,6 +1129,10 @@ class Glm5MoE(nn.Module):
         self.experts = [_Glm5ExpertPlaceholder() for _ in range(self.total_experts)]
         self.shared_experts = Glm5Expert(config.hidden_size, config.moe_intermediate_size)
         self._fp8_blockwise_ready = False
+        self._moe_cuda_graph_manager = None
+        self._moe_cuda_graph_segment_name = None
+        self._moe_cuda_graph_segment = None
+        self._moe_cuda_graph_bucketing = None
 
     # ── Token count management (called by PSM) ──
 
@@ -1293,21 +1163,16 @@ class Glm5MoE(nn.Module):
         ).repeat(global_num_tokens)
 
         # K2.5 3D-MoE buffer allocation (shared across all 75 MoE layers).
-        # When BATCHGEN_GLM5_MTP_BUCKETS is set, size the singleton to the
-        # largest bucket instead of _GLM5_3D_MTP=4096 — the bucket path
-        # always serves batches up to max(_GLM5_MTP_BUCKETS), so the 4096
-        # default is pure waste (~1.5 GiB/GPU for dispatched_x+expert_out
-        # at mtp=4096). Singleton is only used as fallback for oversize.
-        if self.use_3d_moe and _GLM5_HAS_DISPATCH_3D and Glm5MoE._3d_buf is None:
-            if _GLM5_MTP_BUCKETS:
-                _singleton_mtp = max(_GLM5_MTP_BUCKETS)
-                logging.info(
-                    f"[Glm5MoE] Buckets set; sizing singleton _3d_buf to "
-                    f"max bucket mtp={_singleton_mtp} instead of "
-                    f"_GLM5_3D_MTP={_GLM5_3D_MTP} to avoid oversize waste"
-                )
-            else:
-                _singleton_mtp = _GLM5_3D_MTP
+        if (
+            self.use_3d_moe
+            and _GLM5_HAS_DISPATCH_3D
+            and Glm5MoE._3d_buf is None
+            and _glm5_moe_3d_blockwise_supported(
+                self.experts_per_rank,
+                self.num_persistent_local_experts,
+                self.enable_ep_offloading,
+            )
+        ):
             Glm5MoE._3d_buf = Glm5MoE3DBuffers(
                 E_local=self.experts_per_rank,
                 max_global_bsz=global_num_tokens,
@@ -1316,74 +1181,8 @@ class Glm5MoE(nn.Module):
                 topk=K,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_singleton_mtp,
+                max_tokens_padded=_GLM5_3D_MTP,
             )
-
-            # Pre-allocate per-bucket 3D buffers when BATCHGEN_GLM5_MTP_BUCKETS
-            # is set. Each bucket picks its smallest-fitting buffer at decode
-            # time, cutting the 770 MiB/layer HBM waste on small batches.
-            # Independent of CUDA-graph capture; also delivers an eager-mode
-            # speedup when small decode batches are common.
-            #
-            # Each bucket's `padded` must be sized to `mtp // world_size` so
-            # NCCL all_gather sends exactly `bucket_ntp * H` elements per
-            # rank — matching the bucket's global_bsz. Sizing it to the
-            # current `num_tokens_per_rank` is a bug: _forward_decode_3d
-            # would then recreate padded on every step in eager mode (silent
-            # perf loss), and during capture it would either bake a stale
-            # size or recreate during stream capture (graph-invalid).
-            if _GLM5_MTP_BUCKETS:
-                max_global_bsz_any = max(_GLM5_MTP_BUCKETS)
-                for mtp in _GLM5_MTP_BUCKETS:
-                    if mtp in Glm5MoE._bucket_bufs:
-                        continue
-                    bucket_ntp = max(1, mtp // self.world_size)
-                    Glm5MoE._bucket_bufs[mtp] = Glm5MoE3DBuffers(
-                        E_local=self.experts_per_rank,
-                        max_global_bsz=max_global_bsz_any,
-                        H=self.hidden_size,
-                        N_inter=self.config.moe_intermediate_size,
-                        topk=K,
-                        num_tokens_per_rank=bucket_ntp,
-                        device=self.device,
-                        max_tokens_padded=mtp,
-                    )
-                logging.info(
-                    f"[Glm5MoE] Pre-allocated bucket buffers for mtp={_GLM5_MTP_BUCKETS} "
-                    f"(world_size={self.world_size}, bucket_ntp="
-                    f"{[max(1, m // self.world_size) for m in _GLM5_MTP_BUCKETS]})"
-                )
-
-    @classmethod
-    def _select_3d_buf(cls, global_num_tokens: int) -> Glm5MoE3DBuffers:
-        """Pick the smallest pre-allocated bucket buffer whose mtp fits
-        `global_num_tokens`. Falls back to the legacy `_3d_buf` singleton
-        when `BATCHGEN_GLM5_MTP_BUCKETS` is unset or no bucket fits.
-
-        NOTE: the fallback path still calls `buf.resize_if_needed` upstream,
-        which grows the singleton to worst-case. For CUDA graph capture
-        (Phase 2b) the caller must supply a bucket size that has a pre-
-        allocated buffer — otherwise the captured buffer addresses would
-        drift on the first grow event.
-        """
-        if cls._bucket_bufs:
-            for mtp in sorted(cls._bucket_bufs):
-                if mtp >= global_num_tokens:
-                    buf = cls._bucket_bufs[mtp]
-                    if not cls._warned_bucket_select.get(mtp):
-                        logging.info(
-                            f"[Glm5MoE] Selecting bucket buffer mtp={mtp} "
-                            f"for global_num_tokens={global_num_tokens}"
-                        )
-                        cls._warned_bucket_select[mtp] = True
-                    return buf
-            # Oversize — fall through to singleton (which will resize_if_needed).
-            logging.debug(
-                f"[Glm5MoE] global_num_tokens={global_num_tokens} exceeds all "
-                f"pre-allocated buckets {sorted(cls._bucket_bufs)}; "
-                "falling back to singleton (will resize)"
-            )
-        return cls._3d_buf
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
         if num_tokens_per_rank == self.num_tokens_per_rank:
@@ -1463,6 +1262,24 @@ class Glm5MoE(nn.Module):
         # K2.5 3D-MoE weight stacking (per-layer) — mirror
         # MiniMaxM25MoE._init_fp8_blockwise_weights at model.py:874-926.
         if self.use_3d_moe and _GLM5_HAS_FP8_BLOCKWISE:
+            if not _glm5_moe_3d_blockwise_supported(
+                self.experts_per_rank,
+                n_persistent,
+                self.enable_ep_offloading,
+            ):
+                self._fp8_blockwise_ready = False
+                if not Glm5MoE._warned_partial_3d_disabled:
+                    logging.warning(
+                        "[Glm5MoE] 3D FP8 MoE disabled: persistent experts "
+                        "%s/%s, ep_offloading=%s. Falling back to mixed expert "
+                        "decode; GLM-5 MoE/whole-model CUDA graph requires all "
+                        "local experts to be persistent.",
+                        n_persistent,
+                        self.experts_per_rank,
+                        self.enable_ep_offloading,
+                    )
+                    Glm5MoE._warned_partial_3d_disabled = True
+                return
             self._init_fp8_blockwise_weights()
 
     def _init_fp8_blockwise_weights(self):
@@ -1481,6 +1298,21 @@ class Glm5MoE(nn.Module):
         n_blocks = N // scale_block
         k_blocks_pad4 = (k_blocks + 3) // 4 * 4
         n_blocks_pad4 = (n_blocks + 3) // 4 * 4
+
+        if not (
+            len(self.gate_list) == E
+            and len(self.up_list) == E
+            and len(self.down_list) == E
+            and len(self.gate_scale_list) == E
+            and len(self.up_scale_list) == E
+            and len(self.down_scale_list) == E
+        ):
+            raise RuntimeError(
+                "GLM-5 3D FP8 MoE requires all local experts to be resident "
+                f"before stacking weights; experts_per_rank={E}, "
+                f"gate/up/down={len(self.gate_list)}/{len(self.up_list)}/{len(self.down_list)}, "
+                "use mixed expert decode for partial-persistent single-node configs."
+            )
 
         # GLM-5 has ~4x larger MoE projections than minimax (6144x2048 vs
         # 3072x1536). Each MoE-layer weight has THREE live references:
@@ -1577,6 +1409,12 @@ class Glm5MoE(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
+    def enable_moe_cuda_graph(self, manager, segment_name: str, segment, bucketing) -> None:
+        self._moe_cuda_graph_manager = manager
+        self._moe_cuda_graph_segment_name = segment_name
+        self._moe_cuda_graph_segment = segment
+        self._moe_cuda_graph_bucketing = bucketing
+
     # ── Forward ──
 
     @torch.inference_mode()
@@ -1592,6 +1430,23 @@ class Glm5MoE(nn.Module):
         # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
+            compare = _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
+            graph_required = _glm5_moe_cuda_graph_required()
+            if compare:
+                return self._forward_decode_3d_graph_compare(hidden_states)
+            if graph_required:
+                if self._moe_cuda_graph_exceeds_max_bucket():
+                    if not getattr(self, "_moe_cuda_graph_over_bucket_warned", False):
+                        logging.warning(
+                            "Layer %d: GLM-5 MoE CUDA graph requested but "
+                            "num_tokens_per_rank=%s exceeds max graph bucket; "
+                            "using eager MoE for this decode batch",
+                            self.layer_idx,
+                            self.num_tokens_per_rank,
+                        )
+                        self._moe_cuda_graph_over_bucket_warned = True
+                    return self._forward_decode_3d(hidden_states)
+                return self._forward_decode_3d_graph(hidden_states)
             return self._forward_decode_3d(hidden_states)
 
         import torch.distributed as dist
@@ -1665,6 +1520,131 @@ class Glm5MoE(nn.Module):
         out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
+    def _moe_cuda_graph_exceeds_max_bucket(self) -> bool:
+        if self._moe_cuda_graph_bucketing is None or self.num_tokens_per_rank is None:
+            return False
+        try:
+            self._moe_cuda_graph_bucketing.get_padded_size(int(self.num_tokens_per_rank))
+        except ValueError:
+            return True
+        return False
+
+    def _moe_cuda_graph_available(self) -> bool:
+        if not (
+            self._moe_cuda_graph_manager is not None
+            and self._moe_cuda_graph_segment_name is not None
+            and self._moe_cuda_graph_segment is not None
+            and self._moe_cuda_graph_bucketing is not None
+            and self.num_tokens_per_rank is not None
+            and self.num_tokens_per_rank > 0
+        ):
+            return False
+        try:
+            return self._moe_cuda_graph_manager.has_graph(
+                self._moe_cuda_graph_segment_name,
+                self.num_tokens_per_rank,
+            )
+        except ValueError:
+            return False
+
+    @torch.inference_mode()
+    def _forward_decode_3d_graph(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._moe_cuda_graph_available():
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
+            )
+
+        import torch.distributed as dist
+
+        orig_shape = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_flat
+        num_tokens, _ = hidden_flat.shape
+        ntp = self.num_tokens_per_rank
+        if ntp is None or ntp <= 0:
+            raise RuntimeError(f"Layer {self.layer_idx}: num_tokens_per_rank is not initialized")
+        if num_tokens > ntp:
+            raise RuntimeError(
+                f"MoE graph buffer overflow: num_tokens={num_tokens} > "
+                f"num_tokens_per_rank={ntp}"
+            )
+
+        bucket = self._moe_cuda_graph_bucketing.get_padded_size(ntp)
+        bufs = self._moe_cuda_graph_segment.pool.get(bucket)
+        padded = bufs.padded
+        padded.zero_()
+        if num_tokens > 0:
+            padded[:num_tokens].copy_(hidden_flat)
+
+        rank_counts = Glm5MoE._rank_token_counts
+        if rank_counts is None:
+            if not hasattr(self, "_moe_graph_rank_counts_full"):
+                self._moe_graph_rank_counts_full = torch.empty(
+                    self.world_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            self._moe_graph_rank_counts_full.fill_(ntp)
+            rank_counts = self._moe_graph_rank_counts_full
+        elif rank_counts.dtype != torch.int64:
+            rank_counts = rank_counts.to(torch.int64)
+
+        graph_out = self._moe_cuda_graph_manager.replay(
+            self._moe_cuda_graph_segment_name,
+            bucket,
+            padded=padded,
+            rank_token_counts=rank_counts,
+        )
+        routed_global = graph_out["routed_global_output"]
+
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                routed_global,
+                op=dist.ReduceOp.SUM,
+                stream=torch.cuda.current_stream(self.device),
+            )
+
+        if num_tokens == 0:
+            return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
+        start = self.rank * bucket
+        routed_local = routed_global[start:start + num_tokens].to(hidden_flat.dtype)
+        out = routed_local + self.shared_expert_forward(identity)
+        return out.view(*orig_shape)
+
+    @torch.inference_mode()
+    def _forward_decode_3d_graph_compare(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        eager_out = self._forward_decode_3d(hidden_states)
+        if not self._moe_cuda_graph_available():
+            logging.warning(
+                "[GLM5_MOE_GRAPH_COMPARE][L%d] graph unavailable; returning eager output",
+                self.layer_idx,
+            )
+            return eager_out
+
+        graph_out = self._forward_decode_3d_graph(hidden_states)
+        diff = (graph_out.to(torch.float32) - eager_out.to(torch.float32)).abs()
+        max_abs = float(diff.max().item()) if diff.numel() else 0.0
+        mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+        atol = float(os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL", "1e-2"))
+        ok = max_abs <= atol
+        logging.info(
+            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d] %s max_abs=%.6g mean_abs=%.6g "
+            "shape=%s ntp=%s",
+            self.layer_idx,
+            self.rank,
+            "OK" if ok else "FAIL",
+            max_abs,
+            mean_abs,
+            tuple(int(x) for x in eager_out.shape),
+            self.num_tokens_per_rank,
+        )
+        if not ok and _glm5_moe_graph_compare_fail_on_mismatch():
+            raise RuntimeError(
+                f"GLM-5 MoE graph compare mismatch at layer {self.layer_idx}: "
+                f"max_abs={max_abs:.6g} > atol={atol:.6g}"
+            )
+        return eager_out
+
     # ── K2.5 3D MoE decode path (minimax/Kimi parity) ──
 
     @torch.inference_mode()
@@ -1690,125 +1670,89 @@ class Glm5MoE(nn.Module):
         ntp = self.num_tokens_per_rank
         num_global = ntp * self.world_size
         topk = self.num_experts_per_tok
-        # Bucket-aware buffer selection — picks smallest mtp that fits
-        # global_num_tokens when BATCHGEN_GLM5_MTP_BUCKETS is set; otherwise
-        # falls back to the singleton _3d_buf. See _select_3d_buf for the
-        # resize_if_needed contract at the fallback boundary.
-        buf = Glm5MoE._select_3d_buf(num_global)
-        # Still need resize guard for the singleton (or oversize fallback);
-        # a pre-allocated bucket buffer already satisfies num_global, so
-        # resize_if_needed is a cheap no-op on that path.
+        buf = Glm5MoE._3d_buf
         buf.resize_if_needed(num_global)
-        # Keep padded buffer width in sync with per-step num_tokens_per_rank.
-        # NCCL all_gather sends exactly `padded.numel()` elements per rank;
-        # a mismatch between `padded.shape[0]` and the actual `ntp` collapses
-        # all_gather (ranks 1..N's contributions land past the reader slice
-        # — see set_num_tokens_per_rank:1137-1144 for the original incident).
-        #
-        # In eager mode this recreate is benign. Inside CUDA-graph capture
-        # it is fatal: the tensor allocation happens in Python during stream
-        # capture, which either (a) gets recorded as an alloc in the graph
-        # pool (silently wastes memory + breaks static-address invariant)
-        # or (b) hits a torch.cuda.graph assertion. Force it to fail loud so
-        # the scheduler learns it must pad `ntp` to the bucket's `bucket_ntp`
-        # before replay.
-        if buf.padded.shape[0] != ntp:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                f"Glm5MoE3DBuffers.padded.shape[0]={buf.padded.shape[0]} "
-                f"!= ntp={ntp} inside graph capture. The scheduler must "
-                "pad num_tokens_per_rank to the bucket's bucket_ntp "
-                "(= mtp // world_size) before calling graph.replay()."
-            )
-            buf.padded = torch.zeros(
-                ntp, buf.H, dtype=torch.bfloat16, device=buf.device,
-            )
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
-            logging.debug(
+            logging.warning(
                 "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
             Glm5MoE._warned_k25_path = True
 
-        # Timer for per-op breakdown. Resolves to None when disabled;
-        # timed() is a no-op in that case.
-        dt = get_decode_timer()
-        li = getattr(self, "layer_idx", 0)
-
         # 1) AllGather
-        with (dt.timed("allgather_3d", li) if dt else _nullctx()):
-            all_tokens = buf.all_tokens[:num_global]
-            padded = buf.padded
-            padded.zero_()
-            if num_tokens > 0:
-                padded[:num_tokens] = hidden_states
-            with self.comm.change_state(enable=True):
-                self.comm.all_gather(
-                    all_tokens, padded,
-                    stream=torch.cuda.current_stream(self.device),
-                )
-
-        # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
-        with (dt.timed("gate_3d", li) if dt else _nullctx()):
-            topk_idx, topk_weight = self._gate_decode(all_tokens)
-
-            # Mask padding tokens so they don't inflate expert_counts nor pollute
-            # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
-            # each rank contributes `num_tokens_per_rank` slots but only the first
-            # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
-            # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
-            rank_counts = Glm5MoE._rank_token_counts
-            if rank_counts is not None:
-                positions = torch.arange(num_global, device=self.device)
-                rank_ids = positions // ntp
-                local_pos = positions % ntp
-                max_valid = rank_counts[rank_ids]
-                row_valid = (local_pos < max_valid).unsqueeze(1)
-                # Use fixed-shape elementwise masking so CUDA graph replay re-reads
-                # rank_counts values instead of baking in capture-time all-valid
-                # boolean-index cardinality.
-                topk_idx = torch.where(row_valid, topk_idx, -1)
-                topk_weight = torch.where(row_valid, topk_weight, 0.0)
-
-        # 3) 3D dispatch
-        with (dt.timed("dispatch_3d", li) if dt else _nullctx()):
-            buf.dispatched_x.zero_()
-            expert_counts, topk_pos = dispatch_scatter_3d(
-                all_tokens, topk_idx.to(torch.int32),
-                buf.dispatched_x,
-                self.routed_expert_start_idx, self.experts_per_rank,
-                buf.max_tokens_padded,
-                buf.expert_counts, buf.expert_counters,
-                buf.topk_pos[:num_global * topk],
+        all_tokens = buf.all_tokens[:num_global]
+        padded = buf.padded
+        padded.zero_()
+        if num_tokens > 0:
+            padded[:num_tokens] = hidden_states
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.current_stream(self.device),
             )
 
-        # 4) FP8 blockwise GEMM on 3D buffer (per-sub-op timing inside)
+        # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
+        topk_idx, topk_weight = self._gate_decode(all_tokens)
+
+        # Mask padding tokens so they don't inflate expert_counts nor pollute
+        # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
+        # each rank contributes `num_tokens_per_rank` slots but only the first
+        # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
+        # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
+        rank_counts = Glm5MoE._rank_token_counts
+        if rank_counts is not None:
+            positions = torch.arange(num_global, device=self.device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            max_valid = rank_counts[rank_ids]
+            padding_mask = local_pos >= max_valid
+            padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
+            topk_idx = torch.where(
+                padding_mask_2d,
+                torch.full_like(topk_idx, -1),
+                topk_idx,
+            )
+            topk_weight = torch.where(
+                padding_mask_2d,
+                torch.zeros_like(topk_weight),
+                topk_weight,
+            )
+
+        # 3) 3D dispatch
+        buf.dispatched_x.zero_()
+        expert_counts, topk_pos = dispatch_scatter_3d(
+            all_tokens, topk_idx.to(torch.int32),
+            buf.dispatched_x,
+            self.routed_expert_start_idx, self.experts_per_rank,
+            buf.max_tokens_padded,
+            buf.expert_counts, buf.expert_counters,
+            buf.topk_pos[:num_global * topk],
+        )
+
+        # 4) FP8 blockwise GEMM on 3D buffer
         self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
         # 5) Weighted scatter reduce
-        with (dt.timed("reduce_scatter_3d", li) if dt else _nullctx()):
-            result_buf = buf.result_buffer[:num_global]
-            result_buf.zero_()
-            global_results = reduce_weighted_scatter(
-                buf.expert_out, topk_pos, topk_weight,
-                num_global, hidden_size, topk,
-                output=result_buf,
-            )
+        result_buf = buf.result_buffer[:num_global]
+        result_buf.zero_()
+        global_results = reduce_weighted_scatter(
+            buf.expert_out, topk_pos, topk_weight,
+            num_global, hidden_size, topk,
+            output=result_buf,
+        )
 
         # 6) AllReduce across EP ranks
-        with (dt.timed("allreduce_3d", li) if dt else _nullctx()):
-            with self.comm.change_state(enable=True):
-                self.comm.all_reduce(
-                    global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.current_stream(self.device),
-                )
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                global_results, op=dist.ReduceOp.SUM,
+                stream=torch.cuda.current_stream(self.device),
+            )
 
         # 7) Slice local + add shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        with (dt.timed("moe_slice", li) if dt else _nullctx()):
-            start = self.rank * ntp
-            out = global_results[start:start + num_tokens].to(hidden_states.dtype)
-        with (dt.timed("shared_expert", li) if dt else _nullctx()):
-            out = out + self.shared_expert_forward(identity)
+        start = self.rank * ntp
+        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
+        out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
@@ -1818,13 +1762,11 @@ class Glm5MoE(nn.Module):
         Reads buf.dispatched_x, writes buf.expert_out.
         """
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
-            logging.debug(
+            logging.warning(
                 f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
                 f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
             Glm5MoE._warned_gemm_3d = True
 
-        dt = get_decode_timer()
-        li = getattr(self, "layer_idx", 0)
         E = self.experts_per_rank
         K = self.hidden_size                  # 6144
         N = self.config.moe_intermediate_size  # 2048
@@ -1835,54 +1777,50 @@ class Glm5MoE(nn.Module):
         avg = max(mtp // max(E, 1), 1)
 
         # Stage input quant (3D if CUDA ops available, else Triton fallback)
-        with (dt.timed("act_quant_3d", li) if dt else _nullctx()):
-            if _GLM5_HAS_FP8_OPS:
-                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-                x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
-                x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
-                x_quant = x_quant_3d.view(E * mtp, K)
-                x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
-            else:
-                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-                x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
-                x_scale_t = x_scale.t().contiguous()
+        if _GLM5_HAS_FP8_OPS:
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+            x_quant = x_quant_3d.view(E * mtp, K)
+            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
+            x_scale_t = x_scale.t().contiguous()
 
         # S1: gate + up + SiLU (fused if possible) → BF16 intermediate
-        with (dt.timed("fused_s1", li) if dt else _nullctx()):
-            if _GLM5_HAS_FP8_OPS:
-                s1_result = grouped_fp8_blockwise_fused_s1(
-                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                    seqlens, cu_seqlens, avg,
-                )
-                inter_quant_3d, inter_scale_3d = act_quant_3d(
-                    s1_result.view(E, mtp, N), seqlens)
-                inter_quant = inter_quant_3d.view(E * mtp, N)
-                inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
-            else:
-                intermediate = grouped_fp8_blockwise_s1_silu(
-                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                    seqlens, cu_seqlens, avg,
-                )
-                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-                inter_quant, inter_scale = _act_quant(intermediate)
-                inter_scale_t = inter_scale.t().contiguous()
-
-        # S3: down projection (in-place into buf.expert_out — matches kimi_k25
-        # pattern, eliminates ~35 ms/step of redundant copy traffic).
-        with (dt.timed("s3_down", li) if dt else _nullctx()):
-            grouped_fp8_blockwise_s3(
-                inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
-                self.fp8_down_w3d.view(torch.float8_e4m3fn),
-                self.fp8_down_ws3d,
+        if _GLM5_HAS_FP8_OPS:
+            s1_result = grouped_fp8_blockwise_fused_s1(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
                 seqlens, cu_seqlens, avg,
-                output=buf.expert_out[:E * mtp],
             )
+            inter_quant_3d, inter_scale_3d = act_quant_3d(
+                s1_result.view(E, mtp, N), seqlens)
+            inter_quant = inter_quant_3d.view(E * mtp, N)
+            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+        else:
+            intermediate = grouped_fp8_blockwise_s1_silu(
+                x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+            )
+            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+            inter_quant, inter_scale = _act_quant(intermediate)
+            inter_scale_t = inter_scale.t().contiguous()
+
+        # S3: down projection
+        result = grouped_fp8_blockwise_s3(
+            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+            self.fp8_down_w3d.view(torch.float8_e4m3fn),
+            self.fp8_down_ws3d,
+            seqlens, cu_seqlens, avg,
+        )
+        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
 
     # ── Gate + Expert Compute ──
 
@@ -1949,18 +1887,7 @@ class Glm5MoE(nn.Module):
         """Mixed path: WGMMA for persistent + loop for non-persistent.
 
         One .tolist() sync for expert_offsets (acceptable on opt-in path).
-
-        NOT capture-safe: the .tolist() below and the per-expert Python loop
-        over non-persistent experts both require host-visible expert offsets.
-        Production GLM-5-FP8 runs the 3D path (_forward_decode_3d →
-        _fp8_blockwise_gemm_3d) which has zero host syncs; this function is
-        only reachable when 3D is disabled (use_3d_moe=False or EP offloading).
         """
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "expert_compute_mixed is not capture-safe (expert_offsets.tolist()+"
-            "Python per-expert loop). Capture requires the 3D MoE path; ensure "
-            "use_3d_moe, _fp8_blockwise_ready, and Glm5MoE._3d_buf are all set."
-        )
         from mgn_kernel import fused_moe_token_dispatch
 
         n_persistent = self.num_persistent_local_experts
@@ -2106,18 +2033,7 @@ class Glm5MoE(nn.Module):
 
     def _grouped_dequant_moe_fp8(self, x, eids, expert_counts, expert_offsets,
                                   num_local_experts=None):
-        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path).
-
-        NOT capture-safe: uses expert_offsets[-1].item() and
-        num_active_experts.item() below. This function only fires on the
-        Triton fallback path (_triton_compute); the production 3D path does
-        not call it.
-        """
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "_grouped_dequant_moe_fp8 is not capture-safe (two .item() calls). "
-            "Capture requires the 3D MoE path; check that the FP8 blockwise "
-            "3D kernels are active."
-        )
+        """Grouped FP8 GEMM: gate+up+SiLU → down (Triton fallback path)."""
         from batchgen.attention.mla.fa3_backend import act_quant
         from batchgen.gemm.w8a8_grouped_gemm_stage_1 import fused_fp8_moe_stage_1_tma
         from batchgen.moe.fused_grouped_dequant_gemm import fused_dequant_grouped_gemm_fp8_tma
@@ -2290,10 +2206,8 @@ class Glm5Model(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
         use_cache: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, ...]:
-        dt = get_decode_timer()
-        with (dt.timed("embed", 0) if dt else _nullctx()):
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
 
@@ -2302,8 +2216,7 @@ class Glm5Model(nn.Module):
             hidden_states, _, _ = layer(
                 hidden_states, attention_mask, position_ids, past_kv, use_cache,
             )
-        with (dt.timed("final_ln", 0) if dt else _nullctx()):
-            hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         return (hidden_states,)
 
 
@@ -2342,8 +2255,6 @@ class Glm5ForCausalLM(nn.Module):
             use_cache=use_cache,
         )
         hidden_states = outputs[0]
-        dt = get_decode_timer()
-        with (dt.timed("lm_head", 0) if dt else _nullctx()):
-            logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states)
         from types import SimpleNamespace
         return SimpleNamespace(logits=logits)

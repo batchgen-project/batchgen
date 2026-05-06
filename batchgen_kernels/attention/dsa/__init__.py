@@ -9,10 +9,34 @@ __all__ = []
 # WP3: Fused paged gather (Triton)
 try:
     from batchgen_kernels.attention.dsa.fused_paged_gather import (
+        fused_dense_paged_gather,
         fused_paged_gather,
         fused_indexer_gather,
     )
-    __all__ += ["fused_paged_gather", "fused_indexer_gather"]
+    __all__ += [
+        "fused_dense_paged_gather",
+        "fused_paged_gather",
+        "fused_indexer_gather",
+    ]
+except (ImportError, Exception):
+    pass
+
+# Unified selected-KV selector (Triton)
+try:
+    from batchgen_kernels.attention.dsa.fused_unified_selector import (
+        fused_select_mla_kv_bf16,
+        fused_select_mla_kv_bf16_out,
+    )
+    __all__ += ["fused_select_mla_kv_bf16", "fused_select_mla_kv_bf16_out"]
+except (ImportError, Exception):
+    pass
+
+# Synthetic selected-KV FlashMLA block-table fill (Triton)
+try:
+    from batchgen_kernels.attention.dsa.selected_block_table import (
+        make_selected_block_table,
+    )
+    __all__ += ["make_selected_block_table"]
 except (ImportError, Exception):
     pass
 
@@ -22,28 +46,61 @@ try:
         build_module,
         FP8IndexerWeightsCUDA,
         cuda_wk_proj_rmsnorm,
+        cuda_wk_proj_rmsnorm_out,
+        cuda_wk_proj_gemm_only_out,
+        make_fp8_activation_scratch,
     )
-    __all__ += ["build_module", "FP8IndexerWeightsCUDA", "cuda_wk_proj_rmsnorm"]
+    __all__ += [
+        "build_module",
+        "FP8IndexerWeightsCUDA",
+        "cuda_wk_proj_rmsnorm",
+        "cuda_wk_proj_rmsnorm_out",
+        "cuda_wk_proj_gemm_only_out",
+        "make_fp8_activation_scratch",
+    ]
 except (ImportError, Exception):
     pass
 
-# WP4: Fused indexer scoring (CUDA WGMMA + CUDA RoPE/Hadamard + Triton)
-try:
+# WP4: Fused indexer scoring (CUDA WGMMA + CUDA RoPE/Hadamard + Triton).
+# This is required by the production GLM-5 DSA path; import failures must
+# preserve the original exception instead of silently disabling the kernel.
     from batchgen_kernels.attention.dsa.fused_indexer_score import (
         FP8WqbWeightsCUDA,
+        cuda_wq_b_proj_out,
         fused_score_pipeline,
+        fused_score_and_topk,
+        fused_score_and_topk_out,
+        fused_paged_score_and_topk_out,
+        rope_hadamard_q_out,
     )
-    __all__ += ["FP8WqbWeightsCUDA", "fused_score_pipeline"]
-except (ImportError, Exception):
-    pass
+__all__ += [
+        "FP8WqbWeightsCUDA",
+        "cuda_wq_b_proj_out",
+        "fused_score_and_topk",
+        "fused_score_and_topk_out",
+        "fused_paged_score_and_topk_out",
+        "fused_score_pipeline",
+        "rope_hadamard_q_out",
+    ]
 
 # WP5: FP8 absorb (Triton WGMMA)
 try:
     from batchgen_kernels.attention.dsa.fp8_absorb import (
         FP8AbsorbWeights,
         fp8_q_absorb,
+        fp8_q_absorb_out,
         fp8_out_absorb,
+        fp8_out_absorb_out,
     )
-    __all__ += ["FP8AbsorbWeights", "fp8_q_absorb", "fp8_out_absorb"]
+    __all__ += [
+        "FP8AbsorbWeights",
+        "fp8_q_absorb",
+        "fp8_q_absorb_out",
+        "fp8_out_absorb",
+        "fp8_out_absorb_out",
+    ]
 except (ImportError, Exception):
     pass
+
+from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
+__all__ += ["pack_flashmla_query_out"]

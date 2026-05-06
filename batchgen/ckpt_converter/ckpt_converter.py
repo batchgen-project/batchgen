@@ -40,10 +40,16 @@ class ckpt_converter:
 			return "bfloat16"
 		elif dtype == torch.float8_e4m3fn:
 			return "float8_e4m3fn"
+		elif hasattr(torch, "float8_e8m0fnu") and dtype == torch.float8_e8m0fnu:
+			return "float8_e8m0fnu"
+		elif hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2:
+			return "float4_e2m1fn_x2"
 		elif dtype == torch.int64:
 			return "int64"
 		elif dtype == torch.int32:
 			return "int32"
+		elif dtype == torch.int8:
+			return "int8"
 		elif dtype == torch.uint8:
 			return "uint8"
 		else:
@@ -346,7 +352,6 @@ class ckpt_converter:
 
 
 		
-
 
 
 

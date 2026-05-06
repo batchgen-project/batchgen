@@ -474,7 +474,8 @@ class PrefixAwarePrefillOffloader:
         worker_view: object,
         layer_idx: int,
         metadata: PrefixCachePrepackMetadata,
-        track_task: Optional[Callable[[object], None]] = None,
+        track_task: Optional[Callable[[object, int], None]] = None,
+        pin_tensor: Optional[Callable[[torch.Tensor, int], None]] = None,
     ):
         if worker_view is None:
             raise RuntimeError("Prefix-aware prefill offload requires host KV view")
@@ -482,10 +483,25 @@ class PrefixAwarePrefillOffloader:
         self.layer_idx = int(layer_idx)
         self.metadata = metadata
         self.track_task = track_task
+        self.pin_tensor = pin_tensor
 
     def _track(self, task: object) -> None:
         if task is not None and self.track_task is not None:
-            self.track_task(task)
+            self.track_task(task, self.layer_idx)
+
+    def _pin(self, tensor: torch.Tensor) -> None:
+        if self.pin_tensor is not None:
+            self.pin_tensor(tensor, self.layer_idx)
+
+    def _pin_parent_tensors(self, *tensors: torch.Tensor) -> None:
+        should_sync = False
+        for tensor in tensors:
+            self._pin(tensor)
+            should_sync = should_sync or bool(getattr(tensor, "is_cuda", False))
+        if should_sync:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            event.synchronize()
 
     def _destination_starts(self) -> Optional[List[int]]:
         if not self.metadata.prefix_reuse_mode:
@@ -536,6 +552,7 @@ class PrefixAwarePrefillOffloader:
             Callable[[int, int, int, torch.Tensor, torch.Tensor], None]
         ] = None,
     ) -> None:
+        self._pin_parent_tensors(key, value)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
         for seq_idx, sequence_id in enumerate(self.metadata.global_sequence_ids):
@@ -544,6 +561,8 @@ class PrefixAwarePrefillOffloader:
             seq_len = end_idx - start_idx
             seq_key = key[start_idx:end_idx].unsqueeze(0)
             seq_value = value[start_idx:end_idx].unsqueeze(0)
+            self._pin(seq_key)
+            self._pin(seq_value)
             if sequence_callback is not None:
                 sequence_callback(seq_idx, sequence_id, seq_len, seq_key, seq_value)
             self._offload_one(
@@ -564,6 +583,7 @@ class PrefixAwarePrefillOffloader:
             Callable[[int, int, int, torch.Tensor], None]
         ] = None,
     ) -> None:
+        self._pin_parent_tensors(key)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
         for seq_idx, sequence_id in enumerate(self.metadata.global_sequence_ids):
@@ -579,6 +599,7 @@ class PrefixAwarePrefillOffloader:
                 raise RuntimeError(
                     f"MLA prefill offload expects 2D or 3D KV, got {seq_key.dim()}D"
                 )
+            self._pin(seq_key)
             if sequence_callback is not None:
                 sequence_callback(seq_idx, sequence_id, seq_len, seq_key)
             self._offload_one(

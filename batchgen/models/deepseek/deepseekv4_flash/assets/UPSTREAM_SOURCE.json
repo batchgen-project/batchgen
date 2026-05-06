@@ -1,0 +1,15 @@
+{
+  "repo_id": "deepseek-ai/DeepSeek-V4-Flash",
+  "mirror": "ModelScope",
+  "mirror_url": "https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash",
+  "revision": "master",
+  "download_scope": "All public repo files except *.safetensors checkpoint shards",
+  "excluded_patterns": [
+    "*.safetensors"
+  ],
+  "notes": [
+    "Downloaded via modelscope.hub.snapshot_download into this directory.",
+    "The upstream repo includes tokenizer.json, tokenizer_config.json, config.json, generation_config.json, README.md, LICENSE, DeepSeek_V4.pdf, encoding/, inference/, model.safetensors.index.json, and assets/dsv4_performance.png.",
+    "No chat_template.jinja or special_tokens_map.json was present in the mirrored upstream file tree at download time."
+  ]
+}

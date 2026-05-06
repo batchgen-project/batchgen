@@ -107,6 +107,19 @@ class GPUPagedKVStats:
 
 
 @dataclass(frozen=True)
+class CUDAGraphPageTableState:
+	"""Fixed-capacity page-table state for CUDA graph consumers."""
+
+	table: torch.Tensor
+	slot_indices: torch.Tensor
+	slot_to_seq_id: torch.Tensor
+	num_valid_slots: int
+	max_slots: int
+	max_pages_per_sequence: int
+	rebuild_version: int
+
+
+@dataclass(frozen=True)
 class GPUPagedKVConfig:
 	num_layers: int
 	num_pages: int
@@ -343,26 +356,34 @@ class GPUPagedKVLayout:
 
 
 class _GPUPageTableManager:
-	"""Lightweight manager that maintains a 2-D GPU tensor acting as a
-	page table. The table layout is [num_slots, max_pages_per_sequence]
-	and uses -1 as the padding value for sequences with fewer pages.
+	"""Maintains active and CUDA-graph page-table views.
 
-	The manager also keeps two small host-side mappings to translate
-	sequence ids <-> slot indices: ``seq_id_to_slot`` and
-	``slot_to_seq_id``. The table is rebuilt (on device) on demand when
-	`rebuild` is called. The rebuild operation is intentionally simple and
-	safe because it is expected to be infrequent.
+	``gpu_table`` preserves the active-table semantics:
+	``[current_slots, current_max_pages]`` aligned to the latest rebuild.
+	CUDA graph consumers use ``get_cuda_graph_table()``, which exposes
+	separate fixed-capacity storage updated in-place by rebuilds.
 	"""
 
-	def __init__(self, device: torch.device, max_pages_per_sequence: int):
+	def __init__(
+		self,
+		device: torch.device,
+		max_pages_per_sequence: int,
+		max_slots: int,
+	):
 		self.device = device
+		self.graph_max_pages_per_sequence = int(max_pages_per_sequence)
 		self.max_pages_per_sequence = int(max_pages_per_sequence)
+		self.max_slots = int(max_slots)
 		self.seq_id_to_slot: Dict[int, int] = {}
 		self.slot_to_seq_id: List[
 			Optional[int]
 		] = []  # this is also sequence order
-		# GPU tensor of shape [num_slots, max_pages_per_sequence]
+		# Active GPU tensor of shape [current_slots, current_max_pages].
 		self.gpu_table: Optional[torch.Tensor] = None
+		# Stable graph tensor of shape [max_slots, graph_max_pages_per_sequence].
+		self._cuda_graph_table: Optional[torch.Tensor] = None
+		self._cuda_graph_table_valid: bool = False
+		self._cuda_graph_slot_count: int = 0
 		# Small cached 1-D slot_ids,like [0, 1, 2, ...] total length is len(sequence_ids)
 		self._slot_index_tensor: Optional[torch.Tensor] = None
 		# Cached tensor mirroring slot_to_seq_id on device for downstream consumers.
@@ -381,16 +402,13 @@ class _GPUPageTableManager:
 	) -> torch.Tensor:
 		"""(Re)build the GPU page table for the provided sequence order.
 
-		Optimization: if the requested `sequence_ids` exactly matches the
-		current `slot_to_seq_id` prefix and a GPU table already exists,
-		return a view into the existing tensor instead of rebuilding.
+		This preserves the original active-table API while also refreshing
+		the separate graph-stable backing table when the active batch fits
+		within reserved CUDA graph metadata capacity.
 		"""
 		wanted_order = list(sequence_ids)
 
-		# Compute the maximum number of pages required by the provided
-		# sequences. If any sequence requires more than the current
-		# max_pages_per_sequence, expand the table size by at least one
-		# extra page (leave an extra slot) to reduce immediate re-resize.
+		# Compute the maximum number of pages required by the provided sequences.
 		max_required = 0
 		for seq_id in wanted_order:
 			state = sequences.get(seq_id)
@@ -398,23 +416,17 @@ class _GPUPageTableManager:
 				continue
 			max_required = max(max_required, int(state.pages.numel()))
 
-		# Ensure at least one extra page margin.
 		desired_pages = max_required + 1
-		# new_max = max(self.max_pages_per_sequence, desired_pages)
-		new_max = desired_pages
 
 		num_slots = len(wanted_order)
 		flat_pages_cpu = self._build_flat_page_index_tensor(
 			wanted_order, sequences
 		)
 
-		# Fast-path: if an existing GPU table already matches the exact
-		# shape we need and the order is identical, return a view into it.
 		old_shape = self.gpu_table.shape if self.gpu_table is not None else None
-		old_slot_count = len(self.slot_to_seq_id) if self.slot_to_seq_id else 0
 		
 		shape_match = self.gpu_table is not None and self.gpu_table.shape[0] == num_slots
-		cols_sufficient = self.gpu_table is not None and self.gpu_table.shape[1] >= new_max
+		cols_sufficient = self.gpu_table is not None and self.gpu_table.shape[1] >= desired_pages
 		order_match = self.slot_to_seq_id == wanted_order
 		
 		reuse_existing = (
@@ -428,9 +440,10 @@ class _GPUPageTableManager:
 		if BATCHGEN_CB_DEBUG:
 			logging.info(
 				f"GPUPageTableManager.rebuild: "
-				f"num_slots={num_slots}, new_max={new_max}, "
-				f"old_shape={old_shape}, old_slot_count={old_slot_count}, "
-				f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, order_match={order_match}, "
+				f"num_slots={num_slots}, new_max={desired_pages}, "
+				f"old_shape={old_shape}, "
+				f"shape_match={shape_match}, cols_sufficient={cols_sufficient}, "
+				f"order_match={order_match}, "
 				f"reuse_existing={reuse_existing}"
 			)
 
@@ -438,7 +451,7 @@ class _GPUPageTableManager:
 			self.gpu_table
 			if reuse_existing
 			else torch.full(
-				(num_slots, new_max), -1, dtype=torch.int32, device=self.device
+				(num_slots, desired_pages), -1, dtype=torch.int32, device=self.device
 			)
 		)
 
@@ -448,9 +461,9 @@ class _GPUPageTableManager:
 			seq_id: idx for idx, seq_id in enumerate(wanted_order)
 		}
 		self.slot_to_seq_id = list(wanted_order)
-		self.max_pages_per_sequence = int(new_max)
+		self.max_pages_per_sequence = int(desired_pages)
 
-		fill_region = table[:num_slots, :new_max]
+		fill_region = table[:num_slots, :desired_pages]
 
 		# Fill table rows from sequence state pages.
 		# Always clear unused columns to prevent stale page IDs from
@@ -462,23 +475,13 @@ class _GPUPageTableManager:
 				continue
 			pages = state.pages.to(self.device, dtype=torch.int32)
 			count = int(pages.numel())
-			# pages should fit into new_max because we ensured desired_pages
-			if count > new_max:
-				# As a last-resort safety: truncate to new_max and log.
-				logging.warning(
-					"Sequence %s has %d pages > new_max %d; truncating",
-					seq_id,
-					count,
-					new_max,
-				)
-				count = new_max
-				pages = pages[:count]
 			fill_region[slot, :count] = pages[:count]
-			if count < new_max:
+			if count < desired_pages:
 				fill_region[slot, count:] = -1
 
 		if not reuse_existing:
 			self.gpu_table = table
+		self._update_cuda_graph_table(wanted_order, sequences, max_required)
 		self._slot_index_tensor = self._build_slot_index_tensor(num_slots)
 		self._slot_to_seq_id_tensor = self._build_slot_to_seq_id_tensor(
 			self.slot_to_seq_id
@@ -496,9 +499,64 @@ class _GPUPageTableManager:
 				f"slot_to_seq_id_len={len(self.slot_to_seq_id)}"
 			)
 		
-		# If table has more columns than needed, return a view with
-		# the requested number of rows and the existing columns.
 		return table[:num_slots, :]
+
+	def _update_cuda_graph_table(
+		self,
+		sequence_ids: Sequence[int],
+		sequences: Dict[int, _SequenceState],
+		max_required: int,
+	) -> None:
+		num_slots = len(sequence_ids)
+		if num_slots > self.max_slots or max_required > self.graph_max_pages_per_sequence:
+			self._cuda_graph_table_valid = False
+			return
+		table = self._ensure_cuda_graph_table()
+		rows_to_clear = max(self._cuda_graph_slot_count, num_slots)
+		if rows_to_clear:
+			table[:rows_to_clear, :].fill_(-1)
+		for slot, seq_id in enumerate(sequence_ids):
+			state = sequences.get(seq_id)
+			if state is None or state.pages.numel() == 0:
+				continue
+			pages = state.pages.to(self.device, dtype=torch.int32)
+			count = int(pages.numel())
+			table[slot, :count] = pages[:count]
+		self._cuda_graph_slot_count = num_slots
+		self._cuda_graph_table_valid = True
+
+	def _ensure_cuda_graph_table(self) -> torch.Tensor:
+		if self._cuda_graph_table is None:
+			self._cuda_graph_table = torch.full(
+				(self.max_slots, self.graph_max_pages_per_sequence),
+				-1,
+				dtype=torch.int32,
+				device=self.device,
+			)
+		return self._cuda_graph_table
+
+	def get_cuda_graph_table(self) -> torch.Tensor:
+		table = self._ensure_cuda_graph_table()
+		if not self._cuda_graph_table_valid:
+			raise RuntimeError(
+				"CUDA graph page table is not valid for the active rebuild; "
+				f"capacity=({self.max_slots}, {self.graph_max_pages_per_sequence})"
+			)
+		return table
+
+	def get_cuda_graph_state(self) -> CUDAGraphPageTableState:
+		table = self.get_cuda_graph_table()
+		slot_indices = self.get_slot_index_tensor()
+		slot_to_seq_id = self.get_slot_to_seq_id_tensor()
+		return CUDAGraphPageTableState(
+			table=table,
+			slot_indices=slot_indices,
+			slot_to_seq_id=slot_to_seq_id,
+			num_valid_slots=self._cuda_graph_slot_count,
+			max_slots=self.max_slots,
+			max_pages_per_sequence=self.graph_max_pages_per_sequence,
+			rebuild_version=self.rebuild_version,
+		)
 
 	def get_slot_index_tensor(self) -> torch.Tensor:
 		"""Returns a cached 1-D tensor mapping logical batch order to slots."""
@@ -936,13 +994,16 @@ class GPUPagedKVCacheManager:
 		mgr.gpu_table = torch.full(
 			(0, max_pages), -1, dtype=torch.int32, device=mgr.device
 		)
+		mgr._ensure_cuda_graph_table().fill_(-1)
+		mgr._cuda_graph_table_valid = True
+		mgr._cuda_graph_slot_count = 0
 		
 		# Clear the slot mappings
 		mgr.seq_id_to_slot = {}
 		mgr.slot_to_seq_id = []
-		mgr._slot_index_tensor = None
-		mgr._slot_to_seq_id_tensor = None
-		mgr._active_page_indices_cpu = None
+		mgr._slot_index_tensor = torch.empty(0, dtype=torch.int32, device=mgr.device)
+		mgr._slot_to_seq_id_tensor = torch.empty(0, dtype=torch.int64, device=mgr.device)
+		mgr._active_page_indices_cpu = torch.empty(0, dtype=torch.int64)
 		mgr.rebuild_version += 1
 		
 		# Clear active page pointer tables
@@ -1277,6 +1338,40 @@ class GPUPagedKVCacheManager:
 		self._ensure_initialized()
 		return self._gpu_page_table_manager.rebuild_version
 
+	def get_cuda_graph_page_table(self) -> torch.Tensor:
+		"""Return the fixed-capacity page table for CUDA graph consumers."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.get_cuda_graph_table()
+
+	def get_cuda_graph_page_table_storage(self) -> torch.Tensor:
+		"""Return fixed CUDA-graph page-table storage without validating contents.
+
+		Graph capture needs a stable tensor pointer before every future decode row
+		is necessarily allocated in the active GPU manager. Replay paths must use
+		``get_cuda_graph_page_table``/``get_cuda_graph_page_table_state`` so they
+		still require valid active contents.
+		"""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager._ensure_cuda_graph_table()
+
+	def ensure_cuda_graph_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
+		"""Refresh and return graph-stable page-table storage for a capture."""
+		self._ensure_initialized()
+		ordered_ids = list(sequence_ids)
+		mgr = self._gpu_page_table_manager
+		if mgr._cuda_graph_table_valid and mgr.slot_to_seq_id == ordered_ids:
+			return mgr.get_cuda_graph_table()
+		if ordered_ids:
+			self.rebuild_page_table(ordered_ids)
+		else:
+			self.clear_page_table()
+		return self.get_cuda_graph_page_table()
+
+	def get_cuda_graph_page_table_state(self) -> CUDAGraphPageTableState:
+		"""Return graph-stable page table plus active-slot metadata."""
+		self._ensure_initialized()
+		return self._gpu_page_table_manager.get_cuda_graph_state()
+
 	def get_kv_tensors(self) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 		"""Exposes the raw K/V cache tensors."""
 
@@ -1598,13 +1693,65 @@ class GPUPagedKVCacheManager:
 		self._shared_prefix_ref_decrements = 0
 		self._shared_prefix_pages_reused = 0
 		self._shared_prefix_pages_allocated = 0
-		max_pages_per_seq = _ceil_div(
-			DEFAULT_INITIAL_TOKEN_CAPACITY, self.config.page_size_tokens
-		)
+		max_pages_per_seq = self._resolve_page_table_max_pages_per_sequence()
+		max_slots = self._resolve_page_table_max_slots()
 		self._gpu_page_table_manager = _GPUPageTableManager(
-			device=self.device, max_pages_per_sequence=max_pages_per_seq
+			device=self.device,
+			max_pages_per_sequence=max_pages_per_seq,
+			max_slots=max_slots,
 		)
 		self._is_initialized = False
+
+	def _resolve_page_table_max_slots(self) -> int:
+		env_value = _positive_or_none(
+			int(os.environ["BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS"])
+			if "BATCHGEN_GPU_PAGE_TABLE_MAX_SLOTS" in os.environ
+			else None
+		)
+		if env_value is not None:
+			return min(env_value, self.config.num_pages)
+
+		candidates: List[int] = []
+		if self._engine_config is not None:
+			basic = self._engine_config.Basic_Config
+			module_batching = self._engine_config.Module_Batching_Config
+			for value in (
+				module_batching.global_batch_size,
+				module_batching.attn_decoding_micro_batch_size,
+				basic.num_queries,
+			):
+				normalized = _positive_or_none(value)
+				if normalized is not None:
+					candidates.append(normalized)
+		if not candidates:
+			candidates.append(self.config.num_pages)
+		return max(1, min(max(candidates), self.config.num_pages))
+
+	def _resolve_page_table_max_pages_per_sequence(self) -> int:
+		env_value = _positive_or_none(
+			int(os.environ["BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE"])
+			if "BATCHGEN_GPU_PAGE_TABLE_MAX_PAGES_PER_SEQUENCE" in os.environ
+			else None
+		)
+		if env_value is not None:
+			return min(env_value, self.config.num_pages)
+
+		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
+		if self._engine_config is not None:
+			basic = self._engine_config.Basic_Config
+			max_prompt = basic.get_max_prompt_length()
+			max_decode = basic.max_decoding_length
+			if max_prompt is not None and max_decode is not None:
+				token_capacity = max(token_capacity, int(max_prompt) + int(max_decode))
+			elif max_prompt is not None:
+				token_capacity = max(token_capacity, int(max_prompt))
+			elif max_decode is not None:
+				token_capacity = max(token_capacity, int(max_decode))
+			prepack_capacity = self._engine_config.Module_Batching_Config.prepack_row_capacity
+			if prepack_capacity is not None and prepack_capacity > 0:
+				token_capacity = max(token_capacity, int(prepack_capacity))
+		page_capacity = _ceil_div(token_capacity, self.config.page_size_tokens)
+		return max(1, min(page_capacity, self.config.num_pages))
 
 	def _release_cached_cuda_memory(self) -> None:
 		if self.device.type != "cuda":

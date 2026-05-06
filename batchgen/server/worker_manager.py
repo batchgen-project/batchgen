@@ -351,6 +351,7 @@ class WorkerManager:
         max_context_length: Optional[int] = None,
         sampling_params: Optional[List[Dict[str, Any]]] = None,
         per_sequence_max_tokens: Optional[List[int]] = None,
+        batchgen_debug: Optional[Dict[str, Any]] = None,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -369,6 +370,8 @@ class WorkerManager:
         # Per-sequence max output token limits
         if per_sequence_max_tokens is not None:
             payload["per_sequence_max_tokens"] = per_sequence_max_tokens
+        if batchgen_debug:
+            payload["batchgen_debug"] = batchgen_debug
         # Incremental writer metadata (only included when active)
         if incremental_output_dir and custom_id_map:
             payload["incremental_output_dir"] = incremental_output_dir
@@ -786,7 +789,20 @@ class WorkerManager:
     def _load_model_locally(
         self, _hf_cache_dir: Path, converted_ckpt_dir: Path
     ) -> None:
-        if "deepseek" in self.args.model.lower():
+        model_lower = self.args.model.lower()
+        if "deepseek-v4" in model_lower:
+            from batchgen.models.deepseek.deepseekv4_flash.deepseekv4_flash_parameter_server import (
+                DeepSeekV4Flash_Parameter_Server,
+            )
+
+            parameter_server = DeepSeekV4Flash_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
+            )
+        elif "deepseek" in model_lower:
             from batchgen.models.deepseek.deepseek_parameter_server import (
                 DeepSeek_Parameter_Server,
             )

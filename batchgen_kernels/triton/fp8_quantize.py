@@ -119,11 +119,10 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     # Apply minimum threshold (matching C++)
     amax = tl.maximum(amax, FP8_E4M3_MIN_NORMAL)
 
-    # Compute scale factor. Use the SGLang formula ``amax * (1/448)``
-    # instead of ``amax / 448`` — Triton's FP32 division vs multiplication
-    # produce different sub-ULP bit patterns, which propagates into
-    # ``q/scale`` and yields different FP8 rounding on ~0.1% of elements
-    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
+    # Compute scale factor as ``amax * (1/448)`` instead of ``amax / 448``
+    # — Triton's FP32 division vs multiplication produce different sub-ULP
+    # bit patterns, which propagates into ``q/scale`` and yields different
+    # FP8 rounding on ~0.1% of elements.
     scale = tl.maximum(amax * FP8_SAFE_MAX_INV, EPSILON)
     
     # Quantize with explicit clamping
@@ -135,13 +134,11 @@ def per_token_blocked_quantize_bf16_to_fp8_kernel(
     is_finite = tl.abs(q_scaled) < 1e30  # Triton doesn't have isfinite
     q_scaled = tl.where(is_finite, q_scaled, 0.0)
 
-    # Store directly to FP8 output pointer — the typed pointer's dtype
-    # drives the implicit FP32→FP8 cast inside ``tl.store`` and uses
-    # round-to-nearest-even, matching SGLang's ``_act_quant_kernel``
-    # (triton_kernel.py:76-77). The prior explicit ``.to(tl.float8e4nv)``
-    # used a different rounding mode and produced FP8 bytes that differed
-    # from SGLang at ~0.03-0.20% of elements across typical GLM-5 shapes
-    # (see tests/test_glm5_act_quant_triton_vs_triton.py).
+    # Store directly to the FP8 output pointer — the typed pointer's dtype
+    # drives the implicit FP32→FP8 cast inside ``tl.store`` using
+    # round-to-nearest-even. The prior explicit ``.to(tl.float8e4nv)`` used
+    # a different rounding mode and changed FP8 bytes on ~0.03-0.20% of
+    # elements across typical GLM-5 shapes.
     out_offsets = pid_seq * out_stride0 + pid_token * out_stride1 + \
                   (block_start + tl.arange(0, block_size)) * out_stride2
     tl.store(out_ptr + out_offsets, q_scaled, mask=mask)
@@ -706,7 +703,7 @@ def dequant_compressed_kv_per_token_with_length_v2(
 # 					output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
 
 # 			Notes:
-# 					- Persistant kernel approach applied. 
+# 					- Persistent kernel approach applied.
 # 		"""
 # 		cta_id = tl.program_id(0)
 

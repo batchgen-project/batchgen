@@ -25,8 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
-import os
-from typing import ClassVar, Dict, List, Optional, Sequence
+from typing import Any, ClassVar, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -68,6 +67,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     kv_quantization_factor: ClassVar[Optional[List]] = None
     kv_append_callback: ClassVar[Optional[callable]] = None
     kv_append_callback_aux: ClassVar[Optional[callable]] = None
+    batchgen_debug: ClassVar[Optional[Dict[str, Any]]] = None
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
@@ -75,56 +75,83 @@ class AttnWrapperBase(BaseModuleWrapper):
     # KVAsyncTask futures; if Python discards them (fire-and-forget), the
     # CPU thread that queues cudaMemcpyAsync may not have run yet by the
     # time decode starts reading the host KV. Capture each task here and
-    # .wait() on them before exiting prefill.
+    # .wait() on it before releasing the pinned source tensor references.
     pending_prefill_offload_tasks: ClassVar[list] = []
-    # Kept for compatibility with older drains. Source tensors are held by the
-    # C++ async task itself, so Python must not retain every prefill K/V tensor
-    # until end-of-prefill; doing so makes large prefix-reuse prefill grow HBM
-    # monotonically.
+    # Tensor references kept alive for the duration of the async offload.
+    # Mirrors the decode side's `_pending_kv_append_tensors`. The C++ async
+    # lambda captures the tensor by value, but the underlying STORAGE may be
+    # released back to PyTorch's caching allocator if no Python reference is
+    # held — and with `expandable_segments:True` plus multi-seq packed prefill
+    # the allocator may then hand the same physical pages to a later layer's
+    # K/V tensor while the d2h memcpy is still in flight. Holding the source
+    # tensors here pins the storage until the next-layer or end-of-prefill
+    # retire point confirms the memcpy has completed.
     pending_prefill_offload_tensors: ClassVar[list] = []
+    pending_prefill_offload_layer_idx: ClassVar[Optional[int]] = None
 
     @classmethod
-    def _max_pending_prefill_offload_tasks(cls) -> int:
-        raw = os.environ.get("BATCHGEN_MAX_PENDING_PREFILL_OFFLOAD_TASKS", "256")
-        try:
-            return max(1, int(raw))
-        except ValueError:
-            logging.warning(
-                "Invalid BATCHGEN_MAX_PENDING_PREFILL_OFFLOAD_TASKS=%r; using 256",
-                raw,
-            )
-            return 256
-
-    @classmethod
-    def track_prefill_offload_task(cls, task: object) -> None:
-        """Track a prefill D2H task and apply bounded backpressure.
-
-        Prefix reuse can create one D2H copy task per sequence per layer. If
-        those tasks are only drained after the whole prefill, their captured
-        source K/V tensors can keep HBM alive long enough to OOM later MoE
-        layers. Prune completed tasks first, and only wait when offload falls
-        behind the configured bound.
-        """
-        if task is None:
+    def _prefill_offload_sync_device(cls, device: Optional[torch.device]) -> None:
+        if device is None or not torch.cuda.is_available():
             return
+        sync_device = device if isinstance(device, torch.device) else torch.device(device)
+        if sync_device.type == "cuda":
+            torch.cuda.synchronize(sync_device)
 
+    @classmethod
+    def retire_pending_prefill_offloads(
+        cls,
+        *,
+        device: Optional[torch.device] = None,
+        reason: str = "",
+    ) -> int:
         pending = cls.pending_prefill_offload_tasks
-        pending.append(task)
-        max_pending = cls._max_pending_prefill_offload_tasks()
-        if len(pending) < max_pending:
-            return
+        pinned = cls.pending_prefill_offload_tensors
+        if not pending and not pinned:
+            cls.pending_prefill_offload_layer_idx = None
+            return 0
 
-        keep = []
-        for pending_task in pending:
-            if pending_task.done():
-                pending_task.wait()
-            else:
-                keep.append(pending_task)
-        pending[:] = keep
+        num_tasks = len(pending)
+        for task in pending:
+            task.wait()
+        pending.clear()
+        cls._prefill_offload_sync_device(device)
+        pinned.clear()
 
-        while len(pending) >= max_pending:
-            oldest = pending.pop(0)
-            oldest.wait()
+        layer_idx = cls.pending_prefill_offload_layer_idx
+        cls.pending_prefill_offload_layer_idx = None
+        if num_tasks:
+            suffix = f" ({reason})" if reason else ""
+            logging.debug(
+                f"[PREFILL_SYNC] retired {num_tasks} async KV offload tasks"
+                f" from layer {layer_idx}{suffix}"
+            )
+        return num_tasks
+
+    @classmethod
+    def retire_pending_prefill_offloads_before_layer(
+        cls,
+        layer_idx: int,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> int:
+        pending_layer = cls.pending_prefill_offload_layer_idx
+        if pending_layer is None or pending_layer == layer_idx:
+            return 0
+        return cls.retire_pending_prefill_offloads(
+            device=device,
+            reason=f"before layer {layer_idx}",
+        )
+
+    @classmethod
+    def pin_prefill_offload_tensor(cls, tensor: torch.Tensor, layer_idx: int) -> None:
+        cls.pending_prefill_offload_layer_idx = layer_idx
+        cls.pending_prefill_offload_tensors.append(tensor)
+
+    @classmethod
+    def track_prefill_offload_task(cls, task: object, layer_idx: int) -> None:
+        cls.pending_prefill_offload_layer_idx = layer_idx
+        if task is not None:
+            cls.pending_prefill_offload_tasks.append(task)
 
     def prefix_cache_metadata(self):
         """Return validated prepack metadata for prefix-cache helpers."""
@@ -162,11 +189,13 @@ class AttnWrapperBase(BaseModuleWrapper):
 
         metadata = metadata or self.prefix_cache_metadata()
         tracker = self.track_prefill_offload_task if track_tasks else None
+        tensor_pinner = self.pin_prefill_offload_tensor if track_tasks else None
         offloader = PrefixAwarePrefillOffloader(
             worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
             layer_idx=self.layer_idx,
             metadata=metadata,
             track_task=tracker,
+            pin_tensor=tensor_pinner,
         )
         offloader.offload_gqa(
             key=key,
@@ -186,11 +215,13 @@ class AttnWrapperBase(BaseModuleWrapper):
 
         metadata = metadata or self.prefix_cache_metadata()
         tracker = self.track_prefill_offload_task if track_tasks else None
+        tensor_pinner = self.pin_prefill_offload_tensor if track_tasks else None
         offloader = PrefixAwarePrefillOffloader(
             worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
             layer_idx=self.layer_idx,
             metadata=metadata,
             track_task=tracker,
+            pin_tensor=tensor_pinner,
         )
         offloader.offload_mla(key=key)
 
@@ -215,13 +246,12 @@ class AttnWrapperBase(BaseModuleWrapper):
     # Set once per decode step by the worker so per-layer _forward_decode_dsa
     # branches on it without doing a D2H .sum().item() 78 times per step.
     _dsa_short_count: ClassVar[Optional[int]] = None
-    # DSA per-step slot-index hoists: build_batch_slot_indices() used to run
-    # per-layer inside _forward_decode_dsa, producing two tiny int32 HtoD
-    # copies per layer (×78 → 156 HtoDs/step). Inputs (cur_batch +
-    # seq_id_to_slot mapping) are step-constant, so the worker fills these
-    # once before the model forward and wrappers read them back.
-    primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
-    aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
+    # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
+    # rows instead of deriving slot count from cur_batch.
+    glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)

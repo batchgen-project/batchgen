@@ -228,7 +228,7 @@ def validate(
 ):
     """
     Validate fused RMSNorm against PyTorch reference.
-    Uses BF16 WGMMA tolerance from CLAUDE.md.
+    Uses BF16 WGMMA tolerance per project conventions.
     """
     device = torch.device("cuda")
     weight = torch.randn(hidden_size, device=device, dtype=dtype)

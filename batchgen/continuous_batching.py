@@ -91,6 +91,131 @@ class BoundaryDecisions:
     seqs_needing_extension: List[str]    # Sequences needing GPU page extension
     new_load_uuids: List[str]            # Sequences to async-load into GPU
     decode_uuids_final: List[str]        # Final decode_uuids after all decisions
+    scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
+
+
+def _format_ranked_reports(reports: Dict[str, List[int]], limit: int = 8) -> str:
+    items = sorted(reports.items(), key=lambda item: item[0])[:limit]
+    return ", ".join(f"{uuid}:{ranks}" for uuid, ranks in items)
+
+
+def validate_boundary_payload_alignment(
+    decode_uuids: List[str],
+    all_payloads: List[Optional[Dict[str, Any]]],
+) -> None:
+    """Fail fast when boundary all-gather ownership metadata is inconsistent.
+
+    Every UUID in the active decode list must be reported exactly once in
+    ``seq_state`` by its assigned rank. Load candidates must be reported exactly
+    once and must not overlap active decode UUIDs. Violations mean scheduler
+    state is already corrupt enough that silently completing or dropping rows
+    would hide data loss and can lead to long-tail stalls.
+    """
+    errors: List[str] = []
+    active_reports: Dict[str, List[int]] = {}
+    candidate_reports: Dict[str, List[int]] = {}
+    active_wrong_owner: List[Tuple[str, int, Any]] = []
+    candidate_wrong_owner: List[Tuple[str, int, Any]] = []
+    candidate_bad_status: List[Tuple[str, int, Any]] = []
+
+    for rank_idx, payload in enumerate(all_payloads):
+        if not isinstance(payload, dict):
+            errors.append(f"rank {rank_idx} payload missing or invalid: {type(payload).__name__}")
+            continue
+
+        seq_state = payload.get("seq_state") or {}
+        candidate_state = payload.get("candidate_state") or {}
+
+        for uuid, state in seq_state.items():
+            active_reports.setdefault(uuid, []).append(rank_idx)
+            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+            if assigned_rank is not None:
+                try:
+                    assigned_rank_int = int(assigned_rank)
+                except (TypeError, ValueError):
+                    active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
+                    if assigned_rank_int != rank_idx:
+                        active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+
+        for uuid, state in candidate_state.items():
+            candidate_reports.setdefault(uuid, []).append(rank_idx)
+            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+            if assigned_rank is not None:
+                try:
+                    assigned_rank_int = int(assigned_rank)
+                except (TypeError, ValueError):
+                    candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                else:
+                    if assigned_rank_int != rank_idx:
+                        candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+            status = state.get("status") if isinstance(state, dict) else None
+            if status not in (None, "PREFILLED", "ON_HOLD"):
+                candidate_bad_status.append((uuid, rank_idx, status))
+
+    missing_active = [uuid for uuid in decode_uuids if uuid not in active_reports]
+    if missing_active:
+        errors.append(
+            "decode UUIDs missing from gathered seq_state: "
+            f"count={len(missing_active)} first={missing_active[:8]}"
+        )
+
+    duplicate_active = {
+        uuid: ranks for uuid, ranks in active_reports.items() if len(ranks) != 1
+    }
+    if duplicate_active:
+        errors.append(
+            "active UUIDs reported by multiple ranks: "
+            f"{_format_ranked_reports(duplicate_active)}"
+        )
+
+    duplicate_candidates = {
+        uuid: ranks for uuid, ranks in candidate_reports.items() if len(ranks) != 1
+    }
+    if duplicate_candidates:
+        errors.append(
+            "load candidates reported by multiple ranks: "
+            f"{_format_ranked_reports(duplicate_candidates)}"
+        )
+
+    active_candidate_overlap = [
+        uuid for uuid in decode_uuids if uuid in candidate_reports
+    ]
+    if active_candidate_overlap:
+        errors.append(
+            "decode UUIDs also reported as load candidates: "
+            f"count={len(active_candidate_overlap)} first={active_candidate_overlap[:8]}"
+        )
+
+    if active_wrong_owner:
+        errors.append(
+            "active UUID owner/rank mismatch: "
+            + ", ".join(
+                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                for uuid, rank, assigned in active_wrong_owner[:8]
+            )
+        )
+
+    if candidate_wrong_owner:
+        errors.append(
+            "candidate UUID owner/rank mismatch: "
+            + ", ".join(
+                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                for uuid, rank, assigned in candidate_wrong_owner[:8]
+            )
+        )
+
+    if candidate_bad_status:
+        errors.append(
+            "load candidates have invalid status: "
+            + ", ".join(
+                f"{uuid}(rank={rank}, status={status})"
+                for uuid, rank, status in candidate_bad_status[:8]
+            )
+        )
+
+    if errors:
+        raise RuntimeError("[SCHED_INVARIANT] boundary gather misalignment: " + " | ".join(errors))
 
 
 class LoadingStrategy(Enum):
@@ -211,6 +336,133 @@ def select_sequences_for_eviction(
         freed += state.get(page_key, 0)
 
     return evict_uuids, freed
+
+
+@dataclass
+class HostKVGrowthEvictionPlan:
+    """Deterministic host-KV eviction plan that preserves growth headroom."""
+
+    evicted_uuids: List[str]
+    freed_pages: int
+    remaining_growth_uuids: List[str]
+    remaining_growth_pages: List[int]
+    remaining_growth_needed: int
+    expected_free_pages: int
+    required_free_pages: int
+    growth_feasible_after_eviction: bool
+
+
+def plan_host_kv_growth_evictions(
+    *,
+    active_uuids: List[str],
+    completed_uuids: List[str],
+    host_growth_uuids: List[str],
+    host_growth_pages: List[int],
+    eviction_candidates: List[Tuple[str, Dict[str, Any]]],
+    free_pages: int,
+    total_pages: int,
+    completed_pages: int,
+    watermark_percent: float,
+    safety_margin: int,
+    strategy: EvictionStrategy = EvictionStrategy.SHORTEST_FIRST,
+    page_key: str = "host_pages_allocated",
+) -> HostKVGrowthEvictionPlan:
+    """Plan host evictions so remaining active rows can grow before appending.
+
+    The dynamic host-KV invariant is: after a boundary, every still-active row
+    that needs host growth must either have enough free pages to grow, or must
+    have been removed from decode. This planner accounts for pages that will be
+    released by completed rows before growth, then selects deterministic
+    eviction candidates until both the free-page watermark and the remaining
+    growth debt plus reserve are satisfied.
+    """
+    if len(host_growth_uuids) != len(host_growth_pages):
+        raise ValueError("host_growth_uuids and host_growth_pages must align")
+
+    completed_set = set(completed_uuids)
+    base_free = min(max(total_pages, 0), max(free_pages, 0) + max(completed_pages, 0))
+    target_free = int(max(total_pages, 0) * max(watermark_percent, 0.0) / 100.0)
+    growth_by_uuid = {
+        uuid: pages
+        for uuid, pages in zip(host_growth_uuids, host_growth_pages)
+        if pages > 0 and uuid in active_uuids and uuid not in completed_set
+    }
+    remaining_growth = sum(growth_by_uuid.values())
+
+    if strategy == EvictionStrategy.SHORTEST_FIRST:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (
+                x[1].get("priority", 0),
+                x[1].get("decoded_length", 0),
+                x[1].get("global_idx", float("inf")),
+                x[0],
+            ),
+        )
+    elif strategy == EvictionStrategy.LONGEST_FIRST:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (
+                x[1].get("priority", 0),
+                -x[1].get("decoded_length", 0),
+                x[1].get("global_idx", float("inf")),
+                x[0],
+            ),
+        )
+    else:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (x[1].get("priority", 0), x[1].get("global_idx", float("inf")), x[0]),
+        )
+
+    evicted_uuids: List[str] = []
+    evicted_set: Set[str] = set()
+    freed_pages = 0
+    candidate_idx = 0
+
+    while True:
+        expected_free = min(max(total_pages, 0), base_free + freed_pages)
+        growth_required_free = remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
+        required_free = max(target_free, growth_required_free)
+        if expected_free >= required_free:
+            break
+
+        while candidate_idx < len(sorted_candidates):
+            uuid, state = sorted_candidates[candidate_idx]
+            candidate_idx += 1
+            if uuid in completed_set or uuid in evicted_set:
+                continue
+            pages = int(state.get(page_key, 0) or 0)
+            if pages <= 0:
+                continue
+            break
+        else:
+            break
+
+        evicted_uuids.append(uuid)
+        evicted_set.add(uuid)
+        freed_pages += pages
+        remaining_growth -= growth_by_uuid.pop(uuid, 0)
+
+    remaining_growth_uuids = [uuid for uuid in host_growth_uuids if uuid in growth_by_uuid]
+    remaining_growth_pages = [growth_by_uuid[uuid] for uuid in remaining_growth_uuids]
+    expected_free = min(max(total_pages, 0), base_free + freed_pages)
+    required_free = max(
+        target_free,
+        remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0,
+    )
+    growth_feasible = remaining_growth == 0 or expected_free >= remaining_growth + max(safety_margin, 0)
+
+    return HostKVGrowthEvictionPlan(
+        evicted_uuids=evicted_uuids,
+        freed_pages=freed_pages,
+        remaining_growth_uuids=remaining_growth_uuids,
+        remaining_growth_pages=remaining_growth_pages,
+        remaining_growth_needed=remaining_growth,
+        expected_free_pages=expected_free,
+        required_free_pages=required_free,
+        growth_feasible_after_eviction=growth_feasible,
+    )
 
 
 def select_sequences_for_loading(

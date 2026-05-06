@@ -253,3 +253,17 @@ local_archive/
 
 # Internal test harness (not part of repo)
 tests/response_checklist.py
+
+# Agent tooling local state — never commit to public repo
+.copilot/
+.claude/
+.agents/
+AGENT_MEMORY/
+agent-memory/
+memory/
+session-state/
+*.session.jsonl
+task_queue.jsonl
+
+# Kernel-development tree (lives in Andrewxu313/batchgen_kernel_dev, not here)
+batchgen_kernel_dev/

@@ -11,13 +11,14 @@ import os
 import random
 import tempfile
 import time
+from pathlib import Path
 
 import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-_BATCHGEN_ROOT = os.environ.get("BATCHGEN_ROOT", "/data2/tairan/workspace/BatchGen")
+_BATCHGEN_ROOT = os.environ.get("BATCHGEN_ROOT", str(Path(__file__).resolve().parents[2]))
 _TEST_PARQUET = os.path.join(_BATCHGEN_ROOT, "test/r1_mmlu_pro_test/mmlu_pro_test.parquet")
 _VAL_PARQUET = os.path.join(_BATCHGEN_ROOT, "test/r1_mmlu_pro_test/mmlu_pro_validation.parquet")
 

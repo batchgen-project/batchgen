@@ -2,7 +2,6 @@
 // Two-phase persistent 3-WG CuTe kernel, forked from fp8_blockwise_gemm_kernel.cuh.
 // Phase 1: gate K-loop → gate result to SMEM (aliases shm_c).
 // Phase 2: up K-loop → SiLU(gate)*up epilogue → TMA store.
-// v19 in kernel version series (batchgen_kernel_dev/moe_gemm/grouped_fp8/).
 
 #ifndef BATCHGEN_FP8_BLOCKWISE_S1_KERNEL_CUH_
 #define BATCHGEN_FP8_BLOCKWISE_S1_KERNEL_CUH_
