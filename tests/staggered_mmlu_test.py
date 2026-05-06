@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
-sys.path.insert(0, os.environ.get("BATCHGEN_ROOT", "/data2/tairan/workspace/BatchGen"))
+sys.path.insert(0, os.environ.get("BATCHGEN_ROOT", str(Path(__file__).resolve().parents[1])))
 from batchgen.batchgen_client import BatchGenHttpClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -266,7 +266,7 @@ def main():
     args = parser.parse_args()
 
     # Load dataset
-    batchgen_root = os.environ.get("BATCHGEN_ROOT", "/data2/tairan/workspace/BatchGen")
+    batchgen_root = os.environ.get("BATCHGEN_ROOT", str(Path(__file__).resolve().parents[1]))
     test_parquet = os.path.join(batchgen_root, "test/r1_mmlu_pro_test/mmlu_pro_test.parquet")
     val_parquet = os.path.join(batchgen_root, "test/r1_mmlu_pro_test/mmlu_pro_validation.parquet")
     dataset = pd.read_parquet(test_parquet)

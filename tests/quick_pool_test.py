@@ -4,8 +4,9 @@ import json
 import sys
 import os
 import time
+from pathlib import Path
 
-sys.path.insert(0, os.environ.get("BATCHGEN_ROOT", "/data2/tairan/workspace/BatchGen"))
+sys.path.insert(0, os.environ.get("BATCHGEN_ROOT", str(Path(__file__).resolve().parents[1])))
 from batchgen.batchgen_client import BatchGenHttpClient
 
 BASE_URL = os.environ.get("BATCHGEN_URL", "http://localhost:10900")

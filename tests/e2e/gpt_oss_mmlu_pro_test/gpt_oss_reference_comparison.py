@@ -6,11 +6,12 @@ reference implementation to verify correctness.
 Usage:
     python gpt_oss_reference_comparison.py \
         --checkpoint /path/to/model \
-        --gpt_oss_path /data2/tairan/workspace/gpt-oss \
+        --gpt_oss_path /path/to/gpt-oss \
         --max_prompts 3
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List, Dict
@@ -71,8 +72,8 @@ def form_options(options: List[str]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="GPT-OSS Reference Implementation Comparison")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--gpt_oss_path", type=str, default="/data2/tairan/workspace/gpt-oss",
-                        help="Path to gpt-oss repository")
+    parser.add_argument("--gpt_oss_path", type=str, default=os.environ.get("GPT_OSS_PATH", ""),
+                        help="Path to gpt-oss repository (defaults to $GPT_OSS_PATH)")
     parser.add_argument("--max_prompts", type=int, default=3, help="Number of prompts to test")
     parser.add_argument("--max_tokens", type=int, default=50, help="Max tokens to generate")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")

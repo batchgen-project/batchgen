@@ -15,28 +15,30 @@
 #   ./run_all.sh --skip-generate    # Skip data generation
 #
 # Prerequisites:
-#   - SSH access to wechat_87 and wechat_96
-#   - GPT-OSS-120B model at /data2/tairan/models/gpt-oss-120b on Node0
-#   - Branch tairan/dynamic-host-kv checked out on both nodes
+#   - SSH access to two GPU nodes (configured via BATCHGEN_NODE0_SSH and
+#     BATCHGEN_NODE1_SSH env vars, or default ssh aliases ``node0``/``node1``).
+#   - GPT-OSS-120B model present at ``$BATCHGEN_MODEL_PATH`` on Node0.
+#   - The branch under test checked out on both nodes at the configured
+#     ``$BATCHGEN_NODE{0,1}_PATH``.
 # ============================================================================
 
 set -euo pipefail
 
-# ===== Configuration =====
-NODE0_SSH="wechat_87"
-NODE0_DOCKER="tairan-batchgen"
-NODE0_PATH="/data2/tairan/workspace/BatchGen"
-NODE1_SSH="wechat_96"
-NODE1_DOCKER="batchgen"
-NODE1_PATH="/data3/tairan/workspace/BatchGen"
-MODEL_PATH="/data2/tairan/models/gpt-oss-120b"
-MASTER_IP="29.194.13.138"
-MASTER_PORT=33001
-SERVER_PORT=10900
-CONDA="/root/miniconda3/envs/batchgen/bin"
+# ===== Configuration (override via env vars before running) =====
+NODE0_SSH="${BATCHGEN_NODE0_SSH:-node0}"
+NODE0_DOCKER="${BATCHGEN_NODE0_DOCKER:-batchgen}"
+NODE0_PATH="${BATCHGEN_NODE0_PATH:-/workspace/BatchGen}"
+NODE1_SSH="${BATCHGEN_NODE1_SSH:-node1}"
+NODE1_DOCKER="${BATCHGEN_NODE1_DOCKER:-batchgen}"
+NODE1_PATH="${BATCHGEN_NODE1_PATH:-/workspace/BatchGen}"
+MODEL_PATH="${BATCHGEN_MODEL_PATH:?set BATCHGEN_MODEL_PATH to the GPT-OSS-120B checkpoint path on Node0}"
+MASTER_IP="${BATCHGEN_MASTER_IP:-127.0.0.1}"
+MASTER_PORT="${BATCHGEN_MASTER_PORT:-33001}"
+SERVER_PORT="${BATCHGEN_SERVER_PORT:-10900}"
+CONDA="${BATCHGEN_CONDA_BIN:-/root/miniconda3/envs/batchgen/bin}"
 
-NCCL_ENV="NCCL_SOCKET_IFNAME=bond0 UCX_NET_DEVICES=bond0"
-NCCL_ENV+=" NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_4,mlx5_bond_2,mlx5_bond_6,mlx5_bond_3,mlx5_bond_7,mlx5_bond_1,mlx5_bond_5"
+# NCCL/IB env (override via BATCHGEN_NCCL_ENV for cluster-specific tuning).
+NCCL_ENV="${BATCHGEN_NCCL_ENV:-NCCL_SOCKET_IFNAME=eth0}"
 
 # Test directory (on remote)
 TEST_DIR="test/dynamic_host_kv_test"
