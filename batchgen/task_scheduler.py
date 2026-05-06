@@ -47,7 +47,7 @@ class TaskScheduler():
 		"""
 			Default scheduling policy:
 			1. Prioritize prefill tasks until host prefill KV pool is full.
-			2. Do decode tasks with continuous batching untill all the queries prefilled are completed. 
+			2. Do decode tasks with continuous batching until all the queries prefilled are completed.
 		"""
 		next_task = task()
 		# Start running
@@ -84,7 +84,6 @@ class TaskScheduler():
 
 
 			
-
 
 
 

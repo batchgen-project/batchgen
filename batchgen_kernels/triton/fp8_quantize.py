@@ -706,7 +706,7 @@ def dequant_compressed_kv_per_token_with_length_v2(
 # 					output_ptr: Pointer to the output tensor [bsz, padded_seq_len, dim]
 
 # 			Notes:
-# 					- Persistant kernel approach applied. 
+# 					- Persistent kernel approach applied.
 # 		"""
 # 		cta_id = tl.program_id(0)
 

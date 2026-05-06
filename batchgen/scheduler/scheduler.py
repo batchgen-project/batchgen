@@ -108,7 +108,7 @@ class Scheduler:
 			self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = int(self.config.Module_Batching_Config.MoE_prefill_micro_batch_size / factor)
 		
 		else:
-			# For shorter context, increse prefill attention micro batch size and MoE prefill micro batch size accordingly
+			# For shorter context, increase prefill attention micro batch size and MoE prefill micro batch size accordingly
 			factor = self.Max_Prompt_Length / 14000
 			self.config.Module_Batching_Config.attn_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.attn_prefill_micro_batch_size / factor))
 			self.config.Module_Batching_Config.MoE_prefill_micro_batch_size = min(32, int(self.config.Module_Batching_Config.MoE_prefill_micro_batch_size / factor))
@@ -157,4 +157,3 @@ class Scheduler:
 		""" Default EP Config """
 		self.config.EP_Config.enable = True
 		self.config.EP_Config.num_local_expert_per_layer = None
-
