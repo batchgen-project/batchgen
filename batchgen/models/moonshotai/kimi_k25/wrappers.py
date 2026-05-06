@@ -37,7 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from batchgen.models.moonshotai.kimi_k25.prefix_reuse import (
+from batchgen.models.wrappers.prefix_mla_model_adapters import (
     run_kimi_full_hit_prefill,
     run_kimi_prefix_aware_prefill,
 )

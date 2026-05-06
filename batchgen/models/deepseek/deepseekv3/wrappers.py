@@ -29,7 +29,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from batchgen.models.deepseek.deepseekv3.prefix_reuse import (
+from batchgen.models.wrappers.prefix_mla_model_adapters import (
     run_deepseek_full_hit_prefill,
     run_deepseek_prefix_aware_prefill,
 )

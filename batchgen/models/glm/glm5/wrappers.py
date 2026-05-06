@@ -26,7 +26,7 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
-from batchgen.models.glm.glm5.prefix_reuse import (
+from batchgen.models.wrappers.prefix_mla_model_adapters import (
     offload_glm5_prepacked_mla_kv,
     run_glm5_full_hit_prefill,
     run_glm5_prefix_aware_prefill,
