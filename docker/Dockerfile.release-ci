@@ -42,7 +42,10 @@ RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch
 RUN --mount=from=third_party,source=flash-attention,target=/tmp/src/flash-attention,readonly \
     cp -a /tmp/src/flash-attention /root/moegen/flash-attention \
     && cd /root/moegen/flash-attention/hopper \
-    && FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE \
+       FLASH_ATTENTION_DISABLE_SM80=TRUE \
+       FLASH_ATTENTION_DISABLE_BACKWARD=TRUE \
+       uv pip install . --no-build-isolation \
     && cd /root/moegen \
     && rm -rf flash-attention \
     && uv cache clean
