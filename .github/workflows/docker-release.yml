@@ -30,7 +30,7 @@ jobs:
           git -C .docker-build/third_party/DeepGEMM checkout v2.1.1.post3
           git -C .docker-build/third_party/DeepGEMM submodule update --init --recursive
           find .docker-build/third_party \( -name .git -o -name .github \) -prune -exec rm -rf {} +
-          tar -C .docker-build -czf third-party-src.tar.gz third_party
+          tar -czf .docker-build/third-party-src.tar.gz -C .docker-build third_party
           du -h .docker-build/third-party-src.tar.gz
 
       - name: Upload release build sources
