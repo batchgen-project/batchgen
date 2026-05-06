@@ -4,7 +4,7 @@
 
 <div align="center">
 
-[![GitHub Stars](https://img.shields.io/github/stars/EfficientMoE/BatchGen?style=social)](https://github.com/EfficientMoE/BatchGen/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/batchgen-project/batchgen?style=social)](https://github.com/batchgen-project/batchgen/stargazers)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 **High-Throughput Batch Inference**
@@ -49,8 +49,8 @@ For DeepSeek-R1-671B (~700GB model weights), we recommend at least 1TB host memo
 ### Installation
 
 ```bash
-git clone https://github.com/EfficientMoE/BatchGen.git
-cd BatchGen
+git clone https://github.com/batchgen-project/batchgen.git
+cd batchgen
 ./scripts/install_deps.sh
 ```
 
