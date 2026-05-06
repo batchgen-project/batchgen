@@ -88,6 +88,11 @@ from batchgen.query_book import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.models.glm.glm5.cuda_graph_policy import (
+	glm5_dsa_cuda_graph_requested_for_model,
+	glm5_moe_cuda_graph_requested_for_model,
+	glm5_segmented_cuda_graph_requested_for_model,
+)
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 
@@ -395,6 +400,7 @@ class BatchGenWorkerArgs:
 	enable_ep_with_offloading: bool = False  # Enable Expert Parallelism with offloading
 	ep_offloading_ratio: float = 0.0  # Ratio of experts per layer to offload (0.0-1.0)
 	pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+	enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
 	disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (default: off due to 128K+ crash)
 	cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
 	cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
@@ -2351,8 +2357,10 @@ class BatchGenWorker:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
 			(
-				os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1"
-				or os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+				glm5_segmented_cuda_graph_requested_for_model(
+					getattr(self, "model_name", None),
+					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+				)
 				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
 			)
 			and "glm" in (getattr(self, "model_name", "") or "").lower()
@@ -6098,6 +6106,7 @@ class BatchGenWorker:
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
+					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 				)
 				if self._glm5_segmented_graph_capture_already_attempted_for_requested_paths():
 					generic_cuda_graph_warmup_needed = False
@@ -9039,7 +9048,11 @@ class BatchGenWorker:
 		return True
 
 	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "0") == "1":
+		model_name = getattr(self, "model_name", None)
+		if glm5_dsa_cuda_graph_requested_for_model(
+			model_name,
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		):
 			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
 		if not isinstance(debug, dict):
@@ -9063,8 +9076,12 @@ class BatchGenWorker:
 		return False
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
+		model_name = getattr(self, "model_name", None)
 		if (
-			os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+			glm5_moe_cuda_graph_requested_for_model(
+				model_name,
+				enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+			)
 			or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
 		):
 			return True
@@ -10017,6 +10034,8 @@ class BatchGenWorker:
 		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
 		# serializes the shared expert, losing async overlap (~18ms/step regression).
 		if _is_k25:
+			use_whole_model = False
+		elif glm5_dsa_graph_enabled or glm5_moe_graph_enabled:
 			use_whole_model = False
 		else:
 			use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"

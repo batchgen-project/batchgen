@@ -89,6 +89,7 @@ class ServerArgs:
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
     parse_thinking: bool = False  # Extract reasoning_content from model output
     parse_tool_call: bool = False  # Extract tool_calls from model output
+    enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
@@ -331,7 +332,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Extract tool call blocks from model output into tool_calls array",
     )
-    parser.add_argument(
+    cuda_graph_group = parser.add_mutually_exclusive_group()
+    cuda_graph_group.add_argument(
+        "--enable-cuda-graph",
+        "--enable-cuda-graphs",
+        action="store_true",
+        dest="enable_cuda_graph",
+        default=False,
+        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables segmented DSA and MoE graphs.",
+    )
+    cuda_graph_group.add_argument(
         "--disable-cuda-graphs",
         action="store_true",
         default=False,
@@ -542,6 +552,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_thinking=parsed.parse_thinking,
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
+        enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,

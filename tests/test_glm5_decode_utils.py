@@ -959,6 +959,78 @@ def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 
+def test_glm5_enable_cuda_graph_defaults_to_segmented_dsa_and_moe():
+    env = {}
+
+    assert glm5_dsa_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_moe_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_segmented_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_any_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_dsa_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=False,
+        environ=env,
+    )
+    assert not glm5_segmented_cuda_graph_requested_for_model(
+        "zai-org/GLM-5",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_segmented_cuda_graph_requested_for_model(
+        "gpt-oss-120b",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+
+
+def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path):
+    from batchgen.server.server_args import prepare_server_args
+
+    args = prepare_server_args([
+        "--model",
+        "zai-org/GLM-5-FP8",
+        "--enable-cuda-graph",
+        "--storage-path",
+        str(tmp_path / "storage"),
+    ])
+
+    assert args.enable_cuda_graph
+    assert not args.disable_cuda_graphs
+
+
+def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
+    worker._batchgen_debug = {}
+
+    assert worker._glm5_dsa_graph_requested_for_current_batch()
+    assert worker._glm5_moe_graph_requested_for_current_batch()
+
+
 def test_glm5_power2_graph_buckets_cover_local_batches_to_32():
     buckets = GLM5_POWER_OF_TWO_BUCKETS_32
 
