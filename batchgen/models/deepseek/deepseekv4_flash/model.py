@@ -194,6 +194,60 @@ _QAT_FP4_VALUES = (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
                    0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
+# Master switch — set BATCHGEN_V4F_QAT=1 to enable QAT simulation. Default is
+# OFF until we confirm the rest of the decode path is correct without it.
+# See `_qat_*_inplace` and `_qat_hadamard_rotate` callers.
+_QAT_ENABLED = os.environ.get("BATCHGEN_V4F_QAT", "0") == "1"
+
+# Master switch for activation tracing — set BATCHGEN_V4F_TRACE=1 to log
+# tensor stats (min/max/abs.mean/has_nan/has_inf) at key compute boundaries
+# during decode. Helps localize where C++/CUDA kernels produce non-finite
+# values or excessive drift across decode steps.
+_V4F_TRACE = os.environ.get("BATCHGEN_V4F_TRACE", "0") == "1"
+# Layer filter so we don't drown in 43-layer logs. "0" = only layer 0,
+# "all" = every layer, "0,5,21" = specific layers.
+_V4F_TRACE_LAYERS_RAW = os.environ.get("BATCHGEN_V4F_TRACE_LAYERS", "0,42")
+
+
+def _v4f_trace_layers() -> set:
+    if _V4F_TRACE_LAYERS_RAW.strip().lower() == "all":
+        return None  # type: ignore[return-value]  # None ⇒ all layers
+    return {int(x) for x in _V4F_TRACE_LAYERS_RAW.split(",") if x.strip()}
+
+
+_V4F_TRACE_LAYER_SET = _v4f_trace_layers()
+
+
+def _v4f_trace(name: str, tensor: torch.Tensor, layer_idx: int = -1) -> None:
+    """Log tensor stats for non-finite / drift detection. No-op unless
+    BATCHGEN_V4F_TRACE=1. Filters by layer per BATCHGEN_V4F_TRACE_LAYERS."""
+    if not _V4F_TRACE:
+        return
+    if _V4F_TRACE_LAYER_SET is not None and layer_idx >= 0 and layer_idx not in _V4F_TRACE_LAYER_SET:
+        return
+    try:
+        t = tensor.detach().float()
+        n_nan = int(torch.isnan(t).sum().item()) if t.numel() else 0
+        n_inf = int(torch.isinf(t).sum().item()) if t.numel() else 0
+        if n_nan or n_inf or t.numel() == 0:
+            absmean = 0.0
+            mn = mx = float("nan")
+        else:
+            absmean = float(t.abs().mean().item())
+            mn = float(t.min().item())
+            mx = float(t.max().item())
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+        print(
+            f"[V4F-TRACE rank={rank} L{layer_idx}] {name}: "
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"absmean={absmean:.4g} min={mn:.4g} max={mx:.4g} "
+            f"nan={n_nan} inf={n_inf}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[V4F-TRACE L{layer_idx}] {name} trace_failed: {exc!r}", flush=True)
+
+
 def _qat_fp8_act_quant_inplace(
     x: torch.Tensor, block_size: int = _QAT_FP8_BLOCK_SIZE
 ) -> None:
@@ -734,12 +788,15 @@ class DeepSeekV4FlashCompressor(nn.Module):
         _apply_rotary_emb_inplace(kv[..., -rd:], freqs_cis)
         # QAT simulation, matching reference assets/inference/model.py:367-372.
         # rotate=True branch is the indexer's compressor; rotate=False is the
-        # main attention's compressor. See _qat_*_inplace helpers.
-        if self.rotate:
-            kv = _qat_hadamard_rotate(kv)
-            _qat_fp4_act_quant_inplace(kv)
-        else:
-            _qat_fp8_act_quant_inplace(kv[..., :-rd])
+        # main attention's compressor. Gated on BATCHGEN_V4F_QAT — keeps the
+        # JIT-compile-on-first-call Hadamard kernel out of the decode path
+        # while we confirm the indexer cache fix in isolation.
+        if _QAT_ENABLED:
+            if self.rotate:
+                kv = _qat_hadamard_rotate(kv)
+                _qat_fp4_act_quant_inplace(kv)
+            else:
+                _qat_fp8_act_quant_inplace(kv[..., :-rd])
         if start_pos == 0:
             self.kv_cache[:bsz, : seqlen // ratio] = kv
         else:
@@ -864,12 +921,10 @@ class DeepSeekV4FlashIndexer(nn.Module):
         rd = min(self.compressor.rope_head_dim, self.head_dim)
         _apply_rotary_emb_inplace(q[..., -rd:], freqs_cis)
         # QAT: Hadamard + FP4 round-trip on q, matching reference
-        # assets/inference/model.py:414-416. Mirrors the indexer's
-        # compressor's rotate=True branch so q · kv stays consistent under
-        # quant noise (the einsum below would otherwise mix un-rotated q
-        # with rotated kv_cache).
-        q = _qat_hadamard_rotate(q)
-        _qat_fp4_act_quant_inplace(q)
+        # assets/inference/model.py:414-416. Gated on BATCHGEN_V4F_QAT.
+        if _QAT_ENABLED:
+            q = _qat_hadamard_rotate(q)
+            _qat_fp4_act_quant_inplace(q)
 
         self.compressor(x, start_pos)
         cache_len = end_pos // ratio
@@ -1205,13 +1260,45 @@ class DeepSeekV4FlashAttention(nn.Module):
             kv_compress = self.compressor(hidden_states, start_pos)
             if kv_compress is not None:
                 kv_for_attn = torch.cat([kv, kv_compress], dim=1)
-        return _sparse_attn_from_topk(
+        attn_output = _sparse_attn_from_topk(
             q,
             kv_for_attn,
             self.attn_sink,
             topk_idxs.int(),
             self.softmax_scale,
         )
+        if self.layer_idx in (0, 21, 42) and seqlen > self.window_size:
+            import torch as _t
+            with _t.no_grad():
+                kv_amean = float(kv.detach().float().abs().mean().item())
+                kv_compress_amean = (
+                    float(kv_compress.detach().float().abs().mean().item())
+                    if self.compressor is not None and 'kv_compress' in dir() and kv_compress is not None
+                    else -1.0
+                )
+                kv_for_attn_amean = float(kv_for_attn.detach().float().abs().mean().item())
+                attn_out_amean = float(attn_output.detach().float().abs().mean().item())
+                attn_out_last_amean = float(attn_output[0, -1].detach().float().abs().mean().item())
+                attn_out_last_max = float(attn_output[0, -1].detach().float().abs().max().item())
+                attn_out_nan = int(_t.isnan(attn_output).sum().item())
+                attn_out_inf = int(_t.isinf(attn_output).sum().item())
+                topk_last = topk_idxs[0, -1].detach().tolist()
+                topk_last_str = (
+                    str(topk_last[:8]) + "..." + str(topk_last[-8:])
+                    if len(topk_last) > 16 else str(topk_last)
+                )
+                print(
+                    f"[V4F-PREFILL L{self.layer_idx}] "
+                    f"seqlen={seqlen} ratio={self.compress_ratio} win={self.window_size} "
+                    f"kv.shape={tuple(kv.shape)} kv_amean={kv_amean:.4g} "
+                    f"kv_compress_amean={kv_compress_amean:.4g} "
+                    f"kv_for_attn.shape={tuple(kv_for_attn.shape)} kv_for_attn_amean={kv_for_attn_amean:.4g} "
+                    f"topk.shape={tuple(topk_idxs.shape)} topk_last={topk_last_str} "
+                    f"attn_out_amean={attn_out_amean:.4g} attn_out_last_amean={attn_out_last_amean:.4g} "
+                    f"attn_out_last_max={attn_out_last_max:.4g} nan={attn_out_nan} inf={attn_out_inf}",
+                    flush=True,
+                )
+        return attn_output
 
     def _decode_sparse_attention(
         self,
@@ -1303,26 +1390,35 @@ class DeepSeekV4FlashAttention(nn.Module):
         is_decode = past_key_value is not None
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} start shape={tuple(hidden_states.shape)}")
+        if is_decode:
+            _v4f_trace("attn.in.hidden_states", hidden_states, self.layer_idx)
         q_low = self.q_norm(self.wq_a(hidden_states))
         if is_decode:
+            _v4f_trace("attn.q_low (post wq_a+norm)", q_low, self.layer_idx)
             _v4_diag(f"attn L{self.layer_idx} wq_a done")
         q = self.wq_b(q_low).view(bsz, q_len, self.n_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + self.eps)
         if is_decode:
+            _v4f_trace("attn.q (post wq_b+rms)", q, self.layer_idx)
             _v4_diag(f"attn L{self.layer_idx} q done")
 
         kv = self.kv_norm(self.wkv(hidden_states))
+        if is_decode:
+            _v4f_trace("attn.kv (post wkv+norm)", kv, self.layer_idx)
         freqs_cis = self._apply_rope(
             q,
             kv,
             position_ids=position_ids,
             cache_seqlens=cache_seqlens,
         )
+        if is_decode:
+            _v4f_trace("attn.q_post_rope", q, self.layer_idx)
+            _v4f_trace("attn.kv_post_rope", kv, self.layer_idx)
         # QAT: FP8 round-trip on the non-rope dims of kv before it is fed
         # to attention and (for the decode path) written to the window
         # cache. Matches reference assets/inference/model.py:506. Rope dims
-        # stay bf16 for positional precision.
-        if self.rope_head_dim < self.head_dim:
+        # stay bf16 for positional precision. Gated on BATCHGEN_V4F_QAT.
+        if _QAT_ENABLED and self.rope_head_dim < self.head_dim:
             _qat_fp8_act_quant_inplace(kv[..., :-self.rope_head_dim])
         if is_decode:
             _v4_diag(f"attn L{self.layer_idx} wkv done")
@@ -1345,6 +1441,12 @@ class DeepSeekV4FlashAttention(nn.Module):
             attn_output = None
             if past_key_value is not None:
                 kv_for_attn = self._normalize_past_kv(past_key_value)
+                if is_decode:
+                    _v4f_trace(
+                        f"attn.kv_for_attn (gathered cache, len={kv_for_attn.size(1)})",
+                        kv_for_attn,
+                        self.layer_idx,
+                    )
                 if q_len == 1 and cache_seqlens is not None:
                     self._write_current_kv(kv_for_attn, kv, cache_seqlens)
                     attn_output = self._decode_sparse_attention(
@@ -1355,6 +1457,8 @@ class DeepSeekV4FlashAttention(nn.Module):
                         cache_seqlens,
                         start_pos,
                     )
+                    if is_decode:
+                        _v4f_trace("attn.attn_output (post sparse_attn)", attn_output, self.layer_idx)
             if attn_output is None:
                 k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
                 v = k
@@ -1395,6 +1499,8 @@ class DeepSeekV4FlashAttention(nn.Module):
         attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
         attn_output = self.wo_b(attn_output.flatten(2))
         if is_decode:
+            _v4f_trace("attn.out (post wo_b)", attn_output, self.layer_idx)
+            _v4f_trace("attn.kv_returned (cache write)", kv, self.layer_idx)
             _v4_diag(f"attn L{self.layer_idx} output done")
         return attn_output, None, kv
 
@@ -1878,8 +1984,11 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         )
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} attn done")
+            _v4f_trace("layer.attn_out", attn_out, self.layer_idx)
         mark("attn")
         hidden_states = self._hc_post(attn_out, residual, post, comb)
+        if is_decode:
+            _v4f_trace("layer.post_hc_attn (residual+attn)", hidden_states, self.layer_idx)
         mark("post_attn")
 
         residual = hidden_states
@@ -1893,12 +2002,14 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         mlp_out = self.mlp(mlp_input, input_ids)
         if is_decode:
             _v4_diag(f"layer {self.layer_idx} moe done")
+            _v4f_trace("layer.moe_out", mlp_out, self.layer_idx)
         mark("moe")
         hidden_states = self._hc_post(mlp_out, residual, post, comb)
         mark("post_moe")
         if collapse_hc_state:
             hidden_states = hidden_states.mean(dim=2)
         if is_decode:
+            _v4f_trace("layer.OUT (final)", hidden_states, self.layer_idx)
             _v4_diag(f"layer {self.layer_idx} done")
         mark("done")
         return hidden_states, attn_weights, present
