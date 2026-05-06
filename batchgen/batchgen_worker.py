@@ -8934,11 +8934,13 @@ class BatchGenWorker:
 			return False
 
 		def _sig(manager):
-			get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
-			if get_graph_table is None:
-				return None
+			get_storage = getattr(manager, "get_cuda_graph_page_table_storage", None)
 			try:
-				table = get_graph_table()
+				if get_storage is not None:
+					table = get_storage()
+				else:
+					get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
+					table = get_graph_table() if get_graph_table is not None else None
 			except RuntimeError:
 				return None
 			if table is None:
@@ -9169,6 +9171,20 @@ class BatchGenWorker:
 		)
 		if aux_manager is None:
 			return "eager", bucket, "no_aux_manager"
+		active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+		for manager_obj, label in (
+			(primary_manager, "primary"),
+			(aux_manager, "aux"),
+		):
+			ensure_graph_table = getattr(manager_obj, "ensure_cuda_graph_page_table", None)
+			if ensure_graph_table is None:
+				continue
+			if not active_sequence_ids:
+				return "eager", bucket, "no_active_sequence_ids"
+			try:
+				ensure_graph_table(active_sequence_ids)
+			except (RuntimeError, KeyError, ValueError):
+				return "eager", bucket, f"{label}_page_table_state_invalid"
 		if not wrapper._dsa_cuda_graph_page_tables_match(primary_manager, aux_manager):
 			return "eager", bucket, "page_table_storage_changed"
 		return "graph", bucket, "captured"

@@ -191,6 +191,12 @@ def _log_glm5_dsa_graph_compare_unavailable_once(
 
 
 def _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager) -> Optional[torch.Tensor]:
+    get_storage = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table_storage", None)
+    if get_storage is not None:
+        try:
+            return get_storage()
+        except RuntimeError:
+            return None
     get_graph_table = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table", None)
     if get_graph_table is None:
         return None

@@ -39,6 +39,8 @@ from batchgen.models.glm.glm5.wrappers import (
     _glm5_dsa_graph_compare_active,
     _glm5_dsa_graph_compare_layer_enabled,
     _glm5_dsa_cuda_graph_can_replay,
+    _glm5_dsa_gpu_page_table_tensor,
+    _glm5_dsa_page_table_signature,
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 from batchgen.models.wrappers import AttnWrapperBase
@@ -945,12 +947,109 @@ def test_glm5_dsa_graph_path_allows_short_rows_with_fixed_selected_kv(monkeypatc
         raising=False,
     )
     monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
 
     assert worker._glm5_dsa_graph_path_state(2, object()) == (
         "graph",
         40,
         "captured",
     )
+
+
+def test_glm5_dsa_page_table_signature_prefers_stable_graph_storage():
+    storage = torch.empty(4, 8, dtype=torch.int32)
+
+    class FakeManager:
+        def get_cuda_graph_page_table_storage(self):
+            return storage
+
+        def get_cuda_graph_page_table(self):
+            raise RuntimeError("active graph table is invalid")
+
+    assert _glm5_dsa_gpu_page_table_tensor(FakeManager()) is storage
+
+
+def test_glm5_dsa_graph_path_refreshes_page_table_state_before_storage_check(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 40
+
+    class FakeGraphManager:
+        bucketing = FakeBucketing()
+
+        def has_graph(self, segment_name, batch_size):
+            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
+
+    class FakePageManager:
+        def __init__(self, storage):
+            self.storage = storage
+            self.ensure_calls = []
+
+        def ensure_cuda_graph_page_table(self, sequence_ids):
+            self.ensure_calls.append(list(sequence_ids))
+            return self.storage
+
+        def get_cuda_graph_page_table_storage(self):
+            return self.storage
+
+        def get_cuda_graph_page_table(self):
+            raise RuntimeError("active graph table is invalid")
+
+    primary = FakePageManager(torch.empty(4, 8, dtype=torch.int32))
+    aux = FakePageManager(torch.empty(4, 8, dtype=torch.int32))
+    primary_expected = _glm5_dsa_page_table_signature(primary.storage)
+    aux_expected = _glm5_dsa_page_table_signature(aux.storage)
+
+    class FakeWrapper:
+        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+        _dsa_cuda_graph_max_seqlen = 8192
+        module = types.SimpleNamespace(
+            indexer=types.SimpleNamespace(index_topk=2048),
+        )
+
+        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
+            return (
+                _glm5_dsa_page_table_signature(
+                    _glm5_dsa_gpu_page_table_tensor(primary_manager)
+                ) == primary_expected
+                and _glm5_dsa_page_table_signature(
+                    _glm5_dsa_gpu_page_table_tensor(aux_manager)
+                ) == aux_expected
+            )
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = FakeGraphManager()
+    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=aux)
+    worker.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
+        ),
+    )
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "cache_seqlens",
+        torch.tensor([970, 982], dtype=torch.int32),
+        raising=False,
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
+
+    assert worker._glm5_dsa_graph_path_state(
+        2,
+        types.SimpleNamespace(primary=primary, auxiliary=aux),
+    ) == (
+        "graph",
+        40,
+        "captured",
+    )
+    assert primary.ensure_calls == [[11, 22]]
+    assert aux.ensure_calls == [[11, 22]]
 
 
 def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
