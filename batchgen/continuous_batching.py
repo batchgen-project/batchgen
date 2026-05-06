@@ -213,6 +213,133 @@ def select_sequences_for_eviction(
     return evict_uuids, freed
 
 
+@dataclass
+class HostKVGrowthEvictionPlan:
+    """Deterministic host-KV eviction plan that preserves growth headroom."""
+
+    evicted_uuids: List[str]
+    freed_pages: int
+    remaining_growth_uuids: List[str]
+    remaining_growth_pages: List[int]
+    remaining_growth_needed: int
+    expected_free_pages: int
+    required_free_pages: int
+    growth_feasible_after_eviction: bool
+
+
+def plan_host_kv_growth_evictions(
+    *,
+    active_uuids: List[str],
+    completed_uuids: List[str],
+    host_growth_uuids: List[str],
+    host_growth_pages: List[int],
+    eviction_candidates: List[Tuple[str, Dict[str, Any]]],
+    free_pages: int,
+    total_pages: int,
+    completed_pages: int,
+    watermark_percent: float,
+    safety_margin: int,
+    strategy: EvictionStrategy = EvictionStrategy.SHORTEST_FIRST,
+    page_key: str = "host_pages_allocated",
+) -> HostKVGrowthEvictionPlan:
+    """Plan host evictions so remaining active rows can grow before appending.
+
+    The dynamic host-KV invariant is: after a boundary, every still-active row
+    that needs host growth must either have enough free pages to grow, or must
+    have been removed from decode. This planner accounts for pages that will be
+    released by completed rows before growth, then selects deterministic
+    eviction candidates until both the free-page watermark and the remaining
+    growth debt plus reserve are satisfied.
+    """
+    if len(host_growth_uuids) != len(host_growth_pages):
+        raise ValueError("host_growth_uuids and host_growth_pages must align")
+
+    completed_set = set(completed_uuids)
+    base_free = min(max(total_pages, 0), max(free_pages, 0) + max(completed_pages, 0))
+    target_free = int(max(total_pages, 0) * max(watermark_percent, 0.0) / 100.0)
+    growth_by_uuid = {
+        uuid: pages
+        for uuid, pages in zip(host_growth_uuids, host_growth_pages)
+        if pages > 0 and uuid in active_uuids and uuid not in completed_set
+    }
+    remaining_growth = sum(growth_by_uuid.values())
+
+    if strategy == EvictionStrategy.SHORTEST_FIRST:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (
+                x[1].get("priority", 0),
+                x[1].get("decoded_length", 0),
+                x[1].get("global_idx", float("inf")),
+                x[0],
+            ),
+        )
+    elif strategy == EvictionStrategy.LONGEST_FIRST:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (
+                x[1].get("priority", 0),
+                -x[1].get("decoded_length", 0),
+                x[1].get("global_idx", float("inf")),
+                x[0],
+            ),
+        )
+    else:
+        sorted_candidates = sorted(
+            eviction_candidates,
+            key=lambda x: (x[1].get("priority", 0), x[1].get("global_idx", float("inf")), x[0]),
+        )
+
+    evicted_uuids: List[str] = []
+    evicted_set: Set[str] = set()
+    freed_pages = 0
+    candidate_idx = 0
+
+    while True:
+        expected_free = min(max(total_pages, 0), base_free + freed_pages)
+        growth_required_free = remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0
+        required_free = max(target_free, growth_required_free)
+        if expected_free >= required_free:
+            break
+
+        while candidate_idx < len(sorted_candidates):
+            uuid, state = sorted_candidates[candidate_idx]
+            candidate_idx += 1
+            if uuid in completed_set or uuid in evicted_set:
+                continue
+            pages = int(state.get(page_key, 0) or 0)
+            if pages <= 0:
+                continue
+            break
+        else:
+            break
+
+        evicted_uuids.append(uuid)
+        evicted_set.add(uuid)
+        freed_pages += pages
+        remaining_growth -= growth_by_uuid.pop(uuid, 0)
+
+    remaining_growth_uuids = [uuid for uuid in host_growth_uuids if uuid in growth_by_uuid]
+    remaining_growth_pages = [growth_by_uuid[uuid] for uuid in remaining_growth_uuids]
+    expected_free = min(max(total_pages, 0), base_free + freed_pages)
+    required_free = max(
+        target_free,
+        remaining_growth + max(safety_margin, 0) if remaining_growth > 0 else 0,
+    )
+    growth_feasible = remaining_growth == 0 or expected_free >= remaining_growth + max(safety_margin, 0)
+
+    return HostKVGrowthEvictionPlan(
+        evicted_uuids=evicted_uuids,
+        freed_pages=freed_pages,
+        remaining_growth_uuids=remaining_growth_uuids,
+        remaining_growth_pages=remaining_growth_pages,
+        remaining_growth_needed=remaining_growth,
+        expected_free_pages=expected_free,
+        required_free_pages=required_free,
+        growth_feasible_after_eviction=growth_feasible,
+    )
+
+
 def select_sequences_for_loading(
     candidates: Dict[str, Dict[str, Any]],
     per_rank_free_pages: List[int],
