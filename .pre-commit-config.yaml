@@ -1,4 +1,4 @@
-exclude: '(^|/)(external|third_party|build|dist)/'
+exclude: '(^|/)(external|third_party|3rd|build|dist)/'
 
 repos:
 -   repo: meta
