@@ -7310,7 +7310,7 @@ class BatchGenWorker:
 
 				batch_sequences = [
 					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in batch
+					for local_idx in batch_local_indices
 				]
 				batch_new_tokens = self._select_tokens(logits, batch_sequences)
 				if batch_new_tokens.shape[0] != batch_num_seqs:
