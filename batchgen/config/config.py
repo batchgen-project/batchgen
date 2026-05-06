@@ -39,7 +39,8 @@ class BasicConfig:
     attn_mode: int = 1
     module_types: Optional[List[str]] = None
     num_threads: Optional[int] = 0
-    padding_length: Optional[int] = None
+    max_prompt_length: Optional[int] = None
+    padding_length: Optional[int] = None  # Deprecated alias; use max_prompt_length.
     max_decoding_length: Optional[int] = None
     num_queries: Optional[int] = None
     rank: Optional[int] = None
@@ -59,6 +60,13 @@ class BasicConfig:
             "float8_e5m2": torch.float8_e5m2,
         }
         return dtype_map.get(dtype_str, None)
+
+    def get_max_prompt_length(self) -> Optional[int]:
+        return self.max_prompt_length if self.max_prompt_length is not None else self.padding_length
+
+    def set_max_prompt_length(self, value: Optional[int]) -> None:
+        self.max_prompt_length = value
+        self.padding_length = value
     
     def __str__(self):
         return (
@@ -71,7 +79,7 @@ class BasicConfig:
             f"  attn_mode: {self.attn_mode}\n"
             f"  module_types: {self.module_types}\n"
             f"  num_threads: {self.num_threads}\n"
-            f"  padding_length: {self.padding_length}\n"
+            f"  max_prompt_length: {self.get_max_prompt_length()}\n"
             f"  max_decoding_length: {self.max_decoding_length}\n"
             f"  num_queries: {self.num_queries}\n"
             f"  rank: {self.rank}\n"

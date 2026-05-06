@@ -327,6 +327,39 @@ def triton_absorb_fp8(
     return out
 
 
+def triton_absorb_fp8_out(
+    x_bhk: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer Triton FP8 WGMMA absorb for CUDA graph capture."""
+    if not x_bhk.is_contiguous():
+        raise ValueError("x_bhk must be contiguous for graph-captured FP8 absorb")
+    B, H, K = x_bhk.shape
+    N = w_fp8.shape[1]
+    if out.shape != (B, H, N) or out.dtype != torch.bfloat16:
+        raise ValueError(f"out must be BF16 with shape {(B, H, N)}, got {out.shape} {out.dtype}")
+
+    BLOCK_B = min(64, triton.next_power_of_2(B))
+    BLOCK_K = 128
+    if K < BLOCK_K:
+        BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_N = 64
+    grid = (triton.cdiv(B, BLOCK_B), H, triton.cdiv(N, BLOCK_N))
+
+    _absorb_fp8_wgmma_kernel[grid](
+        x_bhk, w_fp8, w_scale, out,
+        x_bhk.stride(0), x_bhk.stride(1),
+        w_fp8.shape[1] * w_fp8.shape[2],
+        w_scale.shape[1] * w_scale.shape[2],
+        B=B, H=H, K=K, N=N,
+        BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+        FP8_MAX=448.0,
+    )
+    return out
+
+
 # ============================================================================
 # High-level API
 # ============================================================================
@@ -361,6 +394,15 @@ def fp8_q_absorb(q_nope: torch.Tensor, weights: FP8AbsorbWeights) -> torch.Tenso
     return triton_absorb_fp8(q_nope, weights.q_absorb_fp8, weights.q_absorb_scale)
 
 
+def fp8_q_absorb_out(
+    q_nope: torch.Tensor,
+    weights: FP8AbsorbWeights,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer FP8 WGMMA q_absorb for CUDA graph capture."""
+    return triton_absorb_fp8_out(q_nope, weights.q_absorb_fp8, weights.q_absorb_scale, out)
+
+
 def fp8_out_absorb(
     attn_out: torch.Tensor,
     weights: FP8AbsorbWeights,
@@ -376,6 +418,31 @@ def fp8_out_absorb(
     if squeeze:
         out = out.unsqueeze(1)
     return out
+
+
+def fp8_out_absorb_out(
+    attn_out: torch.Tensor,
+    weights: FP8AbsorbWeights,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer FP8 WGMMA out_absorb for CUDA graph capture."""
+    squeeze = False
+    if attn_out.dim() == 4:
+        if out.dim() != 4:
+            raise ValueError("out must be 4D when attn_out is 4D")
+        attn_out = attn_out.squeeze(1)
+        out_squeezed = out.squeeze(1)
+        squeeze = True
+    else:
+        out_squeezed = out
+
+    triton_absorb_fp8_out(
+        attn_out,
+        weights.out_absorb_fp8,
+        weights.out_absorb_scale,
+        out_squeezed,
+    )
+    return out if squeeze else out_squeezed
 
 
 # ============================================================================
