@@ -31,12 +31,16 @@ jobs:
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "ghcr_image=ghcr.io/${owner}/batchgen-release:${tag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Download release build context from codeload
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Prepare release build context on node0
         run: |
           context_dir="${RUNNER_TEMP}/batchgen-release-context"
           rm -rf "${context_dir}"
+          mkdir -p "${context_dir}"
+          docker exec \
+            -e RELEASE_TAG="${GITHUB_REF#refs/tags/}" \
+            tairan-batchgen \
+            bash -lc 'set -euo pipefail; cd /data2/tairan/workspace/BatchGen; git fetch --quiet --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"; commit="$(git rev-list -n 1 "${RELEASE_TAG}")"; git archive --format=tar "${commit}"' \
+            | tar -x -C "${context_dir}"
           mkdir -p "${context_dir}/.docker-build/third_party"
           download_archive() {
             local url="$1"
