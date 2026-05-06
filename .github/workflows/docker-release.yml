@@ -12,10 +12,26 @@ jobs:
 
     permissions:
       contents: read
+      packages: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io \
+            --username "${GITHUB_ACTOR}" \
+            --password-stdin
+
+      - name: Extract source context tag
+        id: vars
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "context_image=ghcr.io/${owner}/batchgen-release-context:${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Fetch release build sources
         run: |
@@ -30,18 +46,16 @@ jobs:
           git -C .docker-build/third_party/DeepGEMM checkout v2.1.1.post3
           git -C .docker-build/third_party/DeepGEMM submodule update --init --recursive
           find .docker-build/third_party \( -name .git -o -name .github \) -prune -exec rm -rf {} +
+
+      - name: Push release build context to GHCR
+        env:
+          CONTEXT_IMAGE: ${{ steps.vars.outputs.context_image }}
+        run: |
           tar \
             --exclude=.git \
-            -czf "${RUNNER_TEMP}/release-build-context.tar.gz" \
-            .
-          du -h "${RUNNER_TEMP}/release-build-context.tar.gz"
-
-      - name: Upload release build context
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-build-context
-          path: ${{ runner.temp }}/release-build-context.tar.gz
-          retention-days: 1
+            -cf - \
+            . | docker import - "${CONTEXT_IMAGE}"
+          docker push "${CONTEXT_IMAGE}"
 
   build-and-push-ghcr:
     runs-on: [self-hosted, gpu, node0]
@@ -53,18 +67,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Download release build context
-        uses: actions/download-artifact@v4
-        with:
-          name: release-build-context
-          path: .
-
-      - name: Unpack release build context
-        run: |
-          tar -xzf release-build-context.tar.gz
-          rm release-build-context.tar.gz
-          ls -la .docker-build/third_party
-
       - name: Log in to GitHub Container Registry
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -79,7 +81,22 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "context_image=ghcr.io/${owner}/batchgen-release-context:${tag}" >> "${GITHUB_OUTPUT}"
           echo "ghcr_image=ghcr.io/${owner}/batchgen-release:${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Pull and unpack release build context
+        env:
+          CONTEXT_IMAGE: ${{ steps.vars.outputs.context_image }}
+        run: |
+          context_dir="${RUNNER_TEMP}/batchgen-release-context"
+          rm -rf "${context_dir}"
+          mkdir -p "${context_dir}"
+          docker pull "${CONTEXT_IMAGE}"
+          container_id="$(docker create "${CONTEXT_IMAGE}")"
+          trap 'docker rm -f "${container_id}" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container_id}:/." "${context_dir}/"
+          echo "context_dir=${context_dir}" >> "${GITHUB_ENV}"
+          ls -la "${context_dir}/.docker-build/third_party"
 
       - name: Build and push GHCR image on node0
         env:
@@ -89,11 +106,11 @@ jobs:
           docker build \
             --pull=false \
             --progress=plain \
-            --build-context third_party=.docker-build/third_party \
+            --build-context third_party="${context_dir}/.docker-build/third_party" \
             --build-arg BUILD_PARALLEL_JOBS=4 \
-            --file ./docker/Dockerfile.release-ci \
+            --file "${context_dir}/docker/Dockerfile.release-ci" \
             --tag "${GHCR_IMAGE}" \
-            .
+            "${context_dir}"
           docker push "${GHCR_IMAGE}"
 
   mirror-to-dockerhub:
