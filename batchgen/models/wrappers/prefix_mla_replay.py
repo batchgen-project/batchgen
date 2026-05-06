@@ -53,6 +53,36 @@ def run_prefix_mla_suffix_prefill(
         position_ids,
         max(metadata.full_seq_lengths),
     )
+    return run_prefix_mla_suffix_prefill_with_projected(
+        wrapper=wrapper,
+        query_states=query_states,
+        offload_kv=offload_kv,
+        metadata=metadata,
+        spec=spec,
+        output_projection=output_projection,
+    )
+
+
+def run_prefix_mla_suffix_prefill_with_projected(
+    *,
+    wrapper: object,
+    query_states: torch.Tensor,
+    offload_kv: torch.Tensor,
+    metadata: PrefixCachePrepackMetadata,
+    spec: MlaReplaySpec,
+    output_projection: OutputProjectMlaFn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run suffix-only MLA prefill from already projected suffix Q/KV."""
+    if not metadata.prefix_reuse_mode:
+        raise RuntimeError("MLA prefix replay requires prefix reuse mode")
+    if metadata.num_sequences != 1:
+        raise RuntimeError(
+            "MLA prefix replay currently requires single-sequence suffix "
+            "micro-batches"
+        )
+    if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
+        raise RuntimeError("MLA prefix replay requires prefix metadata")
+
     compressed_kv, cu_k, _ = wrapper.prefix_attention_kv_builder().build_mla_prefix_kv(
         key=offload_kv,
         metadata=metadata,
@@ -96,12 +126,36 @@ def run_prefix_mla_full_hit_prefill(
         position_ids,
         max(metadata.full_seq_lengths),
     )
+    return run_prefix_mla_full_hit_prefill_with_query(
+        wrapper=wrapper,
+        query_states=query_states,
+        metadata=metadata,
+        spec=spec,
+        output_projection=output_projection,
+    )
+
+
+def run_prefix_mla_full_hit_prefill_with_query(
+    *,
+    wrapper: object,
+    query_states: torch.Tensor,
+    metadata: PrefixCachePrepackMetadata,
+    spec: MlaReplaySpec,
+    output_projection: OutputProjectMlaFn,
+) -> torch.Tensor:
+    """Run exact full-hit MLA prefill from already projected query states."""
+    if not metadata.full_hit_mode:
+        raise RuntimeError("MLA full-hit replay requires full-hit mode")
+    if metadata.full_seq_lengths is None:
+        raise RuntimeError("MLA full-hit replay requires full sequence lengths")
+    metadata.validate_full_hit_query_lengths()
+
     compressed_kv, cu_k, _ = (
         wrapper.prefix_attention_kv_builder().build_mla_full_hit_kv(
             metadata=metadata,
             kv_dim=spec.kv_dim,
             dtype=query_states.dtype,
-            device=hidden_states_2d.device,
+            device=query_states.device,
         )
     )
     blocked_k, block_table, cache_seqlens = block_mla_kv_by_sequence(

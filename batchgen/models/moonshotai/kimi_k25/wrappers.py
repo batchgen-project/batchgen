@@ -38,8 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers.prefix_mla_model_adapters import (
-    run_kimi_full_hit_prefill,
-    run_kimi_prefix_aware_prefill,
+    build_kimi_prefix_backend_context,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
@@ -401,33 +400,27 @@ class KimiK25AttnWrapper(AttnWrapperBase):
             hidden_states_2d = hidden_states.squeeze(0)
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
-
-            if metadata.full_hit_mode:
-                attn_output = run_kimi_full_hit_prefill(
+            prefix_context = None
+            if metadata.full_hit_mode or metadata.prefix_reuse_mode:
+                prefix_context = build_kimi_prefix_backend_context(
                     wrapper=self,
-                    hidden_states_2d=hidden_states_2d,
-                    position_ids=position_ids,
                     metadata=metadata,
                 )
+
+            attn_output, offload_kv = self.module.prefill_attn_bf16_prepacked(
+                hidden_states_2d,
+                position_ids,
+                self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                self.prepack_max_seqlen,
+                self.prepack_num_sequences,
+                prefix_context=prefix_context,
+            )
+            if metadata.full_hit_mode:
                 return (attn_output.unsqueeze(0), None, None)
 
-            if metadata.prefix_reuse_mode:
-                attn_output, offload_kv = run_kimi_prefix_aware_prefill(
-                    wrapper=self,
-                    hidden_states_2d=hidden_states_2d,
-                    position_ids=position_ids,
-                    metadata=metadata,
-                )
-            else:
-                attn_output, offload_kv = self.module.prefill_attn_bf16_prepacked(
-                    hidden_states_2d,
-                    position_ids,
-                    self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                    self.prepack_max_seqlen,
-                    self.prepack_num_sequences,
-                )
-
             # Offload KV cache per-sequence to host
+            if offload_kv is None:
+                raise RuntimeError("Kimi prepacked prefill returned no KV")
             self._offload_prepacked_kv(offload_kv)
 
             attn_output = attn_output.unsqueeze(0)

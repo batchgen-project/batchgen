@@ -2,13 +2,13 @@
 
 The page lookup, cached-prefix KV assembly, and FlashMLA replay live in the
 generic prefix-cache helpers. This module keeps the remaining model glue in one
-place: how each MLA model projects suffix/full-hit queries, builds suffix KV,
-applies RoPE, and projects the replayed attention output.
+place: how each MLA model builds prefix replay contexts and projects the replayed
+attention output.
 """
 
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -20,208 +20,117 @@ from .prefix_cache import (
 )
 from .prefix_mla_replay import (
     MlaReplaySpec,
-    run_prefix_mla_full_hit_prefill,
-    run_prefix_mla_suffix_prefill,
+    run_prefix_mla_full_hit_prefill_with_query,
+    run_prefix_mla_suffix_prefill_with_projected,
 )
 
-SuffixProjector = Callable[
-    [torch.Tensor, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]
-]
-QueryProjector = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
 OutputProjector = Callable[[torch.Tensor], torch.Tensor]
+ProjectedQueryBuilder = Callable[[object], torch.Tensor]
 
 
-def run_deepseek_prefix_aware_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run DeepSeek suffix prefill against cached prefix MLA KV."""
-    return _run_mla_suffix_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        project_suffix_query_and_kv=lambda hidden, pos, full_len: (
-            _project_w8a16_suffix_query_and_kv(
-                wrapper=wrapper,
-                hidden_states_2d=hidden,
-                position_ids=pos,
-                full_length=full_len,
-                model_label="DeepSeek prefix replay",
-                use_cached_absorb=False,
-            )
-        ),
-        output_projection=lambda attn_out: _w8a16_output_projection(
-            wrapper,
-            attn_out,
-            model_label="DeepSeek prefix replay",
-            use_cached_absorb=False,
-        ),
-    )
+@dataclass(frozen=True)
+class MlaPrefixBackendContext:
+    """Prefix replay callbacks consumed by the existing MLA prepack backend."""
 
+    wrapper: object
+    metadata: PrefixCachePrepackMetadata
+    spec: MlaReplaySpec
+    suffix_query_builder: ProjectedQueryBuilder
+    full_hit_query_builder: ProjectedQueryBuilder
+    output_projection: OutputProjector
 
-def run_deepseek_full_hit_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-) -> torch.Tensor:
-    """Run DeepSeek exact full-hit prefill against fully cached MLA KV."""
-    return _run_mla_full_hit_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        project_query=lambda hidden, pos, full_len: _project_w8a16_query_states(
-            wrapper=wrapper,
-            hidden_states_2d=hidden,
-            position_ids=pos,
-            full_length=full_len,
-            model_label="DeepSeek prefix replay",
-            use_cached_absorb=False,
-        ),
-        output_projection=lambda attn_out: _w8a16_output_projection(
-            wrapper,
-            attn_out,
-            model_label="DeepSeek prefix replay",
-            use_cached_absorb=False,
-        ),
-    )
+    @property
+    def prefix_reuse_mode(self) -> bool:
+        return self.metadata.prefix_reuse_mode
 
+    @property
+    def full_hit_mode(self) -> bool:
+        return self.metadata.full_hit_mode
 
-def run_kimi_prefix_aware_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run Kimi suffix prefill against cached prefix MLA KV."""
-    return _run_mla_suffix_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        project_suffix_query_and_kv=lambda hidden, pos, full_len: (
-            _project_kimi_suffix_query_and_kv(
-                wrapper=wrapper,
-                hidden_states_2d=hidden,
-                position_ids=pos,
-                full_length=full_len,
-            )
-        ),
-        output_projection=lambda attn_out: _kimi_output_projection(
-            wrapper,
-            attn_out,
-        ),
-    )
+    def rotary_seq_len(
+        self,
+        position_ids: torch.Tensor,
+        fallback_seq_len: int,
+    ) -> int:
+        if self.metadata.full_seq_lengths:
+            return _rotary_seq_len(max(self.metadata.full_seq_lengths), position_ids)
+        return _rotary_seq_len(fallback_seq_len, position_ids)
 
-
-def run_kimi_full_hit_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-) -> torch.Tensor:
-    """Run Kimi exact full-hit prefill against fully cached MLA KV."""
-    return _run_mla_full_hit_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        project_query=lambda hidden, pos, full_len: _project_kimi_query_states(
-            wrapper=wrapper,
-            hidden_states_2d=hidden,
-            position_ids=pos,
-            full_length=full_len,
-        ),
-        output_projection=lambda attn_out: _kimi_output_projection(
-            wrapper,
-            attn_out,
-        ),
-    )
-
-
-def run_glm5_prefix_aware_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run GLM-5 suffix prefill against cached prefix MLA KV."""
-    if not metadata.prefix_reuse_mode:
-        raise RuntimeError("GLM-5 prefix-aware prefill requires prefix reuse mode")
-    if metadata.num_sequences != 1:
-        raise RuntimeError(
-            "GLM-5 prefix-aware prefill currently requires single-sequence "
-            "micro-batches"
+    def run_suffix_prefill(
+        self,
+        projection: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        offload_kv = getattr(projection, "offload_kv", None)
+        if offload_kv is None:
+            raise RuntimeError("MLA prefix backend context requires suffix KV")
+        return run_prefix_mla_suffix_prefill_with_projected(
+            wrapper=self.wrapper,
+            query_states=self.suffix_query_builder(projection),
+            offload_kv=offload_kv,
+            metadata=self.metadata,
+            spec=self.spec,
+            output_projection=self.output_projection,
         )
-    if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
-        raise RuntimeError("GLM-5 prefix-aware prefill requires prefix metadata")
 
-    return _run_mla_suffix_prefill(
+    def run_full_hit_prefill(self, projection: object) -> torch.Tensor:
+        return run_prefix_mla_full_hit_prefill_with_query(
+            wrapper=self.wrapper,
+            query_states=self.full_hit_query_builder(projection),
+            metadata=self.metadata,
+            spec=self.spec,
+            output_projection=self.output_projection,
+        )
+
+
+def build_deepseek_prefix_backend_context(
+    *,
+    wrapper: object,
+    metadata: PrefixCachePrepackMetadata,
+) -> MlaPrefixBackendContext:
+    return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
         metadata=metadata,
-        project_suffix_query_and_kv=lambda hidden, pos, full_len: (
-            _project_w8a16_suffix_query_and_kv(
-                wrapper=wrapper,
-                hidden_states_2d=hidden,
-                position_ids=pos,
-                full_length=full_len,
-                model_label="GLM-5 prefix prefill",
-                use_cached_absorb=True,
-            )
-        ),
-        output_projection=lambda attn_out: _w8a16_output_projection(
-            wrapper,
-            attn_out,
-            model_label="GLM-5 prefix prefill",
-            use_cached_absorb=True,
-        ),
+        model_label="DeepSeek prefix replay",
+        use_cached_absorb=False,
     )
 
 
-def run_glm5_full_hit_prefill(
+def build_glm5_prefix_backend_context(
     *,
     wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
     metadata: PrefixCachePrepackMetadata,
-) -> torch.Tensor:
-    """Run GLM-5 exact full-hit prefill against fully cached MLA KV."""
-    if not metadata.full_hit_mode:
-        raise RuntimeError("GLM-5 full-hit prefill requires full-hit mode")
-    if metadata.full_seq_lengths is None:
-        raise RuntimeError("GLM-5 full-hit prefill requires full sequence lengths")
-    metadata.validate_full_hit_query_lengths()
-
-    return _run_mla_full_hit_prefill(
+) -> MlaPrefixBackendContext:
+    return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
         metadata=metadata,
-        project_query=lambda hidden, pos, full_len: _project_w8a16_query_states(
-            wrapper=wrapper,
-            hidden_states_2d=hidden,
-            position_ids=pos,
-            full_length=full_len,
-            model_label="GLM-5 prefix prefill",
-            use_cached_absorb=True,
-        ),
-        output_projection=lambda attn_out: _w8a16_output_projection(
+        model_label="GLM-5 prefix prefill",
+        use_cached_absorb=True,
+    )
+
+
+def build_kimi_prefix_backend_context(
+    *,
+    wrapper: object,
+    metadata: PrefixCachePrepackMetadata,
+) -> MlaPrefixBackendContext:
+    return MlaPrefixBackendContext(
+        wrapper=wrapper,
+        metadata=metadata,
+        spec=_mla_replay_spec(wrapper),
+        suffix_query_builder=lambda projection: _absorbed_query_states(
             wrapper,
-            attn_out,
-            model_label="GLM-5 prefix prefill",
-            use_cached_absorb=True,
+            projection.q_nope,
+            projection.q_pe,
+            projection.offload_kv.dtype,
+            q_absorb=_kimi_q_absorb_weights(wrapper),
         ),
+        full_hit_query_builder=lambda projection: _full_hit_query_from_projection(
+            wrapper,
+            projection,
+            projection.q_pe.dtype,
+            q_absorb=_kimi_q_absorb_weights(wrapper),
+        ),
+        output_projection=lambda attn_out: _kimi_output_projection(wrapper, attn_out),
     )
 
 
@@ -243,46 +152,6 @@ def offload_glm5_prepacked_mla_kv(
     offloader.offload_mla(key=key)
 
 
-def _run_mla_suffix_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-    project_suffix_query_and_kv: SuffixProjector,
-    output_projection: OutputProjector,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return run_prefix_mla_suffix_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        spec=_mla_replay_spec(wrapper),
-        project_suffix_query_and_kv=project_suffix_query_and_kv,
-        output_projection=output_projection,
-    )
-
-
-def _run_mla_full_hit_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-    project_query: QueryProjector,
-    output_projection: OutputProjector,
-) -> torch.Tensor:
-    return run_prefix_mla_full_hit_prefill(
-        wrapper=wrapper,
-        hidden_states_2d=hidden_states_2d,
-        position_ids=position_ids,
-        metadata=metadata,
-        spec=_mla_replay_spec(wrapper),
-        project_query=project_query,
-        output_projection=output_projection,
-    )
-
-
 def _mla_replay_spec(wrapper: object) -> MlaReplaySpec:
     attn = wrapper.module
     return MlaReplaySpec(
@@ -293,297 +162,45 @@ def _mla_replay_spec(wrapper: object) -> MlaReplaySpec:
     )
 
 
-def _project_w8a16_suffix_query_and_kv(
+def _build_w8a16_prefix_backend_context(
     *,
     wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    full_length: int,
+    metadata: PrefixCachePrepackMetadata,
     model_label: str,
     use_cached_absorb: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    attn = wrapper.module
-    weight_scale = _weight_scale(
-        wrapper,
-        model_label,
-        (
-            "q_a_proj.weight_scale_inv",
-            "q_b_proj.weight_scale_inv",
-            "kv_a_proj_with_mqa.weight_scale_inv",
-        ),
-    )
-
-    q_states = _w8a16_gemm(
-        attn.q_a_proj.weight.data,
-        weight_scale["q_a_proj.weight_scale_inv"],
-        hidden_states_2d,
-    )
-    q_states = attn.q_a_layernorm(q_states)
-    q_states = _w8a16_gemm(
-        attn.q_b_proj.weight.data,
-        weight_scale["q_b_proj.weight_scale_inv"],
-        q_states,
-    )
-    total_tokens = hidden_states_2d.shape[0]
-    q_states = q_states.view(total_tokens, attn.num_heads, attn.q_head_dim)
-    q_nope, q_pe = torch.split(
-        q_states,
-        [attn.qk_nope_head_dim, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-
-    compressed_kv = _w8a16_gemm(
-        attn.kv_a_proj_with_mqa.weight.data,
-        weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-        hidden_states_2d,
-    )
-    kv, k_pe = torch.split(
-        compressed_kv,
-        [attn.kv_lora_rank, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-    kv = attn.kv_a_layernorm(kv)
-    k_pe = k_pe.view(total_tokens, 1, attn.qk_rope_head_dim)
-
-    q_pe, k_pe = _apply_interleaved_rope(
-        attn=attn,
-        q_pe=q_pe,
-        k_pe=k_pe,
-        position_ids=position_ids,
-        full_length=full_length,
-    )
-    if k_pe is None:
-        raise RuntimeError(f"{model_label} failed to build suffix k_pe")
-    offload_kv = torch.cat(
-        [kv, k_pe.view(total_tokens, attn.qk_rope_head_dim)],
-        dim=-1,
-    )
-    q_absorb = _w8a16_q_absorb_weights(
-        wrapper,
-        model_label=model_label,
-        use_cached_absorb=use_cached_absorb,
-    )
-    return (
-        _absorbed_query_states(
+) -> MlaPrefixBackendContext:
+    return MlaPrefixBackendContext(
+        wrapper=wrapper,
+        metadata=metadata,
+        spec=_mla_replay_spec(wrapper),
+        suffix_query_builder=lambda projection: _absorbed_query_states(
             wrapper,
-            q_nope,
-            q_pe,
-            offload_kv.dtype,
-            q_absorb=q_absorb,
+            projection.q_nope,
+            projection.q_pe,
+            projection.offload_kv.dtype,
+            q_absorb=_w8a16_q_absorb_weights(
+                wrapper,
+                model_label=model_label,
+                use_cached_absorb=use_cached_absorb,
+            ),
         ),
-        offload_kv,
-    )
-
-
-def _project_w8a16_query_states(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    full_length: int,
-    model_label: str,
-    use_cached_absorb: bool,
-) -> torch.Tensor:
-    attn = wrapper.module
-    weight_scale = _weight_scale(
-        wrapper,
-        model_label,
-        ("q_a_proj.weight_scale_inv", "q_b_proj.weight_scale_inv"),
-    )
-    q_states = _w8a16_gemm(
-        attn.q_a_proj.weight.data,
-        weight_scale["q_a_proj.weight_scale_inv"],
-        hidden_states_2d,
-    )
-    q_states = attn.q_a_layernorm(q_states)
-    q_states = _w8a16_gemm(
-        attn.q_b_proj.weight.data,
-        weight_scale["q_b_proj.weight_scale_inv"],
-        q_states,
-    )
-    total_tokens = hidden_states_2d.shape[0]
-    q_states = q_states.view(total_tokens, attn.num_heads, attn.q_head_dim)
-    q_nope, q_pe = torch.split(
-        q_states,
-        [attn.qk_nope_head_dim, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-    q_pe, _ = _apply_interleaved_rope(
-        attn=attn,
-        q_pe=q_pe,
-        k_pe=None,
-        position_ids=position_ids,
-        full_length=full_length,
-    )
-    q_absorb = _w8a16_q_absorb_weights(
-        wrapper,
-        model_label=model_label,
-        use_cached_absorb=use_cached_absorb,
-    )
-    return _absorbed_query_states(
-        wrapper,
-        q_nope,
-        q_pe,
-        q_pe.dtype,
-        q_absorb=q_absorb,
-    ).view(
-        total_tokens,
-        1,
-        attn.num_heads,
-        attn.kv_lora_rank + attn.qk_rope_head_dim,
-    ).contiguous()
-
-
-def _project_kimi_suffix_query_and_kv(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    full_length: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    attn = wrapper.module
-    q_states = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hidden_states_2d)))
-    total_tokens = hidden_states_2d.shape[0]
-    q_states = q_states.view(total_tokens, attn.num_heads, attn.q_head_dim)
-    q_nope, q_pe = torch.split(
-        q_states,
-        [attn.qk_nope_head_dim, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-
-    compressed_kv = attn.kv_a_proj_with_mqa(hidden_states_2d)
-    kv, k_pe = torch.split(
-        compressed_kv,
-        [attn.kv_lora_rank, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-    kv = attn.kv_a_layernorm(kv)
-    k_pe = k_pe.view(total_tokens, 1, attn.qk_rope_head_dim)
-
-    q_pe, k_pe = _apply_standard_rope(
-        attn=attn,
-        q_pe=q_pe,
-        k_pe=k_pe,
-        position_ids=position_ids,
-        full_length=full_length,
-    )
-    if k_pe is None:
-        raise RuntimeError("Kimi prefix replay failed to build suffix k_pe")
-    offload_kv = torch.cat(
-        [kv, k_pe.view(total_tokens, attn.qk_rope_head_dim)],
-        dim=-1,
-    )
-    return (
-        _absorbed_query_states(
+        full_hit_query_builder=lambda projection: _full_hit_query_from_projection(
             wrapper,
-            q_nope,
-            q_pe,
-            offload_kv.dtype,
-            q_absorb=_kimi_q_absorb_weights(wrapper),
+            projection,
+            projection.q_pe.dtype,
+            q_absorb=_w8a16_q_absorb_weights(
+                wrapper,
+                model_label=model_label,
+                use_cached_absorb=use_cached_absorb,
+            ),
         ),
-        offload_kv,
+        output_projection=lambda attn_out: _w8a16_output_projection(
+            wrapper,
+            attn_out,
+            model_label=model_label,
+            use_cached_absorb=use_cached_absorb,
+        ),
     )
-
-
-def _project_kimi_query_states(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    full_length: int,
-) -> torch.Tensor:
-    attn = wrapper.module
-    q_states = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hidden_states_2d)))
-    total_tokens = hidden_states_2d.shape[0]
-    q_states = q_states.view(total_tokens, attn.num_heads, attn.q_head_dim)
-    q_nope, q_pe = torch.split(
-        q_states,
-        [attn.qk_nope_head_dim, attn.qk_rope_head_dim],
-        dim=-1,
-    )
-    q_pe, _ = _apply_standard_rope(
-        attn=attn,
-        q_pe=q_pe,
-        k_pe=None,
-        position_ids=position_ids,
-        full_length=full_length,
-    )
-    return _absorbed_query_states(
-        wrapper,
-        q_nope,
-        q_pe,
-        q_pe.dtype,
-        q_absorb=_kimi_q_absorb_weights(wrapper),
-    ).view(
-        total_tokens,
-        1,
-        attn.num_heads,
-        attn.kv_lora_rank + attn.qk_rope_head_dim,
-    ).contiguous()
-
-
-def _apply_interleaved_rope(
-    *,
-    attn: object,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor | None,
-    position_ids: torch.Tensor,
-    full_length: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from batchgen.attention.mla.rotary_embedding import (
-        rotary_pos_emb_interleaved_native,
-    )
-
-    rotary_seq_len = max(int(full_length), int(position_ids.max().item()) + 1)
-    cos, sin = attn.rotary_emb(q_pe.unsqueeze(0), seq_len=rotary_seq_len)
-    q_pe = rotary_pos_emb_interleaved_native(
-        q_pe.unsqueeze(0),
-        cos,
-        sin,
-        position_ids.unsqueeze(0),
-        2,
-    ).squeeze(0)
-    if k_pe is None:
-        return q_pe, None
-    k_pe = rotary_pos_emb_interleaved_native(
-        k_pe.unsqueeze(0),
-        cos,
-        sin,
-        position_ids.unsqueeze(0),
-        2,
-    ).squeeze(0)
-    return q_pe, k_pe
-
-
-def _apply_standard_rope(
-    *,
-    attn: object,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor | None,
-    position_ids: torch.Tensor,
-    full_length: int,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from batchgen.attention.mla.rotary_embedding import rotary_pos_emb
-
-    rotary_seq_len = max(int(full_length), int(position_ids.max().item()) + 1)
-    cos, sin = attn.rotary_emb(q_pe.unsqueeze(0), seq_len=rotary_seq_len)
-    q_pe = rotary_pos_emb(
-        q_pe.unsqueeze(0),
-        cos,
-        sin,
-        position_ids.unsqueeze(0),
-        2,
-    ).squeeze(0)
-    if k_pe is None:
-        return q_pe, None
-    k_pe = rotary_pos_emb(
-        k_pe.unsqueeze(0),
-        cos,
-        sin,
-        position_ids.unsqueeze(0),
-        2,
-    ).squeeze(0)
-    return q_pe, k_pe
 
 
 def _absorbed_query_states(
@@ -613,6 +230,33 @@ def _absorbed_query_states(
     return query_states.contiguous()
 
 
+def _full_hit_query_from_projection(
+    wrapper: object,
+    projection: object,
+    dtype: torch.dtype,
+    *,
+    q_absorb: torch.Tensor,
+) -> torch.Tensor:
+    attn = wrapper.module
+    total_tokens = projection.q_nope.shape[0]
+    return _absorbed_query_states(
+        wrapper,
+        projection.q_nope,
+        projection.q_pe,
+        dtype,
+        q_absorb=q_absorb,
+    ).view(
+        total_tokens,
+        1,
+        attn.num_heads,
+        attn.kv_lora_rank + attn.qk_rope_head_dim,
+    ).contiguous()
+
+
+def _rotary_seq_len(full_length: int, position_ids: torch.Tensor) -> int:
+    return max(int(full_length), int(position_ids.max().item()) + 1)
+
+
 def _w8a16_output_projection(
     wrapper: object,
     attn_out: torch.Tensor,
@@ -631,7 +275,8 @@ def _w8a16_output_projection(
         attn_out.shape[0] * attn_out.shape[1],
         attn.num_heads * attn.v_head_dim,
     )
-    return _w8a16_gemm(
+    from batchgen.attention.mla.fa3_backend import select_w8a16_gemm
+    return select_w8a16_gemm()(
         attn.o_proj.weight.data,
         _weight_scale(wrapper, model_label, ("o_proj.weight_scale_inv",))[
             "o_proj.weight_scale_inv"
@@ -743,18 +388,3 @@ def _weight_scale(
             f"{model_label} requires weight scales: {', '.join(missing)}"
         )
     return weight_scale
-
-
-def _w8a16_gemm(
-    weight_data_fp8: torch.Tensor,
-    weight_scale_inv_fp32: torch.Tensor,
-    activation_bf16: torch.Tensor,
-) -> torch.Tensor:
-    from batchgen.attention.mla.fa3_backend import (
-        w8a16_gemm,
-        w8a16_gemm_dequant,
-    )
-
-    use_dequant_path = os.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
-    gemm = w8a16_gemm_dequant if use_dequant_path else w8a16_gemm
-    return gemm(weight_data_fp8, weight_scale_inv_fp32, activation_bf16)

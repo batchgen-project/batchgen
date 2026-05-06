@@ -27,9 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers.prefix_mla_model_adapters import (
+    build_glm5_prefix_backend_context,
     offload_glm5_prepacked_mla_kv,
-    run_glm5_full_hit_prefill,
-    run_glm5_prefix_aware_prefill,
 )
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 from batchgen.timing import init_decode_timer
@@ -616,30 +615,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
             hidden_states_2d = hidden_states.squeeze(0)
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
+            prefix_context = None
+            if metadata.full_hit_mode or metadata.prefix_reuse_mode:
+                prefix_context = build_glm5_prefix_backend_context(
+                    wrapper=self,
+                    metadata=metadata,
+                )
+            attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
+                hidden_states_2d,
+                position_ids,
+                self.prepack_cu_seqlens.to(hidden_states_2d.device),
+                self.prepack_max_seqlen,
+                self.prepack_num_sequences,
+                self.weight_dequant_scale,
+                prefix_context=prefix_context,
+            )
             if metadata.full_hit_mode:
-                attn_output = run_glm5_full_hit_prefill(
-                    wrapper=self,
-                    hidden_states_2d=hidden_states_2d,
-                    position_ids=position_ids,
-                    metadata=metadata,
-                )
                 return (attn_output.unsqueeze(0), None, None)
-            if metadata.prefix_reuse_mode:
-                attn_output, offload_kv = run_glm5_prefix_aware_prefill(
-                    wrapper=self,
-                    hidden_states_2d=hidden_states_2d,
-                    position_ids=position_ids,
-                    metadata=metadata,
-                )
-            else:
-                attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
-                    hidden_states_2d,
-                    position_ids,
-                    self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                    self.prepack_max_seqlen,
-                    self.prepack_num_sequences,
-                    self.weight_dequant_scale
-                )
 
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
@@ -660,6 +652,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 )
             self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
+            if offload_kv is None:
+                raise RuntimeError("GLM-5 prepacked prefill returned no KV")
             self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)
             return (attn_output, None, None)
