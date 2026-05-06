@@ -30,14 +30,17 @@ jobs:
           git -C .docker-build/third_party/DeepGEMM checkout v2.1.1.post3
           git -C .docker-build/third_party/DeepGEMM submodule update --init --recursive
           find .docker-build/third_party \( -name .git -o -name .github \) -prune -exec rm -rf {} +
-          tar -czf .docker-build/third-party-src.tar.gz -C .docker-build third_party
-          du -h .docker-build/third-party-src.tar.gz
+          tar \
+            --exclude=.git \
+            -czf "${RUNNER_TEMP}/release-build-context.tar.gz" \
+            .
+          du -h "${RUNNER_TEMP}/release-build-context.tar.gz"
 
-      - name: Upload release build sources
+      - name: Upload release build context
         uses: actions/upload-artifact@v4
         with:
-          name: third-party-src
-          path: .docker-build/third-party-src.tar.gz
+          name: release-build-context
+          path: ${{ runner.temp }}/release-build-context.tar.gz
           retention-days: 1
 
   build-and-push-ghcr:
@@ -50,18 +53,16 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download release build sources
+      - name: Download release build context
         uses: actions/download-artifact@v4
         with:
-          name: third-party-src
-          path: .docker-build
+          name: release-build-context
+          path: .
 
-      - name: Unpack release build sources
+      - name: Unpack release build context
         run: |
-          tar -C .docker-build -xzf .docker-build/third-party-src.tar.gz
+          tar -xzf release-build-context.tar.gz
+          rm release-build-context.tar.gz
           ls -la .docker-build/third_party
 
       - name: Log in to GitHub Container Registry
@@ -105,16 +106,6 @@ jobs:
       packages: read
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/cuda-* /opt/cuda /usr/local/cuda
-          bash -x .github/workflows/scripts/free-disk-space.sh
-          docker system prune -af || true
-          df -h
-
       - name: Install skopeo
         run: |
           sudo apt-get update
