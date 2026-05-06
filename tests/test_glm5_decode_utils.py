@@ -1005,6 +1005,8 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path):
     args = prepare_server_args([
         "--model",
         "zai-org/GLM-5-FP8",
+        "--listen-port",
+        "11999",
         "--enable-cuda-graph",
         "--storage-path",
         str(tmp_path / "storage"),
