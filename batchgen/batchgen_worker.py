@@ -5986,7 +5986,6 @@ class BatchGenWorker:
 					prev_status = "ON_HOLD" if seq.had_initial_gpu_reservation else "PREFILLED"
 					seq.log_event(SeqEvent.DECODE_START, self.rank,
 						f"from={prev_status}")
-				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 
 				# ============ CRITICAL: Sync metadata before decode config ============
 				# After decode→prefill→decode transitions, sequence metadata
@@ -6014,6 +6013,8 @@ class BatchGenWorker:
 					reason="pre_decode_warmup",
 				)
 				config_decode_time += time.perf_counter() - config_start
+				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
+				self._sync_sequence_metadata(decode_uuids)
 
 				# CUDA Graph Warmup (lazy, one-time). Whole-model graph paths wait
 				# until the final admitted batch; GLM-5 DSA graph captures only the
@@ -6457,9 +6458,9 @@ class BatchGenWorker:
 				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
-				sequence_tokens.append(initial_capacity)
-				seq.host_token_capacity = initial_capacity
 				seq.host_pages_allocated = math.ceil(initial_capacity / seq.PAGE_SIZE)
+				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
+				sequence_tokens.append(seq.host_token_capacity)
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —
