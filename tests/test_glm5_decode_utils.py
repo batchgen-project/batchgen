@@ -381,6 +381,12 @@ def test_glm5_dsa_cuda_graph_required_fast_fails_without_replay(monkeypatch):
 
 def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 2
+
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.module = type(
         "Attn",
@@ -393,9 +399,34 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     wrapper._dsa_cuda_graph_manager = type(
         "GraphManager",
         (),
-        {"has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2},
+        {
+            "bucketing": FakeBucketing(),
+            "has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2,
+        },
     )()
     expected = torch.ones(2, 1, 16)
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "glm5_dsa_graph_forward_state",
+        {
+            "path": "graph",
+            "bucket": 2,
+            "reason": "captured",
+            "local_bsz": 2,
+            "metadata_prepared": True,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "glm5_dsa_flashmla_graph_metadata",
+        {
+            "bucket_size": 2,
+            "tile_scheduler_metadata": torch.empty(1, dtype=torch.int32),
+            "num_splits": torch.empty(1, dtype=torch.int32),
+        },
+        raising=False,
+    )
 
     def fake_graph_route(self, hidden_states, position_ids, cache_seqlens, max_seqlen, primary, aux):
         assert hidden_states.shape == (2, 1, 16)
@@ -425,7 +456,14 @@ def test_glm5_dsa_decode_routes_to_registered_graph_when_requested(monkeypatch):
     assert actual is expected
 
 
-def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch):
+def test_glm5_dsa_decode_does_not_replay_graph_without_forward_metadata(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 2
+
     wrapper = object.__new__(GLM5AttnWrapper)
     wrapper.module = type(
         "Attn",
@@ -438,7 +476,82 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
     wrapper._dsa_cuda_graph_manager = type(
         "GraphManager",
         (),
-        {"has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2},
+        {
+            "bucketing": FakeBucketing(),
+            "has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2,
+        },
+    )()
+    expected = torch.ones(2, 1, 16)
+    calls = {}
+
+    def fake_graph_route(self, *args, **kwargs):
+        raise AssertionError("graph replay must not run without prepared metadata")
+
+    def fake_eager(self, *args, **kwargs):
+        calls["eager"] = True
+        return expected
+
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_graph", fake_graph_route)
+    monkeypatch.setattr(GLM5AttnWrapper, "_forward_decode_dsa_eager", fake_eager)
+    monkeypatch.setattr(
+        GLM5AttnWrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda self, primary, aux: True,
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "glm5_dsa_graph_forward_state",
+        {
+            "path": "eager",
+            "bucket": 2,
+            "reason": "primary_page_table_state_invalid",
+            "local_bsz": 2,
+            "metadata_prepared": False,
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "glm5_dsa_flashmla_graph_metadata",
+        None,
+        raising=False,
+    )
+
+    actual = wrapper._forward_decode_dsa(
+        torch.zeros(2, 1, 16),
+        torch.tensor([[7], [8]], dtype=torch.int64),
+        torch.tensor([4, 9], dtype=torch.int32),
+        4096,
+        "primary",
+        "aux",
+    )
+
+    assert actual is expected
+    assert calls == {"eager": True}
+
+
+def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch):
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 2
+
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.module = type(
+        "Attn",
+        (),
+        {"hidden_size": 16, "indexer": type("Indexer", (), {"index_topk": 4})()},
+    )()
+    wrapper.layer_idx = 0
+    wrapper._dsa_cuda_graph_max_seqlen = 4096
+    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+    wrapper._dsa_cuda_graph_manager = type(
+        "GraphManager",
+        (),
+        {
+            "bucketing": FakeBucketing(),
+            "has_graph": lambda self, name, batch_size: name == "glm5_layer_0_dsa_attn" and batch_size == 2,
+        },
     )()
     expected = torch.ones(2, 1, 16)
     calls = {}
@@ -467,6 +580,18 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
 
     old_debug = AttnWrapperBase.batchgen_debug
     AttnWrapperBase.batchgen_debug = {"glm5_dsa_graph_compare": True}
+    AttnWrapperBase.glm5_dsa_graph_forward_state = {
+        "path": "graph",
+        "bucket": 2,
+        "reason": "captured",
+        "local_bsz": 2,
+        "metadata_prepared": True,
+    }
+    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+        "bucket_size": 2,
+        "tile_scheduler_metadata": torch.empty(1, dtype=torch.int32),
+        "num_splits": torch.empty(1, dtype=torch.int32),
+    }
     try:
         actual = wrapper._forward_decode_dsa(
             torch.zeros(2, 1, 16),
@@ -478,6 +603,8 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
         )
     finally:
         AttnWrapperBase.batchgen_debug = old_debug
+        AttnWrapperBase.glm5_dsa_graph_forward_state = None
+        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 
     assert actual is expected
     assert calls == {"return_debug": True, "compare": True}
@@ -1050,6 +1177,123 @@ def test_glm5_dsa_graph_path_refreshes_page_table_state_before_storage_check(mon
     )
     assert primary.ensure_calls == [[11, 22]]
     assert aux.ensure_calls == [[11, 22]]
+
+
+def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+    from batchgen.attention.dsa import sparse_decode_mla
+
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 4
+
+    class FakeGraphManager:
+        bucketing = FakeBucketing()
+
+        def has_graph(self, segment_name, batch_size):
+            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
+
+    class FakeWrapper:
+        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
+        _dsa_cuda_graph_max_seqlen = 8192
+        module = types.SimpleNamespace(
+            indexer=types.SimpleNamespace(index_topk=2048),
+            num_heads=64,
+        )
+
+        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
+            return True
+
+    captured_lengths = {}
+
+    def fake_prepare(selected_lengths, num_heads):
+        captured_lengths["values"] = selected_lengths.clone()
+        captured_lengths["num_heads"] = num_heads
+        return (
+            torch.ones(3, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        )
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = FakeGraphManager()
+    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=object())
+    worker.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
+        ),
+    )
+    worker.torch_device = torch.device("cpu")
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "cache_seqlens",
+        torch.tensor([970, 2049], dtype=torch.int32),
+        raising=False,
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 4096, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
+    monkeypatch.setattr(
+        sparse_decode_mla,
+        "prepare_sparse_flash_mla_decode_tensor_metadata",
+        fake_prepare,
+    )
+
+    worker._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(2, object())
+
+    assert captured_lengths["values"].tolist() == [970, 2048, 2048, 2048]
+    assert captured_lengths["num_heads"] == 64
+    assert AttnWrapperBase.glm5_dsa_graph_forward_state == {
+        "path": "graph",
+        "bucket": 4,
+        "reason": "captured",
+        "local_bsz": 2,
+        "metadata_prepared": True,
+    }
+    metadata = AttnWrapperBase.glm5_dsa_flashmla_graph_metadata
+    assert metadata["bucket_size"] == 4
+    assert metadata["tile_scheduler_metadata"].tolist() == [1, 1, 1]
+    assert metadata["num_splits"].tolist() == [1]
+    AttnWrapperBase.glm5_dsa_graph_forward_state = None
+    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+
+
+def test_glm5_gpu_kv_config_uses_actual_prompt_for_graph_page_table():
+    from batchgen.batchgen_worker import BatchGenWorker
+    from batchgen.kv_cache.gpu_paged_kv_manager import (
+        GPUPagedKVCacheManager,
+        GPUPagedKVConfig,
+    )
+
+    worker = object.__new__(BatchGenWorker)
+    worker.max_input_length = 65355
+    worker.max_decoding_length = 4096
+    worker.engine_config = None
+    worker.args = types.SimpleNamespace(cuda_graph_max_bucket_size=64)
+    config = GPUPagedKVConfig(
+        num_layers=1,
+        num_pages=4096,
+        page_size_tokens=64,
+        num_k_heads=1,
+        k_head_dim=1,
+        num_v_heads=0,
+        v_head_dim=0,
+        kv_dtype=torch.bfloat16,
+    )
+
+    updated = worker._with_cuda_graph_page_table_capacity(config)
+    expected_pages = (65355 + 4096 + 63) // 64
+
+    assert updated.cuda_graph_max_pages_per_sequence == expected_pages
+    assert updated.cuda_graph_max_slots == 64
+    manager = GPUPagedKVCacheManager(config=updated, device="cpu")
+    assert (
+        manager._gpu_page_table_manager.graph_max_pages_per_sequence
+        == expected_pages
+    )
+    assert manager._gpu_page_table_manager.max_slots == 64
 
 
 def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):

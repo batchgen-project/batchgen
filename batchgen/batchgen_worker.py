@@ -64,7 +64,7 @@ import gc
 import numpy as np
 from datetime import timedelta
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import torch.distributed._symmetric_memory as symm_mem
 from batchgen.distributed.utils import StatelessProcessGroup
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -830,6 +830,7 @@ class BatchGenWorker:
 				v_head_dim=primary_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(primary_profile.kv_dtype),
 			)
+			primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
 			aux_config = GPUPagedKVConfig(
 				num_layers=aux_profile.num_layers,
 				num_pages=num_pages,
@@ -840,6 +841,7 @@ class BatchGenWorker:
 				v_head_dim=aux_profile.v_head_dim,
 				kv_dtype=_torch_dtype_from_string(aux_profile.kv_dtype),
 			)
+			aux_config = self._with_cuda_graph_page_table_capacity(aux_config)
 
 			primary = GPUPagedKVCacheManager(config=primary_config, device=self.local_rank)
 			primary.initialize()
@@ -862,6 +864,7 @@ class BatchGenWorker:
 				model_name=self.huggingface_ckpt_name,
 				gpu_kv_cache_size_gb=self.gpu_kv_cache_size_gb,
 			)
+			config = self._with_cuda_graph_page_table_capacity(config)
 
 			manager = GPUPagedKVCacheManager(
 				config=config,
@@ -2487,6 +2490,73 @@ class BatchGenWorker:
 			return manager
 		return getattr(self.core_engine, "gpu_paged_kv_manager", None)
 
+	def _cuda_graph_page_table_token_capacity(
+		self,
+		sequence_tokens: Optional[Sequence[int]] = None,
+	) -> int:
+		candidates: List[int] = [16384]
+		if sequence_tokens:
+			candidates.extend(int(tokens) for tokens in sequence_tokens if int(tokens) > 0)
+		max_input_length = int(getattr(self, "max_input_length", 0) or 0)
+		max_decoding_length = int(getattr(self, "max_decoding_length", 0) or 0)
+		if max_input_length > 0:
+			candidates.append(max_input_length + max(0, max_decoding_length))
+		engine_config = getattr(self, "engine_config", None)
+		if engine_config is not None:
+			basic = engine_config.Basic_Config
+			max_prompt = basic.get_max_prompt_length()
+			max_decode = getattr(basic, "max_decoding_length", None)
+			if max_prompt is not None and max_decode is not None:
+				candidates.append(int(max_prompt) + int(max_decode))
+			elif max_prompt is not None:
+				candidates.append(int(max_prompt))
+			elif max_decode is not None:
+				candidates.append(int(max_decode))
+		return max(candidates)
+
+	def _cuda_graph_page_table_slot_capacity(self) -> int:
+		candidates: List[int] = []
+		args = getattr(self, "args", None)
+		if args is not None:
+			value = getattr(args, "cuda_graph_max_bucket_size", None)
+			if value is not None and int(value) > 0:
+				candidates.append(int(value))
+		engine_config = getattr(self, "engine_config", None)
+		if engine_config is not None:
+			basic = engine_config.Basic_Config
+			module_batching = engine_config.Module_Batching_Config
+			for value in (
+				module_batching.global_batch_size,
+				module_batching.attn_decoding_micro_batch_size,
+				basic.num_queries,
+			):
+				if value is not None and int(value) > 0:
+					candidates.append(int(value))
+		return max(candidates) if candidates else 1
+
+	def _with_cuda_graph_page_table_capacity(
+		self,
+		config,
+		sequence_tokens: Optional[Sequence[int]] = None,
+	):
+		token_capacity = self._cuda_graph_page_table_token_capacity(sequence_tokens)
+		page_capacity = max(
+			1,
+			min(
+				int(config.num_pages),
+				math.ceil(token_capacity / int(config.page_size_tokens)),
+			),
+		)
+		slot_capacity = max(
+			1,
+			min(int(config.num_pages), self._cuda_graph_page_table_slot_capacity()),
+		)
+		return replace(
+			config,
+			cuda_graph_max_pages_per_sequence=page_capacity,
+			cuda_graph_max_slots=slot_capacity,
+		)
+
 	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
 		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
 
@@ -2496,6 +2566,10 @@ class BatchGenWorker:
 		gpu_config = build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
+		)
+		gpu_config = self._with_cuda_graph_page_table_capacity(
+			gpu_config,
+			sequence_tokens,
 		)
 
 		manager = self.gpu_paged_kv_cache_manager
@@ -2531,6 +2605,10 @@ class BatchGenWorker:
 			sequence_tokens=sequence_tokens,
 		)
 		if aux_config is not None:
+			aux_config = self._with_cuda_graph_page_table_capacity(
+				aux_config,
+				sequence_tokens,
+			)
 			auxiliary = GPUPagedKVCacheManager(
 				config=aux_config,
 				device=self.local_rank,
@@ -9195,7 +9273,14 @@ class BatchGenWorker:
 		gpu_manager,
 	) -> None:
 		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
-		path, bucket, _reason = self._glm5_dsa_graph_path_state(local_bsz, gpu_manager)
+		path, bucket, reason = self._glm5_dsa_graph_path_state(local_bsz, gpu_manager)
+		AttnWrapperBase.glm5_dsa_graph_forward_state = {
+			"path": path,
+			"bucket": bucket,
+			"reason": reason,
+			"local_bsz": int(local_bsz),
+			"metadata_prepared": False,
+		}
 		if path != "graph" or bucket is None:
 			return
 		model = getattr(self, "model", None)
@@ -9239,6 +9324,13 @@ class BatchGenWorker:
 			"selected_lengths": selected_lengths,
 			"tile_scheduler_metadata": tile_scheduler_metadata,
 			"num_splits": num_splits,
+		}
+		AttnWrapperBase.glm5_dsa_graph_forward_state = {
+			"path": path,
+			"bucket": bucket,
+			"reason": reason,
+			"local_bsz": int(local_bsz),
+			"metadata_prepared": True,
 		}
 
 	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
@@ -10492,6 +10584,7 @@ class BatchGenWorker:
 					AttnWrapperBase.max_seqlen = 0
 					AttnWrapperBase.cur_batch = []
 					AttnWrapperBase._dsa_short_count = 0
+					AttnWrapperBase.glm5_dsa_graph_forward_state = None
 					AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 				
 				if batch:
@@ -11061,6 +11154,7 @@ class BatchGenWorker:
 		AttnWrapperBase.batchgen_debug = None
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
+		AttnWrapperBase.glm5_dsa_graph_forward_state = None
 		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 
 		# Summary (uses cumulative counters for accurate cross-round totals)

@@ -175,6 +175,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     # rows instead of deriving slot count from cur_batch.
     glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
     glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_dsa_graph_forward_state: ClassVar[Optional[Dict[str, Any]]] = None
     glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None

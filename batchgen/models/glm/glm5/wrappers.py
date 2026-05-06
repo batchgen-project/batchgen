@@ -894,6 +894,43 @@ class GLM5AttnWrapper(AttnWrapperBase):
         )
         return attn_output.view(bsz, 1, -1)
 
+    def _dsa_cuda_graph_forward_state_allows_replay(
+        self,
+        batch_size: int,
+    ) -> tuple[bool, str]:
+        if self._dsa_cuda_graph_manager is None:
+            return False, "no graph manager"
+        bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
+        state = getattr(AttnWrapperBase, "glm5_dsa_graph_forward_state", None)
+        if not isinstance(state, dict):
+            return False, "missing per-forward graph state"
+        if state.get("path") != "graph":
+            reason = state.get("reason", "unknown")
+            return False, f"worker selected eager DSA ({reason})"
+        if int(state.get("bucket", -1)) != int(bucket_size):
+            return (
+                False,
+                f"worker graph bucket {state.get('bucket')} does not match replay bucket {bucket_size}",
+            )
+        if not bool(state.get("metadata_prepared", False)):
+            return False, "per-forward FlashMLA metadata was not prepared"
+        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        if not isinstance(metadata, dict):
+            return False, "missing per-forward FlashMLA metadata"
+        if int(metadata.get("bucket_size", -1)) != int(bucket_size):
+            return (
+                False,
+                f"FlashMLA metadata bucket {metadata.get('bucket_size')} does not match replay bucket {bucket_size}",
+            )
+        tile_scheduler_metadata = metadata.get("tile_scheduler_metadata")
+        num_splits = metadata.get("num_splits")
+        if not isinstance(tile_scheduler_metadata, torch.Tensor) or not isinstance(
+            num_splits,
+            torch.Tensor,
+        ):
+            return False, "FlashMLA metadata tensors are missing"
+        return True, "captured"
+
     def _dsa_cuda_graph_flashmla_metadata_inputs(
         self,
         batch_size: int,
@@ -1160,7 +1197,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager,
                 gpu_paged_kv_manager_aux,
             )
-            if graph_can_replay and graph_has_bucket and graph_page_tables_match and not compare_active:
+            if graph_has_bucket:
+                graph_forward_ready, graph_forward_reason = (
+                    self._dsa_cuda_graph_forward_state_allows_replay(bsz)
+                )
+            else:
+                graph_forward_ready = False
+                graph_forward_reason = "batch size has no captured graph bucket"
+            if (
+                graph_can_replay
+                and graph_has_bucket
+                and graph_page_tables_match
+                and graph_forward_ready
+                and not compare_active
+            ):
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -1175,6 +1225,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and graph_can_replay
                 and graph_has_bucket
                 and graph_page_tables_match
+                and graph_forward_ready
             )
             if not graph_can_replay:
                 if index_topk <= 0:
@@ -1187,6 +1238,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 reason = f"batch size {bsz} has no captured graph bucket"
             elif not graph_page_tables_match:
                 reason = "captured page-table storage no longer matches active storage"
+            elif not graph_forward_ready:
+                reason = graph_forward_reason
             else:
                 reason = "graph/eager compare mode is returning eager output"
             _log_glm5_dsa_graph_eager_fallback_once(
