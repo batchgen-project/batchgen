@@ -1,10 +1,19 @@
 """Server argument parsing and validation utilities."""
 
 import argparse
+import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from batchgen.models.glm.glm5.cuda_graph_policy import (
+    GLM5_DSA_CUDA_GRAPH_ENV,
+    GLM5_MOE_CUDA_GRAPH_ENV,
+    is_glm5_fp8_graph_default_model,
+)
+
+_GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
 
 
 def is_port_available(port: int) -> bool:
@@ -45,6 +54,23 @@ def _ensure_local_port_free(port: int, label: str) -> None:
 def _default_storage_path() -> Path:
     """Return default storage path under batchgen directory."""
     return Path(__file__).parent.parent / "storage"
+
+
+def _is_glm_model(model_name: Optional[str]) -> bool:
+    return "glm" in (model_name or "").lower()
+
+
+def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
+    if args.enable_cuda_graph and is_glm5_fp8_graph_default_model(args.model):
+        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "1"
+        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "1"
+        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "1"
+        return
+
+    if args.disable_cuda_graphs and _is_glm_model(args.model):
+        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
 
 
 @dataclass
@@ -574,4 +600,5 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
+    _apply_cuda_graph_cli_env_defaults(server_args)
     return server_args

@@ -1133,6 +1133,7 @@ class Glm5MoE(nn.Module):
         self._moe_cuda_graph_segment_name = None
         self._moe_cuda_graph_segment = None
         self._moe_cuda_graph_bucketing = None
+        self._moe_cuda_graph_required = False
 
     # ── Token count management (called by PSM) ──
 
@@ -1409,11 +1410,20 @@ class Glm5MoE(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
-    def enable_moe_cuda_graph(self, manager, segment_name: str, segment, bucketing) -> None:
+    def enable_moe_cuda_graph(
+        self,
+        manager,
+        segment_name: str,
+        segment,
+        bucketing,
+        *,
+        graph_output_required: bool = False,
+    ) -> None:
         self._moe_cuda_graph_manager = manager
         self._moe_cuda_graph_segment_name = segment_name
         self._moe_cuda_graph_segment = segment
         self._moe_cuda_graph_bucketing = bucketing
+        self._moe_cuda_graph_required = graph_output_required
 
     # ── Forward ──
 
@@ -1431,7 +1441,10 @@ class Glm5MoE(nn.Module):
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
             compare = _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
-            graph_required = _glm5_moe_cuda_graph_required()
+            graph_required = (
+                _glm5_moe_cuda_graph_required()
+                or getattr(self, "_moe_cuda_graph_required", False)
+            )
             if compare:
                 return self._forward_decode_3d_graph_compare(hidden_states)
             if graph_required:

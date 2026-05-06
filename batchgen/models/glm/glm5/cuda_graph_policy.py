@@ -35,6 +35,10 @@ def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     )
 
 
+def is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
+    return _is_glm5_fp8_graph_default_model(model_name)
+
+
 def glm5_dsa_cuda_graph_requested_for_model(
     model_name: str | None,
     *,

@@ -404,6 +404,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._dsa_cuda_graph_max_aux_pages = 0
         self._dsa_cuda_graph_primary_page_table_signature = None
         self._dsa_cuda_graph_aux_page_table_signature = None
+        self._dsa_cuda_graph_required = False
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -554,10 +555,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
         max_aux_pages_per_seq: Optional[int] = None,
         primary_page_table: Optional[torch.Tensor] = None,
         aux_page_table: Optional[torch.Tensor] = None,
+        graph_output_required: bool = False,
     ) -> None:
         self._dsa_cuda_graph_manager = manager
         self._dsa_cuda_graph_segment_name = segment_name
         self._dsa_cuda_graph_max_seqlen = max_seqlen
+        self._dsa_cuda_graph_required = graph_output_required
         self._dsa_cuda_graph_max_primary_pages = (
             primary_page_table.shape[1]
             if primary_page_table is not None
@@ -806,7 +809,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
     ) -> torch.Tensor:
         if self._dsa_cuda_graph_manager is None or self._dsa_cuda_graph_segment_name is None:
             raise RuntimeError(
-                f"[layer {self.layer_idx}] BATCHGEN_GLM5_DSA_CUDA_GRAPH=1 was requested, "
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph was requested, "
                 "but this attention wrapper has no registered DSA CUDA graph segment"
             )
         index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
@@ -1175,7 +1178,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         compare_active = _glm5_dsa_graph_compare_active()
         compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
-        graph_requested = _glm5_dsa_cuda_graph_required() or compare_active
+        graph_requested = (
+            _glm5_dsa_cuda_graph_required()
+            or getattr(self, "_dsa_cuda_graph_required", False)
+            or compare_active
+        )
         compare_after_eager = False
         if graph_requested:
             index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)

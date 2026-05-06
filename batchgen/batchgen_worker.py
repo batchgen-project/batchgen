@@ -8795,7 +8795,7 @@ class BatchGenWorker:
 					self._glm5_moe_cuda_graph_manager.drop_bucket(bucket)
 					self._glm5_moe_graph_failed_buckets.add(bucket)
 				torch.cuda.empty_cache()
-				if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
+				if self._glm5_moe_graph_output_required_for_current_batch():
 					raise
 				logging.error(
 					f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
@@ -8822,7 +8822,7 @@ class BatchGenWorker:
 		)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
 		registered = 0
-		graph_output_required = os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1"
+		graph_output_required = self._glm5_moe_graph_output_required_for_current_batch()
 		compare_active = _glm5_moe_graph_compare_active()
 		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 			moe = getattr(decoder_layer, "mlp", None)
@@ -8846,7 +8846,13 @@ class BatchGenWorker:
 			)
 			segment_name = make_glm5_moe_graph_segment_name(layer_idx)
 			manager.register_segment(segment_name, segment)
-			moe.enable_moe_cuda_graph(manager, segment_name, segment, bucketing)
+			moe.enable_moe_cuda_graph(
+				manager,
+				segment_name,
+				segment,
+				bucketing,
+				graph_output_required=graph_output_required,
+			)
 			registered += 1
 		if registered == 0:
 			self._glm5_moe_graph_capture_attempted_for_batch = True
@@ -8865,7 +8871,7 @@ class BatchGenWorker:
 				manager.drop_bucket(bucket)
 				self._glm5_moe_graph_failed_buckets.add(bucket)
 			torch.cuda.empty_cache()
-			if os.environ.get("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "0") == "1":
+			if self._glm5_moe_graph_output_required_for_current_batch():
 				raise
 			logging.error(
 				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
@@ -9066,6 +9072,12 @@ class BatchGenWorker:
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
 
+	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
+		return glm5_dsa_cuda_graph_requested_for_model(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
+
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
 			return value
@@ -9074,6 +9086,12 @@ class BatchGenWorker:
 		if isinstance(value, str):
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
+
+	def _glm5_moe_graph_output_required_for_current_batch(self) -> bool:
+		return glm5_moe_cuda_graph_requested_for_model(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
 		model_name = getattr(self, "model_name", None)
@@ -9924,6 +9942,7 @@ class BatchGenWorker:
 					max_seqlen=graph_max_seqlen,
 					primary_page_table=primary_page_table,
 					aux_page_table=aux_page_table,
+					graph_output_required=self._glm5_dsa_graph_output_required_for_current_batch(),
 				)
 
 			logging.info(

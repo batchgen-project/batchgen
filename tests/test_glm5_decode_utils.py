@@ -1,3 +1,5 @@
+import os
+import socket
 import sys
 import types
 
@@ -44,6 +46,12 @@ from batchgen.models.glm.glm5.wrappers import (
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 from batchgen.models.wrappers import AttnWrapperBase
+
+
+def _unused_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def test_build_clamped_dense_token_indices_caps_each_row():
@@ -999,14 +1007,18 @@ def test_glm5_enable_cuda_graph_defaults_to_segmented_dsa_and_moe():
     )
 
 
-def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path):
+def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
     from batchgen.server.server_args import prepare_server_args
+
+    monkeypatch.delenv("BATCHGEN_SEGMENTED_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
 
     args = prepare_server_args([
         "--model",
         "zai-org/GLM-5-FP8",
         "--listen-port",
-        "11999",
+        str(_unused_local_port()),
         "--enable-cuda-graph",
         "--storage-path",
         str(tmp_path / "storage"),
@@ -1014,6 +1026,33 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path):
 
     assert args.enable_cuda_graph
     assert not args.disable_cuda_graphs
+    assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "1"
+    assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "1"
+    assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "1"
+
+
+def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
+    from batchgen.server.server_args import prepare_server_args
+
+    monkeypatch.setenv("BATCHGEN_SEGMENTED_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+
+    args = prepare_server_args([
+        "--model",
+        "zai-org/GLM-5-FP8",
+        "--listen-port",
+        str(_unused_local_port()),
+        "--disable-cuda-graphs",
+        "--storage-path",
+        str(tmp_path / "storage"),
+    ])
+
+    assert not args.enable_cuda_graph
+    assert args.disable_cuda_graphs
+    assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "0"
+    assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "0"
+    assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "0"
 
 
 def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
@@ -1030,7 +1069,36 @@ def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
     worker._batchgen_debug = {}
 
     assert worker._glm5_dsa_graph_requested_for_current_batch()
+    assert worker._glm5_dsa_graph_output_required_for_current_batch()
     assert worker._glm5_moe_graph_requested_for_current_batch()
+    assert worker._glm5_moe_graph_output_required_for_current_batch()
+
+
+def test_glm5_dsa_graph_enable_records_cli_required_state():
+    wrapper = object.__new__(GLM5AttnWrapper)
+
+    wrapper.enable_dsa_cuda_graph(
+        manager=object(),
+        segment_name="glm5_dsa_layer_0",
+        max_seqlen=131072,
+        graph_output_required=True,
+    )
+
+    assert wrapper._dsa_cuda_graph_required is True
+
+
+def test_glm5_moe_graph_enable_records_cli_required_state():
+    moe = object.__new__(Glm5MoE)
+
+    moe.enable_moe_cuda_graph(
+        manager=object(),
+        segment_name="glm5_moe_layer_3",
+        segment=object(),
+        bucketing=object(),
+        graph_output_required=True,
+    )
+
+    assert moe._moe_cuda_graph_required is True
 
 
 def test_glm5_power2_graph_buckets_cover_local_batches_to_32():
