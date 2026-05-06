@@ -9057,7 +9057,11 @@ class BatchGenWorker:
 		model_name = getattr(self, "model_name", None)
 		if glm5_dsa_cuda_graph_requested_for_model(
 			model_name,
-			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+			enable_cuda_graph=getattr(
+				getattr(self, "args", None),
+				"enable_cuda_graph",
+				False,
+			),
 		):
 			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
@@ -9075,7 +9079,11 @@ class BatchGenWorker:
 	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
 		return glm5_dsa_cuda_graph_requested_for_model(
 			getattr(self, "model_name", None),
-			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+			enable_cuda_graph=getattr(
+				getattr(self, "args", None),
+				"enable_cuda_graph",
+				False,
+			),
 		)
 
 	def _debug_flag_enabled(self, value) -> bool:
@@ -9090,7 +9098,11 @@ class BatchGenWorker:
 	def _glm5_moe_graph_output_required_for_current_batch(self) -> bool:
 		return glm5_moe_cuda_graph_requested_for_model(
 			getattr(self, "model_name", None),
-			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+			enable_cuda_graph=getattr(
+				getattr(self, "args", None),
+				"enable_cuda_graph",
+				False,
+			),
 		)
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
@@ -9098,7 +9110,11 @@ class BatchGenWorker:
 		if (
 			glm5_moe_cuda_graph_requested_for_model(
 				model_name,
-				enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+				enable_cuda_graph=getattr(
+					getattr(self, "args", None),
+					"enable_cuda_graph",
+					False,
+				),
 			)
 			or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
 		):

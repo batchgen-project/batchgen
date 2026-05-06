@@ -1,5 +1,4 @@
 import os
-import socket
 import sys
 import types
 
@@ -46,12 +45,6 @@ from batchgen.models.glm.glm5.wrappers import (
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 from batchgen.models.wrappers import AttnWrapperBase
-
-
-def _unused_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def test_build_clamped_dense_token_indices_caps_each_row():
@@ -1008,17 +1001,18 @@ def test_glm5_enable_cuda_graph_defaults_to_segmented_dsa_and_moe():
 
 
 def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
-    from batchgen.server.server_args import prepare_server_args
+    import batchgen.server.server_args as server_args_module
 
     monkeypatch.delenv("BATCHGEN_SEGMENTED_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
 
-    args = prepare_server_args([
+    args = server_args_module.prepare_server_args([
         "--model",
         "zai-org/GLM-5-FP8",
         "--listen-port",
-        str(_unused_local_port()),
+        "11999",
         "--enable-cuda-graph",
         "--storage-path",
         str(tmp_path / "storage"),
@@ -1032,17 +1026,18 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
 
 
 def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
-    from batchgen.server.server_args import prepare_server_args
+    import batchgen.server.server_args as server_args_module
 
     monkeypatch.setenv("BATCHGEN_SEGMENTED_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
 
-    args = prepare_server_args([
+    args = server_args_module.prepare_server_args([
         "--model",
         "zai-org/GLM-5-FP8",
         "--listen-port",
-        str(_unused_local_port()),
+        "12000",
         "--disable-cuda-graphs",
         "--storage-path",
         str(tmp_path / "storage"),
