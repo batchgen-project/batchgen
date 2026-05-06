@@ -1126,6 +1126,16 @@ class BatchGenWorker:
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
+			if os.environ.get("BATCHGEN_V4F_BOOK", "0") == "1":
+				last_id = int(seq.input_ids[0, actual_prompt_len - 1].item()) if actual_prompt_len > 0 else -1
+				next_id = int(seq.input_ids[0, actual_prompt_len].item()) if actual_prompt_len < seq.input_ids.size(-1) else -1
+				prev3 = seq.input_ids[0, max(0, actual_prompt_len - 3):actual_prompt_len].tolist()
+				next3 = seq.input_ids[0, actual_prompt_len:min(actual_prompt_len + 3, seq.input_ids.size(-1))].tolist()
+				print(f"[V4F-BOOK admit rank={self.rank}] uuid={seq.uuid[:8]} "
+				      f"prompt_len={actual_prompt_len} buf_size={seq.input_ids.size(-1)} "
+				      f"prev3={prev3} next3={next3}",
+				      flush=True)
+
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
 
@@ -4327,6 +4337,16 @@ class BatchGenWorker:
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
 
+			if os.environ.get("BATCHGEN_V4F_BOOK", "0") == "1":
+				last_id = int(seq.input_ids[0, actual_prompt_len - 1].item()) if actual_prompt_len > 0 else -1
+				next_id = int(seq.input_ids[0, actual_prompt_len].item()) if actual_prompt_len < seq.input_ids.size(-1) else -1
+				prev3 = seq.input_ids[0, max(0, actual_prompt_len - 3):actual_prompt_len].tolist()
+				next3 = seq.input_ids[0, actual_prompt_len:min(actual_prompt_len + 3, seq.input_ids.size(-1))].tolist()
+				print(f"[V4F-BOOK gbatch rank={self.rank}] uuid={seq.uuid[:8]} "
+				      f"prompt_len={actual_prompt_len} buf_size={seq.input_ids.size(-1)} "
+				      f"prev3={prev3} next3={next3}",
+				      flush=True)
+
 			if (seq_i + 1) % 3000 == 0:
 				elapsed = time.perf_counter() - phase3_start
 				logging.info(
@@ -6999,6 +7019,14 @@ class BatchGenWorker:
 			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
 			attention_mask[0, :L] = 1
 
+			if os.environ.get("BATCHGEN_V4F_BOOK", "0") == "1" and self.rank == 0:
+				print(f"[V4F-BOOK prefill rank=0 q_idx={query_idx}] uuid={uuid[:8]} "
+				      f"L={L} encoded_dim={encoded.size(-1)} "
+				      f"first5={input_ids[0,:5].tolist()} last5={input_ids[0,-5:].tolist()} "
+				      f"mask_sum={int(attention_mask.sum().item())} "
+				      f"buf_post_L_first3={encoded[0, L:min(L+3, encoded.size(-1))].tolist()}",
+				      flush=True)
+
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
 
@@ -7218,6 +7246,16 @@ class BatchGenWorker:
 						f"Rank {self.rank}: prefill token selection shape mismatch, "
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
+				if os.environ.get("BATCHGEN_V4F_BOOK", "0") == "1" and self.rank == 0:
+					top5 = logits.topk(5, dim=-1)
+					uuids_short = [seq.uuid[:8] for seq in batch_sequences]
+					prompt_lens = [seq.original_prompt_length for seq in batch_sequences]
+					print(f"[V4F-BOOK first-token rank=0] num_seqs={batch_num_seqs} "
+					      f"uuids={uuids_short} prompt_lens={prompt_lens} "
+					      f"sampled={batch_new_tokens.squeeze(-1).tolist()} "
+					      f"top5_idx={top5.indices.tolist()} "
+					      f"top5_val={[[round(v,3) for v in row] for row in top5.values.tolist()]}",
+					      flush=True)
 				output_tokens.append(batch_new_tokens)
 
 		# Reset prepack mode

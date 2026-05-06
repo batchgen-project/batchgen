@@ -199,6 +199,16 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             )
             output[:, start:end, :] = seq_out
             offload_kv[start:end] = seq_kv.squeeze(0)
+            import os as _os
+            if _os.environ.get("BATCHGEN_V4F_BOOK", "0") == "1" and self.layer_idx == 0:
+                cc = getattr(self.module, "_compress_kv_cache", None)
+                ic = self.module.indexer.kv_cache if getattr(self.module, "indexer", None) is not None else None
+                cc_stat = "(none)" if cc is None else f"shape={tuple(cc.shape)} amean={cc.abs().float().mean().item():.4g}"
+                ic_stat = "(none)" if ic is None else f"shape={tuple(ic.shape)} amean={ic.abs().float().mean().item():.4g}"
+                print(f"[V4F-BOOK prepack-prefill L0 seq_idx={seq_idx} L={int(end-start)}] "
+                      f"compress={cc_stat} indexer={ic_stat} "
+                      f"seq_out_last_amean={seq_out[0,-1,:].abs().float().mean().item():.4g}",
+                      flush=True)
         self._offload_prepacked_kv(offload_kv)
         return output, None, None
 
