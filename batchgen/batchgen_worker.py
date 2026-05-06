@@ -157,6 +157,24 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
+# Optional Nsight Systems capture window for decode-forward profiling.
+# Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
+BATCHGEN_NSYS_DECODE_PROFILE = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE", "0") == "1"
+BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT = int(
+	os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT", "3")
+)
+if BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT <= 0:
+	raise ValueError("BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT must be positive")
+BATCHGEN_NSYS_DECODE_PROFILE_EXIT = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_EXIT", "1") == "1"
+
+def _parse_nsys_controller_ranks() -> Set[int]:
+	raw = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS", "0")
+	return {int(part.strip()) for part in raw.split(",") if part.strip()}
+
+BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS = _parse_nsys_controller_ranks()
+if BATCHGEN_NSYS_DECODE_PROFILE and not BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS:
+	raise ValueError("BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS must not be empty")
+
 # Decode preemption configuration (DEPRECATED: use CLI args instead)
 # --host-kv-watermark: Default 70% (when free slots exceed this threshold, prefill is prioritized)
 # --enable-decode-preemption / --no-decode-preemption: Default enabled
@@ -491,6 +509,9 @@ class BatchGenWorker:
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_signature = None
 		self._glm5_whole_model_graph_unavailable_reason = None
+		self._nsys_decode_profile_forward_count = 0
+		self._nsys_decode_profile_started = False
+		self._nsys_decode_profile_stopped = False
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -5416,6 +5437,80 @@ class BatchGenWorker:
 
 		# Enter the persistent generate loop
 		return self.generate()
+
+	def _nsys_decode_profile_begin_forward(
+		self,
+		*,
+		local_iteration: int,
+		local_bsz: int,
+		max_rank_bsz: int,
+	) -> Optional[int]:
+		"""Start an env-gated nsys decode-forward capture window."""
+		if not BATCHGEN_NSYS_DECODE_PROFILE:
+			return None
+		self._nsys_decode_profile_forward_count += 1
+		forward_idx = self._nsys_decode_profile_forward_count
+		if forward_idx > BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT:
+			return None
+
+		if (
+			self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
+			and not self._nsys_decode_profile_started
+		):
+			torch.cuda.synchronize(self.torch_device)
+			logging.info(
+				"[NSYS_DECODE_PROFILE] rank=%s starting cuda profiler capture "
+				"limit=%s controller_ranks=%s",
+				self.rank,
+				BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT,
+				sorted(BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS),
+			)
+			torch.cuda.cudart().cudaProfilerStart()
+			self._nsys_decode_profile_started = True
+
+		range_name = (
+			f"BatchGen_decode_forward_{forward_idx}"
+			f"_rank_{self.rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
+			f"_iter_{local_iteration}"
+		)
+		torch.cuda.nvtx.range_push(range_name)
+		return forward_idx
+
+	def _nsys_decode_profile_end_forward(self, forward_idx: Optional[int]) -> None:
+		"""End one env-gated nsys decode-forward range and optionally exit."""
+		if forward_idx is None:
+			return
+		torch.cuda.nvtx.range_pop()
+		if forward_idx < BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT:
+			return
+
+		torch.cuda.synchronize(self.torch_device)
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+		if (
+			self.rank in BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS
+			and not self._nsys_decode_profile_stopped
+		):
+			logging.info(
+				"[NSYS_DECODE_PROFILE] rank=%s stopping cuda profiler capture "
+				"after %s decode forwards",
+				self.rank,
+				forward_idx,
+			)
+			torch.cuda.cudart().cudaProfilerStop()
+			self._nsys_decode_profile_stopped = True
+		if dist.is_available() and dist.is_initialized():
+			dist.barrier()
+
+		if BATCHGEN_NSYS_DECODE_PROFILE_EXIT:
+			logging.info(
+				"[NSYS_DECODE_PROFILE] rank=%s exiting after %s profiled decode forwards",
+				self.rank,
+				forward_idx,
+			)
+			sys.stdout.flush()
+			sys.stderr.flush()
+			os._exit(0)
 
 	def generate(self):
 		"""
@@ -10493,6 +10588,12 @@ class BatchGenWorker:
 					gpu_manager,
 				)
 
+				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
+					local_iteration=local_iteration,
+					local_bsz=len(batch),
+					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+				)
+
 				# Forward
 				_glm5_whole_graph_active = bool(
 					getattr(self, "_glm5_whole_model_graph", False)
@@ -10806,6 +10907,7 @@ class BatchGenWorker:
 						use_cache=False
 					)
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
+				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
 
