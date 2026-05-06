@@ -8,9 +8,9 @@ on:
         required: true
         default: "nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04"
       dist_init_addr:
-        description: "Distributed initialization address"
-        required: true
-        default: "29.194.13.138:20000"
+        description: "Distributed initialization address (host:port). Defaults to the BATCHGEN_DIST_INIT_ADDR repo secret if left blank."
+        required: false
+        default: ""
       max_prompts:
         description: "Maximum number of prompts to test (0 for all)"
         required: false
@@ -31,8 +31,11 @@ on:
 jobs:
   test-node0:
     name: MMLU Test Node0
-    runs-on: [self-hosted, gpu, node0]
+    runs-on: [self-hosted, gpu, 8-gpu-h20-node0]
     timeout-minutes: 5760
+    env:
+      DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}
+      MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE0_MODEL_CACHE }}
     steps:
       - name: Print runner info
         run: |
@@ -43,10 +46,10 @@ jobs:
         run: |
           docker version
           docker info | head -n 30
-      
+
       - name: Check NVIDIA driver
         run: nvidia-smi
-      
+
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \
@@ -57,7 +60,7 @@ jobs:
             -e NCCL_OOB_NET_IFNAME="mlx5_" \
             -e NCCL_OOB_NET_ENABLE=1 \
             -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
-            -v /data2/tairan/modelscope/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
+            -v "${MODEL_CACHE_DIR}":/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
             --privileged \
             --shm-size 512g \
@@ -65,7 +68,7 @@ jobs:
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
             --node-rank 0 \
-            --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
+            --dist-init-addr "${DIST_INIT_ADDR}" \
             --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
             --max-prompts "${{ github.event.inputs.max_prompts }}" \
             --max-input-length "${{ github.event.inputs.max_input_length }}" \
@@ -74,8 +77,11 @@ jobs:
 
   test-node1:
     name: MMLU Test Node1
-    runs-on: [self-hosted, gpu, node1]
+    runs-on: [self-hosted, gpu, 8-gpu-h20-node1]
     timeout-minutes: 5760
+    env:
+      DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}
+      MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE1_MODEL_CACHE }}
     steps:
       - name: Print runner info
         run: |
@@ -86,10 +92,10 @@ jobs:
         run: |
           docker version
           docker info | head -n 30
-      
+
       - name: Check NVIDIA driver
         run: nvidia-smi
-      
+
       - name: Run MMLU Test in Container
         run: |
           docker run --rm --gpus all \
@@ -100,7 +106,7 @@ jobs:
             -e NCCL_OOB_NET_IFNAME="mlx5_" \
             -e NCCL_OOB_NET_ENABLE=1 \
             -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
-            -v /data0/.cache/hub/models/deepseek-ai/DeepSeek-R1:/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
+            -v "${MODEL_CACHE_DIR}":/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
             --network host \
             --privileged \
             --shm-size 512g \
@@ -108,7 +114,7 @@ jobs:
             ${{ github.event.inputs.image }} \
             bash .github/workflows/scripts/test-mmlu.sh \
             --node-rank 1 \
-            --dist-init-addr "${{ github.event.inputs.dist_init_addr }}" \
+            --dist-init-addr "${DIST_INIT_ADDR}" \
             --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
             --max-prompts "${{ github.event.inputs.max_prompts }}" \
             --max-input-length "${{ github.event.inputs.max_input_length }}" \

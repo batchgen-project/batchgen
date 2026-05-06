@@ -1,8 +1,4 @@
-"""Marlin weight preprocessing: convert K2.5 INT4 → Marlin packed format.
-
-Ported from batchgen_kernel_dev/moe/k25_m_variant/marlin_quant_utils.py
-with addition of K2.5 INT4 checkpoint format → Marlin converter.
-"""
+"""Marlin weight preprocessing: convert K2.5 INT4 → Marlin packed format."""
 
 import logging
 import numpy as np

@@ -128,7 +128,7 @@ class TestModelIdExtraction:
         """Verify Path.name extracts model ID correctly from various paths."""
         cases = [
             ("/data/models/moonshotai/Kimi-K2.5", "Kimi-K2.5"),
-            ("/data2/tairan/workspace/models/openai/gpt-oss-120b", "gpt-oss-120b"),
+            ("/srv/models/openai/gpt-oss-120b", "gpt-oss-120b"),
             ("DeepSeek-R1", "DeepSeek-R1"),
             ("/mnt/data/GLM-5-FP8", "GLM-5-FP8"),
         ]

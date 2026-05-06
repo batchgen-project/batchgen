@@ -19,7 +19,7 @@
 set -e
 
 # Configuration
-MODEL_PATH="${GPT_OSS_MODEL_PATH:-/data2/tairan/models/gpt-oss-120b}"
+MODEL_PATH="${GPT_OSS_MODEL_PATH:?set GPT_OSS_MODEL_PATH to the GPT-OSS-120B checkpoint dir}"
 SERVER_HOST="${SERVER_HOST:-localhost}"
 SERVER_PORT="${SERVER_PORT:-10900}"
 MAX_PROMPTS="${MAX_PROMPTS:-1024}"

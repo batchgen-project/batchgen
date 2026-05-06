@@ -3,10 +3,13 @@
 Tests basic model functionality with simple prompts.
 """
 
+import os
 import sys
 from pathlib import Path
 
-GPT_OSS_PATH = "/data2/tairan/workspace/gpt-oss"
+GPT_OSS_PATH = os.environ.get("GPT_OSS_PATH", "")
+if not GPT_OSS_PATH:
+    raise RuntimeError("Set GPT_OSS_PATH to the gpt-oss reference repo checkout.")
 sys.path.insert(0, GPT_OSS_PATH)
 
 import torch
@@ -52,7 +55,9 @@ def patched_from_checkpoint(path: str, device: str = "cuda"):
 
 
 def main():
-    checkpoint_path = "/data2/tairan/modelscope/hub/models/openai/gpt-oss-120b/original"
+    checkpoint_path = os.environ.get("GPT_OSS_CHECKPOINT_PATH", "")
+    if not checkpoint_path:
+        raise RuntimeError("Set GPT_OSS_CHECKPOINT_PATH to the GPT-OSS-120B 'original' checkpoint dir.")
     device = torch.device("cpu")
 
     # Patch the from_checkpoint method

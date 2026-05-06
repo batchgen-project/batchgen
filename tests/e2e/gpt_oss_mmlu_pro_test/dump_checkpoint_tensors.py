@@ -4,6 +4,7 @@ This script provides comprehensive knowledge of all tensors in the raw safetenso
 """
 
 import json
+import os
 from pathlib import Path
 from collections import defaultdict
 
@@ -12,7 +13,10 @@ from safetensors import safe_open
 
 
 def main():
-    checkpoint_path = Path("/data2/tairan/modelscope/hub/models/openai/gpt-oss-120b/original")
+    checkpoint_path = os.environ.get("GPT_OSS_CHECKPOINT_PATH", "")
+    if not checkpoint_path:
+        raise RuntimeError("Set GPT_OSS_CHECKPOINT_PATH to the GPT-OSS-120B 'original' checkpoint dir.")
+    checkpoint_path = Path(checkpoint_path)
 
     # Load config
     config_path = checkpoint_path / "config.json"

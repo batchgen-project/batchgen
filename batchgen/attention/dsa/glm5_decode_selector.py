@@ -1,8 +1,8 @@
 """GLM-5 DSA pre-FlashMLA decode input builder.
 
-This module owns the full eager selector segment POIS requested: decode hidden
-states and metadata enter here, existing GLM-5 DSA kernels are invoked, and the
-return value is ready for the raw FlashMLA call.
+This module owns the full eager selector segment for GLM-5 DSA decode:
+decode hidden states and metadata enter here, the GLM-5 DSA kernels are
+invoked, and the return value is ready for the raw FlashMLA call.
 """
 
 from __future__ import annotations
