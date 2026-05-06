@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+ARG CUDA_VERSION=12.8.0
+ARG PYTHON_VERSION=3.11.13
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+
+ARG PYTHON_VERSION
+ARG BUILD_PARALLEL_JOBS=2
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    HF_ENDPOINT=https://hf-mirror.com \
+    TORCH_CUDA_ARCH_LIST=9.0a \
+    MAX_JOBS=${BUILD_PARALLEL_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL_JOBS} \
+    NINJAFLAGS=-j${BUILD_PARALLEL_JOBS} \
+    MAKEFLAGS=-j${BUILD_PARALLEL_JOBS}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget git fish libnuma-dev \
+    build-essential cmake \
+    libibverbs1 libibverbs-dev ibverbs-providers rdma-core \
+    vim tmux htop tree silversearcher-ag lsof unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -o pipefail && \
+    for i in 1 2 3 4 5; do \
+      curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh && break || \
+      { echo "Attempt $i failed, retrying in 10s..."; sleep 10; }; \
+    done && \
+    uv --version
+
+WORKDIR /root/moegen
+RUN uv venv --python ${PYTHON_VERSION} --seed
+
+ENV PATH="/root/moegen/.venv/bin:$PATH"
+
+RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 \
+    setuptools wheel packaging ninja \
+    && uv cache clean
+
+RUN --mount=from=third_party,source=flash-attention,target=/tmp/src/flash-attention,readonly \
+    cp -a /tmp/src/flash-attention /root/moegen/flash-attention \
+    && cd /root/moegen/flash-attention/hopper \
+    && FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
+    && cd /root/moegen \
+    && rm -rf flash-attention \
+    && uv cache clean
+
+RUN --mount=from=third_party,source=FlashMLA,target=/tmp/src/FlashMLA,readonly \
+    cp -a /tmp/src/FlashMLA /root/moegen/FlashMLA \
+    && cd /root/moegen/FlashMLA \
+    && FLASH_MLA_DISABLE_SM100=1 uv pip install -v . --no-build-isolation \
+    && cd /root/moegen \
+    && rm -rf FlashMLA \
+    && uv cache clean
+
+RUN --mount=from=third_party,source=DeepGEMM,target=/tmp/src/DeepGEMM,readonly \
+    cp -a /tmp/src/DeepGEMM /root/moegen/DeepGEMM \
+    && cd /root/moegen/DeepGEMM \
+    && bash ./install.sh \
+    && cd /root/moegen \
+    && rm -rf DeepGEMM \
+    && uv cache clean
+
+COPY . /root/moegen
+
+RUN cd /root/moegen/batchgen_kernels \
+    && uv pip install . --no-build-isolation \
+    && uv cache clean
+
+RUN uv pip install -r requirements.txt && uv pip install . -v \
+    && uv cache clean
+
+ENV NCCL_BUFFSIZE=16777216
+
+CMD ["sleep", "infinity"]

@@ -17,6 +17,7 @@ venv/
 build/
 dist/
 *.egg-info/
+.docker-build/
 
 # Logs
 *.log

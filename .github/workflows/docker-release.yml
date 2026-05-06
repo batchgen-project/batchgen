@@ -6,13 +6,103 @@ on:
       - 'v*'
 
 jobs:
-  build-and-push:
+  prepare-third-party-sources:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fetch release build sources
+        run: |
+          mkdir -p .docker-build/third_party
+          git clone --recursive https://github.com/Dao-AILab/flash-attention.git .docker-build/third_party/flash-attention
+          git -C .docker-build/third_party/flash-attention checkout v2.8.2
+          git -C .docker-build/third_party/flash-attention submodule update --init --recursive
+          git clone --recursive https://github.com/deepseek-ai/FlashMLA.git .docker-build/third_party/FlashMLA
+          git -C .docker-build/third_party/FlashMLA checkout 1408756a88e52a25196b759eaf8db89d2b51b5a1
+          git -C .docker-build/third_party/FlashMLA submodule update --init --recursive
+          git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git .docker-build/third_party/DeepGEMM
+          git -C .docker-build/third_party/DeepGEMM checkout v2.1.1.post3
+          git -C .docker-build/third_party/DeepGEMM submodule update --init --recursive
+          find .docker-build/third_party \( -name .git -o -name .github \) -prune -exec rm -rf {} +
+          tar -C .docker-build -czf third-party-src.tar.gz third_party
+          du -h .docker-build/third-party-src.tar.gz
+
+      - name: Upload release build sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-src
+          path: .docker-build/third-party-src.tar.gz
+          retention-days: 1
+
+  build-and-push-ghcr:
+    runs-on: [self-hosted, gpu, node0]
+    needs: prepare-third-party-sources
     timeout-minutes: 360
 
     permissions:
       contents: read
       packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download release build sources
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-src
+          path: .docker-build
+
+      - name: Unpack release build sources
+        run: |
+          tar -C .docker-build -xzf .docker-build/third-party-src.tar.gz
+          ls -la .docker-build/third_party
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io \
+            --username "${GITHUB_ACTOR}" \
+            --password-stdin
+
+      - name: Extract image tags
+        id: vars
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "ghcr_image=ghcr.io/${owner}/batchgen-release:${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push GHCR image on node0
+        env:
+          DOCKER_BUILDKIT: "1"
+          GHCR_IMAGE: ${{ steps.vars.outputs.ghcr_image }}
+        run: |
+          docker build \
+            --pull=false \
+            --progress=plain \
+            --build-context third_party=.docker-build/third_party \
+            --build-arg BUILD_PARALLEL_JOBS=4 \
+            --file ./docker/Dockerfile.release-ci \
+            --tag "${GHCR_IMAGE}" \
+            .
+          docker push "${GHCR_IMAGE}"
+
+  mirror-to-dockerhub:
+    runs-on: ubuntu-latest
+    needs: build-and-push-ghcr
+    timeout-minutes: 120
+
+    permissions:
+      contents: read
+      packages: read
 
     steps:
       - name: Checkout code
@@ -25,34 +115,33 @@ jobs:
           docker system prune -af || true
           df -h
 
-      - name: Log in to DockerHub
-        env:
-          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Install skopeo
         run: |
-          for attempt in 1 2 3 4 5; do
-            echo "${DOCKERHUB_TOKEN}" | docker login \
-              --username "${DOCKERHUB_USERNAME}" \
-              --password-stdin && exit 0
-            echo "DockerHub login attempt ${attempt} failed; retrying in 30s"
-            sleep 30
-          done
-          exit 1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
 
-      - name: Extract version tag
+      - name: Extract image tags
         id: vars
         run: |
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          tag="${GITHUB_REF#refs/tags/}"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "ghcr_image=ghcr.io/${owner}/batchgen-release:${tag}" >> "${GITHUB_OUTPUT}"
+          echo "dockerhub_image=docker.io/${{ vars.DOCKERHUB_USERNAME }}/0ab602a9:${tag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build and push image
+      - name: Mirror GHCR image to DockerHub
         env:
-          DOCKER_BUILDKIT: "1"
-          IMAGE_TAG: ${{ vars.DOCKERHUB_USERNAME }}/0ab602a9:${{ steps.vars.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GHCR_IMAGE: ${{ steps.vars.outputs.ghcr_image }}
+          DOCKERHUB_IMAGE: ${{ steps.vars.outputs.dockerhub_image }}
         run: |
-          docker build \
-            --progress=plain \
-            --build-arg BUILD_PARALLEL_JOBS=1 \
-            --file ./docker/Dockerfile \
-            --tag "${IMAGE_TAG}" \
-            .
-          docker push "${IMAGE_TAG}"
+          skopeo copy \
+            --src-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" \
+            --dest-creds "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            "docker://${GHCR_IMAGE}" \
+            "docker://${DOCKERHUB_IMAGE}"
+          skopeo inspect \
+            --creds "${DOCKERHUB_USERNAME}:${DOCKERHUB_TOKEN}" \
+            "docker://${DOCKERHUB_IMAGE}" >/dev/null
