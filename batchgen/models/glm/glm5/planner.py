@@ -55,13 +55,9 @@ class GLM5Planner(BasePlanner):
         expert_per_rank = self.NUM_EXPERTS // self.world_size
         assert expert_per_rank > 0, "EXPERT_PER_RANK must be greater than 0"
 
-        if self.world_size > 8:
-            self.config.Basic_Config.attn_mode = 3
-        elif self.config.EP_Config.enable_offloading:
-            self.config.Basic_Config.attn_mode = 3
-            logging.info("EP offloading enabled on single-node: setting attn_mode=3 for decoding_continuous()")
-        else:
-            self.config.Basic_Config.attn_mode = 1
+        # GLM-5 decode must always use the continuous attention path; legacy
+        # attn modes do not support the DSA architecture.
+        self.config.Basic_Config.attn_mode = 3
 
         attn_decoding_micro_batch_size = self.MAGIC_NUM // self.max_prompt_length
         attn_decoding_micro_batch_size = 2 ** (attn_decoding_micro_batch_size.bit_length() - 1)
@@ -103,13 +99,28 @@ class GLM5Planner(BasePlanner):
                 num_local_expert_per_layer = expert_per_rank
 
             expert_size = num_local_expert_per_layer * self.EXPERT_SIZE_GB
+            moe_decode_memory_budget = (
+                available_gpu_mem
+                - model_skeleton_size
+                - cuda_page_table_default_size
+                - expert_size
+                - nccl_default_buffer_usage
+            )
+            if moe_decode_memory_budget <= 0:
+                raise RuntimeError(
+                    "GLM-5 attn_mode=3 requires all local MoE experts to be "
+                    f"persistent, but world_size={self.world_size} requires "
+                    f"{expert_per_rank} experts/rank and exceeds the planner "
+                    f"memory budget by {-moe_decode_memory_budget:.2f} GB. "
+                    "Use the validated two-node H20 configuration or an "
+                    "explicit offloading plan."
+                )
             per_seq_size = (
                 self.max_context_length * self.NUM_LAYERS * self.COMPRESSED_KV_DIM
                 / (1024 ** 3) * kv_element_size
             )
             self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = int(
-                (available_gpu_mem - model_skeleton_size - cuda_page_table_default_size -
-                 expert_size - nccl_default_buffer_usage) / per_seq_size
+                moe_decode_memory_budget / per_seq_size
             )
             logging.info(
                 f"Max Available MoE decoding micro batch size: "

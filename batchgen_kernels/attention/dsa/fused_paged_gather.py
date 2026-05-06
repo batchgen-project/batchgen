@@ -112,6 +112,88 @@ def fused_paged_gather(
     return out.view(B, num_tokens, num_heads, head_dim)
 
 
+@triton.jit
+def _dense_paged_gather_kernel(
+    blocked_kv_ptr,
+    block_table_ptr,
+    out_ptr,
+    num_tokens,
+    D: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages_per_seq: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(1)
+
+    t_start = pid_t * BLOCK_T
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    for ti in range(BLOCK_T):
+        t = t_start + ti
+        if t < num_tokens:
+            logical_page = t // page_size
+            page_offset = t - logical_page * page_size
+            page_in_table = logical_page < max_pages_per_seq
+            logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
+
+            physical_page = tl.load(
+                block_table_ptr + pid_b * max_pages_per_seq + logical_page,
+            )
+            valid = page_in_table & (physical_page >= 0)
+            physical_page = tl.maximum(physical_page, 0)
+            flat_idx = physical_page * page_size + page_offset
+
+            src = blocked_kv_ptr + flat_idx * D + d_offs
+            vals = tl.load(src, mask=d_mask, other=0.0)
+            vals = tl.where(valid, vals, tl.zeros([BLOCK_D], dtype=vals.dtype))
+
+            dst = out_ptr + (pid_b * num_tokens + t) * D + d_offs
+            tl.store(dst, vals, mask=d_mask)
+
+
+def fused_dense_paged_gather(
+    blocked_kv: torch.Tensor,
+    block_table: torch.Tensor,
+    num_tokens: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Gather dense logical token range ``[0, num_tokens)`` without token_indices."""
+
+    B = block_table.shape[0]
+    num_heads = blocked_kv.shape[2]
+    head_dim = blocked_kv.shape[3]
+    D = num_heads * head_dim
+    max_pages_per_seq = block_table.shape[1]
+    blocked_flat = blocked_kv.reshape(-1, D)
+    out = torch.empty(B, num_tokens, D, dtype=blocked_kv.dtype, device=blocked_kv.device)
+
+    BLOCK_D = triton.next_power_of_2(D)
+    total_work = B * num_tokens
+    if total_work <= 4096:
+        BLOCK_T = 1
+    elif total_work <= 32768:
+        BLOCK_T = 8
+    else:
+        BLOCK_T = 32
+
+    grid = (B, triton.cdiv(num_tokens, BLOCK_T))
+    _dense_paged_gather_kernel[grid](
+        blocked_flat,
+        block_table,
+        out,
+        num_tokens,
+        D=D,
+        page_size=page_size,
+        max_pages_per_seq=max_pages_per_seq,
+        BLOCK_T=BLOCK_T,
+        BLOCK_D=BLOCK_D,
+    )
+    return out.view(B, num_tokens, num_heads, head_dim)
+
+
 def fused_indexer_gather(
     indexer_blocked_k: torch.Tensor,  # [num_pages, page_size, 1, 128]
     block_table: torch.Tensor,
@@ -120,13 +202,11 @@ def fused_indexer_gather(
     max_seqlen: int,
 ) -> torch.Tensor:
     """Gather indexer K from paged cache for all valid positions."""
-    B = block_table.shape[0]
-    token_indices = torch.arange(
-        max_seqlen, device=block_table.device, dtype=torch.int32,
-    ).unsqueeze(0).expand(B, -1).contiguous()
-
-    return fused_paged_gather(
-        indexer_blocked_k, block_table, token_indices, page_size,
+    return fused_dense_paged_gather(
+        indexer_blocked_k,
+        block_table,
+        max_seqlen,
+        page_size,
     )
 
 

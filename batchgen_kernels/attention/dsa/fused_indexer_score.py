@@ -27,12 +27,21 @@ import triton
 import triton.language as tl
 import math
 
+from batchgen_kernels.attention.dsa.fast_topk_cuda import (
+    fast_topk_2048,
+    fast_topk_2048_out,
+)
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
-    build_module, FP8IndexerWeightsCUDA,
+    build_module,
+    FP8IndexerWeightsCUDA,
+    _validate_projection_out_buffers,
 )
 
 # Import existing CUDA fused RoPE+Hadamard kernel
-from batchgen_kernels.attention.dsa.indexer import fused_rope_hadamard as _cuda_fused_rope_hadamard
+from batchgen_kernels.attention.dsa.indexer import (
+    fused_rope_hadamard as _cuda_fused_rope_hadamard,
+    fused_rope_hadamard_out as _cuda_fused_rope_hadamard_out,
+)
 
 
 # ============================================================
@@ -69,6 +78,10 @@ class FP8WqbWeightsCUDA:
     @property
     def K(self):
         return self.inner.K
+
+    @property
+    def block_k(self):
+        return self.inner.block_k
 
 
 # ============================================================
@@ -110,6 +123,36 @@ def cuda_wq_b_proj(
     )
 
 
+def cuda_wq_b_proj_out(
+    q_a: torch.Tensor,
+    wq_b_weights: FP8WqbWeightsCUDA,
+    module,
+    x_fp8_padded: torch.Tensor,
+    x_scale: torch.Tensor,
+    a_tma_desc: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer FP8 WGMMA q_b projection for CUDA graph capture."""
+    if not q_a.is_contiguous():
+        raise ValueError("q_a must be contiguous for graph-captured q_b projection")
+    B, K = q_a.shape
+    N = wq_b_weights.N
+    _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
+
+    module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
+    module.indexer_kv_proj_gemm_only_out(
+        a_tma_desc,
+        wq_b_weights.tma_desc,
+        wq_b_weights.w_scale,
+        x_scale,
+        out,
+        B,
+        N,
+        K,
+    )
+    return out
+
+
 # ============================================================
 # Kernel: Fused Q×K scoring + head_gate + sum across heads
 # ============================================================
@@ -125,7 +168,6 @@ def _fused_score_kernel(
     B: tl.constexpr,
     n_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    softmax_scale: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -154,12 +196,205 @@ def _fused_score_kernel(
         q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
         q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
         gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
-        scores = tl.sum(k_tile * q_vec[None, :], axis=1) * softmax_scale
-        scores = tl.maximum(scores, 0.0)
+        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
         agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
 
     agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
     tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
+
+
+@triton.jit
+def _fused_paged_score_kernel(
+    Q_ptr,             # [B, n_heads, head_dim] BF16
+    K_ptr,             # [num_pages, page_size, 1, head_dim] BF16
+    BLOCK_TABLE_ptr,   # [B, max_pages_per_seq] int32/int64
+    GATES_ptr,         # [B, n_heads] FP32
+    SEQLENS_ptr,       # [B] int32
+    AGG_ptr,           # [B, max_seqlen] FP32
+    max_seqlen,
+    B: tl.constexpr,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages_per_seq: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Score Q against paged aux indexer K without dense K materialization.
+
+    Grid: (cdiv(max_seqlen, BLOCK_S), B)
+    """
+    pid_s = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    seqlen = tl.load(SEQLENS_ptr + pid_b)
+    s_mask = s_offs < seqlen
+    page_in_range = s_offs < max_seqlen
+
+    logical_page = s_offs // page_size
+    page_offset = s_offs - logical_page * page_size
+    page_in_table = logical_page < max_pages_per_seq
+    safe_logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
+    physical_page = tl.load(
+        BLOCK_TABLE_ptr + pid_b * max_pages_per_seq + safe_logical_page,
+        mask=page_in_range,
+        other=-1,
+    ).to(tl.int64)
+    k_valid = page_in_table & (physical_page >= 0)
+    physical_page = tl.maximum(physical_page, 0)
+
+    agg = tl.where(
+        s_mask,
+        tl.zeros([BLOCK_S], dtype=tl.float32),
+        float("-inf") + tl.zeros([BLOCK_S], dtype=tl.float32),
+    )
+
+    d_offs = tl.arange(0, BLOCK_D)
+    k_ptrs = K_ptr + (physical_page[:, None] * page_size + page_offset[:, None]) * head_dim + d_offs[None, :]
+    k_tile = tl.load(
+        k_ptrs,
+        mask=page_in_range[:, None] & (d_offs[None, :] < head_dim) & k_valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    q_base = pid_b * n_heads * head_dim
+    gates_base = pid_b * n_heads
+
+    for h in range(n_heads):
+        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
+        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
+        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
+        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+
+    agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
+    tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
+
+
+@triton.jit
+def _fused_paged_score_with_slots_kernel(
+    Q_ptr,             # [B, n_heads, head_dim] BF16
+    K_ptr,             # [num_pages, page_size, 1, head_dim] BF16
+    BLOCK_TABLE_ptr,   # [num_slots, max_pages_per_seq] int32/int64
+    SLOT_INDICES_ptr,  # [B] int32/int64
+    GATES_ptr,         # [B, n_heads] FP32
+    SEQLENS_ptr,       # [B] int32
+    AGG_ptr,           # [B, max_seqlen] FP32
+    max_seqlen,
+    B: tl.constexpr,
+    n_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages_per_seq: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Score Q against paged aux K using runtime slot indices."""
+
+    pid_s = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    slot = tl.load(SLOT_INDICES_ptr + pid_b).to(tl.int64)
+    slot_valid = slot >= 0
+    safe_slot = tl.maximum(slot, 0)
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    seqlen = tl.load(SEQLENS_ptr + pid_b)
+    s_mask = (s_offs < seqlen) & slot_valid
+    page_in_range = s_offs < max_seqlen
+
+    logical_page = s_offs // page_size
+    page_offset = s_offs - logical_page * page_size
+    page_in_table = logical_page < max_pages_per_seq
+    safe_logical_page = tl.minimum(logical_page, max_pages_per_seq - 1)
+    physical_page = tl.load(
+        BLOCK_TABLE_ptr + safe_slot * max_pages_per_seq + safe_logical_page,
+        mask=page_in_range & slot_valid & page_in_table,
+        other=-1,
+    ).to(tl.int64)
+    k_valid = slot_valid & page_in_table & (physical_page >= 0)
+    physical_page = tl.maximum(physical_page, 0)
+
+    agg = tl.where(
+        s_mask,
+        tl.zeros([BLOCK_S], dtype=tl.float32),
+        float("-inf") + tl.zeros([BLOCK_S], dtype=tl.float32),
+    )
+
+    d_offs = tl.arange(0, BLOCK_D)
+    k_ptrs = K_ptr + (physical_page[:, None] * page_size + page_offset[:, None]) * head_dim + d_offs[None, :]
+    k_tile = tl.load(
+        k_ptrs,
+        mask=page_in_range[:, None] & (d_offs[None, :] < head_dim) & k_valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    q_base = pid_b * n_heads * head_dim
+    gates_base = pid_b * n_heads
+
+    for h in range(n_heads):
+        q_ptrs = Q_ptr + q_base + h * head_dim + d_offs
+        q_vec = tl.load(q_ptrs, mask=d_offs < head_dim, other=0.0).to(tl.float32)
+        gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
+        scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        agg += tl.where(s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32))
+
+    agg_ptrs = AGG_ptr + pid_b * max_seqlen + s_offs
+    tl.store(agg_ptrs, agg, mask=s_offs < max_seqlen)
+
+
+@triton.jit
+def _topk_from_scores_kernel(
+    AGG_ptr,           # [B, max_seqlen] FP32
+    OUT_ptr,           # [B, topk] int64/int32
+    max_seqlen: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Select top-k indices from one row of scores.
+
+    One Triton program owns one batch row. It first finds a score threshold whose
+    greater-than set is smaller than ``topk``, compacts that set to the output,
+    then repairs the remaining slots with exact repeated maxima from the residual
+    values. This keeps the common GLM case near O(log(score_range) * N) instead
+    of O(topk * N), while preserving the exact top-k set.
+    """
+
+    pid_b = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    mask = offs < max_seqlen
+    vals = tl.load(
+        AGG_ptr + pid_b * max_seqlen + offs,
+        mask=mask,
+        other=float("-inf"),
+    )
+    idxs = offs
+
+    lo = tl.min(tl.where(mask, vals, float("inf")), axis=0)
+    hi = tl.max(vals, axis=0)
+
+    for _ in range(32):
+        mid = (lo + hi) * 0.5
+        n_ge = tl.sum(tl.where(vals >= mid, 1, 0), axis=0)
+        lo = tl.where(n_ge >= topk, mid, lo)
+        hi = tl.where(n_ge >= topk, hi, mid)
+
+    selected_hi = vals > hi
+    ranks = tl.cumsum(tl.where(selected_hi, 1, 0), 0) - 1
+    tl.store(
+        OUT_ptr + pid_b * topk + ranks,
+        idxs,
+        mask=selected_hi & (ranks < topk),
+    )
+
+    vals = tl.where(selected_hi, float("-inf"), vals)
+    out_pos = tl.sum(tl.where(selected_hi, 1, 0), axis=0)
+    while out_pos < topk:
+        best_val = tl.max(vals, axis=0)
+        best_idx = tl.max(tl.where(vals == best_val, idxs, 0), axis=0)
+        tl.store(OUT_ptr + pid_b * topk + out_pos, best_idx)
+        vals = tl.where(idxs == best_idx, float("-inf"), vals)
+        out_pos += 1
 
 
 # ============================================================
@@ -167,28 +402,27 @@ def _fused_score_kernel(
 # ============================================================
 
 def compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim):
-    """Compute GLM-5 indexer head gates. Pure GPU, no sync."""
-    # Match the PyTorch fallback/model path: BF16 hidden_states and BF16
-    # weights are multiplied in the module's dtype, then promoted for the
-    # downstream FP32 aggregation. Forcing FP32 here changes borderline top-k
-    # ordering relative to score_and_select_relu_gated().
-    gates = torch.nn.functional.linear(hidden_states, weights_proj_weight).float()
-    scale = n_heads ** -0.5
-    return gates * scale
+    """Compute pre-scaled head gates. Pure GPU, no sync."""
+    gates = torch.nn.functional.linear(hidden_states.float(), weights_proj_weight.float())
+    scale = (n_heads ** -0.5) * (head_dim ** -0.5)
+    return (gates * scale).to(torch.float32)
 
 
-def fused_score_and_topk(
+def _score_into_dense_agg(
     q: torch.Tensor,
     cached_k: torch.Tensor,
     head_gates: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    topk: int = 2048,
+    agg: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused scoring + topk. No CPU-GPU sync."""
     B, n_heads, head_dim = q.shape
     max_seqlen = cached_k.shape[1]
-
-    agg = torch.empty(B, max_seqlen, dtype=torch.float32, device=q.device)
+    if agg.shape != (B, max_seqlen):
+        raise ValueError(
+            f"agg must have shape {(B, max_seqlen)}, got {tuple(agg.shape)}"
+        )
+    if agg.dtype != torch.float32:
+        raise TypeError(f"agg must be float32, got {agg.dtype}")
 
     BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
     BLOCK_D = head_dim
@@ -198,15 +432,257 @@ def fused_score_and_topk(
         q, cached_k, head_gates, cache_seqlens,
         agg, max_seqlen,
         B=B, n_heads=n_heads, head_dim=head_dim,
-        softmax_scale=head_dim ** -0.5,
         BLOCK_S=BLOCK_S, BLOCK_D=BLOCK_D,
     )
 
-    # topk — no .item() sync. In production cache_seqlens >= topk always.
-    # Invalid positions are -inf from kernel, so topk naturally picks valid ones.
-    effective_topk = min(topk, max_seqlen)
-    _, top_k_indices = torch.topk(agg, effective_topk, dim=-1)
+    return agg
 
+
+def fused_score_and_topk(
+    q: torch.Tensor,
+    cached_k: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    topk: int = 2048,
+) -> torch.Tensor:
+    """Fused scoring + eager top-k.
+
+    The allocation-returning path is used by eager GLM-5 decode.  Keep the
+    expensive score computation fused, then use the radix CUDA top-k path for
+    production-sized ``index_topk=2048`` contexts; smaller test shapes fall back
+    to PyTorch top-k.
+    """
+    B = q.shape[0]
+    max_seqlen = cached_k.shape[1]
+    effective_topk = min(topk, max_seqlen)
+    agg = torch.empty(B, max_seqlen, dtype=torch.float32, device=q.device)
+    _score_into_dense_agg(q, cached_k, head_gates, cache_seqlens, agg)
+    if effective_topk == 2048 and cache_seqlens.dtype == torch.int32 and q.is_cuda:
+        return fast_topk_2048(agg, cache_seqlens)
+    _, top_k_indices = torch.topk(agg, effective_topk, dim=-1)
+    return top_k_indices
+
+
+def fused_score_and_topk_out(
+    q: torch.Tensor,
+    cached_k: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    topk: int = 2048,
+) -> torch.Tensor:
+    """Out-buffer fused scoring + custom Triton top-k for CUDA graph capture."""
+    B, n_heads, head_dim = q.shape
+    max_seqlen = cached_k.shape[1]
+    if topk > max_seqlen:
+        raise ValueError(f"topk={topk} exceeds max_seqlen={max_seqlen}")
+    if agg.shape != (B, max_seqlen):
+        raise ValueError(
+            f"agg must have shape {(B, max_seqlen)}, got {tuple(agg.shape)}"
+        )
+    if agg.dtype != torch.float32:
+        raise TypeError(f"agg must be float32, got {agg.dtype}")
+    if top_k_indices.shape != (B, topk):
+        raise ValueError(
+            f"top_k_indices must have shape {(B, topk)}, got {tuple(top_k_indices.shape)}"
+        )
+    if top_k_indices.dtype not in (torch.int64, torch.int32):
+        raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
+
+    _score_into_dense_agg(q, cached_k, head_gates, cache_seqlens, agg)
+
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
+
+    return top_k_indices
+
+
+def fused_paged_score_and_topk_out(
+    q: torch.Tensor,
+    aux_blocked_k: torch.Tensor,
+    aux_page_table: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    *,
+    topk: int = 2048,
+    page_size: int = 64,
+    max_seqlen: int | None = None,
+) -> torch.Tensor:
+    """Out-buffer score+top-k directly from paged aux indexer K.
+
+    This is the production graph path for GLM-5 DSA scoring.  It avoids the
+    temporary dense ``[B, max_seqlen, 128]`` aux-K tensor.
+    """
+    B, n_heads, head_dim = q.shape
+    if max_seqlen is None:
+        max_seqlen = agg.shape[1]
+    if aux_blocked_k.ndim != 4:
+        raise ValueError(
+            "aux_blocked_k must have shape [num_pages, page_size, 1, head_dim], "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_blocked_k.shape[1] != page_size:
+        raise ValueError(f"aux page size mismatch: {aux_blocked_k.shape[1]} != {page_size}")
+    if aux_blocked_k.shape[2] != 1 or aux_blocked_k.shape[3] != head_dim:
+        raise ValueError(
+            f"aux_blocked_k must have one head and dim {head_dim}, "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_page_table.shape[0] != B:
+        raise ValueError(
+            f"aux_page_table batch dim {aux_page_table.shape[0]} must match q batch {B}"
+        )
+    if head_gates.shape != (B, n_heads):
+        raise ValueError(f"head_gates must have shape {(B, n_heads)}, got {tuple(head_gates.shape)}")
+    if cache_seqlens.shape != (B,):
+        raise ValueError(f"cache_seqlens must have shape {(B,)}, got {tuple(cache_seqlens.shape)}")
+    if agg.shape != (B, max_seqlen) or agg.dtype != torch.float32:
+        raise ValueError(
+            f"agg must be float32 with shape {(B, max_seqlen)}, got {tuple(agg.shape)} {agg.dtype}"
+        )
+    if topk > max_seqlen:
+        raise ValueError(f"topk={topk} exceeds max_seqlen={max_seqlen}")
+    if top_k_indices.shape != (B, topk):
+        raise ValueError(
+            f"top_k_indices must have shape {(B, topk)}, got {tuple(top_k_indices.shape)}"
+        )
+    if top_k_indices.dtype not in (torch.int64, torch.int32):
+        raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
+
+    BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
+    BLOCK_D = head_dim
+    grid = (triton.cdiv(max_seqlen, BLOCK_S), B)
+    _fused_paged_score_kernel[grid](
+        q,
+        aux_blocked_k.reshape(-1, head_dim),
+        aux_page_table,
+        head_gates,
+        cache_seqlens,
+        agg,
+        max_seqlen,
+        B=B,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        max_pages_per_seq=aux_page_table.shape[1],
+        BLOCK_S=BLOCK_S,
+        BLOCK_D=BLOCK_D,
+    )
+
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
+    return top_k_indices
+
+
+def fused_paged_score_and_topk_with_slots_out(
+    q: torch.Tensor,
+    aux_blocked_k: torch.Tensor,
+    aux_page_table: torch.Tensor,
+    aux_slot_indices: torch.Tensor,
+    head_gates: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    agg: torch.Tensor,
+    top_k_indices: torch.Tensor,
+    *,
+    topk: int = 2048,
+    page_size: int = 64,
+    max_seqlen: int | None = None,
+) -> torch.Tensor:
+    """Out-buffer score+top-k from full aux page table plus slot indices."""
+
+    B, n_heads, head_dim = q.shape
+    if max_seqlen is None:
+        max_seqlen = agg.shape[1]
+    if aux_blocked_k.ndim != 4:
+        raise ValueError(
+            "aux_blocked_k must have shape [num_pages, page_size, 1, head_dim], "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_blocked_k.shape[1] != page_size:
+        raise ValueError(f"aux page size mismatch: {aux_blocked_k.shape[1]} != {page_size}")
+    if aux_blocked_k.shape[2] != 1 or aux_blocked_k.shape[3] != head_dim:
+        raise ValueError(
+            f"aux_blocked_k must have one head and dim {head_dim}, "
+            f"got {tuple(aux_blocked_k.shape)}"
+        )
+    if aux_page_table.ndim != 2:
+        raise ValueError(f"aux_page_table must be 2-D, got {tuple(aux_page_table.shape)}")
+    if aux_slot_indices.shape != (B,):
+        raise ValueError(
+            f"aux_slot_indices must have shape {(B,)}, got {tuple(aux_slot_indices.shape)}"
+        )
+    if aux_slot_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"aux_slot_indices must be int32/int64, got {aux_slot_indices.dtype}")
+    if head_gates.shape != (B, n_heads):
+        raise ValueError(f"head_gates must have shape {(B, n_heads)}, got {tuple(head_gates.shape)}")
+    if cache_seqlens.shape != (B,):
+        raise ValueError(f"cache_seqlens must have shape {(B,)}, got {tuple(cache_seqlens.shape)}")
+    if agg.shape != (B, max_seqlen) or agg.dtype != torch.float32:
+        raise ValueError(
+            f"agg must be float32 with shape {(B, max_seqlen)}, got {tuple(agg.shape)} {agg.dtype}"
+        )
+    if topk > max_seqlen:
+        raise ValueError(f"topk={topk} exceeds max_seqlen={max_seqlen}")
+    if top_k_indices.shape != (B, topk):
+        raise ValueError(
+            f"top_k_indices must have shape {(B, topk)}, got {tuple(top_k_indices.shape)}"
+        )
+    if top_k_indices.dtype not in (torch.int64, torch.int32):
+        raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
+
+    BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
+    BLOCK_D = head_dim
+    grid = (triton.cdiv(max_seqlen, BLOCK_S), B)
+    _fused_paged_score_with_slots_kernel[grid](
+        q,
+        aux_blocked_k.reshape(-1, head_dim),
+        aux_page_table,
+        aux_slot_indices,
+        head_gates,
+        cache_seqlens,
+        agg,
+        max_seqlen,
+        B=B,
+        n_heads=n_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        max_pages_per_seq=aux_page_table.shape[1],
+        BLOCK_S=BLOCK_S,
+        BLOCK_D=BLOCK_D,
+    )
+
+    if topk == 2048 and top_k_indices.dtype == torch.int32:
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+    else:
+        block_n = triton.next_power_of_2(max_seqlen)
+        _topk_from_scores_kernel[(B,)](
+            agg,
+            top_k_indices,
+            max_seqlen=max_seqlen,
+            topk=topk,
+            BLOCK_N=block_n,
+        )
     return top_k_indices
 
 
@@ -278,6 +754,40 @@ def rope_hadamard_q(q, cos_table, sin_table, positions, rope_dim=64):
     return q_out
 
 
+def rope_hadamard_q_out(
+    q: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    positions_expanded: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Out-buffer CUDA RoPE + Hadamard for graph capture.
+
+    ``positions_expanded`` must already have shape ``[B * n_heads]`` to avoid
+    allocating inside the captured segment.
+    """
+    B, n_heads, head_dim = q.shape
+    if head_dim != 128:
+        raise ValueError(f"GLM-5 DSA RoPE+Hadamard requires head_dim=128, got {head_dim}")
+    if out.shape != q.shape or out.dtype != q.dtype:
+        raise ValueError(f"out must match q shape/dtype, got {out.shape} {out.dtype}")
+    if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
+        raise TypeError("cos_table and sin_table must be float32 for graph-captured RoPE+Hadamard")
+    if positions_expanded.shape != (B * n_heads,) or positions_expanded.dtype != torch.int64:
+        raise ValueError(
+            f"positions_expanded must be int64 with shape {(B * n_heads,)}, "
+            f"got {positions_expanded.shape} {positions_expanded.dtype}"
+        )
+    return _cuda_fused_rope_hadamard_out(
+        q.reshape(B * n_heads, head_dim),
+        cos_table,
+        sin_table,
+        positions_expanded,
+        out.reshape(B * n_heads, head_dim),
+        128 ** -0.5,
+    )
+
+
 def rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim=64):
     """PyTorch fallback for RoPE + Hadamard (reference/test only)."""
     head_dim = q.shape[-1]
@@ -305,7 +815,7 @@ def fused_score_pipeline(
     cache_seqlens,          # [B] int32
     wq_b_weights,           # FP8WqbWeightsCUDA
     weights_proj_weight,    # [32, 6144] BF16
-    cos_table, sin_table,   # [max_pos, 64] FP32 — RoPE tables
+    cos_table, sin_table,   # [max_pos, 64] BF16 — RoPE tables
     positions,              # [B] int64
     module,                 # CUDA module from build_module()
     n_heads=32,
@@ -318,7 +828,7 @@ def fused_score_pipeline(
     Step 1: CUDA WGMMA wq_b projection [B, 2048] → [B, 4096]
     Step 2-3: RoPE + Hadamard on Q [B, 32, 128]
     Step 4-8: Fused scoring kernel (Triton)
-    Step 9: torch.topk on aggregated [B, max_seqlen]
+    Step 9: custom Triton top-k on aggregated [B, max_seqlen]
     """
     B = q_a.shape[0]
 
@@ -357,16 +867,14 @@ def reference_score_and_select(
     # RoPE + Hadamard (PyTorch reference)
     q = rope_hadamard_q_pytorch(q, cos_table, sin_table, positions, rope_dim)
 
-    # Head gates: weights_proj(hidden) * n_heads^-0.5.
+    # Head gates
     head_gates = compute_head_gates(hidden_states, weights_proj_weight, n_heads, head_dim)
 
-    # Q×K scoring — chunked per-head to avoid OOM at large seqlens.
-    # Match GLM-5 indexer semantics: ReLU(QK * head_dim^-0.5) before head gating.
+    # Q×K scoring — chunked per-head to avoid OOM at large seqlens
     aggregated = torch.zeros(B, max_seqlen, dtype=torch.float32, device=q.device)
     q_f = q.float()
     for h in range(n_heads):
-        s = torch.bmm(q_f[:, h:h+1, :], cached_k.float().transpose(1, 2)) * (head_dim ** -0.5)
-        s = torch.relu(s)
+        s = torch.bmm(q_f[:, h:h+1, :], cached_k.float().transpose(1, 2))
         aggregated += s.squeeze(1) * head_gates[:, h:h+1]
     pos_idx = torch.arange(max_seqlen, device=q.device).unsqueeze(0)
     mask = pos_idx >= cache_seqlens.unsqueeze(1)

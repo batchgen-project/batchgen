@@ -351,6 +351,7 @@ class WorkerManager:
         max_context_length: Optional[int] = None,
         sampling_params: Optional[List[Dict[str, Any]]] = None,
         per_sequence_max_tokens: Optional[List[int]] = None,
+        batchgen_debug: Optional[Dict[str, Any]] = None,
     ) -> List[Any]:
         if not self.started:
             raise RuntimeError("WorkerManager has not been started")
@@ -369,6 +370,8 @@ class WorkerManager:
         # Per-sequence max output token limits
         if per_sequence_max_tokens is not None:
             payload["per_sequence_max_tokens"] = per_sequence_max_tokens
+        if batchgen_debug:
+            payload["batchgen_debug"] = batchgen_debug
         # Incremental writer metadata (only included when active)
         if incremental_output_dir and custom_id_map:
             payload["incremental_output_dir"] = incremental_output_dir

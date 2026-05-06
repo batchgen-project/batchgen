@@ -72,8 +72,9 @@ class GLM5Initializer:
         logging.info(f"Current device total memory: {total_memory} GB")
 
         # KV storage config
+        max_prompt_length = self.engine_config.Basic_Config.get_max_prompt_length()
         self.engine_config.KV_Storage_Config.reserved_length = (
-            self.engine_config.Basic_Config.padding_length
+            max_prompt_length
             + self.engine_config.Basic_Config.max_decoding_length
         )
         self.engine_config.KV_Storage_Config.slot_byte_size = (
@@ -97,7 +98,7 @@ class GLM5Initializer:
             self.engine_config.Module_Batching_Config.attn_decoding_micro_batch_size
             * (
                 self.engine_config.Basic_Config.max_decoding_length
-                + self.engine_config.Basic_Config.padding_length
+                + max_prompt_length
             )
         )
 
@@ -147,12 +148,6 @@ class GLM5Initializer:
         model_config.head_dim = 256  # qk_nope + qk_rope = 192 + 64
         model_config.compressed_kv_dim = 576  # kv_lora_rank + qk_rope_head_dim
         model_config.first_k_dense_replace = 3
-        # Propagate index_topk so the worker's per-step _dsa_short_count
-        # hoist (batchgen_worker.py:8902-8908) can activate. Without this,
-        # the hoist silently no-ops and every layer falls into the
-        # `_short_mask.sum().item()` fallback in wrappers.py:846 — 78×
-        # per step of 8-byte DtoH syncs. (DSA-only model.)
-        model_config.index_topk = 2048
         return model_config
 
     def Init(self, weights_storage):

@@ -67,10 +67,14 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
     # Num threads (deprecated)
     engine_config.Basic_Config.num_threads = 0
 
-    # Padding / decoding lengths
-    if not input_arguments.get('padding_length', None):
-        raise ValueError("Padding length must be specified")
-    engine_config.Basic_Config.padding_length = input_arguments.padding_length
+    # Prompt / decoding lengths
+    max_prompt_length = (
+        input_arguments.get("max_prompt_length", None)
+        or input_arguments.get("padding_length", None)
+    )
+    if not max_prompt_length:
+        raise ValueError("Max prompt length must be specified")
+    engine_config.Basic_Config.set_max_prompt_length(max_prompt_length)
 
     if not input_arguments.get('max_decoding_length', None):
         raise ValueError("Max decoding length must be specified")

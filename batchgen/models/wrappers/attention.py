@@ -25,7 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
-from typing import ClassVar, Dict, List, Optional, Sequence
+from typing import Any, ClassVar, Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     kv_quantization_factor: ClassVar[Optional[List]] = None
     kv_append_callback: ClassVar[Optional[callable]] = None
     kv_append_callback_aux: ClassVar[Optional[callable]] = None
+    batchgen_debug: ClassVar[Optional[Dict[str, Any]]] = None
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
@@ -74,7 +75,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     # KVAsyncTask futures; if Python discards them (fire-and-forget), the
     # CPU thread that queues cudaMemcpyAsync may not have run yet by the
     # time decode starts reading the host KV. Capture each task here and
-    # .wait() on them before exiting prefill.
+    # .wait() on it before releasing the pinned source tensor references.
     pending_prefill_offload_tasks: ClassVar[list] = []
     # Tensor references kept alive for the duration of the async offload.
     # Mirrors the decode side's `_pending_kv_append_tensors`. The C++ async
@@ -83,8 +84,74 @@ class AttnWrapperBase(BaseModuleWrapper):
     # held — and with `expandable_segments:True` plus multi-seq packed prefill
     # the allocator may then hand the same physical pages to a later layer's
     # K/V tensor while the d2h memcpy is still in flight. Holding the source
-    # tensors here pins the storage until the wait at end-of-prefill.
+    # tensors here pins the storage until the next-layer or end-of-prefill
+    # retire point confirms the memcpy has completed.
     pending_prefill_offload_tensors: ClassVar[list] = []
+    pending_prefill_offload_layer_idx: ClassVar[Optional[int]] = None
+
+    @classmethod
+    def _prefill_offload_sync_device(cls, device: Optional[torch.device]) -> None:
+        if device is None or not torch.cuda.is_available():
+            return
+        sync_device = device if isinstance(device, torch.device) else torch.device(device)
+        if sync_device.type == "cuda":
+            torch.cuda.synchronize(sync_device)
+
+    @classmethod
+    def retire_pending_prefill_offloads(
+        cls,
+        *,
+        device: Optional[torch.device] = None,
+        reason: str = "",
+    ) -> int:
+        pending = cls.pending_prefill_offload_tasks
+        pinned = cls.pending_prefill_offload_tensors
+        if not pending and not pinned:
+            cls.pending_prefill_offload_layer_idx = None
+            return 0
+
+        num_tasks = len(pending)
+        for task in pending:
+            task.wait()
+        pending.clear()
+        cls._prefill_offload_sync_device(device)
+        pinned.clear()
+
+        layer_idx = cls.pending_prefill_offload_layer_idx
+        cls.pending_prefill_offload_layer_idx = None
+        if num_tasks:
+            suffix = f" ({reason})" if reason else ""
+            logging.debug(
+                f"[PREFILL_SYNC] retired {num_tasks} async KV offload tasks"
+                f" from layer {layer_idx}{suffix}"
+            )
+        return num_tasks
+
+    @classmethod
+    def retire_pending_prefill_offloads_before_layer(
+        cls,
+        layer_idx: int,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> int:
+        pending_layer = cls.pending_prefill_offload_layer_idx
+        if pending_layer is None or pending_layer == layer_idx:
+            return 0
+        return cls.retire_pending_prefill_offloads(
+            device=device,
+            reason=f"before layer {layer_idx}",
+        )
+
+    @classmethod
+    def pin_prefill_offload_tensor(cls, tensor: torch.Tensor, layer_idx: int) -> None:
+        cls.pending_prefill_offload_layer_idx = layer_idx
+        cls.pending_prefill_offload_tensors.append(tensor)
+
+    @classmethod
+    def track_prefill_offload_task(cls, task: object, layer_idx: int) -> None:
+        cls.pending_prefill_offload_layer_idx = layer_idx
+        if task is not None:
+            cls.pending_prefill_offload_tasks.append(task)
 
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
@@ -103,13 +170,12 @@ class AttnWrapperBase(BaseModuleWrapper):
     # Set once per decode step by the worker so per-layer _forward_decode_dsa
     # branches on it without doing a D2H .sum().item() 78 times per step.
     _dsa_short_count: ClassVar[Optional[int]] = None
-    # DSA per-step slot-index hoists: build_batch_slot_indices() used to run
-    # per-layer inside _forward_decode_dsa, producing two tiny int32 HtoD
-    # copies per layer (×78 → 156 HtoDs/step). Inputs (cur_batch +
-    # seq_id_to_slot mapping) are step-constant, so the worker fills these
-    # once before the model forward and wrappers read them back.
-    primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
-    aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
+    # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
+    # rows instead of deriving slot count from cur_batch.
+    glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)

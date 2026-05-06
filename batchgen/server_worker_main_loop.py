@@ -449,6 +449,7 @@ def _server_worker_main_impl(
 			top_p = task_data.get("top_p", None)
 			sampling_params = task_data.get("sampling_params", None)
 			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
+			batchgen_debug = task_data.get("batchgen_debug", None)
 			if global_rank == 0:
 				if sampling_params:
 					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
@@ -480,6 +481,7 @@ def _server_worker_main_impl(
 					worker.set_per_sequence_sampling_params(sampling_params)
 				else:
 					worker.set_sampling_params(temperature=temperature, top_p=top_p)
+				worker.set_batchgen_debug(batchgen_debug)
 				local_results = worker.process_new_batch(
 					global_prompts,
 					per_sequence_max_tokens=per_sequence_max_tokens,
