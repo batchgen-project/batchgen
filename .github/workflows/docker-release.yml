@@ -59,10 +59,6 @@ jobs:
               "$@" \
               "${url}" | tar -xz --strip-components=1 -C "${dest}"
           }
-          download_archive \
-            "https://codeload.github.com/EfficientMoE/BatchGen/tar.gz/${GITHUB_REF#refs/tags/}" \
-            "${context_dir}" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}"
           third_party="${context_dir}/.docker-build/third_party"
           download_archive \
             "https://codeload.github.com/Dao-AILab/flash-attention/tar.gz/v2.8.2" \
