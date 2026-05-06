@@ -64,9 +64,6 @@ jobs:
             "https://codeload.github.com/Dao-AILab/flash-attention/tar.gz/v2.8.2" \
             "${third_party}/flash-attention"
           download_archive \
-            "https://codeload.github.com/ROCm/composable_kernel/tar.gz/663992e99b412991eab554b0deb89bb916d40161" \
-            "${third_party}/flash-attention/csrc/composable_kernel"
-          download_archive \
             "https://codeload.github.com/NVIDIA/cutlass/tar.gz/dc4817921edda44a549197ff3a9dcf5df0636e7b" \
             "${third_party}/flash-attention/csrc/cutlass"
           download_archive \
