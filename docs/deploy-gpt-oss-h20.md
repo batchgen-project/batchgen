@@ -202,4 +202,4 @@ with open("reasoning_requests.jsonl", "w") as f:
 ## Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/EfficientMoE/BatchGen/issues
+- GitHub Issues: https://github.com/batchgen-project/batchgen/issues

@@ -1,0 +1,9 @@
+# CODEOWNERS for batchgen-project/batchgen
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Owners listed here are auto-requested for review on matching PRs.
+# Used in conjunction with the `main` branch protection rule's
+# "Require review from Code Owners" setting.
+
+# Default owner for everything not matched below.
+*                                                   @Andrewxu313

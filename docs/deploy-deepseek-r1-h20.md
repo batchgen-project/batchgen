@@ -541,4 +541,4 @@ for batch in batches:
 ## Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/EfficientMoE/BatchGen/issues
+- GitHub Issues: https://github.com/batchgen-project/batchgen/issues
