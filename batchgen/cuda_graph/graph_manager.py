@@ -20,6 +20,7 @@ Usage:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
@@ -171,6 +172,10 @@ class CUDAGraphManager:
 
         self._total_capture_time_ms: float = 0.0
         self._is_captured: bool = False
+        self._memory_diag_enabled = os.environ.get(
+            "BATCHGEN_CUDA_GRAPH_MEMORY_DIAG", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self._capture_memory_stats: List[Dict[str, Any]] = []
 
     @property
     def is_captured(self) -> bool:
@@ -237,6 +242,10 @@ class CUDAGraphManager:
         self, name: str, segment: CapturableSegment, bucket_size: int
     ) -> None:
         """Warmup and capture a single graph for one segment at one bucket size."""
+        memory_record = self._new_capture_memory_record(name, bucket_size)
+        phase_start = self._capture_memory_snapshot()
+        overall_start = phase_start
+
         # 1. Allocate static input buffers
         input_specs = segment.get_static_input_specs(bucket_size)
         static_inputs = {}
@@ -246,6 +255,9 @@ class CUDAGraphManager:
             t = torch.full(shape, spec.fill_value, dtype=spec.dtype, device=self.device)
             static_inputs[key] = t
             fill_values[key] = spec.fill_value
+        phase_start = self._record_capture_memory_phase(
+            memory_record, "static_input_allocation", phase_start
+        )
 
         # 1b. Pre-allocate internal buffers if segment supports it
         # (e.g. MoESegment needs TMA descriptors and intermediate buffers
@@ -254,17 +266,26 @@ class CUDAGraphManager:
             segment.setup_static_buffers(bucket_size)
         if hasattr(segment, 'initialize_static_inputs'):
             segment.initialize_static_inputs(static_inputs, bucket_size)
+        phase_start = self._record_capture_memory_phase(
+            memory_record, "segment_setup", phase_start
+        )
 
         # 2. Warmup on current stream
         for _ in range(self.WARMUP_ITERATIONS):
             with torch.inference_mode():
                 segment.forward(**static_inputs)
+        phase_start = self._record_capture_memory_phase(
+            memory_record, "warmup", phase_start
+        )
 
         # 3. Capture on current stream with shared pool
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._pool):
             with torch.inference_mode():
                 static_outputs = segment.forward(**static_inputs)
+        phase_start = self._record_capture_memory_phase(
+            memory_record, "graph_capture", phase_start
+        )
 
         # Normalize outputs to dict
         if not isinstance(static_outputs, dict):
@@ -277,6 +298,7 @@ class CUDAGraphManager:
             static_outputs=static_outputs,
             input_fill_values=fill_values,
         )
+        self._finish_capture_memory_record(memory_record, overall_start, phase_start)
 
 
     # -- Replay -------------------------------------------------------------
@@ -353,8 +375,101 @@ class CUDAGraphManager:
                 name: list(graphs.keys())
                 for name, graphs in self._graphs.items()
             },
+            "capture_memory_diag_enabled": getattr(
+                self, "_memory_diag_enabled", False
+            ),
+            "capture_memory_stats": list(getattr(
+                self, "_capture_memory_stats", []
+            )),
         }
         return stats
+
+    # -- Capture memory diagnostics ----------------------------------------
+
+    def _new_capture_memory_record(
+        self, name: str, bucket_size: int
+    ) -> Optional[Dict[str, Any]]:
+        if not getattr(self, "_memory_diag_enabled", False):
+            return None
+        return {"segment": name, "bucket_size": bucket_size, "phases": []}
+
+    def _capture_memory_snapshot(self) -> Optional[Dict[str, int]]:
+        if not getattr(self, "_memory_diag_enabled", False):
+            return None
+        if not torch.cuda.is_available() or self.device.type != "cuda":
+            return None
+
+        torch.cuda.synchronize(self.device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        return {
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "used_bytes": int(total_bytes - free_bytes),
+            "allocated_bytes": int(torch.cuda.memory_allocated(self.device)),
+            "reserved_bytes": int(torch.cuda.memory_reserved(self.device)),
+        }
+
+    @staticmethod
+    def _memory_delta(
+        before: Dict[str, int],
+        after: Dict[str, int],
+    ) -> Dict[str, int]:
+        return {
+            "free_delta_bytes": after["free_bytes"] - before["free_bytes"],
+            "used_delta_bytes": after["used_bytes"] - before["used_bytes"],
+            "allocated_delta_bytes": (
+                after["allocated_bytes"] - before["allocated_bytes"]
+            ),
+            "reserved_delta_bytes": (
+                after["reserved_bytes"] - before["reserved_bytes"]
+            ),
+        }
+
+    def _record_capture_memory_phase(
+        self,
+        record: Optional[Dict[str, Any]],
+        phase: str,
+        before: Optional[Dict[str, int]],
+    ) -> Optional[Dict[str, int]]:
+        if record is None or before is None:
+            return None
+        after = self._capture_memory_snapshot()
+        if after is None:
+            return None
+
+        delta = self._memory_delta(before, after)
+        record["phases"].append(
+            {
+                "phase": phase,
+                "before": before,
+                "after": after,
+                "delta": delta,
+            }
+        )
+        logger.info(
+            "[CUDA_GRAPH_MEMORY] segment=%s bucket=%s phase=%s "
+            "used_delta=%.2fMiB allocated_delta=%.2fMiB "
+            "reserved_delta=%.2fMiB free_delta=%.2fMiB",
+            record["segment"],
+            record["bucket_size"],
+            phase,
+            delta["used_delta_bytes"] / (1024 ** 2),
+            delta["allocated_delta_bytes"] / (1024 ** 2),
+            delta["reserved_delta_bytes"] / (1024 ** 2),
+            delta["free_delta_bytes"] / (1024 ** 2),
+        )
+        return after
+
+    def _finish_capture_memory_record(
+        self,
+        record: Optional[Dict[str, Any]],
+        overall_start: Optional[Dict[str, int]],
+        overall_end: Optional[Dict[str, int]],
+    ) -> None:
+        if record is None or overall_start is None or overall_end is None:
+            return
+        record["total_delta"] = self._memory_delta(overall_start, overall_end)
+        self._capture_memory_stats.append(record)
 
     def has_graph(self, name: str, batch_size: int) -> bool:
         """Check if a graph exists for the given segment and batch size."""
