@@ -322,6 +322,20 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.equal(graph_aux_cache, eager_aux_cache)
     assert torch.count_nonzero(graph_primary_cache[2:]).item() == 0
     assert torch.count_nonzero(graph_aux_cache[:2]).item() == 0
+    buffers = shared_buffers[bucket_size]
+    static_outputs = segment._outputs[bucket_size]
+    assert torch.count_nonzero(buffers.selected_mla_kv[actual_bsz:]).item() == 0
+    assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
+    assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
+    assert torch.count_nonzero(static_outputs.attn_output[actual_bsz:]).item() == 0
+    assert torch.equal(
+        buffers.safe_primary_slot_indices[actual_bsz:],
+        torch.zeros(bucket_size - actual_bsz, dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        buffers.safe_aux_slot_indices[actual_bsz:],
+        torch.zeros(bucket_size - actual_bsz, dtype=torch.int32, device=device),
+    )
 
     manager.drop_bucket(bucket_size)
     assert bucket_size not in shared_buffers
