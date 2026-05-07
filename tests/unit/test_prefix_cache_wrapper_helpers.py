@@ -129,7 +129,7 @@ def test_prefix_offloader_uses_destination_offsets(monkeypatch):
         worker_view=worker_view,
         layer_idx=3,
         metadata=metadata,
-        track_task=tracked.append,
+        track_task=lambda task, layer_idx: tracked.append((task, layer_idx)),
     )
 
     offloader.offload_gqa(
@@ -140,7 +140,7 @@ def test_prefix_offloader_uses_destination_offsets(monkeypatch):
     assert [kind for kind, _ in worker_view.calls] == ["offset", "offset"]
     assert worker_view.calls[0][1]["destination_token_starts"] == [7]
     assert worker_view.calls[1][1]["destination_token_starts"] == [11]
-    assert len(tracked) == 2
+    assert [layer_idx for _, layer_idx in tracked] == [3, 3]
 
 
 def test_prefix_offloader_rejects_missing_offset_api(monkeypatch):

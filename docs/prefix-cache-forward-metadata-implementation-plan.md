@@ -152,23 +152,23 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 4: Make Wrappers Prefer Explicit Metadata
 
-- [ ] Change `AttnWrapperBase.prefix_cache_metadata()` to read current `ForwardBatchMetadata` first.
-- [ ] Keep class-variable fallback temporarily for compatibility.
-- [ ] Mark `PrefixCachePrepackMetadata.from_wrapper_cls()` as a legacy compatibility path.
-- [ ] Add a constructor from `PrefillAttentionMetadata` to `PrefixCachePrepackMetadata` if needed.
-- [ ] Update GQA prefix replay helpers to accept `PrefillAttentionMetadata`.
-- [ ] Update MLA prefix replay helpers to accept `PrefillAttentionMetadata`.
-- [ ] Update `PrefixAwarePrefillOffloader` to consume explicit metadata.
-- [ ] Use `global_sequence_ids` from metadata for host offload.
-- [ ] Use `q_seq_lens` from metadata for suffix spans.
-- [ ] Use `prefix_lens` from metadata for destination offsets.
-- [ ] Update GPT-OSS wrappers to prefer explicit metadata.
-- [ ] Update DeepSeek wrappers to prefer explicit metadata.
-- [ ] Update GLM wrappers to prefer explicit metadata.
-- [ ] Update Kimi wrappers to prefer explicit metadata.
-- [ ] Update MiniMax wrappers to prefer explicit metadata.
-- [ ] Add tests showing explicit metadata and legacy fallback produce identical spans.
-- [ ] Add tests showing incomplete fallback raises.
+- [x] Change `AttnWrapperBase.prefix_cache_metadata()` to read current `ForwardBatchMetadata` first.
+- [x] Keep class-variable fallback temporarily for compatibility.
+- [x] Mark `PrefixCachePrepackMetadata.from_wrapper_cls()` as a legacy compatibility path.
+- [x] Add a constructor from `PrefillAttentionMetadata` to `PrefixCachePrepackMetadata` if needed.
+- [x] Update GQA prefix replay helpers to accept `PrefillAttentionMetadata`.
+- [x] Update MLA prefix replay helpers to accept `PrefillAttentionMetadata`.
+- [x] Update `PrefixAwarePrefillOffloader` to consume explicit metadata.
+- [x] Use `global_sequence_ids` from metadata for host offload.
+- [x] Use `q_seq_lens` from metadata for suffix spans.
+- [x] Use `prefix_lens` from metadata for destination offsets.
+- [x] Update GPT-OSS wrappers to prefer explicit metadata.
+- [x] Update DeepSeek wrappers to prefer explicit metadata.
+- [x] Update GLM wrappers to prefer explicit metadata.
+- [x] Update Kimi wrappers to prefer explicit metadata.
+- [x] Update MiniMax wrappers to prefer explicit metadata.
+- [x] Add tests showing explicit metadata and legacy fallback produce identical spans.
+- [x] Add tests showing incomplete fallback raises.
 
 ## Milestone 5: Introduce a Prefix-Aware Attention Backend Interface
 

@@ -7,7 +7,10 @@ from typing import Optional
 
 import torch
 
-from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
+from batchgen.models.wrappers.prefix_cache import (
+    PrefixCachePrepackMetadata,
+    ensure_prefix_cache_prepack_metadata,
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,7 @@ def run_prefix_gqa_prefill_attention(
     """Run GQA prefill attention with optional cached prefix K/V."""
     from batchgen.attention.gqa import gqa_prefill_fa
 
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     cu_q = metadata.cu_seqlens.to(query.device)
     max_seqlen_q = metadata.max_seqlen
     if metadata.full_hit_mode:

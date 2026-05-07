@@ -138,7 +138,7 @@ def _sync_prefix_reuse_fields(
     wrapper_cls.prepack_prefix_reuse_mode = any(length > 0 for length in prefix_lens)
     wrapper_cls.prepack_prefix_shared_tokens = prefix_lens
     wrapper_cls.prepack_full_seq_lengths = full_seq_lens
-    wrapper_cls.prepack_full_hit_mode = _bool_tensor_any(prefix_reuse.is_full_hit)
+    wrapper_cls.prepack_full_hit_mode = _bool_tensor_all(prefix_reuse.is_full_hit)
 
 
 def _sync_decode_fields(wrapper_cls: type, decode: DecodeAttentionMetadata) -> None:
@@ -167,5 +167,5 @@ def _int_list_from_tensor(tensor: torch.Tensor) -> list[int]:
     return [int(value) for value in tensor.detach().cpu().tolist()]
 
 
-def _bool_tensor_any(tensor: torch.Tensor) -> bool:
-    return bool(tensor.detach().cpu().any().item())
+def _bool_tensor_all(tensor: torch.Tensor) -> bool:
+    return bool(tensor.detach().cpu().all().item())

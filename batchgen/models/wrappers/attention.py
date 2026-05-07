@@ -155,8 +155,14 @@ class AttnWrapperBase(BaseModuleWrapper):
 
     def prefix_cache_metadata(self):
         """Return validated prepack metadata for prefix-cache helpers."""
+        from batchgen.attention.forward_metadata_context import (
+            get_current_forward_batch_metadata,
+        )
         from .prefix_cache import PrefixCachePrepackMetadata
 
+        forward_metadata = get_current_forward_batch_metadata()
+        if forward_metadata is not None:
+            return PrefixCachePrepackMetadata.from_forward_metadata(forward_metadata)
         return PrefixCachePrepackMetadata.from_wrapper_cls(type(self))
 
     def host_prefix_reader(self):

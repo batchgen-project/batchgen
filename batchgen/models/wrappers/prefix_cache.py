@@ -9,6 +9,35 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 
 
+def _tensor_to_int_list(tensor: torch.Tensor) -> List[int]:
+    values = tensor.detach().cpu().tolist()
+    return [int(value) for value in values]
+
+
+def ensure_prefix_cache_prepack_metadata(metadata) -> "PrefixCachePrepackMetadata":
+    """Normalize explicit or legacy-compatible prefix metadata."""
+
+    if isinstance(metadata, PrefixCachePrepackMetadata):
+        return metadata
+    if getattr(metadata, "phase", None) is not None:
+        return PrefixCachePrepackMetadata.from_forward_metadata(metadata)
+    if getattr(metadata, "cu_seqlens_q", None) is not None:
+        prefix_reuse = getattr(metadata, "prefix_reuse", None)
+        if prefix_reuse is None:
+            raise RuntimeError(
+                "PrefillAttentionMetadata without prefix reuse does not carry "
+                "global sequence ids; pass ForwardBatchMetadata instead"
+            )
+        return PrefixCachePrepackMetadata.from_prefill_metadata(
+            metadata,
+            global_sequence_ids=prefix_reuse.global_sequence_ids,
+        )
+    raise TypeError(
+        "metadata must be PrefixCachePrepackMetadata, PrefillAttentionMetadata, "
+        "or ForwardBatchMetadata"
+    )
+
+
 @dataclass(frozen=True)
 class PrefixCachePrepackMetadata:
     """Validated prepack metadata needed by prefix-cache-aware wrappers."""
@@ -24,7 +53,63 @@ class PrefixCachePrepackMetadata:
     full_seq_lengths: Optional[List[int]]
 
     @classmethod
+    def from_prefill_metadata(
+        cls,
+        prefill_metadata,
+        *,
+        global_sequence_ids: Sequence[int],
+    ) -> "PrefixCachePrepackMetadata":
+        """Build wrapper-compatible metadata from explicit prefill metadata."""
+
+        prefix_reuse = prefill_metadata.prefix_reuse
+        prefix_shared_tokens = None
+        full_seq_lengths = None
+        prefix_reuse_mode = False
+        full_hit_mode = False
+        if prefix_reuse is not None:
+            prefix_shared_tokens = _tensor_to_int_list(prefix_reuse.prefix_lens)
+            full_seq_lengths = _tensor_to_int_list(prefix_reuse.full_seq_lens)
+            prefix_reuse_mode = any(tokens > 0 for tokens in prefix_shared_tokens)
+            full_hit_mode = bool(prefix_reuse.is_full_hit.detach().cpu().all().item())
+
+        metadata = cls(
+            cu_seqlens=prefill_metadata.cu_seqlens_q,
+            max_seqlen=int(prefill_metadata.max_seqlen_q),
+            num_sequences=int(prefill_metadata.batch_size),
+            seq_lengths=[int(length) for length in prefill_metadata.q_seq_lens],
+            global_sequence_ids=[int(seq_id) for seq_id in global_sequence_ids],
+            prefix_reuse_mode=prefix_reuse_mode,
+            full_hit_mode=full_hit_mode,
+            prefix_shared_tokens=prefix_shared_tokens,
+            full_seq_lengths=full_seq_lengths,
+        )
+        metadata.validate_sequence_spans()
+        if prefix_reuse_mode:
+            metadata.validate_prefix_suffix_lengths()
+        if full_hit_mode:
+            metadata.validate_full_hit_query_lengths()
+        return metadata
+
+    @classmethod
+    def from_forward_metadata(
+        cls,
+        forward_metadata,
+    ) -> "PrefixCachePrepackMetadata":
+        """Build wrapper-compatible metadata from a bound forward metadata object."""
+
+        if forward_metadata.phase != "prefill" or forward_metadata.prefill is None:
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires bound prefill metadata"
+            )
+        return cls.from_prefill_metadata(
+            forward_metadata.prefill,
+            global_sequence_ids=forward_metadata.global_sequence_ids,
+        )
+
+    @classmethod
     def from_wrapper_cls(cls, wrapper_cls: type) -> "PrefixCachePrepackMetadata":
+        """Build metadata from legacy wrapper class variables."""
+
         cu_seqlens = getattr(wrapper_cls, "prepack_cu_seqlens", None)
         max_seqlen = getattr(wrapper_cls, "prepack_max_seqlen", None)
         num_sequences = getattr(wrapper_cls, "prepack_num_sequences", None)
@@ -111,8 +196,7 @@ class PrefixCachePrepackMetadata:
         return metadata
 
     def cu_seqlens_list(self) -> List[int]:
-        values = self.cu_seqlens.detach().cpu().tolist()
-        return [int(value) for value in values]
+        return _tensor_to_int_list(self.cu_seqlens)
 
     def sequence_span(self, seq_idx: int) -> Tuple[int, int]:
         cu = self.cu_seqlens_list()
@@ -481,7 +565,7 @@ class PrefixAwarePrefillOffloader:
             raise RuntimeError("Prefix-aware prefill offload requires host KV view")
         self.worker_view = worker_view
         self.layer_idx = int(layer_idx)
-        self.metadata = metadata
+        self.metadata = ensure_prefix_cache_prepack_metadata(metadata)
         self.track_task = track_task
         self.pin_tensor = pin_tensor
 

@@ -7,7 +7,10 @@ from typing import Callable, Tuple
 
 import torch
 
-from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
+from batchgen.models.wrappers.prefix_cache import (
+    PrefixCachePrepackMetadata,
+    ensure_prefix_cache_prepack_metadata,
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ def run_prefix_mla_suffix_prefill(
     output_projection: OutputProjectMlaFn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill using cached prefix KV."""
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     if not metadata.prefix_reuse_mode:
         raise RuntimeError("MLA prefix replay requires prefix reuse mode")
     if metadata.num_sequences != 1:
@@ -73,6 +77,7 @@ def run_prefix_mla_suffix_prefill_with_projected(
     output_projection: OutputProjectMlaFn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill from already projected suffix Q/KV."""
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     if not metadata.prefix_reuse_mode:
         raise RuntimeError("MLA prefix replay requires prefix reuse mode")
     if metadata.num_sequences != 1:
@@ -115,6 +120,7 @@ def run_prefix_mla_full_hit_prefill(
     output_projection: OutputProjectMlaFn,
 ) -> torch.Tensor:
     """Run exact full-hit MLA prefill using fully cached prompt KV."""
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     if not metadata.full_hit_mode:
         raise RuntimeError("MLA full-hit replay requires full-hit mode")
     if metadata.full_seq_lengths is None:
@@ -144,6 +150,7 @@ def run_prefix_mla_full_hit_prefill_with_query(
     output_projection: OutputProjectMlaFn,
 ) -> torch.Tensor:
     """Run exact full-hit MLA prefill from already projected query states."""
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     if not metadata.full_hit_mode:
         raise RuntimeError("MLA full-hit replay requires full-hit mode")
     if metadata.full_seq_lengths is None:
