@@ -624,9 +624,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
             attn_output, offload_kv = self.module.prefill_attn_w8a16_prepacked(
                 hidden_states_2d,
                 position_ids,
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
+                metadata.cu_seqlens.to(hidden_states_2d.device),
+                metadata.max_seqlen,
+                metadata.num_sequences,
                 self.weight_dequant_scale,
                 prefix_context=prefix_context,
             )

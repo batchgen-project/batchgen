@@ -17,6 +17,7 @@ from .attention import AttnWrapperBase
 from .prefix_cache import (
     PrefixAwarePrefillOffloader,
     PrefixCachePrepackMetadata,
+    ensure_prefix_cache_prepack_metadata,
 )
 from .prefix_mla_replay import (
     MlaReplaySpec,
@@ -87,6 +88,7 @@ def build_deepseek_prefix_backend_context(
     wrapper: object,
     metadata: PrefixCachePrepackMetadata,
 ) -> MlaPrefixBackendContext:
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
@@ -100,6 +102,7 @@ def build_glm5_prefix_backend_context(
     wrapper: object,
     metadata: PrefixCachePrepackMetadata,
 ) -> MlaPrefixBackendContext:
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
@@ -113,6 +116,7 @@ def build_kimi_prefix_backend_context(
     wrapper: object,
     metadata: PrefixCachePrepackMetadata,
 ) -> MlaPrefixBackendContext:
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
     return MlaPrefixBackendContext(
         wrapper=wrapper,
         metadata=metadata,
@@ -145,7 +149,7 @@ def offload_glm5_prepacked_mla_kv(
     offloader = PrefixAwarePrefillOffloader(
         worker_view=worker_view,
         layer_idx=layer_idx,
-        metadata=metadata,
+        metadata=ensure_prefix_cache_prepack_metadata(metadata),
         track_task=AttnWrapperBase.track_prefill_offload_task,
         pin_tensor=AttnWrapperBase.pin_prefill_offload_tensor,
     )

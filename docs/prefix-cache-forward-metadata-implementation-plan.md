@@ -188,18 +188,18 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 6: Consolidate Model-Specific MLA Adapters
 
-- [ ] Keep model-specific differences in `batchgen/models/wrappers/prefix_mla_model_adapters.py`.
-- [ ] DeepSeek adapter should only handle absorbed query projection and output projection.
-- [ ] GLM adapter should only handle DSA auxiliary cache and GLM-specific projection details.
-- [ ] Kimi adapter should only handle Kimi MLA projection details.
-- [ ] MiniMax adapter should only handle MiniMax MLA projection details.
-- [ ] Adapters should accept explicit `PrefillAttentionMetadata`.
-- [ ] Adapters should not read `AttnWrapperBase` class variables.
-- [ ] Remove duplicated prefix length handling from model wrappers.
-- [ ] Remove duplicated cu-seqlens handling from model wrappers.
-- [ ] Remove duplicated global sequence id handling from model wrappers.
-- [ ] Add smoke tests that all supported MLA wrappers enter through the shared adapter path.
-- [ ] Run `py_compile` for model wrapper modules.
+- [x] Keep model-specific differences in `batchgen/models/wrappers/prefix_mla_model_adapters.py`.
+- [x] DeepSeek adapter should only handle absorbed query projection and output projection.
+- [x] GLM adapter should only handle DSA auxiliary cache and GLM-specific projection details.
+- [x] Kimi adapter should only handle Kimi MLA projection details.
+- [x] MiniMax should remain on the shared GQA prefix backend instead of adding an MLA adapter.
+- [x] Adapters should accept explicit `PrefillAttentionMetadata`.
+- [x] Adapters should not read `AttnWrapperBase` class variables.
+- [x] Remove duplicated prefix length handling from model wrappers.
+- [x] Remove duplicated cu-seqlens handling from model wrappers.
+- [x] Remove duplicated global sequence id handling from model wrappers.
+- [x] Add smoke tests that all supported MLA wrappers enter through the shared adapter path.
+- [x] Run `py_compile` for model wrapper modules.
 
 ## Milestone 7: Add True Extend-Mode KV Writes
 
