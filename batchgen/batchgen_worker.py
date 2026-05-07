@@ -2000,12 +2000,13 @@ class BatchGenWorker:
 			self._allocate_gpu_pages_for_sequences(manager, global_ids, pages_per_seq)
 			manager.rebuild_page_table(global_ids)
 		except Exception as e:
-			if load_from_host:
-				self._wait_async_kv_task_distributed(
-					None,
-					"during synchronous host KV load",
-					pre_errors=[f"{type(e).__name__}: {e}"],
-				)
+			logging.error(
+				"Rank %s: GPU KV page allocation failed for global_ids=%s: %s: %s",
+				self.rank,
+				global_ids[:8],
+				type(e).__name__,
+				e,
+			)
 			return False
 
 		# Now safe to update tracking.
@@ -3104,23 +3105,20 @@ class BatchGenWorker:
 				f"Rank {self.rank}: _load_host_kv_to_gpu loading KV for {len(resuming_seq_info)} RESUMING sequences. First 5: {resuming_seq_info[:5]}"
 			)
 		
+		logging.debug(
+			f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
+			f"{len(global_sequence_ids)} sequences..."
+		)
+
 		if isinstance(manager, DualKVCacheCoordinator):
-			load_task = None
-			setup_errors = []
-			try:
-				pointers = self._prepare_dual_kv_load_pointers(
-					manager,
-					global_sequence_ids,
-					existing_global_ids=global_sequence_ids,
-				)
-				load_task = self._launch_dual_host_kv_load(pointers)
-			except Exception as e:
-				setup_errors.append(f"{type(e).__name__}: {e}")
-			self._wait_async_kv_task_distributed(
-				load_task,
-				"during synchronous dual host KV load",
-				pre_errors=setup_errors,
+			pointers = self._prepare_dual_kv_load_pointers(
+				manager,
+				global_sequence_ids,
+				existing_global_ids=global_sequence_ids,
 			)
+			load_task = self._launch_dual_host_kv_load(pointers)
+			load_task.wait()
+			torch.cuda.synchronize(self.torch_device)
 			load_duration = time.perf_counter() - copy_start
 			logging.debug(
 				"Rank %s Loaded dual host KV for %d sequences into GPU cache in %.3fs",
@@ -3128,32 +3126,17 @@ class BatchGenWorker:
 			)
 			return
 
-		load_task = None
-		setup_errors = []
-		try:
-			sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
-			k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
-			active_sequence_page_counts = manager.export_active_sequence_page_counts()
-
-			logging.debug(
-				f"Rank {self.rank}: _load_host_kv_to_gpu launching async load for "
-				f"{len(global_sequence_ids)} sequences..."
-			)
-
-			load_task = worker_view.async_load_layer_paged_kv_to_device(
-				sequence_ids=sequence_tensor,
-				active_page_counts=active_sequence_page_counts,
-				k_device_ptrs=k_ptrs,
-				v_device_ptrs=v_ptrs,
-			)
-		except Exception as e:
-			setup_errors.append(f"{type(e).__name__}: {e}")
-
-		self._wait_async_kv_task_distributed(
-			load_task,
-			"during synchronous host KV load",
-			pre_errors=setup_errors,
+		sequence_tensor = torch.tensor(global_sequence_ids, dtype=torch.int64, device="cpu")
+		k_ptrs, v_ptrs = manager.get_padded_3d_page_pointers()
+		active_sequence_page_counts = manager.export_active_sequence_page_counts()
+		load_task = worker_view.async_load_layer_paged_kv_to_device(
+			sequence_ids=sequence_tensor,
+			active_page_counts=active_sequence_page_counts,
+			k_device_ptrs=k_ptrs,
+			v_device_ptrs=v_ptrs,
 		)
+		load_task.wait()
+		torch.cuda.synchronize(self.torch_device)
 
 		load_duration = time.perf_counter() - copy_start
 		logging.debug(
