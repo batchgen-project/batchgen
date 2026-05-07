@@ -9728,19 +9728,6 @@ class BatchGenWorker:
 				)
 				return
 
-			def _pad_first_dim(tensor, rows, fill_value):
-				if tensor.shape[0] == rows:
-					return tensor
-				out = torch.full(
-					(rows, *tensor.shape[1:]),
-					fill_value,
-					dtype=tensor.dtype,
-					device=tensor.device,
-				)
-				if tensor.shape[0] > 0:
-					out[:tensor.shape[0]].copy_(tensor)
-				return out
-
 			def _capture_slots(manager):
 				ensure_graph_table = getattr(manager, "ensure_cuda_graph_page_table", None)
 				if ensure_graph_table is not None:
@@ -9751,17 +9738,7 @@ class BatchGenWorker:
 						local_bsz, dtype=torch.int32, device=self.torch_device,
 					)
 				real_slots = slot_indices[:local_bsz].to(dtype=torch.int32)
-				if real_slots.shape[0] == capture_bucket:
-					return real_slots
-				slots = torch.full(
-					(capture_bucket,),
-					-1,
-					dtype=torch.int32,
-					device=self.torch_device,
-				)
-				if local_bsz > 0:
-					slots[:local_bsz].copy_(real_slots)
-				return slots
+				return real_slots
 
 			capture_primary_slots = _capture_slots(primary_manager)
 			capture_aux_slots = _capture_slots(aux_manager)
@@ -9773,17 +9750,9 @@ class BatchGenWorker:
 					dtype=torch.int64,
 					device=self.torch_device,
 				)
-			capture_input_ids = _pad_first_dim(capture_input_ids[:local_bsz], capture_bucket, 0)
-			capture_cache_seqlens = _pad_first_dim(
-				AttnWrapperBase.cache_seqlens[:local_bsz].to(dtype=torch.int32),
-				capture_bucket,
-				1,
-			)
-			capture_position_ids = _pad_first_dim(
-				AttnWrapperBase.position_ids[:local_bsz].to(dtype=torch.int64),
-				capture_bucket,
-				0,
-			)
+			capture_input_ids = capture_input_ids[:local_bsz]
+			capture_cache_seqlens = AttnWrapperBase.cache_seqlens[:local_bsz].to(dtype=torch.int32)
+			capture_position_ids = AttnWrapperBase.position_ids[:local_bsz].to(dtype=torch.int64)
 			whole_seg.set_capture_inputs(
 				input_ids=capture_input_ids,
 				cache_seqlens=capture_cache_seqlens,
