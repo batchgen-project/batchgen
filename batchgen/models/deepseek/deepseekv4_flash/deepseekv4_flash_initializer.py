@@ -24,6 +24,7 @@ from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.engine_config_parser import parse_config_from_json
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 
+from .config import DeepSeekV4FlashConfig
 from .set_basic_config import set_basic_config
 
 try:
@@ -36,7 +37,16 @@ except ImportError:
 
 class DeepSeekV4FlashInitializer:
     def __init__(self, input_arguments):
-        self.loaded_model_config = None
+        # Populate loaded_model_config with the BatchGen V4-Flash dataclass so
+        # downstream attribute access (e.g. config.compress_ratios in model.py)
+        # gets the proper 44-element list. Other initializers (GLM5, GptOss,
+        # DeepseekV3) follow this pattern; ours previously left it as None,
+        # which made `_cfg(config, "compress_ratios", [])` fall through to []
+        # — disabling the compressor across all 43 layers and producing
+        # garbage output for any prompt longer than sliding_window=128.
+        self.loaded_model_config = DeepSeekV4FlashConfig()
+        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.loaded_model_config.architectures = ["DeepseekV4ForCausalLM"]
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
         self.global_kv_cache_size_gb = input_arguments.global_host_kv_cache_size_gb
