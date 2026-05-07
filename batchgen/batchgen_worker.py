@@ -9990,6 +9990,7 @@ class BatchGenWorker:
 						index_topk=indexer.index_topk,
 						page_size=primary_page_size,
 						aux_page_size=aux_page_size,
+						shared_buffers=shared_dsa_buffers,
 					)
 					segment_name = make_glm5_full_dsa_graph_segment_name(layer_idx)
 				else:

@@ -79,9 +79,7 @@ class _Glm5FullDsaSegmentBuffers:
     q_nope: torch.Tensor
     q_rope_4d: torch.Tensor
     new_compressed_kv: torch.Tensor
-    primary_k_tensor: torch.Tensor
     indexer_k_raw: torch.Tensor
-    indexer_k_tensor: torch.Tensor
     indexer_k_x_fp8: torch.Tensor
     indexer_k_x_scale: torch.Tensor
     indexer_k_tma_desc: torch.Tensor
@@ -100,8 +98,14 @@ class _Glm5FullDsaSegmentBuffers:
     absorbed_q: torch.Tensor
     query_states: torch.Tensor
     attn_heads: torch.Tensor
-    attn_output: torch.Tensor
     prepared_flashmla: object
+
+
+@dataclass
+class _Glm5FullDsaSegmentOutputs:
+    primary_k_tensor: torch.Tensor
+    indexer_k_tensor: torch.Tensor
+    attn_output: torch.Tensor
 
 
 class Glm5DsaAttnSegment:
@@ -538,6 +542,7 @@ class Glm5FullDsaAttnSegment:
         index_topk: int = 2048,
         page_size: int = 64,
         aux_page_size: int | None = None,
+        shared_buffers: Optional[Dict[int, _Glm5FullDsaSegmentBuffers]] = None,
     ) -> None:
         self.wrapper = wrapper
         self.attn = wrapper.module
@@ -555,7 +560,9 @@ class Glm5FullDsaAttnSegment:
         self.index_topk = int(index_topk)
         self.page_size = int(page_size)
         self.aux_page_size = int(aux_page_size if aux_page_size is not None else page_size)
-        self._buffers: Dict[int, _Glm5FullDsaSegmentBuffers] = {}
+        self._uses_shared_buffers = shared_buffers is not None
+        self._buffers = shared_buffers if shared_buffers is not None else {}
+        self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
         self._flashmla_metadata_specs: Dict[int, tuple[tuple[int, ...], torch.dtype, tuple[int, ...], torch.dtype]] = {}
 
         if self.primary_blocked_k.ndim != 4 or self.primary_blocked_k.shape[2] != 1:
@@ -647,20 +654,11 @@ class Glm5FullDsaAttnSegment:
                 ("batch_size", 1, 1, self.aux_blocked_k.shape[3]),
                 torch.bfloat16,
             ),
-            "attn_heads": TensorSpec(
-                ("batch_size", 1, self.attn.num_heads, self.attn.v_head_dim),
-                torch.bfloat16,
-            ),
-            "top_k_indices": TensorSpec(("batch_size", self.index_topk), torch.int32),
-            "selected_lengths": TensorSpec(("batch_size",), torch.int32),
-            "selected_mla_kv": TensorSpec(
-                ("batch_size", self.index_topk, 1, self.primary_blocked_k.shape[3]),
-                torch.bfloat16,
-            ),
         }
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._buffers:
+            self._setup_static_output_buffers(bucket_size)
             return
         device = self.primary_blocked_k.device
         attn = self.attn
@@ -732,9 +730,7 @@ class Glm5FullDsaAttnSegment:
                 device=device,
             ),
             new_compressed_kv=torch.empty(bucket_size, 1, kv_dim, dtype=torch.bfloat16, device=device),
-            primary_k_tensor=torch.empty(bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device),
             indexer_k_raw=torch.empty(bucket_size, index_dim, dtype=torch.bfloat16, device=device),
-            indexer_k_tensor=torch.empty(bucket_size, 1, 1, index_dim, dtype=torch.bfloat16, device=device),
             indexer_k_x_fp8=indexer_k_x_fp8,
             indexer_k_x_scale=indexer_k_x_scale,
             indexer_k_tma_desc=indexer_k_tma_desc,
@@ -777,8 +773,27 @@ class Glm5FullDsaAttnSegment:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            attn_output=torch.empty(bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device),
             prepared_flashmla=prepared_flashmla,
+        )
+        self._setup_static_output_buffers(bucket_size)
+
+    def _setup_static_output_buffers(self, bucket_size: int) -> None:
+        if bucket_size in self._outputs:
+            return
+        device = self.primary_blocked_k.device
+        attn = self.attn
+        kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+        self._outputs[bucket_size] = _Glm5FullDsaSegmentOutputs(
+            primary_k_tensor=torch.empty(bucket_size, 1, 1, kv_dim, dtype=torch.bfloat16, device=device),
+            indexer_k_tensor=torch.empty(
+                bucket_size,
+                1,
+                1,
+                attn.indexer.index_head_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            attn_output=torch.empty(bucket_size, attn.hidden_size, dtype=torch.bfloat16, device=device),
         )
 
     def initialize_static_inputs(
@@ -807,6 +822,10 @@ class Glm5FullDsaAttnSegment:
         )
         static_inputs["flashmla_num_splits"].copy_(num_splits, non_blocking=True)
 
+    def release_static_buffers(self, bucket_size: int) -> None:
+        self._buffers.pop(bucket_size, None)
+        self._outputs.pop(bucket_size, None)
+
     def forward(
         self,
         *,
@@ -825,6 +844,10 @@ class Glm5FullDsaAttnSegment:
         if buffers is None:
             self.setup_static_buffers(batch_size)
             buffers = self._buffers[batch_size]
+        outputs = self._outputs.get(batch_size)
+        if outputs is None:
+            self._setup_static_output_buffers(batch_size)
+            outputs = self._outputs[batch_size]
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
         hidden_fp8, hidden_scale = act_quant(hidden_flat)
@@ -866,11 +889,11 @@ class Glm5FullDsaAttnSegment:
             attn.qk_rope_head_dim,
             eps=attn.kv_a_layernorm.eps,
         )
-        buffers.primary_k_tensor.copy_(offload_kv.view(batch_size, 1, 1, -1))
+        outputs.primary_k_tensor.copy_(offload_kv.view(batch_size, 1, 1, -1))
         token_indices = position_ids.view(batch_size).to(dtype=torch.int32)
         run_paged_kv_token_update_fused(
             k_cache=self.primary_blocked_k,
-            k_tokens=buffers.primary_k_tensor.view(batch_size, -1),
+            k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
             page_table=self.primary_page_table,
             slot_indices=primary_slot_indices,
             token_indices=token_indices,
@@ -892,10 +915,10 @@ class Glm5FullDsaAttnSegment:
             position_ids.view(batch_size),
             max_seqlen=self.max_seqlen,
         ).unsqueeze(2)
-        buffers.indexer_k_tensor.copy_(indexer_k_tensor)
+        outputs.indexer_k_tensor.copy_(indexer_k_tensor)
         run_paged_kv_token_update_fused(
             k_cache=self.aux_blocked_k,
-            k_tokens=buffers.indexer_k_tensor.view(batch_size, -1),
+            k_tokens=outputs.indexer_k_tensor.view(batch_size, -1),
             page_table=self.aux_page_table,
             slot_indices=aux_slot_indices,
             token_indices=token_indices,
@@ -971,17 +994,13 @@ class Glm5FullDsaAttnSegment:
             attn_output_scale,
             attn.o_proj.weight,
             self.wrapper.weight_dequant_scale["o_proj.weight_scale_inv"],
-            out=buffers.attn_output,
+            out=outputs.attn_output,
         )
 
         return {
-            "attn_output": buffers.attn_output.view(batch_size, 1, attn.hidden_size),
-            "primary_k_tensor": buffers.primary_k_tensor,
-            "indexer_k_tensor": buffers.indexer_k_tensor,
-            "attn_heads": buffers.attn_heads,
-            "top_k_indices": buffers.top_k_indices,
-            "selected_lengths": buffers.selected_lengths,
-            "selected_mla_kv": buffers.selected_mla_kv,
+            "attn_output": outputs.attn_output.view(batch_size, 1, attn.hidden_size),
+            "primary_k_tensor": outputs.primary_k_tensor,
+            "indexer_k_tensor": outputs.indexer_k_tensor,
         }
 
 

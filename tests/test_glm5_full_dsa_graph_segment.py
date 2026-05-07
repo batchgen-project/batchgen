@@ -243,6 +243,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     aux_page_table = torch.tensor([[2, -1], [3, -1]], dtype=torch.int32, device=device)
     cos = torch.ones(max_seqlen, attn.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
     sin = torch.zeros_like(cos)
+    shared_buffers = {}
     segment = Glm5FullDsaAttnSegment(
         wrapper=wrapper,
         primary_blocked_k=primary_cache,
@@ -258,6 +259,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
         index_topk=attn.indexer.index_topk,
         page_size=page_size,
         aux_page_size=page_size,
+        shared_buffers=shared_buffers,
     )
 
     hidden = torch.randn(actual_bsz, 1, attn.hidden_size, dtype=torch.bfloat16, device=device)
@@ -294,6 +296,8 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     name = make_glm5_full_dsa_graph_segment_name(0)
     manager.register_segment(name, segment)
     manager.warmup_and_capture_buckets([bucket_size])
+    assert bucket_size in shared_buffers
+    assert bucket_size in segment._outputs
 
     primary_cache.zero_()
     aux_cache.zero_()
@@ -312,9 +316,13 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     graph_primary_cache = primary_cache.detach().clone()
     graph_aux_cache = aux_cache.detach().clone()
 
-    for key in ("attn_output", "primary_k_tensor", "indexer_k_tensor", "top_k_indices", "selected_lengths"):
+    for key in ("attn_output", "primary_k_tensor", "indexer_k_tensor"):
         assert torch.equal(graph_outputs[key], eager_outputs[key]), key
     assert torch.equal(graph_primary_cache, eager_primary_cache)
     assert torch.equal(graph_aux_cache, eager_aux_cache)
     assert torch.count_nonzero(graph_primary_cache[2:]).item() == 0
     assert torch.count_nonzero(graph_aux_cache[:2]).item() == 0
+
+    manager.drop_bucket(bucket_size)
+    assert bucket_size not in shared_buffers
+    assert bucket_size not in segment._outputs
