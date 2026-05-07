@@ -172,19 +172,19 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 5: Introduce a Prefix-Aware Attention Backend Interface
 
-- [ ] Add `batchgen/attention/prefix_aware_backend.py`.
-- [ ] Define a `PrefixAwareAttentionBackend` protocol or base class.
-- [ ] Add `forward_prefill(query, key, value, metadata, kv_cache_metadata)`.
-- [ ] Add a GQA backend adapter.
-- [ ] The GQA adapter should reuse existing `gqa_prefill_fa` first.
-- [ ] The GQA adapter should support `cu_seqlens_q != cu_seqlens_k`.
-- [ ] Add an MLA backend adapter.
-- [ ] The MLA adapter should reuse existing prepacked MLA and prefix replay logic first.
-- [ ] The first version should not introduce new kernels.
-- [ ] The first version should not change numerical behavior.
-- [ ] Wrappers should select backend adapters instead of directly managing prefix cache details.
-- [ ] Add tests for no prefix, partial prefix, and full prefix using the same interface.
-- [ ] Add tests that missing required backend metadata raises.
+- [x] Add `batchgen/attention/prefix_aware_backend.py`.
+- [x] Define a `PrefixAwareAttentionBackend` protocol or base class.
+- [x] Add `forward_prefill(query, key, value, metadata, kv_cache_metadata)`.
+- [x] Add a GQA backend adapter.
+- [x] The GQA adapter should reuse existing `gqa_prefill_fa` first.
+- [x] The GQA adapter should support `cu_seqlens_q != cu_seqlens_k`.
+- [x] Add an MLA backend adapter.
+- [x] The MLA adapter should reuse existing prepacked MLA and prefix replay logic first.
+- [x] The first version should not introduce new kernels.
+- [x] The first version should not change numerical behavior.
+- [x] Wrappers should select backend adapters instead of directly managing prefix cache details.
+- [x] Add tests for no prefix, partial prefix, and full prefix using the same interface.
+- [x] Add tests that missing required backend metadata raises.
 
 ## Milestone 6: Consolidate Model-Specific MLA Adapters
 

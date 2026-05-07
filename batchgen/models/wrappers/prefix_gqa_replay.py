@@ -7,10 +7,7 @@ from typing import Optional
 
 import torch
 
-from batchgen.models.wrappers.prefix_cache import (
-    PrefixCachePrepackMetadata,
-    ensure_prefix_cache_prepack_metadata,
-)
+from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
 
 
 @dataclass(frozen=True)
@@ -34,47 +31,21 @@ def run_prefix_gqa_prefill_attention(
     spec: GqaReplaySpec,
 ) -> torch.Tensor:
     """Run GQA prefill attention with optional cached prefix K/V."""
-    from batchgen.attention.gqa import gqa_prefill_fa
+    from batchgen.attention.prefix_aware_backend import (
+        GqaPrefixAwareAttentionBackend,
+    )
 
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    cu_q = metadata.cu_seqlens.to(query.device)
-    max_seqlen_q = metadata.max_seqlen
-    if metadata.full_hit_mode:
-        key_for_attn, value_for_attn, cu_k, max_seqlen_k = (
-            wrapper.prefix_attention_kv_builder().build_gqa_full_hit_kv(
-                metadata=metadata,
-                num_heads=spec.num_kv_heads,
-                head_dim=spec.head_dim,
-                dtype=key.dtype,
-                device=key.device,
-            )
-        )
-    elif metadata.prefix_reuse_mode:
-        key_for_attn, value_for_attn, cu_k, max_seqlen_k = (
-            wrapper.prefix_attention_kv_builder().build_gqa_prefix_kv(
-                key=key,
-                value=value,
-                metadata=metadata,
-                num_heads=spec.num_kv_heads,
-                head_dim=spec.head_dim,
-            )
-        )
-    else:
-        key_for_attn = key
-        value_for_attn = value
-        cu_k = cu_q
-        max_seqlen_k = metadata.max_seqlen
-
-    attn_output, _ = gqa_prefill_fa(
-        q=query,
-        k=key_for_attn,
-        v=value_for_attn,
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
+    backend = GqaPrefixAwareAttentionBackend(
+        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
+        num_kv_heads=spec.num_kv_heads,
+        head_dim=spec.head_dim,
         sinks=spec.sinks,
         softmax_scale=spec.softmax_scale,
         sliding_window=spec.sliding_window,
     )
-    return attn_output
+    return backend.forward_prefill(
+        query=query,
+        key=key,
+        value=value,
+        metadata=metadata,
+    )

@@ -1677,7 +1677,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
             Tuple of (output, None, None) - KV cache offloaded to host
         """
         # Import here to avoid circular imports
-        from batchgen.attention.gqa import gqa_prefill_fa
+        from batchgen.attention.prefix_aware_backend import (
+            GqaPrefixAwareAttentionBackend,
+        )
 
         # Handle both 2D and 3D input
         if hidden_states.dim() == 3:
@@ -1817,60 +1819,21 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     k2 * cos_half + k1 * sin_half
                 ], dim=-1)
 
-        if full_hit_mode:
-            key_for_attn, value_for_attn, cu_seqlens_k, max_seqlen_k = (
-                self.prefix_attention_kv_builder().build_gqa_full_hit_kv(
-                    metadata=metadata,
-                    num_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                    dtype=key.dtype,
-                    device=key.device,
-                )
-            )
-        elif prefix_reuse_mode:
-            key_for_attn, value_for_attn, cu_seqlens_k, max_seqlen_k = (
-                self.prefix_attention_kv_builder().build_gqa_prefix_kv(
-                    key=key,
-                    value=value,
-                    metadata=metadata,
-                    num_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                )
-            )
-        else:
-            key_for_attn = key
-            value_for_attn = value
-            cu_seqlens_k = cu_seqlens.to(hidden_states_2d.device)
-            max_seqlen_k = max_seqlen
-
-        # Use gqa_prefill_fa for varlen attention with sink correction
+        backend = GqaPrefixAwareAttentionBackend(
+            prefix_kv_builder=self.prefix_attention_kv_builder(),
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            sinks=self.sinks,
+            softmax_scale=self.scale,
+            sliding_window=self.sliding_window,
+        )
         # q, k, v: [total_tokens, num_heads, head_dim]
-        if prefix_reuse_mode or full_hit_mode:
-            attn_output, lse = gqa_prefill_fa(
-                q=query,
-                k=key_for_attn,
-                v=value_for_attn,
-                cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen_k,
-                sinks=self.sinks,
-                softmax_scale=self.scale,
-                sliding_window=self.sliding_window,
-            )
-        else:
-            attn_output, lse = gqa_prefill_fa(
-                q=query,
-                k=key,
-                v=value,
-                cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
-                cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                sinks=self.sinks,
-                softmax_scale=self.scale,
-                sliding_window=self.sliding_window,
-            )
+        attn_output = backend.forward_prefill(
+            query=query,
+            key=key,
+            value=value,
+            metadata=metadata,
+        )
 
         # attn_output: [total_tokens, num_heads, head_dim]
         # Reshape for output projection
