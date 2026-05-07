@@ -13,10 +13,9 @@ from typing import Callable, Optional, Protocol
 import torch
 
 from batchgen.attention.prefix_gpu_extend import (
-    append_suffix_to_gpu_kv,
-    current_kv_cache_metadata,
     gpu_page_table_attention_enabled,
     gqa_prefill_with_gpu_paged_kv,
+    maybe_append_suffix_to_gpu_kv,
     mla_prefill_with_gpu_paged_kv,
 )
 
@@ -142,26 +141,12 @@ class GqaPrefixAwareAttentionBackend:
         metadata,
         kv_cache_metadata,
     ) -> None:
-        import os
-
-        enabled = self.enable_gpu_suffix_append or (
-            os.environ.get("BATCHGEN_PREFIX_REUSE_GPU_EXTEND_WRITES", "0") == "1"
-        )
-        if not enabled:
-            return
-        if metadata.full_hit_mode:
-            return
-        if self.layer_idx is None:
-            raise RuntimeError(
-                "GQA GPU suffix append requires layer_idx on the backend"
-            )
-        if kv_cache_metadata is None:
-            kv_cache_metadata = current_kv_cache_metadata()
-        append_suffix_to_gpu_kv(
+        maybe_append_suffix_to_gpu_kv(
+            enabled=self.enable_gpu_suffix_append,
             kv_cache_metadata=kv_cache_metadata,
             k_tensor=key,
             v_tensor=value,
-            layer_idx=int(self.layer_idx),
+            layer_idx=self.layer_idx,
             metadata=metadata,
             manager_attr="gpu_paged_kv_manager",
             context="GQA GPU suffix append",
@@ -198,8 +183,7 @@ class MlaProjectedPrefixAwareAttentionBackend:
         )
         from batchgen.models.wrappers.prefix_mla_replay import (
             MlaReplaySpec,
-            block_mla_kv_by_sequence,
-            run_flash_mla_prefix_attention,
+            run_projected_mla_prefix_attention,
         )
 
         metadata = ensure_prefix_cache_prepack_metadata(metadata)
@@ -220,47 +204,20 @@ class MlaProjectedPrefixAwareAttentionBackend:
                 return attn_out
             return self.output_projection(attn_out)
 
-        if metadata.full_hit_mode:
-            compressed_kv, cu_k, _ = self.prefix_kv_builder.build_mla_full_hit_kv(
-                metadata=metadata,
-                kv_dim=int(self.kv_dim),
-                dtype=query.dtype,
-                device=query.device,
-            )
-            query_len = 1
-        elif metadata.prefix_reuse_mode:
-            compressed_kv, cu_k, _ = self.prefix_kv_builder.build_mla_prefix_kv(
-                key=key,
-                metadata=metadata,
-                kv_dim=int(self.kv_dim),
-            )
-            query_len = int(metadata.max_seqlen)
-        else:
-            compressed_kv = key
-            if compressed_kv.dim() == 2:
-                compressed_kv = compressed_kv.unsqueeze(1)
-            cu_k = metadata.cu_seqlens.to(compressed_kv.device)
-            query_len = int(metadata.max_seqlen)
-
-        blocked_k, block_table, cache_seqlens = block_mla_kv_by_sequence(
-            compressed_kv=compressed_kv,
-            cu_k=cu_k,
-            page_size=int(self.page_size),
-        )
         spec = MlaReplaySpec(
             kv_dim=int(self.kv_dim),
             num_heads=int(self.num_heads),
             kv_lora_rank=int(self.kv_lora_rank),
             softmax_scale=float(self.softmax_scale),
         )
-        attention_fn = self.attention_fn or run_flash_mla_prefix_attention
-        attn_out = attention_fn(
+        attn_out = run_projected_mla_prefix_attention(
+            prefix_kv_builder=self.prefix_kv_builder,
             query_states=query,
-            blocked_k=blocked_k,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            query_len=query_len,
+            offload_kv=key,
+            metadata=metadata,
             spec=spec,
+            page_size=int(self.page_size),
+            attention_fn=self.attention_fn,
         )
         self._maybe_append_suffix_to_gpu_kv(
             key=key,
@@ -278,26 +235,12 @@ class MlaProjectedPrefixAwareAttentionBackend:
         metadata,
         kv_cache_metadata,
     ) -> None:
-        import os
-
-        enabled = self.enable_gpu_suffix_append or (
-            os.environ.get("BATCHGEN_PREFIX_REUSE_GPU_EXTEND_WRITES", "0") == "1"
-        )
-        if not enabled:
-            return
-        if metadata.full_hit_mode:
-            return
-        if self.layer_idx is None:
-            raise RuntimeError(
-                "MLA GPU suffix append requires layer_idx on the backend"
-            )
-        if kv_cache_metadata is None:
-            kv_cache_metadata = current_kv_cache_metadata()
-        append_suffix_to_gpu_kv(
+        maybe_append_suffix_to_gpu_kv(
+            enabled=self.enable_gpu_suffix_append,
             kv_cache_metadata=kv_cache_metadata,
             k_tensor=key,
             v_tensor=None,
-            layer_idx=int(self.layer_idx),
+            layer_idx=self.layer_idx,
             metadata=metadata,
             manager_attr="gpu_paged_kv_manager",
             context="MLA GPU suffix append",

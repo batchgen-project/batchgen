@@ -14,6 +14,14 @@ def gpu_page_table_attention_enabled() -> bool:
     return os.environ.get("BATCHGEN_PREFIX_REUSE_GPU_EXTEND_ATTENTION", "0") == "1"
 
 
+def gpu_suffix_append_enabled(explicit_enabled: bool) -> bool:
+    """Whether prefix prefill should append suffix KV into GPU paged KV."""
+
+    return bool(explicit_enabled) or (
+        os.environ.get("BATCHGEN_PREFIX_REUSE_GPU_EXTEND_WRITES", "0") == "1"
+    )
+
+
 def current_kv_cache_metadata():
     from batchgen.attention.forward_metadata_context import (
         get_current_forward_batch_metadata,
@@ -55,6 +63,38 @@ def append_suffix_to_gpu_kv(
         layer_idx=int(layer_idx),
     )
     return append_plan
+
+
+def maybe_append_suffix_to_gpu_kv(
+    *,
+    enabled: bool,
+    kv_cache_metadata,
+    k_tensor: torch.Tensor,
+    v_tensor: Optional[torch.Tensor],
+    layer_idx: Optional[int],
+    metadata,
+    manager_attr: str,
+    context: str,
+) -> None:
+    """Append suffix KV when the experimental GPU-write path is enabled."""
+
+    if not gpu_suffix_append_enabled(enabled):
+        return
+    if metadata.full_hit_mode:
+        return
+    if layer_idx is None:
+        raise RuntimeError(f"{context} requires layer_idx")
+    if kv_cache_metadata is None:
+        kv_cache_metadata = current_kv_cache_metadata()
+    append_suffix_to_gpu_kv(
+        kv_cache_metadata=kv_cache_metadata,
+        k_tensor=k_tensor,
+        v_tensor=v_tensor,
+        layer_idx=int(layer_idx),
+        metadata=metadata,
+        manager_attr=manager_attr,
+        context=context,
+    )
 
 
 def gqa_prefill_with_gpu_paged_kv(
