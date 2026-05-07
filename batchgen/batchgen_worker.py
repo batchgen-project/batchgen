@@ -2051,6 +2051,105 @@ class BatchGenWorker:
 		)
 		return True
 
+	def _gpu_manager_tracks_sequence(
+		self,
+		manager: GPUPagedKVCacheManager,
+		global_id: int,
+	) -> bool:
+		"""Return whether the GPU KV manager already owns pages for a sequence."""
+		primary_manager = getattr(manager, "primary", manager)
+		sequences = getattr(primary_manager, "_sequences", None)
+		if sequences is None:
+			raise RuntimeError(
+				f"Rank {self.rank}: cannot inspect GPU KV manager sequence state "
+				f"for gid={global_id}"
+			)
+		return global_id in sequences
+
+	def _decode_indices_missing_gpu_kv(
+		self,
+		local_decode_indices: List[int],
+	) -> List[int]:
+		"""Identify local decode rows that still need Host KV loaded into GPU KV."""
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is None or not getattr(manager, "is_initialized", False):
+			raise RuntimeError(
+				f"Rank {self.rank}: GPU KV manager is not initialized before decode allocation"
+			)
+
+		missing = []
+		for local_idx in local_decode_indices:
+			uuid = self._local_to_uuid_map[local_idx]
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					f"Rank {self.rank}: local decode idx {local_idx} maps to missing sequence {uuid}"
+				)
+
+			tracked = uuid in self._sequences_with_gpu_kv
+			has_gpu_pages = seq.gpu_pages_allocated > 0
+			manager_tracks = self._gpu_manager_tracks_sequence(manager, seq.global_idx)
+
+			if tracked != has_gpu_pages or tracked != manager_tracks:
+				raise RuntimeError(
+					f"Rank {self.rank}: inconsistent GPU KV tracking for "
+					f"uuid={uuid[:8]} gid={seq.global_idx}: "
+					f"tracked={tracked} gpu_pages={seq.gpu_pages_allocated} "
+					f"manager_tracks={manager_tracks}"
+				)
+
+			if not tracked:
+				missing.append(local_idx)
+
+		return missing
+
+	def _ensure_decode_gpu_kv_loaded(
+		self,
+		local_decode_indices: List[int],
+	) -> None:
+		"""Load Host KV into GPU KV for local decode rows that are not resident yet."""
+		if not local_decode_indices:
+			return
+
+		missing_indices = self._decode_indices_missing_gpu_kv(local_decode_indices)
+		if not missing_indices:
+			return
+
+		alloc_ok = self._allocate_gpu_kv_two_page_buffer(
+			missing_indices,
+			load_from_host=True,
+		)
+		if not alloc_ok:
+			missing_uuids = [
+				self._local_to_uuid_map[idx][:8]
+				for idx in missing_indices
+				if idx in self._local_to_uuid_map
+			]
+			raise RuntimeError(
+				f"Rank {self.rank}: failed to allocate/load GPU KV for "
+				f"{len(missing_indices)} local decode sequences: {missing_uuids[:8]}"
+			)
+
+	def _assert_decode_gpu_kv_ready(
+		self,
+		local_decode_indices: List[int],
+		context: str,
+	) -> None:
+		"""Fail loudly if decode config is reached before local GPU KV is ready."""
+		if not local_decode_indices:
+			return
+		missing_indices = self._decode_indices_missing_gpu_kv(local_decode_indices)
+		if missing_indices:
+			missing_uuids = [
+				self._local_to_uuid_map[idx][:8]
+				for idx in missing_indices
+				if idx in self._local_to_uuid_map
+			]
+			raise RuntimeError(
+				f"Rank {self.rank}: {context}: local decode GPU KV not loaded for "
+				f"{len(missing_indices)} sequences: {missing_uuids[:8]}"
+			)
+
 	def _extend_gpu_kv_allocation(self, uuids: List[str]) -> bool:
 		"""
 		Extend GPU KV allocation for sequences that need more pages.
@@ -6509,6 +6608,11 @@ class BatchGenWorker:
 
 				if not decode_uuids:
 					break
+
+				# Sync while queued rows still have their valid pre-decode status.
+				# New PREFILLED/ON_HOLD rows do not have GPU pages yet, so switching
+				# them to IN_DECODE before this sync violates SequenceEntry invariants.
+				self._sync_sequence_metadata(decode_uuids)
 				
 				for uuid in decode_uuids:
 					seq = self.global_batch.get_sequence(uuid)
@@ -6517,19 +6621,13 @@ class BatchGenWorker:
 						f"from={prev_status}")
 				self._update_batch_status(decode_uuids, SequenceStatus.IN_DECODE)
 
-				# ============ CRITICAL: Sync metadata before decode config ============
-				# After decode→prefill→decode transitions, sequence metadata
-				# (decoded_length, current_context_length, host_pages_allocated) may be
-				# stale on non-owning ranks. The last sync was at the previous decode
-				# group's final boundary. Sequences decoded additional tokens after that
-				# boundary without cross-rank sync. Without this sync,
-				# _allocate_gpu_kv_two_page_buffer may allocate too few GPU pages
-				# (capped by stale host_pages_allocated), causing KV corruption at the
-				# DECISION_INTERVAL boundary (~134-token truncation bug).
-				if decode_uuids:
-					self._sync_sequence_metadata(decode_uuids)
-
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
+				self._ensure_decode_gpu_kv_loaded(local_decode_indices)
+
+				# After local owners load Host KV into GPU KV, propagate the new
+				# gpu_pages_allocated values before global metadata validation.
+				self._sync_sequence_metadata(decode_uuids)
+
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
 					global_decode_sequences
@@ -7456,32 +7554,10 @@ class BatchGenWorker:
 			"Ensure _init_gpu_kv_with_actual_size() was called first."
 		)
 
-		# Allocate GPU KV for sequences
-		if local_decode_indices:
-			alloc_ok = self._allocate_gpu_kv_two_page_buffer(local_decode_indices, load_from_host=True)
-			if alloc_ok:
-				# _allocate_gpu_kv_two_page_buffer already sets gpu_pages_allocated,
-				# mark_initial_gpu_reservation_done, and _sequences_with_gpu_kv.
-				# Keep these for safety / idempotence.
-				for local_idx in local_decode_indices:
-					uuid = self._local_to_uuid_map[local_idx]
-					seq = self.global_batch.get_sequence(uuid)
-					seq.gpu_pages_allocated = seq.get_gpu_pages_for_two_page_buffer()
-					# Mark initial reservation done
-					seq.mark_initial_gpu_reservation_done()
-					self._sequences_with_gpu_kv.add(uuid)
-			else:
-				# CRITICAL FIX: If allocation failed (e.g. insufficient free pages after
-				# a decode→prefill→decode transition with mixed ON_HOLD + PREFILLED),
-				# do NOT add these sequences to tracking. Otherwise subsequent
-				# rebuild_page_table() calls will crash with KeyError because the
-				# sequences exist in _sequences_with_gpu_kv / batch but were never
-				# registered in gpu_manager._sequences.
-				logging.error(
-					f"Rank {self.rank}: GPU KV allocation FAILED for {len(local_decode_indices)} "
-					f"sequences. Clearing local_decode_indices to avoid inconsistent state."
-				)
-				local_decode_indices.clear()
+		self._assert_decode_gpu_kv_ready(
+			local_decode_indices,
+			"_config_decoding_for_batch",
+		)
 		
 		if self.rank == 0:
 			logging.info(f"[DECODE] Config completed: {(time.perf_counter() - start_time)*1000:.1f}ms, {len(decode_uuids)} sequences")
