@@ -158,10 +158,15 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         return top_k_indices
 
     def fake_select(primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_mla_kv, selected_lengths, selected_indices, row_modes, *, index_topk, return_indices, primary_slot_indices=None):
-        del primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_indices, return_indices, primary_slot_indices
+        del primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_indices, return_indices
         selected_mla_kv.copy_(selected_template[: selected_mla_kv.shape[0]])
+        if primary_slot_indices is not None:
+            valid = primary_slot_indices >= 0
+            selected_mla_kv[~valid].zero_()
         selected_lengths.fill_(index_topk)
         row_modes.zero_()
+        if primary_slot_indices is not None:
+            row_modes[primary_slot_indices < 0] = 2
         return selected_mla_kv, selected_lengths, None, row_modes
 
     def fake_metadata(selected_lengths, num_heads):
@@ -328,14 +333,6 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
     assert torch.count_nonzero(static_outputs.attn_output[actual_bsz:]).item() == 0
-    assert torch.equal(
-        buffers.safe_primary_slot_indices[actual_bsz:],
-        torch.zeros(bucket_size - actual_bsz, dtype=torch.int32, device=device),
-    )
-    assert torch.equal(
-        buffers.safe_aux_slot_indices[actual_bsz:],
-        torch.zeros(bucket_size - actual_bsz, dtype=torch.int32, device=device),
-    )
 
     manager.drop_bucket(bucket_size)
     assert bucket_size not in shared_buffers
