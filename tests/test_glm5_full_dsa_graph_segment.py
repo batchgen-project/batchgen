@@ -161,12 +161,9 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         del primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_indices, return_indices
         selected_mla_kv.copy_(selected_template[: selected_mla_kv.shape[0]])
         if primary_slot_indices is not None:
-            valid = primary_slot_indices >= 0
-            selected_mla_kv[~valid].zero_()
+            selected_mla_kv.mul_((primary_slot_indices >= 0).to(torch.bfloat16).view(-1, 1, 1, 1))
         selected_lengths.fill_(index_topk)
         row_modes.zero_()
-        if primary_slot_indices is not None:
-            row_modes[primary_slot_indices < 0] = 2
         return selected_mla_kv, selected_lengths, None, row_modes
 
     def fake_metadata(selected_lengths, num_heads):
