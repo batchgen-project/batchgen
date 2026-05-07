@@ -16,22 +16,59 @@ def _is_glm_model(model_name: str | None) -> bool:
     return "glm" in (model_name or "").lower()
 
 
+def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
+    normalized = (model_name or "").strip().lower()
+    return any(
+        pattern in normalized
+        for pattern in (
+            "zai-org/glm-5-fp8",
+            "zai-org/glm-5.1-fp8",
+            "glm-5-fp8",
+            "glm_5_fp8",
+            "glm-5.1-fp8",
+            "glm_5.1_fp8",
+            "glm5-fp8",
+            "glm5_fp8",
+            "glm51-fp8",
+            "glm51_fp8",
+        )
+    )
+
+
+def is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
+    return _is_glm5_fp8_graph_default_model(model_name)
+
+
 def glm5_dsa_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    return env.get(GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1" and _is_glm_model(model_name)
+    return (
+        (
+            env.get(GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+            or (enable_cuda_graph and _is_glm5_fp8_graph_default_model(model_name))
+        )
+        and _is_glm_model(model_name)
+    )
 
 
 def glm5_moe_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    return env.get(GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1" and _is_glm_model(model_name)
+    return (
+        (
+            env.get(GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
+            or (enable_cuda_graph and _is_glm5_fp8_graph_default_model(model_name))
+        )
+        and _is_glm_model(model_name)
+    )
 
 
 def glm5_whole_model_cuda_graph_requested_for_model(
@@ -55,23 +92,37 @@ def glm5_whole_model_cuda_graph_compare_requested_for_model(
 def glm5_segmented_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     return (
-        glm5_dsa_cuda_graph_requested_for_model(model_name, environ=environ)
-        or glm5_moe_cuda_graph_requested_for_model(model_name, environ=environ)
+        glm5_dsa_cuda_graph_requested_for_model(
+            model_name,
+            enable_cuda_graph=enable_cuda_graph,
+            environ=environ,
+        )
+        or glm5_moe_cuda_graph_requested_for_model(
+            model_name,
+            enable_cuda_graph=enable_cuda_graph,
+            environ=environ,
+        )
     )
 
 
 def glm5_any_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     return (
         glm5_whole_model_cuda_graph_requested_for_model(model_name, environ=environ)
         or glm5_whole_model_cuda_graph_compare_requested_for_model(model_name, environ=environ)
-        or glm5_segmented_cuda_graph_requested_for_model(model_name, environ=environ)
+        or glm5_segmented_cuda_graph_requested_for_model(
+            model_name,
+            enable_cuda_graph=enable_cuda_graph,
+            environ=environ,
+        )
     )
 
 
@@ -131,10 +182,15 @@ def should_warmup_cuda_graphs_before_decode(
     graph_manager_is_initialized: bool,
     global_batch_has_queueing: bool,
     model_name: str | None,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     if graph_manager_is_initialized:
         return False
     if not global_batch_has_queueing:
         return True
-    return glm5_any_cuda_graph_requested_for_model(model_name, environ=environ)
+    return glm5_any_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=enable_cuda_graph,
+        environ=environ,
+    )

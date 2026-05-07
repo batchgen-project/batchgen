@@ -151,8 +151,6 @@ def _glm5_dsa_cuda_graph_can_replay(
 
     if max_seqlen <= 0 or index_topk <= 0:
         return False
-    if captured_max_seqlen is not None and max_seqlen > captured_max_seqlen:
-        return False
     if cache_seqlens.ndim != 1:
         return False
     return True
@@ -193,6 +191,12 @@ def _log_glm5_dsa_graph_compare_unavailable_once(
 
 
 def _glm5_dsa_gpu_page_table_tensor(gpu_paged_kv_manager) -> Optional[torch.Tensor]:
+    get_storage = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table_storage", None)
+    if get_storage is not None:
+        try:
+            return get_storage()
+        except RuntimeError:
+            return None
     get_graph_table = getattr(gpu_paged_kv_manager, "get_cuda_graph_page_table", None)
     if get_graph_table is None:
         return None
@@ -400,6 +404,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._dsa_cuda_graph_max_aux_pages = 0
         self._dsa_cuda_graph_primary_page_table_signature = None
         self._dsa_cuda_graph_aux_page_table_signature = None
+        self._dsa_cuda_graph_required = False
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -550,10 +555,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
         max_aux_pages_per_seq: Optional[int] = None,
         primary_page_table: Optional[torch.Tensor] = None,
         aux_page_table: Optional[torch.Tensor] = None,
+        graph_output_required: bool = False,
     ) -> None:
         self._dsa_cuda_graph_manager = manager
         self._dsa_cuda_graph_segment_name = segment_name
         self._dsa_cuda_graph_max_seqlen = max_seqlen
+        self._dsa_cuda_graph_required = graph_output_required
         self._dsa_cuda_graph_max_primary_pages = (
             primary_page_table.shape[1]
             if primary_page_table is not None
@@ -802,13 +809,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
     ) -> torch.Tensor:
         if self._dsa_cuda_graph_manager is None or self._dsa_cuda_graph_segment_name is None:
             raise RuntimeError(
-                f"[layer {self.layer_idx}] BATCHGEN_GLM5_DSA_CUDA_GRAPH=1 was requested, "
+                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph was requested, "
                 "but this attention wrapper has no registered DSA CUDA graph segment"
-            )
-        if max_seqlen > self._dsa_cuda_graph_max_seqlen:
-            raise RuntimeError(
-                f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph max_seqlen={max_seqlen} "
-                f"exceeds captured cap {self._dsa_cuda_graph_max_seqlen}"
             )
         index_topk = getattr(getattr(self.module, "indexer", None), "index_topk", 2048)
         if not _glm5_dsa_cuda_graph_can_replay(
@@ -819,8 +821,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         ):
             raise RuntimeError(
                 f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay is not "
-                f"valid for max_seqlen={max_seqlen}, captured cap "
-                f"{self._dsa_cuda_graph_max_seqlen}, index_topk={index_topk}"
+                f"valid for max_seqlen={max_seqlen}, index_topk={index_topk}"
             )
         if not self._dsa_cuda_graph_page_tables_match(
             gpu_paged_kv_manager,
@@ -895,6 +896,43 @@ class GLM5AttnWrapper(AttnWrapperBase):
             self.weight_dequant_scale["o_proj.weight_scale_inv"],
         )
         return attn_output.view(bsz, 1, -1)
+
+    def _dsa_cuda_graph_forward_state_allows_replay(
+        self,
+        batch_size: int,
+    ) -> tuple[bool, str]:
+        if self._dsa_cuda_graph_manager is None:
+            return False, "no graph manager"
+        bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
+        state = getattr(AttnWrapperBase, "glm5_dsa_graph_forward_state", None)
+        if not isinstance(state, dict):
+            return False, "missing per-forward graph state"
+        if state.get("path") != "graph":
+            reason = state.get("reason", "unknown")
+            return False, f"worker selected eager DSA ({reason})"
+        if int(state.get("bucket", -1)) != int(bucket_size):
+            return (
+                False,
+                f"worker graph bucket {state.get('bucket')} does not match replay bucket {bucket_size}",
+            )
+        if not bool(state.get("metadata_prepared", False)):
+            return False, "per-forward FlashMLA metadata was not prepared"
+        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        if not isinstance(metadata, dict):
+            return False, "missing per-forward FlashMLA metadata"
+        if int(metadata.get("bucket_size", -1)) != int(bucket_size):
+            return (
+                False,
+                f"FlashMLA metadata bucket {metadata.get('bucket_size')} does not match replay bucket {bucket_size}",
+            )
+        tile_scheduler_metadata = metadata.get("tile_scheduler_metadata")
+        num_splits = metadata.get("num_splits")
+        if not isinstance(tile_scheduler_metadata, torch.Tensor) or not isinstance(
+            num_splits,
+            torch.Tensor,
+        ):
+            return False, "FlashMLA metadata tensors are missing"
+        return True, "captured"
 
     def _dsa_cuda_graph_flashmla_metadata_inputs(
         self,
@@ -1140,7 +1178,11 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         compare_active = _glm5_dsa_graph_compare_active()
         compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
-        graph_requested = _glm5_dsa_cuda_graph_required() or compare_active
+        graph_requested = (
+            _glm5_dsa_cuda_graph_required()
+            or getattr(self, "_dsa_cuda_graph_required", False)
+            or compare_active
+        )
         compare_after_eager = False
         if graph_requested:
             index_topk = getattr(getattr(attn, "indexer", None), "index_topk", 2048)
@@ -1162,7 +1204,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager,
                 gpu_paged_kv_manager_aux,
             )
-            if graph_can_replay and graph_has_bucket and graph_page_tables_match and not compare_active:
+            if graph_has_bucket:
+                graph_forward_ready, graph_forward_reason = (
+                    self._dsa_cuda_graph_forward_state_allows_replay(bsz)
+                )
+            else:
+                graph_forward_ready = False
+                graph_forward_reason = "batch size has no captured graph bucket"
+            if (
+                graph_can_replay
+                and graph_has_bucket
+                and graph_page_tables_match
+                and graph_forward_ready
+                and not compare_active
+            ):
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -1177,15 +1232,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and graph_can_replay
                 and graph_has_bucket
                 and graph_page_tables_match
+                and graph_forward_ready
             )
             if not graph_can_replay:
-                captured_cap = getattr(self, "_dsa_cuda_graph_max_seqlen", None)
-                if captured_cap is not None and max_seqlen > captured_cap:
-                    reason = (
-                        f"max_seqlen={max_seqlen} exceeds captured cap "
-                        f"{captured_cap}"
-                    )
-                elif index_topk <= 0:
+                if index_topk <= 0:
                     reason = f"invalid index_topk={index_topk}"
                 elif cache_seqlens.ndim != 1:
                     reason = f"cache_seqlens ndim {cache_seqlens.ndim} is not 1"
@@ -1195,6 +1245,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 reason = f"batch size {bsz} has no captured graph bucket"
             elif not graph_page_tables_match:
                 reason = "captured page-table storage no longer matches active storage"
+            elif not graph_forward_ready:
+                reason = graph_forward_reason
             else:
                 reason = "graph/eager compare mode is returning eager output"
             _log_glm5_dsa_graph_eager_fallback_once(
