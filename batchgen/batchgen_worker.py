@@ -90,6 +90,7 @@ from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_dsa_cuda_graph_requested_for_model,
+	glm5_dsa_full_cuda_graph_requested,
 	glm5_moe_cuda_graph_requested_for_model,
 	glm5_segmented_cuda_graph_requested_for_model,
 )
@@ -8702,6 +8703,10 @@ class BatchGenWorker:
 			self._glm5_dsa_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		glm5_dsa_full_graph_enabled = (
+			self._glm5_dsa_full_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
 		glm5_moe_graph_enabled = (
 			self._glm5_moe_graph_requested_for_current_batch()
 			and "glm" in model_name_l
@@ -9054,6 +9059,8 @@ class BatchGenWorker:
 		return True
 
 	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
+		if self._glm5_dsa_full_graph_requested_for_current_batch():
+			return True
 		model_name = getattr(self, "model_name", None)
 		if glm5_dsa_cuda_graph_requested_for_model(
 			model_name,
@@ -9075,6 +9082,14 @@ class BatchGenWorker:
 		if isinstance(value, str):
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
+
+	def _glm5_dsa_full_graph_requested_for_current_batch(self) -> bool:
+		if glm5_dsa_full_cuda_graph_requested():
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_dsa_full_graph"))
 
 	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
 		return glm5_dsa_cuda_graph_requested_for_model(
@@ -9324,6 +9339,8 @@ class BatchGenWorker:
 		gpu_manager,
 	) -> None:
 		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+		AttnWrapperBase.glm5_decode_primary_slot_indices = None
+		AttnWrapperBase.glm5_decode_aux_slot_indices = None
 		path, bucket, reason = self._glm5_dsa_graph_path_state(local_bsz, gpu_manager)
 		AttnWrapperBase.glm5_dsa_graph_forward_state = {
 			"path": path,
@@ -9348,6 +9365,24 @@ class BatchGenWorker:
 			raise RuntimeError(
 				f"GLM-5 DSA CUDA graph invalid local batch size {local_bsz} for bucket {bucket}"
 			)
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			raise RuntimeError("GLM-5 DSA CUDA graph replay requires auxiliary GPU KV manager")
+		primary_state = primary_manager.get_cuda_graph_page_table_state()
+		aux_state = aux_manager.get_cuda_graph_page_table_state()
+		AttnWrapperBase.glm5_decode_primary_slot_indices = primary_state.slot_indices[:local_bsz].to(
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
+		AttnWrapperBase.glm5_decode_aux_slot_indices = aux_state.slot_indices[:local_bsz].to(
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
 		selected_lengths = torch.empty(
 			(bucket,),
 			dtype=torch.int32,
@@ -9559,6 +9594,10 @@ class BatchGenWorker:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
 		glm5_dsa_graph_enabled = (
 			self._glm5_dsa_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
+		glm5_dsa_full_graph_enabled = (
+			self._glm5_dsa_full_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		glm5_moe_graph_enabled = (
@@ -9855,7 +9894,9 @@ class BatchGenWorker:
 
 			from batchgen.models.glm.glm5.cuda_graph_segments import (
 				Glm5DsaAttnSegment,
+				Glm5FullDsaAttnSegment,
 				make_glm5_dsa_graph_segment_name,
+				make_glm5_full_dsa_graph_segment_name,
 			)
 
 			primary_manager = getattr(gpu_manager, "primary", gpu_manager)
@@ -9933,24 +9974,43 @@ class BatchGenWorker:
 					dtype=torch.bfloat16,
 				)
 				cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
-				segment = Glm5DsaAttnSegment(
-					primary_blocked_k=primary_blocked_k,
-					aux_blocked_k=aux_blocked_k,
-					primary_page_table=primary_page_table,
-					aux_page_table=aux_page_table,
-					wq_b_weights=wrapper._fused_wqb_weights,
-					absorb_weights=wrapper._fp8_absorb_weights,
-					cuda_module=wrapper._indexer_cuda_module,
-					cos_table=cos_table,
-					sin_table=sin_table,
-					max_seqlen=graph_max_seqlen,
-					index_topk=indexer.index_topk,
-					page_size=primary_page_size,
-					aux_page_size=aux_page_size,
-					softmax_scale=attn.softmax_scale,
-					shared_buffers=shared_dsa_buffers,
-				)
-				segment_name = make_glm5_dsa_graph_segment_name(layer_idx)
+				if glm5_dsa_full_graph_enabled:
+					segment = Glm5FullDsaAttnSegment(
+						wrapper=wrapper,
+						primary_blocked_k=primary_blocked_k,
+						aux_blocked_k=aux_blocked_k,
+						primary_page_table=primary_page_table,
+						aux_page_table=aux_page_table,
+						wq_b_weights=wrapper._fused_wqb_weights,
+						absorb_weights=wrapper._fp8_absorb_weights,
+						cuda_module=wrapper._indexer_cuda_module,
+						cos_table=cos_table,
+						sin_table=sin_table,
+						max_seqlen=graph_max_seqlen,
+						index_topk=indexer.index_topk,
+						page_size=primary_page_size,
+						aux_page_size=aux_page_size,
+					)
+					segment_name = make_glm5_full_dsa_graph_segment_name(layer_idx)
+				else:
+					segment = Glm5DsaAttnSegment(
+						primary_blocked_k=primary_blocked_k,
+						aux_blocked_k=aux_blocked_k,
+						primary_page_table=primary_page_table,
+						aux_page_table=aux_page_table,
+						wq_b_weights=wrapper._fused_wqb_weights,
+						absorb_weights=wrapper._fp8_absorb_weights,
+						cuda_module=wrapper._indexer_cuda_module,
+						cos_table=cos_table,
+						sin_table=sin_table,
+						max_seqlen=graph_max_seqlen,
+						index_topk=indexer.index_topk,
+						page_size=primary_page_size,
+						aux_page_size=aux_page_size,
+						softmax_scale=attn.softmax_scale,
+						shared_buffers=shared_dsa_buffers,
+					)
+					segment_name = make_glm5_dsa_graph_segment_name(layer_idx)
 				manager.register_segment(segment_name, segment)
 				wrapper.enable_dsa_cuda_graph(
 					manager,
@@ -9959,6 +10019,7 @@ class BatchGenWorker:
 					primary_page_table=primary_page_table,
 					aux_page_table=aux_page_table,
 					graph_output_required=self._glm5_dsa_graph_output_required_for_current_batch(),
+					full_segment=glm5_dsa_full_graph_enabled,
 				)
 
 			logging.info(
@@ -11208,6 +11269,8 @@ class BatchGenWorker:
 		AttnWrapperBase.batchgen_debug = None
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
+		AttnWrapperBase.glm5_decode_primary_slot_indices = None
+		AttnWrapperBase.glm5_decode_aux_slot_indices = None
 		AttnWrapperBase.glm5_dsa_graph_forward_state = None
 		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
 

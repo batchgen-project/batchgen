@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 
 GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
 GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
@@ -49,10 +50,19 @@ def glm5_dsa_cuda_graph_requested_for_model(
     return (
         (
             env.get(GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+            or env.get(GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
             or (enable_cuda_graph and _is_glm5_fp8_graph_default_model(model_name))
         )
         and _is_glm_model(model_name)
     )
+
+
+def glm5_dsa_full_cuda_graph_requested(
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    env = os.environ if environ is None else environ
+    return env.get(GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
 
 
 def glm5_moe_cuda_graph_requested_for_model(

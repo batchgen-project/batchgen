@@ -1069,6 +1069,23 @@ def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
     assert worker._glm5_moe_graph_output_required_for_current_batch()
 
 
+def test_worker_full_dsa_graph_flag_requests_dsa_path(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=False)
+    worker._batchgen_debug = {}
+
+    assert worker._glm5_dsa_full_graph_requested_for_current_batch()
+    assert worker._glm5_dsa_graph_requested_for_current_batch()
+
+
 def test_glm5_dsa_graph_enable_records_cli_required_state():
     wrapper = object.__new__(GLM5AttnWrapper)
 
@@ -1080,6 +1097,87 @@ def test_glm5_dsa_graph_enable_records_cli_required_state():
     )
 
     assert wrapper._dsa_cuda_graph_required is True
+
+
+def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection(monkeypatch):
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 2
+            return 4
+
+    class FakeManager:
+        bucketing = FakeBucketing()
+
+        def __init__(self):
+            self.inputs = None
+
+        def replay(self, segment_name, batch_size, **inputs):
+            self.inputs = (segment_name, batch_size, inputs)
+            return {
+                "attn_output": torch.full((batch_size, 1, 8), 3.0, dtype=torch.bfloat16),
+                "primary_k_tensor": torch.ones(batch_size, 1, 1, 4, dtype=torch.bfloat16),
+                "indexer_k_tensor": torch.ones(batch_size, 1, 1, 4, dtype=torch.bfloat16) * 2,
+            }
+
+    manager = FakeManager()
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
+    wrapper.module = types.SimpleNamespace(indexer=types.SimpleNamespace(index_topk=2048))
+    wrapper._dsa_cuda_graph_max_seqlen = 4096
+    wrapper._dsa_cuda_graph_manager = manager
+    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_0_full_dsa_attn"
+    wrapper._dsa_cuda_graph_full = True
+    monkeypatch.setattr(
+        wrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda primary_manager, aux_manager: True,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_project_dsa_attn_heads",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not project")),
+    )
+    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+        "bucket_size": 4,
+        "tile_scheduler_metadata": torch.ones(3, dtype=torch.int32),
+        "num_splits": torch.ones(1, dtype=torch.int32),
+    }
+    AttnWrapperBase.glm5_decode_primary_slot_indices = torch.tensor([3, 4], dtype=torch.int32)
+    AttnWrapperBase.glm5_decode_aux_slot_indices = torch.tensor([7, 8], dtype=torch.int32)
+    primary_appends = []
+    aux_appends = []
+    AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
+        (layer, tensor.clone())
+    )
+    AttnWrapperBase.kv_append_callback_aux = lambda layer, tensor, _: aux_appends.append(
+        (layer, tensor.clone())
+    )
+
+    try:
+        out = wrapper._forward_decode_dsa_graph(
+            torch.zeros(2, 1, 8, dtype=torch.bfloat16),
+            torch.tensor([[2048], [2049]], dtype=torch.int64),
+            torch.tensor([2049, 2050], dtype=torch.int32),
+            4096,
+            object(),
+            object(),
+        )
+    finally:
+        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+        AttnWrapperBase.glm5_decode_primary_slot_indices = None
+        AttnWrapperBase.glm5_decode_aux_slot_indices = None
+        AttnWrapperBase.kv_append_callback = None
+        AttnWrapperBase.kv_append_callback_aux = None
+
+    assert out.shape == (2, 1, 8)
+    assert torch.equal(out, torch.full_like(out, 3.0))
+    segment_name, batch_size, inputs = manager.inputs
+    assert segment_name == "glm5_layer_0_full_dsa_attn"
+    assert batch_size == 2
+    assert inputs["primary_slot_indices"].tolist() == [3, 4]
+    assert inputs["aux_slot_indices"].tolist() == [7, 8]
+    assert primary_appends[0][0] == 0
+    assert aux_appends[0][0] == 0
 
 
 def test_glm5_moe_graph_enable_records_cli_required_state():
@@ -1331,6 +1429,15 @@ def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
         def has_graph(self, segment_name, batch_size):
             return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
 
+    class FakeKVManager:
+        def __init__(self, slot_indices):
+            self._state = types.SimpleNamespace(
+                slot_indices=torch.tensor(slot_indices, dtype=torch.int32)
+            )
+
+        def get_cuda_graph_page_table_state(self):
+            return self._state
+
     class FakeWrapper:
         _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
         _dsa_cuda_graph_max_seqlen = 8192
@@ -1378,7 +1485,12 @@ def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
         fake_prepare,
     )
 
-    worker._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(2, object())
+    primary_manager = FakeKVManager([3, 4])
+    aux_manager = FakeKVManager([7, 8])
+    worker._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
+        2,
+        types.SimpleNamespace(primary=primary_manager, auxiliary=aux_manager),
+    )
 
     assert captured_lengths["values"].tolist() == [970, 2048, 2048, 2048]
     assert captured_lengths["num_heads"] == 64
@@ -1393,8 +1505,12 @@ def test_glm5_dsa_graph_metadata_prep_sets_forward_state(monkeypatch):
     assert metadata["bucket_size"] == 4
     assert metadata["tile_scheduler_metadata"].tolist() == [1, 1, 1]
     assert metadata["num_splits"].tolist() == [1]
+    assert AttnWrapperBase.glm5_decode_primary_slot_indices.tolist() == [3, 4]
+    assert AttnWrapperBase.glm5_decode_aux_slot_indices.tolist() == [7, 8]
     AttnWrapperBase.glm5_dsa_graph_forward_state = None
     AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+    AttnWrapperBase.glm5_decode_primary_slot_indices = None
+    AttnWrapperBase.glm5_decode_aux_slot_indices = None
 
 
 def test_glm5_gpu_kv_config_uses_actual_prompt_for_graph_page_table():
