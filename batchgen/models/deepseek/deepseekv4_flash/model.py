@@ -199,6 +199,65 @@ _QAT_FP4_VALUES = (-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
 # See `_qat_*_inplace` and `_qat_hadamard_rotate` callers.
 _QAT_ENABLED = os.environ.get("BATCHGEN_V4F_QAT", "0") == "1"
 
+# Master switch — set BATCHGEN_ENABLE_DSV4_GROUPED_MXFP4_MOE=1 to opt into the
+# grouped MXFP4 Marlin MoE forward (replaces the per-expert Python loop in
+# DeepSeekV4FlashMoE.forward / _forward_ep). The kernel + wrapper live in
+# batchgen_kernel_dev (v0_dsv4_grouped_mxfp4_marlin.py). On first use, each
+# MoE module lazily builds a per-expert Marlin-permuted weight cache from
+# self.experts[i].runtime_weights. Falls back to the Python loop if the
+# kernel build, the wrapper import, or the cache build fails.
+#
+# Caveats:
+# 1. Cache holds Marlin-permuted weights resident on GPU per local expert.
+#    With EP world_size=8, ~32 experts/rank × 3 weights/expert × ~4 MB/weight
+#    ≈ 380 MB/layer, ~16 GB across 43 layers. Memory budget assumes weights
+#    are not aggressively offloaded.
+# 2. Eager weight loading required: cache build calls expert.runtime_weights
+#    which must be populated. If using a weight-streaming loader, build the
+#    cache after all experts in a layer are resident.
+# 3. Default OFF until we benchmark vs the Python loop on L1 32x512.
+_GROUPED_MXFP4_MOE_ENABLED = os.environ.get(
+    "BATCHGEN_ENABLE_DSV4_GROUPED_MXFP4_MOE", "0"
+) == "1"
+
+# Lazy import of the wrapper. Held here so the model module doesn't crash at
+# import time on machines without the kernel_dev tree on PYTHONPATH.
+_dsv4_grouped_mxfp4_marlin_mod = None
+
+
+def _get_dsv4_grouped_mxfp4_marlin():
+    """Returns the v0_dsv4_grouped_mxfp4_marlin module if available, else None."""
+    global _dsv4_grouped_mxfp4_marlin_mod
+    if _dsv4_grouped_mxfp4_marlin_mod is not None:
+        return _dsv4_grouped_mxfp4_marlin_mod
+    if not _GROUPED_MXFP4_MOE_ENABLED:
+        return None
+    try:
+        # batchgen_kernel_dev expected on PYTHONPATH (sym-linked or path-added).
+        from batchgen_kernel_dev.moe import v0_dsv4_grouped_mxfp4_marlin as mod  # type: ignore
+    except Exception as exc1:
+        # Fallback: try direct file-based import via env-supplied root.
+        try:
+            import importlib.util
+            kdev_root = os.environ.get(
+                "BATCHGEN_KERNEL_DEV_ROOT",
+                "/tmp/kernel_dev_pilot",
+            )
+            mod_path = os.path.join(kdev_root, "moe", "v0_dsv4_grouped_mxfp4_marlin.py")
+            if not os.path.exists(mod_path):
+                return None
+            spec = importlib.util.spec_from_file_location(
+                "_v0_dsv4_grouped_mxfp4_marlin_v4f", mod_path
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc2:
+            print(f"[V4F MoE] grouped MXFP4 Marlin import failed: "
+                  f"package={exc1!r} file={exc2!r}", flush=True)
+            return None
+    _dsv4_grouped_mxfp4_marlin_mod = mod
+    return mod
+
 # Master switch for activation tracing — set BATCHGEN_V4F_TRACE=1 to log
 # tensor stats (min/max/abs.mean/has_nan/has_inf) at key compute boundaries
 # during decode. Helps localize where C++/CUDA kernels produce non-finite
@@ -1684,6 +1743,46 @@ class DeepSeekV4FlashMoE(nn.Module):
         self.experts_per_rank = self.total_experts
         self.enable_ep_offloading = False
 
+        # Lazy-built grouped MXFP4 Marlin cache (None until first MoE forward
+        # under BATCHGEN_ENABLE_DSV4_GROUPED_MXFP4_MOE=1). See
+        # _get_or_build_mxfp4_marlin_cache for the build sequence.
+        self._mxfp4_marlin_cache = None
+        self._mxfp4_marlin_build_failed = False
+
+    def _get_or_build_mxfp4_marlin_cache(self, device: torch.device):
+        """Lazy-build the per-expert Marlin-permuted weight cache for this MoE.
+
+        Returns the cache on success, None if grouped-MXFP4 path is disabled,
+        the kernel can't be loaded, or the cache build raises (e.g. expert
+        runtime_weights not yet populated).
+        """
+        if self._mxfp4_marlin_cache is not None:
+            return self._mxfp4_marlin_cache
+        if self._mxfp4_marlin_build_failed:
+            return None
+        mod = _get_dsv4_grouped_mxfp4_marlin()
+        if mod is None or not mod.is_available():
+            self._mxfp4_marlin_build_failed = True
+            return None
+        try:
+            cache = mod.V4FMxfp4ExpertWeightCache(
+                num_experts=self.total_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+            )
+            cache.build_from_experts(list(self.experts), device=device)
+            self._mxfp4_marlin_cache = cache
+            print(f"[V4F MoE L{self.layer_idx}] grouped MXFP4 Marlin cache "
+                  f"built ({self.total_experts} experts on {device})",
+                  flush=True)
+            return cache
+        except Exception as exc:
+            print(f"[V4F MoE L{self.layer_idx}] grouped MXFP4 Marlin cache "
+                  f"build failed, falling back to expert loop: {exc!r}",
+                  flush=True)
+            self._mxfp4_marlin_build_failed = True
+            return None
+
     def configure_ep(self, rank: int, world_size: int, comm=None) -> None:
         self.comm = comm
         self.experts_per_rank = math.ceil(self.total_experts / world_size)
@@ -1797,14 +1896,29 @@ class DeepSeekV4FlashMoE(nn.Module):
             _v4_diag(f"moe L{self.layer_idx} gate done")
             active_experts = self._active_local_experts(topk_indices)
             mark(f"active_local count={len(active_experts)}")
-            for expert_idx in active_experts:
-                token_idx, topk_pos = torch.where(topk_indices == expert_idx)
-                expert_out = self.experts[expert_idx](
-                    global_states[token_idx],
-                    topk_weights[token_idx, topk_pos].unsqueeze(-1),
+            mxfp4_cache = self._get_or_build_mxfp4_marlin_cache(global_states.device)
+            mxfp4_mod = _get_dsv4_grouped_mxfp4_marlin() if mxfp4_cache is not None else None
+            if mxfp4_cache is not None and mxfp4_mod is not None:
+                routed = mxfp4_mod.grouped_mxfp4_moe_forward(
+                    global_states.to(torch.bfloat16),
+                    topk_indices,
+                    topk_weights,
+                    mxfp4_cache,
+                    swiglu_limit=self.swiglu_limit,
+                    expert_start=self.routed_expert_start_idx,
+                    expert_end=self.routed_expert_end_idx,
                 )
-                routed_global[token_idx] += expert_out.float()
-            mark("routed_experts")
+                routed_global = routed.to(torch.float32)
+                mark("routed_experts_mxfp4_grouped")
+            else:
+                for expert_idx in active_experts:
+                    token_idx, topk_pos = torch.where(topk_indices == expert_idx)
+                    expert_out = self.experts[expert_idx](
+                        global_states[token_idx],
+                        topk_weights[token_idx, topk_pos].unsqueeze(-1),
+                    )
+                    routed_global[token_idx] += expert_out.float()
+                mark("routed_experts")
 
         _v4_diag(f"moe L{self.layer_idx} all_reduce enter")
         dist.all_reduce(routed_global)
@@ -1831,14 +1945,27 @@ class DeepSeekV4FlashMoE(nn.Module):
 
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 
-        routed = torch.zeros_like(flat_states, dtype=torch.float32)
-        for expert_idx in self._active_local_experts(topk_indices):
-            token_idx, topk_pos = torch.where(topk_indices == expert_idx)
-            expert_out = self.experts[expert_idx](
-                flat_states[token_idx],
-                topk_weights[token_idx, topk_pos].unsqueeze(-1),
-            )
-            routed[token_idx] += expert_out.float()
+        mxfp4_cache = self._get_or_build_mxfp4_marlin_cache(flat_states.device)
+        mxfp4_mod = _get_dsv4_grouped_mxfp4_marlin() if mxfp4_cache is not None else None
+        if mxfp4_cache is not None and mxfp4_mod is not None:
+            routed = mxfp4_mod.grouped_mxfp4_moe_forward(
+                flat_states.to(torch.bfloat16),
+                topk_indices,
+                topk_weights,
+                mxfp4_cache,
+                swiglu_limit=self.swiglu_limit,
+                expert_start=self.routed_expert_start_idx,
+                expert_end=self.routed_expert_end_idx,
+            ).to(torch.float32)
+        else:
+            routed = torch.zeros_like(flat_states, dtype=torch.float32)
+            for expert_idx in self._active_local_experts(topk_indices):
+                token_idx, topk_pos = torch.where(topk_indices == expert_idx)
+                expert_out = self.experts[expert_idx](
+                    flat_states[token_idx],
+                    topk_weights[token_idx, topk_pos].unsqueeze(-1),
+                )
+                routed[token_idx] += expert_out.float()
 
         shared = self.shared_experts(flat_states).float()
         return (routed + shared).to(hidden_states.dtype).view(shape)
