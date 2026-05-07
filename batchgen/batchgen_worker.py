@@ -5518,8 +5518,9 @@ class BatchGenWorker:
 		local_iteration: int,
 		local_bsz: int,
 		max_rank_bsz: int,
+		profile_scope: str = "graph_path_forward",
 	) -> Optional[int]:
-		"""Start an env-gated nsys decode-forward capture window."""
+		"""Start an env-gated nsys decode graph-path forward capture window."""
 		if not BATCHGEN_NSYS_DECODE_PROFILE:
 			return None
 		self._nsys_decode_profile_forward_count += 1
@@ -5534,8 +5535,9 @@ class BatchGenWorker:
 			torch.cuda.synchronize(self.torch_device)
 			logging.info(
 				"[NSYS_DECODE_PROFILE] rank=%s starting cuda profiler capture "
-				"limit=%s controller_ranks=%s",
+				"scope=%s limit=%s controller_ranks=%s",
 				self.rank,
+				profile_scope,
 				BATCHGEN_NSYS_DECODE_PROFILE_FORWARD_LIMIT,
 				sorted(BATCHGEN_NSYS_DECODE_PROFILE_CONTROLLER_RANKS),
 			)
@@ -5543,7 +5545,7 @@ class BatchGenWorker:
 			self._nsys_decode_profile_started = True
 
 		range_name = (
-			f"BatchGen_decode_forward_{forward_idx}"
+			f"BatchGen_decode_{profile_scope}_{forward_idx}"
 			f"_rank_{self.rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
 			f"_iter_{local_iteration}"
 		)
@@ -10773,11 +10775,7 @@ class BatchGenWorker:
 					gpu_manager,
 				)
 
-				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
-					local_iteration=local_iteration,
-					local_bsz=len(batch),
-					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
-				)
+				_nsys_forward_idx = None
 
 				# Forward
 				_glm5_whole_graph_active = bool(
@@ -10886,15 +10884,25 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
-							"glm5_whole_model", bucket,
-							input_ids=graph_input_ids,
-							cache_seqlens=graph_cache_seqlens,
-							position_ids=graph_position_ids,
-							primary_slot_indices=primary_slots,
-							aux_slot_indices=aux_slots,
-							rank_token_counts=_all_rank_counts,
+						_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
+							local_iteration=local_iteration,
+							local_bsz=len(batch),
+							max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+							profile_scope="whole_model_graph_replay",
 						)
+						try:
+							graph_out = self._cuda_graph_manager.replay(
+								"glm5_whole_model", bucket,
+								input_ids=graph_input_ids,
+								cache_seqlens=graph_cache_seqlens,
+								position_ids=graph_position_ids,
+								primary_slot_indices=primary_slots,
+								aux_slot_indices=aux_slots,
+								rank_token_counts=_all_rank_counts,
+							)
+						finally:
+							self._nsys_decode_profile_end_forward(_nsys_forward_idx)
+							_nsys_forward_idx = None
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
@@ -10920,13 +10928,23 @@ class BatchGenWorker:
 							)
 						elif pt_slice.shape[1] > wm_max_pages:
 							pt_slice = pt_slice[:, :wm_max_pages]
-						graph_out = self._cuda_graph_manager.replay(
-							"whole_model", bucket,
-							input_ids=new_tokens,
-							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-							page_table=pt_slice,
-							slot_indices=slot_indices_tensor[:batch_size],
+						_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
+							local_iteration=local_iteration,
+							local_bsz=len(batch),
+							max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+							profile_scope="whole_model_graph_replay",
 						)
+						try:
+							graph_out = self._cuda_graph_manager.replay(
+								"whole_model", bucket,
+								input_ids=new_tokens,
+								cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+								page_table=pt_slice,
+								slot_indices=slot_indices_tensor[:batch_size],
+							)
+						finally:
+							self._nsys_decode_profile_end_forward(_nsys_forward_idx)
+							_nsys_forward_idx = None
 
 					logits = graph_out["logits"][:batch_size]
 					graph_hidden_states = graph_out.get("hidden_states")
@@ -11085,14 +11103,23 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
-						new_tokens,
-						attention_mask=Attn_Wrapper.attention_mask,
-						position_ids=Attn_Wrapper.position_ids,
-						use_cache=False
+					_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
+						local_iteration=local_iteration,
+						local_bsz=len(batch),
+						max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
+						profile_scope="segmented_graph_model_forward",
 					)
+					try:
+						outputs = self.model(
+							new_tokens,
+							attention_mask=Attn_Wrapper.attention_mask,
+							position_ids=Attn_Wrapper.position_ids,
+							use_cache=False
+						)
+					finally:
+						self._nsys_decode_profile_end_forward(_nsys_forward_idx)
+						_nsys_forward_idx = None
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
-				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
 			new_tokens = new_tokens_out
 
