@@ -126,29 +126,29 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 3: Move Worker Metadata Construction Into a Builder
 
-- [ ] Add `batchgen/prefill/attention_metadata_builder.py`.
-- [ ] Implement `build_prefill_forward_metadata(...)`.
-- [ ] Inputs should include prepack metadata.
-- [ ] Inputs should include batch spans.
-- [ ] Inputs should include optional `PrefixReusePrefillPlan`.
-- [ ] Inputs should include flattened position ids.
-- [ ] Inputs should include target device.
-- [ ] Output should be `ForwardBatchMetadata`.
-- [ ] For no prefix reuse, generate `cu_seqlens_q == cu_seqlens_k`.
-- [ ] For prefix reuse, generate suffix `cu_seqlens_q`.
-- [ ] For prefix reuse, generate full-context `cu_seqlens_k`.
-- [ ] For prefix reuse, generate `PrefixReuseMetadata`.
-- [ ] Preserve current `global_sequence_ids` ordering.
-- [ ] Preserve current suffix-only position id semantics.
-- [ ] Replace worker-local prepack metadata plumbing with the builder.
-- [ ] Wrap model-layer execution in `bind_forward_batch_metadata(forward_meta)`.
-- [ ] Remove direct duplicate writes to `Attn_Wrapper` and `AttnWrapperBase` from worker code.
-- [ ] Keep compatibility writes only inside the context manager.
-- [ ] Add unit tests for builder output with no prefix reuse.
-- [ ] Add unit tests for builder output with partial prefix reuse.
-- [ ] Add unit tests for builder output with full hit.
-- [ ] Add unit tests for mixed hit and miss.
-- [ ] Run `py_compile` for the touched modules.
+- [x] Add `batchgen/prefill/attention_metadata_builder.py`.
+- [x] Implement `build_prefill_forward_metadata(...)`.
+- [x] Inputs should include prepack metadata.
+- [x] Inputs should include batch spans.
+- [x] Inputs should include optional `PrefixReusePrefillPlan`.
+- [x] Inputs should include flattened position ids.
+- [x] Inputs should include target device.
+- [x] Output should be `ForwardBatchMetadata`.
+- [x] For no prefix reuse, generate `cu_seqlens_q == cu_seqlens_k`.
+- [x] For prefix reuse, generate suffix `cu_seqlens_q`.
+- [x] For prefix reuse, generate full-context `cu_seqlens_k`.
+- [x] For prefix reuse, generate `PrefixReuseMetadata`.
+- [x] Preserve current `global_sequence_ids` ordering.
+- [x] Preserve current suffix-only position id semantics.
+- [x] Replace worker-local prepack metadata plumbing with the builder.
+- [x] Wrap model-layer execution in `bind_forward_batch_metadata(forward_meta)`.
+- [x] Remove direct duplicate writes to `Attn_Wrapper` and `AttnWrapperBase` from worker code.
+- [x] Keep compatibility writes only inside the context manager.
+- [x] Add unit tests for builder output with no prefix reuse.
+- [x] Add unit tests for builder output with partial prefix reuse.
+- [x] Add unit tests for builder output with full hit.
+- [x] Add unit tests for mixed hit and miss.
+- [x] Run `py_compile` for the touched modules.
 
 ## Milestone 4: Make Wrappers Prefer Explicit Metadata
 

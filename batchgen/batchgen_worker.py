@@ -70,6 +70,8 @@ from batchgen.distributed.utils import StatelessProcessGroup
 from batchgen.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 
+from batchgen.attention.forward_metadata import KVCacheMetadata
+from batchgen.attention.forward_metadata_context import bind_forward_batch_metadata
 from .utils import torch_gpu_mem_usage, create_position_ids_from_attention_mask
 from .get_initializer import get_initializer
 from .get_parallel_strategy_manager import get_parallel_strategy_manager
@@ -77,8 +79,6 @@ from batchgen.batch_order import (
 	batch_matches_expected_uuid_order,
 	build_prefill_sequence_spans,
 	local_indices_to_uuid_order,
-	prefill_sequence_spans_to_cu_seqlens,
-	prefill_sequence_spans_to_global_seq_ids,
 )
 from batchgen.query_book import (
 	QueryBookEntry as query,
@@ -111,6 +111,7 @@ from batchgen.prefill.prepack import (
 	PrepackMetadata,
 	build_prefill_micro_batches,
 )
+from batchgen.prefill.attention_metadata_builder import build_prefill_forward_metadata
 from batchgen.prefill.prefix_reuse import PrefixReusePrefillPlan
 from batchgen.prefix_reuse.full_hit_runtime import full_hit_attention_state
 from batchgen.prefix_reuse.prefill_admission import (
@@ -7813,19 +7814,6 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
-		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
-		# loop. Without this binding, GLM-5's prefill indexer-K offload at
-		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
-		# (host_paged_kv_worker_view_aux is None), so the aux cache is never
-		# populated for prompt tokens and any later decode past 2048 tokens
-		# reads unwritten aux pages.
-		# Prefill offloads KV directly to host via host_paged_kv_worker_view_aux;
-		# it does NOT use the GPU paged KV manager. Binding host_*_aux here
-		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
-		# the host aux cache instead of early-returning on a None view.
-		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
-
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
 
@@ -8074,78 +8062,53 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
-				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
-					dtype=torch.int32,
+				forward_metadata = build_prefill_forward_metadata(
+					prepack_metadata=prepack_meta,
+					batch_spans=batch_spans,
+					seq_start=seq_start,
+					seq_end=seq_end,
+					position_ids=batch_position_ids_flat,
 					device=self.torch_device,
+					prefix_reuse_plan=prefix_reuse_plan,
+					kv_cache_metadata=KVCacheMetadata(
+						gpu_paged_kv_manager=getattr(self, "gpu_paged_kv_cache_manager", None),
+						host_worker_view=getattr(
+							self.core_engine, "host_paged_kv_worker_view", None
+						),
+						aux_gpu_paged_kv_manager=getattr(
+							self.core_engine, "gpu_paged_kv_manager_aux", None
+						),
+						aux_host_worker_view=getattr(
+							self, "host_paged_kv_worker_view_aux", None
+						),
+					),
 				)
-				batch_max_seqlen = max(batch_seq_lengths)
+				batch_cu_seqlens = forward_metadata.prefill.cu_seqlens_q
 
-				# Set up Attn_Wrapper for this micro-batch
-				Attn_Wrapper.prepack_mode = True
-				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
-				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
-				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
-				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
-				Attn_Wrapper.position_ids = batch_position_ids_flat
-				Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
-				if prefix_reuse_plan is not None:
-					batch_prefix_shared_tokens = [
-						prefix_reuse_plan.sequences[seq_idx].prefix_shared_tokens
-						for seq_idx in range(seq_start, seq_end)
-					]
-					batch_full_seq_lengths = [
-						prefix_reuse_plan.sequences[seq_idx].full_logical_context_length
-						for seq_idx in range(seq_start, seq_end)
-					]
-				else:
-					batch_prefix_shared_tokens = None
-					batch_full_seq_lengths = None
-				prefix_reuse_active = bool(
-					batch_prefix_shared_tokens
-					and any(tokens > 0 for tokens in batch_prefix_shared_tokens)
-				)
-				Attn_Wrapper.prepack_prefix_reuse_mode = prefix_reuse_active
-				Attn_Wrapper.prepack_prefix_shared_tokens = batch_prefix_shared_tokens
-				Attn_Wrapper.prepack_full_seq_lengths = batch_full_seq_lengths
+				with bind_forward_batch_metadata(forward_metadata):
+					# Embed tokens
+					inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
-				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
-				# which does NOT offload KV to host, causing decode to read garbage.
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
-				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
-				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
-				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
-				AttnWrapperBase.position_ids = batch_position_ids_flat
-				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-				AttnWrapperBase.prepack_prefix_reuse_mode = prefix_reuse_active
-				AttnWrapperBase.prepack_prefix_shared_tokens = batch_prefix_shared_tokens
-				AttnWrapperBase.prepack_full_seq_lengths = batch_full_seq_lengths
+					# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
+					hidden_states = inputs_embeds.unsqueeze(0)
 
-				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+					for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+						layer_outputs = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)
+						hidden_states = layer_outputs[0]
 
-				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-				hidden_states = inputs_embeds.unsqueeze(0)
+					# Final norm
+					hidden_states = self.model.model.norm(hidden_states)
 
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					layer_outputs = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
-					)
-					hidden_states = layer_outputs[0]
-
-				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
-
-				# Extract last token hidden states for each sequence
-				last_token_indices = batch_cu_seqlens[1:] - 1
-				last_token_hidden = hidden_states[0, last_token_indices, :]
+					# Extract last token hidden states for each sequence
+					last_token_indices = batch_cu_seqlens[1:] - 1
+					last_token_hidden = hidden_states[0, last_token_indices, :]
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
 				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
@@ -8173,28 +8136,6 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
-
-		# Reset prepack mode
-		Attn_Wrapper.prepack_mode = False
-		Attn_Wrapper.prepack_cu_seqlens = None
-		Attn_Wrapper.prepack_max_seqlen = None
-		Attn_Wrapper.prepack_num_sequences = None
-		Attn_Wrapper.prepack_seq_lengths = None
-		Attn_Wrapper.prepack_prefix_reuse_mode = False
-		Attn_Wrapper.prepack_prefix_shared_tokens = None
-		Attn_Wrapper.prepack_full_seq_lengths = None
-		Attn_Wrapper.prepack_full_hit_mode = False
-
-		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
-		AttnWrapperBase.prepack_prefix_reuse_mode = False
-		AttnWrapperBase.prepack_prefix_shared_tokens = None
-		AttnWrapperBase.prepack_full_seq_lengths = None
-		AttnWrapperBase.prepack_full_hit_mode = False
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()

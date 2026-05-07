@@ -16,6 +16,7 @@ from .prefix_reuse import (
     split_prefix_reuse_plan_for_micro_batch,
     validate_prefix_reuse_plan,
 )
+from .attention_metadata_builder import build_prefill_forward_metadata
 
 __all__ = [
     "PrepackMetadata",
@@ -30,4 +31,5 @@ __all__ = [
     "build_prefix_reuse_prefill_plan",
     "split_prefix_reuse_plan_for_micro_batch",
     "validate_prefix_reuse_plan",
+    "build_prefill_forward_metadata",
 ]
