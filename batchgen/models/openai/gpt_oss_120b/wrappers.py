@@ -1433,6 +1433,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
             sinks=self.sinks,
             softmax_scale=self.scale,
             sliding_window=self.sliding_window,
+            layer_idx=self.layer_idx,
         )
 
         if do_timing:

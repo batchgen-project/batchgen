@@ -88,25 +88,27 @@ def run_prefix_mla_suffix_prefill_with_projected(
     if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
         raise RuntimeError("MLA prefix replay requires prefix metadata")
 
-    compressed_kv, cu_k, _ = wrapper.prefix_attention_kv_builder().build_mla_prefix_kv(
-        key=offload_kv,
-        metadata=metadata,
-        kv_dim=spec.kv_dim,
+    from batchgen.attention.prefix_aware_backend import (
+        MlaProjectedPrefixAwareAttentionBackend,
     )
-    blocked_k, block_table, cache_seqlens = block_mla_kv_by_sequence(
-        compressed_kv=compressed_kv,
-        cu_k=cu_k,
+
+    backend = MlaProjectedPrefixAwareAttentionBackend(
+        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
         page_size=wrapper.host_prefix_reader().page_size(),
+        kv_dim=spec.kv_dim,
+        num_heads=spec.num_heads,
+        kv_lora_rank=spec.kv_lora_rank,
+        softmax_scale=spec.softmax_scale,
+        output_projection=output_projection,
+        layer_idx=getattr(wrapper, "layer_idx", None),
     )
-    attn_out = run_flash_mla_prefix_attention(
-        query_states=query_states,
-        blocked_k=blocked_k,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        query_len=int(metadata.seq_lengths[0]),
-        spec=spec,
+    attn_out = backend.forward_prefill(
+        query=query_states,
+        key=offload_kv,
+        value=None,
+        metadata=metadata,
     )
-    return output_projection(attn_out), offload_kv
+    return attn_out, offload_kv
 
 
 def run_prefix_mla_full_hit_prefill(

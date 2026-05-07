@@ -203,21 +203,28 @@ The compatibility binder is temporary and must not remain the long-term owner of
 
 ## Milestone 7: Add True Extend-Mode KV Writes
 
-- [ ] Extend `GPUPagedKVCacheManager` with a multi-token suffix append API.
-- [ ] The API should support writing multiple suffix tokens per sequence.
-- [ ] The API should accept `global_sequence_ids`.
-- [ ] The API should accept `prefix_lens`.
-- [ ] The API should accept `suffix_lens`.
-- [ ] The API should accept explicit destination slots or page table metadata.
-- [ ] GQA prefill should write suffix K/V directly into GPU paged KV.
-- [ ] MLA prefill should write suffix compressed MLA KV directly into GPU paged KV.
-- [ ] Attention backend should attend via page table over full context.
-- [ ] Remove host-prefix KV concatenation from hot path where backend support exists.
-- [ ] Keep replay fallback behind an explicit debug or compatibility flag until fully validated.
+- [x] Extend `GPUPagedKVCacheManager` with a multi-token suffix append API.
+- [x] The API should support writing multiple suffix tokens per sequence.
+- [x] The API should accept `global_sequence_ids`.
+- [x] The API should accept `prefix_lens`.
+- [x] The API should accept `suffix_lens`.
+- [x] The API should accept explicit destination slots or page table metadata.
+- [x] GQA prefill should write suffix K/V directly into GPU paged KV.
+- [x] MLA prefill should write suffix compressed MLA KV directly into GPU paged KV.
+- [x] Attention backend should attend via page table over full context.
+- [x] Remove host-prefix KV concatenation from hot path where backend support exists.
+- [x] Keep the true extend path behind an explicit experimental flag and leave replay as the default compatibility fallback until fully validated.
 - [ ] Validate partial reuse exactness.
 - [ ] Validate full reuse exactness.
 - [ ] Validate miss exactness.
 - [ ] Measure prefill wall time before and after.
+
+Notes:
+
+- True extend-mode attention is currently gated by `BATCHGEN_PREFIX_REUSE_GPU_EXTEND_ATTENTION=1`.
+- GPU suffix append without switching attention is gated by `BATCHGEN_PREFIX_REUSE_GPU_EXTEND_WRITES=1`.
+- Replay remains the default compatibility path until exactness and timing validation are complete.
+- The first true extend-mode attention path supports single-sequence suffix micro-batches, matching the current prefix-reuse isolation policy.
 
 ## Milestone 8: Remove Legacy Global Metadata Ownership
 
