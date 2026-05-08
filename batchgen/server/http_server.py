@@ -39,6 +39,7 @@ from batchgen.server.io_struct import (
     ListModelsResponse,
     ModelObject,
     RawInferenceRequest,
+    build_batch_object_from_create_request,
     normalize_inference_results,
 )
 from batchgen.server.health import ServerHealthState
@@ -347,20 +348,11 @@ def create_app(
         batch_id = f"batch_{uuid.uuid4().hex[:24]}"
         now = int(time.time())
         expires_at = now + 86400
-        batch = BatchObject(
-            id=batch_id,
-            endpoint=body.endpoint,
-            input_file_id=body.input_file_id,
-            completion_window=body.completion_window,
-            status=BatchStatus.VALIDATING,
+        batch = build_batch_object_from_create_request(
+            batch_id=batch_id,
+            body=body,
             created_at=now,
             expires_at=expires_at,
-            metadata=body.metadata,
-            # Inference parameters (override per-request values)
-            max_decoding_length=body.max_decoding_length,
-            max_context_length=body.max_context_length,
-            temperature=body.temperature,
-            top_p=body.top_p,
         )
         storage.save_batch(batch)
         await scheduler.enqueue(batch_id)
