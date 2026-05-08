@@ -1002,6 +1002,7 @@ class Glm5FullDsaAttnSegment:
             buffers.indexer_k_x_scale,
             buffers.indexer_k_tma_desc,
             buffers.indexer_k_raw,
+            num_valid_tokens=num_valid_tokens,
         )
         k_normed = indexer.k_norm(buffers.indexer_k_raw)
         indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
@@ -1038,6 +1039,7 @@ class Glm5FullDsaAttnSegment:
             buffers.q_x_scale,
             buffers.q_tma_desc,
             buffers.q_flat_indexer,
+            num_valid_tokens=num_valid_tokens,
         )
         rope_hadamard_q_out(
             buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),

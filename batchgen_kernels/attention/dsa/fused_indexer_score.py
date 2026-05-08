@@ -131,6 +131,7 @@ def cuda_wq_b_proj_out(
     x_scale: torch.Tensor,
     a_tma_desc: torch.Tensor,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer FP8 WGMMA q_b projection for CUDA graph capture."""
     if not q_a.is_contiguous():
@@ -139,7 +140,10 @@ def cuda_wq_b_proj_out(
     N = wq_b_weights.N
     _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
 
-    module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
+    if num_valid_tokens is None:
+        module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
+    else:
+        module.run_act_quant_valid(q_a, x_fp8_padded[:B], x_scale, num_valid_tokens)
     module.indexer_kv_proj_gemm_only_out(
         a_tma_desc,
         wq_b_weights.tma_desc,

@@ -268,14 +268,24 @@ __global__ void act_quant_kernel(
     const __nv_bfloat16* __restrict__ X,  // [B, K] BF16
     __nv_fp8_e4m3* __restrict__ X_fp8,    // [B, K] FP8
     float* __restrict__ X_scale,          // [B] FP32
-    int B, int K
+    const int* __restrict__ num_valid_tokens,  // optional device scalar
+    int B, int K, bool has_valid_tokens
 ) {
     const int row = blockIdx.x;
     if (row >= B) return;
 
     const int tid = threadIdx.x;
-    const __nv_bfloat16* row_ptr = X + row * K;
     __nv_fp8_e4m3* out_ptr = X_fp8 + row * K;
+    if (has_valid_tokens && row >= num_valid_tokens[0]) {
+        for (int i = tid; i < K; i += blockDim.x) {
+            reinterpret_cast<uint8_t*>(out_ptr)[i] =
+                __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3);
+        }
+        if (tid == 0) X_scale[row] = 1e-12f;
+        return;
+    }
+
+    const __nv_bfloat16* row_ptr = X + row * K;
 
     // Find absmax across row
     float local_max = 0.0f;
@@ -604,7 +614,28 @@ void run_act_quant(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(X_fp8.data_ptr()),
         X_scale.data_ptr<float>(),
-        B, K);
+        nullptr,
+        B, K, false);
+}
+
+void run_act_quant_valid(
+    torch::Tensor X,         // [B, K] BF16
+    torch::Tensor X_fp8,     // [B, K] FP8 (output)
+    torch::Tensor X_scale,   // [B] FP32 (output)
+    torch::Tensor num_valid_tokens  // [1] int32 device scalar
+) {
+    TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32, "num_valid_tokens must be int32");
+    TORCH_CHECK(num_valid_tokens.numel() == 1, "num_valid_tokens must contain one element");
+    at::cuda::CUDAGuard device_guard{X.device()};
+    int B = X.size(0);
+    int K = X.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    act_quant_kernel<<<B, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(X_fp8.data_ptr()),
+        X_scale.data_ptr<float>(),
+        num_valid_tokens.data_ptr<int>(),
+        B, K, true);
 }
 
 torch::Tensor indexer_kv_proj_forward(
@@ -753,6 +784,10 @@ torch::Tensor create_tma_desc(
 void run_act_quant(
     torch::Tensor X, torch::Tensor X_fp8, torch::Tensor X_scale);
 
+void run_act_quant_valid(
+    torch::Tensor X, torch::Tensor X_fp8, torch::Tensor X_scale,
+    torch::Tensor num_valid_tokens);
+
 torch::Tensor indexer_kv_proj_forward(
     torch::Tensor a_tma_desc,
     torch::Tensor w_tma_desc,
@@ -808,6 +843,7 @@ def build_module(num_stages=4):
         functions=[
             "create_tma_desc",
             "run_act_quant",
+            "run_act_quant_valid",
             "indexer_kv_proj_forward",
             "indexer_kv_proj_forward_out",
             "indexer_kv_proj_gemm_only",
@@ -969,6 +1005,7 @@ def cuda_wk_proj_gemm_only_out(
     x_scale: torch.Tensor,
     a_tma_desc: torch.Tensor,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous for graph-captured WK projection")
@@ -976,7 +1013,10 @@ def cuda_wk_proj_gemm_only_out(
     N = weights.N
     _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
 
-    module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
+    if num_valid_tokens is None:
+        module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
+    else:
+        module.run_act_quant_valid(hidden_states, x_fp8_padded[:B], x_scale, num_valid_tokens)
     module.indexer_kv_proj_gemm_only_out(
         a_tma_desc,
         weights.tma_desc,

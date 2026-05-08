@@ -137,13 +137,13 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
             torch.empty(1, dtype=torch.uint8, device=device),
         )
 
-    def fake_wk_proj(hidden_flat, weights, cuda_module, x_fp8, x_scale, tma_desc, out):
-        del weights, cuda_module, x_fp8, x_scale, tma_desc
+    def fake_wk_proj(hidden_flat, weights, cuda_module, x_fp8, x_scale, tma_desc, out, num_valid_tokens=None):
+        del weights, cuda_module, x_fp8, x_scale, tma_desc, num_valid_tokens
         out.copy_(hidden_flat[:, : out.shape[1]] + 0.5)
         return out
 
-    def fake_wq_b_proj(q_a_normed, weights, cuda_module, x_fp8, x_scale, tma_desc, out):
-        del weights, cuda_module, x_fp8, x_scale, tma_desc
+    def fake_wq_b_proj(q_a_normed, weights, cuda_module, x_fp8, x_scale, tma_desc, out, num_valid_tokens=None):
+        del weights, cuda_module, x_fp8, x_scale, tma_desc, num_valid_tokens
         out.copy_(q_a_normed[:, :1].expand_as(out) + 0.25)
         return out
 
