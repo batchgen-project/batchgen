@@ -144,16 +144,29 @@ def cuda_wq_b_proj_out(
         module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
     else:
         module.run_act_quant_valid(q_a, x_fp8_padded[:B], x_scale, num_valid_tokens)
-    module.indexer_kv_proj_gemm_only_out(
-        a_tma_desc,
-        wq_b_weights.tma_desc,
-        wq_b_weights.w_scale,
-        x_scale,
-        out,
-        B,
-        N,
-        K,
-    )
+    if num_valid_tokens is None:
+        module.indexer_kv_proj_gemm_only_out(
+            a_tma_desc,
+            wq_b_weights.tma_desc,
+            wq_b_weights.w_scale,
+            x_scale,
+            out,
+            B,
+            N,
+            K,
+        )
+    else:
+        module.indexer_kv_proj_gemm_only_valid_m_out(
+            a_tma_desc,
+            wq_b_weights.tma_desc,
+            wq_b_weights.w_scale,
+            x_scale,
+            out,
+            num_valid_tokens,
+            B,
+            N,
+            K,
+        )
     return out
 
 

@@ -5,6 +5,16 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def _assert_bf16_wgmma_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    diff = (actual.float() - expected.float()).abs()
+    tol = 1e-5 + 1.6e-2 * expected.float().abs()
+    n_fail = (diff > tol).sum().item()
+    n_total = diff.numel()
+    assert n_fail == 0 or n_fail / n_total < 1e-4, (
+        f"max_abs={diff.max().item()} failures={n_fail}/{n_total}"
+    )
+
+
 def test_act_quant_valid_tokens_zeroes_padding_rows():
     from batchgen.attention.mla.fa3_backend import act_quant
 
@@ -157,3 +167,60 @@ def test_selector_valid_tokens_skips_padding_rows():
     assert torch.equal(lengths, torch.tensor([2, 3, 0, 0], device="cuda", dtype=torch.int32))
     assert torch.equal(row_modes[2:], torch.tensor([2, 2], device="cuda", dtype=torch.int32))
     assert torch.count_nonzero(selected[2:].float()).item() == 0
+
+
+@pytest.mark.parametrize("batch_size,valid_m", [(64, 17), (128, 64)])
+def test_indexer_wgmma_valid_m_variant_zeroes_padding_rows(batch_size: int, valid_m: int):
+    from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
+        FP8IndexerWeightsCUDA,
+        build_module,
+    )
+
+    torch.manual_seed(batch_size + valid_m)
+    module = build_module()
+    device = torch.device("cuda")
+    K = 128
+    N = 32
+    padded_batch = max(batch_size, 64)
+    valid = torch.tensor([valid_m], device=device, dtype=torch.int32)
+
+    x_fp8 = (torch.randn(padded_batch, K, device=device) * 0.1).to(torch.float8_e4m3fn)
+    x_scale = torch.rand(batch_size, device=device, dtype=torch.float32) * 0.01 + 1e-4
+    weights = FP8IndexerWeightsCUDA(
+        (torch.randn(N, K, device=device, dtype=torch.bfloat16) * 0.1).contiguous(),
+        module,
+    )
+    a_tma_desc = module.create_tma_desc(x_fp8, padded_batch, K, 64, 128)
+    full_out = torch.empty(batch_size, N, device=device, dtype=torch.bfloat16)
+    valid_out = torch.full(
+        (batch_size, N),
+        7.0,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    module.indexer_kv_proj_gemm_only_out(
+        a_tma_desc,
+        weights.tma_desc,
+        weights.w_scale,
+        x_scale,
+        full_out,
+        batch_size,
+        N,
+        K,
+    )
+    module.indexer_kv_proj_gemm_only_valid_m_out(
+        a_tma_desc,
+        weights.tma_desc,
+        weights.w_scale,
+        x_scale,
+        valid_out,
+        valid,
+        batch_size,
+        N,
+        K,
+    )
+    torch.cuda.synchronize()
+
+    _assert_bf16_wgmma_close(valid_out[:valid_m], full_out[:valid_m])
+    assert torch.count_nonzero(valid_out[valid_m:].float()).item() == 0

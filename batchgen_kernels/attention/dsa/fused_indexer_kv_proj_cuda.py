@@ -329,6 +329,39 @@ __global__ void act_quant_kernel(
     }
 }
 
+__device__ __forceinline__ int clamp_valid_m(
+    const int* __restrict__ num_valid_m,
+    bool has_valid_m,
+    int B
+) {
+    int valid_m = B;
+    if (has_valid_m) valid_m = num_valid_m[0];
+    if (valid_m < 0) valid_m = 0;
+    if (valid_m > B) valid_m = B;
+    return valid_m;
+}
+
+__device__ __forceinline__ void zero_output_tile(
+    __nv_bfloat16* __restrict__ OUT,
+    int B,
+    int N,
+    int m_start,
+    int n_start,
+    int tid
+) {
+    const int total_elems = BLOCK_M * BLOCK_N;
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+    for (int idx = tid; idx < total_elems; idx += THREADS) {
+        const int row = idx / BLOCK_N;
+        const int col = idx % BLOCK_N;
+        const int m_global = m_start + row;
+        const int n_global = n_start + col;
+        if (m_global < B && n_global < N) {
+            OUT[m_global * N + n_global] = zero;
+        }
+    }
+}
+
 // ============================================================================
 // Single-WG WGMMA Kernel — TMA both A and B
 // ============================================================================
@@ -339,6 +372,8 @@ indexer_kv_proj_kernel(
     const float* __restrict__ w_scale,         // [N/32, num_k_blocks] FP32
     const float* __restrict__ a_scale,         // [B] FP32 per-row act scale
     __nv_bfloat16* __restrict__ OUT,           // [B, N] BF16 output
+    const int* __restrict__ num_valid_m,       // optional [1] int32 device scalar
+    bool has_valid_m,
     int B, int K, int N
 ) {
     const int tid = threadIdx.x;
@@ -348,6 +383,11 @@ indexer_kv_proj_kernel(
     if (m_start >= B) return;
     const int n_start = n_tile * BLOCK_N;
     const int num_k_blocks = (K + BLOCK_K - 1) / BLOCK_K;
+    const int valid_m = clamp_valid_m(num_valid_m, has_valid_m, B);
+    if (m_start >= valid_m) {
+        zero_output_tile(OUT, B, N, m_start, n_start, tid);
+        return;
+    }
 
     // ── SMEM layout ──
     extern __shared__ __align__(128) char smem_buf[];
@@ -381,7 +421,7 @@ indexer_kv_proj_kernel(
     }
     // Load per-row activation scales
     for (int i = tid; i < BLOCK_M; i += THREADS) {
-        float s = (m_start + i < B) ? a_scale[m_start + i] : 0.0f;
+        float s = (m_start + i < valid_m) ? a_scale[m_start + i] : 0.0f;
         st_shared(&smem_ascale[i], s);
     }
     __syncthreads();
@@ -412,8 +452,8 @@ indexer_kv_proj_kernel(
 
     const int m_row_in_tile_0 = warp_in_wg * 16 + (lane_id / 4);
     const int m_row_in_tile_1 = m_row_in_tile_0 + 8;
-    const bool valid_0 = (m_start + m_row_in_tile_0 < B);
-    const bool valid_1 = (m_start + m_row_in_tile_1 < B);
+    const bool valid_0 = (m_start + m_row_in_tile_0 < valid_m);
+    const bool valid_1 = (m_start + m_row_in_tile_1 < valid_m);
 
     slot = 0;
     int full_phase = 0;
@@ -512,13 +552,19 @@ indexer_kv_proj_kernel(
         const int m_global = m_start + row;
 
         if (m_global < B && n_global + 1 < N) {
-            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162*>(
-                &smem_out[row * BLOCK_N + col2 * 2]);
-            *reinterpret_cast<__nv_bfloat162*>(
-                &OUT[m_global * N + n_global]) = val;
+            if (m_global < valid_m) {
+                __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162*>(
+                    &smem_out[row * BLOCK_N + col2 * 2]);
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &OUT[m_global * N + n_global]) = val;
+            } else {
+                OUT[m_global * N + n_global] = __float2bfloat16(0.0f);
+                OUT[m_global * N + n_global + 1] = __float2bfloat16(0.0f);
+            }
         } else if (m_global < B && n_global < N) {
-            OUT[m_global * N + n_global] =
-                smem_out[row * BLOCK_N + col2 * 2];
+            OUT[m_global * N + n_global] = (m_global < valid_m)
+                ? smem_out[row * BLOCK_N + col2 * 2]
+                : __float2bfloat16(0.0f);
         }
     }
 }
@@ -665,6 +711,8 @@ torch::Tensor indexer_kv_proj_forward(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT_gemm.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     // RMSNorm
@@ -705,6 +753,8 @@ void indexer_kv_proj_forward_out(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT_gemm.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     rmsnorm_kernel<<<B, 128, 0, stream>>>(
@@ -740,6 +790,8 @@ torch::Tensor indexer_kv_proj_gemm_only(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     return OUT;
@@ -770,6 +822,42 @@ void indexer_kv_proj_gemm_only_out(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        nullptr,
+        false,
+        B, K, N);
+}
+
+void indexer_kv_proj_gemm_only_valid_m_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
+    torch::Tensor num_valid_m,
+    int B, int N, int K
+) {
+    TORCH_CHECK(num_valid_m.is_cuda(), "num_valid_m must be a CUDA tensor");
+    TORCH_CHECK(num_valid_m.dtype() == torch::kInt32, "num_valid_m must be int32");
+    TORCH_CHECK(num_valid_m.numel() == 1, "num_valid_m must contain one element");
+    at::cuda::CUDAGuard device_guard{OUT.device()};
+    const CUtensorMap* a_d = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
+    const CUtensorMap* w_d = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
+    int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_m_tiles, num_n_tiles);
+
+    constexpr int smem_bytes = TOTAL_SMEM_BYTES;
+    cudaFuncSetAttribute(indexer_kv_proj_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    indexer_kv_proj_kernel<<<grid, THREADS, smem_bytes, stream>>>(
+        a_d, w_d,
+        w_scale.data_ptr<float>(),
+        a_scale.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        num_valid_m.data_ptr<int>(),
+        true,
         B, K, N);
 }
 ''';
@@ -820,6 +908,15 @@ void indexer_kv_proj_gemm_only_out(
     torch::Tensor a_scale,
     torch::Tensor OUT,
     int B, int N, int K);
+
+void indexer_kv_proj_gemm_only_valid_m_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
+    torch::Tensor num_valid_m,
+    int B, int N, int K);
 ''';
 
 
@@ -848,6 +945,7 @@ def build_module(num_stages=4):
             "indexer_kv_proj_forward_out",
             "indexer_kv_proj_gemm_only",
             "indexer_kv_proj_gemm_only_out",
+            "indexer_kv_proj_gemm_only_valid_m_out",
         ],
         extra_cuda_cflags=[
             "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
@@ -1017,16 +1115,29 @@ def cuda_wk_proj_gemm_only_out(
         module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
     else:
         module.run_act_quant_valid(hidden_states, x_fp8_padded[:B], x_scale, num_valid_tokens)
-    module.indexer_kv_proj_gemm_only_out(
-        a_tma_desc,
-        weights.tma_desc,
-        weights.w_scale,
-        x_scale,
-        out,
-        B,
-        N,
-        K,
-    )
+    if num_valid_tokens is None:
+        module.indexer_kv_proj_gemm_only_out(
+            a_tma_desc,
+            weights.tma_desc,
+            weights.w_scale,
+            x_scale,
+            out,
+            B,
+            N,
+            K,
+        )
+    else:
+        module.indexer_kv_proj_gemm_only_valid_m_out(
+            a_tma_desc,
+            weights.tma_desc,
+            weights.w_scale,
+            x_scale,
+            out,
+            num_valid_tokens,
+            B,
+            N,
+            K,
+        )
     return out
 
 
