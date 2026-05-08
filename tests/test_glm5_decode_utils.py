@@ -1174,6 +1174,134 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
     assert AttnWrapperBase.glm5_dispatch_counts == {}
 
 
+def test_glm5_dsa_debug_mode_selects_actual_dispatch_branch(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-dsa", raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 0
+    wrapper.module = types.SimpleNamespace(
+        hidden_size=4,
+        indexer=types.SimpleNamespace(index_topk=3),
+    )
+    wrapper._dsa_cuda_graph_manager = types.SimpleNamespace(has_graph=lambda name, bsz: True)
+    wrapper._dsa_cuda_graph_segment_name = "dsa"
+    wrapper._dsa_cuda_graph_max_seqlen = 16
+    monkeypatch.setattr(
+        wrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda primary, aux: True,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_dsa_cuda_graph_forward_state_allows_replay",
+        lambda bsz: (True, "captured"),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_forward_decode_dsa_graph",
+        lambda *args, **kwargs: torch.full((1, 1, 4), 11.0),
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_forward_decode_dsa_eager",
+        lambda *args, **kwargs: torch.full((1, 1, 4), 22.0),
+    )
+    hidden = torch.zeros(1, 1, 4)
+    position_ids = torch.zeros(1, 1, dtype=torch.int64)
+    cache_seqlens = torch.ones(1, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_dsa_mode": "graph"},
+        raising=False,
+    )
+    graph_out = wrapper._forward_decode_dsa(
+        hidden,
+        position_ids,
+        cache_seqlens,
+        1,
+        object(),
+        object(),
+    )
+    assert graph_out[0, 0, 0].item() == 11.0
+    assert AttnWrapperBase.glm5_dispatch_counts["dsa_graph"] == 1
+
+    AttnWrapperBase.glm5_dispatch_counts = {}
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_dsa_mode": "eager"},
+        raising=False,
+    )
+    eager_out = wrapper._forward_decode_dsa(
+        hidden,
+        position_ids,
+        cache_seqlens,
+        1,
+        object(),
+        object(),
+    )
+    assert eager_out[0, 0, 0].item() == 22.0
+    assert AttnWrapperBase.glm5_dispatch_counts["dsa_eager"] == 1
+
+
+def test_glm5_moe_debug_mode_selects_actual_dispatch_branch(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", True, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", "unit-moe", raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", {}, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+    monkeypatch.setattr(glm5_model, "_GLM5_HAS_DISPATCH_3D", True)
+    monkeypatch.setattr(Glm5MoE, "_3d_buf", object(), raising=False)
+
+    moe = object.__new__(Glm5MoE)
+    moe.layer_idx = 3
+    moe.use_3d_moe = True
+    moe._fp8_blockwise_ready = True
+    moe._moe_cuda_graph_required = True
+    moe.num_tokens_per_rank = [1]
+    monkeypatch.setattr(moe, "_moe_cuda_graph_exceeds_max_bucket", lambda: False)
+    monkeypatch.setattr(
+        moe,
+        "_forward_decode_3d_graph",
+        lambda hidden_states: hidden_states + 11,
+    )
+    monkeypatch.setattr(
+        moe,
+        "_forward_decode_3d",
+        lambda hidden_states: hidden_states + 22,
+    )
+    hidden = torch.zeros(1, 4)
+
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_moe_mode": "graph"},
+        raising=False,
+    )
+    graph_out = moe._forward_decode(hidden)
+    assert graph_out[0, 0].item() == 11.0
+    assert AttnWrapperBase.glm5_dispatch_counts["moe_graph"] == 1
+
+    AttnWrapperBase.glm5_dispatch_counts = {}
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_moe_mode": "eager"},
+        raising=False,
+    )
+    eager_out = moe._forward_decode(hidden)
+    assert eager_out[0, 0].item() == 22.0
+    assert AttnWrapperBase.glm5_dispatch_counts["moe_eager"] == 1
+
+
 def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
