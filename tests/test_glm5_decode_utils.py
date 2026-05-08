@@ -1940,6 +1940,32 @@ def test_glm5_segmented_graph_setup_missing_only_when_manager_absent_or_storage_
     assert worker._cuda_graph_manager is None
 
 
+def test_glm5_dsa_graph_zero_local_rank_defers_capture(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._current_decode_local_batch_size = 0
+    worker._cuda_graph_manager = None
+    worker._glm5_dsa_graph_capture_attempted_for_batch = False
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: False,
+    )
+
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert not worker._glm5_segmented_graph_initial_capture_missing()
+
+    worker._current_decode_local_batch_size = 3
+
+    assert worker._glm5_dsa_graph_current_bucket_missing()
+    assert worker._glm5_segmented_graph_initial_capture_missing()
+
+
 def test_glm5_segmented_graph_single_capture_per_batch_after_manager_clear(
     monkeypatch,
 ):
@@ -2023,6 +2049,44 @@ def test_glm5_setup_cuda_graphs_does_not_recapture_after_manager_clear(
 
     assert worker._cuda_graph_manager is None
     assert moe_setup_calls
+
+
+def test_glm5_setup_cuda_graphs_defers_dsa_capture_for_zero_local_rank(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 9
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        cuda_graph_max_bucket_size=64,
+        cuda_graph_num_buckets=7,
+    )
+    worker.model_config = types.SimpleNamespace(max_position_embeddings=131072)
+    worker.torch_device = torch.device("cpu")
+    worker._batchgen_debug = {}
+    worker._cuda_graph_manager = None
+    worker._glm5_moe_cuda_graph_manager = None
+    worker._glm5_dsa_graph_capture_attempted_for_batch = False
+    worker._glm5_moe_graph_capture_attempted_for_batch = False
+    worker._current_decode_local_batch_size = 0
+    worker._current_decode_max_rank_batch_size = 3
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+
+    moe_setup_calls = []
+    monkeypatch.setattr(
+        worker,
+        "_setup_glm5_moe_cuda_graphs",
+        lambda bucket_sizes: moe_setup_calls.append(tuple(bucket_sizes)),
+    )
+
+    worker._setup_cuda_graphs(types.SimpleNamespace())
+
+    assert worker._cuda_graph_manager is None
+    assert not worker._glm5_dsa_graph_capture_attempted_for_batch
+    assert moe_setup_calls == [(1, 2, 4, 8, 16, 32, 64)]
 
 
 def test_glm5_moe_setup_does_not_recapture_after_manager_clear(monkeypatch):

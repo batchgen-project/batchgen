@@ -8977,6 +8977,8 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
+		if int(getattr(self, "_current_decode_local_batch_size", 0) or 0) <= 0:
+			return False
 		capture_attempted = bool(
 			getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False)
 		)
@@ -9012,6 +9014,7 @@ class BatchGenWorker:
 			return False
 		dsa_missing = (
 			self._glm5_dsa_graph_requested_for_current_batch()
+			and int(getattr(self, "_current_decode_local_batch_size", 0) or 0) > 0
 			and self._cuda_graph_manager is None
 			and not getattr(
 				self,
@@ -9021,7 +9024,7 @@ class BatchGenWorker:
 		)
 		moe_missing = (
 			self._glm5_moe_graph_requested_for_current_batch()
-			and self._glm5_moe_cuda_graph_manager is None
+			and getattr(self, "_glm5_moe_cuda_graph_manager", None) is None
 			and not getattr(
 				self,
 				"_glm5_moe_graph_capture_attempted_for_batch",
@@ -9040,6 +9043,7 @@ class BatchGenWorker:
 			return False
 		dsa_done = (
 			not dsa_requested
+			or int(getattr(self, "_current_decode_local_batch_size", 0) or 0) <= 0
 			or bool(getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False))
 		)
 		moe_done = (
@@ -9931,9 +9935,12 @@ class BatchGenWorker:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			if local_bsz <= 0:
 				logging.info(
-					f"Rank {self.rank}: no local GLM-5 decode rows; still capturing configured "
-					"DSA CUDA graph buckets for possible later local reloads"
+					f"Rank {self.rank}: no local GLM-5 decode rows; deferring DSA CUDA "
+					"graph capture until this rank has local rows"
 				)
+				if glm5_moe_graph_enabled:
+					self._setup_glm5_moe_cuda_graphs(bucket_sizes)
+				return
 			if (
 				self._cuda_graph_manager is None
 				and getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False)
