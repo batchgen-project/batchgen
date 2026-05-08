@@ -75,9 +75,18 @@ class _Glm5DsaSegmentBuffers:
 @dataclass
 class _Glm5FullDsaSegmentBuffers:
     valid_mask: torch.Tensor
+    aux_valid_mask: torch.Tensor
     valid_rows_bf16: torch.Tensor
     valid_rows_ones: torch.Tensor
     valid_rows_zeros: torch.Tensor
+    safe_slot_zeros: torch.Tensor
+    skip_slot_neg_ones: torch.Tensor
+    safe_seqlen_zeros: torch.Tensor
+    kv_primary_slot_indices: torch.Tensor
+    kv_aux_slot_indices: torch.Tensor
+    safe_primary_slot_indices: torch.Tensor
+    safe_aux_slot_indices: torch.Tensor
+    safe_cache_seqlens: torch.Tensor
     q_a: torch.Tensor
     q_flat: torch.Tensor
     q_nope: torch.Tensor
@@ -712,9 +721,18 @@ class Glm5FullDsaAttnSegment:
         )
         self._buffers[bucket_size] = _Glm5FullDsaSegmentBuffers(
             valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
+            aux_valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             valid_rows_bf16=torch.empty(bucket_size, dtype=torch.bfloat16, device=device),
             valid_rows_ones=torch.ones(bucket_size, dtype=torch.bfloat16, device=device),
             valid_rows_zeros=torch.zeros(bucket_size, dtype=torch.bfloat16, device=device),
+            safe_slot_zeros=torch.zeros(bucket_size, dtype=torch.int32, device=device),
+            skip_slot_neg_ones=torch.full((bucket_size,), -1, dtype=torch.int32, device=device),
+            safe_seqlen_zeros=torch.zeros(bucket_size, dtype=torch.int32, device=device),
+            kv_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            kv_aux_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            safe_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            safe_aux_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
+            safe_cache_seqlens=torch.empty(bucket_size, dtype=torch.int32, device=device),
             q_a=torch.empty(bucket_size, attn.q_lora_rank, dtype=torch.bfloat16, device=device),
             q_flat=torch.empty(
                 bucket_size,
@@ -858,6 +876,38 @@ class Glm5FullDsaAttnSegment:
             outputs = self._outputs[batch_size]
 
         torch.ge(primary_slot_indices, 0, out=buffers.valid_mask)
+        torch.ge(aux_slot_indices, 0, out=buffers.aux_valid_mask)
+        torch.logical_and(buffers.valid_mask, buffers.aux_valid_mask, out=buffers.valid_mask)
+        torch.where(
+            buffers.valid_mask,
+            primary_slot_indices,
+            buffers.skip_slot_neg_ones,
+            out=buffers.kv_primary_slot_indices,
+        )
+        torch.where(
+            buffers.valid_mask,
+            aux_slot_indices,
+            buffers.skip_slot_neg_ones,
+            out=buffers.kv_aux_slot_indices,
+        )
+        torch.where(
+            buffers.valid_mask,
+            primary_slot_indices,
+            buffers.safe_slot_zeros,
+            out=buffers.safe_primary_slot_indices,
+        )
+        torch.where(
+            buffers.valid_mask,
+            aux_slot_indices,
+            buffers.safe_slot_zeros,
+            out=buffers.safe_aux_slot_indices,
+        )
+        torch.where(
+            buffers.valid_mask,
+            cache_seqlens,
+            buffers.safe_seqlen_zeros,
+            out=buffers.safe_cache_seqlens,
+        )
         torch.where(
             buffers.valid_mask,
             buffers.valid_rows_ones,
@@ -912,7 +962,7 @@ class Glm5FullDsaAttnSegment:
             k_cache=self.primary_blocked_k,
             k_tokens=outputs.primary_k_tensor.view(batch_size, -1),
             page_table=self.primary_page_table,
-            slot_indices=primary_slot_indices,
+            slot_indices=buffers.kv_primary_slot_indices,
             token_indices=token_indices,
             page_size_tokens=self.page_size,
         )
@@ -937,7 +987,7 @@ class Glm5FullDsaAttnSegment:
             k_cache=self.aux_blocked_k,
             k_tokens=outputs.indexer_k_tensor.view(batch_size, -1),
             page_table=self.aux_page_table,
-            slot_indices=aux_slot_indices,
+            slot_indices=buffers.kv_aux_slot_indices,
             token_indices=token_indices,
             page_size_tokens=self.aux_page_size,
         )
@@ -968,9 +1018,9 @@ class Glm5FullDsaAttnSegment:
             buffers.q_index,
             self.aux_blocked_k,
             self.aux_page_table,
-            aux_slot_indices,
+            buffers.safe_aux_slot_indices,
             buffers.head_gates,
-            cache_seqlens,
+            buffers.safe_cache_seqlens,
             buffers.agg_scores,
             buffers.top_k_indices,
             topk=self.index_topk,
@@ -980,7 +1030,7 @@ class Glm5FullDsaAttnSegment:
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,
             self.primary_page_table,
-            cache_seqlens,
+            buffers.safe_cache_seqlens,
             buffers.top_k_indices,
             self.page_size,
             buffers.selected_mla_kv,
@@ -989,7 +1039,7 @@ class Glm5FullDsaAttnSegment:
             buffers.row_modes,
             index_topk=self.index_topk,
             return_indices=False,
-            primary_slot_indices=primary_slot_indices,
+            primary_slot_indices=buffers.safe_primary_slot_indices,
         )
 
         fp8_q_absorb_out(buffers.q_nope, self.absorb_weights, buffers.absorbed_q)
