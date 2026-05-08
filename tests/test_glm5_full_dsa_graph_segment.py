@@ -152,9 +152,8 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         return out
 
     def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen):
-        del q_index, aux_blocked_k, aux_page_table, head_gates, cache_seqlens, agg_scores, page_size, max_seqlen
+        del q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, page_size, max_seqlen
         assert topk == index_topk
-        assert torch.all(aux_slot_indices >= 0)
         top_k_indices.copy_(topk_template[: top_k_indices.shape[0]])
         return top_k_indices
 
@@ -162,7 +161,6 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         del primary_blocked_k, primary_page_table, top_k_indices, page_size, selected_indices, return_indices
         selected_mla_kv.copy_(selected_template[: selected_mla_kv.shape[0]])
         if primary_slot_indices is not None:
-            assert torch.all(primary_slot_indices >= 0)
             selected_mla_kv.mul_((cache_seqlens > 0).to(torch.bfloat16).view(-1, 1, 1, 1))
         selected_lengths.fill_(index_topk)
         row_modes.zero_()
@@ -328,6 +326,14 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.count_nonzero(graph_aux_cache[:2]).item() == 0
     buffers = shared_buffers[bucket_size]
     static_outputs = segment._outputs[bucket_size]
+    expected_safe_slots = torch.tensor([0, 1, 0, 0], dtype=torch.int32, device=device)
+    expected_kv_slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32, device=device)
+    expected_safe_seqlens = torch.tensor([2, 3, 0, 0], dtype=torch.int32, device=device)
+    assert torch.equal(buffers.safe_primary_slot_indices, expected_safe_slots)
+    assert torch.equal(buffers.safe_aux_slot_indices, expected_safe_slots)
+    assert torch.equal(buffers.kv_primary_slot_indices, expected_kv_slots)
+    assert torch.equal(buffers.kv_aux_slot_indices, expected_kv_slots)
+    assert torch.equal(buffers.safe_cache_seqlens, expected_safe_seqlens)
     assert torch.count_nonzero(buffers.selected_mla_kv[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
