@@ -73,6 +73,43 @@ def test_query_pack_valid_tokens_zeroes_padding_rows():
     assert torch.count_nonzero(out[2:].float()).item() == 0
 
 
+def test_fp8_absorb_valid_tokens_zeroes_padding_rows():
+    from batchgen_kernels.attention.dsa.fp8_absorb import (
+        FP8AbsorbWeights,
+        fp8_out_absorb_out,
+        fp8_q_absorb_out,
+    )
+
+    torch.manual_seed(1234)
+    batch = 4
+    valid_rows = 2
+    heads = 2
+    num_valid = torch.tensor([valid_rows], device="cuda", dtype=torch.int32)
+    q_absorb = (torch.randn(heads, 192, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    out_absorb = (torch.randn(heads, 256, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    weights = FP8AbsorbWeights(q_absorb, out_absorb)
+
+    q_nope = (torch.randn(batch, heads, 192, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    q_nope[valid_rows:].fill_(77)
+    q_full = torch.empty(batch, heads, 512, device="cuda", dtype=torch.bfloat16)
+    q_valid = torch.full_like(q_full, 9)
+    fp8_q_absorb_out(q_nope, weights, q_full)
+    fp8_q_absorb_out(q_nope, weights, q_valid, num_valid_tokens=num_valid)
+
+    attn = (torch.randn(batch, 1, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    attn[valid_rows:].fill_(88)
+    out_full = torch.empty(batch, 1, heads, 256, device="cuda", dtype=torch.bfloat16)
+    out_valid = torch.full_like(out_full, 11)
+    fp8_out_absorb_out(attn, weights, out_full)
+    fp8_out_absorb_out(attn, weights, out_valid, num_valid_tokens=num_valid)
+    torch.cuda.synchronize()
+
+    _assert_bf16_wgmma_close(q_valid[:valid_rows], q_full[:valid_rows])
+    _assert_bf16_wgmma_close(out_valid[:valid_rows], out_full[:valid_rows])
+    assert torch.count_nonzero(q_valid[valid_rows:].float()).item() == 0
+    assert torch.count_nonzero(out_valid[valid_rows:].float()).item() == 0
+
+
 def test_paged_kv_update_valid_tokens_skips_invalid_slots():
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 

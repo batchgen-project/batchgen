@@ -161,9 +161,10 @@ def _absorb_fp8_wgmma_kernel(
 
     b_start = pid_b * BLOCK_B
     b_offs = b_start + tl.arange(0, BLOCK_B)
-    b_mask = b_offs < B
+    b_in_bounds = b_offs < B
+    b_mask = b_in_bounds
     if HAS_VALID_TOKENS:
-        num_valid_tokens = tl.load(NUM_VALID_TOKENS_ptr)
+        num_valid_tokens = tl.minimum(tl.maximum(tl.load(NUM_VALID_TOKENS_ptr), 0), B)
         if b_start >= num_valid_tokens:
             n_start = pid_n * BLOCK_N
             n_offs = n_start + tl.arange(0, BLOCK_N)
