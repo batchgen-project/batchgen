@@ -425,6 +425,8 @@ def act_quant(
     M, N = x_flat.shape
 
     if x.dtype == torch.bfloat16 and M > 0 and block_size == 128:
+        if scale_tma_aligned and x.dim() != 2:
+            raise ValueError("scale_tma_aligned act_quant currently requires a 2D input")
         from batchgen_kernels.triton.fp8_quantize import per_token_blocked_quantize_bf16_to_fp8_1d
         y_flat, scale_flat = per_token_blocked_quantize_bf16_to_fp8_1d(
             x_flat,
@@ -434,10 +436,12 @@ def act_quant(
         )
         num_blocks = scale_flat.size(-1)
         y = y_flat.view(*original_shape)
-        scale = scale_flat.view(*original_shape[:-1], num_blocks)
+        scale = scale_flat if scale_tma_aligned else scale_flat.view(*original_shape[:-1], num_blocks)
         return y, scale
 
     fp8_max = 448.0
+    if scale_tma_aligned and x.dim() != 2:
+        raise ValueError("scale_tma_aligned act_quant currently requires a 2D input")
     
     # 2. Allocate Outputs
     y = torch.empty_like(x_flat, dtype=torch.float8_e4m3fn)
@@ -493,9 +497,10 @@ def act_quant(
     
     # CRITICAL: Reshape Scale back to (E, T, NumBlocks)
     # This allows downstream kernels to calculate strides correctly.
-    scale_shape = list(original_shape[:-1]) + [num_blocks]
-    scale = scale.view(*scale_shape)
-    
+    if not scale_tma_aligned:
+        scale_shape = list(original_shape[:-1]) + [num_blocks]
+        scale = scale.view(*scale_shape)
+
     return y, scale
 
 

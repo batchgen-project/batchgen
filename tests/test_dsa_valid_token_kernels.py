@@ -15,12 +15,14 @@ def _assert_bf16_wgmma_close(actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
-def test_act_quant_valid_tokens_zeroes_padding_rows():
+@pytest.mark.parametrize("rows", [1, 4])
+def test_act_quant_valid_tokens_zeroes_padding_rows(rows: int):
     from batchgen.attention.mla.fa3_backend import act_quant
 
-    x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
-    x[2:].fill_(123)
-    num_valid = torch.tensor([2], device="cuda", dtype=torch.int32)
+    valid_rows = min(rows, 2)
+    x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+    x[valid_rows:].fill_(123)
+    num_valid = torch.tensor([valid_rows], device="cuda", dtype=torch.int32)
 
     y, scale = act_quant(
         x.contiguous(),
@@ -29,9 +31,10 @@ def test_act_quant_valid_tokens_zeroes_padding_rows():
     )
     torch.cuda.synchronize()
 
-    assert scale.stride(0) == 1
-    assert torch.count_nonzero(y[2:].float()).item() == 0
-    assert torch.all(scale[2:] == 1e-12)
+    aligned_m = ((rows + 3) // 4) * 4
+    assert scale.stride() == (1, aligned_m)
+    assert torch.count_nonzero(y[valid_rows:].float()).item() == 0
+    assert torch.all(scale[valid_rows:] == 1e-12)
 
 
 def test_head_gates_valid_tokens_zeroes_padding_rows():
