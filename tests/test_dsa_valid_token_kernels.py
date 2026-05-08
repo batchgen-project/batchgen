@@ -115,6 +115,36 @@ def test_fp8_absorb_valid_tokens_zeroes_padding_rows(batch: int, valid_rows: int
     assert torch.count_nonzero(out_valid[valid_rows:].float()).item() == 0
 
 
+def test_fp8_out_absorb_zero_valid_cuda_graph_capture():
+    from batchgen_kernels.attention.dsa.fp8_absorb import (
+        FP8AbsorbWeights,
+        fp8_out_absorb_out,
+    )
+
+    torch.manual_seed(5678)
+    batch = 32
+    heads = 64
+    out_absorb = (torch.randn(heads, 256, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    q_absorb = (torch.randn(heads, 192, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    weights = FP8AbsorbWeights(q_absorb, out_absorb)
+    num_valid = torch.zeros(1, device="cuda", dtype=torch.int32)
+    attn = (torch.randn(batch, 1, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
+    out = torch.full((batch, 1, heads, 256), 7.0, device="cuda", dtype=torch.bfloat16)
+
+    fp8_out_absorb_out(attn, weights, out, num_valid_tokens=num_valid)
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(out.float()).item() == 0
+
+    out.fill_(7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fp8_out_absorb_out(attn, weights, out, num_valid_tokens=num_valid)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(out.float()).item() == 0
+
+
 def test_paged_kv_update_valid_tokens_skips_invalid_slots():
     from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 

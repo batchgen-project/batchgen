@@ -834,10 +834,9 @@ class Glm5FullDsaAttnSegment:
         static_inputs["cache_seqlens"].fill_(self.max_seqlen)
         static_inputs["primary_slot_indices"].fill_(-1)
         static_inputs["aux_slot_indices"].fill_(-1)
-        static_inputs["num_valid_tokens"].fill_(bucket_size)
-        selected_lengths = torch.full(
+        static_inputs["num_valid_tokens"].zero_()
+        selected_lengths = torch.zeros(
             (bucket_size,),
-            self._padding_selected_length(),
             dtype=torch.int32,
             device=self.primary_blocked_k.device,
         )

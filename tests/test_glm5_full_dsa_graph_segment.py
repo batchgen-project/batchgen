@@ -304,6 +304,11 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     manager.warmup_and_capture_buckets([bucket_size])
     assert bucket_size in shared_buffers
     assert bucket_size in segment._outputs
+    captured = manager._graphs[name][bucket_size]
+    assert torch.equal(
+        captured.static_inputs["num_valid_tokens"],
+        torch.zeros(1, dtype=torch.int32, device=device),
+    )
 
     primary_cache.zero_()
     aux_cache.zero_()
@@ -338,7 +343,6 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.equal(buffers.kv_primary_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.kv_aux_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.safe_cache_seqlens, expected_safe_seqlens)
-    captured = manager._graphs[name][bucket_size]
     assert torch.equal(captured.static_inputs["num_valid_tokens"], num_valid_tokens)
     assert torch.count_nonzero(buffers.selected_mla_kv[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
