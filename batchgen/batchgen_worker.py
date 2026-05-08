@@ -957,6 +957,92 @@ class BatchGenWorker:
 						merged[key] = value
 		return merged or None
 
+	def _glm5_dispatch_trace_enabled(self, debug: Optional[dict]) -> bool:
+		if isinstance(debug, dict) and self._debug_flag_enabled(debug.get("glm5_dispatch_trace")):
+			return True
+		return os.environ.get("BATCHGEN_GLM5_DISPATCH_TRACE", "0") == "1"
+
+	def _flush_glm5_dispatch_trace_summary(self, reason: str) -> None:
+		if not getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False):
+			return
+		counts = dict(getattr(AttnWrapperBase, "glm5_dispatch_counts", {}) or {})
+		if not counts:
+			return
+		context = getattr(AttnWrapperBase, "glm5_dispatch_trace_context", None) or {}
+		counts_text = ",".join(f"{key}={counts[key]}" for key in sorted(counts))
+		logging.warning(
+			"[GLM5_DISPATCH_TRACE] rank=%s summary reason=%s trace=%s "
+			"batch_ids=%s global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s counts=%s",
+			context.get("rank", self.rank),
+			reason,
+			getattr(AttnWrapperBase, "glm5_dispatch_trace_id", None) or "unknown",
+			context.get("batch_ids", "-"),
+			context.get("global_ids", "-"),
+			context.get("bsz", "-"),
+			context.get("glm5_dsa_mode", "-"),
+			context.get("glm5_moe_mode", "-"),
+			counts_text,
+		)
+
+	def _configure_glm5_dispatch_trace(self, batch_sequences) -> None:
+		debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			debug = {}
+		enabled = self._glm5_dispatch_trace_enabled(debug)
+		if not enabled:
+			if getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False):
+				self._flush_glm5_dispatch_trace_summary("disabled")
+			AttnWrapperBase.glm5_dispatch_trace_enabled = False
+			AttnWrapperBase.glm5_dispatch_trace_id = None
+			AttnWrapperBase.glm5_dispatch_trace_context = None
+			AttnWrapperBase.glm5_dispatch_counts = {}
+			AttnWrapperBase.glm5_dispatch_seen = set()
+			return
+
+		seqs = list(batch_sequences or [])
+		batch_ids = sorted({
+			str(getattr(seq, "batch_id", None) or "-") for seq in seqs
+		})
+		global_ids = [str(getattr(seq, "global_idx", "-")) for seq in sorted(
+			seqs,
+			key=lambda seq: getattr(seq, "global_idx", -1),
+		)]
+		context = {
+			"rank": self.rank,
+			"batch_ids": ",".join(batch_ids) if batch_ids else "-",
+			"global_ids": ",".join(global_ids) if global_ids else "-",
+			"bsz": len(seqs),
+			"glm5_dsa_mode": debug.get("glm5_dsa_mode", "-"),
+			"glm5_moe_mode": debug.get("glm5_moe_mode", "-"),
+		}
+		trace_id = (
+			f"batches={context['batch_ids']}|global_ids={context['global_ids']}|"
+			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}"
+		)
+		if (
+			not getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False)
+			or getattr(AttnWrapperBase, "glm5_dispatch_trace_id", None) != trace_id
+		):
+			self._flush_glm5_dispatch_trace_summary("switch")
+			AttnWrapperBase.glm5_dispatch_trace_enabled = True
+			AttnWrapperBase.glm5_dispatch_trace_id = trace_id
+			AttnWrapperBase.glm5_dispatch_trace_context = context
+			AttnWrapperBase.glm5_dispatch_counts = {}
+			AttnWrapperBase.glm5_dispatch_seen = set()
+			logging.warning(
+				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
+				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s",
+				self.rank,
+				trace_id,
+				context["batch_ids"],
+				context["global_ids"],
+				context["bsz"],
+				context["glm5_dsa_mode"],
+				context["glm5_moe_mode"],
+			)
+		else:
+			AttnWrapperBase.glm5_dispatch_trace_context = context
+
 	def _debug_sequences_for_decode_uuids(self, decode_uuids) -> list:
 		if self.global_batch is None:
 			return []
@@ -6079,6 +6165,7 @@ class BatchGenWorker:
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
 					global_decode_sequences
 				)
+				self._configure_glm5_dispatch_trace(global_decode_sequences)
 
 				# B. Config Decode
 				config_start = time.perf_counter()
@@ -10593,6 +10680,7 @@ class BatchGenWorker:
 			AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
 				global_decode_sequences
 			)
+			self._configure_glm5_dispatch_trace(global_decode_sequences)
 
 			if self._glm5_moe_graph_current_bucket_missing():
 				logging.info(
@@ -11268,7 +11356,13 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		self._flush_glm5_dispatch_trace_summary("decode_end")
 		AttnWrapperBase.batchgen_debug = None
+		AttnWrapperBase.glm5_dispatch_trace_enabled = False
+		AttnWrapperBase.glm5_dispatch_trace_id = None
+		AttnWrapperBase.glm5_dispatch_trace_context = None
+		AttnWrapperBase.glm5_dispatch_counts = {}
+		AttnWrapperBase.glm5_dispatch_seen = set()
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
 		AttnWrapperBase.glm5_decode_primary_slot_indices = None

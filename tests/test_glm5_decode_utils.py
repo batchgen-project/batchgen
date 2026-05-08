@@ -1103,6 +1103,77 @@ def test_worker_glm5_debug_modes_override_segmented_graph(monkeypatch):
     assert worker._glm5_moe_graph_output_required_for_current_batch()
 
 
+def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_GLM5_DISPATCH_TRACE", raising=False)
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {
+            "glm5_dispatch_trace": True,
+            "glm5_dsa_mode": "eager",
+            "glm5_moe_mode": "graph",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_id", None, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_trace_context", None, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_counts", {}, raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "glm5_dispatch_seen", set(), raising=False)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    seqs = [
+        types.SimpleNamespace(batch_id="batch-a", global_idx=7),
+        types.SimpleNamespace(batch_id="batch-a", global_idx=3),
+    ]
+
+    worker._configure_glm5_dispatch_trace(seqs)
+    assert AttnWrapperBase.glm5_dispatch_trace_enabled
+    assert AttnWrapperBase.glm5_dispatch_trace_context == {
+        "rank": 0,
+        "batch_ids": "batch-a",
+        "global_ids": "3,7",
+        "bsz": 2,
+        "glm5_dsa_mode": "eager",
+        "glm5_moe_mode": "graph",
+    }
+
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="dsa",
+        path="eager",
+        layer_idx=0,
+        bsz=2,
+        reason="debug mode requested eager",
+    )
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="dsa",
+        path="eager",
+        layer_idx=1,
+        bsz=2,
+        reason="debug mode requested eager",
+    )
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="moe",
+        path="graph",
+        layer_idx=3,
+        bsz=2,
+        reason="graph replay",
+    )
+
+    assert AttnWrapperBase.glm5_dispatch_counts == {
+        "dsa_eager": 2,
+        "moe_graph": 1,
+    }
+
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
+    worker._configure_glm5_dispatch_trace(seqs)
+    assert not AttnWrapperBase.glm5_dispatch_trace_enabled
+    assert AttnWrapperBase.glm5_dispatch_counts == {}
+
+
 def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")

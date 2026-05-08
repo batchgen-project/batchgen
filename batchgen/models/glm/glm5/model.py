@@ -107,6 +107,26 @@ def _glm5_moe_debug_mode() -> Optional[str]:
     return mode if mode in {"graph", "eager"} else None
 
 
+def _record_glm5_moe_dispatch(
+    path: str,
+    *,
+    layer_idx: int,
+    bsz: int,
+    reason: str,
+) -> None:
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="moe",
+        path=path,
+        layer_idx=layer_idx,
+        bsz=bsz,
+        reason=reason,
+    )
+
+
 def _glm5_moe_graph_compare_active() -> bool:
     if _glm5_moe_debug_mode() == "eager":
         return False
@@ -1471,6 +1491,12 @@ class Glm5MoE(nn.Module):
                 )
             )
             if compare:
+                _record_glm5_moe_dispatch(
+                    "eager",
+                    layer_idx=self.layer_idx,
+                    bsz=hidden_states.shape[0],
+                    reason="graph compare returns eager output",
+                )
                 return self._forward_decode_3d_graph_compare(hidden_states)
             if graph_required:
                 if self._moe_cuda_graph_exceeds_max_bucket():
@@ -1483,10 +1509,38 @@ class Glm5MoE(nn.Module):
                             self.num_tokens_per_rank,
                         )
                         self._moe_cuda_graph_over_bucket_warned = True
+                    _record_glm5_moe_dispatch(
+                        "eager",
+                        layer_idx=self.layer_idx,
+                        bsz=hidden_states.shape[0],
+                        reason="graph requested but rank bucket exceeded",
+                    )
                     return self._forward_decode_3d(hidden_states)
+                _record_glm5_moe_dispatch(
+                    "graph",
+                    layer_idx=self.layer_idx,
+                    bsz=hidden_states.shape[0],
+                    reason="graph replay",
+                )
                 return self._forward_decode_3d_graph(hidden_states)
+            if debug_mode == "eager":
+                reason = "debug mode requested eager"
+            else:
+                reason = "graph not requested"
+            _record_glm5_moe_dispatch(
+                "eager",
+                layer_idx=self.layer_idx,
+                bsz=hidden_states.shape[0],
+                reason=reason,
+            )
             return self._forward_decode_3d(hidden_states)
 
+        _record_glm5_moe_dispatch(
+            "eager",
+            layer_idx=self.layer_idx,
+            bsz=hidden_states.shape[0],
+            reason="3d MoE graph path unavailable",
+        )
         import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer

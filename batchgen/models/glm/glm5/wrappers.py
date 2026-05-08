@@ -82,6 +82,22 @@ _glm5_dsa_graph_eager_fallback_logged = False
 _glm5_dsa_graph_compare_unavailable_logged = False
 
 
+def _record_glm5_dsa_dispatch(
+    path: str,
+    *,
+    layer_idx: int,
+    bsz: int,
+    reason: str,
+) -> None:
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="dsa",
+        path=path,
+        layer_idx=layer_idx,
+        bsz=bsz,
+        reason=reason,
+    )
+
+
 def _glm5_dsa_cuda_graph_required() -> bool:
     mode = _glm5_dsa_debug_mode()
     if mode == "eager":
@@ -1302,6 +1318,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and graph_forward_ready
                 and not compare_active
             ):
+                _record_glm5_dsa_dispatch(
+                    "graph",
+                    layer_idx=self.layer_idx,
+                    bsz=bsz,
+                    reason="graph replay",
+                )
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -1344,7 +1366,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     self.layer_idx,
                     reason,
                 )
+        else:
+            if debug_mode == "eager":
+                reason = "debug mode requested eager"
+            else:
+                reason = "graph not requested"
 
+        _record_glm5_dsa_dispatch(
+            "eager",
+            layer_idx=self.layer_idx,
+            bsz=bsz,
+            reason=reason,
+        )
         eager_result = self._forward_decode_dsa_eager(
             hidden_states,
             position_ids,
