@@ -2,7 +2,7 @@ import types
 
 import pytest
 
-from batchgen.cuda_graph.graph_manager import BatchSizeBucketing, CUDAGraphManager
+from batchgen.cuda_graph.graph_manager import BatchSizeBucketing, CapturedGraph, CUDAGraphManager
 
 
 def _make_uninitialized_manager(bucket_sizes, segment_names=("seg",)):
@@ -103,6 +103,41 @@ def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():
 
     manager.drop_bucket(2)
     assert not manager.is_captured
+
+
+def test_replay_auto_populates_num_valid_tokens_static_input():
+    import torch
+
+    manager = _make_uninitialized_manager([4])
+    static_inputs = {
+        "x": torch.full((4,), -9, dtype=torch.int32),
+        "num_valid_tokens": torch.full((1,), 4, dtype=torch.int32),
+    }
+    replay_observations = []
+
+    class FakeGraph:
+        def replay(self):
+            replay_observations.append(
+                (
+                    static_inputs["x"].clone(),
+                    static_inputs["num_valid_tokens"].clone(),
+                )
+            )
+
+    manager._graphs["seg"][4] = CapturedGraph(
+        bucket_size=4,
+        graph=FakeGraph(),
+        static_inputs=static_inputs,
+        static_outputs={"y": torch.arange(4, dtype=torch.int32)},
+        input_fill_values={"x": 0.0, "num_valid_tokens": 4.0},
+    )
+
+    result = manager.replay("seg", 2, x=torch.tensor([10, 11], dtype=torch.int32))
+
+    assert torch.equal(static_inputs["x"], torch.tensor([10, 11, 0, 0], dtype=torch.int32))
+    assert torch.equal(static_inputs["num_valid_tokens"], torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(replay_observations[0][1], torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(result["y"], torch.tensor([0, 1], dtype=torch.int32))
 
 
 def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):

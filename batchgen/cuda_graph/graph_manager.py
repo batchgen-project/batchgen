@@ -350,6 +350,14 @@ class CUDAGraphManager:
                     f"Input '{key}' batch dim {tensor.shape[0]} exceeds "
                     f"static buffer {static_tensor.shape[0]} for bucket {bucket_size}"
                 )
+        valid_tokens = captured.static_inputs.get("num_valid_tokens")
+        if valid_tokens is not None and "num_valid_tokens" not in inputs:
+            if valid_tokens.numel() != 1:
+                raise ValueError(
+                    "'num_valid_tokens' static input must contain exactly one element, "
+                    f"got shape {tuple(valid_tokens.shape)}"
+                )
+            valid_tokens.fill_(batch_size)
 
         # Replay on current stream — no cross-stream sync needed
         captured.graph.replay()

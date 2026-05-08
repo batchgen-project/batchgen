@@ -21,8 +21,6 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
-import torch.nn.functional as F
-
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -50,6 +48,7 @@ from batchgen_kernels.attention.dsa.fused_indexer_score import (
     fused_paged_score_and_topk_with_slots_out,
     rope_hadamard_q_out,
 )
+from batchgen_kernels.attention.dsa.head_gates import head_gates_out
 from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
 from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
@@ -76,6 +75,7 @@ class _Glm5DsaSegmentBuffers:
 class _Glm5FullDsaSegmentBuffers:
     valid_mask: torch.Tensor
     aux_valid_mask: torch.Tensor
+    row_indices: torch.Tensor
     valid_rows_bf16: torch.Tensor
     valid_rows_ones: torch.Tensor
     valid_rows_zeros: torch.Tensor
@@ -649,6 +649,7 @@ class Glm5FullDsaAttnSegment:
             ),
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
+            "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
             "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
@@ -722,6 +723,7 @@ class Glm5FullDsaAttnSegment:
         self._buffers[bucket_size] = _Glm5FullDsaSegmentBuffers(
             valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             aux_valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
+            row_indices=torch.arange(bucket_size, dtype=torch.int32, device=device),
             valid_rows_bf16=torch.empty(bucket_size, dtype=torch.bfloat16, device=device),
             valid_rows_ones=torch.ones(bucket_size, dtype=torch.bfloat16, device=device),
             valid_rows_zeros=torch.zeros(bucket_size, dtype=torch.bfloat16, device=device),
@@ -832,6 +834,7 @@ class Glm5FullDsaAttnSegment:
         static_inputs["cache_seqlens"].fill_(self.max_seqlen)
         static_inputs["primary_slot_indices"].fill_(-1)
         static_inputs["aux_slot_indices"].fill_(-1)
+        static_inputs["num_valid_tokens"].fill_(bucket_size)
         selected_lengths = torch.full(
             (bucket_size,),
             self._padding_selected_length(),
@@ -862,6 +865,7 @@ class Glm5FullDsaAttnSegment:
         aux_slot_indices: torch.Tensor,
         flashmla_tile_scheduler_metadata: torch.Tensor,
         flashmla_num_splits: torch.Tensor,
+        num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
         indexer = attn.indexer
@@ -875,7 +879,12 @@ class Glm5FullDsaAttnSegment:
             self._setup_static_output_buffers(batch_size)
             outputs = self._outputs[batch_size]
 
-        torch.ge(primary_slot_indices, 0, out=buffers.valid_mask)
+        if num_valid_tokens is None:
+            torch.ge(primary_slot_indices, 0, out=buffers.valid_mask)
+        else:
+            torch.lt(buffers.row_indices, num_valid_tokens, out=buffers.valid_mask)
+            torch.ge(primary_slot_indices, 0, out=buffers.aux_valid_mask)
+            torch.logical_and(buffers.valid_mask, buffers.aux_valid_mask, out=buffers.valid_mask)
         torch.ge(aux_slot_indices, 0, out=buffers.aux_valid_mask)
         torch.logical_and(buffers.valid_mask, buffers.aux_valid_mask, out=buffers.valid_mask)
         torch.where(
@@ -917,23 +926,37 @@ class Glm5FullDsaAttnSegment:
         valid_rows_bf16_4d = buffers.valid_rows_bf16.view(batch_size, 1, 1, 1)
 
         hidden_flat = hidden_states.view(batch_size, attn.hidden_size).contiguous()
-        hidden_fp8, hidden_scale = act_quant(hidden_flat)
+        hidden_fp8, hidden_scale = act_quant(
+            hidden_flat,
+            num_valid_tokens=num_valid_tokens,
+            scale_tma_aligned=num_valid_tokens is not None,
+        )
         w8a8_deepgemm(
             hidden_fp8,
             hidden_scale,
             attn.q_a_proj.weight,
             self.wrapper.weight_dequant_scale["q_a_proj.weight_scale_inv"],
             out=buffers.q_a,
+            num_valid_tokens=num_valid_tokens,
+            expected_m=batch_size,
         )
+        buffers.q_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
         q_a_normed = attn.q_a_layernorm(buffers.q_a).contiguous()
-        q_a_fp8, q_a_scale = act_quant(q_a_normed)
+        q_a_fp8, q_a_scale = act_quant(
+            q_a_normed,
+            num_valid_tokens=num_valid_tokens,
+            scale_tma_aligned=num_valid_tokens is not None,
+        )
         w8a8_deepgemm(
             q_a_fp8,
             q_a_scale,
             attn.q_b_proj.weight,
             self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
             out=buffers.q_flat,
+            num_valid_tokens=num_valid_tokens,
+            expected_m=batch_size,
         )
+        buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
         q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
@@ -944,7 +967,10 @@ class Glm5FullDsaAttnSegment:
             attn.kv_a_proj_with_mqa.weight,
             self.wrapper.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"],
             out=buffers.new_compressed_kv.view(batch_size, -1),
+            num_valid_tokens=num_valid_tokens,
+            expected_m=batch_size,
         )
+        buffers.new_compressed_kv.mul_(buffers.valid_rows_bf16.view(batch_size, 1, 1))
         offload_kv = _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,
@@ -965,6 +991,7 @@ class Glm5FullDsaAttnSegment:
             slot_indices=buffers.kv_primary_slot_indices,
             token_indices=token_indices,
             page_size_tokens=self.page_size,
+            num_valid_tokens=num_valid_tokens,
         )
 
         cuda_wk_proj_gemm_only_out(
@@ -990,11 +1017,16 @@ class Glm5FullDsaAttnSegment:
             slot_indices=buffers.kv_aux_slot_indices,
             token_indices=token_indices,
             page_size_tokens=self.aux_page_size,
+            num_valid_tokens=num_valid_tokens,
         )
 
-        gates = F.linear(hidden_flat.float(), indexer.weights_proj.weight.data.float())
-        gates = gates * ((indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5))
-        buffers.head_gates.copy_(gates.to(torch.float32))
+        head_gates_out(
+            hidden_flat,
+            indexer.weights_proj.weight.data,
+            buffers.head_gates,
+            scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
+            num_valid_tokens=num_valid_tokens,
+        )
         buffers.positions_expanded.copy_(
             position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
         )
@@ -1026,6 +1058,7 @@ class Glm5FullDsaAttnSegment:
             topk=self.index_topk,
             page_size=self.aux_page_size,
             max_seqlen=self.max_seqlen,
+            num_valid_tokens=num_valid_tokens,
         )
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,
@@ -1040,13 +1073,20 @@ class Glm5FullDsaAttnSegment:
             index_topk=self.index_topk,
             return_indices=False,
             primary_slot_indices=buffers.safe_primary_slot_indices,
+            num_valid_tokens=num_valid_tokens,
         )
 
-        fp8_q_absorb_out(buffers.q_nope, self.absorb_weights, buffers.absorbed_q)
+        fp8_q_absorb_out(
+            buffers.q_nope,
+            self.absorb_weights,
+            buffers.absorbed_q,
+            num_valid_tokens=num_valid_tokens,
+        )
         pack_flashmla_query_out(
             buffers.absorbed_q,
             buffers.q_rope_4d.squeeze(2),
             buffers.query_states,
+            num_valid_tokens=num_valid_tokens,
         )
         buffers.query_states.mul_(valid_rows_bf16_4d)
         attn_out = run_prepared_sparse_flash_mla_decode(
@@ -1054,16 +1094,27 @@ class Glm5FullDsaAttnSegment:
             tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
             num_splits=flashmla_num_splits,
         )
-        fp8_out_absorb_out(attn_out, self.absorb_weights, buffers.attn_heads)
+        fp8_out_absorb_out(
+            attn_out,
+            self.absorb_weights,
+            buffers.attn_heads,
+            num_valid_tokens=num_valid_tokens,
+        )
         buffers.attn_heads.mul_(valid_rows_bf16_4d)
         attn_heads_flat = buffers.attn_heads.reshape(batch_size, attn.num_heads * attn.v_head_dim)
-        attn_output_fp8, attn_output_scale = act_quant(attn_heads_flat)
+        attn_output_fp8, attn_output_scale = act_quant(
+            attn_heads_flat,
+            num_valid_tokens=num_valid_tokens,
+            scale_tma_aligned=num_valid_tokens is not None,
+        )
         w8a8_deepgemm(
             attn_output_fp8,
             attn_output_scale,
             attn.o_proj.weight,
             self.wrapper.weight_dequant_scale["o_proj.weight_scale_inv"],
             out=outputs.attn_output,
+            num_valid_tokens=num_valid_tokens,
+            expected_m=batch_size,
         )
         outputs.attn_output.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
 

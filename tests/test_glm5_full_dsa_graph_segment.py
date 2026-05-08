@@ -112,11 +112,12 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
     selected_template = topk_template.to(torch.bfloat16).view(bucket_size, index_topk, 1, 1)
     selected_template = selected_template.expand(bucket_size, index_topk, 1, kv_dim).contiguous()
 
-    def fake_act_quant(x):
+    def fake_act_quant(x, num_valid_tokens=None, scale_tma_aligned=False):
+        del num_valid_tokens, scale_tma_aligned
         return x.contiguous(), torch.ones(x.shape[0], 1, device=x.device, dtype=torch.float32)
 
-    def fake_w8a8_deepgemm(a, a_scale, w, w_scale, c=None, disable_ue8m0_cast=True, recipe=None, out=None):
-        del a_scale, w_scale, c, disable_ue8m0_cast, recipe
+    def fake_w8a8_deepgemm(a, a_scale, w, w_scale, c=None, disable_ue8m0_cast=True, recipe=None, out=None, num_valid_tokens=None, expected_m=None):
+        del a_scale, w_scale, c, disable_ue8m0_cast, recipe, expected_m, num_valid_tokens
         result = a.float().matmul(w.float().t()).to(torch.bfloat16)
         if out is None:
             return result
@@ -151,14 +152,14 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         out.copy_(q_flat + 0.03125)
         return out
 
-    def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen):
-        del q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, page_size, max_seqlen
+    def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):
+        del q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, page_size, max_seqlen, num_valid_tokens
         assert topk == index_topk
         top_k_indices.copy_(topk_template[: top_k_indices.shape[0]])
         return top_k_indices
 
-    def fake_select(primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_mla_kv, selected_lengths, selected_indices, row_modes, *, index_topk, return_indices, primary_slot_indices=None):
-        del primary_blocked_k, primary_page_table, top_k_indices, page_size, selected_indices, return_indices
+    def fake_select(primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_mla_kv, selected_lengths, selected_indices, row_modes, *, index_topk, return_indices, primary_slot_indices=None, num_valid_tokens=None):
+        del primary_blocked_k, primary_page_table, top_k_indices, page_size, selected_indices, return_indices, num_valid_tokens
         selected_mla_kv.copy_(selected_template[: selected_mla_kv.shape[0]])
         if primary_slot_indices is not None:
             selected_mla_kv.mul_((cache_seqlens > 0).to(torch.bfloat16).view(-1, 1, 1, 1))
@@ -186,19 +187,20 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         selected = prepared.selected_mla_kv[:, :1, :, :v_dim]
         return prepared.query_states[..., :v_dim] + selected
 
-    def fake_q_absorb(q_nope, weights, absorbed_q):
-        del weights
+    def fake_q_absorb(q_nope, weights, absorbed_q, num_valid_tokens=None):
+        del weights, num_valid_tokens
         absorbed_q.copy_(q_nope[..., : absorbed_q.shape[-1]])
         return absorbed_q
 
-    def fake_pack_query(absorbed_q, q_rope, query_states):
+    def fake_pack_query(absorbed_q, q_rope, query_states, num_valid_tokens=None):
+        del num_valid_tokens
         query_states.zero_()
         query_states[:, :, :, : absorbed_q.shape[-1]].copy_(absorbed_q.unsqueeze(1))
         query_states[:, :, :, -q_rope.shape[-1] :].copy_(q_rope.unsqueeze(1))
         return query_states
 
-    def fake_out_absorb(attn_out, weights, attn_heads):
-        del weights
+    def fake_out_absorb(attn_out, weights, attn_heads, num_valid_tokens=None):
+        del weights, num_valid_tokens
         attn_heads.copy_(attn_out)
         return attn_heads
 
@@ -271,6 +273,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     aux_slots = torch.tensor([0, 1], dtype=torch.int32, device=device)
     metadata = torch.arange(4, dtype=torch.int32, device=device).view(1, 4)
     num_splits = torch.ones(1, dtype=torch.int32, device=device)
+    num_valid_tokens = torch.tensor([actual_bsz], dtype=torch.int32, device=device)
 
     def run_eager():
         primary_cache.zero_()
@@ -281,6 +284,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
             cache_seqlens=cache_seqlens,
             primary_slot_indices=primary_slots,
             aux_slot_indices=aux_slots,
+            num_valid_tokens=num_valid_tokens,
             flashmla_tile_scheduler_metadata=metadata,
             flashmla_num_splits=num_splits,
         )
@@ -334,6 +338,8 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.equal(buffers.kv_primary_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.kv_aux_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.safe_cache_seqlens, expected_safe_seqlens)
+    captured = manager._graphs[name][bucket_size]
+    assert torch.equal(captured.static_inputs["num_valid_tokens"], num_valid_tokens)
     assert torch.count_nonzero(buffers.selected_mla_kv[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
