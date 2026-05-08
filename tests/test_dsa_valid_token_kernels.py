@@ -73,7 +73,15 @@ def test_query_pack_valid_tokens_zeroes_padding_rows():
     assert torch.count_nonzero(out[2:].float()).item() == 0
 
 
-def test_fp8_absorb_valid_tokens_zeroes_padding_rows():
+@pytest.mark.parametrize(
+    ("batch", "valid_rows", "heads"),
+    [
+        (4, 0, 2),
+        (4, 2, 2),
+        (32, 0, 64),
+    ],
+)
+def test_fp8_absorb_valid_tokens_zeroes_padding_rows(batch: int, valid_rows: int, heads: int):
     from batchgen_kernels.attention.dsa.fp8_absorb import (
         FP8AbsorbWeights,
         fp8_out_absorb_out,
@@ -81,9 +89,6 @@ def test_fp8_absorb_valid_tokens_zeroes_padding_rows():
     )
 
     torch.manual_seed(1234)
-    batch = 4
-    valid_rows = 2
-    heads = 2
     num_valid = torch.tensor([valid_rows], device="cuda", dtype=torch.int32)
     q_absorb = (torch.randn(heads, 192, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()
     out_absorb = (torch.randn(heads, 256, 512, device="cuda", dtype=torch.bfloat16) * 0.1).contiguous()

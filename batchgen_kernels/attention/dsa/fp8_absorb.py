@@ -165,16 +165,8 @@ def _absorb_fp8_wgmma_kernel(
     b_mask = b_in_bounds
     if HAS_VALID_TOKENS:
         num_valid_tokens = tl.minimum(tl.maximum(tl.load(NUM_VALID_TOKENS_ptr), 0), B)
-        if b_start >= num_valid_tokens:
-            n_start = pid_n * BLOCK_N
-            n_offs = n_start + tl.arange(0, BLOCK_N)
-            n_mask = n_offs < N
-            tl.store(
-                OUT_ptr + b_offs[:, None] * (H * N) + pid_h * N + n_offs[None, :],
-                tl.zeros((BLOCK_B, BLOCK_N), dtype=tl.float32),
-                mask=(b_offs[:, None] < B) & n_mask[None, :],
-            )
-            return
+        # Keep zero-valid tiles on the same straight-line path: Triton dynamic
+        # early-return poisoned CUDA graph capture on zero-local-rank buckets.
         b_mask = b_mask & (b_offs < num_valid_tokens)
 
     n_start = pid_n * BLOCK_N
