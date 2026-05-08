@@ -82,6 +82,11 @@ def _debug_flag_enabled(value) -> bool:
 
 
 def _glm5_moe_cuda_graph_required() -> bool:
+    mode = _glm5_moe_debug_mode()
+    if mode == "eager":
+        return False
+    if mode == "graph":
+        return True
     return os.environ.get(_GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
 
 
@@ -94,7 +99,17 @@ def _glm5_moe_debug_dict() -> dict:
     return debug if isinstance(debug, dict) else {}
 
 
+def _glm5_moe_debug_mode() -> Optional[str]:
+    value = _glm5_moe_debug_dict().get("glm5_moe_mode")
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    return mode if mode in {"graph", "eager"} else None
+
+
 def _glm5_moe_graph_compare_active() -> bool:
+    if _glm5_moe_debug_mode() == "eager":
+        return False
     debug = _glm5_moe_debug_dict()
     return (
         _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
@@ -1440,10 +1455,20 @@ class Glm5MoE(nn.Module):
         # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
-            compare = _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
+            debug_mode = _glm5_moe_debug_mode()
+            compare = (
+                False if debug_mode == "eager"
+                else _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
+            )
             graph_required = (
-                _glm5_moe_cuda_graph_required()
-                or getattr(self, "_moe_cuda_graph_required", False)
+                debug_mode == "graph"
+                or (
+                    debug_mode != "eager"
+                    and (
+                        _glm5_moe_cuda_graph_required()
+                        or getattr(self, "_moe_cuda_graph_required", False)
+                    )
+                )
             )
             if compare:
                 return self._forward_decode_3d_graph_compare(hidden_states)

@@ -9059,6 +9059,11 @@ class BatchGenWorker:
 		return True
 
 	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
+		mode = self._glm5_debug_mode("glm5_dsa_mode")
+		if mode == "eager":
+			return False
+		if mode == "graph":
+			return True
 		if self._glm5_dsa_full_graph_requested_for_current_batch():
 			return True
 		model_name = getattr(self, "model_name", None)
@@ -9084,6 +9089,8 @@ class BatchGenWorker:
 		return False
 
 	def _glm5_dsa_full_graph_requested_for_current_batch(self) -> bool:
+		if self._glm5_debug_mode("glm5_dsa_mode") == "eager":
+			return False
 		if glm5_dsa_full_cuda_graph_requested():
 			return True
 		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
@@ -9092,6 +9099,11 @@ class BatchGenWorker:
 		return self._debug_flag_enabled(debug.get("glm5_dsa_full_graph"))
 
 	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
+		mode = self._glm5_debug_mode("glm5_dsa_mode")
+		if mode == "eager":
+			return False
+		if mode == "graph":
+			return True
 		return glm5_dsa_cuda_graph_requested_for_model(
 			getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(
@@ -9110,7 +9122,22 @@ class BatchGenWorker:
 			return value.strip().lower() in {"1", "true", "yes", "on"}
 		return False
 
+	def _glm5_debug_mode(self, key: str):
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return None
+		value = debug.get(key)
+		if not isinstance(value, str):
+			return None
+		mode = value.strip().lower()
+		return mode if mode in {"graph", "eager"} else None
+
 	def _glm5_moe_graph_output_required_for_current_batch(self) -> bool:
+		mode = self._glm5_debug_mode("glm5_moe_mode")
+		if mode == "eager":
+			return False
+		if mode == "graph":
+			return True
 		return glm5_moe_cuda_graph_requested_for_model(
 			getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(
@@ -9121,6 +9148,11 @@ class BatchGenWorker:
 		)
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
+		mode = self._glm5_debug_mode("glm5_moe_mode")
+		if mode == "eager":
+			return False
+		if mode == "graph":
+			return True
 		model_name = getattr(self, "model_name", None)
 		if (
 			glm5_moe_cuda_graph_requested_for_model(

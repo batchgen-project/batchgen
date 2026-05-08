@@ -37,6 +37,7 @@ from batchgen.models.glm.glm5.model import (
 import batchgen.models.glm.glm5.model as glm5_model
 from batchgen.models.glm.glm5.wrappers import (
     GLM5AttnWrapper,
+    _glm5_dsa_cuda_graph_required,
     _glm5_dsa_graph_compare_active,
     _glm5_dsa_graph_compare_layer_enabled,
     _glm5_dsa_cuda_graph_can_replay,
@@ -1067,6 +1068,65 @@ def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
     assert worker._glm5_dsa_graph_output_required_for_current_batch()
     assert worker._glm5_moe_graph_requested_for_current_batch()
     assert worker._glm5_moe_graph_output_required_for_current_batch()
+
+
+def test_worker_glm5_debug_modes_override_segmented_graph(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
+    worker._batchgen_debug = {
+        "glm5_dsa_mode": "eager",
+        "glm5_moe_mode": "eager",
+    }
+
+    assert not worker._glm5_dsa_full_graph_requested_for_current_batch()
+    assert not worker._glm5_dsa_graph_requested_for_current_batch()
+    assert not worker._glm5_dsa_graph_output_required_for_current_batch()
+    assert not worker._glm5_moe_graph_requested_for_current_batch()
+    assert not worker._glm5_moe_graph_output_required_for_current_batch()
+
+    worker.args = types.SimpleNamespace(enable_cuda_graph=False)
+    worker._batchgen_debug = {
+        "glm5_dsa_mode": "graph",
+        "glm5_moe_mode": "graph",
+    }
+
+    assert worker._glm5_dsa_graph_requested_for_current_batch()
+    assert worker._glm5_dsa_graph_output_required_for_current_batch()
+    assert worker._glm5_moe_graph_requested_for_current_batch()
+    assert worker._glm5_moe_graph_output_required_for_current_batch()
+
+
+def test_glm5_debug_modes_override_env_graph_requirements(monkeypatch):
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_dsa_mode": "eager", "glm5_moe_mode": "eager"},
+        raising=False,
+    )
+
+    assert not _glm5_dsa_cuda_graph_required()
+    assert not glm5_model._glm5_moe_cuda_graph_required()
+    assert not _glm5_dsa_graph_compare_active()
+    assert not glm5_model._glm5_moe_graph_compare_active()
+
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_dsa_mode": "graph", "glm5_moe_mode": "graph"},
+        raising=False,
+    )
+
+    assert _glm5_dsa_cuda_graph_required()
+    assert glm5_model._glm5_moe_cuda_graph_required()
 
 
 def test_worker_full_dsa_graph_flag_requests_dsa_path(monkeypatch):

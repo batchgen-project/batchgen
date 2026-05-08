@@ -83,6 +83,11 @@ _glm5_dsa_graph_compare_unavailable_logged = False
 
 
 def _glm5_dsa_cuda_graph_required() -> bool:
+    mode = _glm5_dsa_debug_mode()
+    if mode == "eager":
+        return False
+    if mode == "graph":
+        return True
     return (
         os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
         or os.environ.get(_GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
@@ -99,8 +104,23 @@ def _debug_flag_enabled(value: Any) -> bool:
     return False
 
 
-def _glm5_dsa_graph_compare_active() -> bool:
+def _glm5_dsa_debug_dict() -> dict:
     debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return debug if isinstance(debug, dict) else {}
+
+
+def _glm5_dsa_debug_mode() -> Optional[str]:
+    value = _glm5_dsa_debug_dict().get("glm5_dsa_mode")
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    return mode if mode in {"graph", "eager"} else None
+
+
+def _glm5_dsa_graph_compare_active() -> bool:
+    if _glm5_dsa_debug_mode() == "eager":
+        return False
+    debug = _glm5_dsa_debug_dict()
     return (
         _debug_flag_enabled(debug.get("glm5_dsa_graph_compare"))
         or os.environ.get(_GLM5_DSA_GRAPH_COMPARE_ENV, "0") == "1"
@@ -110,7 +130,7 @@ def _glm5_dsa_graph_compare_active() -> bool:
 def _glm5_dsa_graph_compare_layer_enabled(layer_idx: int) -> bool:
     if not _glm5_dsa_graph_compare_active():
         return False
-    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    debug = _glm5_dsa_debug_dict()
     layers = debug.get("glm5_dsa_graph_compare_layers")
     if layers is None:
         layers = os.environ.get("BATCHGEN_GLM5_DSA_GRAPH_COMPARE_LAYERS", "0")
@@ -1230,12 +1250,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if bsz == 0:
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
-        compare_active = _glm5_dsa_graph_compare_active()
+        debug_mode = _glm5_dsa_debug_mode()
+        compare_active = (
+            False if debug_mode == "eager"
+            else _glm5_dsa_graph_compare_active()
+        )
         compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
         graph_requested = (
-            _glm5_dsa_cuda_graph_required()
-            or getattr(self, "_dsa_cuda_graph_required", False)
-            or compare_active
+            debug_mode == "graph"
+            or (
+                debug_mode != "eager"
+                and (
+                    _glm5_dsa_cuda_graph_required()
+                    or getattr(self, "_dsa_cuda_graph_required", False)
+                    or compare_active
+                )
+            )
         )
         compare_after_eager = False
         if graph_requested:
