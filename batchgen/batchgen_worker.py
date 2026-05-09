@@ -8856,11 +8856,21 @@ class BatchGenWorker:
 			make_glm5_moe_graph_segment_name,
 		)
 
-		bucketing = BatchSizeBucketing(bucket_sizes)
+		moe_bucket_sizes = self._glm5_exact_moe_cuda_graph_bucket_sizes()
+		bucketing = BatchSizeBucketing(moe_bucket_sizes)
+		try:
+			needed_bucket = bucketing.get_padded_size(max_bsz)
+		except ValueError:
+			logging.info(
+				f"Rank {self.rank}: GLM-5 MoE exact CUDA graph bucket unavailable "
+				f"for max rank batch size {max_bsz}; using eager MoE"
+			)
+			self._glm5_moe_graph_capture_attempted_for_batch = True
+			return
 		capture_buckets = [
-			int(bucket)
-			for bucket in bucketing.bucket_sizes
-			if int(bucket) not in getattr(self, "_glm5_moe_graph_failed_buckets", set())
+			needed_bucket
+			for bucket in (needed_bucket,)
+			if bucket not in getattr(self, "_glm5_moe_graph_failed_buckets", set())
 		]
 		if not capture_buckets:
 			self._glm5_moe_graph_capture_attempted_for_batch = True
@@ -8868,16 +8878,16 @@ class BatchGenWorker:
 
 		if self._glm5_moe_cuda_graph_manager is not None:
 			missing_buckets = [
-				bucket
-				for bucket in capture_buckets
-				if not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(bucket)
+				needed_bucket
+				for bucket in (needed_bucket,)
+				if not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
 			]
 			if not missing_buckets:
 				self._glm5_moe_graph_capture_attempted_for_batch = True
 				return
 			logging.info(
 				f"Rank {self.rank}: capturing missing GLM-5 MoE CUDA graph buckets "
-				f"{missing_buckets} at decode entry (max rank batch size {max_bsz})"
+				f"{missing_buckets} at decode entry (exact max rank batch size {max_bsz})"
 			)
 			self._glm5_moe_graph_capture_attempted_for_batch = True
 			try:
@@ -8909,7 +8919,7 @@ class BatchGenWorker:
 			num_local_experts=first_moe.experts_per_rank,
 			intermediate_size=first_moe.config.moe_intermediate_size,
 			device=self.torch_device,
-			bucket_sizes=bucket_sizes,
+			bucket_sizes=moe_bucket_sizes,
 			base_mtp=_GLM5_3D_MTP,
 		)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
@@ -8952,7 +8962,7 @@ class BatchGenWorker:
 		logging.info(
 			f"Rank {self.rank}: capturing GLM-5 MoE CUDA graph segments for "
 			f"{registered} layers with buckets {capture_buckets} "
-			f"(max rank batch size {max_bsz})"
+			f"(exact max rank batch size {max_bsz})"
 		)
 		self._glm5_moe_cuda_graph_manager = manager
 		self._glm5_moe_graph_capture_attempted_for_batch = True
@@ -9057,6 +9067,12 @@ class BatchGenWorker:
 			self.args.cuda_graph_max_bucket_size,
 			self.args.cuda_graph_num_buckets,
 		)
+
+	def _glm5_exact_moe_cuda_graph_bucket_sizes(self) -> list:
+		max_bucket = int(self.args.cuda_graph_max_bucket_size)
+		if max_bucket <= 0:
+			return []
+		return list(range(1, max_bucket + 1))
 
 	def _glm5_cuda_graph_manager_missing_configured_buckets(
 		self,
@@ -9383,10 +9399,17 @@ class BatchGenWorker:
 				"_glm5_moe_graph_capture_attempted_for_batch",
 				False,
 			)
-		missing = self._glm5_cuda_graph_manager_missing_configured_buckets(
-			self._glm5_moe_cuda_graph_manager,
-			getattr(self, "_glm5_moe_graph_failed_buckets", set()),
-		)
+		failed_buckets = getattr(self, "_glm5_moe_graph_failed_buckets", set())
+		try:
+			bucket = self._glm5_moe_cuda_graph_manager.bucketing.get_padded_size(max_bsz)
+		except AttributeError:
+			missing = not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
+		except ValueError:
+			return False
+		else:
+			if bucket in failed_buckets:
+				return False
+			missing = not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
 		if not missing:
 			self._glm5_moe_graph_capture_attempted_for_batch = True
 		return missing

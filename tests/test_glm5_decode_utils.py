@@ -1854,7 +1854,7 @@ def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatc
     worker._current_decode_local_batch_size = 17
     worker._current_decode_max_rank_batch_size = 17
     worker._cuda_graph_manager = FakeManager(configured_buckets)
-    worker._glm5_moe_cuda_graph_manager = FakeManager(configured_buckets)
+    worker._glm5_moe_cuda_graph_manager = FakeManager([17, 33])
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
     monkeypatch.setattr(
@@ -1871,6 +1871,15 @@ def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatc
 
     assert not worker._glm5_dsa_graph_current_bucket_missing()
     assert not worker._glm5_moe_graph_current_bucket_missing()
+
+
+def test_glm5_moe_graph_exact_buckets_cover_every_rank_batch_size():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.args = types.SimpleNamespace(cuda_graph_max_bucket_size=8)
+
+    assert worker._glm5_exact_moe_cuda_graph_bucket_sizes() == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_glm5_segmented_graph_existing_manager_missing_configured_bucket_requests_setup(
