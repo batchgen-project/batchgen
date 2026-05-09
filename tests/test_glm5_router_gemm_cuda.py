@@ -30,7 +30,7 @@ def _reference_router(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        return hidden.float().matmul(weight.float().t())
+        return hidden.matmul(weight.t()).float()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
 

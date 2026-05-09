@@ -17,6 +17,15 @@
 namespace {
 
 constexpr int ROUTER_THREADS = 256;
+constexpr int ROUTER_WARP_SIZE = 32;
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = ROUTER_WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
 
 __global__ void glm5_router_gemm_kernel(
     const __nv_bfloat16* __restrict__ hidden_states,  // [N, H]
@@ -29,39 +38,61 @@ __global__ void glm5_router_gemm_kernel(
     int bucket_size,
     int world_size
 ) {
-    const int row = blockIdx.x;
-    const int expert = blockIdx.y * blockDim.x + threadIdx.x;
-    if (row >= N || expert >= E) {
+    const int expert = blockIdx.x;
+    if (expert >= E) {
         return;
     }
 
-    bool valid = true;
-    if (rank_token_counts != nullptr) {
-        valid = false;
-        if (bucket_size > 0) {
-            const int rank = row / bucket_size;
-            const int local_pos = row - rank * bucket_size;
-            if (rank >= 0 && rank < world_size) {
-                valid = local_pos < static_cast<int>(rank_token_counts[rank]);
+    const int tid = threadIdx.x;
+    const int lane = tid % ROUTER_WARP_SIZE;
+    const int warp = tid / ROUTER_WARP_SIZE;
+    constexpr int NUM_WARPS = ROUTER_THREADS / ROUTER_WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
+
+    const __nv_bfloat16* w = router_weight + expert * H;
+
+    for (int row = 0; row < N; ++row) {
+        bool valid = true;
+        if (rank_token_counts != nullptr) {
+            valid = false;
+            if (bucket_size > 0) {
+                const int rank = row / bucket_size;
+                const int local_pos = row - rank * bucket_size;
+                if (rank >= 0 && rank < world_size) {
+                    valid = local_pos < static_cast<int>(rank_token_counts[rank]);
+                }
             }
         }
-    }
 
-    float* out = output + row * E + expert;
-    if (!valid) {
-        *out = 0.0f;
-        return;
-    }
+        if (!valid) {
+            if (tid == 0) {
+                output[row * E + expert] = 0.0f;
+            }
+            continue;
+        }
 
-    const __nv_bfloat16* x = hidden_states + row * H;
-    const __nv_bfloat16* w = router_weight + expert * H;
-    float acc = 0.0f;
+        const __nv_bfloat16* x = hidden_states + row * H;
+        float acc = 0.0f;
 
-    #pragma unroll 4
-    for (int k = 0; k < H; ++k) {
-        acc = fmaf(__bfloat162float(x[k]), __bfloat162float(w[k]), acc);
+        for (int k = tid; k < H; k += ROUTER_THREADS) {
+            acc = fmaf(__bfloat162float(x[k]), __bfloat162float(w[k]), acc);
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            warp_sums[warp] = acc;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float sum = (lane < NUM_WARPS) ? warp_sums[lane] : 0.0f;
+            sum = warp_reduce_sum(sum);
+            if (lane == 0) {
+                output[row * E + expert] = sum;
+            }
+        }
+        __syncthreads();
     }
-    *out = acc;
 }
 
 }  // namespace
@@ -125,7 +156,7 @@ torch::Tensor glm5_router_gemm_cuda(
         return output;
     }
 
-    const dim3 grid(N, (E + ROUTER_THREADS - 1) / ROUTER_THREADS);
+    const dim3 grid(E);
     const dim3 block(ROUTER_THREADS);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     glm5_router_gemm_kernel<<<grid, block, 0, stream>>>(
