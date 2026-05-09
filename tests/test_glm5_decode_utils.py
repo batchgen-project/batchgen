@@ -1171,6 +1171,7 @@ def test_glm5_dispatch_trace_records_requested_paths(monkeypatch):
         "bsz": 2,
         "glm5_dsa_mode": "eager",
         "glm5_moe_mode": "graph",
+        "glm5_moe_router_mode": "-",
     }
 
     AttnWrapperBase.record_glm5_dispatch(
