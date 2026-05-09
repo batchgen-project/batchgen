@@ -1854,7 +1854,12 @@ def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatc
     worker._glm5_moe_graph_failed_buckets = set()
     worker._current_decode_local_batch_size = 17
     worker._current_decode_max_rank_batch_size = 17
-    worker._cuda_graph_manager = FakeManager([32, 64])
+    worker._cuda_graph_manager = FakeManager(
+        BatchGenWorker._generate_bucket_sizes(
+            worker.args.cuda_graph_max_bucket_size,
+            worker.args.cuda_graph_num_buckets,
+        )
+    )
     worker._glm5_moe_cuda_graph_manager = FakeManager([32, 64])
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
