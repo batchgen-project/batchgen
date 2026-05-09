@@ -1922,12 +1922,15 @@ class Glm5MoE(nn.Module):
         Single CUDA launch for sigmoid + e_score_correction bias + top-k +
         normalize + scale. Replaces the 6-op PyTorch eager path
         (F.linear → sigmoid → +bias → topk → gather → /sum → ×scale) with
-        one kernel. Router matmul is kept FP32 to match HF reference
-        (routing precision re-orders top-K for scores within ~1% of each
-        other, compounding across 75 MoE layers).
+        one kernel after a graph-stable BF16 router GEMM. The router GEMM uses
+        a fixed per-row accumulation order so valid rows do not drift when CUDA
+        graph buckets include rank padding.
         """
-        from batchgen.moe.routing import gate_sigmoid_topk_cuda
-        router_logits = F.linear(x.float(), self.gate.weight.float())
+        from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
+        router_logits = glm5_router_gemm_cuda(
+            x,
+            self.gate.weight,
+        )
         return gate_sigmoid_topk_cuda(
             router_logits,
             self.gate.e_score_correction_bias.float(),
