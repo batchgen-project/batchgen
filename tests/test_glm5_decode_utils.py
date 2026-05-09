@@ -33,6 +33,7 @@ from batchgen.models.glm.glm5.model import (
     _glm5_moe_3d_blockwise_supported,
     _glm5_moe_graph_compare_active,
     _glm5_moe_graph_compare_layer_enabled,
+    _glm5_moe_router_mode,
 )
 import batchgen.models.glm.glm5.model as glm5_model
 from batchgen.models.glm.glm5.wrappers import (
@@ -96,6 +97,37 @@ def test_glm5_moe_graph_compare_defaults_to_layer3(monkeypatch):
 
     assert _glm5_moe_graph_compare_layer_enabled(3)
     assert not _glm5_moe_graph_compare_layer_enabled(20)
+
+
+def test_glm5_moe_router_mode_defaults_to_custom(monkeypatch):
+    monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", raising=False)
+
+    assert _glm5_moe_router_mode() == "custom"
+
+
+def test_glm5_moe_router_mode_batch_debug_overrides_env(monkeypatch):
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_moe_router_mode": "cublas"},
+        raising=False,
+    )
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", "custom")
+
+    assert _glm5_moe_router_mode() == "cublas"
+
+
+def test_glm5_moe_router_mode_rejects_unknown_values(monkeypatch):
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        {"glm5_moe_router_mode": "not-a-router"},
+        raising=False,
+    )
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_ROUTER_MODE", "cublas")
+
+    assert _glm5_moe_router_mode() == "custom"
 
 
 def test_glm5_moe_3d_blockwise_requires_all_persistent_experts():

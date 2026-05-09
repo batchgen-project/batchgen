@@ -1014,10 +1014,12 @@ class BatchGenWorker:
 			"bsz": len(seqs),
 			"glm5_dsa_mode": debug.get("glm5_dsa_mode", "-"),
 			"glm5_moe_mode": debug.get("glm5_moe_mode", "-"),
+			"glm5_moe_router_mode": debug.get("glm5_moe_router_mode", "-"),
 		}
 		trace_id = (
 			f"batches={context['batch_ids']}|global_ids={context['global_ids']}|"
-			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}"
+			f"dsa={context['glm5_dsa_mode']}|moe={context['glm5_moe_mode']}|"
+			f"router={context['glm5_moe_router_mode']}"
 		)
 		if (
 			not getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False)
@@ -1031,7 +1033,8 @@ class BatchGenWorker:
 			AttnWrapperBase.glm5_dispatch_seen = set()
 			logging.warning(
 				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
-				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s",
+				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s "
+				"debug_moe_router=%s",
 				self.rank,
 				trace_id,
 				context["batch_ids"],
@@ -1039,6 +1042,7 @@ class BatchGenWorker:
 				context["bsz"],
 				context["glm5_dsa_mode"],
 				context["glm5_moe_mode"],
+				context["glm5_moe_router_mode"],
 			)
 		else:
 			AttnWrapperBase.glm5_dispatch_trace_context = context

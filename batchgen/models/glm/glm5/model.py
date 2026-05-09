@@ -69,6 +69,7 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
+_GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
 
 
 def _debug_flag_enabled(value) -> bool:
@@ -105,6 +106,19 @@ def _glm5_moe_debug_mode() -> Optional[str]:
         return None
     mode = value.strip().lower()
     return mode if mode in {"graph", "eager"} else None
+
+
+def _glm5_moe_router_mode() -> str:
+    """Router GEMM implementation for eager GLM-5 MoE decode.
+
+    Default ``custom`` keeps graph/eager on the row-stable GLM router kernel.
+    ``cublas`` restores the historical eager router for trajectory A/B tests.
+    """
+    value = _glm5_moe_debug_dict().get("glm5_moe_router_mode")
+    if not isinstance(value, str):
+        value = os.environ.get(_GLM5_MOE_ROUTER_MODE_ENV, "")
+    mode = value.strip().lower()
+    return mode if mode in {"custom", "cublas"} else "custom"
 
 
 def _record_glm5_moe_dispatch(
@@ -1926,11 +1940,15 @@ class Glm5MoE(nn.Module):
         a fixed per-row accumulation order so valid rows do not drift when CUDA
         graph buckets include rank padding.
         """
-        from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
-        router_logits = glm5_router_gemm_cuda(
-            x,
-            self.gate.weight,
-        )
+        from batchgen.moe.routing import gate_sigmoid_topk_cuda
+        if _glm5_moe_router_mode() == "cublas":
+            router_logits = F.linear(x.float(), self.gate.weight.float())
+        else:
+            from batchgen.moe.routing import glm5_router_gemm_cuda
+            router_logits = glm5_router_gemm_cuda(
+                x,
+                self.gate.weight,
+            )
         return gate_sigmoid_topk_cuda(
             router_logits,
             self.gate.e_score_correction_bias.float(),
