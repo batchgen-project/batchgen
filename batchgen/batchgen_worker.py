@@ -2965,6 +2965,46 @@ class BatchGenWorker:
 			)
 		return manager
 
+	def _create_scoped_prefix_gpu_paged_kv_manager(
+		self,
+		sequence_tokens: Sequence[int],
+	) -> GPUPagedKVCacheManager:
+		"""Create a prefill-scoped GPU KV manager for prefix materialization.
+
+		This intentionally does not reuse or bind ``self.gpu_paged_kv_cache_manager``.
+		The worker-level manager may be sized for decode capacity and can be much
+		larger than a single prefix-hit prefill microbatch. Reinitializing that
+		manager during prefill would allocate decode-sized KV buffers next to the
+		prefill model and can OOM.
+		"""
+		aux_config = build_gpu_kv_config_aux(
+			model_name=self.huggingface_ckpt_name,
+			sequence_tokens=sequence_tokens,
+		)
+		if aux_config is not None:
+			raise RuntimeError(
+				"Scoped prefix GPU materialization for dual primary/aux KV is "
+				"not implemented yet"
+			)
+
+		gpu_config = build_gpu_kv_config(
+			model_name=self.huggingface_ckpt_name,
+			sequence_tokens=sequence_tokens,
+		)
+		logging.info(
+			"Rank %s creating scoped prefix GPUPagedKVCacheManager on %s "
+			"with %d pages",
+			self.rank,
+			self.local_rank,
+			gpu_config.num_pages,
+		)
+		manager = GPUPagedKVCacheManager(
+			config=gpu_config,
+			device=self.local_rank,
+		)
+		manager.initialize()
+		return manager
+
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
 		"""Allocate GPU KV pages and load host-resident KV for the batch."""
 		if not local_sequence_ids:
@@ -3007,7 +3047,7 @@ class BatchGenWorker:
 		]
 		suffix_lens = [int(item.suffix_length) for item in sequence_plans]
 
-		manager = self._ensure_gpu_paged_kv_manager(full_lengths)
+		manager = self._create_scoped_prefix_gpu_paged_kv_manager(full_lengths)
 		if isinstance(manager, DualKVCacheCoordinator):
 			raise RuntimeError(
 				"Prefix GPU materialized prefill for dual primary/aux KV is "
@@ -3041,7 +3081,7 @@ class BatchGenWorker:
 		"""Materialize cached full-prompt pages for exact full-hit prefill."""
 		if not sequence_ids:
 			return None
-		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
+		manager = self._create_scoped_prefix_gpu_paged_kv_manager(prompt_lengths)
 		if isinstance(manager, DualKVCacheCoordinator):
 			raise RuntimeError(
 				"Exact full-hit prefix GPU materialization for dual primary/aux "
