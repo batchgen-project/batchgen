@@ -12,13 +12,6 @@ from typing import Callable, Optional, Protocol
 
 import torch
 
-from batchgen.attention.prefix_gpu_extend import (
-    gpu_page_table_attention_enabled,
-    gqa_prefill_with_gpu_paged_kv,
-    maybe_append_suffix_to_gpu_kv,
-    mla_prefill_with_gpu_paged_kv,
-)
-
 
 class PrefixAwareAttentionBackend(Protocol):
     """Common protocol for prefix-aware prefill attention backends."""
@@ -46,9 +39,6 @@ class GqaPrefixAwareAttentionBackend:
     softmax_scale: Optional[float] = None
     sliding_window: Optional[int] = None
     attention_fn: Optional[Callable[..., tuple[torch.Tensor, object]]] = None
-    paged_attention_fn: Optional[Callable[..., tuple[torch.Tensor, object]]] = None
-    layer_idx: Optional[int] = None
-    enable_gpu_suffix_append: bool = False
 
     def forward_prefill(
         self,
@@ -67,19 +57,7 @@ class GqaPrefixAwareAttentionBackend:
         )
 
         metadata = ensure_prefix_cache_prepack_metadata(metadata)
-        if gpu_page_table_attention_enabled() and metadata.prefix_reuse_mode:
-            return gqa_prefill_with_gpu_paged_kv(
-                query=query,
-                key=key,
-                value=value,
-                metadata=metadata,
-                kv_cache_metadata=kv_cache_metadata,
-                layer_idx=self.layer_idx,
-                paged_attention_fn=self.paged_attention_fn,
-                sinks=self.sinks,
-                softmax_scale=self.softmax_scale,
-                sliding_window=self.sliding_window,
-            )
+        del kv_cache_metadata
 
         cu_q = metadata.cu_seqlens.to(query.device)
         if metadata.full_hit_mode:
@@ -125,32 +103,7 @@ class GqaPrefixAwareAttentionBackend:
             softmax_scale=self.softmax_scale,
             sliding_window=self.sliding_window,
         )
-        self._maybe_append_suffix_to_gpu_kv(
-            key=key,
-            value=value,
-            metadata=metadata,
-            kv_cache_metadata=kv_cache_metadata,
-        )
         return attn_output
-
-    def _maybe_append_suffix_to_gpu_kv(
-        self,
-        *,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        metadata,
-        kv_cache_metadata,
-    ) -> None:
-        maybe_append_suffix_to_gpu_kv(
-            enabled=self.enable_gpu_suffix_append,
-            kv_cache_metadata=kv_cache_metadata,
-            k_tensor=key,
-            v_tensor=value,
-            layer_idx=self.layer_idx,
-            metadata=metadata,
-            manager_attr="gpu_paged_kv_manager",
-            context="GQA GPU suffix append",
-        )
 
 
 @dataclass(frozen=True)
@@ -165,8 +118,6 @@ class MlaProjectedPrefixAwareAttentionBackend:
     softmax_scale: float
     output_projection: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     attention_fn: Optional[Callable[..., torch.Tensor]] = None
-    layer_idx: Optional[int] = None
-    enable_gpu_suffix_append: bool = False
 
     def forward_prefill(
         self,
@@ -187,22 +138,7 @@ class MlaProjectedPrefixAwareAttentionBackend:
         )
 
         metadata = ensure_prefix_cache_prepack_metadata(metadata)
-        if gpu_page_table_attention_enabled() and metadata.prefix_reuse_mode:
-            attn_out = mla_prefill_with_gpu_paged_kv(
-                query=query,
-                key=key,
-                metadata=metadata,
-                kv_cache_metadata=kv_cache_metadata,
-                layer_idx=self.layer_idx,
-                kv_dim=int(self.kv_dim),
-                num_heads=int(self.num_heads),
-                kv_lora_rank=int(self.kv_lora_rank),
-                softmax_scale=float(self.softmax_scale),
-                attention_fn=self.attention_fn,
-            )
-            if self.output_projection is None:
-                return attn_out
-            return self.output_projection(attn_out)
+        del kv_cache_metadata
 
         spec = MlaReplaySpec(
             kv_dim=int(self.kv_dim),
@@ -219,29 +155,6 @@ class MlaProjectedPrefixAwareAttentionBackend:
             page_size=int(self.page_size),
             attention_fn=self.attention_fn,
         )
-        self._maybe_append_suffix_to_gpu_kv(
-            key=key,
-            metadata=metadata,
-            kv_cache_metadata=kv_cache_metadata,
-        )
         if self.output_projection is None:
             return attn_out
         return self.output_projection(attn_out)
-
-    def _maybe_append_suffix_to_gpu_kv(
-        self,
-        *,
-        key: torch.Tensor,
-        metadata,
-        kv_cache_metadata,
-    ) -> None:
-        maybe_append_suffix_to_gpu_kv(
-            enabled=self.enable_gpu_suffix_append,
-            kv_cache_metadata=kv_cache_metadata,
-            k_tensor=key,
-            v_tensor=None,
-            layer_idx=self.layer_idx,
-            metadata=metadata,
-            manager_attr="gpu_paged_kv_manager",
-            context="MLA GPU suffix append",
-        )

@@ -201,30 +201,21 @@ The compatibility binder is temporary and must not remain the long-term owner of
 - [x] Add smoke tests that all supported MLA wrappers enter through the shared adapter path.
 - [x] Run `py_compile` for model wrapper modules.
 
-## Milestone 7: Add True Extend-Mode KV Writes
+## Milestone 7: Keep Prefix Reuse on the Host-Replay Path
 
-- [x] Extend `GPUPagedKVCacheManager` with a multi-token suffix append API.
-- [x] The API should support writing multiple suffix tokens per sequence.
-- [x] The API should accept `global_sequence_ids`.
-- [x] The API should accept `prefix_lens`.
-- [x] The API should accept `suffix_lens`.
-- [x] The API should accept explicit destination slots or page table metadata.
-- [x] GQA prefill should write suffix K/V directly into GPU paged KV.
-- [x] MLA prefill should write suffix compressed MLA KV directly into GPU paged KV.
-- [x] Attention backend should attend via page table over full context.
-- [x] Remove host-prefix KV concatenation from hot path where backend support exists.
-- [x] Keep the true extend path behind an explicit experimental flag and leave replay as the default compatibility fallback until fully validated.
+- [x] Remove the experimental GPU page-table extend attention path from the shared prefix-aware backend.
+- [x] Remove experimental GPU suffix append switches from the shared prefix-aware backend.
+- [x] Keep host-prefix KV replay as the only prefix reuse execution path.
+- [x] Keep model wrappers independent of GPU paged-KV extend-specific metadata.
 - [ ] Validate partial reuse exactness.
 - [ ] Validate full reuse exactness.
 - [ ] Validate miss exactness.
-- [ ] Measure prefill wall time before and after.
+- [ ] Measure prefill wall time.
 
 Notes:
 
-- True extend-mode attention is currently gated by `BATCHGEN_PREFIX_REUSE_GPU_EXTEND_ATTENTION=1`.
-- GPU suffix append without switching attention is gated by `BATCHGEN_PREFIX_REUSE_GPU_EXTEND_WRITES=1`.
-- Replay remains the default compatibility path until exactness and timing validation are complete.
-- The first true extend-mode attention path supports single-sequence suffix micro-batches, matching the current prefix-reuse isolation policy.
+- Prefix reuse loads cached host KV pages and composes the full logical attention context in the replay path.
+- GPU paged-KV extend attention is not part of the current BatchGen prefix cache design.
 
 ## Milestone 8: Remove Legacy Global Metadata Ownership
 

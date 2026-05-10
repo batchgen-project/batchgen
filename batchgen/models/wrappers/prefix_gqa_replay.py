@@ -42,7 +42,6 @@ def run_prefix_gqa_prefill_attention(
         sinks=spec.sinks,
         softmax_scale=spec.softmax_scale,
         sliding_window=spec.sliding_window,
-        layer_idx=getattr(wrapper, "layer_idx", None),
     )
     return backend.forward_prefill(
         query=query,
