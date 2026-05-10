@@ -136,7 +136,7 @@ class _FakeHostPrefixView:
 
 def test_dual_host_prefix_allocation_delegates_to_both_views():
     primary = _FakeHostPrefixView(shared_pages=[3], shared_tokens=4)
-    auxiliary = _FakeHostPrefixView(shared_pages=[3], shared_tokens=4)
+    auxiliary = _FakeHostPrefixView(shared_pages=[9], shared_tokens=4)
     coordinator = DualHostKVCoordinator(primary, auxiliary)
 
     requests = [(1, [10, 11, 12, 13], 8, 99)]
@@ -149,9 +149,27 @@ def test_dual_host_prefix_allocation_delegates_to_both_views():
     assert coordinator.shared_prefix_tokens(1) == 4
 
 
-def test_dual_host_prefix_allocation_mismatch_raises_and_releases():
+def test_dual_host_prefix_allocation_page_id_drift_is_allowed():
     primary = _FakeHostPrefixView(
         allocation_results=[_allocation_result(private_pages=[8])]
+    )
+    auxiliary = _FakeHostPrefixView(
+        allocation_results=[_allocation_result(private_pages=[9])]
+    )
+    coordinator = DualHostKVCoordinator(primary, auxiliary)
+
+    result = coordinator.allocate_pages_for_sequences_with_prefix(
+        [(1, [10, 11, 12, 13], 8, 99)]
+    )
+
+    assert result == primary.allocation_results
+    assert primary.release_calls == []
+    assert auxiliary.release_calls == []
+
+
+def test_dual_host_prefix_allocation_length_mismatch_raises_and_releases():
+    primary = _FakeHostPrefixView(
+        allocation_results=[_allocation_result(private_pages=[8, 7])]
     )
     auxiliary = _FakeHostPrefixView(
         allocation_results=[_allocation_result(private_pages=[9])]

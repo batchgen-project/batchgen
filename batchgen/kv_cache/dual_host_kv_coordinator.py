@@ -435,11 +435,11 @@ class DualHostKVCoordinator:
 				sequence_id
 			)
 		)
-		if primary_pages != auxiliary_pages:
+		if len(primary_pages) != len(auxiliary_pages):
 			raise RuntimeError(
-				"shared_prefix_pages: primary/auxiliary page mismatch for "
-				f"seq {sequence_id}: primary={primary_pages[:10]}, "
-				f"auxiliary={auxiliary_pages[:10]}"
+				"shared_prefix_pages: primary/auxiliary shared-page count "
+				f"mismatch for seq {sequence_id}: primary={len(primary_pages)}, "
+				f"auxiliary={len(auxiliary_pages)}"
 			)
 		return primary_pages
 

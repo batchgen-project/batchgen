@@ -13,14 +13,17 @@ from typing import Any, Iterable, Sequence
 
 PREFIX_ALLOCATION_FIELDS = (
 	"sequence_id",
-	"shared_prefix_pages",
-	"private_pages",
 	"shared_prefix_tokens",
 	"private_start_token",
 	"logical_page_count",
 	"physical_pages_allocated",
 	"full_hit",
 	"miss_reason",
+)
+
+PREFIX_ALLOCATION_PAGE_LIST_FIELDS = (
+	"shared_prefix_pages",
+	"private_pages",
 )
 
 PREFIX_STATS_FIELDS = (
@@ -74,6 +77,15 @@ def assert_matching_prefix_allocation_results(
 					f"{context}: primary/auxiliary prefix allocation mismatch "
 					f"at result {idx} field {field}: "
 					f"primary={primary_value}, auxiliary={auxiliary_value}"
+				)
+		for field in PREFIX_ALLOCATION_PAGE_LIST_FIELDS:
+			primary_len = _page_list_length(primary.get(field))
+			auxiliary_len = _page_list_length(auxiliary.get(field))
+			if primary_len != auxiliary_len:
+				raise RuntimeError(
+					f"{context}: primary/auxiliary prefix allocation mismatch "
+					f"at result {idx} field {field} length: "
+					f"primary={primary_len}, auxiliary={auxiliary_len}"
 				)
 
 
@@ -132,3 +144,11 @@ def _normalize_value(value: Any) -> Any:
 	if isinstance(value, list):
 		return [_normalize_value(item) for item in value]
 	return value
+
+
+def _page_list_length(value: Any) -> int:
+	if value is None:
+		return 0
+	if isinstance(value, (list, tuple)):
+		return len(value)
+	return len(list(value))
