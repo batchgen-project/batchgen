@@ -13,6 +13,14 @@ from typing import Callable
 
 import torch
 
+from batchgen.attention.mla.prefix_absorb import (
+    build_absorbed_mla_query_states,
+    build_full_hit_absorbed_mla_query_states,
+    prefix_rotary_seq_len,
+    project_absorbed_mla_output,
+    project_absorbed_mla_output_w8a16,
+)
+
 from .attention import AttnWrapperBase
 from .prefix_cache import (
     PrefixAwarePrefillOffloader,
@@ -54,8 +62,11 @@ class MlaPrefixBackendContext:
         fallback_seq_len: int,
     ) -> int:
         if self.metadata.full_seq_lengths:
-            return _rotary_seq_len(max(self.metadata.full_seq_lengths), position_ids)
-        return _rotary_seq_len(fallback_seq_len, position_ids)
+            return prefix_rotary_seq_len(
+                max(self.metadata.full_seq_lengths),
+                position_ids,
+            )
+        return prefix_rotary_seq_len(fallback_seq_len, position_ids)
 
     def run_suffix_prefill(
         self,
@@ -121,20 +132,26 @@ def build_kimi_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
         spec=_mla_replay_spec(wrapper),
-        suffix_query_builder=lambda projection: _absorbed_query_states(
-            wrapper,
-            projection.q_nope,
-            projection.q_pe,
-            projection.offload_kv.dtype,
+        suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
+            q_nope=projection.q_nope,
+            q_pe=projection.q_pe,
+            dtype=projection.offload_kv.dtype,
             q_absorb=_kimi_q_absorb_weights(wrapper),
         ),
-        full_hit_query_builder=lambda projection: _full_hit_query_from_projection(
-            wrapper,
-            projection,
-            projection.q_pe.dtype,
-            q_absorb=_kimi_q_absorb_weights(wrapper),
+        full_hit_query_builder=lambda projection: (
+            build_full_hit_absorbed_mla_query_states(
+                q_nope=projection.q_nope,
+                q_pe=projection.q_pe,
+                dtype=projection.q_pe.dtype,
+                q_absorb=_kimi_q_absorb_weights(wrapper),
+            )
         ),
-        output_projection=lambda attn_out: _kimi_output_projection(wrapper, attn_out),
+        output_projection=lambda attn_out: project_absorbed_mla_output(
+            attn_out=attn_out,
+            out_absorb=_kimi_out_absorb_weights(wrapper),
+            v_head_dim=wrapper.module.v_head_dim,
+            output_projection=wrapper.module.o_proj,
+        ),
     )
 
 
@@ -177,127 +194,61 @@ def _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
         spec=_mla_replay_spec(wrapper),
-        suffix_query_builder=lambda projection: _absorbed_query_states(
-            wrapper,
-            projection.q_nope,
-            projection.q_pe,
-            projection.offload_kv.dtype,
+        suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
+            q_nope=projection.q_nope,
+            q_pe=projection.q_pe,
+            dtype=projection.offload_kv.dtype,
             q_absorb=_w8a16_q_absorb_weights(
                 wrapper,
                 model_label=model_label,
                 use_cached_absorb=use_cached_absorb,
             ),
         ),
-        full_hit_query_builder=lambda projection: _full_hit_query_from_projection(
-            wrapper,
-            projection,
-            projection.q_pe.dtype,
-            q_absorb=_w8a16_q_absorb_weights(
+        full_hit_query_builder=lambda projection: (
+            build_full_hit_absorbed_mla_query_states(
+                q_nope=projection.q_nope,
+                q_pe=projection.q_pe,
+                dtype=projection.q_pe.dtype,
+                q_absorb=_w8a16_q_absorb_weights(
+                    wrapper,
+                    model_label=model_label,
+                    use_cached_absorb=use_cached_absorb,
+                ),
+            )
+        ),
+        output_projection=lambda attn_out: _project_w8a16_absorbed_output(
+            wrapper=wrapper,
+            attn_out=attn_out,
+            out_absorb=_w8a16_out_absorb_weights(
                 wrapper,
                 model_label=model_label,
                 use_cached_absorb=use_cached_absorb,
             ),
-        ),
-        output_projection=lambda attn_out: _w8a16_output_projection(
-            wrapper,
-            attn_out,
             model_label=model_label,
-            use_cached_absorb=use_cached_absorb,
         ),
     )
 
 
-def _absorbed_query_states(
-    wrapper: object,
-    q_nope: torch.Tensor,
-    q_pe: torch.Tensor,
-    dtype: torch.dtype,
+def _project_w8a16_absorbed_output(
     *,
-    q_absorb: torch.Tensor,
-) -> torch.Tensor:
-    attn = wrapper.module
-    total_tokens = q_nope.shape[0]
-    query_states = torch.empty(
-        1,
-        total_tokens,
-        attn.num_heads,
-        attn.kv_lora_rank + attn.qk_rope_head_dim,
-        dtype=dtype,
-        device=q_pe.device,
-    )
-    query_states[0, :, :, : attn.kv_lora_rank] = torch.einsum(
-        "thd,hdc->thc",
-        q_nope,
-        q_absorb,
-    )
-    query_states[0, :, :, attn.kv_lora_rank :] = q_pe
-    return query_states.contiguous()
-
-
-def _full_hit_query_from_projection(
-    wrapper: object,
-    projection: object,
-    dtype: torch.dtype,
-    *,
-    q_absorb: torch.Tensor,
-) -> torch.Tensor:
-    attn = wrapper.module
-    total_tokens = projection.q_nope.shape[0]
-    return _absorbed_query_states(
-        wrapper,
-        projection.q_nope,
-        projection.q_pe,
-        dtype,
-        q_absorb=q_absorb,
-    ).view(
-        total_tokens,
-        1,
-        attn.num_heads,
-        attn.kv_lora_rank + attn.qk_rope_head_dim,
-    ).contiguous()
-
-
-def _rotary_seq_len(full_length: int, position_ids: torch.Tensor) -> int:
-    return max(int(full_length), int(position_ids.max().item()) + 1)
-
-
-def _w8a16_output_projection(
     wrapper: object,
     attn_out: torch.Tensor,
-    *,
+    out_absorb: torch.Tensor,
     model_label: str,
-    use_cached_absorb: bool,
 ) -> torch.Tensor:
     attn = wrapper.module
-    out_absorb = _w8a16_out_absorb_weights(
-        wrapper,
-        model_label=model_label,
-        use_cached_absorb=use_cached_absorb,
-    )
-    attn_output = torch.einsum("bqhc,hdc->bqhd", attn_out, out_absorb)
-    attn_output = attn_output.reshape(
-        attn_out.shape[0] * attn_out.shape[1],
-        attn.num_heads * attn.v_head_dim,
-    )
     from batchgen.attention.mla.fa3_backend import select_w8a16_gemm
-    return select_w8a16_gemm()(
-        attn.o_proj.weight.data,
-        _weight_scale(wrapper, model_label, ("o_proj.weight_scale_inv",))[
+
+    return project_absorbed_mla_output_w8a16(
+        attn_out=attn_out,
+        out_absorb=out_absorb,
+        v_head_dim=attn.v_head_dim,
+        o_proj_weight=attn.o_proj.weight.data,
+        o_proj_scale=_weight_scale(wrapper, model_label, ("o_proj.weight_scale_inv",))[
             "o_proj.weight_scale_inv"
         ],
-        attn_output,
+        gemm=select_w8a16_gemm(),
     )
-
-
-def _kimi_output_projection(wrapper: object, attn_out: torch.Tensor) -> torch.Tensor:
-    attn = wrapper.module
-    out_absorb = _kimi_out_absorb_weights(wrapper)
-    attn_output = torch.einsum("bqhc,hdc->bqhd", attn_out, out_absorb)
-    attn_output = attn_output.reshape(
-        attn_out.shape[0] * attn_out.shape[1],
-        attn.num_heads * attn.v_head_dim,
-    )
-    return attn.o_proj(attn_output)
 
 
 def _w8a16_q_absorb_weights(
