@@ -2942,20 +2942,16 @@ class BatchGenWorker:
 		manager during prefill would allocate decode-sized KV buffers next to the
 		prefill model and can OOM.
 		"""
-		aux_config = build_gpu_kv_config_aux(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=sequence_tokens,
-		)
-		if aux_config is not None:
-			raise RuntimeError(
-				"Scoped prefix GPU materialization for dual primary/aux KV is "
-				"not implemented yet"
-			)
-
 		gpu_config = build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
 		)
+		if not gpu_config.has_v_cache:
+			raise RuntimeError(
+				"Scoped prefix GPU materialization is only valid for GQA/MHA "
+				"models with separate V cache; MLA prefix replay reads "
+				"compressed KV from host directly"
+			)
 		logging.info(
 			"Rank %s creating scoped prefix GPUPagedKVCacheManager on %s "
 			"with %d pages",
@@ -2969,6 +2965,23 @@ class BatchGenWorker:
 		)
 		manager.initialize()
 		return manager
+
+	def _prefix_reuse_requires_gpu_materialization(
+		self,
+		sequence_tokens: Sequence[int],
+	) -> bool:
+		"""Return whether prefix replay needs a scoped GPU paged KV manager.
+
+		GQA/MHA prefix replay consumes paged K/V directly, so cached pages must be
+		materialized into a temporary GPU paged manager. MLA prefix replay builds
+		compressed-KV tensors from host cache through the model wrapper and does
+		not consume this manager; creating it for DSA primary/aux models would be
+		both unnecessary and incorrect.
+		"""
+		return build_gpu_kv_config(
+			model_name=self.huggingface_ckpt_name,
+			sequence_tokens=sequence_tokens,
+		).has_v_cache
 
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
 		"""Allocate GPU KV pages and load host-resident KV for the batch."""
@@ -3011,13 +3024,10 @@ class BatchGenWorker:
 			int(item.full_logical_context_length) for item in sequence_plans
 		]
 		suffix_lens = [int(item.suffix_length) for item in sequence_plans]
+		if not self._prefix_reuse_requires_gpu_materialization(full_lengths):
+			return None
 
 		manager = self._create_scoped_prefix_gpu_paged_kv_manager(full_lengths)
-		if isinstance(manager, DualKVCacheCoordinator):
-			raise RuntimeError(
-				"Prefix GPU materialized prefill for dual primary/aux KV is "
-				"not implemented yet"
-			)
 		worker_view = self._host_worker_view_for_prefix_reuse()
 		if worker_view is None:
 			raise RuntimeError(
@@ -3046,12 +3056,9 @@ class BatchGenWorker:
 		"""Materialize cached full-prompt pages for exact full-hit prefill."""
 		if not sequence_ids:
 			return None
+		if not self._prefix_reuse_requires_gpu_materialization(prompt_lengths):
+			return None
 		manager = self._create_scoped_prefix_gpu_paged_kv_manager(prompt_lengths)
-		if isinstance(manager, DualKVCacheCoordinator):
-			raise RuntimeError(
-				"Exact full-hit prefix GPU materialization for dual primary/aux "
-				"KV is not implemented yet"
-			)
 		worker_view = self._host_worker_view_for_prefix_reuse()
 		if worker_view is None:
 			raise RuntimeError(
