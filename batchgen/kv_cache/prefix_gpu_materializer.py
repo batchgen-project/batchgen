@@ -164,5 +164,5 @@ def materialize_prefill_prefix_pages(
 		load_task=load_task,
 		host_pages_loaded=host_pages_to_load,
 		gpu_pages_loaded=gpu_pages_to_load,
-		destroy_manager_on_cleanup=destroy_manager_on_cleanup,
+		_destroy_manager_on_cleanup=destroy_manager_on_cleanup,
 	)
