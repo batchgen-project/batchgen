@@ -2248,6 +2248,43 @@ class GPUPagedKVCacheManager:
 
 		return k_tensor, v_tensor
 
+	def get_page_pointer_matrix(
+		self,
+		gpu_pages: Sequence[int] | torch.Tensor,
+	) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+		"""Return layer-major device pointer matrices for explicit GPU pages.
+
+		The returned tensors are CPU ``int64`` matrices shaped
+		``[num_layers, num_pages]``. They are suitable for C++ page-level H2D
+		copy APIs that take explicit destination pages instead of active
+		sequence layouts.
+		"""
+
+		self._ensure_initialized()
+		pages = torch.as_tensor(gpu_pages, dtype=torch.long, device="cpu")
+		if pages.dim() != 1:
+			raise ValueError(
+				"get_page_pointer_matrix: gpu_pages must be 1-D, "
+				f"got shape={tuple(pages.shape)}"
+			)
+		if pages.numel() == 0:
+			empty = self._k_page_ptr_table.new_empty(
+				(self.config.num_layers, 0)
+			)
+			return empty, None if self._v_page_ptr_table is None else empty.clone()
+		if torch.any(pages < 0) or torch.any(pages >= self.config.num_pages):
+			raise ValueError(
+				"get_page_pointer_matrix: gpu_pages contains out-of-range page IDs"
+			)
+
+		k_ptrs = self._select_active_page_columns(self._k_page_ptr_table, pages)
+		v_ptrs = None
+		if self.config.has_v_cache:
+			v_ptrs = self._select_active_page_columns(
+				self._v_page_ptr_table, pages
+			)
+		return k_ptrs.contiguous(), None if v_ptrs is None else v_ptrs.contiguous()
+
 	# In gpu_paged_kv_manager.py
 	def extend_pages_for_sequence(self, sequence_id: int, new_total_tokens: int) -> int:
 		self._ensure_initialized()

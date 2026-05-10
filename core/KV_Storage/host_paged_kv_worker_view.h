@@ -1103,6 +1103,181 @@ class HostPagedKVWorkerView {
         });
     }
 
+    KVAsyncTask AsyncLoadPrefixPagesToDevice(
+        torch::Tensor host_page_ids, torch::Tensor k_device_ptrs,
+        std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
+        EnsureDeviceReady();
+        constexpr std::string_view kOpName =
+            "AsyncLoadPrefixPagesToDevice";
+
+        auto validated_pages =
+            ValidatePageIdTensor(std::move(host_page_ids), "host_page_ids",
+                                 kOpName);
+        const auto total_pages =
+            static_cast<std::size_t>(validated_pages.size(0));
+
+        auto validated_k_ptrs = ValidatePointerMatrix(
+            std::move(k_device_ptrs), "k_device_ptrs", kOpName);
+        if (static_cast<std::size_t>(validated_k_ptrs.size(1)) !=
+            total_pages) {
+            std::ostringstream oss;
+            oss << kOpName << ": k_device_ptrs second dimension must match "
+                << "host_page_ids length (" << validated_k_ptrs.size(1)
+                << " != " << total_pages << ")";
+            throw std::out_of_range(oss.str());
+        }
+
+        std::optional<torch::Tensor> validated_v_ptrs;
+        if (v_device_ptrs.has_value()) {
+            if constexpr (!kHasVCache) {
+                throw std::invalid_argument(std::string(kOpName) +
+                                            ": V cache is disabled");
+            }
+            auto tensor = ValidatePointerMatrix(
+                std::move(*v_device_ptrs), "v_device_ptrs", kOpName);
+            if (tensor.sizes() != validated_k_ptrs.sizes()) {
+                std::ostringstream oss;
+                oss << kOpName
+                    << ": v_device_ptrs must match k_device_ptrs shape";
+                throw std::invalid_argument(oss.str());
+            }
+            validated_v_ptrs = std::move(tensor);
+        }
+
+        if (total_pages == 0) {
+            return LaunchAsyncTask([] {});
+        }
+
+        const std::size_t num_layers = config_.num_layers;
+        const std::size_t copy_entries = num_layers * total_pages;
+        const auto kernel_limit =
+            static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (copy_entries > kernel_limit) {
+            std::ostringstream oss;
+            oss << kOpName << ": copy_entries=" << copy_entries
+                << " exceeds kernel limit=" << kernel_limit;
+            throw std::invalid_argument(oss.str());
+        }
+
+        auto page_vector = TensorToInt32Vector(validated_pages, "host_page_ids",
+                                               kOpName);
+        std::vector<std::vector<std::int32_t>> page_table(1);
+        page_table[0] = std::move(page_vector);
+        std::vector<std::size_t> sequence_offsets{0};
+
+        logger_->debug(
+            "Prepared AsyncLoadPrefixPagesToDevice (num_layers={}, total_pages={})",
+            num_layers, total_pages);
+
+        return LaunchAsyncTask([
+            this,
+            page_table = std::move(page_table),
+            sequence_offsets = std::move(sequence_offsets),
+            k_tensor = std::move(validated_k_ptrs),
+            v_tensor = std::move(validated_v_ptrs),
+            total_pages,
+            num_layers,
+            copy_entries,
+            kOpName
+        ]() mutable {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+            const std::size_t k_page_bytes = layout_.KPageBytes();
+            if (k_page_bytes == 0) {
+                return;
+            }
+
+            auto* k_dest_ptr = k_tensor.template data_ptr<std::int64_t>();
+            const std::int64_t* v_dest_ptr =
+                v_tensor.has_value()
+                    ? v_tensor->data_ptr<std::int64_t>()
+                    : nullptr;
+            const std::size_t row_stride = total_pages;
+            auto build_plan = [&](const std::int64_t* dest_ptrs,
+                                  auto&& host_ptr_provider) {
+                if (dest_ptrs == nullptr) {
+                    throw std::invalid_argument(std::string(kOpName) +
+                                                ": null device pointers");
+                }
+                return this->BuildPageCopyPlan(
+                    page_table, sequence_offsets, num_layers, row_stride,
+                    copy_entries, dest_ptrs,
+                    std::forward<decltype(host_ptr_provider)>(
+                        host_ptr_provider),
+                    kOpName);
+            };
+
+            const auto k_plan = build_plan(
+                k_dest_ptr,
+                [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
+                    return this->KPagePtr(layer_idx, page_idx);
+                });
+
+            std::optional<PageCopyPlan> v_plan;
+            if constexpr (kHasVCache) {
+                if (v_dest_ptr != nullptr) {
+                    v_plan = build_plan(
+                        v_dest_ptr, [this](std::size_t layer_idx,
+                                           std::int32_t page_idx) -> void* {
+                            return this->template VPagePtr<>(layer_idx,
+                                                             page_idx);
+                        });
+                }
+            }
+
+            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
+                copy_entries);
+            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
+                copy_entries);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
+                v_plan.has_value() ? copy_entries : 0);
+            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
+                v_plan.has_value() ? copy_entries : 0);
+
+            auto enqueue_plan =
+                [&](const PageCopyPlan& plan,
+                    worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
+                    worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
+                    std::size_t page_bytes) {
+                    if (plan.host_sources.empty() || page_bytes == 0) {
+                        return;
+                    }
+                    const std::size_t ptr_bytes =
+                        plan.host_sources.size() * sizeof(uint8_t*);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(
+                            plan.host_sources.data()),
+                        reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+                    EnqueueCopy(
+                        reinterpret_cast<const std::byte*>(
+                            plan.device_dests.data()),
+                        reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
+                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
+                    worker_detail::LaunchUvaPageCopyKernel(
+                        dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
+                        static_cast<int>(plan.host_sources.size()),
+                        cuda_stream);
+                };
+
+            enqueue_plan(k_plan, k_device_src_ptrs, k_device_dst_ptrs,
+                         k_page_bytes);
+
+            if constexpr (kHasVCache) {
+                if (v_plan.has_value()) {
+                    const std::size_t v_page_bytes = layout_.VPageBytes();
+                    enqueue_plan(*v_plan, v_device_src_ptrs,
+                                 v_device_dst_ptrs, v_page_bytes);
+                }
+            }
+
+            logger_->debug(
+                "AsyncLoadPrefixPagesToDevice completed (num_layers={}, total_pages={}, k_page_bytes={})",
+                num_layers, total_pages, k_page_bytes);
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
     std::byte* DataBase() { return backend_.DataBase(); }
     const std::byte* DataBase() const { return backend_.DataBase(); }
 
@@ -2690,6 +2865,37 @@ class HostPagedKVWorkerView {
         return tensor;
     }
 
+    torch::Tensor ValidatePageIdTensor(torch::Tensor tensor,
+                                       std::string_view tensor_name,
+                                       std::string_view op_name) const {
+        if (tensor.device().type() != torch::kCPU) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must reside on CPU";
+            throw std::invalid_argument(oss.str());
+        }
+        if (!tensor.is_contiguous()) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be contiguous";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.dim() != 1) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must be 1-D";
+            throw std::invalid_argument(oss.str());
+        }
+        if (tensor.scalar_type() != torch::kInt64 &&
+            tensor.scalar_type() != torch::kInt32) {
+            std::ostringstream oss;
+            oss << op_name << ": " << tensor_name
+                << " must have dtype int32 or int64";
+            throw std::invalid_argument(oss.str());
+        }
+        return tensor;
+    }
+
     std::vector<std::size_t> TensorToSizeVector(
         const torch::Tensor& tensor, std::string_view tensor_name,
         std::string_view op_name) const {
@@ -2795,6 +3001,46 @@ class HostPagedKVWorkerView {
         }
         const auto* data = tensor.data_ptr<std::int64_t>();
         std::copy(data, data + length, values.begin());
+        return values;
+    }
+
+    std::vector<std::int32_t> TensorToInt32Vector(
+        const torch::Tensor& tensor, std::string_view tensor_name,
+        std::string_view op_name) const {
+        const auto length = static_cast<std::size_t>(tensor.size(0));
+        std::vector<std::int32_t> values(length);
+        if (length == 0) {
+            return values;
+        }
+        if (tensor.scalar_type() == torch::kInt64) {
+            const auto* data = tensor.data_ptr<std::int64_t>();
+            for (std::size_t idx = 0; idx < length; ++idx) {
+                const auto value = data[idx];
+                if (value < 0 ||
+                    value > std::numeric_limits<std::int32_t>::max()) {
+                    std::ostringstream oss;
+                    oss << op_name << ": " << tensor_name
+                        << " value out of int32 page range (index=" << idx
+                        << ", value=" << value << ")";
+                    throw std::out_of_range(oss.str());
+                }
+                values[idx] = static_cast<std::int32_t>(value);
+            }
+            return values;
+        }
+
+        const auto* data = tensor.data_ptr<std::int32_t>();
+        for (std::size_t idx = 0; idx < length; ++idx) {
+            const auto value = data[idx];
+            if (value < 0) {
+                std::ostringstream oss;
+                oss << op_name << ": " << tensor_name
+                    << " must be non-negative (index=" << idx
+                    << ", value=" << value << ")";
+                throw std::out_of_range(oss.str());
+            }
+            values[idx] = value;
+        }
         return values;
     }
 

@@ -267,6 +267,20 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("k_device_ptrs"),
             py::arg("v_device_ptrs") = py::none(),
             "Load only the active per-sequence KV pages using padded page tables.")
+        .def(
+            "async_load_prefix_pages_to_device",
+            [](WorkerView& self, torch::Tensor host_page_ids,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadPrefixPagesToDevice(
+                    std::move(host_page_ids), std::move(k_device_ptrs),
+                    std::move(v_device_ptrs));
+            },
+            py::arg("host_page_ids"), py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load explicit host prefix page IDs into explicit GPU page "
+            "destinations. k_device_ptrs/v_device_ptrs are CPU int64 pointer "
+            "matrices shaped [num_layers, num_pages].")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(

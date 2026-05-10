@@ -57,34 +57,41 @@ class GqaPrefixAwareAttentionBackend:
         )
 
         metadata = ensure_prefix_cache_prepack_metadata(metadata)
-        del kv_cache_metadata
 
         cu_q = metadata.cu_seqlens.to(query.device)
+        materialization = (
+            getattr(kv_cache_metadata, "prefill_prefix_materialization", None)
+            if kv_cache_metadata is not None
+            else None
+        )
+        if metadata.full_hit_mode and materialization is None:
+            raise RuntimeError(
+                "GQA full-hit prefix reuse requires GPU paged materialization"
+            )
+        if metadata.prefix_reuse_mode and materialization is None:
+            raise RuntimeError(
+                "GQA partial-hit prefix reuse requires GPU paged materialization"
+            )
+
         if metadata.full_hit_mode:
-            key_for_attn, value_for_attn, cu_k, max_seqlen_k = (
-                self.prefix_kv_builder.build_gqa_full_hit_kv(
-                    metadata=metadata,
-                    num_heads=int(self.num_kv_heads),
-                    head_dim=int(self.head_dim),
-                    dtype=key.dtype,
-                    device=key.device,
-                )
+            return self._forward_paged_full_hit_prefill(
+                query=query,
+                metadata=metadata,
+                materialization=materialization,
             )
-        elif metadata.prefix_reuse_mode:
-            key_for_attn, value_for_attn, cu_k, max_seqlen_k = (
-                self.prefix_kv_builder.build_gqa_prefix_kv(
-                    key=key,
-                    value=value,
-                    metadata=metadata,
-                    num_heads=int(self.num_kv_heads),
-                    head_dim=int(self.head_dim),
-                )
+        if metadata.prefix_reuse_mode:
+            return self._forward_paged_extend_prefill(
+                query=query,
+                key=key,
+                value=value,
+                metadata=metadata,
+                materialization=materialization,
             )
-        else:
-            key_for_attn = key
-            value_for_attn = value
-            cu_k = cu_q
-            max_seqlen_k = metadata.max_seqlen
+
+        key_for_attn = key
+        value_for_attn = value
+        cu_k = cu_q
+        max_seqlen_k = metadata.max_seqlen
 
         attention_fn = self.attention_fn
         if attention_fn is None:
@@ -104,6 +111,123 @@ class GqaPrefixAwareAttentionBackend:
             sliding_window=self.sliding_window,
         )
         return attn_output
+
+    def _forward_paged_extend_prefill(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata,
+        materialization,
+    ) -> torch.Tensor:
+        """Run prefix-hit suffix prefill over materialized GPU paged KV."""
+
+        from batchgen.attention.gqa import gqa_decode_fa
+
+        if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
+            raise RuntimeError(
+                "Paged prefix prefill requires prefix and full length metadata"
+            )
+        if metadata.full_hit_mode:
+            raise RuntimeError("Full-hit prefill is handled by the full-hit path")
+
+        layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
+        materialization.wait_for_load()
+        materialization.manager.append_layer_prefill_suffix_tokens(
+            k_tensor=key,
+            v_tensor=value,
+            append_plan=materialization.append_plan,
+            layer_idx=layer_idx,
+        )
+        k_cache, v_cache, page_table = (
+            materialization.manager.get_layer_kv_with_page_table(layer_idx)
+        )
+        if v_cache is None:
+            raise RuntimeError("GQA paged prefix prefill requires V cache")
+
+        cu = metadata.cu_seqlens_list()
+        outputs = []
+        slot_indices = materialization.append_plan.slot_indices.detach().cpu().tolist()
+        for seq_idx, suffix_len in enumerate(metadata.seq_lengths):
+            start = int(cu[seq_idx])
+            end = int(cu[seq_idx + 1])
+            if end - start != int(suffix_len):
+                raise RuntimeError("Paged prefix prefill suffix span mismatch")
+            if suffix_len <= 0:
+                raise RuntimeError("Paged prefix prefill requires non-empty suffix")
+
+            q_segment = query[start:end].unsqueeze(0)
+            cache_seqlens = torch.tensor(
+                [int(metadata.full_seq_lengths[seq_idx])],
+                dtype=torch.int32,
+                device=query.device,
+            )
+            slot_idx = int(slot_indices[seq_idx])
+            block_table = page_table[slot_idx : slot_idx + 1]
+            attn_output, _ = gqa_decode_fa(
+                q=q_segment,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                sinks=self.sinks,
+                softmax_scale=self.softmax_scale,
+                sliding_window=self.sliding_window,
+            )
+            outputs.append(attn_output.squeeze(0))
+
+        return torch.cat(outputs, dim=0)
+
+    def _forward_paged_full_hit_prefill(
+        self,
+        *,
+        query: torch.Tensor,
+        metadata,
+        materialization,
+    ) -> torch.Tensor:
+        """Run exact full-hit prefill over materialized GPU paged KV."""
+
+        from batchgen.attention.gqa import gqa_decode_fa
+
+        if metadata.full_seq_lengths is None:
+            raise RuntimeError("Paged full-hit prefill requires full lengths")
+        metadata.validate_full_hit_query_lengths()
+
+        layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
+        materialization.wait_for_load()
+        k_cache, v_cache, page_table = (
+            materialization.manager.get_layer_kv_with_page_table(layer_idx)
+        )
+        if v_cache is None:
+            raise RuntimeError("GQA paged full-hit prefill requires V cache")
+
+        outputs = []
+        slot_indices = materialization.append_plan.slot_indices.detach().cpu().tolist()
+        for seq_idx, query_len in enumerate(metadata.seq_lengths):
+            if int(query_len) != 1:
+                raise RuntimeError("Paged full-hit prefill expects one query token")
+            q_segment = query[seq_idx : seq_idx + 1].unsqueeze(0)
+            cache_seqlens = torch.tensor(
+                [int(metadata.full_seq_lengths[seq_idx])],
+                dtype=torch.int32,
+                device=query.device,
+            )
+            slot_idx = int(slot_indices[seq_idx])
+            block_table = page_table[slot_idx : slot_idx + 1]
+            attn_output, _ = gqa_decode_fa(
+                q=q_segment,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                sinks=self.sinks,
+                softmax_scale=self.softmax_scale,
+                sliding_window=self.sliding_window,
+            )
+            outputs.append(attn_output.squeeze(0))
+
+        return torch.cat(outputs, dim=0)
 
 
 @dataclass(frozen=True)

@@ -44,6 +44,7 @@ _LEGACY_ATTENTION_FIELDS = (
     "max_seqlen",
     "gpu_paged_kv_manager",
     "host_paged_kv_worker_view",
+    "prefill_prefix_materialization",
     "gpu_paged_kv_manager_aux",
     "host_paged_kv_worker_view_aux",
 )
@@ -159,6 +160,9 @@ def _sync_decode_fields(wrapper_cls: type, decode: DecodeAttentionMetadata) -> N
 def _sync_kv_cache_fields(wrapper_cls: type, kv_cache: KVCacheMetadata) -> None:
     wrapper_cls.gpu_paged_kv_manager = kv_cache.gpu_paged_kv_manager
     wrapper_cls.host_paged_kv_worker_view = kv_cache.host_worker_view
+    wrapper_cls.prefill_prefix_materialization = (
+        kv_cache.prefill_prefix_materialization
+    )
     wrapper_cls.gpu_paged_kv_manager_aux = kv_cache.aux_gpu_paged_kv_manager
     wrapper_cls.host_paged_kv_worker_view_aux = kv_cache.aux_host_worker_view
 

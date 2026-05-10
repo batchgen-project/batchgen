@@ -1827,12 +1827,32 @@ class GptOssAttnWrapper(AttnWrapperBase):
             softmax_scale=self.scale,
             sliding_window=self.sliding_window,
         )
+        from batchgen.attention.forward_metadata_context import (
+            get_current_forward_batch_metadata,
+        )
+
+        forward_metadata = get_current_forward_batch_metadata()
+        kv_cache_metadata = (
+            None if forward_metadata is None else forward_metadata.kv_cache
+        )
+        if (
+            kv_cache_metadata is None
+            and AttnWrapperBase.prefill_prefix_materialization is not None
+        ):
+            from types import SimpleNamespace
+
+            kv_cache_metadata = SimpleNamespace(
+                prefill_prefix_materialization=(
+                    AttnWrapperBase.prefill_prefix_materialization
+                )
+            )
         # q, k, v: [total_tokens, num_heads, head_dim]
         attn_output = backend.forward_prefill(
             query=query,
             key=key,
             value=value,
             metadata=metadata,
+            kv_cache_metadata=kv_cache_metadata,
         )
 
         # attn_output: [total_tokens, num_heads, head_dim]

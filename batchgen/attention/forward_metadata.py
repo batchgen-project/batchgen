@@ -275,6 +275,7 @@ class KVCacheMetadata:
     host_worker_view: Optional[object] = None
     aux_gpu_paged_kv_manager: Optional[object] = None
     aux_host_worker_view: Optional[object] = None
+    prefill_prefix_materialization: Optional[object] = None
 
     def validate(self) -> None:
         # Handles are intentionally opaque. Validation only asserts the object is

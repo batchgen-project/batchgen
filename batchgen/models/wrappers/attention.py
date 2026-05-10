@@ -260,6 +260,7 @@ class AttnWrapperBase(BaseModuleWrapper):
     glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
+    prefill_prefix_materialization: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)
     gpu_paged_kv_manager_aux: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view_aux: ClassVar[Optional[object]] = None

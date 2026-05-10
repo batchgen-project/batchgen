@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterable, Iterator, List
+from typing import Iterable, Iterator, List, Optional
 
 import torch
 
@@ -16,9 +16,14 @@ def full_hit_attention_state(
     position_ids: torch.Tensor,
     global_sequence_ids: List[int],
     prompt_lengths: List[int],
+    prefill_prefix_materialization: Optional[object] = None,
 ) -> Iterator[None]:
     """Temporarily configure attention wrappers for full-hit prefix replay."""
     wrapper_classes = tuple(wrapper_classes)
+    previous_materializations = {
+        wrapper_cls: getattr(wrapper_cls, "prefill_prefix_materialization", None)
+        for wrapper_cls in wrapper_classes
+    }
     for wrapper_cls in wrapper_classes:
         wrapper_cls.prepack_mode = True
         wrapper_cls.prepack_cu_seqlens = cu_seqlens
@@ -31,6 +36,7 @@ def full_hit_attention_state(
         wrapper_cls.prepack_prefix_shared_tokens = prompt_lengths
         wrapper_cls.prepack_full_seq_lengths = prompt_lengths
         wrapper_cls.prepack_full_hit_mode = True
+        wrapper_cls.prefill_prefix_materialization = prefill_prefix_materialization
     try:
         yield
     finally:
@@ -44,3 +50,6 @@ def full_hit_attention_state(
             wrapper_cls.prepack_prefix_shared_tokens = None
             wrapper_cls.prepack_full_seq_lengths = None
             wrapper_cls.prepack_full_hit_mode = False
+            wrapper_cls.prefill_prefix_materialization = previous_materializations[
+                wrapper_cls
+            ]

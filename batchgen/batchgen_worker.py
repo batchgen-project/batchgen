@@ -93,6 +93,9 @@ from batchgen.config.model_name_utils import (
 	is_prefix_reuse_supported_model,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
+from batchgen.kv_cache.prefix_gpu_materializer import (
+	materialize_prefill_prefix_pages,
+)
 from batchgen.models.engine_loader import core_engine
 
 from batchgen.kv_cache.host_kv_mananger_config import (
@@ -2981,6 +2984,92 @@ class BatchGenWorker:
 		self._allocate_gpu_pages_for_sequences(manager, global_sequence_ids, sequence_tokens)
 		manager.rebuild_page_table(global_sequence_ids)
 		self._load_host_kv_to_gpu(manager, global_sequence_ids)
+
+	def _prepare_prefill_prefix_gpu_materialization(
+		self,
+		sequence_plans: Sequence[object],
+	):
+		"""Materialize cached prefix pages for one prefix-hit prefill microbatch."""
+		if not sequence_plans:
+			return None
+		prefix_lens = [int(item.prefix_shared_tokens) for item in sequence_plans]
+		if not any(prefix_len > 0 for prefix_len in prefix_lens):
+			return None
+		if not all(prefix_len > 0 for prefix_len in prefix_lens):
+			raise RuntimeError(
+				"Prefix GPU materialization currently expects a prefix-hit-only "
+				"microbatch; keep miss requests on the ordinary prefill path"
+			)
+
+		sequence_ids = [int(item.sequence_id) for item in sequence_plans]
+		full_lengths = [
+			int(item.full_logical_context_length) for item in sequence_plans
+		]
+		suffix_lens = [int(item.suffix_length) for item in sequence_plans]
+
+		manager = self._ensure_gpu_paged_kv_manager(full_lengths)
+		if isinstance(manager, DualKVCacheCoordinator):
+			raise RuntimeError(
+				"Prefix GPU materialized prefill for dual primary/aux KV is "
+				"not implemented yet"
+			)
+		worker_view = self._host_worker_view_for_prefix_reuse()
+		if worker_view is None:
+			raise RuntimeError(
+				"Prefix GPU materialization requires a host KV worker view"
+			)
+		shared_prefix_pages = [
+			list(worker_view.shared_prefix_pages(sequence_id))
+			for sequence_id in sequence_ids
+		]
+		return materialize_prefill_prefix_pages(
+			manager=manager,
+			worker_view=worker_view,
+			sequence_ids=sequence_ids,
+			full_lengths=full_lengths,
+			prefix_lens=prefix_lens,
+			suffix_lens=suffix_lens,
+			shared_prefix_pages=shared_prefix_pages,
+			destroy_manager_on_cleanup=True,
+		)
+
+	def _prepare_full_hit_prefix_gpu_materialization(
+		self,
+		sequence_ids: Sequence[int],
+		prompt_lengths: Sequence[int],
+	):
+		"""Materialize cached full-prompt pages for exact full-hit prefill."""
+		if not sequence_ids:
+			return None
+		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
+		if isinstance(manager, DualKVCacheCoordinator):
+			raise RuntimeError(
+				"Exact full-hit prefix GPU materialization for dual primary/aux "
+				"KV is not implemented yet"
+			)
+		worker_view = self._host_worker_view_for_prefix_reuse()
+		if worker_view is None:
+			raise RuntimeError(
+				"Exact full-hit prefix GPU materialization requires a host KV "
+				"worker view"
+			)
+		sequence_ids = [int(sequence_id) for sequence_id in sequence_ids]
+		prompt_lengths = [int(length) for length in prompt_lengths]
+		shared_prefix_pages = [
+			list(worker_view.shared_prefix_pages(sequence_id))
+			for sequence_id in sequence_ids
+		]
+		return materialize_prefill_prefix_pages(
+			manager=manager,
+			worker_view=worker_view,
+			sequence_ids=sequence_ids,
+			full_lengths=prompt_lengths,
+			prefix_lens=prompt_lengths,
+			suffix_lens=[0] * len(sequence_ids),
+			shared_prefix_pages=shared_prefix_pages,
+			destroy_manager_on_cleanup=True,
+			require_page_aligned_prefix=False,
+		)
 
 	def _launch_aux_host_kv_load(self, sequence_tensor: torch.Tensor):
 		"""Launch async aux (DSA indexer) host->GPU load. Returns task or None.
@@ -8121,6 +8210,18 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
+				prefill_prefix_materialization = None
+				if prefix_reuse_plan is not None:
+					prefill_prefix_materialization = (
+						self._prepare_prefill_prefix_gpu_materialization(
+							prefix_reuse_plan.sequences[seq_start:seq_end]
+						)
+					)
+				metadata_gpu_manager = (
+					prefill_prefix_materialization.manager
+					if prefill_prefix_materialization is not None
+					else None
+				)
 				forward_metadata = build_prefill_forward_metadata(
 					prepack_metadata=prepack_meta,
 					batch_spans=batch_spans,
@@ -8130,44 +8231,50 @@ class BatchGenWorker:
 					device=self.torch_device,
 					prefix_reuse_plan=prefix_reuse_plan,
 					kv_cache_metadata=KVCacheMetadata(
-						gpu_paged_kv_manager=getattr(self, "gpu_paged_kv_cache_manager", None),
+						gpu_paged_kv_manager=metadata_gpu_manager,
 						host_worker_view=getattr(
 							self.core_engine, "host_paged_kv_worker_view", None
 						),
-						aux_gpu_paged_kv_manager=getattr(
-							self.core_engine, "gpu_paged_kv_manager_aux", None
-						),
+						aux_gpu_paged_kv_manager=None,
 						aux_host_worker_view=getattr(
 							self, "host_paged_kv_worker_view_aux", None
+						),
+						prefill_prefix_materialization=(
+							prefill_prefix_materialization
 						),
 					),
 				)
 				batch_cu_seqlens = forward_metadata.prefill.cu_seqlens_q
 
-				with bind_forward_batch_metadata(forward_metadata):
-					# Embed tokens
-					inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+				try:
+					with bind_forward_batch_metadata(forward_metadata):
+						# Embed tokens
+						inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
 
-					# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-					hidden_states = inputs_embeds.unsqueeze(0)
+						# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
+						hidden_states = inputs_embeds.unsqueeze(0)
 
-					for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-						layer_outputs = decoder_layer(
-							hidden_states,
-							attention_mask=None,
-							position_ids=None,
-							past_key_value=None,
-							output_attentions=False,
-							use_cache=False,
-						)
-						hidden_states = layer_outputs[0]
+						for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+							layer_outputs = decoder_layer(
+								hidden_states,
+								attention_mask=None,
+								position_ids=None,
+								past_key_value=None,
+								output_attentions=False,
+								use_cache=False,
+							)
+							hidden_states = layer_outputs[0]
 
-					# Final norm
-					hidden_states = self.model.model.norm(hidden_states)
+						# Final norm
+						hidden_states = self.model.model.norm(hidden_states)
 
-					# Extract last token hidden states for each sequence
-					last_token_indices = batch_cu_seqlens[1:] - 1
-					last_token_hidden = hidden_states[0, last_token_indices, :]
+						# Extract last token hidden states for each sequence
+						last_token_indices = batch_cu_seqlens[1:] - 1
+						last_token_hidden = hidden_states[0, last_token_indices, :]
+				finally:
+					if prefill_prefix_materialization is not None:
+						torch.cuda.current_stream(self.torch_device).synchronize()
+						prefill_prefix_materialization.cleanup()
 
 				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
 				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
@@ -8292,46 +8399,58 @@ class BatchGenWorker:
 		self._prefix_reuse_prefill_stats["full_hit_exact_paths"] += len(batch)
 		self._prefix_reuse_prefill_stats["full_hit_tokens_computed"] += len(batch)
 
-		with full_hit_attention_state(
-			wrapper_classes=(Attn_Wrapper, AttnWrapperBase),
-			cu_seqlens=cu_seqlens,
-			position_ids=position_ids_tensor,
-			global_sequence_ids=global_sequence_ids,
-			prompt_lengths=prompt_lengths,
-		):
-			with torch.inference_mode():
-				inputs_embeds = self.model.model.embed_tokens(input_ids)
-				hidden_states = inputs_embeds.unsqueeze(0)
-				for decoder_layer in self.model.model.layers:
-					layer_outputs = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
-					)
-					hidden_states = layer_outputs[0]
+		prefill_prefix_materialization = (
+			self._prepare_full_hit_prefix_gpu_materialization(
+				global_sequence_ids,
+				prompt_lengths,
+			)
+		)
+		try:
+			with full_hit_attention_state(
+				wrapper_classes=(Attn_Wrapper, AttnWrapperBase),
+				cu_seqlens=cu_seqlens,
+				position_ids=position_ids_tensor,
+				global_sequence_ids=global_sequence_ids,
+				prompt_lengths=prompt_lengths,
+				prefill_prefix_materialization=prefill_prefix_materialization,
+			):
+				with torch.inference_mode():
+					inputs_embeds = self.model.model.embed_tokens(input_ids)
+					hidden_states = inputs_embeds.unsqueeze(0)
+					for decoder_layer in self.model.model.layers:
+						layer_outputs = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)
+						hidden_states = layer_outputs[0]
 
-				hidden_states = self.model.model.norm(hidden_states)
-				last_token_hidden = hidden_states[0, :, :]
-				if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
-				full_hit_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in batch
-				]
-				return self._select_tokens(logits, full_hit_sequences)
+					hidden_states = self.model.model.norm(hidden_states)
+					last_token_hidden = hidden_states[0, :, :]
+					if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+						logits = torch.nn.functional.linear(
+							last_token_hidden.float(),
+							self.model.lm_head.weight.float(),
+							self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						)
+					else:
+						logits = torch.nn.functional.linear(
+							last_token_hidden,
+							self.model.lm_head.weight,
+							self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						).float()
+					full_hit_sequences = [
+						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+						for local_idx in batch
+					]
+					return self._select_tokens(logits, full_hit_sequences)
+		finally:
+			if prefill_prefix_materialization is not None:
+				torch.cuda.current_stream(self.torch_device).synchronize()
+				prefill_prefix_materialization.cleanup()
 
 	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 
