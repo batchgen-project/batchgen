@@ -238,15 +238,11 @@ class MlaProjectedPrefixAwareAttentionBackend:
         kv_cache_metadata=None,
     ) -> torch.Tensor:
         del value
-        from batchgen.models.wrappers.prefix_cache import (
-            ensure_prefix_cache_prepack_metadata,
-        )
         from batchgen.models.wrappers.prefix_mla_replay import (
             MlaReplaySpec,
             run_projected_mla_prefix_attention,
         )
 
-        metadata = ensure_prefix_cache_prepack_metadata(metadata)
         del kv_cache_metadata
 
         spec = MlaReplaySpec(

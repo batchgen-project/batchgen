@@ -383,7 +383,6 @@ class PrefixAttentionKvBuilder:
         num_heads: int,
         head_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        metadata.validate_prefix_suffix_lengths()
         if metadata.prefix_shared_tokens is None:
             raise RuntimeError("GQA prefix KV build requires prefix token metadata")
 
@@ -415,8 +414,6 @@ class PrefixAttentionKvBuilder:
                 seq_k = suffix_k
                 seq_v = suffix_v
 
-            if seq_k.shape[0] != prefix_tokens + int(suffix_len):
-                raise RuntimeError("GQA prefix KV segment length mismatch")
             k_segments.append(seq_k)
             v_segments.append(seq_v)
             cu_k.append(cu_k[-1] + int(seq_k.shape[0]))
@@ -438,7 +435,6 @@ class PrefixAttentionKvBuilder:
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        metadata.validate_full_hit_query_lengths()
         if metadata.full_seq_lengths is None:
             raise RuntimeError("GQA full-hit KV build requires full lengths")
 
@@ -474,7 +470,6 @@ class PrefixAttentionKvBuilder:
         metadata: PrefixCachePrepackMetadata,
         kv_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        metadata.validate_prefix_suffix_lengths()
         if metadata.prefix_shared_tokens is None:
             raise RuntimeError("MLA prefix KV build requires prefix token metadata")
 
@@ -503,8 +498,6 @@ class PrefixAttentionKvBuilder:
             else:
                 seq_k = suffix_k
 
-            if seq_k.shape[0] != prefix_tokens + int(suffix_len):
-                raise RuntimeError("MLA prefix KV segment length mismatch")
             k_segments.append(seq_k)
             cu_k.append(cu_k[-1] + int(seq_k.shape[0]))
             max_seqlen_k = max(max_seqlen_k, int(seq_k.shape[0]))
@@ -523,7 +516,6 @@ class PrefixAttentionKvBuilder:
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        metadata.validate_full_hit_query_lengths()
         if metadata.full_seq_lengths is None:
             raise RuntimeError("MLA full-hit KV build requires full lengths")
 

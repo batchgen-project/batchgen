@@ -43,13 +43,6 @@ def run_prefix_mla_suffix_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill using cached prefix KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if not metadata.prefix_reuse_mode:
-        raise RuntimeError("MLA prefix replay requires prefix reuse mode")
-    if metadata.num_sequences != 1:
-        raise RuntimeError(
-            "MLA prefix replay currently requires single-sequence suffix "
-            "micro-batches"
-        )
     if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
         raise RuntimeError("MLA prefix replay requires prefix metadata")
 
@@ -79,17 +72,8 @@ def run_prefix_mla_suffix_prefill_with_projected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill from already projected suffix Q/KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if not metadata.prefix_reuse_mode:
-        raise RuntimeError("MLA prefix replay requires prefix reuse mode")
-    if metadata.num_sequences != 1:
-        raise RuntimeError(
-            "MLA prefix replay currently requires single-sequence suffix "
-            "micro-batches"
-        )
-    if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
-        raise RuntimeError("MLA prefix replay requires prefix metadata")
 
-    attn_out = run_projected_mla_prefix_attention(
+    attn_out = _run_projected_mla_prefix_attention_normalized(
         prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
         query_states=query_states,
         offload_kv=offload_kv,
@@ -112,11 +96,8 @@ def run_prefix_mla_full_hit_prefill(
 ) -> torch.Tensor:
     """Run exact full-hit MLA prefill using fully cached prompt KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if not metadata.full_hit_mode:
-        raise RuntimeError("MLA full-hit replay requires full-hit mode")
     if metadata.full_seq_lengths is None:
         raise RuntimeError("MLA full-hit replay requires full sequence lengths")
-    metadata.validate_full_hit_query_lengths()
 
     query_states = project_query(
         hidden_states_2d,
@@ -142,13 +123,8 @@ def run_prefix_mla_full_hit_prefill_with_query(
 ) -> torch.Tensor:
     """Run exact full-hit MLA prefill from already projected query states."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if not metadata.full_hit_mode:
-        raise RuntimeError("MLA full-hit replay requires full-hit mode")
-    if metadata.full_seq_lengths is None:
-        raise RuntimeError("MLA full-hit replay requires full sequence lengths")
-    metadata.validate_full_hit_query_lengths()
 
-    attn_out = run_projected_mla_prefix_attention(
+    attn_out = _run_projected_mla_prefix_attention_normalized(
         prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
         query_states=query_states,
         offload_kv=None,
@@ -172,10 +148,28 @@ def run_projected_mla_prefix_attention(
     """Run MLA prefix/no-prefix attention from projected query and compressed KV."""
 
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    return _run_projected_mla_prefix_attention_normalized(
+        prefix_kv_builder=prefix_kv_builder,
+        query_states=query_states,
+        offload_kv=offload_kv,
+        metadata=metadata,
+        spec=spec,
+        page_size=page_size,
+        attention_fn=attention_fn,
+    )
+
+
+def _run_projected_mla_prefix_attention_normalized(
+    *,
+    prefix_kv_builder: object,
+    query_states: torch.Tensor,
+    offload_kv: torch.Tensor | None,
+    metadata: PrefixCachePrepackMetadata,
+    spec: MlaReplaySpec,
+    page_size: int,
+    attention_fn: PrefixMlaAttentionFn | None = None,
+) -> torch.Tensor:
     if metadata.full_hit_mode:
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("MLA full-hit replay requires full sequence lengths")
-        metadata.validate_full_hit_query_lengths()
         compressed_kv, cu_k, _ = prefix_kv_builder.build_mla_full_hit_kv(
             metadata=metadata,
             kv_dim=spec.kv_dim,
@@ -184,8 +178,6 @@ def run_projected_mla_prefix_attention(
         )
         query_len = 1
     elif metadata.prefix_reuse_mode:
-        if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
-            raise RuntimeError("MLA prefix replay requires prefix metadata")
         if offload_kv is None:
             raise RuntimeError("MLA prefix replay requires suffix KV")
         compressed_kv, cu_k, _ = prefix_kv_builder.build_mla_prefix_kv(
