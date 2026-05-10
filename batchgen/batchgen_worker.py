@@ -1872,27 +1872,6 @@ class BatchGenWorker:
 			shared_pages.append(pages)
 		return shared_pages
 
-	def _estimate_gpu_physical_pages_for_allocation(
-		self,
-		manager: GPUPagedKVCacheManager,
-		tokens: List[int],
-		shared_prefix_pages: List[List[int]],
-	) -> int:
-		if not self._prefix_reuse_runtime_enabled():
-			return sum(t // self.PAGE_SIZE for t in tokens)
-		materialized_shared = getattr(manager, "_shared_prefix_gpu_pages", {})
-		missing_shared = {
-			page
-			for pages in shared_prefix_pages
-			for page in pages
-			if page not in materialized_shared
-		}
-		private_pages = 0
-		for token_count, shared_pages in zip(tokens, shared_prefix_pages):
-			logical_pages = math.ceil(token_count / self.PAGE_SIZE)
-			private_pages += max(0, logical_pages - len(shared_pages))
-		return len(missing_shared) + private_pages
-
 	def _allocate_gpu_pages_for_sequences(
 		self,
 		manager: GPUPagedKVCacheManager,

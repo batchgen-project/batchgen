@@ -124,6 +124,10 @@ class GPUPagedKVSuffixAppendPlan:
 	"""Destination metadata for multi-token suffix writes into GPU paged KV."""
 
 	sequence_ids: List[int]
+	prefix_values: Tuple[int, ...]
+	suffix_values: Tuple[int, ...]
+	slot_values: Tuple[int, ...]
+	total_suffix_tokens: int
 	prefix_lens: torch.Tensor
 	suffix_lens: torch.Tensor
 	cache_seqlens: torch.Tensor
@@ -134,10 +138,6 @@ class GPUPagedKVSuffixAppendPlan:
 	@property
 	def batch_size(self) -> int:
 		return len(self.sequence_ids)
-
-	@property
-	def total_suffix_tokens(self) -> int:
-		return int(self.suffix_lens.detach().cpu().sum().item())
 
 
 @dataclass(frozen=True)
@@ -1086,6 +1086,10 @@ class GPUPagedKVCacheManager:
 
 		return GPUPagedKVSuffixAppendPlan(
 			sequence_ids=sequence_ids,
+			prefix_values=tuple(prefix_values),
+			suffix_values=tuple(suffix_values),
+			slot_values=tuple(slot_indices),
+			total_suffix_tokens=sum(suffix_values),
 			prefix_lens=torch.tensor(prefix_values, dtype=torch.int32, device=self.device),
 			suffix_lens=torch.tensor(suffix_values, dtype=torch.int32, device=self.device),
 			cache_seqlens=torch.tensor(full_lengths, dtype=torch.int32, device=self.device),
@@ -1129,30 +1133,14 @@ class GPUPagedKVCacheManager:
 		elif self.config.has_v_cache:
 			logging.debug("%s: V cache enabled but v_tensor is None", op_name)
 
-		prefix_values = self._device_int_tensor_to_list(append_plan.prefix_lens)
-		suffix_values = self._device_int_tensor_to_list(append_plan.suffix_lens)
-		if len(append_plan.sequence_ids) != len(prefix_values):
-			raise ValueError(
-				f"{op_name}: append_plan sequence_ids and prefix_lens length mismatch"
-			)
-		if len(append_plan.sequence_ids) != len(suffix_values):
-			raise ValueError(
-				f"{op_name}: append_plan sequence_ids and suffix_lens length mismatch"
-			)
-
 		k_layer = self._k_cache[layer_idx]
 		v_layer = self._v_cache[layer_idx] if self._v_cache is not None else None
 		source_offset = 0
-		slot_values = self._device_int_tensor_to_list(append_plan.slot_indices)
-		if len(append_plan.sequence_ids) != len(slot_values):
-			raise ValueError(
-				f"{op_name}: append_plan sequence_ids and slot_indices length mismatch"
-			)
 		for seq_id, prefix_len, suffix_len, slot_idx in zip(
 			append_plan.sequence_ids,
-			prefix_values,
-			suffix_values,
-			slot_values,
+			append_plan.prefix_values,
+			append_plan.suffix_values,
+			append_plan.slot_values,
 		):
 			end_offset = source_offset + int(suffix_len)
 			if suffix_len > 0:
@@ -1717,19 +1705,6 @@ class GPUPagedKVCacheManager:
 			requirement = "non-negative" if allow_zero else "positive"
 			raise ValueError(f"{name} values must be {requirement}")
 		return [int(value) for value in tensor.tolist()]
-
-	def _device_int_tensor_to_list(self, tensor: torch.Tensor) -> List[int]:
-		if not isinstance(tensor, torch.Tensor):
-			raise TypeError("append plan tensor fields must be torch.Tensor")
-		if tensor.dim() != 1:
-			raise ValueError(
-				f"append plan tensor fields must be 1-D, got {tuple(tensor.shape)}"
-			)
-		if tensor.dtype not in (torch.int32, torch.int64):
-			raise TypeError(
-				f"append plan tensor fields must be int32/int64, got {tensor.dtype}"
-			)
-		return [int(value) for value in tensor.detach().cpu().tolist()]
 
 	def _prepare_flat_suffix_tensor(
 		self,

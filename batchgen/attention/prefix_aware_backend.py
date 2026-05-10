@@ -125,13 +125,6 @@ class GqaPrefixAwareAttentionBackend:
 
         from batchgen.attention.gqa import gqa_decode_fa
 
-        if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
-            raise RuntimeError(
-                "Paged prefix prefill requires prefix and full length metadata"
-            )
-        if metadata.full_hit_mode:
-            raise RuntimeError("Full-hit prefill is handled by the full-hit path")
-
         layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
         materialization.wait_for_load()
         materialization.manager.append_layer_prefill_suffix_tokens(
@@ -148,12 +141,10 @@ class GqaPrefixAwareAttentionBackend:
 
         cu = metadata.cu_seqlens_list()
         outputs = []
-        slot_indices = materialization.append_plan.slot_indices.detach().cpu().tolist()
+        slot_indices = materialization.append_plan.slot_values
         for seq_idx, suffix_len in enumerate(metadata.seq_lengths):
             start = int(cu[seq_idx])
             end = int(cu[seq_idx + 1])
-            if end - start != int(suffix_len):
-                raise RuntimeError("Paged prefix prefill suffix span mismatch")
             if suffix_len <= 0:
                 raise RuntimeError("Paged prefix prefill requires non-empty suffix")
 
@@ -190,10 +181,6 @@ class GqaPrefixAwareAttentionBackend:
 
         from batchgen.attention.gqa import gqa_decode_fa
 
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("Paged full-hit prefill requires full lengths")
-        metadata.validate_full_hit_query_lengths()
-
         layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
         materialization.wait_for_load()
         k_cache, v_cache, page_table = (
@@ -203,10 +190,8 @@ class GqaPrefixAwareAttentionBackend:
             raise RuntimeError("GQA paged full-hit prefill requires V cache")
 
         outputs = []
-        slot_indices = materialization.append_plan.slot_indices.detach().cpu().tolist()
-        for seq_idx, query_len in enumerate(metadata.seq_lengths):
-            if int(query_len) != 1:
-                raise RuntimeError("Paged full-hit prefill expects one query token")
+        slot_indices = materialization.append_plan.slot_values
+        for seq_idx in range(len(metadata.seq_lengths)):
             q_segment = query[seq_idx : seq_idx + 1].unsqueeze(0)
             cache_seqlens = torch.tensor(
                 [int(metadata.full_seq_lengths[seq_idx])],
