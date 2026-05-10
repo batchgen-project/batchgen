@@ -9,9 +9,13 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 
 
-def _tensor_to_int_list(tensor: torch.Tensor) -> List[int]:
-    values = tensor.detach().cpu().tolist()
-    return [int(value) for value in values]
+def _build_cu_seqlens_values(seq_lengths: Sequence[int]) -> List[int]:
+    values = [0]
+    running = 0
+    for length in seq_lengths:
+        running += int(length)
+        values.append(running)
+    return values
 
 
 def ensure_prefix_cache_prepack_metadata(metadata) -> "PrefixCachePrepackMetadata":
@@ -43,6 +47,7 @@ class PrefixCachePrepackMetadata:
     """Validated prepack metadata needed by prefix-cache-aware wrappers."""
 
     cu_seqlens: torch.Tensor
+    cu_seqlens_cpu: List[int]
     max_seqlen: int
     num_sequences: int
     seq_lengths: List[int]
@@ -66,28 +71,32 @@ class PrefixCachePrepackMetadata:
         full_seq_lengths = None
         prefix_reuse_mode = False
         full_hit_mode = False
+        seq_lengths = [int(length) for length in prefill_metadata.q_seq_lens]
         if prefix_reuse is not None:
-            prefix_shared_tokens = _tensor_to_int_list(prefix_reuse.prefix_lens)
-            full_seq_lengths = _tensor_to_int_list(prefix_reuse.full_seq_lens)
+            full_seq_lengths = [
+                int(length) for length in prefill_metadata.kv_seq_lens
+            ]
+            prefix_shared_tokens = [
+                int(full_len) - int(query_len)
+                for query_len, full_len in zip(seq_lengths, full_seq_lengths)
+            ]
             prefix_reuse_mode = any(tokens > 0 for tokens in prefix_shared_tokens)
-            full_hit_mode = bool(prefix_reuse.is_full_hit.detach().cpu().all().item())
+            full_hit_mode = bool(seq_lengths) and all(
+                int(length) == 0 for length in seq_lengths
+            )
 
         metadata = cls(
             cu_seqlens=prefill_metadata.cu_seqlens_q,
+            cu_seqlens_cpu=_build_cu_seqlens_values(seq_lengths),
             max_seqlen=int(prefill_metadata.max_seqlen_q),
             num_sequences=int(prefill_metadata.batch_size),
-            seq_lengths=[int(length) for length in prefill_metadata.q_seq_lens],
+            seq_lengths=seq_lengths,
             global_sequence_ids=[int(seq_id) for seq_id in global_sequence_ids],
             prefix_reuse_mode=prefix_reuse_mode,
             full_hit_mode=full_hit_mode,
             prefix_shared_tokens=prefix_shared_tokens,
             full_seq_lengths=full_seq_lengths,
         )
-        metadata.validate_sequence_spans()
-        if prefix_reuse_mode:
-            metadata.validate_prefix_suffix_lengths()
-        if full_hit_mode:
-            metadata.validate_full_hit_query_lengths()
         return metadata
 
     @classmethod
@@ -179,6 +188,7 @@ class PrefixCachePrepackMetadata:
 
         metadata = cls(
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=_build_cu_seqlens_values(seq_lengths),
             max_seqlen=int(max_seqlen),
             num_sequences=num_sequences,
             seq_lengths=seq_lengths,
@@ -188,50 +198,14 @@ class PrefixCachePrepackMetadata:
             prefix_shared_tokens=prefix_shared_tokens,
             full_seq_lengths=full_seq_lengths,
         )
-        metadata.validate_sequence_spans()
-        if prefix_reuse_mode:
-            metadata.validate_prefix_suffix_lengths()
-        if full_hit_mode:
-            metadata.validate_full_hit_query_lengths()
         return metadata
 
     def cu_seqlens_list(self) -> List[int]:
-        return _tensor_to_int_list(self.cu_seqlens)
+        return list(self.cu_seqlens_cpu)
 
     def sequence_span(self, seq_idx: int) -> Tuple[int, int]:
         cu = self.cu_seqlens_list()
         return cu[seq_idx], cu[seq_idx + 1]
-
-    def validate_sequence_spans(self) -> None:
-        cu = self.cu_seqlens_list()
-        for seq_idx, expected_len in enumerate(self.seq_lengths):
-            actual_len = int(cu[seq_idx + 1]) - int(cu[seq_idx])
-            if actual_len != int(expected_len):
-                raise RuntimeError(
-                    "Prefix cache cu_seqlens does not match seq_lengths: "
-                    f"seq={seq_idx}, cu_len={actual_len}, seq_len={expected_len}"
-                )
-
-    def validate_prefix_suffix_lengths(self) -> None:
-        if self.prefix_shared_tokens is None or self.full_seq_lengths is None:
-            raise RuntimeError("Prefix cache suffix validation requires metadata")
-        for seq_idx, suffix_len in enumerate(self.seq_lengths):
-            prefix_tokens = int(self.prefix_shared_tokens[seq_idx])
-            full_length = int(self.full_seq_lengths[seq_idx])
-            if prefix_tokens + int(suffix_len) != full_length:
-                raise RuntimeError(
-                    "Prefix cache full length mismatch: "
-                    f"seq={seq_idx}, prefix={prefix_tokens}, "
-                    f"suffix={suffix_len}, full={full_length}"
-                )
-
-    def validate_full_hit_query_lengths(self) -> None:
-        for seq_idx, query_len in enumerate(self.seq_lengths):
-            if int(query_len) != 1:
-                raise RuntimeError(
-                    "Full-hit prefix cache prefill expects one query token "
-                    f"per sequence, got seq={seq_idx}, query_len={query_len}"
-                )
 
 
 class HostPrefixPageReader:

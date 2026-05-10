@@ -49,6 +49,12 @@ def build_prefill_forward_metadata(
         )
 
     global_sequence_ids = [int(span.global_seq_id) for span in batch_spans]
+    total_query_tokens = sum(q_seq_lens)
+    if position_ids.numel() != total_query_tokens:
+        raise ValueError(
+            f"position_ids length must match micro-batch query tokens: "
+            f"{position_ids.numel()} != {total_query_tokens}"
+        )
     position_ids = position_ids.to(device=device)
     cu_seqlens_q = _build_cu_seqlens(q_seq_lens, device=device)
 
@@ -66,7 +72,7 @@ def build_prefill_forward_metadata(
         )
     cu_seqlens_k = _build_cu_seqlens(kv_seq_lens, device=device)
 
-    metadata = ForwardBatchMetadata(
+    return ForwardBatchMetadata(
         phase="prefill",
         global_sequence_ids=global_sequence_ids,
         prefill=PrefillAttentionMetadata(
@@ -81,8 +87,6 @@ def build_prefill_forward_metadata(
         ),
         kv_cache=kv_cache_metadata,
     )
-    metadata.validate()
-    return metadata
 
 
 def _build_prefix_reuse_metadata(

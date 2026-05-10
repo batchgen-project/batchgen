@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Sequence, Tuple
 
 import torch
 
@@ -170,21 +170,27 @@ def _run_projected_mla_prefix_attention_normalized(
     attention_fn: PrefixMlaAttentionFn | None = None,
 ) -> torch.Tensor:
     if metadata.full_hit_mode:
-        compressed_kv, cu_k, _ = prefix_kv_builder.build_mla_full_hit_kv(
+        compressed_kv, _, _ = prefix_kv_builder.build_mla_full_hit_kv(
             metadata=metadata,
             kv_dim=spec.kv_dim,
             dtype=query_states.dtype,
             device=query_states.device,
         )
+        if metadata.full_seq_lengths is None:
+            raise RuntimeError("MLA full-hit replay requires full sequence lengths")
+        cu_k_values = _build_cu_seqlens_values(metadata.full_seq_lengths)
         query_len = 1
     elif metadata.prefix_reuse_mode:
         if offload_kv is None:
             raise RuntimeError("MLA prefix replay requires suffix KV")
-        compressed_kv, cu_k, _ = prefix_kv_builder.build_mla_prefix_kv(
+        compressed_kv, _, _ = prefix_kv_builder.build_mla_prefix_kv(
             key=offload_kv,
             metadata=metadata,
             kv_dim=spec.kv_dim,
         )
+        if metadata.full_seq_lengths is None:
+            raise RuntimeError("MLA prefix replay requires full sequence lengths")
+        cu_k_values = _build_cu_seqlens_values(metadata.full_seq_lengths)
         query_len = int(metadata.max_seqlen)
     else:
         if offload_kv is None:
@@ -192,12 +198,12 @@ def _run_projected_mla_prefix_attention_normalized(
         compressed_kv = offload_kv
         if compressed_kv.dim() == 2:
             compressed_kv = compressed_kv.unsqueeze(1)
-        cu_k = metadata.cu_seqlens.to(compressed_kv.device)
+        cu_k_values = metadata.cu_seqlens_list()
         query_len = int(metadata.max_seqlen)
 
     blocked_k, block_table, cache_seqlens = block_mla_kv_by_sequence(
         compressed_kv=compressed_kv,
-        cu_k=cu_k,
+        cu_k_values=cu_k_values,
         page_size=page_size,
     )
     attention_fn = attention_fn or run_flash_mla_prefix_attention
@@ -248,7 +254,7 @@ def run_flash_mla_prefix_attention(
 def block_mla_kv_by_sequence(
     *,
     compressed_kv: torch.Tensor,
-    cu_k: torch.Tensor,
+    cu_k_values: Sequence[int],
     page_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert packed per-sequence MLA KV into FlashMLA page blocks."""
@@ -258,7 +264,7 @@ def block_mla_kv_by_sequence(
             f"{tuple(compressed_kv.shape)}"
         )
     page_size = int(page_size)
-    cu_values = [int(value) for value in cu_k.detach().cpu().tolist()]
+    cu_values = [int(value) for value in cu_k_values]
     if len(cu_values) < 2:
         raise RuntimeError("MLA blocked KV build requires at least one sequence")
 
@@ -320,3 +326,12 @@ def block_mla_kv_by_sequence(
         device=compressed_kv.device,
     )
     return blocked_k, block_table, cache_seqlens
+
+
+def _build_cu_seqlens_values(seq_lengths: Sequence[int]) -> list[int]:
+    values = [0]
+    running = 0
+    for length in seq_lengths:
+        running += int(length)
+        values.append(running)
+    return values

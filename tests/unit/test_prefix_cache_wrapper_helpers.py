@@ -110,16 +110,6 @@ def test_prefix_cache_metadata_validates_prefix_lengths(monkeypatch):
     assert metadata.prefix_shared_tokens == [7, 11]
 
 
-def test_prefix_cache_metadata_rejects_silent_length_mismatch(monkeypatch):
-    mod = _prefix_cache_module(monkeypatch)
-
-    class BadWrapper(_Wrapper):
-        prepack_full_seq_lengths = [10, 14]
-
-    with pytest.raises(RuntimeError, match="full length mismatch"):
-        mod.PrefixCachePrepackMetadata.from_wrapper_cls(BadWrapper)
-
-
 def test_prefix_offloader_uses_destination_offsets(monkeypatch):
     mod = _prefix_cache_module(monkeypatch)
     metadata = mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)

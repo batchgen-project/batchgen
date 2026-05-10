@@ -53,6 +53,7 @@ def _metadata(
         full_lengths = [5] if prefix_reuse else None
     return PrefixCachePrepackMetadata(
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=[int(value) for value in cu_seqlens.tolist()],
         max_seqlen=max_seqlen,
         num_sequences=1,
         seq_lengths=seq_lengths,
@@ -99,67 +100,41 @@ def test_gqa_backend_no_prefix_uses_query_cu_seqlens_for_kv():
     assert recorded["max_seqlen_k"] == 2
 
 
-def test_gqa_backend_prefix_reuse_uses_prefix_kv_builder():
-    recorded = {}
-
-    def attention_fn(**kwargs):
-        recorded.update(kwargs)
-        return kwargs["q"], None
-
+def test_gqa_backend_prefix_reuse_requires_gpu_materialization():
     builder = _FakePrefixKvBuilder()
     backend = GqaPrefixAwareAttentionBackend(
         prefix_kv_builder=builder,
         num_kv_heads=1,
         head_dim=2,
-        attention_fn=attention_fn,
     )
     query = torch.zeros((2, 2, 2))
     key = torch.ones((2, 1, 2))
     value = key + 10
 
-    backend.forward_prefill(
-        query=query,
-        key=key,
-        value=value,
-        metadata=_metadata(prefix_reuse=True),
-    )
-
-    assert len(builder.prefix_calls) == 1
-    assert recorded["k"].shape == (5, 1, 2)
-    assert recorded["v"].shape == (5, 1, 2)
-    assert recorded["cu_seqlens_k"].tolist() == [0, 5]
-    assert recorded["max_seqlen_k"] == 5
+    with pytest.raises(RuntimeError, match="GPU paged materialization"):
+        backend.forward_prefill(
+            query=query,
+            key=key,
+            value=value,
+            metadata=_metadata(prefix_reuse=True),
+        )
 
 
-def test_gqa_backend_full_hit_uses_full_hit_kv_builder():
-    recorded = {}
-
-    def attention_fn(**kwargs):
-        recorded.update(kwargs)
-        return kwargs["q"], None
-
+def test_gqa_backend_full_hit_requires_gpu_materialization():
     builder = _FakePrefixKvBuilder()
     backend = GqaPrefixAwareAttentionBackend(
         prefix_kv_builder=builder,
         num_kv_heads=1,
         head_dim=2,
-        attention_fn=attention_fn,
     )
 
-    backend.forward_prefill(
-        query=torch.zeros((1, 2, 2)),
-        key=torch.ones((1, 1, 2)),
-        value=torch.ones((1, 1, 2)),
-        metadata=_metadata(full_hit=True),
-    )
-
-    assert len(builder.full_hit_calls) == 1
-    assert recorded["k"].shape == (4, 1, 2)
-    assert recorded["v"].shape == (4, 1, 2)
-    assert recorded["cu_seqlens_q"].tolist() == [0, 1]
-    assert recorded["cu_seqlens_k"].tolist() == [0, 4]
-    assert recorded["max_seqlen_q"] == 1
-    assert recorded["max_seqlen_k"] == 4
+    with pytest.raises(RuntimeError, match="GPU paged materialization"):
+        backend.forward_prefill(
+            query=torch.zeros((1, 2, 2)),
+            key=torch.ones((1, 1, 2)),
+            value=torch.ones((1, 1, 2)),
+            metadata=_metadata(full_hit=True),
+        )
 
 
 def test_gqa_backend_missing_value_raises():

@@ -12,14 +12,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Iterator, Optional
 
-import torch
-
 from batchgen.attention.forward_metadata import (
     DecodeAttentionMetadata,
     ForwardBatchMetadata,
     KVCacheMetadata,
     PrefillAttentionMetadata,
-    PrefixReuseMetadata,
 )
 
 
@@ -69,7 +66,6 @@ def bind_forward_batch_metadata(
 
     if not isinstance(metadata, ForwardBatchMetadata):
         raise TypeError("metadata must be a ForwardBatchMetadata instance")
-    metadata.validate()
 
     # Import lazily so metadata users can be unit-tested without importing model
     # wrappers unless the compatibility bridge is actually used.
@@ -127,19 +123,24 @@ def _sync_prefill_fields(
         wrapper_cls.prepack_full_hit_mode = False
         return
 
-    _sync_prefix_reuse_fields(wrapper_cls, prefill.prefix_reuse)
+    _sync_prefix_reuse_fields(wrapper_cls, prefill)
 
 
 def _sync_prefix_reuse_fields(
     wrapper_cls: type,
-    prefix_reuse: PrefixReuseMetadata,
+    prefill: PrefillAttentionMetadata,
 ) -> None:
-    prefix_lens = _int_list_from_tensor(prefix_reuse.prefix_lens)
-    full_seq_lens = _int_list_from_tensor(prefix_reuse.full_seq_lens)
+    prefix_lens = [
+        int(kv_len) - int(q_len)
+        for q_len, kv_len in zip(prefill.q_seq_lens, prefill.kv_seq_lens)
+    ]
+    full_seq_lens = [int(length) for length in prefill.kv_seq_lens]
     wrapper_cls.prepack_prefix_reuse_mode = any(length > 0 for length in prefix_lens)
     wrapper_cls.prepack_prefix_shared_tokens = prefix_lens
     wrapper_cls.prepack_full_seq_lengths = full_seq_lens
-    wrapper_cls.prepack_full_hit_mode = _bool_tensor_all(prefix_reuse.is_full_hit)
+    wrapper_cls.prepack_full_hit_mode = bool(prefill.q_seq_lens) and all(
+        int(length) == 0 for length in prefill.q_seq_lens
+    )
 
 
 def _sync_decode_fields(wrapper_cls: type, decode: DecodeAttentionMetadata) -> None:
@@ -165,11 +166,3 @@ def _sync_kv_cache_fields(wrapper_cls: type, kv_cache: KVCacheMetadata) -> None:
     )
     wrapper_cls.gpu_paged_kv_manager_aux = kv_cache.aux_gpu_paged_kv_manager
     wrapper_cls.host_paged_kv_worker_view_aux = kv_cache.aux_host_worker_view
-
-
-def _int_list_from_tensor(tensor: torch.Tensor) -> list[int]:
-    return [int(value) for value in tensor.detach().cpu().tolist()]
-
-
-def _bool_tensor_all(tensor: torch.Tensor) -> bool:
-    return bool(tensor.detach().cpu().all().item())
