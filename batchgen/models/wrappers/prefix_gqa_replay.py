@@ -31,10 +31,17 @@ def run_prefix_gqa_prefill_attention(
     spec: GqaReplaySpec,
 ) -> torch.Tensor:
     """Run GQA prefill attention with optional cached prefix K/V."""
+    from batchgen.attention.forward_metadata_context import (
+        get_current_forward_batch_metadata,
+    )
     from batchgen.attention.prefix_aware_backend import (
         GqaPrefixAwareAttentionBackend,
     )
 
+    forward_metadata = get_current_forward_batch_metadata()
+    kv_cache_metadata = (
+        None if forward_metadata is None else forward_metadata.kv_cache
+    )
     backend = GqaPrefixAwareAttentionBackend(
         prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
         num_kv_heads=spec.num_kv_heads,
@@ -48,4 +55,5 @@ def run_prefix_gqa_prefill_attention(
         key=key,
         value=value,
         metadata=metadata,
+        kv_cache_metadata=kv_cache_metadata,
     )

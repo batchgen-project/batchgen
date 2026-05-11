@@ -5,11 +5,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from batchgen.attention.forward_metadata import (
+    ForwardBatchMetadata,
+    KVCacheMetadata,
+    PrefillAttentionMetadata,
+)
+from batchgen.attention.forward_metadata_context import bind_forward_batch_metadata
 from batchgen.attention.prefix_aware_backend import (
     GqaPrefixAwareAttentionBackend,
     MlaProjectedPrefixAwareAttentionBackend,
 )
 from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
+from batchgen.models.wrappers.prefix_gqa_replay import (
+    GqaReplaySpec,
+    run_prefix_gqa_prefill_attention,
+)
 
 
 class _FakePrefixKvBuilder:
@@ -138,6 +148,61 @@ def test_gqa_backend_full_hit_requires_gpu_materialization():
             value=torch.ones((1, 1, 2)),
             metadata=_metadata(full_hit=True),
         )
+
+
+class _FakeGqaReplayWrapper:
+    def __init__(self, builder):
+        self._builder = builder
+
+    def prefix_attention_kv_builder(self):
+        return self._builder
+
+
+def test_gqa_replay_passes_bound_kv_cache_metadata(monkeypatch):
+    recorded = {}
+
+    def fake_forward_prefill(self, **kwargs):
+        recorded.update(kwargs)
+        return kwargs["query"]
+
+    monkeypatch.setattr(
+        GqaPrefixAwareAttentionBackend,
+        "forward_prefill",
+        fake_forward_prefill,
+    )
+    kv_cache = KVCacheMetadata(
+        prefill_prefix_materialization=object(),
+    )
+    forward_metadata = ForwardBatchMetadata(
+        phase="prefill",
+        global_sequence_ids=[100],
+        prefill=PrefillAttentionMetadata(
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 5], dtype=torch.int32),
+            max_seqlen_q=2,
+            max_seqlen_k=5,
+            q_seq_lens=[2],
+            kv_seq_lens=[5],
+            position_ids=torch.tensor([3, 4], dtype=torch.int64),
+        ),
+        kv_cache=kv_cache,
+    )
+    query = torch.zeros((2, 2, 2))
+    key = torch.ones((2, 1, 2))
+    value = key + 10
+
+    with bind_forward_batch_metadata(forward_metadata):
+        output = run_prefix_gqa_prefill_attention(
+            wrapper=_FakeGqaReplayWrapper(_FakePrefixKvBuilder()),
+            query=query,
+            key=key,
+            value=value,
+            metadata=_metadata(prefix_reuse=True),
+            spec=GqaReplaySpec(num_kv_heads=1, head_dim=2),
+        )
+
+    assert output is query
+    assert recorded["kv_cache_metadata"] is kv_cache
 
 
 def test_gqa_backend_missing_value_raises():
