@@ -47,7 +47,10 @@ if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
     die "GitHub release already exists: $RELEASE_TAG"
 fi
 
-mapfile -t LOCAL_WHEELS < <(python3 - "$PLAN_FILE" <<'PY'
+LOCAL_WHEELS=()
+while IFS= read -r wheel_path; do
+    [[ -n "$wheel_path" ]] && LOCAL_WHEELS+=("$wheel_path")
+done < <(python3 - "$PLAN_FILE" <<'PY'
 import glob
 import json
 import os
