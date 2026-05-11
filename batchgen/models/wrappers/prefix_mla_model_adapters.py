@@ -47,6 +47,7 @@ class MlaPrefixBackendContext:
     suffix_query_builder: ProjectedQueryBuilder
     full_hit_query_builder: ProjectedQueryBuilder
     output_projection: OutputProjector
+    prefill_prefix_materialization: object | None = None
 
     @property
     def prefix_reuse_mode(self) -> bool:
@@ -82,6 +83,7 @@ class MlaPrefixBackendContext:
             metadata=self.metadata,
             spec=self.spec,
             output_projection=self.output_projection,
+            prefill_prefix_materialization=self.prefill_prefix_materialization,
         )
 
     def run_full_hit_prefill(self, projection: object) -> torch.Tensor:
@@ -91,6 +93,7 @@ class MlaPrefixBackendContext:
             metadata=self.metadata,
             spec=self.spec,
             output_projection=self.output_projection,
+            prefill_prefix_materialization=self.prefill_prefix_materialization,
         )
 
 
@@ -132,6 +135,7 @@ def build_kimi_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
         spec=_mla_replay_spec(wrapper),
+        prefill_prefix_materialization=_prefill_prefix_materialization(wrapper),
         suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
             q_nope=projection.q_nope,
             q_pe=projection.q_pe,
@@ -183,6 +187,10 @@ def _mla_replay_spec(wrapper: object) -> MlaReplaySpec:
     )
 
 
+def _prefill_prefix_materialization(wrapper: object) -> object | None:
+    return getattr(wrapper, "prefill_prefix_materialization", None)
+
+
 def _build_w8a16_prefix_backend_context(
     *,
     wrapper: object,
@@ -194,6 +202,7 @@ def _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
         spec=_mla_replay_spec(wrapper),
+        prefill_prefix_materialization=_prefill_prefix_materialization(wrapper),
         suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
             q_nope=projection.q_nope,
             q_pe=projection.q_pe,

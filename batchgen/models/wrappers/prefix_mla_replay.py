@@ -69,18 +69,30 @@ def run_prefix_mla_suffix_prefill_with_projected(
     metadata: PrefixCachePrepackMetadata,
     spec: MlaReplaySpec,
     output_projection: OutputProjectMlaFn,
+    prefill_prefix_materialization: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill from already projected suffix Q/KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
 
-    attn_out = _run_projected_mla_prefix_attention_normalized(
-        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
-        query_states=query_states,
-        offload_kv=offload_kv,
-        metadata=metadata,
-        spec=spec,
-        page_size=wrapper.host_prefix_reader().page_size(),
-    )
+    prefix_kv_builder = wrapper.prefix_attention_kv_builder()
+    if prefill_prefix_materialization is not None:
+        attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
+            prefix_kv_builder=prefix_kv_builder,
+            query_states=query_states,
+            offload_kv=offload_kv,
+            metadata=metadata,
+            spec=spec,
+            materialization=prefill_prefix_materialization,
+        )
+    else:
+        attn_out = _run_projected_mla_prefix_attention_normalized(
+            prefix_kv_builder=prefix_kv_builder,
+            query_states=query_states,
+            offload_kv=offload_kv,
+            metadata=metadata,
+            spec=spec,
+            page_size=wrapper.host_prefix_reader().page_size(),
+        )
     return output_projection(attn_out), offload_kv
 
 
@@ -120,18 +132,30 @@ def run_prefix_mla_full_hit_prefill_with_query(
     metadata: PrefixCachePrepackMetadata,
     spec: MlaReplaySpec,
     output_projection: OutputProjectMlaFn,
+    prefill_prefix_materialization: object | None = None,
 ) -> torch.Tensor:
     """Run exact full-hit MLA prefill from already projected query states."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
 
-    attn_out = _run_projected_mla_prefix_attention_normalized(
-        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
-        query_states=query_states,
-        offload_kv=None,
-        metadata=metadata,
-        spec=spec,
-        page_size=wrapper.host_prefix_reader().page_size(),
-    )
+    prefix_kv_builder = wrapper.prefix_attention_kv_builder()
+    if prefill_prefix_materialization is not None:
+        attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
+            prefix_kv_builder=prefix_kv_builder,
+            query_states=query_states,
+            offload_kv=None,
+            metadata=metadata,
+            spec=spec,
+            materialization=prefill_prefix_materialization,
+        )
+    else:
+        attn_out = _run_projected_mla_prefix_attention_normalized(
+            prefix_kv_builder=prefix_kv_builder,
+            query_states=query_states,
+            offload_kv=None,
+            metadata=metadata,
+            spec=spec,
+            page_size=wrapper.host_prefix_reader().page_size(),
+        )
     return output_projection(attn_out)
 
 
@@ -144,10 +168,21 @@ def run_projected_mla_prefix_attention(
     spec: MlaReplaySpec,
     page_size: int,
     attention_fn: PrefixMlaAttentionFn | None = None,
+    prefill_prefix_materialization: object | None = None,
 ) -> torch.Tensor:
     """Run MLA prefix/no-prefix attention from projected query and compressed KV."""
 
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    if prefill_prefix_materialization is not None:
+        return run_projected_mla_prefix_attention_from_gpu_pages(
+            prefix_kv_builder=prefix_kv_builder,
+            query_states=query_states,
+            offload_kv=offload_kv,
+            metadata=metadata,
+            spec=spec,
+            materialization=prefill_prefix_materialization,
+            attention_fn=attention_fn,
+        )
     return _run_projected_mla_prefix_attention_normalized(
         prefix_kv_builder=prefix_kv_builder,
         query_states=query_states,
@@ -156,6 +191,64 @@ def run_projected_mla_prefix_attention(
         spec=spec,
         page_size=page_size,
         attention_fn=attention_fn,
+    )
+
+
+def run_projected_mla_prefix_attention_from_gpu_pages(
+    *,
+    prefix_kv_builder: object,
+    query_states: torch.Tensor,
+    offload_kv: torch.Tensor | None,
+    metadata: PrefixCachePrepackMetadata,
+    spec: MlaReplaySpec,
+    materialization: object,
+    attention_fn: PrefixMlaAttentionFn | None = None,
+) -> torch.Tensor:
+    """Run MLA prefix/full-hit attention from materialized GPU compressed KV."""
+
+    metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    manager = materialization.manager
+    if manager.config.has_v_cache:
+        raise RuntimeError(
+            "MLA GPU prefix materialization requires K-only compressed KV pages"
+        )
+
+    materialization.wait_for_load()
+    layer_idx = int(prefix_kv_builder.reader.layer_idx)
+
+    if metadata.full_hit_mode:
+        query_len = 1
+    elif metadata.prefix_reuse_mode:
+        if offload_kv is None:
+            raise RuntimeError("MLA GPU prefix replay requires suffix KV")
+        manager.append_layer_prefill_suffix_tokens(
+            k_tensor=offload_kv,
+            v_tensor=None,
+            append_plan=materialization.append_plan,
+            layer_idx=layer_idx,
+        )
+        query_len = int(metadata.max_seqlen)
+    else:
+        raise RuntimeError(
+            "MLA GPU prefix materialization requires prefix reuse or full hit"
+        )
+
+    blocked_k, blocked_v, block_table = manager.get_layer_kv_with_page_table(
+        layer_idx
+    )
+    if blocked_v is not None:
+        raise RuntimeError("MLA GPU prefix materialization unexpectedly has V cache")
+    if block_table is None:
+        raise RuntimeError("MLA GPU prefix materialization requires page table")
+
+    attention_fn = attention_fn or run_flash_mla_prefix_attention
+    return attention_fn(
+        query_states=query_states,
+        blocked_k=blocked_k,
+        block_table=block_table,
+        cache_seqlens=materialization.append_plan.cache_seqlens,
+        query_len=query_len,
+        spec=spec,
     )
 
 

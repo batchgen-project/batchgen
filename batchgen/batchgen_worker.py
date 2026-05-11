@@ -2946,18 +2946,13 @@ class BatchGenWorker:
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
 		)
-		if not gpu_config.has_v_cache:
-			raise RuntimeError(
-				"Scoped prefix GPU materialization is only valid for GQA/MHA "
-				"models with separate V cache; MLA prefix replay reads "
-				"compressed KV from host directly"
-			)
 		logging.info(
 			"Rank %s creating scoped prefix GPUPagedKVCacheManager on %s "
-			"with %d pages",
+			"with %d pages (%s)",
 			self.rank,
 			self.local_rank,
 			gpu_config.num_pages,
+			"K/V" if gpu_config.has_v_cache else "K-only",
 		)
 		manager = GPUPagedKVCacheManager(
 			config=gpu_config,
@@ -2972,16 +2967,15 @@ class BatchGenWorker:
 	) -> bool:
 		"""Return whether prefix replay needs a scoped GPU paged KV manager.
 
-		GQA/MHA prefix replay consumes paged K/V directly, so cached pages must be
-		materialized into a temporary GPU paged manager. MLA prefix replay builds
-		compressed-KV tensors from host cache through the model wrapper and does
-		not consume this manager; creating it for DSA primary/aux models would be
-		both unnecessary and incorrect.
+		Registered prefix-reuse models consume a scoped GPU materialization in
+		their attention backend. GQA/MHA backends interpret it as paged K/V,
+		while MLA backends interpret it as paged compressed K-only KV.
 		"""
-		return build_gpu_kv_config(
+		build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=sequence_tokens,
-		).has_v_cache
+		)
+		return True
 
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
 		"""Allocate GPU KV pages and load host-resident KV for the batch."""

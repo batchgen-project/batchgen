@@ -243,7 +243,11 @@ class MlaProjectedPrefixAwareAttentionBackend:
             run_projected_mla_prefix_attention,
         )
 
-        del kv_cache_metadata
+        materialization = (
+            getattr(kv_cache_metadata, "prefill_prefix_materialization", None)
+            if kv_cache_metadata is not None
+            else None
+        )
 
         spec = MlaReplaySpec(
             kv_dim=int(self.kv_dim),
@@ -259,6 +263,7 @@ class MlaProjectedPrefixAwareAttentionBackend:
             spec=spec,
             page_size=int(self.page_size),
             attention_fn=self.attention_fn,
+            prefill_prefix_materialization=materialization,
         )
         if self.output_projection is None:
             return attn_out

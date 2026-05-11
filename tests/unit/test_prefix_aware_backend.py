@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ class _FakePrefixKvBuilder:
     def __init__(self):
         self.prefix_calls = []
         self.full_hit_calls = []
+        self.reader = SimpleNamespace(layer_idx=2)
 
     def build_gqa_prefix_kv(self, **kwargs):
         self.prefix_calls.append(kwargs)
@@ -201,3 +204,75 @@ def test_mla_backend_prefix_reuse_uses_host_replay_path():
     torch.testing.assert_close(output, query + 2)
     assert recorded["blocked_k"].shape == (2, 4, 1, 3)
     assert recorded["cache_seqlens"].tolist() == [5]
+
+
+class _FakeMlaMaterializedManager:
+    def __init__(self):
+        self.config = SimpleNamespace(has_v_cache=False)
+        self.blocked_k = torch.zeros((3, 4, 1, 3))
+        self.block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        self.append_calls = []
+
+    def append_layer_prefill_suffix_tokens(self, **kwargs):
+        self.append_calls.append(kwargs)
+
+    def get_layer_kv_with_page_table(self, layer_idx):
+        assert layer_idx == 2
+        return self.blocked_k, None, self.block_table
+
+
+class _FakeMlaMaterialization:
+    def __init__(self):
+        self.manager = _FakeMlaMaterializedManager()
+        self.append_plan = SimpleNamespace(
+            cache_seqlens=torch.tensor([5], dtype=torch.int32)
+        )
+        self.waited = False
+
+    def wait_for_load(self):
+        self.waited = True
+
+
+def test_mla_backend_prefix_reuse_uses_gpu_materialization():
+    recorded = {}
+
+    def attention_fn(**kwargs):
+        recorded.update(kwargs)
+        return kwargs["query_states"] + 3
+
+    builder = _FakePrefixKvBuilder()
+    materialization = _FakeMlaMaterialization()
+    backend = MlaProjectedPrefixAwareAttentionBackend(
+        prefix_kv_builder=builder,
+        page_size=4,
+        kv_dim=3,
+        num_heads=2,
+        kv_lora_rank=1,
+        softmax_scale=0.5,
+        attention_fn=attention_fn,
+    )
+    query = torch.zeros((1, 2, 2, 3))
+    key = torch.ones((2, 3))
+
+    output = backend.forward_prefill(
+        query=query,
+        key=key,
+        value=None,
+        metadata=_metadata(prefix_reuse=True),
+        kv_cache_metadata=SimpleNamespace(
+            prefill_prefix_materialization=materialization
+        ),
+    )
+
+    torch.testing.assert_close(output, query + 3)
+    assert materialization.waited
+    assert len(materialization.manager.append_calls) == 1
+    append_call = materialization.manager.append_calls[0]
+    assert append_call["k_tensor"] is key
+    assert append_call["v_tensor"] is None
+    assert append_call["layer_idx"] == 2
+    assert builder.prefix_calls == []
+    assert recorded["blocked_k"] is materialization.manager.blocked_k
+    assert recorded["block_table"] is materialization.manager.block_table
+    assert recorded["cache_seqlens"].tolist() == [5]
+    assert recorded["query_len"] == 2
