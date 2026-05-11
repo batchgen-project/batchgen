@@ -27,7 +27,7 @@ def main():
     lines = []
     answers = {}
     for i in range(32):
-        q, opts, answer = QUESTIONS[i % len(QUESTIONS)]
+        q, opts, ans = QUESTIONS[i % len(QUESTIONS)]
         prompt = f"Answer with just the letter in parentheses. {q}\n{opts}"
         body = {
             "model": MODEL,
@@ -42,7 +42,7 @@ def main():
             "url": "/v1/chat/completions",
             "body": body,
         }))
-        answers[cid] = answer
+        answers[cid] = ans
 
     path = "/tmp/pool_quick_test.jsonl"
     with open(path, "w") as f:
