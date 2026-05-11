@@ -131,6 +131,7 @@ def cuda_wq_b_proj_out(
     x_scale: torch.Tensor,
     a_tma_desc: torch.Tensor,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer FP8 WGMMA q_b projection for CUDA graph capture."""
     if not q_a.is_contiguous():
@@ -139,17 +140,33 @@ def cuda_wq_b_proj_out(
     N = wq_b_weights.N
     _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
 
-    module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
-    module.indexer_kv_proj_gemm_only_out(
-        a_tma_desc,
-        wq_b_weights.tma_desc,
-        wq_b_weights.w_scale,
-        x_scale,
-        out,
-        B,
-        N,
-        K,
-    )
+    if num_valid_tokens is None:
+        module.run_act_quant(q_a, x_fp8_padded[:B], x_scale)
+    else:
+        module.run_act_quant_valid(q_a, x_fp8_padded[:B], x_scale, num_valid_tokens)
+    if num_valid_tokens is None:
+        module.indexer_kv_proj_gemm_only_out(
+            a_tma_desc,
+            wq_b_weights.tma_desc,
+            wq_b_weights.w_scale,
+            x_scale,
+            out,
+            B,
+            N,
+            K,
+        )
+    else:
+        module.indexer_kv_proj_gemm_only_valid_m_out(
+            a_tma_desc,
+            wq_b_weights.tma_desc,
+            wq_b_weights.w_scale,
+            x_scale,
+            out,
+            num_valid_tokens,
+            B,
+            N,
+            K,
+        )
     return out
 
 
@@ -278,6 +295,7 @@ def _fused_paged_score_with_slots_kernel(
     K_ptr,             # [num_pages, page_size, 1, head_dim] BF16
     BLOCK_TABLE_ptr,   # [num_slots, max_pages_per_seq] int32/int64
     SLOT_INDICES_ptr,  # [B] int32/int64
+    NUM_VALID_TOKENS_ptr,  # [1] int32, optional by HAS_VALID_TOKENS
     GATES_ptr,         # [B, n_heads] FP32
     SEQLENS_ptr,       # [B] int32
     AGG_ptr,           # [B, max_seqlen] FP32
@@ -287,6 +305,7 @@ def _fused_paged_score_with_slots_kernel(
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
     max_pages_per_seq: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -294,11 +313,21 @@ def _fused_paged_score_with_slots_kernel(
 
     pid_s = tl.program_id(0)
     pid_b = tl.program_id(1)
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.load(NUM_VALID_TOKENS_ptr)
+        if pid_b >= num_valid_tokens:
+            tl.store(
+                AGG_ptr + pid_b * max_seqlen + s_offs,
+                float("-inf") + tl.zeros([BLOCK_S], dtype=tl.float32),
+                mask=s_offs < max_seqlen,
+            )
+            return
+
     slot = tl.load(SLOT_INDICES_ptr + pid_b).to(tl.int64)
     slot_valid = slot >= 0
     safe_slot = tl.maximum(slot, 0)
 
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     seqlen = tl.load(SEQLENS_ptr + pid_b)
     s_mask = (s_offs < seqlen) & slot_valid
     page_in_range = s_offs < max_seqlen
@@ -347,8 +376,10 @@ def _fused_paged_score_with_slots_kernel(
 def _topk_from_scores_kernel(
     AGG_ptr,           # [B, max_seqlen] FP32
     OUT_ptr,           # [B, topk] int64/int32
+    NUM_VALID_TOKENS_ptr,  # [1] int32, optional by HAS_VALID_TOKENS
     max_seqlen: tl.constexpr,
     topk: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Select top-k indices from one row of scores.
@@ -362,6 +393,16 @@ def _topk_from_scores_kernel(
 
     pid_b = tl.program_id(0)
     offs = tl.arange(0, BLOCK_N)
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.load(NUM_VALID_TOKENS_ptr)
+        if pid_b >= num_valid_tokens:
+            tl.store(
+                OUT_ptr + pid_b * topk + offs,
+                -1,
+                mask=offs < topk,
+            )
+            return
+
     mask = offs < max_seqlen
     vals = tl.load(
         AGG_ptr + pid_b * max_seqlen + offs,
@@ -499,8 +540,10 @@ def fused_score_and_topk_out(
         _topk_from_scores_kernel[(B,)](
             agg,
             top_k_indices,
+            cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
+            HAS_VALID_TOKENS=False,
             BLOCK_N=block_n,
         )
 
@@ -588,8 +631,10 @@ def fused_paged_score_and_topk_out(
         _topk_from_scores_kernel[(B,)](
             agg,
             top_k_indices,
+            cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
+            HAS_VALID_TOKENS=False,
             BLOCK_N=block_n,
         )
     return top_k_indices
@@ -608,6 +653,7 @@ def fused_paged_score_and_topk_with_slots_out(
     topk: int = 2048,
     page_size: int = 64,
     max_seqlen: int | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer score+top-k from full aux page table plus slot indices."""
 
@@ -650,6 +696,15 @@ def fused_paged_score_and_topk_with_slots_out(
         )
     if top_k_indices.dtype not in (torch.int64, torch.int32):
         raise TypeError(f"top_k_indices must be int64 or int32, got {top_k_indices.dtype}")
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != q.device:
+            raise ValueError("num_valid_tokens must be on the same device as q")
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
 
     BLOCK_S = min(128, triton.next_power_of_2(max_seqlen))
     BLOCK_D = head_dim
@@ -659,6 +714,7 @@ def fused_paged_score_and_topk_with_slots_out(
         aux_blocked_k.reshape(-1, head_dim),
         aux_page_table,
         aux_slot_indices,
+        num_valid_tokens if num_valid_tokens is not None else cache_seqlens,
         head_gates,
         cache_seqlens,
         agg,
@@ -668,19 +724,22 @@ def fused_paged_score_and_topk_with_slots_out(
         head_dim=head_dim,
         page_size=page_size,
         max_pages_per_seq=aux_page_table.shape[1],
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
         BLOCK_S=BLOCK_S,
         BLOCK_D=BLOCK_D,
     )
 
     if topk == 2048 and top_k_indices.dtype == torch.int32:
-        fast_topk_2048_out(agg, cache_seqlens, top_k_indices)
+        fast_topk_2048_out(agg, cache_seqlens, top_k_indices, num_valid_tokens=num_valid_tokens)
     else:
         block_n = triton.next_power_of_2(max_seqlen)
         _topk_from_scores_kernel[(B,)](
             agg,
             top_k_indices,
+            num_valid_tokens if num_valid_tokens is not None else cache_seqlens,
             max_seqlen=max_seqlen,
             topk=topk,
+            HAS_VALID_TOKENS=num_valid_tokens is not None,
             BLOCK_N=block_n,
         )
     return top_k_indices

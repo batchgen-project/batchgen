@@ -268,14 +268,24 @@ __global__ void act_quant_kernel(
     const __nv_bfloat16* __restrict__ X,  // [B, K] BF16
     __nv_fp8_e4m3* __restrict__ X_fp8,    // [B, K] FP8
     float* __restrict__ X_scale,          // [B] FP32
-    int B, int K
+    const int* __restrict__ num_valid_tokens,  // optional device scalar
+    int B, int K, bool has_valid_tokens
 ) {
     const int row = blockIdx.x;
     if (row >= B) return;
 
     const int tid = threadIdx.x;
-    const __nv_bfloat16* row_ptr = X + row * K;
     __nv_fp8_e4m3* out_ptr = X_fp8 + row * K;
+    if (has_valid_tokens && row >= num_valid_tokens[0]) {
+        for (int i = tid; i < K; i += blockDim.x) {
+            reinterpret_cast<uint8_t*>(out_ptr)[i] =
+                __nv_cvt_float_to_fp8(0.0f, __NV_SATFINITE, __NV_E4M3);
+        }
+        if (tid == 0) X_scale[row] = 1e-12f;
+        return;
+    }
+
+    const __nv_bfloat16* row_ptr = X + row * K;
 
     // Find absmax across row
     float local_max = 0.0f;
@@ -319,6 +329,39 @@ __global__ void act_quant_kernel(
     }
 }
 
+__device__ __forceinline__ int clamp_valid_m(
+    const int* __restrict__ num_valid_m,
+    bool has_valid_m,
+    int B
+) {
+    int valid_m = B;
+    if (has_valid_m) valid_m = num_valid_m[0];
+    if (valid_m < 0) valid_m = 0;
+    if (valid_m > B) valid_m = B;
+    return valid_m;
+}
+
+__device__ __forceinline__ void zero_output_tile(
+    __nv_bfloat16* __restrict__ OUT,
+    int B,
+    int N,
+    int m_start,
+    int n_start,
+    int tid
+) {
+    const int total_elems = BLOCK_M * BLOCK_N;
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
+    for (int idx = tid; idx < total_elems; idx += THREADS) {
+        const int row = idx / BLOCK_N;
+        const int col = idx % BLOCK_N;
+        const int m_global = m_start + row;
+        const int n_global = n_start + col;
+        if (m_global < B && n_global < N) {
+            OUT[m_global * N + n_global] = zero;
+        }
+    }
+}
+
 // ============================================================================
 // Single-WG WGMMA Kernel — TMA both A and B
 // ============================================================================
@@ -329,6 +372,8 @@ indexer_kv_proj_kernel(
     const float* __restrict__ w_scale,         // [N/32, num_k_blocks] FP32
     const float* __restrict__ a_scale,         // [B] FP32 per-row act scale
     __nv_bfloat16* __restrict__ OUT,           // [B, N] BF16 output
+    const int* __restrict__ num_valid_m,       // optional [1] int32 device scalar
+    bool has_valid_m,
     int B, int K, int N
 ) {
     const int tid = threadIdx.x;
@@ -338,6 +383,11 @@ indexer_kv_proj_kernel(
     if (m_start >= B) return;
     const int n_start = n_tile * BLOCK_N;
     const int num_k_blocks = (K + BLOCK_K - 1) / BLOCK_K;
+    const int valid_m = clamp_valid_m(num_valid_m, has_valid_m, B);
+    if (m_start >= valid_m) {
+        zero_output_tile(OUT, B, N, m_start, n_start, tid);
+        return;
+    }
 
     // ── SMEM layout ──
     extern __shared__ __align__(128) char smem_buf[];
@@ -371,7 +421,7 @@ indexer_kv_proj_kernel(
     }
     // Load per-row activation scales
     for (int i = tid; i < BLOCK_M; i += THREADS) {
-        float s = (m_start + i < B) ? a_scale[m_start + i] : 0.0f;
+        float s = (m_start + i < valid_m) ? a_scale[m_start + i] : 0.0f;
         st_shared(&smem_ascale[i], s);
     }
     __syncthreads();
@@ -402,8 +452,8 @@ indexer_kv_proj_kernel(
 
     const int m_row_in_tile_0 = warp_in_wg * 16 + (lane_id / 4);
     const int m_row_in_tile_1 = m_row_in_tile_0 + 8;
-    const bool valid_0 = (m_start + m_row_in_tile_0 < B);
-    const bool valid_1 = (m_start + m_row_in_tile_1 < B);
+    const bool valid_0 = (m_start + m_row_in_tile_0 < valid_m);
+    const bool valid_1 = (m_start + m_row_in_tile_1 < valid_m);
 
     slot = 0;
     int full_phase = 0;
@@ -502,13 +552,19 @@ indexer_kv_proj_kernel(
         const int m_global = m_start + row;
 
         if (m_global < B && n_global + 1 < N) {
-            __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162*>(
-                &smem_out[row * BLOCK_N + col2 * 2]);
-            *reinterpret_cast<__nv_bfloat162*>(
-                &OUT[m_global * N + n_global]) = val;
+            if (m_global < valid_m) {
+                __nv_bfloat162 val = *reinterpret_cast<__nv_bfloat162*>(
+                    &smem_out[row * BLOCK_N + col2 * 2]);
+                *reinterpret_cast<__nv_bfloat162*>(
+                    &OUT[m_global * N + n_global]) = val;
+            } else {
+                OUT[m_global * N + n_global] = __float2bfloat16(0.0f);
+                OUT[m_global * N + n_global + 1] = __float2bfloat16(0.0f);
+            }
         } else if (m_global < B && n_global < N) {
-            OUT[m_global * N + n_global] =
-                smem_out[row * BLOCK_N + col2 * 2];
+            OUT[m_global * N + n_global] = (m_global < valid_m)
+                ? smem_out[row * BLOCK_N + col2 * 2]
+                : __float2bfloat16(0.0f);
         }
     }
 }
@@ -604,7 +660,28 @@ void run_act_quant(
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()),
         reinterpret_cast<__nv_fp8_e4m3*>(X_fp8.data_ptr()),
         X_scale.data_ptr<float>(),
-        B, K);
+        nullptr,
+        B, K, false);
+}
+
+void run_act_quant_valid(
+    torch::Tensor X,         // [B, K] BF16
+    torch::Tensor X_fp8,     // [B, K] FP8 (output)
+    torch::Tensor X_scale,   // [B] FP32 (output)
+    torch::Tensor num_valid_tokens  // [1] int32 device scalar
+) {
+    TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32, "num_valid_tokens must be int32");
+    TORCH_CHECK(num_valid_tokens.numel() == 1, "num_valid_tokens must contain one element");
+    at::cuda::CUDAGuard device_guard{X.device()};
+    int B = X.size(0);
+    int K = X.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    act_quant_kernel<<<B, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()),
+        reinterpret_cast<__nv_fp8_e4m3*>(X_fp8.data_ptr()),
+        X_scale.data_ptr<float>(),
+        num_valid_tokens.data_ptr<int>(),
+        B, K, true);
 }
 
 torch::Tensor indexer_kv_proj_forward(
@@ -634,6 +711,8 @@ torch::Tensor indexer_kv_proj_forward(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT_gemm.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     // RMSNorm
@@ -674,6 +753,8 @@ void indexer_kv_proj_forward_out(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT_gemm.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     rmsnorm_kernel<<<B, 128, 0, stream>>>(
@@ -709,6 +790,8 @@ torch::Tensor indexer_kv_proj_gemm_only(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        nullptr,
+        false,
         B, K, N);
 
     return OUT;
@@ -739,6 +822,42 @@ void indexer_kv_proj_gemm_only_out(
         w_scale.data_ptr<float>(),
         a_scale.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        nullptr,
+        false,
+        B, K, N);
+}
+
+void indexer_kv_proj_gemm_only_valid_m_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
+    torch::Tensor num_valid_m,
+    int B, int N, int K
+) {
+    TORCH_CHECK(num_valid_m.is_cuda(), "num_valid_m must be a CUDA tensor");
+    TORCH_CHECK(num_valid_m.dtype() == torch::kInt32, "num_valid_m must be int32");
+    TORCH_CHECK(num_valid_m.numel() == 1, "num_valid_m must contain one element");
+    at::cuda::CUDAGuard device_guard{OUT.device()};
+    const CUtensorMap* a_d = reinterpret_cast<const CUtensorMap*>(a_tma_desc.data_ptr());
+    const CUtensorMap* w_d = reinterpret_cast<const CUtensorMap*>(w_tma_desc.data_ptr());
+    int num_m_tiles = (B + BLOCK_M - 1) / BLOCK_M;
+    int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
+    dim3 grid(num_m_tiles, num_n_tiles);
+
+    constexpr int smem_bytes = TOTAL_SMEM_BYTES;
+    cudaFuncSetAttribute(indexer_kv_proj_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    indexer_kv_proj_kernel<<<grid, THREADS, smem_bytes, stream>>>(
+        a_d, w_d,
+        w_scale.data_ptr<float>(),
+        a_scale.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(OUT.data_ptr()),
+        num_valid_m.data_ptr<int>(),
+        true,
         B, K, N);
 }
 ''';
@@ -752,6 +871,10 @@ torch::Tensor create_tma_desc(
 
 void run_act_quant(
     torch::Tensor X, torch::Tensor X_fp8, torch::Tensor X_scale);
+
+void run_act_quant_valid(
+    torch::Tensor X, torch::Tensor X_fp8, torch::Tensor X_scale,
+    torch::Tensor num_valid_tokens);
 
 torch::Tensor indexer_kv_proj_forward(
     torch::Tensor a_tma_desc,
@@ -785,6 +908,15 @@ void indexer_kv_proj_gemm_only_out(
     torch::Tensor a_scale,
     torch::Tensor OUT,
     int B, int N, int K);
+
+void indexer_kv_proj_gemm_only_valid_m_out(
+    torch::Tensor a_tma_desc,
+    torch::Tensor w_tma_desc,
+    torch::Tensor w_scale,
+    torch::Tensor a_scale,
+    torch::Tensor OUT,
+    torch::Tensor num_valid_m,
+    int B, int N, int K);
 ''';
 
 
@@ -808,10 +940,12 @@ def build_module(num_stages=4):
         functions=[
             "create_tma_desc",
             "run_act_quant",
+            "run_act_quant_valid",
             "indexer_kv_proj_forward",
             "indexer_kv_proj_forward_out",
             "indexer_kv_proj_gemm_only",
             "indexer_kv_proj_gemm_only_out",
+            "indexer_kv_proj_gemm_only_valid_m_out",
         ],
         extra_cuda_cflags=[
             "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
@@ -969,6 +1103,7 @@ def cuda_wk_proj_gemm_only_out(
     x_scale: torch.Tensor,
     a_tma_desc: torch.Tensor,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous for graph-captured WK projection")
@@ -976,17 +1111,33 @@ def cuda_wk_proj_gemm_only_out(
     N = weights.N
     _validate_projection_out_buffers(B, K, N, x_fp8_padded, x_scale, out)
 
-    module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
-    module.indexer_kv_proj_gemm_only_out(
-        a_tma_desc,
-        weights.tma_desc,
-        weights.w_scale,
-        x_scale,
-        out,
-        B,
-        N,
-        K,
-    )
+    if num_valid_tokens is None:
+        module.run_act_quant(hidden_states, x_fp8_padded[:B], x_scale)
+    else:
+        module.run_act_quant_valid(hidden_states, x_fp8_padded[:B], x_scale, num_valid_tokens)
+    if num_valid_tokens is None:
+        module.indexer_kv_proj_gemm_only_out(
+            a_tma_desc,
+            weights.tma_desc,
+            weights.w_scale,
+            x_scale,
+            out,
+            B,
+            N,
+            K,
+        )
+    else:
+        module.indexer_kv_proj_gemm_only_valid_m_out(
+            a_tma_desc,
+            weights.tma_desc,
+            weights.w_scale,
+            x_scale,
+            out,
+            num_valid_tokens,
+            B,
+            N,
+            K,
+        )
     return out
 
 

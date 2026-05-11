@@ -2,7 +2,7 @@ import types
 
 import pytest
 
-from batchgen.cuda_graph.graph_manager import BatchSizeBucketing, CUDAGraphManager
+from batchgen.cuda_graph.graph_manager import BatchSizeBucketing, CapturedGraph, CUDAGraphManager
 
 
 def _make_uninitialized_manager(bucket_sizes, segment_names=("seg",)):
@@ -12,6 +12,8 @@ def _make_uninitialized_manager(bucket_sizes, segment_names=("seg",)):
     manager._segments = {name: object() for name in segment_names}
     manager._total_capture_time_ms = 0.0
     manager._is_captured = False
+    manager._memory_diag_enabled = False
+    manager._capture_memory_stats = []
     return manager
 
 
@@ -103,6 +105,41 @@ def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():
     assert not manager.is_captured
 
 
+def test_replay_auto_populates_num_valid_tokens_static_input():
+    import torch
+
+    manager = _make_uninitialized_manager([4])
+    static_inputs = {
+        "x": torch.full((4,), -9, dtype=torch.int32),
+        "num_valid_tokens": torch.full((1,), 4, dtype=torch.int32),
+    }
+    replay_observations = []
+
+    class FakeGraph:
+        def replay(self):
+            replay_observations.append(
+                (
+                    static_inputs["x"].clone(),
+                    static_inputs["num_valid_tokens"].clone(),
+                )
+            )
+
+    manager._graphs["seg"][4] = CapturedGraph(
+        bucket_size=4,
+        graph=FakeGraph(),
+        static_inputs=static_inputs,
+        static_outputs={"y": torch.arange(4, dtype=torch.int32)},
+        input_fill_values={"x": 0.0, "num_valid_tokens": 4.0},
+    )
+
+    result = manager.replay("seg", 2, x=torch.tensor([10, 11], dtype=torch.int32))
+
+    assert torch.equal(static_inputs["x"], torch.tensor([10, 11, 0, 0], dtype=torch.int32))
+    assert torch.equal(static_inputs["num_valid_tokens"], torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(replay_observations[0][1], torch.tensor([2], dtype=torch.int32))
+    assert torch.equal(result["y"], torch.tensor([0, 1], dtype=torch.int32))
+
+
 def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):
     import torch
 
@@ -142,3 +179,94 @@ def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):
 
     assert calls[0][0] == "init"
     assert all(torch.equal(call[1], torch.tensor([7, 7])) for call in calls)
+
+
+def test_capture_one_records_phase_memory_stats(monkeypatch):
+    import torch
+
+    manager = _make_uninitialized_manager([2])
+    manager.device = torch.device("cpu")
+    manager._pool = object()
+    manager._memory_diag_enabled = True
+
+    snapshots = [
+        {
+            "free_bytes": 1000,
+            "total_bytes": 2000,
+            "used_bytes": 1000,
+            "allocated_bytes": 100,
+            "reserved_bytes": 200,
+        },
+        {
+            "free_bytes": 900,
+            "total_bytes": 2000,
+            "used_bytes": 1100,
+            "allocated_bytes": 140,
+            "reserved_bytes": 260,
+        },
+        {
+            "free_bytes": 860,
+            "total_bytes": 2000,
+            "used_bytes": 1140,
+            "allocated_bytes": 150,
+            "reserved_bytes": 280,
+        },
+        {
+            "free_bytes": 840,
+            "total_bytes": 2000,
+            "used_bytes": 1160,
+            "allocated_bytes": 155,
+            "reserved_bytes": 280,
+        },
+        {
+            "free_bytes": 700,
+            "total_bytes": 2000,
+            "used_bytes": 1300,
+            "allocated_bytes": 180,
+            "reserved_bytes": 400,
+        },
+    ]
+
+    monkeypatch.setattr(manager, "_capture_memory_snapshot", lambda: snapshots.pop(0))
+
+    class Segment:
+        def get_static_input_specs(self, bucket_size):
+            from batchgen.cuda_graph.graph_manager import TensorSpec
+
+            return {"x": TensorSpec(("batch_size",), torch.float32)}
+
+        def setup_static_buffers(self, bucket_size):
+            pass
+
+        def initialize_static_inputs(self, static_inputs, bucket_size):
+            static_inputs["x"].fill_(1.0)
+
+        def forward(self, **inputs):
+            return {"y": inputs["x"] + 1.0}
+
+    class FakeGraph:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: FakeGraph())
+
+    manager._segments = {"seg": Segment()}
+    manager._graphs = {"seg": {}}
+    manager._capture_one("seg", manager._segments["seg"], 2)
+
+    stats = manager.get_capture_stats()["capture_memory_stats"]
+    assert len(stats) == 1
+    assert stats[0]["segment"] == "seg"
+    assert stats[0]["bucket_size"] == 2
+    assert [phase["phase"] for phase in stats[0]["phases"]] == [
+        "static_input_allocation",
+        "segment_setup",
+        "warmup",
+        "graph_capture",
+    ]
+    assert stats[0]["phases"][0]["delta"]["used_delta_bytes"] == 100
+    assert stats[0]["total_delta"]["used_delta_bytes"] == 300

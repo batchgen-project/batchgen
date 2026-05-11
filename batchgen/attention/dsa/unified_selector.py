@@ -35,6 +35,7 @@ def select_mla_kv_for_flashmla_bf16(
     page_size: int = 64,
     return_indices: bool = True,
     primary_slot_indices: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Select BF16 MLA KV for one dense FlashMLA call.
 
@@ -88,6 +89,7 @@ def select_mla_kv_for_flashmla_bf16(
         page_size,
         return_indices=return_indices,
         primary_slot_indices=primary_slot_indices,
+        num_valid_tokens=num_valid_tokens,
     )
 
 
@@ -105,6 +107,7 @@ def select_mla_kv_for_flashmla_bf16_out(
     index_topk: int = 2048,
     return_indices: bool = True,
     primary_slot_indices: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Out-buffer fused selector for CUDA graph capture."""
 
@@ -133,6 +136,7 @@ def select_mla_kv_for_flashmla_bf16_out(
         row_modes,
         return_indices=return_indices,
         primary_slot_indices=primary_slot_indices,
+        num_valid_tokens=num_valid_tokens,
     )
 
 

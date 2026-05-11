@@ -251,6 +251,7 @@ def per_token_blocked_quantize_bf16_to_fp8_flat(
 @triton.jit
 def _per_token_blocked_quantize_1d_kernel(
     q_ptr, scale_ptr, out_ptr,
+    num_valid_tokens_ptr,
     M,
     dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,       # 128 — fp8 blockwise scale block
@@ -259,6 +260,7 @@ def _per_token_blocked_quantize_1d_kernel(
     q_stride_m, q_stride_d,
     scale_stride_m, scale_stride_b,
     out_stride_m, out_stride_d,
+    HAS_VALID_TOKENS: tl.constexpr,
 ):
     """1 CTA per token. 2D tile [NUM_BLOCKS_P2, BLOCK_SIZE] loaded in one shot,
     per-block amax reduced along axis=1, then quantized + stored.
@@ -293,6 +295,17 @@ def _per_token_blocked_quantize_1d_kernel(
     out_stride_m_i64 = tl.cast(out_stride_m, tl.int64)
     scale_stride_m_i64 = tl.cast(scale_stride_m, tl.int64)
 
+    out_offsets = pid_m * out_stride_m_i64 + cols_2d * out_stride_d
+    block_valid = block_ids < NUM_BLOCKS
+    scale_offsets = pid_m * scale_stride_m_i64 + block_ids.to(tl.int64) * scale_stride_b
+
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.load(num_valid_tokens_ptr)
+        if pid_m >= num_valid_tokens:
+            tl.store(out_ptr + out_offsets, tl.zeros([NUM_BLOCKS_P2, BLOCK_SIZE], dtype=tl.float32), mask=col_mask)
+            tl.store(scale_ptr + scale_offsets, EPSILON + tl.zeros([NUM_BLOCKS_P2], dtype=tl.float32), mask=block_valid)
+            return
+
     q_offsets = pid_m * q_stride_m_i64 + cols_2d * q_stride_d
     q_bf16 = tl.load(q_ptr + q_offsets, mask=col_mask, other=0.0)
     q_float = q_bf16.to(tl.float32)
@@ -311,18 +324,17 @@ def _per_token_blocked_quantize_1d_kernel(
     is_finite = tl.abs(q_scaled) < 1e30
     q_scaled = tl.where(is_finite, q_scaled, 0.0)
 
-    out_offsets = pid_m * out_stride_m_i64 + cols_2d * out_stride_d
     tl.store(out_ptr + out_offsets, q_scaled, mask=col_mask)
 
     # Store scales, masking padded block rows.
-    block_valid = block_ids < NUM_BLOCKS
-    scale_offsets = pid_m * scale_stride_m_i64 + block_ids.to(tl.int64) * scale_stride_b
     tl.store(scale_ptr + scale_offsets, scale, mask=block_valid)
 
 
 def per_token_blocked_quantize_bf16_to_fp8_1d(
     x: torch.Tensor, block_size: int = 128,
     num_warps: int = 4, num_stages: int = 2,
+    num_valid_tokens: torch.Tensor | None = None,
+    scale_tma_aligned: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fast Triton 1D-grid variant: 1 CTA per token (matches the CUDA
     act_quant_3d kernel's partitioning). At M=100k, K=6144 this is ~3× faster
@@ -336,6 +348,15 @@ def per_token_blocked_quantize_bf16_to_fp8_1d(
     assert x.dtype == torch.bfloat16
     assert x.is_contiguous()
     assert x.dim() == 2, f"Expected 2D tensor got {x.dim()}D with shape {x.shape}"
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != x.device:
+            raise ValueError("num_valid_tokens must be on the same device as x")
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
 
     M, dim = x.shape
     num_blocks = (dim + block_size - 1) // block_size
@@ -345,15 +366,25 @@ def per_token_blocked_quantize_bf16_to_fp8_1d(
         num_blocks_p2 *= 2
 
     out = torch.empty((M, dim), device=x.device, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
+    if scale_tma_aligned:
+        aligned_m = ((M + 3) // 4) * 4
+        scale = torch.empty(
+            (num_blocks, aligned_m),
+            device=x.device,
+            dtype=torch.float32,
+        ).transpose(0, 1)[:M, :]
+    else:
+        scale = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
 
     grid = (M,)
     _per_token_blocked_quantize_1d_kernel[grid](
         x, scale, out,
+        num_valid_tokens if num_valid_tokens is not None else scale,
         M, dim, block_size, num_blocks, num_blocks_p2,
         x.stride(0), x.stride(1),
         scale.stride(0), scale.stride(1),
         out.stride(0), out.stride(1),
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
         num_warps=num_warps, num_stages=num_stages,
     )
     return out, scale

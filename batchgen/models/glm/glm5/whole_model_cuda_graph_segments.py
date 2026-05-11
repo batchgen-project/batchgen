@@ -113,6 +113,9 @@ class Glm5WholeModelSegment:
         missing = required - set(inputs)
         if missing:
             raise ValueError(f"missing GLM-5 whole-model capture inputs: {sorted(missing)}")
+        unknown = set(inputs) - required
+        if unknown:
+            raise ValueError(f"unknown GLM-5 whole-model capture inputs: {sorted(unknown)}")
         self._capture_inputs = dict(inputs)
 
     def initialize_static_inputs(
@@ -125,18 +128,44 @@ class Glm5WholeModelSegment:
                 "GLM-5 whole-model graph capture requires runtime inputs so warmup "
                 "does not mutate real KV cache with fill-value positions"
             )
+        input_specs = self.get_static_input_specs(bucket_size)
+        for name, target in static_inputs.items():
+            spec = input_specs.get(name)
+            if spec is not None:
+                target.fill_(spec.fill_value)
+
         for name, source in self._capture_inputs.items():
             target = static_inputs[name]
-            if source.shape[0] != target.shape[0]:
+            if name == "rank_token_counts":
+                if tuple(source.shape) != tuple(target.shape):
+                    raise ValueError(
+                        f"GLM-5 whole-model capture input {name} shape {tuple(source.shape)} "
+                        f"does not match static shape {tuple(target.shape)} for bucket {bucket_size}"
+                    )
+                target.copy_(source.to(device=target.device, dtype=target.dtype), non_blocking=True)
+                continue
+            if source.shape[0] > target.shape[0]:
                 raise ValueError(
-                    f"GLM-5 whole-model capture input {name} shape {tuple(source.shape)} "
-                    f"does not match static shape {tuple(target.shape)} for bucket {bucket_size}"
+                    f"GLM-5 whole-model capture input {name} batch dim {source.shape[0]} "
+                    f"exceeds static shape {tuple(target.shape)} for bucket {bucket_size}"
                 )
-            target.copy_(source.to(device=target.device, dtype=target.dtype), non_blocking=True)
+            if source.shape[1:] != target.shape[1:]:
+                raise ValueError(
+                    f"GLM-5 whole-model capture input {name} trailing shape "
+                    f"{tuple(source.shape[1:])} does not match static shape "
+                    f"{tuple(target.shape[1:])} for bucket {bucket_size}"
+                )
+            if source.shape[0] > 0:
+                target[: source.shape[0]].copy_(
+                    source.to(device=target.device, dtype=target.dtype),
+                    non_blocking=True,
+                )
         cache_seqlens = static_inputs.get("cache_seqlens")
-        if cache_seqlens is not None:
+        primary_slot_indices = static_inputs.get("primary_slot_indices")
+        if cache_seqlens is not None and primary_slot_indices is not None:
+            valid_rows = primary_slot_indices >= 0
             self._capture_dsa_short_count = int(
-                (cache_seqlens <= self.index_topk).sum().item()
+                ((cache_seqlens <= self.index_topk) & valid_rows).sum().item()
             )
 
     def setup_static_buffers(self, bucket_size: int) -> None:

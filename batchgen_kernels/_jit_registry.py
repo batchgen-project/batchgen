@@ -93,6 +93,7 @@ def get_registry():
                 "src/moe/routing/reduce_weighted_scatter.cu",
                 "src/moe/routing/router_epilogue.cu",
                 "src/moe/routing/gate_sigmoid_topk.cu",
+                "src/moe/routing/glm5_router_gemm.cu",
                 "src/moe/routing/fused_gate.cu",
             ],
             "nvcc_flags": [
