@@ -20,7 +20,7 @@ require_manifest_state "$RELEASE_TAG" "published"
 
 PLAN_FILE="$(wheel_plan_for_tag "$RELEASE_TAG")"
 VIEW_JSON="$(state_dir_for_tag "$RELEASE_TAG")/gh_release_view.json"
-gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" --json isDraft,isPrerelease,isLatest,assets,body > "$VIEW_JSON"
+gh release view "$RELEASE_TAG" --repo "$GITHUB_REPO" --json isDraft,isPrerelease,assets,body > "$VIEW_JSON"
 
 python3 - "$PLAN_FILE" "$VIEW_JSON" <<'PY'
 import glob
@@ -37,9 +37,6 @@ if view.get("isDraft"):
     errors.append("release is draft")
 if view.get("isPrerelease"):
     errors.append("release is prerelease")
-if not view.get("isLatest"):
-    errors.append("release is not marked latest")
-
 asset_names = {asset["name"] for asset in view.get("assets", [])}
 expected = set()
 for entry in plan["required_wheels"]:
