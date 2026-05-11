@@ -596,12 +596,10 @@ class BatchGenWorker:
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
-		if self.global_host_kv_cache_size_gb is None:
-			raise RuntimeError("Worker received no resolved host KV cache budget")
 
 		# DSA models: create DualHostKVCoordinator with proportional budget split.
 		# Non-DSA models get a single-view worker below.
-		host_budget_bytes = int(self.global_host_kv_cache_size_gb * (1024**3))
+		host_budget_bytes = int(args.global_host_kv_cache_size_gb * (1024**3))
 		dual_host = DualHostKVCoordinator.from_budget(
 			model_name=args.model_name,
 			host_kv_cache_size=host_budget_bytes,

@@ -591,12 +591,6 @@ class WorkerManager:
         # Auto-detect GPU architecture if not specified
         gpu_arch = self.args.gpu_arch or detect_gpu_arch()
 
-        host_kv_cache_size_gb = self.args_dict.get("host_kv_cache_size_per_rank")
-        if host_kv_cache_size_gb is None:
-            raise RuntimeError(
-                "Host KV cache budget was not configured before spawning workers"
-            )
-
         args = BatchGenWorkerArgs(
             model_name=self.args.model,
             hf_cache_dir=self.args.hf_cache_dir,
@@ -612,8 +606,10 @@ class WorkerManager:
             tensor_meta_shm_name=self.model_info["tensor_meta_shm_name"],
             enable_hugetlbfs=self.args.enable_hugetlbfs,
             weight_byte_size=self.model_info["parameter_server_size"],
-            host_kv_cache_size=host_kv_cache_size_gb,
-            global_host_kv_cache_size_gb=host_kv_cache_size_gb,
+            host_kv_cache_size=self.args_dict.get(
+                "host_kv_cache_size_per_rank"
+            ),
+            global_host_kv_cache_size_gb=self.args.host_kv_cache_size,
             skeleton_state_dict_file=self.skeleton_state_dict_file,
             # placeholders
             local_rank=-1,
