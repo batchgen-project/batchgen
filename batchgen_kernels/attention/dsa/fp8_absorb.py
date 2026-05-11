@@ -53,7 +53,8 @@ def _absorb_gemv_kernel(
 
     b_start = pid_b * BLOCK_B
     b_offs = b_start + tl.arange(0, BLOCK_B)
-    b_mask = b_offs < B
+    b_in_bounds = b_offs < B
+    b_mask = b_in_bounds
 
     n_start = pid_n * BLOCK_N
     n_offs = n_start + tl.arange(0, BLOCK_N)
@@ -127,6 +128,7 @@ def _absorb_fp8_wgmma_kernel(
     W_ptr,       # [H, N, K] FP8 E4M3 — pre-quantized weight (row-major: each row is K)
     W_scale_ptr, # [H, N_scale_blocks, K_scale_blocks] FP32 — per-block weight scales
     OUT_ptr,     # [B, H, N] BF16 — output
+    NUM_VALID_TOKENS_ptr,  # [1] int32, optional by HAS_VALID_TOKENS
     stride_xb,   # strides
     stride_xh,
     stride_wh,   # stride for W along H dim = N * K
@@ -139,6 +141,7 @@ def _absorb_fp8_wgmma_kernel(
     BLOCK_K: tl.constexpr,   # tile K for FP8 block quantization — 128
     BLOCK_N: tl.constexpr,   # tile N — 64 or 128
     FP8_MAX: tl.constexpr,   # 448.0 for E4M3
+    HAS_VALID_TOKENS: tl.constexpr,
 ):
     """FP8 WGMMA absorb kernel — quantizes activations on-the-fly.
 
@@ -158,7 +161,13 @@ def _absorb_fp8_wgmma_kernel(
 
     b_start = pid_b * BLOCK_B
     b_offs = b_start + tl.arange(0, BLOCK_B)
-    b_mask = b_offs < B
+    b_in_bounds = b_offs < B
+    b_mask = b_in_bounds
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.minimum(tl.maximum(tl.load(NUM_VALID_TOKENS_ptr), 0), B)
+        # Keep zero-valid tiles on the same straight-line path: Triton dynamic
+        # early-return poisoned CUDA graph capture on zero-local-rank buckets.
+        b_mask = b_mask & (b_offs < num_valid_tokens)
 
     n_start = pid_n * BLOCK_N
     n_offs = n_start + tl.arange(0, BLOCK_N)
@@ -234,7 +243,7 @@ def _absorb_fp8_wgmma_kernel(
     tl.store(
         out_base2 + b_offs[:, None] * (H * N) + pid_h * N + n_offs[None, :],
         acc.to(tl.bfloat16),
-        mask=b_mask[:, None] & n_mask[None, :],
+        mask=b_in_bounds[:, None] & n_mask[None, :],
     )
 
 
@@ -297,6 +306,7 @@ def triton_absorb_fp8(
     x_bhk: torch.Tensor,           # [B, H, K] BF16
     w_fp8: torch.Tensor,           # [H, N, K] FP8
     w_scale: torch.Tensor,         # [H, N, ceil(K/128)] FP32
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton FP8 WGMMA absorb — on-the-fly activation quantization."""
     x_bhk = x_bhk.contiguous()
@@ -316,12 +326,14 @@ def triton_absorb_fp8(
 
     _absorb_fp8_wgmma_kernel[grid](
         x_bhk, w_fp8, w_scale, out,
+        num_valid_tokens if num_valid_tokens is not None else x_bhk,
         x_bhk.stride(0), x_bhk.stride(1),
         w_fp8.shape[1] * w_fp8.shape[2],   # stride_wh = N * K
         w_scale.shape[1] * w_scale.shape[2],  # stride_wsh = N * num_k_blocks
         B=B, H=H, K=K, N=N,
         BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
         FP8_MAX=448.0,
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
     )
 
     return out
@@ -332,6 +344,7 @@ def triton_absorb_fp8_out(
     w_fp8: torch.Tensor,
     w_scale: torch.Tensor,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer Triton FP8 WGMMA absorb for CUDA graph capture."""
     if not x_bhk.is_contiguous():
@@ -340,6 +353,15 @@ def triton_absorb_fp8_out(
     N = w_fp8.shape[1]
     if out.shape != (B, H, N) or out.dtype != torch.bfloat16:
         raise ValueError(f"out must be BF16 with shape {(B, H, N)}, got {out.shape} {out.dtype}")
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != x_bhk.device:
+            raise ValueError("num_valid_tokens must be on the same device as x_bhk")
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
 
     BLOCK_B = min(64, triton.next_power_of_2(B))
     BLOCK_K = 128
@@ -350,12 +372,14 @@ def triton_absorb_fp8_out(
 
     _absorb_fp8_wgmma_kernel[grid](
         x_bhk, w_fp8, w_scale, out,
+        num_valid_tokens if num_valid_tokens is not None else x_bhk,
         x_bhk.stride(0), x_bhk.stride(1),
         w_fp8.shape[1] * w_fp8.shape[2],
         w_scale.shape[1] * w_scale.shape[2],
         B=B, H=H, K=K, N=N,
         BLOCK_B=BLOCK_B, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
         FP8_MAX=448.0,
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
     )
     return out
 
@@ -398,9 +422,16 @@ def fp8_q_absorb_out(
     q_nope: torch.Tensor,
     weights: FP8AbsorbWeights,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer FP8 WGMMA q_absorb for CUDA graph capture."""
-    return triton_absorb_fp8_out(q_nope, weights.q_absorb_fp8, weights.q_absorb_scale, out)
+    return triton_absorb_fp8_out(
+        q_nope,
+        weights.q_absorb_fp8,
+        weights.q_absorb_scale,
+        out,
+        num_valid_tokens=num_valid_tokens,
+    )
 
 
 def fp8_out_absorb(
@@ -424,6 +455,7 @@ def fp8_out_absorb_out(
     attn_out: torch.Tensor,
     weights: FP8AbsorbWeights,
     out: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Out-buffer FP8 WGMMA out_absorb for CUDA graph capture."""
     squeeze = False
@@ -441,6 +473,7 @@ def fp8_out_absorb_out(
         weights.out_absorb_fp8,
         weights.out_absorb_scale,
         out_squeezed,
+        num_valid_tokens=num_valid_tokens,
     )
     return out if squeeze else out_squeezed
 

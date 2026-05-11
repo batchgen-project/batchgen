@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -402,7 +403,13 @@ void* allocate_shared_pinned_memory(const std::string& shm_name,
             madvise(ptr, allocated_size, MADV_HUGEPAGE);
             // Pre-fault THP pages before weight loading to avoid
             // non-deterministic compaction stalls during direct I/O.
-            {
+            if (const char* skip_touch =
+                    std::getenv("BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH");
+                skip_touch != nullptr && std::strcmp(skip_touch, "1") == 0) {
+                logger->warn(
+                    "--fast-init: Skipping weights page touching because "
+                    "BATCHGEN_FAST_INIT_SKIP_WEIGHT_TOUCH=1");
+            } else {
                 auto touch_start = std::chrono::high_resolution_clock::now();
                 bool ok = touch_pages(ptr, allocated_size, huge_page_size, /*multi_threaded=*/true);
                 auto touch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

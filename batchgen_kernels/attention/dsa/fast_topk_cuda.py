@@ -12,7 +12,12 @@ _TOPK = 2048
 CPP_SOURCE = r"""
 #include <torch/extension.h>
 
-void fast_topk_2048_out(torch::Tensor score, torch::Tensor lengths, torch::Tensor indices);
+void fast_topk_2048_out(
+    torch::Tensor score,
+    torch::Tensor lengths,
+    torch::Tensor indices,
+    torch::Tensor num_valid_tokens,
+    bool has_valid_tokens);
 """
 
 
@@ -36,7 +41,9 @@ struct FastTopKParams {
   const float* __restrict__ input;
   int32_t* __restrict__ indices;
   const int32_t* __restrict__ lengths;
+  const int32_t* __restrict__ num_valid_tokens;
   int64_t input_stride;
+  bool has_valid_tokens;
 };
 
 __device__ void dense_prefix_topk(int32_t* __restrict__ indices, int32_t length) {
@@ -218,8 +225,12 @@ __device__ void radix_topk_2048(
 __global__ __launch_bounds__(kThreadsPerBlock)
 void topk_2048_kernel(FastTopKParams params) {
   const uint64_t bid = static_cast<uint64_t>(blockIdx.x);
-  const int32_t length = params.lengths[bid];
   int32_t* row_indices = params.indices + bid * TopK;
+  if (params.has_valid_tokens && bid >= static_cast<uint64_t>(params.num_valid_tokens[0])) {
+    dense_prefix_topk(row_indices, 0);
+    return;
+  }
+  const int32_t length = params.lengths[bid];
   const float* row_scores = params.input + bid * params.input_stride;
   if (length <= TopK) {
     dense_prefix_topk(row_indices, length);
@@ -230,16 +241,23 @@ void topk_2048_kernel(FastTopKParams params) {
 
 }  // namespace
 
-void fast_topk_2048_out(torch::Tensor score, torch::Tensor lengths, torch::Tensor indices) {
+void fast_topk_2048_out(
+    torch::Tensor score,
+    torch::Tensor lengths,
+    torch::Tensor indices,
+    torch::Tensor num_valid_tokens,
+    bool has_valid_tokens) {
   TORCH_CHECK(score.is_cuda(), "score must be CUDA");
   TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA");
   TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
   TORCH_CHECK(score.dtype() == torch::kFloat32, "score must be float32");
   TORCH_CHECK(lengths.dtype() == torch::kInt32, "lengths must be int32");
   TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
+  TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32, "num_valid_tokens must be int32");
   TORCH_CHECK(score.dim() == 2 && score.is_contiguous(), "score must be contiguous [B, N]");
   TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous(), "lengths must be contiguous [B]");
   TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous(), "indices must be contiguous [B, 2048]");
+  TORCH_CHECK(num_valid_tokens.numel() == 1, "num_valid_tokens must contain one element");
   TORCH_CHECK(score.size(0) == lengths.size(0), "score and lengths batch mismatch");
   TORCH_CHECK(indices.size(0) == score.size(0) && indices.size(1) == TopK, "indices shape must be [B, 2048]");
 
@@ -248,7 +266,9 @@ void fast_topk_2048_out(torch::Tensor score, torch::Tensor lengths, torch::Tenso
       score.data_ptr<float>(),
       indices.data_ptr<int32_t>(),
       lengths.data_ptr<int32_t>(),
+      num_valid_tokens.data_ptr<int32_t>(),
       score.stride(0),
+      has_valid_tokens,
   };
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const dim3 grid(static_cast<uint32_t>(score.size(0)));
@@ -277,6 +297,7 @@ def fast_topk_2048_out(
     score: torch.Tensor,
     lengths: torch.Tensor,
     indices: torch.Tensor,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if score.ndim != 2:
         raise ValueError(f"score must have shape [B, N], got {tuple(score.shape)}")
@@ -294,9 +315,24 @@ def fast_topk_2048_out(
         )
     if indices.dtype != torch.int32:
         raise TypeError(f"indices must be int32, got {indices.dtype}")
+    if num_valid_tokens is not None:
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
     if not score.is_cuda or not lengths.is_cuda or not indices.is_cuda:
         raise ValueError("score, lengths, and indices must be CUDA tensors")
-    _get_module().fast_topk_2048_out(score.contiguous(), lengths.contiguous(), indices)
+    if num_valid_tokens is not None and not num_valid_tokens.is_cuda:
+        raise ValueError("num_valid_tokens must be a CUDA tensor")
+    _get_module().fast_topk_2048_out(
+        score.contiguous(),
+        lengths.contiguous(),
+        indices,
+        num_valid_tokens.contiguous() if num_valid_tokens is not None else lengths,
+        num_valid_tokens is not None,
+    )
     return indices
 
 

@@ -76,13 +76,38 @@ _glm5_decode_timer = init_decode_timer(
 )
 
 _GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
+_GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
 _GLM5_DSA_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_DSA_GRAPH_COMPARE"
 _glm5_dsa_graph_eager_fallback_logged = False
 _glm5_dsa_graph_compare_unavailable_logged = False
 
 
+def _record_glm5_dsa_dispatch(
+    path: str,
+    *,
+    layer_idx: int,
+    bsz: int,
+    reason: str,
+) -> None:
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="dsa",
+        path=path,
+        layer_idx=layer_idx,
+        bsz=bsz,
+        reason=reason,
+    )
+
+
 def _glm5_dsa_cuda_graph_required() -> bool:
-    return os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+    mode = _glm5_dsa_debug_mode()
+    if mode == "eager":
+        return False
+    if mode == "graph":
+        return True
+    return (
+        os.environ.get(_GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
+        or os.environ.get(_GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
+    )
 
 
 def _debug_flag_enabled(value: Any) -> bool:
@@ -95,8 +120,23 @@ def _debug_flag_enabled(value: Any) -> bool:
     return False
 
 
-def _glm5_dsa_graph_compare_active() -> bool:
+def _glm5_dsa_debug_dict() -> dict:
     debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    return debug if isinstance(debug, dict) else {}
+
+
+def _glm5_dsa_debug_mode() -> Optional[str]:
+    value = _glm5_dsa_debug_dict().get("glm5_dsa_mode")
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    return mode if mode in {"graph", "eager"} else None
+
+
+def _glm5_dsa_graph_compare_active() -> bool:
+    if _glm5_dsa_debug_mode() == "eager":
+        return False
+    debug = _glm5_dsa_debug_dict()
     return (
         _debug_flag_enabled(debug.get("glm5_dsa_graph_compare"))
         or os.environ.get(_GLM5_DSA_GRAPH_COMPARE_ENV, "0") == "1"
@@ -106,7 +146,7 @@ def _glm5_dsa_graph_compare_active() -> bool:
 def _glm5_dsa_graph_compare_layer_enabled(layer_idx: int) -> bool:
     if not _glm5_dsa_graph_compare_active():
         return False
-    debug = getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+    debug = _glm5_dsa_debug_dict()
     layers = debug.get("glm5_dsa_graph_compare_layers")
     if layers is None:
         layers = os.environ.get("BATCHGEN_GLM5_DSA_GRAPH_COMPARE_LAYERS", "0")
@@ -405,6 +445,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._dsa_cuda_graph_primary_page_table_signature = None
         self._dsa_cuda_graph_aux_page_table_signature = None
         self._dsa_cuda_graph_required = False
+        self._dsa_cuda_graph_full = False
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
@@ -556,11 +597,13 @@ class GLM5AttnWrapper(AttnWrapperBase):
         primary_page_table: Optional[torch.Tensor] = None,
         aux_page_table: Optional[torch.Tensor] = None,
         graph_output_required: bool = False,
+        full_segment: bool = False,
     ) -> None:
         self._dsa_cuda_graph_manager = manager
         self._dsa_cuda_graph_segment_name = segment_name
         self._dsa_cuda_graph_max_seqlen = max_seqlen
         self._dsa_cuda_graph_required = graph_output_required
+        self._dsa_cuda_graph_full = full_segment
         self._dsa_cuda_graph_max_primary_pages = (
             primary_page_table.shape[1]
             if primary_page_table is not None
@@ -832,10 +875,60 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "storage no longer matches the active GPU page-table storage"
             )
 
+        bsz = hidden_states.shape[0]
+        flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+            self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+        )
+        if getattr(self, "_dsa_cuda_graph_full", False):
+            primary_slot_indices = getattr(
+                AttnWrapperBase,
+                "glm5_decode_primary_slot_indices",
+                None,
+            )
+            aux_slot_indices = getattr(
+                AttnWrapperBase,
+                "glm5_decode_aux_slot_indices",
+                None,
+            )
+            if primary_slot_indices is None or aux_slot_indices is None:
+                raise RuntimeError(
+                    f"[layer {self.layer_idx}] GLM-5 full DSA CUDA graph requires "
+                    "per-forward primary/aux slot tensors to be prepared"
+                )
+            graph_outputs = self._dsa_cuda_graph_manager.replay(
+                self._dsa_cuda_graph_segment_name,
+                bsz,
+                hidden_states=hidden_states,
+                position_ids=position_ids,
+                cache_seqlens=cache_seqlens.to(dtype=torch.int32, device=hidden_states.device),
+                primary_slot_indices=primary_slot_indices[:bsz].to(
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                aux_slot_indices=aux_slot_indices[:bsz].to(
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                flashmla_num_splits=flashmla_num_splits,
+            )
+            if AttnWrapperBase.kv_append_callback is not None:
+                AttnWrapperBase.kv_append_callback(
+                    self.layer_idx,
+                    graph_outputs["primary_k_tensor"],
+                    None,
+                )
+            if AttnWrapperBase.kv_append_callback_aux is not None:
+                AttnWrapperBase.kv_append_callback_aux(
+                    self.layer_idx,
+                    graph_outputs["indexer_k_tensor"],
+                    None,
+                )
+            return graph_outputs["attn_output"]
+
         from batchgen.attention.dsa.glm5_decode_selector import (
             build_glm5_dsa_graph_segment_inputs,
         )
-        bsz = hidden_states.shape[0]
         graph_inputs = build_glm5_dsa_graph_segment_inputs(
             self,
             hidden_states,
@@ -858,9 +951,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 None,
             )
 
-        flashmla_tile_scheduler_metadata, flashmla_num_splits = (
-            self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
-        )
         graph_outputs = self._dsa_cuda_graph_manager.replay(
             self._dsa_cuda_graph_segment_name,
             bsz,
@@ -1176,12 +1266,22 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if bsz == 0:
             return hidden_states.new_empty(0, 1, attn.hidden_size)
 
-        compare_active = _glm5_dsa_graph_compare_active()
+        debug_mode = _glm5_dsa_debug_mode()
+        compare_active = (
+            False if debug_mode == "eager"
+            else _glm5_dsa_graph_compare_active()
+        )
         compare_this_layer = _glm5_dsa_graph_compare_layer_enabled(self.layer_idx)
         graph_requested = (
-            _glm5_dsa_cuda_graph_required()
-            or getattr(self, "_dsa_cuda_graph_required", False)
-            or compare_active
+            debug_mode == "graph"
+            or (
+                debug_mode != "eager"
+                and (
+                    _glm5_dsa_cuda_graph_required()
+                    or getattr(self, "_dsa_cuda_graph_required", False)
+                    or compare_active
+                )
+            )
         )
         compare_after_eager = False
         if graph_requested:
@@ -1218,6 +1318,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 and graph_forward_ready
                 and not compare_active
             ):
+                _record_glm5_dsa_dispatch(
+                    "graph",
+                    layer_idx=self.layer_idx,
+                    bsz=bsz,
+                    reason="graph replay",
+                )
                 return self._forward_decode_dsa_graph(
                     hidden_states,
                     position_ids,
@@ -1260,7 +1366,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     self.layer_idx,
                     reason,
                 )
+        else:
+            if debug_mode == "eager":
+                reason = "debug mode requested eager"
+            else:
+                reason = "graph not requested"
 
+        _record_glm5_dsa_dispatch(
+            "eager",
+            layer_idx=self.layer_idx,
+            bsz=bsz,
+            reason=reason,
+        )
         eager_result = self._forward_decode_dsa_eager(
             hidden_states,
             position_ids,

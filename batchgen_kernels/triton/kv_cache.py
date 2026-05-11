@@ -161,6 +161,7 @@ def _paged_cache_update_with_page_table_kernel(
     page_table_ptr,
     slot_indices_ptr,
     token_indices_ptr,
+    num_valid_tokens_ptr,
     page_stride,
     token_stride,
     page_table_cols,
@@ -168,6 +169,7 @@ def _paged_cache_update_with_page_table_kernel(
     elements_per_token,
     num_tokens,
     num_chunks,
+    HAS_VALID_TOKENS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
@@ -175,6 +177,10 @@ def _paged_cache_update_with_page_table_kernel(
 
     if token_id >= num_tokens or chunk_id >= num_chunks:
         return
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.load(num_valid_tokens_ptr)
+        if token_id >= num_valid_tokens:
+            return
 
     slot = tl.load(slot_indices_ptr + token_id)
     if slot < 0:  # sentinel: skip padding tokens (CUDA graph bucketing)
@@ -203,6 +209,7 @@ def _launch_single_cache_update_with_page_table(
     slot_indices: torch.Tensor,
     token_indices: torch.Tensor,
     page_size_tokens: int,
+    num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     num_tokens = src_tokens.shape[0]
     if num_tokens == 0:
@@ -220,6 +227,15 @@ def _launch_single_cache_update_with_page_table(
     num_chunks = (elements_per_token + _BLOCK_SIZE - 1) // _BLOCK_SIZE
 
     page_table_cols = page_table.shape[1]
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != src_tokens.device:
+            raise ValueError("num_valid_tokens must be on the same device as src_tokens")
+        if num_valid_tokens.dtype != torch.int32:
+            raise ValueError("num_valid_tokens must be int32")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
 
     grid = (num_tokens, num_chunks)
 
@@ -229,6 +245,7 @@ def _launch_single_cache_update_with_page_table(
         page_table,
         slot_indices,
         token_indices,
+        num_valid_tokens if num_valid_tokens is not None else slot_indices,
         page_stride,
         token_stride,
         page_table_cols,
@@ -236,6 +253,7 @@ def _launch_single_cache_update_with_page_table(
         elements_per_token,
         num_tokens,
         num_chunks,
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
         BLOCK_SIZE=_BLOCK_SIZE,
     )
 
@@ -250,6 +268,7 @@ def run_paged_kv_token_update_fused(
     page_size_tokens: int,
     v_cache: Optional[torch.Tensor] = None,
     v_tokens: Optional[torch.Tensor] = None,
+    num_valid_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused variant that looks up page numbers from a GPU-side page table.
 
@@ -266,6 +285,7 @@ def run_paged_kv_token_update_fused(
         slot_indices=slot_indices,
         token_indices=token_indices,
         page_size_tokens=page_size_tokens,
+        num_valid_tokens=num_valid_tokens,
     )
 
     if v_cache is None:
@@ -285,4 +305,5 @@ def run_paged_kv_token_update_fused(
         slot_indices=slot_indices,
         token_indices=token_indices,
         page_size_tokens=page_size_tokens,
+        num_valid_tokens=num_valid_tokens,
     )

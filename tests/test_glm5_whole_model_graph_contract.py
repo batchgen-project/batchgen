@@ -120,9 +120,56 @@ def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
 
     segment.initialize_static_inputs(static_inputs, bucket_size=2)
 
-    assert segment._capture_dsa_short_count == 2
+    assert segment._capture_dsa_short_count == 1
     assert static_inputs["primary_slot_indices"].tolist() == [3, -1]
     assert static_inputs["cache_seqlens"].tolist() == [128, 1]
+
+
+def test_glm5_whole_model_segment_materializes_bucket_from_real_rows():
+    segment = _make_segment(max_bucket_size=4, max_seqlen=8192)
+    specs = segment.get_static_input_specs(bucket_size=4)
+    static_inputs = {
+        name: torch.empty(spec.resolve_shape(4), dtype=spec.dtype, device="cpu")
+        for name, spec in specs.items()
+    }
+    segment.set_capture_inputs(
+        input_ids=torch.tensor([[7]], dtype=torch.int64),
+        cache_seqlens=torch.tensor([128], dtype=torch.int32),
+        position_ids=torch.tensor([[127]], dtype=torch.int64),
+        primary_slot_indices=torch.tensor([3], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([4], dtype=torch.int32),
+        rank_token_counts=torch.tensor([1, 2] + [0] * 14, dtype=torch.int64),
+    )
+
+    segment.initialize_static_inputs(static_inputs, bucket_size=4)
+
+    assert static_inputs["input_ids"].tolist() == [[7], [0], [0], [0]]
+    assert static_inputs["cache_seqlens"].tolist() == [128, 8192, 8192, 8192]
+    assert static_inputs["position_ids"].tolist() == [[127], [0], [0], [0]]
+    assert static_inputs["primary_slot_indices"].tolist() == [3, -1, -1, -1]
+    assert static_inputs["aux_slot_indices"].tolist() == [4, -1, -1, -1]
+    assert static_inputs["rank_token_counts"].tolist() == [1, 2] + [0] * 14
+    assert segment._capture_dsa_short_count == 1
+
+
+def test_glm5_whole_model_segment_rejects_capture_input_larger_than_bucket():
+    segment = _make_segment(max_bucket_size=4)
+    specs = segment.get_static_input_specs(bucket_size=2)
+    static_inputs = {
+        name: torch.empty(spec.resolve_shape(2), dtype=spec.dtype, device="cpu")
+        for name, spec in specs.items()
+    }
+    segment.set_capture_inputs(
+        input_ids=torch.tensor([[7], [8], [9]], dtype=torch.int64),
+        cache_seqlens=torch.tensor([128, 129, 130], dtype=torch.int32),
+        position_ids=torch.tensor([[127], [128], [129]], dtype=torch.int64),
+        primary_slot_indices=torch.tensor([3, 4, 5], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([3, 4, 5], dtype=torch.int32),
+        rank_token_counts=torch.tensor([3] + [0] * 15, dtype=torch.int64),
+    )
+
+    with pytest.raises(ValueError, match="batch dim 3 exceeds"):
+        segment.initialize_static_inputs(static_inputs, bucket_size=2)
 
 
 def test_glm5_whole_model_segment_uses_moe_bucket_resizer(monkeypatch):

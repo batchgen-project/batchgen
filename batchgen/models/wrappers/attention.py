@@ -25,7 +25,7 @@ Provides common functionality for attention module wrappers:
 """
 
 import logging
-from typing import Any, ClassVar, Dict, List, Optional, Sequence
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -68,6 +68,11 @@ class AttnWrapperBase(BaseModuleWrapper):
     kv_append_callback: ClassVar[Optional[callable]] = None
     kv_append_callback_aux: ClassVar[Optional[callable]] = None
     batchgen_debug: ClassVar[Optional[Dict[str, Any]]] = None
+    glm5_dispatch_trace_enabled: ClassVar[bool] = False
+    glm5_dispatch_trace_id: ClassVar[Optional[str]] = None
+    glm5_dispatch_trace_context: ClassVar[Optional[Dict[str, Any]]] = None
+    glm5_dispatch_counts: ClassVar[Dict[str, int]] = {}
+    glm5_dispatch_seen: ClassVar[Set[Tuple[str, str, str, int]]] = set()
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
@@ -88,6 +93,48 @@ class AttnWrapperBase(BaseModuleWrapper):
     # retire point confirms the memcpy has completed.
     pending_prefill_offload_tensors: ClassVar[list] = []
     pending_prefill_offload_layer_idx: ClassVar[Optional[int]] = None
+
+    @classmethod
+    def record_glm5_dispatch(
+        cls,
+        *,
+        kind: str,
+        path: str,
+        layer_idx: int,
+        bsz: int,
+        reason: str,
+    ) -> None:
+        if not cls.glm5_dispatch_trace_enabled:
+            return
+        counts = cls.glm5_dispatch_counts
+        counter_key = f"{kind}_{path}"
+        counts[counter_key] = counts.get(counter_key, 0) + 1
+
+        trace_id = cls.glm5_dispatch_trace_id or "unknown"
+        seen_key = (trace_id, kind, path, int(bsz))
+        if seen_key in cls.glm5_dispatch_seen:
+            return
+        cls.glm5_dispatch_seen.add(seen_key)
+
+        context = cls.glm5_dispatch_trace_context or {}
+        logging.warning(
+            "[GLM5_DISPATCH_TRACE] rank=%s trace=%s kind=%s path=%s "
+            "layer=%s bsz=%s batch_ids=%s global_ids=%s debug_dsa=%s "
+            "debug_moe=%s debug_moe_router=%s reason=%s count=%s",
+            context.get("rank", "?"),
+            trace_id,
+            kind,
+            path,
+            layer_idx,
+            bsz,
+            context.get("batch_ids", "-"),
+            context.get("global_ids", "-"),
+            context.get("glm5_dsa_mode", "-"),
+            context.get("glm5_moe_mode", "-"),
+            context.get("glm5_moe_router_mode", "-"),
+            reason,
+            counts[counter_key],
+        )
 
     @classmethod
     def _prefill_offload_sync_device(cls, device: Optional[torch.device]) -> None:

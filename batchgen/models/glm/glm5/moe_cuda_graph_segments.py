@@ -24,7 +24,7 @@ from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
 )
-from batchgen.moe.routing import gate_sigmoid_topk_cuda
+from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,6 @@ def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
 class _Glm5MoEGraphBuffers:
     padded: torch.Tensor
     all_tokens: torch.Tensor
-    all_tokens_fp32: torch.Tensor
     router_logits: torch.Tensor
     topk_indices: torch.Tensor
     topk_weights: torch.Tensor
@@ -111,7 +110,6 @@ class Glm5MoEGraphBufferPool:
         b = self._base
         b["padded"] = torch.zeros(max_bucket, h, dtype=torch.bfloat16, device=d)
         b["all_tokens"] = torch.zeros(max_global, h, dtype=torch.bfloat16, device=d)
-        b["all_tokens_fp32"] = torch.empty(max_global, h, dtype=torch.float32, device=d)
         b["router_logits"] = torch.empty(max_global, 256, dtype=torch.float32, device=d)
         b["topk_indices"] = torch.empty(max_global, k, dtype=torch.int32, device=d)
         b["topk_weights"] = torch.empty(max_global, k, dtype=torch.float32, device=d)
@@ -161,7 +159,6 @@ class Glm5MoEGraphBufferPool:
         self._views[bucket_size] = _Glm5MoEGraphBuffers(
             padded=b["padded"][:bucket_size],
             all_tokens=b["all_tokens"][:global_rows],
-            all_tokens_fp32=b["all_tokens_fp32"][:global_rows],
             router_logits=b["router_logits"][:global_rows],
             topk_indices=b["topk_indices"][:global_rows],
             topk_weights=b["topk_weights"][:global_rows],
@@ -220,7 +217,7 @@ class Glm5MoEGraphSegment:
         if comm is None:
             raise RuntimeError(f"Layer {moe.layer_idx}: GLM-5 MoE graph requires EP communicator")
 
-        self.gate_weight_fp32 = moe.gate.weight.detach().float().contiguous()
+        self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
 
     def setup_static_buffers(self, bucket_size: int) -> None:
@@ -259,11 +256,13 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        bufs.all_tokens_fp32.copy_(bufs.all_tokens)
-        torch.mm(
-            bufs.all_tokens_fp32,
-            self.gate_weight_fp32.t(),
-            out=bufs.router_logits,
+        glm5_router_gemm_cuda(
+            bufs.all_tokens,
+            self.gate_weight_bf16,
+            router_logits=bufs.router_logits,
+            rank_token_counts=rank_token_counts,
+            bucket_size=bucket_size,
+            world_size=self.world_size,
         )
         gate_sigmoid_topk_cuda(
             bufs.router_logits,

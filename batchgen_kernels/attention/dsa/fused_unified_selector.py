@@ -17,6 +17,7 @@ def _unified_select_kernel(
     blocked_kv_ptr,
     block_table_ptr,
     slot_indices_ptr,
+    num_valid_tokens_ptr,
     cache_seqlens_ptr,
     long_topk_ptr,
     selected_ptr,
@@ -29,6 +30,7 @@ def _unified_select_kernel(
     D: tl.constexpr,
     STORE_INDICES: tl.constexpr,
     USE_SLOT_INDICES: tl.constexpr,
+    HAS_VALID_TOKENS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -43,6 +45,20 @@ def _unified_select_kernel(
     t_start = pid_t * BLOCK_T
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
+    if HAS_VALID_TOKENS:
+        num_valid_tokens = tl.load(num_valid_tokens_ptr)
+        if pid_b >= num_valid_tokens:
+            if pid_t == 0:
+                tl.store(selected_lengths_ptr + pid_b, 0)
+                tl.store(row_modes_ptr + pid_b, 2)
+            for ti in range(BLOCK_T):
+                t = t_start + ti
+                if t < index_topk:
+                    dst = selected_ptr + (pid_b * index_topk + t) * D + d_offs
+                    tl.store(dst, tl.zeros([BLOCK_D], dtype=tl.float32), mask=d_mask)
+                    if STORE_INDICES:
+                        tl.store(selected_indices_ptr + pid_b * index_topk + t, -1)
+            return
 
     seqlen = tl.load(cache_seqlens_ptr + pid_b).to(tl.int64)
     is_long = seqlen > index_topk
@@ -96,6 +112,7 @@ def fused_select_mla_kv_bf16(
     *,
     return_indices: bool = True,
     primary_slot_indices: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Gather selected GLM-5 BF16 MLA KV for FlashMLA dense decode."""
 
@@ -150,6 +167,7 @@ def fused_select_mla_kv_bf16(
         row_modes,
         return_indices=return_indices,
         primary_slot_indices=primary_slot_indices,
+        num_valid_tokens=num_valid_tokens,
     )
 
     return (
@@ -173,6 +191,7 @@ def fused_select_mla_kv_bf16_out(
     *,
     return_indices: bool = True,
     primary_slot_indices: torch.Tensor | None = None,
+    num_valid_tokens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Out-buffer variant for CUDA graph capture."""
 
@@ -200,6 +219,15 @@ def fused_select_mla_kv_bf16_out(
                 "primary_slot_indices must be int32/int64, "
                 f"got {primary_slot_indices.dtype}"
             )
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != primary_blocked_k.device:
+            raise ValueError("num_valid_tokens must be on the same device as primary_blocked_k")
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}")
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
+            )
 
     block_d = triton.next_power_of_2(dim)
     total_work = batch_size * index_topk
@@ -214,6 +242,7 @@ def fused_select_mla_kv_bf16_out(
         primary_blocked_k.reshape(-1, dim),
         primary_page_table,
         primary_slot_indices if primary_slot_indices is not None else cache_seqlens,
+        num_valid_tokens if num_valid_tokens is not None else cache_seqlens,
         cache_seqlens,
         long_topk_indices,
         selected_flat,
@@ -226,6 +255,7 @@ def fused_select_mla_kv_bf16_out(
         D=dim,
         STORE_INDICES=return_indices,
         USE_SLOT_INDICES=primary_slot_indices is not None,
+        HAS_VALID_TOKENS=num_valid_tokens is not None,
         BLOCK_T=block_t,
         BLOCK_D=block_d,
     )
