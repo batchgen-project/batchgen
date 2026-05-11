@@ -21,8 +21,8 @@ The routine is fail-closed:
 Collect these inputs before any tool use that mutates state:
 
 - `base_commit`: required git commit SHA/ref. It must exist and already be reachable from `origin/main`.
-- `release_version`: required release version, e.g. `1.0.9.post6`.
-- `release_tag`: optional; defaults to `v{release_version}` and must match that default unless POIS explicitly overrides before validation.
+- `release_version`: required exact post-release version, e.g. `1.0.9.post6`. It must match `X.X.X.postX`; do not append topical suffixes.
+- `release_tag`: optional; defaults to `v{release_version}` and must match that default. It must match `vX.X.X.postX`; do not append topical suffixes such as `-glm5-stability`.
 - `package_scope`: required. One of `auto`, `batchgen-only`, `kernels-only`, `batchgen-and-kernels`, `full-dependency-wheels`.
 - `build_arch`: optional; defaults to `sm90a`. One of `sm90a`, `sm100`, `all`.
 - `kernel_release_version`: required when `package_scope` includes `batchgen_kernels`. Independent `batchgen_kernels` semver, e.g. `0.3.3`; do not include the `+sm90a` wheel local-version suffix.
@@ -102,6 +102,7 @@ Every script must read the same frozen manifest and fail if the prior step has n
 - Do not run `gh release create` with `--draft` or `--prerelease`.
 - Do not run `git push --tags`.
 - Do not publish without validated and POIS-confirmed release notes.
+- Do not append topical suffixes to release versions, release tags, release names, or release titles. Use exactly `X.X.X.postX` for versions and `vX.X.X.postX` for tags/names; describe release content in release notes only.
 - Do not upload wheel globs unless they expand from the verified wheel plan.
 - Do not call `scripts/build_wheels.sh` unless `package_scope=full-dependency-wheels`.
 - Do not rebuild all wheels because an expected wheel was not found.

@@ -21,10 +21,12 @@
       "const": "batchgen-release"
     },
     "release_tag": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+\\.post[0-9]+$"
     },
     "release_version": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.post[0-9]+$"
     },
     "base_commit": {
       "type": "string"

@@ -19,11 +19,13 @@
     },
     "release_version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([.-]?(a|b|rc|post|dev)[0-9]+)?$"
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.post[0-9]+$",
+      "description": "Exact BatchGen post release version. Do not append topical suffixes."
     },
     "release_tag": {
       "type": "string",
-      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+([.-]?(a|b|rc|post|dev)[0-9]+)?$"
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+\\.post[0-9]+$",
+      "description": "Exact BatchGen post release tag. Must be v{release_version}; do not append topical suffixes."
     },
     "package_scope": {
       "type": "string",

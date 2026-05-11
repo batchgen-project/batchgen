@@ -9,6 +9,10 @@ debug summary, benchmark log, or agent handoff.
 2. `## What's New`
 3. `## Compatibility and Installation`
 
+`<release_tag>` must be exactly `vX.X.X.postX`. Do not append topical
+suffixes such as `-glm5-stability` to release tags, release names, or release
+titles; describe release content in the body instead.
+
 ## Optional sections
 
 - `## Breaking Changes`
@@ -51,4 +55,3 @@ Do not include:
 
 If release notes validation fails, stop and alarm POIS. Do not publish the
 release and do not bypass the validator.
-

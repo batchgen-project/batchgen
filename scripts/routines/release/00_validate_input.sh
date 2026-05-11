@@ -41,8 +41,10 @@ fi
 require_cmd git
 require_cmd python3
 
-[[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-]?(a|b|rc|post|dev)[0-9]+)?$ ]] \
-    || die "invalid release version: $RELEASE_VERSION"
+[[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.post[0-9]+$ ]] \
+    || die "invalid release version: $RELEASE_VERSION (expected X.X.X.postX with no suffix)"
+[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.post[0-9]+$ ]] \
+    || die "invalid release tag: $RELEASE_TAG (expected vX.X.X.postX with no suffix)"
 [[ "$RELEASE_TAG" == "v$RELEASE_VERSION" ]] \
     || die "release tag must equal v{release_version}; got $RELEASE_TAG for $RELEASE_VERSION"
 
