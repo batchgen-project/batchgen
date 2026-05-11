@@ -89,6 +89,7 @@ class _FakeHostPrefixView:
         self.commit_calls = []
         self.release_calls = []
         self.clear_calls = 0
+        self.prefix_load_calls = []
 
     def allocate_pages_for_sequences_with_prefix(self, requests):
         self.allocate_calls.append(list(requests))
@@ -132,6 +133,18 @@ class _FakeHostPrefixView:
         max_entries_to_scan=0,
     ):
         return self.eviction
+
+    def async_load_prefix_pages_to_device(
+        self,
+        host_page_ids,
+        k_device_ptrs,
+        v_device_ptrs,
+    ):
+        task = SimpleNamespace(wait=lambda: None)
+        self.prefix_load_calls.append(
+            (host_page_ids, k_device_ptrs, v_device_ptrs, task)
+        )
+        return task
 
 
 def test_dual_host_prefix_allocation_delegates_to_both_views():
@@ -214,6 +227,25 @@ def test_dual_host_prefix_estimate_and_eviction_are_mirrored():
     coordinator.clear_prefix_cache()
     assert primary.clear_calls == 1
     assert auxiliary.clear_calls == 1
+
+
+def test_dual_host_prefix_materialization_load_uses_primary_only():
+    primary = _FakeHostPrefixView()
+    auxiliary = _FakeHostPrefixView()
+    coordinator = DualHostKVCoordinator(primary, auxiliary)
+
+    host_pages = torch.tensor([1, 2], dtype=torch.int32)
+    k_ptrs = object()
+    v_ptrs = object()
+    task = coordinator.async_load_prefix_pages_to_device(
+        host_pages,
+        k_ptrs,
+        v_ptrs,
+    )
+
+    assert task is primary.prefix_load_calls[0][3]
+    assert primary.prefix_load_calls[0][:3] == (host_pages, k_ptrs, v_ptrs)
+    assert auxiliary.prefix_load_calls == []
 
 
 def _make_gpu_config() -> GPUPagedKVConfig:

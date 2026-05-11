@@ -523,6 +523,24 @@ class DualHostKVCoordinator:
 
 	# -- Migration / load helpers --
 
+	def async_load_prefix_pages_to_device(
+		self,
+		host_page_ids,
+		k_device_ptrs,
+		v_device_ptrs,
+	):
+		"""Load primary prefix pages for prefill-scoped GPU materialization.
+
+		MLA prefix attention consumes the primary compressed KV cache. The
+		auxiliary/indexer cache is still mirrored for lifecycle and decode reloads,
+		but it is not part of this temporary attention materialization path.
+		"""
+		return self.primary.async_load_prefix_pages_to_device(
+			host_page_ids,
+			k_device_ptrs,
+			v_device_ptrs,
+		)
+
 	def async_load_layer_paged_kv_to_device(self, **kwargs):
 		raise RuntimeError(
 			"DSA dual host KV load must use async_load_layer_paged_kv_to_device_dual(); "
