@@ -91,7 +91,7 @@ pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu12
 ## Step 6: Install BatchGen
 
 ```bash
-git clone git@github.com:EfficientMoE/BatchGen.git
+git clone git@github.com:batchgen-project/batchgen.git
 cd BatchGen
 pip install -e .
 ```

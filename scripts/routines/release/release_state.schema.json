@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://efficientmoe.local/batchgen/release_state.schema.json",
+  "title": "BatchGen formal release state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "routine_id",
+    "release_tag",
+    "release_version",
+    "base_commit",
+    "package_scope",
+    "build_arch",
+    "state",
+    "current_step",
+    "confirmed_by_pois",
+    "paths"
+  ],
+  "properties": {
+    "routine_id": {
+      "const": "batchgen-release"
+    },
+    "release_tag": {
+      "type": "string"
+    },
+    "release_version": {
+      "type": "string"
+    },
+    "base_commit": {
+      "type": "string"
+    },
+    "package_scope": {
+      "type": "string"
+    },
+    "build_arch": {
+      "type": "string"
+    },
+    "previous_release_tag": {
+      "type": ["string", "null"]
+    },
+    "kernel_release_version": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "input_validated",
+        "input_confirmed",
+        "release_notes_drafted",
+        "release_notes_validated",
+        "release_notes_confirmed",
+        "worktree_created",
+        "versions_updated",
+        "versions_verified",
+        "version_committed",
+        "tagged",
+        "wheel_plan_created",
+        "synced_to_remote",
+        "wheels_built",
+        "wheels_verified",
+        "published",
+        "release_verified",
+        "complete"
+      ]
+    },
+    "current_step": {
+      "type": "string"
+    },
+    "confirmed_by_pois": {
+      "type": "boolean"
+    },
+    "release_notes_confirmed_by_pois": {
+      "type": "boolean"
+    },
+    "paths": {
+      "type": "object",
+      "required": [
+        "state_dir",
+        "local_canonical_repo",
+        "local_release_worktree",
+        "remote_release_worktree",
+        "remote_artifact_dir",
+        "remote_wheel_dir",
+        "remote_log_dir",
+        "local_artifact_dir",
+        "local_wheel_dir"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_dir": {"type": "string"},
+        "local_canonical_repo": {"type": "string"},
+        "local_release_worktree": {"type": "string"},
+        "remote_release_worktree": {"type": "string"},
+        "remote_artifact_dir": {"type": "string"},
+        "remote_wheel_dir": {"type": "string"},
+        "remote_log_dir": {"type": "string"},
+        "local_artifact_dir": {"type": "string"},
+        "local_wheel_dir": {"type": "string"}
+      }
+    }
+  }
+}

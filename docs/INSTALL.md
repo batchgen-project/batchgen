@@ -26,7 +26,7 @@ conda create -n batchgen python=3.11 -y
 conda activate batchgen
 
 # 2. Clone repo
-git clone --recursive https://github.com/EfficientMoE/BatchGen.git
+git clone --recursive https://github.com/batchgen-project/batchgen.git
 cd BatchGen
 
 # 3. Install everything
@@ -46,7 +46,7 @@ Total: ~40-50 min on first install.
 ## Option C: Pre-built Wheels (Fastest, ~2 min)
 
 Pre-built wheels for Hopper GPUs (CUDA 12.8, PyTorch 2.9, Python 3.11) are
-available on the [GitHub Releases](https://github.com/EfficientMoE/BatchGen/releases) page.
+available on the [GitHub Releases](https://github.com/batchgen-project/batchgen/releases) page.
 
 ```bash
 # 1. Create conda env + install PyTorch
@@ -55,7 +55,7 @@ conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install all wheels from the latest release
-RELEASE_URL="https://github.com/EfficientMoE/BatchGen/releases/download/v1.0.9.post3"
+RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.9.post3"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
