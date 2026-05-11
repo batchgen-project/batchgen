@@ -8407,13 +8407,6 @@ class BatchGenWorker:
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
 			l2_balance=_USE_L2_MB,
-			# Prefix-reuse suffix prefill must preserve exact duplicate semantics.
-			# Mixing different suffixes in one BF16 prefill micro-batch changes
-			# downstream GEMM/MoE batch shapes enough to flip greedy boundary
-			# cases, even when the cached KV is correct. Isolate reused suffixes
-			# so each request follows the same compute shape as a single-request
-			# reuse replay.
-			single_sequence_only=(prefix_reuse_plan is not None),
 		)
 		total_tokens_all = sum(seq_lengths_list)
 
