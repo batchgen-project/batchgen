@@ -113,6 +113,43 @@ def test_glm5_router_gemm_valid_rows_are_bucket_stable():
     torch.testing.assert_close(padded_logits[valid], compact_logits, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("world_size,bucket", [(16, 1), (16, 8), (16, 32)])
+def test_glm5_router_gemm_production_graph_envelope_rank_counts(world_size, bucket):
+    from batchgen.moe.routing import glm5_router_gemm_cuda
+
+    torch.manual_seed(20260511 + bucket)
+    device = torch.device("cuda")
+    hidden = (
+        torch.randn(world_size * bucket, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    weight = (
+        torch.randn(256, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    rank_counts = (
+        (torch.arange(world_size, device=device, dtype=torch.int64) * 7) % (bucket + 1)
+    )
+    rank_counts[0] = bucket
+    if world_size > 1:
+        rank_counts[1] = 0
+
+    rows = torch.arange(world_size * bucket, device=device)
+    valid = (rows % bucket) < rank_counts[rows // bucket]
+    hidden_poisoned = hidden.clone()
+    hidden_poisoned[~valid] = torch.tensor(float("nan"), device=device, dtype=torch.bfloat16)
+
+    actual = glm5_router_gemm_cuda(
+        hidden_poisoned,
+        weight,
+        rank_token_counts=rank_counts,
+        bucket_size=bucket,
+        world_size=world_size,
+    )
+    ref_valid = _reference_router(hidden[valid].contiguous(), weight)
+
+    torch.testing.assert_close(actual[~valid], torch.zeros_like(actual[~valid]), atol=0, rtol=0)
+    _assert_bf16_router_close(actual[valid], ref_valid)
+
+
 def test_glm5_router_gemm_cuda_graph_replay_uses_device_rank_counts():
     from batchgen.moe.routing import glm5_router_gemm_cuda
 
