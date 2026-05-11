@@ -198,26 +198,6 @@ class WorkerManager:
         _diag(">>> config_torch_module_initializer")
         config_torch_module_initializer()
         _diag("<<< config_torch_module_initializer")
-        if self.args.host_kv_cache_size:
-            kv_start = _time.monotonic()
-            try:
-                _diag(">>> allocate_host_kv_cache")
-                result = self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size, self.args.model,
-                    enable_memfd=self.args.fast_init,
-                )
-                _diag("<<< allocate_host_kv_cache")
-                if isinstance(result, tuple):
-                    self.host_kv_manager, self.host_kv_aux_manager = result
-                else:
-                    self.host_kv_manager = result
-                    self.host_kv_aux_manager = None
-            except Exception as exc:
-                logger.warning("Host KV cache allocation failed: %s", exc)
-                self.host_kv_manager = None
-                self.host_kv_aux_manager = None
-            logger.info("[startup] Host KV cache allocated in %.2fs",
-                        _time.monotonic() - kv_start)
 
         model_start = _time.monotonic()
         _diag(">>> _load_model_resources")
@@ -225,6 +205,13 @@ class WorkerManager:
         _diag("<<< _load_model_resources")
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
+
+        kv_start = _time.monotonic()
+        _diag(">>> _allocate_host_kv_cache_for_workers")
+        self._allocate_host_kv_cache_for_workers()
+        _diag("<<< _allocate_host_kv_cache_for_workers")
+        logger.info("[startup] Host KV cache allocated in %.2fs",
+                    _time.monotonic() - kv_start)
 
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
@@ -559,6 +546,22 @@ class WorkerManager:
         self._configure_host_kv_cache_budget()
         _diag("  <<< _configure_host_kv_cache_budget")
         logger.info("Model Loaded. SHM: %s", self.model_info.get("shm_name"))
+
+    def _allocate_host_kv_cache_for_workers(self) -> None:
+        host_kv_cache_size_gb = self.args_dict.get("host_kv_cache_size_per_rank")
+        if host_kv_cache_size_gb is None:
+            raise RuntimeError("Host KV cache budget is not configured")
+
+        result = self.allocate_host_kv_cache(
+            int(host_kv_cache_size_gb),
+            self.args.model,
+            enable_memfd=self.args.fast_init,
+        )
+        if isinstance(result, tuple):
+            self.host_kv_manager, self.host_kv_aux_manager = result
+        else:
+            self.host_kv_manager = result
+            self.host_kv_aux_manager = None
 
     def _spawn_workers(self) -> None:
         local_device_count = torch.cuda.device_count()
