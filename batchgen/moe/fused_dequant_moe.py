@@ -60,7 +60,7 @@ def fused_dequant_weighted_moe_stage_1_kernel(
 		start_idx = tl.load(group_start_indices_ptr + g * stride_group_start_indices)
 		num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
 
-		# We have determinated the rhs. So we do the base pointer calculation here.
+		# We have determined the rhs. So we do the base pointer calculation here.
 		gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
 		up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
 		gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
@@ -237,7 +237,7 @@ def fused_fp8_moe_stage_1_kernel(
 		start_idx = tl.load(group_start_indices_ptr + g * stride_group_start_indices)
 		num_sub_groups = tl.cdiv(gm, GEMM_BLOCK_SIZE_M)
 
-		# We have determinated the rhs. So we do the base pointer calculation here.
+		# We have determined the rhs. So we do the base pointer calculation here.
 		gate_base_ptr = tl.load(gate_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
 		up_base_ptr = tl.load(up_ptrs_ptr + group_idx * stride_weight_ptrs).to(tl.pointer_type(rhs_dtype))
 		gate_scale_base_ptr = tl.load(gate_scale_ptrs_ptr + group_idx * stride_scale_ptrs).to(tl.pointer_type(scale_dtype))
@@ -585,6 +585,5 @@ def fused_fp8_moe_stage_1(
         raise
     
     return output
-
 
 
