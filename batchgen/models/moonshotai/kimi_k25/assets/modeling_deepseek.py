@@ -889,9 +889,8 @@ class MoEGate(nn.Module):
 			self.e_score_correction_bias,
 			self.n_group,
 			self.topk_group,
-			self.n_routed_experts,
 			self.top_k,
-			self.routed_scaling_factor
+			routed_scaling_factor=self.routed_scaling_factor,
 		)
 
 		return topk_idx, topk_weight
