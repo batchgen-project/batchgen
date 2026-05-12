@@ -288,6 +288,7 @@ class Glm5DsaAttnSegment:
             ),
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
             "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
@@ -462,6 +463,7 @@ class Glm5DsaAttnSegment:
         positions_expanded: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
         flashmla_tile_scheduler_metadata: torch.Tensor,
         flashmla_num_splits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -499,6 +501,7 @@ class Glm5DsaAttnSegment:
             topk=self.index_topk,
             page_size=self.aux_page_size,
             max_seqlen=self.max_seqlen,
+            num_valid_tokens=num_valid_tokens,
         )
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,
