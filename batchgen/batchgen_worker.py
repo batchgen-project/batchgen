@@ -519,6 +519,13 @@ class BatchGenWorker:
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
+		self._decode_local_count_tensor = None
+		self._decode_all_rank_counts = None
+		self._decode_cache_seqlens_i32 = None
+		self._decode_position_ids_i64 = None
+		self._decode_cache_seqlens_cpu_staging = None
+		self._decode_metadata_batch_key = None
+		self._decode_metadata_cpu_seqlens = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -8752,11 +8759,86 @@ class BatchGenWorker:
 		
 		return updated_uuids, updated_batch
 
+	def _ensure_decode_metadata_capacity(self, batch_size: int) -> None:
+		"""Allocate reusable decode metadata buffers sized for the local batch."""
+		current = self._decode_cache_seqlens_i32
+		if current is not None and current.shape[0] >= batch_size:
+			return
+
+		capacity = max(1, batch_size)
+		self._decode_cache_seqlens_i32 = torch.empty(
+			(capacity,), dtype=torch.int32, device=self.torch_device
+		)
+		self._decode_position_ids_i64 = torch.empty(
+			(capacity, 1), dtype=torch.int64, device=self.torch_device
+		)
+		self._decode_cache_seqlens_cpu_staging = torch.empty(
+			(capacity,), dtype=torch.int32, pin_memory=True
+		)
+		self._decode_metadata_batch_key = None
+		self._decode_metadata_cpu_seqlens = None
+
+	def _bind_decode_attention_metadata(
+		self,
+		batch_sequences: List[SequenceEntry],
+		cache_seqlens: List[int],
+	) -> Tuple[torch.Tensor, torch.Tensor]:
+		"""Bind cache_seqlens/position_ids while avoiding steady-state HtoD copies.
+
+		The first decode step for a batch seeds the reusable device buffers from
+		CPU sequence metadata. While the same local batch remains active, every
+		sequence advances by exactly one token per step, so metadata advances with
+		device-side increments instead of rebuilding CUDA tensors from Python lists.
+		"""
+		batch_size = len(cache_seqlens)
+		self._ensure_decode_metadata_capacity(batch_size)
+
+		batch_key = tuple(seq.global_idx for seq in batch_sequences)
+		cache_seqlens_key = tuple(int(v) for v in cache_seqlens)
+		prev_key = self._decode_metadata_batch_key
+		prev_seqlens = self._decode_metadata_cpu_seqlens
+		can_advance_on_device = (
+			prev_key == batch_key
+			and prev_seqlens is not None
+			and len(prev_seqlens) == batch_size
+			and all(cur == prev + 1 for cur, prev in zip(cache_seqlens_key, prev_seqlens))
+		)
+
+		cache_view = self._decode_cache_seqlens_i32[:batch_size]
+		position_view = self._decode_position_ids_i64[:batch_size]
+
+		if can_advance_on_device:
+			cache_view.add_(1)
+			position_view.add_(1)
+		else:
+			staging = self._decode_cache_seqlens_cpu_staging
+			for i, value in enumerate(cache_seqlens_key):
+				staging[i] = value
+			cache_view.copy_(staging[:batch_size], non_blocking=True)
+			position_view[:, 0].copy_(cache_view.to(dtype=torch.int64))
+			position_view.sub_(1)
+
+		self._decode_metadata_batch_key = batch_key
+		self._decode_metadata_cpu_seqlens = cache_seqlens_key
+		return cache_view, position_view
+
 	def _sync_decode_moe_rank_counts(self, batch: List[int], *, reason: str) -> int:
 		"""Synchronize per-rank decode row counts for 3D MoE padding masks."""
 		local_count = int(len(batch))
-		local_count_tensor = torch.tensor([local_count], dtype=torch.int64, device=self.torch_device)
-		all_rank_counts = torch.zeros(self.world_size, dtype=torch.int64, device=self.torch_device)
+		if self._decode_local_count_tensor is None:
+			self._decode_local_count_tensor = torch.empty(
+				(1,), dtype=torch.int64, device=self.torch_device
+			)
+		if (
+			self._decode_all_rank_counts is None
+			or self._decode_all_rank_counts.shape[0] != self.world_size
+		):
+			self._decode_all_rank_counts = torch.empty(
+				(self.world_size,), dtype=torch.int64, device=self.torch_device
+			)
+		local_count_tensor = self._decode_local_count_tensor
+		all_rank_counts = self._decode_all_rank_counts
+		local_count_tensor.fill_(local_count)
 		dist.all_gather_into_tensor(all_rank_counts, local_count_tensor)
 		max_batch_size = int(all_rank_counts.max().item())
 
@@ -10764,12 +10846,11 @@ class BatchGenWorker:
 						for uid, dl, ctx, pg in resumed[:5]:
 							logging.info(f"[MULTI_DIAG]   RESUMED: {uid} decoded={dl} cache_seqlen={ctx} gpu_pages={pg}")
 
-					# Build attention metadata directly on GPU
-					seqlens_tensor = torch.tensor(cache_seqlens, dtype=torch.int64, device=self.torch_device)
-
 					Attn_Wrapper.attention_mask = None  # Removed: no longer used in decode
-					Attn_Wrapper.cache_seqlens = seqlens_tensor.to(torch.int32)
-					Attn_Wrapper.position_ids = (Attn_Wrapper.cache_seqlens - 1).unsqueeze(-1).to(torch.int64)
+					(
+						Attn_Wrapper.cache_seqlens,
+						Attn_Wrapper.position_ids,
+					) = self._bind_decode_attention_metadata(batch_sequences, cache_seqlens)
 					Attn_Wrapper.max_seqlen = max_ctx
 
 					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
@@ -10809,6 +10890,8 @@ class BatchGenWorker:
 					AttnWrapperBase._dsa_short_count = 0
 					AttnWrapperBase.glm5_dsa_graph_forward_state = None
 					AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+					self._decode_metadata_batch_key = None
+					self._decode_metadata_cpu_seqlens = None
 				
 				if batch:
 					Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch)
