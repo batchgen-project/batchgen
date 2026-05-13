@@ -228,6 +228,32 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
             append_plan=materialization.append_plan,
             layer_idx=layer_idx,
         )
+        blocked_k, blocked_v, block_table = manager.get_layer_kv_with_page_table(
+            layer_idx
+        )
+        if blocked_v is not None:
+            raise RuntimeError(
+                "MLA GPU prefix materialization unexpectedly has V cache"
+            )
+        if block_table is None:
+            raise RuntimeError("MLA GPU prefix materialization requires page table")
+        if attention_fn is None:
+            from batchgen.attention.mla.flashinfer_paged_prefill import (
+                run_flashinfer_mla_paged_suffix_prefill,
+            )
+
+            return run_flashinfer_mla_paged_suffix_prefill(
+                query_states=query_states,
+                compressed_kv_cache=blocked_k,
+                page_table=block_table,
+                slot_indices=materialization.append_plan.slot_indices,
+                cache_seqlens=materialization.append_plan.cache_seqlens,
+                cu_seqlens_q=metadata.cu_seqlens,
+                kv_lora_rank=int(spec.kv_lora_rank),
+                num_heads=int(spec.num_heads),
+                softmax_scale=float(spec.softmax_scale),
+            )
+
         query_len = int(metadata.max_seqlen)
         query_lengths = metadata.seq_lengths
     else:
