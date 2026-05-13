@@ -283,10 +283,10 @@ class _FakeMlaMaterialization:
             cache_seqlens=torch.tensor([5], dtype=torch.int32),
             slot_indices=torch.tensor([0], dtype=torch.int32),
         )
-        self.waited = False
+        self.waited_layers = []
 
-    def wait_for_load(self):
-        self.waited = True
+    def wait_for_layer(self, layer_idx):
+        self.waited_layers.append(int(layer_idx))
 
 
 def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatch):
@@ -328,7 +328,7 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatc
     )
 
     torch.testing.assert_close(output, torch.full((1, 2, 2, 1), 3.0))
-    assert materialization.waited
+    assert materialization.waited_layers == [2]
     assert len(materialization.manager.append_calls) == 1
     append_call = materialization.manager.append_calls[0]
     assert append_call["k_tensor"] is key
@@ -377,7 +377,7 @@ def test_mla_backend_full_hit_uses_flashinfer_gpu_materialization(monkeypatch):
     )
 
     torch.testing.assert_close(output, torch.full((1, 1, 2, 1), 4.0))
-    assert materialization.waited
+    assert materialization.waited_layers == [2]
     assert materialization.manager.append_calls == []
     assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
     assert recorded["page_table"] is materialization.manager.block_table

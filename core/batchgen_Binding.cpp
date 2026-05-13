@@ -604,6 +604,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)
         .def("wait", &kv::KVAsyncTask::wait)
+        .def("wait_layer", &kv::KVAsyncTask::wait_layer)
+        .def("layer_count", &kv::KVAsyncTask::layer_count)
         .def("done", &kv::KVAsyncTask::done)
         .def("result", &kv::KVAsyncTask::result);
 

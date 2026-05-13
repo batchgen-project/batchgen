@@ -126,7 +126,7 @@ class GqaPrefixAwareAttentionBackend:
         from batchgen.attention.gqa import gqa_decode_fa
 
         layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
-        materialization.wait_for_load()
+        materialization.wait_for_layer(layer_idx)
         materialization.manager.append_layer_prefill_suffix_tokens(
             k_tensor=key,
             v_tensor=value,
@@ -182,7 +182,7 @@ class GqaPrefixAwareAttentionBackend:
         from batchgen.attention.gqa import gqa_decode_fa
 
         layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
-        materialization.wait_for_load()
+        materialization.wait_for_layer(layer_idx)
         k_cache, v_cache, page_table = (
             materialization.manager.get_layer_kv_with_page_table(layer_idx)
         )

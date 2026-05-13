@@ -35,20 +35,17 @@ class PrefillPrefixGpuMaterialization:
 	host_pages_loaded: list[int]
 	gpu_pages_loaded: list[int]
 	_destroy_manager_on_cleanup: bool = False
-	_load_waited: bool = False
 	_cleaned: bool = False
 
-	def wait_for_load(self) -> None:
-		if self._load_waited:
-			return
+	def wait_for_layer(self, layer_idx: int) -> None:
 		if self.load_task is not None:
-			self.load_task.wait()
-		self._load_waited = True
+			self.load_task.wait_layer(int(layer_idx))
 
 	def cleanup(self) -> None:
 		if self._cleaned:
 			return
-		self.wait_for_load()
+		if self.load_task is not None:
+			self.load_task.wait()
 		if self.sequence_ids:
 			self.manager.free_pages_for_sequences(self.sequence_ids)
 		if self._destroy_manager_on_cleanup:

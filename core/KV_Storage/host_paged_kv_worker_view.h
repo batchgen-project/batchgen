@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <iomanip>
@@ -245,10 +246,86 @@ class BoundedAsyncExecutor {
 };
 }  // namespace worker_detail
 
+class KVLayerCompletionState {
+   public:
+    explicit KVLayerCompletionState(std::size_t num_layers)
+        : events_(num_layers, nullptr), ready_(num_layers, false) {}
+
+    KVLayerCompletionState(const KVLayerCompletionState&) = delete;
+    KVLayerCompletionState& operator=(const KVLayerCompletionState&) = delete;
+
+    ~KVLayerCompletionState() {
+        for (cudaEvent_t event : events_) {
+            if (event != nullptr) {
+                cudaEventDestroy(event);
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t num_layers() const { return events_.size(); }
+
+    void RecordLayerEvent(std::size_t layer_idx, cudaEvent_t event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        CheckLayerBounds(layer_idx);
+        if (ready_[layer_idx]) {
+            throw std::runtime_error("Layer completion event recorded twice");
+        }
+        events_[layer_idx] = event;
+        ready_[layer_idx] = true;
+        cv_.notify_all();
+    }
+
+    void SetFailure(std::exception_ptr failure) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failure_ = std::move(failure);
+        cv_.notify_all();
+    }
+
+    void WaitLayer(std::size_t layer_idx) const {
+        cudaEvent_t event = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            CheckLayerBounds(layer_idx);
+            cv_.wait(lock, [this, layer_idx]() {
+                return ready_[layer_idx] || failure_ != nullptr;
+            });
+            if (!ready_[layer_idx]) {
+                std::rethrow_exception(failure_);
+            }
+            event = events_[layer_idx];
+        }
+
+        auto stream = c10::cuda::getCurrentCUDAStream();
+        CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), event, 0));
+    }
+
+   private:
+    void CheckLayerBounds(std::size_t layer_idx) const {
+        if (layer_idx >= events_.size()) {
+            std::ostringstream oss;
+            oss << "layer_idx=" << layer_idx
+                << " is out of range for layered KV async task with "
+                << events_.size() << " layers";
+            throw std::out_of_range(oss.str());
+        }
+    }
+
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    std::vector<cudaEvent_t> events_;
+    std::vector<bool> ready_;
+    std::exception_ptr failure_;
+};
+
 struct KVAsyncTask {
     KVAsyncTask() = default;
     KVAsyncTask(std::uint64_t id, std::shared_future<void> future)
         : id_(id), future_(std::move(future)) {}
+    KVAsyncTask(std::uint64_t id, std::shared_future<void> future,
+                std::shared_ptr<KVLayerCompletionState> layer_state)
+        : id_(id),
+          future_(std::move(future)),
+          layer_state_(std::move(layer_state)) {}
 
     [[nodiscard]] std::uint64_t id() const { return id_; }
 
@@ -266,6 +343,18 @@ struct KVAsyncTask {
         }
     }
 
+    void wait_layer(std::size_t layer_idx) const {
+        if (layer_state_ == nullptr) {
+            wait();
+            return;
+        }
+        layer_state_->WaitLayer(layer_idx);
+    }
+
+    [[nodiscard]] std::size_t layer_count() const {
+        return layer_state_ == nullptr ? 0 : layer_state_->num_layers();
+    }
+
     void result() const {
         if (future_.valid()) {
             future_.get();
@@ -275,6 +364,7 @@ struct KVAsyncTask {
    private:
     std::uint64_t id_ = 0;
     std::shared_future<void> future_;
+    std::shared_ptr<KVLayerCompletionState> layer_state_;
 };
 
 using SequenceLengthMap = std::unordered_map<std::int64_t, std::size_t>;
@@ -1169,7 +1259,7 @@ class HostPagedKVWorkerView {
             "Prepared AsyncLoadPrefixPagesToDevice (num_layers={}, total_pages={})",
             num_layers, total_pages);
 
-        return LaunchAsyncTask([
+        return LaunchLayeredAsyncTask(num_layers, [
             this,
             page_table = std::move(page_table),
             sequence_offsets = std::move(sequence_offsets),
@@ -1179,7 +1269,7 @@ class HostPagedKVWorkerView {
             num_layers,
             copy_entries,
             kOpName
-        ]() mutable {
+        ](KVLayerCompletionState& layer_state) mutable {
             c10::cuda::OptionalCUDAGuard device_guard(device_index_);
             const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
             const std::size_t k_page_bytes = layout_.KPageBytes();
@@ -1193,82 +1283,103 @@ class HostPagedKVWorkerView {
                     ? v_tensor->data_ptr<std::int64_t>()
                     : nullptr;
             const std::size_t row_stride = total_pages;
-            auto build_plan = [&](const std::int64_t* dest_ptrs,
-                                  auto&& host_ptr_provider) {
+            auto build_layer_plan = [&](std::size_t layer_idx,
+                                        const std::int64_t* dest_ptrs,
+                                        auto&& host_ptr_provider) {
                 if (dest_ptrs == nullptr) {
                     throw std::invalid_argument(std::string(kOpName) +
                                                 ": null device pointers");
                 }
                 return this->BuildPageCopyPlan(
-                    page_table, sequence_offsets, num_layers, row_stride,
-                    copy_entries, dest_ptrs,
+                    page_table, sequence_offsets, 1, row_stride, total_pages,
+                    dest_ptrs + layer_idx * row_stride,
                     std::forward<decltype(host_ptr_provider)>(
                         host_ptr_provider),
                     kOpName);
             };
-
-            const auto k_plan = build_plan(
-                k_dest_ptr,
-                [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
-                    return this->KPagePtr(layer_idx, page_idx);
-                });
-
-            std::optional<PageCopyPlan> v_plan;
-            if constexpr (kHasVCache) {
-                if (v_dest_ptr != nullptr) {
-                    v_plan = build_plan(
-                        v_dest_ptr, [this](std::size_t layer_idx,
-                                           std::int32_t page_idx) -> void* {
-                            return this->template VPagePtr<>(layer_idx,
-                                                             page_idx);
-                        });
-                }
-            }
 
             worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
                 copy_entries);
             worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
                 copy_entries);
             worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
+                v_dest_ptr != nullptr ? copy_entries : 0);
             worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
-                v_plan.has_value() ? copy_entries : 0);
+                v_dest_ptr != nullptr ? copy_entries : 0);
 
             auto enqueue_plan =
                 [&](const PageCopyPlan& plan,
                     worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
                     worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
-                    std::size_t page_bytes) {
+                    std::size_t page_bytes, std::size_t layer_idx) {
                     if (plan.host_sources.empty() || page_bytes == 0) {
                         return;
                     }
+                    const std::size_t device_offset = layer_idx * total_pages;
                     const std::size_t ptr_bytes =
                         plan.host_sources.size() * sizeof(uint8_t*);
                     EnqueueCopy(
                         reinterpret_cast<const std::byte*>(
                             plan.host_sources.data()),
-                        reinterpret_cast<std::byte*>(dev_src_ptrs.get()),
+                        reinterpret_cast<std::byte*>(
+                            dev_src_ptrs.get() + device_offset),
                         ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
                     EnqueueCopy(
                         reinterpret_cast<const std::byte*>(
                             plan.device_dests.data()),
-                        reinterpret_cast<std::byte*>(dev_dst_ptrs.get()),
+                        reinterpret_cast<std::byte*>(
+                            dev_dst_ptrs.get() + device_offset),
                         ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
                     worker_detail::LaunchUvaPageCopyKernel(
-                        dev_src_ptrs.get(), dev_dst_ptrs.get(), page_bytes,
+                        dev_src_ptrs.get() + device_offset,
+                        dev_dst_ptrs.get() + device_offset, page_bytes,
                         static_cast<int>(plan.host_sources.size()),
                         cuda_stream);
                 };
 
-            enqueue_plan(k_plan, k_device_src_ptrs, k_device_dst_ptrs,
-                         k_page_bytes);
-
+            std::vector<PageCopyPlan> k_layer_plans;
+            k_layer_plans.reserve(num_layers);
+            std::vector<PageCopyPlan> v_layer_plans;
             if constexpr (kHasVCache) {
-                if (v_plan.has_value()) {
-                    const std::size_t v_page_bytes = layout_.VPageBytes();
-                    enqueue_plan(*v_plan, v_device_src_ptrs,
-                                 v_device_dst_ptrs, v_page_bytes);
+                if (v_dest_ptr != nullptr) {
+                    v_layer_plans.reserve(num_layers);
                 }
+            }
+            for (std::size_t layer_idx = 0; layer_idx < num_layers;
+                 ++layer_idx) {
+                k_layer_plans.emplace_back(build_layer_plan(
+                    layer_idx, k_dest_ptr,
+                    [this, layer_idx](
+                        std::size_t /*unused*/, std::int32_t page_idx
+                    ) -> void* {
+                        return this->KPagePtr(layer_idx, page_idx);
+                    }));
+                enqueue_plan(k_layer_plans.back(), k_device_src_ptrs,
+                             k_device_dst_ptrs, k_page_bytes, layer_idx);
+
+                if constexpr (kHasVCache) {
+                    if (v_dest_ptr != nullptr) {
+                        v_layer_plans.emplace_back(build_layer_plan(
+                            layer_idx, v_dest_ptr,
+                            [this, layer_idx](
+                                std::size_t /*unused*/,
+                                std::int32_t page_idx
+                            ) -> void* {
+                                return this->template VPagePtr<>(layer_idx,
+                                                                 page_idx);
+                            }));
+                        const std::size_t v_page_bytes = layout_.VPageBytes();
+                        enqueue_plan(v_layer_plans.back(), v_device_src_ptrs,
+                                     v_device_dst_ptrs, v_page_bytes,
+                                     layer_idx);
+                    }
+                }
+
+                cudaEvent_t layer_event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(
+                    &layer_event, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(layer_event, cuda_stream));
+                layer_state.RecordLayerEvent(layer_idx, layer_event);
             }
 
             logger_->debug(
@@ -3154,6 +3265,27 @@ class HostPagedKVWorkerView {
         const std::uint64_t id =
             task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
         return KVAsyncTask{id, std::move(future)};
+    }
+
+    template <typename Fn>
+    KVAsyncTask LaunchLayeredAsyncTask(std::size_t num_layers, Fn&& fn) const {
+        auto layer_state = std::make_shared<KVLayerCompletionState>(num_layers);
+        auto task = [
+            layer_state,
+            fn = std::forward<Fn>(fn)
+        ]() mutable {
+            try {
+                fn(*layer_state);
+            } catch (...) {
+                layer_state->SetFailure(std::current_exception());
+                throw;
+            }
+        };
+        auto future = worker_detail::BoundedAsyncExecutor::Instance().Submit(
+            std::move(task));
+        const std::uint64_t id =
+            task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+        return KVAsyncTask{id, std::move(future), std::move(layer_state)};
     }
 
     void SynchronizeWithEvent(cudaStream_t stream) const {

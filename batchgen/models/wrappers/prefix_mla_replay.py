@@ -194,8 +194,8 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
             "MLA GPU prefix materialization requires K-only compressed KV pages"
         )
 
-    materialization.wait_for_load()
     layer_idx = int(prefix_kv_builder.reader.layer_idx)
+    materialization.wait_for_layer(layer_idx)
 
     if metadata.prefix_reuse_mode:
         if offload_kv is None:
