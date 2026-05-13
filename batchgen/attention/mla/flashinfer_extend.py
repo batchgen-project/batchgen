@@ -1,4 +1,4 @@
-"""FlashInfer MLA paged-KV extend prefill helpers."""
+"""FlashInfer MLA paged-KV extend helpers."""
 
 from __future__ import annotations
 

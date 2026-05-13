@@ -1,6 +1,6 @@
 import torch
 
-from batchgen.attention.mla import flashinfer_extend_prefill
+from batchgen.attention.mla import flashinfer_extend
 
 
 def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
@@ -50,9 +50,9 @@ def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
             }
             return torch.ones_like(q_nope)
 
-    flashinfer_extend_prefill._reset_flashinfer_mla_extend_prefill_cache_for_tests()
+    flashinfer_extend._reset_flashinfer_mla_extend_prefill_cache_for_tests()
     monkeypatch.setattr(
-        flashinfer_extend_prefill,
+        flashinfer_extend,
         "_WRAPPER_CLASS_FOR_TESTS",
         FakeWrapper,
     )
@@ -71,7 +71,7 @@ def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
     cache_seqlens = torch.tensor([17, 33], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 1, 3], dtype=torch.int32)
 
-    output = flashinfer_extend_prefill.run_flashinfer_mla_extend_prefill(
+    output = flashinfer_extend.run_flashinfer_mla_extend_prefill(
         query_states=query_states,
         compressed_kv_cache=compressed_kv_cache,
         page_table=page_table,
@@ -120,14 +120,14 @@ def test_flashinfer_mla_extend_prefill_accepts_full_hit_query_layout(monkeypatch
             calls["q_nope_shape"] = q_nope.shape
             return torch.ones_like(q_nope)
 
-    flashinfer_extend_prefill._reset_flashinfer_mla_extend_prefill_cache_for_tests()
+    flashinfer_extend._reset_flashinfer_mla_extend_prefill_cache_for_tests()
     monkeypatch.setattr(
-        flashinfer_extend_prefill,
+        flashinfer_extend,
         "_WRAPPER_CLASS_FOR_TESTS",
         FakeWrapper,
     )
 
-    output = flashinfer_extend_prefill.run_flashinfer_mla_extend_prefill(
+    output = flashinfer_extend.run_flashinfer_mla_extend_prefill(
         query_states=torch.zeros(2, 1, 3, 6),
         compressed_kv_cache=torch.zeros(5, 16, 1, 6),
         page_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
