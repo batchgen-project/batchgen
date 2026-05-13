@@ -300,7 +300,7 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatc
 
     monkeypatch.setattr(
         flashinfer_paged_prefill,
-        "run_flashinfer_mla_paged_suffix_prefill",
+        "run_flashinfer_mla_paged_prefill",
         flashinfer_fn,
     )
 
@@ -335,6 +335,50 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatc
     assert append_call["v_tensor"] is None
     assert append_call["layer_idx"] == 2
     assert builder.prefix_calls == []
+    assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
+    assert recorded["page_table"] is materialization.manager.block_table
+    assert recorded["cache_seqlens"].tolist() == [5]
+    assert recorded["slot_indices"].tolist() == [0]
+
+
+def test_mla_backend_full_hit_uses_flashinfer_gpu_materialization(monkeypatch):
+    recorded = {}
+
+    from batchgen.attention.mla import flashinfer_paged_prefill
+
+    def flashinfer_fn(**kwargs):
+        recorded.update(kwargs)
+        return torch.full((1, 1, 2, 1), 4.0)
+
+    monkeypatch.setattr(
+        flashinfer_paged_prefill,
+        "run_flashinfer_mla_paged_prefill",
+        flashinfer_fn,
+    )
+
+    materialization = _FakeMlaMaterialization()
+    backend = MlaProjectedPrefixAwareAttentionBackend(
+        prefix_kv_builder=_FakePrefixKvBuilder(),
+        page_size=4,
+        kv_dim=3,
+        num_heads=2,
+        kv_lora_rank=1,
+        softmax_scale=0.5,
+    )
+
+    output = backend.forward_prefill(
+        query=torch.zeros((1, 1, 2, 3)),
+        key=None,
+        value=None,
+        metadata=_metadata(full_hit=True),
+        kv_cache_metadata=SimpleNamespace(
+            prefill_prefix_materialization=materialization
+        ),
+    )
+
+    torch.testing.assert_close(output, torch.full((1, 1, 2, 1), 4.0))
+    assert materialization.waited
+    assert materialization.manager.append_calls == []
     assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
     assert recorded["page_table"] is materialization.manager.block_table
     assert recorded["cache_seqlens"].tolist() == [5]

@@ -13,7 +13,7 @@ _WRAPPER_CACHE: dict[tuple[str, Optional[int], str], object] = {}
 _WRAPPER_CLASS_FOR_TESTS = None
 
 
-def run_flashinfer_mla_paged_suffix_prefill(
+def run_flashinfer_mla_paged_prefill(
     *,
     query_states: torch.Tensor,
     compressed_kv_cache: torch.Tensor,
@@ -25,12 +25,13 @@ def run_flashinfer_mla_paged_suffix_prefill(
     num_heads: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Run prefix-hit suffix prefill through FlashInfer paged MLA attention.
+    """Run prefix-hit MLA prefill through FlashInfer paged attention.
 
     ``compressed_kv_cache`` is BatchGen's materialized GPU paged MLA cache with
     shape ``[num_pages, page_size, 1, kv_lora_rank + rope_dim]``. The returned
-    tensor keeps the legacy prefix replay shape ``[1, tokens, heads, rank]`` so
-    existing MLA output-projection glue can stay unchanged.
+    tensor is packed as ``[1, tokens, heads, rank]`` so existing MLA
+    output-projection glue can stay unchanged. Exact full hits are represented
+    as one query token per sequence.
     """
 
     packed_query = _packed_query_view(query_states)
@@ -73,11 +74,18 @@ def run_flashinfer_mla_paged_suffix_prefill(
 def _packed_query_view(query_states: torch.Tensor) -> torch.Tensor:
     if query_states.dim() == 4 and query_states.shape[0] == 1:
         return query_states.squeeze(0)
+    if query_states.dim() == 4 and query_states.shape[1] == 1:
+        return query_states.reshape(
+            query_states.shape[0],
+            query_states.shape[2],
+            query_states.shape[3],
+        )
     if query_states.dim() == 3:
         return query_states
     raise RuntimeError(
         "FlashInfer MLA paged prefill expects packed query states shaped "
-        "[1, tokens, heads, dim] or [tokens, heads, dim]"
+        "[1, tokens, heads, dim], [batch, 1, heads, dim], or "
+        "[tokens, heads, dim]"
     )
 
 

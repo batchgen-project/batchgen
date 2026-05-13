@@ -215,29 +215,27 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
             )
         if block_table is None:
             raise RuntimeError("MLA GPU prefix materialization requires page table")
-        if attention_fn is None:
-            from batchgen.attention.mla.flashinfer_paged_prefill import (
-                run_flashinfer_mla_paged_suffix_prefill,
+        if attention_fn is not None:
+            raise RuntimeError(
+                "MLA prefix-cache suffix prefill must use FlashInfer paged "
+                "MLA attention"
             )
-
-            return run_flashinfer_mla_paged_suffix_prefill(
-                query_states=query_states,
-                compressed_kv_cache=blocked_k,
-                page_table=block_table,
-                slot_indices=materialization.append_plan.slot_indices,
-                cache_seqlens=materialization.append_plan.cache_seqlens,
-                cu_seqlens_q=metadata.cu_seqlens,
-                kv_lora_rank=int(spec.kv_lora_rank),
-                num_heads=int(spec.num_heads),
-                softmax_scale=float(spec.softmax_scale),
-            )
-
-        raise RuntimeError(
-            "MLA prefix-cache suffix prefill must use FlashInfer paged MLA "
-            "attention; custom attention_fn is only supported for full-hit"
+        return _run_flashinfer_mla_prefix_attention(
+            query_states=query_states,
+            blocked_k=blocked_k,
+            block_table=block_table,
+            cache_seqlens=materialization.append_plan.cache_seqlens,
+            slot_indices=materialization.append_plan.slot_indices,
+            metadata=metadata,
+            spec=spec,
         )
-    elif metadata.full_hit_mode:
-        query_len = 1
+    if metadata.full_hit_mode:
+        if offload_kv is not None:
+            raise RuntimeError("MLA full-hit prefix replay does not accept suffix KV")
+        if attention_fn is not None:
+            raise RuntimeError(
+                "MLA full-hit prefix replay must use FlashInfer paged MLA attention"
+            )
     else:
         raise RuntimeError(
             "MLA GPU prefix materialization requires prefix reuse or full hit"
@@ -251,46 +249,40 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
     if block_table is None:
         raise RuntimeError("MLA GPU prefix materialization requires page table")
 
-    attention_fn = attention_fn or run_flash_mla_prefix_attention
-    return attention_fn(
+    return _run_flashinfer_mla_prefix_attention(
         query_states=query_states.contiguous(),
         blocked_k=blocked_k,
         block_table=block_table,
         cache_seqlens=materialization.append_plan.cache_seqlens,
-        query_len=query_len,
+        slot_indices=materialization.append_plan.slot_indices,
+        metadata=metadata,
         spec=spec,
     )
 
 
-def run_flash_mla_prefix_attention(
+def _run_flashinfer_mla_prefix_attention(
     *,
     query_states: torch.Tensor,
     blocked_k: torch.Tensor,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
-    query_len: int,
+    slot_indices: torch.Tensor,
+    metadata: PrefixCachePrepackMetadata,
     spec: MlaReplaySpec,
 ) -> torch.Tensor:
-    """Run FlashMLA against cached-prefix page blocks."""
-    from batchgen.attention.mla.flashmla_backend import (
-        flash_mla_with_kvcache,
-        get_mla_metadata,
+    """Run FlashInfer MLA paged attention against materialized prefix pages."""
+    from batchgen.attention.mla.flashinfer_paged_prefill import (
+        run_flashinfer_mla_paged_prefill,
     )
 
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens,
-        int(spec.num_heads),
-        int(query_len),
+    return run_flashinfer_mla_paged_prefill(
+        query_states=query_states,
+        compressed_kv_cache=blocked_k,
+        page_table=block_table,
+        slot_indices=slot_indices,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=metadata.cu_seqlens,
+        kv_lora_rank=int(spec.kv_lora_rank),
+        num_heads=int(spec.num_heads),
+        softmax_scale=float(spec.softmax_scale),
     )
-    attn_out, _ = flash_mla_with_kvcache(
-        query_states,
-        blocked_k,
-        block_table,
-        cache_seqlens,
-        int(spec.kv_lora_rank),
-        tile_scheduler_metadata,
-        num_splits,
-        float(spec.softmax_scale),
-        True,
-    )
-    return attn_out
