@@ -644,6 +644,21 @@ def test_glm5_dsa_graph_compare_returns_eager_and_runs_side_channel(monkeypatch)
     assert calls == {"return_debug": True, "compare": True}
 
 
+def test_glm5_compare_tensor_summary_exact_checks_bfloat_values():
+    graph = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+    eager = torch.tensor([1.0078125, 2.0], dtype=torch.bfloat16)
+
+    failed, summary = GLM5AttnWrapper._compare_tensor_summary(
+        "primary_k_tensor",
+        graph,
+        eager,
+        exact=True,
+    )
+
+    assert failed
+    assert "mismatch=1/2" in summary
+
+
 def test_glm5_dsa_graph_segment_inputs_expose_rotated_q_rope(monkeypatch):
     flash_attn_mod = types.ModuleType("flash_attn_interface")
     flash_attn_mod.flash_attn_varlen_func = lambda *args, **kwargs: None
