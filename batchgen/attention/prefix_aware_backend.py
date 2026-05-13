@@ -30,7 +30,7 @@ class PrefixAwareAttentionBackend(Protocol):
 
 @dataclass(frozen=True)
 class GqaPrefixAwareAttentionBackend:
-    """GQA backend adapter using existing varlen FlashAttention implementation."""
+    """GQA backend adapter for varlen prefill and paged extend prefill."""
 
     prefix_kv_builder: object
     num_kv_heads: int
@@ -123,7 +123,7 @@ class GqaPrefixAwareAttentionBackend:
     ) -> torch.Tensor:
         """Run prefix-hit suffix prefill over materialized GPU paged KV."""
 
-        from batchgen.attention.gqa import gqa_decode_fa
+        from batchgen.attention.gqa import gqa_extend_fa
 
         layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
         materialization.wait_for_layer(layer_idx)
@@ -139,36 +139,31 @@ class GqaPrefixAwareAttentionBackend:
         if v_cache is None:
             raise RuntimeError("GQA paged prefix prefill requires V cache")
 
-        cu = metadata.cu_seqlens_list()
-        outputs = []
-        slot_indices = materialization.append_plan.slot_values
-        for seq_idx, suffix_len in enumerate(metadata.seq_lengths):
-            start = int(cu[seq_idx])
-            end = int(cu[seq_idx + 1])
-            if suffix_len <= 0:
-                raise RuntimeError("Paged prefix prefill requires non-empty suffix")
-
-            q_segment = query[start:end].unsqueeze(0)
-            cache_seqlens = torch.tensor(
-                [int(metadata.full_seq_lengths[seq_idx])],
+        cu_k = torch.nn.functional.pad(
+            torch.cumsum(
+                materialization.append_plan.cache_seqlens,
+                dim=0,
                 dtype=torch.int32,
+            ),
+            (1, 0),
+        )
+        attn_output, _ = gqa_extend_fa(
+            q=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=materialization.append_plan.cache_seqlens,
+            page_table=page_table,
+            cu_seqlens_q=metadata.cu_seqlens.to(
                 device=query.device,
-            )
-            slot_idx = int(slot_indices[seq_idx])
-            block_table = page_table[slot_idx : slot_idx + 1]
-            attn_output, _ = gqa_decode_fa(
-                q=q_segment,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                sinks=self.sinks,
-                softmax_scale=self.softmax_scale,
-                sliding_window=self.sliding_window,
-            )
-            outputs.append(attn_output.squeeze(0))
-
-        return torch.cat(outputs, dim=0)
+                dtype=torch.int32,
+            ),
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=int(metadata.max_seqlen),
+            sinks=self.sinks,
+            softmax_scale=self.softmax_scale,
+            sliding_window=self.sliding_window,
+        )
+        return attn_output
 
     def _forward_paged_full_hit_prefill(
         self,
