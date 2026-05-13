@@ -271,11 +271,11 @@ def _run_flashinfer_mla_prefix_attention(
     spec: MlaReplaySpec,
 ) -> torch.Tensor:
     """Run FlashInfer MLA paged attention against materialized prefix pages."""
-    from batchgen.attention.mla.flashinfer_paged_prefill import (
-        run_flashinfer_mla_paged_prefill,
+    from batchgen.attention.mla.flashinfer_extend_prefill import (
+        run_flashinfer_mla_extend_prefill,
     )
 
-    return run_flashinfer_mla_paged_prefill(
+    return run_flashinfer_mla_extend_prefill(
         query_states=query_states,
         compressed_kv_cache=blocked_k,
         page_table=block_table,

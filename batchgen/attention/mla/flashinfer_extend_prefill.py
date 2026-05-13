@@ -13,7 +13,7 @@ _WRAPPER_CACHE: dict[tuple[str, Optional[int], str], object] = {}
 _WRAPPER_CLASS_FOR_TESTS = None
 
 
-def run_flashinfer_mla_paged_prefill(
+def run_flashinfer_mla_extend_prefill(
     *,
     query_states: torch.Tensor,
     compressed_kv_cache: torch.Tensor,
@@ -25,7 +25,7 @@ def run_flashinfer_mla_paged_prefill(
     num_heads: int,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Run prefix-hit MLA prefill through FlashInfer paged attention.
+    """Run prefix-hit MLA extend prefill through FlashInfer paged attention.
 
     ``compressed_kv_cache`` is BatchGen's materialized GPU paged MLA cache with
     shape ``[num_pages, page_size, 1, kv_lora_rank + rope_dim]``. The returned
@@ -83,7 +83,7 @@ def _packed_query_view(query_states: torch.Tensor) -> torch.Tensor:
     if query_states.dim() == 3:
         return query_states
     raise RuntimeError(
-        "FlashInfer MLA paged prefill expects packed query states shaped "
+        "FlashInfer MLA extend prefill expects packed query states shaped "
         "[1, tokens, heads, dim], [batch, 1, heads, dim], or "
         "[tokens, heads, dim]"
     )
@@ -96,7 +96,7 @@ def _split_compressed_mla_cache(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if compressed_kv_cache.dim() != 4 or compressed_kv_cache.shape[2] != 1:
         raise RuntimeError(
-            "FlashInfer MLA paged prefill expects K-only compressed MLA cache "
+            "FlashInfer MLA extend prefill expects K-only compressed MLA cache "
             "shaped [pages, page_size, 1, dim]"
         )
     cache = compressed_kv_cache.squeeze(2)
@@ -183,6 +183,6 @@ def _cache_key(device: torch.device) -> tuple[str, Optional[int]]:
     return normalized.type, normalized.index
 
 
-def _reset_flashinfer_mla_paged_prefill_cache_for_tests() -> None:
+def _reset_flashinfer_mla_extend_prefill_cache_for_tests() -> None:
     _WORKSPACE_CACHE.clear()
     _WRAPPER_CACHE.clear()

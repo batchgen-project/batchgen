@@ -292,15 +292,15 @@ class _FakeMlaMaterialization:
 def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatch):
     recorded = {}
 
-    from batchgen.attention.mla import flashinfer_paged_prefill
+    from batchgen.attention.mla import flashinfer_extend_prefill
 
     def flashinfer_fn(**kwargs):
         recorded.update(kwargs)
         return torch.full((1, 2, 2, 1), 3.0)
 
     monkeypatch.setattr(
-        flashinfer_paged_prefill,
-        "run_flashinfer_mla_paged_prefill",
+        flashinfer_extend_prefill,
+        "run_flashinfer_mla_extend_prefill",
         flashinfer_fn,
     )
 
@@ -344,15 +344,15 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatc
 def test_mla_backend_full_hit_uses_flashinfer_gpu_materialization(monkeypatch):
     recorded = {}
 
-    from batchgen.attention.mla import flashinfer_paged_prefill
+    from batchgen.attention.mla import flashinfer_extend_prefill
 
     def flashinfer_fn(**kwargs):
         recorded.update(kwargs)
         return torch.full((1, 1, 2, 1), 4.0)
 
     monkeypatch.setattr(
-        flashinfer_paged_prefill,
-        "run_flashinfer_mla_paged_prefill",
+        flashinfer_extend_prefill,
+        "run_flashinfer_mla_extend_prefill",
         flashinfer_fn,
     )
 
