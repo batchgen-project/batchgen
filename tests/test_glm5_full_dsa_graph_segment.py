@@ -307,7 +307,15 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     captured = manager._graphs[name][bucket_size]
     assert torch.equal(
         captured.static_inputs["num_valid_tokens"],
-        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        captured.static_inputs["cache_seqlens"],
+        torch.tensor([1, 0, 0, 0], dtype=torch.int32, device=device),
+    )
+    assert torch.equal(
+        captured.static_inputs["primary_slot_indices"],
+        torch.tensor([0, -1, -1, -1], dtype=torch.int32, device=device),
     )
 
     primary_cache.zero_()
