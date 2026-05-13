@@ -239,13 +239,7 @@ def test_gqa_backend_missing_metadata_raises():
         )
 
 
-def test_mla_backend_prefix_reuse_uses_host_replay_path():
-    recorded = {}
-
-    def attention_fn(**kwargs):
-        recorded.update(kwargs)
-        return kwargs["query_states"] + 2
-
+def test_mla_backend_prefix_reuse_requires_gpu_materialization():
     backend = MlaProjectedPrefixAwareAttentionBackend(
         prefix_kv_builder=_FakePrefixKvBuilder(),
         page_size=4,
@@ -253,22 +247,18 @@ def test_mla_backend_prefix_reuse_uses_host_replay_path():
         num_heads=2,
         kv_lora_rank=1,
         softmax_scale=0.5,
-        attention_fn=attention_fn,
     )
     query = torch.zeros((1, 2, 2, 3))
     key = torch.ones((2, 3))
 
-    output = backend.forward_prefill(
-        query=query,
-        key=key,
-        value=None,
-        metadata=_metadata(prefix_reuse=True),
-        kv_cache_metadata=object(),
-    )
-
-    torch.testing.assert_close(output, query + 2)
-    assert recorded["blocked_k"].shape == (2, 4, 1, 3)
-    assert recorded["cache_seqlens"].tolist() == [5]
+    with pytest.raises(RuntimeError, match="GPU paged materialization"):
+        backend.forward_prefill(
+            query=query,
+            key=key,
+            value=None,
+            metadata=_metadata(prefix_reuse=True),
+            kv_cache_metadata=object(),
+        )
 
 
 class _FakeMlaMaterializedManager:
@@ -290,7 +280,8 @@ class _FakeMlaMaterialization:
     def __init__(self):
         self.manager = _FakeMlaMaterializedManager()
         self.append_plan = SimpleNamespace(
-            cache_seqlens=torch.tensor([5], dtype=torch.int32)
+            cache_seqlens=torch.tensor([5], dtype=torch.int32),
+            slot_indices=torch.tensor([0], dtype=torch.int32),
         )
         self.waited = False
 
@@ -298,12 +289,20 @@ class _FakeMlaMaterialization:
         self.waited = True
 
 
-def test_mla_backend_prefix_reuse_uses_gpu_materialization():
+def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatch):
     recorded = {}
 
-    def attention_fn(**kwargs):
+    from batchgen.attention.mla import flashinfer_paged_prefill
+
+    def flashinfer_fn(**kwargs):
         recorded.update(kwargs)
-        return kwargs["query_states"] + 3
+        return torch.full((1, 2, 2, 1), 3.0)
+
+    monkeypatch.setattr(
+        flashinfer_paged_prefill,
+        "run_flashinfer_mla_paged_suffix_prefill",
+        flashinfer_fn,
+    )
 
     builder = _FakePrefixKvBuilder()
     materialization = _FakeMlaMaterialization()
@@ -314,7 +313,6 @@ def test_mla_backend_prefix_reuse_uses_gpu_materialization():
         num_heads=2,
         kv_lora_rank=1,
         softmax_scale=0.5,
-        attention_fn=attention_fn,
     )
     query = torch.zeros((1, 2, 2, 3))
     key = torch.ones((2, 3))
@@ -329,7 +327,7 @@ def test_mla_backend_prefix_reuse_uses_gpu_materialization():
         ),
     )
 
-    torch.testing.assert_close(output, query + 3)
+    torch.testing.assert_close(output, torch.full((1, 2, 2, 1), 3.0))
     assert materialization.waited
     assert len(materialization.manager.append_calls) == 1
     append_call = materialization.manager.append_calls[0]
@@ -337,7 +335,7 @@ def test_mla_backend_prefix_reuse_uses_gpu_materialization():
     assert append_call["v_tensor"] is None
     assert append_call["layer_idx"] == 2
     assert builder.prefix_calls == []
-    assert recorded["blocked_k"] is materialization.manager.blocked_k
-    assert recorded["block_table"] is materialization.manager.block_table
+    assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
+    assert recorded["page_table"] is materialization.manager.block_table
     assert recorded["cache_seqlens"].tolist() == [5]
-    assert recorded["query_len"] == 2
+    assert recorded["slot_indices"].tolist() == [0]

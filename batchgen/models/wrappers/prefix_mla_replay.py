@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Sequence, Tuple
+from typing import Callable
 
 import torch
 
@@ -24,7 +24,7 @@ class MlaReplaySpec:
 
 
 ProjectSuffixMlaFn = Callable[
-    [torch.Tensor, torch.Tensor, int], Tuple[torch.Tensor, torch.Tensor]
+    [torch.Tensor, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]
 ]
 ProjectQueryMlaFn = Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
 OutputProjectMlaFn = Callable[[torch.Tensor], torch.Tensor]
@@ -74,25 +74,18 @@ def run_prefix_mla_suffix_prefill_with_projected(
     """Run suffix-only MLA prefill from already projected suffix Q/KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
 
-    prefix_kv_builder = wrapper.prefix_attention_kv_builder()
-    if prefill_prefix_materialization is not None:
-        attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
-            prefix_kv_builder=prefix_kv_builder,
-            query_states=query_states,
-            offload_kv=offload_kv,
-            metadata=metadata,
-            spec=spec,
-            materialization=prefill_prefix_materialization,
+    if prefill_prefix_materialization is None:
+        raise RuntimeError(
+            "MLA prefix-cache suffix prefill requires GPU paged materialization"
         )
-    else:
-        attn_out = _run_projected_mla_prefix_attention_normalized(
-            prefix_kv_builder=prefix_kv_builder,
-            query_states=query_states,
-            offload_kv=offload_kv,
-            metadata=metadata,
-            spec=spec,
-            page_size=wrapper.host_prefix_reader().page_size(),
-        )
+    attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
+        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
+        query_states=query_states,
+        offload_kv=offload_kv,
+        metadata=metadata,
+        spec=spec,
+        materialization=prefill_prefix_materialization,
+    )
     return output_projection(attn_out), offload_kv
 
 
@@ -137,25 +130,18 @@ def run_prefix_mla_full_hit_prefill_with_query(
     """Run exact full-hit MLA prefill from already projected query states."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
 
-    prefix_kv_builder = wrapper.prefix_attention_kv_builder()
-    if prefill_prefix_materialization is not None:
-        attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
-            prefix_kv_builder=prefix_kv_builder,
-            query_states=query_states,
-            offload_kv=None,
-            metadata=metadata,
-            spec=spec,
-            materialization=prefill_prefix_materialization,
+    if prefill_prefix_materialization is None:
+        raise RuntimeError(
+            "MLA full-hit prefix prefill requires GPU paged materialization"
         )
-    else:
-        attn_out = _run_projected_mla_prefix_attention_normalized(
-            prefix_kv_builder=prefix_kv_builder,
-            query_states=query_states,
-            offload_kv=None,
-            metadata=metadata,
-            spec=spec,
-            page_size=wrapper.host_prefix_reader().page_size(),
-        )
+    attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
+        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
+        query_states=query_states,
+        offload_kv=None,
+        metadata=metadata,
+        spec=spec,
+        materialization=prefill_prefix_materialization,
+    )
     return output_projection(attn_out)
 
 
@@ -173,23 +159,18 @@ def run_projected_mla_prefix_attention(
     """Run MLA prefix/no-prefix attention from projected query and compressed KV."""
 
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if prefill_prefix_materialization is not None:
-        return run_projected_mla_prefix_attention_from_gpu_pages(
-            prefix_kv_builder=prefix_kv_builder,
-            query_states=query_states,
-            offload_kv=offload_kv,
-            metadata=metadata,
-            spec=spec,
-            materialization=prefill_prefix_materialization,
-            attention_fn=attention_fn,
+    del page_size
+    if prefill_prefix_materialization is None:
+        raise RuntimeError(
+            "MLA prefix attention requires GPU paged materialization"
         )
-    return _run_projected_mla_prefix_attention_normalized(
+    return run_projected_mla_prefix_attention_from_gpu_pages(
         prefix_kv_builder=prefix_kv_builder,
         query_states=query_states,
         offload_kv=offload_kv,
         metadata=metadata,
         spec=spec,
-        page_size=page_size,
+        materialization=prefill_prefix_materialization,
         attention_fn=attention_fn,
     )
 
@@ -216,10 +197,7 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
     materialization.wait_for_load()
     layer_idx = int(prefix_kv_builder.reader.layer_idx)
 
-    if metadata.full_hit_mode:
-        query_len = 1
-        query_lengths = [1] * metadata.num_sequences
-    elif metadata.prefix_reuse_mode:
+    if metadata.prefix_reuse_mode:
         if offload_kv is None:
             raise RuntimeError("MLA GPU prefix replay requires suffix KV")
         manager.append_layer_prefill_suffix_tokens(
@@ -254,8 +232,12 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
                 softmax_scale=float(spec.softmax_scale),
             )
 
-        query_len = int(metadata.max_seqlen)
-        query_lengths = metadata.seq_lengths
+        raise RuntimeError(
+            "MLA prefix-cache suffix prefill must use FlashInfer paged MLA "
+            "attention; custom attention_fn is only supported for full-hit"
+        )
+    elif metadata.full_hit_mode:
+        query_len = 1
     else:
         raise RuntimeError(
             "MLA GPU prefix materialization requires prefix reuse or full hit"
@@ -270,98 +252,13 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
         raise RuntimeError("MLA GPU prefix materialization requires page table")
 
     attention_fn = attention_fn or run_flash_mla_prefix_attention
-    padded_query = _right_pad_query_states(
-        query_states,
-        query_lengths=query_lengths,
-        query_len=query_len,
-    )
-    padded_output = attention_fn(
-        query_states=padded_query,
+    return attention_fn(
+        query_states=query_states.contiguous(),
         blocked_k=blocked_k,
         block_table=block_table,
         cache_seqlens=materialization.append_plan.cache_seqlens,
         query_len=query_len,
         spec=spec,
-    )
-    del padded_query
-    return _restore_packed_attention_output(
-        padded_output,
-        query_lengths=query_lengths,
-        query_len=query_len,
-        keep_batched_shape=metadata.full_hit_mode,
-    )
-
-
-def _run_projected_mla_prefix_attention_normalized(
-    *,
-    prefix_kv_builder: object,
-    query_states: torch.Tensor,
-    offload_kv: torch.Tensor | None,
-    metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
-    page_size: int,
-    attention_fn: PrefixMlaAttentionFn | None = None,
-) -> torch.Tensor:
-    if metadata.full_hit_mode:
-        compressed_kv, _, _ = prefix_kv_builder.build_mla_full_hit_kv(
-            metadata=metadata,
-            kv_dim=spec.kv_dim,
-            dtype=query_states.dtype,
-            device=query_states.device,
-        )
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("MLA full-hit replay requires full sequence lengths")
-        cu_k_values = _build_cu_seqlens_values(metadata.full_seq_lengths)
-        query_len = 1
-        query_lengths = [1] * metadata.num_sequences
-    elif metadata.prefix_reuse_mode:
-        if offload_kv is None:
-            raise RuntimeError("MLA prefix replay requires suffix KV")
-        compressed_kv, _, _ = prefix_kv_builder.build_mla_prefix_kv(
-            key=offload_kv,
-            metadata=metadata,
-            kv_dim=spec.kv_dim,
-        )
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("MLA prefix replay requires full sequence lengths")
-        cu_k_values = _build_cu_seqlens_values(metadata.full_seq_lengths)
-        query_len = int(metadata.max_seqlen)
-        query_lengths = metadata.seq_lengths
-    else:
-        if offload_kv is None:
-            raise RuntimeError("MLA prefill requires KV")
-        compressed_kv = offload_kv
-        if compressed_kv.dim() == 2:
-            compressed_kv = compressed_kv.unsqueeze(1)
-        cu_k_values = metadata.cu_seqlens_list()
-        query_len = int(metadata.max_seqlen)
-        query_lengths = metadata.seq_lengths
-
-    blocked_k, block_table, cache_seqlens = block_mla_kv_by_sequence(
-        compressed_kv=compressed_kv,
-        cu_k_values=cu_k_values,
-        page_size=page_size,
-    )
-    attention_fn = attention_fn or run_flash_mla_prefix_attention
-    padded_query = _right_pad_query_states(
-        query_states,
-        query_lengths=query_lengths,
-        query_len=query_len,
-    )
-    padded_output = attention_fn(
-        query_states=padded_query,
-        blocked_k=blocked_k,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        query_len=query_len,
-        spec=spec,
-    )
-    del padded_query
-    return _restore_packed_attention_output(
-        padded_output,
-        query_lengths=query_lengths,
-        query_len=query_len,
-        keep_batched_shape=metadata.full_hit_mode,
     )
 
 
@@ -397,178 +294,3 @@ def run_flash_mla_prefix_attention(
         True,
     )
     return attn_out
-
-
-def _right_pad_query_states(
-    query_states: torch.Tensor,
-    *,
-    query_lengths: Sequence[int],
-    query_len: int,
-) -> torch.Tensor:
-    """Convert packed per-sequence Q into FlashMLA's fixed-q-len layout.
-
-    FlashMLA interprets query column ``j`` as cache position
-    ``cache_seqlen - query_len + j``. Prefix-reuse suffixes can have different
-    lengths, so actual suffix tokens must be right-aligned within the padded
-    query dimension to keep their logical positions unchanged.
-    """
-
-    lengths = [int(length) for length in query_lengths]
-    batch_size = len(lengths)
-    max_query_len = int(query_len)
-    if query_states.dim() == 4 and (
-        query_states.shape[0] == batch_size
-        and query_states.shape[1] == max_query_len
-    ):
-        return query_states.contiguous()
-
-    total_tokens = sum(lengths)
-    if query_states.dim() == 4 and query_states.shape[0] == 1:
-        packed_query = query_states.squeeze(0)
-    elif query_states.dim() == 3:
-        packed_query = query_states
-    else:
-        raise RuntimeError(
-            "MLA prefix replay query must be packed as [1, tokens, heads, dim], "
-            "[tokens, heads, dim], or padded as [batch, q_len, heads, dim]"
-        )
-    if packed_query.shape[0] != total_tokens:
-        raise RuntimeError(
-            "MLA prefix replay packed query length mismatch: "
-            f"{packed_query.shape[0]} != {total_tokens}"
-        )
-
-    padded = packed_query.new_zeros(
-        batch_size,
-        max_query_len,
-        packed_query.shape[1],
-        packed_query.shape[2],
-    )
-    offset = 0
-    for row, length in enumerate(lengths):
-        if length <= 0:
-            continue
-        if length > max_query_len:
-            raise RuntimeError(
-                f"MLA prefix replay query length {length} exceeds q_len {max_query_len}"
-            )
-        start = max_query_len - length
-        padded[row, start:max_query_len] = packed_query[offset : offset + length]
-        offset += length
-    return padded.contiguous()
-
-
-def _restore_packed_attention_output(
-    padded_output: torch.Tensor,
-    *,
-    query_lengths: Sequence[int],
-    query_len: int,
-    keep_batched_shape: bool,
-) -> torch.Tensor:
-    """Undo right-aligned Q padding and return packed prefill output."""
-
-    if keep_batched_shape:
-        return padded_output
-
-    lengths = [int(length) for length in query_lengths]
-    max_query_len = int(query_len)
-    segments = []
-    for row, length in enumerate(lengths):
-        if length <= 0:
-            continue
-        start = max_query_len - length
-        segments.append(padded_output[row, start:max_query_len])
-    if not segments:
-        return padded_output.new_empty(
-            1,
-            0,
-            padded_output.shape[2],
-            padded_output.shape[3],
-        )
-    return torch.cat(segments, dim=0).unsqueeze(0).contiguous()
-
-
-def block_mla_kv_by_sequence(
-    *,
-    compressed_kv: torch.Tensor,
-    cu_k_values: Sequence[int],
-    page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert packed per-sequence MLA KV into FlashMLA page blocks."""
-    if compressed_kv.dim() != 3:
-        raise RuntimeError(
-            f"MLA compressed KV must be [tokens, 1, dim], got "
-            f"{tuple(compressed_kv.shape)}"
-        )
-    page_size = int(page_size)
-    cu_values = [int(value) for value in cu_k_values]
-    if len(cu_values) < 2:
-        raise RuntimeError("MLA blocked KV build requires at least one sequence")
-
-    page_blocks = []
-    block_rows = []
-    cache_lengths = []
-    next_page_idx = 0
-    for seq_idx in range(len(cu_values) - 1):
-        start = cu_values[seq_idx]
-        end = cu_values[seq_idx + 1]
-        seq_len = end - start
-        if seq_len <= 0:
-            raise RuntimeError(
-                f"MLA blocked KV build got empty sequence at index {seq_idx}"
-            )
-        segment = compressed_kv[start:end]
-        num_pages = (seq_len + page_size - 1) // page_size
-        padded_tokens = num_pages * page_size
-        if padded_tokens != seq_len:
-            padding = torch.zeros(
-                padded_tokens - seq_len,
-                compressed_kv.shape[1],
-                compressed_kv.shape[2],
-                dtype=compressed_kv.dtype,
-                device=compressed_kv.device,
-            )
-            segment = torch.cat([segment, padding], dim=0)
-        page_blocks.append(
-            segment.contiguous().view(
-                num_pages,
-                page_size,
-                compressed_kv.shape[1],
-                compressed_kv.shape[2],
-            )
-        )
-        block_rows.append(
-            torch.arange(
-                next_page_idx,
-                next_page_idx + num_pages,
-                dtype=torch.int32,
-                device=compressed_kv.device,
-            )
-        )
-        cache_lengths.append(seq_len)
-        next_page_idx += num_pages
-
-    blocked_k = torch.cat(page_blocks, dim=0)
-    max_pages = max(int(row.numel()) for row in block_rows)
-    block_table = torch.zeros(
-        (len(block_rows), max_pages),
-        dtype=torch.int32,
-        device=compressed_kv.device,
-    )
-    for row_idx, row in enumerate(block_rows):
-        block_table[row_idx, : row.numel()] = row
-    cache_seqlens = torch.tensor(
-        cache_lengths,
-        dtype=torch.int32,
-        device=compressed_kv.device,
-    )
-    return blocked_k, block_table, cache_seqlens
-
-
-def _build_cu_seqlens_values(seq_lengths: Sequence[int]) -> list[int]:
-    values = [0]
-    running = 0
-    for length in seq_lengths:
-        running += int(length)
-        values.append(running)
-    return values
