@@ -1501,6 +1501,92 @@ def test_glm5_moe_graph_enable_records_cli_required_state():
     assert moe._moe_cuda_graph_required is True
 
 
+def test_glm5_moe_graph_output_is_full_module_boundary(monkeypatch):
+    class FakeBucketing:
+        def get_padded_size(self, batch_size):
+            assert batch_size == 4
+            return 4
+
+    class FakePool:
+        def __init__(self):
+            self.padded = torch.empty(4, 2)
+
+        def get(self, bucket):
+            assert bucket == 4
+            return types.SimpleNamespace(padded=self.padded)
+
+    class FakeManager:
+        def __init__(self):
+            self.replay_inputs = None
+
+        def has_graph(self, segment_name, batch_size):
+            return segment_name == "glm5_layer_3_moe" and batch_size == 4
+
+        def replay(self, segment_name, bucket, **inputs):
+            assert segment_name == "glm5_layer_3_moe"
+            assert bucket == 4
+            self.replay_inputs = inputs
+            return {
+                "moe_output": torch.tensor(
+                    [
+                        [10.0, 11.0],
+                        [12.0, 13.0],
+                        [99.0, 99.0],
+                        [99.0, 99.0],
+                    ]
+                ),
+                "routed_global_output": torch.full((8, 2), -999.0),
+            }
+
+    class FakeComm:
+        all_reduce_calls = 0
+
+        class _State:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def change_state(self, enable=True):
+            return self._State()
+
+        def all_reduce(self, *args, **kwargs):
+            self.all_reduce_calls += 1
+
+    manager = FakeManager()
+    segment = types.SimpleNamespace(pool=FakePool())
+    comm = FakeComm()
+
+    moe = object.__new__(Glm5MoE)
+    moe.layer_idx = 3
+    moe.rank = 1
+    moe.world_size = 2
+    moe.device = torch.device("cpu")
+    moe.num_tokens_per_rank = 4
+    moe._moe_cuda_graph_manager = manager
+    moe._moe_cuda_graph_segment_name = "glm5_layer_3_moe"
+    moe._moe_cuda_graph_segment = segment
+    moe._moe_cuda_graph_bucketing = FakeBucketing()
+    moe.comm = comm
+
+    def unexpected_shared_expert(_identity):
+        raise AssertionError("shared expert must be inside the MoE graph")
+
+    moe.shared_expert_forward = unexpected_shared_expert
+    monkeypatch.setattr(Glm5MoE, "_rank_token_counts", None)
+
+    hidden = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
+    out = moe._forward_decode_3d_graph(hidden)
+
+    assert torch.equal(out, torch.tensor([[[10.0, 11.0]], [[12.0, 13.0]]]))
+    assert comm.all_reduce_calls == 0
+    assert torch.equal(segment.pool.padded[:2], hidden.view(2, 2))
+    assert torch.equal(segment.pool.padded[2:], torch.zeros(2, 2))
+    assert manager.replay_inputs["padded"] is segment.pool.padded
+    assert manager.replay_inputs["rank_token_counts"].tolist() == [4, 4]
+
+
 def test_glm5_power2_graph_buckets_cover_local_batches_to_32():
     buckets = GLM5_POWER_OF_TWO_BUCKETS_32
 
