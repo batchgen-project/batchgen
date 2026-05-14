@@ -358,3 +358,31 @@ def test_glm5_layer_graph_segment_static_contract_and_delegation():
     assert dsa.init_calls == [2]
     assert dsa.release_calls == [2]
     assert static_inputs["rank_token_counts"].tolist() == [1] * 16
+
+
+def test_glm5_layer_graph_segment_empty_rank_capture_context():
+    dsa = _FakeDsaSegment()
+    rank_counts = torch.tensor([1, 1, 0, 0] + [0] * 12, dtype=torch.int64)
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=dsa,
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+        capture_local_bsz=0,
+        capture_rank_token_counts=rank_counts,
+    )
+    inputs = segment.get_static_input_specs(bucket_size=2)
+    static_inputs = {
+        name: torch.full(
+            spec.resolve_shape(2),
+            spec.fill_value,
+            dtype=spec.dtype,
+        )
+        for name, spec in inputs.items()
+    }
+
+    segment.initialize_static_inputs(static_inputs, bucket_size=2)
+
+    assert static_inputs["num_valid_tokens"].item() == 0
+    assert static_inputs["rank_token_counts"].tolist() == rank_counts.tolist()

@@ -8971,6 +8971,8 @@ class BatchGenWorker:
 			)
 			self._glm5_layer_graph_capture_attempted_for_batch = True
 			try:
+				self._refresh_glm5_layer_graph_page_tables(gpu_manager)
+				self._configure_glm5_layer_graph_capture_context(manager)
 				manager.warmup_and_capture_buckets([capture_bucket])
 			except torch.OutOfMemoryError as exc:
 				manager.drop_bucket(capture_bucket)
@@ -8995,6 +8997,7 @@ class BatchGenWorker:
 
 		primary_page_size = int(primary_manager.config.page_size_tokens)
 		aux_page_size = int(aux_manager.config.page_size_tokens)
+		self._refresh_glm5_layer_graph_page_tables(gpu_manager)
 		primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
 		aux_page_table = aux_manager.get_cuda_graph_page_table_storage()
 		if primary_page_table is None or aux_page_table is None:
@@ -9018,6 +9021,8 @@ class BatchGenWorker:
 			layer.mlp for layer in self.model.model.layers
 			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
 		]
+		capture_local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
+		capture_rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
 		moe_pool = None
 		if moe_layers:
 			first_moe = moe_layers[0]
@@ -9103,6 +9108,8 @@ class BatchGenWorker:
 					moe_segment=moe_segment,
 					device=self.torch_device,
 					world_size=self.world_size,
+					capture_local_bsz=capture_local_bsz,
+					capture_rank_token_counts=capture_rank_counts,
 				),
 			)
 			registered += 1
@@ -9120,6 +9127,7 @@ class BatchGenWorker:
 		torch.cuda.synchronize(self.torch_device)
 		dist.barrier()
 		try:
+			self._configure_glm5_layer_graph_capture_context(manager)
 			manager.warmup_and_capture_buckets([capture_bucket])
 		except torch.OutOfMemoryError as exc:
 			manager.drop_bucket(capture_bucket)
@@ -9140,6 +9148,32 @@ class BatchGenWorker:
 			f"Rank {self.rank}: GLM-5 full-layer CUDA graph ready in "
 			f"{stats['total_capture_time_ms']:.0f}ms"
 		)
+
+	def _refresh_glm5_layer_graph_page_tables(self, gpu_manager) -> None:
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+		for manager in (primary_manager, aux_manager):
+			if manager is None:
+				continue
+			ensure_graph_table = getattr(manager, "ensure_cuda_graph_page_table", None)
+			if ensure_graph_table is not None:
+				ensure_graph_table(active_sequence_ids)
+
+	def _configure_glm5_layer_graph_capture_context(self, manager) -> None:
+		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
+		rank_counts = getattr(self, "_current_decode_rank_token_counts", None)
+		for segment in getattr(manager, "_segments", {}).values():
+			set_context = getattr(segment, "set_capture_context", None)
+			if set_context is not None:
+				set_context(
+					local_bsz=local_bsz,
+					rank_token_counts=rank_counts,
+				)
 
 	def _setup_glm5_moe_cuda_graphs(self, bucket_sizes):
 		model_name_l = (getattr(self, "model_name", "") or "").lower()

@@ -28,6 +28,8 @@ class Glm5DecoderLayerGraphSegment:
         moe_segment=None,
         device: torch.device,
         world_size: int,
+        capture_local_bsz: Optional[int] = None,
+        capture_rank_token_counts: Optional[torch.Tensor] = None,
     ) -> None:
         self.layer = layer
         self.dsa_segment = dsa_segment
@@ -40,6 +42,33 @@ class Glm5DecoderLayerGraphSegment:
         self.index_topk = int(getattr(dsa_segment, "index_topk"))
         self.primary_kv_dim = int(dsa_segment.primary_blocked_k.shape[3])
         self.aux_kv_dim = int(dsa_segment.aux_blocked_k.shape[3])
+        self.capture_local_bsz: Optional[int] = None
+        self.capture_rank_token_counts: Optional[torch.Tensor] = None
+        self.set_capture_context(
+            local_bsz=capture_local_bsz,
+            rank_token_counts=capture_rank_token_counts,
+        )
+
+    def set_capture_context(
+        self,
+        *,
+        local_bsz: Optional[int],
+        rank_token_counts: Optional[torch.Tensor],
+    ) -> None:
+        self.capture_local_bsz = None if local_bsz is None else max(0, int(local_bsz))
+        if rank_token_counts is None:
+            self.capture_rank_token_counts = None
+            return
+        if rank_token_counts.numel() != self.world_size:
+            raise ValueError(
+                f"rank_token_counts must have {self.world_size} elements, "
+                f"got {rank_token_counts.numel()}"
+            )
+        self.capture_rank_token_counts = (
+            rank_token_counts.detach()
+            .to(device=self.device, dtype=torch.int64)
+            .clone()
+        )
 
     def _flashmla_tensor_metadata_specs(
         self,
@@ -101,7 +130,17 @@ class Glm5DecoderLayerGraphSegment:
         bucket_size: int,
     ) -> None:
         self.dsa_segment.initialize_static_inputs(static_inputs, bucket_size)
-        static_inputs["rank_token_counts"].fill_(1)
+        # Empty ranks still have to capture/replay the MoE collectives, but they
+        # must not run DSA kernels against a dummy slot 0 page-table row.
+        if self.capture_local_bsz is not None and self.capture_local_bsz <= 0:
+            static_inputs["num_valid_tokens"].zero_()
+        if self.capture_rank_token_counts is not None:
+            static_inputs["rank_token_counts"].copy_(
+                self.capture_rank_token_counts,
+                non_blocking=True,
+            )
+        else:
+            static_inputs["rank_token_counts"].fill_(1)
 
     def release_static_buffers(self, bucket_size: int) -> None:
         release = getattr(self.dsa_segment, "release_static_buffers", None)
