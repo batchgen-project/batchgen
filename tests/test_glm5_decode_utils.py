@@ -2039,6 +2039,37 @@ def test_glm5_moe_graph_accepts_larger_configured_bucket(monkeypatch):
     assert worker._glm5_moe_graph_current_bucket_missing()
 
 
+def test_glm5_moe_capture_uses_only_current_padded_bucket():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker._current_decode_max_rank_batch_size = 17
+    worker._glm5_moe_graph_failed_buckets = set()
+
+    buckets = worker._glm5_moe_capture_buckets_for_current_decode(
+        BatchSizeBucketing([1, 2, 4, 8, 16, 32, 64])
+    )
+
+    assert buckets == [32]
+
+
+def test_glm5_moe_capture_skips_failed_or_over_bucket():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker._current_decode_max_rank_batch_size = 17
+    worker._glm5_moe_graph_failed_buckets = {32}
+    bucketing = BatchSizeBucketing([1, 2, 4, 8, 16, 32, 64])
+
+    assert worker._glm5_moe_capture_buckets_for_current_decode(bucketing) == []
+
+    worker._current_decode_max_rank_batch_size = 65
+    worker._glm5_moe_graph_failed_buckets = set()
+    assert worker._glm5_moe_capture_buckets_for_current_decode(bucketing) == []
+
+
 def test_glm5_segmented_graph_existing_manager_missing_configured_bucket_requests_setup(
     monkeypatch,
 ):

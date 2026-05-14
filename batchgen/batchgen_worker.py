@@ -8943,11 +8943,7 @@ class BatchGenWorker:
 		)
 
 		bucketing = BatchSizeBucketing(bucket_sizes)
-		capture_buckets = [
-			int(bucket)
-			for bucket in bucketing.bucket_sizes
-			if int(bucket) not in getattr(self, "_glm5_moe_graph_failed_buckets", set())
-		]
+		capture_buckets = self._glm5_moe_capture_buckets_for_current_decode(bucketing)
 		if not capture_buckets:
 			self._glm5_moe_graph_capture_attempted_for_batch = True
 			return
@@ -9055,6 +9051,22 @@ class BatchGenWorker:
 				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
 				f"{capture_buckets} ran out of memory; using eager MoE: {exc}"
 			)
+
+	def _glm5_moe_capture_buckets_for_current_decode(self, bucketing):
+		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+		if max_bsz <= 0:
+			return []
+		try:
+			bucket = int(bucketing.get_padded_size(max_bsz))
+		except ValueError:
+			logging.info(
+				f"Rank {self.rank}: GLM-5 MoE current max rank batch size "
+				f"{max_bsz} exceeds configured CUDA graph buckets; using eager MoE"
+			)
+			return []
+		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
+			return []
+		return [bucket]
 
 	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
