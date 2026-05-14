@@ -507,6 +507,11 @@ class BatchGenWorker:
 		# CUDA graph state
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_layer_cuda_graph_manager = None
+		self._glm5_layer_graph_failed_buckets = set()
+		self._glm5_layer_graph_capture_attempted_for_batch = False
+		self._glm5_layer_graph_signature = None
+		self._glm5_layer_graph_max_seqlen = None
 		self._glm5_moe_graph_failed_buckets = set()
 		self._glm5_dsa_graph_capture_attempted_for_batch = False
 		self._glm5_moe_graph_capture_attempted_for_batch = False
@@ -6201,6 +6206,10 @@ class BatchGenWorker:
 					self._glm5_whole_model_graph_requested_for_current_batch()
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
+				glm5_layer_graph_requested = (
+					self._glm5_layer_graph_requested_for_current_batch()
+					and "glm" in (getattr(self, "model_name", "") or "").lower()
+				)
 				generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
@@ -6211,6 +6220,8 @@ class BatchGenWorker:
 					generic_cuda_graph_warmup_needed = False
 				if generic_cuda_graph_warmup_needed or (
 					glm5_whole_graph_requested and self._cuda_graph_manager is None
+				) or (
+					glm5_layer_graph_requested and self._glm5_layer_graph_current_bucket_missing()
 				) or (
 					self._glm5_segmented_graph_initial_capture_missing()
 				) or self._glm5_whole_model_graph_current_bucket_missing() or (
@@ -8884,12 +8895,16 @@ class BatchGenWorker:
 			self._glm5_moe_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		glm5_layer_graph_enabled = (
+			self._glm5_layer_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
-			if glm5_dsa_graph_enabled or glm5_moe_graph_enabled or glm5_whole_graph_enabled:
+			if glm5_dsa_graph_enabled or glm5_moe_graph_enabled or glm5_layer_graph_enabled or glm5_whole_graph_enabled:
 				self.engine_config.Basic_Config.enable_cuda_graphs = True
 			else:
 				return
@@ -8898,6 +8913,7 @@ class BatchGenWorker:
 			and not is_kimi_k25_backend_model(model_name)
 			and not glm5_dsa_graph_enabled
 			and not glm5_moe_graph_enabled
+			and not glm5_layer_graph_enabled
 			and not glm5_whole_graph_enabled
 		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -8909,6 +8925,221 @@ class BatchGenWorker:
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
+
+	def _setup_glm5_layer_cuda_graphs(self, gpu_manager, bucket_sizes):
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l or not self._glm5_layer_graph_requested_for_current_batch():
+			return
+		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+		if max_bsz <= 0:
+			logging.info(f"Rank {self.rank}: no GLM-5 decode rows globally; skipping layer graph capture")
+			return
+
+		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+		from batchgen.models.glm.glm5.cuda_graph_segments import Glm5FullDsaAttnSegment
+		from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
+			Glm5DecoderLayerGraphSegment,
+			make_glm5_layer_graph_segment_name,
+		)
+		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+			Glm5MoEGraphBufferPool,
+			Glm5MoEGraphSegment,
+		)
+
+		bucketing = BatchSizeBucketing(bucket_sizes)
+		try:
+			capture_bucket = int(bucketing.get_padded_size(max_bsz))
+		except ValueError:
+			logging.info(
+				f"Rank {self.rank}: GLM-5 layer graph max rank batch size {max_bsz} "
+				"exceeds configured CUDA graph buckets; using eager/segmented decode"
+			)
+			return
+		if capture_bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
+			return
+
+		signature = self._glm5_whole_model_graph_capture_signature(capture_bucket)
+		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+		if manager is not None and signature == getattr(self, "_glm5_layer_graph_signature", None):
+			if manager.has_bucket_for_all_segments(max_bsz):
+				self._glm5_layer_graph_capture_attempted_for_batch = True
+				return
+			logging.info(
+				f"Rank {self.rank}: capturing missing GLM-5 layer CUDA graph bucket "
+				f"BS={capture_bucket} at decode entry"
+			)
+			self._glm5_layer_graph_capture_attempted_for_batch = True
+			try:
+				manager.warmup_and_capture_buckets([capture_bucket])
+			except torch.OutOfMemoryError as exc:
+				manager.drop_bucket(capture_bucket)
+				self._glm5_layer_graph_failed_buckets.add(capture_bucket)
+				torch.cuda.empty_cache()
+				if os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1":
+					raise
+				logging.error(
+					f"Rank {self.rank}: GLM-5 layer CUDA graph capture for "
+					f"bucket BS={capture_bucket} ran out of memory; using eager decode: {exc}"
+				)
+			return
+
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			raise RuntimeError("GLM-5 layer CUDA graph requested but auxiliary GPU KV manager is missing")
+
+		primary_page_size = int(primary_manager.config.page_size_tokens)
+		aux_page_size = int(aux_manager.config.page_size_tokens)
+		primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
+		aux_page_table = aux_manager.get_cuda_graph_page_table_storage()
+		if primary_page_table is None or aux_page_table is None:
+			raise RuntimeError(
+				"GLM-5 layer CUDA graph requested but GPU page-table storage is not initialized"
+			)
+		graph_max_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
+			primary_page_table,
+			primary_page_size,
+			aux_page_table,
+			aux_page_size,
+			model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
+		)
+
+		AttnWrapperBase.gpu_paged_kv_manager = primary_manager
+		AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+		primary_k_cache, _ = primary_manager.get_kv_tensors()
+		aux_k_cache, _ = aux_manager.get_kv_tensors()
+
+		moe_layers = [
+			layer.mlp for layer in self.model.model.layers
+			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
+		]
+		moe_pool = None
+		if moe_layers:
+			first_moe = moe_layers[0]
+			moe_pool = Glm5MoEGraphBufferPool(
+				world_size=self.world_size,
+				hidden_size=first_moe.hidden_size,
+				num_experts_per_tok=first_moe.num_experts_per_tok,
+				num_local_experts=first_moe.experts_per_rank,
+				intermediate_size=first_moe.config.moe_intermediate_size,
+				device=self.torch_device,
+				bucket_sizes=bucket_sizes,
+				base_mtp=_GLM5_3D_MTP,
+			)
+
+		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		shared_dsa_buffers = {}
+		registered = 0
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			wrapper = decoder_layer.self_attn
+			attn = wrapper.module
+			indexer = getattr(attn, "indexer", None)
+			if indexer is None:
+				raise RuntimeError(f"GLM-5 layer graph requested but layer {layer_idx} has no indexer")
+			if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+				wrapper.initialize_decode_absorb()
+			if getattr(wrapper, "_fused_wqb_weights", None) is None or getattr(wrapper, "_indexer_cuda_module", None) is None:
+				wrapper.initialize_fused_kernels()
+			if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+				raise RuntimeError(f"Layer {layer_idx}: GLM-5 layer graph requires FP8 absorb weights")
+			if getattr(wrapper, "_fused_wqb_weights", None) is None:
+				raise RuntimeError(f"Layer {layer_idx}: GLM-5 layer graph requires fused WQB weights")
+			if getattr(wrapper, "_indexer_cuda_module", None) is None:
+				raise RuntimeError(f"Layer {layer_idx}: GLM-5 layer graph requires fused indexer CUDA module")
+
+			primary_blocked_k = primary_k_cache[layer_idx]
+			aux_blocked_k = aux_k_cache[layer_idx]
+			dummy = torch.empty(
+				1,
+				1,
+				indexer.rope_head_dim,
+				device=primary_blocked_k.device,
+				dtype=torch.bfloat16,
+			)
+			cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
+			dsa_segment = Glm5FullDsaAttnSegment(
+				wrapper=wrapper,
+				primary_blocked_k=primary_blocked_k,
+				aux_blocked_k=aux_blocked_k,
+				primary_page_table=primary_page_table,
+				aux_page_table=aux_page_table,
+				wq_b_weights=wrapper._fused_wqb_weights,
+				absorb_weights=wrapper._fp8_absorb_weights,
+				cuda_module=wrapper._indexer_cuda_module,
+				cos_table=cos_table,
+				sin_table=sin_table,
+				max_seqlen=graph_max_seqlen,
+				index_topk=indexer.index_topk,
+				page_size=primary_page_size,
+				aux_page_size=aux_page_size,
+				shared_buffers=shared_dsa_buffers,
+			)
+
+			moe_segment = None
+			moe = getattr(decoder_layer, "mlp", None)
+			if isinstance(moe, Glm5MoE):
+				if not getattr(moe, "_fp8_blockwise_ready", False):
+					raise RuntimeError(f"Layer {layer_idx}: GLM-5 layer graph requires FP8 blockwise MoE weights")
+				moe_segment = Glm5MoEGraphSegment(
+					moe,
+					moe_pool,
+					moe.comm,
+					world_size=self.world_size,
+					rank=self.rank,
+					device=self.torch_device,
+				)
+
+			segment_name = make_glm5_layer_graph_segment_name(layer_idx)
+			manager.register_segment(
+				segment_name,
+				Glm5DecoderLayerGraphSegment(
+					layer=decoder_layer,
+					dsa_segment=dsa_segment,
+					moe_segment=moe_segment,
+					device=self.torch_device,
+					world_size=self.world_size,
+				),
+			)
+			registered += 1
+
+		if registered == 0:
+			self._glm5_layer_graph_capture_attempted_for_batch = True
+			return
+		logging.info(
+			f"Rank {self.rank}: capturing GLM-5 full-layer CUDA graph segments for "
+			f"{registered} layers with bucket BS={capture_bucket}, max_seqlen={graph_max_seqlen}"
+		)
+		self._glm5_layer_cuda_graph_manager = manager
+		self._glm5_layer_graph_capture_attempted_for_batch = True
+		self._glm5_layer_graph_max_seqlen = graph_max_seqlen
+		torch.cuda.synchronize(self.torch_device)
+		dist.barrier()
+		try:
+			manager.warmup_and_capture_buckets([capture_bucket])
+		except torch.OutOfMemoryError as exc:
+			manager.drop_bucket(capture_bucket)
+			self._glm5_layer_graph_failed_buckets.add(capture_bucket)
+			self._glm5_layer_cuda_graph_manager = None
+			self._glm5_layer_graph_signature = None
+			torch.cuda.empty_cache()
+			if os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1":
+				raise
+			logging.error(
+				f"Rank {self.rank}: GLM-5 layer CUDA graph capture for "
+				f"bucket BS={capture_bucket} ran out of memory; using eager decode: {exc}"
+			)
+			return
+		self._glm5_layer_graph_signature = signature
+		stats = manager.get_capture_stats()
+		logging.info(
+			f"Rank {self.rank}: GLM-5 full-layer CUDA graph ready in "
+			f"{stats['total_capture_time_ms']:.0f}ms"
+		)
 
 	def _setup_glm5_moe_cuda_graphs(self, bucket_sizes):
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
@@ -9406,6 +9637,36 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
+	def _glm5_layer_graph_requested_for_current_batch(self) -> bool:
+		if (
+			os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1"
+			or os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "0") == "1"
+		):
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return (
+			self._debug_flag_enabled(debug.get("glm5_layer_graph"))
+			or self._debug_flag_enabled(debug.get("glm5_layer_graph_compare"))
+		)
+
+	def _glm5_layer_graph_compare_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare"))
+
+	def _glm5_layer_graph_compare_fail_on_mismatch(self) -> bool:
+		if os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_FAIL", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare_fail"))
+
 	def _glm5_whole_model_graph_capture_signature(self, bucket_size: int):
 		gpu_manager = self._get_cuda_graph_gpu_manager()
 		if gpu_manager is None:
@@ -9464,6 +9725,38 @@ class BatchGenWorker:
 			return True
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
 		return signature != getattr(self, "_glm5_whole_model_graph_signature", None)
+
+	def _glm5_layer_graph_current_bucket_missing(self) -> bool:
+		model_name_l = (getattr(self, 'model_name', '') or '').lower()
+		if (
+			not self._glm5_layer_graph_requested_for_current_batch()
+			or "glm" not in model_name_l
+		):
+			return False
+		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
+		if max_bsz <= 0:
+			return False
+		try:
+			from batchgen.cuda_graph import BatchSizeBucketing
+			bucket = BatchSizeBucketing(
+				self._glm5_configured_cuda_graph_bucket_sizes()
+			).get_padded_size(max_bsz)
+		except ValueError:
+			return False
+		if bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
+			return False
+		signature = self._glm5_whole_model_graph_capture_signature(bucket)
+		if (
+			getattr(self, "_glm5_layer_graph_signature", None) is not None
+			and signature != getattr(self, "_glm5_layer_graph_signature", None)
+		):
+			self._glm5_layer_cuda_graph_manager = None
+			self._glm5_layer_graph_capture_attempted_for_batch = False
+			return True
+		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+		if manager is None:
+			return not getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False)
+		return not manager.has_bucket_for_all_segments(max_bsz)
 
 	def _glm5_moe_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
@@ -9646,6 +9939,140 @@ class BatchGenWorker:
 			"local_bsz": int(local_bsz),
 			"metadata_prepared": True,
 		}
+
+	def _prepare_glm5_layer_graph_inputs(
+		self,
+		*,
+		local_bsz: int,
+		bucket: int,
+		gpu_manager,
+	):
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			raise RuntimeError("GLM-5 layer graph replay requires auxiliary GPU KV manager")
+
+		active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+
+		def _graph_slots(manager):
+			ensure_graph_table = getattr(manager, "ensure_cuda_graph_page_table", None)
+			if ensure_graph_table is not None:
+				ensure_graph_table(active_sequence_ids)
+			slot_indices = manager._gpu_page_table_manager._slot_index_tensor
+			if slot_indices is None:
+				slot_indices = torch.arange(
+					local_bsz,
+					dtype=torch.int32,
+					device=self.torch_device,
+				)
+			return slot_indices[:local_bsz].to(dtype=torch.int32, device=self.torch_device)
+
+		cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
+		position_ids = getattr(AttnWrapperBase, "position_ids", None)
+		if cache_seqlens is None or position_ids is None:
+			raise RuntimeError("GLM-5 layer graph replay requires decode metadata")
+		if local_bsz > 0:
+			cache_seqlens_i32 = cache_seqlens[:local_bsz].to(dtype=torch.int32, device=self.torch_device)
+			position_ids_i64 = position_ids[:local_bsz].to(dtype=torch.int64, device=self.torch_device)
+		else:
+			cache_seqlens_i32 = torch.empty((0,), dtype=torch.int32, device=self.torch_device)
+			position_ids_i64 = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
+
+		layers = getattr(getattr(self.model, "model", None), "layers", None)
+		if not layers:
+			raise RuntimeError("GLM-5 layer graph replay requires decoder layers")
+		wrapper = layers[0].self_attn
+		index_topk = int(getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048))
+		num_heads = int(getattr(wrapper.module, "num_heads", 64))
+		graph_max_seqlen = int(
+			getattr(self, "_glm5_layer_graph_max_seqlen", None)
+			or getattr(AttnWrapperBase, "max_seqlen", 0)
+			or index_topk
+		)
+		selected_lengths = torch.empty(
+			(bucket,),
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
+		if local_bsz > 0:
+			selected_lengths[:local_bsz].copy_(
+				torch.clamp(cache_seqlens_i32, max=index_topk),
+				non_blocking=True,
+			)
+		if local_bsz < bucket:
+			selected_lengths[local_bsz:].fill_(min(graph_max_seqlen, index_topk))
+		from batchgen.attention.dsa.sparse_decode_mla import (
+			prepare_sparse_flash_mla_decode_tensor_metadata,
+		)
+		tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
+			selected_lengths,
+			num_heads,
+		)
+		num_valid_tokens = torch.empty((1,), dtype=torch.int32, device=self.torch_device)
+		num_valid_tokens.fill_(local_bsz)
+		return {
+			"cache_seqlens": cache_seqlens_i32,
+			"position_ids": position_ids_i64,
+			"primary_slot_indices": _graph_slots(primary_manager),
+			"aux_slot_indices": _graph_slots(aux_manager),
+			"num_valid_tokens": num_valid_tokens,
+			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
+			"flashmla_num_splits": num_splits,
+		}
+
+	def _run_glm5_layer_graph_forward(
+		self,
+		*,
+		input_ids: torch.Tensor,
+		local_bsz: int,
+		max_rank_bsz: int,
+		rank_token_counts: torch.Tensor,
+		gpu_manager,
+		emit_kv_callbacks: bool,
+	) -> torch.Tensor:
+		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+		if manager is None:
+			raise RuntimeError("GLM-5 layer graph replay requested but manager is unavailable")
+		from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
+			make_glm5_layer_graph_segment_name,
+		)
+
+		bucket = manager.bucketing.get_padded_size(max_rank_bsz)
+		graph_inputs = self._prepare_glm5_layer_graph_inputs(
+			local_bsz=local_bsz,
+			bucket=bucket,
+			gpu_manager=gpu_manager,
+		)
+		hidden_states = self.model.model.embed_tokens(input_ids)
+		kv_cb = getattr(AttnWrapperBase, "kv_append_callback", None)
+		aux_cb = getattr(AttnWrapperBase, "kv_append_callback_aux", None)
+		for layer_idx, _decoder_layer in enumerate(self.model.model.layers):
+			graph_out = manager.replay(
+				make_glm5_layer_graph_segment_name(layer_idx),
+				max_rank_bsz,
+				hidden_states=hidden_states,
+				position_ids=graph_inputs["position_ids"],
+				cache_seqlens=graph_inputs["cache_seqlens"],
+				primary_slot_indices=graph_inputs["primary_slot_indices"],
+				aux_slot_indices=graph_inputs["aux_slot_indices"],
+				num_valid_tokens=graph_inputs["num_valid_tokens"],
+				rank_token_counts=rank_token_counts,
+				flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
+				flashmla_num_splits=graph_inputs["flashmla_num_splits"],
+			)
+			hidden_states = graph_out["hidden_states"][:local_bsz]
+			if emit_kv_callbacks and local_bsz > 0:
+				if kv_cb is not None:
+					kv_cb(layer_idx, graph_out["primary_k_tensor"][:local_bsz], None)
+				if aux_cb is not None:
+					aux_cb(layer_idx, graph_out["indexer_k_tensor"][:local_bsz], None)
+
+		hidden_states = self.model.model.norm(hidden_states)
+		return self.model.lm_head(hidden_states)[:, -1, :]
 
 	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
 		if not self._glm5_moe_graph_requested_for_current_batch():
@@ -9832,10 +10259,17 @@ class BatchGenWorker:
 			self._glm5_moe_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		glm5_layer_graph_enabled = (
+			self._glm5_layer_graph_requested_for_current_batch()
+			and "glm" in model_name_l
+		)
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		if glm5_layer_graph_enabled:
+			self._setup_glm5_layer_cuda_graphs(gpu_manager, bucket_sizes)
+			return
 		if glm5_whole_graph_enabled:
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
@@ -10935,7 +11369,11 @@ class BatchGenWorker:
 				# Between boundaries, batch size is constant — skip the all_reduce + .item()
 				# CPU-GPU sync that drains the GPU pipeline every step.
 				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
-				if getattr(self, '_whole_model_graph', False) or self._glm5_whole_model_graph_requested_for_current_batch():
+				if (
+					getattr(self, '_whole_model_graph', False)
+					or self._glm5_whole_model_graph_requested_for_current_batch()
+					or self._glm5_layer_graph_requested_for_current_batch()
+				):
 					# Whole-model graph needs globally synced counts for NCCL bucket
 					# matching, but the count vector only changes at decode-entry,
 					# page-boundary, and async-load-finalize sync points. Reusing it
@@ -11044,6 +11482,34 @@ class BatchGenWorker:
 				)
 
 				# Forward
+				_glm5_layer_graph_requested = bool(
+					self._glm5_layer_graph_requested_for_current_batch()
+					and "glm" in (getattr(self, "model_name", "") or "").lower()
+				)
+				_glm5_layer_graph_active = False
+				if _glm5_layer_graph_requested:
+					_layer_manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+					if _layer_manager is not None:
+						try:
+							_glm5_layer_bucket = _layer_manager.bucketing.get_padded_size(_max_bs)
+						except ValueError:
+							_glm5_layer_graph_active = False
+						else:
+							_glm5_layer_graph_active = (
+								_glm5_layer_bucket not in getattr(self, "_glm5_layer_graph_failed_buckets", set())
+								and _layer_manager.has_bucket_for_all_segments(_max_bs)
+								and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
+								and self._glm5_whole_model_graph_capture_signature(_glm5_layer_bucket) == getattr(self, "_glm5_layer_graph_signature", None)
+							)
+					if (
+						not _glm5_layer_graph_active
+						and os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1"
+					):
+						raise RuntimeError(
+							"GLM-5 layer CUDA graph was required but no replayable "
+							"full-layer graph is available for this decode step"
+						)
+
 				_glm5_whole_graph_active = bool(
 					getattr(self, "_glm5_whole_model_graph", False)
 					and self._cuda_graph_manager is not None
@@ -11069,7 +11535,62 @@ class BatchGenWorker:
 						or _glm5_whole_graph_active
 					)
 				)
-				if _use_graph:
+				if _glm5_layer_graph_active:
+					_glm5_layer_compare = self._glm5_layer_graph_compare_requested_for_current_batch()
+					if _glm5_layer_compare:
+						graph_logits = self._run_glm5_layer_graph_forward(
+							input_ids=new_tokens[:len(batch)],
+							local_bsz=len(batch),
+							max_rank_bsz=_max_bs,
+							rank_token_counts=_all_rank_counts,
+							gpu_manager=gpu_manager,
+							emit_kv_callbacks=False,
+						)
+						outputs = self.model(
+							new_tokens,
+							attention_mask=Attn_Wrapper.attention_mask,
+							position_ids=Attn_Wrapper.position_ids,
+							use_cache=False,
+						)
+						eager_logits = outputs.logits[:, -1, :]
+						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
+						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
+							compare_glm5_whole_model_graph_logits,
+						)
+						compare = compare_glm5_whole_model_graph_logits(
+							eager_logits=eager_logits,
+							graph_logits=graph_logits,
+							eager_tokens=torch.argmax(eager_logits, dim=-1, keepdim=True),
+							graph_tokens=torch.argmax(graph_logits, dim=-1, keepdim=True),
+							atol=float(os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_ATOL", "1e-2")),
+							rtol=float(os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_RTOL", "1e-2")),
+						)
+						_log = logging.info if compare["ok"] else logging.error
+						_log(
+							"[GLM5_LAYER_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
+							"max_abs=%.6g mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
+							self.rank,
+							_glm5_layer_bucket,
+							len(batch),
+							"OK" if compare["ok"] else "MISMATCH",
+							compare["max_abs"],
+							compare["mean_abs"],
+							compare["argmax_mismatch"],
+							compare["token_mismatch"],
+						)
+						if not compare["ok"] and self._glm5_layer_graph_compare_fail_on_mismatch():
+							raise RuntimeError(f"GLM-5 layer CUDA graph compare mismatch: {compare}")
+					else:
+						logits = self._run_glm5_layer_graph_forward(
+							input_ids=new_tokens[:len(batch)],
+							local_bsz=len(batch),
+							max_rank_bsz=_max_bs,
+							rank_token_counts=_all_rank_counts,
+							gpu_manager=gpu_manager,
+							emit_kv_callbacks=True,
+						)
+						new_tokens_out = self._select_tokens(logits, batch_sequences)
+				elif _use_graph:
 					_glm5_whole_compare = bool(
 						getattr(self, "_glm5_whole_model_graph", False)
 						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
@@ -13077,6 +13598,11 @@ class BatchGenWorker:
 		self.model = None
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_layer_cuda_graph_manager = None
+		self._glm5_layer_graph_failed_buckets = set()
+		self._glm5_layer_graph_capture_attempted_for_batch = False
+		self._glm5_layer_graph_signature = None
+		self._glm5_layer_graph_max_seqlen = None
 		self._glm5_dsa_graph_capture_attempted_for_batch = False
 		self._glm5_moe_graph_capture_attempted_for_batch = False
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
@@ -13198,17 +13724,22 @@ class BatchGenWorker:
 		self.model = None
 		self._cuda_graph_manager = None
 		self._glm5_moe_cuda_graph_manager = None
+		self._glm5_layer_cuda_graph_manager = None
 		self._whole_model_segment = None
 		self._whole_model_bucketing = None
 		self._glm5_whole_model_capture_input_ids = None
 		self._glm5_moe_graph_failed_buckets = set()
+		self._glm5_layer_graph_failed_buckets = set()
 		self._glm5_dsa_graph_capture_attempted_for_batch = False
 		self._glm5_moe_graph_capture_attempted_for_batch = False
+		self._glm5_layer_graph_capture_attempted_for_batch = False
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_signature = None
+		self._glm5_layer_graph_signature = None
+		self._glm5_layer_graph_max_seqlen = None
 
 		# 9. Clear CUDA cache
 		torch.cuda.empty_cache()

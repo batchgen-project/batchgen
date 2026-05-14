@@ -2342,13 +2342,18 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
     worker.parallel_manager = None
     worker._cuda_graph_manager = object()
     worker._glm5_moe_cuda_graph_manager = object()
+    worker._glm5_layer_cuda_graph_manager = object()
     worker._glm5_dsa_graph_capture_attempted_for_batch = True
     worker._glm5_moe_graph_capture_attempted_for_batch = True
+    worker._glm5_layer_graph_capture_attempted_for_batch = True
     worker._glm5_dsa_graph_page_table_change_after_capture_logged = True
     worker._whole_model_segment = object()
     worker._whole_model_bucketing = object()
     worker._glm5_whole_model_capture_input_ids = object()
     worker._glm5_moe_graph_failed_buckets = {64}
+    worker._glm5_layer_graph_failed_buckets = {32}
+    worker._glm5_layer_graph_signature = object()
+    worker._glm5_layer_graph_max_seqlen = 8192
     worker._whole_model_graph = True
     worker._glm5_whole_model_graph = True
     worker._glm5_whole_model_graph_failed_buckets = {64}
@@ -2361,9 +2366,14 @@ def test_glm5_deep_free_resets_segmented_graph_capture_attempts(monkeypatch):
     assert worker.model is None
     assert worker._cuda_graph_manager is None
     assert worker._glm5_moe_cuda_graph_manager is None
+    assert worker._glm5_layer_cuda_graph_manager is None
     assert not worker._glm5_dsa_graph_capture_attempted_for_batch
     assert not worker._glm5_moe_graph_capture_attempted_for_batch
+    assert not worker._glm5_layer_graph_capture_attempted_for_batch
     assert not worker._glm5_dsa_graph_page_table_change_after_capture_logged
+    assert worker._glm5_layer_graph_failed_buckets == set()
+    assert worker._glm5_layer_graph_signature is None
+    assert worker._glm5_layer_graph_max_seqlen is None
 
 
 def test_glm5_dsa_graph_page_table_change_after_capture_falls_back_eager(

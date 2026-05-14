@@ -1,6 +1,10 @@
 import torch
 import pytest
 
+from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
+    Glm5DecoderLayerGraphSegment,
+    make_glm5_layer_graph_segment_name,
+)
 from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
     Glm5WholeModelSegment,
     compare_glm5_whole_model_graph_logits,
@@ -269,3 +273,88 @@ def test_glm5_whole_model_compare_reports_shape_mismatch():
     assert not result["shape_match"]
     assert result["eager_shape"] == (2, 3)
     assert result["graph_shape"] == (2, 4)
+
+
+class _IdentityModule(torch.nn.Module):
+    def forward(self, x):
+        return x
+
+
+class _FakePostNorm:
+    weight = torch.ones(4, dtype=torch.bfloat16)
+    eps = 1e-5
+
+
+class _FakeLayerForGraph:
+    layer_idx = 7
+    hidden_size = 4
+    input_layernorm = _IdentityModule()
+    post_attention_layernorm = _FakePostNorm()
+    mlp = _IdentityModule()
+
+
+class _FakeDsaSegment:
+    max_seqlen = 16
+    index_topk = 8
+    primary_blocked_k = torch.empty(1, 1, 1, 6)
+    aux_blocked_k = torch.empty(1, 1, 1, 3)
+
+    def __init__(self):
+        self.setup_calls = []
+        self.init_calls = []
+        self.release_calls = []
+
+    def _flashmla_tensor_metadata_specs(self, bucket_size):
+        return (bucket_size, 2), torch.int32, (1,), torch.int32
+
+    def setup_static_buffers(self, bucket_size):
+        self.setup_calls.append(bucket_size)
+
+    def initialize_static_inputs(self, static_inputs, bucket_size):
+        self.init_calls.append(bucket_size)
+        static_inputs["num_valid_tokens"].fill_(1)
+
+    def release_static_buffers(self, bucket_size):
+        self.release_calls.append(bucket_size)
+
+
+def test_glm5_layer_graph_segment_static_contract_and_delegation():
+    dsa = _FakeDsaSegment()
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=dsa,
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+    )
+
+    assert make_glm5_layer_graph_segment_name(7) == "glm5_layer_7_full_layer"
+
+    inputs = segment.get_static_input_specs(bucket_size=2)
+    assert inputs["hidden_states"].resolve_shape(2) == (2, 1, 4)
+    assert inputs["primary_slot_indices"].fill_value == -1
+    assert inputs["aux_slot_indices"].fill_value == -1
+    assert inputs["rank_token_counts"].resolve_shape(2) == (16,)
+    assert inputs["flashmla_tile_scheduler_metadata"].resolve_shape(2) == (2, 2)
+
+    outputs = segment.get_static_output_specs(bucket_size=2)
+    assert outputs["hidden_states"].resolve_shape(2) == (2, 1, 4)
+    assert outputs["primary_k_tensor"].resolve_shape(2) == (2, 1, 1, 6)
+    assert outputs["indexer_k_tensor"].resolve_shape(2) == (2, 1, 1, 3)
+
+    static_inputs = {
+        name: torch.full(
+            spec.resolve_shape(2),
+            spec.fill_value,
+            dtype=spec.dtype,
+        )
+        for name, spec in inputs.items()
+    }
+    segment.setup_static_buffers(bucket_size=2)
+    segment.initialize_static_inputs(static_inputs, bucket_size=2)
+    segment.release_static_buffers(bucket_size=2)
+
+    assert dsa.setup_calls == [2]
+    assert dsa.init_calls == [2]
+    assert dsa.release_calls == [2]
+    assert static_inputs["rank_token_counts"].tolist() == [1] * 16
