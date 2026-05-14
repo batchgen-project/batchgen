@@ -2623,6 +2623,10 @@ class BatchGenWorker:
 				candidates.append(int(max_prompt))
 			elif max_decode is not None:
 				candidates.append(int(max_decode))
+		model_config = getattr(self, "model_config", None)
+		model_max_position = getattr(model_config, "max_position_embeddings", None)
+		if model_max_position is not None and int(model_max_position) > 0:
+			candidates.append(int(model_max_position))
 		return max(candidates)
 
 	def _cuda_graph_page_table_slot_capacity(self) -> int:
@@ -9340,6 +9344,8 @@ class BatchGenWorker:
 			or "glm" not in model_name_l
 		):
 			return False
+		if self._glm5_segmented_graph_suppressed_by_composite_graph():
+			return False
 		if int(getattr(self, "_current_decode_local_batch_size", 0) or 0) <= 0:
 			return False
 		capture_attempted = bool(
@@ -9375,6 +9381,8 @@ class BatchGenWorker:
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l:
 			return False
+		if self._glm5_segmented_graph_suppressed_by_composite_graph():
+			return False
 		dsa_missing = (
 			self._glm5_dsa_graph_requested_for_current_batch()
 			and int(getattr(self, "_current_decode_local_batch_size", 0) or 0) > 0
@@ -9400,6 +9408,8 @@ class BatchGenWorker:
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l:
 			return False
+		if self._glm5_segmented_graph_suppressed_by_composite_graph():
+			return True
 		dsa_requested = self._glm5_dsa_graph_requested_for_current_batch()
 		moe_requested = self._glm5_moe_graph_requested_for_current_batch()
 		if not dsa_requested and not moe_requested:
@@ -9701,6 +9711,15 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare_fail"))
 
+	def _glm5_segmented_graph_suppressed_by_composite_graph(self) -> bool:
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" not in model_name_l:
+			return False
+		return (
+			self._glm5_layer_graph_requested_for_current_batch()
+			or self._glm5_whole_model_graph_requested_for_current_batch()
+		)
+
 	def _glm5_whole_model_graph_capture_signature(self, bucket_size: int):
 		gpu_manager = self._get_cuda_graph_gpu_manager()
 		if gpu_manager is None:
@@ -9780,6 +9799,24 @@ class BatchGenWorker:
 		if bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
 			return False
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
+		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+		captured_max_seqlen = int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
+		if (
+			manager is not None
+			and current_max_seqlen > 0
+			and captured_max_seqlen > 0
+			and current_max_seqlen > captured_max_seqlen
+		):
+			logging.info(
+				f"Rank {self.rank}: GLM-5 layer CUDA graph max_seqlen "
+				f"{captured_max_seqlen} is below current decode max_seqlen "
+				f"{current_max_seqlen}; recapturing with current page-table capacity"
+			)
+			self._glm5_layer_cuda_graph_manager = None
+			self._glm5_layer_graph_signature = None
+			self._glm5_layer_graph_capture_attempted_for_batch = False
+			return True
 		if (
 			getattr(self, "_glm5_layer_graph_signature", None) is not None
 			and signature != getattr(self, "_glm5_layer_graph_signature", None)
@@ -9787,7 +9824,6 @@ class BatchGenWorker:
 			self._glm5_layer_cuda_graph_manager = None
 			self._glm5_layer_graph_capture_attempted_for_batch = False
 			return True
-		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
 		if manager is None:
 			return not getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False)
 		return not manager.has_bucket_for_all_segments(max_bsz)
@@ -9798,6 +9834,8 @@ class BatchGenWorker:
 			not self._glm5_moe_graph_requested_for_current_batch()
 			or "glm" not in model_name_l
 		):
+			return False
+		if self._glm5_segmented_graph_suppressed_by_composite_graph():
 			return False
 		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 		if max_bsz <= 0:

@@ -1942,6 +1942,33 @@ def test_glm5_gpu_kv_config_uses_actual_prompt_for_graph_page_table():
     assert manager._gpu_page_table_manager.max_slots == 64
 
 
+def test_glm5_gpu_kv_config_uses_model_max_for_graph_page_table():
+    from batchgen.batchgen_worker import BatchGenWorker
+    from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
+
+    worker = object.__new__(BatchGenWorker)
+    worker.max_input_length = 0
+    worker.max_decoding_length = 0
+    worker.engine_config = None
+    worker.model_config = types.SimpleNamespace(max_position_embeddings=131072)
+    worker.args = types.SimpleNamespace(cuda_graph_max_bucket_size=64)
+    config = GPUPagedKVConfig(
+        num_layers=1,
+        num_pages=4096,
+        page_size_tokens=64,
+        num_k_heads=1,
+        k_head_dim=1,
+        num_v_heads=0,
+        v_head_dim=0,
+        kv_dtype=torch.bfloat16,
+    )
+
+    updated = worker._with_cuda_graph_page_table_capacity(config)
+
+    assert updated.cuda_graph_max_pages_per_sequence == 2048
+    assert updated.cuda_graph_max_slots == 64
+
+
 def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
@@ -2209,6 +2236,74 @@ def test_glm5_segmented_graph_blocks_generic_warmup_after_capture_attempts(
     worker._glm5_moe_graph_capture_attempted_for_batch = False
 
     assert not worker._glm5_segmented_graph_capture_already_attempted_for_requested_paths()
+
+
+def test_glm5_layer_graph_suppresses_segmented_graph_warmup(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
+    worker._batchgen_debug = {}
+    worker._current_decode_local_batch_size = 1
+    worker._current_decode_max_rank_batch_size = 1
+    worker._cuda_graph_manager = None
+    worker._glm5_moe_cuda_graph_manager = None
+    worker._glm5_dsa_graph_capture_attempted_for_batch = False
+    worker._glm5_moe_graph_capture_attempted_for_batch = False
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_page_table_storage_changed",
+        lambda: False,
+    )
+
+    assert worker._glm5_segmented_graph_suppressed_by_composite_graph()
+    assert not worker._glm5_segmented_graph_initial_capture_missing()
+    assert worker._glm5_segmented_graph_capture_already_attempted_for_requested_paths()
+    assert not worker._glm5_dsa_graph_current_bucket_missing()
+    assert not worker._glm5_moe_graph_current_bucket_missing()
+
+
+def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        bucketing = BatchSizeBucketing([1, 2, 4])
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return True
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker.args = types.SimpleNamespace(
+        cuda_graph_max_bucket_size=4,
+        cuda_graph_num_buckets=3,
+    )
+    worker._batchgen_debug = {}
+    worker._current_decode_max_rank_batch_size = 1
+    worker._glm5_layer_graph_failed_buckets = set()
+    worker._glm5_layer_cuda_graph_manager = FakeManager()
+    worker._glm5_layer_graph_signature = ("same",)
+    worker._glm5_layer_graph_max_seqlen = 16384
+    worker._glm5_layer_graph_capture_attempted_for_batch = True
+    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_capture_signature",
+        lambda bucket: ("same",),
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 20000, raising=False)
+
+    assert worker._glm5_layer_graph_current_bucket_missing()
+    assert worker._glm5_layer_cuda_graph_manager is None
+    assert worker._glm5_layer_graph_signature is None
+    assert not worker._glm5_layer_graph_capture_attempted_for_batch
 
 
 def test_glm5_setup_cuda_graphs_does_not_recapture_after_manager_clear(
