@@ -2267,6 +2267,38 @@ def test_glm5_layer_graph_suppresses_segmented_graph_warmup(monkeypatch):
     assert not worker._glm5_moe_graph_current_bucket_missing()
 
 
+def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    original_debug = {
+        "glm5_layer_graph_compare": True,
+        "glm5_dsa_mode": "graph",
+        "glm5_moe_mode": "graph",
+        "glm5_moe_router_mode": "custom",
+    }
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        original_debug,
+        raising=False,
+    )
+
+    worker = object.__new__(BatchGenWorker)
+    with worker._glm5_force_segmented_graph_eager():
+        active_debug = AttnWrapperBase.batchgen_debug
+        assert active_debug is not original_debug
+        assert active_debug["glm5_layer_graph_compare"] is True
+        assert active_debug["glm5_dsa_mode"] == "eager"
+        assert active_debug["glm5_moe_mode"] == "eager"
+        assert active_debug["glm5_moe_router_mode"] == "custom"
+        assert original_debug["glm5_dsa_mode"] == "graph"
+        assert original_debug["glm5_moe_mode"] == "graph"
+
+    assert AttnWrapperBase.batchgen_debug is original_debug
+
+
 def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
     monkeypatch,
 ):

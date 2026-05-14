@@ -9711,6 +9711,18 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare_fail"))
 
+	@contextmanager
+	def _glm5_force_segmented_graph_eager(self):
+		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
+		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
+		debug["glm5_dsa_mode"] = "eager"
+		debug["glm5_moe_mode"] = "eager"
+		AttnWrapperBase.batchgen_debug = debug
+		try:
+			yield
+		finally:
+			AttnWrapperBase.batchgen_debug = old_debug
+
 	def _glm5_segmented_graph_suppressed_by_composite_graph(self) -> bool:
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l:
@@ -11618,12 +11630,13 @@ class BatchGenWorker:
 							gpu_manager=gpu_manager,
 							emit_kv_callbacks=False,
 						)
-						outputs = self.model(
-							new_tokens,
-							attention_mask=Attn_Wrapper.attention_mask,
-							position_ids=Attn_Wrapper.position_ids,
-							use_cache=False,
-						)
+						with self._glm5_force_segmented_graph_eager():
+							outputs = self.model(
+								new_tokens,
+								attention_mask=Attn_Wrapper.attention_mask,
+								position_ids=Attn_Wrapper.position_ids,
+								use_cache=False,
+							)
 						eager_logits = outputs.logits[:, -1, :]
 						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
 						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
