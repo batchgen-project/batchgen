@@ -2715,7 +2715,7 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
 
     class FakeEmbedding:
         def __call__(self, input_ids):
-            return input_ids.to(torch.bfloat16).repeat(1, 1, hidden_size)
+            return input_ids.to(torch.bfloat16).unsqueeze(-1).repeat(1, 1, hidden_size)
 
     class FakeNorm:
         def __call__(self, hidden_states):
