@@ -2299,6 +2299,50 @@ def test_glm5_layer_graph_compare_eager_reference_forces_segmented_modes(
     assert AttnWrapperBase.batchgen_debug is original_debug
 
 
+def test_glm5_composite_fallback_forward_forces_segmented_modes(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    original_debug = {
+        "glm5_dsa_mode": "graph",
+        "glm5_moe_mode": "graph",
+        "glm5_moe_router_mode": "custom",
+    }
+    seen_debug = {}
+
+    class FakeModel:
+        def __call__(self, input_ids, **kwargs):
+            seen_debug.update(AttnWrapperBase.batchgen_debug)
+            assert kwargs["position_ids"] is AttnWrapperBase.position_ids
+            assert kwargs["attention_mask"] is AttnWrapperBase.attention_mask
+            assert kwargs["use_cache"] is False
+            return types.SimpleNamespace(
+                logits=torch.zeros(input_ids.shape[0], 1, 4)
+            )
+
+    monkeypatch.setenv("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        AttnWrapperBase,
+        "batchgen_debug",
+        original_debug,
+        raising=False,
+    )
+    monkeypatch.setattr(AttnWrapperBase, "position_ids", object(), raising=False)
+    monkeypatch.setattr(AttnWrapperBase, "attention_mask", object(), raising=False)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker.model = FakeModel()
+
+    out = worker._glm5_decode_model_forward(torch.zeros(2, 1, dtype=torch.long))
+
+    assert out.logits.shape == (2, 1, 4)
+    assert seen_debug["glm5_dsa_mode"] == "eager"
+    assert seen_debug["glm5_moe_mode"] == "eager"
+    assert seen_debug["glm5_moe_router_mode"] == "custom"
+    assert AttnWrapperBase.batchgen_debug is original_debug
+
+
 def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
     monkeypatch,
 ):
@@ -2336,6 +2380,37 @@ def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
     assert worker._glm5_layer_cuda_graph_manager is None
     assert worker._glm5_layer_graph_signature is None
     assert not worker._glm5_layer_graph_capture_attempted_for_batch
+
+
+def test_glm5_layer_signature_uses_stable_page_table_storage():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        def __init__(self, storage):
+            self.storage = storage
+
+        def get_cuda_graph_page_table_storage(self):
+            return self.storage
+
+        def get_cuda_graph_page_table(self):
+            raise RuntimeError("active graph table is invalid")
+
+    primary = FakeManager(torch.empty(4, 8, dtype=torch.int32))
+    aux = FakeManager(torch.empty(4, 9, dtype=torch.int32))
+    worker = object.__new__(BatchGenWorker)
+    worker.gpu_paged_kv_cache_manager = types.SimpleNamespace(
+        primary=primary,
+        auxiliary=aux,
+    )
+    worker.core_engine = types.SimpleNamespace()
+
+    signature = worker._glm5_whole_model_graph_capture_signature(4)
+
+    assert signature[0] == 4
+    assert signature[1][0] == primary.storage.data_ptr()
+    assert signature[1][1] == (4, 8)
+    assert signature[2][0] == aux.storage.data_ptr()
+    assert signature[2][1] == (4, 9)
 
 
 def test_glm5_setup_cuda_graphs_does_not_recapture_after_manager_clear(

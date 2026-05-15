@@ -9723,6 +9723,20 @@ class BatchGenWorker:
 		finally:
 			AttnWrapperBase.batchgen_debug = old_debug
 
+	def _glm5_decode_model_forward(self, new_tokens: torch.Tensor):
+		def _forward():
+			return self.model(
+				new_tokens,
+				attention_mask=Attn_Wrapper.attention_mask,
+				position_ids=Attn_Wrapper.position_ids,
+				use_cache=False,
+			)
+
+		if self._glm5_segmented_graph_suppressed_by_composite_graph():
+			with self._glm5_force_segmented_graph_eager():
+				return _forward()
+		return _forward()
+
 	def _glm5_segmented_graph_suppressed_by_composite_graph(self) -> bool:
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l:
@@ -9746,9 +9760,13 @@ class BatchGenWorker:
 			return None
 
 		def _table_sig(manager):
+			get_storage = getattr(manager, "get_cuda_graph_page_table_storage", None)
 			get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
 			try:
-				table = get_graph_table() if get_graph_table is not None else None
+				if get_storage is not None:
+					table = get_storage()
+				else:
+					table = get_graph_table() if get_graph_table is not None else None
 			except RuntimeError:
 				return None
 			if table is None:
@@ -9839,6 +9857,41 @@ class BatchGenWorker:
 		if manager is None:
 			return not getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False)
 		return not manager.has_bucket_for_all_segments(max_bsz)
+
+	def _glm5_layer_graph_path_state(self, max_rank_bsz: int):
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if (
+			not self._glm5_layer_graph_requested_for_current_batch()
+			or "glm" not in model_name_l
+		):
+			return "disabled", None, "not_requested"
+		if max_rank_bsz <= 0:
+			return "eager", None, "empty_global_batch"
+		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
+		if manager is None:
+			if getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False):
+				return "eager", None, "no_manager_after_initial_capture"
+			return "eager", None, "no_manager"
+		try:
+			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
+		except ValueError:
+			return "eager", None, "over_bucket"
+		if bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
+			return "eager", bucket, "failed_bucket"
+		if not manager.has_bucket_for_all_segments(max_rank_bsz):
+			return "eager", bucket, "bucket_not_captured"
+		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
+		captured_max_seqlen = int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
+		if (
+			current_max_seqlen > 0
+			and captured_max_seqlen > 0
+			and current_max_seqlen > captured_max_seqlen
+		):
+			return "eager", bucket, "max_seqlen_exceeds_capture"
+		signature = self._glm5_whole_model_graph_capture_signature(bucket)
+		if signature != getattr(self, "_glm5_layer_graph_signature", None):
+			return "eager", bucket, "page_table_storage_changed"
+		return "graph", bucket, "captured"
 
 	def _glm5_moe_graph_current_bucket_missing(self) -> bool:
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
@@ -10210,6 +10263,7 @@ class BatchGenWorker:
 			gpu_manager,
 		)
 		moe_path, moe_bucket, moe_reason = self._glm5_moe_graph_path_state(max_rank_bsz)
+		layer_path, layer_bucket, layer_reason = self._glm5_layer_graph_path_state(max_rank_bsz)
 		if rank_counts is None:
 			counts_repr = None
 		else:
@@ -10220,7 +10274,8 @@ class BatchGenWorker:
 		logging.info(
 			"[GLM5_GRAPH_PATH] rank=%s decode_iter=%s local_bsz=%s "
 			"max_rank_bsz=%s rank_counts=%s dsa=%s dsa_bucket=%s "
-			"dsa_reason=%s moe=%s moe_bucket=%s moe_reason=%s",
+			"dsa_reason=%s moe=%s moe_bucket=%s moe_reason=%s "
+			"layer=%s layer_bucket=%s layer_reason=%s",
 			self.rank,
 			decode_iter,
 			local_bsz,
@@ -10232,6 +10287,9 @@ class BatchGenWorker:
 			moe_path,
 			moe_bucket,
 			moe_reason,
+			layer_path,
+			layer_bucket,
+			layer_reason,
 		)
 
 	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
@@ -11539,6 +11597,13 @@ class BatchGenWorker:
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
 
+				if self._glm5_layer_graph_current_bucket_missing():
+					logging.info(
+						f"Rank {self.rank}: warming GLM-5 layer CUDA graph at "
+						"decode entry after cache metadata and page tables are bound"
+					)
+					self._warmup_cuda_graphs()
+
 				if self._glm5_whole_model_graph_current_bucket_missing():
 					logging.info(
 						f"Rank {self.rank}: warming GLM-5 whole-model CUDA graph at "
@@ -11571,27 +11636,21 @@ class BatchGenWorker:
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
 				_glm5_layer_graph_active = False
+				_glm5_layer_bucket = None
+				_glm5_layer_reason = "not_requested"
 				if _glm5_layer_graph_requested:
-					_layer_manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
-					if _layer_manager is not None:
-						try:
-							_glm5_layer_bucket = _layer_manager.bucketing.get_padded_size(_max_bs)
-						except ValueError:
-							_glm5_layer_graph_active = False
-						else:
-							_glm5_layer_graph_active = (
-								_glm5_layer_bucket not in getattr(self, "_glm5_layer_graph_failed_buckets", set())
-								and _layer_manager.has_bucket_for_all_segments(_max_bs)
-								and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
-								and self._glm5_whole_model_graph_capture_signature(_glm5_layer_bucket) == getattr(self, "_glm5_layer_graph_signature", None)
-							)
+					_glm5_layer_path, _glm5_layer_bucket, _glm5_layer_reason = (
+						self._glm5_layer_graph_path_state(_max_bs)
+					)
+					_glm5_layer_graph_active = _glm5_layer_path == "graph"
 					if (
 						not _glm5_layer_graph_active
 						and os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1"
 					):
 						raise RuntimeError(
 							"GLM-5 layer CUDA graph was required but no replayable "
-							"full-layer graph is available for this decode step"
+							"full-layer graph is available for this decode step "
+							f"(reason={_glm5_layer_reason})"
 						)
 
 				_glm5_whole_graph_active = bool(
@@ -11630,13 +11689,7 @@ class BatchGenWorker:
 							gpu_manager=gpu_manager,
 							emit_kv_callbacks=False,
 						)
-						with self._glm5_force_segmented_graph_eager():
-							outputs = self.model(
-								new_tokens,
-								attention_mask=Attn_Wrapper.attention_mask,
-								position_ids=Attn_Wrapper.position_ids,
-								use_cache=False,
-							)
+						outputs = self._glm5_decode_model_forward(new_tokens)
 						eager_logits = outputs.logits[:, -1, :]
 						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
 						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
@@ -11955,12 +12008,7 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self.model(
-						new_tokens,
-						attention_mask=Attn_Wrapper.attention_mask,
-						position_ids=Attn_Wrapper.position_ids,
-						use_cache=False
-					)
+					outputs = self._glm5_decode_model_forward(new_tokens)
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
