@@ -2382,6 +2382,47 @@ def test_glm5_layer_graph_recaptures_when_decode_exceeds_captured_seqlen(
     assert not worker._glm5_layer_graph_capture_attempted_for_batch
 
 
+def test_glm5_whole_graph_recaptures_when_decode_exceeds_captured_seqlen(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeManager:
+        bucketing = BatchSizeBucketing([1, 2, 4])
+
+        def has_bucket_for_all_segments(self, batch_size):
+            return True
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    worker._current_decode_max_rank_batch_size = 1
+    worker._cuda_graph_manager = FakeManager()
+    worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
+    worker._whole_model_bucketing = FakeManager.bucketing
+    worker._whole_model_graph = True
+    worker._glm5_whole_model_graph = True
+    worker._glm5_whole_model_graph_failed_buckets = set()
+    worker._glm5_whole_model_graph_signature = ("same",)
+    worker._glm5_whole_model_graph_unavailable_reason = None
+    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_capture_signature",
+        lambda bucket: ("same",),
+    )
+    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 9000, raising=False)
+
+    assert worker._glm5_whole_model_graph_current_bucket_missing()
+    assert worker._cuda_graph_manager is None
+    assert worker._whole_model_segment is None
+    assert worker._whole_model_bucketing is None
+    assert not worker._whole_model_graph
+    assert not worker._glm5_whole_model_graph
+    assert worker._glm5_whole_model_graph_signature is None
+
+
 def test_glm5_layer_signature_uses_stable_page_table_storage():
     from batchgen.batchgen_worker import BatchGenWorker
 
@@ -2662,6 +2703,124 @@ def test_glm5_whole_model_warmup_policy_allows_capture_with_queued_prefill():
         model_name="zai-org/GLM-5-FP8",
         environ=env,
     )
+
+
+def test_glm5_whole_model_segment_composes_decoder_layer_segments():
+    from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
+        Glm5WholeModelSegment,
+    )
+
+    hidden_size = 4
+    vocab_size = 5
+
+    class FakeEmbedding:
+        def __call__(self, input_ids):
+            return input_ids.to(torch.bfloat16).repeat(1, 1, hidden_size)
+
+    class FakeNorm:
+        def __call__(self, hidden_states):
+            return hidden_states
+
+    class FakeLmHead:
+        def __call__(self, hidden_states):
+            logits = hidden_states.new_zeros(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                vocab_size,
+            )
+            logits[..., :hidden_size] = hidden_states
+            return logits
+
+    class FakeLayer:
+        def __init__(self, layer_idx):
+            self.layer_idx = layer_idx
+            self.hidden_size = hidden_size
+            self.self_attn = types.SimpleNamespace(
+                module=types.SimpleNamespace(
+                    kv_lora_rank=2,
+                    qk_rope_head_dim=1,
+                    indexer=types.SimpleNamespace(index_head_dim=2, index_topk=4),
+                )
+            )
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("whole-model graph should use layer segments directly")
+
+    class FakeLayerSegment:
+        def __init__(self, value):
+            self.value = value
+            self.calls = 0
+            self.setup_bucket = None
+
+        def setup_static_buffers(self, bucket_size):
+            self.setup_bucket = bucket_size
+
+        def _flashmla_tensor_metadata_specs(self, bucket_size):
+            return (bucket_size, 2), torch.int32, (bucket_size,), torch.int32
+
+        def forward(self, *, hidden_states, **kwargs):
+            self.calls += 1
+            rows = hidden_states.shape[0]
+            return {
+                "hidden_states": hidden_states + self.value,
+                "primary_k_tensor": torch.full(
+                    (rows, 1, 1, 3),
+                    self.value,
+                    dtype=torch.bfloat16,
+                ),
+                "indexer_k_tensor": torch.full(
+                    (rows, 1, 1, 2),
+                    self.value,
+                    dtype=torch.bfloat16,
+                ),
+            }
+
+    layers = [FakeLayer(0), FakeLayer(1)]
+    model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=layers,
+            embed_tokens=FakeEmbedding(),
+            norm=FakeNorm(),
+        ),
+        lm_head=FakeLmHead(),
+    )
+    layer_segments = [FakeLayerSegment(1), FakeLayerSegment(2)]
+    segment = Glm5WholeModelSegment(
+        model=model,
+        device=torch.device("cpu"),
+        world_size=2,
+        max_pages_per_seq=1,
+        max_aux_pages_per_seq=1,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        max_bucket_size=2,
+        max_seqlen=16,
+        layer_segments=layer_segments,
+    )
+
+    specs = segment.get_static_input_specs(2)
+    assert "num_valid_tokens" in specs
+    assert "flashmla_tile_scheduler_metadata" in specs
+
+    segment.setup_static_buffers(2)
+    outputs = segment.forward(
+        input_ids=torch.tensor([[1], [2]], dtype=torch.long),
+        cache_seqlens=torch.tensor([4, 5], dtype=torch.int32),
+        position_ids=torch.tensor([[3], [4]], dtype=torch.long),
+        primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32),
+        rank_token_counts=torch.tensor([2, 2], dtype=torch.int64),
+        num_valid_tokens=torch.tensor([2], dtype=torch.int32),
+        flashmla_tile_scheduler_metadata=torch.zeros(2, 2, dtype=torch.int32),
+        flashmla_num_splits=torch.zeros(2, dtype=torch.int32),
+    )
+
+    assert [layer_segment.calls for layer_segment in layer_segments] == [1, 1]
+    assert [layer_segment.setup_bucket for layer_segment in layer_segments] == [2, 2]
+    assert outputs["logits"][0, :hidden_size].tolist() == [4.0, 4.0, 4.0, 4.0]
+    assert outputs["logits"][1, :hidden_size].tolist() == [5.0, 5.0, 5.0, 5.0]
+    assert segment.primary_kv_offload_buffers[1]["key"][0, 0, 0, 0].item() == 2.0
+    assert segment.aux_kv_offload_buffers[1]["key"][0, 0, 0, 0].item() == 2.0
 
 
 def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch):

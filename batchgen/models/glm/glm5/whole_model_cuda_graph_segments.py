@@ -40,6 +40,7 @@ class Glm5WholeModelSegment:
         include_embedding: bool = True,
         include_lm_head: bool = True,
         compare_probe_layers: Iterable[int] | None = None,
+        layer_segments: Iterable[object] | None = None,
     ) -> None:
         if not include_embedding:
             raise NotImplementedError(
@@ -89,6 +90,12 @@ class Glm5WholeModelSegment:
             )
         self.compare_probe_layers = tuple(probes)
         self._compare_probe_layer_set = set(self.compare_probe_layers)
+        self.layer_segments = list(layer_segments or [])
+        if self.layer_segments and len(self.layer_segments) != self.num_layers:
+            raise ValueError(
+                "GLM-5 whole-model graph layer_segments length must match "
+                f"num_layers={self.num_layers}, got {len(self.layer_segments)}"
+            )
 
         attn0 = layers[0].self_attn.module
         indexer0 = getattr(attn0, "indexer", None)
@@ -205,9 +212,13 @@ class Glm5WholeModelSegment:
         ]
         self.primary_kv_offload_buffers = self._kv_buffers
         self.aux_kv_offload_buffers = self._aux_kv_buffers
+        for layer_segment in self.layer_segments:
+            setup = getattr(layer_segment, "setup_static_buffers", None)
+            if setup is not None:
+                setup(bucket_size)
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
+        specs = {
             "input_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),
             "cache_seqlens": TensorSpec(
                 ("batch_size",), torch.int32, fill_value=float(self.max_seqlen)
@@ -217,6 +228,19 @@ class Glm5WholeModelSegment:
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
         }
+        if self.layer_segments:
+            first_layer = self.layer_segments[0]
+            tile_shape, tile_dtype, splits_shape, splits_dtype = (
+                first_layer._flashmla_tensor_metadata_specs(bucket_size)
+            )
+            specs.update(
+                {
+                    "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
+                    "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
+                    "flashmla_num_splits": TensorSpec(splits_shape, splits_dtype),
+                }
+            )
+        return specs
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         specs = {
@@ -275,19 +299,61 @@ class Glm5WholeModelSegment:
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        primary_slot_indices: torch.Tensor | None = None,
+        aux_slot_indices: torch.Tensor | None = None,
+        num_valid_tokens: torch.Tensor | None = None,
+        rank_token_counts: torch.Tensor | None = None,
+        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
+        flashmla_num_splits: torch.Tensor | None = None,
+        use_layer_segments: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         hidden_states = self.model.model.embed_tokens(input_ids)
         outputs: dict[str, torch.Tensor] = {}
-        for layer_idx, layer in enumerate(self.model.model.layers):
-            hidden_states, _, _ = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=None,
-                use_cache=False,
-            )
-            if layer_idx in self._compare_probe_layer_set:
-                outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
+        if self.layer_segments and use_layer_segments is not False:
+            required = {
+                "cache_seqlens": cache_seqlens,
+                "primary_slot_indices": primary_slot_indices,
+                "aux_slot_indices": aux_slot_indices,
+                "num_valid_tokens": num_valid_tokens,
+                "rank_token_counts": rank_token_counts,
+                "flashmla_tile_scheduler_metadata": flashmla_tile_scheduler_metadata,
+                "flashmla_num_splits": flashmla_num_splits,
+            }
+            missing = [name for name, value in required.items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    "GLM-5 whole-model layer-composed graph missing inputs: "
+                    f"{missing}"
+                )
+            for layer_idx, layer_segment in enumerate(self.layer_segments):
+                graph_out = layer_segment.forward(
+                    hidden_states=hidden_states,
+                    position_ids=position_ids,
+                    cache_seqlens=cache_seqlens,
+                    primary_slot_indices=primary_slot_indices,
+                    aux_slot_indices=aux_slot_indices,
+                    num_valid_tokens=num_valid_tokens,
+                    rank_token_counts=rank_token_counts,
+                    flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                    flashmla_num_splits=flashmla_num_splits,
+                )
+                hidden_states = graph_out["hidden_states"]
+                self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
+                self._copy_aux_kv(layer_idx, graph_out["indexer_k_tensor"], None)
+                if layer_idx in self._compare_probe_layer_set:
+                    outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
+        else:
+            for layer_idx, layer in enumerate(self.model.model.layers):
+                hidden_states, _, _ = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=None,
+                    use_cache=False,
+                )
+                if layer_idx in self._compare_probe_layer_set:
+                    outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
 
         hidden_states = self.model.model.norm(hidden_states)
         logits = self.model.lm_head(hidden_states)
@@ -303,6 +369,9 @@ class Glm5WholeModelSegment:
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
         rank_token_counts: torch.Tensor,
+        num_valid_tokens: torch.Tensor | None = None,
+        flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
+        flashmla_num_splits: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
         bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
@@ -327,6 +396,13 @@ class Glm5WholeModelSegment:
             outputs = self.run_model_with_probes(
                 input_ids=input_ids,
                 position_ids=position_ids,
+                cache_seqlens=cache_seqlens,
+                primary_slot_indices=primary_slot_indices,
+                aux_slot_indices=aux_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+                rank_token_counts=rank_token_counts,
+                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                flashmla_num_splits=flashmla_num_splits,
             )
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens
