@@ -106,7 +106,11 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return reinterpret_cast<std::uintptr_t>(
                      self.KPagePtr(layer_idx, page_idx));
              },
-             py::arg("layer_idx"), py::arg("page_idx"))
+             py::arg("layer_idx"), py::arg("page_idx"),
+             "Return the host K page pointer. For mapped worker views, "
+             "layer_idx is a logical layer id and is resolved to a physical "
+             "layer id before address calculation. For normal worker views, "
+             "logical and physical layer ids are identical.")
         .def(
             "v_page_ptr",
             [](WorkerView& self, std::size_t layer_idx,
@@ -118,7 +122,11 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 throw std::runtime_error(
                     "V cache is disabled for this worker view");
             },
-            py::arg("layer_idx"), py::arg("page_idx"))
+            py::arg("layer_idx"), py::arg("page_idx"),
+            "Return the host V page pointer. For mapped worker views, "
+            "layer_idx is a logical layer id and is resolved to a physical "
+            "layer id before address calculation. Raises when this worker "
+            "view has no V cache.")
         .def("get_stats", &WorkerView::GetStats)
        .def("build_page_table",
            [](WorkerView& self,
@@ -137,21 +145,32 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
        .def("read_sequence_kv_to_cpu", &WorkerView::ReadSequenceKVToCPU,
             py::arg("sequence_id"),
             "Read all KV pages for a sequence directly to CPU tensors (no GPU). "
-            "Returns (k_tensor, v_tensor). For MLA, v_tensor is empty.")
+            "Returns (k_tensor, v_tensor). For MLA, v_tensor is empty. "
+            "The returned tensor's first dimension is physical layer id; this "
+            "method does not expand or reorder logical layer ids for mapped "
+            "worker views.")
        .def("write_sequence_kv_from_cpu", &WorkerView::WriteSequenceKVFromCPU,
             py::arg("sequence_id"), py::arg("k_tensor"),
             py::arg("v_tensor") = std::nullopt,
-            "Write KV data from CPU tensors directly to host pages (no GPU).")
+            "Write KV data from CPU tensors directly to host pages (no GPU). "
+            "The input tensor's first dimension is physical layer id; this "
+            "method does not accept logical layer ids for mapped worker views.")
        .def("async_offload_layer_kv_to_host",
            &WorkerView::AsyncOffloadLayerKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"))
+           py::arg("sequence_lengths"),
+           "Offload one layer of prefill KV into host pages. For mapped "
+           "worker views, layer_idx is a logical layer id and is resolved to "
+           "a physical layer id before writing.")
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"))
+           py::arg("sequence_lengths"),
+           "Append one decode token per sequence into host pages. For mapped "
+           "worker views, layer_idx is a logical layer id and is resolved to "
+           "a physical layer id before writing.")
        .def("async_append_decode_kv_to_host_batched_kernel",
            [](WorkerView& self,
               py::list entries_py,
@@ -183,7 +202,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            "Batched variant: all (layer × seq) host-KV writes issued by "
            "one UVA kernel launch on the DtoH stream. Replaces the "
            "per-layer async_append_decode_kv_to_host loop of 78×bsz "
-           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs.")
+           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs. Each "
+           "entry's layer_idx is a logical layer id for mapped worker views "
+           "and is resolved before building destination pointers.")
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -196,7 +217,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("sequence_ids"), py::arg("k_device_ptrs"),
             py::arg("v_device_ptrs") = py::none(),
             "Schedule host-paged KV pages to be loaded onto device memory "
-            "using pre-allocated GPU destinations.")
+            "using pre-allocated GPU destinations. This loads all physical "
+            "layers; destination pointer tensors are indexed by physical "
+            "layer id even for mapped worker views.")
         .def(
             "async_load_layer_paged_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -210,7 +233,10 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("sequence_ids"), py::arg("active_page_counts"),
             py::arg("k_device_ptrs"),
             py::arg("v_device_ptrs") = py::none(),
-            "Load only the active per-sequence KV pages using padded page tables.")
+            "Load only the active per-sequence KV pages using padded page "
+            "tables. This loads all physical layers; destination pointer "
+            "tensors are indexed by physical layer id even for mapped worker "
+            "views.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(
@@ -265,7 +291,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return self.ResolvePhysicalLayer(layer_idx,
                                                   "resolve_physical_layer");
              },
-             py::arg("layer_idx"))
+             py::arg("layer_idx"),
+             "Resolve a logical layer id to the physical layer id used by "
+             "this worker view. Normal worker views return layer_idx unchanged.")
         .def("get_sequence_layer_page_pointers",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t layer_idx,
@@ -289,7 +317,11 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return py::make_tuple(std::move(k_ptrs), v_ptrs);
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
-             py::arg("max_tokens") = py::none());;
+             py::arg("max_tokens") = py::none(),
+             "Return per-page K/V host pointers for one sequence and one "
+             "layer. For mapped worker views, layer_idx is a logical layer id "
+             "and is resolved to a physical layer id before address "
+             "calculation.");
 }
 
 }  // namespace

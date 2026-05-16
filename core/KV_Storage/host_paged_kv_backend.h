@@ -133,6 +133,28 @@ inline std::size_t AlignUp(std::size_t value, std::size_t alignment) {
 
 }  // namespace detail
 
+inline void AppendLogicalLayerMapping(std::ostringstream& oss,
+                                      const std::vector<std::int32_t>& mapping) {
+    oss << '[';
+    constexpr std::size_t kMaxEntriesToPrint = 32;
+    const std::size_t entries =
+        mapping.size() < kMaxEntriesToPrint ? mapping.size()
+                                            : kMaxEntriesToPrint;
+    for (std::size_t i = 0; i < entries; ++i) {
+        if (i != 0) {
+            oss << ',';
+        }
+        oss << mapping[i];
+    }
+    if (mapping.size() > entries) {
+        if (entries != 0) {
+            oss << ',';
+        }
+        oss << "...(" << mapping.size() << " total)";
+    }
+    oss << ']';
+}
+
 inline std::string ToString(const HostPagedKVConfig& config) {
     std::ostringstream oss;
     oss << "HostPagedKVConfig(shm_name='" << config.shm_name
@@ -147,8 +169,9 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", v_element_size_bytes=" << config.v_element_size_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
         << ", alignment_bytes=" << config.alignment_bytes
-        << ", logical_to_physical_layer_size="
-        << config.logical_to_physical_layer.size() << ")";
+        << ", logical_to_physical_layer=";
+    AppendLogicalLayerMapping(oss, config.logical_to_physical_layer);
+    oss << ")";
     return oss.str();
 }
 

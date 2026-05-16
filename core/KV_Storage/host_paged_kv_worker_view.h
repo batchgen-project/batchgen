@@ -197,6 +197,16 @@ struct VectorLayerMapper {
                 "Mapped HostPagedKVWorkerView requires "
                 "logical_to_physical_layer");
         }
+        const bool has_physical_layer = std::any_of(
+            logical_to_physical_layer_.begin(),
+            logical_to_physical_layer_.end(),
+            [](std::int32_t physical_layer) { return physical_layer >= 0; });
+        if (!has_physical_layer) {
+            throw std::invalid_argument(
+                "Mapped HostPagedKVWorkerView requires at least one "
+                "logical_to_physical_layer entry with a non-negative physical "
+                "layer id");
+        }
     }
 
     [[nodiscard]] std::size_t Resolve(std::size_t logical_layer_idx,

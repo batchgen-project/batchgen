@@ -7,8 +7,6 @@ import string
 import pytest
 import torch
 
-from batchgen.models.engine_loader import core_engine as bg
-
 
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
@@ -29,6 +27,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="module")
+def bg():
+    if not torch.cuda.is_available():
+        pytest.skip("mapped HostKV tests require CUDA")
+    from batchgen.models.engine_loader import core_engine as bg_module
+
+    return bg_module
+
+
 def _random_shm_name() -> str:
     suffix = "".join(
         random.choices(string.ascii_lowercase + string.digits, k=10)
@@ -46,7 +53,7 @@ def _shm_unlink(name: str) -> None:
             raise OSError(err, f"shm_unlink({name}) failed")
 
 
-def _make_mapped_mla_config(shm_name: str) -> bg.HostPagedKVConfig:  # type: ignore
+def _make_mapped_mla_config(bg, shm_name: str):
     cfg = bg.HostPagedKVConfig()
     cfg.shm_name = shm_name
     cfg.num_layers = NUM_PHYSICAL_LAYERS
@@ -111,9 +118,11 @@ def _close_view(view, sequence_ids) -> None:
         pass
 
 
-def test_mapped_mla_view_routes_logical_layers_after_cpu_write():
+def test_mapped_mla_view_routes_logical_layers_after_cpu_write(bg):
     shm_name = _random_shm_name()
-    cfg = _make_mapped_mla_config(shm_name)
+    cfg = _make_mapped_mla_config(bg, shm_name)
+    mapping_repr = "logical_to_physical_layer=[-1,3,0,-1,2,1,-1]"
+    assert mapping_repr in repr(cfg)
     view = None
     sequence_lengths = {
         101: 1,
@@ -124,6 +133,7 @@ def test_mapped_mla_view_routes_logical_layers_after_cpu_write():
 
     try:
         view = bg.MappedMLAHostPagedKVWorkerView(cfg)
+        assert mapping_repr in repr(view)
         assert view.uses_logical_layer_mapping is True
         assert view.has_v_cache is False
         for logical_layer, physical_layer in enumerate(LOGICAL_TO_PHYSICAL):
@@ -215,9 +225,9 @@ def test_mapped_mla_view_routes_logical_layers_after_cpu_write():
         _shm_unlink(shm_name)
 
 
-def test_mapped_mla_view_routes_prefill_and_batched_decode_writes():
+def test_mapped_mla_view_routes_prefill_and_batched_decode_writes(bg):
     shm_name = _random_shm_name()
-    cfg = _make_mapped_mla_config(shm_name)
+    cfg = _make_mapped_mla_config(bg, shm_name)
     view = None
     sequence_ids = [11, 22, 33, 44]
     capacity_tokens = PAGE_TOKENS * 4
@@ -307,3 +317,11 @@ def test_mapped_mla_view_routes_prefill_and_batched_decode_writes():
     finally:
         _close_view(view, sequence_ids)
         _shm_unlink(shm_name)
+
+
+def test_mapped_mla_view_rejects_all_absent_mapping(bg):
+    cfg = _make_mapped_mla_config(bg, _random_shm_name())
+    cfg.logical_to_physical_layer = [-1, -1, -1]
+
+    with pytest.raises(ValueError, match="non-negative physical layer id"):
+        bg.MappedMLAHostPagedKVWorkerView(cfg)
