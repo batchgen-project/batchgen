@@ -22,11 +22,12 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
 	GPUPagedKVConfig,
 	GPUPagedKVStats,
 )
+from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 
 logger = logging.getLogger(__name__)
 
 
-class DualKVCacheCoordinator:
+class DualKVCacheCoordinator(GPUKVCoordinator):
 	"""Synchronizes a primary and auxiliary GPUPagedKVCacheManager.
 
 	Both managers track identical sequences with identical token counts.
@@ -43,8 +44,10 @@ class DualKVCacheCoordinator:
 		primary: GPUPagedKVCacheManager,
 		auxiliary: GPUPagedKVCacheManager,
 	) -> None:
-		self.primary = primary
+		super().__init__(primary_component_name="primary")
 		self.auxiliary = auxiliary
+		self.register_component("primary", primary)
+		self.register_component("auxiliary", auxiliary)
 		if primary.config.page_size_tokens != auxiliary.config.page_size_tokens:
 			raise ValueError(
 				"DSA primary/aux GPU KV page size mismatch: "
