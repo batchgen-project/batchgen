@@ -4,14 +4,9 @@
 # ---------------------------------------------------------------------------- #
 
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVComponent, GPUKVCoordinator
-from batchgen.kv_cache.host_kv_coordinator import (
-	AsyncKVTaskGroup,
-	HostKVComponent,
-	HostKVCoordinator,
-)
+from batchgen.kv_cache.host_kv_coordinator import HostKVComponent, HostKVCoordinator
 
 __all__ = [
-	"AsyncKVTaskGroup",
 	"GPUKVComponent",
 	"GPUKVCoordinator",
 	"HostKVComponent",

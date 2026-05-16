@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
 
 from batchgen.models.engine_loader import core_engine as bg_lib
-from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +126,7 @@ def _compute_dual_page_count(
 	return primary_profile, aux_profile, num_pages
 
 
-class DualHostKVCoordinator(HostKVCoordinator):
+class DualHostKVCoordinator:
 	"""Synchronizes a primary and auxiliary host paged KV worker view.
 
 	Both views track identical sequences with identical page allocations.
@@ -140,13 +139,10 @@ class DualHostKVCoordinator(HostKVCoordinator):
 	"""
 
 	def __init__(self, primary, auxiliary) -> None:
-		super().__init__(primary_component_name="primary")
 		if auxiliary is None:
 			raise RuntimeError("DualHostKVCoordinator requires auxiliary host KV for DSA")
 		self.primary = primary
 		self.auxiliary = auxiliary
-		self.register_component("primary", primary)
-		self.register_component("auxiliary", auxiliary)
 
 	@classmethod
 	def from_budget(
