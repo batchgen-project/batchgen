@@ -255,6 +255,17 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
         .def_property_readonly_static(
             "has_v_cache",
             [](py::object /* cls */) { return WorkerView::kHasVCache; })
+        .def_property_readonly_static(
+            "uses_logical_layer_mapping",
+            [](py::object /* cls */) {
+                return WorkerView::kUsesLogicalLayerMapping;
+            })
+        .def("resolve_physical_layer",
+             [](WorkerView& self, std::size_t layer_idx) {
+                 return self.ResolvePhysicalLayer(layer_idx,
+                                                  "resolve_physical_layer");
+             },
+             py::arg("layer_idx"))
         .def("get_sequence_layer_page_pointers",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t layer_idx,
@@ -378,6 +389,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
+        .def_readwrite("logical_to_physical_layer",
+                       &kv::HostPagedKVConfig::logical_to_physical_layer)
         .def_readwrite("logger_name", &kv::HostPagedKVConfig::logger_name)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
@@ -415,6 +428,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "DefaultHostPagedKVWorkerView");
     BindHostPagedWorkerView<kv::MLAHostPagedKVWorkerView>(
         m, "MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::MappedDefaultHostPagedKVWorkerView>(
+        m, "MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::MappedMLAHostPagedKVWorkerView>(
+        m, "MappedMLAHostPagedKVWorkerView");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),

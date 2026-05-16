@@ -37,6 +37,7 @@ struct HostPagedKVConfig {
     bool enable_memfd = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
+    std::vector<std::int32_t> logical_to_physical_layer;
     std::string logger_name;  // Custom logger name (empty = use default)
 };
 
@@ -72,6 +73,27 @@ inline HostPagedKVConfig SanitizeConfig(HostPagedKVConfig config) {
     }
     if (config.k_element_size_bytes == 0) {
         errors.emplace_back("k_element_size_bytes must be > 0");
+    }
+    for (std::size_t logical_layer = 0;
+         logical_layer < config.logical_to_physical_layer.size();
+         ++logical_layer) {
+        const std::int32_t physical_layer =
+            config.logical_to_physical_layer[logical_layer];
+        if (physical_layer < -1) {
+            std::ostringstream oss;
+            oss << "logical_to_physical_layer[" << logical_layer
+                << "] must be >= -1";
+            errors.emplace_back(oss.str());
+            continue;
+        }
+        if (config.num_layers > 0 && physical_layer >= 0 &&
+            static_cast<std::size_t>(physical_layer) >= config.num_layers) {
+            std::ostringstream oss;
+            oss << "logical_to_physical_layer[" << logical_layer
+                << "] physical layer id " << physical_layer
+                << " must be < num_layers (" << config.num_layers << ")";
+            errors.emplace_back(oss.str());
+        }
     }
     if (!errors.empty()) {
         std::string message = "Invalid HostPagedKVConfig: ";
@@ -124,7 +146,9 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", k_element_size_bytes=" << config.k_element_size_bytes
         << ", v_element_size_bytes=" << config.v_element_size_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
-        << ", alignment_bytes=" << config.alignment_bytes << ")";
+        << ", alignment_bytes=" << config.alignment_bytes
+        << ", logical_to_physical_layer_size="
+        << config.logical_to_physical_layer.size() << ")";
     return oss.str();
 }
 
@@ -154,6 +178,8 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
     seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
+    // logical_to_physical_layer is view-level routing. It does not change the
+    // physical shared-memory layout, so it is intentionally excluded here.
     return seed;
 }
 

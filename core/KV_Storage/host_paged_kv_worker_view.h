@@ -174,27 +174,99 @@ using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
 using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
 using SequenceLengths = batchgen::kv::SequenceLengths;
 
-template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>>
-class HostPagedKVWorkerView {
+struct IdentityLayerMapper {
+    static constexpr bool kMapped = false;
+
+    explicit IdentityLayerMapper(const HostPagedKVConfig&) {}
+
+    [[nodiscard]] std::size_t Resolve(std::size_t logical_layer_idx,
+                                      const HostPagedKVGeometry& geometry,
+                                      std::string_view context) const {
+        geometry.EnsureLayerBounds(logical_layer_idx, context);
+        return logical_layer_idx;
+    }
+};
+
+struct VectorLayerMapper {
+    static constexpr bool kMapped = true;
+
+    explicit VectorLayerMapper(const HostPagedKVConfig& config)
+        : logical_to_physical_layer_(config.logical_to_physical_layer) {
+        if (logical_to_physical_layer_.empty()) {
+            throw std::invalid_argument(
+                "Mapped HostPagedKVWorkerView requires "
+                "logical_to_physical_layer");
+        }
+    }
+
+    [[nodiscard]] std::size_t Resolve(std::size_t logical_layer_idx,
+                                      const HostPagedKVGeometry& geometry,
+                                      std::string_view context) const {
+        if (logical_layer_idx >= logical_to_physical_layer_.size()) {
+            std::ostringstream oss;
+            oss << context << ": logical layer id " << logical_layer_idx
+                << " exceeds mapping size "
+                << logical_to_physical_layer_.size();
+            throw std::out_of_range(oss.str());
+        }
+        const std::int32_t physical_layer =
+            logical_to_physical_layer_[logical_layer_idx];
+        if (physical_layer < 0) {
+            std::ostringstream oss;
+            oss << context << ": logical layer id " << logical_layer_idx
+                << " has no physical layer id in this HostPagedKVWorkerView";
+            throw std::out_of_range(oss.str());
+        }
+        const auto physical_layer_idx =
+            static_cast<std::size_t>(physical_layer);
+        geometry.EnsureLayerBounds(physical_layer_idx, context);
+        return physical_layer_idx;
+    }
+
+    [[nodiscard]] std::size_t logical_layer_count() const noexcept {
+        return logical_to_physical_layer_.size();
+    }
+
+   private:
+    std::vector<std::int32_t> logical_to_physical_layer_;
+};
+
+template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>,
+          typename LayerMapper = IdentityLayerMapper>
+class HostPagedKVWorkerView : private LayerMapper {
+   private:
+    struct SanitizedConfigTag {};
+
    public:
     using ModeTraits = HostKVModeTraits<Mode>;
     static constexpr HostKVMode kMode = Mode;
     static constexpr bool kHasVCache = Layout::kHasVCache;
+    static constexpr bool kUsesLogicalLayerMapping = LayerMapper::kMapped;
 
-        explicit HostPagedKVWorkerView(const EngineConfig& engine_config,
-                                                                     const ModelConfig& model_config)
-                : HostPagedKVWorkerView(config::BuildHostPagedKVConfig(
-                            engine_config, model_config)) {}
+    explicit HostPagedKVWorkerView(const EngineConfig& engine_config,
+                                   const ModelConfig& model_config)
+        : HostPagedKVWorkerView(config::BuildHostPagedKVConfig(
+              engine_config, model_config)) {}
 
     explicit HostPagedKVWorkerView(const HostPagedKVConfig& config)
-        : config_(detail::SanitizeConfig(ModeTraits::Adjust(config))),
+        : HostPagedKVWorkerView(
+              detail::SanitizeConfig(ModeTraits::Adjust(config)),
+              SanitizedConfigTag{}) {}
+
+   private:
+    HostPagedKVWorkerView(HostPagedKVConfig config, SanitizedConfigTag)
+        : LayerMapper(config),
+          config_(std::move(config)),
           geometry_(config_),
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache),
           logger_(init_logger("info",
-              config_.logger_name.empty() ? "HostPagedKVWorkerView" : config_.logger_name)) {}
+                              config_.logger_name.empty()
+                                  ? "HostPagedKVWorkerView"
+                                  : config_.logger_name)) {}
 
+   public:
     HostPagedKVWorkerView(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView& operator=(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView(HostPagedKVWorkerView&&) = delete;
@@ -401,7 +473,7 @@ class HostPagedKVWorkerView {
             const auto k_plan = build_plan(
                 k_dest_ptr,
                 [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
-                    return this->KPagePtr(layer_idx, page_idx);
+                    return this->KPhysicalPagePtr(layer_idx, page_idx);
                 });
             const auto end = std::chrono::high_resolution_clock::now();
             double plan_ms =
@@ -419,8 +491,9 @@ class HostPagedKVWorkerView {
                     v_plan = build_plan(v_dest_ptr,
                                         [this](std::size_t layer_idx,
                                                std::int32_t page_idx) -> void* {
-                                            return this->template VPagePtr<>(
-                                                layer_idx, page_idx);
+                                            return this
+                                                ->template VPhysicalPagePtr<>(
+                                                    layer_idx, page_idx);
                                         });
                 }
             }
@@ -637,7 +710,7 @@ class HostPagedKVWorkerView {
             const auto k_plan = build_plan(
                 k_dest_ptr,
                 [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
-                    return this->KPagePtr(layer_idx, page_idx);
+                    return this->KPhysicalPagePtr(layer_idx, page_idx);
                 });
             const auto plan_end = std::chrono::high_resolution_clock::now();
             const double plan_ms =
@@ -655,8 +728,8 @@ class HostPagedKVWorkerView {
                     v_plan = build_plan(
                         v_dest_ptr, [this](std::size_t layer_idx,
                                            std::int32_t page_idx) -> void* {
-                            return this->template VPagePtr<>(layer_idx,
-                                                             page_idx);
+                            return this->template VPhysicalPagePtr<>(
+                                layer_idx, page_idx);
                         });
                 }
             }
@@ -718,35 +791,42 @@ class HostPagedKVWorkerView {
     const std::byte* DataBase() const { return backend_.DataBase(); }
 
     void* KPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<void*>(
-            layout_.KPageAddress(backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return KPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     const void* KPagePtr(std::size_t layer_idx, std::int32_t page_idx) const {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<const void*>(
-            layout_.KPageAddress(backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return KPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     template <bool Enabled = Layout::kHasVCache,
               typename = std::enable_if_t<Enabled>>
     void* VPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<void*>(layout_.template VPageAddress<>(
-            backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return VPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     template <bool Enabled = Layout::kHasVCache,
               typename = std::enable_if_t<Enabled>>
     const void* VPagePtr(std::size_t layer_idx, std::int32_t page_idx) const {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<const void*>(layout_.template VPageAddress<>(
-            backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return VPhysicalPagePtr(physical_layer_idx, page_idx);
+    }
+
+    [[nodiscard]] std::size_t ResolvePhysicalLayer(
+        std::size_t logical_layer_idx, std::string_view context) const {
+        if constexpr (LayerMapper::kMapped) {
+            return static_cast<const LayerMapper&>(*this).Resolve(
+                logical_layer_idx, geometry_, context);
+        } else {
+            geometry_.EnsureLayerBounds(logical_layer_idx, context);
+            return logical_layer_idx;
+        }
     }
 
     const HostPagedKVConfig& config() const { return config_; }
@@ -789,7 +869,7 @@ class HostPagedKVWorkerView {
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
         std::optional<std::size_t> max_tokens = std::nullopt) const {
-        geometry_.EnsureLayerBounds(
+        const std::size_t physical_layer_idx = ResolvePhysicalLayer(
             layer_idx, "HostPagedKVWorkerView::GetSequenceLayerPagePointers");
         std::optional<std::size_t> max_pages;
         if (max_tokens.has_value()) {
@@ -805,14 +885,14 @@ class HostPagedKVWorkerView {
         }
         std::byte* base = const_cast<std::byte*>(backend_.DataBase());
         for (std::int32_t page : page_indices) {
-            void* k_ptr =
-                static_cast<void*>(layout_.KPageAddress(base, layer_idx, page));
+            void* k_ptr = static_cast<void*>(
+                layout_.KPageAddress(base, physical_layer_idx, page));
             k_ptrs.emplace_back(k_ptr);
             // LogPageBytes("K", layer_idx, sequence_id, page, k_ptr,
             //              geometry_.KTokenBytes());
             if constexpr (Layout::kHasVCache) {
                 void* v_ptr = static_cast<void*>(
-                    layout_.VPageAddress(base, layer_idx, page));
+                    layout_.VPageAddress(base, physical_layer_idx, page));
                 v_ptrs->emplace_back(v_ptr);
                 // LogPageBytes("V", layer_idx, sequence_id, page, v_ptr,
                 //              geometry_.template VTokenBytes<true>());
@@ -874,7 +954,8 @@ class HostPagedKVWorkerView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         // [B, S, H, D]
         SequenceLengths sequence_lengths) {
-        geometry_.EnsureLayerBounds(layer_idx, "AsyncOffloadLayerKVToHost");
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "AsyncOffloadLayerKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
         if (batch == 0) {
@@ -899,7 +980,7 @@ class HostPagedKVWorkerView {
         const auto producer_cuda_stream =
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
-        return LaunchAsyncTask([this, layer_idx,
+        return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v, tokens_per_sequence,
@@ -950,7 +1031,8 @@ class HostPagedKVWorkerView {
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
                         std::byte* dst = layout_.KPageAddress(
-                                             host_base, layer_idx, page_idx) +
+                                             host_base, physical_layer_idx,
+                                             page_idx) +
                                          page_offset_tokens * k_token_bytes;
                         const std::byte* src =
                             seq_k_src + relative_token_offset * k_token_bytes;
@@ -969,7 +1051,8 @@ class HostPagedKVWorkerView {
                                 std::size_t relative_token_offset) {
                                 std::byte* dst =
                                     layout_.template VPageAddress<>(
-                                        host_base, layer_idx, page_idx) +
+                                        host_base, physical_layer_idx,
+                                        page_idx) +
                                     page_offset_tokens * v_token_bytes;
                                 const std::byte* src =
                                     seq_v_src +
@@ -992,7 +1075,8 @@ class HostPagedKVWorkerView {
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths sequence_lengths) {
-        geometry_.EnsureLayerBounds(layer_idx, "AsyncAppendDecodeKVToHost");
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "AsyncAppendDecodeKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
         if (batch == 0) {
@@ -1023,7 +1107,7 @@ class HostPagedKVWorkerView {
         const auto producer_cuda_stream =
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
-        return LaunchAsyncTask([this, layer_idx,
+        return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v,
@@ -1067,8 +1151,9 @@ class HostPagedKVWorkerView {
                                         "AsyncAppendDecodeKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
-                std::byte* k_dst = layout_.KPageAddress(host_base, layer_idx,
-                                                        location.page_idx) +
+                std::byte* k_dst =
+                    layout_.KPageAddress(host_base, physical_layer_idx,
+                                         location.page_idx) +
                                    location.page_offset_tokens * k_token_bytes;
                 EnqueueCopy(seq_k_src, k_dst, k_token_bytes,
                             CopyDirection::kDeviceToHost, cuda_stream);
@@ -1079,7 +1164,8 @@ class HostPagedKVWorkerView {
                             v_base + batch_idx * v_seq_stride;
                         std::byte* v_dst =
                             layout_.template VPageAddress<>(
-                                host_base, layer_idx, location.page_idx) +
+                                host_base, physical_layer_idx,
+                                location.page_idx) +
                             location.page_offset_tokens * v_token_bytes;
                         EnqueueCopy(seq_v_src, v_dst, v_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
@@ -1126,9 +1212,9 @@ class HostPagedKVWorkerView {
 
         // Validate each entry and detect V presence
         bool has_v = false;
-        for (const auto& e : entries) {
-            geometry_.EnsureLayerBounds(e.layer_idx,
-                                        "AsyncAppendDecodeKVToHostBatchedKernel");
+        for (auto& e : entries) {
+            e.layer_idx = ResolvePhysicalLayer(
+                e.layer_idx, "AsyncAppendDecodeKVToHostBatchedKernel");
             const std::size_t tokens_per_seq =
                 ValidateKTensorShape(e.k_tensor, batch);
             if (tokens_per_seq != 1) {
@@ -1428,6 +1514,42 @@ class HostPagedKVWorkerView {
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
 
+    void* KPhysicalPagePtr(std::size_t physical_layer_idx,
+                           std::int32_t page_idx) {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<void*>(layout_.KPageAddress(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    const void* KPhysicalPagePtr(std::size_t physical_layer_idx,
+                                 std::int32_t page_idx) const {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<const void*>(layout_.KPageAddress(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    template <bool Enabled = Layout::kHasVCache,
+              typename = std::enable_if_t<Enabled>>
+    void* VPhysicalPagePtr(std::size_t physical_layer_idx,
+                           std::int32_t page_idx) {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<void*>(layout_.template VPageAddress<>(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    template <bool Enabled = Layout::kHasVCache,
+              typename = std::enable_if_t<Enabled>>
+    const void* VPhysicalPagePtr(std::size_t physical_layer_idx,
+                                 std::int32_t page_idx) const {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<const void*>(layout_.template VPageAddress<>(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
     void RegisterPinnedMemory() {
         if (pinned_registered_) {
             return;
@@ -1597,6 +1719,8 @@ class HostPagedKVWorkerView {
                               std::size_t tokens_per_sequence,
                               std::byte* host_base) const {
         constexpr std::string_view kOpName = "AsyncOffloadLayerKVToHost";
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kOpName);
         const std::size_t tokens_per_page = geometry_.PageSizeTokens();
         if (host_base == nullptr) {
             logger_->warn(
@@ -1620,7 +1744,8 @@ class HostPagedKVWorkerView {
                 }
                 const std::int32_t page_idx = pages[slot];
                 const std::byte* token_ptr =
-                    layout_.KPageAddress(host_base, layer_idx, page_idx);
+                    layout_.KPageAddress(host_base, physical_layer_idx,
+                                         page_idx);
                 logger_->info("Layer {} Seq {} Page {} first_token_hex {}",
                               layer_idx, sequence_id, page_idx,
                               geometry_.DescribeBytes(token_ptr,
@@ -1634,6 +1759,8 @@ class HostPagedKVWorkerView {
                                const SequenceLengths& sequence_lengths,
                                std::byte* host_base,
                                std::size_t neighborhood = 1) const {
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "LogDecodeNeighborhood");
         if (host_base == nullptr) {
             logger_->warn("LogDecodeNeighborhood: host_base is null, skipping");
             return;
@@ -1670,7 +1797,7 @@ class HostPagedKVWorkerView {
                     pages, sequence_id, token_idx, "LogDecodeNeighborhood");
 
                 const std::byte* token_ptr =
-                    layout_.KPageAddress(host_base, layer_idx,
+                    layout_.KPageAddress(host_base, physical_layer_idx,
                                          location.page_idx) +
                     location.page_offset_tokens * k_token_bytes;
 
@@ -2310,6 +2437,12 @@ class HostPagedKVWorkerView {
 
 using DefaultHostPagedKVWorkerView = HostPagedKVWorkerView<HostKVMode::kMHA>;
 using MLAHostPagedKVWorkerView = HostPagedKVWorkerView<HostKVMode::kMLA>;
+using MappedDefaultHostPagedKVWorkerView =
+    HostPagedKVWorkerView<HostKVMode::kMHA, HostPagedKVLayout<HostKVMode::kMHA>,
+                          VectorLayerMapper>;
+using MappedMLAHostPagedKVWorkerView =
+    HostPagedKVWorkerView<HostKVMode::kMLA, HostPagedKVLayout<HostKVMode::kMLA>,
+                          VectorLayerMapper>;
 
 }  // namespace batchgen::kv
 
