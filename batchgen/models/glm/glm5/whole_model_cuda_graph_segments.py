@@ -218,6 +218,20 @@ class Glm5WholeModelSegment:
             if setup is not None:
                 setup(bucket_size)
 
+    def release_static_buffers(self, bucket_size: int) -> None:
+        for layer_segment in self.layer_segments:
+            release = getattr(layer_segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
+        self._kv_buffers = None
+        self._aux_kv_buffers = None
+        self._kv_key_buffer = None
+        self._aux_kv_key_buffer = None
+        self.primary_kv_offload_buffers = None
+        self.aux_kv_offload_buffers = None
+        self._capture_inputs = None
+        self._capture_dsa_short_count = None
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         specs = {
             "input_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),

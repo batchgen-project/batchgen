@@ -2449,15 +2449,22 @@ def test_glm5_whole_graph_recaptures_when_decode_exceeds_captured_seqlen(
     class FakeManager:
         bucketing = BatchSizeBucketing([1, 2, 4])
 
+        def __init__(self):
+            self.dropped = []
+
         def has_bucket_for_all_segments(self, batch_size):
             return True
+
+        def drop_bucket(self, bucket_size):
+            self.dropped.append(bucket_size)
 
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
     worker.model_name = "zai-org/GLM-5-FP8"
     worker._batchgen_debug = {}
     worker._current_decode_max_rank_batch_size = 1
-    worker._cuda_graph_manager = FakeManager()
+    manager = FakeManager()
+    worker._cuda_graph_manager = manager
     worker._whole_model_segment = types.SimpleNamespace(max_seqlen=8192)
     worker._whole_model_bucketing = FakeManager.bucketing
     worker._whole_model_graph = True
@@ -2480,6 +2487,46 @@ def test_glm5_whole_graph_recaptures_when_decode_exceeds_captured_seqlen(
     assert not worker._whole_model_graph
     assert not worker._glm5_whole_model_graph
     assert worker._glm5_whole_model_graph_signature is None
+    assert manager.dropped == [1, 2, 4]
+
+
+def test_glm5_release_whole_model_graph_state_preserves_capture_inputs():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeBucketing:
+        bucket_sizes = [4, 8]
+
+    class FakeManager:
+        bucketing = FakeBucketing()
+
+        def __init__(self):
+            self.dropped = []
+
+        def drop_bucket(self, bucket_size):
+            self.dropped.append(bucket_size)
+
+    worker = object.__new__(BatchGenWorker)
+    manager = FakeManager()
+    capture_ids = object()
+    worker.torch_device = torch.device("cpu")
+    worker._cuda_graph_manager = manager
+    worker._whole_model_segment = object()
+    worker._whole_model_bucketing = FakeBucketing()
+    worker._whole_model_graph = True
+    worker._glm5_whole_model_graph = True
+    worker._glm5_whole_model_graph_signature = ("old",)
+    worker._glm5_whole_model_capture_input_ids = capture_ids
+
+    worker._release_glm5_whole_model_graph_state(empty_cuda_cache=False)
+
+    assert manager.dropped == [4, 8]
+    assert worker._cuda_graph_manager is None
+    assert worker._whole_model_segment is None
+    assert worker._whole_model_bucketing is None
+    assert not worker._whole_model_graph
+    assert not worker._glm5_whole_model_graph
+    assert worker._glm5_whole_model_graph_signature is None
+    assert worker._glm5_whole_model_capture_input_ids is capture_ids
 
 
 def test_glm5_layer_signature_uses_stable_page_table_storage():
@@ -2856,9 +2903,13 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
             self.value = value
             self.calls = 0
             self.setup_bucket = None
+            self.release_bucket = None
 
         def setup_static_buffers(self, bucket_size):
             self.setup_bucket = bucket_size
+
+        def release_static_buffers(self, bucket_size):
+            self.release_bucket = bucket_size
 
         def _flashmla_tensor_metadata_specs(self, bucket_size):
             return (bucket_size, 2), torch.int32, (bucket_size,), torch.int32
@@ -2926,6 +2977,14 @@ def test_glm5_whole_model_segment_composes_decoder_layer_segments():
     assert outputs["logits"][1, :hidden_size].tolist() == [5.0, 5.0, 5.0, 5.0]
     assert segment.primary_kv_offload_buffers[1]["key"][0, 0, 0, 0].item() == 2.0
     assert segment.aux_kv_offload_buffers[1]["key"][0, 0, 0, 0].item() == 2.0
+    segment.release_static_buffers(2)
+    assert [layer_segment.release_bucket for layer_segment in layer_segments] == [2, 2]
+    assert segment._kv_buffers is None
+    assert segment._aux_kv_buffers is None
+    assert segment._kv_key_buffer is None
+    assert segment._aux_kv_key_buffer is None
+    assert segment.primary_kv_offload_buffers is None
+    assert segment.aux_kv_offload_buffers is None
 
 
 def test_glm5_dsa_graph_route_fast_fails_without_registered_segment(monkeypatch):

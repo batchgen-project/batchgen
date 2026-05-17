@@ -186,6 +186,10 @@ class Glm5MoEGraphBufferPool:
     def _round_up(value: int, block: int) -> int:
         return ((value + block - 1) // block) * block
 
+    def release(self) -> None:
+        self._views.clear()
+        self._base.clear()
+
 
 class Glm5MoEGraphSegment:
     """Graph-capturable full GLM-5 MoE decode module segment."""
@@ -252,6 +256,9 @@ class Glm5MoEGraphSegment:
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
         self.pool.setup()
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        self.pool.release()
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
