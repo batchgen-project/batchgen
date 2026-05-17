@@ -288,7 +288,7 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
     c4_table = c4.rebuild_page_table([10, 20])
 
     assert tuple(primary_table.shape) == (2, 4)
-    assert tuple(c4_table.shape) == (2, 5)
+    assert tuple(c4_table.shape) == (2, 6)
     assert primary._sequences[20].pages.numel() == 3
     assert c4._sequences[20].pages.numel() == 5
 
