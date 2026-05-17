@@ -21,8 +21,6 @@ COMPRESSOR_C4 = "compressor_c4"
 COMPRESSOR_C128 = "compressor_c128"
 INDEXER_C4 = "indexer_c4"
 
-_SUPPORTED_COMPRESS_RATIOS = {0, 4, 128}
-
 
 @dataclass
 class DeepSeekV4KVLayout:
@@ -46,23 +44,8 @@ class DeepSeekV4KVLayout:
 			num_layers = len(ratios)
 		else:
 			num_layers = int(num_layers)
-		if num_layers <= 0:
-			raise ValueError("DeepSeekV4KVLayout.num_layers must be > 0")
-		if len(ratios) > num_layers:
-			raise ValueError(
-				"compression_ratios has more entries than num_layers: "
-				f"{len(ratios)} > {num_layers}"
-			)
 		if len(ratios) < num_layers:
 			ratios.extend([0] * (num_layers - len(ratios)))
-		invalid = sorted(set(ratios) - _SUPPORTED_COMPRESS_RATIOS)
-		if invalid:
-			raise ValueError(
-				"Unsupported DeepSeek-V4 compression ratios: "
-				f"{invalid}; expected only 0, 4, or 128"
-			)
-		if sliding_window is not None and int(sliding_window) <= 0:
-			raise ValueError("sliding_window must be > 0 when set")
 		return cls(
 			compression_ratios=ratios,
 			c4_logical_to_physical_layer=_compact_logical_to_physical_layer(

@@ -318,8 +318,9 @@ def test_deepseek_v4_layout_builds_compact_component_maps():
 	assert layout.token_capacity(INDEXER_C4, 9) == 3
 	assert layout.token_capacity(SWA, 4096) == 128
 
-	with pytest.raises(ValueError):
-		DeepSeekV4KVLayout.from_compression_ratios([0, 8, 4])
+	layout_with_other_ratio = DeepSeekV4KVLayout.from_compression_ratios([0, 8, 4])
+	assert layout_with_other_ratio.c4_logical_to_physical_layer == [-1, -1, 0]
+	assert layout_with_other_ratio.c128_logical_to_physical_layer == [-1, -1, -1]
 
 
 def test_deepseek_v4_host_coordinator_registers_dsv4_components():
