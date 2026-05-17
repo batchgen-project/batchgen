@@ -114,7 +114,11 @@ class _FakeHostView:
 
 
 def _make_gpu_manager(
-	*, num_layers: int, num_pages: int, page_size_tokens: int
+	*,
+	num_layers: int,
+	num_pages: int,
+	page_size_tokens: int,
+	logical_to_physical_layer=None,
 ) -> GPUPagedKVCacheManager:
 	config = GPUPagedKVConfig(
 		num_layers=num_layers,
@@ -125,6 +129,7 @@ def _make_gpu_manager(
 		num_v_heads=0,
 		v_head_dim=0,
 		kv_dtype=torch.float32,
+		logical_to_physical_layer=logical_to_physical_layer,
 	)
 	return GPUPagedKVCacheManager(config=config, device="cpu")
 
@@ -299,6 +304,50 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	assert tuple(c4_table.shape) == (2, 3)
 	assert primary._sequences[20].pages.numel() == 3
 	assert c4._sequences[20].pages.numel() == 2
+
+
+def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
+	manager = _make_gpu_manager(
+		num_layers=2,
+		num_pages=8,
+		page_size_tokens=4,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
+	assert manager.uses_logical_layer_mapping
+	assert manager.resolve_physical_layer(2) == 0
+	assert manager.resolve_physical_layer(4) == 1
+
+	manager.initialize()
+	manager.allocate_pages_for_sequences([10], [8])
+	manager.rebuild_page_table([10])
+	page_id = int(manager._sequences[10].pages[0].item())
+
+	k_ptrs, _ = manager.get_sequence_layer_page_pointers(10, 4)
+	assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
+
+	k_layer, _, _ = manager.get_layer_kv_with_page_table(2)
+	assert k_layer.data_ptr() == manager._k_cache[0].data_ptr()
+
+	with pytest.raises(KeyError):
+		manager.get_sequence_layer_page_pointers(10, 3)
+
+
+def test_gpu_kv_coordinator_does_not_double_map_mapped_managers():
+	manager = _make_gpu_manager(
+		num_layers=2,
+		num_pages=8,
+		page_size_tokens=4,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
+	coordinator = GPUKVCoordinator()
+	coordinator.register_component(
+		"compressor_c4",
+		manager,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
+
+	assert coordinator.resolve_physical_layer("compressor_c4", 4) == 1
+	assert coordinator.storage_layer_id("compressor_c4", 4) == 4
 
 
 def test_deepseek_v4_layout_builds_compact_component_maps():

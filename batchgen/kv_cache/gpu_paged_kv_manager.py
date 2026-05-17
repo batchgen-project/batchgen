@@ -18,6 +18,10 @@ from batchgen.kv_cache.gpu_kv_kernels import (
 	run_paged_kv_token_update,
 	run_paged_kv_token_update_fused,
 )
+from batchgen.kv_cache.coordinator_utils import (
+	resolve_from_layer_mapping,
+	validate_layer_mapping,
+)
 
 # Debug logging level for continuous batching page boundary
 BATCHGEN_CB_DEBUG = os.environ.get("BATCHGEN_CB_LOG", "").upper() == "DEBUG"
@@ -124,6 +128,7 @@ class GPUPagedKVConfig:
 	num_v_heads: Optional[int]
 	v_head_dim: Optional[int]
 	kv_dtype: torch.dtype
+	logical_to_physical_layer: Optional[Sequence[int]] = None
 
 	@classmethod
 	def from_device_config(
@@ -208,6 +213,24 @@ class GPUPagedKVConfig:
 	@property
 	def has_v_cache(self) -> bool:
 		return bool(self.num_v_heads and self.v_head_dim)
+
+
+def _normalize_gpu_layer_mapping(
+	mapping: Optional[Sequence[int]],
+	num_layers: int,
+) -> Optional[Tuple[int, ...]]:
+	if mapping is None:
+		return None
+	normalized = tuple(int(layer_id) for layer_id in mapping)
+	validate_layer_mapping("GPU KV", "paged", normalized)
+	for logical_layer_id, physical_layer_id in enumerate(normalized):
+		if physical_layer_id >= int(num_layers):
+			raise ValueError(
+				"GPU KV logical_to_physical_layer entry out of range: "
+				f"logical layer {logical_layer_id} maps to physical layer "
+				f"{physical_layer_id}, but num_layers={num_layers}"
+			)
+	return normalized
 
 
 class _TensorStack:
@@ -645,6 +668,10 @@ class GPUPagedKVCacheManager:
 
 		self._engine_config = engine_config
 		self.config = config
+		self._logical_to_physical_layer = _normalize_gpu_layer_mapping(
+			self.config.logical_to_physical_layer,
+			self.config.num_layers,
+		)
 		self._geometry = GPUPagedKVGeometry(self.config)
 		self._layout = GPUPagedKVLayout(self.config)
 		self.device = resolved_device
@@ -976,9 +1003,7 @@ class GPUPagedKVCacheManager:
 		"""Returns contiguous GPU page pointers for context loading."""
 
 		self._ensure_initialized()
-		self._geometry.ensure_layer_bounds(
-			layer_idx, "get_context_kv_page_ptrs"
-		)
+		layer_idx = self.resolve_physical_layer(layer_idx)
 		state = self._get_sequence_state(sequence_id)
 		required_pages = self._geometry.required_pages(context_length)
 		if required_pages > state.pages.numel():
@@ -1002,9 +1027,7 @@ class GPUPagedKVCacheManager:
 		"""Returns page pointers for copy operations between host and device."""
 
 		self._ensure_initialized()
-		self._geometry.ensure_layer_bounds(
-			layer_idx, "get_sequence_layer_page_pointers"
-		)
+		layer_idx = self.resolve_physical_layer(layer_idx)
 		state = self._get_sequence_state(sequence_id)
 		page_indices = state.pages.tolist()
 		k_ptrs = [
@@ -1040,9 +1063,7 @@ class GPUPagedKVCacheManager:
 			slot_indices: Optional explicit page-table slot indices aligned with
 				``k_tensor`` / ``sequence_lengths`` batch order.
 		"""
-		# op_name = "update_layer_decode_new_token"
-		# self._ensure_initialized()
-		# self._geometry.ensure_layer_bounds(layer_idx, op_name)
+		layer_idx = self.resolve_physical_layer(layer_idx)
 		# self._validate_token_inputs(k_tensor, v_tensor)
 		batch_size, seq_len, _, _ = k_tensor.shape
 		if seq_len != 1:
@@ -1180,9 +1201,7 @@ class GPUPagedKVCacheManager:
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
 		"""Returns layer tensors alongside a placeholder for the page table."""
 		self._ensure_initialized()
-		self._geometry.ensure_layer_bounds(
-			layer_idx, "get_layer_kv_with_page_table"
-		)
+		layer_idx = self.resolve_physical_layer(layer_idx)
 		gpu_table = None
 		mgr = self._gpu_page_table_manager
 		gpu_table = mgr.gpu_table
@@ -1352,6 +1371,26 @@ class GPUPagedKVCacheManager:
 	def is_initialized(self) -> bool:
 		return self._is_initialized
 
+	@property
+	def uses_logical_layer_mapping(self) -> bool:
+		return self._logical_to_physical_layer is not None
+
+	def resolve_physical_layer(self, logical_layer_id: int) -> int:
+		logical_layer_id = int(logical_layer_id)
+		if logical_layer_id < 0:
+			raise IndexError("resolve_physical_layer: logical layer id must be >= 0")
+		if self._logical_to_physical_layer is None:
+			self._geometry.ensure_layer_bounds(
+				logical_layer_id, "resolve_physical_layer"
+			)
+			return logical_layer_id
+		return resolve_from_layer_mapping(
+			"GPU KV",
+			"paged",
+			self._logical_to_physical_layer,
+			logical_layer_id,
+		)
+
 	def _get_sequence_state(self, sequence_id: int) -> _SequenceState:
 		state = self._sequences.get(sequence_id)
 		if state is None:
@@ -1464,7 +1503,7 @@ class GPUPagedKVCacheManager:
 			padded with -1 where a sequence has fewer pages.
 		"""
 		self._ensure_initialized()
-		self._geometry.ensure_layer_bounds(layer_idx, "_build_page_table")
+		self.resolve_physical_layer(layer_idx)
 
 		seq_states = [
 			self._get_sequence_state(seq_id) for seq_id in sequence_ids

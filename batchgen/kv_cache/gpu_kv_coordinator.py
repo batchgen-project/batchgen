@@ -28,6 +28,10 @@ class GPUKVCoordinator:
 				)
 			item = component
 		else:
+			if _manager_owns_layer_mapping(manager):
+				# The manager expects logical layer ids and resolves them itself.
+				kwargs = dict(kwargs)
+				kwargs["logical_to_physical_layer"] = None
 			item = GPUKVComponent(name=component, manager=manager, **kwargs)
 		if item.name in self._components:
 			raise ValueError(f"GPU KV component already registered: {item.name}")
@@ -361,6 +365,7 @@ class GPUKVCoordinator:
 		component = self._component_for_op(component_name, "copy_tensor_to_kv")
 		return component.manager.copy_tensor_to_kv(int(sequence_id), k_tensor)
 
+
 def _rollback_gpu_allocations(manager: Any, allocations: Any) -> None:
 	if not isinstance(allocations, Mapping):
 		return
@@ -388,3 +393,7 @@ def _rollback_gpu_allocations(manager: Any, allocations: Any) -> None:
 
 		manager._free_pages.push(torch.cat(reclaimed, dim=0))
 		manager._clear_active_page_pointer_tables()
+
+
+def _manager_owns_layer_mapping(manager: Any) -> bool:
+	return bool(getattr(manager, "uses_logical_layer_mapping", False))
