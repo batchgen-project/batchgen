@@ -54,6 +54,9 @@ class KVComponent:
 				f"{type(self).__name__}({self.name}): logical layer id must be >= 0"
 			)
 		if self.logical_to_physical_layer is None:
+			resolver = getattr(self.storage, "resolve_physical_layer", None)
+			if resolver is not None:
+				return int(resolver(logical_layer_id))
 			return int(logical_layer_id)
 		return resolve_from_layer_mapping(
 			self.component_kind,
@@ -86,18 +89,6 @@ class HostKVComponent(KVComponent):
 	@property
 	def view(self) -> Any:
 		return self.storage
-
-	def resolve_physical_layer(self, logical_layer_id: int) -> int:
-		if self.logical_to_physical_layer is not None:
-			return super().resolve_physical_layer(logical_layer_id)
-		if logical_layer_id < 0:
-			raise IndexError(
-				f"{type(self).__name__}({self.name}): logical layer id must be >= 0"
-			)
-		resolver = getattr(self.view, "resolve_physical_layer", None)
-		if resolver is not None:
-			return int(resolver(logical_layer_id))
-		return int(logical_layer_id)
 
 	def view_layer_id(self, logical_layer_id: int) -> int:
 		"""Layer id that should be passed to this backing view.
