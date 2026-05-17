@@ -89,10 +89,12 @@ from batchgen.query_book import (
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.models.glm.glm5.cuda_graph_policy import (
+	glm5_any_cuda_graph_requested_for_model,
 	glm5_dsa_cuda_graph_requested_for_model,
 	glm5_dsa_full_cuda_graph_requested,
 	glm5_moe_cuda_graph_requested_for_model,
 	glm5_segmented_cuda_graph_requested_for_model,
+	glm5_whole_model_cuda_graph_requested_for_model,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
@@ -2459,14 +2461,14 @@ class BatchGenWorker:
 		if self.args.disable_cuda_graphs:
 			self.engine_config.Basic_Config.enable_cuda_graphs = False
 		elif (
-			(
-				glm5_segmented_cuda_graph_requested_for_model(
+			"glm" in (getattr(self, "model_name", "") or "").lower()
+			and (
+				glm5_any_cuda_graph_requested_for_model(
 					getattr(self, "model_name", None),
 					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 				)
 				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
 			)
-			and "glm" in (getattr(self, "model_name", "") or "").lower()
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
@@ -9644,6 +9646,17 @@ class BatchGenWorker:
 		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
 
 	def _glm5_whole_model_graph_requested_for_current_batch(self) -> bool:
+		if getattr(getattr(self, "args", None), "disable_cuda_graphs", False):
+			return False
+		if glm5_whole_model_cuda_graph_requested_for_model(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(
+				getattr(self, "args", None),
+				"enable_cuda_graph",
+				False,
+			),
+		):
+			return True
 		if (
 			os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1"
 			or os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1"
@@ -9656,6 +9669,9 @@ class BatchGenWorker:
 			self._debug_flag_enabled(debug.get("glm5_whole_model_graph"))
 			or self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 		)
+
+	def _glm5_whole_model_graph_required_for_current_batch(self) -> bool:
+		return self._glm5_whole_model_graph_requested_for_current_batch()
 
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
@@ -10325,13 +10341,7 @@ class BatchGenWorker:
 		moe_path, moe_bucket, moe_reason = self._glm5_moe_graph_path_state(max_rank_bsz)
 		layer_path, layer_bucket, layer_reason = self._glm5_layer_graph_path_state(max_rank_bsz)
 		whole_path, whole_bucket, whole_reason = self._glm5_whole_graph_path_state(max_rank_bsz)
-		if rank_counts is None:
-			counts_repr = None
-		else:
-			try:
-				counts_repr = rank_counts.detach().cpu().tolist()
-			except RuntimeError:
-				counts_repr = "<unavailable>"
+		counts_repr = None if rank_counts is None else f"device_tensor(shape={tuple(rank_counts.shape)})"
 		logging.info(
 			"[GLM5_GRAPH_PATH] rank=%s decode_iter=%s local_bsz=%s "
 			"max_rank_bsz=%s rank_counts=%s dsa=%s dsa_bucket=%s "
@@ -10478,6 +10488,7 @@ class BatchGenWorker:
 			self._setup_glm5_layer_cuda_graphs(gpu_manager, bucket_sizes)
 			return
 		if glm5_whole_graph_enabled:
+			whole_graph_required = self._glm5_whole_model_graph_required_for_current_batch()
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 			if max_bsz <= 0:
@@ -10494,6 +10505,11 @@ class BatchGenWorker:
 				)
 				return
 			if capture_bucket in getattr(self, "_glm5_whole_model_graph_failed_buckets", set()):
+				if whole_graph_required:
+					raise RuntimeError(
+						f"GLM-5 whole-model CUDA graph required but bucket BS={capture_bucket} "
+						"was previously marked failed"
+					)
 				return
 			cur_batch = getattr(AttnWrapperBase, "cur_batch", None) or []
 			cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
@@ -10601,7 +10617,7 @@ class BatchGenWorker:
 					"decode, but cannot validate the real whole-model graph."
 				)
 				self._glm5_whole_model_graph_unavailable_reason = reason
-				if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1":
+				if whole_graph_required:
 					raise RuntimeError(reason)
 				logging.warning("%s Using eager decode without whole-model graph compare.", reason)
 				return
@@ -10757,7 +10773,7 @@ class BatchGenWorker:
 				self._whole_model_graph = False
 				self._glm5_whole_model_graph = False
 				torch.cuda.empty_cache()
-				if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1":
+				if whole_graph_required:
 					raise
 				logging.error(
 					f"Rank {self.rank}: GLM-5 whole-model CUDA graph capture for "
@@ -11239,8 +11255,6 @@ class BatchGenWorker:
 		3. Reduced logging overhead
 		4. No timing object allocation in hot path
 		"""
-		# RELOAD-TEST-MARKER-v4: HOT RELOAD via /v1/reload (post-deadlock-fix)
-		logging.info(f"[RELOAD-TEST-V4] DEADLOCK-FIXED hot-reload on rank {getattr(self, 'global_rank', '?')}")
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = True
 		
@@ -11823,10 +11837,12 @@ class BatchGenWorker:
 					getattr(self, "_glm5_whole_model_graph", False)
 					and self._cuda_graph_manager is not None
 				)
+				_glm5_whole_graph_over_bucket = False
 				if _glm5_whole_graph_active:
 					try:
 						_glm5_whole_bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
 					except ValueError:
+						_glm5_whole_graph_over_bucket = True
 						_glm5_whole_graph_active = False
 					else:
 						_glm5_whole_graph_active = (
@@ -11835,6 +11851,25 @@ class BatchGenWorker:
 							and int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) <= int(getattr(self._whole_model_segment, "max_seqlen", 0))
 							and self._glm5_whole_model_graph_capture_signature(_glm5_whole_bucket) == getattr(self, "_glm5_whole_model_graph_signature", None)
 						)
+				elif self._glm5_whole_model_graph_requested_for_current_batch():
+					try:
+						configured_max_bucket = int(self.args.cuda_graph_max_bucket_size)
+					except AttributeError:
+						pass
+					else:
+						_glm5_whole_graph_over_bucket = _max_bs > configured_max_bucket
+				if (
+					self._glm5_whole_model_graph_required_for_current_batch()
+					and self._glm5_whole_model_graph_requested_for_current_batch()
+					and not _glm5_whole_graph_active
+					and not _glm5_whole_graph_over_bucket
+				):
+					_, _required_bucket, _required_reason = self._glm5_whole_graph_path_state(_max_bs)
+					raise RuntimeError(
+						"GLM-5 whole-model CUDA graph was required but no replayable "
+						"whole-model graph is available for this decode step "
+						f"(bucket={_required_bucket}, reason={_required_reason})"
+					)
 				_use_graph = (
 					getattr(self, '_whole_model_graph', False)
 					and self._cuda_graph_manager is not None

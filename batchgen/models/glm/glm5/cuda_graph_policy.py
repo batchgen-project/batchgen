@@ -8,6 +8,7 @@ from collections.abc import Mapping
 GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
 GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
 GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
+GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
 GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
 GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
@@ -36,6 +37,20 @@ def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     )
 
 
+def _env_flag_enabled(env: Mapping[str, str], name: str) -> bool:
+    return env.get(name, "0") == "1"
+
+
+def _glm5_segmented_override_requested(
+    model_name: str | None,
+    env: Mapping[str, str],
+) -> bool:
+    return (
+        _env_flag_enabled(env, GLM5_SEGMENTED_CUDA_GRAPH_ENV)
+        and _is_glm5_fp8_graph_default_model(model_name)
+    )
+
+
 def is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     return _is_glm5_fp8_graph_default_model(model_name)
 
@@ -49,9 +64,9 @@ def glm5_dsa_cuda_graph_requested_for_model(
     env = os.environ if environ is None else environ
     return (
         (
-            env.get(GLM5_DSA_CUDA_GRAPH_ENV, "0") == "1"
-            or env.get(GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
-            or (enable_cuda_graph and _is_glm5_fp8_graph_default_model(model_name))
+            _env_flag_enabled(env, GLM5_DSA_CUDA_GRAPH_ENV)
+            or _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
+            or _glm5_segmented_override_requested(model_name, env)
         )
         and _is_glm_model(model_name)
     )
@@ -62,7 +77,7 @@ def glm5_dsa_full_cuda_graph_requested(
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    return env.get(GLM5_DSA_FULL_CUDA_GRAPH_ENV, "0") == "1"
+    return _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
 
 
 def glm5_moe_cuda_graph_requested_for_model(
@@ -74,8 +89,8 @@ def glm5_moe_cuda_graph_requested_for_model(
     env = os.environ if environ is None else environ
     return (
         (
-            env.get(GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
-            or (enable_cuda_graph and _is_glm5_fp8_graph_default_model(model_name))
+            _env_flag_enabled(env, GLM5_MOE_CUDA_GRAPH_ENV)
+            or _glm5_segmented_override_requested(model_name, env)
         )
         and _is_glm_model(model_name)
     )
@@ -84,10 +99,22 @@ def glm5_moe_cuda_graph_requested_for_model(
 def glm5_whole_model_cuda_graph_requested_for_model(
     model_name: str | None,
     *,
+    enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    return env.get(GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV, "0") == "1" and _is_glm_model(model_name)
+    if not _is_glm_model(model_name):
+        return False
+    if _env_flag_enabled(env, GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV):
+        return True
+    if not enable_cuda_graph or not _is_glm5_fp8_graph_default_model(model_name):
+        return False
+    return not (
+        _glm5_segmented_override_requested(model_name, env)
+        or _env_flag_enabled(env, GLM5_DSA_CUDA_GRAPH_ENV)
+        or _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
+        or _env_flag_enabled(env, GLM5_MOE_CUDA_GRAPH_ENV)
+    )
 
 
 def glm5_whole_model_cuda_graph_compare_requested_for_model(
@@ -96,7 +123,7 @@ def glm5_whole_model_cuda_graph_compare_requested_for_model(
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     env = os.environ if environ is None else environ
-    return env.get(GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV, "0") == "1" and _is_glm_model(model_name)
+    return _env_flag_enabled(env, GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV) and _is_glm_model(model_name)
 
 
 def glm5_segmented_cuda_graph_requested_for_model(
@@ -126,7 +153,11 @@ def glm5_any_cuda_graph_requested_for_model(
     environ: Mapping[str, str] | None = None,
 ) -> bool:
     return (
-        glm5_whole_model_cuda_graph_requested_for_model(model_name, environ=environ)
+        glm5_whole_model_cuda_graph_requested_for_model(
+            model_name,
+            enable_cuda_graph=enable_cuda_graph,
+            environ=environ,
+        )
         or glm5_whole_model_cuda_graph_compare_requested_for_model(model_name, environ=environ)
         or glm5_segmented_cuda_graph_requested_for_model(
             model_name,
