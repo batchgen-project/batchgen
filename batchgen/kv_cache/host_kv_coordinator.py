@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
+import logging
+from typing import Any, Dict, Iterator, Mapping, Optional
 
 from batchgen.kv_cache.coordinator_utils import HostKVComponent
 logger = logging.getLogger(__name__)
@@ -55,8 +55,8 @@ def wait_kv_tasks(tasks: Mapping[str, Any], *, context: str = "host KV task") ->
 class HostKVCoordinator:
 	"""Minimal component registry for host KV.
 
-	The coordinator centralizes component lookup, layer routing, optional
-	token-capacity mapping, and generic host/device KV movement helpers.
+	The coordinator centralizes component lookup and generic host/device KV
+	movement helpers. Each backing view owns its own layer and capacity rules.
 	"""
 
 	def __init__(self) -> None:
@@ -75,6 +75,11 @@ class HostKVCoordinator:
 				)
 			item = component
 		else:
+			if kwargs:
+				raise ValueError(
+					"HostKVCoordinator does not accept component metadata; "
+					"configure the backing HostPagedKVWorkerView instead"
+				)
 			item = HostKVComponent(name=component, view=view, **kwargs)
 		if item.name in self._components:
 			raise ValueError(f"Host KV component already registered: {item.name}")
@@ -97,17 +102,6 @@ class HostKVCoordinator:
 
 	def get_view(self, name: str) -> Any:
 		return self.get_component(name).view
-
-	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
-		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
-
-	def storage_layer_id(self, component_name: str, logical_layer_id: int) -> int:
-		return self.get_component(component_name).storage_layer_id(logical_layer_id)
-
-	def map_token_counts(
-		self, component_name: str, token_counts: Iterable[int]
-	) -> list[int]:
-		return self.get_component(component_name).map_token_counts(list(token_counts))
 
 	def call_all(self, method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 		"""Call the same method on every backing view."""
@@ -164,25 +158,20 @@ class HostKVCoordinator:
 			(int(sequence_id), int(num_tokens))
 			for sequence_id, num_tokens in list(seq_token_pairs)
 		]
-		sequence_ids = [seq_id for seq_id, _ in pairs]
-		token_counts = [num_tokens for _, num_tokens in pairs]
 		if component_name is not None:
 			component = self._component_for_op(
 				component_name, "allocate_pages_for_sequences"
 			)
-			return component.view.allocate_pages_for_sequences(
-				list(zip(sequence_ids, component.map_token_counts(token_counts)))
-			)
+			return component.view.allocate_pages_for_sequences(pairs)
 
 		results: dict[str, Any] = {}
 		allocated: list[HostKVComponent] = []
 		try:
 			for component in self.components():
-				results[component.name] = component.view.allocate_pages_for_sequences(
-					list(zip(sequence_ids, component.map_token_counts(token_counts)))
-				)
+				results[component.name] = component.view.allocate_pages_for_sequences(pairs)
 				allocated.append(component)
 		except Exception:
+			sequence_ids = [seq_id for seq_id, _ in pairs]
 			for component in reversed(allocated):
 				try:
 					component.view.release_sequence_pages(sequence_ids)
@@ -267,10 +256,10 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		view, storage_layer_id = self._view_for_data_op(
+		view, layer_idx = self._view_for_data_op(
 			component_name, layer_idx, "k_page_ptr"
 		)
-		return view.k_page_ptr(storage_layer_id, int(page_idx))
+		return view.k_page_ptr(layer_idx, int(page_idx))
 
 	def v_page_ptr(
 		self,
@@ -279,10 +268,10 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		view, storage_layer_id = self._view_for_data_op(
+		view, layer_idx = self._view_for_data_op(
 			component_name, layer_idx, "v_page_ptr"
 		)
-		return view.v_page_ptr(storage_layer_id, int(page_idx))
+		return view.v_page_ptr(layer_idx, int(page_idx))
 
 	def get_sequence_layer_page_pointers(
 		self,
@@ -297,8 +286,8 @@ class HostKVCoordinator:
 		)
 		return component.view.get_sequence_layer_page_pointers(
 			int(sequence_id),
-			component.storage_layer_id(int(layer_idx)),
-			None if max_tokens is None else component.token_capacity(int(max_tokens)),
+			int(layer_idx),
+			max_tokens,
 		)
 
 	def _component_for_op(self, component_name: str, context: str) -> HostKVComponent:
@@ -312,10 +301,10 @@ class HostKVCoordinator:
 			) from exc
 
 	def _view_for_data_op(
-		self, component_name: str, logical_layer_id: int, context: str
+		self, component_name: str, layer_idx: int, context: str
 	) -> tuple[Any, int]:
 		component = self._component_for_op(component_name, context)
-		return component.view, component.storage_layer_id(int(logical_layer_id))
+		return component.view, int(layer_idx)
 
 	def async_offload_layer_kv_to_host(
 		self,
@@ -329,11 +318,11 @@ class HostKVCoordinator:
 	):
 		if sequence_lengths is None:
 			raise TypeError("async_offload_layer_kv_to_host requires sequence_lengths")
-		view, storage_layer_id = self._view_for_data_op(
+		view, layer_idx = self._view_for_data_op(
 			component_name, layer_idx, "async_offload_layer_kv_to_host"
 		)
 		return view.async_offload_layer_kv_to_host(
-			storage_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
+			layer_idx, sequence_ids, k_tensor, v_tensor, sequence_lengths
 		)
 
 	def async_append_decode_kv_to_host(
@@ -348,11 +337,11 @@ class HostKVCoordinator:
 	):
 		if sequence_lengths is None:
 			raise TypeError("async_append_decode_kv_to_host requires sequence_lengths")
-		view, storage_layer_id = self._view_for_data_op(
+		view, layer_idx = self._view_for_data_op(
 			component_name, layer_idx, "async_append_decode_kv_to_host"
 		)
 		return view.async_append_decode_kv_to_host(
-			storage_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
+			layer_idx, sequence_ids, k_tensor, v_tensor, sequence_lengths
 		)
 
 	def async_append_decode_kv_to_host_batched_kernel(
@@ -366,16 +355,16 @@ class HostKVCoordinator:
 		component = self._component_for_op(
 			component_name, "async_append_decode_kv_to_host_batched_kernel"
 		)
-		mapped_entries = [
+		normalized_entries = [
 			(
-				component.storage_layer_id(int(entry[0])),
+				int(entry[0]),
 				entry[1],
 				entry[2],
 			)
 			for entry in entries
 		]
 		return component.view.async_append_decode_kv_to_host_batched_kernel(
-			mapped_entries, sequence_ids, sequence_lengths
+			normalized_entries, sequence_ids, sequence_lengths
 		)
 
 	def async_load_layer_kv_to_device(

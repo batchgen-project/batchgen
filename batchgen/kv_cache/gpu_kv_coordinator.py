@@ -28,10 +28,11 @@ class GPUKVCoordinator:
 				)
 			item = component
 		else:
-			if _manager_owns_layer_mapping(manager):
-				# The manager expects logical layer ids and resolves them itself.
-				kwargs = dict(kwargs)
-				kwargs["logical_to_physical_layer"] = None
+			if kwargs:
+				raise ValueError(
+					"GPUKVCoordinator does not accept component metadata; "
+					"configure the backing GPUPagedKVCacheManager instead"
+				)
 			item = GPUKVComponent(name=component, manager=manager, **kwargs)
 		if item.name in self._components:
 			raise ValueError(f"GPU KV component already registered: {item.name}")
@@ -55,15 +56,6 @@ class GPUKVCoordinator:
 	def get_manager(self, name: str) -> Any:
 		return self.get_component(name).manager
 
-	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
-		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
-
-	def storage_layer_id(self, component_name: str, logical_layer_id: int) -> int:
-		return self.get_component(component_name).storage_layer_id(logical_layer_id)
-
-	def map_token_counts(self, component_name: str, token_counts: Sequence[int]) -> list[int]:
-		return self.get_component(component_name).map_token_counts(token_counts)
-
 	def call_all(self, method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 		"""Call the same method on every backing manager."""
 
@@ -82,12 +74,6 @@ class GPUKVCoordinator:
 			raise KeyError(
 				f"{context}: unknown GPU KV component {component_name!r}"
 			) from exc
-
-	def _manager_for_layer(
-		self, component_name: str, logical_layer_id: int, context: str
-	) -> tuple[Any, int]:
-		component = self._component_for_op(component_name, context)
-		return component.manager, component.storage_layer_id(int(logical_layer_id))
 
 	def initialize(self) -> dict[str, Any]:
 		return self.call_all("initialize")
@@ -117,7 +103,7 @@ class GPUKVCoordinator:
 		if component_name is not None:
 			component = self._component_for_op(component_name, "allocate_pages")
 			return component.manager.allocate_pages(
-				int(sequence_id), component.token_capacity(int(num_tokens))
+				int(sequence_id), int(num_tokens)
 			)
 
 		return self.allocate_pages_for_sequences([sequence_id], [num_tokens])
@@ -136,7 +122,7 @@ class GPUKVCoordinator:
 				component_name, "allocate_pages_for_sequences"
 			)
 			return component.manager.allocate_pages_for_sequences(
-				sequence_ids, component.map_token_counts(num_tokens)
+				sequence_ids, num_tokens
 			)
 
 		results: dict[str, Any] = {}
@@ -144,7 +130,7 @@ class GPUKVCoordinator:
 		try:
 			for component in self.components():
 				result = component.manager.allocate_pages_for_sequences(
-					sequence_ids, component.map_token_counts(num_tokens)
+					sequence_ids, num_tokens
 				)
 				results[component.name] = result
 				allocated.append((component, result))
@@ -201,12 +187,12 @@ class GPUKVCoordinator:
 				component_name, "extend_pages_for_sequence"
 			)
 			return component.manager.extend_pages_for_sequence(
-				int(sequence_id), component.token_capacity(int(new_total_tokens))
+				int(sequence_id), int(new_total_tokens)
 			)
 		results: dict[str, Any] = {}
 		for component in self.components():
 			results[component.name] = component.manager.extend_pages_for_sequence(
-				int(sequence_id), component.token_capacity(int(new_total_tokens))
+				int(sequence_id), int(new_total_tokens)
 			)
 		return results
 
@@ -274,10 +260,10 @@ class GPUKVCoordinator:
 		*,
 		component_name: str,
 	):
-		manager, physical_layer_id = self._manager_for_layer(
-			component_name, layer_idx, "get_layer_kv_with_page_table"
+		component = self._component_for_op(
+			component_name, "get_layer_kv_with_page_table"
 		)
-		return manager.get_layer_kv_with_page_table(physical_layer_id)
+		return component.manager.get_layer_kv_with_page_table(int(layer_idx))
 
 	def update_layer_decode_new_token(
 		self,
@@ -290,14 +276,14 @@ class GPUKVCoordinator:
 		*,
 		component_name: str,
 	) -> None:
-		manager, physical_layer_id = self._manager_for_layer(
-			component_name, layer_idx, "update_layer_decode_new_token"
+		component = self._component_for_op(
+			component_name, "update_layer_decode_new_token"
 		)
-		return manager.update_layer_decode_new_token(
+		return component.manager.update_layer_decode_new_token(
 			k_tensor=k_tensor,
 			v_tensor=v_tensor,
 			sequence_lengths=sequence_lengths,
-			layer_idx=physical_layer_id,
+			layer_idx=int(layer_idx),
 			batch_slice=batch_slice,
 			slot_indices=slot_indices,
 		)
@@ -315,8 +301,8 @@ class GPUKVCoordinator:
 		)
 		return component.manager.get_context_kv_page_ptrs(
 			int(sequence_id),
-			component.storage_layer_id(int(layer_idx)),
-			component.token_capacity(int(context_length)),
+			int(layer_idx),
+			int(context_length),
 		)
 
 	def get_sequence_layer_page_pointers(
@@ -326,11 +312,11 @@ class GPUKVCoordinator:
 		*,
 		component_name: str,
 	):
-		manager, physical_layer_id = self._manager_for_layer(
-			component_name, layer_idx, "get_sequence_layer_page_pointers"
+		component = self._component_for_op(
+			component_name, "get_sequence_layer_page_pointers"
 		)
-		return manager.get_sequence_layer_page_pointers(
-			int(sequence_id), physical_layer_id
+		return component.manager.get_sequence_layer_page_pointers(
+			int(sequence_id), int(layer_idx)
 		)
 
 	def export_layer_page_pointer_table(self, *, component_name: str):
@@ -393,7 +379,3 @@ def _rollback_gpu_allocations(manager: Any, allocations: Any) -> None:
 
 		manager._free_pages.push(torch.cat(reclaimed, dim=0))
 		manager._clear_active_page_pointer_tables()
-
-
-def _manager_owns_layer_mapping(manager: Any) -> bool:
-	return bool(getattr(manager, "uses_logical_layer_mapping", False))

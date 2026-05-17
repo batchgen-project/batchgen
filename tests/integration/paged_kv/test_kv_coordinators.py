@@ -30,14 +30,9 @@ class _FakeTask:
 
 
 class _FakeHostView:
-	def __init__(self, name: str, layer_mapping=None, *, mapped: bool = False) -> None:
+	def __init__(self, name: str) -> None:
 		self.name = name
-		self.layer_mapping = layer_mapping or {}
 		self.calls = []
-		self.uses_logical_layer_mapping = mapped
-
-	def resolve_physical_layer(self, layer_idx):
-		return self.layer_mapping.get(layer_idx, layer_idx)
 
 	def register_sequences(self, sequence_ids) -> None:
 		self.calls.append(("register_sequences", list(sequence_ids)))
@@ -139,46 +134,49 @@ def test_host_kv_coordinator_is_a_lightweight_registry():
 	c4 = _FakeHostView("c4")
 	coordinator = HostKVCoordinator()
 	coordinator.register_component("primary", primary)
-	coordinator.register_component(
-		"compressor_c4",
-		c4,
-		logical_to_physical_layer=[-1, -1, 0, -1, 1],
-		token_capacity_scale=0.25,
-	)
+	coordinator.register_component("compressor_c4", c4)
 
 	assert coordinator.component_names == ["primary", "compressor_c4"]
 	assert coordinator.primary is primary
 	assert coordinator.get_view("compressor_c4") is c4
-	assert coordinator.resolve_physical_layer("compressor_c4", 4) == 1
-	assert coordinator.storage_layer_id("compressor_c4", 4) == 1
-	assert coordinator.map_token_counts("compressor_c4", [9, 16]) == [3, 4]
-
-	with pytest.raises(KeyError):
-		coordinator.resolve_physical_layer("compressor_c4", 3)
 
 	coordinator.call_all("register_sequences", [101, 102])
 	assert primary.calls == [("register_sequences", [101, 102])]
 	assert c4.calls == [("register_sequences", [101, 102])]
 
 
-def test_host_kv_component_rejects_empty_layer_mapping():
+def test_host_kv_coordinator_rejects_component_metadata():
 	coordinator = HostKVCoordinator()
 
-	with pytest.raises(ValueError, match="has no physical layers"):
+	with pytest.raises(ValueError, match="does not accept component metadata"):
 		coordinator.register_component(
 			"empty_component",
 			_FakeHostView("empty"),
-			logical_to_physical_layer=[-1, -1],
+			logical_to_physical_layer=[-1, -1, 0],
 		)
 
 
-def test_host_kv_coordinator_does_not_double_map_mapped_worker_views():
-	mapped_view = _FakeHostView("mapped", layer_mapping={4: 1})
+def test_host_kv_coordinator_passes_layer_ids_to_worker_views():
+	mapped_view = _FakeHostView("mapped")
 	coordinator = HostKVCoordinator()
 	coordinator.register_component("mapped", mapped_view)
 
-	assert coordinator.resolve_physical_layer("mapped", 4) == 1
-	assert coordinator.storage_layer_id("mapped", 4) == 4
+	coordinator.async_offload_layer_kv_to_host(
+		4,
+		[101],
+		"k",
+		"v",
+		[65],
+		component_name="mapped",
+	)
+	assert mapped_view.calls[-1] == (
+		"async_offload_layer_kv_to_host",
+		4,
+		[101],
+		"k",
+		"v",
+		[65],
+	)
 
 
 def test_host_kv_coordinator_routes_async_data_movement_by_component():
@@ -186,11 +184,7 @@ def test_host_kv_coordinator_routes_async_data_movement_by_component():
 	c4 = _FakeHostView("c4")
 	coordinator = HostKVCoordinator()
 	coordinator.register_component("primary", primary)
-	coordinator.register_component(
-		"compressor_c4",
-		c4,
-		logical_to_physical_layer=[-1, -1, 0, -1, 1],
-	)
+	coordinator.register_component("compressor_c4", c4)
 
 	task = coordinator.async_offload_layer_kv_to_host(
 		4,
@@ -203,7 +197,7 @@ def test_host_kv_coordinator_routes_async_data_movement_by_component():
 	assert task.name == "c4:offload"
 	assert c4.calls[-1] == (
 		"async_offload_layer_kv_to_host",
-		1,
+		4,
 		[101],
 		"k",
 		"v",
@@ -218,7 +212,7 @@ def test_host_kv_coordinator_routes_async_data_movement_by_component():
 	)
 	assert c4.calls[-1] == (
 		"async_append_decode_kv_to_host_batched_kernel",
-		[(1, "k4", "v4"), (0, "k2", "v2")],
+		[(4, "k4", "v4"), (2, "k2", "v2")],
 		[101, 102],
 		[65, 66],
 	)
@@ -256,22 +250,12 @@ def test_host_kv_coordinator_routes_async_data_movement_by_component():
 	)
 	assert c4.calls[-1] == (
 		"async_offload_layer_kv_to_host",
-		0,
+		2,
 		[101],
 		"ck",
 		"cv",
 		[17],
 	)
-
-	with pytest.raises(KeyError):
-		coordinator.async_offload_layer_kv_to_host(
-			3,
-			[101],
-			"k",
-			"v",
-			[65],
-			component_name="compressor_c4",
-		)
 
 
 def test_gpu_kv_coordinator_keeps_managers_independent():
@@ -279,20 +263,10 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	c4 = _make_gpu_manager(num_layers=2, num_pages=16, page_size_tokens=2)
 	coordinator = GPUKVCoordinator()
 	coordinator.register_component("primary", primary)
-	coordinator.register_component(
-		"compressor_c4",
-		c4,
-		logical_to_physical_layer=[-1, -1, 0, -1, -1, 1],
-		token_capacity_scale=0.25,
-	)
+	coordinator.register_component("compressor_c4", c4)
 
 	assert coordinator.primary is primary
 	assert coordinator.get_manager("compressor_c4") is c4
-	assert coordinator.resolve_physical_layer("compressor_c4", 5) == 1
-	assert coordinator.storage_layer_id("compressor_c4", 5) == 1
-	assert coordinator.map_token_counts("compressor_c4", [5, 9]) == [2, 3]
-	with pytest.raises(KeyError):
-		coordinator.resolve_physical_layer("compressor_c4", 4)
 
 	coordinator.initialize()
 	coordinator.allocate_pages_for_sequences([10, 20], [5, 9])
@@ -301,9 +275,20 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	c4_table = c4.rebuild_page_table([10, 20])
 
 	assert tuple(primary_table.shape) == (2, 4)
-	assert tuple(c4_table.shape) == (2, 3)
+	assert tuple(c4_table.shape) == (2, 5)
 	assert primary._sequences[20].pages.numel() == 3
-	assert c4._sequences[20].pages.numel() == 2
+	assert c4._sequences[20].pages.numel() == 5
+
+
+def test_gpu_kv_coordinator_rejects_component_metadata():
+	coordinator = GPUKVCoordinator()
+
+	with pytest.raises(ValueError, match="does not accept component metadata"):
+		coordinator.register_component(
+			"compressor_c4",
+			_make_gpu_manager(num_layers=2, num_pages=8, page_size_tokens=4),
+			logical_to_physical_layer=[-1, -1, 0, -1, 1],
+		)
 
 
 def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
@@ -332,28 +317,33 @@ def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
 		manager.get_sequence_layer_page_pointers(10, 3)
 
 
-def test_gpu_kv_coordinator_does_not_double_map_mapped_managers():
+def test_gpu_kv_coordinator_passes_layer_ids_to_mapped_managers():
 	manager = _make_gpu_manager(
 		num_layers=2,
 		num_pages=8,
 		page_size_tokens=4,
 		logical_to_physical_layer=[-1, -1, 0, -1, 1],
 	)
+	manager.initialize()
+	manager.allocate_pages_for_sequences([10], [8])
+	manager.rebuild_page_table([10])
+	page_id = int(manager._sequences[10].pages[0].item())
+
 	coordinator = GPUKVCoordinator()
-	coordinator.register_component(
-		"compressor_c4",
-		manager,
-		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	coordinator.register_component("compressor_c4", manager)
+
+	k_ptrs, _ = coordinator.get_sequence_layer_page_pointers(
+		10,
+		4,
+		component_name="compressor_c4",
 	)
 
-	assert coordinator.resolve_physical_layer("compressor_c4", 4) == 1
-	assert coordinator.storage_layer_id("compressor_c4", 4) == 4
+	assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
 
 
 def test_deepseek_v4_layout_builds_compact_component_maps():
 	layout = DeepSeekV4KVLayout.from_compression_ratios(
 		[0, 128, 4, 128, 4],
-		sliding_window=128,
 	)
 
 	assert layout.num_layers == 5
@@ -362,10 +352,6 @@ def test_deepseek_v4_layout_builds_compact_component_maps():
 	assert layout.num_c4_layers == 2
 	assert layout.num_c128_layers == 2
 	assert layout.physical_layer_count(SWA) == 5
-	assert layout.token_capacity(COMPRESSOR_C4, 65) == 17
-	assert layout.token_capacity(COMPRESSOR_C128, 257) == 3
-	assert layout.token_capacity(INDEXER_C4, 9) == 3
-	assert layout.token_capacity(SWA, 4096) == 128
 
 	layout_with_other_ratio = DeepSeekV4KVLayout.from_compression_ratios([0, 8, 4])
 	assert layout_with_other_ratio.c4_logical_to_physical_layer == [-1, -1, 0]
@@ -379,12 +365,10 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 	indexer = _FakeHostView("indexer")
 
 	coordinator = DeepSeekV4HostKVCoordinator(
-		compression_ratios=[0, 128, 4, 128, 4],
 		swa=swa,
 		compressor_c4=c4,
 		compressor_c128=c128,
 		indexer_c4=indexer,
-		sliding_window=128,
 	)
 
 	assert coordinator.component_names == [
@@ -397,57 +381,64 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 	assert coordinator.compressor_c4 is c4
 	assert coordinator.compressor_c128 is c128
 	assert coordinator.indexer_c4 is indexer
-	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
-	assert coordinator.resolve_physical_layer(COMPRESSOR_C128, 3) == 1
-	assert coordinator.resolve_physical_layer(INDEXER_C4, 2) == 0
-	assert coordinator.map_token_counts(COMPRESSOR_C4, [65, 128]) == [17, 32]
-	assert coordinator.map_token_counts(COMPRESSOR_C128, [257]) == [3]
-	assert coordinator.map_token_counts(SWA, [4096]) == [128]
 
-	with pytest.raises(KeyError):
-		coordinator.resolve_physical_layer(COMPRESSOR_C4, 3)
-
-
-def test_deepseek_v4_host_coordinator_keeps_mapped_storage_layer_ids_logical():
-	c4 = _FakeHostView("mapped_c4", {2: 0, 4: 1}, mapped=True)
-	coordinator = DeepSeekV4HostKVCoordinator(
-		compression_ratios=[0, 128, 4, 128, 4],
-		swa=_FakeHostView("swa"),
-		compressor_c4=c4,
+	coordinator.async_offload_layer_kv_to_host(
+		4,
+		[101],
+		"k",
+		None,
+		[17],
+		component_name=COMPRESSOR_C4,
 	)
-
-	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
-	assert coordinator.storage_layer_id(COMPRESSOR_C4, 4) == 4
+	assert c4.calls[-1] == (
+		"async_offload_layer_kv_to_host",
+		4,
+		[101],
+		"k",
+		None,
+		[17],
+	)
 
 
 def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 	swa = _make_gpu_manager(num_layers=5, num_pages=32, page_size_tokens=4)
-	c4 = _make_gpu_manager(num_layers=2, num_pages=32, page_size_tokens=4)
-	c128 = _make_gpu_manager(num_layers=2, num_pages=32, page_size_tokens=4)
-	indexer = _make_gpu_manager(num_layers=2, num_pages=32, page_size_tokens=4)
+	c4 = _make_gpu_manager(
+		num_layers=2,
+		num_pages=32,
+		page_size_tokens=4,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
+	c128 = _make_gpu_manager(
+		num_layers=2,
+		num_pages=32,
+		page_size_tokens=4,
+		logical_to_physical_layer=[-1, 0, -1, 1, -1],
+	)
+	indexer = _make_gpu_manager(
+		num_layers=2,
+		num_pages=32,
+		page_size_tokens=4,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
 
 	coordinator = DeepSeekV4GPUKVCoordinator(
-		compression_ratios=[0, 128, 4, 128, 4],
 		swa=swa,
 		compressor_c4=c4,
 		compressor_c128=c128,
 		indexer_c4=indexer,
-		sliding_window=128,
 	)
 
 	assert coordinator.get_manager(SWA) is swa
 	assert coordinator.get_manager(COMPRESSOR_C4) is c4
-	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
-	assert coordinator.storage_layer_id(COMPRESSOR_C4, 4) == 1
-	assert coordinator.resolve_physical_layer(COMPRESSOR_C128, 1) == 0
-	assert coordinator.resolve_physical_layer(INDEXER_C4, 2) == 0
-	assert coordinator.map_token_counts(COMPRESSOR_C4, [65, 128]) == [17, 32]
-	assert coordinator.map_token_counts(COMPRESSOR_C128, [257]) == [3]
-	assert coordinator.map_token_counts(SWA, [64, 4096]) == [64, 128]
 
 	coordinator.initialize()
-	coordinator.allocate_pages_for_sequences([10], [65])
+	coordinator.allocate_pages_for_sequences([10], [8])
+	coordinator.rebuild_page_table([10])
+	page_id = int(c4._sequences[10].pages[0].item())
+	k_ptrs, _ = coordinator.get_sequence_layer_page_pointers(
+		10,
+		4,
+		component_name=COMPRESSOR_C4,
+	)
 
-	assert swa._sequences[10].pages.numel() == 17
-	assert c4._sequences[10].pages.numel() == 5
-	assert c128._sequences[10].pages.numel() == 1
+	assert k_ptrs[0] == c4._k_cache[1, page_id].data_ptr()
