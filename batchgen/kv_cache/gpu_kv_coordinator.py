@@ -66,6 +66,9 @@ class GPUKVCoordinator:
 	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
 		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
 
+	def storage_layer_id(self, component_name: str, logical_layer_id: int) -> int:
+		return self.get_component(component_name).storage_layer_id(logical_layer_id)
+
 	def map_token_counts(self, component_name: str, token_counts: Sequence[int]) -> list[int]:
 		return self.get_component(component_name).map_token_counts(token_counts)
 
@@ -93,7 +96,7 @@ class GPUKVCoordinator:
 		self, component_name: Optional[str], logical_layer_id: int, context: str
 	) -> tuple[Any, int]:
 		component = self._component_or_default(component_name, context)
-		return component.manager, component.resolve_physical_layer(int(logical_layer_id))
+		return component.manager, component.storage_layer_id(int(logical_layer_id))
 
 	def initialize(self) -> dict[str, Any]:
 		return self.call_all("initialize")
@@ -348,7 +351,7 @@ class GPUKVCoordinator:
 		)
 		return component.manager.get_context_kv_page_ptrs(
 			int(sequence_id),
-			component.resolve_physical_layer(int(layer_idx)),
+			component.storage_layer_id(int(layer_idx)),
 			component.token_capacity(int(context_length)),
 		)
 

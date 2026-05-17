@@ -145,7 +145,7 @@ def test_host_kv_coordinator_is_a_lightweight_registry():
 	assert coordinator.primary is primary
 	assert coordinator.get_view("compressor_c4") is c4
 	assert coordinator.resolve_physical_layer("compressor_c4", 4) == 1
-	assert coordinator.view_layer_id("compressor_c4", 4) == 1
+	assert coordinator.storage_layer_id("compressor_c4", 4) == 1
 	assert coordinator.map_token_counts("compressor_c4", [9, 16]) == [3, 4]
 
 	with pytest.raises(KeyError):
@@ -162,7 +162,7 @@ def test_host_kv_coordinator_does_not_double_map_mapped_worker_views():
 	coordinator.register_component("mapped", mapped_view)
 
 	assert coordinator.resolve_physical_layer("mapped", 4) == 1
-	assert coordinator.view_layer_id("mapped", 4) == 4
+	assert coordinator.storage_layer_id("mapped", 4) == 4
 
 
 def test_host_kv_coordinator_routes_async_data_movement_by_component():
@@ -273,6 +273,7 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	assert coordinator.primary is primary
 	assert coordinator.get_manager("compressor_c4") is c4
 	assert coordinator.resolve_physical_layer("compressor_c4", 5) == 1
+	assert coordinator.storage_layer_id("compressor_c4", 5) == 1
 	assert coordinator.map_token_counts("compressor_c4", [5, 9]) == [2, 3]
 	with pytest.raises(KeyError):
 		coordinator.resolve_physical_layer("compressor_c4", 4)
@@ -345,7 +346,7 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 		coordinator.resolve_physical_layer(COMPRESSOR_C4, 3)
 
 
-def test_deepseek_v4_host_coordinator_keeps_mapped_view_layer_ids_logical():
+def test_deepseek_v4_host_coordinator_keeps_mapped_storage_layer_ids_logical():
 	c4 = _FakeHostView("mapped_c4", {2: 0, 4: 1}, mapped=True)
 	coordinator = DeepSeekV4HostKVCoordinator(
 		compression_ratios=[0, 128, 4, 128, 4],
@@ -354,7 +355,7 @@ def test_deepseek_v4_host_coordinator_keeps_mapped_view_layer_ids_logical():
 	)
 
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
-	assert coordinator.view_layer_id(COMPRESSOR_C4, 4) == 4
+	assert coordinator.storage_layer_id(COMPRESSOR_C4, 4) == 4
 
 
 def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
@@ -375,6 +376,7 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 	assert coordinator.get_manager(SWA) is swa
 	assert coordinator.get_manager(COMPRESSOR_C4) is c4
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
+	assert coordinator.storage_layer_id(COMPRESSOR_C4, 4) == 1
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C128, 1) == 0
 	assert coordinator.resolve_physical_layer(INDEXER_C4, 2) == 0
 	assert coordinator.map_token_counts(COMPRESSOR_C4, [65, 128]) == [17, 32]

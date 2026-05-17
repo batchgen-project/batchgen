@@ -65,6 +65,22 @@ class KVComponent:
 			logical_layer_id,
 		)
 
+	def storage_layer_id(self, logical_layer_id: int) -> int:
+		"""Layer id that should be passed to the backing storage object.
+
+		If Python owns the logical-to-physical mapping, the backing storage is
+		compact and expects the physical id. If the storage object owns mapping
+		itself, keep passing the logical id through so storage can resolve it.
+		"""
+
+		if logical_layer_id < 0:
+			raise IndexError(
+				f"{type(self).__name__}({self.name}): logical layer id must be >= 0"
+			)
+		if self.logical_to_physical_layer is None:
+			return int(logical_layer_id)
+		return self.resolve_physical_layer(logical_layer_id)
+
 	def map_token_counts(self, token_counts: Sequence[int]) -> list[int]:
 		return [self.token_capacity(int(count)) for count in token_counts]
 
@@ -92,18 +108,6 @@ class HostKVComponent(KVComponent):
 	@property
 	def view(self) -> Any:
 		return self.storage
-
-	def view_layer_id(self, logical_layer_id: int) -> int:
-		"""Layer id that should be passed to this backing view.
-
-		If the C++ view already owns logical-layer mapping, keep passing the
-		logical id into the view. If the mapping is owned by this Python
-		component, pass the resolved compact physical layer id.
-		"""
-
-		if self.logical_to_physical_layer is None:
-			return int(logical_layer_id)
-		return self.resolve_physical_layer(logical_layer_id)
 
 
 class GPUKVComponent(KVComponent):
