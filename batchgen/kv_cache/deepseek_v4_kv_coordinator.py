@@ -23,14 +23,12 @@ from batchgen.kv_cache.host_kv_coordinator import (
 )
 
 
-PRIMARY_MLA = "primary_mla"
 SWA = "swa"
 COMPRESSOR_C4 = "compressor_c4"
 COMPRESSOR_C128 = "compressor_c128"
 INDEXER_C4 = "indexer_c4"
 
 DEEPSEEK_V4_COMPONENT_ORDER = (
-	PRIMARY_MLA,
 	SWA,
 	COMPRESSOR_C4,
 	COMPRESSOR_C128,
@@ -109,12 +107,12 @@ class DeepSeekV4KVLayout:
 			return self.c128_layer_map
 		if component_name == INDEXER_C4:
 			return self.c4_layer_map
-		if component_name in (PRIMARY_MLA, SWA):
+		if component_name == SWA:
 			return None
 		raise KeyError(f"Unknown DeepSeek-V4 KV component: {component_name}")
 
 	def physical_layer_count(self, component_name: str) -> int:
-		if component_name in (PRIMARY_MLA, SWA):
+		if component_name == SWA:
 			return self.num_layers
 		mapping = self.layer_mapping(component_name)
 		if mapping is None:
@@ -129,7 +127,7 @@ class DeepSeekV4KVLayout:
 		if component_name == SWA and self.sliding_window is not None:
 			window = self.sliding_window
 			return lambda num_tokens: min(_check_positive_tokens(num_tokens), window)
-		if component_name == PRIMARY_MLA or component_name == SWA:
+		if component_name == SWA:
 			return _identity_token_capacity
 		raise KeyError(f"Unknown DeepSeek-V4 KV component: {component_name}")
 
@@ -150,8 +148,7 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 		self,
 		*,
 		compression_ratios: Sequence[int],
-		primary_mla: Any = None,
-		swa: Any = None,
+		swa: Any,
 		compressor_c4: Any = None,
 		compressor_c128: Any = None,
 		indexer_c4: Any = None,
@@ -166,18 +163,14 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 			sliding_window=sliding_window,
 		)
 
-		if primary_mla is not None:
-			self.register_component(
-				PRIMARY_MLA,
-				primary_mla,
-				token_capacity_fn=self.layout.token_capacity_fn(PRIMARY_MLA),
-			)
-		self._register_optional_view(SWA, swa)
+		self.register_component(
+			SWA,
+			swa,
+			token_capacity_fn=self.layout.token_capacity_fn(SWA),
+		)
 		self._register_optional_view(COMPRESSOR_C4, compressor_c4)
 		self._register_optional_view(COMPRESSOR_C128, compressor_c128)
 		self._register_optional_view(INDEXER_C4, indexer_c4)
-		if not self.component_names:
-			raise RuntimeError("DeepSeekV4HostKVCoordinator requires at least one view")
 		self.default_component_name = self._resolve_default_component_name(
 			default_component
 		)
@@ -208,11 +201,7 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 		if component_name is not None:
 			self.get_component(component_name)
 			return component_name
-		if SWA in self.component_names:
-			return SWA
-		if PRIMARY_MLA in self.component_names:
-			return PRIMARY_MLA
-		return self.component_names[0]
+		return SWA
 
 	def _component_or_default(self, component_name: Optional[str], context: str):
 		name = self.default_component_name if component_name is None else component_name
@@ -557,8 +546,7 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 		self,
 		*,
 		compression_ratios: Sequence[int],
-		primary_mla: Any = None,
-		swa: Any = None,
+		swa: Any,
 		compressor_c4: Any = None,
 		compressor_c128: Any = None,
 		indexer_c4: Any = None,
@@ -573,18 +561,14 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 			sliding_window=sliding_window,
 		)
 
-		if primary_mla is not None:
-			self.register_component(
-				PRIMARY_MLA,
-				primary_mla,
-				token_capacity_fn=self.layout.token_capacity_fn(PRIMARY_MLA),
-			)
-		self._register_optional_manager(SWA, swa)
+		self.register_component(
+			SWA,
+			swa,
+			token_capacity_fn=self.layout.token_capacity_fn(SWA),
+		)
 		self._register_optional_manager(COMPRESSOR_C4, compressor_c4)
 		self._register_optional_manager(COMPRESSOR_C128, compressor_c128)
 		self._register_optional_manager(INDEXER_C4, indexer_c4)
-		if not self.component_names:
-			raise RuntimeError("DeepSeekV4GPUKVCoordinator requires at least one manager")
 		self.default_component_name = self._resolve_default_component_name(
 			default_component
 		)
@@ -612,11 +596,7 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 		if component_name is not None:
 			self.get_component(component_name)
 			return component_name
-		if SWA in self.component_names:
-			return SWA
-		if PRIMARY_MLA in self.component_names:
-			return PRIMARY_MLA
-		return self.component_names[0]
+		return SWA
 
 	def _component_or_default(self, component_name: Optional[str], context: str):
 		name = self.default_component_name if component_name is None else component_name

@@ -13,7 +13,6 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 	COMPRESSOR_C4,
 	COMPRESSOR_C128,
 	INDEXER_C4,
-	PRIMARY_MLA,
 	SWA,
 	DeepSeekV4GPUKVCoordinator,
 	DeepSeekV4HostKVCoordinator,
@@ -133,7 +132,6 @@ def test_deepseek_v4_layout_builds_compact_component_maps():
 	assert layout.c128_layer_map == (-1, 0, -1, 1, -1)
 	assert layout.num_c4_layers == 2
 	assert layout.num_c128_layers == 2
-	assert layout.physical_layer_count(PRIMARY_MLA) == 5
 	assert layout.physical_layer_count(SWA) == 5
 	assert layout.token_capacity(COMPRESSOR_C4, 65) == 17
 	assert layout.token_capacity(COMPRESSOR_C128, 257) == 3
@@ -145,7 +143,6 @@ def test_deepseek_v4_layout_builds_compact_component_maps():
 
 
 def test_deepseek_v4_host_coordinator_registers_dsv4_components():
-	primary = _FakeHostView("primary")
 	swa = _FakeHostView("swa")
 	c4 = _FakeHostView("c4")
 	c128 = _FakeHostView("c128")
@@ -153,7 +150,6 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 
 	coordinator = DeepSeekV4HostKVCoordinator(
 		compression_ratios=[0, 128, 4, 128, 4],
-		primary_mla=primary,
 		swa=swa,
 		compressor_c4=c4,
 		compressor_c128=c128,
@@ -162,13 +158,11 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 	)
 
 	assert coordinator.component_names == [
-		PRIMARY_MLA,
 		SWA,
 		COMPRESSOR_C4,
 		COMPRESSOR_C128,
 		INDEXER_C4,
 	]
-	assert coordinator.primary_mla is primary
 	assert coordinator.swa is swa
 	assert coordinator.compressor_c4 is c4
 	assert coordinator.compressor_c128 is c128
@@ -192,7 +186,7 @@ def test_deepseek_v4_host_coordinator_keeps_mapped_view_layer_ids_logical():
 	c4 = _FakeHostView("mapped_c4", {2: 0, 4: 1}, mapped=True)
 	coordinator = DeepSeekV4HostKVCoordinator(
 		compression_ratios=[0, 128, 4, 128, 4],
-		primary_mla=_FakeHostView("primary"),
+		swa=_FakeHostView("swa"),
 		compressor_c4=c4,
 	)
 
@@ -201,7 +195,6 @@ def test_deepseek_v4_host_coordinator_keeps_mapped_view_layer_ids_logical():
 
 
 def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
-	primary = _make_gpu_manager(num_layers=5, num_pages=32, page_size_tokens=4)
 	swa = _make_gpu_manager(num_layers=5, num_pages=32, page_size_tokens=4)
 	c4 = _make_gpu_manager(num_layers=2, num_pages=32, page_size_tokens=4)
 	c128 = _make_gpu_manager(num_layers=2, num_pages=32, page_size_tokens=4)
@@ -209,7 +202,6 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 
 	coordinator = DeepSeekV4GPUKVCoordinator(
 		compression_ratios=[0, 128, 4, 128, 4],
-		primary_mla=primary,
 		swa=swa,
 		compressor_c4=c4,
 		compressor_c128=c128,
@@ -217,7 +209,7 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 		sliding_window=128,
 	)
 
-	assert coordinator.get_manager(PRIMARY_MLA) is primary
+	assert coordinator.get_manager(SWA) is swa
 	assert coordinator.get_manager(COMPRESSOR_C4) is c4
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C128, 1) == 0
@@ -227,7 +219,7 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 	assert coordinator.map_token_counts(SWA, [64, 4096]) == [64, 128]
 
 	coordinator.call_all("initialize")
-	primary.allocate_pages_for_sequences([10], [65])
+	swa.allocate_pages_for_sequences([10], coordinator.map_token_counts(SWA, [65]))
 	c4.allocate_pages_for_sequences(
 		[10], coordinator.map_token_counts(COMPRESSOR_C4, [65])
 	)
@@ -235,6 +227,6 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 		[10], coordinator.map_token_counts(COMPRESSOR_C128, [65])
 	)
 
-	assert primary._sequences[10].pages.numel() == 17
+	assert swa._sequences[10].pages.numel() == 17
 	assert c4._sequences[10].pages.numel() == 5
 	assert c128._sequences[10].pages.numel() == 1
