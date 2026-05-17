@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence
 
+from batchgen.kv_cache.coordinator_utils import resolve_from_layer_mapping
+
 
 LayerMapping = Mapping[int, int] | Sequence[int]
 TokenCapacityFn = Callable[[int], int]
@@ -55,8 +57,8 @@ class GPUKVComponent:
 			)
 		if self.logical_to_physical_layer is None:
 			return int(logical_layer_id)
-		return _resolve_from_mapping(
-			self.name, self.logical_to_physical_layer, logical_layer_id
+		return resolve_from_layer_mapping(
+			"GPU KV", self.name, self.logical_to_physical_layer, logical_layer_id
 		)
 
 	def map_token_counts(self, token_counts: Sequence[int]) -> list[int]:
@@ -459,25 +461,6 @@ class GPUKVCoordinator:
 	) -> None:
 		component = self._component_or_default(component_name, "copy_tensor_to_kv")
 		return component.manager.copy_tensor_to_kv(int(sequence_id), k_tensor)
-
-
-def _resolve_from_mapping(
-	component_name: str, mapping: LayerMapping, logical_layer_id: int
-) -> int:
-	if isinstance(mapping, Mapping):
-		physical = mapping.get(int(logical_layer_id), -1)
-	else:
-		if logical_layer_id >= len(mapping):
-			physical = -1
-		else:
-			physical = int(mapping[logical_layer_id])
-	if physical < 0:
-		raise KeyError(
-			f"GPU KV component {component_name!r} has no physical layer for "
-			f"logical layer {logical_layer_id}"
-		)
-	return int(physical)
-
 
 def _rollback_gpu_allocations(manager: Any, allocations: Any) -> None:
 	if not isinstance(allocations, Mapping):

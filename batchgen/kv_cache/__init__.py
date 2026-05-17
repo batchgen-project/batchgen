@@ -13,7 +13,6 @@ from batchgen.kv_cache.host_kv_coordinator import (
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 	COMPRESSOR_C4,
 	COMPRESSOR_C128,
-	DEEPSEEK_V4_COMPONENT_ORDER,
 	INDEXER_C4,
 	SWA,
 	DeepSeekV4GPUKVCoordinator,
@@ -24,7 +23,6 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 __all__ = [
 	"COMPRESSOR_C4",
 	"COMPRESSOR_C128",
-	"DEEPSEEK_V4_COMPONENT_ORDER",
 	"INDEXER_C4",
 	"SWA",
 	"AsyncKVTask",

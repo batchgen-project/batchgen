@@ -20,13 +20,6 @@ COMPRESSOR_C4 = "compressor_c4"
 COMPRESSOR_C128 = "compressor_c128"
 INDEXER_C4 = "indexer_c4"
 
-DEEPSEEK_V4_COMPONENT_ORDER = (
-	SWA,
-	COMPRESSOR_C4,
-	COMPRESSOR_C128,
-	INDEXER_C4,
-)
-
 _SUPPORTED_COMPRESS_RATIOS = {0, 4, 128}
 
 TokenCapacityFn = Callable[[int], int]
@@ -117,7 +110,7 @@ class DeepSeekV4KVLayout:
 			return _ceil_div_fn(128)
 		if component_name == SWA and self.sliding_window is not None:
 			window = self.sliding_window
-			return lambda num_tokens: min(_check_positive_tokens(num_tokens), window)
+			return lambda num_tokens: min(int(num_tokens), window)
 		if component_name == SWA:
 			return _identity_token_capacity
 		raise KeyError(f"Unknown DeepSeek-V4 KV component: {component_name}")
@@ -257,21 +250,14 @@ def _count_physical_layers(mapping: Sequence[int]) -> int:
 
 def _ceil_div_fn(divisor: int) -> TokenCapacityFn:
 	def token_capacity(num_tokens: int) -> int:
-		checked = _check_positive_tokens(num_tokens)
-		return (checked + divisor - 1) // divisor
+		num_tokens = int(num_tokens)
+		return (num_tokens + divisor - 1) // divisor
 
 	return token_capacity
 
 
 def _identity_token_capacity(num_tokens: int) -> int:
-	return _check_positive_tokens(num_tokens)
-
-
-def _check_positive_tokens(num_tokens: int) -> int:
-	num_tokens = int(num_tokens)
-	if num_tokens <= 0:
-		raise ValueError(f"num_tokens must be > 0, got {num_tokens}")
-	return num_tokens
+	return int(num_tokens)
 
 
 def _view_owns_layer_mapping(view: Any) -> bool:

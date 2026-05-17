@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
+from batchgen.kv_cache.coordinator_utils import resolve_from_layer_mapping
+
 
 LayerMapping = Mapping[int, int] | Sequence[int]
 TokenCapacityFn = Callable[[int], int]
@@ -100,8 +102,8 @@ class HostKVComponent:
 				f"HostKVComponent({self.name}): logical layer id must be >= 0"
 			)
 		if self.logical_to_physical_layer is not None:
-			return _resolve_from_mapping(
-				self.name, self.logical_to_physical_layer, logical_layer_id
+			return resolve_from_layer_mapping(
+				"Host KV", self.name, self.logical_to_physical_layer, logical_layer_id
 			)
 		resolver = getattr(self.view, "resolve_physical_layer", None)
 		if resolver is not None:
@@ -249,7 +251,10 @@ class HostKVCoordinator:
 		*,
 		component_name: Optional[str] = None,
 	):
-		pairs = _normalize_seq_token_pairs(seq_token_pairs)
+		pairs = [
+			(int(sequence_id), int(num_tokens))
+			for sequence_id, num_tokens in list(seq_token_pairs)
+		]
 		if component_name is not None:
 			component = self._component_or_default(
 				component_name, "allocate_pages_for_sequences"
@@ -298,7 +303,10 @@ class HostKVCoordinator:
 		*,
 		component_name: Optional[str] = None,
 	):
-		pairs = _normalize_seq_token_pairs(seq_page_pairs)
+		pairs = [
+			(int(sequence_id), int(num_pages))
+			for sequence_id, num_pages in list(seq_page_pairs)
+		]
 		if component_name is not None:
 			component = self._component_or_default(
 				component_name, "grow_pages_for_sequences"
@@ -530,35 +538,3 @@ class HostKVCoordinator:
 				wait_kv_tasks(tasks, context=context)
 				raise
 		return AsyncKVTask(tasks=tasks, tensors=tensors)
-
-
-def _resolve_from_mapping(
-	component_name: str, mapping: LayerMapping, logical_layer_id: int
-) -> int:
-	if isinstance(mapping, Mapping):
-		physical = mapping.get(int(logical_layer_id), -1)
-	else:
-		if logical_layer_id >= len(mapping):
-			physical = -1
-		else:
-			physical = int(mapping[logical_layer_id])
-	if physical < 0:
-		raise KeyError(
-			f"Host KV component {component_name!r} has no physical layer for "
-			f"logical layer {logical_layer_id}"
-		)
-	return int(physical)
-
-
-def _normalize_seq_token_pairs(seq_token_pairs) -> list[tuple[int, int]]:
-	return [
-		(int(sequence_id), _check_positive_tokens(num_tokens))
-		for sequence_id, num_tokens in list(seq_token_pairs)
-	]
-
-
-def _check_positive_tokens(num_tokens: int) -> int:
-	num_tokens = int(num_tokens)
-	if num_tokens <= 0:
-		raise ValueError(f"num_tokens must be > 0, got {num_tokens}")
-	return num_tokens
