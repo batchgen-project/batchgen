@@ -12,6 +12,8 @@
 
 namespace batchgen::kv {
 
+using LayerMapping = std::vector<std::int32_t>;
+
 struct HostPagedKVStats {
     std::size_t num_total_pages = 0;
     std::size_t num_free_pages = 0;
@@ -37,7 +39,7 @@ struct HostPagedKVConfig {
     bool enable_memfd = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
-    std::vector<std::int32_t> logical_to_physical_layer;
+    LayerMapping logical_to_physical_layer;
     std::string logger_name;  // Custom logger name (empty = use default)
 };
 
@@ -134,7 +136,7 @@ inline std::size_t AlignUp(std::size_t value, std::size_t alignment) {
 }  // namespace detail
 
 inline void AppendLogicalLayerMapping(std::ostringstream& oss,
-                                      const std::vector<std::int32_t>& mapping) {
+                                      const LayerMapping& mapping) {
     oss << '[';
     constexpr std::size_t kMaxEntriesToPrint = 32;
     const std::size_t entries =

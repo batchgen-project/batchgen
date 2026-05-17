@@ -238,7 +238,7 @@ struct VectorLayerMapper {
     }
 
    private:
-    std::vector<std::int32_t> logical_to_physical_layer_;
+    LayerMapping logical_to_physical_layer_;
 };
 
 template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>,
