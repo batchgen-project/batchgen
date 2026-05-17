@@ -132,14 +132,13 @@ class HostKVComponent:
 class HostKVCoordinator:
 	"""Minimal component registry for host KV.
 
-	This class deliberately does not mirror the full HostPagedKVWorkerView API.
-	Callers should get the backing view with ``get_view(name)`` and use the
-	view's existing methods. The coordinator only centralizes component lookup,
-	layer routing, and optional token-capacity mapping.
+	The coordinator centralizes component lookup, layer routing, optional
+	token-capacity mapping, and generic host/device KV movement helpers.
 	"""
 
 	def __init__(self) -> None:
 		self._components: Dict[str, HostKVComponent] = {}
+		self.default_component_name: Optional[str] = None
 
 	def register_component(
 		self,
@@ -158,6 +157,8 @@ class HostKVCoordinator:
 		if item.name in self._components:
 			raise ValueError(f"Host KV component already registered: {item.name}")
 		self._components[item.name] = item
+		if self.default_component_name is None:
+			self.default_component_name = item.name
 		setattr(self, item.name, item.view)
 		return item
 
@@ -196,6 +197,151 @@ class HostKVCoordinator:
 			method = getattr(component.view, method_name)
 			results[component.name] = method(*args, **kwargs)
 		return results
+
+	def _component_or_default(
+		self, component_name: Optional[str], context: str
+	) -> HostKVComponent:
+		name = self.default_component_name if component_name is None else component_name
+		if name is None:
+			raise KeyError(f"{context}: host KV coordinator has no components")
+		try:
+			return self.get_component(name)
+		except KeyError as exc:
+			raise KeyError(f"{context}: unknown host KV component {name!r}") from exc
+
+	def _view_for_data_op(
+		self, component_name: Optional[str], logical_layer_id: int, context: str
+	) -> tuple[Any, int]:
+		component = self._component_or_default(component_name, context)
+		return component.view, component.view_layer_id(int(logical_layer_id))
+
+	def async_offload_layer_kv_to_host(
+		self,
+		layer_idx: int,
+		sequence_ids,
+		k_tensor,
+		v_tensor=None,
+		sequence_lengths=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		if sequence_lengths is None:
+			raise TypeError("async_offload_layer_kv_to_host requires sequence_lengths")
+		view, view_layer_id = self._view_for_data_op(
+			component_name, layer_idx, "async_offload_layer_kv_to_host"
+		)
+		return view.async_offload_layer_kv_to_host(
+			view_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
+		)
+
+	def async_append_decode_kv_to_host(
+		self,
+		layer_idx: int,
+		sequence_ids,
+		k_tensor,
+		v_tensor=None,
+		sequence_lengths=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		if sequence_lengths is None:
+			raise TypeError("async_append_decode_kv_to_host requires sequence_lengths")
+		view, view_layer_id = self._view_for_data_op(
+			component_name, layer_idx, "async_append_decode_kv_to_host"
+		)
+		return view.async_append_decode_kv_to_host(
+			view_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
+		)
+
+	def async_append_decode_kv_to_host_batched_kernel(
+		self,
+		entries,
+		sequence_ids,
+		sequence_lengths,
+		*,
+		component_name: Optional[str] = None,
+	):
+		component = self._component_or_default(
+			component_name, "async_append_decode_kv_to_host_batched_kernel"
+		)
+		mapped_entries = [
+			(
+				component.view_layer_id(int(entry[0])),
+				entry[1],
+				entry[2],
+			)
+			for entry in entries
+		]
+		return component.view.async_append_decode_kv_to_host_batched_kernel(
+			mapped_entries, sequence_ids, sequence_lengths
+		)
+
+	def async_load_layer_kv_to_device(
+		self,
+		sequence_ids,
+		k_device_ptrs,
+		v_device_ptrs=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		component = self._component_or_default(
+			component_name, "async_load_layer_kv_to_device"
+		)
+		return component.view.async_load_layer_kv_to_device(
+			sequence_ids, k_device_ptrs, v_device_ptrs
+		)
+
+	def async_load_layer_paged_kv_to_device(
+		self,
+		sequence_ids,
+		active_page_counts,
+		k_device_ptrs,
+		v_device_ptrs=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		component = self._component_or_default(
+			component_name, "async_load_layer_paged_kv_to_device"
+		)
+		return component.view.async_load_layer_paged_kv_to_device(
+			sequence_ids, active_page_counts, k_device_ptrs, v_device_ptrs
+		)
+
+	def async_load_components_paged_kv_to_device(
+		self,
+		component_loads: Mapping[str, Mapping[str, Any]],
+		*,
+		tensors: Any = None,
+		context: str = "host KV load",
+	) -> AsyncKVTask:
+		tasks: dict[str, Any] = {}
+		for component_name, kwargs in component_loads.items():
+			try:
+				tasks[component_name] = self.async_load_layer_paged_kv_to_device(
+					component_name=component_name, **dict(kwargs)
+				)
+			except Exception:
+				wait_kv_tasks(tasks, context=context)
+				raise
+		return AsyncKVTask(tasks=tasks, tensors=tensors)
+
+	def async_offload_components_kv_to_host(
+		self,
+		component_offloads: Mapping[str, Mapping[str, Any]],
+		*,
+		tensors: Any = None,
+		context: str = "host KV offload",
+	) -> AsyncKVTask:
+		tasks: dict[str, Any] = {}
+		for component_name, kwargs in component_offloads.items():
+			try:
+				tasks[component_name] = self.async_offload_layer_kv_to_host(
+					component_name=component_name, **dict(kwargs)
+				)
+			except Exception:
+				wait_kv_tasks(tasks, context=context)
+				raise
+		return AsyncKVTask(tasks=tasks, tensors=tensors)
 
 
 def _resolve_from_mapping(

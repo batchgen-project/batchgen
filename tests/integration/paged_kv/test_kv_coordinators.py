@@ -20,6 +20,15 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 )
 
 
+class _FakeTask:
+	def __init__(self, name: str) -> None:
+		self.name = name
+		self.waited = False
+
+	def wait(self) -> None:
+		self.waited = True
+
+
 class _FakeHostView:
 	def __init__(self, name: str, layer_mapping=None, *, mapped: bool = False) -> None:
 		self.name = name
@@ -32,6 +41,76 @@ class _FakeHostView:
 
 	def register_sequences(self, sequence_ids) -> None:
 		self.calls.append(("register_sequences", list(sequence_ids)))
+
+	def async_offload_layer_kv_to_host(
+		self, layer_idx, sequence_ids, k_tensor, v_tensor=None, sequence_lengths=None
+	):
+		self.calls.append(
+			(
+				"async_offload_layer_kv_to_host",
+				int(layer_idx),
+				list(sequence_ids),
+				k_tensor,
+				v_tensor,
+				list(sequence_lengths),
+			)
+		)
+		return _FakeTask(f"{self.name}:offload")
+
+	def async_append_decode_kv_to_host(
+		self, layer_idx, sequence_ids, k_tensor, v_tensor=None, sequence_lengths=None
+	):
+		self.calls.append(
+			(
+				"async_append_decode_kv_to_host",
+				int(layer_idx),
+				list(sequence_ids),
+				k_tensor,
+				v_tensor,
+				list(sequence_lengths),
+			)
+		)
+		return _FakeTask(f"{self.name}:append")
+
+	def async_append_decode_kv_to_host_batched_kernel(
+		self, entries, sequence_ids, sequence_lengths
+	):
+		self.calls.append(
+			(
+				"async_append_decode_kv_to_host_batched_kernel",
+				list(entries),
+				list(sequence_ids),
+				list(sequence_lengths),
+			)
+		)
+		return _FakeTask(f"{self.name}:append_batched")
+
+	def async_load_layer_kv_to_device(
+		self, sequence_ids, k_device_ptrs, v_device_ptrs=None
+	):
+		self.calls.append(
+			(
+				"async_load_layer_kv_to_device",
+				list(sequence_ids),
+				k_device_ptrs,
+				v_device_ptrs,
+			)
+		)
+		return _FakeTask(f"{self.name}:load")
+
+	def async_load_layer_paged_kv_to_device(
+		self, sequence_ids, active_page_counts, k_device_ptrs, v_device_ptrs=None
+	):
+		self.calls.append(
+			(
+				"async_load_layer_paged_kv_to_device",
+				list(sequence_ids),
+				active_page_counts,
+				k_device_ptrs,
+				v_device_ptrs,
+			)
+		)
+		return _FakeTask(f"{self.name}:load_paged")
 
 
 def _make_gpu_manager(
@@ -86,6 +165,99 @@ def test_host_kv_coordinator_does_not_double_map_mapped_worker_views():
 
 	assert coordinator.resolve_physical_layer("mapped", 4) == 1
 	assert coordinator.view_layer_id("mapped", 4) == 4
+
+
+def test_host_kv_coordinator_routes_async_data_movement_by_component():
+	primary = _FakeHostView("primary")
+	c4 = _FakeHostView("c4")
+	coordinator = HostKVCoordinator()
+	coordinator.register_component("primary", primary)
+	coordinator.register_component(
+		"compressor_c4",
+		c4,
+		logical_to_physical_layer=[-1, -1, 0, -1, 1],
+	)
+
+	task = coordinator.async_offload_layer_kv_to_host(
+		4,
+		[101],
+		"k",
+		"v",
+		[65],
+		component_name="compressor_c4",
+	)
+	assert task.name == "c4:offload"
+	assert c4.calls[-1] == (
+		"async_offload_layer_kv_to_host",
+		1,
+		[101],
+		"k",
+		"v",
+		[65],
+	)
+
+	coordinator.async_append_decode_kv_to_host_batched_kernel(
+		[(4, "k4", "v4"), (2, "k2", "v2")],
+		[101, 102],
+		[65, 66],
+		component_name="compressor_c4",
+	)
+	assert c4.calls[-1] == (
+		"async_append_decode_kv_to_host_batched_kernel",
+		[(1, "k4", "v4"), (0, "k2", "v2")],
+		[101, 102],
+		[65, 66],
+	)
+
+	composite = coordinator.async_offload_components_kv_to_host(
+		{
+			"primary": {
+				"layer_idx": 0,
+				"sequence_ids": [101],
+				"k_tensor": "pk",
+				"v_tensor": "pv",
+				"sequence_lengths": [65],
+			},
+			"compressor_c4": {
+				"layer_idx": 2,
+				"sequence_ids": [101],
+				"k_tensor": "ck",
+				"v_tensor": "cv",
+				"sequence_lengths": [17],
+			},
+		},
+		tensors="held",
+	)
+	assert composite.tensors == "held"
+	composite.wait()
+	assert composite.tasks["primary"].waited
+	assert composite.tasks["compressor_c4"].waited
+	assert primary.calls[-1] == (
+		"async_offload_layer_kv_to_host",
+		0,
+		[101],
+		"pk",
+		"pv",
+		[65],
+	)
+	assert c4.calls[-1] == (
+		"async_offload_layer_kv_to_host",
+		0,
+		[101],
+		"ck",
+		"cv",
+		[17],
+	)
+
+	with pytest.raises(KeyError):
+		coordinator.async_offload_layer_kv_to_host(
+			3,
+			[101],
+			"k",
+			"v",
+			[65],
+			component_name="compressor_c4",
+		)
 
 
 def test_gpu_kv_coordinator_keeps_managers_independent():

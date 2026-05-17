@@ -4,7 +4,7 @@ DeepSeek-V4 has multiple logical KV components whose layer sets and token
 rates differ. The generic Host/GPU coordinators keep the component registry and
 layer mapping metadata; the DSV4 coordinators below add the runtime facade that
 the rest of BatchGen expects: allocate/free lifecycle APIs plus component-aware
-offload/load/write helpers.
+query/write helpers.
 """
 
 from __future__ import annotations
@@ -16,11 +16,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import torch
 
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
-from batchgen.kv_cache.host_kv_coordinator import (
-	AsyncKVTask,
-	HostKVCoordinator,
-	wait_kv_tasks,
-)
+from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
 
 
 SWA = "swa"
@@ -209,12 +205,6 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 			return self.get_component(name)
 		except KeyError as exc:
 			raise KeyError(f"{context}: unknown DSV4 host KV component {name!r}") from exc
-
-	def _view_for_data_op(
-		self, component_name: Optional[str], logical_layer_id: int, context: str
-	) -> tuple[Any, int]:
-		component = self._component_or_default(component_name, context)
-		return component.view, component.view_layer_id(int(logical_layer_id))
 
 	def _call_all_views(self, method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 		results: dict[str, Any] = {}
@@ -409,135 +399,6 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 			component.view_layer_id(int(layer_idx)),
 			None if max_tokens is None else component.token_capacity(int(max_tokens)),
 		)
-
-	# -- Component-aware host/device data movement --
-
-	def async_offload_layer_kv_to_host(
-		self,
-		layer_idx: int,
-		sequence_ids,
-		k_tensor,
-		v_tensor=None,
-		sequence_lengths=None,
-		*,
-		component_name: Optional[str] = None,
-	):
-		if sequence_lengths is None:
-			raise TypeError("async_offload_layer_kv_to_host requires sequence_lengths")
-		view, view_layer_id = self._view_for_data_op(
-			component_name, layer_idx, "async_offload_layer_kv_to_host"
-		)
-		return view.async_offload_layer_kv_to_host(
-			view_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
-		)
-
-	def async_append_decode_kv_to_host(
-		self,
-		layer_idx: int,
-		sequence_ids,
-		k_tensor,
-		v_tensor=None,
-		sequence_lengths=None,
-		*,
-		component_name: Optional[str] = None,
-	):
-		if sequence_lengths is None:
-			raise TypeError("async_append_decode_kv_to_host requires sequence_lengths")
-		view, view_layer_id = self._view_for_data_op(
-			component_name, layer_idx, "async_append_decode_kv_to_host"
-		)
-		return view.async_append_decode_kv_to_host(
-			view_layer_id, sequence_ids, k_tensor, v_tensor, sequence_lengths
-		)
-
-	def async_append_decode_kv_to_host_batched_kernel(
-		self,
-		entries,
-		sequence_ids,
-		sequence_lengths,
-		*,
-		component_name: Optional[str] = None,
-	):
-		component = self._component_or_default(
-			component_name, "async_append_decode_kv_to_host_batched_kernel"
-		)
-		mapped_entries = [
-			(
-				component.view_layer_id(int(entry[0])),
-				entry[1],
-				entry[2],
-			)
-			for entry in entries
-		]
-		return component.view.async_append_decode_kv_to_host_batched_kernel(
-			mapped_entries, sequence_ids, sequence_lengths
-		)
-
-	def async_load_layer_kv_to_device(
-		self,
-		sequence_ids,
-		k_device_ptrs,
-		v_device_ptrs=None,
-		*,
-		component_name: Optional[str] = None,
-	):
-		component = self._component_or_default(
-			component_name, "async_load_layer_kv_to_device"
-		)
-		return component.view.async_load_layer_kv_to_device(
-			sequence_ids, k_device_ptrs, v_device_ptrs
-		)
-
-	def async_load_layer_paged_kv_to_device(
-		self,
-		sequence_ids,
-		active_page_counts,
-		k_device_ptrs,
-		v_device_ptrs=None,
-		*,
-		component_name: Optional[str] = None,
-	):
-		component = self._component_or_default(
-			component_name, "async_load_layer_paged_kv_to_device"
-		)
-		return component.view.async_load_layer_paged_kv_to_device(
-			sequence_ids, active_page_counts, k_device_ptrs, v_device_ptrs
-		)
-
-	def async_load_components_paged_kv_to_device(
-		self,
-		component_loads: Mapping[str, Mapping[str, Any]],
-		*,
-		tensors: Any = None,
-	) -> AsyncKVTask:
-		tasks: dict[str, Any] = {}
-		for component_name, kwargs in component_loads.items():
-			try:
-				tasks[component_name] = self.async_load_layer_paged_kv_to_device(
-					component_name=component_name, **dict(kwargs)
-				)
-			except Exception:
-				wait_kv_tasks(tasks, context="DSV4 host KV load")
-				raise
-		return AsyncKVTask(tasks=tasks, tensors=tensors)
-
-	def async_offload_components_kv_to_host(
-		self,
-		component_offloads: Mapping[str, Mapping[str, Any]],
-		*,
-		tensors: Any = None,
-	) -> AsyncKVTask:
-		tasks: dict[str, Any] = {}
-		for component_name, kwargs in component_offloads.items():
-			try:
-				tasks[component_name] = self.async_offload_layer_kv_to_host(
-					component_name=component_name, **dict(kwargs)
-				)
-			except Exception:
-				wait_kv_tasks(tasks, context="DSV4 host KV offload")
-				raise
-		return AsyncKVTask(tasks=tasks, tensors=tensors)
-
 
 class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 	"""Runtime facade for DeepSeek-V4 GPU paged KV managers."""
