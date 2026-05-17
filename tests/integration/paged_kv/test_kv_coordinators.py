@@ -268,7 +268,7 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	coordinator.register_component(
 		"compressor_c4",
 		c4,
-		logical_to_physical_layer={2: 0, 5: 1},
+		logical_to_physical_layer=[-1, -1, 0, -1, -1, 1],
 		token_capacity_scale=0.25,
 	)
 
