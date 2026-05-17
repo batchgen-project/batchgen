@@ -947,17 +947,27 @@ def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
     )
 
 
-def test_glm5_whole_model_graph_policy_is_opt_in_and_glm_only():
+def test_glm5_whole_model_graph_policy_is_env_or_cli_default_and_glm_only():
     env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
 
     assert glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8", environ=env
+    )
+    assert glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ={},
     )
     assert not glm5_whole_model_cuda_graph_requested_for_model(
         "gpt-oss-120b", environ=env
     )
     assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8", environ={}
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5",
+        enable_cuda_graph=True,
+        environ={},
     )
 
 
@@ -1008,20 +1018,30 @@ def test_glm5_graph_policy_tracks_segmented_and_any_requests():
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 
-def test_glm5_enable_cuda_graph_defaults_to_segmented_dsa_and_moe():
+def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     env = {}
 
-    assert glm5_dsa_cuda_graph_requested_for_model(
+    assert glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert glm5_moe_cuda_graph_requested_for_model(
+    assert glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5.1-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert glm5_segmented_cuda_graph_requested_for_model(
+    assert not glm5_dsa_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_moe_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_segmented_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
@@ -1031,18 +1051,43 @@ def test_glm5_enable_cuda_graph_defaults_to_segmented_dsa_and_moe():
         enable_cuda_graph=True,
         environ=env,
     )
-    assert not glm5_dsa_cuda_graph_requested_for_model(
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=False,
         environ=env,
     )
-    assert not glm5_segmented_cuda_graph_requested_for_model(
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert not glm5_segmented_cuda_graph_requested_for_model(
+    assert not glm5_any_cuda_graph_requested_for_model(
         "gpt-oss-120b",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+
+
+def test_glm5_segmented_env_overrides_cli_whole_model_default():
+    env = {"BATCHGEN_SEGMENTED_GRAPH": "1"}
+
+    assert glm5_segmented_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_dsa_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_moe_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
@@ -1054,6 +1099,7 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
     monkeypatch.delenv("BATCHGEN_SEGMENTED_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", raising=False)
     monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
 
     args = server_args_module.prepare_server_args([
@@ -1068,9 +1114,10 @@ def test_server_enable_cuda_graph_flag_is_user_facing(tmp_path, monkeypatch):
 
     assert args.enable_cuda_graph
     assert not args.disable_cuda_graphs
-    assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "1"
-    assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "1"
-    assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "1"
+    assert "BATCHGEN_SEGMENTED_GRAPH" not in os.environ
+    assert "BATCHGEN_GLM5_DSA_CUDA_GRAPH" not in os.environ
+    assert "BATCHGEN_GLM5_MOE_CUDA_GRAPH" not in os.environ
+    assert "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH" not in os.environ
 
 
 def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypatch):
@@ -1078,7 +1125,10 @@ def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypat
 
     monkeypatch.setenv("BATCHGEN_SEGMENTED_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", "1")
     monkeypatch.setenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "1")
+    monkeypatch.setenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "1")
     monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
 
     args = server_args_module.prepare_server_args([
@@ -1095,26 +1145,35 @@ def test_server_disable_cuda_graphs_overrides_legacy_glm_env(tmp_path, monkeypat
     assert args.disable_cuda_graphs
     assert os.environ["BATCHGEN_SEGMENTED_GRAPH"] == "0"
     assert os.environ["BATCHGEN_GLM5_DSA_CUDA_GRAPH"] == "0"
+    assert os.environ["BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"] == "0"
     assert os.environ["BATCHGEN_GLM5_MOE_CUDA_GRAPH"] == "0"
+    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"] == "0"
+    assert os.environ["BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"] == "0"
 
 
-def test_worker_enable_cuda_graph_requests_glm5_segmented_paths(monkeypatch):
+def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
+    monkeypatch.delenv("BATCHGEN_SEGMENTED_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_MOE_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", raising=False)
+    monkeypatch.delenv("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", raising=False)
     monkeypatch.delenv("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", raising=False)
     monkeypatch.setattr(AttnWrapperBase, "batchgen_debug", {}, raising=False)
 
     worker = object.__new__(BatchGenWorker)
     worker.model_name = "zai-org/GLM-5-FP8"
-    worker.args = types.SimpleNamespace(enable_cuda_graph=True)
+    worker.args = types.SimpleNamespace(enable_cuda_graph=True, disable_cuda_graphs=False)
     worker._batchgen_debug = {}
 
-    assert worker._glm5_dsa_graph_requested_for_current_batch()
-    assert worker._glm5_dsa_graph_output_required_for_current_batch()
-    assert worker._glm5_moe_graph_requested_for_current_batch()
-    assert worker._glm5_moe_graph_output_required_for_current_batch()
+    assert worker._glm5_whole_model_graph_requested_for_current_batch()
+    assert worker._glm5_whole_model_graph_required_for_current_batch()
+    assert not worker._glm5_dsa_graph_requested_for_current_batch()
+    assert not worker._glm5_dsa_graph_output_required_for_current_batch()
+    assert not worker._glm5_moe_graph_requested_for_current_batch()
+    assert not worker._glm5_moe_graph_output_required_for_current_batch()
 
 
 def test_worker_glm5_debug_modes_override_segmented_graph(monkeypatch):
@@ -2658,6 +2717,52 @@ def test_glm5_graph_path_log_flag_uses_batch_debug_and_env(monkeypatch):
 
     monkeypatch.setenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", "1")
     assert worker._glm5_graph_path_log_requested_for_current_batch()
+
+
+def test_glm5_graph_path_log_default_skips_hot_path_state(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class RankCountsSentinel:
+        @property
+        def shape(self):
+            raise AssertionError("rank_counts must not be touched when path log is off")
+
+        def detach(self):
+            raise AssertionError("rank_counts must not be copied to CPU")
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.model_name = "zai-org/GLM-5-FP8"
+    worker._batchgen_debug = {}
+    monkeypatch.delenv("BATCHGEN_GLM5_GRAPH_PATH_LOG", raising=False)
+    monkeypatch.setattr(
+        worker,
+        "_glm5_dsa_graph_path_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_glm5_moe_graph_path_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_glm5_layer_graph_path_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_graph_path_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("state check")),
+    )
+
+    worker._log_glm5_graph_path_for_forward(
+        local_bsz=1,
+        max_rank_bsz=1,
+        rank_counts=RankCountsSentinel(),
+        gpu_manager=object(),
+        decode_iter=7,
+    )
 
 
 def test_glm5_graph_path_state_reports_over_bucket_eager(monkeypatch):

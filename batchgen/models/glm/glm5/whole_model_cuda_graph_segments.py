@@ -1,14 +1,15 @@
 """GLM-5 decode CUDA graph segment.
 
-This first whole-model milestone captures the existing GLM-5 decode forward as
+This production whole-model path captures the existing GLM-5 decode forward as
 one CUDA graph for stable, globally bucketed decode batches. It deliberately keeps
 host KV offload outside the graph by redirecting per-layer decode KV callbacks
-to static GPU buffers during capture; the worker clones and appends those
+to static GPU buffers during capture; the worker stages and appends those
 buffers after replay.
 
-The segment is intentionally strict: it is an opt-in sanity/performance path,
-not a silent fallback. Padded rows use explicit -1 slot sentinels so all ranks
-can participate in NCCL graph capture/replay even when a rank has no local rows.
+The segment is intentionally strict: when selected by the server CUDA graph
+policy it must either replay a valid whole-model graph or surface a clear
+runtime error. Padded rows use explicit -1 slot sentinels so all ranks can
+participate in NCCL graph capture/replay even when a rank has no local rows.
 """
 
 from __future__ import annotations

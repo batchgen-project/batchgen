@@ -9,11 +9,13 @@ from typing import Optional
 
 from batchgen.models.glm.glm5.cuda_graph_policy import (
     GLM5_DSA_CUDA_GRAPH_ENV,
+    GLM5_DSA_FULL_CUDA_GRAPH_ENV,
     GLM5_MOE_CUDA_GRAPH_ENV,
+    GLM5_SEGMENTED_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
-
-_GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
 
 
 def is_port_available(port: int) -> bool:
@@ -62,15 +64,15 @@ def _is_glm_model(model_name: Optional[str]) -> bool:
 
 def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
     if args.enable_cuda_graph and is_glm5_fp8_graph_default_model(args.model):
-        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "1"
-        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "1"
-        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "1"
         return
 
     if args.disable_cuda_graphs and _is_glm_model(args.model):
-        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
         os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_DSA_FULL_CUDA_GRAPH_ENV] = "0"
         os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV] = "0"
 
 
 @dataclass
@@ -365,7 +367,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="enable_cuda_graph",
         default=False,
-        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables segmented DSA and MoE graphs.",
+        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables the whole-model decode graph by default.",
     )
     cuda_graph_group.add_argument(
         "--disable-cuda-graphs",
@@ -377,13 +379,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cuda-graph-max-bucket-size",
         type=int,
         default=128,
-        help="Maximum batch size per rank for CUDA graph capture (default: 128). Batches exceeding this fall back to eager execution.",
+        help="Maximum batch size per rank for CUDA graph capture (default: 128). For GLM whole-model graph, this defines the top bucket; larger decode batches use eager fallback.",
     )
     parser.add_argument(
         "--cuda-graph-num-buckets",
         type=int,
         default=16,
-        help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
+        help="Maximum number of CUDA graph bucket sizes (default: 16). For GLM, use 7 with max bucket 64 for [1,2,4,8,16,32,64].",
     )
     parser.add_argument(
         "--detokenization-include-special-tokens",
