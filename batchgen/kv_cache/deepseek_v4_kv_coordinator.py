@@ -158,10 +158,6 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 		):
 			if view is None:
 				continue
-			if self.layout.physical_layer_count(component_name) <= 0:
-				raise ValueError(
-					f"DeepSeek-V4 component {component_name!r} has no physical layers"
-				)
 			self.register_component(
 				component_name,
 				view,
@@ -207,10 +203,6 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 		):
 			if manager is None:
 				continue
-			if self.layout.physical_layer_count(component_name) <= 0:
-				raise ValueError(
-					f"DeepSeek-V4 component {component_name!r} has no physical layers"
-				)
 			self.register_component(
 				component_name,
 				manager,

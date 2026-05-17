@@ -156,6 +156,17 @@ def test_host_kv_coordinator_is_a_lightweight_registry():
 	assert c4.calls == [("register_sequences", [101, 102])]
 
 
+def test_host_kv_component_rejects_empty_layer_mapping():
+	coordinator = HostKVCoordinator()
+
+	with pytest.raises(ValueError, match="has no physical layers"):
+		coordinator.register_component(
+			"empty_component",
+			_FakeHostView("empty"),
+			logical_to_physical_layer=[-1, -1],
+		)
+
+
 def test_host_kv_coordinator_does_not_double_map_mapped_worker_views():
 	mapped_view = _FakeHostView("mapped", layer_mapping={4: 1})
 	coordinator = HostKVCoordinator()
