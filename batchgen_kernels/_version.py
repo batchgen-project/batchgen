@@ -4,15 +4,15 @@ setup.py reads this via exec() at build time (no torch/CUDA import needed).
 __init__.py re-exports __version__ and version_info at runtime.
 
 BUILD_ARCH env var controls the arch suffix in wheel names:
-  "sm90a" (default) -> batchgen_kernels-0.3.2+sm90a
-  "sm100"           -> batchgen_kernels-0.3.2+sm100
-  "all"             -> batchgen_kernels-0.3.2 (no suffix)
+  "sm90a" (default) -> batchgen_kernels-0.3.3+sm90a
+  "sm100"           -> batchgen_kernels-0.3.3+sm100
+  "all"             -> batchgen_kernels-0.3.3 (no suffix)
 """
 
 import os
 
-__version__ = "0.3.2"
-version_info = (0, 3, 2)
+__version__ = "0.3.3"
+version_info = (0, 3, 3)
 
 # Arch suffix for wheel naming (PEP 440 local version)
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
