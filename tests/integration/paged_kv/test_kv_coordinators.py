@@ -280,7 +280,8 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 
 	coordinator.initialize()
 	coordinator.allocate_pages_for_sequences([10, 20], [5, 9])
-	primary_table = coordinator.rebuild_page_table([10, 20])
+	page_tables = coordinator.rebuild_page_table([10, 20])
+	primary_table = page_tables["primary"]
 	c4_table = c4.rebuild_page_table([10, 20])
 
 	assert tuple(primary_table.shape) == (2, 4)

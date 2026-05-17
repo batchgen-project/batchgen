@@ -61,7 +61,6 @@ class HostKVCoordinator:
 
 	def __init__(self) -> None:
 		self._components: Dict[str, HostKVComponent] = {}
-		self.default_component_name: Optional[str] = None
 
 	def register_component(
 		self,
@@ -80,8 +79,6 @@ class HostKVCoordinator:
 		if item.name in self._components:
 			raise ValueError(f"Host KV component already registered: {item.name}")
 		self._components[item.name] = item
-		if self.default_component_name is None:
-			self.default_component_name = item.name
 		setattr(self, item.name, item.view)
 		return item
 
@@ -100,15 +97,6 @@ class HostKVCoordinator:
 
 	def get_view(self, name: str) -> Any:
 		return self.get_component(name).view
-
-	def set_default_component(self, component_name: Optional[str]) -> str:
-		if component_name is None:
-			if self.default_component_name is None:
-				raise KeyError("Host KV coordinator has no default component")
-			return self.default_component_name
-		self.get_component(component_name)
-		self.default_component_name = component_name
-		return component_name
 
 	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
 		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
@@ -179,7 +167,7 @@ class HostKVCoordinator:
 		sequence_ids = [seq_id for seq_id, _ in pairs]
 		token_counts = [num_tokens for _, num_tokens in pairs]
 		if component_name is not None:
-			component = self._component_or_default(
+			component = self._component_for_op(
 				component_name, "allocate_pages_for_sequences"
 			)
 			return component.view.allocate_pages_for_sequences(
@@ -215,7 +203,7 @@ class HostKVCoordinator:
 		component_name: Optional[str] = None,
 	):
 		if component_name is not None:
-			component = self._component_or_default(component_name, "grow_sequence_pages")
+			component = self._component_for_op(component_name, "grow_sequence_pages")
 			return component.view.grow_sequence_pages(int(sequence_id), int(num_pages))
 		return self.call_all("grow_sequence_pages", int(sequence_id), int(num_pages))
 
@@ -230,7 +218,7 @@ class HostKVCoordinator:
 			for sequence_id, num_pages in list(seq_page_pairs)
 		]
 		if component_name is not None:
-			component = self._component_or_default(
+			component = self._component_for_op(
 				component_name, "grow_pages_for_sequences"
 			)
 			return component.view.grow_pages_for_sequences(pairs)
@@ -243,23 +231,20 @@ class HostKVCoordinator:
 		return self.release_sequence_pages(sequence_ids)
 
 	def build_page_table(self, sequence_ids):
-		results = self.call_all("build_page_table", list(sequence_ids))
-		return results[self.set_default_component(None)]
+		return self.call_all("build_page_table", list(sequence_ids))
 
 	def get_stats(self):
-		return self._component_or_default(None, "get_stats").view.get_stats()
-
-	def get_stats_by_component(self) -> dict[str, Any]:
 		return self.call_all("get_stats")
 
-	def data_base_address(self, *, component_name: Optional[str] = None):
-		component = self._component_or_default(component_name, "data_base_address")
+	def get_stats_by_component(self) -> dict[str, Any]:
+		return self.get_stats()
+
+	def data_base_address(self, *, component_name: str):
+		component = self._component_for_op(component_name, "data_base_address")
 		return component.view.data_base_address()
 
-	def read_sequence_kv_to_cpu(
-		self, sequence_id: int, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(component_name, "read_sequence_kv_to_cpu")
+	def read_sequence_kv_to_cpu(self, sequence_id: int, *, component_name: str):
+		component = self._component_for_op(component_name, "read_sequence_kv_to_cpu")
 		return component.view.read_sequence_kv_to_cpu(int(sequence_id))
 
 	def write_sequence_kv_from_cpu(
@@ -268,9 +253,9 @@ class HostKVCoordinator:
 		k_tensor,
 		v_tensor=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(component_name, "write_sequence_kv_from_cpu")
+		component = self._component_for_op(component_name, "write_sequence_kv_from_cpu")
 		return component.view.write_sequence_kv_from_cpu(
 			int(sequence_id), k_tensor, v_tensor
 		)
@@ -280,7 +265,7 @@ class HostKVCoordinator:
 		layer_idx: int,
 		page_idx: int,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		view, storage_layer_id = self._view_for_data_op(
 			component_name, layer_idx, "k_page_ptr"
@@ -292,7 +277,7 @@ class HostKVCoordinator:
 		layer_idx: int,
 		page_idx: int,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		view, storage_layer_id = self._view_for_data_op(
 			component_name, layer_idx, "v_page_ptr"
@@ -305,9 +290,9 @@ class HostKVCoordinator:
 		layer_idx: int,
 		max_tokens=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "get_sequence_layer_page_pointers"
 		)
 		return component.view.get_sequence_layer_page_pointers(
@@ -316,21 +301,20 @@ class HostKVCoordinator:
 			None if max_tokens is None else component.token_capacity(int(max_tokens)),
 		)
 
-	def _component_or_default(
-		self, component_name: Optional[str], context: str
-	) -> HostKVComponent:
-		name = self.default_component_name if component_name is None else component_name
-		if name is None:
-			raise KeyError(f"{context}: host KV coordinator has no components")
+	def _component_for_op(self, component_name: str, context: str) -> HostKVComponent:
+		if component_name is None:
+			raise KeyError(f"{context}: component_name is required")
 		try:
-			return self.get_component(name)
+			return self.get_component(component_name)
 		except KeyError as exc:
-			raise KeyError(f"{context}: unknown host KV component {name!r}") from exc
+			raise KeyError(
+				f"{context}: unknown host KV component {component_name!r}"
+			) from exc
 
 	def _view_for_data_op(
-		self, component_name: Optional[str], logical_layer_id: int, context: str
+		self, component_name: str, logical_layer_id: int, context: str
 	) -> tuple[Any, int]:
-		component = self._component_or_default(component_name, context)
+		component = self._component_for_op(component_name, context)
 		return component.view, component.storage_layer_id(int(logical_layer_id))
 
 	def async_offload_layer_kv_to_host(
@@ -341,7 +325,7 @@ class HostKVCoordinator:
 		v_tensor=None,
 		sequence_lengths=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		if sequence_lengths is None:
 			raise TypeError("async_offload_layer_kv_to_host requires sequence_lengths")
@@ -360,7 +344,7 @@ class HostKVCoordinator:
 		v_tensor=None,
 		sequence_lengths=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		if sequence_lengths is None:
 			raise TypeError("async_append_decode_kv_to_host requires sequence_lengths")
@@ -377,9 +361,9 @@ class HostKVCoordinator:
 		sequence_ids,
 		sequence_lengths,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "async_append_decode_kv_to_host_batched_kernel"
 		)
 		mapped_entries = [
@@ -400,9 +384,9 @@ class HostKVCoordinator:
 		k_device_ptrs,
 		v_device_ptrs=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "async_load_layer_kv_to_device"
 		)
 		return component.view.async_load_layer_kv_to_device(
@@ -416,9 +400,9 @@ class HostKVCoordinator:
 		k_device_ptrs,
 		v_device_ptrs=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "async_load_layer_paged_kv_to_device"
 		)
 		return component.view.async_load_layer_paged_kv_to_device(

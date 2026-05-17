@@ -14,7 +14,6 @@ class GPUKVCoordinator:
 
 	def __init__(self) -> None:
 		self._components: Dict[str, GPUKVComponent] = {}
-		self.default_component_name: Optional[str] = None
 
 	def register_component(
 		self,
@@ -33,8 +32,6 @@ class GPUKVCoordinator:
 		if item.name in self._components:
 			raise ValueError(f"GPU KV component already registered: {item.name}")
 		self._components[item.name] = item
-		if self.default_component_name is None:
-			self.default_component_name = item.name
 		setattr(self, item.name, item.manager)
 		return item
 
@@ -54,15 +51,6 @@ class GPUKVCoordinator:
 	def get_manager(self, name: str) -> Any:
 		return self.get_component(name).manager
 
-	def set_default_component(self, component_name: Optional[str]) -> str:
-		if component_name is None:
-			if self.default_component_name is None:
-				raise KeyError("GPU KV coordinator has no default component")
-			return self.default_component_name
-		self.get_component(component_name)
-		self.default_component_name = component_name
-		return component_name
-
 	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
 		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
 
@@ -81,21 +69,20 @@ class GPUKVCoordinator:
 			results[component.name] = method(*args, **kwargs)
 		return results
 
-	def _component_or_default(
-		self, component_name: Optional[str], context: str
-	) -> GPUKVComponent:
-		name = self.default_component_name if component_name is None else component_name
-		if name is None:
-			raise KeyError(f"{context}: GPU KV coordinator has no components")
+	def _component_for_op(self, component_name: str, context: str) -> GPUKVComponent:
+		if component_name is None:
+			raise KeyError(f"{context}: component_name is required")
 		try:
-			return self.get_component(name)
+			return self.get_component(component_name)
 		except KeyError as exc:
-			raise KeyError(f"{context}: unknown GPU KV component {name!r}") from exc
+			raise KeyError(
+				f"{context}: unknown GPU KV component {component_name!r}"
+			) from exc
 
 	def _manager_for_layer(
-		self, component_name: Optional[str], logical_layer_id: int, context: str
+		self, component_name: str, logical_layer_id: int, context: str
 	) -> tuple[Any, int]:
-		component = self._component_or_default(component_name, context)
+		component = self._component_for_op(component_name, context)
 		return component.manager, component.storage_layer_id(int(logical_layer_id))
 
 	def initialize(self) -> dict[str, Any]:
@@ -116,24 +103,6 @@ class GPUKVCoordinator:
 			for component in self.components()
 		)
 
-	@property
-	def config(self):
-		return self._component_or_default(None, "config").manager.config
-
-	@property
-	def device(self):
-		return self._component_or_default(None, "device").manager.device
-
-	@property
-	def _gpu_page_table_manager(self):
-		return self._component_or_default(
-			None, "_gpu_page_table_manager"
-		).manager._gpu_page_table_manager
-
-	@property
-	def _sequences(self):
-		return self._component_or_default(None, "_sequences").manager._sequences
-
 	def allocate_pages(
 		self,
 		sequence_id: int,
@@ -142,13 +111,12 @@ class GPUKVCoordinator:
 		component_name: Optional[str] = None,
 	):
 		if component_name is not None:
-			component = self._component_or_default(component_name, "allocate_pages")
+			component = self._component_for_op(component_name, "allocate_pages")
 			return component.manager.allocate_pages(
 				int(sequence_id), component.token_capacity(int(num_tokens))
 			)
 
-		results = self.allocate_pages_for_sequences([sequence_id], [num_tokens])
-		return results.get(self.set_default_component(None), {}).get(int(sequence_id), [])
+		return self.allocate_pages_for_sequences([sequence_id], [num_tokens])
 
 	def allocate_pages_for_sequences(
 		self,
@@ -160,7 +128,7 @@ class GPUKVCoordinator:
 		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
 		num_tokens = [int(tokens) for tokens in num_tokens]
 		if component_name is not None:
-			component = self._component_or_default(
+			component = self._component_for_op(
 				component_name, "allocate_pages_for_sequences"
 			)
 			return component.manager.allocate_pages_for_sequences(
@@ -197,10 +165,9 @@ class GPUKVCoordinator:
 		component_name: Optional[str] = None,
 	):
 		if component_name is not None:
-			component = self._component_or_default(component_name, "grow_sequence_pages")
+			component = self._component_for_op(component_name, "grow_sequence_pages")
 			return component.manager.grow_sequence_pages(int(sequence_id), int(num_pages))
-		results = self.grow_pages_for_sequences([sequence_id], [num_pages])
-		return results.get(self.set_default_component(None), {}).get(int(sequence_id), [])
+		return self.grow_pages_for_sequences([sequence_id], [num_pages])
 
 	def grow_pages_for_sequences(
 		self,
@@ -212,7 +179,7 @@ class GPUKVCoordinator:
 		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
 		num_pages = [int(count) for count in num_pages]
 		if component_name is not None:
-			component = self._component_or_default(
+			component = self._component_for_op(
 				component_name, "grow_pages_for_sequences"
 			)
 			return component.manager.grow_pages_for_sequences(sequence_ids, num_pages)
@@ -226,7 +193,7 @@ class GPUKVCoordinator:
 		component_name: Optional[str] = None,
 	):
 		if component_name is not None:
-			component = self._component_or_default(
+			component = self._component_for_op(
 				component_name, "extend_pages_for_sequence"
 			)
 			return component.manager.extend_pages_for_sequence(
@@ -237,7 +204,7 @@ class GPUKVCoordinator:
 			results[component.name] = component.manager.extend_pages_for_sequence(
 				int(sequence_id), component.token_capacity(int(new_total_tokens))
 			)
-		return results.get(self.set_default_component(None), 0)
+		return results
 
 	def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> dict[str, Any]:
 		return self.call_all(
@@ -245,30 +212,25 @@ class GPUKVCoordinator:
 		)
 
 	def rebuild_page_table(self, sequence_ids: Sequence[int]):
-		results = self.call_all(
+		return self.call_all(
 			"rebuild_page_table", [int(seq_id) for seq_id in sequence_ids]
 		)
-		return results[self.set_default_component(None)]
 
 	def clear_page_table(self) -> dict[str, Any]:
 		return self.call_all("clear_page_table")
 
-	def get_page_table_version(self) -> int:
-		component = self._component_or_default(None, "get_page_table_version")
+	def get_page_table_version(self, *, component_name: str) -> int:
+		component = self._component_for_op(component_name, "get_page_table_version")
 		return component.manager.get_page_table_version()
 
-	def get_cuda_graph_page_table(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def get_cuda_graph_page_table(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "get_cuda_graph_page_table"
 		)
 		return component.manager.get_cuda_graph_page_table()
 
-	def get_cuda_graph_page_table_storage(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def get_cuda_graph_page_table_storage(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "get_cuda_graph_page_table_storage"
 		)
 		return component.manager.get_cuda_graph_page_table_storage()
@@ -277,38 +239,36 @@ class GPUKVCoordinator:
 		self,
 		sequence_ids: Sequence[int],
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "ensure_cuda_graph_page_table"
 		)
 		return component.manager.ensure_cuda_graph_page_table(
 			[int(seq_id) for seq_id in sequence_ids]
 		)
 
-	def get_cuda_graph_page_table_state(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def get_cuda_graph_page_table_state(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "get_cuda_graph_page_table_state"
 		)
 		return component.manager.get_cuda_graph_page_table_state()
 
 	def get_stats(self):
-		return self._component_or_default(None, "get_stats").manager.get_stats()
-
-	def get_stats_by_component(self) -> dict[str, Any]:
 		return self.call_all("get_stats")
 
-	def get_kv_tensors(self, *, component_name: Optional[str] = None):
-		component = self._component_or_default(component_name, "get_kv_tensors")
+	def get_stats_by_component(self) -> dict[str, Any]:
+		return self.get_stats()
+
+	def get_kv_tensors(self, *, component_name: str):
+		component = self._component_for_op(component_name, "get_kv_tensors")
 		return component.manager.get_kv_tensors()
 
 	def get_layer_kv_with_page_table(
 		self,
 		layer_idx: int,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		manager, physical_layer_id = self._manager_for_layer(
 			component_name, layer_idx, "get_layer_kv_with_page_table"
@@ -324,7 +284,7 @@ class GPUKVCoordinator:
 		batch_slice: Optional[tuple] = None,
 		slot_indices=None,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	) -> None:
 		manager, physical_layer_id = self._manager_for_layer(
 			component_name, layer_idx, "update_layer_decode_new_token"
@@ -344,9 +304,9 @@ class GPUKVCoordinator:
 		layer_idx: int,
 		context_length: int,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
-		component = self._component_or_default(
+		component = self._component_for_op(
 			component_name, "get_context_kv_page_ptrs"
 		)
 		return component.manager.get_context_kv_page_ptrs(
@@ -360,7 +320,7 @@ class GPUKVCoordinator:
 		sequence_id: int,
 		layer_idx: int,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	):
 		manager, physical_layer_id = self._manager_for_layer(
 			component_name, layer_idx, "get_sequence_layer_page_pointers"
@@ -369,34 +329,26 @@ class GPUKVCoordinator:
 			int(sequence_id), physical_layer_id
 		)
 
-	def export_layer_page_pointer_table(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def export_layer_page_pointer_table(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "export_layer_page_pointer_table"
 		)
 		return component.manager.export_layer_page_pointer_table()
 
-	def export_active_sequence_page_counts(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def export_active_sequence_page_counts(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "export_active_sequence_page_counts"
 		)
 		return component.manager.export_active_sequence_page_counts()
 
-	def get_padded_3d_page_pointers(
-		self, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(
+	def get_padded_3d_page_pointers(self, *, component_name: str):
+		component = self._component_for_op(
 			component_name, "get_padded_3d_page_pointers"
 		)
 		return component.manager.get_padded_3d_page_pointers()
 
-	def copy_kv_to_tensor(
-		self, sequence_id: int, *, component_name: Optional[str] = None
-	):
-		component = self._component_or_default(component_name, "copy_kv_to_tensor")
+	def copy_kv_to_tensor(self, sequence_id: int, *, component_name: str):
+		component = self._component_for_op(component_name, "copy_kv_to_tensor")
 		return component.manager.copy_kv_to_tensor(int(sequence_id))
 
 	def copy_tensor_to_kv(
@@ -404,9 +356,9 @@ class GPUKVCoordinator:
 		sequence_id: int,
 		k_tensor,
 		*,
-		component_name: Optional[str] = None,
+		component_name: str,
 	) -> None:
-		component = self._component_or_default(component_name, "copy_tensor_to_kv")
+		component = self._component_for_op(component_name, "copy_tensor_to_kv")
 		return component.manager.copy_tensor_to_kv(int(sequence_id), k_tensor)
 
 def _rollback_gpu_allocations(manager: Any, allocations: Any) -> None:

@@ -138,7 +138,6 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 		indexer_c4: Any = None,
 		num_layers: Optional[int] = None,
 		sliding_window: Optional[int] = None,
-		default_component: Optional[str] = None,
 	) -> None:
 		super().__init__()
 		self.layout = DeepSeekV4KVLayout.from_compression_ratios(
@@ -173,9 +172,6 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
 			)
-		self.set_default_component(
-			SWA if default_component is None else default_component
-		)
 
 
 class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
@@ -191,7 +187,6 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 		indexer_c4: Any = None,
 		num_layers: Optional[int] = None,
 		sliding_window: Optional[int] = None,
-		default_component: Optional[str] = None,
 	) -> None:
 		super().__init__()
 		self.layout = DeepSeekV4KVLayout.from_compression_ratios(
@@ -224,9 +219,6 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
 			)
-		self.set_default_component(
-			SWA if default_component is None else default_component
-		)
 
 
 def _compact_logical_to_physical_layer(
