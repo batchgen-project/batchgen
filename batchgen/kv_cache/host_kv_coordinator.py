@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
@@ -9,6 +10,49 @@ from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, S
 
 LayerMapping = Mapping[int, int] | Sequence[int]
 TokenCapacityFn = Callable[[int], int]
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AsyncKVTask:
+	"""Composite async KV task keyed by component name."""
+
+	tasks: Mapping[str, Any]
+	tensors: Any = None
+
+	def wait(self) -> None:
+		errors = []
+		for component_name, task in self.tasks.items():
+			if task is None:
+				continue
+			try:
+				task.wait()
+			except Exception as exc:
+				errors.append((component_name, exc))
+		if not errors:
+			return
+		if len(errors) == 1:
+			raise errors[0][1]
+		names = ", ".join(name for name, _ in errors)
+		raise RuntimeError(
+			f"AsyncKVTask wait failed for components: {names}"
+		) from errors[0][1]
+
+
+def wait_kv_tasks(tasks: Mapping[str, Any], *, context: str = "host KV task") -> None:
+	"""Best-effort drain for async tasks that were already launched."""
+
+	for component_name, task in tasks.items():
+		if task is None:
+			continue
+		try:
+			task.wait()
+		except Exception:
+			logger.exception(
+				"%s launched before failure did not drain cleanly: %s",
+				context,
+				component_name,
+			)
 
 
 @dataclass
