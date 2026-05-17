@@ -279,12 +279,9 @@ def test_gpu_kv_coordinator_keeps_managers_independent():
 	with pytest.raises(KeyError):
 		coordinator.resolve_physical_layer("compressor_c4", 4)
 
-	coordinator.call_all("initialize")
-	primary.allocate_pages_for_sequences([10, 20], [5, 9])
-	c4.allocate_pages_for_sequences(
-		[10, 20], coordinator.map_token_counts("compressor_c4", [5, 9])
-	)
-	primary_table = primary.rebuild_page_table([10, 20])
+	coordinator.initialize()
+	coordinator.allocate_pages_for_sequences([10, 20], [5, 9])
+	primary_table = coordinator.rebuild_page_table([10, 20])
 	c4_table = c4.rebuild_page_table([10, 20])
 
 	assert tuple(primary_table.shape) == (2, 4)
@@ -390,14 +387,8 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
 	assert coordinator.map_token_counts(COMPRESSOR_C128, [257]) == [3]
 	assert coordinator.map_token_counts(SWA, [64, 4096]) == [64, 128]
 
-	coordinator.call_all("initialize")
-	swa.allocate_pages_for_sequences([10], coordinator.map_token_counts(SWA, [65]))
-	c4.allocate_pages_for_sequences(
-		[10], coordinator.map_token_counts(COMPRESSOR_C4, [65])
-	)
-	c128.allocate_pages_for_sequences(
-		[10], coordinator.map_token_counts(COMPRESSOR_C128, [65])
-	)
+	coordinator.initialize()
+	coordinator.allocate_pages_for_sequences([10], [65])
 
 	assert swa._sequences[10].pages.numel() == 17
 	assert c4._sequences[10].pages.numel() == 5

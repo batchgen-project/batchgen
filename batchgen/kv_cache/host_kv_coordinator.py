@@ -178,6 +178,15 @@ class HostKVCoordinator:
 	def get_view(self, name: str) -> Any:
 		return self.get_component(name).view
 
+	def set_default_component(self, component_name: Optional[str]) -> str:
+		if component_name is None:
+			if self.default_component_name is None:
+				raise KeyError("Host KV coordinator has no default component")
+			return self.default_component_name
+		self.get_component(component_name)
+		self.default_component_name = component_name
+		return component_name
+
 	def resolve_physical_layer(self, component_name: str, logical_layer_id: int) -> int:
 		return self.get_component(component_name).resolve_physical_layer(logical_layer_id)
 
@@ -197,6 +206,185 @@ class HostKVCoordinator:
 			method = getattr(component.view, method_name)
 			results[component.name] = method(*args, **kwargs)
 		return results
+
+	def initialize(self, **kwargs: Any) -> dict[str, Any]:
+		return self.call_all("initialize", **kwargs)
+
+	def shutdown(self) -> dict[str, Any]:
+		results: dict[str, Any] = {}
+		for component in reversed(list(self.components())):
+			results[component.name] = component.view.shutdown()
+		return results
+
+	def register_sequences(self, sequence_ids) -> dict[str, Any]:
+		sequence_ids = list(sequence_ids)
+		results: dict[str, Any] = {}
+		registered: list[HostKVComponent] = []
+		try:
+			for component in self.components():
+				results[component.name] = component.view.register_sequences(sequence_ids)
+				registered.append(component)
+		except Exception:
+			for component in reversed(registered):
+				try:
+					component.view.unregister_sequences(sequence_ids)
+				except Exception:
+					logger.exception(
+						"Failed to rollback host KV registration for %s on %s",
+						sequence_ids[:10],
+						component.name,
+					)
+			raise
+		return results
+
+	def unregister_sequence(self, sequence_id: int) -> dict[str, Any]:
+		return self.call_all("unregister_sequence", int(sequence_id))
+
+	def unregister_sequences(self, sequence_ids) -> dict[str, Any]:
+		return self.call_all("unregister_sequences", list(sequence_ids))
+
+	def allocate_pages_for_sequences(
+		self,
+		seq_token_pairs,
+		*,
+		component_name: Optional[str] = None,
+	):
+		pairs = _normalize_seq_token_pairs(seq_token_pairs)
+		if component_name is not None:
+			component = self._component_or_default(
+				component_name, "allocate_pages_for_sequences"
+			)
+			return component.view.allocate_pages_for_sequences(
+				component.map_sequence_tokens(pairs)
+			)
+
+		sequence_ids = [seq_id for seq_id, _ in pairs]
+		results: dict[str, Any] = {}
+		allocated: list[HostKVComponent] = []
+		try:
+			for component in self.components():
+				results[component.name] = component.view.allocate_pages_for_sequences(
+					component.map_sequence_tokens(pairs)
+				)
+				allocated.append(component)
+		except Exception:
+			for component in reversed(allocated):
+				try:
+					component.view.release_sequence_pages(sequence_ids)
+				except Exception:
+					logger.exception(
+						"Failed to rollback host KV allocation for %s on %s",
+						sequence_ids[:10],
+						component.name,
+					)
+			raise
+		return results
+
+	def grow_sequence_pages(
+		self,
+		sequence_id: int,
+		num_pages: int,
+		*,
+		component_name: Optional[str] = None,
+	):
+		if component_name is not None:
+			component = self._component_or_default(component_name, "grow_sequence_pages")
+			return component.view.grow_sequence_pages(int(sequence_id), int(num_pages))
+		return self.call_all("grow_sequence_pages", int(sequence_id), int(num_pages))
+
+	def grow_pages_for_sequences(
+		self,
+		seq_page_pairs,
+		*,
+		component_name: Optional[str] = None,
+	):
+		pairs = _normalize_seq_token_pairs(seq_page_pairs)
+		if component_name is not None:
+			component = self._component_or_default(
+				component_name, "grow_pages_for_sequences"
+			)
+			return component.view.grow_pages_for_sequences(pairs)
+		return self.call_all("grow_pages_for_sequences", pairs)
+
+	def release_sequence_pages(self, sequence_ids) -> dict[str, Any]:
+		return self.call_all("release_sequence_pages", list(sequence_ids))
+
+	def free_pages_for_sequences(self, sequence_ids) -> dict[str, Any]:
+		return self.release_sequence_pages(sequence_ids)
+
+	def build_page_table(self, sequence_ids):
+		results = self.call_all("build_page_table", list(sequence_ids))
+		return results[self.set_default_component(None)]
+
+	def get_stats(self):
+		return self._component_or_default(None, "get_stats").view.get_stats()
+
+	def get_stats_by_component(self) -> dict[str, Any]:
+		return self.call_all("get_stats")
+
+	def data_base_address(self, *, component_name: Optional[str] = None):
+		component = self._component_or_default(component_name, "data_base_address")
+		return component.view.data_base_address()
+
+	def read_sequence_kv_to_cpu(
+		self, sequence_id: int, *, component_name: Optional[str] = None
+	):
+		component = self._component_or_default(component_name, "read_sequence_kv_to_cpu")
+		return component.view.read_sequence_kv_to_cpu(int(sequence_id))
+
+	def write_sequence_kv_from_cpu(
+		self,
+		sequence_id: int,
+		k_tensor,
+		v_tensor=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		component = self._component_or_default(component_name, "write_sequence_kv_from_cpu")
+		return component.view.write_sequence_kv_from_cpu(
+			int(sequence_id), k_tensor, v_tensor
+		)
+
+	def k_page_ptr(
+		self,
+		layer_idx: int,
+		page_idx: int,
+		*,
+		component_name: Optional[str] = None,
+	):
+		view, view_layer_id = self._view_for_data_op(
+			component_name, layer_idx, "k_page_ptr"
+		)
+		return view.k_page_ptr(view_layer_id, int(page_idx))
+
+	def v_page_ptr(
+		self,
+		layer_idx: int,
+		page_idx: int,
+		*,
+		component_name: Optional[str] = None,
+	):
+		view, view_layer_id = self._view_for_data_op(
+			component_name, layer_idx, "v_page_ptr"
+		)
+		return view.v_page_ptr(view_layer_id, int(page_idx))
+
+	def get_sequence_layer_page_pointers(
+		self,
+		sequence_id: int,
+		layer_idx: int,
+		max_tokens=None,
+		*,
+		component_name: Optional[str] = None,
+	):
+		component = self._component_or_default(
+			component_name, "get_sequence_layer_page_pointers"
+		)
+		return component.view.get_sequence_layer_page_pointers(
+			int(sequence_id),
+			component.view_layer_id(int(layer_idx)),
+			None if max_tokens is None else component.token_capacity(int(max_tokens)),
+		)
 
 	def _component_or_default(
 		self, component_name: Optional[str], context: str
@@ -360,3 +548,17 @@ def _resolve_from_mapping(
 			f"logical layer {logical_layer_id}"
 		)
 	return int(physical)
+
+
+def _normalize_seq_token_pairs(seq_token_pairs) -> list[tuple[int, int]]:
+	return [
+		(int(sequence_id), _check_positive_tokens(num_tokens))
+		for sequence_id, num_tokens in list(seq_token_pairs)
+	]
+
+
+def _check_positive_tokens(num_tokens: int) -> int:
+	num_tokens = int(num_tokens)
+	if num_tokens <= 0:
+		raise ValueError(f"num_tokens must be > 0, got {num_tokens}")
+	return num_tokens
