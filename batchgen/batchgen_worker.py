@@ -10897,6 +10897,8 @@ class BatchGenWorker:
 			self._glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
 				for capture_bucket in capture_buckets:
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
 					whole_seg.set_capture_inputs(
 						**self._make_glm5_whole_model_capture_inputs(
 							bucket=capture_bucket,
@@ -10904,6 +10906,8 @@ class BatchGenWorker:
 						)
 					)
 					manager.warmup_and_capture_buckets([capture_bucket])
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
 			except torch.OutOfMemoryError as exc:
 				manager.drop_bucket(capture_bucket)
 				self._glm5_whole_model_graph_failed_buckets.add(capture_bucket)
