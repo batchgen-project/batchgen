@@ -149,32 +149,30 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 			swa,
 			token_capacity_fn=self.layout.token_capacity_fn(SWA),
 		)
-		self._register_optional_view(COMPRESSOR_C4, compressor_c4)
-		self._register_optional_view(COMPRESSOR_C128, compressor_c128)
-		self._register_optional_view(INDEXER_C4, indexer_c4)
+		for component_name, view in (
+			(COMPRESSOR_C4, compressor_c4),
+			(COMPRESSOR_C128, compressor_c128),
+			(INDEXER_C4, indexer_c4),
+		):
+			if view is None:
+				continue
+			if self.layout.physical_layer_count(component_name) <= 0:
+				raise ValueError(
+					f"DeepSeek-V4 component {component_name!r} has no physical layers"
+				)
+			self.register_component(
+				component_name,
+				view,
+				logical_to_physical_layer=(
+					None
+					if _view_owns_layer_mapping(view)
+					else self.layout.layer_mapping(component_name)
+				),
+				token_capacity_fn=self.layout.token_capacity_fn(component_name),
+			)
 		self.set_default_component(
 			SWA if default_component is None else default_component
 		)
-
-	def _register_optional_view(self, component_name: str, view: Any) -> None:
-		if view is None:
-			return
-		self._ensure_component_has_layers(component_name)
-		mapping = self.layout.layer_mapping(component_name)
-		if _view_owns_layer_mapping(view):
-			mapping = None
-		self.register_component(
-			component_name,
-			view,
-			logical_to_physical_layer=mapping,
-			token_capacity_fn=self.layout.token_capacity_fn(component_name),
-		)
-
-	def _ensure_component_has_layers(self, component_name: str) -> None:
-		if self.layout.physical_layer_count(component_name) <= 0:
-			raise ValueError(
-				f"DeepSeek-V4 component {component_name!r} has no physical layers"
-			)
 
 
 class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
@@ -204,29 +202,26 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 			swa,
 			token_capacity_fn=self.layout.token_capacity_fn(SWA),
 		)
-		self._register_optional_manager(COMPRESSOR_C4, compressor_c4)
-		self._register_optional_manager(COMPRESSOR_C128, compressor_c128)
-		self._register_optional_manager(INDEXER_C4, indexer_c4)
+		for component_name, manager in (
+			(COMPRESSOR_C4, compressor_c4),
+			(COMPRESSOR_C128, compressor_c128),
+			(INDEXER_C4, indexer_c4),
+		):
+			if manager is None:
+				continue
+			if self.layout.physical_layer_count(component_name) <= 0:
+				raise ValueError(
+					f"DeepSeek-V4 component {component_name!r} has no physical layers"
+				)
+			self.register_component(
+				component_name,
+				manager,
+				logical_to_physical_layer=self.layout.layer_mapping(component_name),
+				token_capacity_fn=self.layout.token_capacity_fn(component_name),
+			)
 		self.set_default_component(
 			SWA if default_component is None else default_component
 		)
-
-	def _register_optional_manager(self, component_name: str, manager: Any) -> None:
-		if manager is None:
-			return
-		self._ensure_component_has_layers(component_name)
-		self.register_component(
-			component_name,
-			manager,
-			logical_to_physical_layer=self.layout.layer_mapping(component_name),
-			token_capacity_fn=self.layout.token_capacity_fn(component_name),
-		)
-
-	def _ensure_component_has_layers(self, component_name: str) -> None:
-		if self.layout.physical_layer_count(component_name) <= 0:
-			raise ValueError(
-				f"DeepSeek-V4 component {component_name!r} has no physical layers"
-			)
 
 
 def _compact_layer_map(
