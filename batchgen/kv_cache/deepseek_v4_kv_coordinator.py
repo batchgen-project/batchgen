@@ -129,12 +129,8 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 			sliding_window=sliding_window,
 		)
 
-		self.register_component(
-			SWA,
-			swa,
-			token_capacity_fn=self.layout.token_capacity_fn(SWA),
-		)
 		for component_name, view in (
+			(SWA, swa),
 			(COMPRESSOR_C4, compressor_c4),
 			(COMPRESSOR_C128, compressor_c128),
 			(INDEXER_C4, indexer_c4),
@@ -146,7 +142,7 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 				view,
 				logical_to_physical_layer=(
 					None
-					if _view_owns_layer_mapping(view)
+					if component_name == SWA or _view_owns_layer_mapping(view)
 					else self.layout.logical_to_physical_layer(component_name)
 				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
@@ -174,12 +170,8 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 			sliding_window=sliding_window,
 		)
 
-		self.register_component(
-			SWA,
-			swa,
-			token_capacity_fn=self.layout.token_capacity_fn(SWA),
-		)
 		for component_name, manager in (
+			(SWA, swa),
 			(COMPRESSOR_C4, compressor_c4),
 			(COMPRESSOR_C128, compressor_c128),
 			(INDEXER_C4, indexer_c4),
@@ -190,7 +182,9 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 				component_name,
 				manager,
 				logical_to_physical_layer=(
-					self.layout.logical_to_physical_layer(component_name)
+					None
+					if component_name == SWA
+					else self.layout.logical_to_physical_layer(component_name)
 				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
 			)
