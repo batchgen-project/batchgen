@@ -1,63 +1,11 @@
-"""Shared helpers for heterogeneous KV coordinators."""
+"""Shared layer-mapping helpers for heterogeneous KV storage."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any
 
 
 LayerMapping = Sequence[int]
-
-
-@dataclass
-class KVComponent:
-	"""Common registry entry for one heterogeneous KV component."""
-
-	name: str
-	storage: Any
-
-	def __post_init__(self) -> None:
-		if not self.name:
-			raise ValueError(f"{type(self).__name__}.name must be non-empty")
-		if self.storage is None:
-			raise ValueError(f"{type(self).__name__}({self.name}): storage must be set")
-
-
-class HostKVComponent(KVComponent):
-	"""One named host KV component backed by a host worker view."""
-
-	def __init__(
-		self,
-		name: str,
-		view: Any,
-	) -> None:
-		super().__init__(
-			name=name,
-			storage=view,
-		)
-
-	@property
-	def view(self) -> Any:
-		return self.storage
-
-
-class GPUKVComponent(KVComponent):
-	"""One named GPU KV component backed by a paged GPU manager."""
-
-	def __init__(
-		self,
-		name: str,
-		manager: Any,
-	) -> None:
-		super().__init__(
-			name=name,
-			storage=manager,
-		)
-
-	@property
-	def manager(self) -> Any:
-		return self.storage
 
 
 def resolve_from_layer_mapping(

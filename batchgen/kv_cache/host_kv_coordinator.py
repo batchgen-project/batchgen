@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Iterator, Mapping, Optional
 
-from batchgen.kv_cache.coordinator_utils import HostKVComponent
 logger = logging.getLogger(__name__)
 
 
@@ -60,56 +59,54 @@ class HostKVCoordinator:
 	"""
 
 	def __init__(self) -> None:
-		self._components: Dict[str, HostKVComponent] = {}
+		self._components: Dict[str, Any] = {}
 
 	def register_component(
 		self,
-		component: HostKVComponent | str,
-		view: Any = None,
+		component_name: str,
+		view: Any,
 		**kwargs: Any,
-	) -> HostKVComponent:
-		if isinstance(component, HostKVComponent):
-			if view is not None or kwargs:
-				raise ValueError(
-					"Pass either a HostKVComponent or name/view/kwargs, not both"
-				)
-			item = component
-		else:
-			if kwargs:
-				raise ValueError(
-					"HostKVCoordinator does not accept component metadata; "
-					"configure the backing HostPagedKVWorkerView instead"
-				)
-			item = HostKVComponent(name=component, view=view, **kwargs)
-		if item.name in self._components:
-			raise ValueError(f"Host KV component already registered: {item.name}")
-		self._components[item.name] = item
-		setattr(self, item.name, item.view)
-		return item
+	) -> Any:
+		if kwargs:
+			raise ValueError(
+				"HostKVCoordinator does not accept component metadata; "
+				"configure the backing HostPagedKVWorkerView instead"
+			)
+		if not component_name:
+			raise ValueError("Host KV component name must be non-empty")
+		if view is None:
+			raise ValueError(
+				f"Host KV component {component_name!r}: view must be set"
+			)
+		if component_name in self._components:
+			raise ValueError(f"Host KV component already registered: {component_name}")
+		self._components[component_name] = view
+		setattr(self, component_name, view)
+		return view
 
 	@property
 	def component_names(self) -> list[str]:
 		return list(self._components.keys())
 
-	def components(self) -> Iterator[HostKVComponent]:
-		return iter(self._components.values())
+	def components(self) -> Iterator[tuple[str, Any]]:
+		return iter(self._components.items())
 
-	def get_component(self, name: str) -> HostKVComponent:
+	def get_component(self, name: str) -> Any:
 		try:
 			return self._components[name]
 		except KeyError as exc:
 			raise KeyError(f"Unknown host KV component: {name}") from exc
 
 	def get_view(self, name: str) -> Any:
-		return self.get_component(name).view
+		return self.get_component(name)
 
 	def call_all(self, method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 		"""Call the same method on every backing view."""
 
 		results: dict[str, Any] = {}
-		for component in self.components():
-			method = getattr(component.view, method_name)
-			results[component.name] = method(*args, **kwargs)
+		for component_name, view in self.components():
+			method = getattr(view, method_name)
+			results[component_name] = method(*args, **kwargs)
 		return results
 
 	def initialize(self, **kwargs: Any) -> dict[str, Any]:
@@ -117,27 +114,27 @@ class HostKVCoordinator:
 
 	def shutdown(self) -> dict[str, Any]:
 		results: dict[str, Any] = {}
-		for component in reversed(list(self.components())):
-			results[component.name] = component.view.shutdown()
+		for component_name, view in reversed(list(self.components())):
+			results[component_name] = view.shutdown()
 		return results
 
 	def register_sequences(self, sequence_ids) -> dict[str, Any]:
 		sequence_ids = list(sequence_ids)
 		results: dict[str, Any] = {}
-		registered: list[HostKVComponent] = []
+		registered: list[tuple[str, Any]] = []
 		try:
-			for component in self.components():
-				results[component.name] = component.view.register_sequences(sequence_ids)
-				registered.append(component)
+			for component_name, view in self.components():
+				results[component_name] = view.register_sequences(sequence_ids)
+				registered.append((component_name, view))
 		except Exception:
-			for component in reversed(registered):
+			for component_name, view in reversed(registered):
 				try:
-					component.view.unregister_sequences(sequence_ids)
+					view.unregister_sequences(sequence_ids)
 				except Exception:
 					logger.exception(
 						"Failed to rollback host KV registration for %s on %s",
 						sequence_ids[:10],
-						component.name,
+						component_name,
 					)
 			raise
 		return results
@@ -159,27 +156,27 @@ class HostKVCoordinator:
 			for sequence_id, num_tokens in list(seq_token_pairs)
 		]
 		if component_name is not None:
-			component = self._component_for_op(
+			view = self._component_for_op(
 				component_name, "allocate_pages_for_sequences"
 			)
-			return component.view.allocate_pages_for_sequences(pairs)
+			return view.allocate_pages_for_sequences(pairs)
 
 		results: dict[str, Any] = {}
-		allocated: list[HostKVComponent] = []
+		allocated: list[tuple[str, Any]] = []
 		try:
-			for component in self.components():
-				results[component.name] = component.view.allocate_pages_for_sequences(pairs)
-				allocated.append(component)
+			for component_name, view in self.components():
+				results[component_name] = view.allocate_pages_for_sequences(pairs)
+				allocated.append((component_name, view))
 		except Exception:
 			sequence_ids = [seq_id for seq_id, _ in pairs]
-			for component in reversed(allocated):
+			for component_name, view in reversed(allocated):
 				try:
-					component.view.release_sequence_pages(sequence_ids)
+					view.release_sequence_pages(sequence_ids)
 				except Exception:
 					logger.exception(
 						"Failed to rollback host KV allocation for %s on %s",
 						sequence_ids[:10],
-						component.name,
+						component_name,
 					)
 			raise
 		return results
@@ -192,8 +189,8 @@ class HostKVCoordinator:
 		component_name: Optional[str] = None,
 	):
 		if component_name is not None:
-			component = self._component_for_op(component_name, "grow_sequence_pages")
-			return component.view.grow_sequence_pages(int(sequence_id), int(num_pages))
+			view = self._component_for_op(component_name, "grow_sequence_pages")
+			return view.grow_sequence_pages(int(sequence_id), int(num_pages))
 		return self.call_all("grow_sequence_pages", int(sequence_id), int(num_pages))
 
 	def grow_pages_for_sequences(
@@ -207,10 +204,10 @@ class HostKVCoordinator:
 			for sequence_id, num_pages in list(seq_page_pairs)
 		]
 		if component_name is not None:
-			component = self._component_for_op(
+			view = self._component_for_op(
 				component_name, "grow_pages_for_sequences"
 			)
-			return component.view.grow_pages_for_sequences(pairs)
+			return view.grow_pages_for_sequences(pairs)
 		return self.call_all("grow_pages_for_sequences", pairs)
 
 	def release_sequence_pages(self, sequence_ids) -> dict[str, Any]:
@@ -229,12 +226,12 @@ class HostKVCoordinator:
 		return self.get_stats()
 
 	def data_base_address(self, *, component_name: str):
-		component = self._component_for_op(component_name, "data_base_address")
-		return component.view.data_base_address()
+		view = self._component_for_op(component_name, "data_base_address")
+		return view.data_base_address()
 
 	def read_sequence_kv_to_cpu(self, sequence_id: int, *, component_name: str):
-		component = self._component_for_op(component_name, "read_sequence_kv_to_cpu")
-		return component.view.read_sequence_kv_to_cpu(int(sequence_id))
+		view = self._component_for_op(component_name, "read_sequence_kv_to_cpu")
+		return view.read_sequence_kv_to_cpu(int(sequence_id))
 
 	def write_sequence_kv_from_cpu(
 		self,
@@ -244,8 +241,8 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		component = self._component_for_op(component_name, "write_sequence_kv_from_cpu")
-		return component.view.write_sequence_kv_from_cpu(
+		view = self._component_for_op(component_name, "write_sequence_kv_from_cpu")
+		return view.write_sequence_kv_from_cpu(
 			int(sequence_id), k_tensor, v_tensor
 		)
 
@@ -281,16 +278,16 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		component = self._component_for_op(
+		view = self._component_for_op(
 			component_name, "get_sequence_layer_page_pointers"
 		)
-		return component.view.get_sequence_layer_page_pointers(
+		return view.get_sequence_layer_page_pointers(
 			int(sequence_id),
 			int(layer_idx),
 			max_tokens,
 		)
 
-	def _component_for_op(self, component_name: str, context: str) -> HostKVComponent:
+	def _component_for_op(self, component_name: str, context: str) -> Any:
 		if component_name is None:
 			raise KeyError(f"{context}: component_name is required")
 		try:
@@ -303,8 +300,8 @@ class HostKVCoordinator:
 	def _view_for_data_op(
 		self, component_name: str, layer_idx: int, context: str
 	) -> tuple[Any, int]:
-		component = self._component_for_op(component_name, context)
-		return component.view, int(layer_idx)
+		view = self._component_for_op(component_name, context)
+		return view, int(layer_idx)
 
 	def async_offload_layer_kv_to_host(
 		self,
@@ -352,7 +349,7 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		component = self._component_for_op(
+		view = self._component_for_op(
 			component_name, "async_append_decode_kv_to_host_batched_kernel"
 		)
 		normalized_entries = [
@@ -363,7 +360,7 @@ class HostKVCoordinator:
 			)
 			for entry in entries
 		]
-		return component.view.async_append_decode_kv_to_host_batched_kernel(
+		return view.async_append_decode_kv_to_host_batched_kernel(
 			normalized_entries, sequence_ids, sequence_lengths
 		)
 
@@ -375,10 +372,10 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		component = self._component_for_op(
+		view = self._component_for_op(
 			component_name, "async_load_layer_kv_to_device"
 		)
-		return component.view.async_load_layer_kv_to_device(
+		return view.async_load_layer_kv_to_device(
 			sequence_ids, k_device_ptrs, v_device_ptrs
 		)
 
@@ -391,10 +388,10 @@ class HostKVCoordinator:
 		*,
 		component_name: str,
 	):
-		component = self._component_for_op(
+		view = self._component_for_op(
 			component_name, "async_load_layer_paged_kv_to_device"
 		)
-		return component.view.async_load_layer_paged_kv_to_device(
+		return view.async_load_layer_paged_kv_to_device(
 			sequence_ids, active_page_counts, k_device_ptrs, v_device_ptrs
 		)
 

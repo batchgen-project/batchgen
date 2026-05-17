@@ -16,7 +16,6 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 	SWA,
 	DeepSeekV4GPUKVCoordinator,
 	DeepSeekV4HostKVCoordinator,
-	DeepSeekV4KVLayout,
 )
 
 
@@ -339,23 +338,6 @@ def test_gpu_kv_coordinator_passes_layer_ids_to_mapped_managers():
 	)
 
 	assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
-
-
-def test_deepseek_v4_layout_builds_compact_component_maps():
-	layout = DeepSeekV4KVLayout.from_compression_ratios(
-		[0, 128, 4, 128, 4],
-	)
-
-	assert layout.num_layers == 5
-	assert layout.c4_logical_to_physical_layer == [-1, -1, 0, -1, 1]
-	assert layout.c128_logical_to_physical_layer == [-1, 0, -1, 1, -1]
-	assert layout.num_c4_layers == 2
-	assert layout.num_c128_layers == 2
-	assert layout.physical_layer_count(SWA) == 5
-
-	layout_with_other_ratio = DeepSeekV4KVLayout.from_compression_ratios([0, 8, 4])
-	assert layout_with_other_ratio.c4_logical_to_physical_layer == [-1, -1, 0]
-	assert layout_with_other_ratio.c128_logical_to_physical_layer == [-1, -1, -1]
 
 
 def test_deepseek_v4_host_coordinator_registers_dsv4_components():

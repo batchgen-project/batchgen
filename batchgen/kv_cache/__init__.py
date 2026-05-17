@@ -3,10 +3,9 @@
 #  copyright (c) EfficientMoE team 2025                                          #
 # ---------------------------------------------------------------------------- #
 
-from batchgen.kv_cache.gpu_kv_coordinator import GPUKVComponent, GPUKVCoordinator
+from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 from batchgen.kv_cache.host_kv_coordinator import (
 	AsyncKVTask,
-	HostKVComponent,
 	HostKVCoordinator,
 	wait_kv_tasks,
 )
@@ -17,7 +16,6 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
 	SWA,
 	DeepSeekV4GPUKVCoordinator,
 	DeepSeekV4HostKVCoordinator,
-	DeepSeekV4KVLayout,
 )
 
 __all__ = [
@@ -28,10 +26,7 @@ __all__ = [
 	"AsyncKVTask",
 	"DeepSeekV4GPUKVCoordinator",
 	"DeepSeekV4HostKVCoordinator",
-	"DeepSeekV4KVLayout",
-	"GPUKVComponent",
 	"GPUKVCoordinator",
-	"HostKVComponent",
 	"HostKVCoordinator",
 	"wait_kv_tasks",
 ]

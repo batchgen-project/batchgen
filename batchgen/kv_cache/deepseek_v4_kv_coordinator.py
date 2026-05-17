@@ -7,8 +7,7 @@ DSV4 coordinators below only register the model's component names.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any
 
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
@@ -18,70 +17,6 @@ SWA = "swa"
 COMPRESSOR_C4 = "compressor_c4"
 COMPRESSOR_C128 = "compressor_c128"
 INDEXER_C4 = "indexer_c4"
-
-
-@dataclass
-class DeepSeekV4KVLayout:
-	"""Layer routing metadata for DeepSeek-V4 KV components."""
-
-	compression_ratios: list[int]
-	c4_logical_to_physical_layer: list[int]
-	c128_logical_to_physical_layer: list[int]
-
-	@classmethod
-	def from_compression_ratios(
-		cls,
-		compression_ratios: Sequence[int],
-		*,
-		num_layers: Optional[int] = None,
-	) -> "DeepSeekV4KVLayout":
-		ratios = [int(ratio) for ratio in compression_ratios]
-		if num_layers is None:
-			num_layers = len(ratios)
-		else:
-			num_layers = int(num_layers)
-		if len(ratios) < num_layers:
-			ratios.extend([0] * (num_layers - len(ratios)))
-		return cls(
-			compression_ratios=ratios,
-			c4_logical_to_physical_layer=_compact_logical_to_physical_layer(
-				ratios, 4
-			),
-			c128_logical_to_physical_layer=_compact_logical_to_physical_layer(
-				ratios, 128
-			),
-		)
-
-	@property
-	def num_layers(self) -> int:
-		return len(self.compression_ratios)
-
-	@property
-	def num_c4_layers(self) -> int:
-		return _count_physical_layers(self.c4_logical_to_physical_layer)
-
-	@property
-	def num_c128_layers(self) -> int:
-		return _count_physical_layers(self.c128_logical_to_physical_layer)
-
-	def logical_to_physical_layer(self, component_name: str) -> Optional[list[int]]:
-		if component_name == COMPRESSOR_C4:
-			return self.c4_logical_to_physical_layer
-		if component_name == COMPRESSOR_C128:
-			return self.c128_logical_to_physical_layer
-		if component_name == INDEXER_C4:
-			return self.c4_logical_to_physical_layer
-		if component_name == SWA:
-			return None
-		raise KeyError(f"Unknown DeepSeek-V4 KV component: {component_name}")
-
-	def physical_layer_count(self, component_name: str) -> int:
-		if component_name == SWA:
-			return self.num_layers
-		mapping = self.logical_to_physical_layer(component_name)
-		if mapping is None:
-			return self.num_layers
-		return _count_physical_layers(mapping)
 
 
 class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
@@ -132,21 +67,3 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 			if manager is None:
 				continue
 			self.register_component(component_name, manager)
-
-
-def _compact_logical_to_physical_layer(
-	compression_ratios: Sequence[int], target_ratio: int
-) -> list[int]:
-	next_physical_layer = 0
-	mapping: list[int] = []
-	for ratio in compression_ratios:
-		if int(ratio) == target_ratio:
-			mapping.append(next_physical_layer)
-			next_physical_layer += 1
-		else:
-			mapping.append(-1)
-	return mapping
-
-
-def _count_physical_layers(mapping: Sequence[int]) -> int:
-	return sum(1 for physical_layer in mapping if int(physical_layer) >= 0)
