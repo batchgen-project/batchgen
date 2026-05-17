@@ -296,8 +296,8 @@ def test_deepseek_v4_layout_builds_compact_component_maps():
 	)
 
 	assert layout.num_layers == 5
-	assert layout.c4_layer_map == (-1, -1, 0, -1, 1)
-	assert layout.c128_layer_map == (-1, 0, -1, 1, -1)
+	assert layout.c4_logical_to_physical_layer == [-1, -1, 0, -1, 1]
+	assert layout.c128_logical_to_physical_layer == [-1, 0, -1, 1, -1]
 	assert layout.num_c4_layers == 2
 	assert layout.num_c128_layers == 2
 	assert layout.physical_layer_count(SWA) == 5

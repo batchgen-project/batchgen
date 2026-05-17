@@ -24,13 +24,13 @@ INDEXER_C4 = "indexer_c4"
 _SUPPORTED_COMPRESS_RATIOS = {0, 4, 128}
 
 
-@dataclass(frozen=True)
+@dataclass
 class DeepSeekV4KVLayout:
 	"""Layer and token routing metadata for DeepSeek-V4 KV components."""
 
-	compression_ratios: tuple[int, ...]
-	c4_layer_map: tuple[int, ...]
-	c128_layer_map: tuple[int, ...]
+	compression_ratios: list[int]
+	c4_logical_to_physical_layer: list[int]
+	c128_logical_to_physical_layer: list[int]
 	sliding_window: Optional[int] = None
 
 	@classmethod
@@ -63,11 +63,14 @@ class DeepSeekV4KVLayout:
 			)
 		if sliding_window is not None and int(sliding_window) <= 0:
 			raise ValueError("sliding_window must be > 0 when set")
-		ratios_tuple = tuple(ratios)
 		return cls(
-			compression_ratios=ratios_tuple,
-			c4_layer_map=_compact_layer_map(ratios_tuple, 4),
-			c128_layer_map=_compact_layer_map(ratios_tuple, 128),
+			compression_ratios=ratios,
+			c4_logical_to_physical_layer=_compact_logical_to_physical_layer(
+				ratios, 4
+			),
+			c128_logical_to_physical_layer=_compact_logical_to_physical_layer(
+				ratios, 128
+			),
 			sliding_window=None if sliding_window is None else int(sliding_window),
 		)
 
@@ -77,19 +80,19 @@ class DeepSeekV4KVLayout:
 
 	@property
 	def num_c4_layers(self) -> int:
-		return _count_physical_layers(self.c4_layer_map)
+		return _count_physical_layers(self.c4_logical_to_physical_layer)
 
 	@property
 	def num_c128_layers(self) -> int:
-		return _count_physical_layers(self.c128_layer_map)
+		return _count_physical_layers(self.c128_logical_to_physical_layer)
 
-	def layer_mapping(self, component_name: str) -> Optional[tuple[int, ...]]:
+	def logical_to_physical_layer(self, component_name: str) -> Optional[list[int]]:
 		if component_name == COMPRESSOR_C4:
-			return self.c4_layer_map
+			return self.c4_logical_to_physical_layer
 		if component_name == COMPRESSOR_C128:
-			return self.c128_layer_map
+			return self.c128_logical_to_physical_layer
 		if component_name == INDEXER_C4:
-			return self.c4_layer_map
+			return self.c4_logical_to_physical_layer
 		if component_name == SWA:
 			return None
 		raise KeyError(f"Unknown DeepSeek-V4 KV component: {component_name}")
@@ -97,7 +100,7 @@ class DeepSeekV4KVLayout:
 	def physical_layer_count(self, component_name: str) -> int:
 		if component_name == SWA:
 			return self.num_layers
-		mapping = self.layer_mapping(component_name)
+		mapping = self.logical_to_physical_layer(component_name)
 		if mapping is None:
 			return self.num_layers
 		return _count_physical_layers(mapping)
@@ -166,7 +169,7 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
 				logical_to_physical_layer=(
 					None
 					if _view_owns_layer_mapping(view)
-					else self.layout.layer_mapping(component_name)
+					else self.layout.logical_to_physical_layer(component_name)
 				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
 			)
@@ -216,7 +219,9 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 			self.register_component(
 				component_name,
 				manager,
-				logical_to_physical_layer=self.layout.layer_mapping(component_name),
+				logical_to_physical_layer=(
+					self.layout.logical_to_physical_layer(component_name)
+				),
 				token_capacity_fn=self.layout.token_capacity_fn(component_name),
 			)
 		self.set_default_component(
@@ -224,9 +229,9 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
 		)
 
 
-def _compact_layer_map(
+def _compact_logical_to_physical_layer(
 	compression_ratios: Sequence[int], target_ratio: int
-) -> tuple[int, ...]:
+) -> list[int]:
 	next_physical_layer = 0
 	mapping: list[int] = []
 	for ratio in compression_ratios:
@@ -235,7 +240,7 @@ def _compact_layer_map(
 			next_physical_layer += 1
 		else:
 			mapping.append(-1)
-	return tuple(mapping)
+	return mapping
 
 
 def _count_physical_layers(mapping: Sequence[int]) -> int:
