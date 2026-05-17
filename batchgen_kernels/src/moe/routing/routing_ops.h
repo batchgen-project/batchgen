@@ -60,6 +60,17 @@ std::vector<torch::Tensor> gate_sigmoid_topk_cuda(
     torch::Tensor topk_weights    // optional pre-allocated
 );
 
+// GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits.
+// Uses device-side rank_token_counts for graph-stable rank-major padding masks.
+torch::Tensor glm5_router_gemm_cuda(
+    torch::Tensor hidden_states,   // [N, H] BF16
+    torch::Tensor router_weight,   // [E, H] BF16
+    torch::Tensor rank_token_counts, // [world_size] int64 or empty
+    torch::Tensor output,          // [N, E] FP32 pre-allocated (optional)
+    int64_t bucket_size,
+    int64_t world_size
+);
+
 // Fused Gate: WGMMA GEMM + bias + TopK + Softmax (SM90a, 2 kernels)
 // Requires FusedGateContext for cached weight transpose + TMA descriptors.
 int64_t create_fused_gate_context(

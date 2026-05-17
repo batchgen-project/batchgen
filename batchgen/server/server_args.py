@@ -1,10 +1,21 @@
 """Server argument parsing and validation utilities."""
 
 import argparse
+import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from batchgen.models.glm.glm5.cuda_graph_policy import (
+    GLM5_DSA_CUDA_GRAPH_ENV,
+    GLM5_DSA_FULL_CUDA_GRAPH_ENV,
+    GLM5_MOE_CUDA_GRAPH_ENV,
+    GLM5_SEGMENTED_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
+    is_glm5_fp8_graph_default_model,
+)
 
 
 def is_port_available(port: int) -> bool:
@@ -45,6 +56,23 @@ def _ensure_local_port_free(port: int, label: str) -> None:
 def _default_storage_path() -> Path:
     """Return default storage path under batchgen directory."""
     return Path(__file__).parent.parent / "storage"
+
+
+def _is_glm_model(model_name: Optional[str]) -> bool:
+    return "glm" in (model_name or "").lower()
+
+
+def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
+    if args.enable_cuda_graph and is_glm5_fp8_graph_default_model(args.model):
+        return
+
+    if args.disable_cuda_graphs and _is_glm_model(args.model):
+        os.environ[GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_DSA_FULL_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV] = "0"
 
 
 @dataclass
@@ -89,6 +117,7 @@ class ServerArgs:
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
     parse_thinking: bool = False  # Extract reasoning_content from model output
     parse_tool_call: bool = False  # Extract tool_calls from model output
+    enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
@@ -331,7 +360,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Extract tool call blocks from model output into tool_calls array",
     )
-    parser.add_argument(
+    cuda_graph_group = parser.add_mutually_exclusive_group()
+    cuda_graph_group.add_argument(
+        "--enable-cuda-graph",
+        "--enable-cuda-graphs",
+        action="store_true",
+        dest="enable_cuda_graph",
+        default=False,
+        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables the whole-model decode graph by default.",
+    )
+    cuda_graph_group.add_argument(
         "--disable-cuda-graphs",
         action="store_true",
         default=False,
@@ -341,13 +379,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cuda-graph-max-bucket-size",
         type=int,
         default=128,
-        help="Maximum batch size per rank for CUDA graph capture (default: 128). Batches exceeding this fall back to eager execution.",
+        help="Maximum batch size per rank for CUDA graph capture (default: 128). For GLM whole-model graph, this defines the top bucket; larger decode batches use eager fallback.",
     )
     parser.add_argument(
         "--cuda-graph-num-buckets",
         type=int,
         default=16,
-        help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
+        help="Maximum number of CUDA graph bucket sizes (default: 16). For GLM, use 7 with max bucket 64 for [1,2,4,8,16,32,64].",
     )
     parser.add_argument(
         "--detokenization-include-special-tokens",
@@ -542,6 +580,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         parse_thinking=parsed.parse_thinking,
         parse_tool_call=parsed.parse_tool_call,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
+        enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
         cuda_graph_max_bucket_size=parsed.cuda_graph_max_bucket_size,
         cuda_graph_num_buckets=parsed.cuda_graph_num_buckets,
@@ -563,4 +602,5 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
     )
     server_args.resolve_paths()
     validate_server_args(server_args)
+    _apply_cuda_graph_cli_env_defaults(server_args)
     return server_args

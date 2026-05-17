@@ -206,6 +206,31 @@ class BatchObject(BaseModel):
         return values
 
 
+def build_batch_object_from_create_request(
+    *,
+    batch_id: str,
+    body: CreateBatchRequest,
+    created_at: int,
+    expires_at: int,
+) -> BatchObject:
+    return BatchObject(
+        id=batch_id,
+        endpoint=body.endpoint,
+        input_file_id=body.input_file_id,
+        completion_window=body.completion_window,
+        status=BatchStatus.VALIDATING,
+        created_at=created_at,
+        expires_at=expires_at,
+        metadata=body.metadata,
+        max_decoding_length=body.max_decoding_length,
+        max_context_length=body.max_context_length,
+        temperature=body.temperature,
+        top_p=body.top_p,
+        top_k=body.top_k,
+        batchgen_debug=body.batchgen_debug,
+    )
+
+
 class ListBatchesRequest(BaseModel):
     after: Optional[str] = None
     limit: int = Field(default=20, ge=1, le=1000)

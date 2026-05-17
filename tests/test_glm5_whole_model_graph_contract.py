@@ -1,6 +1,10 @@
 import torch
 import pytest
 
+from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
+    Glm5DecoderLayerGraphSegment,
+    make_glm5_layer_graph_segment_name,
+)
 from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
     Glm5WholeModelSegment,
     compare_glm5_whole_model_graph_logits,
@@ -120,9 +124,56 @@ def test_glm5_whole_model_segment_accepts_padded_capture_inputs():
 
     segment.initialize_static_inputs(static_inputs, bucket_size=2)
 
-    assert segment._capture_dsa_short_count == 2
+    assert segment._capture_dsa_short_count == 1
     assert static_inputs["primary_slot_indices"].tolist() == [3, -1]
     assert static_inputs["cache_seqlens"].tolist() == [128, 1]
+
+
+def test_glm5_whole_model_segment_materializes_bucket_from_real_rows():
+    segment = _make_segment(max_bucket_size=4, max_seqlen=8192)
+    specs = segment.get_static_input_specs(bucket_size=4)
+    static_inputs = {
+        name: torch.empty(spec.resolve_shape(4), dtype=spec.dtype, device="cpu")
+        for name, spec in specs.items()
+    }
+    segment.set_capture_inputs(
+        input_ids=torch.tensor([[7]], dtype=torch.int64),
+        cache_seqlens=torch.tensor([128], dtype=torch.int32),
+        position_ids=torch.tensor([[127]], dtype=torch.int64),
+        primary_slot_indices=torch.tensor([3], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([4], dtype=torch.int32),
+        rank_token_counts=torch.tensor([1, 2] + [0] * 14, dtype=torch.int64),
+    )
+
+    segment.initialize_static_inputs(static_inputs, bucket_size=4)
+
+    assert static_inputs["input_ids"].tolist() == [[7], [0], [0], [0]]
+    assert static_inputs["cache_seqlens"].tolist() == [128, 8192, 8192, 8192]
+    assert static_inputs["position_ids"].tolist() == [[127], [0], [0], [0]]
+    assert static_inputs["primary_slot_indices"].tolist() == [3, -1, -1, -1]
+    assert static_inputs["aux_slot_indices"].tolist() == [4, -1, -1, -1]
+    assert static_inputs["rank_token_counts"].tolist() == [1, 2] + [0] * 14
+    assert segment._capture_dsa_short_count == 1
+
+
+def test_glm5_whole_model_segment_rejects_capture_input_larger_than_bucket():
+    segment = _make_segment(max_bucket_size=4)
+    specs = segment.get_static_input_specs(bucket_size=2)
+    static_inputs = {
+        name: torch.empty(spec.resolve_shape(2), dtype=spec.dtype, device="cpu")
+        for name, spec in specs.items()
+    }
+    segment.set_capture_inputs(
+        input_ids=torch.tensor([[7], [8], [9]], dtype=torch.int64),
+        cache_seqlens=torch.tensor([128, 129, 130], dtype=torch.int32),
+        position_ids=torch.tensor([[127], [128], [129]], dtype=torch.int64),
+        primary_slot_indices=torch.tensor([3, 4, 5], dtype=torch.int32),
+        aux_slot_indices=torch.tensor([3, 4, 5], dtype=torch.int32),
+        rank_token_counts=torch.tensor([3] + [0] * 15, dtype=torch.int64),
+    )
+
+    with pytest.raises(ValueError, match="batch dim 3 exceeds"):
+        segment.initialize_static_inputs(static_inputs, bucket_size=2)
 
 
 def test_glm5_whole_model_segment_uses_moe_bucket_resizer(monkeypatch):
@@ -222,3 +273,116 @@ def test_glm5_whole_model_compare_reports_shape_mismatch():
     assert not result["shape_match"]
     assert result["eager_shape"] == (2, 3)
     assert result["graph_shape"] == (2, 4)
+
+
+class _IdentityModule(torch.nn.Module):
+    def forward(self, x):
+        return x
+
+
+class _FakePostNorm:
+    weight = torch.ones(4, dtype=torch.bfloat16)
+    eps = 1e-5
+
+
+class _FakeLayerForGraph:
+    layer_idx = 7
+    hidden_size = 4
+    input_layernorm = _IdentityModule()
+    post_attention_layernorm = _FakePostNorm()
+    mlp = _IdentityModule()
+
+
+class _FakeDsaSegment:
+    max_seqlen = 16
+    index_topk = 8
+    primary_blocked_k = torch.empty(1, 1, 1, 6)
+    aux_blocked_k = torch.empty(1, 1, 1, 3)
+
+    def __init__(self):
+        self.setup_calls = []
+        self.init_calls = []
+        self.release_calls = []
+
+    def _flashmla_tensor_metadata_specs(self, bucket_size):
+        return (bucket_size, 2), torch.int32, (1,), torch.int32
+
+    def setup_static_buffers(self, bucket_size):
+        self.setup_calls.append(bucket_size)
+
+    def initialize_static_inputs(self, static_inputs, bucket_size):
+        self.init_calls.append(bucket_size)
+        static_inputs["num_valid_tokens"].fill_(1)
+
+    def release_static_buffers(self, bucket_size):
+        self.release_calls.append(bucket_size)
+
+
+def test_glm5_layer_graph_segment_static_contract_and_delegation():
+    dsa = _FakeDsaSegment()
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=dsa,
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+    )
+
+    assert make_glm5_layer_graph_segment_name(7) == "glm5_layer_7_full_layer"
+
+    inputs = segment.get_static_input_specs(bucket_size=2)
+    assert inputs["hidden_states"].resolve_shape(2) == (2, 1, 4)
+    assert inputs["primary_slot_indices"].fill_value == -1
+    assert inputs["aux_slot_indices"].fill_value == -1
+    assert inputs["rank_token_counts"].resolve_shape(2) == (16,)
+    assert inputs["flashmla_tile_scheduler_metadata"].resolve_shape(2) == (2, 2)
+
+    outputs = segment.get_static_output_specs(bucket_size=2)
+    assert outputs["hidden_states"].resolve_shape(2) == (2, 1, 4)
+    assert outputs["primary_k_tensor"].resolve_shape(2) == (2, 1, 1, 6)
+    assert outputs["indexer_k_tensor"].resolve_shape(2) == (2, 1, 1, 3)
+
+    static_inputs = {
+        name: torch.full(
+            spec.resolve_shape(2),
+            spec.fill_value,
+            dtype=spec.dtype,
+        )
+        for name, spec in inputs.items()
+    }
+    segment.setup_static_buffers(bucket_size=2)
+    segment.initialize_static_inputs(static_inputs, bucket_size=2)
+    segment.release_static_buffers(bucket_size=2)
+
+    assert dsa.setup_calls == [2]
+    assert dsa.init_calls == [2]
+    assert dsa.release_calls == [2]
+    assert static_inputs["rank_token_counts"].tolist() == [1] * 16
+
+
+def test_glm5_layer_graph_segment_empty_rank_capture_context():
+    dsa = _FakeDsaSegment()
+    rank_counts = torch.tensor([1, 1, 0, 0] + [0] * 12, dtype=torch.int64)
+    segment = Glm5DecoderLayerGraphSegment(
+        layer=_FakeLayerForGraph(),
+        dsa_segment=dsa,
+        moe_segment=None,
+        device=torch.device("cpu"),
+        world_size=16,
+        capture_local_bsz=0,
+        capture_rank_token_counts=rank_counts,
+    )
+    inputs = segment.get_static_input_specs(bucket_size=2)
+    static_inputs = {
+        name: torch.full(
+            spec.resolve_shape(2),
+            spec.fill_value,
+            dtype=spec.dtype,
+        )
+        for name, spec in inputs.items()
+    }
+
+    segment.initialize_static_inputs(static_inputs, bucket_size=2)
+
+    assert static_inputs["num_valid_tokens"].item() == 0
+    assert static_inputs["rank_token_counts"].tolist() == rank_counts.tolist()

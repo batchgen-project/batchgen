@@ -125,6 +125,57 @@ def router_bias_cast_cuda(logits, bias, output):
     _get_ext().router_bias_cast(logits, bias, output)
 
 
+def glm5_router_gemm_cuda(
+    hidden_states,
+    router_weight,
+    router_logits=None,
+    rank_token_counts=None,
+    bucket_size=0,
+    world_size=1,
+):
+    """GLM-5 graph-safe router GEMM.
+
+    Computes ``hidden_states @ router_weight.T`` into FP32 logits from BF16
+    inputs. If ``rank_token_counts`` is provided, rows are interpreted as
+    rank-major ``[world_size, bucket_size]`` and invalid padding rows are
+    zeroed inside the CUDA kernel using device-side counts.
+    """
+    ext = _get_ext()
+    if hidden_states.dtype != torch.bfloat16:
+        hidden_states = hidden_states.to(torch.bfloat16)
+    if router_weight.dtype != torch.bfloat16:
+        router_weight = router_weight.to(torch.bfloat16)
+    if not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
+    if not router_weight.is_contiguous():
+        router_weight = router_weight.contiguous()
+
+    N = hidden_states.shape[0]
+    E = router_weight.shape[0]
+    device = hidden_states.device
+    if router_logits is None:
+        router_logits = torch.empty(N, E, dtype=torch.float32, device=device)
+    elif not router_logits.is_contiguous():
+        raise ValueError("router_logits must be contiguous")
+
+    if rank_token_counts is None:
+        rank_token_counts = torch.empty(0, dtype=torch.int64, device=device)
+    else:
+        if rank_token_counts.dtype != torch.int64:
+            rank_token_counts = rank_token_counts.to(torch.int64)
+        if not rank_token_counts.is_contiguous():
+            rank_token_counts = rank_token_counts.contiguous()
+
+    return ext.glm5_router_gemm(
+        hidden_states,
+        router_weight,
+        rank_token_counts,
+        router_logits,
+        int(bucket_size),
+        int(world_size),
+    )
+
+
 def dispatch_count_gather_cuda(
     x, topk_indices,
     expert_start, num_local_experts,

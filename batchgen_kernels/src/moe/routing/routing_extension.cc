@@ -45,6 +45,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bias"),
           py::arg("output"));
 
+    m.def("glm5_router_gemm", &glm5_router_gemm_cuda,
+          "GLM-5 router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits (CUDA)",
+          py::arg("hidden_states"),
+          py::arg("router_weight"),
+          py::arg("rank_token_counts"),
+          py::arg("output"),
+          py::arg("bucket_size"),
+          py::arg("world_size"));
+
     m.def("create_fused_gate_context", &create_fused_gate_context,
           "Create cached fused gate context (SM90a WGMMA)",
           py::arg("router_weight"),

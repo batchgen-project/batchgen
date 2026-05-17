@@ -69,6 +69,7 @@ _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
 _GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
+_GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
 
 
 def _debug_flag_enabled(value) -> bool:
@@ -82,6 +83,11 @@ def _debug_flag_enabled(value) -> bool:
 
 
 def _glm5_moe_cuda_graph_required() -> bool:
+    mode = _glm5_moe_debug_mode()
+    if mode == "eager":
+        return False
+    if mode == "graph":
+        return True
     return os.environ.get(_GLM5_MOE_CUDA_GRAPH_ENV, "0") == "1"
 
 
@@ -94,7 +100,50 @@ def _glm5_moe_debug_dict() -> dict:
     return debug if isinstance(debug, dict) else {}
 
 
+def _glm5_moe_debug_mode() -> Optional[str]:
+    value = _glm5_moe_debug_dict().get("glm5_moe_mode")
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    return mode if mode in {"graph", "eager"} else None
+
+
+def _glm5_moe_router_mode() -> str:
+    """Router GEMM implementation for eager GLM-5 MoE decode.
+
+    Default ``custom`` keeps graph/eager on the row-stable GLM router kernel.
+    ``cublas`` restores the historical eager router for trajectory A/B tests.
+    """
+    value = _glm5_moe_debug_dict().get("glm5_moe_router_mode")
+    if not isinstance(value, str):
+        value = os.environ.get(_GLM5_MOE_ROUTER_MODE_ENV, "")
+    mode = value.strip().lower()
+    return mode if mode in {"custom", "cublas"} else "custom"
+
+
+def _record_glm5_moe_dispatch(
+    path: str,
+    *,
+    layer_idx: int,
+    bsz: int,
+    reason: str,
+) -> None:
+    try:
+        from batchgen.models.wrappers.attention import AttnWrapperBase
+    except ImportError:
+        return
+    AttnWrapperBase.record_glm5_dispatch(
+        kind="moe",
+        path=path,
+        layer_idx=layer_idx,
+        bsz=bsz,
+        reason=reason,
+    )
+
+
 def _glm5_moe_graph_compare_active() -> bool:
+    if _glm5_moe_debug_mode() == "eager":
+        return False
     debug = _glm5_moe_debug_dict()
     return (
         _debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
@@ -1133,6 +1182,7 @@ class Glm5MoE(nn.Module):
         self._moe_cuda_graph_segment_name = None
         self._moe_cuda_graph_segment = None
         self._moe_cuda_graph_bucketing = None
+        self._moe_cuda_graph_required = False
 
     # ── Token count management (called by PSM) ──
 
@@ -1409,11 +1459,20 @@ class Glm5MoE(nn.Module):
                       'gate_scale_ptrs_ptr', 'up_scale_ptrs_ptr', 'down_scale_ptrs_ptr'):
             setattr(self, attr, None)
 
-    def enable_moe_cuda_graph(self, manager, segment_name: str, segment, bucketing) -> None:
+    def enable_moe_cuda_graph(
+        self,
+        manager,
+        segment_name: str,
+        segment,
+        bucketing,
+        *,
+        graph_output_required: bool = False,
+    ) -> None:
         self._moe_cuda_graph_manager = manager
         self._moe_cuda_graph_segment_name = segment_name
         self._moe_cuda_graph_segment = segment
         self._moe_cuda_graph_bucketing = bucketing
+        self._moe_cuda_graph_required = graph_output_required
 
     # ── Forward ──
 
@@ -1430,9 +1489,28 @@ class Glm5MoE(nn.Module):
         # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
-            compare = _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
-            graph_required = _glm5_moe_cuda_graph_required()
+            debug_mode = _glm5_moe_debug_mode()
+            compare = (
+                False if debug_mode == "eager"
+                else _glm5_moe_graph_compare_layer_enabled(self.layer_idx)
+            )
+            graph_required = (
+                debug_mode == "graph"
+                or (
+                    debug_mode != "eager"
+                    and (
+                        _glm5_moe_cuda_graph_required()
+                        or getattr(self, "_moe_cuda_graph_required", False)
+                    )
+                )
+            )
             if compare:
+                _record_glm5_moe_dispatch(
+                    "eager",
+                    layer_idx=self.layer_idx,
+                    bsz=hidden_states.shape[0],
+                    reason="graph compare returns eager output",
+                )
                 return self._forward_decode_3d_graph_compare(hidden_states)
             if graph_required:
                 if self._moe_cuda_graph_exceeds_max_bucket():
@@ -1445,10 +1523,38 @@ class Glm5MoE(nn.Module):
                             self.num_tokens_per_rank,
                         )
                         self._moe_cuda_graph_over_bucket_warned = True
+                    _record_glm5_moe_dispatch(
+                        "eager",
+                        layer_idx=self.layer_idx,
+                        bsz=hidden_states.shape[0],
+                        reason="graph requested but rank bucket exceeded",
+                    )
                     return self._forward_decode_3d(hidden_states)
+                _record_glm5_moe_dispatch(
+                    "graph",
+                    layer_idx=self.layer_idx,
+                    bsz=hidden_states.shape[0],
+                    reason="full-module graph replay",
+                )
                 return self._forward_decode_3d_graph(hidden_states)
+            if debug_mode == "eager":
+                reason = "debug mode requested eager"
+            else:
+                reason = "graph not requested"
+            _record_glm5_moe_dispatch(
+                "eager",
+                layer_idx=self.layer_idx,
+                bsz=hidden_states.shape[0],
+                reason=reason,
+            )
             return self._forward_decode_3d(hidden_states)
 
+        _record_glm5_moe_dispatch(
+            "eager",
+            layer_idx=self.layer_idx,
+            bsz=hidden_states.shape[0],
+            reason="3d MoE graph path unavailable",
+        )
         import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
@@ -1554,11 +1660,8 @@ class Glm5MoE(nn.Module):
                 f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
             )
 
-        import torch.distributed as dist
-
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        identity = hidden_flat
         num_tokens, _ = hidden_flat.shape
         ntp = self.num_tokens_per_rank
         if ntp is None or ntp <= 0:
@@ -1595,21 +1698,16 @@ class Glm5MoE(nn.Module):
             padded=padded,
             rank_token_counts=rank_counts,
         )
-        routed_global = graph_out["routed_global_output"]
-
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                routed_global,
-                op=dist.ReduceOp.SUM,
-                stream=torch.cuda.current_stream(self.device),
+        moe_output = graph_out.get("moe_output")
+        if moe_output is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 MoE graph replay did not return "
+                "full-module 'moe_output'"
             )
 
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * bucket
-        routed_local = routed_global[start:start + num_tokens].to(hidden_flat.dtype)
-        out = routed_local + self.shared_expert_forward(identity)
-        return out.view(*orig_shape)
+        return moe_output[:num_tokens].to(hidden_flat.dtype).view(*orig_shape)
 
     @torch.inference_mode()
     def _forward_decode_3d_graph_compare(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1628,7 +1726,8 @@ class Glm5MoE(nn.Module):
         atol = float(os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL", "1e-2"))
         ok = max_abs <= atol
         logging.info(
-            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d] %s max_abs=%.6g mean_abs=%.6g "
+            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d][boundary=full_module] "
+            "%s max_abs=%.6g mean_abs=%.6g "
             "shape=%s ntp=%s",
             self.layer_idx,
             self.rank,
@@ -1830,12 +1929,19 @@ class Glm5MoE(nn.Module):
         Single CUDA launch for sigmoid + e_score_correction bias + top-k +
         normalize + scale. Replaces the 6-op PyTorch eager path
         (F.linear → sigmoid → +bias → topk → gather → /sum → ×scale) with
-        one kernel. Router matmul is kept FP32 to match HF reference
-        (routing precision re-orders top-K for scores within ~1% of each
-        other, compounding across 75 MoE layers).
+        one kernel after a graph-stable BF16 router GEMM. The router GEMM uses
+        a fixed per-row accumulation order so valid rows do not drift when CUDA
+        graph buckets include rank padding.
         """
         from batchgen.moe.routing import gate_sigmoid_topk_cuda
-        router_logits = F.linear(x.float(), self.gate.weight.float())
+        if _glm5_moe_router_mode() == "cublas":
+            router_logits = F.linear(x.float(), self.gate.weight.float())
+        else:
+            from batchgen.moe.routing import glm5_router_gemm_cuda
+            router_logits = glm5_router_gemm_cuda(
+                x,
+                self.gate.weight,
+            )
         return gate_sigmoid_topk_cuda(
             router_logits,
             self.gate.e_score_correction_bias.float(),

@@ -128,6 +128,8 @@ class GPUPagedKVConfig:
 	num_v_heads: Optional[int]
 	v_head_dim: Optional[int]
 	kv_dtype: torch.dtype
+	cuda_graph_max_pages_per_sequence: Optional[int] = None
+	cuda_graph_max_slots: Optional[int] = None
 	logical_to_physical_layer: Optional[Sequence[int]] = None
 
 	@classmethod
@@ -1603,6 +1605,11 @@ class GPUPagedKVCacheManager:
 		)
 		if env_value is not None:
 			return min(env_value, self.config.num_pages)
+		config_value = _positive_or_none(
+			getattr(self.config, "cuda_graph_max_slots", None)
+		)
+		if config_value is not None:
+			return min(config_value, self.config.num_pages)
 
 		candidates: List[int] = []
 		if self._engine_config is not None:
@@ -1628,6 +1635,11 @@ class GPUPagedKVCacheManager:
 		)
 		if env_value is not None:
 			return min(env_value, self.config.num_pages)
+		config_value = _positive_or_none(
+			getattr(self.config, "cuda_graph_max_pages_per_sequence", None)
+		)
+		if config_value is not None:
+			return min(config_value, self.config.num_pages)
 
 		token_capacity = DEFAULT_INITIAL_TOKEN_CAPACITY
 		if self._engine_config is not None:

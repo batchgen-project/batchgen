@@ -8,11 +8,10 @@ To help make your contributions as smooth as possible, we've put together this g
 
 ## Table of Contents
 
-- [Contributing to BatchGen](#contributing-to-BatchGen)
+- [Contributing to BatchGen](#contributing-to-batchgen)
   - [Table of Contents](#table-of-contents)
-  - [Community](#community)
-  - [Code of Conduct](#code-of-conduct)
   - [How to Contribute](#how-to-contribute)
+    - [Merge Policy](#merge-policy)
     - [Roadmap and Tasks](#roadmap-and-tasks)
     - [Development Environment](#development-environment)
     - [Commit Message Guidelines](#commit-message-guidelines)
@@ -21,15 +20,35 @@ To help make your contributions as smooth as possible, we've put together this g
 
 ## How to Contribute
 
-- Check the [public development board](https://github.com/orgs/BatchGen/projects/2) for tasks (i.e., items with the status `Ready 🟢`) or [issue tracker](https://github.com/BatchGen/BatchGen/issues) for open issues. You can also create a new one to discuss your idea.
+- Check the [issue tracker](https://github.com/batchgen-project/batchgen/issues) for open issues, or open a new one to discuss your idea.
 - Follow the [Fork-and-Pull-Request](https://docs.github.com/en/get-started/quickstart/contributing-to-projects) workflow when opening your pull requests.
 - Ensure your code follows our style guidelines and passes all tests (see [Development Environment](#development-environment)).
 - Submit a pull request with a clear description of your changes.
   - The pull request title should follow the [Commit Message Guidelines](#commit-message-guidelines).
-  - The description should follow the [Pull Request Template](https://github.com/BatchGen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
+  - The description should follow the [Pull Request Template](https://github.com/batchgen-project/batchgen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
   - Make sure to mention any related issues.
 
 Before your pull request can be merged, it must pass the formatting, linting, and testing checks (see [Development Environment](#development-environment)).
+
+### Merge Policy
+
+To keep the `main` branch coherent and reviewed, only the project owner
+presses the **Merge** button on pull requests. Contributors with `Write`
+access — including members of the `batchgen-core` team — should:
+
+- Open pull requests targeting `main`.
+- Push commits to feature branches and PR branches as needed.
+- Review pull requests, leave comments, formally Approve / Request changes.
+- **Not press the Merge button** on any PR, including their own. Wait for
+  the owner to merge after approval.
+
+The owner is the only person whose merge lands on `main`. Pull requests
+must have at least one approving review (from a Code Owner where
+applicable, per `.github/CODEOWNERS`) and a green CI status before the
+owner merges. Direct pushes to `main` are reserved for the owner only.
+
+This policy is currently enforced socially. When the repository becomes
+public it will be enforced by GitHub branch protection.
 
 If you fix a bug:
 - Add a relevant unit test when possible. These can be found in the `test` directory.
@@ -42,8 +61,7 @@ If you add a feature:
 
 ### Roadmap and Tasks
 
-You can find available tasks (i.e., `status=Ready 🟢`) and contribute to planned features by checking our [public development board](https://github.com/orgs/BatchGen/projects/2).
-For beginners, we recommend starting with issues labeled `good first issue` or `help wanted`.
+For beginners, we recommend starting with issues labeled `good first issue` or `help wanted` in the [issue tracker](https://github.com/batchgen-project/batchgen/issues).
 Feel free to discuss any ideas before getting started!
 
 ### Development Environment
