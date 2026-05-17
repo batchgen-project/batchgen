@@ -9,8 +9,9 @@ component layout.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
+from batchgen.kv_cache.coordinator_utils import TokenCapacityFn
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
 
@@ -21,8 +22,6 @@ COMPRESSOR_C128 = "compressor_c128"
 INDEXER_C4 = "indexer_c4"
 
 _SUPPORTED_COMPRESS_RATIOS = {0, 4, 128}
-
-TokenCapacityFn = Callable[[int], int]
 
 
 @dataclass(frozen=True)

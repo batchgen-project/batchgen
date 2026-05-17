@@ -3,15 +3,10 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 
-from batchgen.kv_cache.coordinator_utils import resolve_from_layer_mapping
-
-
-LayerMapping = Mapping[int, int] | Sequence[int]
-TokenCapacityFn = Callable[[int], int]
+from batchgen.kv_cache.coordinator_utils import HostKVComponent
 logger = logging.getLogger(__name__)
 
 
@@ -55,80 +50,6 @@ def wait_kv_tasks(tasks: Mapping[str, Any], *, context: str = "host KV task") ->
 				context,
 				component_name,
 			)
-
-
-@dataclass
-class HostKVComponent:
-	"""One named host KV component.
-
-	The component keeps only metadata needed to route from a model's logical
-	layer id to the compact physical layer stored by its backing view.
-	"""
-
-	name: str
-	view: Any
-	logical_to_physical_layer: Optional[LayerMapping] = None
-	token_capacity_scale: float = 1.0
-	token_capacity_fn: Optional[TokenCapacityFn] = None
-
-	def __post_init__(self) -> None:
-		if not self.name:
-			raise ValueError("HostKVComponent.name must be non-empty")
-		if self.view is None:
-			raise ValueError(f"HostKVComponent({self.name}): view must be set")
-		if self.token_capacity_scale <= 0:
-			raise ValueError(
-				f"HostKVComponent({self.name}): token_capacity_scale must be > 0"
-			)
-
-	def token_capacity(self, num_tokens: int) -> int:
-		if num_tokens <= 0:
-			raise ValueError(
-				f"HostKVComponent({self.name}): num_tokens must be > 0, got {num_tokens}"
-			)
-		if self.token_capacity_fn is not None:
-			capacity = int(self.token_capacity_fn(int(num_tokens)))
-		else:
-			capacity = int(math.ceil(int(num_tokens) * self.token_capacity_scale))
-		if capacity <= 0:
-			raise ValueError(
-				f"HostKVComponent({self.name}): token capacity must be > 0, got {capacity}"
-			)
-		return capacity
-
-	def resolve_physical_layer(self, logical_layer_id: int) -> int:
-		if logical_layer_id < 0:
-			raise IndexError(
-				f"HostKVComponent({self.name}): logical layer id must be >= 0"
-			)
-		if self.logical_to_physical_layer is not None:
-			return resolve_from_layer_mapping(
-				"Host KV", self.name, self.logical_to_physical_layer, logical_layer_id
-			)
-		resolver = getattr(self.view, "resolve_physical_layer", None)
-		if resolver is not None:
-			return int(resolver(logical_layer_id))
-		return int(logical_layer_id)
-
-	def view_layer_id(self, logical_layer_id: int) -> int:
-		"""Layer id that should be passed to this backing view.
-
-		If the C++ view already owns logical-layer mapping, keep passing the
-		logical id into the view. If the mapping is owned by this Python
-		component, pass the resolved compact physical layer id.
-		"""
-
-		if self.logical_to_physical_layer is None:
-			return int(logical_layer_id)
-		return self.resolve_physical_layer(logical_layer_id)
-
-	def map_sequence_tokens(
-		self, seq_token_pairs: Iterable[tuple[int, int]]
-	) -> list[tuple[int, int]]:
-		return [
-			(int(seq_id), self.token_capacity(int(num_tokens)))
-			for seq_id, num_tokens in seq_token_pairs
-		]
 
 
 class HostKVCoordinator:
