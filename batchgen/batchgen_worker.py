@@ -9834,15 +9834,39 @@ class BatchGenWorker:
 				f"{captured_max_seqlen} is below current decode max_seqlen "
 				f"{current_max_seqlen}; recapturing with current page-table capacity"
 			)
-			self._cuda_graph_manager = None
-			self._whole_model_segment = None
-			self._whole_model_bucketing = None
-			self._whole_model_graph = False
-			self._glm5_whole_model_graph = False
-			self._glm5_whole_model_graph_signature = None
+			self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
 			return True
 		signature = self._glm5_whole_model_graph_capture_signature(bucket)
 		return signature != getattr(self, "_glm5_whole_model_graph_signature", None)
+
+	def _release_glm5_whole_model_graph_state(self, *, empty_cuda_cache: bool = False) -> None:
+		manager = getattr(self, "_cuda_graph_manager", None)
+		segment = getattr(self, "_whole_model_segment", None)
+		device = getattr(self, "torch_device", None)
+		if torch.cuda.is_available() and getattr(device, "type", None) == "cuda":
+			torch.cuda.synchronize(device)
+		drop_bucket = getattr(manager, "drop_bucket", None)
+		bucketing = getattr(manager, "bucketing", None)
+		if drop_bucket is not None and bucketing is not None:
+			for bucket in list(getattr(bucketing, "bucket_sizes", []) or []):
+				drop_bucket(int(bucket))
+		elif segment is not None:
+			release = getattr(segment, "release_static_buffers", None)
+			if release is not None:
+				bucket_sizes = list(getattr(getattr(self, "_whole_model_bucketing", None), "bucket_sizes", []) or [])
+				for bucket in bucket_sizes:
+					release(int(bucket))
+		self._cuda_graph_manager = None
+		self._whole_model_segment = None
+		self._whole_model_bucketing = None
+		self._whole_model_graph = False
+		self._glm5_whole_model_graph = False
+		self._glm5_whole_model_graph_signature = None
+		manager = None
+		segment = None
+		gc.collect()
+		if empty_cuda_cache and torch.cuda.is_available():
+			torch.cuda.empty_cache()
 
 	def _glm5_whole_graph_path_state(self, max_rank_bsz: int):
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
@@ -10621,6 +10645,13 @@ class BatchGenWorker:
 					raise RuntimeError(reason)
 				logging.warning("%s Using eager decode without whole-model graph compare.", reason)
 				return
+
+			if getattr(self, "_glm5_whole_model_graph", False) or getattr(self, "_whole_model_segment", None) is not None:
+				logging.info(
+					f"Rank {self.rank}: releasing previous GLM-5 whole-model CUDA graph "
+					f"before recapturing bucket BS={capture_bucket}"
+				)
+				self._release_glm5_whole_model_graph_state(empty_cuda_cache=True)
 
 			manager = CUDAGraphManager(bucketing, device=self.torch_device)
 			moe_layers = [

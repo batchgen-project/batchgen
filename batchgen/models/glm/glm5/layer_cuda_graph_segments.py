@@ -146,6 +146,10 @@ class Glm5DecoderLayerGraphSegment:
         release = getattr(self.dsa_segment, "release_static_buffers", None)
         if release is not None:
             release(bucket_size)
+        if self.moe_segment is not None:
+            release = getattr(self.moe_segment, "release_static_buffers", None)
+            if release is not None:
+                release(bucket_size)
 
     def forward(
         self,
