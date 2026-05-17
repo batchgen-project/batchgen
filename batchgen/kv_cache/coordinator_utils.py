@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,6 +65,9 @@ class KVComponent:
 			logical_layer_id,
 		)
 
+	def map_token_counts(self, token_counts: Sequence[int]) -> list[int]:
+		return [self.token_capacity(int(count)) for count in token_counts]
+
 
 class HostKVComponent(KVComponent):
 	"""One named host KV component backed by a host worker view."""
@@ -102,14 +105,6 @@ class HostKVComponent(KVComponent):
 			return int(logical_layer_id)
 		return self.resolve_physical_layer(logical_layer_id)
 
-	def map_sequence_tokens(
-		self, seq_token_pairs: Iterable[tuple[int, int]]
-	) -> list[tuple[int, int]]:
-		return [
-			(int(seq_id), self.token_capacity(int(num_tokens)))
-			for seq_id, num_tokens in seq_token_pairs
-		]
-
 
 class GPUKVComponent(KVComponent):
 	"""One named GPU KV component backed by a paged GPU manager."""
@@ -134,9 +129,6 @@ class GPUKVComponent(KVComponent):
 	@property
 	def manager(self) -> Any:
 		return self.storage
-
-	def map_token_counts(self, token_counts: Sequence[int]) -> list[int]:
-		return [self.token_capacity(int(count)) for count in token_counts]
 
 
 def resolve_from_layer_mapping(

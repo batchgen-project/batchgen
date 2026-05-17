@@ -146,9 +146,7 @@ def test_host_kv_coordinator_is_a_lightweight_registry():
 	assert coordinator.get_view("compressor_c4") is c4
 	assert coordinator.resolve_physical_layer("compressor_c4", 4) == 1
 	assert coordinator.view_layer_id("compressor_c4", 4) == 1
-	assert coordinator.map_sequence_tokens(
-		"compressor_c4", [(101, 9), (102, 16)]
-	) == [(101, 3), (102, 4)]
+	assert coordinator.map_token_counts("compressor_c4", [9, 16]) == [3, 4]
 
 	with pytest.raises(KeyError):
 		coordinator.resolve_physical_layer("compressor_c4", 3)
@@ -339,13 +337,9 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C4, 4) == 1
 	assert coordinator.resolve_physical_layer(COMPRESSOR_C128, 3) == 1
 	assert coordinator.resolve_physical_layer(INDEXER_C4, 2) == 0
-	assert coordinator.map_sequence_tokens(
-		COMPRESSOR_C4, [(101, 65), (102, 128)]
-	) == [(101, 17), (102, 32)]
-	assert coordinator.map_sequence_tokens(COMPRESSOR_C128, [(101, 257)]) == [
-		(101, 3)
-	]
-	assert coordinator.map_sequence_tokens(SWA, [(101, 4096)]) == [(101, 128)]
+	assert coordinator.map_token_counts(COMPRESSOR_C4, [65, 128]) == [17, 32]
+	assert coordinator.map_token_counts(COMPRESSOR_C128, [257]) == [3]
+	assert coordinator.map_token_counts(SWA, [4096]) == [128]
 
 	with pytest.raises(KeyError):
 		coordinator.resolve_physical_layer(COMPRESSOR_C4, 3)

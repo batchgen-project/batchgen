@@ -116,10 +116,10 @@ class HostKVCoordinator:
 	def view_layer_id(self, component_name: str, logical_layer_id: int) -> int:
 		return self.get_component(component_name).view_layer_id(logical_layer_id)
 
-	def map_sequence_tokens(
-		self, component_name: str, seq_token_pairs: Iterable[tuple[int, int]]
-	) -> list[tuple[int, int]]:
-		return self.get_component(component_name).map_sequence_tokens(seq_token_pairs)
+	def map_token_counts(
+		self, component_name: str, token_counts: Iterable[int]
+	) -> list[int]:
+		return self.get_component(component_name).map_token_counts(list(token_counts))
 
 	def call_all(self, method_name: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
 		"""Call the same method on every backing view."""
@@ -176,21 +176,22 @@ class HostKVCoordinator:
 			(int(sequence_id), int(num_tokens))
 			for sequence_id, num_tokens in list(seq_token_pairs)
 		]
+		sequence_ids = [seq_id for seq_id, _ in pairs]
+		token_counts = [num_tokens for _, num_tokens in pairs]
 		if component_name is not None:
 			component = self._component_or_default(
 				component_name, "allocate_pages_for_sequences"
 			)
 			return component.view.allocate_pages_for_sequences(
-				component.map_sequence_tokens(pairs)
+				list(zip(sequence_ids, component.map_token_counts(token_counts)))
 			)
 
-		sequence_ids = [seq_id for seq_id, _ in pairs]
 		results: dict[str, Any] = {}
 		allocated: list[HostKVComponent] = []
 		try:
 			for component in self.components():
 				results[component.name] = component.view.allocate_pages_for_sequences(
-					component.map_sequence_tokens(pairs)
+					list(zip(sequence_ids, component.map_token_counts(token_counts)))
 				)
 				allocated.append(component)
 		except Exception:
