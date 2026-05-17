@@ -288,6 +288,7 @@ class Glm5DsaAttnSegment:
             ),
             "primary_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
             "aux_slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
             "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
         }
@@ -462,6 +463,7 @@ class Glm5DsaAttnSegment:
         positions_expanded: torch.Tensor,
         primary_slot_indices: torch.Tensor,
         aux_slot_indices: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
         flashmla_tile_scheduler_metadata: torch.Tensor,
         flashmla_num_splits: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -499,6 +501,7 @@ class Glm5DsaAttnSegment:
             topk=self.index_topk,
             page_size=self.aux_page_size,
             max_seqlen=self.max_seqlen,
+            num_valid_tokens=num_valid_tokens,
         )
         select_mla_kv_for_flashmla_bf16_out(
             self.primary_blocked_k,
@@ -830,12 +833,18 @@ class Glm5FullDsaAttnSegment:
         bucket_size: int,
     ) -> None:
         static_inputs["hidden_states"].zero_()
-        static_inputs["position_ids"].fill_(self.max_seqlen - 1)
-        static_inputs["cache_seqlens"].fill_(self.max_seqlen)
+        static_inputs["position_ids"].zero_()
+        static_inputs["cache_seqlens"].zero_()
         static_inputs["primary_slot_indices"].fill_(-1)
         static_inputs["aux_slot_indices"].fill_(-1)
-        static_inputs["num_valid_tokens"].zero_()
-        selected_lengths = torch.zeros(
+        # FlashMLA can illegal-access during graph capture with an all-zero
+        # selected-length schedule. Capture one safe dummy row; replay overwrites
+        # this scalar with the real local batch size before graph launch.
+        static_inputs["num_valid_tokens"].fill_(1)
+        static_inputs["cache_seqlens"][:1].fill_(1)
+        static_inputs["primary_slot_indices"][:1].fill_(0)
+        static_inputs["aux_slot_indices"][:1].fill_(0)
+        selected_lengths = torch.ones(
             (bucket_size,),
             dtype=torch.int32,
             device=self.primary_blocked_k.device,

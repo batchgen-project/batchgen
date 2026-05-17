@@ -1534,7 +1534,7 @@ class Glm5MoE(nn.Module):
                     "graph",
                     layer_idx=self.layer_idx,
                     bsz=hidden_states.shape[0],
-                    reason="graph replay",
+                    reason="full-module graph replay",
                 )
                 return self._forward_decode_3d_graph(hidden_states)
             if debug_mode == "eager":
@@ -1660,11 +1660,8 @@ class Glm5MoE(nn.Module):
                 f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
             )
 
-        import torch.distributed as dist
-
         orig_shape = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        identity = hidden_flat
         num_tokens, _ = hidden_flat.shape
         ntp = self.num_tokens_per_rank
         if ntp is None or ntp <= 0:
@@ -1701,21 +1698,16 @@ class Glm5MoE(nn.Module):
             padded=padded,
             rank_token_counts=rank_counts,
         )
-        routed_global = graph_out["routed_global_output"]
-
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                routed_global,
-                op=dist.ReduceOp.SUM,
-                stream=torch.cuda.current_stream(self.device),
+        moe_output = graph_out.get("moe_output")
+        if moe_output is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 MoE graph replay did not return "
+                "full-module 'moe_output'"
             )
 
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * bucket
-        routed_local = routed_global[start:start + num_tokens].to(hidden_flat.dtype)
-        out = routed_local + self.shared_expert_forward(identity)
-        return out.view(*orig_shape)
+        return moe_output[:num_tokens].to(hidden_flat.dtype).view(*orig_shape)
 
     @torch.inference_mode()
     def _forward_decode_3d_graph_compare(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1734,7 +1726,8 @@ class Glm5MoE(nn.Module):
         atol = float(os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE_ATOL", "1e-2"))
         ok = max_abs <= atol
         logging.info(
-            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d] %s max_abs=%.6g mean_abs=%.6g "
+            "[GLM5_MOE_GRAPH_COMPARE][L%d][rank=%d][boundary=full_module] "
+            "%s max_abs=%.6g mean_abs=%.6g "
             "shape=%s ntp=%s",
             self.layer_idx,
             self.rank,
