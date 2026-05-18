@@ -174,6 +174,7 @@ class SWAHostPagedKVWorkerView {
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             auto& state = sequence_states_[sequence_ids[i]];
             state.window_start_page = windows[i].window_start_page;
+            state.active_pages = windows[i].required_pages;
             state.max_seen_raw_pos = raw_num_tokens[i] - 1;
             state.has_tokens = true;
         }
@@ -321,6 +322,7 @@ class SWAHostPagedKVWorkerView {
    private:
     struct SWASequenceState {
         std::size_t window_start_page = 0;
+        std::size_t active_pages = 0;
         std::size_t max_seen_raw_pos = 0;
         bool has_tokens = false;
     };
@@ -420,12 +422,22 @@ class SWAHostPagedKVWorkerView {
             window.window_start_page > state.window_start_page) {
             const std::size_t pages_to_release =
                 window.window_start_page - state.window_start_page;
+            if (pages_to_release > state.active_pages) {
+                std::ostringstream oss;
+                oss << "SWAHostPagedKVWorkerView: sequence " << sequence_id
+                    << " cannot release " << pages_to_release
+                    << " pages with only " << state.active_pages
+                    << " active pages";
+                throw std::out_of_range(oss.str());
+            }
             DrainPendingHostWritesLocked();
             base_view_.ReleaseSequencePrefixPages(sequence_id,
                                                   pages_to_release);
+            state.active_pages -= pages_to_release;
         }
         state.window_start_page = window.window_start_page;
-        EnsureCapacityForActiveTokensLocked(sequence_id, window.active_tokens);
+        EnsureCapacityForActivePagesLocked(sequence_id, state,
+                                           window.required_pages);
         if (raw_end_tokens > 0) {
             state.max_seen_raw_pos =
                 std::max(state.max_seen_raw_pos, raw_end_tokens - 1);
@@ -434,13 +446,12 @@ class SWAHostPagedKVWorkerView {
         return window.active_tokens;
     }
 
-    void EnsureCapacityForActiveTokensLocked(std::int64_t sequence_id,
-                                             std::size_t active_tokens) {
-        if (active_tokens == 0) {
+    void EnsureCapacityForActivePagesLocked(std::int64_t sequence_id,
+                                            SWASequenceState& state,
+                                            std::size_t required_pages) {
+        if (required_pages == 0) {
             return;
         }
-        const std::size_t required_pages =
-            (active_tokens + page_size_tokens_ - 1) / page_size_tokens_;
         if (required_pages > window_pages_ + 1) {
             std::ostringstream oss;
             oss << "SWAHostPagedKVWorkerView: sequence " << sequence_id
@@ -449,12 +460,12 @@ class SWAHostPagedKVWorkerView {
                 << (window_pages_ + 1) << ")";
             throw std::out_of_range(oss.str());
         }
-        const auto table = base_view_.BuildPageTable({sequence_id});
-        const std::size_t current_pages =
-            table.empty() ? 0 : table.front().size();
-        if (current_pages < required_pages) {
+        if (state.active_pages < required_pages) {
+            const std::size_t missing_pages =
+                required_pages - state.active_pages;
             base_view_.GrowSequencePages(sequence_id,
-                                         required_pages - current_pages);
+                                         missing_pages);
+            state.active_pages += missing_pages;
         }
     }
 

@@ -16,6 +16,7 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
 @dataclass
 class _SWASequenceState:
     window_start_page: int = 0
+    active_pages: int = 0
     max_seen_raw_pos: int = -1
     has_tokens: bool = False
 
@@ -65,10 +66,12 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         self.window_pages = self.window_size_tokens // self.page_size_tokens
         self._states: dict[int, _SWASequenceState] = {}
         self._last_page_table_order: Optional[list[int]] = None
+        self._page_table_dirty = False
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
         self._states.clear()
         self._last_page_table_order = None
+        self._page_table_dirty = False
         return super().destroy(empty_cuda_cache=empty_cuda_cache)
 
     def allocate_pages(self, sequence_id: int, num_tokens: int) -> list[int]:
@@ -107,8 +110,10 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         ):
             state = self._states.setdefault(seq_id, _SWASequenceState())
             state.window_start_page = window.window_start_page
+            state.active_pages = window.required_pages
             state.max_seen_raw_pos = token_count - 1
             state.has_tokens = True
+        self._page_table_dirty = True
         return allocations
 
     def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
@@ -123,19 +128,40 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
                 for seq_id in self._last_page_table_order
                 if seq_id not in freed
             ]
+        else:
+            freed = set(sequence_ids)
+            active_order = [
+                seq_id
+                for seq_id in self._gpu_page_table_manager.slot_to_seq_id
+                if seq_id not in freed
+            ]
+            if active_order != self._gpu_page_table_manager.slot_to_seq_id:
+                self._last_page_table_order = active_order
+        self._page_table_dirty = True
+        self._rebuild_last_page_table_if_dirty()
 
     def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
         self._last_page_table_order = [int(seq_id) for seq_id in sequence_ids]
-        return super().rebuild_page_table(self._last_page_table_order)
+        table = super().rebuild_page_table(self._last_page_table_order)
+        self._page_table_dirty = False
+        return table
 
     def clear_page_table(self) -> None:
         self._last_page_table_order = None
+        self._page_table_dirty = False
         return super().clear_page_table()
 
     def ensure_cuda_graph_page_table(
         self, sequence_ids: Sequence[int]
     ) -> torch.Tensor:
         self._last_page_table_order = [int(seq_id) for seq_id in sequence_ids]
+        if self._page_table_dirty:
+            if self._last_page_table_order:
+                super().rebuild_page_table(self._last_page_table_order)
+            else:
+                super().clear_page_table()
+            self._page_table_dirty = False
+            return super().get_cuda_graph_page_table()
         return super().ensure_cuda_graph_page_table(self._last_page_table_order)
 
     def get_context_kv_page_ptrs(
@@ -144,7 +170,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         active_tokens, _ = self._update_window_for_raw_end(
             int(sequence_id), int(context_length)
         )
-        self._rebuild_last_page_table_if_available()
+        self._rebuild_last_page_table_if_dirty()
         return super().get_context_kv_page_ptrs(
             int(sequence_id), int(layer_idx), active_tokens
         )
@@ -181,7 +207,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             slot_indices=resolved_slots,
             like=sequence_lengths,
         )
-        self._rebuild_last_page_table_if_available()
+        self._rebuild_last_page_table_if_dirty()
         return super().update_layer_decode_new_token(
             k_tensor=k_tensor,
             v_tensor=v_tensor,
@@ -283,11 +309,18 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             pages_to_release = (
                 window.window_start_page - state.window_start_page
             )
+            if pages_to_release > state.active_pages:
+                raise RuntimeError(
+                    f"sequence {sequence_id} cannot release {pages_to_release} "
+                    f"SWA pages with only {state.active_pages} active pages"
+                )
             self._release_sequence_prefix_pages(sequence_id, pages_to_release)
+            state.active_pages -= pages_to_release
+            self._page_table_dirty = True
 
         state.window_start_page = window.window_start_page
         added_pages = self._ensure_active_capacity(
-            sequence_id, window.active_tokens
+            sequence_id, window.required_pages, state
         )
         if raw_end_tokens > 0:
             state.max_seen_raw_pos = max(
@@ -297,26 +330,33 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         return window.active_tokens, added_pages
 
     def _ensure_active_capacity(
-        self, sequence_id: int, active_tokens: int
+        self,
+        sequence_id: int,
+        required_pages: int,
+        state: _SWASequenceState,
     ) -> int:
-        if active_tokens <= 0:
+        if required_pages <= 0:
             return 0
-        required_pages = ceil_div(active_tokens, self.page_size_tokens)
         if required_pages > self.window_pages + 1:
             raise ValueError(
                 f"sequence {sequence_id} requires {required_pages} active "
                 f"pages, exceeding window_pages + 1 ({self.window_pages + 1})"
             )
-        state = self._sequences.get(sequence_id)
-        current_pages = int(state.pages.numel()) if state is not None else 0
+        current_pages = int(state.active_pages)
+        base_state = self._sequences.get(sequence_id)
+        if current_pages == 0 and base_state is not None:
+            current_pages = int(base_state.pages.numel())
+            state.active_pages = current_pages
         missing_pages = max(0, required_pages - current_pages)
         if missing_pages:
-            if state is None:
+            if base_state is None:
                 super().allocate_pages(
                     sequence_id, missing_pages * self.page_size_tokens
                 )
             else:
                 super().grow_sequence_pages(sequence_id, missing_pages)
+            state.active_pages += missing_pages
+            self._page_table_dirty = True
         return missing_pages
 
     def _resolve_slot_indices(
@@ -402,13 +442,18 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             device=like.device,
         )
 
-    def _rebuild_last_page_table_if_available(self) -> None:
+    def _rebuild_last_page_table_if_dirty(self) -> None:
+        if not self._page_table_dirty:
+            return
         order = self._last_page_table_order
         if order is None:
             order = list(self._gpu_page_table_manager.slot_to_seq_id)
         if order:
             self._last_page_table_order = [int(seq_id) for seq_id in order]
             super().rebuild_page_table(self._last_page_table_order)
+        else:
+            super().clear_page_table()
+        self._page_table_dirty = False
 
 
 __all__ = ["SWAGPUPagedKVCacheManager"]
