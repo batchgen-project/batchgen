@@ -23,17 +23,6 @@ class _WindowForRawEnd:
 	required_pages: int
 
 
-_BLOCKED_BASE_PAGE_APIS = frozenset(
-	{
-		"grow_sequence_pages",
-		"grow_pages_for_sequences",
-		"extend_pages_for_sequence",
-		"release_sequence_prefix_pages",
-		"_release_sequence_prefix_pages",
-	}
-)
-
-
 class SWAGPUPagedKVCacheManager:
 	"""Page-level sliding-window wrapper for ``GPUPagedKVCacheManager``.
 
@@ -68,11 +57,6 @@ class SWAGPUPagedKVCacheManager:
 		self._last_page_table_order: Optional[list[int]] = None
 
 	def __getattr__(self, name: str):
-		if name in _BLOCKED_BASE_PAGE_APIS:
-			raise AttributeError(
-				f"{type(self).__name__} does not expose {name}; "
-				"SWA page growth and prefix release are managed internally"
-			)
 		return getattr(self._base, name)
 
 	@property
