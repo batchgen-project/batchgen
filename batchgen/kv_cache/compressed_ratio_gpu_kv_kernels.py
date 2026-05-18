@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _masked_paged_kv_token_update_kernel(
+    k_cache,
+    k_tokens,
+    v_cache,
+    v_tokens,
+    page_table,
+    slot_indices,
+    token_indices,
+    k_cache_stride_page: tl.constexpr,
+    k_cache_stride_token: tl.constexpr,
+    k_tokens_stride_batch: tl.constexpr,
+    v_cache_stride_page: tl.constexpr,
+    v_cache_stride_token: tl.constexpr,
+    v_tokens_stride_batch: tl.constexpr,
+    page_table_stride_slot: tl.constexpr,
+    page_table_stride_page: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    K_VEC: tl.constexpr,
+    V_VEC: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    HAS_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+
+    token_idx = tl.load(token_indices + row)
+    slot_idx = tl.load(slot_indices + row)
+    valid_row = (token_idx >= 0) & (slot_idx >= 0)
+
+    safe_token_idx = tl.maximum(token_idx, 0)
+    safe_slot_idx = tl.maximum(slot_idx, 0)
+    logical_page_idx = safe_token_idx // PAGE_SIZE
+    token_offset = safe_token_idx - logical_page_idx * PAGE_SIZE
+
+    physical_page_idx = tl.load(
+        page_table
+        + safe_slot_idx * page_table_stride_slot
+        + logical_page_idx * page_table_stride_page,
+        mask=valid_row,
+        other=-1,
+    )
+    valid_row = valid_row & (physical_page_idx >= 0)
+    safe_physical_page_idx = tl.maximum(physical_page_idx, 0)
+
+    k_offsets = tl.arange(0, BLOCK_K)
+    k_values = tl.load(
+        k_tokens + row * k_tokens_stride_batch + k_offsets,
+        mask=k_offsets < K_VEC,
+        other=0.0,
+    )
+    tl.store(
+        k_cache
+        + safe_physical_page_idx * k_cache_stride_page
+        + token_offset * k_cache_stride_token
+        + k_offsets,
+        k_values,
+        mask=valid_row & (k_offsets < K_VEC),
+    )
+
+    if HAS_V:
+        v_offsets = tl.arange(0, BLOCK_V)
+        v_values = tl.load(
+            v_tokens + row * v_tokens_stride_batch + v_offsets,
+            mask=v_offsets < V_VEC,
+            other=0.0,
+        )
+        tl.store(
+            v_cache
+            + safe_physical_page_idx * v_cache_stride_page
+            + token_offset * v_cache_stride_token
+            + v_offsets,
+            v_values,
+            mask=valid_row & (v_offsets < V_VEC),
+        )
+
+
+def _next_power_of_2(value: int) -> int:
+    return 1 << (int(value) - 1).bit_length()
+
+
+def _num_warps(block_size: int) -> int:
+    if block_size >= 2048:
+        return 8
+    if block_size >= 512:
+        return 4
+    return 1
+
+
+def run_masked_paged_kv_token_update_fused(
+    *,
+    k_cache: torch.Tensor,
+    k_tokens: torch.Tensor,
+    page_table: torch.Tensor,
+    slot_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    page_size_tokens: int,
+    v_cache: Optional[torch.Tensor] = None,
+    v_tokens: Optional[torch.Tensor] = None,
+) -> None:
+    """Write paged KV rows, skipping rows whose token index is negative."""
+
+    if k_tokens.ndim != 2:
+        raise ValueError("k_tokens must be a 2D flattened token tensor")
+    if not k_cache.is_contiguous() or not k_tokens.is_contiguous():
+        raise ValueError("k_cache and k_tokens must be contiguous")
+    if not page_table.is_contiguous():
+        raise ValueError("page_table must be contiguous")
+    if not slot_indices.is_contiguous() or not token_indices.is_contiguous():
+        raise ValueError("slot_indices and token_indices must be contiguous")
+
+    batch_size = int(k_tokens.shape[0])
+    if int(slot_indices.shape[0]) != batch_size:
+        raise ValueError("slot_indices must align with k_tokens batch size")
+    if int(token_indices.shape[0]) != batch_size:
+        raise ValueError("token_indices must align with k_tokens batch size")
+
+    has_v = v_cache is not None and v_tokens is not None
+    if has_v:
+        assert v_cache is not None
+        assert v_tokens is not None
+        if v_tokens.ndim != 2:
+            raise ValueError("v_tokens must be a 2D flattened token tensor")
+        if not v_cache.is_contiguous() or not v_tokens.is_contiguous():
+            raise ValueError("v_cache and v_tokens must be contiguous")
+        if int(v_tokens.shape[0]) != batch_size:
+            raise ValueError("v_tokens must align with k_tokens batch size")
+        v_vec = int(v_tokens.shape[1])
+        v_cache_arg = v_cache
+        v_tokens_arg = v_tokens
+        v_cache_stride_page = int(v_cache.stride(0))
+        v_cache_stride_token = int(v_cache.stride(1))
+        v_tokens_stride_batch = int(v_tokens.stride(0))
+    else:
+        v_vec = 1
+        v_cache_arg = k_cache
+        v_tokens_arg = k_tokens
+        v_cache_stride_page = 0
+        v_cache_stride_token = 0
+        v_tokens_stride_batch = 0
+
+    k_vec = int(k_tokens.shape[1])
+    block_k = _next_power_of_2(k_vec)
+    block_v = _next_power_of_2(v_vec)
+    _masked_paged_kv_token_update_kernel[(batch_size,)](
+        k_cache,
+        k_tokens,
+        v_cache_arg,
+        v_tokens_arg,
+        page_table,
+        slot_indices,
+        token_indices,
+        int(k_cache.stride(0)),
+        int(k_cache.stride(1)),
+        int(k_tokens.stride(0)),
+        v_cache_stride_page,
+        v_cache_stride_token,
+        v_tokens_stride_batch,
+        int(page_table.stride(0)),
+        int(page_table.stride(1)),
+        int(page_size_tokens),
+        k_vec,
+        v_vec,
+        block_k,
+        block_v,
+        has_v,
+        num_warps=max(_num_warps(block_k), _num_warps(block_v)),
+    )
+
+
+__all__ = ["run_masked_paged_kv_token_update_fused"]

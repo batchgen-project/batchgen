@@ -5,6 +5,9 @@ from typing import Optional, Sequence, Union
 import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
+from batchgen.kv_cache.compressed_ratio_gpu_kv_kernels import (
+    run_masked_paged_kv_token_update_fused,
+)
 from batchgen.kv_cache.coordinator_utils import as_int_list, ceil_div
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
@@ -186,7 +189,14 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
     ) -> None:
         """Append only decode rows that produced a compressed KV token."""
 
+        layer_idx = self.resolve_physical_layer(layer_idx)
         batch_size = int(k_tensor.shape[0])
+        if k_tensor.shape[1] != 1:
+            raise ValueError(
+                "update_layer_decode_new_token: k_tensor must have sequence "
+                f"dimension 1, got {k_tensor.shape[1]}"
+            )
+
         resolved_slots = self._resolve_slot_indices(
             batch_size=batch_size,
             batch_slice=batch_slice,
@@ -215,25 +225,35 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             )
             self._rebuild_last_page_table_if_dirty()
 
-        valid_rows = torch.nonzero(storage_positions >= 0).flatten()
-        if int(valid_rows.numel()) == 0:
-            return
-        valid_rows = valid_rows.to(device=k_tensor.device, dtype=torch.long)
-        compact_k = k_tensor.index_select(0, valid_rows).contiguous()
-        compact_v = None
-        if v_tensor is not None:
-            compact_v = v_tensor.index_select(0, valid_rows).contiguous()
-        compact_slots = resolved_slots.index_select(0, valid_rows).contiguous()
-        compact_positions = storage_positions.index_select(
-            0, valid_rows.to(device=storage_positions.device)
+        page_table = self._gpu_page_table_manager.gpu_table
+        if page_table is None:
+            raise RuntimeError(
+                "CompressedRatioGPUPagedKVCacheManager: GPU page table is not "
+                "initialized"
+            )
+
+        if storage_positions.dtype != torch.int32:
+            storage_positions = storage_positions.to(dtype=torch.int32)
+        storage_positions = storage_positions.to(
+            device=page_table.device, dtype=torch.int32
         ).contiguous()
-        return super().update_layer_decode_new_token(
-            k_tensor=compact_k,
-            v_tensor=compact_v,
-            sequence_lengths=compact_positions,
-            layer_idx=int(layer_idx),
-            batch_slice=None,
-            slot_indices=compact_slots,
+
+        k_tokens = k_tensor.view(batch_size, -1)
+        v_tokens = None
+        v_cache_layer = None
+        if v_tensor is not None and self._v_cache is not None:
+            v_tokens = v_tensor.view(batch_size, -1)
+            v_cache_layer = self._v_cache[layer_idx]
+
+        run_masked_paged_kv_token_update_fused(
+            k_cache=self._k_cache[layer_idx],
+            k_tokens=k_tokens,
+            page_table=page_table,
+            slot_indices=resolved_slots,
+            token_indices=storage_positions,
+            page_size_tokens=self.config.page_size_tokens,
+            v_cache=v_cache_layer,
+            v_tokens=v_tokens,
         )
 
     def map_raw_lengths_to_compressed_lengths(
