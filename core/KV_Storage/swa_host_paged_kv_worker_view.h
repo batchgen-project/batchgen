@@ -23,7 +23,7 @@
 namespace batchgen::kv {
 
 template <typename BaseView>
-class SWAHostPagedKVWorkerView {
+class SWAHostPagedKVWorkerView : public BaseView {
    public:
     using BatchedKVEntry = typename BaseView::BatchedKVEntry;
     static constexpr bool kHasVCache = BaseView::kHasVCache;
@@ -33,17 +33,16 @@ class SWAHostPagedKVWorkerView {
     SWAHostPagedKVWorkerView(const EngineConfig& engine_config,
                              const ModelConfig& model_config,
                              std::size_t window_size_tokens)
-        : base_view_(engine_config, model_config),
-          page_size_tokens_(base_view_.config().page_size_tokens),
+        : BaseView(engine_config, model_config),
           window_size_tokens_(window_size_tokens) {
+        page_size_tokens_ = BaseView::config().page_size_tokens;
         ValidateWindowConfig();
     }
 
     explicit SWAHostPagedKVWorkerView(const HostPagedKVConfig& config,
                                       std::size_t window_size_tokens)
-        : base_view_(config),
-          page_size_tokens_(base_view_.config().page_size_tokens),
-          window_size_tokens_(window_size_tokens) {
+        : BaseView(config), window_size_tokens_(window_size_tokens) {
+        page_size_tokens_ = BaseView::config().page_size_tokens;
         ValidateWindowConfig();
     }
 
@@ -54,7 +53,7 @@ class SWAHostPagedKVWorkerView {
     SWAHostPagedKVWorkerView& operator=(SWAHostPagedKVWorkerView&&) = delete;
 
     void Initialize(int device_index, bool create_region = false) {
-        base_view_.Initialize(device_index, create_region);
+        BaseView::Initialize(device_index, create_region);
     }
 
     void Shutdown() {
@@ -63,41 +62,41 @@ class SWAHostPagedKVWorkerView {
             DrainPendingHostWritesLocked();
             sequence_states_.clear();
         }
-        base_view_.Shutdown();
+        BaseView::Shutdown();
     }
 
-    std::byte* DataBase() { return base_view_.DataBase(); }
-    const std::byte* DataBase() const { return base_view_.DataBase(); }
+    std::byte* DataBase() { return BaseView::DataBase(); }
+    const std::byte* DataBase() const { return BaseView::DataBase(); }
 
     void* KPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        return base_view_.KPagePtr(layer_idx, page_idx);
+        return BaseView::KPagePtr(layer_idx, page_idx);
     }
 
     const void* KPagePtr(std::size_t layer_idx,
                          std::int32_t page_idx) const {
-        return base_view_.KPagePtr(layer_idx, page_idx);
+        return BaseView::KPagePtr(layer_idx, page_idx);
     }
 
     template <bool Enabled = kHasVCache, typename = std::enable_if_t<Enabled>>
     void* VPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        return base_view_.VPagePtr(layer_idx, page_idx);
+        return BaseView::VPagePtr(layer_idx, page_idx);
     }
 
     template <bool Enabled = kHasVCache, typename = std::enable_if_t<Enabled>>
     const void* VPagePtr(std::size_t layer_idx,
                          std::int32_t page_idx) const {
-        return base_view_.VPagePtr(layer_idx, page_idx);
+        return BaseView::VPagePtr(layer_idx, page_idx);
     }
 
     [[nodiscard]] std::size_t ResolvePhysicalLayer(
         std::size_t logical_layer_idx, std::string_view context) const {
-        return base_view_.ResolvePhysicalLayer(logical_layer_idx, context);
+        return BaseView::ResolvePhysicalLayer(logical_layer_idx, context);
     }
 
-    const HostPagedKVConfig& config() const { return base_view_.config(); }
-    const auto& layout() const { return base_view_.layout(); }
-    HostPagedKVStats GetStats() const { return base_view_.GetStats(); }
-    int device_index() const { return base_view_.device_index(); }
+    const HostPagedKVConfig& config() const { return BaseView::config(); }
+    const auto& layout() const { return BaseView::layout(); }
+    HostPagedKVStats GetStats() const { return BaseView::GetStats(); }
+    int device_index() const { return BaseView::device_index(); }
     std::size_t page_size_tokens() const { return page_size_tokens_; }
     std::size_t window_size_tokens() const { return window_size_tokens_; }
     std::size_t window_pages() const { return window_pages_; }
@@ -107,25 +106,25 @@ class SWAHostPagedKVWorkerView {
         oss << "SWAHostPagedKVWorkerView(window_size_tokens="
             << window_size_tokens_ << ", page_size_tokens="
             << page_size_tokens_ << ", window_pages=" << window_pages_
-            << ", base=" << base_view_.DebugString() << ")";
+            << ", base=" << BaseView::DebugString() << ")";
         return oss.str();
     }
 
     std::vector<std::vector<std::int32_t>> BuildPageTable(
         const std::vector<std::int64_t>& sequence_ids) const {
-        return base_view_.BuildPageTable(sequence_ids);
+        return BaseView::BuildPageTable(sequence_ids);
     }
 
     std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
         std::optional<std::size_t> max_tokens = std::nullopt) const {
-        return base_view_.GetSequenceLayerPagePointers(sequence_id, layer_idx,
+        return BaseView::GetSequenceLayerPagePointers(sequence_id, layer_idx,
                                                        max_tokens);
     }
 
     void RegisterSequences(const std::vector<std::int64_t>& sequence_ids) {
-        base_view_.RegisterSequences(sequence_ids);
+        BaseView::RegisterSequences(sequence_ids);
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.try_emplace(sequence_id);
@@ -133,13 +132,13 @@ class SWAHostPagedKVWorkerView {
     }
 
     void UnregisterSequence(std::int64_t sequence_id) {
-        base_view_.UnregisterSequence(sequence_id);
+        BaseView::UnregisterSequence(sequence_id);
         std::lock_guard<std::mutex> lock(mutex_);
         sequence_states_.erase(sequence_id);
     }
 
     void UnregisterSequences(const std::vector<std::int64_t>& sequence_ids) {
-        base_view_.UnregisterSequences(sequence_ids);
+        BaseView::UnregisterSequences(sequence_ids);
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.erase(sequence_id);
@@ -169,7 +168,7 @@ class SWAHostPagedKVWorkerView {
         }
 
         auto allocations =
-            base_view_.AllocatePagesForSequences(sequence_ids, active_tokens);
+            BaseView::AllocatePagesForSequences(sequence_ids, active_tokens);
         std::lock_guard<std::mutex> lock(mutex_);
         for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
             auto& state = sequence_states_[sequence_ids[i]];
@@ -183,7 +182,7 @@ class SWAHostPagedKVWorkerView {
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
         std::lock_guard<std::mutex> lock(mutex_);
         DrainPendingHostWritesLocked();
-        base_view_.ReleaseSequencePages(sequence_ids);
+        BaseView::ReleaseSequencePages(sequence_ids);
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.erase(sequence_id);
         }
@@ -192,7 +191,7 @@ class SWAHostPagedKVWorkerView {
     KVAsyncTask AsyncLoadLayerKVToDevice(
         torch::Tensor sequence_ids, torch::Tensor k_device_ptrs,
         std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
-        return base_view_.AsyncLoadLayerKVToDevice(
+        return BaseView::AsyncLoadLayerKVToDevice(
             std::move(sequence_ids), std::move(k_device_ptrs),
             std::move(v_device_ptrs));
     }
@@ -201,7 +200,7 @@ class SWAHostPagedKVWorkerView {
         torch::Tensor sequence_ids, torch::Tensor active_page_counts,
         torch::Tensor k_device_ptrs,
         std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
-        return base_view_.AsyncLoadLayerPagedKVToDevice(
+        return BaseView::AsyncLoadLayerPagedKVToDevice(
             std::move(sequence_ids), std::move(active_page_counts),
             std::move(k_device_ptrs), std::move(v_device_ptrs));
     }
@@ -248,7 +247,7 @@ class SWAHostPagedKVWorkerView {
                                               active_tokens))
                                   .contiguous();
                 }
-                auto task = base_view_.AsyncOffloadLayerKVToHost(
+                auto task = BaseView::AsyncOffloadLayerKVToHost(
                     layer_idx, {sequence_id}, std::move(k_slice),
                     std::move(v_slice), SequenceLengthVector{active_tokens});
                 TrackHostWriteTaskLocked(task);
@@ -270,7 +269,7 @@ class SWAHostPagedKVWorkerView {
             std::lock_guard<std::mutex> lock(mutex_);
             auto storage_positions =
                 PrepareStoragePositionsLocked(sequence_ids, raw_positions);
-            task = base_view_.AsyncAppendDecodeKVToHost(
+            task = BaseView::AsyncAppendDecodeKVToHost(
                 layer_idx, std::move(sequence_ids), std::move(k_tensor),
                 std::move(v_tensor), std::move(storage_positions));
             TrackHostWriteTaskLocked(task);
@@ -289,7 +288,7 @@ class SWAHostPagedKVWorkerView {
             std::lock_guard<std::mutex> lock(mutex_);
             auto storage_positions =
                 PrepareStoragePositionsLocked(sequence_ids, raw_positions);
-            task = base_view_.AsyncAppendDecodeKVToHostBatchedKernel(
+            task = BaseView::AsyncAppendDecodeKVToHostBatchedKernel(
                 std::move(entries), std::move(sequence_ids),
                 std::move(storage_positions));
             TrackHostWriteTaskLocked(task);
@@ -299,13 +298,13 @@ class SWAHostPagedKVWorkerView {
 
     std::pair<torch::Tensor, torch::Tensor> ReadSequenceKVToCPU(
         std::int64_t sequence_id) const {
-        return base_view_.ReadSequenceKVToCPU(sequence_id);
+        return BaseView::ReadSequenceKVToCPU(sequence_id);
     }
 
     void WriteSequenceKVFromCPU(
         std::int64_t sequence_id, const torch::Tensor& k_tensor,
         const std::optional<torch::Tensor>& v_tensor = std::nullopt) {
-        base_view_.WriteSequenceKVFromCPU(sequence_id, k_tensor, v_tensor);
+        BaseView::WriteSequenceKVFromCPU(sequence_id, k_tensor, v_tensor);
     }
 
     std::size_t WindowStartPage(std::int64_t sequence_id) const {
@@ -421,7 +420,7 @@ class SWAHostPagedKVWorkerView {
             const std::size_t pages_to_release =
                 window.window_start_page - state.window_start_page;
             DrainPendingHostWritesLocked();
-            base_view_.ReleaseSequencePrefixPages(sequence_id,
+            BaseView::ReleaseSequencePrefixPages(sequence_id,
                                                   pages_to_release);
         }
         state.window_start_page = window.window_start_page;
@@ -449,11 +448,11 @@ class SWAHostPagedKVWorkerView {
                 << (window_pages_ + 1) << ")";
             throw std::out_of_range(oss.str());
         }
-        const auto table = base_view_.BuildPageTable({sequence_id});
+        const auto table = BaseView::BuildPageTable({sequence_id});
         const std::size_t current_pages =
             table.empty() ? 0 : table.front().size();
         if (current_pages < required_pages) {
-            base_view_.GrowSequencePages(sequence_id,
+            BaseView::GrowSequencePages(sequence_id,
                                          required_pages - current_pages);
         }
     }
@@ -517,7 +516,6 @@ class SWAHostPagedKVWorkerView {
         });
     }
 
-    BaseView base_view_;
     std::size_t page_size_tokens_ = 0;
     std::size_t window_size_tokens_ = 0;
     std::size_t window_pages_ = 0;
