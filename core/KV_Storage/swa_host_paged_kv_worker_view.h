@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "host_paged_kv_worker_view.h"
+#include "transformed_host_paged_kv_utils.h"
 
 namespace batchgen::kv {
 
@@ -60,7 +61,7 @@ class SWAHostPagedKVWorkerView {
     void Shutdown() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            DrainPendingHostWritesLocked();
+            pending_host_writes_.Drain();
             sequence_states_.clear();
         }
         base_view_.Shutdown();
@@ -183,7 +184,7 @@ class SWAHostPagedKVWorkerView {
 
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
         std::lock_guard<std::mutex> lock(mutex_);
-        DrainPendingHostWritesLocked();
+        pending_host_writes_.Drain();
         base_view_.ReleaseSequencePages(sequence_ids);
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.erase(sequence_id);
@@ -212,7 +213,7 @@ class SWAHostPagedKVWorkerView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths raw_sequence_lengths) {
         if (sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
         std::vector<KVAsyncTask> tasks;
         {
@@ -220,9 +221,11 @@ class SWAHostPagedKVWorkerView {
             const std::size_t batch = sequence_ids.size();
             for (std::size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
                 const std::int64_t sequence_id = sequence_ids[batch_idx];
-                const std::size_t raw_tokens = ResolveLength(
-                    raw_sequence_lengths, batch_idx, sequence_id,
-                    "SWAHostPagedKVWorkerView::AsyncOffloadLayerKVToHost");
+                const std::size_t raw_tokens =
+                    transformed_detail::ResolveLength(
+                        raw_sequence_lengths, batch_idx, sequence_id,
+                        "SWAHostPagedKVWorkerView::"
+                        "AsyncOffloadLayerKVToHost");
                 const auto active_tokens =
                     UpdateWindowForRawEndLocked(sequence_id, raw_tokens);
                 if (active_tokens == 0) {
@@ -252,11 +255,11 @@ class SWAHostPagedKVWorkerView {
                 auto task = base_view_.AsyncOffloadLayerKVToHost(
                     layer_idx, {sequence_id}, std::move(k_slice),
                     std::move(v_slice), SequenceLengthVector{active_tokens});
-                TrackHostWriteTaskLocked(task);
+                pending_host_writes_.Track(task);
                 tasks.emplace_back(std::move(task));
             }
         }
-        return MakeCombinedTask(std::move(tasks));
+        return transformed_detail::MakeCombinedTask(std::move(tasks));
     }
 
     KVAsyncTask AsyncAppendDecodeKVToHost(
@@ -264,7 +267,7 @@ class SWAHostPagedKVWorkerView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths raw_positions) {
         if (sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
         KVAsyncTask task;
         {
@@ -274,7 +277,7 @@ class SWAHostPagedKVWorkerView {
             task = base_view_.AsyncAppendDecodeKVToHost(
                 layer_idx, std::move(sequence_ids), std::move(k_tensor),
                 std::move(v_tensor), std::move(storage_positions));
-            TrackHostWriteTaskLocked(task);
+            pending_host_writes_.Track(task);
         }
         return task;
     }
@@ -283,7 +286,7 @@ class SWAHostPagedKVWorkerView {
         std::vector<BatchedKVEntry> entries,
         std::vector<std::int64_t> sequence_ids, SequenceLengths raw_positions) {
         if (entries.empty() || sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
         KVAsyncTask task;
         {
@@ -293,7 +296,7 @@ class SWAHostPagedKVWorkerView {
             task = base_view_.AsyncAppendDecodeKVToHostBatchedKernel(
                 std::move(entries), std::move(sequence_ids),
                 std::move(storage_positions));
-            TrackHostWriteTaskLocked(task);
+            pending_host_writes_.Track(task);
         }
         return task;
     }
@@ -366,38 +369,6 @@ class SWAHostPagedKVWorkerView {
         return {window_start_page, active_tokens, required_pages};
     }
 
-    static std::size_t ResolveLength(const SequenceLengths& sequence_lengths,
-                                     std::size_t batch_idx,
-                                     std::int64_t sequence_id,
-                                     std::string_view op_name) {
-        return std::visit(
-            [&](const auto& container) -> std::size_t {
-                using Container = std::decay_t<decltype(container)>;
-                if constexpr (std::is_same_v<Container, SequenceLengthMap>) {
-                    const auto it = container.find(sequence_id);
-                    if (it == container.end()) {
-                        std::ostringstream oss;
-                        oss << op_name
-                            << ": missing sequence length for sequence "
-                            << sequence_id;
-                        throw std::out_of_range(oss.str());
-                    }
-                    return it->second;
-                } else {
-                    if (batch_idx >= container.size()) {
-                        std::ostringstream oss;
-                        oss << op_name
-                            << ": sequence_lengths vector is missing batch "
-                               "index "
-                            << batch_idx;
-                        throw std::out_of_range(oss.str());
-                    }
-                    return container[batch_idx];
-                }
-            },
-            sequence_lengths);
-    }
-
     std::size_t UpdateWindowForRawEndLocked(std::int64_t sequence_id,
                                             std::size_t raw_end_tokens) {
         const auto window = ComputeWindowForRawEnd(raw_end_tokens);
@@ -420,7 +391,7 @@ class SWAHostPagedKVWorkerView {
                     << " active pages";
                 throw std::out_of_range(oss.str());
             }
-            DrainPendingHostWritesLocked();
+            pending_host_writes_.Drain();
             base_view_.ReleaseSequencePrefixPages(sequence_id,
                                                   pages_to_release);
             state.active_pages -= pages_to_release;
@@ -467,7 +438,7 @@ class SWAHostPagedKVWorkerView {
         for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
              ++batch_idx) {
             const std::int64_t sequence_id = sequence_ids[batch_idx];
-            const std::size_t raw_pos = ResolveLength(
+            const std::size_t raw_pos = transformed_detail::ResolveLength(
                 raw_positions, batch_idx, sequence_id,
                 "SWAHostPagedKVWorkerView::AsyncAppendDecodeKVToHost");
             if (raw_pos == std::numeric_limits<std::size_t>::max()) {
@@ -481,52 +452,13 @@ class SWAHostPagedKVWorkerView {
         return storage_positions;
     }
 
-    void DrainPendingHostWritesLocked() {
-        for (const auto& task : pending_host_write_tasks_) {
-            task.wait();
-        }
-        pending_host_write_tasks_.clear();
-    }
-
-    void PruneDoneHostWritesLocked() {
-        pending_host_write_tasks_.erase(
-            std::remove_if(pending_host_write_tasks_.begin(),
-                           pending_host_write_tasks_.end(),
-                           [](const KVAsyncTask& task) { return task.done(); }),
-            pending_host_write_tasks_.end());
-    }
-
-    void TrackHostWriteTaskLocked(const KVAsyncTask& task) {
-        PruneDoneHostWritesLocked();
-        pending_host_write_tasks_.push_back(task);
-    }
-
-    template <typename Fn>
-    static KVAsyncTask MakeAsyncTask(Fn&& fn) {
-        auto future =
-            std::async(std::launch::async, std::forward<Fn>(fn)).share();
-        const std::uint64_t id =
-            task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-        return KVAsyncTask{id, std::move(future)};
-    }
-
-    static KVAsyncTask MakeCombinedTask(std::vector<KVAsyncTask> tasks) {
-        return MakeAsyncTask([tasks = std::move(tasks)] {
-            for (const auto& task : tasks) {
-                task.wait();
-            }
-        });
-    }
-
     BaseView base_view_;
     std::size_t page_size_tokens_ = 0;
     std::size_t window_size_tokens_ = 0;
     std::size_t window_pages_ = 0;
     mutable std::mutex mutex_;
     std::unordered_map<std::int64_t, SWASequenceState> sequence_states_;
-    std::vector<KVAsyncTask> pending_host_write_tasks_;
-
-    inline static std::atomic<std::uint64_t> task_id_counter_{0};
+    transformed_detail::PendingHostWriteTasks pending_host_writes_;
 };
 
 using SWADefaultHostPagedKVWorkerView =

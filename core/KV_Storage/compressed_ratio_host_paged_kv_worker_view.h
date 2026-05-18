@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "host_paged_kv_worker_view.h"
+#include "transformed_host_paged_kv_utils.h"
 
 namespace batchgen::kv {
 
@@ -60,7 +61,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
     void Shutdown() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            DrainPendingHostWritesLocked();
+            pending_host_writes_.Drain();
             sequence_states_.clear();
         }
         BaseView::Shutdown();
@@ -144,7 +145,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
 
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
         std::lock_guard<std::mutex> lock(mutex_);
-        DrainPendingHostWritesLocked();
+        pending_host_writes_.Drain();
         BaseView::ReleaseSequencePages(sequence_ids);
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.erase(sequence_id);
@@ -156,7 +157,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths raw_sequence_lengths) {
         if (sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
         std::vector<std::int64_t> valid_sequence_ids;
@@ -169,20 +170,21 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
                                      compressed_lengths);
         }
         if (valid_sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
-        auto prepared_k = SelectRows(k_tensor, valid_rows);
+        auto prepared_k = transformed_detail::SelectRows(k_tensor, valid_rows);
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
-            prepared_v = SelectRows(*v_tensor, valid_rows);
+            prepared_v =
+                transformed_detail::SelectRows(*v_tensor, valid_rows);
         }
         auto task = BaseView::AsyncOffloadLayerKVToHost(
             layer_idx, std::move(valid_sequence_ids), std::move(prepared_k),
             std::move(prepared_v), std::move(compressed_lengths));
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            TrackHostWriteTaskLocked(task);
+            pending_host_writes_.Track(task);
         }
         return task;
     }
@@ -192,7 +194,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths raw_positions) {
         if (sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
         std::vector<std::int64_t> valid_sequence_ids;
@@ -205,20 +207,21 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
                                     storage_positions);
         }
         if (valid_sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
-        auto prepared_k = SelectRows(k_tensor, valid_rows);
+        auto prepared_k = transformed_detail::SelectRows(k_tensor, valid_rows);
         std::optional<torch::Tensor> prepared_v;
         if (v_tensor.has_value()) {
-            prepared_v = SelectRows(*v_tensor, valid_rows);
+            prepared_v =
+                transformed_detail::SelectRows(*v_tensor, valid_rows);
         }
         auto task = BaseView::AsyncAppendDecodeKVToHost(
             layer_idx, std::move(valid_sequence_ids), std::move(prepared_k),
             std::move(prepared_v), std::move(storage_positions));
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            TrackHostWriteTaskLocked(task);
+            pending_host_writes_.Track(task);
         }
         return task;
     }
@@ -227,7 +230,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         std::vector<BatchedKVEntry> entries,
         std::vector<std::int64_t> sequence_ids, SequenceLengths raw_positions) {
         if (entries.empty() || sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
         std::vector<std::int64_t> valid_sequence_ids;
@@ -240,13 +243,15 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
                                     storage_positions);
         }
         if (valid_sequence_ids.empty()) {
-            return MakeAsyncTask([] {});
+            return transformed_detail::MakeAsyncTask([] {});
         }
 
         for (auto& entry : entries) {
-            entry.k_tensor = SelectRows(entry.k_tensor, valid_rows);
+            entry.k_tensor =
+                transformed_detail::SelectRows(entry.k_tensor, valid_rows);
             if (entry.v_tensor.has_value()) {
-                entry.v_tensor = SelectRows(*entry.v_tensor, valid_rows);
+                entry.v_tensor =
+                    transformed_detail::SelectRows(*entry.v_tensor, valid_rows);
             }
         }
         auto task = BaseView::AsyncAppendDecodeKVToHostBatchedKernel(
@@ -254,7 +259,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
             std::move(storage_positions));
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            TrackHostWriteTaskLocked(task);
+            pending_host_writes_.Track(task);
         }
         return task;
     }
@@ -298,38 +303,6 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
                page_size_tokens_;
     }
 
-    static std::size_t ResolveLength(const SequenceLengths& sequence_lengths,
-                                     std::size_t batch_idx,
-                                     std::int64_t sequence_id,
-                                     std::string_view op_name) {
-        return std::visit(
-            [&](const auto& container) -> std::size_t {
-                using Container = std::decay_t<decltype(container)>;
-                if constexpr (std::is_same_v<Container, SequenceLengthMap>) {
-                    const auto it = container.find(sequence_id);
-                    if (it == container.end()) {
-                        std::ostringstream oss;
-                        oss << op_name
-                            << ": missing sequence length for sequence "
-                            << sequence_id;
-                        throw std::out_of_range(oss.str());
-                    }
-                    return it->second;
-                } else {
-                    if (batch_idx >= container.size()) {
-                        std::ostringstream oss;
-                        oss << op_name
-                            << ": sequence_lengths vector is missing batch "
-                               "index "
-                            << batch_idx;
-                        throw std::out_of_range(oss.str());
-                    }
-                    return container[batch_idx];
-                }
-            },
-            sequence_lengths);
-    }
-
     void EnsureCapacityLocked(std::int64_t sequence_id,
                               std::size_t exposed_tokens) {
         const std::size_t required_pages =
@@ -360,7 +333,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         compressed_lengths.reserve(batch);
         for (std::size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
             const std::int64_t sequence_id = sequence_ids[batch_idx];
-            const std::size_t raw_tokens = ResolveLength(
+            const std::size_t raw_tokens = transformed_detail::ResolveLength(
                 raw_sequence_lengths, batch_idx, sequence_id,
                 "CompressedRatioHostPagedKVWorkerView::"
                 "AsyncOffloadLayerKVToHost");
@@ -387,7 +360,7 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         storage_positions.reserve(batch);
         for (std::size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
             const std::int64_t sequence_id = sequence_ids[batch_idx];
-            const std::size_t raw_position = ResolveLength(
+            const std::size_t raw_position = transformed_detail::ResolveLength(
                 raw_positions, batch_idx, sequence_id,
                 "CompressedRatioHostPagedKVWorkerView::"
                 "AsyncAppendDecodeKVToHost");
@@ -406,53 +379,10 @@ class CompressedRatioHostPagedKVWorkerView : public BaseView {
         }
     }
 
-    static torch::Tensor SelectRows(const torch::Tensor& tensor,
-                                    const std::vector<std::int64_t>& rows) {
-        if (rows.size() == static_cast<std::size_t>(tensor.size(0))) {
-            return tensor;
-        }
-        auto indices =
-            torch::tensor(rows, torch::TensorOptions()
-                                    .dtype(torch::kLong)
-                                    .device(tensor.device()));
-        return tensor.index_select(0, indices).contiguous();
-    }
-
-    void DrainPendingHostWritesLocked() {
-        for (const auto& task : pending_host_write_tasks_) {
-            task.wait();
-        }
-        pending_host_write_tasks_.clear();
-    }
-
-    void PruneDoneHostWritesLocked() {
-        pending_host_write_tasks_.erase(
-            std::remove_if(pending_host_write_tasks_.begin(),
-                           pending_host_write_tasks_.end(),
-                           [](const KVAsyncTask& task) { return task.done(); }),
-            pending_host_write_tasks_.end());
-    }
-
-    void TrackHostWriteTaskLocked(const KVAsyncTask& task) {
-        PruneDoneHostWritesLocked();
-        pending_host_write_tasks_.push_back(task);
-    }
-
-    template <typename Fn>
-    static KVAsyncTask MakeAsyncTask(Fn&& fn) {
-        auto future =
-            std::async(std::launch::async, std::forward<Fn>(fn)).share();
-        const std::uint64_t id =
-            task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-        return KVAsyncTask{id, std::move(future)};
-    }
-
     std::size_t page_size_tokens_ = 0;
     mutable std::mutex mutex_;
     std::unordered_map<std::int64_t, SequenceState> sequence_states_;
-    std::vector<KVAsyncTask> pending_host_write_tasks_;
-
-    inline static std::atomic<std::uint64_t> task_id_counter_{0};
+    transformed_detail::PendingHostWriteTasks pending_host_writes_;
 };
 
 using CompressedRatio4DefaultHostPagedKVWorkerView =
