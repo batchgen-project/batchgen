@@ -231,6 +231,9 @@ class HostPagedKVBackend {
 
     void ReleaseSequences(const std::vector<std::int64_t>& sequence_ids);
 
+    std::vector<std::int32_t> ReleaseSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages);
+
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
 

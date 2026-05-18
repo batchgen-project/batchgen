@@ -959,6 +959,38 @@ class HostPagedKVWorkerView : private LayerMapper {
         UnregisterSequences(sequence_ids);
     }
 
+    std::vector<std::int32_t> ReleaseSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages) {
+        if (num_pages == 0) {
+            return {};
+        }
+        EnsureSequenceRegistered(sequence_id);
+        const auto current_pages = page_table_.Pages(sequence_id);
+        if (num_pages > current_pages.size()) {
+            std::ostringstream oss;
+            oss << "ReleaseSequencePrefixPages: cannot release " << num_pages
+                << " prefix pages from sequence " << sequence_id
+                << " with only " << current_pages.size()
+                << " pages in the worker page table";
+            throw std::out_of_range(oss.str());
+        }
+        auto released =
+            backend_.ReleaseSequencePrefixPages(sequence_id, num_pages);
+        const auto popped =
+            page_table_.PopPrefixPages(sequence_id, num_pages);
+        if (released.size() != popped.size()) {
+            throw std::logic_error(
+                "ReleaseSequencePrefixPages: backend/page-table size "
+                "mismatch");
+        }
+        if (released != popped) {
+            throw std::logic_error(
+                "ReleaseSequencePrefixPages: backend/page-table page order "
+                "mismatch");
+        }
+        return released;
+    }
+
     KVAsyncTask AsyncOffloadLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,

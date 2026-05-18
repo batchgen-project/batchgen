@@ -32,6 +32,27 @@ void HostKVPageTable::AppendPages(
                         additional_pages.end());
 }
 
+std::vector<std::int32_t> HostKVPageTable::PopPrefixPages(
+    std::int64_t sequence_id, std::size_t num_pages) {
+    if (num_pages == 0) {
+        return {};
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    SequenceRecord& record = RequireRecordLocked(sequence_id, lock);
+    if (num_pages > record.pages.size()) {
+        std::ostringstream oss;
+        oss << "Cannot pop " << num_pages << " pages from sequence "
+            << sequence_id << " with only " << record.pages.size()
+            << " pages";
+        throw std::out_of_range(oss.str());
+    }
+    std::vector<std::int32_t> popped(record.pages.begin(),
+                                    record.pages.begin() + num_pages);
+    record.pages.erase(record.pages.begin(),
+                       record.pages.begin() + num_pages);
+    return popped;
+}
+
 std::vector<std::int32_t> HostKVPageTable::Pages(
     std::int64_t sequence_id) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);

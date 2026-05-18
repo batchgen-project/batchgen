@@ -4,6 +4,9 @@
 # ---------------------------------------------------------------------------- #
 
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
+from batchgen.kv_cache.swa_gpu_paged_kv_manager import (
+    SWAGPUPagedKVCacheManager,
+)
 from batchgen.kv_cache.host_kv_coordinator import (
     AsyncKVTask,
     HostKVCoordinator,
@@ -28,5 +31,6 @@ __all__ = [
     "DeepSeekV4HostKVCoordinator",
     "GPUKVCoordinator",
     "HostKVCoordinator",
+    "SWAGPUPagedKVCacheManager",
     "wait_kv_tasks",
 ]

@@ -201,6 +201,8 @@ struct HostPagedKVBackend::SharedState {
     std::vector<std::int32_t> AcquirePages(std::int64_t sequence_id,
                                            std::size_t num_pages);
     void ReleaseSequence(std::int64_t sequence_id);
+    std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
+                                                 std::size_t num_pages);
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
     HostPagedKVStats CollectStats() const;
@@ -760,6 +762,61 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
     }
 }
 
+std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
+    std::int64_t sequence_id, std::size_t num_pages) {
+    if (num_pages == 0) {
+        return {};
+    }
+    std::vector<std::int32_t> pages;
+    {
+        ScopedMutexLock lock(&header->sequence_mutex);
+        SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
+        if (entry == nullptr) {
+            throw std::out_of_range("Sequence ID " +
+                                    std::to_string(sequence_id) +
+                                    " not found during prefix release");
+        }
+        if (num_pages > entry->num_pages) {
+            throw std::out_of_range(
+                "Requested prefix release of " + std::to_string(num_pages) +
+                " pages but sequence " + std::to_string(sequence_id) +
+                " only owns " + std::to_string(entry->num_pages) + " pages");
+        }
+
+        pages.reserve(num_pages);
+        std::int32_t page = entry->head_page;
+        for (std::size_t i = 0; i < num_pages; ++i) {
+            if (page == kInvalidPageIndex) {
+                throw std::logic_error(
+                    "Corrupt page chain during prefix release for sequence " +
+                    std::to_string(sequence_id));
+            }
+            pages.push_back(page);
+            const std::int32_t next = page_links[page];
+            page_links[page] = kInvalidPageIndex;
+            page_owners[page] = kEmptySequenceId;
+            page = next;
+        }
+
+        entry->head_page = page;
+        entry->num_pages -= static_cast<std::uint32_t>(num_pages);
+        if (entry->num_pages == 0) {
+            entry->tail_page = kInvalidPageIndex;
+        }
+    }
+
+    if (!pages.empty()) {
+        ScopedMutexLock lock(&header->allocation_mutex);
+        std::uint32_t top =
+            header->free_stack_top.load(std::memory_order_relaxed);
+        for (std::int32_t page : pages) {
+            free_stack[top++] = page;
+        }
+        header->free_stack_top.store(top, std::memory_order_relaxed);
+    }
+    return pages;
+}
+
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
     std::int64_t sequence_id, std::optional<std::size_t> max_pages) const {
     ScopedMutexLock lock(&header->sequence_mutex);
@@ -915,6 +972,11 @@ void HostPagedKVBackend::ReleaseSequences(
     for (auto& future : futures) {
         future.get();
     }
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(
+    std::int64_t sequence_id, std::size_t num_pages) {
+    return state_->ReleasePrefixPages(sequence_id, num_pages);
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SequencePages(

@@ -32,6 +32,9 @@ class HostKVPageTable {
     void AppendPages(std::int64_t sequence_id,
                      const std::vector<std::int32_t>& additional_pages);
 
+    std::vector<std::int32_t> PopPrefixPages(std::int64_t sequence_id,
+                                             std::size_t num_pages);
+
     [[nodiscard]] std::vector<std::int32_t> Pages(
         std::int64_t sequence_id) const;
 

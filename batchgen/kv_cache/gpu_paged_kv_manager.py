@@ -999,6 +999,44 @@ class GPUPagedKVCacheManager:
 		if reclaimed:
 			self._clear_active_page_pointer_tables()
 
+	def release_sequence_prefix_pages(
+		self, sequence_id: int, num_pages: int
+	) -> List[int]:
+		"""Release the oldest pages of one active sequence.
+
+		This is used by page-level sliding-window caches. The remaining pages
+		keep their order, so the sequence's page table becomes window-local
+		after the caller rebuilds it.
+		"""
+
+		self._ensure_initialized()
+		sequence_id = int(sequence_id)
+		num_pages = int(num_pages)
+		if num_pages < 0:
+			raise ValueError(
+				f"release_sequence_prefix_pages: num_pages must be >= 0, got {num_pages}"
+			)
+		if num_pages == 0:
+			return []
+		state = self._sequences.get(sequence_id)
+		if state is None:
+			raise KeyError(
+				f"release_sequence_prefix_pages: unknown sequence id {sequence_id}"
+			)
+		current_pages = int(state.pages.numel())
+		if num_pages > current_pages:
+			raise ValueError(
+				"release_sequence_prefix_pages: cannot release "
+				f"{num_pages} pages from sequence {sequence_id} with only "
+				f"{current_pages} pages"
+			)
+
+		released = state.pages[:num_pages].clone()
+		state.pages = state.pages[num_pages:].clone()
+		self._free_pages.push(released)
+		self._clear_active_page_pointer_tables()
+		return released.tolist()
+
 	def get_context_kv_page_ptrs(
 		self, sequence_id: int, layer_idx: int, context_length: int
 	) -> Tuple[List[int], Optional[List[int]]]:
