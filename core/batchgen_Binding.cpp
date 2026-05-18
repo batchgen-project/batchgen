@@ -399,9 +399,6 @@ void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
              py::arg("sequence_ids"))
         .def("release_sequence_pages", &WorkerView::ReleaseSequencePages,
              py::arg("sequence_ids"))
-        .def("release_sequence_prefix_pages",
-             &WorkerView::ReleaseSequencePrefixPages,
-             py::arg("sequence_id"), py::arg("num_pages"))
         .def("allocate_pages_for_sequences",
              [](WorkerView& self,
                 const std::vector<std::pair<std::int64_t, std::size_t>>&
@@ -419,27 +416,6 @@ void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
              },
              "Allocate only the active SWA window pages for each raw sequence "
              "length.")
-        .def("grow_sequence_pages",
-             [](WorkerView& self, std::int64_t sequence_id,
-                std::size_t num_pages) {
-                 return self.GrowSequencePages(sequence_id, num_pages);
-             },
-             py::arg("sequence_id"), py::arg("num_pages"))
-        .def("grow_pages_for_sequences",
-             [](WorkerView& self,
-                const std::vector<std::pair<std::int64_t, std::size_t>>&
-                    requests) {
-                 std::vector<std::int64_t> sequence_ids;
-                 std::vector<std::size_t> page_counts;
-                 sequence_ids.reserve(requests.size());
-                 page_counts.reserve(requests.size());
-                 for (const auto& request : requests) {
-                     sequence_ids.push_back(request.first);
-                     page_counts.push_back(request.second);
-                 }
-                 return self.GrowPagesForSequences(sequence_ids,
-                                                   page_counts);
-             })
         .def("async_offload_layer_kv_to_host",
              &WorkerView::AsyncOffloadLayerKVToHost,
              py::arg("layer_idx"), py::arg("sequence_ids"),

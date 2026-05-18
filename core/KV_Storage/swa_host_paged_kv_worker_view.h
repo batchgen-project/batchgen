@@ -180,17 +180,6 @@ class SWAHostPagedKVWorkerView {
         return allocations;
     }
 
-    std::vector<std::int32_t> GrowSequencePages(std::int64_t sequence_id,
-                                                std::size_t num_pages) {
-        return base_view_.GrowSequencePages(sequence_id, num_pages);
-    }
-
-    std::vector<std::vector<std::int32_t>> GrowPagesForSequences(
-        const std::vector<std::int64_t>& sequence_ids,
-        const std::vector<std::size_t>& num_pages) {
-        return base_view_.GrowPagesForSequences(sequence_ids, num_pages);
-    }
-
     void ReleaseSequencePages(const std::vector<std::int64_t>& sequence_ids) {
         std::lock_guard<std::mutex> lock(mutex_);
         DrainPendingHostWritesLocked();
@@ -198,19 +187,6 @@ class SWAHostPagedKVWorkerView {
         for (std::int64_t sequence_id : sequence_ids) {
             sequence_states_.erase(sequence_id);
         }
-    }
-
-    std::vector<std::int32_t> ReleaseSequencePrefixPages(
-        std::int64_t sequence_id, std::size_t num_pages) {
-        if (num_pages == 0) {
-            return {};
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        DrainPendingHostWritesLocked();
-        auto released =
-            base_view_.ReleaseSequencePrefixPages(sequence_id, num_pages);
-        sequence_states_[sequence_id].window_start_page += num_pages;
-        return released;
     }
 
     KVAsyncTask AsyncLoadLayerKVToDevice(

@@ -23,6 +23,17 @@ class _WindowForRawEnd:
 	required_pages: int
 
 
+_BLOCKED_BASE_PAGE_APIS = frozenset(
+	{
+		"grow_sequence_pages",
+		"grow_pages_for_sequences",
+		"extend_pages_for_sequence",
+		"release_sequence_prefix_pages",
+		"_release_sequence_prefix_pages",
+	}
+)
+
+
 class SWAGPUPagedKVCacheManager:
 	"""Page-level sliding-window wrapper for ``GPUPagedKVCacheManager``.
 
@@ -57,6 +68,11 @@ class SWAGPUPagedKVCacheManager:
 		self._last_page_table_order: Optional[list[int]] = None
 
 	def __getattr__(self, name: str):
+		if name in _BLOCKED_BASE_PAGE_APIS:
+			raise AttributeError(
+				f"{type(self).__name__} does not expose {name}; "
+				"SWA page growth and prefix release are managed internally"
+			)
 		return getattr(self._base, name)
 
 	@property
@@ -126,36 +142,6 @@ class SWAGPUPagedKVCacheManager:
 			state.max_seen_raw_pos = token_count - 1
 			state.has_tokens = True
 		return allocations
-
-	def grow_sequence_pages(self, sequence_id: int, num_pages: int) -> list[int]:
-		return self._base.grow_sequence_pages(int(sequence_id), int(num_pages))
-
-	def grow_pages_for_sequences(
-		self, sequence_ids: Sequence[int], num_pages: Sequence[int]
-	):
-		return self._base.grow_pages_for_sequences(sequence_ids, num_pages)
-
-	def extend_pages_for_sequence(
-		self, sequence_id: int, new_total_tokens: int
-	) -> int:
-		_, added_pages = self._update_window_for_raw_end(
-			int(sequence_id), int(new_total_tokens)
-		)
-		self._rebuild_last_page_table_if_available()
-		return added_pages
-
-	def release_sequence_prefix_pages(
-		self, sequence_id: int, num_pages: int
-	) -> list[int]:
-		sequence_id = int(sequence_id)
-		num_pages = int(num_pages)
-		released = self._base.release_sequence_prefix_pages(
-			sequence_id, num_pages
-		)
-		state = self._states.setdefault(sequence_id, _SWASequenceState())
-		state.window_start_page += num_pages
-		self._rebuild_last_page_table_if_available()
-		return released
 
 	def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
 		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
@@ -321,7 +307,7 @@ class SWAGPUPagedKVCacheManager:
 			)
 		if state.has_tokens and window.window_start_page > state.window_start_page:
 			pages_to_release = window.window_start_page - state.window_start_page
-			self._base.release_sequence_prefix_pages(
+			self._base._release_sequence_prefix_pages(
 				sequence_id, pages_to_release
 			)
 

@@ -994,7 +994,7 @@ class GPUPagedKVCacheManager:
 		if reclaimed:
 			self._clear_active_page_pointer_tables()
 
-	def release_sequence_prefix_pages(
+	def _release_sequence_prefix_pages(
 		self, sequence_id: int, num_pages: int
 	) -> List[int]:
 		"""Release the oldest pages of one active sequence.
@@ -1009,19 +1009,19 @@ class GPUPagedKVCacheManager:
 		num_pages = int(num_pages)
 		if num_pages < 0:
 			raise ValueError(
-				f"release_sequence_prefix_pages: num_pages must be >= 0, got {num_pages}"
+				f"_release_sequence_prefix_pages: num_pages must be >= 0, got {num_pages}"
 			)
 		if num_pages == 0:
 			return []
 		state = self._sequences.get(sequence_id)
 		if state is None:
 			raise KeyError(
-				f"release_sequence_prefix_pages: unknown sequence id {sequence_id}"
+				f"_release_sequence_prefix_pages: unknown sequence id {sequence_id}"
 			)
 		current_pages = int(state.pages.numel())
 		if num_pages > current_pages:
 			raise ValueError(
-				"release_sequence_prefix_pages: cannot release "
+				"_release_sequence_prefix_pages: cannot release "
 				f"{num_pages} pages from sequence {sequence_id} with only "
 				f"{current_pages} pages"
 			)
