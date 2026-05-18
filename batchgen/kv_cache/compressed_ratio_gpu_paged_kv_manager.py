@@ -48,6 +48,7 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
 
         self._last_page_table_order: Optional[list[int]] = None
         self._page_table_dirty = False
+        self._prepared_decode_page_table: Optional[torch.Tensor] = None
         self._prepared_decode_positions: Optional[torch.Tensor] = None
         self._prepared_decode_position_count = 0
 
@@ -58,6 +59,7 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
         self._last_page_table_order = None
         self._page_table_dirty = False
+        self._prepared_decode_page_table = None
         self._prepared_decode_positions = None
         self._prepared_decode_position_count = 0
         return super().destroy(empty_cuda_cache=empty_cuda_cache)
@@ -109,6 +111,7 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
     def clear_page_table(self) -> None:
         self._last_page_table_order = None
         self._page_table_dirty = False
+        self._prepared_decode_page_table = None
         return super().clear_page_table()
 
     def ensure_cuda_graph_page_table(
@@ -159,10 +162,12 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         self._write_prepared_decode_positions(storage_positions)
 
         if refresh_page_table:
-            self._refresh_decode_page_table(
+            self._prepared_decode_page_table = self._refresh_decode_page_table(
                 sequence_ids,
                 use_cuda_graph_page_table=use_cuda_graph_page_table,
             )
+        else:
+            self._prepared_decode_page_table = None
 
     def get_context_kv_page_ptrs(
         self, sequence_id: int, layer_idx: int, context_length: int
@@ -225,7 +230,10 @@ class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             )
             self._rebuild_last_page_table_if_dirty()
 
-        page_table = self._gpu_page_table_manager.gpu_table
+        if assume_prepared and self._prepared_decode_page_table is not None:
+            page_table = self._prepared_decode_page_table
+        else:
+            page_table = self._gpu_page_table_manager.gpu_table
         if page_table is None:
             raise RuntimeError(
                 "CompressedRatioGPUPagedKVCacheManager: GPU page table is not "
