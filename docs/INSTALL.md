@@ -55,13 +55,13 @@ conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install all wheels from the latest release
-RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post2"
+RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post4"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/batchgen_kernels-0.3.2+sm90a-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-1.0.10.post2-py3-none-any.whl"
+  "${RELEASE_URL}/batchgen-1.0.10.post4-py3-none-any.whl"
 ```
 
 No source compilation needed — pip auto-installs all remaining Python dependencies
@@ -78,8 +78,8 @@ bash scripts/build_wheels.sh --output-dir /path/to/wheels
 Then upload to a GitHub Release:
 
 ```bash
-gh release create v1.0.4.post1 --title "BatchGen v1.0.4.post1"
-gh release upload v1.0.4.post1 /path/to/wheels/*.whl
+gh release create v1.0.10.post4 --title "BatchGen v1.0.10.post4"
+gh release upload v1.0.10.post4 /path/to/wheels/*.whl
 ```
 
 ## Important: Do Not Run from the Source Directory
