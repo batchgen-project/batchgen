@@ -67,11 +67,19 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         self._states: dict[int, _SWASequenceState] = {}
         self._last_page_table_order: Optional[list[int]] = None
         self._page_table_dirty = False
+        self._prepared_decode_positions: Optional[torch.Tensor] = None
+        self._prepared_decode_position_count = 0
+
+    def initialize(self) -> None:
+        super().initialize()
+        self._ensure_prepared_decode_position_buffer()
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
         self._states.clear()
         self._last_page_table_order = None
         self._page_table_dirty = False
+        self._prepared_decode_positions = None
+        self._prepared_decode_position_count = 0
         return super().destroy(empty_cuda_cache=empty_cuda_cache)
 
     def allocate_pages(self, sequence_id: int, num_tokens: int) -> list[int]:
@@ -164,6 +172,66 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             return super().get_cuda_graph_page_table()
         return super().ensure_cuda_graph_page_table(self._last_page_table_order)
 
+    def prepare_decode_step(
+        self,
+        sequence_ids: Sequence[int],
+        raw_positions: Sequence[int] | torch.Tensor,
+        *,
+        refresh_page_table: bool = True,
+        use_cuda_graph_page_table: bool = False,
+    ) -> None:
+        """Advance SWA metadata before the actual decode KV write.
+
+        ``raw_positions`` are the model-global decode write positions, aligned
+        with ``sequence_ids``. This method performs the work that can change
+        allocation metadata: page-level window advance, prefix-page release,
+        capacity growth, and optional page-table refresh. The window-local write
+        positions are written into the manager-owned decode-position buffer and
+        consumed by :meth:`update_layer_decode_new_token` when
+        ``assume_prepared=True``.
+        """
+
+        sequence_ids = [int(seq_id) for seq_id in sequence_ids]
+        raw_values = as_int_list(raw_positions)
+        if len(sequence_ids) != len(raw_values):
+            raise ValueError(
+                "prepare_decode_step: sequence_ids and raw_positions must "
+                "have the same length"
+            )
+
+        storage_positions: list[int] = []
+        for sequence_id, raw_pos in zip(sequence_ids, raw_values):
+            active_tokens, _ = self._update_window_for_raw_end(
+                sequence_id, int(raw_pos) + 1
+            )
+            storage_positions.append(active_tokens - 1)
+        self._write_prepared_decode_positions(storage_positions)
+
+        if refresh_page_table:
+            self._refresh_decode_page_table(
+                sequence_ids,
+                use_cuda_graph_page_table=use_cuda_graph_page_table,
+            )
+
+    def get_prepared_decode_positions(
+        self, batch_size: Optional[int] = None
+    ) -> torch.Tensor:
+        """Return the manager-owned prepared decode-position buffer view."""
+
+        buffer = self._ensure_prepared_decode_position_buffer()
+        count = (
+            self._prepared_decode_position_count
+            if batch_size is None
+            else int(batch_size)
+        )
+        if count < 0 or count > self._prepared_decode_position_count:
+            raise ValueError(
+                "get_prepared_decode_positions: requested "
+                f"{count} positions, but only "
+                f"{self._prepared_decode_position_count} are prepared"
+            )
+        return buffer[:count]
+
     def get_context_kv_page_ptrs(
         self, sequence_id: int, layer_idx: int, context_length: int
     ):
@@ -179,16 +247,21 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         self,
         k_tensor: torch.Tensor,
         v_tensor: Optional[torch.Tensor],
-        sequence_lengths: torch.Tensor,
+        sequence_lengths: Optional[torch.Tensor],
         layer_idx: int,
         batch_slice: Optional[tuple] = None,
         slot_indices: Optional[torch.Tensor] = None,
+        *,
+        assume_prepared: bool = False,
     ) -> None:
         """Append decode KV using raw token positions.
 
         ``sequence_lengths`` keeps the old manager's argument name, but for this
-        wrapper it is interpreted as raw decode write positions. The backing
-        manager receives window-local storage positions.
+        wrapper it is interpreted as raw decode write positions unless
+        ``assume_prepared`` is set. With ``assume_prepared=True``, this method
+        reads the manager-owned prepared decode-position buffer by default; no
+        window advance, allocation, prefix release, or page-table rebuild is
+        performed here.
         """
 
         batch_size = int(k_tensor.shape[0])
@@ -197,17 +270,24 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             batch_slice=batch_slice,
             slot_indices=slot_indices,
         )
-        raw_positions = self._resolve_raw_positions(
-            batch_size=batch_size,
-            batch_slice=batch_slice,
-            sequence_lengths=sequence_lengths,
-        )
-        storage_positions = self._prepare_storage_positions(
-            raw_positions=raw_positions,
-            slot_indices=resolved_slots,
-            like=sequence_lengths,
-        )
-        self._rebuild_last_page_table_if_dirty()
+        if assume_prepared:
+            storage_positions = self._resolve_prepared_storage_positions(
+                batch_size=batch_size,
+                batch_slice=batch_slice,
+                sequence_lengths=sequence_lengths,
+            )
+        else:
+            raw_positions = self._resolve_raw_positions(
+                batch_size=batch_size,
+                batch_slice=batch_slice,
+                sequence_lengths=sequence_lengths,
+            )
+            storage_positions = self._prepare_storage_positions(
+                raw_positions=raw_positions,
+                slot_indices=resolved_slots,
+                like=sequence_lengths,
+            )
+            self._rebuild_last_page_table_if_dirty()
         return super().update_layer_decode_new_token(
             k_tensor=k_tensor,
             v_tensor=v_tensor,
@@ -411,6 +491,47 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             )
         return raw_positions.contiguous()
 
+    def _resolve_prepared_storage_positions(
+        self,
+        *,
+        batch_size: int,
+        batch_slice: Optional[tuple],
+        sequence_lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if sequence_lengths is not None:
+            return self._resolve_raw_positions(
+                batch_size=batch_size,
+                batch_slice=batch_slice,
+                sequence_lengths=sequence_lengths,
+            )
+
+        buffer = self._ensure_prepared_decode_position_buffer()
+        prepared_count = int(self._prepared_decode_position_count)
+        if batch_slice is not None and prepared_count != batch_size:
+            start_idx, end_idx = batch_slice
+            if start_idx < 0 or end_idx < start_idx or end_idx > prepared_count:
+                raise ValueError(
+                    "SWAGPUPagedKVCacheManager: batch_slice is outside the "
+                    f"prepared decode-position range, slice={batch_slice}, "
+                    f"prepared={prepared_count}"
+                )
+            positions = buffer[start_idx:end_idx]
+        else:
+            if batch_size > prepared_count:
+                raise ValueError(
+                    "SWAGPUPagedKVCacheManager: requested "
+                    f"{batch_size} prepared positions, but only "
+                    f"{prepared_count} are available"
+                )
+            positions = buffer[:batch_size]
+
+        if positions.shape[0] != batch_size:
+            raise ValueError(
+                "SWAGPUPagedKVCacheManager: prepared positions must align "
+                f"with batch size, got {positions.shape[0]} vs {batch_size}"
+            )
+        return positions
+
     def _prepare_storage_positions(
         self,
         *,
@@ -442,6 +563,41 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             device=like.device,
         )
 
+    def _ensure_prepared_decode_position_buffer(self) -> torch.Tensor:
+        if self._prepared_decode_positions is None:
+            max_slots = int(self._gpu_page_table_manager.max_slots)
+            self._prepared_decode_positions = torch.full(
+                (max_slots,),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        return self._prepared_decode_positions
+
+    def _write_prepared_decode_positions(
+        self, positions: Sequence[int]
+    ) -> None:
+        buffer = self._ensure_prepared_decode_position_buffer()
+        count = len(positions)
+        if count > buffer.numel():
+            raise ValueError(
+                "prepare_decode_step: active batch size exceeds the "
+                f"prepared decode-position buffer capacity, batch={count}, "
+                f"capacity={buffer.numel()}"
+            )
+        if count:
+            buffer[:count].copy_(
+                torch.as_tensor(
+                    positions,
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                )
+            )
+        previous_count = self._prepared_decode_position_count
+        if previous_count > count:
+            buffer[count:previous_count].fill_(-1)
+        self._prepared_decode_position_count = count
+
     def _rebuild_last_page_table_if_dirty(self) -> None:
         if not self._page_table_dirty:
             return
@@ -454,6 +610,38 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         else:
             super().clear_page_table()
         self._page_table_dirty = False
+
+    def _refresh_decode_page_table(
+        self,
+        sequence_ids: Sequence[int],
+        *,
+        use_cuda_graph_page_table: bool,
+    ) -> Optional[torch.Tensor]:
+        order = [int(seq_id) for seq_id in sequence_ids]
+        if use_cuda_graph_page_table:
+            return self.ensure_cuda_graph_page_table(order)
+
+        manager = self._gpu_page_table_manager
+        if not order:
+            if (
+                self._page_table_dirty
+                or manager.gpu_table is None
+                or manager.slot_to_seq_id
+            ):
+                self.clear_page_table()
+            else:
+                self._last_page_table_order = []
+            return manager.gpu_table
+
+        if (
+            self._page_table_dirty
+            or manager.gpu_table is None
+            or manager.slot_to_seq_id != order
+        ):
+            return self.rebuild_page_table(order)
+
+        self._last_page_table_order = order
+        return manager.gpu_table
 
 
 __all__ = ["SWAGPUPagedKVCacheManager"]

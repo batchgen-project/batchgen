@@ -245,6 +245,22 @@ class GPUKVCoordinator:
             [int(seq_id) for seq_id in sequence_ids]
         )
 
+    def prepare_decode_step(
+        self,
+        sequence_ids: Sequence[int],
+        raw_positions,
+        *,
+        component_name: str,
+        **kwargs,
+    ):
+        manager = self._component_for_op(component_name, "prepare_decode_step")
+        prepare = getattr(manager, "prepare_decode_step")
+        return prepare(
+            [int(seq_id) for seq_id in sequence_ids],
+            raw_positions,
+            **kwargs,
+        )
+
     def get_cuda_graph_page_table_state(self, *, component_name: str):
         manager = self._component_for_op(
             component_name, "get_cuda_graph_page_table_state"
@@ -282,6 +298,7 @@ class GPUKVCoordinator:
         slot_indices=None,
         *,
         component_name: str,
+        **kwargs,
     ) -> None:
         manager = self._component_for_op(
             component_name, "update_layer_decode_new_token"
@@ -293,6 +310,7 @@ class GPUKVCoordinator:
             layer_idx=int(layer_idx),
             batch_slice=batch_slice,
             slot_indices=slot_indices,
+            **kwargs,
         )
 
     def get_context_kv_page_ptrs(
