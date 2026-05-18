@@ -4,8 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import torch
+
 
 LayerMapping = Sequence[int]
+
+
+def ceil_div(value: int, divisor: int) -> int:
+    if divisor <= 0:
+        raise ValueError("divisor must be positive")
+    return -(-value // divisor)
+
+
+def as_int_list(values: Sequence[int] | torch.Tensor) -> list[int]:
+    if isinstance(values, torch.Tensor):
+        return [int(v) for v in values.detach().cpu().tolist()]
+    return [int(v) for v in values]
 
 
 def resolve_from_layer_mapping(

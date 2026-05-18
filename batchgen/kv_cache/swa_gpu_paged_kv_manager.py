@@ -1,23 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 
+from batchgen.kv_cache.coordinator_utils import as_int_list, ceil_div
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-	if divisor <= 0:
-		raise ValueError("divisor must be positive")
-	return -(-value // divisor)
-
-
-def _as_int_list(values: Sequence[int] | torch.Tensor) -> list[int]:
-	if isinstance(values, torch.Tensor):
-		return [int(v) for v in values.detach().cpu().tolist()]
-	return [int(v) for v in values]
 
 
 @dataclass
@@ -265,7 +254,7 @@ class SWAGPUPagedKVCacheManager:
 		"""
 
 		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
-		raw_values = _as_int_list(raw_lengths)
+		raw_values = as_int_list(raw_lengths)
 		if len(sequence_ids) != len(raw_values):
 			raise ValueError(
 				"map_raw_lengths_to_window_local_lengths: sequence_ids and "
@@ -308,7 +297,7 @@ class SWAGPUPagedKVCacheManager:
 		window_start_page = first_needed_token // self.page_size_tokens
 		window_start_token = window_start_page * self.page_size_tokens
 		active_tokens = raw_end_tokens - window_start_token
-		required_pages = _ceil_div(active_tokens, self.page_size_tokens)
+		required_pages = ceil_div(active_tokens, self.page_size_tokens)
 		if required_pages > self.window_pages + 1:
 			raise RuntimeError(
 				f"SWA active pages {required_pages} exceed window_pages + 1 "
@@ -352,7 +341,7 @@ class SWAGPUPagedKVCacheManager:
 	) -> int:
 		if active_tokens <= 0:
 			return 0
-		required_pages = _ceil_div(active_tokens, self.page_size_tokens)
+		required_pages = ceil_div(active_tokens, self.page_size_tokens)
 		if required_pages > self.window_pages + 1:
 			raise ValueError(
 				f"sequence {sequence_id} requires {required_pages} active "
@@ -429,8 +418,8 @@ class SWAGPUPagedKVCacheManager:
 		slot_indices: torch.Tensor,
 		like: torch.Tensor,
 	) -> torch.Tensor:
-		slot_values = _as_int_list(slot_indices)
-		raw_values = _as_int_list(raw_positions)
+		slot_values = as_int_list(slot_indices)
+		raw_values = as_int_list(raw_positions)
 		slot_order = self._base._gpu_page_table_manager.slot_to_seq_id
 		storage_positions: list[int] = []
 		for slot, raw_pos in zip(slot_values, raw_values):

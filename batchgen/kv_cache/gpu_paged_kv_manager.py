@@ -19,6 +19,7 @@ from batchgen.kv_cache.gpu_kv_kernels import (
 	run_paged_kv_token_update_fused,
 )
 from batchgen.kv_cache.coordinator_utils import (
+	ceil_div as _ceil_div,
 	resolve_from_layer_mapping,
 	validate_layer_mapping,
 )
@@ -37,12 +38,6 @@ def _require_positive(value: Optional[int], field_name: str) -> int:
 	if value is None or value <= 0:
 		raise ValueError(f"{field_name} must be > 0, got {value}")
 	return int(value)
-
-
-def _ceil_div(value: int, divisor: int) -> int:
-	if divisor <= 0:
-		raise ValueError("divisor must be positive")
-	return -(-value // divisor)
 
 
 def _as_int_tensor(values: Iterable[int]) -> torch.Tensor:
