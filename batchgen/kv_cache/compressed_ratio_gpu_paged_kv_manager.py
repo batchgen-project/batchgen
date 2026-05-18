@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
 import torch
@@ -13,28 +12,13 @@ from batchgen.kv_cache.gpu_paged_kv_manager import (
 )
 
 
-@dataclass
-class _SWASequenceState:
-    window_start_page: int = 0
-    active_pages: int = 0
-    max_seen_raw_pos: int = -1
-    has_tokens: bool = False
+class CompressedRatioGPUPagedKVCacheManager(GPUPagedKVCacheManager):
+    """GPU paged KV manager for floor-compressed token streams.
 
-
-@dataclass(frozen=True)
-class _WindowForRawEnd:
-    window_start_page: int
-    active_tokens: int
-    required_pages: int
-
-
-class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
-    """Page-level sliding-window GPU paged KV manager.
-
-    Storage, page allocation, page-table rebuilds, and update kernels come from
-    ``GPUPagedKVCacheManager``. This subclass only converts raw token positions
-    into window-local storage positions and releases old prefix pages when the
-    page-aligned SWA window moves forward.
+    The base manager still owns storage, page allocation, page tables, and the
+    token update kernel. This wrapper only maps raw sequence lengths to
+    ``raw_length // compression_ratio`` and filters decode steps that have not
+    produced a full compressed KV token yet.
     """
 
     def __init__(
@@ -44,7 +28,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         *,
         config: Optional[GPUPagedKVConfig] = None,
         device: Optional[Union[str, int, torch.device]] = None,
-        window_size_tokens: int,
+        compression_ratio: int,
     ) -> None:
         super().__init__(
             engine_config=engine_config,
@@ -52,19 +36,13 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             config=config,
             device=device,
         )
-        self.window_size_tokens = int(window_size_tokens)
+        self.compression_ratio = int(compression_ratio)
+        if self.compression_ratio <= 0:
+            raise ValueError("compression_ratio must be > 0")
         self.page_size_tokens = int(self.config.page_size_tokens)
         if self.page_size_tokens <= 0:
             raise ValueError("page_size_tokens must be > 0")
-        if self.window_size_tokens <= 0:
-            raise ValueError("window_size_tokens must be > 0")
-        if self.window_size_tokens % self.page_size_tokens != 0:
-            raise ValueError(
-                "window_size_tokens must be divisible by page_size_tokens "
-                "for page-level SWA"
-            )
-        self.window_pages = self.window_size_tokens // self.page_size_tokens
-        self._states: dict[int, _SWASequenceState] = {}
+
         self._last_page_table_order: Optional[list[int]] = None
         self._page_table_dirty = False
         self._prepared_decode_positions: Optional[torch.Tensor] = None
@@ -75,7 +53,6 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         self._ensure_prepared_decode_position_buffer()
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
-        self._states.clear()
         self._last_page_table_order = None
         self._page_table_dirty = False
         self._prepared_decode_positions = None
@@ -97,38 +74,20 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
                 "must have the same length"
             )
         sequence_ids = [int(seq_id) for seq_id in sequence_ids]
-        raw_tokens = [int(tokens) for tokens in num_tokens]
-        active_tokens: list[int] = []
-        windows: list[_WindowForRawEnd] = []
-        for token_count in raw_tokens:
-            window = self._compute_window_for_raw_end(token_count)
-            if window.active_tokens <= 0:
-                raise ValueError(
-                    "allocate_pages_for_sequences: num_tokens entries must "
-                    "be > 0"
-                )
-            active_tokens.append(window.active_tokens)
-            windows.append(window)
-
+        storage_tokens = [
+            self._storage_capacity_tokens(self._compressed_tokens(tokens))
+            for tokens in num_tokens
+        ]
         allocations = super().allocate_pages_for_sequences(
-            sequence_ids, active_tokens
+            sequence_ids, storage_tokens
         )
-        for seq_id, token_count, window in zip(
-            sequence_ids, raw_tokens, windows
-        ):
-            state = self._states.setdefault(seq_id, _SWASequenceState())
-            state.window_start_page = window.window_start_page
-            state.active_pages = window.required_pages
-            state.max_seen_raw_pos = token_count - 1
-            state.has_tokens = True
-        self._page_table_dirty = True
+        if allocations:
+            self._page_table_dirty = True
         return allocations
 
     def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
         sequence_ids = [int(seq_id) for seq_id in sequence_ids]
         super().free_pages_for_sequences(sequence_ids)
-        for seq_id in sequence_ids:
-            self._states.pop(seq_id, None)
         if self._last_page_table_order is not None:
             freed = set(sequence_ids)
             self._last_page_table_order = [
@@ -136,17 +95,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
                 for seq_id in self._last_page_table_order
                 if seq_id not in freed
             ]
-        else:
-            freed = set(sequence_ids)
-            active_order = [
-                seq_id
-                for seq_id in self._gpu_page_table_manager.slot_to_seq_id
-                if seq_id not in freed
-            ]
-            if active_order != self._gpu_page_table_manager.slot_to_seq_id:
-                self._last_page_table_order = active_order
         self._page_table_dirty = True
-        self._rebuild_last_page_table_if_dirty()
 
     def rebuild_page_table(self, sequence_ids: Sequence[int]) -> torch.Tensor:
         self._last_page_table_order = [int(seq_id) for seq_id in sequence_ids]
@@ -180,15 +129,11 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         refresh_page_table: bool = True,
         use_cuda_graph_page_table: bool = False,
     ) -> None:
-        """Advance SWA metadata before the actual decode KV write.
+        """Prepare compressed decode writes before the update kernel.
 
-        ``raw_positions`` are the model-global decode write positions, aligned
-        with ``sequence_ids``. This method performs the work that can change
-        allocation metadata: page-level window advance, prefix-page release,
-        capacity growth, and optional page-table refresh. The window-local write
-        positions are written into the manager-owned decode-position buffer and
-        consumed by :meth:`update_layer_decode_new_token` when
-        ``assume_prepared=True``.
+        ``raw_positions`` are uncompressed decode write positions. Positions
+        that do not finish a compression group are recorded as ``-1`` and will
+        be skipped by :meth:`update_layer_decode_new_token`.
         """
 
         sequence_ids = [int(seq_id) for seq_id in sequence_ids]
@@ -201,10 +146,13 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
 
         storage_positions: list[int] = []
         for sequence_id, raw_pos in zip(sequence_ids, raw_values):
-            active_tokens, _ = self._update_window_for_raw_end(
-                sequence_id, int(raw_pos) + 1
-            )
-            storage_positions.append(active_tokens - 1)
+            raw_end = self._checked_raw_end(raw_pos)
+            compressed_tokens = raw_end // self.compression_ratio
+            self._ensure_compressed_capacity(sequence_id, compressed_tokens)
+            if raw_end % self.compression_ratio == 0:
+                storage_positions.append(compressed_tokens - 1)
+            else:
+                storage_positions.append(-1)
         self._write_prepared_decode_positions(storage_positions)
 
         if refresh_page_table:
@@ -216,12 +164,13 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
     def get_context_kv_page_ptrs(
         self, sequence_id: int, layer_idx: int, context_length: int
     ):
-        active_tokens, _ = self._update_window_for_raw_end(
-            int(sequence_id), int(context_length)
-        )
+        compressed_length = self._compressed_tokens(context_length)
+        self._ensure_compressed_capacity(int(sequence_id), compressed_length)
         self._rebuild_last_page_table_if_dirty()
         return super().get_context_kv_page_ptrs(
-            int(sequence_id), int(layer_idx), active_tokens
+            int(sequence_id),
+            int(layer_idx),
+            self._storage_capacity_tokens(compressed_length),
         )
 
     def update_layer_decode_new_token(
@@ -235,15 +184,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         *,
         assume_prepared: bool = False,
     ) -> None:
-        """Append decode KV using raw token positions.
-
-        ``sequence_lengths`` keeps the old manager's argument name, but for this
-        wrapper it is interpreted as raw decode write positions unless
-        ``assume_prepared`` is set. With ``assume_prepared=True``, callers must
-        pass ``sequence_lengths=None`` and this method reads the manager-owned
-        prepared decode-position buffer; no window advance, allocation, prefix
-        release, or page-table rebuild is performed here.
-        """
+        """Append only decode rows that produced a compressed KV token."""
 
         batch_size = int(k_tensor.shape[0])
         resolved_slots = self._resolve_slot_indices(
@@ -254,8 +195,8 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         if assume_prepared:
             if sequence_lengths is not None:
                 raise TypeError(
-                    "SWAGPUPagedKVCacheManager: sequence_lengths must be None "
-                    "when assume_prepared=True"
+                    "CompressedRatioGPUPagedKVCacheManager: sequence_lengths "
+                    "must be None when assume_prepared=True"
                 )
             storage_positions = self._resolve_prepared_storage_positions(
                 batch_size=batch_size,
@@ -270,148 +211,80 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             storage_positions = self._prepare_storage_positions(
                 raw_positions=raw_positions,
                 slot_indices=resolved_slots,
-                like=sequence_lengths,
+                like=raw_positions,
             )
             self._rebuild_last_page_table_if_dirty()
+
+        valid_rows = torch.nonzero(storage_positions >= 0).flatten()
+        if int(valid_rows.numel()) == 0:
+            return
+        valid_rows = valid_rows.to(device=k_tensor.device, dtype=torch.long)
+        compact_k = k_tensor.index_select(0, valid_rows).contiguous()
+        compact_v = None
+        if v_tensor is not None:
+            compact_v = v_tensor.index_select(0, valid_rows).contiguous()
+        compact_slots = resolved_slots.index_select(0, valid_rows).contiguous()
+        compact_positions = storage_positions.index_select(
+            0, valid_rows.to(device=storage_positions.device)
+        ).contiguous()
         return super().update_layer_decode_new_token(
-            k_tensor=k_tensor,
-            v_tensor=v_tensor,
-            sequence_lengths=storage_positions,
+            k_tensor=compact_k,
+            v_tensor=compact_v,
+            sequence_lengths=compact_positions,
             layer_idx=int(layer_idx),
             batch_slice=None,
-            slot_indices=resolved_slots,
+            slot_indices=compact_slots,
         )
 
-    def map_raw_lengths_to_window_local_lengths(
+    def map_raw_lengths_to_compressed_lengths(
         self,
-        sequence_ids: Sequence[int],
         raw_lengths: Sequence[int] | torch.Tensor,
         *,
         device: Optional[torch.device | str] = None,
         dtype: torch.dtype = torch.int32,
     ) -> torch.Tensor:
-        """Return page-level SWA lengths aligned with ``sequence_ids``.
-
-        This is the value that attention should consume as cache length when it
-        uses the page table owned by this SWA manager.
-        """
-
-        sequence_ids = [int(seq_id) for seq_id in sequence_ids]
         raw_values = as_int_list(raw_lengths)
-        if len(sequence_ids) != len(raw_values):
-            raise ValueError(
-                "map_raw_lengths_to_window_local_lengths: sequence_ids and "
-                "raw_lengths must have the same length"
-            )
-        local_lengths: list[int] = []
-        for seq_id, raw_length in zip(sequence_ids, raw_values):
-            state = self._states.get(seq_id)
-            if state is None or not state.has_tokens:
-                window = self._compute_window_for_raw_end(raw_length)
-                local_lengths.append(window.active_tokens)
-                continue
-            window_start_token = state.window_start_page * self.page_size_tokens
-            local_lengths.append(max(0, int(raw_length) - window_start_token))
         output_device = device
         if output_device is None and isinstance(raw_lengths, torch.Tensor):
             output_device = raw_lengths.device
         return torch.as_tensor(
-            local_lengths,
+            [
+                max(0, int(length)) // self.compression_ratio
+                for length in raw_values
+            ],
             dtype=dtype,
             device=output_device if output_device is not None else self.device,
         )
 
-    def _compute_window_for_raw_end(
-        self, raw_end_tokens: int
-    ) -> _WindowForRawEnd:
-        raw_end_tokens = int(raw_end_tokens)
-        if raw_end_tokens <= 0:
-            return _WindowForRawEnd(0, 0, 0)
-        first_needed_token = max(0, raw_end_tokens - self.window_size_tokens)
-        window_start_page = first_needed_token // self.page_size_tokens
-        window_start_token = window_start_page * self.page_size_tokens
-        active_tokens = raw_end_tokens - window_start_token
-        required_pages = ceil_div(active_tokens, self.page_size_tokens)
-        if required_pages > self.window_pages + 1:
-            raise RuntimeError(
-                f"SWA active pages {required_pages} exceed window_pages + 1 "
-                f"({self.window_pages + 1})"
-            )
-        return _WindowForRawEnd(
-            window_start_page=window_start_page,
-            active_tokens=active_tokens,
-            required_pages=required_pages,
-        )
+    def _compressed_tokens(self, raw_tokens: int) -> int:
+        return max(0, int(raw_tokens)) // self.compression_ratio
 
-    def _update_window_for_raw_end(
-        self, sequence_id: int, raw_end_tokens: int
-    ) -> tuple[int, int]:
-        window = self._compute_window_for_raw_end(raw_end_tokens)
-        state = self._states.setdefault(sequence_id, _SWASequenceState())
-        if (
-            state.has_tokens
-            and window.window_start_page < state.window_start_page
-        ):
-            raise ValueError(
-                "SWA GPU manager does not support writing tokens older than "
-                "the current page-level window"
-            )
-        if (
-            state.has_tokens
-            and window.window_start_page > state.window_start_page
-        ):
-            pages_to_release = (
-                window.window_start_page - state.window_start_page
-            )
-            if pages_to_release > state.active_pages:
-                raise RuntimeError(
-                    f"sequence {sequence_id} cannot release {pages_to_release} "
-                    f"SWA pages with only {state.active_pages} active pages"
-                )
-            self._release_sequence_prefix_pages(sequence_id, pages_to_release)
-            state.active_pages -= pages_to_release
-            self._page_table_dirty = True
+    @staticmethod
+    def _storage_capacity_tokens(exposed_tokens: int) -> int:
+        return max(1, int(exposed_tokens))
 
-        state.window_start_page = window.window_start_page
-        added_pages = self._ensure_active_capacity(
-            sequence_id, window.required_pages, state
-        )
-        if raw_end_tokens > 0:
-            state.max_seen_raw_pos = max(
-                state.max_seen_raw_pos, raw_end_tokens - 1
-            )
-            state.has_tokens = True
-        return window.active_tokens, added_pages
+    @staticmethod
+    def _checked_raw_end(raw_position: int) -> int:
+        raw_position = int(raw_position)
+        if raw_position < 0:
+            raise ValueError("raw decode positions must be non-negative")
+        return raw_position + 1
 
-    def _ensure_active_capacity(
-        self,
-        sequence_id: int,
-        required_pages: int,
-        state: _SWASequenceState,
-    ) -> int:
-        if required_pages <= 0:
-            return 0
-        if required_pages > self.window_pages + 1:
-            raise ValueError(
-                f"sequence {sequence_id} requires {required_pages} active "
-                f"pages, exceeding window_pages + 1 ({self.window_pages + 1})"
-            )
-        current_pages = int(state.active_pages)
-        base_state = self._sequences.get(sequence_id)
-        if current_pages == 0 and base_state is not None:
-            current_pages = int(base_state.pages.numel())
-            state.active_pages = current_pages
+    def _ensure_compressed_capacity(
+        self, sequence_id: int, exposed_tokens: int
+    ) -> None:
+        capacity_tokens = self._storage_capacity_tokens(exposed_tokens)
+        required_pages = ceil_div(capacity_tokens, self.page_size_tokens)
+        state = self._sequences.get(sequence_id)
+        current_pages = int(state.pages.numel()) if state is not None else 0
         missing_pages = max(0, required_pages - current_pages)
-        if missing_pages:
-            if base_state is None:
-                super().allocate_pages(
-                    sequence_id, missing_pages * self.page_size_tokens
-                )
-            else:
-                super().grow_sequence_pages(sequence_id, missing_pages)
-            state.active_pages += missing_pages
-            self._page_table_dirty = True
-        return missing_pages
+        if missing_pages == 0:
+            return
+        if state is None:
+            super().allocate_pages(sequence_id, capacity_tokens)
+        else:
+            super().grow_sequence_pages(sequence_id, missing_pages)
+        self._page_table_dirty = True
 
     def _resolve_slot_indices(
         self,
@@ -423,13 +296,15 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         page_table = self._gpu_page_table_manager.gpu_table
         if page_table is None:
             raise RuntimeError(
-                "SWAGPUPagedKVCacheManager: GPU page table is not initialized"
+                "CompressedRatioGPUPagedKVCacheManager: GPU page table is not "
+                "initialized"
             )
         if slot_indices is None:
             slot_indices = self._gpu_page_table_manager._slot_index_tensor
             if slot_indices is None:
                 raise RuntimeError(
-                    "SWAGPUPagedKVCacheManager: slot indices are unavailable"
+                    "CompressedRatioGPUPagedKVCacheManager: slot indices are "
+                    "unavailable"
                 )
         else:
             slot_indices = slot_indices.to(
@@ -440,13 +315,14 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             slot_indices = slot_indices[start_idx:end_idx]
         if slot_indices.shape[0] != batch_size:
             raise ValueError(
-                "SWAGPUPagedKVCacheManager: slot_indices must align with "
-                f"batch size, got {slot_indices.shape[0]} vs {batch_size}"
+                "CompressedRatioGPUPagedKVCacheManager: slot_indices must "
+                f"align with batch size, got {slot_indices.shape[0]} vs "
+                f"{batch_size}"
             )
         return slot_indices.contiguous()
 
+    @staticmethod
     def _resolve_raw_positions(
-        self,
         *,
         batch_size: int,
         batch_slice: Optional[tuple],
@@ -460,8 +336,9 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             raw_positions = raw_positions[start_idx:end_idx]
         if raw_positions.shape[0] != batch_size:
             raise ValueError(
-                "SWAGPUPagedKVCacheManager: sequence_lengths must align with "
-                f"batch size, got {raw_positions.shape[0]} vs {batch_size}"
+                "CompressedRatioGPUPagedKVCacheManager: sequence_lengths must "
+                f"align with batch size, got {raw_positions.shape[0]} vs "
+                f"{batch_size}"
             )
         return raw_positions.contiguous()
 
@@ -477,24 +354,23 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
             start_idx, end_idx = batch_slice
             if start_idx < 0 or end_idx < start_idx or end_idx > prepared_count:
                 raise ValueError(
-                    "SWAGPUPagedKVCacheManager: batch_slice is outside the "
-                    f"prepared decode-position range, slice={batch_slice}, "
-                    f"prepared={prepared_count}"
+                    "CompressedRatioGPUPagedKVCacheManager: batch_slice is "
+                    "outside the prepared decode-position range"
                 )
             positions = buffer[start_idx:end_idx]
         else:
             if batch_size > prepared_count:
                 raise ValueError(
-                    "SWAGPUPagedKVCacheManager: requested "
+                    "CompressedRatioGPUPagedKVCacheManager: requested "
                     f"{batch_size} prepared positions, but only "
                     f"{prepared_count} are available"
                 )
             positions = buffer[:batch_size]
-
         if positions.shape[0] != batch_size:
             raise ValueError(
-                "SWAGPUPagedKVCacheManager: prepared positions must align "
-                f"with batch size, got {positions.shape[0]} vs {batch_size}"
+                "CompressedRatioGPUPagedKVCacheManager: prepared positions "
+                f"must align with batch size, got {positions.shape[0]} vs "
+                f"{batch_size}"
             )
         return positions
 
@@ -511,7 +387,7 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         storage_positions: list[int] = []
         for slot, raw_pos in zip(slot_values, raw_values):
             if slot < 0:
-                storage_positions.append(0)
+                storage_positions.append(-1)
                 continue
             if slot >= len(slot_order):
                 raise IndexError(
@@ -519,10 +395,13 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
                     f"{len(slot_order)}"
                 )
             sequence_id = int(slot_order[slot])
-            active_tokens, _ = self._update_window_for_raw_end(
-                sequence_id, int(raw_pos) + 1
-            )
-            storage_positions.append(active_tokens - 1)
+            raw_end = self._checked_raw_end(raw_pos)
+            compressed_tokens = raw_end // self.compression_ratio
+            self._ensure_compressed_capacity(sequence_id, compressed_tokens)
+            if raw_end % self.compression_ratio == 0:
+                storage_positions.append(compressed_tokens - 1)
+            else:
+                storage_positions.append(-1)
         return torch.as_tensor(
             storage_positions,
             dtype=like.dtype,
@@ -547,8 +426,8 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         count = len(positions)
         if count > buffer.numel():
             raise ValueError(
-                "prepare_decode_step: active batch size exceeds the "
-                f"prepared decode-position buffer capacity, batch={count}, "
+                "prepare_decode_step: active batch size exceeds the prepared "
+                f"decode-position buffer capacity, batch={count}, "
                 f"capacity={buffer.numel()}"
             )
         if count:
@@ -610,4 +489,4 @@ class SWAGPUPagedKVCacheManager(GPUPagedKVCacheManager):
         return manager.gpu_table
 
 
-__all__ = ["SWAGPUPagedKVCacheManager"]
+__all__ = ["CompressedRatioGPUPagedKVCacheManager"]

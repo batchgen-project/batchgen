@@ -20,6 +20,7 @@
 
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
+#include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
 #include "Weights_Storage/Weights_Storage.h" 
@@ -31,6 +32,8 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -39,6 +42,14 @@ namespace py = pybind11;
 namespace kv = batchgen::kv;
 
 namespace {
+
+template <typename T, typename = void>
+struct HasCompressionRatio : std::false_type {};
+
+template <typename T>
+struct HasCompressionRatio<
+    T, std::void_t<decltype(std::declval<const T&>().compression_ratio())>>
+    : std::true_type {};
 
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
@@ -90,7 +101,8 @@ void BindHostPagedManager(py::module& m, const char* name) {
 
 template <typename WorkerView>
 void BindHostPagedWorkerView(py::module& m, const char* name) {
-    py::class_<WorkerView>(m, name)
+    auto cls = py::class_<WorkerView>(m, name);
+    cls
         .def(py::init<EngineConfig, ModelConfig>())
         .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"))
         .def("initialize", &WorkerView::Initialize,
@@ -323,6 +335,10 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
              "layer. For mapped worker views, layer_idx is a logical layer id "
              "and is resolved to a physical layer id before address "
              "calculation.");
+    if constexpr (HasCompressionRatio<WorkerView>::value) {
+        cls.def_property_readonly("compression_ratio",
+                                  &WorkerView::compression_ratio);
+    }
 }
 
 template <typename WorkerView>
@@ -499,8 +515,6 @@ void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
              py::arg("max_tokens") = py::none())
-        .def("window_start_page", &WorkerView::WindowStartPage,
-             py::arg("sequence_id"))
         .def_property_readonly("device_index", &WorkerView::device_index)
         .def_property_readonly("page_size_tokens",
                                &WorkerView::page_size_tokens)
@@ -667,6 +681,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "SWAMappedDefaultHostPagedKVWorkerView");
     BindSWAHostPagedWorkerView<kv::SWAMappedMLAHostPagedKVWorkerView>(
         m, "SWAMappedMLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4DefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio4DefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::CompressedRatio4MLAHostPagedKVWorkerView>(
+        m, "CompressedRatio4MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4MappedDefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio4MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4MappedMLAHostPagedKVWorkerView>(
+        m, "CompressedRatio4MappedMLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128DefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio128DefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::CompressedRatio128MLAHostPagedKVWorkerView>(
+        m, "CompressedRatio128MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128MappedDefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio128MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128MappedMLAHostPagedKVWorkerView>(
+        m, "CompressedRatio128MappedMLAHostPagedKVWorkerView");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),

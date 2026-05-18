@@ -309,16 +309,6 @@ class SWAHostPagedKVWorkerView {
         base_view_.WriteSequenceKVFromCPU(sequence_id, k_tensor, v_tensor);
     }
 
-    std::size_t WindowStartPage(std::int64_t sequence_id) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = sequence_states_.find(sequence_id);
-        if (it == sequence_states_.end()) {
-            throw std::out_of_range(
-                "SWAHostPagedKVWorkerView: missing sequence state");
-        }
-        return it->second.window_start_page;
-    }
-
    private:
     struct SWASequenceState {
         std::size_t window_start_page = 0;
