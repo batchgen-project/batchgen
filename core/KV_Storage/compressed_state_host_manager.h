@@ -184,13 +184,23 @@ class CompressedStateHostManager {
         torch::Tensor state_tensor, SequenceLengths raw_positions) {
         constexpr std::string_view kOpName =
             "AsyncOffloadDecodeStateToHost";
+        EnsureDeviceReady();
         auto prepared =
             PrepareDecodeRows(layer_idx, sequence_ids, state_tensor,
                               raw_positions, CopyDirection::kDeviceToHost,
                               kOpName);
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
         auto task = transformed_detail::MakeAsyncTask(
-            [prepared = std::move(prepared)]() mutable {
-                CopyDecodeRows(prepared, CopyDirection::kDeviceToHost);
+            [this, prepared = std::move(prepared),
+             producer_cuda_stream]() mutable {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+                CopyDecodeRowsAsync(prepared, CopyDirection::kDeviceToHost,
+                                    cuda_stream);
+                SynchronizeWithEvent(cuda_stream);
             });
         TrackTask(task);
         return task;
@@ -200,13 +210,18 @@ class CompressedStateHostManager {
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor state_tensor, SequenceLengths raw_positions) {
         constexpr std::string_view kOpName = "AsyncLoadDecodeStateToDevice";
+        EnsureDeviceReady();
         auto prepared =
             PrepareDecodeRows(layer_idx, sequence_ids, state_tensor,
                               raw_positions, CopyDirection::kHostToDevice,
                               kOpName);
         auto task = transformed_detail::MakeAsyncTask(
-            [prepared = std::move(prepared)]() mutable {
-                CopyDecodeRows(prepared, CopyDirection::kHostToDevice);
+            [this, prepared = std::move(prepared)]() mutable {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+                CopyDecodeRowsAsync(prepared, CopyDirection::kHostToDevice,
+                                    cuda_stream);
+                SynchronizeWithEvent(cuda_stream);
             });
         TrackTask(task);
         return task;
@@ -306,12 +321,22 @@ class CompressedStateHostManager {
     KVAsyncTask AsyncOffloadStateItemsToHost(
         std::vector<std::int64_t> sequence_ids,
         torch::Tensor state_device_ptrs) {
+        EnsureDeviceReady();
         auto prepared = PrepareStateItemRows(
             std::move(sequence_ids), std::move(state_device_ptrs),
             "AsyncOffloadStateItemsToHost");
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
         auto task = transformed_detail::MakeAsyncTask(
-            [prepared = std::move(prepared)]() mutable {
-                CopyStateItems(prepared, CopyDirection::kDeviceToHost);
+            [this, prepared = std::move(prepared),
+             producer_cuda_stream]() mutable {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+                CopyStateItemsAsync(prepared, CopyDirection::kDeviceToHost,
+                                    cuda_stream);
+                SynchronizeWithEvent(cuda_stream);
             });
         TrackTask(task);
         return task;
@@ -320,12 +345,17 @@ class CompressedStateHostManager {
     KVAsyncTask AsyncLoadStateItemsToDevice(
         std::vector<std::int64_t> sequence_ids,
         torch::Tensor state_device_ptrs) {
+        EnsureDeviceReady();
         auto prepared = PrepareStateItemRows(
             std::move(sequence_ids), std::move(state_device_ptrs),
             "AsyncLoadStateItemsToDevice");
         auto task = transformed_detail::MakeAsyncTask(
-            [prepared = std::move(prepared)]() mutable {
-                CopyStateItems(prepared, CopyDirection::kHostToDevice);
+            [this, prepared = std::move(prepared)]() mutable {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
+                CopyStateItemsAsync(prepared, CopyDirection::kHostToDevice,
+                                    cuda_stream);
+                SynchronizeWithEvent(cuda_stream);
             });
         TrackTask(task);
         return task;
@@ -713,6 +743,7 @@ class CompressedStateHostManager {
         if (sequence_ids.empty()) {
             return {std::move(state_tensor), {}, config_.state_token_bytes};
         }
+        ValidateCudaTensor(state_tensor, "state_tensor");
         if (state_tensor.size(0) !=
             static_cast<std::int64_t>(sequence_ids.size())) {
             std::ostringstream oss;
@@ -721,14 +752,10 @@ class CompressedStateHostManager {
                    "size";
             throw std::invalid_argument(oss.str());
         }
-        if (direction == CopyDirection::kHostToDevice &&
-            !state_tensor.is_contiguous()) {
-            std::ostringstream oss;
-            oss << op_name << ": destination state_tensor must be contiguous";
-            throw std::invalid_argument(oss.str());
-        }
         if (!state_tensor.is_contiguous()) {
-            state_tensor = state_tensor.contiguous();
+            std::ostringstream oss;
+            oss << op_name << ": state_tensor must be contiguous";
+            throw std::invalid_argument(oss.str());
         }
         const std::size_t row_bytes = RowBytes(state_tensor, op_name);
         PreparedDecodeRows prepared;
@@ -872,44 +899,32 @@ class CompressedStateHostManager {
                batch_idx * row_bytes;
     }
 
-    static void CopyDecodeRows(const PreparedDecodeRows& prepared,
-                               CopyDirection direction) {
-        if (prepared.device_index >= 0) {
-            CUDA_CHECK(cudaSetDevice(prepared.device_index));
-        }
+    void CopyDecodeRowsAsync(const PreparedDecodeRows& prepared,
+                             CopyDirection direction,
+                             cudaStream_t stream) const {
         for (const DecodeRowCopy& row : prepared.rows) {
             if (direction == CopyDirection::kDeviceToHost) {
-                CopyBytes(row.tensor_ptr, row.host_ptr, prepared.row_bytes);
+                EnqueueCopy(row.tensor_ptr, row.host_ptr, prepared.row_bytes,
+                            direction, stream);
             } else {
-                CopyBytes(row.host_ptr, row.tensor_ptr, prepared.row_bytes);
+                EnqueueCopy(row.host_ptr, row.tensor_ptr, prepared.row_bytes,
+                            direction, stream);
             }
         }
     }
 
-    static void CopyStateItems(const PreparedStateItemRows& prepared,
-                               CopyDirection direction) {
-        if (prepared.device_index >= 0) {
-            CUDA_CHECK(cudaSetDevice(prepared.device_index));
-        }
+    void CopyStateItemsAsync(const PreparedStateItemRows& prepared,
+                             CopyDirection direction,
+                             cudaStream_t stream) const {
         for (const StateItemCopy& state_item : prepared.state_items) {
             if (direction == CopyDirection::kDeviceToHost) {
-                CopyBytes(state_item.device_ptr, state_item.host_ptr,
-                          prepared.state_item_bytes);
+                EnqueueCopy(state_item.device_ptr, state_item.host_ptr,
+                            prepared.state_item_bytes, direction, stream);
             } else {
-                CopyBytes(state_item.host_ptr, state_item.device_ptr,
-                          prepared.state_item_bytes);
+                EnqueueCopy(state_item.host_ptr, state_item.device_ptr,
+                            prepared.state_item_bytes, direction, stream);
             }
         }
-    }
-
-    static void CopyBytes(const std::byte* src, std::byte* dst,
-                          std::size_t bytes) {
-        if (bytes == 0) {
-            return;
-        }
-        CUDA_CHECK(cudaMemcpy(static_cast<void*>(dst),
-                              static_cast<const void*>(src), bytes,
-                              cudaMemcpyDefault));
     }
 
     void SynchronizeWithEvent(cudaStream_t stream) const {

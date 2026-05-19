@@ -3,20 +3,27 @@ from __future__ import annotations
 import pytest
 import torch
 
+from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
+    CompressedRatioGPUPagedKVCacheManager,
+)
+from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
+    COMPRESSOR_C4,
+    COMPRESSOR_C4_STATE,
+    COMPRESSOR_C128,
+    COMPRESSOR_C128_STATE,
+    INDEXER_C4,
+    INDEXER_C4_STATE,
+    SWA,
+    DeepSeekV4GPUKVCoordinator,
+    DeepSeekV4HostKVCoordinator,
+)
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
 )
 from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
-from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
-    COMPRESSOR_C4,
-    COMPRESSOR_C128,
-    INDEXER_C4,
-    SWA,
-    DeepSeekV4GPUKVCoordinator,
-    DeepSeekV4HostKVCoordinator,
-)
+from batchgen.kv_cache.swa_gpu_paged_kv_manager import SWAGPUPagedKVCacheManager
 
 
 class _FakeTask:
@@ -119,6 +126,141 @@ class _FakeHostView:
             )
         )
         return _FakeTask(f"{self.name}:load_paged")
+
+
+class _FakeStateManager:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls = []
+        self.is_initialized = False
+
+    def initialize(self, *args, **kwargs) -> None:
+        self.is_initialized = True
+        self.calls.append(("initialize", args, kwargs))
+
+    def shutdown(self) -> None:
+        self.is_initialized = False
+        self.calls.append(("shutdown",))
+
+    def destroy(self, *, empty_cuda_cache: bool = False) -> None:
+        self.is_initialized = False
+        self.calls.append(("destroy", empty_cuda_cache))
+
+    def allocate_state_items_for_sequences(self, sequence_ids):
+        self.calls.append(
+            ("allocate_state_items_for_sequences", list(sequence_ids))
+        )
+        return {
+            int(seq_id): int(offset)
+            for offset, seq_id in enumerate(sequence_ids)
+        }
+
+    def release_sequence_states(self, sequence_ids) -> None:
+        self.calls.append(("release_sequence_states", list(sequence_ids)))
+
+    def async_offload_decode_state_to_host(
+        self, layer_idx, sequence_ids, state_tensor, raw_positions
+    ):
+        self.calls.append(
+            (
+                "async_offload_decode_state_to_host",
+                int(layer_idx),
+                list(sequence_ids),
+                state_tensor,
+                raw_positions,
+            )
+        )
+        return _FakeTask(f"{self.name}:offload_state")
+
+    def async_load_decode_state_to_device(
+        self, layer_idx, sequence_ids, state_tensor, raw_positions
+    ):
+        self.calls.append(
+            (
+                "async_load_decode_state_to_device",
+                int(layer_idx),
+                list(sequence_ids),
+                state_tensor,
+                raw_positions,
+            )
+        )
+        return _FakeTask(f"{self.name}:load_state")
+
+    def async_append_decode_state_to_host_batched_kernel(
+        self, entries, sequence_ids, raw_positions
+    ):
+        self.calls.append(
+            (
+                "async_append_decode_state_to_host_batched_kernel",
+                list(entries),
+                list(sequence_ids),
+                raw_positions,
+            )
+        )
+        return _FakeTask(f"{self.name}:append_state")
+
+    def async_offload_state_items_to_host(
+        self, sequence_ids, state_device_ptrs
+    ):
+        self.calls.append(
+            (
+                "async_offload_state_items_to_host",
+                list(sequence_ids),
+                state_device_ptrs,
+            )
+        )
+        return _FakeTask(f"{self.name}:offload_state_items")
+
+    def async_load_state_items_to_device(self, sequence_ids, state_device_ptrs):
+        self.calls.append(
+            (
+                "async_load_state_items_to_device",
+                list(sequence_ids),
+                state_device_ptrs,
+            )
+        )
+        return _FakeTask(f"{self.name}:load_state_items")
+
+    def prepare_decode_step(self, sequence_ids, raw_positions) -> None:
+        self.calls.append(
+            ("prepare_decode_step", list(sequence_ids), raw_positions)
+        )
+
+    def update_layer_decode_state(
+        self,
+        state_tensor,
+        raw_positions,
+        layer_idx,
+        *,
+        sequence_ids=None,
+        batch_slice=None,
+        assume_prepared=False,
+    ) -> None:
+        self.calls.append(
+            (
+                "update_layer_decode_state",
+                state_tensor,
+                raw_positions,
+                int(layer_idx),
+                sequence_ids,
+                batch_slice,
+                assume_prepared,
+            )
+        )
+
+    def export_state_item_pointers(self, sequence_ids):
+        self.calls.append(("export_state_item_pointers", list(sequence_ids)))
+        return "state_ptrs"
+
+    def get_sequence_layer_state_item_pointer(self, sequence_id, layer_idx):
+        self.calls.append(
+            (
+                "get_sequence_layer_state_item_pointer",
+                int(sequence_id),
+                int(layer_idx),
+            )
+        )
+        return 12345
 
 
 def _make_gpu_manager(
@@ -354,6 +496,76 @@ def test_gpu_kv_coordinator_passes_layer_ids_to_mapped_managers():
     assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
 
 
+def test_compressed_ratio_gpu_manager_uses_floor_positions_without_padding():
+    manager = CompressedRatioGPUPagedKVCacheManager(
+        config=GPUPagedKVConfig(
+            num_layers=1,
+            num_pages=16,
+            page_size_tokens=2,
+            num_k_heads=1,
+            k_head_dim=2,
+            num_v_heads=0,
+            v_head_dim=0,
+            kv_dtype=torch.float32,
+        ),
+        device="cpu",
+        compression_ratio=4,
+    )
+    manager.initialize()
+    manager.allocate_pages_for_sequences([10, 20, 30, 40], [3, 4, 7, 8])
+
+    assert manager._sequences[10].pages.numel() == 1
+    assert manager._sequences[40].pages.numel() == 1
+    assert manager.map_raw_lengths_to_compressed_lengths(
+        [3, 4, 7, 8]
+    ).tolist() == [
+        0,
+        1,
+        1,
+        2,
+    ]
+
+    manager.prepare_decode_step(
+        [10, 20, 30, 40],
+        torch.tensor([2, 3, 6, 7], dtype=torch.int32),
+        refresh_page_table=True,
+    )
+    assert manager._prepared_decode_positions[:4].tolist() == [-1, 0, -1, 1]
+
+
+def test_swa_gpu_manager_releases_prefix_pages_at_page_boundary():
+    manager = SWAGPUPagedKVCacheManager(
+        config=GPUPagedKVConfig(
+            num_layers=1,
+            num_pages=8,
+            page_size_tokens=4,
+            num_k_heads=1,
+            k_head_dim=2,
+            num_v_heads=0,
+            v_head_dim=0,
+            kv_dtype=torch.float32,
+        ),
+        device="cpu",
+        window_size_tokens=8,
+    )
+    manager.initialize()
+    manager.allocate_pages_for_sequences([10], [9])
+    before_pages = manager._sequences[10].pages.tolist()
+    assert len(before_pages) == 3
+
+    manager.prepare_decode_step(
+        [10],
+        torch.tensor([12], dtype=torch.int32),
+        refresh_page_table=True,
+    )
+    after_pages = manager._sequences[10].pages.tolist()
+
+    assert manager._states[10].window_start_page == 1
+    assert len(after_pages) == 3
+    assert after_pages[0] != before_pages[0]
+    assert manager._prepared_decode_positions[:1].tolist() == [8]
+
+
 def test_deepseek_v4_host_coordinator_registers_dsv4_components():
     swa = _FakeHostView("swa")
     c4 = _FakeHostView("c4")
@@ -394,6 +606,49 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
         None,
         [17],
     )
+
+
+def test_deepseek_v4_host_coordinator_routes_state_components():
+    swa = _FakeHostView("swa")
+    c4_state = _FakeStateManager("c4_state")
+    indexer_state = _FakeStateManager("indexer_state")
+
+    coordinator = DeepSeekV4HostKVCoordinator(
+        swa=swa,
+        compressor_c4_state=c4_state,
+        indexer_c4_state=indexer_state,
+    )
+
+    assert coordinator.state_component_names == [
+        COMPRESSOR_C4_STATE,
+        INDEXER_C4_STATE,
+    ]
+    coordinator.initialize_state_managers(0)
+    assert c4_state.calls[-1] == ("initialize", (0,), {})
+
+    allocation = coordinator.allocate_state_items_for_sequences(
+        [101, 102],
+        component_name=COMPRESSOR_C4_STATE,
+    )
+    assert allocation == {101: 0, 102: 1}
+
+    task = coordinator.async_append_decode_state_to_host_batched_kernel(
+        [(2, "state_l2")],
+        [101],
+        [7],
+        component_name=COMPRESSOR_C4_STATE,
+    )
+    assert task.name == "c4_state:append_state"
+    assert c4_state.calls[-1] == (
+        "async_append_decode_state_to_host_batched_kernel",
+        [(2, "state_l2")],
+        [101],
+        [7],
+    )
+
+    coordinator.release_sequence_states([101])
+    assert c4_state.calls[-1] == ("release_sequence_states", [101])
+    assert indexer_state.calls[-1] == ("release_sequence_states", [101])
 
 
 def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
@@ -438,3 +693,46 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
     )
 
     assert k_ptrs[0] == c4._k_cache[1, page_id].data_ptr()
+
+
+def test_deepseek_v4_gpu_coordinator_routes_state_components():
+    swa = _make_gpu_manager(num_layers=5, num_pages=32, page_size_tokens=4)
+    c4_state = _FakeStateManager("c4_state")
+    c128_state = _FakeStateManager("c128_state")
+
+    coordinator = DeepSeekV4GPUKVCoordinator(
+        swa=swa,
+        compressor_c4_state=c4_state,
+        compressor_c128_state=c128_state,
+    )
+
+    assert coordinator.state_component_names == [
+        COMPRESSOR_C4_STATE,
+        COMPRESSOR_C128_STATE,
+    ]
+    coordinator.initialize()
+    assert c4_state.calls[-1] == ("initialize", (), {})
+
+    coordinator.prepare_state_decode_step(
+        [10],
+        torch.tensor([3], dtype=torch.int32),
+        component_name=COMPRESSOR_C4_STATE,
+    )
+    assert c4_state.calls[-1][0] == "prepare_decode_step"
+
+    coordinator.update_layer_decode_state(
+        "state",
+        None,
+        2,
+        component_name=COMPRESSOR_C4_STATE,
+        assume_prepared=True,
+    )
+    assert c4_state.calls[-1] == (
+        "update_layer_decode_state",
+        "state",
+        None,
+        2,
+        None,
+        None,
+        True,
+    )
