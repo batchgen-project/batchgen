@@ -8,11 +8,8 @@ from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
 )
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     COMPRESSOR_C4,
-    COMPRESSOR_C4_STATE,
     COMPRESSOR_C128,
-    COMPRESSOR_C128_STATE,
     INDEXER_C4,
-    INDEXER_C4_STATE,
     SWA,
     DeepSeekV4GPUKVCoordinator,
     DeepSeekV4HostKVCoordinator,
@@ -39,6 +36,12 @@ class _FakeHostView:
     def __init__(self, name: str) -> None:
         self.name = name
         self.calls = []
+
+    def initialize(self, *args, **kwargs) -> None:
+        self.calls.append(("initialize", args, kwargs))
+
+    def shutdown(self) -> None:
+        self.calls.append(("shutdown",))
 
     def register_sequences(self, sequence_ids) -> None:
         self.calls.append(("register_sequences", list(sequence_ids)))
@@ -619,24 +622,24 @@ def test_deepseek_v4_host_coordinator_routes_state_components():
         indexer_c4_state=indexer_state,
     )
 
-    assert coordinator.state_component_names == [
-        COMPRESSOR_C4_STATE,
-        INDEXER_C4_STATE,
-    ]
-    coordinator.initialize_state_managers(0)
+    assert coordinator.compressor_c4_state is c4_state
+    assert coordinator.compressor_c128_state is None
+    assert coordinator.indexer_c4_state is indexer_state
+
+    coordinator.initialize(0)
     assert c4_state.calls[-1] == ("initialize", (0,), {})
 
-    allocation = coordinator.allocate_state_items_for_sequences(
-        [101, 102],
-        component_name=COMPRESSOR_C4_STATE,
+    allocation = (
+        coordinator.compressor_c4_state.allocate_state_items_for_sequences(
+            [101, 102]
+        )
     )
     assert allocation == {101: 0, 102: 1}
 
-    task = coordinator.async_append_decode_state_to_host_batched_kernel(
+    task = coordinator.compressor_c4_state.async_append_decode_state_to_host_batched_kernel(
         [(2, "state_l2")],
         [101],
         [7],
-        component_name=COMPRESSOR_C4_STATE,
     )
     assert task.name == "c4_state:append_state"
     assert c4_state.calls[-1] == (
@@ -646,7 +649,8 @@ def test_deepseek_v4_host_coordinator_routes_state_components():
         [7],
     )
 
-    coordinator.release_sequence_states([101])
+    coordinator.compressor_c4_state.release_sequence_states([101])
+    coordinator.indexer_c4_state.release_sequence_states([101])
     assert c4_state.calls[-1] == ("release_sequence_states", [101])
     assert indexer_state.calls[-1] == ("release_sequence_states", [101])
 
@@ -706,25 +710,23 @@ def test_deepseek_v4_gpu_coordinator_routes_state_components():
         compressor_c128_state=c128_state,
     )
 
-    assert coordinator.state_component_names == [
-        COMPRESSOR_C4_STATE,
-        COMPRESSOR_C128_STATE,
-    ]
+    assert coordinator.compressor_c4_state is c4_state
+    assert coordinator.compressor_c128_state is c128_state
+    assert coordinator.indexer_c4_state is None
+
     coordinator.initialize()
     assert c4_state.calls[-1] == ("initialize", (), {})
 
-    coordinator.prepare_state_decode_step(
+    coordinator.compressor_c4_state.prepare_decode_step(
         [10],
         torch.tensor([3], dtype=torch.int32),
-        component_name=COMPRESSOR_C4_STATE,
     )
     assert c4_state.calls[-1][0] == "prepare_decode_step"
 
-    coordinator.update_layer_decode_state(
+    coordinator.compressor_c4_state.update_layer_decode_state(
         "state",
         None,
         2,
-        component_name=COMPRESSOR_C4_STATE,
         assume_prepared=True,
     )
     assert c4_state.calls[-1] == (
