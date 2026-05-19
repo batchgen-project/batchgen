@@ -16,19 +16,16 @@ import pytest
 
 from batchgen.sequence import (
     SINGLE_SEQ_PAGE_HEADROOM,
-    SINGLE_SEQ_SAFETY_MARGIN,
     SequenceEntry,
 )
 from batchgen.continuous_batching import BoundaryDecisions
 
 
 def test_capacity_constants_have_sensible_defaults():
-    # Tight headroom (8 pages = 512 tokens) is enough for page-table /
-    # two-page-buffer overhead but not so large it rejects fitting requests.
+    # Tight headroom (8 pages = 512 tokens) absorbs page-table /
+    # two-page-buffer overhead. This is the only safety slack — the cap
+    # itself is just num_total_pages (no percentage margin).
     assert SINGLE_SEQ_PAGE_HEADROOM == 8
-    # 5% margin matches the existing host-KV safety margin used in
-    # _compute_boundary_decisions for host eviction planning.
-    assert SINGLE_SEQ_SAFETY_MARGIN == pytest.approx(0.05)
 
 
 def test_get_admission_pages_required_uses_kv_token_budget():
@@ -98,17 +95,21 @@ def test_glm5_128k_request_triggers_abort_threshold():
     """Regression for the run failure: a 128K decode on a 2011-page rank.
 
     The capacity-abort guard compares get_admission_pages_required() to
-    safe_single_seq_per_rank_capacity = int(num_total_pages * (1 - 0.05)).
-    Use a realistic per-rank total of 2200 pages: the 5% margin caps single-seq
-    capacity at 2090, while the 128K + 2K prompt request needs 2080 + 8 = 2088
-    pages, so it sits just under the cap (no abort).
+    safe_single_seq_per_rank_capacity = num_total_pages (no margin).
+    A 2K-prompt + 128K-decode request needs ceil((2048+131072)/64) + 8 = 2088
+    pages. On a 2088-page rank it just fits; on the failing run's 2011-page
+    rank it does NOT, so the guard fires.
     """
-    seq_under = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=131_072)
-    total_pages_under = 2200
-    safe_cap_under = int(total_pages_under * (1.0 - SINGLE_SEQ_SAFETY_MARGIN))
-    assert seq_under.get_admission_pages_required() <= safe_cap_under
+    seq = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=131_072)
+    required = seq.get_admission_pages_required()
+    assert required == 2088, f"expected 2088 admission pages, got {required}"
 
-    # And the actual failing run: 2011 total pages caps the seq below 2080.
-    total_pages_failing = 2011
-    safe_cap_failing = int(total_pages_failing * (1.0 - SINGLE_SEQ_SAFETY_MARGIN))
-    assert seq_under.get_admission_pages_required() > safe_cap_failing
+    # On a comfortably-large rank, no abort.
+    assert required <= 2200, "should fit on a 2200-page rank"
+
+    # On the failing run's actual rank (2011 / 1765 pages), guard must fire.
+    for total_pages_failing in (2011, 1765):
+        assert required > total_pages_failing, (
+            f"with safe_cap = {total_pages_failing}, admission {required} "
+            f"must exceed cap for the guard to fire"
+        )

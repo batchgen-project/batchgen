@@ -35,7 +35,11 @@ DECISION_FREQUENCY_PAGES = 2  # How often to make scheduling decisions (in pages
 # on its DP-attention rank even if every other sequence is evicted, so the
 # scheduler aborts it with finish_reason="capacity" instead of looping it
 # through ON_HOLD re-entry forever (see batchgen-project/batchgen-internal#1).
-SINGLE_SEQ_SAFETY_MARGIN = 0.05
+# The headroom is an absolute page count (8 × 64 = 512 tokens of slack)
+# that absorbs page-table fragmentation and two-page-buffer scratch. We
+# intentionally do NOT also apply a percentage margin on the cap — that
+# was redundant with this headroom and caused false-positive aborts on
+# requests that physically fit.
 SINGLE_SEQ_PAGE_HEADROOM = 8
 
 

@@ -6808,9 +6808,12 @@ class BatchGenWorker:
 
 		stats = self.gpu_paged_kv_cache_manager.get_stats()
 		total_pages = stats.num_total_pages
-		self.safe_single_seq_per_rank_capacity = int(
-			total_pages * (1.0 - SequenceEntry.SINGLE_SEQ_SAFETY_MARGIN)
-		)
+		# Cap = full per-rank total pages. SINGLE_SEQ_PAGE_HEADROOM (8 pages)
+		# is already added to admission_pages in get_admission_pages_required(),
+		# so the abort threshold is "kv_token_budget needs > num_total_pages
+		# pages after that headroom." No percentage margin: it was redundant
+		# and caused false-positive aborts on requests that physically fit.
+		self.safe_single_seq_per_rank_capacity = total_pages
 		# Debug override: lets integration tests force a small single-seq cap
 		# without needing a real 128K-context model. Logged as a warning so an
 		# accidentally-set override never ships silently.
