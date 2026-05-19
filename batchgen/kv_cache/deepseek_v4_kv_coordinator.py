@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
-from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
+from batchgen.kv_cache.component_coordinator import (
+    GPUKVCoordinator,
+    HostKVCoordinator,
+)
 
 SWA = "swa"
 COMPRESSOR_C4 = "compressor_c4"

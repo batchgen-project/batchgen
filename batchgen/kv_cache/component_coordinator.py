@@ -65,3 +65,56 @@ class ComponentCoordinator:
             method = getattr(component, method_name)
             results[component_name] = method(*args, **kwargs)
         return results
+
+    def initialize(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self.call_all("initialize", *args, **kwargs)
+
+    def shutdown(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        for component_name, component in reversed(list(self.components())):
+            method = getattr(component, "shutdown")
+            results[component_name] = method(*args, **kwargs)
+        return results
+
+    def destroy(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        for component_name, component in reversed(list(self.components())):
+            method = getattr(component, "destroy")
+            results[component_name] = method(*args, **kwargs)
+        return results
+
+    @property
+    def is_initialized(self) -> bool:
+        return all(
+            bool(getattr(component, "is_initialized", False))
+            for _, component in self.components()
+        )
+
+
+class HostKVCoordinator(ComponentCoordinator):
+    """Host-side named component registry.
+
+    Components may be paged KV views, compressed-state managers, or any future
+    host-side KV object. Paged-KV operations are intentionally left on the
+    component itself and should be called explicitly through the named member.
+    """
+
+    component_label = "host KV component"
+
+
+class GPUKVCoordinator(ComponentCoordinator):
+    """GPU-side named component registry.
+
+    Components may be paged KV managers, compressed-state managers, or any
+    future GPU-side KV object. Paged-KV operations are intentionally left on the
+    component itself and should be called explicitly through the named member.
+    """
+
+    component_label = "GPU KV component"
+
+
+__all__ = [
+    "ComponentCoordinator",
+    "GPUKVCoordinator",
+    "HostKVCoordinator",
+]

@@ -3,6 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from batchgen.kv_cache.component_coordinator import (
+    GPUKVCoordinator,
+    HostKVCoordinator,
+)
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
     CompressedRatioGPUPagedKVCacheManager,
 )
@@ -17,12 +21,10 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     DeepSeekV4GPUKVCoordinator,
     DeepSeekV4HostKVCoordinator,
 )
-from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     GPUPagedKVCacheManager,
     GPUPagedKVConfig,
 )
-from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
 from batchgen.kv_cache.swa_gpu_paged_kv_manager import SWAGPUPagedKVCacheManager
 
 
