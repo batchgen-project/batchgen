@@ -165,6 +165,51 @@ def test_host_compressed_state_decode_round_trip(bg):
         manager.shutdown()
 
 
+def test_host_compressed_state_batched_append_round_trip(bg):
+    device = torch.device("cuda:0")
+    manager = bg.NonOverlapCompressedState4HostManager(
+        _host_config(bg, mapped=False)
+    )
+    manager.initialize(0)
+    sequence_ids = [351, 352]
+    raw_positions = [18, 3]
+
+    try:
+        manager.allocate_state_items_for_sequences(sequence_ids)
+        layer0 = torch.arange(
+            len(sequence_ids) * STATE_DIM,
+            dtype=torch.float32,
+            device=device,
+        ).view(len(sequence_ids), STATE_DIM)
+        layer1 = layer0 + 100
+        manager.async_append_decode_state_to_host_batched_kernel(
+            [(0, layer0), (1, layer1)],
+            sequence_ids,
+            raw_positions,
+        ).wait()
+
+        restored0 = torch.empty_like(layer0)
+        restored1 = torch.empty_like(layer1)
+        manager.async_load_decode_state_to_device(
+            0,
+            sequence_ids,
+            restored0,
+            raw_positions,
+        ).wait()
+        manager.async_load_decode_state_to_device(
+            1,
+            sequence_ids,
+            restored1,
+            raw_positions,
+        ).wait()
+        torch.cuda.synchronize()
+        assert torch.equal(restored0, layer0)
+        assert torch.equal(restored1, layer1)
+    finally:
+        manager.release_sequence_states(sequence_ids)
+        manager.shutdown()
+
+
 def test_host_compressed_state_item_copy_round_trip(bg):
     device = torch.device("cuda:0")
     host = bg.NonOverlapCompressedState4HostManager(

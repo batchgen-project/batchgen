@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -86,6 +87,7 @@ class CompressedStateHostManager {
                           ? "CompressedStateHostManager"
                           : config_.logger_name)) {
         ResetFreeStateItems();
+        ResetCopyStreams();
     }
 
     CompressedStateHostManager(const CompressedStateHostManager&) = delete;
@@ -119,6 +121,7 @@ class CompressedStateHostManager {
                 storage_.data(), storage_.size(), device_index_, logger_);
             pinned_ = true;
         }
+        InitializeCopyStreams();
         initialized_ = true;
         logger_->info(
             "CompressedStateHostManager ready (device_index={}, ratio={}, "
@@ -141,6 +144,7 @@ class CompressedStateHostManager {
         storage_.clear();
         sequence_states_.clear();
         ResetFreeStateItems();
+        ResetCopyStreams();
     }
 
     std::vector<std::int32_t> AllocateStateItemsForSequences(
@@ -203,6 +207,97 @@ class CompressedStateHostManager {
         auto task = transformed_detail::MakeAsyncTask(
             [prepared = std::move(prepared)]() mutable {
                 CopyDecodeRows(prepared, CopyDirection::kHostToDevice);
+            });
+        TrackTask(task);
+        return task;
+    }
+
+    struct BatchedStateEntry {
+        std::size_t layer_idx;
+        torch::Tensor state_tensor;
+    };
+
+    KVAsyncTask AsyncAppendDecodeStateToHostBatchedKernel(
+        std::vector<BatchedStateEntry> entries,
+        std::vector<std::int64_t> sequence_ids,
+        SequenceLengths raw_positions) {
+        if (entries.empty() || sequence_ids.empty()) {
+            return transformed_detail::MakeAsyncTask([] {});
+        }
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+        for (auto& entry : entries) {
+            entry.layer_idx = ResolvePhysicalLayer(
+                entry.layer_idx,
+                "AsyncAppendDecodeStateToHostBatchedKernel");
+            ValidateStateTensorForBatchedAppend(
+                entry.state_tensor, batch,
+                "AsyncAppendDecodeStateToHostBatchedKernel");
+        }
+
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+
+        const std::size_t total = entries.size() * batch;
+        std::vector<uint8_t*> src_host(total);
+        std::vector<uint8_t*> dst_host(total);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (std::size_t entry_idx = 0; entry_idx < entries.size();
+                 ++entry_idx) {
+                const auto& entry = entries[entry_idx];
+                auto* src_base =
+                    static_cast<uint8_t*>(entry.state_tensor.data_ptr());
+                for (std::size_t batch_idx = 0; batch_idx < batch;
+                     ++batch_idx) {
+                    const std::int64_t sequence_id = sequence_ids[batch_idx];
+                    const std::size_t raw_position =
+                        transformed_detail::ResolveLength(
+                            raw_positions, batch_idx, sequence_id,
+                            "AsyncAppendDecodeStateToHostBatchedKernel");
+                    if (raw_position ==
+                        std::numeric_limits<std::size_t>::max()) {
+                        throw std::out_of_range(
+                            "raw position overflow in compressed state "
+                            "batched append");
+                    }
+                    EnsureStateItemLocked(sequence_id);
+                    const SlotAddress slot = ResolveSlotLocked(
+                        sequence_id, raw_position, entry.layer_idx,
+                        "AsyncAppendDecodeStateToHostBatchedKernel");
+                    const std::size_t idx = entry_idx * batch + batch_idx;
+                    src_host[idx] =
+                        src_base + batch_idx * config_.state_token_bytes;
+                    dst_host[idx] = reinterpret_cast<uint8_t*>(slot.host_ptr);
+                }
+            }
+        }
+
+        auto task = transformed_detail::MakeAsyncTask(
+            [this, src_host = std::move(src_host),
+             dst_host = std::move(dst_host), total,
+             producer_cuda_stream]() mutable {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream =
+                    CopyStream(CopyDirection::kDeviceToHost);
+                WaitForProducerStream(cuda_stream, producer_cuda_stream);
+
+                worker_detail::DeviceBuffer<uint8_t*> src_buf(total);
+                worker_detail::DeviceBuffer<uint8_t*> dst_buf(total);
+                const std::size_t ptr_bytes = total * sizeof(uint8_t*);
+                EnqueueCopy(
+                    reinterpret_cast<const std::byte*>(src_host.data()),
+                    reinterpret_cast<std::byte*>(src_buf.get()), ptr_bytes,
+                    CopyDirection::kHostToDevice, cuda_stream);
+                EnqueueCopy(
+                    reinterpret_cast<const std::byte*>(dst_host.data()),
+                    reinterpret_cast<std::byte*>(dst_buf.get()), ptr_bytes,
+                    CopyDirection::kHostToDevice, cuda_stream);
+                worker_detail::LaunchUvaPageCopyKernel(
+                    src_buf.get(), dst_buf.get(), config_.state_token_bytes,
+                    static_cast<int>(total), cuda_stream);
+                SynchronizeWithEvent(cuda_stream);
             });
         TrackTask(task);
         return task;
@@ -454,6 +549,79 @@ class CompressedStateHostManager {
         }
     }
 
+    void InitializeCopyStreams() {
+        if (copy_streams_ready_) {
+            return;
+        }
+        if (device_index_ < 0) {
+            throw std::runtime_error(
+                "device_index must be set before initializing copy streams");
+        }
+        c10::cuda::OptionalCUDAGuard guard(device_index_);
+        h2d_stream_.emplace(at::cuda::getStreamFromPool(
+            /* isHighPriority */ false, device_index_));
+        d2h_stream_.emplace(at::cuda::getStreamFromPool(
+            /* isHighPriority */ false, device_index_));
+        copy_streams_ready_ = true;
+    }
+
+    void ResetCopyStreams() noexcept {
+        copy_streams_ready_ = false;
+        h2d_stream_.reset();
+        d2h_stream_.reset();
+    }
+
+    cudaStream_t CopyStream(CopyDirection direction) const {
+        if (!copy_streams_ready_) {
+            throw std::runtime_error(
+                "Copy streams are not initialized; call Initialize first");
+        }
+        const at::cuda::CUDAStream& stream =
+            direction == CopyDirection::kHostToDevice ? *h2d_stream_
+                                                      : *d2h_stream_;
+        return stream.stream();
+    }
+
+    static constexpr cudaMemcpyKind ToCudaMemcpyKind(CopyDirection direction) {
+        return direction == CopyDirection::kHostToDevice
+                   ? cudaMemcpyHostToDevice
+                   : cudaMemcpyDeviceToHost;
+    }
+
+    void EnqueueCopy(const std::byte* src, std::byte* dst,
+                     std::size_t num_bytes, CopyDirection direction,
+                     cudaStream_t stream) const {
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<void*>(dst),
+                                   static_cast<const void*>(src), num_bytes,
+                                   ToCudaMemcpyKind(direction), stream));
+    }
+
+    void EnsureDeviceReady() const {
+        EnsureInitialized();
+        if (device_index_ < 0) {
+            throw std::runtime_error(
+                "CompressedStateHostManager must be initialized before async "
+                "operations");
+        }
+        if (!copy_streams_ready_) {
+            throw std::runtime_error(
+                "Copy streams are not initialized; call Initialize first");
+        }
+    }
+
+    void ValidateCudaTensor(const torch::Tensor& tensor,
+                            std::string_view tensor_name) const {
+        if (!tensor.is_cuda()) {
+            throw std::invalid_argument(std::string(tensor_name) +
+                                        " must reside on CUDA device");
+        }
+        if (tensor.device().index() != device_index_) {
+            throw std::invalid_argument(
+                std::string(tensor_name) +
+                " device index does not match compressed state manager");
+        }
+    }
+
     void ResetFreeStateItems() {
         free_state_items_.clear();
         free_state_items_.reserve(config_.num_state_items);
@@ -591,6 +759,32 @@ class CompressedStateHostManager {
         return prepared;
     }
 
+    void ValidateStateTensorForBatchedAppend(
+        const torch::Tensor& state_tensor, std::size_t batch,
+        std::string_view op_name) const {
+        ValidateCudaTensor(state_tensor, "state_tensor");
+        if (!state_tensor.is_contiguous()) {
+            std::ostringstream oss;
+            oss << op_name << ": state_tensor must be contiguous";
+            throw std::invalid_argument(oss.str());
+        }
+        if (state_tensor.dim() < 1 ||
+            state_tensor.size(0) != static_cast<std::int64_t>(batch)) {
+            std::ostringstream oss;
+            oss << op_name
+                << ": state_tensor batch dimension must equal sequence_ids "
+                   "size";
+            throw std::invalid_argument(oss.str());
+        }
+        const std::size_t row_bytes = RowBytes(state_tensor, op_name);
+        if (row_bytes != config_.state_token_bytes) {
+            std::ostringstream oss;
+            oss << op_name << ": state tensor row has " << row_bytes
+                << " bytes, expected " << config_.state_token_bytes;
+            throw std::invalid_argument(oss.str());
+        }
+    }
+
     PreparedStateItemRows PrepareStateItemRows(
         std::vector<std::int64_t> sequence_ids,
         torch::Tensor state_device_ptrs, std::string_view op_name) {
@@ -718,6 +912,22 @@ class CompressedStateHostManager {
                               cudaMemcpyDefault));
     }
 
+    void SynchronizeWithEvent(cudaStream_t stream) const {
+        worker_detail::ScopedCudaEvent event(logger_);
+        CUDA_CHECK(cudaEventRecord(event.get(), stream));
+        CUDA_CHECK(cudaEventSynchronize(event.get()));
+    }
+
+    void WaitForProducerStream(cudaStream_t consumer_stream,
+                               cudaStream_t producer_stream) const {
+        if (producer_stream == nullptr || consumer_stream == producer_stream) {
+            return;
+        }
+        worker_detail::ScopedCudaEvent event(logger_);
+        CUDA_CHECK(cudaEventRecord(event.get(), producer_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(consumer_stream, event.get(), 0));
+    }
+
     void TrackTask(const KVAsyncTask& task) {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_tasks_.Track(task);
@@ -734,6 +944,9 @@ class CompressedStateHostManager {
     bool initialized_ = false;
     bool pinned_ = false;
     int device_index_ = -1;
+    bool copy_streams_ready_ = false;
+    std::optional<at::cuda::CUDAStream> h2d_stream_;
+    std::optional<at::cuda::CUDAStream> d2h_stream_;
     std::vector<std::byte> storage_;
     std::vector<std::int32_t> free_state_items_;
     std::unordered_map<std::int64_t, SequenceState> sequence_states_;

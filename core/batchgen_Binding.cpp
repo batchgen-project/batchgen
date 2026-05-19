@@ -142,6 +142,26 @@ std::vector<typename WorkerView::BatchedKVEntry> ParseBatchedKVEntries(
     return entries;
 }
 
+template <typename Manager>
+std::vector<typename Manager::BatchedStateEntry> ParseBatchedStateEntries(
+    py::list entries_py) {
+    std::vector<typename Manager::BatchedStateEntry> entries;
+    entries.reserve(entries_py.size());
+    for (auto item : entries_py) {
+        auto tup = py::cast<py::tuple>(item);
+        if (py::len(tup) != 2) {
+            throw std::invalid_argument(
+                "async_append_decode_state_to_host_batched_kernel entries "
+                "must be (layer_idx, state_tensor)");
+        }
+        typename Manager::BatchedStateEntry entry;
+        entry.layer_idx = py::cast<std::size_t>(tup[0]);
+        entry.state_tensor = py::cast<torch::Tensor>(tup[1]);
+        entries.emplace_back(std::move(entry));
+    }
+    return entries;
+}
+
 template <typename WorkerView>
 void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
     cls
@@ -414,6 +434,17 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
         .def("async_load_decode_state_to_device",
              &Manager::AsyncLoadDecodeStateToDevice, py::arg("layer_idx"),
              py::arg("sequence_ids"), py::arg("state_tensor"),
+             py::arg("raw_positions"))
+        .def("async_append_decode_state_to_host_batched_kernel",
+             [](Manager& self, py::list entries_py,
+                std::vector<std::int64_t> sequence_ids,
+                batchgen::kv::SequenceLengths raw_positions) {
+                 auto entries = ParseBatchedStateEntries<Manager>(entries_py);
+                 return self.AsyncAppendDecodeStateToHostBatchedKernel(
+                     std::move(entries), std::move(sequence_ids),
+                     std::move(raw_positions));
+             },
+             py::arg("entries"), py::arg("sequence_ids"),
              py::arg("raw_positions"))
         .def("async_offload_state_items_to_host",
              &Manager::AsyncOffloadStateItemsToHost, py::arg("sequence_ids"),
