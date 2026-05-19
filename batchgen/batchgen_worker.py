@@ -636,6 +636,12 @@ class BatchGenWorker:
 		# 6. Initialize Placeholders for Core Components
 		# These are populated later in Init() / _initialize_core_components
 		self.gpu_paged_kv_cache_manager = None
+		# Maximum GPU KV pages a single sequence may need on its DP-attention
+		# rank. Set once by _init_gpu_kv_with_actual_size() after the manager
+		# has the real per-rank page count. Used by the capacity-abort guard
+		# in _compute_boundary_decisions to terminate over-cap requests with
+		# finish_reason="capacity" instead of looping them through ON_HOLD.
+		self.safe_single_seq_per_rank_capacity: Optional[int] = None
 		self.model = None
 		self.model_config = None
 		self.loaded_model_config = None
@@ -1679,10 +1685,16 @@ class BatchGenWorker:
 		Unified completion check that respects ignore_eos.
 
 		A sequence is completed if:
-		1. It reached max_decoding_length (always checked), OR
-		2. It hit EOS AND ignore_eos is False, OR
-		3. current_context_length >= model_context_length (context limit reached)
+		1. The scheduler marked it as capacity-aborted (kv_token_budget exceeds
+		   the per-rank single-seq capacity, see _compute_boundary_decisions), OR
+		2. It reached max_decoding_length (always checked), OR
+		3. It hit EOS AND ignore_eos is False, OR
+		4. current_context_length >= model_context_length (context limit reached)
 		"""
+		# Scheduler determined the seq can never fit on its DP-attn rank
+		if getattr(seq, '_finish_capacity', False):
+			return True
+
 		# Always complete at per-sequence max decoding length
 		if seq.decoded_length >= seq.max_decode_length:
 			return True
@@ -1710,6 +1722,13 @@ class BatchGenWorker:
 		must look at the true cause of completion here, not just the
 		eos_reached bit.
 		"""
+		# Capacity abort — seq could not fit on its DP-attn rank; reported as
+		# a successful (HTTP 200) completion with finish_reason="capacity" so
+		# the client sees a clear reason rather than a server error.
+		if getattr(seq, '_finish_capacity', False):
+			seq.log_event(SeqEvent.COMPLETED, self.rank, "finish_reason=capacity")
+			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "CAPACITY_ABORT")
+			return "capacity"
 		# Repetition detected — dump lifespan for root cause analysis
 		if seq._rep_detected:
 			seq.log_event(SeqEvent.COMPLETED, self.rank, "finish_reason=repetition")
@@ -6786,9 +6805,19 @@ class BatchGenWorker:
 		# Initialize GPU KV manager with actual size
 		self._initialize_gpu_kv_manager_fixed_size()
 
+		stats = self.gpu_paged_kv_cache_manager.get_stats()
+		total_pages = stats.num_total_pages
+		self.safe_single_seq_per_rank_capacity = int(
+			total_pages * (1.0 - SequenceEntry.SINGLE_SEQ_SAFETY_MARGIN)
+		)
 		if self.rank == 0:
-			stats = self.gpu_paged_kv_cache_manager.get_stats()
-			logging.info(f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {stats.num_total_pages} pages")
+			logging.info(
+				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {total_pages} pages"
+			)
+			logging.info(
+				f"[GPU-KV] Single-seq capacity = {self.safe_single_seq_per_rank_capacity} pages "
+				f"({self.safe_single_seq_per_rank_capacity * SequenceEntry.PAGE_SIZE} tokens) per DP-attn rank"
+			)
 
 	def _config_decoding_for_batch(
 		self,
@@ -7574,10 +7603,56 @@ class BatchGenWorker:
 
 		This centralizes all decision-making to prevent desync between ranks.
 		"""
+		# Per-boundary capacity log: gives every scheduling decision an
+		# audit-trail line tying decode_uuids / candidates back to free/total
+		# pages and the single-seq cap (see batchgen-project/batchgen-internal#1).
+		mgr = self.gpu_paged_kv_cache_manager
+		total_pages_log = mgr.get_stats().num_total_pages if (mgr and mgr.is_initialized) else 0
+		logging.info(
+			f"[KV_PAGES] boundary: free={per_rank_free} total={total_pages_log} "
+			f"min_free={min(per_rank_free) if per_rank_free else 0} "
+			f"cap={self.safe_single_seq_per_rank_capacity} "
+			f"decode={len(decode_uuids)} candidates={len(global_candidate_info or {})}"
+		)
+
+		# Capacity-abort pass: any candidate (PREFILLED or ON_HOLD) whose worst-
+		# case kv_token_budget cannot fit on its assigned DP-attention rank even
+		# with that rank's entire KV evicted gets terminated cleanly with
+		# finish_reason="capacity". Without this, such a seq loops forever
+		# through ON_HOLD re-entry and eventually triggers a decode-model
+		# reconfiguration that OOMs (see batchgen-project/batchgen-internal#1).
+		capacity_aborted_uuids: List[str] = []
+		safe_cap = self.safe_single_seq_per_rank_capacity
+		if safe_cap is not None and global_candidate_info:
+			for uuid, info in global_candidate_info.items():
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					continue
+				# Compare worst-case lifetime page budget (prompt + max_decode +
+				# headroom) against the per-rank cap. Using the per-iteration
+				# pages_needed here would only catch a 128K seq after it had
+				# already filled the rank — the goal is to abort BEFORE that.
+				req_pages = seq.get_admission_pages_required()
+				if req_pages > safe_cap:
+					capacity_aborted_uuids.append(uuid)
+					seq._finish_capacity = True
+					logging.warning(
+						f"[KV_CAPACITY_ABORT] uuid={uuid[:8]} "
+						f"assigned_rank={info.get('assigned_rank')} "
+						f"req_pages={req_pages} > safe_per_rank_cap={safe_cap}; "
+						f"completing with finish_reason=capacity"
+					)
+
 		# Identify completed sequences
-		completed_uuids = []
+		completed_uuids = list(capacity_aborted_uuids)
 		active_uuids = []
+		aborted_set = set(capacity_aborted_uuids)
 		for uuid in decode_uuids:
+			if uuid in aborted_set:
+				# Defensive: an already-in-decode seq should never trip the
+				# guard (it was admitted to GPU), but treat it the same way.
+				completed_uuids.append(uuid)
+				continue
 			state = global_seq_state.get(uuid)
 			if state and state['completed']:
 				completed_uuids.append(uuid)
@@ -7862,7 +7937,7 @@ class BatchGenWorker:
 			new_load_uuids, _ = select_sequences_for_loading(
 				candidates=global_candidate_info,
 				per_rank_free_pages=adjusted_per_rank_free,
-				exclude_uuids=completed_set | onhold_set | evicted_set,
+				exclude_uuids=completed_set | onhold_set | evicted_set | aborted_set,
 				strategy=LoadingStrategy.LONGEST_FIRST,
 				get_global_idx_fn=lambda u: (
 					self.global_batch.get_sequence(u).global_idx
@@ -7882,6 +7957,7 @@ class BatchGenWorker:
 			new_load_uuids=new_load_uuids,
 			decode_uuids_final=decode_uuids_final,
 			scheduler_error=scheduler_error,
+			capacity_aborted_uuids=capacity_aborted_uuids,
 		)
 
 	# ============ OPTIMIZED PAGE BOUNDARY (Consolidated Collectives) ============
@@ -8187,6 +8263,16 @@ class BatchGenWorker:
 
 		timing.num_completed = len(decisions.completed_uuids)
 		timing.num_onhold = len(decisions.onhold_uuids)
+
+		# Mirror capacity-abort flag onto local SequenceEntry replicas so the
+		# downstream _get_finish_reason / completion-reporting path emits
+		# finish_reason="capacity" on every rank (not just rank 0 where the
+		# decision was made).
+		if decisions.capacity_aborted_uuids:
+			for uuid in decisions.capacity_aborted_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is not None:
+					seq._finish_capacity = True
 
 		# ========== PHASE 4: EXECUTE DECISIONS LOCALLY ==========
 		# All ranks execute the same decisions, but only operate on locally-owned sequences
@@ -13105,7 +13191,12 @@ class BatchGenWorker:
 		per_rank_free = [int(t.item()) for t in gathered]
 		
 		if self.rank == 0:
-			logging.info(f"Per-rank GPU free pages: {per_rank_free}")
+			total_pages = manager.get_stats().num_total_pages if manager and manager.is_initialized else 0
+			logging.info(
+				f"[KV_PAGES] try_load_at_boundary: free={per_rank_free} total={total_pages} "
+				f"min_free={min(per_rank_free) if per_rank_free else 0} "
+				f"cap={self.safe_single_seq_per_rank_capacity}"
+			)
 		
 		# Step 2: Get PREFILLED candidates (all ranks see identical list)
 		candidates = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
@@ -14140,6 +14231,7 @@ class BatchGenWorker:
 		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
 		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
 		self.gpu_paged_kv_cache_manager = None
+		self.safe_single_seq_per_rank_capacity = None
 		
 		# 4. Reset global batch state
 		self.global_batch = None

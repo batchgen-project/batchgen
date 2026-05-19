@@ -9,7 +9,7 @@ help organize the scheduling process.
 import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -92,6 +92,12 @@ class BoundaryDecisions:
     new_load_uuids: List[str]            # Sequences to async-load into GPU
     decode_uuids_final: List[str]        # Final decode_uuids after all decisions
     scheduler_error: Optional[str] = None # Fatal scheduler invariant violation, raised after broadcast
+    # Sequences that cannot fit on their assigned DP-attention rank even with
+    # the entire rank's GPU KV evicted (kv_token_budget > safe per-rank cap).
+    # These are also appended to completed_uuids so the existing release/report
+    # path fires, but tracked separately so receivers can flip _finish_capacity
+    # and emit finish_reason="capacity". See batchgen-project/batchgen-internal#1.
+    capacity_aborted_uuids: List[str] = field(default_factory=list)
 
 
 def _format_ranked_reports(reports: Dict[str, List[int]], limit: int = 8) -> str:

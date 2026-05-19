@@ -30,6 +30,14 @@ EXTENSION_GPU_PAGE_BUFFER = 4  # Pages to add at boundaries
 # Decision frequency: how many pages (each 64 tokens) between boundary checks
 DECISION_FREQUENCY_PAGES = 2  # How often to make scheduling decisions (in pages)
 
+# Single-sequence per-rank capacity guard. A request whose worst-case page
+# budget exceeds (total_per_rank_pages - SINGLE_SEQ_PAGE_HEADROOM) cannot fit
+# on its DP-attention rank even if every other sequence is evicted, so the
+# scheduler aborts it with finish_reason="capacity" instead of looping it
+# through ON_HOLD re-entry forever (see batchgen-project/batchgen-internal#1).
+SINGLE_SEQ_SAFETY_MARGIN = 0.05
+SINGLE_SEQ_PAGE_HEADROOM = 8
+
 
 def configure_page_buffers(
     initial_gpu_page_buffer: int = 32,
@@ -104,6 +112,10 @@ class SequenceEntry:
         '_rep_last_token',  # int, last token ID seen
         '_rep_count',       # int, consecutive same-token count
         '_rep_detected',    # bool, whether repetition was detected
+        # Capacity-abort: set when scheduler determined this seq cannot fit on
+        # its assigned DP-attention rank. Routed through the normal completion
+        # path with finish_reason="capacity".
+        '_finish_capacity',
     )
 
     VALID_TRANSITIONS = {
@@ -180,6 +192,8 @@ class SequenceEntry:
         self._rep_last_token: int = -1
         self._rep_count: int = 0
         self._rep_detected: bool = False
+
+        self._finish_capacity: bool = False
 
     def log_event(self, event: int, rank: int, detail: str = "") -> None:
         """Log a lifespan event. No-op when BATCHGEN_SEQ_LIFESPAN is not set."""
@@ -364,6 +378,16 @@ class SequenceEntry:
         Used for HOST KV allocation (which holds complete KV history).
         """
         return math.ceil(self.kv_token_budget / self.PAGE_SIZE)
+
+    def get_admission_pages_required(self) -> int:
+        """
+        Worst-case GPU KV pages this sequence may need over its lifetime.
+
+        Used by the capacity-abort guard to decide whether the seq can ever fit
+        on its assigned DP-attention rank. Adds SINGLE_SEQ_PAGE_HEADROOM to
+        absorb buffer / page-table overhead.
+        """
+        return math.ceil(self.kv_token_budget / self.PAGE_SIZE) + SINGLE_SEQ_PAGE_HEADROOM
 
     def get_current_pages_used(self) -> int:
         """Return number of pages currently used by this sequence's context."""
