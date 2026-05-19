@@ -32,8 +32,10 @@ def test_capacity_constants_have_sensible_defaults():
 
 
 def test_get_admission_pages_required_uses_kv_token_budget():
-    seq = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=128_000)
-    expected = math.ceil((2048 + 128_000) / SequenceEntry.PAGE_SIZE) + SINGLE_SEQ_PAGE_HEADROOM
+    # 128K decode + 2K prompt in real binary tokens (131_072) — matches the
+    # issue's "128K completion requires 2048 pages before prompt tokens".
+    seq = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=131_072)
+    expected = math.ceil((2048 + 131_072) / SequenceEntry.PAGE_SIZE) + SINGLE_SEQ_PAGE_HEADROOM
     assert seq.get_admission_pages_required() == expected
     # The 128K-over-cap regression: 2080 pages of payload + 8 headroom.
     assert seq.get_admission_pages_required() > 2048
@@ -101,7 +103,7 @@ def test_glm5_128k_request_triggers_abort_threshold():
     capacity at 2090, while the 128K + 2K prompt request needs 2080 + 8 = 2088
     pages, so it sits just under the cap (no abort).
     """
-    seq_under = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=128_000)
+    seq_under = SequenceEntry(uuid="u", global_idx=0, prompt_length=2048, max_decode_length=131_072)
     total_pages_under = 2200
     safe_cap_under = int(total_pages_under * (1.0 - SINGLE_SEQ_SAFETY_MARGIN))
     assert seq_under.get_admission_pages_required() <= safe_cap_under
