@@ -6,6 +6,10 @@
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
     CompressedRatioGPUPagedKVCacheManager,
 )
+from batchgen.kv_cache.compressed_state_gpu_manager import (
+    CompressedStateGPUConfig,
+    CompressedStateGPUManager,
+)
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     COMPRESSOR_C4,
     COMPRESSOR_C128,
@@ -31,6 +35,8 @@ __all__ = [
     "SWA",
     "AsyncKVTask",
     "CompressedRatioGPUPagedKVCacheManager",
+    "CompressedStateGPUConfig",
+    "CompressedStateGPUManager",
     "DeepSeekV4GPUKVCoordinator",
     "DeepSeekV4HostKVCoordinator",
     "GPUKVCoordinator",

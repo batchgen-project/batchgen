@@ -20,6 +20,7 @@
 
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
+#include "KV_Storage/compressed_state_host_manager.h"
 #include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
@@ -393,6 +394,80 @@ void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
         .def_property_readonly("window_pages", &WorkerView::window_pages);
 }
 
+template <typename Manager>
+void BindCompressedStateHostManager(py::module& m, const char* name) {
+    py::class_<Manager>(m, name)
+        .def(py::init<kv::CompressedStateHostConfig>(), py::arg("config"))
+        .def("initialize", &Manager::Initialize, py::arg("device_index"))
+        .def("shutdown", &Manager::Shutdown)
+        .def(
+            "allocate_pages_for_sequences",
+            [](Manager& self,
+               const std::vector<std::pair<std::int64_t, std::size_t>>&
+                   requests) {
+                std::vector<std::int64_t> sequence_ids;
+                std::vector<std::size_t> raw_num_tokens;
+                sequence_ids.reserve(requests.size());
+                raw_num_tokens.reserve(requests.size());
+                for (const auto& request : requests) {
+                    sequence_ids.push_back(request.first);
+                    raw_num_tokens.push_back(request.second);
+                }
+                return self.AllocatePagesForSequences(sequence_ids,
+                                                      raw_num_tokens);
+            },
+            py::arg("requests"))
+        .def("release_sequence_pages", &Manager::ReleaseSequencePages,
+             py::arg("sequence_ids"))
+        .def("build_page_table", &Manager::BuildPageTable,
+             py::arg("sequence_ids"))
+        .def("async_offload_decode_state_to_host",
+             &Manager::AsyncOffloadDecodeStateToHost, py::arg("layer_idx"),
+             py::arg("sequence_ids"), py::arg("state_tensor"),
+             py::arg("raw_positions"))
+        .def("async_load_decode_state_to_device",
+             &Manager::AsyncLoadDecodeStateToDevice, py::arg("layer_idx"),
+             py::arg("sequence_ids"), py::arg("state_tensor"),
+             py::arg("raw_positions"))
+        .def("async_offload_state_pages_to_host",
+             &Manager::AsyncOffloadStatePagesToHost, py::arg("sequence_ids"),
+             py::arg("active_page_counts"), py::arg("state_device_ptrs"))
+        .def("async_load_state_pages_to_device",
+             &Manager::AsyncLoadStatePagesToDevice, py::arg("sequence_ids"),
+             py::arg("active_page_counts"), py::arg("state_device_ptrs"))
+        .def("get_sequence_layer_state_page_pointers",
+             &Manager::GetSequenceLayerStatePagePointers,
+             py::arg("sequence_id"), py::arg("layer_idx"))
+        .def("state_page_ptr", &Manager::StatePagePtr,
+             py::arg("layer_idx"), py::arg("page_idx"))
+        .def("resolve_state_slot", &Manager::ResolveStateSlot,
+             py::arg("sequence_id"), py::arg("raw_position"))
+        .def("resolve_physical_layer",
+             [](const Manager& self, std::size_t layer_idx) {
+                 return self.ResolvePhysicalLayer(layer_idx,
+                                                  "resolve_physical_layer");
+             },
+             py::arg("layer_idx"))
+        .def("get_stats", &Manager::GetStats)
+        .def_property_readonly("device_index", &Manager::device_index)
+        .def_property_readonly("ratio", &Manager::ratio)
+        .def_property_readonly("overlap", &Manager::overlap)
+        .def_property_readonly("state_page_size_tokens",
+                               &Manager::state_page_size_tokens)
+        .def_property_readonly("ring_size", &Manager::ring_size)
+        .def_property_readonly("state_token_bytes",
+                               &Manager::state_token_bytes)
+        .def_property_readonly("page_bytes", &Manager::page_bytes)
+        .def_property_readonly("page_stride_bytes",
+                               &Manager::page_stride_bytes)
+        .def_property_readonly("layer_stride_bytes",
+                               &Manager::layer_stride_bytes)
+        .def_property_readonly("data_base_address",
+                               &Manager::DataBaseAddress)
+        .def("__repr__",
+             [](const Manager& self) { return self.DebugString(); });
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -513,6 +588,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  return kv::ToString(self);
              });
 
+    py::class_<kv::CompressedStateHostConfig>(m,
+                                              "CompressedStateHostConfig")
+        .def(py::init<>())
+        .def_readwrite("num_layers",
+                       &kv::CompressedStateHostConfig::num_layers)
+        .def_readwrite("num_pages",
+                       &kv::CompressedStateHostConfig::num_pages)
+        .def_readwrite(
+            "state_page_size_tokens",
+            &kv::CompressedStateHostConfig::state_page_size_tokens)
+        .def_readwrite("ring_size",
+                       &kv::CompressedStateHostConfig::ring_size)
+        .def_readwrite("state_token_bytes",
+                       &kv::CompressedStateHostConfig::state_token_bytes)
+        .def_readwrite(
+            "sequence_table_capacity",
+            &kv::CompressedStateHostConfig::sequence_table_capacity)
+        .def_readwrite("alignment_bytes",
+                       &kv::CompressedStateHostConfig::alignment_bytes)
+        .def_readwrite(
+            "logical_to_physical_layer",
+            &kv::CompressedStateHostConfig::logical_to_physical_layer)
+        .def_readwrite("logger_name",
+                       &kv::CompressedStateHostConfig::logger_name)
+        .def("__repr__",
+             [](const kv::CompressedStateHostConfig& self) {
+                 return kv::ToString(self);
+             });
+
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)
         .def("wait", &kv::KVAsyncTask::wait)
@@ -563,6 +667,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     BindHostPagedWorkerView<
         kv::CompressedRatio128MappedMLAHostPagedKVWorkerView>(
         m, "CompressedRatio128MappedMLAHostPagedKVWorkerView");
+    BindCompressedStateHostManager<kv::OverlapCompressedState4HostManager>(
+        m, "OverlapCompressedState4HostManager");
+    BindCompressedStateHostManager<kv::NonOverlapCompressedState4HostManager>(
+        m, "NonOverlapCompressedState4HostManager");
+    BindCompressedStateHostManager<kv::OverlapCompressedState128HostManager>(
+        m, "OverlapCompressedState128HostManager");
+    BindCompressedStateHostManager<kv::NonOverlapCompressedState128HostManager>(
+        m, "NonOverlapCompressedState128HostManager");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),
