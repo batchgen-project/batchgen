@@ -11,7 +11,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -539,6 +539,49 @@ def select_sequences_for_loading(
             rank_pages_used[assigned_rank] += req_pages
 
     return load_uuids, rank_pages_used
+
+
+def compute_capacity_aborts(
+    candidate_info: Dict[str, Dict[str, Any]],
+    safe_cap: Optional[int],
+    get_seq_fn: Callable[[str], Optional[Any]],
+) -> List[str]:
+    """Return uuids of candidates that cannot fit on their DP-attention rank.
+
+    A candidate is "over-cap" when its worst-case lifetime page budget
+    (``seq.get_admission_pages_required()`` = ``ceil(kv_token_budget/PAGE_SIZE) +
+    SINGLE_SEQ_PAGE_HEADROOM``) exceeds ``safe_cap``. Such a request can never
+    decode to its declared ``max_decode_length`` on its assigned rank even if
+    every other sequence is evicted — so the scheduler aborts it cleanly with
+    ``finish_reason="capacity"`` instead of looping it through ON_HOLD re-entry.
+
+    This is split out of ``_compute_boundary_decisions`` so it can be exercised
+    in tests without constructing a real ``BatchGenWorker``. The function is
+    pure with respect to (``candidate_info``, ``safe_cap``, ``get_seq_fn``);
+    it has no side effects.
+
+    Args:
+        candidate_info: Mapping of uuid -> state dict for PREFILLED/ON_HOLD
+            candidates collected by the page-boundary all-gather. Iteration
+            order is preserved in the returned list.
+        safe_cap: Per-rank single-sequence capacity in pages, or None when the
+            GPU KV manager hasn't initialized yet (guard is a no-op then).
+        get_seq_fn: Callable returning the ``SequenceEntry`` for a uuid (or
+            None if the seq was evicted between gather and decide).
+
+    Returns:
+        List of uuids to abort, in iteration order of ``candidate_info``.
+    """
+    if safe_cap is None or not candidate_info:
+        return []
+    aborted: List[str] = []
+    for uuid in candidate_info:
+        seq = get_seq_fn(uuid)
+        if seq is None:
+            continue
+        if seq.get_admission_pages_required() > safe_cap:
+            aborted.append(uuid)
+    return aborted
 
 
 def check_extension_feasibility(

@@ -122,6 +122,7 @@ from batchgen.continuous_batching import (
 	AdaptiveChunkSizer,
 	BoundaryDecisions,
 	FastBoundaryTimingStats,
+	compute_capacity_aborts,
 	plan_host_kv_growth_evictions,
 	EvictionStrategy,
 	LoadingStrategy,
@@ -6810,6 +6811,28 @@ class BatchGenWorker:
 		self.safe_single_seq_per_rank_capacity = int(
 			total_pages * (1.0 - SequenceEntry.SINGLE_SEQ_SAFETY_MARGIN)
 		)
+		# Debug override: lets integration tests force a small single-seq cap
+		# without needing a real 128K-context model. Logged as a warning so an
+		# accidentally-set override never ships silently.
+		_cap_override = os.environ.get("BATCHGEN_DEBUG_SINGLE_SEQ_CAP_PAGES")
+		if _cap_override is not None:
+			try:
+				_cap_override_int = int(_cap_override)
+			except ValueError:
+				if self.rank == 0:
+					logging.warning(
+						f"[GPU-KV] Ignoring BATCHGEN_DEBUG_SINGLE_SEQ_CAP_PAGES={_cap_override!r} "
+						f"(not an int)"
+					)
+			else:
+				_auto = self.safe_single_seq_per_rank_capacity
+				self.safe_single_seq_per_rank_capacity = _cap_override_int
+				if self.rank == 0:
+					logging.warning(
+						f"[GPU-KV] Single-seq capacity OVERRIDDEN to "
+						f"{self.safe_single_seq_per_rank_capacity} pages by "
+						f"BATCHGEN_DEBUG_SINGLE_SEQ_CAP_PAGES (auto-computed was {_auto})"
+					)
 		if self.rank == 0:
 			logging.info(
 				f"[GPU-KV] Initialized: {self.gpu_kv_cache_size_gb:.2f} GB, {total_pages} pages"
@@ -7621,27 +7644,25 @@ class BatchGenWorker:
 		# finish_reason="capacity". Without this, such a seq loops forever
 		# through ON_HOLD re-entry and eventually triggers a decode-model
 		# reconfiguration that OOMs (see batchgen-project/batchgen-internal#1).
-		capacity_aborted_uuids: List[str] = []
+		# The decision is delegated to a pure helper for testability.
 		safe_cap = self.safe_single_seq_per_rank_capacity
-		if safe_cap is not None and global_candidate_info:
-			for uuid, info in global_candidate_info.items():
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is None:
-					continue
-				# Compare worst-case lifetime page budget (prompt + max_decode +
-				# headroom) against the per-rank cap. Using the per-iteration
-				# pages_needed here would only catch a 128K seq after it had
-				# already filled the rank — the goal is to abort BEFORE that.
-				req_pages = seq.get_admission_pages_required()
-				if req_pages > safe_cap:
-					capacity_aborted_uuids.append(uuid)
-					seq._finish_capacity = True
-					logging.warning(
-						f"[KV_CAPACITY_ABORT] uuid={uuid[:8]} "
-						f"assigned_rank={info.get('assigned_rank')} "
-						f"req_pages={req_pages} > safe_per_rank_cap={safe_cap}; "
-						f"completing with finish_reason=capacity"
-					)
+		capacity_aborted_uuids = compute_capacity_aborts(
+			candidate_info=global_candidate_info or {},
+			safe_cap=safe_cap,
+			get_seq_fn=self.global_batch.get_sequence,
+		)
+		for uuid in capacity_aborted_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq._finish_capacity = True
+			info = (global_candidate_info or {}).get(uuid, {})
+			req_pages = seq.get_admission_pages_required() if seq is not None else -1
+			logging.warning(
+				f"[KV_CAPACITY_ABORT] uuid={uuid[:8]} "
+				f"assigned_rank={info.get('assigned_rank')} "
+				f"req_pages={req_pages} > safe_per_rank_cap={safe_cap}; "
+				f"completing with finish_reason=capacity"
+			)
 
 		# Identify completed sequences
 		completed_uuids = list(capacity_aborted_uuids)
