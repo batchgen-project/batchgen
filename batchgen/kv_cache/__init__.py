@@ -3,6 +3,7 @@
 #  copyright (c) EfficientMoE team 2025                                          #
 # ---------------------------------------------------------------------------- #
 
+from batchgen.kv_cache.component_coordinator import ComponentCoordinator
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
     CompressedRatioGPUPagedKVCacheManager,
 )
@@ -23,11 +24,7 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     DeepSeekV4HostKVCoordinator,
 )
 from batchgen.kv_cache.gpu_kv_coordinator import GPUKVCoordinator
-from batchgen.kv_cache.host_kv_coordinator import (
-    AsyncKVTask,
-    HostKVCoordinator,
-    wait_kv_tasks,
-)
+from batchgen.kv_cache.host_kv_coordinator import HostKVCoordinator
 from batchgen.kv_cache.swa_gpu_paged_kv_manager import (
     SWAGPUPagedKVCacheManager,
 )
@@ -40,15 +37,14 @@ __all__ = [
     "INDEXER_C4",
     "INDEXER_C4_STATE",
     "SWA",
-    "AsyncKVTask",
     "CompressedRatioGPUPagedKVCacheManager",
     "CompressedStateGPUConfig",
     "CompressedStateGPUManager",
     "CompressedStateGPUStats",
+    "ComponentCoordinator",
     "DeepSeekV4GPUKVCoordinator",
     "DeepSeekV4HostKVCoordinator",
     "GPUKVCoordinator",
     "HostKVCoordinator",
     "SWAGPUPagedKVCacheManager",
-    "wait_kv_tasks",
 ]

@@ -8,8 +8,11 @@ from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
 )
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     COMPRESSOR_C4,
+    COMPRESSOR_C4_STATE,
     COMPRESSOR_C128,
+    COMPRESSOR_C128_STATE,
     INDEXER_C4,
+    INDEXER_C4_STATE,
     SWA,
     DeepSeekV4GPUKVCoordinator,
     DeepSeekV4HostKVCoordinator,
@@ -287,20 +290,53 @@ def _make_gpu_manager(
     return GPUPagedKVCacheManager(config=config, device="cpu")
 
 
-def test_host_kv_coordinator_is_a_lightweight_registry():
+def test_host_kv_coordinator_is_a_generic_component_registry():
     primary = _FakeHostView("primary")
     c4 = _FakeHostView("c4")
+    c4_state = _FakeStateManager("c4_state")
     coordinator = HostKVCoordinator()
     coordinator.register_component("primary", primary)
     coordinator.register_component("compressor_c4", c4)
+    coordinator.register_component("compressor_c4_state", c4_state)
 
-    assert coordinator.component_names == ["primary", "compressor_c4"]
+    assert coordinator.component_names == [
+        "primary",
+        "compressor_c4",
+        "compressor_c4_state",
+    ]
     assert coordinator.primary is primary
-    assert coordinator.get_view("compressor_c4") is c4
+    assert coordinator.get_component("compressor_c4") is c4
+    assert coordinator.compressor_c4_state is c4_state
 
-    coordinator.call_all("register_sequences", [101, 102])
-    assert primary.calls == [("register_sequences", [101, 102])]
-    assert c4.calls == [("register_sequences", [101, 102])]
+    coordinator.call_all("initialize", 0)
+    assert primary.calls == [("initialize", (0,), {})]
+    assert c4.calls == [("initialize", (0,), {})]
+    assert c4_state.calls == [("initialize", (0,), {})]
+
+
+def test_host_kv_coordinator_can_call_one_component_explicitly():
+    coordinator = HostKVCoordinator()
+    mapped_view = _FakeHostView("mapped")
+    coordinator.register_component("mapped", mapped_view)
+
+    task = coordinator.call_component(
+        "mapped",
+        "async_offload_layer_kv_to_host",
+        4,
+        [101],
+        "k",
+        "v",
+        [65],
+    )
+    assert task.name == "mapped:offload"
+    assert mapped_view.calls[-1] == (
+        "async_offload_layer_kv_to_host",
+        4,
+        [101],
+        "k",
+        "v",
+        [65],
+    )
 
 
 def test_host_kv_coordinator_rejects_component_metadata():
@@ -314,122 +350,24 @@ def test_host_kv_coordinator_rejects_component_metadata():
         )
 
 
-def test_host_kv_coordinator_passes_layer_ids_to_worker_views():
-    mapped_view = _FakeHostView("mapped")
-    coordinator = HostKVCoordinator()
-    coordinator.register_component("mapped", mapped_view)
-
-    coordinator.async_offload_layer_kv_to_host(
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-        component_name="mapped",
-    )
-    assert mapped_view.calls[-1] == (
-        "async_offload_layer_kv_to_host",
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-    )
-
-
-def test_host_kv_coordinator_routes_async_data_movement_by_component():
-    primary = _FakeHostView("primary")
-    c4 = _FakeHostView("c4")
-    coordinator = HostKVCoordinator()
-    coordinator.register_component("primary", primary)
-    coordinator.register_component("compressor_c4", c4)
-
-    task = coordinator.async_offload_layer_kv_to_host(
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-        component_name="compressor_c4",
-    )
-    assert task.name == "c4:offload"
-    assert c4.calls[-1] == (
-        "async_offload_layer_kv_to_host",
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-    )
-
-    coordinator.async_append_decode_kv_to_host_batched_kernel(
-        [(4, "k4", "v4"), (2, "k2", "v2")],
-        [101, 102],
-        [65, 66],
-        component_name="compressor_c4",
-    )
-    assert c4.calls[-1] == (
-        "async_append_decode_kv_to_host_batched_kernel",
-        [(4, "k4", "v4"), (2, "k2", "v2")],
-        [101, 102],
-        [65, 66],
-    )
-
-    composite = coordinator.async_offload_components_kv_to_host(
-        {
-            "primary": {
-                "layer_idx": 0,
-                "sequence_ids": [101],
-                "k_tensor": "pk",
-                "v_tensor": "pv",
-                "sequence_lengths": [65],
-            },
-            "compressor_c4": {
-                "layer_idx": 2,
-                "sequence_ids": [101],
-                "k_tensor": "ck",
-                "v_tensor": "cv",
-                "sequence_lengths": [17],
-            },
-        },
-        tensors="held",
-    )
-    assert composite.tensors == "held"
-    composite.wait()
-    assert composite.tasks["primary"].waited
-    assert composite.tasks["compressor_c4"].waited
-    assert primary.calls[-1] == (
-        "async_offload_layer_kv_to_host",
-        0,
-        [101],
-        "pk",
-        "pv",
-        [65],
-    )
-    assert c4.calls[-1] == (
-        "async_offload_layer_kv_to_host",
-        2,
-        [101],
-        "ck",
-        "cv",
-        [17],
-    )
-
-
-def test_gpu_kv_coordinator_keeps_managers_independent():
+def test_gpu_kv_coordinator_is_a_generic_component_registry():
     primary = _make_gpu_manager(num_layers=3, num_pages=16, page_size_tokens=4)
     c4 = _make_gpu_manager(num_layers=2, num_pages=16, page_size_tokens=2)
+    c4_state = _FakeStateManager("c4_state")
     coordinator = GPUKVCoordinator()
     coordinator.register_component("primary", primary)
     coordinator.register_component("compressor_c4", c4)
+    coordinator.register_component("compressor_c4_state", c4_state)
 
     assert coordinator.primary is primary
-    assert coordinator.get_manager("compressor_c4") is c4
+    assert coordinator.get_component("compressor_c4") is c4
+    assert coordinator.compressor_c4_state is c4_state
 
-    coordinator.initialize()
-    coordinator.allocate_pages_for_sequences([10, 20], [5, 9])
-    page_tables = coordinator.rebuild_page_table([10, 20])
-    primary_table = page_tables["primary"]
+    coordinator.call_component("primary", "initialize")
+    coordinator.call_component("compressor_c4", "initialize")
+    primary.allocate_pages_for_sequences([10, 20], [5, 9])
+    c4.allocate_pages_for_sequences([10, 20], [5, 9])
+    primary_table = primary.rebuild_page_table([10, 20])
     c4_table = c4.rebuild_page_table([10, 20])
 
     assert tuple(primary_table.shape) == (2, 4)
@@ -475,7 +413,7 @@ def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
         manager.get_sequence_layer_page_pointers(10, 3)
 
 
-def test_gpu_kv_coordinator_passes_layer_ids_to_mapped_managers():
+def test_gpu_kv_coordinator_can_call_one_component_explicitly():
     manager = _make_gpu_manager(
         num_layers=2,
         num_pages=8,
@@ -490,10 +428,11 @@ def test_gpu_kv_coordinator_passes_layer_ids_to_mapped_managers():
     coordinator = GPUKVCoordinator()
     coordinator.register_component("compressor_c4", manager)
 
-    k_ptrs, _ = coordinator.get_sequence_layer_page_pointers(
+    k_ptrs, _ = coordinator.call_component(
+        "compressor_c4",
+        "get_sequence_layer_page_pointers",
         10,
         4,
-        component_name="compressor_c4",
     )
 
     assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
@@ -593,13 +532,12 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
     assert coordinator.compressor_c128 is c128
     assert coordinator.indexer_c4 is indexer
 
-    coordinator.async_offload_layer_kv_to_host(
+    coordinator.compressor_c4.async_offload_layer_kv_to_host(
         4,
         [101],
         "k",
         None,
         [17],
-        component_name=COMPRESSOR_C4,
     )
     assert c4.calls[-1] == (
         "async_offload_layer_kv_to_host",
@@ -625,6 +563,13 @@ def test_deepseek_v4_host_coordinator_routes_state_components():
     assert coordinator.compressor_c4_state is c4_state
     assert coordinator.compressor_c128_state is None
     assert coordinator.indexer_c4_state is indexer_state
+    assert coordinator.component_names == [
+        SWA,
+        COMPRESSOR_C4_STATE,
+        INDEXER_C4_STATE,
+    ]
+    assert coordinator.get_component(COMPRESSOR_C4_STATE) is c4_state
+    assert coordinator.get_component(INDEXER_C4_STATE) is indexer_state
 
     coordinator.initialize(0)
     assert c4_state.calls[-1] == ("initialize", (0,), {})
@@ -683,17 +628,16 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
         indexer_c4=indexer,
     )
 
-    assert coordinator.get_manager(SWA) is swa
-    assert coordinator.get_manager(COMPRESSOR_C4) is c4
+    assert coordinator.get_component(SWA) is swa
+    assert coordinator.get_component(COMPRESSOR_C4) is c4
 
     coordinator.initialize()
-    coordinator.allocate_pages_for_sequences([10], [8])
-    coordinator.rebuild_page_table([10])
+    coordinator.compressor_c4.allocate_pages_for_sequences([10], [8])
+    coordinator.compressor_c4.rebuild_page_table([10])
     page_id = int(c4._sequences[10].pages[0].item())
-    k_ptrs, _ = coordinator.get_sequence_layer_page_pointers(
+    k_ptrs, _ = coordinator.compressor_c4.get_sequence_layer_page_pointers(
         10,
         4,
-        component_name=COMPRESSOR_C4,
     )
 
     assert k_ptrs[0] == c4._k_cache[1, page_id].data_ptr()
@@ -713,6 +657,13 @@ def test_deepseek_v4_gpu_coordinator_routes_state_components():
     assert coordinator.compressor_c4_state is c4_state
     assert coordinator.compressor_c128_state is c128_state
     assert coordinator.indexer_c4_state is None
+    assert coordinator.component_names == [
+        SWA,
+        COMPRESSOR_C4_STATE,
+        COMPRESSOR_C128_STATE,
+    ]
+    assert coordinator.get_component(COMPRESSOR_C4_STATE) is c4_state
+    assert coordinator.get_component(COMPRESSOR_C128_STATE) is c128_state
 
     coordinator.initialize()
     assert c4_state.calls[-1] == ("initialize", (), {})

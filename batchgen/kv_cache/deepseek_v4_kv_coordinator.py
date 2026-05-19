@@ -22,10 +22,11 @@ INDEXER_C4_STATE = "indexer_c4_state"
 
 
 class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
-    """Runtime facade for DeepSeek-V4 host KV worker views.
+    """Runtime facade for DeepSeek-V4 host KV components.
 
-    The base coordinator provides lifecycle, page, query, and data movement for
-    registered components. Each worker view owns its layer mapping.
+    Each component owns its own layout and operation protocol. The coordinator
+    only registers names and performs the small amount of model-level lifecycle
+    wiring whose signatures differ between paged KV and compressor state.
     """
 
     def __init__(
@@ -45,22 +46,31 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
             (COMPRESSOR_C4, compressor_c4),
             (COMPRESSOR_C128, compressor_c128),
             (INDEXER_C4, indexer_c4),
+            (COMPRESSOR_C4_STATE, compressor_c4_state),
+            (COMPRESSOR_C128_STATE, compressor_c128_state),
+            (INDEXER_C4_STATE, indexer_c4_state),
         ):
+            setattr(self, component_name, view)
             if view is None:
                 continue
             self.register_component(component_name, view)
 
-        self.compressor_c4_state = compressor_c4_state
-        self.compressor_c128_state = compressor_c128_state
-        self.indexer_c4_state = indexer_c4_state
-
     def initialize(
         self, device_index: int, create_region: bool = False
     ) -> dict[str, Any]:
-        results = super().initialize(
-            device_index=int(device_index),
-            create_region=create_region,
-        )
+        results: dict[str, Any] = {}
+        for component_name in (
+            SWA,
+            COMPRESSOR_C4,
+            COMPRESSOR_C128,
+            INDEXER_C4,
+        ):
+            manager = getattr(self, component_name, None)
+            if manager is not None:
+                results[component_name] = manager.initialize(
+                    device_index=int(device_index),
+                    create_region=create_region,
+                )
         for component_name, manager in (
             (COMPRESSOR_C4_STATE, self.compressor_c4_state),
             (COMPRESSOR_C128_STATE, self.compressor_c128_state),
@@ -71,7 +81,7 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
         return results
 
     def shutdown(self) -> dict[str, Any]:
-        results = super().shutdown()
+        results: dict[str, Any] = {}
         for component_name, manager in (
             (INDEXER_C4_STATE, self.indexer_c4_state),
             (COMPRESSOR_C128_STATE, self.compressor_c128_state),
@@ -79,11 +89,20 @@ class DeepSeekV4HostKVCoordinator(HostKVCoordinator):
         ):
             if manager is not None:
                 results[component_name] = manager.shutdown()
+        for component_name in (
+            INDEXER_C4,
+            COMPRESSOR_C128,
+            COMPRESSOR_C4,
+            SWA,
+        ):
+            manager = getattr(self, component_name, None)
+            if manager is not None:
+                results[component_name] = manager.shutdown()
         return results
 
 
 class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
-    """Runtime facade for DeepSeek-V4 GPU paged KV managers."""
+    """Runtime facade for DeepSeek-V4 GPU KV components."""
 
     def __init__(
         self,
@@ -102,35 +121,22 @@ class DeepSeekV4GPUKVCoordinator(GPUKVCoordinator):
             (COMPRESSOR_C4, compressor_c4),
             (COMPRESSOR_C128, compressor_c128),
             (INDEXER_C4, indexer_c4),
+            (COMPRESSOR_C4_STATE, compressor_c4_state),
+            (COMPRESSOR_C128_STATE, compressor_c128_state),
+            (INDEXER_C4_STATE, indexer_c4_state),
         ):
+            setattr(self, component_name, manager)
             if manager is None:
                 continue
             self.register_component(component_name, manager)
 
-        self.compressor_c4_state = compressor_c4_state
-        self.compressor_c128_state = compressor_c128_state
-        self.indexer_c4_state = indexer_c4_state
-
     def initialize(self) -> dict[str, Any]:
-        results = super().initialize()
-        for component_name, manager in (
-            (COMPRESSOR_C4_STATE, self.compressor_c4_state),
-            (COMPRESSOR_C128_STATE, self.compressor_c128_state),
-            (INDEXER_C4_STATE, self.indexer_c4_state),
-        ):
-            if manager is not None:
-                results[component_name] = manager.initialize()
-        return results
+        return self.call_all("initialize")
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> dict[str, Any]:
-        results = super().destroy(empty_cuda_cache=empty_cuda_cache)
-        for component_name, manager in (
-            (INDEXER_C4_STATE, self.indexer_c4_state),
-            (COMPRESSOR_C128_STATE, self.compressor_c128_state),
-            (COMPRESSOR_C4_STATE, self.compressor_c4_state),
-        ):
-            if manager is not None:
-                results[component_name] = manager.destroy(
-                    empty_cuda_cache=empty_cuda_cache
-                )
+        results: dict[str, Any] = {}
+        for component_name, manager in reversed(list(self.components())):
+            results[component_name] = manager.destroy(
+                empty_cuda_cache=empty_cuda_cache
+            )
         return results
