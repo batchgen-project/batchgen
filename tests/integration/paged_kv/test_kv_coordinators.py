@@ -3,10 +3,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from batchgen.kv_cache.component_coordinator import (
-    GPUKVCoordinator,
-    HostKVCoordinator,
-)
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
     CompressedRatioGPUPagedKVCacheManager,
 )
@@ -292,103 +288,6 @@ def _make_gpu_manager(
     return GPUPagedKVCacheManager(config=config, device="cpu")
 
 
-def test_host_kv_coordinator_is_a_generic_component_registry():
-    primary = _FakeHostView("primary")
-    c4 = _FakeHostView("c4")
-    c4_state = _FakeStateManager("c4_state")
-    coordinator = HostKVCoordinator()
-    coordinator.register_component("primary", primary)
-    coordinator.register_component("compressor_c4", c4)
-    coordinator.register_component("compressor_c4_state", c4_state)
-
-    assert coordinator.component_names == [
-        "primary",
-        "compressor_c4",
-        "compressor_c4_state",
-    ]
-    assert coordinator.primary is primary
-    assert coordinator.get_component("compressor_c4") is c4
-    assert coordinator.compressor_c4_state is c4_state
-
-    coordinator.call_all("initialize", 0)
-    assert primary.calls == [("initialize", (0,), {})]
-    assert c4.calls == [("initialize", (0,), {})]
-    assert c4_state.calls == [("initialize", (0,), {})]
-
-
-def test_host_kv_coordinator_can_call_one_component_explicitly():
-    coordinator = HostKVCoordinator()
-    mapped_view = _FakeHostView("mapped")
-    coordinator.register_component("mapped", mapped_view)
-
-    task = coordinator.call_component(
-        "mapped",
-        "async_offload_layer_kv_to_host",
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-    )
-    assert task.name == "mapped:offload"
-    assert mapped_view.calls[-1] == (
-        "async_offload_layer_kv_to_host",
-        4,
-        [101],
-        "k",
-        "v",
-        [65],
-    )
-
-
-def test_host_kv_coordinator_rejects_component_metadata():
-    coordinator = HostKVCoordinator()
-
-    with pytest.raises(ValueError, match="does not accept component metadata"):
-        coordinator.register_component(
-            "empty_component",
-            _FakeHostView("empty"),
-            logical_to_physical_layer=[-1, -1, 0],
-        )
-
-
-def test_gpu_kv_coordinator_is_a_generic_component_registry():
-    primary = _make_gpu_manager(num_layers=3, num_pages=16, page_size_tokens=4)
-    c4 = _make_gpu_manager(num_layers=2, num_pages=16, page_size_tokens=2)
-    c4_state = _FakeStateManager("c4_state")
-    coordinator = GPUKVCoordinator()
-    coordinator.register_component("primary", primary)
-    coordinator.register_component("compressor_c4", c4)
-    coordinator.register_component("compressor_c4_state", c4_state)
-
-    assert coordinator.primary is primary
-    assert coordinator.get_component("compressor_c4") is c4
-    assert coordinator.compressor_c4_state is c4_state
-
-    coordinator.call_component("primary", "initialize")
-    coordinator.call_component("compressor_c4", "initialize")
-    primary.allocate_pages_for_sequences([10, 20], [5, 9])
-    c4.allocate_pages_for_sequences([10, 20], [5, 9])
-    primary_table = primary.rebuild_page_table([10, 20])
-    c4_table = c4.rebuild_page_table([10, 20])
-
-    assert tuple(primary_table.shape) == (2, 4)
-    assert tuple(c4_table.shape) == (2, 6)
-    assert primary._sequences[20].pages.numel() == 3
-    assert c4._sequences[20].pages.numel() == 5
-
-
-def test_gpu_kv_coordinator_rejects_component_metadata():
-    coordinator = GPUKVCoordinator()
-
-    with pytest.raises(ValueError, match="does not accept component metadata"):
-        coordinator.register_component(
-            "compressor_c4",
-            _make_gpu_manager(num_layers=2, num_pages=8, page_size_tokens=4),
-            logical_to_physical_layer=[-1, -1, 0, -1, 1],
-        )
-
-
 def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
     manager = _make_gpu_manager(
         num_layers=2,
@@ -413,31 +312,6 @@ def test_mapped_gpu_paged_kv_manager_resolves_logical_layers():
 
     with pytest.raises(KeyError):
         manager.get_sequence_layer_page_pointers(10, 3)
-
-
-def test_gpu_kv_coordinator_can_call_one_component_explicitly():
-    manager = _make_gpu_manager(
-        num_layers=2,
-        num_pages=8,
-        page_size_tokens=4,
-        logical_to_physical_layer=[-1, -1, 0, -1, 1],
-    )
-    manager.initialize()
-    manager.allocate_pages_for_sequences([10], [8])
-    manager.rebuild_page_table([10])
-    page_id = int(manager._sequences[10].pages[0].item())
-
-    coordinator = GPUKVCoordinator()
-    coordinator.register_component("compressor_c4", manager)
-
-    k_ptrs, _ = coordinator.call_component(
-        "compressor_c4",
-        "get_sequence_layer_page_pointers",
-        10,
-        4,
-    )
-
-    assert k_ptrs[0] == manager._k_cache[1, page_id].data_ptr()
 
 
 def test_compressed_ratio_gpu_manager_uses_floor_positions_without_padding():
@@ -523,12 +397,6 @@ def test_deepseek_v4_host_coordinator_registers_dsv4_components():
         indexer_c4=indexer,
     )
 
-    assert coordinator.component_names == [
-        SWA,
-        COMPRESSOR_C4,
-        COMPRESSOR_C128,
-        INDEXER_C4,
-    ]
     assert coordinator.swa is swa
     assert coordinator.compressor_c4 is c4
     assert coordinator.compressor_c128 is c128
@@ -565,13 +433,6 @@ def test_deepseek_v4_host_coordinator_routes_state_components():
     assert coordinator.compressor_c4_state is c4_state
     assert coordinator.compressor_c128_state is None
     assert coordinator.indexer_c4_state is indexer_state
-    assert coordinator.component_names == [
-        SWA,
-        COMPRESSOR_C4_STATE,
-        INDEXER_C4_STATE,
-    ]
-    assert coordinator.get_component(COMPRESSOR_C4_STATE) is c4_state
-    assert coordinator.get_component(INDEXER_C4_STATE) is indexer_state
 
     coordinator.initialize(0)
     assert c4_state.calls[-1] == ("initialize", (0,), {})
@@ -630,8 +491,10 @@ def test_deepseek_v4_gpu_coordinator_registers_dsv4_components():
         indexer_c4=indexer,
     )
 
-    assert coordinator.get_component(SWA) is swa
-    assert coordinator.get_component(COMPRESSOR_C4) is c4
+    assert coordinator.swa is swa
+    assert coordinator.compressor_c4 is c4
+    assert coordinator.compressor_c128 is c128
+    assert coordinator.indexer_c4 is indexer
 
     coordinator.initialize()
     coordinator.compressor_c4.allocate_pages_for_sequences([10], [8])
@@ -659,13 +522,6 @@ def test_deepseek_v4_gpu_coordinator_routes_state_components():
     assert coordinator.compressor_c4_state is c4_state
     assert coordinator.compressor_c128_state is c128_state
     assert coordinator.indexer_c4_state is None
-    assert coordinator.component_names == [
-        SWA,
-        COMPRESSOR_C4_STATE,
-        COMPRESSOR_C128_STATE,
-    ]
-    assert coordinator.get_component(COMPRESSOR_C4_STATE) is c4_state
-    assert coordinator.get_component(COMPRESSOR_C128_STATE) is c128_state
 
     coordinator.initialize()
     assert c4_state.calls[-1] == ("initialize", (), {})
