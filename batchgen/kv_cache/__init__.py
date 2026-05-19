@@ -9,6 +9,7 @@ from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
 from batchgen.kv_cache.compressed_state_gpu_manager import (
     CompressedStateGPUConfig,
     CompressedStateGPUManager,
+    CompressedStateGPUStats,
 )
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     COMPRESSOR_C4,
@@ -37,6 +38,7 @@ __all__ = [
     "CompressedRatioGPUPagedKVCacheManager",
     "CompressedStateGPUConfig",
     "CompressedStateGPUManager",
+    "CompressedStateGPUStats",
     "DeepSeekV4GPUKVCoordinator",
     "DeepSeekV4HostKVCoordinator",
     "GPUKVCoordinator",

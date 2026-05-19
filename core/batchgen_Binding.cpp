@@ -400,26 +400,12 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
         .def(py::init<kv::CompressedStateHostConfig>(), py::arg("config"))
         .def("initialize", &Manager::Initialize, py::arg("device_index"))
         .def("shutdown", &Manager::Shutdown)
-        .def(
-            "allocate_pages_for_sequences",
-            [](Manager& self,
-               const std::vector<std::pair<std::int64_t, std::size_t>>&
-                   requests) {
-                std::vector<std::int64_t> sequence_ids;
-                std::vector<std::size_t> raw_num_tokens;
-                sequence_ids.reserve(requests.size());
-                raw_num_tokens.reserve(requests.size());
-                for (const auto& request : requests) {
-                    sequence_ids.push_back(request.first);
-                    raw_num_tokens.push_back(request.second);
-                }
-                return self.AllocatePagesForSequences(sequence_ids,
-                                                      raw_num_tokens);
-            },
-            py::arg("requests"))
-        .def("release_sequence_pages", &Manager::ReleaseSequencePages,
+        .def("allocate_state_item", &Manager::AllocateStateItem,
+             py::arg("sequence_id"))
+        .def("allocate_state_items_for_sequences",
+             &Manager::AllocateStateItemsForSequences,
              py::arg("sequence_ids"))
-        .def("build_page_table", &Manager::BuildPageTable,
+        .def("release_sequence_states", &Manager::ReleaseSequenceStates,
              py::arg("sequence_ids"))
         .def("async_offload_decode_state_to_host",
              &Manager::AsyncOffloadDecodeStateToHost, py::arg("layer_idx"),
@@ -429,17 +415,17 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
              &Manager::AsyncLoadDecodeStateToDevice, py::arg("layer_idx"),
              py::arg("sequence_ids"), py::arg("state_tensor"),
              py::arg("raw_positions"))
-        .def("async_offload_state_pages_to_host",
-             &Manager::AsyncOffloadStatePagesToHost, py::arg("sequence_ids"),
-             py::arg("active_page_counts"), py::arg("state_device_ptrs"))
-        .def("async_load_state_pages_to_device",
-             &Manager::AsyncLoadStatePagesToDevice, py::arg("sequence_ids"),
-             py::arg("active_page_counts"), py::arg("state_device_ptrs"))
-        .def("get_sequence_layer_state_page_pointers",
-             &Manager::GetSequenceLayerStatePagePointers,
+        .def("async_offload_state_items_to_host",
+             &Manager::AsyncOffloadStateItemsToHost, py::arg("sequence_ids"),
+             py::arg("state_device_ptrs"))
+        .def("async_load_state_items_to_device",
+             &Manager::AsyncLoadStateItemsToDevice, py::arg("sequence_ids"),
+             py::arg("state_device_ptrs"))
+        .def("get_sequence_layer_state_item_pointer",
+             &Manager::GetSequenceLayerStateItemPointer,
              py::arg("sequence_id"), py::arg("layer_idx"))
-        .def("state_page_ptr", &Manager::StatePagePtr,
-             py::arg("layer_idx"), py::arg("page_idx"))
+        .def("state_item_ptr", &Manager::StateItemPtr,
+             py::arg("layer_idx"), py::arg("state_item_id"))
         .def("resolve_state_slot", &Manager::ResolveStateSlot,
              py::arg("sequence_id"), py::arg("raw_position"))
         .def("resolve_physical_layer",
@@ -452,14 +438,15 @@ void BindCompressedStateHostManager(py::module& m, const char* name) {
         .def_property_readonly("device_index", &Manager::device_index)
         .def_property_readonly("ratio", &Manager::ratio)
         .def_property_readonly("overlap", &Manager::overlap)
-        .def_property_readonly("state_page_size_tokens",
-                               &Manager::state_page_size_tokens)
+        .def_property_readonly("num_state_items",
+                               &Manager::num_state_items)
         .def_property_readonly("ring_size", &Manager::ring_size)
         .def_property_readonly("state_token_bytes",
                                &Manager::state_token_bytes)
-        .def_property_readonly("page_bytes", &Manager::page_bytes)
-        .def_property_readonly("page_stride_bytes",
-                               &Manager::page_stride_bytes)
+        .def_property_readonly("state_item_bytes",
+                               &Manager::state_item_bytes)
+        .def_property_readonly("state_item_stride_bytes",
+                               &Manager::state_item_stride_bytes)
         .def_property_readonly("layer_stride_bytes",
                                &Manager::layer_stride_bytes)
         .def_property_readonly("data_base_address",
@@ -588,16 +575,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  return kv::ToString(self);
              });
 
+    py::class_<kv::CompressedStateHostStats>(m,
+                                             "CompressedStateHostStats")
+        .def(py::init<>())
+        .def_readwrite(
+            "num_total_state_items",
+            &kv::CompressedStateHostStats::num_total_state_items)
+        .def_readwrite(
+            "num_free_state_items",
+            &kv::CompressedStateHostStats::num_free_state_items)
+        .def_readwrite(
+            "num_used_state_items",
+            &kv::CompressedStateHostStats::num_used_state_items)
+        .def_readwrite(
+            "num_active_sequences",
+            &kv::CompressedStateHostStats::num_active_sequences)
+        .def_readwrite(
+            "sequence_table_capacity",
+            &kv::CompressedStateHostStats::sequence_table_capacity)
+        .def_readwrite("total_bytes",
+                       &kv::CompressedStateHostStats::total_bytes)
+        .def("__repr__",
+             [](const kv::CompressedStateHostStats& self) {
+                 return kv::ToString(self);
+             });
+
     py::class_<kv::CompressedStateHostConfig>(m,
                                               "CompressedStateHostConfig")
         .def(py::init<>())
         .def_readwrite("num_layers",
                        &kv::CompressedStateHostConfig::num_layers)
-        .def_readwrite("num_pages",
-                       &kv::CompressedStateHostConfig::num_pages)
-        .def_readwrite(
-            "state_page_size_tokens",
-            &kv::CompressedStateHostConfig::state_page_size_tokens)
+        .def_readwrite("num_state_items",
+                       &kv::CompressedStateHostConfig::num_state_items)
         .def_readwrite("ring_size",
                        &kv::CompressedStateHostConfig::ring_size)
         .def_readwrite("state_token_bytes",

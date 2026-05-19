@@ -1,14 +1,11 @@
 #ifndef COMPRESSED_STATE_HOST_MANAGER_H_
 #define COMPRESSED_STATE_HOST_MANAGER_H_
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,8 +21,7 @@ namespace batchgen::kv {
 
 struct CompressedStateHostConfig {
     std::size_t num_layers = 0;
-    std::size_t num_pages = 0;
-    std::size_t state_page_size_tokens = 0;
+    std::size_t num_state_items = 0;
     std::size_t ring_size = 0;
     std::size_t state_token_bytes = 0;
     std::size_t sequence_table_capacity = 0;
@@ -37,8 +33,7 @@ struct CompressedStateHostConfig {
 inline std::string ToString(const CompressedStateHostConfig& config) {
     std::ostringstream oss;
     oss << "CompressedStateHostConfig(num_layers=" << config.num_layers
-        << ", num_pages=" << config.num_pages
-        << ", state_page_size_tokens=" << config.state_page_size_tokens
+        << ", num_state_items=" << config.num_state_items
         << ", ring_size=" << config.ring_size
         << ", state_token_bytes=" << config.state_token_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
@@ -46,6 +41,27 @@ inline std::string ToString(const CompressedStateHostConfig& config) {
         << ", logical_to_physical_layer=";
     AppendLogicalLayerMapping(oss, config.logical_to_physical_layer);
     oss << ")";
+    return oss.str();
+}
+
+struct CompressedStateHostStats {
+    std::size_t num_total_state_items = 0;
+    std::size_t num_free_state_items = 0;
+    std::size_t num_used_state_items = 0;
+    std::size_t num_active_sequences = 0;
+    std::size_t sequence_table_capacity = 0;
+    std::size_t total_bytes = 0;
+};
+
+inline std::string ToString(const CompressedStateHostStats& stats) {
+    std::ostringstream oss;
+    oss << "CompressedStateHostStats(num_total_state_items="
+        << stats.num_total_state_items
+        << ", num_free_state_items=" << stats.num_free_state_items
+        << ", num_used_state_items=" << stats.num_used_state_items
+        << ", num_active_sequences=" << stats.num_active_sequences
+        << ", sequence_table_capacity=" << stats.sequence_table_capacity
+        << ", total_bytes=" << stats.total_bytes << ")";
     return oss.str();
 }
 
@@ -58,23 +74,23 @@ class CompressedStateHostManager {
 
     explicit CompressedStateHostManager(CompressedStateHostConfig config)
         : config_(SanitizeConfig(std::move(config))),
-          page_bytes_(config_.ring_size * config_.state_token_bytes),
-          page_stride_bytes_(
-              detail::AlignUp(page_bytes_, config_.alignment_bytes)),
+          state_item_bytes_(config_.ring_size * config_.state_token_bytes),
+          state_item_stride_bytes_(
+              detail::AlignUp(state_item_bytes_, config_.alignment_bytes)),
           layer_stride_bytes_(detail::AlignUp(
-              config_.num_pages * page_stride_bytes_,
+              config_.num_state_items * state_item_stride_bytes_,
               config_.alignment_bytes)),
           total_bytes_(config_.num_layers * layer_stride_bytes_),
           logger_(init_logger(
               "info", config_.logger_name.empty()
                           ? "CompressedStateHostManager"
                           : config_.logger_name)) {
-        ResetFreePages();
+        ResetFreeStateItems();
     }
 
     CompressedStateHostManager(const CompressedStateHostManager&) = delete;
-    CompressedStateHostManager& operator=(const CompressedStateHostManager&) =
-        delete;
+    CompressedStateHostManager& operator=(
+        const CompressedStateHostManager&) = delete;
     CompressedStateHostManager(CompressedStateHostManager&&) = delete;
     CompressedStateHostManager& operator=(CompressedStateHostManager&&) =
         delete;
@@ -106,10 +122,10 @@ class CompressedStateHostManager {
         initialized_ = true;
         logger_->info(
             "CompressedStateHostManager ready (device_index={}, ratio={}, "
-            "overlap={}, layers={}, pages={}, page_bytes={}, "
+            "overlap={}, layers={}, state_items={}, state_item_bytes={}, "
             "total_bytes={})",
             device_index_, Ratio, Overlap, config_.num_layers,
-            config_.num_pages, page_bytes_, total_bytes_);
+            config_.num_state_items, state_item_bytes_, total_bytes_);
     }
 
     void Shutdown() {
@@ -124,36 +140,27 @@ class CompressedStateHostManager {
         device_index_ = -1;
         storage_.clear();
         sequence_states_.clear();
-        ResetFreePages();
+        ResetFreeStateItems();
     }
 
-    std::vector<std::vector<std::int32_t>> AllocatePagesForSequences(
-        const std::vector<std::int64_t>& sequence_ids,
-        const std::vector<std::size_t>& raw_num_tokens) {
+    std::vector<std::int32_t> AllocateStateItemsForSequences(
+        const std::vector<std::int64_t>& sequence_ids) {
         EnsureInitialized();
-        if (sequence_ids.size() != raw_num_tokens.size()) {
-            throw std::invalid_argument(
-                "sequence_ids and raw_num_tokens must have the same length");
-        }
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::vector<std::int32_t>> allocations;
+        std::vector<std::int32_t> allocations;
         allocations.reserve(sequence_ids.size());
-        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
-            allocations.push_back(EnsureCapacityLocked(sequence_ids[i],
-                                                       raw_num_tokens[i]));
+        for (std::int64_t sequence_id : sequence_ids) {
+            allocations.push_back(EnsureStateItemLocked(sequence_id));
         }
         return allocations;
     }
 
-    std::vector<std::int32_t> AllocatePages(std::int64_t sequence_id,
-                                            std::size_t raw_num_tokens) {
-        auto allocations = AllocatePagesForSequences({sequence_id},
-                                                     {raw_num_tokens});
-        return allocations.empty() ? std::vector<std::int32_t>{}
-                                   : std::move(allocations.front());
+    std::int32_t AllocateStateItem(std::int64_t sequence_id) {
+        auto allocations = AllocateStateItemsForSequences({sequence_id});
+        return allocations.empty() ? -1 : allocations.front();
     }
 
-    void ReleaseSequencePages(
+    void ReleaseSequenceStates(
         const std::vector<std::int64_t>& sequence_ids) {
         EnsureInitialized();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -163,10 +170,7 @@ class CompressedStateHostManager {
             if (it == sequence_states_.end()) {
                 continue;
             }
-            for (auto page_it = it->second.pages.rbegin();
-                 page_it != it->second.pages.rend(); ++page_it) {
-                free_pages_.push_back(*page_it);
-            }
+            free_state_items_.push_back(it->second.state_item_id);
             sequence_states_.erase(it);
         }
     }
@@ -204,75 +208,54 @@ class CompressedStateHostManager {
         return task;
     }
 
-    KVAsyncTask AsyncOffloadStatePagesToHost(
+    KVAsyncTask AsyncOffloadStateItemsToHost(
         std::vector<std::int64_t> sequence_ids,
-        std::vector<std::size_t> active_page_counts,
         torch::Tensor state_device_ptrs) {
-        auto prepared = PreparePageRows(std::move(sequence_ids),
-                                        std::move(active_page_counts),
-                                        std::move(state_device_ptrs),
-                                        "AsyncOffloadStatePagesToHost");
+        auto prepared = PrepareStateItemRows(
+            std::move(sequence_ids), std::move(state_device_ptrs),
+            "AsyncOffloadStateItemsToHost");
         auto task = transformed_detail::MakeAsyncTask(
             [prepared = std::move(prepared)]() mutable {
-                CopyPages(prepared, CopyDirection::kDeviceToHost);
+                CopyStateItems(prepared, CopyDirection::kDeviceToHost);
             });
         TrackTask(task);
         return task;
     }
 
-    KVAsyncTask AsyncLoadStatePagesToDevice(
+    KVAsyncTask AsyncLoadStateItemsToDevice(
         std::vector<std::int64_t> sequence_ids,
-        std::vector<std::size_t> active_page_counts,
         torch::Tensor state_device_ptrs) {
-        auto prepared = PreparePageRows(std::move(sequence_ids),
-                                        std::move(active_page_counts),
-                                        std::move(state_device_ptrs),
-                                        "AsyncLoadStatePagesToDevice");
+        auto prepared = PrepareStateItemRows(
+            std::move(sequence_ids), std::move(state_device_ptrs),
+            "AsyncLoadStateItemsToDevice");
         auto task = transformed_detail::MakeAsyncTask(
             [prepared = std::move(prepared)]() mutable {
-                CopyPages(prepared, CopyDirection::kHostToDevice);
+                CopyStateItems(prepared, CopyDirection::kHostToDevice);
             });
         TrackTask(task);
         return task;
     }
 
-    [[nodiscard]] std::vector<std::vector<std::int32_t>> BuildPageTable(
-        const std::vector<std::int64_t>& sequence_ids) const {
-        EnsureInitialized();
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::vector<std::int32_t>> table;
-        table.reserve(sequence_ids.size());
-        for (std::int64_t sequence_id : sequence_ids) {
-            table.push_back(SequencePagesLocked(sequence_id));
-        }
-        return table;
-    }
-
-    [[nodiscard]] std::vector<std::uintptr_t>
-    GetSequenceLayerStatePagePointers(std::int64_t sequence_id,
-                                      std::size_t layer_idx) const {
+    [[nodiscard]] std::uintptr_t GetSequenceLayerStateItemPointer(
+        std::int64_t sequence_id, std::size_t layer_idx) const {
         EnsureInitialized();
         const std::size_t physical_layer =
             ResolvePhysicalLayer(layer_idx,
-                                 "GetSequenceLayerStatePagePointers");
+                                 "GetSequenceLayerStateItemPointer");
         std::lock_guard<std::mutex> lock(mutex_);
-        const auto pages = SequencePagesLocked(sequence_id);
-        std::vector<std::uintptr_t> ptrs;
-        ptrs.reserve(pages.size());
-        for (std::int32_t page : pages) {
-            ptrs.push_back(reinterpret_cast<std::uintptr_t>(
-                StatePagePtrPhysical(physical_layer, page)));
-        }
-        return ptrs;
+        const std::int32_t state_item_id =
+            SequenceStateItemLocked(sequence_id);
+        return reinterpret_cast<std::uintptr_t>(
+            StateItemPtrPhysical(physical_layer, state_item_id));
     }
 
-    [[nodiscard]] std::uintptr_t StatePagePtr(std::size_t layer_idx,
-                                              std::int32_t page_idx) {
+    [[nodiscard]] std::uintptr_t StateItemPtr(std::size_t layer_idx,
+                                              std::int32_t state_item_id) {
         EnsureInitialized();
         const std::size_t physical_layer =
-            ResolvePhysicalLayer(layer_idx, "StatePagePtr");
+            ResolvePhysicalLayer(layer_idx, "StateItemPtr");
         return reinterpret_cast<std::uintptr_t>(
-            StatePagePtrPhysical(physical_layer, page_idx));
+            StateItemPtrPhysical(physical_layer, state_item_id));
     }
 
     [[nodiscard]] std::int64_t ResolveStateSlot(std::int64_t sequence_id,
@@ -283,7 +266,8 @@ class CompressedStateHostManager {
             ResolveSlotLocked(sequence_id, raw_position, 0,
                               "ResolveStateSlot");
         return static_cast<std::int64_t>(
-            slot.page_id * static_cast<std::int32_t>(config_.ring_size) +
+            slot.state_item_id *
+                static_cast<std::int32_t>(config_.ring_size) +
             static_cast<std::int32_t>(slot.ring_offset));
     }
 
@@ -316,13 +300,14 @@ class CompressedStateHostManager {
         return static_cast<std::size_t>(physical);
     }
 
-    [[nodiscard]] HostPagedKVStats GetStats() const {
+    [[nodiscard]] CompressedStateHostStats GetStats() const {
         EnsureInitialized();
         std::lock_guard<std::mutex> lock(mutex_);
-        HostPagedKVStats stats;
-        stats.num_total_pages = config_.num_pages;
-        stats.num_free_pages = free_pages_.size();
-        stats.num_used_pages = config_.num_pages - free_pages_.size();
+        CompressedStateHostStats stats;
+        stats.num_total_state_items = config_.num_state_items;
+        stats.num_free_state_items = free_state_items_.size();
+        stats.num_used_state_items =
+            config_.num_state_items - free_state_items_.size();
         stats.num_active_sequences = sequence_states_.size();
         stats.sequence_table_capacity = config_.sequence_table_capacity;
         stats.total_bytes = total_bytes_;
@@ -341,16 +326,18 @@ class CompressedStateHostManager {
     [[nodiscard]] int device_index() const { return device_index_; }
     [[nodiscard]] std::size_t ratio() const { return Ratio; }
     [[nodiscard]] bool overlap() const { return Overlap; }
-    [[nodiscard]] std::size_t state_page_size_tokens() const {
-        return config_.state_page_size_tokens;
+    [[nodiscard]] std::size_t num_state_items() const {
+        return config_.num_state_items;
     }
     [[nodiscard]] std::size_t ring_size() const { return config_.ring_size; }
     [[nodiscard]] std::size_t state_token_bytes() const {
         return config_.state_token_bytes;
     }
-    [[nodiscard]] std::size_t page_bytes() const { return page_bytes_; }
-    [[nodiscard]] std::size_t page_stride_bytes() const {
-        return page_stride_bytes_;
+    [[nodiscard]] std::size_t state_item_bytes() const {
+        return state_item_bytes_;
+    }
+    [[nodiscard]] std::size_t state_item_stride_bytes() const {
+        return state_item_stride_bytes_;
     }
     [[nodiscard]] std::size_t layer_stride_bytes() const {
         return layer_stride_bytes_;
@@ -368,11 +355,11 @@ class CompressedStateHostManager {
     enum class CopyDirection { kHostToDevice, kDeviceToHost };
 
     struct SequenceState {
-        std::vector<std::int32_t> pages;
+        std::int32_t state_item_id = -1;
     };
 
     struct SlotAddress {
-        std::int32_t page_id = -1;
+        std::int32_t state_item_id = -1;
         std::size_t ring_offset = 0;
         std::byte* host_ptr = nullptr;
     };
@@ -389,38 +376,32 @@ class CompressedStateHostManager {
         int device_index = -1;
     };
 
-    struct PageCopy {
+    struct StateItemCopy {
         std::byte* host_ptr = nullptr;
         std::byte* device_ptr = nullptr;
     };
 
-    struct PreparedPageRows {
+    struct PreparedStateItemRows {
         torch::Tensor pointer_tensor;
-        std::vector<PageCopy> pages;
-        std::size_t page_bytes = 0;
+        std::vector<StateItemCopy> state_items;
+        std::size_t state_item_bytes = 0;
         int device_index = -1;
     };
 
     static CompressedStateHostConfig SanitizeConfig(
         CompressedStateHostConfig config) {
         if (config.sequence_table_capacity == 0) {
-            config.sequence_table_capacity = config.num_pages;
+            config.sequence_table_capacity = config.num_state_items;
         }
         if (config.alignment_bytes == 0) {
             config.alignment_bytes = 64;
-        }
-        if (config.state_page_size_tokens == 0 && config.ring_size != 0) {
-            config.state_page_size_tokens = config.ring_size;
         }
         std::vector<std::string> errors;
         if (config.num_layers == 0) {
             errors.emplace_back("num_layers must be > 0");
         }
-        if (config.num_pages == 0) {
-            errors.emplace_back("num_pages must be > 0");
-        }
-        if (config.state_page_size_tokens == 0) {
-            errors.emplace_back("state_page_size_tokens must be > 0");
+        if (config.num_state_items == 0) {
+            errors.emplace_back("num_state_items must be > 0");
         }
         if (config.ring_size == 0) {
             errors.emplace_back("ring_size must be > 0");
@@ -473,104 +454,84 @@ class CompressedStateHostManager {
         }
     }
 
-    void ResetFreePages() {
-        free_pages_.clear();
-        free_pages_.reserve(config_.num_pages);
-        for (std::int32_t page =
-                 static_cast<std::int32_t>(config_.num_pages);
-             page > 0; --page) {
-            free_pages_.push_back(page - 1);
+    void ResetFreeStateItems() {
+        free_state_items_.clear();
+        free_state_items_.reserve(config_.num_state_items);
+        for (std::int32_t state_item =
+                 static_cast<std::int32_t>(config_.num_state_items);
+             state_item > 0; --state_item) {
+            free_state_items_.push_back(state_item - 1);
         }
     }
 
-    [[nodiscard]] std::size_t RequiredPages(std::size_t raw_tokens) const {
-        (void)raw_tokens;
-        return 1;
-    }
-
-    std::vector<std::int32_t> EnsureCapacityLocked(
-        std::int64_t sequence_id, std::size_t raw_num_tokens) {
-        const std::size_t required_pages = RequiredPages(raw_num_tokens);
-        auto& state = sequence_states_[sequence_id];
-        const std::size_t current_pages = state.pages.size();
-        if (required_pages <= current_pages) {
-            return {};
+    std::int32_t EnsureStateItemLocked(std::int64_t sequence_id) {
+        auto it = sequence_states_.find(sequence_id);
+        if (it != sequence_states_.end()) {
+            return it->second.state_item_id;
         }
-        const std::size_t missing = required_pages - current_pages;
-        if (missing > free_pages_.size()) {
+        if (sequence_states_.size() >= config_.sequence_table_capacity) {
             std::ostringstream oss;
-            oss << "CompressedStateHostManager: insufficient free pages "
-                << "(need=" << missing << ", free=" << free_pages_.size()
-                << ")";
+            oss << "CompressedStateHostManager: sequence table capacity "
+                << config_.sequence_table_capacity << " exceeded";
             throw std::runtime_error(oss.str());
         }
-        std::vector<std::int32_t> new_pages;
-        new_pages.reserve(missing);
-        for (std::size_t i = 0; i < missing; ++i) {
-            new_pages.push_back(free_pages_.back());
-            free_pages_.pop_back();
+        if (free_state_items_.empty()) {
+            throw std::runtime_error(
+                "CompressedStateHostManager: insufficient free state items");
         }
-        state.pages.insert(state.pages.end(), new_pages.begin(),
-                           new_pages.end());
-        return new_pages;
+        const std::int32_t state_item_id = free_state_items_.back();
+        free_state_items_.pop_back();
+        sequence_states_.emplace(sequence_id, SequenceState{state_item_id});
+        return state_item_id;
     }
 
-    [[nodiscard]] std::vector<std::int32_t> SequencePagesLocked(
+    [[nodiscard]] std::int32_t SequenceStateItemLocked(
         std::int64_t sequence_id) const {
         const auto it = sequence_states_.find(sequence_id);
         if (it == sequence_states_.end()) {
             std::ostringstream oss;
             oss << "CompressedStateHostManager: sequence " << sequence_id
-                << " has no allocated state pages";
+                << " has no allocated state item";
             throw std::out_of_range(oss.str());
         }
-        return it->second.pages;
+        return it->second.state_item_id;
     }
 
     [[nodiscard]] SlotAddress ResolveSlotLocked(
         std::int64_t sequence_id, std::size_t raw_position,
         std::size_t physical_layer, std::string_view context) {
-        const auto it = sequence_states_.find(sequence_id);
-        if (it == sequence_states_.end()) {
-            std::ostringstream oss;
-            oss << context << ": sequence " << sequence_id
-                << " has no allocated state pages";
-            throw std::out_of_range(oss.str());
-        }
-        if (it->second.pages.size() != 1) {
-            std::ostringstream oss;
-            oss << context << ": sequence " << sequence_id << " has "
-                << it->second.pages.size()
-                << " compressed state blocks; expected exactly one";
-            throw std::runtime_error(oss.str());
-        }
-        const std::int32_t page_id = it->second.pages.front();
+        (void)context;
+        const std::int32_t state_item_id =
+            SequenceStateItemLocked(sequence_id);
         const std::size_t ring_offset = raw_position % config_.ring_size;
-        return {page_id, ring_offset,
-                StateSlotPtrPhysical(physical_layer, page_id, ring_offset)};
+        return {state_item_id, ring_offset,
+                StateSlotPtrPhysical(physical_layer, state_item_id,
+                                     ring_offset)};
     }
 
-    [[nodiscard]] std::byte* StatePagePtrPhysical(
-        std::size_t physical_layer, std::int32_t page_idx) const {
+    [[nodiscard]] std::byte* StateItemPtrPhysical(
+        std::size_t physical_layer, std::int32_t state_item_id) const {
         if (physical_layer >= config_.num_layers) {
             throw std::out_of_range("physical layer out of range");
         }
-        if (page_idx < 0 ||
-            static_cast<std::size_t>(page_idx) >= config_.num_pages) {
-            throw std::out_of_range("state page id out of range");
+        if (state_item_id < 0 ||
+            static_cast<std::size_t>(state_item_id) >=
+                config_.num_state_items) {
+            throw std::out_of_range("state item id out of range");
         }
         return const_cast<std::byte*>(
             storage_.data() + physical_layer * layer_stride_bytes_ +
-            static_cast<std::size_t>(page_idx) * page_stride_bytes_);
+            static_cast<std::size_t>(state_item_id) *
+                state_item_stride_bytes_);
     }
 
     [[nodiscard]] std::byte* StateSlotPtrPhysical(
-        std::size_t physical_layer, std::int32_t page_idx,
+        std::size_t physical_layer, std::int32_t state_item_id,
         std::size_t ring_offset) const {
         if (ring_offset >= config_.ring_size) {
             throw std::out_of_range("ring offset out of range");
         }
-        return StatePagePtrPhysical(physical_layer, page_idx) +
+        return StateItemPtrPhysical(physical_layer, state_item_id) +
                ring_offset * config_.state_token_bytes;
     }
 
@@ -619,7 +580,7 @@ class CompressedStateHostManager {
                 throw std::out_of_range(
                     "raw position overflow in compressed state manager");
             }
-            EnsureCapacityLocked(sequence_id, raw_position + 1);
+            EnsureStateItemLocked(sequence_id);
             const SlotAddress slot =
                 ResolveSlotLocked(sequence_id, raw_position, physical_layer,
                                   op_name);
@@ -630,30 +591,23 @@ class CompressedStateHostManager {
         return prepared;
     }
 
-    PreparedPageRows PreparePageRows(
+    PreparedStateItemRows PrepareStateItemRows(
         std::vector<std::int64_t> sequence_ids,
-        std::vector<std::size_t> active_page_counts,
         torch::Tensor state_device_ptrs, std::string_view op_name) {
         EnsureInitialized();
-        if (sequence_ids.size() != active_page_counts.size()) {
-            throw std::invalid_argument(
-                "sequence_ids and active_page_counts must have the same "
-                "length");
-        }
         if (state_device_ptrs.scalar_type() != torch::kInt64) {
             std::ostringstream oss;
             oss << op_name << ": state_device_ptrs must be int64";
             throw std::invalid_argument(oss.str());
         }
-        if (state_device_ptrs.dim() != 3 ||
+        if (state_device_ptrs.dim() != 2 ||
             state_device_ptrs.size(0) !=
                 static_cast<std::int64_t>(config_.num_layers) ||
             state_device_ptrs.size(1) !=
                 static_cast<std::int64_t>(sequence_ids.size())) {
             std::ostringstream oss;
             oss << op_name
-                << ": state_device_ptrs must have shape "
-                   "[num_layers, batch, max_pages]";
+                << ": state_device_ptrs must have shape [num_layers, batch]";
             throw std::invalid_argument(oss.str());
         }
         if (state_device_ptrs.device().is_cuda()) {
@@ -661,45 +615,30 @@ class CompressedStateHostManager {
                 state_device_ptrs.to(torch::Device(torch::kCPU));
         }
         state_device_ptrs = state_device_ptrs.contiguous();
-        const auto max_pages =
-            static_cast<std::size_t>(state_device_ptrs.size(2));
-        PreparedPageRows prepared;
+        PreparedStateItemRows prepared;
         prepared.pointer_tensor = std::move(state_device_ptrs);
-        prepared.page_bytes = page_bytes_;
+        prepared.state_item_bytes = state_item_bytes_;
         prepared.device_index = device_index_;
         std::lock_guard<std::mutex> lock(mutex_);
         const auto* ptrs =
             prepared.pointer_tensor.template data_ptr<std::int64_t>();
-        const std::size_t layer_stride = sequence_ids.size() * max_pages;
-        for (std::size_t seq_idx = 0; seq_idx < sequence_ids.size();
-             ++seq_idx) {
-            const auto pages = SequencePagesLocked(sequence_ids[seq_idx]);
-            const std::size_t count = active_page_counts[seq_idx];
-            if (count > pages.size() || count > max_pages) {
-                std::ostringstream oss;
-                oss << op_name << ": active_page_count " << count
-                    << " exceeds allocated/capacity pages for sequence "
-                    << sequence_ids[seq_idx];
-                throw std::out_of_range(oss.str());
-            }
+        const std::size_t batch_size = sequence_ids.size();
+        for (std::size_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            const std::int32_t state_item_id =
+                SequenceStateItemLocked(sequence_ids[seq_idx]);
             for (std::size_t layer = 0; layer < config_.num_layers; ++layer) {
-                for (std::size_t page_ordinal = 0; page_ordinal < count;
-                     ++page_ordinal) {
-                    const std::size_t ptr_index =
-                        layer * layer_stride + seq_idx * max_pages +
-                        page_ordinal;
-                    const std::int64_t device_ptr = ptrs[ptr_index];
-                    if (device_ptr == 0) {
-                        std::ostringstream oss;
-                        oss << op_name
-                            << ": state_device_ptrs contains null pointer";
-                        throw std::invalid_argument(oss.str());
-                    }
-                    prepared.pages.push_back(
-                        {StatePagePtrPhysical(layer, pages[page_ordinal]),
-                         reinterpret_cast<std::byte*>(
-                             static_cast<std::uintptr_t>(device_ptr))});
+                const std::size_t ptr_index = layer * batch_size + seq_idx;
+                const std::int64_t device_ptr = ptrs[ptr_index];
+                if (device_ptr == 0) {
+                    std::ostringstream oss;
+                    oss << op_name
+                        << ": state_device_ptrs contains null pointer";
+                    throw std::invalid_argument(oss.str());
                 }
+                prepared.state_items.push_back(
+                    {StateItemPtrPhysical(layer, state_item_id),
+                     reinterpret_cast<std::byte*>(
+                         static_cast<std::uintptr_t>(device_ptr))});
             }
         }
         return prepared;
@@ -753,18 +692,18 @@ class CompressedStateHostManager {
         }
     }
 
-    static void CopyPages(const PreparedPageRows& prepared,
-                          CopyDirection direction) {
+    static void CopyStateItems(const PreparedStateItemRows& prepared,
+                               CopyDirection direction) {
         if (prepared.device_index >= 0) {
             CUDA_CHECK(cudaSetDevice(prepared.device_index));
         }
-        for (const PageCopy& page : prepared.pages) {
+        for (const StateItemCopy& state_item : prepared.state_items) {
             if (direction == CopyDirection::kDeviceToHost) {
-                CopyBytes(page.device_ptr, page.host_ptr,
-                          prepared.page_bytes);
+                CopyBytes(state_item.device_ptr, state_item.host_ptr,
+                          prepared.state_item_bytes);
             } else {
-                CopyBytes(page.host_ptr, page.device_ptr,
-                          prepared.page_bytes);
+                CopyBytes(state_item.host_ptr, state_item.device_ptr,
+                          prepared.state_item_bytes);
             }
         }
     }
@@ -785,8 +724,8 @@ class CompressedStateHostManager {
     }
 
     CompressedStateHostConfig config_;
-    std::size_t page_bytes_ = 0;
-    std::size_t page_stride_bytes_ = 0;
+    std::size_t state_item_bytes_ = 0;
+    std::size_t state_item_stride_bytes_ = 0;
     std::size_t layer_stride_bytes_ = 0;
     std::size_t total_bytes_ = 0;
     std::shared_ptr<spdlog::logger> logger_;
@@ -796,10 +735,9 @@ class CompressedStateHostManager {
     bool pinned_ = false;
     int device_index_ = -1;
     std::vector<std::byte> storage_;
-    std::vector<std::int32_t> free_pages_;
+    std::vector<std::int32_t> free_state_items_;
     std::unordered_map<std::int64_t, SequenceState> sequence_states_;
     transformed_detail::PendingHostWriteTasks pending_tasks_;
-
 };
 
 using OverlapCompressedState4HostManager =
