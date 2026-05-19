@@ -5,7 +5,7 @@ from typing import Optional, Sequence, Union
 
 import torch
 
-from batchgen.kv_cache.compressed_state_gpu_kernels import (
+from batchgen.kv_cache.compressed_ratio_gpu_kv_kernels import (
     run_compressed_state_update,
 )
 from batchgen.kv_cache.coordinator_utils import (
