@@ -10,7 +10,6 @@ from batchgen.kv_cache.compressed_ratio_gpu_kv_kernels import (
 )
 from batchgen.kv_cache.coordinator_utils import (
     as_int_list,
-    ceil_div,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import (
     CUDAGraphPageTableState,
@@ -43,10 +42,11 @@ class CompressedStateGPUConfig:
 class CompressedStateGPUManager:
     """GPU storage for rolling compressor state.
 
-    This manager stores raw compressor state, not completed compressed KV. A
-    raw token position maps to one storage slot:
+    This manager stores compressor scratch state, not completed compressed KV.
+    Each active sequence owns one fixed-size state item. A raw token position
+    only selects the ring slot within that item:
 
-    ``page(raw_position) * ring_size + raw_position % ring_size``.
+    ``state_item_id * ring_size + raw_position % ring_size``.
     """
 
     manager_name = "CompressedStateGPUManager"
@@ -77,10 +77,6 @@ class CompressedStateGPUManager:
             raise ValueError("state_dim must be > 0")
         if self.config.ring_size % self.ratio != 0:
             raise ValueError("ring_size must be divisible by ratio")
-        if self.config.state_page_size_tokens % self.config.ring_size != 0:
-            raise ValueError(
-                "state_page_size_tokens must be divisible by ring_size"
-            )
         self._logical_to_physical_layer = _normalize_gpu_layer_mapping(
             self.config.logical_to_physical_layer,
             self.config.num_layers,
@@ -104,7 +100,7 @@ class CompressedStateGPUManager:
         )
         max_pages = self.config.cuda_graph_max_pages_per_sequence
         if max_pages is None:
-            max_pages = max(1, self.config.num_pages)
+            max_pages = 1
         max_slots = self.config.cuda_graph_max_slots
         if max_slots is None:
             max_slots = 1024
@@ -406,8 +402,8 @@ class CompressedStateGPUManager:
         return new_pages.tolist()
 
     def _required_pages(self, raw_num_tokens: int) -> int:
-        raw_num_tokens = max(1, int(raw_num_tokens))
-        return ceil_div(raw_num_tokens, self.config.state_page_size_tokens)
+        del raw_num_tokens
+        return 1
 
     def _prepare_state_slot(self, sequence_id: int, raw_position: int) -> int:
         raw_position = int(raw_position)
@@ -415,10 +411,9 @@ class CompressedStateGPUManager:
             raise ValueError("raw positions must be non-negative")
         self._ensure_capacity(sequence_id, raw_position + 1)
         state = self._get_sequence_state(sequence_id)
-        page_ordinal = raw_position // self.config.state_page_size_tokens
-        if page_ordinal >= int(state.pages.numel()):
+        if int(state.pages.numel()) != 1:
             raise RuntimeError("state capacity was not allocated")
-        page_id = int(state.pages[page_ordinal].item())
+        page_id = int(state.pages[0].item())
         ring_offset = raw_position % self.config.ring_size
         return page_id * self.config.ring_size + ring_offset
 

@@ -67,8 +67,12 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
     manager.initialize()
 
     sequence_ids = [101, 202]
-    manager.allocate_pages_for_sequences(sequence_ids, [20, 4])
+    allocations = manager.allocate_pages_for_sequences(sequence_ids, [20, 4])
+    assert all(len(pages) == 1 for pages in allocations.values())
     page_table = manager.rebuild_page_table(sequence_ids)
+    assert page_table.shape[0] == len(sequence_ids)
+    assert page_table.shape[1] >= 1
+    assert torch.all(page_table[:, 1:] == -1)
 
     values = torch.arange(
         len(sequence_ids) * STATE_DIM,
@@ -81,8 +85,7 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
 
     layer_buffer = manager.get_layer_state_buffer(2)
     for row, raw_position in enumerate(raw_positions.tolist()):
-        page_ordinal = raw_position // STATE_PAGE_TOKENS
-        page_id = int(page_table[row, page_ordinal].item())
+        page_id = int(page_table[row, 0].item())
         ring_offset = raw_position % RING_SIZE
         assert torch.equal(layer_buffer[page_id, ring_offset], values[row])
 
@@ -107,8 +110,7 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
     torch.cuda.synchronize()
 
     for row, raw_position in enumerate(prepared_positions.tolist()):
-        page_ordinal = raw_position // STATE_PAGE_TOKENS
-        page_id = int(page_table[row, page_ordinal].item())
+        page_id = int(page_table[row, 0].item())
         ring_offset = raw_position % RING_SIZE
         assert torch.equal(
             layer_buffer[page_id, ring_offset], prepared_values[row]
@@ -187,6 +189,7 @@ def test_host_compressed_state_page_copy_round_trip(bg):
         host.allocate_pages_for_sequences([(401, 20)])
         gpu.allocate_pages_for_sequences(sequence_ids, [20])
         pages = gpu._sequences[401].pages.tolist()
+        assert len(pages) == 1
         active_page_counts = [len(pages)]
 
         state_cache = gpu.state_cache

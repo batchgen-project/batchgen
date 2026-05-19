@@ -409,6 +409,9 @@ class CompressedStateHostManager {
         if (config.alignment_bytes == 0) {
             config.alignment_bytes = 64;
         }
+        if (config.state_page_size_tokens == 0 && config.ring_size != 0) {
+            config.state_page_size_tokens = config.ring_size;
+        }
         std::vector<std::string> errors;
         if (config.num_layers == 0) {
             errors.emplace_back("num_layers must be > 0");
@@ -427,11 +430,6 @@ class CompressedStateHostManager {
         }
         if (config.ring_size != 0 && config.ring_size % Ratio != 0) {
             errors.emplace_back("ring_size must be divisible by ratio");
-        }
-        if (config.ring_size != 0 && config.state_page_size_tokens != 0 &&
-            config.state_page_size_tokens % config.ring_size != 0) {
-            errors.emplace_back(
-                "state_page_size_tokens must be divisible by ring_size");
         }
         for (std::size_t logical_layer = 0;
              logical_layer < config.logical_to_physical_layer.size();
@@ -486,9 +484,8 @@ class CompressedStateHostManager {
     }
 
     [[nodiscard]] std::size_t RequiredPages(std::size_t raw_tokens) const {
-        raw_tokens = std::max<std::size_t>(1, raw_tokens);
-        return (raw_tokens + config_.state_page_size_tokens - 1) /
-               config_.state_page_size_tokens;
+        (void)raw_tokens;
+        return 1;
     }
 
     std::vector<std::int32_t> EnsureCapacityLocked(
@@ -540,17 +537,14 @@ class CompressedStateHostManager {
                 << " has no allocated state pages";
             throw std::out_of_range(oss.str());
         }
-        const std::size_t page_ordinal =
-            raw_position / config_.state_page_size_tokens;
-        if (page_ordinal >= it->second.pages.size()) {
+        if (it->second.pages.size() != 1) {
             std::ostringstream oss;
-            oss << context << ": raw position " << raw_position
-                << " maps to page ordinal " << page_ordinal
-                << " but sequence " << sequence_id << " has only "
-                << it->second.pages.size() << " pages";
-            throw std::out_of_range(oss.str());
+            oss << context << ": sequence " << sequence_id << " has "
+                << it->second.pages.size()
+                << " compressed state blocks; expected exactly one";
+            throw std::runtime_error(oss.str());
         }
-        const std::int32_t page_id = it->second.pages[page_ordinal];
+        const std::int32_t page_id = it->second.pages.front();
         const std::size_t ring_offset = raw_position % config_.ring_size;
         return {page_id, ring_offset,
                 StateSlotPtrPhysical(physical_layer, page_id, ring_offset)};
