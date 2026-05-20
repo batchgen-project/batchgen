@@ -25,6 +25,10 @@ def _overlap_decode_row(raw_position: int) -> int:
     return COMPRESS_RATIO + int(raw_position) % COMPRESS_RATIO
 
 
+def _boundary_snapshot_row(raw_position: int) -> int:
+    return int(raw_position) % COMPRESS_RATIO
+
+
 @pytest.fixture(scope="module")
 def bg():
     from batchgen.models.engine_loader import core_engine as bg_module
@@ -163,12 +167,20 @@ def test_host_compressed_state_decode_round_trip(bg):
     manager = bg.OverlapCompressedState4HostManager(
         _host_config(bg, mapped=True)
     )
+    gpu = CompressedStateGPUManager(
+        config=_gpu_config(mapped=False),
+        device=device,
+        ratio=COMPRESS_RATIO,
+        overlap=True,
+    )
     manager.initialize(0)
+    gpu.initialize()
     sequence_ids = [301, 302]
     raw_positions = [18, 3]
 
     try:
         manager.allocate_state_items_for_sequences(sequence_ids)
+        gpu_allocations = gpu.allocate_state_items_for_sequences(sequence_ids)
         values = torch.arange(
             len(sequence_ids) * STATE_DIM,
             dtype=torch.float32,
@@ -191,12 +203,43 @@ def test_host_compressed_state_decode_round_trip(bg):
         torch.cuda.synchronize()
         assert torch.equal(restored, values)
 
+        ptrs = gpu.export_state_item_pointers(sequence_ids)
+        gpu.state_cache.zero_()
+        manager.async_load_state_items_to_device(sequence_ids, ptrs).wait()
+        torch.cuda.synchronize()
+        layer_buffer = gpu.get_layer_state_buffer(0)
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[301],
+                _overlap_decode_row(raw_positions[0]),
+            ],
+            values[0],
+        )
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[302],
+                _overlap_decode_row(raw_positions[1]),
+            ],
+            values[1],
+        )
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[302],
+                _boundary_snapshot_row(raw_positions[1]),
+            ],
+            values[1],
+        )
+
         overwritten = values + 50
+        overwrite_positions = [
+            raw_positions[0] + RING_SIZE,
+            raw_positions[1] + RING_SIZE,
+        ]
         manager.async_offload_decode_state_to_host(
             2,
             sequence_ids,
             overwritten,
-            [raw_positions[0] + RING_SIZE, raw_positions[1] + RING_SIZE],
+            overwrite_positions,
         ).wait()
         manager.async_load_decode_state_to_device(
             2,
@@ -206,9 +249,35 @@ def test_host_compressed_state_decode_round_trip(bg):
         ).wait()
         torch.cuda.synchronize()
         assert torch.equal(restored, overwritten)
+
+        gpu.state_cache.zero_()
+        manager.async_load_state_items_to_device(sequence_ids, ptrs).wait()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[301],
+                _overlap_decode_row(overwrite_positions[0]),
+            ],
+            overwritten[0],
+        )
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[302],
+                _overlap_decode_row(overwrite_positions[1]),
+            ],
+            overwritten[1],
+        )
+        assert torch.equal(
+            layer_buffer[
+                gpu_allocations[302],
+                _boundary_snapshot_row(overwrite_positions[1]),
+            ],
+            overwritten[1],
+        )
     finally:
         manager.release_sequence_states(sequence_ids)
         manager.shutdown()
+        gpu.destroy()
 
 
 def test_host_compressed_state_batched_append_round_trip(bg):
@@ -254,6 +323,93 @@ def test_host_compressed_state_batched_append_round_trip(bg):
     finally:
         manager.release_sequence_states(sequence_ids)
         manager.shutdown()
+
+
+def test_host_overlap_compressed_state_batched_append_rolls_snapshot(bg):
+    device = torch.device("cuda:0")
+    manager = bg.OverlapCompressedState4HostManager(
+        _host_config(bg, mapped=False)
+    )
+    gpu = CompressedStateGPUManager(
+        config=_gpu_config(mapped=False),
+        device=device,
+        ratio=COMPRESS_RATIO,
+        overlap=True,
+    )
+    manager.initialize(0)
+    gpu.initialize()
+    sequence_ids = [451, 452]
+    raw_positions = [18, 3]
+
+    try:
+        manager.allocate_state_items_for_sequences(sequence_ids)
+        gpu_allocations = gpu.allocate_state_items_for_sequences(sequence_ids)
+        layer0 = torch.arange(
+            len(sequence_ids) * STATE_DIM,
+            dtype=torch.float32,
+            device=device,
+        ).view(len(sequence_ids), STATE_DIM)
+        layer1 = layer0 + 100
+        manager.async_append_decode_state_to_host_batched_kernel(
+            [(0, layer0), (1, layer1)],
+            sequence_ids,
+            raw_positions,
+        ).wait()
+
+        restored0 = torch.empty_like(layer0)
+        restored1 = torch.empty_like(layer1)
+        manager.async_load_decode_state_to_device(
+            0,
+            sequence_ids,
+            restored0,
+            raw_positions,
+        ).wait()
+        manager.async_load_decode_state_to_device(
+            1,
+            sequence_ids,
+            restored1,
+            raw_positions,
+        ).wait()
+        torch.cuda.synchronize()
+        assert torch.equal(restored0, layer0)
+        assert torch.equal(restored1, layer1)
+
+        ptrs = gpu.export_state_item_pointers(sequence_ids)
+        gpu.state_cache.zero_()
+        manager.async_load_state_items_to_device(sequence_ids, ptrs).wait()
+        torch.cuda.synchronize()
+
+        layer0_buffer = gpu.get_layer_state_buffer(0)
+        layer1_buffer = gpu.get_layer_state_buffer(1)
+        for buffer, expected in (
+            (layer0_buffer, layer0),
+            (layer1_buffer, layer1),
+        ):
+            assert torch.equal(
+                buffer[
+                    gpu_allocations[451],
+                    _overlap_decode_row(raw_positions[0]),
+                ],
+                expected[0],
+            )
+            assert torch.equal(
+                buffer[
+                    gpu_allocations[452],
+                    _overlap_decode_row(raw_positions[1]),
+                ],
+                expected[1],
+            )
+            assert torch.equal(
+                buffer[
+                    gpu_allocations[452],
+                    _boundary_snapshot_row(raw_positions[1]),
+                ],
+                expected[1],
+            )
+    finally:
+        manager.release_sequence_states(sequence_ids)
+        manager.shutdown()
+        gpu.destroy()
 
 
 def test_host_compressed_state_item_copy_round_trip(bg):

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,12 @@ inline std::string ToString(const CompressedStateHostStats& stats) {
 
 template <std::size_t Ratio, bool Overlap>
 class CompressedStateHostManager {
+   private:
+    struct OverlapRollingUpdate {
+        std::size_t physical_layer = 0;
+        std::int32_t state_item_id = -1;
+    };
+
    public:
     static_assert(Ratio > 0, "Ratio must be greater than zero");
     static constexpr std::size_t kRatio = Ratio;
@@ -201,6 +208,7 @@ class CompressedStateHostManager {
                 CopyDecodeRowsAsync(prepared, CopyDirection::kDeviceToHost,
                                     cuda_stream);
                 SynchronizeWithEvent(cuda_stream);
+                ApplyOverlapRollingUpdates(prepared.rolling_updates);
             });
         TrackTask(task);
         return task;
@@ -257,6 +265,7 @@ class CompressedStateHostManager {
         const std::size_t total = entries.size() * batch;
         std::vector<uint8_t*> src_host(total);
         std::vector<uint8_t*> dst_host(total);
+        std::vector<OverlapRollingUpdate> rolling_updates;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (std::size_t entry_idx = 0; entry_idx < entries.size();
@@ -281,6 +290,9 @@ class CompressedStateHostManager {
                     const SlotAddress slot = ResolveSlotLocked(
                         sequence_id, raw_position, entry.layer_idx,
                         "AsyncAppendDecodeStateToHostBatchedKernel");
+                    AppendOverlapRollingUpdateIfNeeded(
+                        rolling_updates, raw_position, entry.layer_idx,
+                        slot.state_item_id);
                     const std::size_t idx = entry_idx * batch + batch_idx;
                     src_host[idx] =
                         src_base + batch_idx * config_.state_token_bytes;
@@ -292,6 +304,7 @@ class CompressedStateHostManager {
         auto task = transformed_detail::MakeAsyncTask(
             [this, src_host = std::move(src_host),
              dst_host = std::move(dst_host), total,
+             rolling_updates = std::move(rolling_updates),
              producer_cuda_stream]() mutable {
                 c10::cuda::OptionalCUDAGuard device_guard(device_index_);
                 const auto cuda_stream =
@@ -313,6 +326,7 @@ class CompressedStateHostManager {
                     src_buf.get(), dst_buf.get(), config_.state_token_bytes,
                     static_cast<int>(total), cuda_stream);
                 SynchronizeWithEvent(cuda_stream);
+                ApplyOverlapRollingUpdates(rolling_updates);
             });
         TrackTask(task);
         return task;
@@ -497,6 +511,7 @@ class CompressedStateHostManager {
     struct PreparedDecodeRows {
         torch::Tensor tensor;
         std::vector<DecodeRowCopy> rows;
+        std::vector<OverlapRollingUpdate> rolling_updates;
         std::size_t row_bytes = 0;
         int device_index = -1;
     };
@@ -536,6 +551,12 @@ class CompressedStateHostManager {
         }
         if (config.ring_size != 0 && config.ring_size % Ratio != 0) {
             errors.emplace_back("ring_size must be divisible by ratio");
+        }
+        if constexpr (Overlap) {
+            if (config.ring_size != 0 && config.ring_size != 2 * Ratio) {
+                errors.emplace_back(
+                    "overlap compressed state expects ring_size == 2 * ratio");
+            }
         }
         for (std::size_t logical_layer = 0;
              logical_layer < config.logical_to_physical_layer.size();
@@ -695,16 +716,61 @@ class CompressedStateHostManager {
         return it->second.state_item_id;
     }
 
+    [[nodiscard]] static constexpr bool ShouldRollAfterRawPosition(
+        std::size_t raw_position) {
+        if constexpr (!Overlap) {
+            return false;
+        }
+        return (raw_position + 1) % Ratio == 0;
+    }
+
+    [[nodiscard]] std::size_t DecodeRingOffset(
+        std::size_t raw_position) const {
+        if constexpr (Overlap) {
+            return Ratio + raw_position % Ratio;
+        }
+        return raw_position % config_.ring_size;
+    }
+
     [[nodiscard]] SlotAddress ResolveSlotLocked(
         std::int64_t sequence_id, std::size_t raw_position,
         std::size_t physical_layer, std::string_view context) {
         (void)context;
         const std::int32_t state_item_id =
             SequenceStateItemLocked(sequence_id);
-        const std::size_t ring_offset = raw_position % config_.ring_size;
+        const std::size_t ring_offset = DecodeRingOffset(raw_position);
         return {state_item_id, ring_offset,
                 StateSlotPtrPhysical(physical_layer, state_item_id,
                                      ring_offset)};
+    }
+
+    void AppendOverlapRollingUpdateIfNeeded(
+        std::vector<OverlapRollingUpdate>& rolling_updates,
+        std::size_t raw_position, std::size_t physical_layer,
+        std::int32_t state_item_id) const {
+        if constexpr (Overlap) {
+            if (ShouldRollAfterRawPosition(raw_position)) {
+                rolling_updates.push_back({physical_layer, state_item_id});
+            }
+        }
+    }
+
+    void ApplyOverlapRollingUpdates(
+        const std::vector<OverlapRollingUpdate>& rolling_updates) const {
+        if constexpr (!Overlap) {
+            (void)rolling_updates;
+            return;
+        }
+        for (const OverlapRollingUpdate& update : rolling_updates) {
+            for (std::size_t offset = 0; offset < Ratio; ++offset) {
+                std::memcpy(
+                    StateSlotPtrPhysical(update.physical_layer,
+                                         update.state_item_id, offset),
+                    StateSlotPtrPhysical(update.physical_layer,
+                                         update.state_item_id, Ratio + offset),
+                    config_.state_token_bytes);
+            }
+        }
     }
 
     [[nodiscard]] std::byte* StateItemPtrPhysical(
@@ -741,7 +807,8 @@ class CompressedStateHostManager {
         const std::size_t physical_layer =
             ResolvePhysicalLayer(layer_idx, op_name);
         if (sequence_ids.empty()) {
-            return {std::move(state_tensor), {}, config_.state_token_bytes};
+            return {std::move(state_tensor), {}, {},
+                    config_.state_token_bytes};
         }
         ValidateCudaTensor(state_tensor, "state_tensor");
         if (state_tensor.size(0) !=
@@ -779,6 +846,11 @@ class CompressedStateHostManager {
             const SlotAddress slot =
                 ResolveSlotLocked(sequence_id, raw_position, physical_layer,
                                   op_name);
+            if (direction == CopyDirection::kDeviceToHost) {
+                AppendOverlapRollingUpdateIfNeeded(
+                    prepared.rolling_updates, raw_position, physical_layer,
+                    slot.state_item_id);
+            }
             prepared.rows.push_back(
                 {slot.host_ptr,
                  TensorRowPtr(prepared.tensor, batch_idx, row_bytes)});
