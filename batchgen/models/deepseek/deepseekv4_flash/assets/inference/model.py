@@ -398,6 +398,8 @@ class Indexer(torch.nn.Module):
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim), persistent=False)
         self.freqs_cis = None
+        # Test-only export hook; disabled during normal reference inference.
+        self.trace_hook = None
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
@@ -430,6 +432,18 @@ class Indexer(torch.nn.Module):
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
         else:
             topk_idxs += offset
+        if self.trace_hook is not None:
+            self.trace_hook(
+                q=q,
+                weights=weights,
+                topk_idxs=topk_idxs,
+                start_pos=start_pos,
+                seqlen=seqlen,
+                offset=offset,
+                compress_ratio=ratio,
+                compressed_tokens=end_pos // ratio,
+                index_topk=self.index_topk,
+            )
         return topk_idxs
 
 
