@@ -670,7 +670,11 @@ def replay_manager_trace(
     rtol: float,
 ) -> None:
     runtime = init_runtime()
+    if runtime.rank == 0:
+        print("manager replay: runtime initialized", flush=True)
     ref_model = import_reference_model_module()
+    if runtime.rank == 0:
+        print("manager replay: reference model module imported", flush=True)
     ref_model.world_size = runtime.world_size
     ref_model.rank = runtime.rank
     try:
@@ -678,6 +682,8 @@ def replay_manager_trace(
         if not resolved_trace_path.exists():
             resolved_trace_path = ranked_output_path(trace_path, runtime)
         trace = torch.load(resolved_trace_path, map_location="cpu")
+        if runtime.rank == 0:
+            print(f"manager replay: loaded trace {resolved_trace_path}", flush=True)
         metadata = trace["metadata"]
         if int(metadata["world_size"]) != runtime.world_size:
             raise ValueError(
