@@ -46,6 +46,10 @@ class CompressedStateGPUManager:
     only selects the ring slot within that item:
 
     ``state_item_id * ring_size + raw_position % ring_size``.
+
+    For overlap compressors, decode writes target the current rolling block:
+
+    ``state_item_id * ring_size + ratio + raw_position % ratio``.
     """
 
     manager_name = "CompressedStateGPUManager"
@@ -74,6 +78,10 @@ class CompressedStateGPUManager:
             raise ValueError("state_dim must be > 0")
         if self.config.ring_size % self.ratio != 0:
             raise ValueError("ring_size must be divisible by ratio")
+        if self.overlap and self.config.ring_size != 2 * self.ratio:
+            raise ValueError(
+                "overlap compressed state expects ring_size == 2 * ratio"
+            )
         self._logical_to_physical_layer = _normalize_gpu_layer_mapping(
             self.config.logical_to_physical_layer,
             self.config.num_layers,
@@ -193,6 +201,8 @@ class CompressedStateGPUManager:
             state_cache=cache,
             state_tokens=tokens,
             state_slots=slots.to(device=self.device, dtype=torch.int32),
+            overlap=self.overlap,
+            rolling_size=self.ratio if self.overlap else 0,
         )
 
     def update_layer_state_slots(
@@ -333,7 +343,10 @@ class CompressedStateGPUManager:
         if raw_position < 0:
             raise ValueError("raw positions must be non-negative")
         state_item_id = self._ensure_state_item(sequence_id)
-        ring_offset = raw_position % self.config.ring_size
+        if self.overlap:
+            ring_offset = self.ratio + raw_position % self.ratio
+        else:
+            ring_offset = raw_position % self.config.ring_size
         return state_item_id * self.config.ring_size + ring_offset
 
     def _resolve_state_slots_from_sequences(

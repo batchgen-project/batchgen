@@ -112,6 +112,57 @@ def _compressed_state_update_kernel(
     )
 
 
+@triton.jit
+def _compressed_state_overlap_update_kernel(
+    state_cache,
+    state_tokens,
+    state_slots,
+    cache_stride_slot: tl.constexpr,
+    token_stride_batch: tl.constexpr,
+    STATE_VEC: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ROLLING_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(state_slots + row)
+    valid_row = slot >= 0
+    safe_slot = tl.maximum(slot, 0)
+
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(
+        state_tokens + row * token_stride_batch + offsets,
+        mask=offsets < STATE_VEC,
+        other=0.0,
+    )
+    tl.store(
+        state_cache + safe_slot * cache_stride_slot + offsets,
+        values,
+        mask=valid_row & (offsets < STATE_VEC),
+    )
+
+    ring_size = 2 * ROLLING_SIZE
+    ring_offset = safe_slot - (safe_slot // ring_size) * ring_size
+    base_slot = safe_slot - ring_offset
+    should_roll = valid_row & (ring_offset == ring_size - 1)
+
+    for rolling_offset in tl.static_range(0, ROLLING_SIZE):
+        src_slot = base_slot + ROLLING_SIZE + rolling_offset
+        dst_slot = base_slot + rolling_offset
+        if rolling_offset == ROLLING_SIZE - 1:
+            rolling_values = values
+        else:
+            rolling_values = tl.load(
+                state_cache + src_slot * cache_stride_slot + offsets,
+                mask=offsets < STATE_VEC,
+                other=0.0,
+            )
+        tl.store(
+            state_cache + dst_slot * cache_stride_slot + offsets,
+            rolling_values,
+            mask=should_roll & (offsets < STATE_VEC),
+        )
+
+
 def _next_power_of_2(value: int) -> int:
     return 1 << (int(value) - 1).bit_length()
 
@@ -210,6 +261,8 @@ def run_compressed_state_update(
     state_cache: torch.Tensor,
     state_tokens: torch.Tensor,
     state_slots: torch.Tensor,
+    overlap: bool = False,
+    rolling_size: int = 0,
 ) -> None:
     """Write raw compressor state rows into precomputed state slots."""
 
@@ -236,16 +289,38 @@ def run_compressed_state_update(
 
     state_vec = int(state_tokens.shape[1])
     block = _next_power_of_2(state_vec)
-    _compressed_state_update_kernel[(batch_size,)](
-        state_cache,
-        state_tokens,
-        state_slots.to(device=state_cache.device, dtype=torch.int32),
-        int(state_cache.stride(0)),
-        int(state_tokens.stride(0)),
-        state_vec,
-        block,
-        num_warps=_num_warps(block),
-    )
+    state_slots = state_slots.to(device=state_cache.device, dtype=torch.int32)
+    if overlap:
+        rolling_size = int(rolling_size)
+        if rolling_size <= 0:
+            raise ValueError("rolling_size must be positive when overlap=True")
+        if int(state_cache.shape[0]) % (2 * rolling_size) != 0:
+            raise ValueError(
+                "state_cache slot dimension must be divisible by "
+                "2 * rolling_size when overlap=True"
+            )
+        _compressed_state_overlap_update_kernel[(batch_size,)](
+            state_cache,
+            state_tokens,
+            state_slots,
+            int(state_cache.stride(0)),
+            int(state_tokens.stride(0)),
+            state_vec,
+            block,
+            rolling_size,
+            num_warps=_num_warps(block),
+        )
+    else:
+        _compressed_state_update_kernel[(batch_size,)](
+            state_cache,
+            state_tokens,
+            state_slots,
+            int(state_cache.stride(0)),
+            int(state_tokens.stride(0)),
+            state_vec,
+            block,
+            num_warps=_num_warps(block),
+        )
 
 
 __all__ = [

@@ -18,6 +18,11 @@ STATE_DIM = KV_STATE_DIM + SCORE_STATE_DIM
 NUM_LAYERS = 2
 NUM_STATE_ITEMS = 16
 RING_SIZE = 8
+COMPRESS_RATIO = 4
+
+
+def _overlap_decode_row(raw_position: int) -> int:
+    return COMPRESS_RATIO + int(raw_position) % COMPRESS_RATIO
 
 
 @pytest.fixture(scope="module")
@@ -59,7 +64,7 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
     manager = CompressedStateGPUManager(
         config=_gpu_config(mapped=True),
         device=device,
-        ratio=4,
+        ratio=COMPRESS_RATIO,
         overlap=True,
     )
     manager.initialize()
@@ -85,7 +90,7 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
     layer_buffer = manager.get_layer_state_buffer(2)
     for row, raw_position in enumerate(raw_positions.tolist()):
         state_item_id = allocations[sequence_ids[row]]
-        ring_offset = raw_position % RING_SIZE
+        ring_offset = _overlap_decode_row(raw_position)
         assert torch.equal(
             layer_buffer[state_item_id, ring_offset], values[row]
         )
@@ -97,6 +102,7 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
             layer_buffer[state_item_id, ring_offset, KV_STATE_DIM:],
             values[row, KV_STATE_DIM:],
         )
+    assert torch.equal(layer_buffer[allocations[202], 3], values[1])
 
     prepared_values = values + 100
     prepared_positions = torch.tensor(
@@ -116,10 +122,13 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
 
     for row, raw_position in enumerate(prepared_positions.tolist()):
         state_item_id = allocations[sequence_ids[row]]
-        ring_offset = raw_position % RING_SIZE
+        ring_offset = _overlap_decode_row(raw_position)
         assert torch.equal(
             layer_buffer[state_item_id, ring_offset], prepared_values[row]
         )
+    assert torch.equal(layer_buffer[allocations[101], 2], values[0])
+    assert torch.equal(layer_buffer[allocations[101], 3], prepared_values[0])
+    assert torch.equal(layer_buffer[allocations[202], 3], prepared_values[1])
 
     explicit_values = values + 200
     explicit_slots = torch.tensor(
@@ -255,7 +264,7 @@ def test_host_compressed_state_item_copy_round_trip(bg):
     gpu = CompressedStateGPUManager(
         config=_gpu_config(mapped=False),
         device=device,
-        ratio=4,
+        ratio=COMPRESS_RATIO,
         overlap=False,
     )
     host.initialize(0)

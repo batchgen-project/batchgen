@@ -366,9 +366,10 @@ def _update_manager_state_to_match_reference(
     if int(row_ids.numel()) == 0:
         return
 
+    state_item_id = manager._sequence_state_items[int(sequence_id)]
     slots = torch.tensor(
         [
-            manager.resolve_state_slot(sequence_id, int(row_id.item()))
+            state_item_id * int(manager.config.ring_size) + int(row_id.item())
             for row_id in row_ids
         ],
         dtype=torch.int32,
