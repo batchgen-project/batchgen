@@ -105,12 +105,17 @@ def _capture_decode_layer_updates(
     *,
     layer_id: int,
     decode_start_pos: int,
+    page_size_tokens: int,
 ) -> dict:
     attention = model.layers[layer_id].attn
     window_size = int(attention.window_size)
     compress_ratio = int(attention.compress_ratio)
     decode_end = decode_start_pos + 1
     decode_window_slot = decode_start_pos % window_size
+    first_needed_token = max(0, decode_end - window_size)
+    storage_start_token = (
+        first_needed_token // int(page_size_tokens)
+    ) * int(page_size_tokens)
 
     updates: dict[str, object] = {
         "new_swa_kv": clone_to_cpu(
@@ -121,6 +126,8 @@ def _capture_decode_layer_updates(
         ),
         "decode_window_slot": decode_window_slot,
         "swa_active_tokens_after": min(decode_end, window_size),
+        "swa_storage_start_token": storage_start_token,
+        "swa_storage_tokens_after": decode_end - storage_start_token,
     }
 
     if compress_ratio:
@@ -250,6 +257,7 @@ def export_reference_trace(
                             model,
                             layer_id=layer_id,
                             decode_start_pos=start_pos,
+                            page_size_tokens=page_size_tokens,
                         )
                     )
                 decode_token = decode_logits.argmax(dim=-1).view(1, 1)

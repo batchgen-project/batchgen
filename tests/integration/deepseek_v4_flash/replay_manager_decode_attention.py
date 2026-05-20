@@ -359,6 +359,15 @@ def _layer_indexer_decode_steps(layer_export: dict) -> list[dict]:
     return []
 
 
+def _swa_storage_tokens_after(decode: dict) -> int:
+    return int(
+        decode.get(
+            "swa_storage_tokens_after",
+            decode["swa_active_tokens_after"],
+        )
+    )
+
+
 def _map_reference_topk_to_manager_layout(
     decode: dict,
     *,
@@ -368,10 +377,13 @@ def _map_reference_topk_to_manager_layout(
     window_size = int(decode["window_size"])
     raw_end = int(decode["start_pos"]) + int(decode["seqlen"])
     strict_start = max(0, raw_end - window_size)
-    storage_start = (strict_start // int(page_size_tokens)) * int(
-        page_size_tokens
+    storage_start = int(
+        decode.get(
+            "swa_storage_start_token",
+            (strict_start // int(page_size_tokens)) * int(page_size_tokens),
+        )
     )
-    swa_active_tokens = int(decode["swa_active_tokens_after"])
+    swa_storage_tokens = _swa_storage_tokens_after(decode)
 
     mapped = topk.clone()
     valid_window = (topk >= 0) & (topk < window_size)
@@ -392,7 +404,7 @@ def _map_reference_topk_to_manager_layout(
     compressed = topk >= window_size
     if compressed.any():
         mapped[compressed] = (
-            topk[compressed] - window_size + swa_active_tokens
+            topk[compressed] - window_size + swa_storage_tokens
         )
     return mapped
 
@@ -439,7 +451,7 @@ def _indexer_topk_from_manager(
     ).to(indexer_manager.device)
     window_topk = mapped_reference_topk[..., : int(decode["window_size"])]
     manager_compressed_topk = topk_idxs_zero_based + int(
-        decode["swa_active_tokens_after"]
+        _swa_storage_tokens_after(decode)
     )
     return torch.cat([window_topk, manager_compressed_topk], dim=-1)
 
@@ -495,7 +507,7 @@ def _manager_kv_after_decode_step(
         swa_manager,
         layer_id=layer_id,
         sequence_id=sequence_id,
-        token_count=int(target_decode["swa_active_tokens_after"]),
+        token_count=_swa_storage_tokens_after(target_decode),
     )
     manager_topk = _map_reference_topk_to_manager_layout(
         target_decode,
@@ -621,7 +633,7 @@ def _manager_kv_for_layer(
         swa_manager,
         layer_id=layer_id,
         sequence_id=sequence_id,
-        token_count=int(decode["swa_active_tokens_after"]),
+        token_count=_swa_storage_tokens_after(decode),
     )
 
     if not compress_ratio:
