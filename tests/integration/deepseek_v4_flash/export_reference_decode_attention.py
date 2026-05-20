@@ -159,7 +159,11 @@ def export_reference_trace(
     page_size_tokens: int,
     layer_ids: list[int],
     decode_token_id: Optional[int],
+    decode_steps: int,
 ) -> Path:
+    if decode_steps <= 0:
+        raise ValueError("decode_steps must be positive")
+
     runtime = init_runtime()
     try:
         ref_model, model, config = load_reference_model(
@@ -217,53 +221,98 @@ def export_reference_trace(
                 for layer_id in layer_ids
             }
 
-            if decode_token_id is None:
-                decode_token = prefill_logits.argmax(dim=-1).view(1, 1)
-            else:
-                decode_token = torch.tensor(
+            decode_token = (
+                prefill_logits.argmax(dim=-1).view(1, 1)
+                if decode_token_id is None
+                else torch.tensor(
                     [[int(decode_token_id)]],
                     dtype=torch.long,
                     device=device,
                 )
+            )
 
-            decode_logits = model(decode_token, prefill_tokens)
-
-        traces_by_layer = {
-            trace.layer_id: trace
-            for trace in hook.traces
-            if trace.phase == "decode"
-        }
-        missing = sorted(set(layer_ids) - set(traces_by_layer))
-        if missing:
-            raise RuntimeError(f"missing decode traces for layers {missing}")
+            decode_records: list[dict[str, object]] = []
+            decode_layer_updates: dict[tuple[int, int], dict] = {}
+            for step in range(decode_steps):
+                start_pos = prefill_tokens + step
+                decode_logits = model(decode_token, start_pos)
+                decode_records.append(
+                    {
+                        "step": step,
+                        "start_pos": start_pos,
+                        "token": clone_to_cpu(decode_token),
+                        "logits": clone_to_cpu(decode_logits),
+                    }
+                )
+                for layer_id in layer_ids:
+                    decode_layer_updates[(layer_id, start_pos)] = (
+                        _capture_decode_layer_updates(
+                            model,
+                            layer_id=layer_id,
+                            decode_start_pos=start_pos,
+                        )
+                    )
+                decode_token = decode_logits.argmax(dim=-1).view(1, 1)
 
         for layer_id in layer_ids:
-            module_key = (layer_id, "decode")
-            if module_key not in hook.attention_forward_traces:
-                raise RuntimeError(
-                    f"missing Attention.forward decode trace for layer {layer_id}"
+            layer_decode_steps = []
+            module_decode_steps = []
+            indexer_decode_steps = []
+            for record in decode_records:
+                start_pos = int(record["start_pos"])
+                decode_trace = next(
+                    (
+                        trace
+                        for trace in hook.traces
+                        if trace.phase == "decode"
+                        and trace.layer_id == layer_id
+                        and trace.start_pos == start_pos
+                    ),
+                    None,
                 )
-            layer_exports[layer_id]["module_decode"] = (
-                hook.attention_forward_traces[module_key]
-            )
-            layer_exports[layer_id]["decode"] = trace_to_dict(
-                traces_by_layer[layer_id]
-            )
-            layer_exports[layer_id]["decode"].update(
-                _capture_decode_layer_updates(
-                    model,
-                    layer_id=layer_id,
-                    decode_start_pos=prefill_tokens,
-                )
-            )
-            if int(config["compress_ratios"][layer_id]) == 4:
-                if layer_id not in hook.indexer_traces:
+                if decode_trace is None:
                     raise RuntimeError(
-                        f"missing C4 indexer trace for layer {layer_id}"
+                        f"missing decode trace for layer {layer_id} at "
+                        f"start_pos {start_pos}"
                     )
-                layer_exports[layer_id]["indexer_decode"] = hook.indexer_traces[
-                    layer_id
-                ]
+                decode = trace_to_dict(decode_trace)
+                decode.update(decode_layer_updates[(layer_id, start_pos)])
+                layer_decode_steps.append(decode)
+
+                module_key = (layer_id, "decode", start_pos)
+                if module_key not in hook.attention_forward_traces_by_start:
+                    raise RuntimeError(
+                        "missing Attention.forward decode trace for layer "
+                        f"{layer_id} at start_pos {start_pos}"
+                    )
+                module_decode_steps.append(
+                    hook.attention_forward_traces_by_start[module_key]
+                )
+
+                if int(config["compress_ratios"][layer_id]) == 4:
+                    indexer_key = (layer_id, start_pos)
+                    if indexer_key not in hook.indexer_traces_by_start:
+                        raise RuntimeError(
+                            f"missing C4 indexer trace for layer {layer_id} "
+                            f"at start_pos {start_pos}"
+                        )
+                    indexer_decode_steps.append(
+                        hook.indexer_traces_by_start[indexer_key]
+                    )
+
+            layer_exports[layer_id]["decode_steps"] = layer_decode_steps
+            layer_exports[layer_id]["module_decode_steps"] = (
+                module_decode_steps
+            )
+            layer_exports[layer_id]["decode"] = layer_decode_steps[0]
+            layer_exports[layer_id]["module_decode"] = module_decode_steps[0]
+            if indexer_decode_steps:
+                layer_exports[layer_id]["indexer_decode_steps"] = (
+                    indexer_decode_steps
+                )
+                layer_exports[layer_id]["indexer_decode"] = (
+                    indexer_decode_steps[0]
+                )
 
         output = {
             "metadata": {
@@ -275,14 +324,21 @@ def export_reference_trace(
                 "prefill_tokens": prefill_tokens,
                 "page_size_tokens": page_size_tokens,
                 "decode_start_pos": prefill_tokens,
-                "decode_end_pos": prefill_tokens + 1,
+                "decode_end_pos": prefill_tokens + decode_steps,
+                "decode_steps": decode_steps,
                 "layers": layer_ids,
                 "sequence_id": 0,
             },
             "prompt_tokens": prompt_tokens,
-            "decode_token": clone_to_cpu(decode_token),
+            "decode_token": decode_records[0]["token"],
+            "decode_tokens": [
+                record["token"] for record in decode_records
+            ],
             "prefill_logits": clone_to_cpu(prefill_logits),
-            "decode_logits": clone_to_cpu(decode_logits),
+            "decode_logits": decode_records[0]["logits"],
+            "decode_logits_steps": [
+                record["logits"] for record in decode_records
+            ],
             "layers": layer_exports,
         }
 
@@ -315,6 +371,7 @@ def main() -> None:
         default=",".join(str(layer) for layer in DEFAULT_TRACE_LAYERS),
     )
     parser.add_argument("--decode-token-id", type=int, default=None)
+    parser.add_argument("--decode-steps", type=int, default=1)
     args = parser.parse_args()
 
     config_path = args.config or args.model_dir / "config.json"
@@ -328,6 +385,7 @@ def main() -> None:
         page_size_tokens=args.page_size_tokens,
         layer_ids=parse_layers(args.layers),
         decode_token_id=args.decode_token_id,
+        decode_steps=args.decode_steps,
     )
     print(f"wrote {path}")
 

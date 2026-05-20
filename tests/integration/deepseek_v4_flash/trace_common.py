@@ -323,7 +323,11 @@ class MultiLayerSparseAttentionHook:
         self.phases = set(phases)
         self.traces: list[SparseAttentionTrace] = []
         self.indexer_traces: dict[int, dict] = {}
+        self.indexer_traces_by_start: dict[tuple[int, int], dict] = {}
         self.attention_forward_traces: dict[tuple[int, str], dict] = {}
+        self.attention_forward_traces_by_start: dict[
+            tuple[int, str, int], dict
+        ] = {}
         self._original_sparse_attn: Optional[Callable[..., torch.Tensor]] = None
         self._original_forwards: dict[int, Callable[..., torch.Tensor]] = {}
         self._original_indexer_trace_hooks: dict[int, object] = {}
@@ -354,7 +358,7 @@ class MultiLayerSparseAttentionHook:
                 try:
                     output = _forward(x, start_pos)
                     if phase in self.phases:
-                        self.attention_forward_traces[(_layer_id, phase)] = {
+                        trace = {
                             "layer_id": int(_layer_id),
                             "phase": phase,
                             "start_pos": int(start_pos),
@@ -362,6 +366,12 @@ class MultiLayerSparseAttentionHook:
                             "input": clone_to_cpu(x),
                             "output": clone_to_cpu(output),
                         }
+                        self.attention_forward_traces[(_layer_id, phase)] = (
+                            trace
+                        )
+                        self.attention_forward_traces_by_start[
+                            (_layer_id, phase, int(start_pos))
+                        ] = trace
                     return output
                 finally:
                     self._current_context = previous
@@ -381,7 +391,7 @@ class MultiLayerSparseAttentionHook:
                     start_pos = int(payload["start_pos"])
                     if start_pos == 0:
                         return
-                    self.indexer_traces[_layer_id] = {
+                    trace = {
                         "layer_id": int(_layer_id),
                         "start_pos": start_pos,
                         "seqlen": int(payload["seqlen"]),
@@ -395,6 +405,10 @@ class MultiLayerSparseAttentionHook:
                         "weights": clone_to_cpu(payload["weights"]),
                         "topk_idxs": clone_to_cpu(payload["topk_idxs"]),
                     }
+                    self.indexer_traces[_layer_id] = trace
+                    self.indexer_traces_by_start[(_layer_id, start_pos)] = (
+                        trace
+                    )
 
                 indexer.trace_hook = trace_indexer_decode
 
@@ -475,8 +489,9 @@ def replay_sparse_attention(
     kv: torch.Tensor,
     *,
     topk_idxs: Optional[torch.Tensor] = None,
+    decode: Optional[dict] = None,
 ) -> torch.Tensor:
-    decode = layer_export["decode"]
+    decode = layer_export["decode"] if decode is None else decode
     device = kv.device
     resolved_topk = decode["topk_idxs"] if topk_idxs is None else topk_idxs
     return ref_model.sparse_attn(

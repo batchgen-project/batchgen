@@ -347,6 +347,238 @@ def _verify_indexer_replay(
     return torch.cat([window_topk, topk_idxs], dim=-1)
 
 
+def _layer_decode_steps(layer_export: dict) -> list[dict]:
+    return list(layer_export.get("decode_steps") or [layer_export["decode"]])
+
+
+def _layer_indexer_decode_steps(layer_export: dict) -> list[dict]:
+    if "indexer_decode_steps" in layer_export:
+        return list(layer_export["indexer_decode_steps"])
+    if "indexer_decode" in layer_export:
+        return [layer_export["indexer_decode"]]
+    return []
+
+
+def _map_reference_topk_to_manager_layout(
+    decode: dict,
+    *,
+    page_size_tokens: int,
+) -> torch.Tensor:
+    topk = decode["topk_idxs"].clone()
+    window_size = int(decode["window_size"])
+    raw_end = int(decode["start_pos"]) + int(decode["seqlen"])
+    strict_start = max(0, raw_end - window_size)
+    storage_start = (strict_start // int(page_size_tokens)) * int(
+        page_size_tokens
+    )
+    swa_active_tokens = int(decode["swa_active_tokens_after"])
+
+    mapped = topk.clone()
+    valid_window = (topk >= 0) & (topk < window_size)
+    if valid_window.any():
+        slots = topk[valid_window].to(dtype=torch.long)
+        raw_tokens = strict_start + (
+            (slots - (strict_start % window_size)) % window_size
+        )
+        raw_tokens = torch.where(
+            raw_tokens >= raw_end,
+            raw_tokens - window_size,
+            raw_tokens,
+        )
+        mapped[valid_window] = (raw_tokens - storage_start).to(
+            dtype=mapped.dtype
+        )
+
+    compressed = topk >= window_size
+    if compressed.any():
+        mapped[compressed] = (
+            topk[compressed] - window_size + swa_active_tokens
+        )
+    return mapped
+
+
+def _indexer_topk_from_manager(
+    *,
+    layer_export: dict,
+    decode: dict,
+    indexer_decode: dict,
+    indexer_manager,
+    sequence_id: int,
+    page_size_tokens: int,
+) -> torch.Tensor:
+    import torch.distributed as dist
+
+    layer_id = int(layer_export["layer_id"])
+    compressed_tokens_after = int(indexer_decode["compressed_tokens_after"])
+    indexer_kv = _gather_dense_tokens_from_manager(
+        indexer_manager,
+        layer_id=layer_id,
+        sequence_id=sequence_id,
+        token_count=compressed_tokens_after,
+    )
+
+    q = indexer_decode["q"].to(indexer_manager.device)
+    weights = indexer_decode["weights"].to(indexer_manager.device)
+    index_score = torch.einsum("bshd,btd->bsht", q, indexer_kv)
+    index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(index_score)
+    topk_count = min(int(indexer_decode["index_topk"]), compressed_tokens_after)
+    topk_idxs_zero_based = index_score.topk(topk_count, dim=-1)[1]
+    topk_idxs = topk_idxs_zero_based + int(indexer_decode["offset"])
+    expected = indexer_decode["topk_idxs"].to(indexer_manager.device)
+    if not torch.equal(topk_idxs.cpu(), expected.cpu()):
+        raise AssertionError(
+            f"layer {layer_id}: manager indexer topk mismatch at "
+            f"start_pos={indexer_decode['start_pos']}; "
+            f"actual shape={tuple(topk_idxs.shape)}, expected shape={tuple(expected.shape)}"
+        )
+    mapped_reference_topk = _map_reference_topk_to_manager_layout(
+        decode,
+        page_size_tokens=page_size_tokens,
+    ).to(indexer_manager.device)
+    window_topk = mapped_reference_topk[..., : int(decode["window_size"])]
+    manager_compressed_topk = topk_idxs_zero_based + int(
+        decode["swa_active_tokens_after"]
+    )
+    return torch.cat([window_topk, manager_compressed_topk], dim=-1)
+
+
+def _manager_kv_after_decode_step(
+    layer_export: dict,
+    *,
+    step_index: int,
+    prefill_tokens: int,
+    sequence_id: int,
+    page_size_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, list[object], Optional[torch.Tensor]]:
+    decode_steps = _layer_decode_steps(layer_export)
+    if step_index >= len(decode_steps):
+        raise ValueError(
+            f"requested decode step {step_index}, but trace only has "
+            f"{len(decode_steps)} step(s)"
+        )
+
+    layer_id = int(layer_export["layer_id"])
+    first_decode = decode_steps[0]
+    target_decode = decode_steps[step_index]
+    prefill = layer_export["prefill"]
+    window_size = int(first_decode["window_size"])
+    compress_ratio = int(first_decode["compress_ratio"])
+    dtype = first_decode["kv_reference"].dtype
+    head_dim = int(prefill["swa_kv"].shape[-1])
+    managers: list[object] = []
+
+    swa_manager = _build_swa_manager(
+        layer_id=layer_id,
+        prefill_tokens=prefill_tokens,
+        window_size=window_size,
+        page_size_tokens=page_size_tokens,
+        dtype=dtype,
+        head_dim=head_dim,
+        sequence_id=sequence_id,
+        prefill_swa_kv=prefill["swa_kv"],
+        new_swa_kv=first_decode["new_swa_kv"],
+        device=device,
+    )
+    managers.append(swa_manager)
+    for decode in decode_steps[1 : step_index + 1]:
+        _decode_update(
+            swa_manager,
+            layer_id=layer_id,
+            sequence_id=sequence_id,
+            raw_position=int(decode["start_pos"]),
+            token=decode["new_swa_kv"],
+        )
+    swa_kv = _gather_dense_tokens_from_manager(
+        swa_manager,
+        layer_id=layer_id,
+        sequence_id=sequence_id,
+        token_count=int(target_decode["swa_active_tokens_after"]),
+    )
+    manager_topk = _map_reference_topk_to_manager_layout(
+        target_decode,
+        page_size_tokens=page_size_tokens,
+    )
+
+    if not compress_ratio:
+        return swa_kv, managers, manager_topk
+
+    compressed_manager = _build_compressed_manager(
+        layer_id=layer_id,
+        prefill_tokens=prefill_tokens,
+        compressed_tokens_after=int(first_decode["compressed_tokens_after"]),
+        compression_ratio=compress_ratio,
+        page_size_tokens=page_size_tokens,
+        dtype=dtype,
+        head_dim=head_dim,
+        sequence_id=sequence_id,
+        prefill_compressed_kv=prefill["compressed_kv"],
+        new_compressed_kv=first_decode["new_compressed_kv"],
+        device=device,
+    )
+    managers.append(compressed_manager)
+    for decode in decode_steps[1 : step_index + 1]:
+        _decode_update(
+            compressed_manager,
+            layer_id=layer_id,
+            sequence_id=sequence_id,
+            raw_position=int(decode["start_pos"]),
+            token=decode.get("new_compressed_kv"),
+        )
+    compressed_kv = _gather_dense_tokens_from_manager(
+        compressed_manager,
+        layer_id=layer_id,
+        sequence_id=sequence_id,
+        token_count=int(target_decode["compressed_tokens_after"]),
+    )
+
+    indexer_decode_steps = _layer_indexer_decode_steps(layer_export)
+    if indexer_decode_steps:
+        if step_index >= len(indexer_decode_steps):
+            raise ValueError(
+                f"requested indexer decode step {step_index}, but trace only "
+                f"has {len(indexer_decode_steps)} step(s)"
+            )
+        first_indexer_decode = indexer_decode_steps[0]
+        target_indexer_decode = indexer_decode_steps[step_index]
+        indexer_manager = _build_indexer_manager(
+            layer_id=layer_id,
+            prefill_tokens=prefill_tokens,
+            compressed_tokens_after=int(
+                first_indexer_decode["compressed_tokens_after"]
+            ),
+            compression_ratio=int(first_indexer_decode["compress_ratio"]),
+            page_size_tokens=page_size_tokens,
+            dtype=prefill["indexer_kv"].dtype,
+            head_dim=int(prefill["indexer_kv"].shape[-1]),
+            sequence_id=sequence_id,
+            prefill_indexer_kv=prefill["indexer_kv"],
+            new_indexer_kv=first_decode.get("new_indexer_kv"),
+            device=device,
+        )
+        managers.append(indexer_manager)
+        for decode in decode_steps[1 : step_index + 1]:
+            _decode_update(
+                indexer_manager,
+                layer_id=layer_id,
+                sequence_id=sequence_id,
+                raw_position=int(decode["start_pos"]),
+                token=decode.get("new_indexer_kv"),
+            )
+        manager_topk = _indexer_topk_from_manager(
+            layer_export=layer_export,
+            decode=target_decode,
+            indexer_decode=target_indexer_decode,
+            indexer_manager=indexer_manager,
+            sequence_id=sequence_id,
+            page_size_tokens=page_size_tokens,
+        )
+
+    return torch.cat([swa_kv, compressed_kv], dim=1), managers, manager_topk
+
+
 def _manager_kv_for_layer(
     layer_export: dict,
     *,
@@ -476,6 +708,40 @@ def replay_manager_trace(
                 print(
                     f"layer {layer_id}: manager attention replay matched (ratio={ratio})"
                 )
+                decode_steps = _layer_decode_steps(layer_export)
+                if len(decode_steps) >= 2:
+                    next_managers: list[object] = []
+                    try:
+                        next_kv, next_managers, next_topk = (
+                            _manager_kv_after_decode_step(
+                                layer_export,
+                                step_index=1,
+                                prefill_tokens=prefill_tokens,
+                                sequence_id=sequence_id,
+                                page_size_tokens=resolved_page_size_tokens,
+                                device=runtime.device,
+                            )
+                        )
+                        next_actual = replay_sparse_attention(
+                            ref_model,
+                            layer_export,
+                            next_kv,
+                            topk_idxs=next_topk,
+                            decode=decode_steps[1],
+                        )
+                        assert_close(
+                            next_actual,
+                            decode_steps[1]["output"],
+                            atol=atol,
+                            rtol=rtol,
+                        )
+                        print(
+                            f"layer {layer_id}: next-decode replay matched "
+                            f"after manager KV writes (ratio={ratio})"
+                        )
+                    finally:
+                        for manager in next_managers:
+                            manager.destroy()
             finally:
                 for manager in managers:
                     manager.destroy()
