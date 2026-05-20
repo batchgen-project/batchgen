@@ -483,7 +483,7 @@ def replay_sparse_attention(
         decode["q"].to(device),
         kv.to(device),
         decode["attn_sink"].to(device),
-        resolved_topk.to(device),
+        resolved_topk.to(device=device, dtype=torch.int32),
         float(decode["softmax_scale"]),
     )
 
