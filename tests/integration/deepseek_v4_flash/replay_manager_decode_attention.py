@@ -295,6 +295,20 @@ def _state_rows(state: torch.Tensor) -> torch.Tensor:
     return state.contiguous().view(1, int(state.shape[1]), -1)
 
 
+def _kv_score_state(
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+) -> torch.Tensor:
+    kv_rows = _state_rows(kv_state)
+    score_rows = _state_rows(score_state)
+    if kv_rows.shape[:2] != score_rows.shape[:2]:
+        raise ValueError(
+            "kv/score compressed state shapes differ before feature dim: "
+            f"{tuple(kv_rows.shape)} vs {tuple(score_rows.shape)}"
+        )
+    return torch.cat([kv_rows, score_rows], dim=-1)
+
+
 def _build_compressed_state_manager(
     *,
     layer_id: int,
@@ -375,11 +389,31 @@ def _assert_manager_state(
     *,
     layer_id: int,
     sequence_id: int,
-    expected_state: torch.Tensor,
+    expected_kv_state: torch.Tensor,
+    expected_score_state: torch.Tensor,
 ) -> None:
-    expected_rows = _state_rows(expected_state)
+    expected_kv_rows = _state_rows(expected_kv_state)
+    expected_score_rows = _state_rows(expected_score_state)
+    expected_rows = torch.cat([expected_kv_rows, expected_score_rows], dim=-1)
     state_item_id = manager._sequence_state_items[int(sequence_id)]
     actual = manager.get_layer_state_buffer(layer_id)[state_item_id]
+    kv_dim = int(expected_kv_rows.shape[-1])
+    actual_kv = actual[:, :kv_dim]
+    actual_score = actual[:, kv_dim:]
+    torch.testing.assert_close(
+        actual_kv.float().cpu(),
+        expected_kv_rows[0].float().cpu(),
+        atol=0,
+        rtol=0,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        actual_score.float().cpu(),
+        expected_score_rows[0].float().cpu(),
+        atol=0,
+        rtol=0,
+        equal_nan=True,
+    )
     torch.testing.assert_close(
         actual.float().cpu(),
         expected_rows[0].float().cpu(),
@@ -389,16 +423,19 @@ def _assert_manager_state(
     )
 
 
-def _verify_state_component_replay(
+def _verify_kv_score_state_replay(
     *,
     layer_id: int,
     sequence_id: int,
     compression_ratio: int,
     overlap: bool,
-    prefill_state: torch.Tensor,
-    after_states: list[torch.Tensor],
+    prefill_kv_state: torch.Tensor,
+    prefill_score_state: torch.Tensor,
+    after_kv_states: list[torch.Tensor],
+    after_score_states: list[torch.Tensor],
     device: torch.device,
 ) -> None:
+    prefill_state = _kv_score_state(prefill_kv_state, prefill_score_state)
     manager = _build_compressed_state_manager(
         layer_id=layer_id,
         sequence_id=sequence_id,
@@ -413,9 +450,15 @@ def _verify_state_component_replay(
             manager,
             layer_id=layer_id,
             sequence_id=sequence_id,
-            expected_state=current,
+            expected_kv_state=prefill_kv_state,
+            expected_score_state=prefill_score_state,
         )
-        for after_state in after_states:
+        for after_kv_state, after_score_state in zip(
+            after_kv_states,
+            after_score_states,
+            strict=True,
+        ):
+            after_state = _kv_score_state(after_kv_state, after_score_state)
             _update_manager_state_to_match_reference(
                 manager,
                 layer_id=layer_id,
@@ -427,7 +470,8 @@ def _verify_state_component_replay(
                 manager,
                 layer_id=layer_id,
                 sequence_id=sequence_id,
-                expected_state=after_state,
+                expected_kv_state=after_kv_state,
+                expected_score_state=after_score_state,
             )
             current = after_state
     finally:
@@ -451,10 +495,8 @@ def _verify_compressed_state_replay(
     components = [
         (
             "compressor_kv_state",
-            "compressor_kv_state_after",
-        ),
-        (
             "compressor_score_state",
+            "compressor_kv_state_after",
             "compressor_score_state_after",
         ),
     ]
@@ -463,24 +505,32 @@ def _verify_compressed_state_replay(
             [
                 (
                     "indexer_compressor_kv_state",
-                    "indexer_compressor_kv_state_after",
-                ),
-                (
                     "indexer_compressor_score_state",
+                    "indexer_compressor_kv_state_after",
                     "indexer_compressor_score_state_after",
                 ),
             ]
         )
 
-    for prefill_key, after_key in components:
-        after_states = [decode[after_key] for decode in decode_steps]
-        _verify_state_component_replay(
+    for (
+        prefill_kv_key,
+        prefill_score_key,
+        after_kv_key,
+        after_score_key,
+    ) in components:
+        after_kv_states = [decode[after_kv_key] for decode in decode_steps]
+        after_score_states = [
+            decode[after_score_key] for decode in decode_steps
+        ]
+        _verify_kv_score_state_replay(
             layer_id=layer_id,
             sequence_id=sequence_id,
             compression_ratio=compression_ratio,
             overlap=overlap,
-            prefill_state=prefill[prefill_key],
-            after_states=after_states,
+            prefill_kv_state=prefill[prefill_kv_key],
+            prefill_score_state=prefill[prefill_score_key],
+            after_kv_states=after_kv_states,
+            after_score_states=after_score_states,
             device=device,
         )
     print(

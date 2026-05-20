@@ -12,7 +12,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-STATE_DIM = 8
+KV_STATE_DIM = 4
+SCORE_STATE_DIM = 4
+STATE_DIM = KV_STATE_DIM + SCORE_STATE_DIM
 NUM_LAYERS = 2
 NUM_STATE_ITEMS = 16
 RING_SIZE = 8
@@ -87,6 +89,14 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
         assert torch.equal(
             layer_buffer[state_item_id, ring_offset], values[row]
         )
+        assert torch.equal(
+            layer_buffer[state_item_id, ring_offset, :KV_STATE_DIM],
+            values[row, :KV_STATE_DIM],
+        )
+        assert torch.equal(
+            layer_buffer[state_item_id, ring_offset, KV_STATE_DIM:],
+            values[row, KV_STATE_DIM:],
+        )
 
     prepared_values = values + 100
     prepared_positions = torch.tensor(
@@ -129,6 +139,14 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
 
     assert torch.equal(layer_buffer[allocations[101], 0], explicit_values[0])
     assert torch.equal(layer_buffer[allocations[101], 3], explicit_values[1])
+    assert torch.equal(
+        layer_buffer[allocations[101], 0, :KV_STATE_DIM],
+        explicit_values[0, :KV_STATE_DIM],
+    )
+    assert torch.equal(
+        layer_buffer[allocations[101], 0, KV_STATE_DIM:],
+        explicit_values[0, KV_STATE_DIM:],
+    )
 
 
 def test_host_compressed_state_decode_round_trip(bg):
