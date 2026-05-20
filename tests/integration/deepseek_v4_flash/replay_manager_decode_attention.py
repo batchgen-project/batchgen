@@ -424,12 +424,61 @@ def _assert_manager_state(
     )
 
 
+def _decode_state_write_row(
+    *,
+    compression_ratio: int,
+    overlap: bool,
+    raw_position: int,
+    ring_size: int,
+) -> int:
+    if overlap:
+        expected_ring_size = 2 * int(compression_ratio)
+        if int(ring_size) != expected_ring_size:
+            raise ValueError(
+                "overlap compressed state replay expects ring_size == "
+                f"2 * compression_ratio, got {ring_size} vs "
+                f"{expected_ring_size}"
+            )
+        return int(compression_ratio) + int(raw_position) % int(
+            compression_ratio
+        )
+    return int(raw_position) % int(ring_size)
+
+
+def _update_manager_state_with_decode_kernel(
+    manager: CompressedStateGPUManager,
+    *,
+    layer_id: int,
+    sequence_id: int,
+    compression_ratio: int,
+    overlap: bool,
+    raw_position: int,
+    after_state: torch.Tensor,
+) -> None:
+    after_rows = _state_rows(after_state)
+    write_row = _decode_state_write_row(
+        compression_ratio=compression_ratio,
+        overlap=overlap,
+        raw_position=raw_position,
+        ring_size=int(manager.config.ring_size),
+    )
+    manager.update_layer_decode_state(
+        after_rows[0, write_row]
+        .to(device=manager.device, dtype=manager.config.state_dtype)
+        .unsqueeze(0),
+        [int(raw_position)],
+        layer_id,
+        sequence_ids=[int(sequence_id)],
+    )
+
+
 def _verify_kv_score_state_replay(
     *,
     layer_id: int,
     sequence_id: int,
     compression_ratio: int,
     overlap: bool,
+    decode_steps: list[dict],
     prefill_kv_state: torch.Tensor,
     prefill_score_state: torch.Tensor,
     after_kv_states: list[torch.Tensor],
@@ -477,6 +526,48 @@ def _verify_kv_score_state_replay(
             current = after_state
     finally:
         manager.destroy()
+
+    decode_manager = _build_compressed_state_manager(
+        layer_id=layer_id,
+        sequence_id=sequence_id,
+        prefill_state=prefill_state,
+        compression_ratio=compression_ratio,
+        overlap=overlap,
+        device=device,
+    )
+    try:
+        _assert_manager_state(
+            decode_manager,
+            layer_id=layer_id,
+            sequence_id=sequence_id,
+            expected_kv_state=prefill_kv_state,
+            expected_score_state=prefill_score_state,
+        )
+        for decode, after_kv_state, after_score_state in zip(
+            decode_steps,
+            after_kv_states,
+            after_score_states,
+            strict=True,
+        ):
+            after_state = _kv_score_state(after_kv_state, after_score_state)
+            _update_manager_state_with_decode_kernel(
+                decode_manager,
+                layer_id=layer_id,
+                sequence_id=sequence_id,
+                compression_ratio=compression_ratio,
+                overlap=overlap,
+                raw_position=int(decode["start_pos"]),
+                after_state=after_state,
+            )
+            _assert_manager_state(
+                decode_manager,
+                layer_id=layer_id,
+                sequence_id=sequence_id,
+                expected_kv_state=after_kv_state,
+                expected_score_state=after_score_state,
+            )
+    finally:
+        decode_manager.destroy()
 
 
 def _verify_compressed_state_replay(
@@ -528,6 +619,7 @@ def _verify_compressed_state_replay(
             sequence_id=sequence_id,
             compression_ratio=compression_ratio,
             overlap=overlap,
+            decode_steps=decode_steps,
             prefill_kv_state=prefill[prefill_kv_key],
             prefill_score_state=prefill[prefill_score_key],
             after_kv_states=after_kv_states,
