@@ -128,11 +128,13 @@ def init_runtime() -> RuntimeInfo:
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group("nccl")
     torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    torch.set_default_device(device)
     return RuntimeInfo(
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,
-        device=torch.device(f"cuda:{local_rank}"),
+        device=device,
     )
 
 
