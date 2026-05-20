@@ -18,6 +18,10 @@ from trace_common import (
 from batchgen.kv_cache.compressed_ratio_gpu_paged_kv_manager import (
     CompressedRatioGPUPagedKVCacheManager,
 )
+from batchgen.kv_cache.compressed_state_gpu_manager import (
+    CompressedStateGPUConfig,
+    CompressedStateGPUManager,
+)
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.kv_cache.swa_gpu_paged_kv_manager import (
     SWAGPUPagedKVCacheManager,
@@ -282,6 +286,209 @@ def _build_indexer_manager(
     )
 
 
+def _state_rows(state: torch.Tensor) -> torch.Tensor:
+    if state.ndim < 2 or int(state.shape[0]) != 1:
+        raise ValueError(
+            "compressed state must have shape [1, ring_size, ...], got "
+            f"{tuple(state.shape)}"
+        )
+    return state.contiguous().view(1, int(state.shape[1]), -1)
+
+
+def _build_compressed_state_manager(
+    *,
+    layer_id: int,
+    sequence_id: int,
+    prefill_state: torch.Tensor,
+    compression_ratio: int,
+    overlap: bool,
+    device: torch.device,
+) -> CompressedStateGPUManager:
+    rows = _state_rows(prefill_state)
+    manager = CompressedStateGPUManager(
+        config=CompressedStateGPUConfig(
+            num_layers=layer_id + 1,
+            num_state_items=4,
+            ring_size=int(rows.shape[1]),
+            state_dim=int(rows.shape[2]),
+            state_dtype=prefill_state.dtype,
+            cuda_graph_max_slots=max(8, int(rows.shape[1])),
+        ),
+        device=device,
+        ratio=compression_ratio,
+        overlap=overlap,
+    )
+    manager.initialize()
+    allocations = manager.allocate_state_items_for_sequences([sequence_id])
+    state_item_id = allocations[int(sequence_id)]
+    manager.state_cache[
+        manager.resolve_physical_layer(layer_id),
+        state_item_id,
+    ].copy_(rows[0].to(device=device, dtype=prefill_state.dtype))
+    return manager
+
+
+def _update_manager_state_to_match_reference(
+    manager: CompressedStateGPUManager,
+    *,
+    layer_id: int,
+    sequence_id: int,
+    before_state: torch.Tensor,
+    after_state: torch.Tensor,
+) -> None:
+    before_rows = _state_rows(before_state)
+    after_rows = _state_rows(after_state)
+    if before_rows.shape != after_rows.shape:
+        raise ValueError(
+            "before/after compressed state shapes differ: "
+            f"{tuple(before_rows.shape)} vs {tuple(after_rows.shape)}"
+        )
+
+    changed_rows = (
+        before_rows[0].to(dtype=torch.float32)
+        != after_rows[0].to(dtype=torch.float32)
+    ).any(dim=1)
+    row_ids = torch.nonzero(changed_rows, as_tuple=False).flatten()
+    if int(row_ids.numel()) == 0:
+        return
+
+    slots = torch.tensor(
+        [
+            manager.resolve_state_slot(sequence_id, int(row_id.item()))
+            for row_id in row_ids
+        ],
+        dtype=torch.int32,
+        device=manager.device,
+    )
+    manager.update_layer_state_slots(
+        after_rows[0, row_ids].to(
+            device=manager.device,
+            dtype=manager.config.state_dtype,
+        ),
+        slots,
+        layer_id,
+    )
+
+
+def _assert_manager_state(
+    manager: CompressedStateGPUManager,
+    *,
+    layer_id: int,
+    sequence_id: int,
+    expected_state: torch.Tensor,
+) -> None:
+    expected_rows = _state_rows(expected_state)
+    state_item_id = manager._sequence_state_items[int(sequence_id)]
+    actual = manager.get_layer_state_buffer(layer_id)[state_item_id]
+    torch.testing.assert_close(
+        actual.float().cpu(),
+        expected_rows[0].float().cpu(),
+        atol=0,
+        rtol=0,
+        equal_nan=True,
+    )
+
+
+def _verify_state_component_replay(
+    *,
+    layer_id: int,
+    sequence_id: int,
+    compression_ratio: int,
+    overlap: bool,
+    prefill_state: torch.Tensor,
+    after_states: list[torch.Tensor],
+    device: torch.device,
+) -> None:
+    manager = _build_compressed_state_manager(
+        layer_id=layer_id,
+        sequence_id=sequence_id,
+        prefill_state=prefill_state,
+        compression_ratio=compression_ratio,
+        overlap=overlap,
+        device=device,
+    )
+    try:
+        current = prefill_state
+        _assert_manager_state(
+            manager,
+            layer_id=layer_id,
+            sequence_id=sequence_id,
+            expected_state=current,
+        )
+        for after_state in after_states:
+            _update_manager_state_to_match_reference(
+                manager,
+                layer_id=layer_id,
+                sequence_id=sequence_id,
+                before_state=current,
+                after_state=after_state,
+            )
+            _assert_manager_state(
+                manager,
+                layer_id=layer_id,
+                sequence_id=sequence_id,
+                expected_state=after_state,
+            )
+            current = after_state
+    finally:
+        manager.destroy()
+
+
+def _verify_compressed_state_replay(
+    layer_export: dict,
+    *,
+    sequence_id: int,
+    device: torch.device,
+) -> None:
+    prefill = layer_export["prefill"]
+    decode_steps = _layer_decode_steps(layer_export)
+    if not int(layer_export["compress_ratio"]):
+        return
+
+    layer_id = int(layer_export["layer_id"])
+    compression_ratio = int(layer_export["compress_ratio"])
+    overlap = compression_ratio == 4
+    components = [
+        (
+            "compressor_kv_state",
+            "compressor_kv_state_after",
+        ),
+        (
+            "compressor_score_state",
+            "compressor_score_state_after",
+        ),
+    ]
+    if "indexer_compressor_kv_state" in prefill:
+        components.extend(
+            [
+                (
+                    "indexer_compressor_kv_state",
+                    "indexer_compressor_kv_state_after",
+                ),
+                (
+                    "indexer_compressor_score_state",
+                    "indexer_compressor_score_state_after",
+                ),
+            ]
+        )
+
+    for prefill_key, after_key in components:
+        after_states = [decode[after_key] for decode in decode_steps]
+        _verify_state_component_replay(
+            layer_id=layer_id,
+            sequence_id=sequence_id,
+            compression_ratio=compression_ratio,
+            overlap=overlap,
+            prefill_state=prefill[prefill_key],
+            after_states=after_states,
+            device=device,
+        )
+    print(
+        f"layer {layer_id}: compressed state replay matched "
+        f"(ratio={compression_ratio})"
+    )
+
+
 def _verify_indexer_replay(
     layer_export: dict,
     *,
@@ -403,9 +610,7 @@ def _map_reference_topk_to_manager_layout(
 
     compressed = topk >= window_size
     if compressed.any():
-        mapped[compressed] = (
-            topk[compressed] - window_size + swa_storage_tokens
-        )
+        mapped[compressed] = topk[compressed] - window_size + swa_storage_tokens
     return mapped
 
 
@@ -683,7 +888,10 @@ def replay_manager_trace(
             resolved_trace_path = ranked_output_path(trace_path, runtime)
         trace = torch.load(resolved_trace_path, map_location="cpu")
         if runtime.rank == 0:
-            print(f"manager replay: loaded trace {resolved_trace_path}", flush=True)
+            print(
+                f"manager replay: loaded trace {resolved_trace_path}",
+                flush=True,
+            )
         metadata = trace["metadata"]
         if int(metadata["world_size"]) != runtime.world_size:
             raise ValueError(
@@ -725,6 +933,11 @@ def replay_manager_trace(
                 ratio = int(layer_export["decode"]["compress_ratio"])
                 print(
                     f"layer {layer_id}: manager attention replay matched (ratio={ratio})"
+                )
+                _verify_compressed_state_replay(
+                    layer_export,
+                    sequence_id=sequence_id,
+                    device=runtime.device,
                 )
                 decode_steps = _layer_decode_steps(layer_export)
                 if len(decode_steps) >= 2:

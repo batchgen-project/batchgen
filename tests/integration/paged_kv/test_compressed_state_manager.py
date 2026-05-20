@@ -111,6 +111,25 @@ def test_gpu_compressed_state_maps_raw_positions_and_prepared_slots():
             layer_buffer[state_item_id, ring_offset], prepared_values[row]
         )
 
+    explicit_values = values + 200
+    explicit_slots = torch.tensor(
+        [
+            allocations[101] * RING_SIZE + 0,
+            allocations[101] * RING_SIZE + 3,
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    manager.update_layer_state_slots(
+        explicit_values,
+        explicit_slots,
+        layer_idx=2,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(layer_buffer[allocations[101], 0], explicit_values[0])
+    assert torch.equal(layer_buffer[allocations[101], 3], explicit_values[1])
+
 
 def test_host_compressed_state_decode_round_trip(bg):
     device = torch.device("cuda:0")

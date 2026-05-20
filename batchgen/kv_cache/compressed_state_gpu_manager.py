@@ -195,6 +195,35 @@ class CompressedStateGPUManager:
             state_slots=slots.to(device=self.device, dtype=torch.int32),
         )
 
+    def update_layer_state_slots(
+        self,
+        state_tensor: torch.Tensor,
+        state_slots: Sequence[int] | torch.Tensor,
+        layer_idx: int,
+    ) -> None:
+        self._ensure_initialized()
+        physical_layer = self.resolve_physical_layer(layer_idx)
+        tokens = self._flatten_state_tensor(state_tensor)
+        slots = torch.as_tensor(
+            state_slots,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if slots.ndim != 1:
+            raise ValueError("state_slots must be a 1D tensor or sequence")
+        if int(slots.shape[0]) != int(tokens.shape[0]):
+            raise ValueError("state_slots must align with state_tensor rows")
+
+        cache = self._state_cache[physical_layer].view(
+            self.config.num_state_items * self.config.ring_size,
+            self.config.state_dim,
+        )
+        run_compressed_state_update(
+            state_cache=cache,
+            state_tokens=tokens,
+            state_slots=slots,
+        )
+
     def get_layer_state_buffer(self, layer_idx: int) -> torch.Tensor:
         self._ensure_initialized()
         return self._state_cache[self.resolve_physical_layer(layer_idx)]

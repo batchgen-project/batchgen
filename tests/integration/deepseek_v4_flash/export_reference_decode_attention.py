@@ -113,9 +113,9 @@ def _capture_decode_layer_updates(
     decode_end = decode_start_pos + 1
     decode_window_slot = decode_start_pos % window_size
     first_needed_token = max(0, decode_end - window_size)
-    storage_start_token = (
-        first_needed_token // int(page_size_tokens)
-    ) * int(page_size_tokens)
+    storage_start_token = (first_needed_token // int(page_size_tokens)) * int(
+        page_size_tokens
+    )
 
     updates: dict[str, object] = {
         "new_swa_kv": clone_to_cpu(
@@ -134,6 +134,12 @@ def _capture_decode_layer_updates(
         before = decode_start_pos // compress_ratio
         after = decode_end // compress_ratio
         updates["compressed_tokens_after"] = after
+        updates["compressor_kv_state_after"] = clone_to_cpu(
+            attention.compressor.kv_state
+        )
+        updates["compressor_score_state_after"] = clone_to_cpu(
+            attention.compressor.score_state
+        )
         if after > before:
             updates["new_compressed_kv"] = clone_to_cpu(
                 attention.kv_cache[
@@ -145,8 +151,21 @@ def _capture_decode_layer_updates(
                 updates["new_indexer_kv"] = clone_to_cpu(
                     attention.indexer.kv_cache[:, after - 1 : after]
                 )
+                updates["indexer_compressor_kv_state_after"] = clone_to_cpu(
+                    attention.indexer.compressor.kv_state
+                )
+                updates["indexer_compressor_score_state_after"] = clone_to_cpu(
+                    attention.indexer.compressor.score_state
+                )
         else:
             updates["new_compressed_kv"] = None
+            if getattr(attention, "indexer", None) is not None:
+                updates["indexer_compressor_kv_state_after"] = clone_to_cpu(
+                    attention.indexer.compressor.kv_state
+                )
+                updates["indexer_compressor_score_state_after"] = clone_to_cpu(
+                    attention.indexer.compressor.score_state
+                )
     else:
         updates["compressed_tokens_after"] = 0
         updates["new_compressed_kv"] = None
@@ -309,9 +328,7 @@ def export_reference_trace(
                     )
 
             layer_exports[layer_id]["decode_steps"] = layer_decode_steps
-            layer_exports[layer_id]["module_decode_steps"] = (
-                module_decode_steps
-            )
+            layer_exports[layer_id]["module_decode_steps"] = module_decode_steps
             layer_exports[layer_id]["decode"] = layer_decode_steps[0]
             layer_exports[layer_id]["module_decode"] = module_decode_steps[0]
             if indexer_decode_steps:
@@ -339,9 +356,7 @@ def export_reference_trace(
             },
             "prompt_tokens": prompt_tokens,
             "decode_token": decode_records[0]["token"],
-            "decode_tokens": [
-                record["token"] for record in decode_records
-            ],
+            "decode_tokens": [record["token"] for record in decode_records],
             "prefill_logits": clone_to_cpu(prefill_logits),
             "decode_logits": decode_records[0]["logits"],
             "decode_logits_steps": [
