@@ -9,29 +9,9 @@ namespace batchgen::kv::worker_detail {
 namespace {
 
 // each block copies one page. page_idx = blockIdx.x
-// src_ptrs:
-//     A device-resident array of uint8_t* pointers.
-//     Each pointer refers to **host pinned memory** (allocated with
-//     cudaHostAlloc or registered with cudaHostRegister), that is **UVA-mapped
-//     into the device address space**. Because of UVA (Unified Virtual
-//     Addressing), these host pointers are valid device pointers as well, so
-//     the GPU can directly load from them using global memory instructions
-//     (zero-copy access).
-//
-// dst_ptrs:
-//     A device-resident array of uint8_t* pointers to normal GPU global memory.
-//
-// Why this works (important UVA explanation):
-//     - Pinned host memory is registered with the CUDA driver.
-//     - On UVA-enabled systems (all modern GPUs), the driver maps this host
-//       memory into the GPU's virtual address space.
-//     - Therefore, the CPU pointer returned by cudaHostAlloc is already a
-//       **device-accessible virtual address**.
-//     - The GPU can dereference these pointers directly inside the kernel,
-//       performing PCIe reads with no need for cudaMemcpyAsync.
-//
-// This kernel performs a simple vectorized copy (using uint4 loads/stores)
-// from host memory → device memory without using cudaMemcpyAsync.
+// src_ptrs / dst_ptrs are device-resident arrays of byte pointers. Either side
+// may point to GPU memory or UVA-mapped pinned host memory, so the same kernel
+// is used for host->device page loads and device->host decode appends.
 //
 __device__ void UvaPageCopyKernelImpl(uint8_t** src_ptrs, uint8_t** dst_ptrs,
                                       size_t page_size_bytes, int num_pages) {
@@ -43,12 +23,29 @@ __device__ void UvaPageCopyKernelImpl(uint8_t** src_ptrs, uint8_t** dst_ptrs,
     uint8_t* src = src_ptrs[page_idx];  // UVA-mapped host memory pointer
     uint8_t* dst = dst_ptrs[page_idx];  // device global memory pointer
 
-    const int num_words = static_cast<int>(page_size_bytes / sizeof(uint4));
-    uint4* src_vec = reinterpret_cast<uint4*>(src);
-    uint4* dst_vec = reinterpret_cast<uint4*>(dst);
+    const auto src_addr = reinterpret_cast<uintptr_t>(src);
+    const auto dst_addr = reinterpret_cast<uintptr_t>(dst);
+    const bool can_vectorize =
+        (src_addr % alignof(uint4) == 0) && (dst_addr % alignof(uint4) == 0);
 
-    for (int i = threadIdx.x; i < num_words; i += blockDim.x) {
-        dst_vec[i] = src_vec[i];  // GPU performs a PCIe read here
+    if (can_vectorize) {
+        const size_t num_words = page_size_bytes / sizeof(uint4);
+        const size_t vector_bytes = num_words * sizeof(uint4);
+        uint4* src_vec = reinterpret_cast<uint4*>(src);
+        uint4* dst_vec = reinterpret_cast<uint4*>(dst);
+
+        for (size_t i = threadIdx.x; i < num_words; i += blockDim.x) {
+            dst_vec[i] = src_vec[i];
+        }
+        for (size_t i = vector_bytes + threadIdx.x; i < page_size_bytes;
+             i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        return;
+    }
+
+    for (size_t i = threadIdx.x; i < page_size_bytes; i += blockDim.x) {
+        dst[i] = src[i];
     }
 }
 

@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Sequence, Union
+
+import torch
+
+from batchgen.config.config import EngineConfig, ModelConfig
+from batchgen.kv_cache.coordinator_utils import as_int_list, ceil_div
+from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
+from batchgen.kv_cache.position_mapped_gpu_paged_kv_manager import (
+    PositionMappedGPUPagedKVCacheManager,
+)
+
+
+@dataclass
+class _SWASequenceState:
+    window_start_page: int = 0
+    active_pages: int = 0
+    max_seen_raw_pos: int = -1
+    has_tokens: bool = False
+
+
+@dataclass(frozen=True)
+class _WindowForRawEnd:
+    window_start_page: int
+    active_tokens: int
+    required_pages: int
+
+
+class SWAGPUPagedKVCacheManager(PositionMappedGPUPagedKVCacheManager):
+    """Page-level sliding-window GPU paged KV manager.
+
+    Storage, page allocation, page-table rebuilds, and update kernels come from
+    ``GPUPagedKVCacheManager``. This subclass only converts raw token positions
+    into window-local storage positions and releases old prefix pages when the
+    page-aligned SWA window moves forward.
+    """
+
+    manager_name = "SWAGPUPagedKVCacheManager"
+
+    def __init__(
+        self,
+        engine_config: Optional[EngineConfig] = None,
+        model_config: Optional[ModelConfig] = None,
+        *,
+        config: Optional[GPUPagedKVConfig] = None,
+        device: Optional[Union[str, int, torch.device]] = None,
+        window_size_tokens: int,
+    ) -> None:
+        super().__init__(
+            engine_config=engine_config,
+            model_config=model_config,
+            config=config,
+            device=device,
+        )
+        self.window_size_tokens = int(window_size_tokens)
+        if self.window_size_tokens <= 0:
+            raise ValueError("window_size_tokens must be > 0")
+        if self.window_size_tokens % self.page_size_tokens != 0:
+            raise ValueError(
+                "window_size_tokens must be divisible by page_size_tokens "
+                "for page-level SWA"
+            )
+        self.window_pages = self.window_size_tokens // self.page_size_tokens
+        self._states: dict[int, _SWASequenceState] = {}
+
+    def destroy(self, *, empty_cuda_cache: bool = False) -> None:
+        self._states.clear()
+        return super().destroy(empty_cuda_cache=empty_cuda_cache)
+
+    def allocate_pages_for_sequences(
+        self, sequence_ids: Sequence[int], num_tokens: Sequence[int]
+    ) -> dict[int, list[int]]:
+        if len(sequence_ids) != len(num_tokens):
+            raise ValueError(
+                "allocate_pages_for_sequences: sequence_ids and num_tokens "
+                "must have the same length"
+            )
+        sequence_ids = [int(seq_id) for seq_id in sequence_ids]
+        raw_tokens = [int(tokens) for tokens in num_tokens]
+        active_tokens: list[int] = []
+        windows: list[_WindowForRawEnd] = []
+        for token_count in raw_tokens:
+            window = self._compute_window_for_raw_end(token_count)
+            if window.active_tokens <= 0:
+                raise ValueError(
+                    "allocate_pages_for_sequences: num_tokens entries must "
+                    "be > 0"
+                )
+            active_tokens.append(window.active_tokens)
+            windows.append(window)
+
+        allocations = super().allocate_pages_for_sequences(
+            sequence_ids, active_tokens
+        )
+        for seq_id, token_count, window in zip(
+            sequence_ids, raw_tokens, windows
+        ):
+            state = self._states.setdefault(seq_id, _SWASequenceState())
+            state.window_start_page = window.window_start_page
+            state.active_pages = window.required_pages
+            state.max_seen_raw_pos = token_count - 1
+            state.has_tokens = True
+        self._page_table_dirty = True
+        return allocations
+
+    def update_layer_decode_new_token(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: Optional[torch.Tensor],
+        sequence_lengths: Optional[torch.Tensor],
+        layer_idx: int,
+        batch_slice: Optional[tuple] = None,
+        slot_indices: Optional[torch.Tensor] = None,
+        *,
+        assume_prepared: bool = False,
+    ) -> None:
+        """Append decode KV using raw token positions.
+
+        ``sequence_lengths`` keeps the old manager's argument name, but for this
+        wrapper it is interpreted as raw decode write positions unless
+        ``assume_prepared`` is set. With ``assume_prepared=True``, callers must
+        pass ``sequence_lengths=None`` and this method reads the manager-owned
+        prepared decode-position buffer; no window advance, allocation, prefix
+        release, or page-table rebuild is performed here.
+        """
+
+        _, resolved_slots, storage_positions = (
+            self._resolve_decode_update_inputs(
+                k_tensor=k_tensor,
+                sequence_lengths=sequence_lengths,
+                batch_slice=batch_slice,
+                slot_indices=slot_indices,
+                assume_prepared=assume_prepared,
+            )
+        )
+        return super().update_layer_decode_new_token(
+            k_tensor=k_tensor,
+            v_tensor=v_tensor,
+            sequence_lengths=storage_positions,
+            layer_idx=int(layer_idx),
+            batch_slice=None,
+            slot_indices=resolved_slots,
+        )
+
+    def map_raw_lengths_to_window_local_lengths(
+        self,
+        sequence_ids: Sequence[int],
+        raw_lengths: Sequence[int] | torch.Tensor,
+        *,
+        device: Optional[torch.device | str] = None,
+        dtype: torch.dtype = torch.int32,
+    ) -> torch.Tensor:
+        """Return page-level SWA lengths aligned with ``sequence_ids``.
+
+        This is the value that attention should consume as cache length when it
+        uses the page table owned by this SWA manager.
+        """
+
+        sequence_ids = [int(seq_id) for seq_id in sequence_ids]
+        raw_values = as_int_list(raw_lengths)
+        if len(sequence_ids) != len(raw_values):
+            raise ValueError(
+                "map_raw_lengths_to_window_local_lengths: sequence_ids and "
+                "raw_lengths must have the same length"
+            )
+        local_lengths: list[int] = []
+        for seq_id, raw_length in zip(sequence_ids, raw_values):
+            state = self._states.get(seq_id)
+            if state is None or not state.has_tokens:
+                window = self._compute_window_for_raw_end(raw_length)
+                local_lengths.append(window.active_tokens)
+                continue
+            window_start_token = state.window_start_page * self.page_size_tokens
+            local_lengths.append(max(0, int(raw_length) - window_start_token))
+        output_device = device
+        if output_device is None and isinstance(raw_lengths, torch.Tensor):
+            output_device = raw_lengths.device
+        return torch.as_tensor(
+            local_lengths,
+            dtype=dtype,
+            device=output_device if output_device is not None else self.device,
+        )
+
+    def _compute_window_for_raw_end(
+        self, raw_end_tokens: int
+    ) -> _WindowForRawEnd:
+        raw_end_tokens = int(raw_end_tokens)
+        if raw_end_tokens <= 0:
+            return _WindowForRawEnd(0, 0, 0)
+        first_needed_token = max(0, raw_end_tokens - self.window_size_tokens)
+        window_start_page = first_needed_token // self.page_size_tokens
+        window_start_token = window_start_page * self.page_size_tokens
+        active_tokens = raw_end_tokens - window_start_token
+        required_pages = ceil_div(active_tokens, self.page_size_tokens)
+        if required_pages > self.window_pages + 1:
+            raise RuntimeError(
+                f"SWA active pages {required_pages} exceed window_pages + 1 "
+                f"({self.window_pages + 1})"
+            )
+        return _WindowForRawEnd(
+            window_start_page=window_start_page,
+            active_tokens=active_tokens,
+            required_pages=required_pages,
+        )
+
+    def _update_window_for_raw_end(
+        self, sequence_id: int, raw_end_tokens: int
+    ) -> tuple[int, int]:
+        window = self._compute_window_for_raw_end(raw_end_tokens)
+        state = self._states.setdefault(sequence_id, _SWASequenceState())
+        if (
+            state.has_tokens
+            and window.window_start_page < state.window_start_page
+        ):
+            raise ValueError(
+                "SWA GPU manager does not support writing tokens older than "
+                "the current page-level window"
+            )
+        if (
+            state.has_tokens
+            and window.window_start_page > state.window_start_page
+        ):
+            pages_to_release = (
+                window.window_start_page - state.window_start_page
+            )
+            if pages_to_release > state.active_pages:
+                raise RuntimeError(
+                    f"sequence {sequence_id} cannot release {pages_to_release} "
+                    f"SWA pages with only {state.active_pages} active pages"
+                )
+            self._release_sequence_prefix_pages(sequence_id, pages_to_release)
+            state.active_pages -= pages_to_release
+            self._page_table_dirty = True
+
+        state.window_start_page = window.window_start_page
+        added_pages = self._ensure_active_capacity(
+            sequence_id, window.required_pages, state
+        )
+        if raw_end_tokens > 0:
+            state.max_seen_raw_pos = max(
+                state.max_seen_raw_pos, raw_end_tokens - 1
+            )
+            state.has_tokens = True
+        return window.active_tokens, added_pages
+
+    def _ensure_active_capacity(
+        self,
+        sequence_id: int,
+        required_pages: int,
+        state: _SWASequenceState,
+    ) -> int:
+        if required_pages <= 0:
+            return 0
+        if required_pages > self.window_pages + 1:
+            raise ValueError(
+                f"sequence {sequence_id} requires {required_pages} active "
+                f"pages, exceeding window_pages + 1 ({self.window_pages + 1})"
+            )
+        current_pages = int(state.active_pages)
+        base_state = self._sequences.get(sequence_id)
+        if current_pages == 0 and base_state is not None:
+            current_pages = int(base_state.pages.numel())
+            state.active_pages = current_pages
+        missing_pages = max(0, required_pages - current_pages)
+        if missing_pages:
+            if base_state is None:
+                self._allocate_storage_pages(
+                    sequence_id, missing_pages * self.page_size_tokens
+                )
+            else:
+                self._grow_storage_sequence_pages(sequence_id, missing_pages)
+            state.active_pages += missing_pages
+            self._page_table_dirty = True
+        return missing_pages
+
+    def _prepare_decode_storage_position(
+        self, sequence_id: int, raw_position: int
+    ) -> int:
+        active_tokens, _ = self._update_window_for_raw_end(
+            sequence_id, raw_position + 1
+        )
+        return active_tokens - 1
+
+    def _context_storage_tokens(
+        self, sequence_id: int, context_length: int
+    ) -> int:
+        active_tokens, _ = self._update_window_for_raw_end(
+            sequence_id, context_length
+        )
+        return active_tokens
+
+    def _invalid_slot_storage_position(self) -> int:
+        return 0
+
+    def _after_free_pages_for_sequences(
+        self, sequence_ids: Sequence[int]
+    ) -> None:
+        for seq_id in sequence_ids:
+            self._states.pop(seq_id, None)
+        if self._last_page_table_order is None:
+            freed = set(sequence_ids)
+            active_order = [
+                seq_id
+                for seq_id in self._gpu_page_table_manager.slot_to_seq_id
+                if seq_id not in freed
+            ]
+            if active_order != self._gpu_page_table_manager.slot_to_seq_id:
+                self._last_page_table_order = active_order
+
+    def _rebuild_after_free_pages(self) -> bool:
+        return True
+
+
+__all__ = ["SWAGPUPagedKVCacheManager"]

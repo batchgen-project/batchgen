@@ -12,6 +12,8 @@
 
 namespace batchgen::kv {
 
+using LayerMapping = std::vector<std::int32_t>;
+
 struct HostPagedKVStats {
     std::size_t num_total_pages = 0;
     std::size_t num_free_pages = 0;
@@ -37,6 +39,7 @@ struct HostPagedKVConfig {
     bool enable_memfd = false;
     int memfd_creator_pid = -1;
     int memfd_fd = -1;
+    LayerMapping logical_to_physical_layer;
     std::string logger_name;  // Custom logger name (empty = use default)
 };
 
@@ -72,6 +75,27 @@ inline HostPagedKVConfig SanitizeConfig(HostPagedKVConfig config) {
     }
     if (config.k_element_size_bytes == 0) {
         errors.emplace_back("k_element_size_bytes must be > 0");
+    }
+    for (std::size_t logical_layer = 0;
+         logical_layer < config.logical_to_physical_layer.size();
+         ++logical_layer) {
+        const std::int32_t physical_layer =
+            config.logical_to_physical_layer[logical_layer];
+        if (physical_layer < -1) {
+            std::ostringstream oss;
+            oss << "logical_to_physical_layer[" << logical_layer
+                << "] must be >= -1";
+            errors.emplace_back(oss.str());
+            continue;
+        }
+        if (config.num_layers > 0 && physical_layer >= 0 &&
+            static_cast<std::size_t>(physical_layer) >= config.num_layers) {
+            std::ostringstream oss;
+            oss << "logical_to_physical_layer[" << logical_layer
+                << "] physical layer id " << physical_layer
+                << " must be < num_layers (" << config.num_layers << ")";
+            errors.emplace_back(oss.str());
+        }
     }
     if (!errors.empty()) {
         std::string message = "Invalid HostPagedKVConfig: ";
@@ -111,6 +135,28 @@ inline std::size_t AlignUp(std::size_t value, std::size_t alignment) {
 
 }  // namespace detail
 
+inline void AppendLogicalLayerMapping(std::ostringstream& oss,
+                                      const LayerMapping& mapping) {
+    oss << '[';
+    constexpr std::size_t kMaxEntriesToPrint = 32;
+    const std::size_t entries =
+        mapping.size() < kMaxEntriesToPrint ? mapping.size()
+                                            : kMaxEntriesToPrint;
+    for (std::size_t i = 0; i < entries; ++i) {
+        if (i != 0) {
+            oss << ',';
+        }
+        oss << mapping[i];
+    }
+    if (mapping.size() > entries) {
+        if (entries != 0) {
+            oss << ',';
+        }
+        oss << "...(" << mapping.size() << " total)";
+    }
+    oss << ']';
+}
+
 inline std::string ToString(const HostPagedKVConfig& config) {
     std::ostringstream oss;
     oss << "HostPagedKVConfig(shm_name='" << config.shm_name
@@ -124,7 +170,10 @@ inline std::string ToString(const HostPagedKVConfig& config) {
         << ", k_element_size_bytes=" << config.k_element_size_bytes
         << ", v_element_size_bytes=" << config.v_element_size_bytes
         << ", sequence_table_capacity=" << config.sequence_table_capacity
-        << ", alignment_bytes=" << config.alignment_bytes << ")";
+        << ", alignment_bytes=" << config.alignment_bytes
+        << ", logical_to_physical_layer=";
+    AppendLogicalLayerMapping(oss, config.logical_to_physical_layer);
+    oss << ")";
     return oss.str();
 }
 
@@ -154,6 +203,8 @@ inline std::uint64_t HashHostKVConfig(const HostPagedKVConfig& config) {
     seed = HashCombine(seed, sanitized.sequence_table_capacity);
     seed = HashCombine(seed, sanitized.alignment_bytes);
     seed = HashCombine(seed, static_cast<std::uint64_t>(sanitized.enable_memfd));
+    // logical_to_physical_layer is view-level routing. It does not change the
+    // physical shared-memory layout, so it is intentionally excluded here.
     return seed;
 }
 
@@ -179,6 +230,9 @@ class HostPagedKVBackend {
     void ReleaseSequence(std::int64_t sequence_id);
 
     void ReleaseSequences(const std::vector<std::int64_t>& sequence_ids);
+
+    std::vector<std::int32_t> ReleaseSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages);
 
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
