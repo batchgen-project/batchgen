@@ -1043,7 +1043,19 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if graph_tensor.numel() == 0:
             return False, f"{name}: empty"
 
-        if exact or not graph_tensor.is_floating_point():
+        if exact:
+            eager_same = eager_tensor.to(device=graph_tensor.device)
+            mismatch = int((graph_tensor != eager_same).sum().item())
+            if mismatch == 0:
+                return False, f"{name}: exact"
+            diff = (graph_tensor.float() - eager_same.float()).abs()
+            max_abs = float(diff.max().item())
+            return True, (
+                f"{name}: mismatch={mismatch}/{graph_tensor.numel()} "
+                f"max_abs={max_abs:.6g}"
+            )
+
+        if not graph_tensor.is_floating_point():
             graph_i = graph_tensor.to(dtype=torch.int64)
             eager_i = eager_tensor.to(dtype=torch.int64, device=graph_tensor.device)
             mismatch = int((graph_i != eager_i).sum().item())
@@ -1078,13 +1090,105 @@ class GLM5AttnWrapper(AttnWrapperBase):
     ) -> None:
         """Run graph replay as a side-channel and return/log eager-vs-graph diffs."""
 
-        from batchgen.attention.dsa.glm5_decode_selector import (
-            build_glm5_dsa_graph_segment_inputs,
-        )
-
         fail_on_mismatch = _glm5_dsa_graph_compare_fail_on_mismatch()
         try:
             bsz = hidden_states.shape[0]
+            flashmla_tile_scheduler_metadata, flashmla_num_splits = (
+                self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
+            )
+            if getattr(self, "_dsa_cuda_graph_full", False):
+                if not fail_on_mismatch:
+                    logging.warning(
+                        "[GLM5_DSA_FULL_GRAPH_COMPARE] layer=%s skipped because "
+                        "full-DSA side-channel replay writes active GPU KV cache; "
+                        "set batchgen_debug.glm5_dsa_graph_compare_fail_on_mismatch=true "
+                        "for fail-fast diagnostic runs.",
+                        self.layer_idx,
+                    )
+                    return
+                primary_slot_indices = getattr(
+                    AttnWrapperBase,
+                    "glm5_decode_primary_slot_indices",
+                    None,
+                )
+                aux_slot_indices = getattr(
+                    AttnWrapperBase,
+                    "glm5_decode_aux_slot_indices",
+                    None,
+                )
+                if primary_slot_indices is None or aux_slot_indices is None:
+                    raise RuntimeError(
+                        f"[layer {self.layer_idx}] GLM-5 full DSA graph compare "
+                        "requires per-forward primary/aux slot tensors"
+                    )
+                graph_outputs = self._dsa_cuda_graph_manager.replay(
+                    self._dsa_cuda_graph_segment_name,
+                    bsz,
+                    hidden_states=hidden_states,
+                    position_ids=position_ids,
+                    cache_seqlens=cache_seqlens.to(
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    ),
+                    primary_slot_indices=primary_slot_indices[:bsz].to(
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    ),
+                    aux_slot_indices=aux_slot_indices[:bsz].to(
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    ),
+                    flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                    flashmla_num_splits=flashmla_num_splits,
+                )
+
+                selector_inputs = eager_debug.get("selector_inputs")
+                checks = [
+                    self._compare_tensor_summary(
+                        "final_o_proj",
+                        graph_outputs.get("attn_output"),
+                        eager_output,
+                    ),
+                ]
+                if selector_inputs is not None:
+                    checks.extend(
+                        [
+                            self._compare_tensor_summary(
+                                "primary_k_tensor",
+                                graph_outputs.get("primary_k_tensor"),
+                                selector_inputs.primary_k_tensor,
+                                exact=True,
+                            ),
+                            self._compare_tensor_summary(
+                                "indexer_k_tensor",
+                                graph_outputs.get("indexer_k_tensor"),
+                                selector_inputs.indexer_k_tensor,
+                                exact=True,
+                            ),
+                        ]
+                    )
+                failed = any(item[0] for item in checks)
+                log_fn = logging.error if failed else logging.info
+                log_fn(
+                    "[GLM5_DSA_FULL_GRAPH_COMPARE] layer=%s status=%s bsz=%s "
+                    "max_seqlen=%s min_cache=%s %s",
+                    self.layer_idx,
+                    "FAIL" if failed else "OK",
+                    bsz,
+                    max_seqlen,
+                    int(cache_seqlens.min().item()),
+                    "; ".join(message for _, message in checks),
+                )
+                if failed:
+                    raise RuntimeError(
+                        f"GLM-5 full DSA graph/eager compare failed on layer {self.layer_idx}"
+                    )
+                return
+
+            from batchgen.attention.dsa.glm5_decode_selector import (
+                build_glm5_dsa_graph_segment_inputs,
+            )
+
             graph_inputs = build_glm5_dsa_graph_segment_inputs(
                 self,
                 hidden_states,
@@ -1094,9 +1198,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 gpu_paged_kv_manager,
                 gpu_paged_kv_manager_aux,
                 write_kv=False,
-            )
-            flashmla_tile_scheduler_metadata, flashmla_num_splits = (
-                self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
             )
             graph_outputs = self._dsa_cuda_graph_manager.replay(
                 self._dsa_cuda_graph_segment_name,

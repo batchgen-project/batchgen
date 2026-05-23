@@ -10,25 +10,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <deque>
-#include <exception>
-#include <functional>
 #include <future>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,7 +35,6 @@
 #include "host_paged_kv_config_utils.h"
 #include "host_paged_kv_geometry.h"
 #include "host_paged_kv_layout.h"
-#include "host_prefix_cache.h"
 #include "spdlog/spdlog.h"
 #include "util_measure_time.h"
 
@@ -140,192 +132,12 @@ class ScopedCudaEvent final {
 void LaunchUvaPageCopyKernel(uint8_t** src_ptrs, uint8_t** dst_ptrs,
                              std::size_t page_size_bytes, int num_pages,
                              cudaStream_t stream);
-
-inline std::size_t ReadEnvSize(const char* name, std::size_t fallback,
-                               std::size_t min_value,
-                               std::size_t max_value) {
-    const char* raw = std::getenv(name);
-    if (raw == nullptr || *raw == '\0') {
-        return fallback;
-    }
-    char* end = nullptr;
-    const unsigned long parsed = std::strtoul(raw, &end, 10);
-    if (end == raw || parsed == 0) {
-        return fallback;
-    }
-    return std::min<std::size_t>(
-        max_value, std::max<std::size_t>(min_value, parsed));
-}
-
-class BoundedAsyncExecutor {
-   public:
-    static BoundedAsyncExecutor& Instance() {
-        static BoundedAsyncExecutor executor;
-        return executor;
-    }
-
-    template <typename Fn>
-    std::shared_future<void> Submit(Fn&& fn) {
-        auto task =
-            std::make_shared<std::packaged_task<void()>>(std::forward<Fn>(fn));
-        auto future = task->get_future().share();
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            queue_space_cv_.wait(lock, [this]() {
-                return stopping_ || queue_.size() < max_queue_depth_;
-            });
-            if (stopping_) {
-                throw std::runtime_error(
-                    "Host KV async executor is shutting down");
-            }
-            queue_.emplace_back([task = std::move(task)]() { (*task)(); });
-        }
-        queue_cv_.notify_one();
-        return future;
-    }
-
-   private:
-    BoundedAsyncExecutor()
-        : max_queue_depth_(ReadEnvSize("BATCHGEN_HOST_KV_ASYNC_QUEUE_DEPTH",
-                                       2048, 1, 1 << 20)) {
-        const unsigned int hw = std::max(1u, std::thread::hardware_concurrency());
-        const std::size_t default_threads =
-            std::min<std::size_t>(16, std::max<std::size_t>(4, hw / 8));
-        const std::size_t num_threads =
-            ReadEnvSize("BATCHGEN_HOST_KV_ASYNC_THREADS", default_threads, 1,
-                        256);
-        workers_.reserve(num_threads);
-        for (std::size_t idx = 0; idx < num_threads; ++idx) {
-            workers_.emplace_back([this]() { WorkerLoop(); });
-        }
-    }
-
-    ~BoundedAsyncExecutor() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-        }
-        queue_cv_.notify_all();
-        queue_space_cv_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-    BoundedAsyncExecutor(const BoundedAsyncExecutor&) = delete;
-    BoundedAsyncExecutor& operator=(const BoundedAsyncExecutor&) = delete;
-
-    void WorkerLoop() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                queue_cv_.wait(lock, [this]() {
-                    return stopping_ || !queue_.empty();
-                });
-                if (stopping_ && queue_.empty()) {
-                    return;
-                }
-                task = std::move(queue_.front());
-                queue_.pop_front();
-            }
-            queue_space_cv_.notify_one();
-            task();
-        }
-    }
-
-    const std::size_t max_queue_depth_;
-    std::mutex mutex_;
-    std::condition_variable queue_cv_;
-    std::condition_variable queue_space_cv_;
-    std::deque<std::function<void()>> queue_;
-    std::vector<std::thread> workers_;
-    bool stopping_ = false;
-};
 }  // namespace worker_detail
-
-class KVLayerCompletionState {
-   public:
-    explicit KVLayerCompletionState(std::size_t num_layers)
-        : events_(num_layers, nullptr), ready_(num_layers, false) {}
-
-    KVLayerCompletionState(const KVLayerCompletionState&) = delete;
-    KVLayerCompletionState& operator=(const KVLayerCompletionState&) = delete;
-
-    ~KVLayerCompletionState() {
-        for (cudaEvent_t event : events_) {
-            if (event != nullptr) {
-                cudaEventDestroy(event);
-            }
-        }
-    }
-
-    [[nodiscard]] std::size_t num_layers() const { return events_.size(); }
-
-    void RecordLayerEvent(std::size_t layer_idx, cudaEvent_t event) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        CheckLayerBounds(layer_idx);
-        if (ready_[layer_idx]) {
-            throw std::runtime_error("Layer completion event recorded twice");
-        }
-        events_[layer_idx] = event;
-        ready_[layer_idx] = true;
-        cv_.notify_all();
-    }
-
-    void SetFailure(std::exception_ptr failure) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        failure_ = std::move(failure);
-        cv_.notify_all();
-    }
-
-    void WaitLayer(std::size_t layer_idx) const {
-        cudaEvent_t event = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            CheckLayerBounds(layer_idx);
-            cv_.wait(lock, [this, layer_idx]() {
-                return ready_[layer_idx] || failure_ != nullptr;
-            });
-            if (!ready_[layer_idx]) {
-                std::rethrow_exception(failure_);
-            }
-            event = events_[layer_idx];
-        }
-
-        auto stream = c10::cuda::getCurrentCUDAStream();
-        CUDA_CHECK(cudaStreamWaitEvent(stream.stream(), event, 0));
-    }
-
-   private:
-    void CheckLayerBounds(std::size_t layer_idx) const {
-        if (layer_idx >= events_.size()) {
-            std::ostringstream oss;
-            oss << "layer_idx=" << layer_idx
-                << " is out of range for layered KV async task with "
-                << events_.size() << " layers";
-            throw std::out_of_range(oss.str());
-        }
-    }
-
-    mutable std::mutex mutex_;
-    mutable std::condition_variable cv_;
-    std::vector<cudaEvent_t> events_;
-    std::vector<bool> ready_;
-    std::exception_ptr failure_;
-};
 
 struct KVAsyncTask {
     KVAsyncTask() = default;
     KVAsyncTask(std::uint64_t id, std::shared_future<void> future)
         : id_(id), future_(std::move(future)) {}
-    KVAsyncTask(std::uint64_t id, std::shared_future<void> future,
-                std::shared_ptr<KVLayerCompletionState> layer_state)
-        : id_(id),
-          future_(std::move(future)),
-          layer_state_(std::move(layer_state)) {}
 
     [[nodiscard]] std::uint64_t id() const { return id_; }
 
@@ -343,18 +155,6 @@ struct KVAsyncTask {
         }
     }
 
-    void wait_layer(std::size_t layer_idx) const {
-        if (layer_state_ == nullptr) {
-            wait();
-            return;
-        }
-        layer_state_->WaitLayer(layer_idx);
-    }
-
-    [[nodiscard]] std::size_t layer_count() const {
-        return layer_state_ == nullptr ? 0 : layer_state_->num_layers();
-    }
-
     void result() const {
         if (future_.valid()) {
             future_.get();
@@ -364,7 +164,6 @@ struct KVAsyncTask {
    private:
     std::uint64_t id_ = 0;
     std::shared_future<void> future_;
-    std::shared_ptr<KVLayerCompletionState> layer_state_;
 };
 
 using SequenceLengthMap = std::unordered_map<std::int64_t, std::size_t>;
@@ -375,46 +174,109 @@ using SequenceLengthMap = batchgen::kv::SequenceLengthMap;
 using SequenceLengthVector = batchgen::kv::SequenceLengthVector;
 using SequenceLengths = batchgen::kv::SequenceLengths;
 
-struct PrefixAllocationRequest {
-    std::int64_t sequence_id = 0;
-    std::vector<std::int64_t> token_ids;
-    std::size_t capacity_tokens = 0;
-    std::uint64_t namespace_hash = 0;
+struct IdentityLayerMapper {
+    static constexpr bool kMapped = false;
+
+    explicit IdentityLayerMapper(const HostPagedKVConfig&) {}
+
+    [[nodiscard]] std::size_t Resolve(std::size_t logical_layer_idx,
+                                      const HostPagedKVGeometry& geometry,
+                                      std::string_view context) const {
+        geometry.EnsureLayerBounds(logical_layer_idx, context);
+        return logical_layer_idx;
+    }
 };
 
-struct PrefixAllocationResult {
-    std::int64_t sequence_id = 0;
-    std::vector<std::int32_t> shared_prefix_pages;
-    std::vector<std::int32_t> private_pages;
-    std::size_t shared_prefix_tokens = 0;
-    std::size_t private_start_token = 0;
-    std::size_t logical_page_count = 0;
-    std::size_t physical_pages_allocated = 0;
-    bool full_hit = false;
-    std::string miss_reason;
+struct VectorLayerMapper {
+    static constexpr bool kMapped = true;
+
+    explicit VectorLayerMapper(const HostPagedKVConfig& config)
+        : logical_to_physical_layer_(config.logical_to_physical_layer) {
+        if (logical_to_physical_layer_.empty()) {
+            throw std::invalid_argument(
+                "Mapped HostPagedKVWorkerView requires "
+                "logical_to_physical_layer");
+        }
+        const bool has_physical_layer = std::any_of(
+            logical_to_physical_layer_.begin(),
+            logical_to_physical_layer_.end(),
+            [](std::int32_t physical_layer) { return physical_layer >= 0; });
+        if (!has_physical_layer) {
+            throw std::invalid_argument(
+                "Mapped HostPagedKVWorkerView requires at least one "
+                "logical_to_physical_layer entry with a non-negative physical "
+                "layer id");
+        }
+    }
+
+    [[nodiscard]] std::size_t Resolve(std::size_t logical_layer_idx,
+                                      const HostPagedKVGeometry& geometry,
+                                      std::string_view context) const {
+        if (logical_layer_idx >= logical_to_physical_layer_.size()) {
+            std::ostringstream oss;
+            oss << context << ": logical layer id " << logical_layer_idx
+                << " exceeds mapping size "
+                << logical_to_physical_layer_.size();
+            throw std::out_of_range(oss.str());
+        }
+        const std::int32_t physical_layer =
+            logical_to_physical_layer_[logical_layer_idx];
+        if (physical_layer < 0) {
+            std::ostringstream oss;
+            oss << context << ": logical layer id " << logical_layer_idx
+                << " has no physical layer id in this HostPagedKVWorkerView";
+            throw std::out_of_range(oss.str());
+        }
+        const auto physical_layer_idx =
+            static_cast<std::size_t>(physical_layer);
+        geometry.EnsureLayerBounds(physical_layer_idx, context);
+        return physical_layer_idx;
+    }
+
+    [[nodiscard]] std::size_t logical_layer_count() const noexcept {
+        return logical_to_physical_layer_.size();
+    }
+
+   private:
+    LayerMapping logical_to_physical_layer_;
 };
 
-template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>>
-class HostPagedKVWorkerView {
+template <HostKVMode Mode, typename Layout = HostPagedKVLayout<Mode>,
+          typename LayerMapper = IdentityLayerMapper>
+class HostPagedKVWorkerView : private LayerMapper {
+   private:
+    struct SanitizedConfigTag {};
+
    public:
     using ModeTraits = HostKVModeTraits<Mode>;
     static constexpr HostKVMode kMode = Mode;
     static constexpr bool kHasVCache = Layout::kHasVCache;
+    static constexpr bool kUsesLogicalLayerMapping = LayerMapper::kMapped;
 
-        explicit HostPagedKVWorkerView(const EngineConfig& engine_config,
-                                                                     const ModelConfig& model_config)
-                : HostPagedKVWorkerView(config::BuildHostPagedKVConfig(
-                            engine_config, model_config)) {}
+    explicit HostPagedKVWorkerView(const EngineConfig& engine_config,
+                                   const ModelConfig& model_config)
+        : HostPagedKVWorkerView(config::BuildHostPagedKVConfig(
+              engine_config, model_config)) {}
 
     explicit HostPagedKVWorkerView(const HostPagedKVConfig& config)
-        : config_(detail::SanitizeConfig(ModeTraits::Adjust(config))),
+        : HostPagedKVWorkerView(
+              detail::SanitizeConfig(ModeTraits::Adjust(config)),
+              SanitizedConfigTag{}) {}
+
+   private:
+    HostPagedKVWorkerView(HostPagedKVConfig config, SanitizedConfigTag)
+        : LayerMapper(config),
+          config_(std::move(config)),
           geometry_(config_),
           layout_(config_),
           backend_(config_, layout_.DataSectionBytes(), layout_.Fingerprint(),
                    Layout::kHasVCache),
           logger_(init_logger("info",
-              config_.logger_name.empty() ? "HostPagedKVWorkerView" : config_.logger_name)) {}
+                              config_.logger_name.empty()
+                                  ? "HostPagedKVWorkerView"
+                                  : config_.logger_name)) {}
 
+   public:
     HostPagedKVWorkerView(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView& operator=(const HostPagedKVWorkerView&) = delete;
     HostPagedKVWorkerView(HostPagedKVWorkerView&&) = delete;
@@ -422,7 +284,6 @@ class HostPagedKVWorkerView {
 
     ~HostPagedKVWorkerView() {
         try {
-            ClearPrefixCache();
             ResetCopyStreams();
             UnregisterPinnedMemory();
         } catch (const std::exception& ex) {
@@ -486,263 +347,6 @@ class HostPagedKVWorkerView {
         return allocated_pages;
     }
 
-    std::vector<PrefixAllocationResult> AllocatePagesForSequencesWithPrefix(
-        const std::vector<PrefixAllocationRequest>& requests) {
-        if (requests.empty()) {
-            return {};
-        }
-        std::vector<std::int64_t> sequence_ids;
-        sequence_ids.reserve(requests.size());
-        for (const auto& request : requests) {
-            sequence_ids.push_back(request.sequence_id);
-        }
-        EnsureSequencesRegistered(sequence_ids);
-
-        struct AllocationPlan {
-            const PrefixAllocationRequest* request = nullptr;
-            PrefixLookupResult hit;
-            std::size_t private_pages_required = 0;
-            std::vector<std::int32_t> private_pages;
-            bool attached_shared_pages = false;
-        };
-
-        std::vector<AllocationPlan> plans;
-        plans.reserve(requests.size());
-        std::unordered_set<std::int32_t> protected_pages;
-        std::size_t total_private_pages_required = 0;
-
-        for (const auto& request : requests) {
-            if (request.token_ids.empty()) {
-                throw std::invalid_argument(
-                    "Prefix allocation requires at least one prompt token");
-            }
-            if (request.capacity_tokens < request.token_ids.size()) {
-                throw std::invalid_argument(
-                    "capacity_tokens must be >= token_ids.size()");
-            }
-
-            const PrefixLookupResult hit = prefix_cache_.Lookup(
-                request.namespace_hash,
-                static_cast<std::int32_t>(config_.page_size_tokens),
-                request.token_ids);
-            const std::size_t private_tokens =
-                request.capacity_tokens - hit.matched_tokens;
-            const std::size_t private_pages_required =
-                private_tokens == 0 ? 0 : geometry_.RequiredPages(private_tokens);
-            total_private_pages_required += private_pages_required;
-            for (std::int32_t page : hit.host_pages) {
-                protected_pages.insert(page);
-            }
-            AllocationPlan plan;
-            plan.request = &request;
-            plan.hit = std::move(hit);
-            plan.private_pages_required = private_pages_required;
-            plans.emplace_back(std::move(plan));
-        }
-
-        if (backend_.FreePageCount() < total_private_pages_required) {
-            PrefixEvictionResult eviction = EvictPrefixCacheUntilFree(
-                total_private_pages_required, protected_pages);
-            if (!eviction.reached_target &&
-                backend_.FreePageCount() < total_private_pages_required) {
-                std::ostringstream oss;
-                oss << "AllocatePagesForSequencesWithPrefix: insufficient "
-                       "free pages after prefix cache eviction "
-                    << "(required=" << total_private_pages_required
-                    << ", available=" << backend_.FreePageCount()
-                    << ", evicted_entries=" << eviction.entries_removed
-                    << ", protected_skips="
-                    << eviction.protected_entries_skipped << ")";
-                throw std::runtime_error(oss.str());
-            }
-        }
-
-        std::vector<std::size_t> allocated_plan_indices;
-        std::vector<std::size_t> attached_plan_indices;
-        try {
-            for (std::size_t i = 0; i < plans.size(); ++i) {
-                AllocationPlan& plan = plans[i];
-                if (plan.private_pages_required == 0) {
-                    continue;
-                }
-                plan.private_pages = backend_.AcquirePages(
-                    plan.request->sequence_id, plan.private_pages_required);
-                allocated_plan_indices.push_back(i);
-            }
-            for (std::size_t i = 0; i < plans.size(); ++i) {
-                AllocationPlan& plan = plans[i];
-                if (plan.hit.host_pages.empty()) {
-                    continue;
-                }
-                backend_.AttachSequencePages(plan.hit.host_pages);
-                plan.attached_shared_pages = true;
-                attached_plan_indices.push_back(i);
-            }
-            for (const AllocationPlan& plan : plans) {
-                page_table_.RegisterOrUpdate(
-                    plan.request->sequence_id, plan.hit.host_pages,
-                    plan.private_pages,
-                    static_cast<std::int64_t>(plan.hit.matched_tokens),
-                    static_cast<std::int64_t>(plan.hit.matched_tokens),
-                    static_cast<std::int64_t>(plan.request->capacity_tokens));
-                if (!plan.hit.host_pages.empty()) {
-                    prefix_cache_.RecordAttachedPages(
-                        plan.hit.host_pages.size());
-                }
-            }
-        } catch (...) {
-            for (auto it = attached_plan_indices.rbegin();
-                 it != attached_plan_indices.rend(); ++it) {
-                const AllocationPlan& plan = plans[*it];
-                try {
-                    backend_.DetachSequencePages(plan.hit.host_pages);
-                } catch (const std::exception& ex) {
-                    logger_->error(
-                        "Failed to roll back attached prefix pages for "
-                        "sequence {}: {}",
-                        plan.request->sequence_id, ex.what());
-                }
-            }
-            for (auto it = allocated_plan_indices.rbegin();
-                 it != allocated_plan_indices.rend(); ++it) {
-                const AllocationPlan& plan = plans[*it];
-                try {
-                    backend_.ReleaseSequence(plan.request->sequence_id);
-                } catch (const std::exception& ex) {
-                    logger_->error(
-                        "Failed to roll back private pages for sequence {}: {}",
-                        plan.request->sequence_id, ex.what());
-                }
-            }
-            for (const auto& request : requests) {
-                try {
-                    page_table_.RegisterOrUpdate(
-                        request.sequence_id, std::vector<std::int32_t>{});
-                } catch (const std::exception& ex) {
-                    logger_->error(
-                        "Failed to reset page table for sequence {} after "
-                        "allocation rollback: {}",
-                        request.sequence_id, ex.what());
-                }
-            }
-            throw;
-        }
-
-        std::vector<PrefixAllocationResult> results;
-        results.reserve(plans.size());
-        for (const AllocationPlan& plan : plans) {
-            PrefixAllocationResult result;
-            result.sequence_id = plan.request->sequence_id;
-            result.shared_prefix_pages = plan.hit.host_pages;
-            result.private_pages = plan.private_pages;
-            result.shared_prefix_tokens = plan.hit.matched_tokens;
-            result.private_start_token = plan.hit.matched_tokens;
-            result.logical_page_count =
-                plan.hit.host_pages.size() + plan.private_pages.size();
-            result.physical_pages_allocated = plan.private_pages.size();
-            result.full_hit = plan.hit.full_hit;
-            result.miss_reason = plan.hit.miss_reason;
-            results.emplace_back(std::move(result));
-        }
-        return results;
-    }
-
-    std::vector<PrefixAllocationResult> EstimatePagesForSequencesWithPrefix(
-        const std::vector<PrefixAllocationRequest>& requests) {
-        std::vector<PrefixAllocationResult> results;
-        results.reserve(requests.size());
-        for (const auto& request : requests) {
-            if (request.token_ids.empty()) {
-                throw std::invalid_argument(
-                    "Prefix allocation estimate requires at least one prompt "
-                    "token");
-            }
-            if (request.capacity_tokens < request.token_ids.size()) {
-                throw std::invalid_argument(
-                    "capacity_tokens must be >= token_ids.size()");
-            }
-
-            const PrefixLookupResult hit = prefix_cache_.Peek(
-                request.namespace_hash,
-                static_cast<std::int32_t>(config_.page_size_tokens),
-                request.token_ids);
-            const std::size_t private_tokens =
-                request.capacity_tokens - hit.matched_tokens;
-            const std::size_t private_pages_required =
-                private_tokens == 0 ? 0 : geometry_.RequiredPages(private_tokens);
-
-            PrefixAllocationResult result;
-            result.sequence_id = request.sequence_id;
-            result.shared_prefix_pages = hit.host_pages;
-            result.shared_prefix_tokens = hit.matched_tokens;
-            result.private_start_token = hit.matched_tokens;
-            result.logical_page_count =
-                hit.host_pages.size() + private_pages_required;
-            result.physical_pages_allocated = private_pages_required;
-            result.full_hit = hit.full_hit;
-            result.miss_reason = hit.miss_reason;
-            results.emplace_back(std::move(result));
-        }
-        return results;
-    }
-
-    std::size_t CommitSequencePrefixPages(
-        std::int64_t sequence_id,
-        const std::vector<std::int64_t>& token_ids,
-        std::uint64_t namespace_hash = 0) {
-        EnsureSequenceRegistered(sequence_id);
-        const auto logical_pages = page_table_.Pages(sequence_id);
-        return prefix_cache_.CommitPages(
-            namespace_hash, static_cast<std::int32_t>(config_.page_size_tokens),
-            token_ids, logical_pages,
-            [this](std::int32_t page) { backend_.PinPrefixPage(page); });
-    }
-
-    PrefixCacheStats GetPrefixCacheStats() const {
-        return prefix_cache_.Stats();
-    }
-
-    std::vector<PrefixDebugEntry> PrefixCacheDebugEntries(
-        std::size_t limit = 0, bool cold_first = true) const {
-        return prefix_cache_.DebugEntries(limit, cold_first);
-    }
-
-    void ClearPrefixCache() {
-        prefix_cache_.Clear(
-            [this](std::int32_t page) { backend_.UnpinPrefixPage(page); });
-    }
-
-    PrefixEvictionResult EvictPrefixCacheUntilFree(
-        std::size_t target_free_pages,
-        const std::unordered_set<std::int32_t>& protected_pages = {}) {
-        PrefixEvictionOptions options;
-        options.target_free_pages = target_free_pages;
-        options.protected_pages = protected_pages;
-        PrefixEvictionResult result = prefix_cache_.EvictLeafPages(
-            options, [this](std::int32_t page) {
-                backend_.UnpinPrefixPage(page);
-            },
-            [this]() { return backend_.FreePageCount(); });
-        if (result.entries_removed > 0 || !result.reached_target) {
-            logger_->info(
-                "[PREFIX_EVICT] target_free={} entries_removed={} "
-                "pins_released={} immediate_free={} active_ref_removed={} "
-                "protected_skips={} reached_target={} free_pages={}",
-                target_free_pages, result.entries_removed,
-                result.prefix_pins_released, result.pages_immediately_freed,
-                result.active_ref_entries_removed,
-                result.protected_entries_skipped, result.reached_target,
-                backend_.FreePageCount());
-        }
-        if (result.active_ref_entries_removed > 0) {
-            logger_->debug(
-                "[PREFIX_EVICT] {} evicted prefix entries remain held by "
-                "active sequence refs",
-                result.active_ref_entries_removed);
-        }
-        return result;
-    }
-
     std::vector<std::int32_t> GrowSequencePages(
         std::int64_t sequence_id, std::size_t num_pages) {
         if (num_pages == 0) {
@@ -784,7 +388,6 @@ class HostPagedKVWorkerView {
     void Shutdown() {
         logger_->info("Shutting down HostPagedKVWorkerView (device_index={})",
                       device_index_);
-        ClearPrefixCache();
         ResetCopyStreams();
         UnregisterPinnedMemory();
         page_table_.Clear();
@@ -880,7 +483,7 @@ class HostPagedKVWorkerView {
             const auto k_plan = build_plan(
                 k_dest_ptr,
                 [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
-                    return this->KPagePtr(layer_idx, page_idx);
+                    return this->KPhysicalPagePtr(layer_idx, page_idx);
                 });
             const auto end = std::chrono::high_resolution_clock::now();
             double plan_ms =
@@ -898,8 +501,9 @@ class HostPagedKVWorkerView {
                     v_plan = build_plan(v_dest_ptr,
                                         [this](std::size_t layer_idx,
                                                std::int32_t page_idx) -> void* {
-                                            return this->template VPagePtr<>(
-                                                layer_idx, page_idx);
+                                            return this
+                                                ->template VPhysicalPagePtr<>(
+                                                    layer_idx, page_idx);
                                         });
                 }
             }
@@ -1116,7 +720,7 @@ class HostPagedKVWorkerView {
             const auto k_plan = build_plan(
                 k_dest_ptr,
                 [this](std::size_t layer_idx, std::int32_t page_idx) -> void* {
-                    return this->KPagePtr(layer_idx, page_idx);
+                    return this->KPhysicalPagePtr(layer_idx, page_idx);
                 });
             const auto plan_end = std::chrono::high_resolution_clock::now();
             const double plan_ms =
@@ -1134,8 +738,8 @@ class HostPagedKVWorkerView {
                     v_plan = build_plan(
                         v_dest_ptr, [this](std::size_t layer_idx,
                                            std::int32_t page_idx) -> void* {
-                            return this->template VPagePtr<>(layer_idx,
-                                                             page_idx);
+                            return this->template VPhysicalPagePtr<>(
+                                layer_idx, page_idx);
                         });
                 }
             }
@@ -1193,248 +797,51 @@ class HostPagedKVWorkerView {
         });
     }
 
-    KVAsyncTask AsyncLoadPrefixPagesToDevice(
-        torch::Tensor host_page_ids, torch::Tensor k_device_ptrs,
-        std::optional<torch::Tensor> v_device_ptrs = std::nullopt) {
-        EnsureDeviceReady();
-        constexpr std::string_view kOpName =
-            "AsyncLoadPrefixPagesToDevice";
-
-        auto validated_pages =
-            ValidatePageIdTensor(std::move(host_page_ids), "host_page_ids",
-                                 kOpName);
-        const auto total_pages =
-            static_cast<std::size_t>(validated_pages.size(0));
-
-        auto validated_k_ptrs = ValidatePointerMatrix(
-            std::move(k_device_ptrs), "k_device_ptrs", kOpName);
-        if (static_cast<std::size_t>(validated_k_ptrs.size(1)) !=
-            total_pages) {
-            std::ostringstream oss;
-            oss << kOpName << ": k_device_ptrs second dimension must match "
-                << "host_page_ids length (" << validated_k_ptrs.size(1)
-                << " != " << total_pages << ")";
-            throw std::out_of_range(oss.str());
-        }
-
-        std::optional<torch::Tensor> validated_v_ptrs;
-        if (v_device_ptrs.has_value()) {
-            if constexpr (!kHasVCache) {
-                throw std::invalid_argument(std::string(kOpName) +
-                                            ": V cache is disabled");
-            }
-            auto tensor = ValidatePointerMatrix(
-                std::move(*v_device_ptrs), "v_device_ptrs", kOpName);
-            if (tensor.sizes() != validated_k_ptrs.sizes()) {
-                std::ostringstream oss;
-                oss << kOpName
-                    << ": v_device_ptrs must match k_device_ptrs shape";
-                throw std::invalid_argument(oss.str());
-            }
-            validated_v_ptrs = std::move(tensor);
-        }
-
-        if (total_pages == 0) {
-            return LaunchAsyncTask([] {});
-        }
-
-        const std::size_t num_layers = config_.num_layers;
-        const std::size_t copy_entries = num_layers * total_pages;
-        const auto kernel_limit =
-            static_cast<std::size_t>(std::numeric_limits<int>::max());
-        if (copy_entries > kernel_limit) {
-            std::ostringstream oss;
-            oss << kOpName << ": copy_entries=" << copy_entries
-                << " exceeds kernel limit=" << kernel_limit;
-            throw std::invalid_argument(oss.str());
-        }
-
-        auto page_vector = TensorToInt32Vector(validated_pages, "host_page_ids",
-                                               kOpName);
-        std::vector<std::vector<std::int32_t>> page_table(1);
-        page_table[0] = std::move(page_vector);
-        std::vector<std::size_t> sequence_offsets{0};
-
-        logger_->debug(
-            "Prepared AsyncLoadPrefixPagesToDevice (num_layers={}, total_pages={})",
-            num_layers, total_pages);
-
-        return LaunchLayeredAsyncTask(num_layers, [
-            this,
-            page_table = std::move(page_table),
-            sequence_offsets = std::move(sequence_offsets),
-            k_tensor = std::move(validated_k_ptrs),
-            v_tensor = std::move(validated_v_ptrs),
-            total_pages,
-            num_layers,
-            copy_entries,
-            kOpName
-        ](KVLayerCompletionState& layer_state) mutable {
-            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
-            const auto cuda_stream = CopyStream(CopyDirection::kHostToDevice);
-            const std::size_t k_page_bytes = layout_.KPageBytes();
-            if (k_page_bytes == 0) {
-                return;
-            }
-
-            auto* k_dest_ptr = k_tensor.template data_ptr<std::int64_t>();
-            const std::int64_t* v_dest_ptr =
-                v_tensor.has_value()
-                    ? v_tensor->data_ptr<std::int64_t>()
-                    : nullptr;
-            const std::size_t row_stride = total_pages;
-            auto build_layer_plan = [&](std::size_t layer_idx,
-                                        const std::int64_t* dest_ptrs,
-                                        auto&& host_ptr_provider) {
-                if (dest_ptrs == nullptr) {
-                    throw std::invalid_argument(std::string(kOpName) +
-                                                ": null device pointers");
-                }
-                return this->BuildPageCopyPlan(
-                    page_table, sequence_offsets, 1, row_stride, total_pages,
-                    dest_ptrs + layer_idx * row_stride,
-                    std::forward<decltype(host_ptr_provider)>(
-                        host_ptr_provider),
-                    kOpName);
-            };
-
-            worker_detail::DeviceBuffer<uint8_t*> k_device_src_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> k_device_dst_ptrs(
-                copy_entries);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_src_ptrs(
-                v_dest_ptr != nullptr ? copy_entries : 0);
-            worker_detail::DeviceBuffer<uint8_t*> v_device_dst_ptrs(
-                v_dest_ptr != nullptr ? copy_entries : 0);
-
-            auto enqueue_plan =
-                [&](const PageCopyPlan& plan,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_src_ptrs,
-                    worker_detail::DeviceBuffer<uint8_t*>& dev_dst_ptrs,
-                    std::size_t page_bytes, std::size_t layer_idx) {
-                    if (plan.host_sources.empty() || page_bytes == 0) {
-                        return;
-                    }
-                    const std::size_t device_offset = layer_idx * total_pages;
-                    const std::size_t ptr_bytes =
-                        plan.host_sources.size() * sizeof(uint8_t*);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.host_sources.data()),
-                        reinterpret_cast<std::byte*>(
-                            dev_src_ptrs.get() + device_offset),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    EnqueueCopy(
-                        reinterpret_cast<const std::byte*>(
-                            plan.device_dests.data()),
-                        reinterpret_cast<std::byte*>(
-                            dev_dst_ptrs.get() + device_offset),
-                        ptr_bytes, CopyDirection::kHostToDevice, cuda_stream);
-                    worker_detail::LaunchUvaPageCopyKernel(
-                        dev_src_ptrs.get() + device_offset,
-                        dev_dst_ptrs.get() + device_offset, page_bytes,
-                        static_cast<int>(plan.host_sources.size()),
-                        cuda_stream);
-                };
-
-            std::vector<PageCopyPlan> k_layer_plans;
-            k_layer_plans.reserve(num_layers);
-            std::vector<PageCopyPlan> v_layer_plans;
-            if constexpr (kHasVCache) {
-                if (v_dest_ptr != nullptr) {
-                    v_layer_plans.reserve(num_layers);
-                }
-            }
-            for (std::size_t layer_idx = 0; layer_idx < num_layers;
-                 ++layer_idx) {
-                k_layer_plans.emplace_back(build_layer_plan(
-                    layer_idx, k_dest_ptr,
-                    [this, layer_idx](
-                        std::size_t /*unused*/, std::int32_t page_idx
-                    ) -> void* {
-                        return this->KPagePtr(layer_idx, page_idx);
-                    }));
-                enqueue_plan(k_layer_plans.back(), k_device_src_ptrs,
-                             k_device_dst_ptrs, k_page_bytes, layer_idx);
-
-                if constexpr (kHasVCache) {
-                    if (v_dest_ptr != nullptr) {
-                        v_layer_plans.emplace_back(build_layer_plan(
-                            layer_idx, v_dest_ptr,
-                            [this, layer_idx](
-                                std::size_t /*unused*/,
-                                std::int32_t page_idx
-                            ) -> void* {
-                                return this->template VPagePtr<>(layer_idx,
-                                                                 page_idx);
-                            }));
-                        const std::size_t v_page_bytes = layout_.VPageBytes();
-                        enqueue_plan(v_layer_plans.back(), v_device_src_ptrs,
-                                     v_device_dst_ptrs, v_page_bytes,
-                                     layer_idx);
-                    }
-                }
-
-                cudaEvent_t layer_event = nullptr;
-                CUDA_CHECK(cudaEventCreateWithFlags(
-                    &layer_event, cudaEventDisableTiming));
-                CUDA_CHECK(cudaEventRecord(layer_event, cuda_stream));
-                layer_state.RecordLayerEvent(layer_idx, layer_event);
-            }
-
-            logger_->debug(
-                "AsyncLoadPrefixPagesToDevice completed (num_layers={}, total_pages={}, k_page_bytes={})",
-                num_layers, total_pages, k_page_bytes);
-            this->SynchronizeWithEvent(cuda_stream);
-        });
-    }
-
     std::byte* DataBase() { return backend_.DataBase(); }
     const std::byte* DataBase() const { return backend_.DataBase(); }
 
     void* KPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<void*>(
-            layout_.KPageAddress(backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return KPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     const void* KPagePtr(std::size_t layer_idx, std::int32_t page_idx) const {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<const void*>(
-            layout_.KPageAddress(backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return KPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     template <bool Enabled = Layout::kHasVCache,
               typename = std::enable_if_t<Enabled>>
     void* VPagePtr(std::size_t layer_idx, std::int32_t page_idx) {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<void*>(layout_.template VPageAddress<>(
-            backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return VPhysicalPagePtr(physical_layer_idx, page_idx);
     }
 
     template <bool Enabled = Layout::kHasVCache,
               typename = std::enable_if_t<Enabled>>
     const void* VPagePtr(std::size_t layer_idx, std::int32_t page_idx) const {
-        geometry_.EnsureLayerBounds(layer_idx, kClassTag);
-        geometry_.EnsurePageBounds(page_idx, kClassTag);
-        return static_cast<const void*>(layout_.template VPageAddress<>(
-            backend_.DataBase(), layer_idx, page_idx));
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kClassTag);
+        return VPhysicalPagePtr(physical_layer_idx, page_idx);
+    }
+
+    [[nodiscard]] std::size_t ResolvePhysicalLayer(
+        std::size_t logical_layer_idx, std::string_view context) const {
+        if constexpr (LayerMapper::kMapped) {
+            return static_cast<const LayerMapper&>(*this).Resolve(
+                logical_layer_idx, geometry_, context);
+        } else {
+            geometry_.EnsureLayerBounds(logical_layer_idx, context);
+            return logical_layer_idx;
+        }
     }
 
     const HostPagedKVConfig& config() const { return config_; }
     const Layout& layout() const { return layout_; }
     HostPagedKVStats GetStats() const { return backend_.CollectStats(); }
-    std::size_t FreePageCount() const { return backend_.FreePageCount(); }
-    HostPageRefState PageRefState(std::int32_t page) const {
-        return backend_.PageRefState(page);
-    }
-    std::vector<HostPageRefState> PageRefStates(
-        const std::vector<std::int32_t>& pages) const {
-        return backend_.PageRefStates(pages);
-    }
     int device_index() const { return device_index_; }
 
     std::string DebugString() const {
@@ -1468,44 +875,17 @@ class HostPagedKVWorkerView {
         return table;
     }
 
-    std::vector<std::int32_t> SharedPrefixPages(
-        std::int64_t sequence_id) const {
-        return page_table_.SharedPrefixPages(sequence_id);
-    }
-
-    std::vector<std::int32_t> PrivatePages(std::int64_t sequence_id) const {
-        return page_table_.PrivatePages(sequence_id);
-    }
-
-    std::int64_t SharedPrefixTokens(std::int64_t sequence_id) const {
-        return page_table_.SharedPrefixTokens(sequence_id);
-    }
-
     std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
         std::optional<std::size_t> max_tokens = std::nullopt) const {
-        geometry_.EnsureLayerBounds(
+        const std::size_t physical_layer_idx = ResolvePhysicalLayer(
             layer_idx, "HostPagedKVWorkerView::GetSequenceLayerPagePointers");
         std::optional<std::size_t> max_pages;
         if (max_tokens.has_value()) {
             max_pages = geometry_.RequiredPages(max_tokens.value());
         }
-        const bool has_shared_prefix =
-            page_table_.Contains(sequence_id) &&
-            !page_table_.SharedPrefixPages(sequence_id).empty();
-        auto page_indices =
-            has_shared_prefix
-                ? page_table_.Pages(sequence_id)
-                : backend_.SequencePages(sequence_id, max_pages);
-        if (max_pages.has_value()) {
-            if (max_pages.value() > page_indices.size()) {
-                throw std::out_of_range(
-                    "HostPagedKVWorkerView::GetSequenceLayerPagePointers: "
-                    "requested more pages than allocated");
-            }
-            page_indices.resize(max_pages.value());
-        }
+        auto page_indices = backend_.SequencePages(sequence_id, max_pages);
         std::vector<void*> k_ptrs;
         k_ptrs.reserve(page_indices.size());
         std::optional<std::vector<void*>> v_ptrs;
@@ -1515,14 +895,14 @@ class HostPagedKVWorkerView {
         }
         std::byte* base = const_cast<std::byte*>(backend_.DataBase());
         for (std::int32_t page : page_indices) {
-            void* k_ptr =
-                static_cast<void*>(layout_.KPageAddress(base, layer_idx, page));
+            void* k_ptr = static_cast<void*>(
+                layout_.KPageAddress(base, physical_layer_idx, page));
             k_ptrs.emplace_back(k_ptr);
             // LogPageBytes("K", layer_idx, sequence_id, page, k_ptr,
             //              geometry_.KTokenBytes());
             if constexpr (Layout::kHasVCache) {
                 void* v_ptr = static_cast<void*>(
-                    layout_.VPageAddress(base, layer_idx, page));
+                    layout_.VPageAddress(base, physical_layer_idx, page));
                 v_ptrs->emplace_back(v_ptr);
                 // LogPageBytes("V", layer_idx, sequence_id, page, v_ptr,
                 //              geometry_.template VTokenBytes<true>());
@@ -1574,32 +954,41 @@ class HostPagedKVWorkerView {
                 throw std::runtime_error(oss.str());
             }
         }
-        std::vector<std::int64_t> registered_sequence_ids;
-        registered_sequence_ids.reserve(sequence_ids.size());
-        for (std::int64_t sequence_id : sequence_ids) {
-            if (page_table_.Contains(sequence_id)) {
-                registered_sequence_ids.push_back(sequence_id);
-            }
+        EnsureSequencesRegistered(sequence_ids);
+        backend_.ReleaseSequences(sequence_ids);
+        UnregisterSequences(sequence_ids);
+    }
+
+    std::vector<std::int32_t> ReleaseSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages) {
+        if (num_pages == 0) {
+            return {};
         }
-        if (registered_sequence_ids.empty()) {
-            return;
+        EnsureSequenceRegistered(sequence_id);
+        const auto current_pages = page_table_.Pages(sequence_id);
+        if (num_pages > current_pages.size()) {
+            std::ostringstream oss;
+            oss << "ReleaseSequencePrefixPages: cannot release " << num_pages
+                << " prefix pages from sequence " << sequence_id
+                << " with only " << current_pages.size()
+                << " pages in the worker page table";
+            throw std::out_of_range(oss.str());
         }
-        const bool has_any_shared_prefix =
-            std::any_of(registered_sequence_ids.begin(),
-                        registered_sequence_ids.end(),
-                        [this](std::int64_t sequence_id) {
-                            return !page_table_.SharedPrefixPages(sequence_id)
-                                        .empty();
-                        });
-        if (!has_any_shared_prefix) {
-            backend_.ReleaseSequences(registered_sequence_ids);
-        } else {
-            for (std::int64_t sequence_id : registered_sequence_ids) {
-                backend_.ReleaseSequenceLogical(sequence_id,
-                                                page_table_.Pages(sequence_id));
-            }
+        auto released =
+            backend_.ReleaseSequencePrefixPages(sequence_id, num_pages);
+        const auto popped =
+            page_table_.PopPrefixPages(sequence_id, num_pages);
+        if (released.size() != popped.size()) {
+            throw std::logic_error(
+                "ReleaseSequencePrefixPages: backend/page-table size "
+                "mismatch");
         }
-        UnregisterSequences(registered_sequence_ids);
+        if (released != popped) {
+            throw std::logic_error(
+                "ReleaseSequencePrefixPages: backend/page-table page order "
+                "mismatch");
+        }
+        return released;
     }
 
     KVAsyncTask AsyncOffloadLayerKVToHost(
@@ -1607,7 +996,8 @@ class HostPagedKVWorkerView {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         // [B, S, H, D]
         SequenceLengths sequence_lengths) {
-        geometry_.EnsureLayerBounds(layer_idx, "AsyncOffloadLayerKVToHost");
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "AsyncOffloadLayerKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
         if (batch == 0) {
@@ -1632,7 +1022,7 @@ class HostPagedKVWorkerView {
         const auto producer_cuda_stream =
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
-        return LaunchAsyncTask([this, layer_idx,
+        return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v, tokens_per_sequence,
@@ -1683,7 +1073,8 @@ class HostPagedKVWorkerView {
                         std::size_t chunk_tokens,
                         std::size_t relative_token_offset) {
                         std::byte* dst = layout_.KPageAddress(
-                                             host_base, layer_idx, page_idx) +
+                                             host_base, physical_layer_idx,
+                                             page_idx) +
                                          page_offset_tokens * k_token_bytes;
                         const std::byte* src =
                             seq_k_src + relative_token_offset * k_token_bytes;
@@ -1702,7 +1093,8 @@ class HostPagedKVWorkerView {
                                 std::size_t relative_token_offset) {
                                 std::byte* dst =
                                     layout_.template VPageAddress<>(
-                                        host_base, layer_idx, page_idx) +
+                                        host_base, physical_layer_idx,
+                                        page_idx) +
                                     page_offset_tokens * v_token_bytes;
                                 const std::byte* src =
                                     seq_v_src +
@@ -1721,178 +1113,12 @@ class HostPagedKVWorkerView {
         });
     }
 
-    KVAsyncTask AsyncOffloadLayerKVToHostWithOffsets(
-        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
-        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
-        SequenceLengths sequence_lengths,
-        std::vector<std::size_t> source_token_starts,
-        std::vector<std::size_t> destination_token_starts) {
-        constexpr std::string_view kOpName =
-            "AsyncOffloadLayerKVToHostWithOffsets";
-        geometry_.EnsureLayerBounds(layer_idx, kOpName);
-        EnsureDeviceReady();
-        const std::size_t batch = sequence_ids.size();
-        if (source_token_starts.size() != batch ||
-            destination_token_starts.size() != batch) {
-            std::ostringstream oss;
-            oss << kOpName
-                << ": source_token_starts and destination_token_starts must "
-                   "match sequence_ids size ("
-                << batch << ")";
-            throw std::invalid_argument(oss.str());
-        }
-        if (batch == 0) {
-            return LaunchAsyncTask([] {});
-        }
-
-        const std::size_t tokens_per_sequence =
-            ValidateKTensorShape(k_tensor, batch);
-        ValidateSequenceLengthsInput(sequence_lengths, batch, kOpName);
-        torch::Tensor prepared_k = k_tensor;
-        std::optional<torch::Tensor> prepared_v;
-        if (v_tensor.has_value()) {
-            if constexpr (kHasVCache) {
-                ValidateVTensorShape(*v_tensor, batch, tokens_per_sequence);
-                prepared_v = *v_tensor;
-            } else {
-                throw std::invalid_argument(
-                    "V tensor provided but V cache is disabled");
-            }
-        }
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
-        const std::string op_name(kOpName);
-
-        return LaunchAsyncTask([this, layer_idx,
-                                 sequence_ids = std::move(sequence_ids),
-                                 sequence_lengths = std::move(sequence_lengths),
-                                 source_token_starts =
-                                     std::move(source_token_starts),
-                                 destination_token_starts =
-                                     std::move(destination_token_starts),
-                                 op_name,
-                                 prepared_k, prepared_v, tokens_per_sequence,
-                                 producer_cuda_stream]() {
-            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
-            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
-
-            const auto* k_base =
-                static_cast<const std::byte*>(prepared_k.data_ptr());
-            const std::size_t k_token_bytes = geometry_.KTokenBytes();
-            const std::size_t k_seq_stride =
-                tokens_per_sequence * k_token_bytes;
-
-            const std::byte* v_base = nullptr;
-            std::size_t v_token_bytes = 0;
-            std::size_t v_seq_stride = 0;
-            if (prepared_v.has_value()) {
-                if constexpr (kHasVCache) {
-                    v_base =
-                        static_cast<const std::byte*>(prepared_v->data_ptr());
-                    v_token_bytes =
-                        geometry_.template VTokenBytes<kHasVCache>();
-                    v_seq_stride = tokens_per_sequence * v_token_bytes;
-                }
-            }
-
-            std::byte* host_base = backend_.DataBase();
-
-            for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
-                 ++batch_idx) {
-                const std::int64_t sequence_id = sequence_ids[batch_idx];
-                const auto pages = page_table_.Pages(sequence_id);
-                const std::size_t tokens_to_copy = ResolveSequenceLength(
-                    sequence_lengths, batch_idx, sequence_id,
-                    tokens_per_sequence, op_name);
-                if (tokens_to_copy == 0) {
-                    continue;
-                }
-
-                const std::size_t source_token_start =
-                    source_token_starts[batch_idx];
-                const std::size_t destination_token_start =
-                    destination_token_starts[batch_idx];
-                if (source_token_start + tokens_to_copy >
-                    tokens_per_sequence) {
-                    std::ostringstream oss;
-                    oss << op_name << ": source range exceeds tensor capacity "
-                        << "for sequence " << sequence_id
-                        << " (source_start=" << source_token_start
-                        << ", tokens=" << tokens_to_copy
-                        << ", tensor_tokens=" << tokens_per_sequence << ")";
-                    throw std::out_of_range(oss.str());
-                }
-
-                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
-                    page_table_.SharedPrefixTokens(sequence_id));
-                if (destination_token_start < shared_prefix_tokens) {
-                    std::ostringstream oss;
-                    oss << op_name << ": refusing to write into shared prefix "
-                        << "for sequence " << sequence_id
-                        << " (destination_start=" << destination_token_start
-                        << ", shared_prefix_tokens="
-                        << shared_prefix_tokens << ")";
-                    throw std::invalid_argument(oss.str());
-                }
-
-                geometry_.ValidatePageCapacity(
-                    pages, destination_token_start + tokens_to_copy, op_name);
-
-                const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
-                ForEachPageChunk(
-                    pages, destination_token_start, tokens_to_copy,
-                    [&](std::int32_t page_idx, std::size_t page_offset_tokens,
-                        std::size_t chunk_tokens,
-                        std::size_t relative_token_offset) {
-                        std::byte* dst = layout_.KPageAddress(
-                                             host_base, layer_idx, page_idx) +
-                                         page_offset_tokens * k_token_bytes;
-                        const std::byte* src =
-                            seq_k_src +
-                            (source_token_start + relative_token_offset) *
-                                k_token_bytes;
-                        EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
-                                    CopyDirection::kDeviceToHost, cuda_stream);
-                    });
-
-                if constexpr (kHasVCache) {
-                    if (v_base != nullptr) {
-                        const auto* seq_v_src =
-                            v_base + batch_idx * v_seq_stride;
-                        ForEachPageChunk(
-                            pages, destination_token_start, tokens_to_copy,
-                            [&](std::int32_t page_idx,
-                                std::size_t page_offset_tokens,
-                                std::size_t chunk_tokens,
-                                std::size_t relative_token_offset) {
-                                std::byte* dst =
-                                    layout_.template VPageAddress<>(
-                                        host_base, layer_idx, page_idx) +
-                                    page_offset_tokens * v_token_bytes;
-                                const std::byte* src =
-                                    seq_v_src +
-                                    (source_token_start +
-                                     relative_token_offset) *
-                                        v_token_bytes;
-                                EnqueueCopy(
-                                    src, dst, chunk_tokens * v_token_bytes,
-                                    CopyDirection::kDeviceToHost, cuda_stream);
-                            });
-                    }
-                }
-            }
-
-            this->SynchronizeWithEvent(cuda_stream);
-        });
-    }
-
     KVAsyncTask AsyncAppendDecodeKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         SequenceLengths sequence_lengths) {
-        geometry_.EnsureLayerBounds(layer_idx, "AsyncAppendDecodeKVToHost");
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "AsyncAppendDecodeKVToHost");
         EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
         if (batch == 0) {
@@ -1923,7 +1149,7 @@ class HostPagedKVWorkerView {
         const auto producer_cuda_stream =
             at::cuda::getCurrentCUDAStream(device_index_).stream();
 
-        return LaunchAsyncTask([this, layer_idx,
+        return LaunchAsyncTask([this, physical_layer_idx,
                                  sequence_ids = std::move(sequence_ids),
                                  sequence_lengths = std::move(sequence_lengths),
                                  prepared_k, prepared_v,
@@ -1958,13 +1184,6 @@ class HostPagedKVWorkerView {
                 const std::size_t start_token = ResolveSequenceLength(
                     sequence_lengths, batch_idx, sequence_id, std::nullopt,
                     "AsyncAppendDecodeKVToHost");
-                const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
-                    page_table_.SharedPrefixTokens(sequence_id));
-                if (start_token < shared_prefix_tokens) {
-                    throw std::runtime_error(
-                        "AsyncAppendDecodeKVToHost: refusing to write into "
-                        "shared prefix pages");
-                }
                 const auto pages = page_table_.Pages(sequence_id);
                 geometry_.ValidatePageCapacity(pages, start_token + 1,
                                                "AsyncAppendDecodeKVToHost");
@@ -1974,8 +1193,9 @@ class HostPagedKVWorkerView {
                                         "AsyncAppendDecodeKVToHost");
 
                 const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
-                std::byte* k_dst = layout_.KPageAddress(host_base, layer_idx,
-                                                        location.page_idx) +
+                std::byte* k_dst =
+                    layout_.KPageAddress(host_base, physical_layer_idx,
+                                         location.page_idx) +
                                    location.page_offset_tokens * k_token_bytes;
                 EnqueueCopy(seq_k_src, k_dst, k_token_bytes,
                             CopyDirection::kDeviceToHost, cuda_stream);
@@ -1986,7 +1206,8 @@ class HostPagedKVWorkerView {
                             v_base + batch_idx * v_seq_stride;
                         std::byte* v_dst =
                             layout_.template VPageAddress<>(
-                                host_base, layer_idx, location.page_idx) +
+                                host_base, physical_layer_idx,
+                                location.page_idx) +
                             location.page_offset_tokens * v_token_bytes;
                         EnqueueCopy(seq_v_src, v_dst, v_token_bytes,
                                     CopyDirection::kDeviceToHost, cuda_stream);
@@ -2033,9 +1254,9 @@ class HostPagedKVWorkerView {
 
         // Validate each entry and detect V presence
         bool has_v = false;
-        for (const auto& e : entries) {
-            geometry_.EnsureLayerBounds(e.layer_idx,
-                                        "AsyncAppendDecodeKVToHostBatchedKernel");
+        for (auto& e : entries) {
+            e.layer_idx = ResolvePhysicalLayer(
+                e.layer_idx, "AsyncAppendDecodeKVToHostBatchedKernel");
             const std::size_t tokens_per_seq =
                 ValidateKTensorShape(e.k_tensor, batch);
             if (tokens_per_seq != 1) {
@@ -2073,13 +1294,6 @@ class HostPagedKVWorkerView {
             const std::size_t start_token = ResolveSequenceLength(
                 sequence_lengths, b, sid, std::nullopt,
                 "AsyncAppendDecodeKVToHostBatchedKernel");
-            const std::size_t shared_prefix_tokens = static_cast<std::size_t>(
-                page_table_.SharedPrefixTokens(sid));
-            if (start_token < shared_prefix_tokens) {
-                throw std::runtime_error(
-                    "AsyncAppendDecodeKVToHostBatchedKernel: refusing to write "
-                    "into shared prefix pages");
-            }
             const auto pages = page_table_.Pages(sid);
             geometry_.ValidatePageCapacity(
                 pages, start_token + 1,
@@ -2339,23 +1553,44 @@ class HostPagedKVWorkerView {
         std::vector<uint8_t*> device_dests;
     };
 
-    struct CopyPointerPair {
-        std::uintptr_t host = 0;
-        std::uintptr_t device = 0;
-
-        bool operator==(const CopyPointerPair& other) const {
-            return host == other.host && device == other.device;
-        }
-    };
-
-    struct CopyPointerPairHash {
-        std::size_t operator()(const CopyPointerPair& pair) const {
-            return static_cast<std::size_t>(HashCombine(pair.host, pair.device));
-        }
-    };
-
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
+
+    void* KPhysicalPagePtr(std::size_t physical_layer_idx,
+                           std::int32_t page_idx) {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<void*>(layout_.KPageAddress(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    const void* KPhysicalPagePtr(std::size_t physical_layer_idx,
+                                 std::int32_t page_idx) const {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<const void*>(layout_.KPageAddress(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    template <bool Enabled = Layout::kHasVCache,
+              typename = std::enable_if_t<Enabled>>
+    void* VPhysicalPagePtr(std::size_t physical_layer_idx,
+                           std::int32_t page_idx) {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<void*>(layout_.template VPageAddress<>(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
+
+    template <bool Enabled = Layout::kHasVCache,
+              typename = std::enable_if_t<Enabled>>
+    const void* VPhysicalPagePtr(std::size_t physical_layer_idx,
+                                 std::int32_t page_idx) const {
+        geometry_.EnsureLayerBounds(physical_layer_idx, kClassTag);
+        geometry_.EnsurePageBounds(page_idx, kClassTag);
+        return static_cast<const void*>(layout_.template VPageAddress<>(
+            backend_.DataBase(), physical_layer_idx, page_idx));
+    }
 
     void RegisterPinnedMemory() {
         if (pinned_registered_) {
@@ -2526,6 +1761,8 @@ class HostPagedKVWorkerView {
                               std::size_t tokens_per_sequence,
                               std::byte* host_base) const {
         constexpr std::string_view kOpName = "AsyncOffloadLayerKVToHost";
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, kOpName);
         const std::size_t tokens_per_page = geometry_.PageSizeTokens();
         if (host_base == nullptr) {
             logger_->warn(
@@ -2549,7 +1786,8 @@ class HostPagedKVWorkerView {
                 }
                 const std::int32_t page_idx = pages[slot];
                 const std::byte* token_ptr =
-                    layout_.KPageAddress(host_base, layer_idx, page_idx);
+                    layout_.KPageAddress(host_base, physical_layer_idx,
+                                         page_idx);
                 logger_->info("Layer {} Seq {} Page {} first_token_hex {}",
                               layer_idx, sequence_id, page_idx,
                               geometry_.DescribeBytes(token_ptr,
@@ -2563,6 +1801,8 @@ class HostPagedKVWorkerView {
                                const SequenceLengths& sequence_lengths,
                                std::byte* host_base,
                                std::size_t neighborhood = 1) const {
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, "LogDecodeNeighborhood");
         if (host_base == nullptr) {
             logger_->warn("LogDecodeNeighborhood: host_base is null, skipping");
             return;
@@ -2599,7 +1839,7 @@ class HostPagedKVWorkerView {
                     pages, sequence_id, token_idx, "LogDecodeNeighborhood");
 
                 const std::byte* token_ptr =
-                    layout_.KPageAddress(host_base, layer_idx,
+                    layout_.KPageAddress(host_base, physical_layer_idx,
                                          location.page_idx) +
                     location.page_offset_tokens * k_token_bytes;
 
@@ -2769,11 +2009,10 @@ class HostPagedKVWorkerView {
                                         ": device pointer tensor is null");
         }
         PageCopyPlan plan;
-        plan.host_sources.reserve(total_entries);
-        plan.device_dests.reserve(total_entries);
-        std::unordered_set<CopyPointerPair, CopyPointerPairHash> seen_copies;
-        seen_copies.reserve(total_entries);
+        plan.host_sources.resize(total_entries);
+        plan.device_dests.resize(total_entries);
         auto&& provider = std::forward<HostPtrProvider>(host_ptr_provider);
+        std::size_t cursor = 0;
         for (std::size_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
             const std::size_t layer_offset = layer_idx * row_stride;
             for (std::size_t seq_idx = 0; seq_idx < page_table.size();
@@ -2809,17 +2048,17 @@ class HostPagedKVWorkerView {
                         static_cast<uint8_t*>(provider(layer_idx, page_idx));
                     auto* device_ptr = reinterpret_cast<uint8_t*>(
                         static_cast<std::uintptr_t>(dest_raw));
-                    const auto host_key =
-                        reinterpret_cast<std::uintptr_t>(host_ptr);
-                    const auto device_key =
-                        reinterpret_cast<std::uintptr_t>(device_ptr);
-                    const CopyPointerPair copy_key{host_key, device_key};
-                    if (seen_copies.insert(copy_key).second) {
-                        plan.host_sources.emplace_back(host_ptr);
-                        plan.device_dests.emplace_back(device_ptr);
-                    }
+                    plan.host_sources[cursor] = host_ptr;
+                    plan.device_dests[cursor] = device_ptr;
+                    ++cursor;
                 }
             }
+        }
+        if (cursor != total_entries) {
+            std::ostringstream oss;
+            oss << op_name << ": expected " << total_entries
+                << " entries but prepared " << cursor;
+            throw std::logic_error(oss.str());
         }
         return plan;
     }
@@ -2976,37 +2215,6 @@ class HostPagedKVWorkerView {
         return tensor;
     }
 
-    torch::Tensor ValidatePageIdTensor(torch::Tensor tensor,
-                                       std::string_view tensor_name,
-                                       std::string_view op_name) const {
-        if (tensor.device().type() != torch::kCPU) {
-            std::ostringstream oss;
-            oss << op_name << ": " << tensor_name
-                << " must reside on CPU";
-            throw std::invalid_argument(oss.str());
-        }
-        if (!tensor.is_contiguous()) {
-            std::ostringstream oss;
-            oss << op_name << ": " << tensor_name
-                << " must be contiguous";
-            throw std::invalid_argument(oss.str());
-        }
-        if (tensor.dim() != 1) {
-            std::ostringstream oss;
-            oss << op_name << ": " << tensor_name
-                << " must be 1-D";
-            throw std::invalid_argument(oss.str());
-        }
-        if (tensor.scalar_type() != torch::kInt64 &&
-            tensor.scalar_type() != torch::kInt32) {
-            std::ostringstream oss;
-            oss << op_name << ": " << tensor_name
-                << " must have dtype int32 or int64";
-            throw std::invalid_argument(oss.str());
-        }
-        return tensor;
-    }
-
     std::vector<std::size_t> TensorToSizeVector(
         const torch::Tensor& tensor, std::string_view tensor_name,
         std::string_view op_name) const {
@@ -3115,46 +2323,6 @@ class HostPagedKVWorkerView {
         return values;
     }
 
-    std::vector<std::int32_t> TensorToInt32Vector(
-        const torch::Tensor& tensor, std::string_view tensor_name,
-        std::string_view op_name) const {
-        const auto length = static_cast<std::size_t>(tensor.size(0));
-        std::vector<std::int32_t> values(length);
-        if (length == 0) {
-            return values;
-        }
-        if (tensor.scalar_type() == torch::kInt64) {
-            const auto* data = tensor.data_ptr<std::int64_t>();
-            for (std::size_t idx = 0; idx < length; ++idx) {
-                const auto value = data[idx];
-                if (value < 0 ||
-                    value > std::numeric_limits<std::int32_t>::max()) {
-                    std::ostringstream oss;
-                    oss << op_name << ": " << tensor_name
-                        << " value out of int32 page range (index=" << idx
-                        << ", value=" << value << ")";
-                    throw std::out_of_range(oss.str());
-                }
-                values[idx] = static_cast<std::int32_t>(value);
-            }
-            return values;
-        }
-
-        const auto* data = tensor.data_ptr<std::int32_t>();
-        for (std::size_t idx = 0; idx < length; ++idx) {
-            const auto value = data[idx];
-            if (value < 0) {
-                std::ostringstream oss;
-                oss << op_name << ": " << tensor_name
-                    << " must be non-negative (index=" << idx
-                    << ", value=" << value << ")";
-                throw std::out_of_range(oss.str());
-            }
-            values[idx] = value;
-        }
-        return values;
-    }
-
     std::size_t ValidateKTensorShape(const torch::Tensor& tensor,
                                      std::size_t expected_batch) const {
         ValidateCudaTensor(tensor);
@@ -3260,32 +2428,11 @@ class HostPagedKVWorkerView {
 
     template <typename Fn>
     KVAsyncTask LaunchAsyncTask(Fn&& fn) const {
-        auto future = worker_detail::BoundedAsyncExecutor::Instance().Submit(
-            std::forward<Fn>(fn));
+        auto future =
+            std::async(std::launch::async, std::forward<Fn>(fn)).share();
         const std::uint64_t id =
             task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
         return KVAsyncTask{id, std::move(future)};
-    }
-
-    template <typename Fn>
-    KVAsyncTask LaunchLayeredAsyncTask(std::size_t num_layers, Fn&& fn) const {
-        auto layer_state = std::make_shared<KVLayerCompletionState>(num_layers);
-        auto task = [
-            layer_state,
-            fn = std::forward<Fn>(fn)
-        ]() mutable {
-            try {
-                fn(*layer_state);
-            } catch (...) {
-                layer_state->SetFailure(std::current_exception());
-                throw;
-            }
-        };
-        auto future = worker_detail::BoundedAsyncExecutor::Instance().Submit(
-            std::move(task));
-        const std::uint64_t id =
-            task_id_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
-        return KVAsyncTask{id, std::move(future), std::move(layer_state)};
     }
 
     void SynchronizeWithEvent(cudaStream_t stream) const {
@@ -3317,7 +2464,6 @@ class HostPagedKVWorkerView {
     std::optional<at::cuda::CUDAStream> h2d_stream_;
     std::optional<at::cuda::CUDAStream> d2h_stream_;
     HostKVPageTable page_table_;
-    HostPrefixCache prefix_cache_;
 
     // Scratch device buffers for AsyncAppendDecodeKVToHostBatchedKernel —
     // pointer arrays (src + dst) uploaded once per batched call. Sized
@@ -3333,6 +2479,12 @@ class HostPagedKVWorkerView {
 
 using DefaultHostPagedKVWorkerView = HostPagedKVWorkerView<HostKVMode::kMHA>;
 using MLAHostPagedKVWorkerView = HostPagedKVWorkerView<HostKVMode::kMLA>;
+using MappedDefaultHostPagedKVWorkerView =
+    HostPagedKVWorkerView<HostKVMode::kMHA, HostPagedKVLayout<HostKVMode::kMHA>,
+                          VectorLayerMapper>;
+using MappedMLAHostPagedKVWorkerView =
+    HostPagedKVWorkerView<HostKVMode::kMLA, HostPagedKVLayout<HostKVMode::kMLA>,
+                          VectorLayerMapper>;
 
 }  // namespace batchgen::kv
 

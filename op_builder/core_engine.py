@@ -34,7 +34,6 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_kv_page_table.cpp",
-            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_prefix_cache.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/uva_copy_kernel.cu",
             f"{BATCHGEN_CORE_ROOT}/Hetero_Attn/CPU_Kernels/grouped_query_attention_cpu_avx2_omp.cpp",
             f"{BATCHGEN_CORE_ROOT}/allocator.cpp",

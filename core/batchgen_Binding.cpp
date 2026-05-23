@@ -20,6 +20,9 @@
 
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
+#include "KV_Storage/compressed_state_host_manager.h"
+#include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
+#include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
 #include "Weights_Storage/Weights_Storage.h" 
 #include "allocator.h"
@@ -30,7 +33,8 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
-#include <unordered_set>
+#include <type_traits>
+#include <utility>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -40,48 +44,32 @@ namespace kv = batchgen::kv;
 
 namespace {
 
-std::vector<kv::PrefixAllocationRequest> PrefixAllocationRequestsFromPy(
-    py::list requests_py) {
-    std::vector<kv::PrefixAllocationRequest> requests;
-    requests.reserve(py::len(requests_py));
-    for (auto item : requests_py) {
-        auto tup = py::cast<py::tuple>(item);
-        if (py::len(tup) != 3 && py::len(tup) != 4) {
-            throw std::invalid_argument(
-                "prefix allocation requests must be "
-                "(sequence_id, token_ids, capacity_tokens[, "
-                "namespace_hash])");
-        }
-        kv::PrefixAllocationRequest request;
-        request.sequence_id = py::cast<std::int64_t>(tup[0]);
-        request.token_ids = py::cast<std::vector<std::int64_t>>(tup[1]);
-        request.capacity_tokens = py::cast<std::size_t>(tup[2]);
-        if (py::len(tup) == 4) {
-            request.namespace_hash = py::cast<std::uint64_t>(tup[3]);
-        }
-        requests.emplace_back(std::move(request));
-    }
-    return requests;
-}
+template <typename T, typename = void>
+struct HasCompressionRatio : std::false_type {};
 
-py::list PrefixAllocationResultsToPy(
-    const std::vector<kv::PrefixAllocationResult>& results) {
-    py::list out;
-    for (const auto& result : results) {
-        py::dict item;
-        item["sequence_id"] = result.sequence_id;
-        item["shared_prefix_pages"] = result.shared_prefix_pages;
-        item["private_pages"] = result.private_pages;
-        item["shared_prefix_tokens"] = result.shared_prefix_tokens;
-        item["private_start_token"] = result.private_start_token;
-        item["logical_page_count"] = result.logical_page_count;
-        item["physical_pages_allocated"] = result.physical_pages_allocated;
-        item["full_hit"] = result.full_hit;
-        item["miss_reason"] = result.miss_reason;
-        out.append(std::move(item));
-    }
-    return out;
-}
+template <typename T>
+struct HasCompressionRatio<
+    T, std::void_t<decltype(std::declval<const T&>().compression_ratio())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasGrowSequencePages : std::false_type {};
+
+template <typename T>
+struct HasGrowSequencePages<
+    T, std::void_t<decltype(std::declval<T&>().GrowSequencePages(
+           std::declval<std::int64_t>(), std::declval<std::size_t>()))>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasGrowPagesForSequences : std::false_type {};
+
+template <typename T>
+struct HasGrowPagesForSequences<
+    T, std::void_t<decltype(std::declval<T&>().GrowPagesForSequences(
+           std::declval<const std::vector<std::int64_t>&>(),
+           std::declval<const std::vector<std::size_t>&>()))>>
+    : std::true_type {};
 
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
@@ -132,10 +120,51 @@ void BindHostPagedManager(py::module& m, const char* name) {
 }
 
 template <typename WorkerView>
-void BindHostPagedWorkerView(py::module& m, const char* name) {
-    py::class_<WorkerView>(m, name)
-        .def(py::init<EngineConfig, ModelConfig>())
-        .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"))
+std::vector<typename WorkerView::BatchedKVEntry> ParseBatchedKVEntries(
+    py::list entries_py) {
+    std::vector<typename WorkerView::BatchedKVEntry> entries;
+    entries.reserve(entries_py.size());
+    for (auto item : entries_py) {
+        auto tup = py::cast<py::tuple>(item);
+        if (py::len(tup) != 3) {
+            throw std::invalid_argument(
+                "async_append_decode_kv_to_host_batched_kernel entries must "
+                "be (layer_idx, k_tensor, v_tensor|None)");
+        }
+        typename WorkerView::BatchedKVEntry entry;
+        entry.layer_idx = py::cast<std::size_t>(tup[0]);
+        entry.k_tensor = py::cast<torch::Tensor>(tup[1]);
+        if (!tup[2].is_none()) {
+            entry.v_tensor = py::cast<torch::Tensor>(tup[2]);
+        }
+        entries.emplace_back(std::move(entry));
+    }
+    return entries;
+}
+
+template <typename Manager>
+std::vector<typename Manager::BatchedStateEntry> ParseBatchedStateEntries(
+    py::list entries_py) {
+    std::vector<typename Manager::BatchedStateEntry> entries;
+    entries.reserve(entries_py.size());
+    for (auto item : entries_py) {
+        auto tup = py::cast<py::tuple>(item);
+        if (py::len(tup) != 2) {
+            throw std::invalid_argument(
+                "async_append_decode_state_to_host_batched_kernel entries "
+                "must be (layer_idx, state_tensor)");
+        }
+        typename Manager::BatchedStateEntry entry;
+        entry.layer_idx = py::cast<std::size_t>(tup[0]);
+        entry.state_tensor = py::cast<torch::Tensor>(tup[1]);
+        entries.emplace_back(std::move(entry));
+    }
+    return entries;
+}
+
+template <typename WorkerView>
+void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
+    cls
         .def("initialize", &WorkerView::Initialize,
              py::arg("device_index"),
              py::arg("create_region") = false)
@@ -150,7 +179,11 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return reinterpret_cast<std::uintptr_t>(
                      self.KPagePtr(layer_idx, page_idx));
              },
-             py::arg("layer_idx"), py::arg("page_idx"))
+             py::arg("layer_idx"), py::arg("page_idx"),
+             "Return the host K page pointer. For mapped worker views, "
+             "layer_idx is a logical layer id and is resolved to a physical "
+             "layer id before address calculation. For normal worker views, "
+             "logical and physical layer ids are identical.")
         .def(
             "v_page_ptr",
             [](WorkerView& self, std::size_t layer_idx,
@@ -162,7 +195,11 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 throw std::runtime_error(
                     "V cache is disabled for this worker view");
             },
-            py::arg("layer_idx"), py::arg("page_idx"))
+            py::arg("layer_idx"), py::arg("page_idx"),
+            "Return the host V page pointer. For mapped worker views, "
+            "layer_idx is a logical layer id and is resolved to a physical "
+            "layer id before address calculation. Raises when this worker "
+            "view has no V cache.")
         .def("get_stats", &WorkerView::GetStats)
        .def("build_page_table",
            [](WorkerView& self,
@@ -170,12 +207,6 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
               return self.BuildPageTable(sequence_ids);
            },
            py::arg("sequence_ids"))
-       .def("shared_prefix_pages", &WorkerView::SharedPrefixPages,
-            py::arg("sequence_id"))
-       .def("private_pages", &WorkerView::PrivatePages,
-            py::arg("sequence_id"))
-       .def("shared_prefix_tokens", &WorkerView::SharedPrefixTokens,
-            py::arg("sequence_id"))
        .def("register_sequences", &WorkerView::RegisterSequences,
            py::arg("sequence_ids"))
        .def("unregister_sequence", &WorkerView::UnregisterSequence,
@@ -187,49 +218,38 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
        .def("read_sequence_kv_to_cpu", &WorkerView::ReadSequenceKVToCPU,
             py::arg("sequence_id"),
             "Read all KV pages for a sequence directly to CPU tensors (no GPU). "
-            "Returns (k_tensor, v_tensor). For MLA, v_tensor is empty.")
+            "Returns (k_tensor, v_tensor). For MLA, v_tensor is empty. "
+            "The returned tensor's first dimension is physical layer id; this "
+            "method does not expand or reorder logical layer ids for mapped "
+            "worker views.")
        .def("write_sequence_kv_from_cpu", &WorkerView::WriteSequenceKVFromCPU,
             py::arg("sequence_id"), py::arg("k_tensor"),
             py::arg("v_tensor") = std::nullopt,
-            "Write KV data from CPU tensors directly to host pages (no GPU).")
+            "Write KV data from CPU tensors directly to host pages (no GPU). "
+            "The input tensor's first dimension is physical layer id; this "
+            "method does not accept logical layer ids for mapped worker views.")
        .def("async_offload_layer_kv_to_host",
            &WorkerView::AsyncOffloadLayerKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"))
-       .def("async_offload_layer_kv_to_host_with_offsets",
-           &WorkerView::AsyncOffloadLayerKVToHostWithOffsets,
-           py::arg("layer_idx"), py::arg("sequence_ids"),
-           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"), py::arg("source_token_starts"),
-           py::arg("destination_token_starts"))
+           py::arg("sequence_lengths"),
+           "Offload one layer of prefill KV into host pages. For mapped "
+           "worker views, layer_idx is a logical layer id and is resolved to "
+           "a physical layer id before writing.")
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
            py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
-           py::arg("sequence_lengths"))
+           py::arg("sequence_lengths"),
+           "Append one decode token per sequence into host pages. For mapped "
+           "worker views, layer_idx is a logical layer id and is resolved to "
+           "a physical layer id before writing.")
        .def("async_append_decode_kv_to_host_batched_kernel",
            [](WorkerView& self,
               py::list entries_py,
               std::vector<std::int64_t> sequence_ids,
               batchgen::kv::SequenceLengths sequence_lengths) {
-               std::vector<typename WorkerView::BatchedKVEntry> entries;
-               entries.reserve(entries_py.size());
-               for (auto item : entries_py) {
-                   auto tup = py::cast<py::tuple>(item);
-                   if (py::len(tup) != 3) {
-                       throw std::invalid_argument(
-                           "async_append_decode_kv_to_host_batched_kernel "
-                           "entries must be (layer_idx, k_tensor, v_tensor|None)");
-                   }
-                   typename WorkerView::BatchedKVEntry e;
-                   e.layer_idx = py::cast<std::size_t>(tup[0]);
-                   e.k_tensor = py::cast<torch::Tensor>(tup[1]);
-                   if (!tup[2].is_none()) {
-                       e.v_tensor = py::cast<torch::Tensor>(tup[2]);
-                   }
-                   entries.emplace_back(std::move(e));
-               }
+               auto entries = ParseBatchedKVEntries<WorkerView>(entries_py);
                return self.AsyncAppendDecodeKVToHostBatchedKernel(
                    std::move(entries), std::move(sequence_ids),
                    std::move(sequence_lengths));
@@ -239,7 +259,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
            "Batched variant: all (layer × seq) host-KV writes issued by "
            "one UVA kernel launch on the DtoH stream. Replaces the "
            "per-layer async_append_decode_kv_to_host loop of 78×bsz "
-           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs.")
+           "cudaMemcpyAsync with 1 kernel + 2 small ptr-array HtoDs. Each "
+           "entry's layer_idx is a logical layer id for mapped worker views "
+           "and is resolved before building destination pointers.")
         .def(
             "async_load_layer_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -252,7 +274,9 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("sequence_ids"), py::arg("k_device_ptrs"),
             py::arg("v_device_ptrs") = py::none(),
             "Schedule host-paged KV pages to be loaded onto device memory "
-            "using pre-allocated GPU destinations.")
+            "using pre-allocated GPU destinations. This loads all physical "
+            "layers; destination pointer tensors are indexed by physical "
+            "layer id even for mapped worker views.")
         .def(
             "async_load_layer_paged_kv_to_device",
             [](WorkerView& self, torch::Tensor sequence_ids,
@@ -266,21 +290,10 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
             py::arg("sequence_ids"), py::arg("active_page_counts"),
             py::arg("k_device_ptrs"),
             py::arg("v_device_ptrs") = py::none(),
-            "Load only the active per-sequence KV pages using padded page tables.")
-        .def(
-            "async_load_prefix_pages_to_device",
-            [](WorkerView& self, torch::Tensor host_page_ids,
-               torch::Tensor k_device_ptrs,
-               std::optional<torch::Tensor> v_device_ptrs) {
-                return self.AsyncLoadPrefixPagesToDevice(
-                    std::move(host_page_ids), std::move(k_device_ptrs),
-                    std::move(v_device_ptrs));
-            },
-            py::arg("host_page_ids"), py::arg("k_device_ptrs"),
-            py::arg("v_device_ptrs") = py::none(),
-            "Load explicit host prefix page IDs into explicit GPU page "
-            "destinations. k_device_ptrs/v_device_ptrs are CPU int64 pointer "
-            "matrices shaped [num_layers, num_pages].")
+            "Load only the active per-sequence KV pages using padded page "
+            "tables. This loads all physical layers; destination pointer "
+            "tensors are indexed by physical layer id even for mapped worker "
+            "views.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(
@@ -299,75 +312,23 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                 return self.AllocatePagesForSequences(sequence_ids,
                                                       num_tokens);
             })
-        .def(
-            "allocate_pages_for_sequences_with_prefix",
-            [](WorkerView& self, py::list requests_py) {
-                const auto requests = PrefixAllocationRequestsFromPy(requests_py);
-                return PrefixAllocationResultsToPy(
-                    self.AllocatePagesForSequencesWithPrefix(requests));
-            },
-            py::arg("requests"))
-        .def(
-            "estimate_pages_for_sequences_with_prefix",
-            [](WorkerView& self, py::list requests_py) {
-                const auto requests = PrefixAllocationRequestsFromPy(requests_py);
-                return PrefixAllocationResultsToPy(
-                    self.EstimatePagesForSequencesWithPrefix(requests));
-            },
-            py::arg("requests"),
-            "Estimate prefix allocation without registering sequences, "
-            "attaching pages, allocating private pages, or updating prefix "
-            "lookup statistics.")
-        .def("commit_sequence_prefix_pages",
-             &WorkerView::CommitSequencePrefixPages,
-             py::arg("sequence_id"), py::arg("token_ids"),
-             py::arg("namespace_hash") = 0)
-        .def("get_prefix_cache_stats", &WorkerView::GetPrefixCacheStats)
-        .def("prefix_cache_debug_entries",
-             &WorkerView::PrefixCacheDebugEntries,
-             py::arg("limit") = 0, py::arg("cold_first") = true)
-        .def("clear_prefix_cache", &WorkerView::ClearPrefixCache)
-        .def(
-            "evict_prefix_cache_until_free",
-            [](WorkerView& self, std::size_t target_free_pages,
-               std::vector<std::int32_t> protected_pages) {
-                std::unordered_set<std::int32_t> protected_set(
-                    protected_pages.begin(), protected_pages.end());
-                return self.EvictPrefixCacheUntilFree(target_free_pages,
-                                                      protected_set);
-            },
-            py::arg("target_free_pages"),
-            py::arg("protected_pages") = std::vector<std::int32_t>{})
-        .def("free_page_count", &WorkerView::FreePageCount)
-        .def("page_ref_state", &WorkerView::PageRefState, py::arg("page"))
-        .def("page_ref_states", &WorkerView::PageRefStates,
-             py::arg("pages"))
-        .def("grow_sequence_pages",
-             [](WorkerView& self, std::int64_t sequence_id,
-                std::size_t num_pages) {
-                 return self.GrowSequencePages(sequence_id, num_pages);
-             },
-             py::arg("sequence_id"), py::arg("num_pages"))
-        .def(
-            "grow_pages_for_sequences",
-            [](WorkerView& self,
-               const std::vector<std::pair<std::int64_t, std::size_t>>&
-                   requests) {
-                std::vector<std::int64_t> sequence_ids;
-                std::vector<std::size_t> page_counts;
-                sequence_ids.reserve(requests.size());
-                page_counts.reserve(requests.size());
-                for (const auto& request : requests) {
-                    sequence_ids.push_back(request.first);
-                    page_counts.push_back(request.second);
-                }
-                return self.GrowPagesForSequences(sequence_ids,
-                                                   page_counts);
-            })
         .def_property_readonly("device_index", &WorkerView::device_index)
         .def_property_readonly_static(
             "has_v_cache",
             [](py::object /* cls */) { return WorkerView::kHasVCache; })
+        .def_property_readonly_static(
+            "uses_logical_layer_mapping",
+            [](py::object /* cls */) {
+                return WorkerView::kUsesLogicalLayerMapping;
+            })
+        .def("resolve_physical_layer",
+             [](WorkerView& self, std::size_t layer_idx) {
+                 return self.ResolvePhysicalLayer(layer_idx,
+                                                  "resolve_physical_layer");
+             },
+             py::arg("layer_idx"),
+             "Resolve a logical layer id to the physical layer id used by "
+             "this worker view. Normal worker views return layer_idx unchanged.")
         .def("get_sequence_layer_page_pointers",
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t layer_idx,
@@ -391,7 +352,138 @@ void BindHostPagedWorkerView(py::module& m, const char* name) {
                  return py::make_tuple(std::move(k_ptrs), v_ptrs);
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
-             py::arg("max_tokens") = py::none());;
+             py::arg("max_tokens") = py::none(),
+             "Return per-page K/V host pointers for one sequence and one "
+             "layer. For mapped worker views, layer_idx is a logical layer id "
+             "and is resolved to a physical layer id before address "
+             "calculation.");
+
+    if constexpr (HasGrowSequencePages<WorkerView>::value) {
+        cls.def("grow_sequence_pages",
+                [](WorkerView& self, std::int64_t sequence_id,
+                   std::size_t num_pages) {
+                    return self.GrowSequencePages(sequence_id, num_pages);
+                },
+                py::arg("sequence_id"), py::arg("num_pages"));
+    }
+    if constexpr (HasGrowPagesForSequences<WorkerView>::value) {
+        cls.def(
+            "grow_pages_for_sequences",
+            [](WorkerView& self,
+               const std::vector<std::pair<std::int64_t, std::size_t>>&
+                   requests) {
+                std::vector<std::int64_t> sequence_ids;
+                std::vector<std::size_t> page_counts;
+                sequence_ids.reserve(requests.size());
+                page_counts.reserve(requests.size());
+                for (const auto& request : requests) {
+                    sequence_ids.push_back(request.first);
+                    page_counts.push_back(request.second);
+                }
+                return self.GrowPagesForSequences(sequence_ids, page_counts);
+            });
+    }
+    if constexpr (HasCompressionRatio<WorkerView>::value) {
+        cls.def_property_readonly("compression_ratio",
+                                  &WorkerView::compression_ratio);
+    }
+}
+
+template <typename WorkerView>
+void BindHostPagedWorkerView(py::module& m, const char* name) {
+    auto cls = py::class_<WorkerView>(m, name);
+    cls.def(py::init<EngineConfig, ModelConfig>())
+        .def(py::init<kv::HostPagedKVConfig>(), py::arg("config"));
+    BindCommonHostPagedWorkerViewMethods(cls);
+}
+
+template <typename WorkerView>
+void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
+    auto cls = py::class_<WorkerView>(m, name);
+    cls.def(py::init<EngineConfig, ModelConfig, std::size_t>(),
+            py::arg("engine_config"), py::arg("model_config"),
+            py::arg("window_size_tokens"))
+        .def(py::init<kv::HostPagedKVConfig, std::size_t>(),
+             py::arg("config"), py::arg("window_size_tokens"));
+    BindCommonHostPagedWorkerViewMethods(cls);
+    cls
+        .def_property_readonly("page_size_tokens",
+                               &WorkerView::page_size_tokens)
+        .def_property_readonly("window_size_tokens",
+                               &WorkerView::window_size_tokens)
+        .def_property_readonly("window_pages", &WorkerView::window_pages);
+}
+
+template <typename Manager>
+void BindCompressedStateHostManager(py::module& m, const char* name) {
+    py::class_<Manager>(m, name)
+        .def(py::init<kv::CompressedStateHostConfig>(), py::arg("config"))
+        .def("initialize", &Manager::Initialize, py::arg("device_index"))
+        .def("shutdown", &Manager::Shutdown)
+        .def("allocate_state_item", &Manager::AllocateStateItem,
+             py::arg("sequence_id"))
+        .def("allocate_state_items_for_sequences",
+             &Manager::AllocateStateItemsForSequences,
+             py::arg("sequence_ids"))
+        .def("release_sequence_states", &Manager::ReleaseSequenceStates,
+             py::arg("sequence_ids"))
+        .def("async_offload_decode_state_to_host",
+             &Manager::AsyncOffloadDecodeStateToHost, py::arg("layer_idx"),
+             py::arg("sequence_ids"), py::arg("state_tensor"),
+             py::arg("raw_positions"))
+        .def("async_load_decode_state_to_device",
+             &Manager::AsyncLoadDecodeStateToDevice, py::arg("layer_idx"),
+             py::arg("sequence_ids"), py::arg("state_tensor"),
+             py::arg("raw_positions"))
+        .def("async_append_decode_state_to_host_batched_kernel",
+             [](Manager& self, py::list entries_py,
+                std::vector<std::int64_t> sequence_ids,
+                batchgen::kv::SequenceLengths raw_positions) {
+                 auto entries = ParseBatchedStateEntries<Manager>(entries_py);
+                 return self.AsyncAppendDecodeStateToHostBatchedKernel(
+                     std::move(entries), std::move(sequence_ids),
+                     std::move(raw_positions));
+             },
+             py::arg("entries"), py::arg("sequence_ids"),
+             py::arg("raw_positions"))
+        .def("async_offload_state_items_to_host",
+             &Manager::AsyncOffloadStateItemsToHost, py::arg("sequence_ids"),
+             py::arg("state_device_ptrs"))
+        .def("async_load_state_items_to_device",
+             &Manager::AsyncLoadStateItemsToDevice, py::arg("sequence_ids"),
+             py::arg("state_device_ptrs"))
+        .def("get_sequence_layer_state_item_pointer",
+             &Manager::GetSequenceLayerStateItemPointer,
+             py::arg("sequence_id"), py::arg("layer_idx"))
+        .def("state_item_ptr", &Manager::StateItemPtr,
+             py::arg("layer_idx"), py::arg("state_item_id"))
+        .def("resolve_state_slot", &Manager::ResolveStateSlot,
+             py::arg("sequence_id"), py::arg("raw_position"))
+        .def("resolve_physical_layer",
+             [](const Manager& self, std::size_t layer_idx) {
+                 return self.ResolvePhysicalLayer(layer_idx,
+                                                  "resolve_physical_layer");
+             },
+             py::arg("layer_idx"))
+        .def("get_stats", &Manager::GetStats)
+        .def_property_readonly("device_index", &Manager::device_index)
+        .def_property_readonly("ratio", &Manager::ratio)
+        .def_property_readonly("overlap", &Manager::overlap)
+        .def_property_readonly("num_state_items",
+                               &Manager::num_state_items)
+        .def_property_readonly("ring_size", &Manager::ring_size)
+        .def_property_readonly("state_token_bytes",
+                               &Manager::state_token_bytes)
+        .def_property_readonly("state_item_bytes",
+                               &Manager::state_item_bytes)
+        .def_property_readonly("state_item_stride_bytes",
+                               &Manager::state_item_stride_bytes)
+        .def_property_readonly("layer_stride_bytes",
+                               &Manager::layer_stride_bytes)
+        .def_property_readonly("data_base_address",
+                               &Manager::DataBaseAddress)
+        .def("__repr__",
+             [](const Manager& self) { return self.DebugString(); });
 }
 
 }  // namespace
@@ -491,6 +583,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("memfd_creator_pid",
                        &kv::HostPagedKVConfig::memfd_creator_pid)
         .def_readwrite("memfd_fd", &kv::HostPagedKVConfig::memfd_fd)
+        .def_readwrite("logical_to_physical_layer",
+                       &kv::HostPagedKVConfig::logical_to_physical_layer)
         .def_readwrite("logger_name", &kv::HostPagedKVConfig::logger_name)
         .def("__repr__",
              [](const kv::HostPagedKVConfig& self) {
@@ -507,105 +601,65 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("sequence_table_capacity",
                        &kv::HostPagedKVStats::sequence_table_capacity)
         .def_readwrite("total_bytes", &kv::HostPagedKVStats::total_bytes)
-        .def_readwrite("num_sequence_ref_pages",
-                       &kv::HostPagedKVStats::num_sequence_ref_pages)
-        .def_readwrite("num_prefix_pinned_pages",
-                       &kv::HostPagedKVStats::num_prefix_pinned_pages)
-        .def_readwrite("num_pages_with_sequence_refs",
-                       &kv::HostPagedKVStats::num_pages_with_sequence_refs)
-        .def_readwrite("num_pages_with_prefix_pins",
-                       &kv::HostPagedKVStats::num_pages_with_prefix_pins)
-        .def_readwrite("sequence_ref_increments",
-                       &kv::HostPagedKVStats::sequence_ref_increments)
-        .def_readwrite("sequence_ref_decrements",
-                       &kv::HostPagedKVStats::sequence_ref_decrements)
-        .def_readwrite("prefix_pin_increments",
-                       &kv::HostPagedKVStats::prefix_pin_increments)
-        .def_readwrite("prefix_pin_decrements",
-                       &kv::HostPagedKVStats::prefix_pin_decrements)
         .def("__repr__",
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
 
-    py::class_<kv::HostPageRefState>(m, "HostPageRefState")
+    py::class_<kv::CompressedStateHostStats>(m,
+                                             "CompressedStateHostStats")
         .def(py::init<>())
-        .def_readwrite("page", &kv::HostPageRefState::page)
-        .def_readwrite("sequence_refs", &kv::HostPageRefState::sequence_refs)
-        .def_readwrite("prefix_pins", &kv::HostPageRefState::prefix_pins)
-        .def_readwrite("free_if_unpinned_once",
-                       &kv::HostPageRefState::free_if_unpinned_once)
-        .def_readwrite("is_free", &kv::HostPageRefState::is_free);
+        .def_readwrite(
+            "num_total_state_items",
+            &kv::CompressedStateHostStats::num_total_state_items)
+        .def_readwrite(
+            "num_free_state_items",
+            &kv::CompressedStateHostStats::num_free_state_items)
+        .def_readwrite(
+            "num_used_state_items",
+            &kv::CompressedStateHostStats::num_used_state_items)
+        .def_readwrite(
+            "num_active_sequences",
+            &kv::CompressedStateHostStats::num_active_sequences)
+        .def_readwrite(
+            "sequence_table_capacity",
+            &kv::CompressedStateHostStats::sequence_table_capacity)
+        .def_readwrite("total_bytes",
+                       &kv::CompressedStateHostStats::total_bytes)
+        .def("__repr__",
+             [](const kv::CompressedStateHostStats& self) {
+                 return kv::ToString(self);
+             });
 
-    py::class_<kv::PrefixCacheStats>(m, "PrefixCacheStats")
+    py::class_<kv::CompressedStateHostConfig>(m,
+                                              "CompressedStateHostConfig")
         .def(py::init<>())
-        .def_readwrite("entries", &kv::PrefixCacheStats::entries)
-        .def_readwrite("lookup_hits", &kv::PrefixCacheStats::lookup_hits)
-        .def_readwrite("lookup_misses", &kv::PrefixCacheStats::lookup_misses)
-        .def_readwrite("shared_pages_attached",
-                       &kv::PrefixCacheStats::shared_pages_attached)
-        .def_readwrite("prefix_pin_increments",
-                       &kv::PrefixCacheStats::prefix_pin_increments)
-        .def_readwrite("prefix_pin_decrements",
-                       &kv::PrefixCacheStats::prefix_pin_decrements)
-        .def_readwrite("host_pages_saved",
-                       &kv::PrefixCacheStats::host_pages_saved)
-        .def_readwrite("eviction_epoch",
-                       &kv::PrefixCacheStats::eviction_epoch)
-        .def_readwrite("eviction_runs",
-                       &kv::PrefixCacheStats::eviction_runs)
-        .def_readwrite("evicted_entries",
-                       &kv::PrefixCacheStats::evicted_entries)
-        .def_readwrite("evicted_prefix_pins",
-                       &kv::PrefixCacheStats::evicted_prefix_pins)
-        .def_readwrite("evicted_pages_immediately_freed",
-                       &kv::PrefixCacheStats::evicted_pages_immediately_freed)
-        .def_readwrite("evicted_active_ref_entries",
-                       &kv::PrefixCacheStats::evicted_active_ref_entries)
-        .def_readwrite("eviction_protected_skips",
-                       &kv::PrefixCacheStats::eviction_protected_skips)
-        .def_readwrite("eviction_target_failures",
-                       &kv::PrefixCacheStats::eviction_target_failures);
-
-    py::class_<kv::PrefixEvictionResult>(m, "PrefixEvictionResult")
-        .def(py::init<>())
-        .def_readwrite("requested_free_pages",
-                       &kv::PrefixEvictionResult::requested_free_pages)
-        .def_readwrite("entries_removed",
-                       &kv::PrefixEvictionResult::entries_removed)
-        .def_readwrite("prefix_pins_released",
-                       &kv::PrefixEvictionResult::prefix_pins_released)
-        .def_readwrite("pages_immediately_freed",
-                       &kv::PrefixEvictionResult::pages_immediately_freed)
-        .def_readwrite("protected_entries_skipped",
-                       &kv::PrefixEvictionResult::protected_entries_skipped)
-        .def_readwrite("active_ref_entries_removed",
-                       &kv::PrefixEvictionResult::active_ref_entries_removed)
-        .def_readwrite("reached_target",
-                       &kv::PrefixEvictionResult::reached_target)
-        .def_readwrite("eviction_epoch",
-                       &kv::PrefixEvictionResult::eviction_epoch);
-
-    py::class_<kv::PrefixDebugEntry>(m, "PrefixDebugEntry")
-        .def(py::init<>())
-        .def_readwrite("namespace_hash", &kv::PrefixDebugEntry::namespace_hash)
-        .def_readwrite("page_index", &kv::PrefixDebugEntry::page_index)
-        .def_readwrite("host_page_id", &kv::PrefixDebugEntry::host_page_id)
-        .def_readwrite("page_chain_hash",
-                       &kv::PrefixDebugEntry::page_chain_hash)
-        .def_readwrite("parent_page_hash",
-                       &kv::PrefixDebugEntry::parent_page_hash)
-        .def_readwrite("insert_epoch", &kv::PrefixDebugEntry::insert_epoch)
-        .def_readwrite("last_access_epoch",
-                       &kv::PrefixDebugEntry::last_access_epoch)
-        .def_readwrite("hit_count", &kv::PrefixDebugEntry::hit_count)
-        .def_readwrite("child_count", &kv::PrefixDebugEntry::child_count);
+        .def_readwrite("num_layers",
+                       &kv::CompressedStateHostConfig::num_layers)
+        .def_readwrite("num_state_items",
+                       &kv::CompressedStateHostConfig::num_state_items)
+        .def_readwrite("ring_size",
+                       &kv::CompressedStateHostConfig::ring_size)
+        .def_readwrite("state_token_bytes",
+                       &kv::CompressedStateHostConfig::state_token_bytes)
+        .def_readwrite(
+            "sequence_table_capacity",
+            &kv::CompressedStateHostConfig::sequence_table_capacity)
+        .def_readwrite("alignment_bytes",
+                       &kv::CompressedStateHostConfig::alignment_bytes)
+        .def_readwrite(
+            "logical_to_physical_layer",
+            &kv::CompressedStateHostConfig::logical_to_physical_layer)
+        .def_readwrite("logger_name",
+                       &kv::CompressedStateHostConfig::logger_name)
+        .def("__repr__",
+             [](const kv::CompressedStateHostConfig& self) {
+                 return kv::ToString(self);
+             });
 
     py::class_<kv::KVAsyncTask>(m, "KVAsyncTask")
         .def_property_readonly("id", &kv::KVAsyncTask::id)
         .def("wait", &kv::KVAsyncTask::wait)
-        .def("wait_layer", &kv::KVAsyncTask::wait_layer)
-        .def("layer_count", &kv::KVAsyncTask::layer_count)
         .def("done", &kv::KVAsyncTask::done)
         .def("result", &kv::KVAsyncTask::result);
 
@@ -619,6 +673,48 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "DefaultHostPagedKVWorkerView");
     BindHostPagedWorkerView<kv::MLAHostPagedKVWorkerView>(
         m, "MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::MappedDefaultHostPagedKVWorkerView>(
+        m, "MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::MappedMLAHostPagedKVWorkerView>(
+        m, "MappedMLAHostPagedKVWorkerView");
+    BindSWAHostPagedWorkerView<kv::SWADefaultHostPagedKVWorkerView>(
+        m, "SWADefaultHostPagedKVWorkerView");
+    BindSWAHostPagedWorkerView<kv::SWAMLAHostPagedKVWorkerView>(
+        m, "SWAMLAHostPagedKVWorkerView");
+    BindSWAHostPagedWorkerView<kv::SWAMappedDefaultHostPagedKVWorkerView>(
+        m, "SWAMappedDefaultHostPagedKVWorkerView");
+    BindSWAHostPagedWorkerView<kv::SWAMappedMLAHostPagedKVWorkerView>(
+        m, "SWAMappedMLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4DefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio4DefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::CompressedRatio4MLAHostPagedKVWorkerView>(
+        m, "CompressedRatio4MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4MappedDefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio4MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio4MappedMLAHostPagedKVWorkerView>(
+        m, "CompressedRatio4MappedMLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128DefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio128DefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<kv::CompressedRatio128MLAHostPagedKVWorkerView>(
+        m, "CompressedRatio128MLAHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128MappedDefaultHostPagedKVWorkerView>(
+        m, "CompressedRatio128MappedDefaultHostPagedKVWorkerView");
+    BindHostPagedWorkerView<
+        kv::CompressedRatio128MappedMLAHostPagedKVWorkerView>(
+        m, "CompressedRatio128MappedMLAHostPagedKVWorkerView");
+    BindCompressedStateHostManager<kv::OverlapCompressedState4HostManager>(
+        m, "OverlapCompressedState4HostManager");
+    BindCompressedStateHostManager<kv::NonOverlapCompressedState4HostManager>(
+        m, "NonOverlapCompressedState4HostManager");
+    BindCompressedStateHostManager<kv::OverlapCompressedState128HostManager>(
+        m, "OverlapCompressedState128HostManager");
+    BindCompressedStateHostManager<kv::NonOverlapCompressedState128HostManager>(
+        m, "NonOverlapCompressedState128HostManager");
 
     py::class_<Parameter_Server>(m, "Parameter_Server")
         .def(py::init<bool, bool>(), py::arg("enable_hugetlbfs"),

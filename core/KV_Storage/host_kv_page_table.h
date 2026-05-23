@@ -17,11 +17,7 @@ namespace batchgen::kv {
 class HostKVPageTable {
    public:
     struct SequenceRecord {
-        std::vector<std::int32_t> shared_prefix_pages;
-        std::vector<std::int32_t> private_pages;
-        std::int64_t shared_prefix_tokens = 0;
-        std::int64_t private_start_token = 0;
-        std::int64_t logical_context_tokens = 0;
+        std::vector<std::int32_t> pages;
     };
 
     HostKVPageTable() = default;
@@ -33,32 +29,13 @@ class HostKVPageTable {
     void RegisterOrUpdate(std::int64_t sequence_id,
                           std::vector<std::int32_t> pages);
 
-    void RegisterOrUpdate(std::int64_t sequence_id,
-                          std::vector<std::int32_t> shared_prefix_pages,
-                          std::vector<std::int32_t> private_pages,
-                          std::int64_t shared_prefix_tokens,
-                          std::int64_t private_start_token,
-                          std::int64_t logical_context_tokens);
-
     void AppendPages(std::int64_t sequence_id,
                      const std::vector<std::int32_t>& additional_pages);
 
+    std::vector<std::int32_t> PopPrefixPages(std::int64_t sequence_id,
+                                             std::size_t num_pages);
+
     [[nodiscard]] std::vector<std::int32_t> Pages(
-        std::int64_t sequence_id) const;
-
-    [[nodiscard]] std::vector<std::int32_t> SharedPrefixPages(
-        std::int64_t sequence_id) const;
-
-    [[nodiscard]] std::vector<std::int32_t> PrivatePages(
-        std::int64_t sequence_id) const;
-
-    [[nodiscard]] std::int64_t SharedPrefixTokens(
-        std::int64_t sequence_id) const;
-
-    [[nodiscard]] std::int64_t PrivateStartToken(
-        std::int64_t sequence_id) const;
-
-    [[nodiscard]] std::int64_t LogicalContextTokens(
         std::int64_t sequence_id) const;
 
     [[nodiscard]] bool Contains(std::int64_t sequence_id) const;

@@ -185,6 +185,20 @@ class PrefixCachePrepackMetadata:
                     "Full sequence length metadata length does not match batch: "
                     f"{len(full_seq_lengths)} != {num_sequences}"
                 )
+            for idx, (query_len, prefix_tokens, full_length) in enumerate(
+                zip(seq_lengths, prefix_shared_tokens, full_seq_lengths)
+            ):
+                expected_full_length = (
+                    int(prefix_tokens)
+                    if full_hit_mode
+                    else int(query_len) + int(prefix_tokens)
+                )
+                if expected_full_length != int(full_length):
+                    raise RuntimeError(
+                        "Prefix cache full length mismatch at sequence "
+                        f"{idx}: query={query_len}, prefix={prefix_tokens}, "
+                        f"full={full_length}"
+                    )
 
         metadata = cls(
             cu_seqlens=cu_seqlens,

@@ -1,13 +1,13 @@
 """CUDA-graph capturable GLM-5 MoE decode segments.
 
-The first GLM-5 MoE graph milestone captures the routed-expert compute only:
+The GLM-5 MoE graph captures the full decode MoE module boundary:
 
     padded local tokens -> all_gather -> router -> rank padding mask
       -> dispatch_scatter_3d -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
+      -> all_reduce -> local slice + shared expert
 
-AllReduce, local slice, shared expert, and residual add remain eager in the
-caller. This mirrors the safer GPT-OSS MoEComputeSegment boundary while
-preserving GLM-5's 3D FP8 blockwise decode path.
+The decoder-layer residual add remains eager in the caller because it is owned
+by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ class _Glm5MoEGraphBuffers:
     intermediate: torch.Tensor
     expert_out: torch.Tensor
     routed_global_output: torch.Tensor
+    local_moe_output: torch.Tensor
     cu_seqlens: torch.Tensor
     max_tokens_padded: int
 
@@ -124,6 +125,7 @@ class Glm5MoEGraphBufferPool:
         b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
         b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
         b["routed_global_output"] = torch.empty(max_global, h, dtype=torch.bfloat16, device=d)
+        b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
         b["cu_seqlens"] = torch.arange(
             0,
             (self.num_local_experts + 1) * mtp,
@@ -175,6 +177,7 @@ class Glm5MoEGraphBufferPool:
             intermediate=b["intermediate"][:rows],
             expert_out=b["expert_out"][:rows],
             routed_global_output=b["routed_global_output"][:global_rows],
+            local_moe_output=b["local_moe_output"][:bucket_size],
             cu_seqlens=b["cu_seqlens"],
             max_tokens_padded=mtp,
         )
@@ -183,9 +186,13 @@ class Glm5MoEGraphBufferPool:
     def _round_up(value: int, block: int) -> int:
         return ((value + block - 1) // block) * block
 
+    def release(self) -> None:
+        self._views.clear()
+        self._base.clear()
+
 
 class Glm5MoEGraphSegment:
-    """Graph-capturable routed GLM-5 MoE decode segment."""
+    """Graph-capturable full GLM-5 MoE decode module segment."""
 
     def __init__(
         self,
@@ -216,14 +223,42 @@ class Glm5MoEGraphSegment:
             )
         if comm is None:
             raise RuntimeError(f"Layer {moe.layer_idx}: GLM-5 MoE graph requires EP communicator")
+        self._validate_shared_expert_graph_safe()
 
         self.gate_weight_bf16 = moe.gate.weight.detach().to(torch.bfloat16).contiguous()
         self.gate_bias_fp32 = moe.gate.e_score_correction_bias.detach().float().contiguous()
+
+    def _validate_shared_expert_graph_safe(self) -> None:
+        shared = getattr(self.moe, "shared_experts", None)
+        if shared is None:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires a shared expert module"
+            )
+        if getattr(shared, "persistent", True) is False:
+            raise RuntimeError(
+                f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires persistent "
+                "shared expert weights; non-persistent shared expert forward loads "
+                "and frees weights inside forward"
+            )
+        if getattr(shared, "is_fp8", False):
+            missing = [
+                name
+                for name in ("cached_gate", "cached_up", "cached_down")
+                if getattr(shared, name, None) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Layer {self.moe.layer_idx}: GLM-5 MoE graph requires cached "
+                    f"shared expert FP8 weights; missing {missing}"
+                )
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         if hasattr(self.comm, "disabled"):
             self.comm.disabled = False
         self.pool.setup()
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        self.pool.release()
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
@@ -233,8 +268,8 @@ class Glm5MoEGraphSegment:
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "routed_global_output": TensorSpec(
-                (self.world_size * bucket_size, self.hidden_size),
+            "moe_output": TensorSpec(
+                ("batch_size", self.hidden_size),
                 torch.bfloat16,
             ),
         }
@@ -314,7 +349,20 @@ class Glm5MoEGraphSegment:
             self.num_experts_per_tok,
             output=bufs.routed_global_output,
         )
-        return {"routed_global_output": routed_global_output}
+
+        import torch.distributed as dist
+
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                routed_global_output,
+                op=dist.ReduceOp.SUM,
+                stream=torch.cuda.current_stream(self.device),
+            )
+
+        start = self.rank * bucket_size
+        bufs.local_moe_output.copy_(routed_global_output[start:start + bucket_size])
+        bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+        return {"moe_output": bufs.local_moe_output}
 
     def _fp8_blockwise_gemm_3d(
         self,

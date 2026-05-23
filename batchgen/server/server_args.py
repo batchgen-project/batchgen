@@ -7,14 +7,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from batchgen.config.model_name_utils import is_prefix_reuse_supported_model
 from batchgen.models.glm.glm5.cuda_graph_policy import (
     GLM5_DSA_CUDA_GRAPH_ENV,
+    GLM5_DSA_FULL_CUDA_GRAPH_ENV,
     GLM5_MOE_CUDA_GRAPH_ENV,
+    GLM5_SEGMENTED_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV,
+    GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
-
-_GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
 
 
 def is_port_available(port: int) -> bool:
@@ -63,15 +64,15 @@ def _is_glm_model(model_name: Optional[str]) -> bool:
 
 def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
     if args.enable_cuda_graph and is_glm5_fp8_graph_default_model(args.model):
-        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "1"
-        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "1"
-        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "1"
         return
 
     if args.disable_cuda_graphs and _is_glm_model(args.model):
-        os.environ[_GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
         os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_DSA_FULL_CUDA_GRAPH_ENV] = "0"
         os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV] = "0"
+        os.environ[GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV] = "0"
 
 
 @dataclass
@@ -125,7 +126,6 @@ class ServerArgs:
     host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
     host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
     enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
-    enable_prefix_reuse: bool = False  # Opt-in page-level prefix KV reuse
     adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
     adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
     adaptive_chunk_max: int = 65536  # Maximum adaptive chunk size in tokens
@@ -367,7 +367,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="enable_cuda_graph",
         default=False,
-        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables segmented DSA and MoE graphs.",
+        help="Enable CUDA graph capture for supported models. For GLM-5-FP8/GLM-5.1-FP8 this enables the whole-model decode graph by default.",
     )
     cuda_graph_group.add_argument(
         "--disable-cuda-graphs",
@@ -379,13 +379,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--cuda-graph-max-bucket-size",
         type=int,
         default=128,
-        help="Maximum batch size per rank for CUDA graph capture (default: 128). Batches exceeding this fall back to eager execution.",
+        help="Maximum batch size per rank for CUDA graph capture (default: 128). For GLM whole-model graph, this defines the top bucket; larger decode batches use eager fallback.",
     )
     parser.add_argument(
         "--cuda-graph-num-buckets",
         type=int,
         default=16,
-        help="Maximum number of CUDA graph bucket sizes (default: 16). More buckets = longer capture time but less padding waste.",
+        help="Maximum number of CUDA graph bucket sizes (default: 16). For GLM, use 7 with max bucket 64 for [1,2,4,8,16,32,64].",
     )
     parser.add_argument(
         "--detokenization-include-special-tokens",
@@ -411,15 +411,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="[Deprecated] Host KV eviction is now always enabled. This flag is ignored.",
-    )
-    parser.add_argument(
-        "--enable-prefix-reuse",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable experimental page-level prefix KV reuse. Supported by "
-            "GPT-OSS, GLM-5, DeepSeek-R1/V3/V4, Kimi-K2.5/K2.6, and MiniMax-M2.5."
-        ),
     )
     parser.add_argument(
         "--adaptive-chunk",
@@ -536,13 +527,6 @@ def validate_server_args(args: ServerArgs) -> None:
         raise ValueError("host_kv_chunk_size must be positive")
     if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
         raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
-    if args.enable_prefix_reuse:
-        if not is_prefix_reuse_supported_model(args.model):
-            raise ValueError(
-                "--enable-prefix-reuse is currently supported only for "
-                "GPT-OSS, GLM-5, DeepSeek-R1/V3/V4, Kimi-K2.5/K2.6, "
-                "and MiniMax-M2.5 models"
-            )
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
     if args.adaptive_chunk_max < args.adaptive_chunk_min:
@@ -604,7 +588,6 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
         enable_host_kv_eviction=parsed.enable_host_kv_eviction,
-        enable_prefix_reuse=parsed.enable_prefix_reuse,
         adaptive_chunk=not getattr(parsed, 'no_adaptive_chunk', False),
         adaptive_chunk_min=parsed.adaptive_chunk_min,
         adaptive_chunk_max=parsed.adaptive_chunk_max,

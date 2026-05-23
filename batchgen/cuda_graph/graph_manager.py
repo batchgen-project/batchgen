@@ -205,8 +205,9 @@ class CUDAGraphManager:
     def warmup_and_capture_buckets(self, bucket_sizes: List[int]) -> None:
         """Capture all registered segments for the requested bucket sizes.
 
-        This is used by memory-heavy model-specific segments that should be
-        captured lazily only for buckets observed in live decode traffic.
+        Callers may pass the full configured bucket set during decode
+        configuration, or a smaller explicit subset when a model-specific path
+        intentionally supports partial capture.
         """
         if not self._segments:
             return

@@ -176,7 +176,6 @@ Controls how host KV cache pages are allocated and reclaimed during inference. B
 | `--host-kv-chunk-size` | `8192` | Initial chunk size in tokens. Each sequence reserves `max(prompt_length, chunk_size)` tokens at prefill instead of the full decode budget. Smaller values increase oversubscription but may trigger more evictions. |
 | `--enable-host-kv-eviction` | _(ignored)_ | **[Deprecated]** Host KV eviction is now always enabled when chunked reservation is active. This flag is ignored. Evicted sequences are automatically re-prefilled (recomputed) when pages become available. |
 | `--host-kv-eviction-watermark` | `10` | Trigger eviction when free pages drop below this percentage (0-100). |
-| `--enable-prefix-reuse` | `false` | Enable page-level prefix KV reuse for supported GPT-OSS/GQA models. Prefix cache pages may use all otherwise-free host KV pages and are evicted automatically under allocation pressure. There are no reserve-pages or max-pages knobs for prefix cache. |
 | `--adaptive-chunk` | `true` | Enable EMA-based adaptive chunk sizing. Tracks completed sequence decode lengths and adjusts the chunk size to reduce waste. |
 | `--no-adaptive-chunk` | - | Disable adaptive chunk sizing (use static `--host-kv-chunk-size`). |
 | `--adaptive-chunk-min` | `1024` | Minimum adaptive chunk size in tokens. |

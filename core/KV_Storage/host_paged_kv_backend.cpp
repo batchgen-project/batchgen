@@ -114,10 +114,6 @@ struct SharedHeader {
     std::uint32_t has_v_cache = 0;
     std::atomic<std::uint32_t> free_stack_top{0};
     std::atomic<std::uint32_t> active_sequences{0};
-    std::atomic<std::uint64_t> sequence_ref_increments{0};
-    std::atomic<std::uint64_t> sequence_ref_decrements{0};
-    std::atomic<std::uint64_t> prefix_pin_increments{0};
-    std::atomic<std::uint64_t> prefix_pin_decrements{0};
     pthread_mutex_t allocation_mutex{};
     pthread_mutex_t sequence_mutex{};
 };
@@ -205,19 +201,11 @@ struct HostPagedKVBackend::SharedState {
     std::vector<std::int32_t> AcquirePages(std::int64_t sequence_id,
                                            std::size_t num_pages);
     void ReleaseSequence(std::int64_t sequence_id);
-    void ReleaseSequenceLogical(std::int64_t sequence_id,
-                                const std::vector<std::int32_t>& logical_pages);
-    void AttachSequencePages(const std::vector<std::int32_t>& pages);
-    void DetachSequencePages(const std::vector<std::int32_t>& pages);
-    void PinPrefixPage(std::int32_t page);
-    void UnpinPrefixPage(std::int32_t page);
+    std::vector<std::int32_t> ReleasePrefixPages(std::int64_t sequence_id,
+                                                 std::size_t num_pages);
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
     HostPagedKVStats CollectStats() const;
-    HostPageRefState PageRefState(std::int32_t page) const;
-    std::vector<HostPageRefState> PageRefStates(
-        const std::vector<std::int32_t>& pages) const;
-    std::size_t FreePageCount() const;
 
     std::byte* DataBase() { return data_base; }
     const std::byte* DataBase() const { return data_base; }
@@ -234,8 +222,6 @@ struct HostPagedKVBackend::SharedState {
     std::int32_t* free_stack = nullptr;
     std::int64_t* page_owners = nullptr;
     std::int32_t* page_links = nullptr;
-    std::uint32_t* page_sequence_refs = nullptr;
-    std::uint32_t* page_prefix_pins = nullptr;
     SequenceEntry* sequence_table = nullptr;
     std::byte* data_base = nullptr;
 
@@ -247,8 +233,6 @@ struct HostPagedKVBackend::SharedState {
     std::size_t free_stack_offset = 0;
     std::size_t page_owner_offset = 0;
     std::size_t page_link_offset = 0;
-    std::size_t page_sequence_ref_offset = 0;
-    std::size_t page_prefix_pin_offset = 0;
     std::size_t sequence_table_offset = 0;
     std::size_t data_offset = 0;
     std::size_t total_bytes_unaligned = 0;
@@ -264,10 +248,6 @@ struct HostPagedKVBackend::SharedState {
                                                    bool* is_new);
     SequenceEntry* FindSequenceEntryLocked(std::int64_t sequence_id) const;
     std::size_t HashSequenceId(std::int64_t sequence_id) const;
-    void EnsurePageIndex(std::int32_t page, const char* op_name) const;
-    bool ReturnPageToFreeStackLocked(std::int32_t page);
-    void DetachSequencePagesLocked(const std::vector<std::int32_t>& pages,
-                                   const char* op_name);
 };
 
 void HostPagedKVBackend::SharedState::ComputeOffsets() {
@@ -288,14 +268,6 @@ void HostPagedKVBackend::SharedState::ComputeOffsets() {
     offset = AlignUp(offset, alignof(std::int32_t));
     page_link_offset = offset;
     offset += sizeof(std::int32_t) * config.num_pages;
-
-    offset = AlignUp(offset, alignof(std::uint32_t));
-    page_sequence_ref_offset = offset;
-    offset += sizeof(std::uint32_t) * config.num_pages;
-
-    offset = AlignUp(offset, alignof(std::uint32_t));
-    page_prefix_pin_offset = offset;
-    offset += sizeof(std::uint32_t) * config.num_pages;
 
     offset = AlignUp(offset, alignof(SequenceEntry));
     sequence_table_offset = offset;
@@ -319,10 +291,6 @@ void HostPagedKVBackend::SharedState::MapPointers() {
     free_stack = reinterpret_cast<std::int32_t*>(mapping + free_stack_offset);
     page_owners = reinterpret_cast<std::int64_t*>(mapping + page_owner_offset);
     page_links = reinterpret_cast<std::int32_t*>(mapping + page_link_offset);
-    page_sequence_refs =
-        reinterpret_cast<std::uint32_t*>(mapping + page_sequence_ref_offset);
-    page_prefix_pins =
-        reinterpret_cast<std::uint32_t*>(mapping + page_prefix_pin_offset);
     sequence_table =
         reinterpret_cast<SequenceEntry*>(mapping + sequence_table_offset);
     data_base = mapping + data_offset;
@@ -352,17 +320,11 @@ void HostPagedKVBackend::SharedState::ConstructSharedState() {
     header->free_stack_top.store(static_cast<std::uint32_t>(config.num_pages),
                                  std::memory_order_relaxed);
     header->active_sequences.store(0, std::memory_order_relaxed);
-    header->sequence_ref_increments.store(0, std::memory_order_relaxed);
-    header->sequence_ref_decrements.store(0, std::memory_order_relaxed);
-    header->prefix_pin_increments.store(0, std::memory_order_relaxed);
-    header->prefix_pin_decrements.store(0, std::memory_order_relaxed);
 
     for (std::size_t i = 0; i < config.num_pages; ++i) {
         free_stack[i] = static_cast<std::int32_t>(config.num_pages - 1 - i);
         page_owners[i] = kEmptySequenceId;
         page_links[i] = kInvalidPageIndex;
-        page_sequence_refs[i] = 0;
-        page_prefix_pins[i] = 0;
     }
     for (std::size_t i = 0; i < sequence_capacity; ++i) {
         sequence_table[i] = SequenceEntry();
@@ -522,50 +484,6 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
     }
     throw std::runtime_error("Sequence table is full (capacity=" +
                              std::to_string(sequence_capacity) + ")");
-}
-
-void HostPagedKVBackend::SharedState::EnsurePageIndex(
-    std::int32_t page, const char* op_name) const {
-    if (page < 0 ||
-        static_cast<std::size_t>(page) >= static_cast<std::size_t>(config.num_pages)) {
-        throw std::out_of_range(std::string(op_name) +
-                                ": page index out of range: " +
-                                std::to_string(page));
-    }
-}
-
-bool HostPagedKVBackend::SharedState::ReturnPageToFreeStackLocked(
-    std::int32_t page) {
-    EnsurePageIndex(page, "ReturnPageToFreeStackLocked");
-    if (page_sequence_refs[page] != 0 || page_prefix_pins[page] != 0) {
-        return false;
-    }
-    page_owners[page] = kEmptySequenceId;
-    page_links[page] = kInvalidPageIndex;
-    std::uint32_t top =
-        header->free_stack_top.load(std::memory_order_relaxed);
-    if (top >= config.num_pages) {
-        throw std::runtime_error("free page stack overflow");
-    }
-    free_stack[top++] = page;
-    header->free_stack_top.store(top, std::memory_order_relaxed);
-    return true;
-}
-
-void HostPagedKVBackend::SharedState::DetachSequencePagesLocked(
-    const std::vector<std::int32_t>& pages, const char* op_name) {
-    for (std::int32_t page : pages) {
-        EnsurePageIndex(page, op_name);
-        if (page_sequence_refs[page] == 0) {
-            throw std::runtime_error(std::string(op_name) +
-                                     ": sequence ref underflow for page " +
-                                     std::to_string(page));
-        }
-        --page_sequence_refs[page];
-        header->sequence_ref_decrements.fetch_add(1,
-                                                  std::memory_order_relaxed);
-        ReturnPageToFreeStackLocked(page);
-    }
 }
 
 void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
@@ -793,10 +711,6 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
             const std::int32_t page = pages[i];
             page_owners[page] = sequence_id;
             page_links[page] = kInvalidPageIndex;
-            page_sequence_refs[page] = 1;
-            page_prefix_pins[page] = 0;
-            header->sequence_ref_increments.fetch_add(
-                1, std::memory_order_relaxed);
             if (entry->head_page == kInvalidPageIndex) {
                 entry->head_page = page;
                 entry->tail_page = page;
@@ -839,90 +753,68 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
 
     if (!pages.empty()) {
         ScopedMutexLock lock(&header->allocation_mutex);
-        DetachSequencePagesLocked(pages, "ReleaseSequence");
+        std::uint32_t top =
+            header->free_stack_top.load(std::memory_order_relaxed);
+        for (std::int32_t page : pages) {
+            free_stack[top++] = page;
+        }
+        header->free_stack_top.store(top, std::memory_order_relaxed);
     }
 }
 
-void HostPagedKVBackend::SharedState::ReleaseSequenceLogical(
-    std::int64_t sequence_id, const std::vector<std::int32_t>& logical_pages) {
-    std::vector<std::int32_t> private_pages;
+std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
+    std::int64_t sequence_id, std::size_t num_pages) {
+    if (num_pages == 0) {
+        return {};
+    }
+    std::vector<std::int32_t> pages;
     {
         ScopedMutexLock lock(&header->sequence_mutex);
         SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
-        if (entry != nullptr) {
-            private_pages.reserve(entry->num_pages);
-            std::int32_t page = entry->head_page;
-            while (page != kInvalidPageIndex) {
-                private_pages.push_back(page);
-                const std::int32_t next = page_links[page];
-                page_links[page] = kInvalidPageIndex;
-                page = next;
+        if (entry == nullptr) {
+            throw std::out_of_range("Sequence ID " +
+                                    std::to_string(sequence_id) +
+                                    " not found during prefix release");
+        }
+        if (num_pages > entry->num_pages) {
+            throw std::out_of_range(
+                "Requested prefix release of " + std::to_string(num_pages) +
+                " pages but sequence " + std::to_string(sequence_id) +
+                " only owns " + std::to_string(entry->num_pages) + " pages");
+        }
+
+        pages.reserve(num_pages);
+        std::int32_t page = entry->head_page;
+        for (std::size_t i = 0; i < num_pages; ++i) {
+            if (page == kInvalidPageIndex) {
+                throw std::logic_error(
+                    "Corrupt page chain during prefix release for sequence " +
+                    std::to_string(sequence_id));
             }
-            entry->sequence_id = kTombstoneSequenceId;
-            entry->num_pages = 0;
-            entry->head_page = kInvalidPageIndex;
+            pages.push_back(page);
+            const std::int32_t next = page_links[page];
+            page_links[page] = kInvalidPageIndex;
+            page_owners[page] = kEmptySequenceId;
+            page = next;
+        }
+
+        entry->head_page = page;
+        entry->num_pages -= static_cast<std::uint32_t>(num_pages);
+        if (entry->num_pages == 0) {
             entry->tail_page = kInvalidPageIndex;
-            header->active_sequences.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 
-    const std::vector<std::int32_t>& pages_to_detach =
-        logical_pages.empty() ? private_pages : logical_pages;
-    if (!pages_to_detach.empty()) {
+    if (!pages.empty()) {
         ScopedMutexLock lock(&header->allocation_mutex);
-        DetachSequencePagesLocked(pages_to_detach, "ReleaseSequenceLogical");
-    }
-}
-
-void HostPagedKVBackend::SharedState::AttachSequencePages(
-    const std::vector<std::int32_t>& pages) {
-    if (pages.empty()) {
-        return;
-    }
-    ScopedMutexLock lock(&header->allocation_mutex);
-    for (std::int32_t page : pages) {
-        EnsurePageIndex(page, "AttachSequencePages");
-        if (page_sequence_refs[page] == 0 && page_prefix_pins[page] == 0) {
-            throw std::runtime_error(
-                "AttachSequencePages: cannot attach a free page " +
-                std::to_string(page));
+        std::uint32_t top =
+            header->free_stack_top.load(std::memory_order_relaxed);
+        for (std::int32_t page : pages) {
+            free_stack[top++] = page;
         }
-        ++page_sequence_refs[page];
-        header->sequence_ref_increments.fetch_add(1,
-                                                  std::memory_order_relaxed);
+        header->free_stack_top.store(top, std::memory_order_relaxed);
     }
-}
-
-void HostPagedKVBackend::SharedState::DetachSequencePages(
-    const std::vector<std::int32_t>& pages) {
-    if (pages.empty()) {
-        return;
-    }
-    ScopedMutexLock lock(&header->allocation_mutex);
-    DetachSequencePagesLocked(pages, "DetachSequencePages");
-}
-
-void HostPagedKVBackend::SharedState::PinPrefixPage(std::int32_t page) {
-    ScopedMutexLock lock(&header->allocation_mutex);
-    EnsurePageIndex(page, "PinPrefixPage");
-    if (page_sequence_refs[page] == 0 && page_prefix_pins[page] == 0) {
-        throw std::runtime_error("PinPrefixPage: cannot pin a free page " +
-                                 std::to_string(page));
-    }
-    ++page_prefix_pins[page];
-    header->prefix_pin_increments.fetch_add(1, std::memory_order_relaxed);
-}
-
-void HostPagedKVBackend::SharedState::UnpinPrefixPage(std::int32_t page) {
-    ScopedMutexLock lock(&header->allocation_mutex);
-    EnsurePageIndex(page, "UnpinPrefixPage");
-    if (page_prefix_pins[page] == 0) {
-        throw std::runtime_error("UnpinPrefixPage: prefix pin underflow for page " +
-                                 std::to_string(page));
-    }
-    --page_prefix_pins[page];
-    header->prefix_pin_decrements.fetch_add(1, std::memory_order_relaxed);
-    ReturnPageToFreeStackLocked(page);
+    return pages;
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
@@ -959,74 +851,15 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
 HostPagedKVStats HostPagedKVBackend::SharedState::CollectStats() const {
     HostPagedKVStats stats;
     stats.num_total_pages = config.num_pages;
-    {
-        ScopedMutexLock lock(&header->allocation_mutex);
-        const std::uint32_t free_count =
-            header->free_stack_top.load(std::memory_order_relaxed);
-        stats.num_free_pages = free_count;
-        stats.num_used_pages = config.num_pages - free_count;
-        for (std::size_t page = 0; page < config.num_pages; ++page) {
-            stats.num_sequence_ref_pages += page_sequence_refs[page];
-            stats.num_prefix_pinned_pages += page_prefix_pins[page];
-            if (page_sequence_refs[page] > 0) {
-                ++stats.num_pages_with_sequence_refs;
-            }
-            if (page_prefix_pins[page] > 0) {
-                ++stats.num_pages_with_prefix_pins;
-            }
-        }
-    }
+    const std::uint32_t free_count =
+        header->free_stack_top.load(std::memory_order_relaxed);
+    stats.num_free_pages = free_count;
+    stats.num_used_pages = config.num_pages - free_count;
     stats.num_active_sequences =
         header->active_sequences.load(std::memory_order_relaxed);
     stats.sequence_table_capacity = sequence_capacity;
     stats.total_bytes = total_bytes;
-    stats.sequence_ref_increments =
-        header->sequence_ref_increments.load(std::memory_order_relaxed);
-    stats.sequence_ref_decrements =
-        header->sequence_ref_decrements.load(std::memory_order_relaxed);
-    stats.prefix_pin_increments =
-        header->prefix_pin_increments.load(std::memory_order_relaxed);
-    stats.prefix_pin_decrements =
-        header->prefix_pin_decrements.load(std::memory_order_relaxed);
     return stats;
-}
-
-HostPageRefState HostPagedKVBackend::SharedState::PageRefState(
-    std::int32_t page) const {
-    ScopedMutexLock lock(&header->allocation_mutex);
-    EnsurePageIndex(page, "PageRefState");
-    HostPageRefState state;
-    state.page = page;
-    state.sequence_refs = page_sequence_refs[page];
-    state.prefix_pins = page_prefix_pins[page];
-    state.free_if_unpinned_once =
-        state.sequence_refs == 0 && state.prefix_pins == 1;
-    state.is_free = state.sequence_refs == 0 && state.prefix_pins == 0;
-    return state;
-}
-
-std::vector<HostPageRefState> HostPagedKVBackend::SharedState::PageRefStates(
-    const std::vector<std::int32_t>& pages) const {
-    std::vector<HostPageRefState> states;
-    states.reserve(pages.size());
-    ScopedMutexLock lock(&header->allocation_mutex);
-    for (std::int32_t page : pages) {
-        EnsurePageIndex(page, "PageRefStates");
-        HostPageRefState state;
-        state.page = page;
-        state.sequence_refs = page_sequence_refs[page];
-        state.prefix_pins = page_prefix_pins[page];
-        state.free_if_unpinned_once =
-            state.sequence_refs == 0 && state.prefix_pins == 1;
-        state.is_free = state.sequence_refs == 0 && state.prefix_pins == 0;
-        states.push_back(state);
-    }
-    return states;
-}
-
-std::size_t HostPagedKVBackend::SharedState::FreePageCount() const {
-    ScopedMutexLock lock(&header->allocation_mutex);
-    return header->free_stack_top.load(std::memory_order_relaxed);
 }
 
 // HostPagedKVBackend public API
@@ -1141,27 +974,9 @@ void HostPagedKVBackend::ReleaseSequences(
     }
 }
 
-void HostPagedKVBackend::AttachSequencePages(
-    const std::vector<std::int32_t>& pages) {
-    state_->AttachSequencePages(pages);
-}
-
-void HostPagedKVBackend::DetachSequencePages(
-    const std::vector<std::int32_t>& pages) {
-    state_->DetachSequencePages(pages);
-}
-
-void HostPagedKVBackend::PinPrefixPage(std::int32_t page) {
-    state_->PinPrefixPage(page);
-}
-
-void HostPagedKVBackend::UnpinPrefixPage(std::int32_t page) {
-    state_->UnpinPrefixPage(page);
-}
-
-void HostPagedKVBackend::ReleaseSequenceLogical(
-    std::int64_t sequence_id, const std::vector<std::int32_t>& logical_pages) {
-    state_->ReleaseSequenceLogical(sequence_id, logical_pages);
+std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(
+    std::int64_t sequence_id, std::size_t num_pages) {
+    return state_->ReleasePrefixPages(sequence_id, num_pages);
 }
 
 std::vector<std::int32_t> HostPagedKVBackend::SequencePages(
@@ -1171,19 +986,6 @@ std::vector<std::int32_t> HostPagedKVBackend::SequencePages(
 
 HostPagedKVStats HostPagedKVBackend::CollectStats() const {
     return state_->CollectStats();
-}
-
-HostPageRefState HostPagedKVBackend::PageRefState(std::int32_t page) const {
-    return state_->PageRefState(page);
-}
-
-std::vector<HostPageRefState> HostPagedKVBackend::PageRefStates(
-    const std::vector<std::int32_t>& pages) const {
-    return state_->PageRefStates(pages);
-}
-
-std::size_t HostPagedKVBackend::FreePageCount() const {
-    return state_->FreePageCount();
 }
 
 std::byte* HostPagedKVBackend::DataBase() { return state_->DataBase(); }
