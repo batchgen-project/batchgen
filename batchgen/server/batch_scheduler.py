@@ -276,7 +276,6 @@ class BatchScheduler:
                 model_name=requests[0].body.model if requests else "unknown",
                 incremental_output_dir=incremental_output_dir,
                 parse_thinking=self.server_args.parse_thinking,
-                parse_tool_call=self.server_args.parse_tool_call,
             )
 
         # --- Pool mode: send admission messages instead of blocking infer() ---
@@ -569,6 +568,7 @@ class BatchScheduler:
         self,
         model: str,
         decoded_text: str,
+        request_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[str, Optional[str], Optional[List[ToolCall]]]:
         """Apply thinking/tool-call parsing if flags are enabled.
 
@@ -589,25 +589,49 @@ class BatchScheduler:
             except NotImplementedError:
                 pass
 
-        if self.server_args.parse_tool_call:
-            try:
-                raw_calls, content = tokenizer.parse_tool_calls(content)
-                if raw_calls:
-                    tool_calls = [
-                        ToolCall(
-                            id=c["id"],
-                            type=c["type"],
-                            function=ToolCallFunction(
-                                name=c["function"]["name"],
-                                arguments=c["function"]["arguments"],
-                            ),
-                        )
-                        for c in raw_calls
-                    ]
-            except NotImplementedError:
-                pass
+        if self.server_args.tool_call_parser:
+            content, tool_calls = self._parse_tool_calls_via_function_call(
+                self.server_args.tool_call_parser, content, request_tools
+            )
 
         return content, reasoning_content, tool_calls
+
+    @staticmethod
+    def _parse_tool_calls_via_function_call(
+        parser_name: str,
+        content: str,
+        request_tools: Optional[List[Dict[str, Any]]],
+    ) -> tuple[str, Optional[List[ToolCall]]]:
+        from batchgen.function_call import FunctionCallParser
+        from batchgen.function_call import base_format_detector
+
+        if not request_tools:
+            return content, None
+
+        original = base_format_detector.SGLANG_FORWARD_UNKNOWN_TOOLS
+        base_format_detector.SGLANG_FORWARD_UNKNOWN_TOOLS = True
+        try:
+            parser = FunctionCallParser(
+                tools=request_tools, tool_call_parser=parser_name
+            )
+            normal_text, items = parser.parse_non_stream(content)
+        finally:
+            base_format_detector.SGLANG_FORWARD_UNKNOWN_TOOLS = original
+
+        if not items:
+            return content, None
+        tool_calls = [
+            ToolCall(
+                id=f"call_{uuid.uuid4().hex[:24]}",
+                type="function",
+                function=ToolCallFunction(
+                    name=item.name or "", arguments=item.parameters
+                ),
+            )
+            for item in items
+            if item.name
+        ]
+        return normal_text, tool_calls or None
 
     def _build_response_body(
         self,
@@ -619,8 +643,13 @@ class BatchScheduler:
         created_at = int(time.time())
         decoded_text = self._decode_tokens(model, token_ids)
         usage = self._build_usage(model, prompt_text, token_ids)
+        request_tools = (
+            request.body.tools
+            if isinstance(request.body, ChatCompletionRequest)
+            else None
+        )
         content, reasoning_content, tool_calls = self._parse_output(
-            model, decoded_text
+            model, decoded_text, request_tools=request_tools
         )
 
         if request.url == BatchEndpoint.CHAT_COMPLETIONS:

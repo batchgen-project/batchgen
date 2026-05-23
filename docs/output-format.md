@@ -67,7 +67,7 @@ BatchGen output follows the OpenAI Batch API format. Each line in the output JSO
 }
 ```
 
-Note: `--parse-thinking` and `--parse-tool-call` only apply to chat completion responses. Text completion responses always return raw decoded text.
+Note: `--parse-thinking` and `--tool-call-parser` only apply to chat completion responses. Text completion responses always return raw decoded text.
 
 ---
 
@@ -95,11 +95,11 @@ Extracts model reasoning/thinking into a separate `reasoning_content` field. The
 }
 ```
 
-### `--parse-tool-call`
+### `--tool-call-parser <name>`
 
-Extracts tool/function calls into an OpenAI-compatible `tool_calls` array.
+Selects a format detector that extracts tool/function calls into an OpenAI-compatible `tool_calls` array. Available names match `batchgen.function_call.FunctionCallParser.ToolCallParserEnum` (e.g. `qwen25`, `deepseekv3`, `kimi_k2`, `glm`, `mistral`, `hermes`, …). Leave the flag unset to return raw model output.
 
-**Without `--parse-tool-call`:**
+**Without `--tool-call-parser`:**
 ```json
 {
   "content": "Let me check.<｜tool▁call▁begin｜>get_weather\n{\"city\": \"London\"}<｜tool▁call▁end｜>",
@@ -107,7 +107,7 @@ Extracts tool/function calls into an OpenAI-compatible `tool_calls` array.
 }
 ```
 
-**With `--parse-tool-call`:**
+**With `--tool-call-parser deepseekv3`:**
 ```json
 {
   "content": "Let me check.",
@@ -123,6 +123,8 @@ Extracts tool/function calls into an OpenAI-compatible `tool_calls` array.
   ]
 }
 ```
+
+The detector validates emitted function names against the per-request `tools` field of `ChatCompletionRequest`. Requests without `tools` produce `tool_calls: null` even if the flag is set.
 
 ---
 
@@ -158,7 +160,7 @@ with open("results.jsonl", "r") as f:
         if msg.get("reasoning_content"):
             print(f"  Reasoning: {msg['reasoning_content'][:100]}...")
 
-        # Tool calls (when --parse-tool-call is enabled)
+        # Tool calls (when --tool-call-parser is set)
         if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 fn = tc["function"]
@@ -169,5 +171,5 @@ with open("results.jsonl", "r") as f:
 
 ## See Also
 
-- [Server Flags](server-flags.md#output-parsing) - Enable `--parse-thinking` and `--parse-tool-call`
+- [Server Flags](server-flags.md#output-parsing) - Enable `--parse-thinking` and `--tool-call-parser`
 - [Client API](client-api.md) - Submitting batches and downloading results

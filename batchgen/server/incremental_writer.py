@@ -29,8 +29,6 @@ from batchgen.server.io_struct import (
     ChatCompletionResponse,
     CompletionChoice,
     CompletionResponse,
-    ToolCall,
-    ToolCallFunction,
     Usage,
 )
 
@@ -57,7 +55,6 @@ class IncrementalWriter:
         eos_token_ids: Set[int],
         pad_token_id: int = 0,
         parse_thinking: bool = False,
-        parse_tool_call: bool = False,
     ):
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -70,7 +67,6 @@ class IncrementalWriter:
         self._eos_token_ids = set(eos_token_ids)
         self._pad_token_id = pad_token_id
         self._parse_thinking = parse_thinking
-        self._parse_tool_call = parse_tool_call
 
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
@@ -293,10 +289,10 @@ class IncrementalWriter:
     def _parse_output(
         self, decoded_text: str
     ) -> tuple:
-        """Apply thinking/tool-call parsing if flags are enabled.
+        """Apply thinking parsing if enabled. Tool-call extraction lives in BatchScheduler
+        because it needs access to per-request `tools` from ChatCompletionRequest.
 
         Returns (content, reasoning_content, tool_calls).
-        Mirrors BatchScheduler._parse_output().
         """
         content = decoded_text
         reasoning_content = None
@@ -305,24 +301,6 @@ class IncrementalWriter:
         if self._parse_thinking:
             try:
                 reasoning_content, content = self._tokenizer.parse_thinking(content)
-            except (NotImplementedError, AttributeError):
-                pass
-
-        if self._parse_tool_call:
-            try:
-                raw_calls, content = self._tokenizer.parse_tool_calls(content)
-                if raw_calls:
-                    tool_calls = [
-                        ToolCall(
-                            id=c["id"],
-                            type=c["type"],
-                            function=ToolCallFunction(
-                                name=c["function"]["name"],
-                                arguments=c["function"]["arguments"],
-                            ),
-                        )
-                        for c in raw_calls
-                    ]
             except (NotImplementedError, AttributeError):
                 pass
 

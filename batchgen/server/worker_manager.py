@@ -347,7 +347,6 @@ class WorkerManager:
         model_name: Optional[str] = None,
         incremental_output_dir: Optional[str] = None,
         parse_thinking: bool = False,
-        parse_tool_call: bool = False,
         max_context_length: Optional[int] = None,
         sampling_params: Optional[List[Dict[str, Any]]] = None,
         per_sequence_max_tokens: Optional[List[int]] = None,
@@ -381,7 +380,6 @@ class WorkerManager:
             payload["batch_id"] = batch_id
             payload["model_name"] = model_name
             payload["parse_thinking"] = parse_thinking
-            payload["parse_tool_call"] = parse_tool_call
         with self._lock:
             self.request_queue.put(payload)
             result = self.response_queue.get()

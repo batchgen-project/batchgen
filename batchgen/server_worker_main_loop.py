@@ -467,7 +467,6 @@ def _server_worker_main_impl(
 					"request_urls": task_data.get("request_url_map", {}),
 					"prompt_texts": task_data.get("prompt_text_map", {}),
 					"parse_thinking": task_data.get("parse_thinking", False),
-					"parse_tool_call": task_data.get("parse_tool_call", False),
 				}
 
 			if hasattr(worker, 'reset_runtime_state'):

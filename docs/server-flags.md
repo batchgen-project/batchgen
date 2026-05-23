@@ -269,7 +269,7 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--parse-thinking` | `false` | Extract thinking/reasoning blocks into `reasoning_content` field |
-| `--parse-tool-call` | `false` | Extract tool call blocks into `tool_calls` array |
+| `--tool-call-parser` | unset | Format detector that extracts tool-call blocks into the OpenAI-compatible `tool_calls` array. Choices: `qwen25`, `qwen3_coder`, `qwen`, `deepseekv3`, `deepseekv31`, `deepseekv32`, `deepseekv4`, `glm`, `glm45`, `glm47`, `hermes`, `kimi_k2`, `llama3`, `minimax-m2`, `mistral`, `pythonic`. Leaving it unset returns raw model output. |
 
 ---
 

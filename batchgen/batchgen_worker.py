@@ -3907,7 +3907,6 @@ class BatchGenWorker:
 			eos_token_ids=self.eos_token_ids,
 			pad_token_id=self.pad_token_id,
 			parse_thinking=cfg.get("parse_thinking", False),
-			parse_tool_call=cfg.get("parse_tool_call", False),
 		)
 
 	def process_new_batch(

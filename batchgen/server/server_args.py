@@ -116,7 +116,7 @@ class ServerArgs:
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
     pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
     parse_thinking: bool = False  # Extract reasoning_content from model output
-    parse_tool_call: bool = False  # Extract tool_calls from model output
+    tool_call_parser: Optional[str] = None  # Format name for batchgen.function_call.FunctionCallParser (e.g. "qwen25", "deepseekv3"). Setting this enables tool-call extraction; leaving it unset disables parsing.
     enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
     cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
@@ -355,10 +355,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Extract thinking/reasoning blocks from model output into reasoning_content field",
     )
     parser.add_argument(
-        "--parse-tool-call",
-        action="store_true",
-        default=False,
-        help="Extract tool call blocks from model output into tool_calls array",
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=[
+            "deepseekv3",
+            "deepseekv31",
+            "deepseekv32",
+            "deepseekv4",
+            "glm",
+            "glm45",
+            "glm47",
+            "gpt-oss",
+            "hermes",
+            "kimi_k2",
+            "llama3",
+            "minimax-m2",
+            "mistral",
+            "pythonic",
+            "qwen",
+            "qwen25",
+            "qwen3_coder",
+        ],
+        help=(
+            "Enable tool-call extraction using the named format detector. "
+            "Tool calls are stripped from `content` and placed in the OpenAI-compatible "
+            "`tool_calls` array. Leave unset to return raw model output."
+        ),
     )
     cuda_graph_group = parser.add_mutually_exclusive_group()
     cuda_graph_group.add_argument(
@@ -578,7 +601,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         enable_ep_with_offloading=parsed.enable_ep_with_offloading,
         ep_offloading_ratio=parsed.ep_offloading_ratio,
         parse_thinking=parsed.parse_thinking,
-        parse_tool_call=parsed.parse_tool_call,
+        tool_call_parser=parsed.tool_call_parser,
         pre_dequantize_weights=parsed.pre_dequantize_weights,
         enable_cuda_graph=parsed.enable_cuda_graph,
         disable_cuda_graphs=parsed.disable_cuda_graphs,
