@@ -1,5 +1,7 @@
 #include "host_prefix_cache_coordinator.h"
 
+#include "shared_memory_utils.h"
+
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -30,12 +32,6 @@ namespace {
 constexpr std::uint64_t kPrefixCacheMagic = 0x484f535450434348ULL;
 constexpr std::uint32_t kPrefixCacheAbiVersion = 1;
 
-enum class InitState : std::uint32_t {
-    kUninitialized = 0,
-    kInitializing = 1,
-    kReady = 2,
-};
-
 enum class EntryState : std::uint32_t {
     kEmpty = 0,
     kResident = 1,
@@ -44,7 +40,7 @@ enum class EntryState : std::uint32_t {
 
 struct SharedHeader {
     std::atomic<std::uint32_t> init_state{
-        static_cast<std::uint32_t>(InitState::kUninitialized)};
+        static_cast<std::uint32_t>(SharedMemoryInitState::kUninitialized)};
     std::uint64_t magic = kPrefixCacheMagic;
     std::uint32_t abi_version = kPrefixCacheAbiVersion;
     std::uint64_t create_time_ns = 0;
@@ -108,26 +104,6 @@ struct SharedAttachment {
     std::uint32_t pending_load_count = 0;
     std::uint32_t release_requested = 0;
 };
-
-std::size_t AlignUp(std::size_t value, std::size_t alignment) {
-    if (alignment == 0) {
-        return value;
-    }
-    const std::size_t remainder = value % alignment;
-    if (remainder == 0) {
-        return value;
-    }
-    return value + (alignment - remainder);
-}
-
-std::size_t SystemPageSize() {
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "sysconf(_SC_PAGESIZE) failed");
-    }
-    return static_cast<std::size_t>(page_size);
-}
 
 std::uint64_t NowNs() {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -230,36 +206,6 @@ std::uint32_t ComputeCommitBoundaryTokens(
     }
     return has_required_group ? result : 0;
 }
-
-class ScopedMutexLock {
-   public:
-    explicit ScopedMutexLock(pthread_mutex_t* mutex) : mutex_(mutex) {
-        const int rc = pthread_mutex_lock(mutex_);
-        if (rc == EOWNERDEAD) {
-            const int consistent_rc = pthread_mutex_consistent(mutex_);
-            if (consistent_rc != 0) {
-                throw std::system_error(consistent_rc, std::generic_category(),
-                                        "pthread_mutex_consistent failed");
-            }
-        } else if (rc != 0) {
-            throw std::system_error(rc, std::generic_category(),
-                                    "pthread_mutex_lock failed");
-        }
-    }
-
-    ScopedMutexLock(const ScopedMutexLock&) = delete;
-    ScopedMutexLock& operator=(const ScopedMutexLock&) = delete;
-
-    ~ScopedMutexLock() {
-        const int rc = pthread_mutex_unlock(mutex_);
-        if (rc != 0) {
-            std::terminate();
-        }
-    }
-
-   private:
-    pthread_mutex_t* mutex_;
-};
 
 }  // namespace
 
@@ -469,39 +415,17 @@ void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
         group_specs[i].compression_ratio = spec.compression_ratio;
     }
 
-    pthread_mutexattr_t attr;
-    if (const int rc = pthread_mutexattr_init(&attr); rc != 0) {
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_init failed");
-    }
-    if (const int rc =
-            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-        rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_setpshared failed");
-    }
-    if (const int rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-        rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_setrobust failed");
-    }
-    if (const int rc = pthread_mutex_init(&header->mutex, &attr); rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutex_init failed");
-    }
-    pthread_mutexattr_destroy(&attr);
-    header->init_state.store(static_cast<std::uint32_t>(InitState::kReady),
-                             std::memory_order_release);
+    InitProcessSharedRobustMutex(&header->mutex, "pthread_mutex_init failed");
+    header->init_state.store(
+        static_cast<std::uint32_t>(SharedMemoryInitState::kReady),
+        std::memory_order_release);
 }
 
 void HostPrefixCacheCoordinator::SharedState::WaitForInitialization() const {
     while (true) {
-        const auto state = static_cast<InitState>(
+        const auto state = static_cast<SharedMemoryInitState>(
             header->init_state.load(std::memory_order_acquire));
-        if (state == InitState::kReady) {
+        if (state == SharedMemoryInitState::kReady) {
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -591,7 +515,7 @@ void HostPrefixCacheCoordinator::SharedState::Initialize(bool create_region) {
 
     if (create_region) {
         header->init_state.store(
-            static_cast<std::uint32_t>(InitState::kInitializing),
+            static_cast<std::uint32_t>(SharedMemoryInitState::kInitializing),
             std::memory_order_relaxed);
         ConstructSharedState();
     } else {
@@ -1050,7 +974,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
     PrefixCommitResult result;
     result.committed_tokens = commit_tokens;
 
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     std::uint32_t new_nodes_needed = 0;
     std::uint32_t group_entries_needed = 0;
     std::uint32_t page_handles_needed = 0;
@@ -1209,7 +1133,7 @@ PrefixLookupResult HostPrefixCacheCoordinator::SharedState::LookupAndAttach(
     const auto chain = BuildPrefixHashChain(namespace_digest, token_ids,
                                            hash_block_tokens);
     PrefixLookupResult result;
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     for (auto iter = chain.rbegin(); iter != chain.rend(); ++iter) {
         const std::uint32_t raw_end_token = iter->first;
         if (raw_end_token % commit_boundary_tokens != 0) {
@@ -1240,7 +1164,7 @@ PrefixLookupResult HostPrefixCacheCoordinator::SharedState::EstimateLookup(
     const auto chain = BuildPrefixHashChain(namespace_digest, token_ids,
                                            hash_block_tokens);
     PrefixLookupResult result;
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     for (auto iter = chain.rbegin(); iter != chain.rend(); ++iter) {
         const std::uint32_t raw_end_token = iter->first;
         if (raw_end_token % commit_boundary_tokens != 0) {
@@ -1267,7 +1191,7 @@ void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
     if (attachment_handle == 0) {
         return;
     }
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
     if (attachment == nullptr) {
         throw std::out_of_range("unknown host prefix cache attachment handle");
@@ -1299,7 +1223,7 @@ void HostPrefixCacheCoordinator::SharedState::BeginAttachmentLoad(
         throw std::invalid_argument(
             "host prefix cache load attachment handle must be non-zero");
     }
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
     if (attachment == nullptr) {
         throw std::out_of_range("unknown host prefix cache attachment handle");
@@ -1318,7 +1242,7 @@ void HostPrefixCacheCoordinator::SharedState::EndAttachmentLoad(
         throw std::invalid_argument(
             "host prefix cache load attachment handle must be non-zero");
     }
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
     if (attachment == nullptr) {
         throw std::out_of_range("unknown host prefix cache attachment handle");
@@ -1342,7 +1266,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
     std::uint32_t min_free_page_handles,
     std::uint32_t max_scan_nodes) {
     PrefixEvictionResult result;
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     CompactArenasLocked();
 
     const auto has_enough_free_capacity = [&result, this, min_free_nodes,
@@ -1416,7 +1340,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
 
 PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
     PrefixEvictionResult result;
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     CompactArenasLocked();
 
     for (std::uint32_t node_index = 0; node_index < config.max_nodes;
@@ -1447,7 +1371,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearUnprotected()
 PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
     PrefixDigest namespace_digest) {
     PrefixEvictionResult result;
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     CompactArenasLocked();
 
     for (std::uint32_t node_index = 0; node_index < config.max_nodes;
@@ -1479,7 +1403,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
-    ScopedMutexLock lock(&header->mutex);
+    ScopedPthreadMutexLock lock(&header->mutex);
     HostPrefixCacheStats stats;
     for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
         if (nodes[index].state ==

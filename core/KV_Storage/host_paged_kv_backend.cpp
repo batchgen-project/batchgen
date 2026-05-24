@@ -1,5 +1,7 @@
 #include "host_paged_kv_backend.h"
 
+#include "shared_memory_utils.h"
+
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <pthread.h>
@@ -35,63 +37,6 @@ constexpr std::int64_t kEmptySequenceId =
     std::numeric_limits<std::int64_t>::min();
 constexpr std::int64_t kTombstoneSequenceId = kEmptySequenceId + 1;
 
-enum class InitState : std::uint32_t {
-    kUninitialized = 0,
-    kInitializing = 1,
-    kReady = 2,
-};
-
-std::size_t AlignUp(std::size_t value, std::size_t alignment) {
-    if (alignment == 0) {
-        return value;
-    }
-    const std::size_t remainder = value % alignment;
-    if (remainder == 0) {
-        return value;
-    }
-    return value + (alignment - remainder);
-}
-
-std::size_t GetSystemPageSize() {
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        const int err = errno;
-        throw std::system_error(err, std::generic_category(),
-                                "sysconf(_SC_PAGESIZE) failed");
-    }
-    return static_cast<std::size_t>(page_size);
-}
-
-class ScopedMutexLock {
-   public:
-    explicit ScopedMutexLock(pthread_mutex_t* mu) : mu_(mu) {
-        int rc = pthread_mutex_lock(mu_);
-        if (rc == EOWNERDEAD) {
-            const int consistent_rc = pthread_mutex_consistent(mu_);
-            if (consistent_rc != 0) {
-                throw std::system_error(consistent_rc, std::generic_category(),
-                                        "pthread_mutex_consistent failed");
-            }
-        } else if (rc != 0) {
-            throw std::system_error(rc, std::generic_category(),
-                                    "pthread_mutex_lock failed");
-        }
-    }
-
-    ScopedMutexLock(const ScopedMutexLock&) = delete;
-    ScopedMutexLock& operator=(const ScopedMutexLock&) = delete;
-
-    ~ScopedMutexLock() {
-        const int rc = pthread_mutex_unlock(mu_);
-        if (rc != 0) {
-            std::terminate();  // Unlock failure is irrecoverable here.
-        }
-    }
-
-   private:
-    pthread_mutex_t* mu_;
-};
-
 struct SequenceEntry {
     std::int64_t sequence_id = kEmptySequenceId;
     std::uint32_t num_pages = 0;
@@ -101,7 +46,7 @@ struct SequenceEntry {
 
 struct SharedHeader {
     std::atomic<std::uint32_t> init_state{
-        static_cast<std::uint32_t>(InitState::kUninitialized)};
+        static_cast<std::uint32_t>(SharedMemoryInitState::kUninitialized)};
     std::uint64_t magic = kSharedMemoryMagic;
     std::uint64_t layout_fingerprint = 0;
     std::uint64_t config_hash = 0;
@@ -333,52 +278,31 @@ void HostPagedKVBackend::SharedState::ConstructSharedState() {
         sequence_table[i] = SequenceEntry();
     }
 
-    pthread_mutexattr_t attr;
-    if (const int rc = pthread_mutexattr_init(&attr); rc != 0) {
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_init failed");
-    }
-    if (const int rc =
-            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-        rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_setpshared failed");
-    }
-    if (const int rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-        rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutexattr_setrobust failed");
-    }
-
-    if (const int rc = pthread_mutex_init(&header->allocation_mutex, &attr);
-        rc != 0) {
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutex_init allocation_mutex failed");
-    }
-    if (const int rc = pthread_mutex_init(&header->sequence_mutex, &attr);
-        rc != 0) {
+    InitProcessSharedRobustMutex(
+        &header->allocation_mutex,
+        "pthread_mutex_init allocation_mutex failed");
+    try {
+        InitProcessSharedRobustMutex(
+            &header->sequence_mutex,
+            "pthread_mutex_init sequence_mutex failed");
+    } catch (...) {
         pthread_mutex_destroy(&header->allocation_mutex);
-        pthread_mutexattr_destroy(&attr);
-        throw std::system_error(rc, std::generic_category(),
-                                "pthread_mutex_init sequence_mutex failed");
+        throw;
     }
-    pthread_mutexattr_destroy(&attr);
 
-    header->init_state.store(static_cast<std::uint32_t>(InitState::kReady),
-                             std::memory_order_release);
+    header->init_state.store(
+        static_cast<std::uint32_t>(SharedMemoryInitState::kReady),
+        std::memory_order_release);
 }
 
 void HostPagedKVBackend::SharedState::WaitForInitialization() const {
     while (true) {
-        const auto state = static_cast<InitState>(
+        const auto state = static_cast<SharedMemoryInitState>(
             header->init_state.load(std::memory_order_acquire));
-        if (state == InitState::kReady) {
+        if (state == SharedMemoryInitState::kReady) {
             return;
         }
-        if (state == InitState::kUninitialized) {
+        if (state == SharedMemoryInitState::kUninitialized) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -490,7 +414,7 @@ SequenceEntry* HostPagedKVBackend::SharedState::FindOrInsertSequenceEntryLocked(
 }
 
 void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
-    const std::size_t page_size = GetSystemPageSize();
+    const std::size_t page_size = SystemPageSize();
     total_bytes = AlignUp(total_bytes_unaligned, page_size);
     constexpr std::size_t kHugePageSize = 2 * 1024 * 1024;
     const std::size_t alignment = std::max(kHugePageSize, page_size);
@@ -534,7 +458,8 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
             mapping = static_cast<std::byte*>(mapped);
             MapPointers();
             header->init_state.store(
-                static_cast<std::uint32_t>(InitState::kInitializing),
+                static_cast<std::uint32_t>(
+                    SharedMemoryInitState::kInitializing),
                 std::memory_order_relaxed);
             ConstructSharedState();
         } else {
@@ -669,7 +594,7 @@ void HostPagedKVBackend::SharedState::Initialize(bool create_region) {
 
     if (created_region) {
         header->init_state.store(
-            static_cast<std::uint32_t>(InitState::kInitializing),
+            static_cast<std::uint32_t>(SharedMemoryInitState::kInitializing),
             std::memory_order_relaxed);
         ConstructSharedState();
     } else {
@@ -685,7 +610,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
     }
     std::vector<std::int32_t> pages(num_pages);
     {
-        ScopedMutexLock lock(&header->allocation_mutex);
+        ScopedPthreadMutexLock lock(&header->allocation_mutex);
         const std::uint32_t top =
             header->free_stack_top.load(std::memory_order_relaxed);
         if (top < num_pages) {
@@ -703,7 +628,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::AcquirePages(
     }
 
     {
-        ScopedMutexLock lock(&header->sequence_mutex);
+        ScopedPthreadMutexLock lock(&header->sequence_mutex);
         bool is_new = false;
         SequenceEntry* entry =
             FindOrInsertSequenceEntryLocked(sequence_id, &is_new);
@@ -731,7 +656,7 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
     std::int64_t sequence_id) {
     std::vector<std::int32_t> pages;
     {
-        ScopedMutexLock lock(&header->sequence_mutex);
+        ScopedPthreadMutexLock lock(&header->sequence_mutex);
         SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
         if (entry == nullptr) {
             throw std::out_of_range("Sequence ID " +
@@ -755,7 +680,7 @@ void HostPagedKVBackend::SharedState::ReleaseSequence(
     }
 
     if (!pages.empty()) {
-        ScopedMutexLock lock(&header->allocation_mutex);
+        ScopedPthreadMutexLock lock(&header->allocation_mutex);
         std::uint32_t top =
             header->free_stack_top.load(std::memory_order_relaxed);
         for (std::int32_t page : pages) {
@@ -772,7 +697,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
     }
     std::vector<std::int32_t> pages;
     {
-        ScopedMutexLock lock(&header->sequence_mutex);
+        ScopedPthreadMutexLock lock(&header->sequence_mutex);
         SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
         if (entry == nullptr) {
             throw std::out_of_range("Sequence ID " +
@@ -809,7 +734,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
     }
 
     if (!pages.empty()) {
-        ScopedMutexLock lock(&header->allocation_mutex);
+        ScopedPthreadMutexLock lock(&header->allocation_mutex);
         std::uint32_t top =
             header->free_stack_top.load(std::memory_order_relaxed);
         for (std::int32_t page : pages) {
@@ -822,7 +747,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
     std::int64_t sequence_id, std::optional<std::size_t> max_pages) const {
-    ScopedMutexLock lock(&header->sequence_mutex);
+    ScopedPthreadMutexLock lock(&header->sequence_mutex);
     SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
     if (entry == nullptr) {
         throw std::out_of_range("Sequence ID " + std::to_string(sequence_id) +
@@ -854,7 +779,7 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePageRange(
     std::int64_t sequence_id, std::size_t start_page,
     std::size_t page_count) const {
-    ScopedMutexLock lock(&header->sequence_mutex);
+    ScopedPthreadMutexLock lock(&header->sequence_mutex);
     SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
     if (entry == nullptr) {
         throw std::out_of_range("Sequence ID " + std::to_string(sequence_id) +
