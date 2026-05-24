@@ -139,7 +139,7 @@ def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
         active = coordinator.lookup_and_attach(namespace, token_ids)
         assert active.common_cached_tokens == 16
 
-        evicted = coordinator.evict_until_free(1, 0, 0, 2)
+        evicted = coordinator.evict_until_free(2, 0, 0, 2)
         assert evicted.evicted_nodes == 1
         assert evicted.protected_nodes == 1
         assert evicted.freed_group_entries == 2
