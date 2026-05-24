@@ -786,6 +786,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("min_free_page_handles"), py::arg("max_scan_nodes"))
         .def("clear_unprotected",
              &kv::HostPrefixCacheCoordinator::ClearUnprotected)
+        .def("clear_namespace",
+             &kv::HostPrefixCacheCoordinator::ClearNamespace,
+             py::arg("namespace_digest"))
         .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
         .def_property_readonly(
             "hash_block_tokens",

@@ -78,6 +78,7 @@ struct SharedGroupSpec {
 
 struct SharedPrefixNode {
     std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
+    PrefixDigest namespace_digest{};
     PrefixDigest digest{};
     std::uint32_t raw_end_token = 0;
     std::uint32_t first_group_entry = 0;
@@ -339,6 +340,7 @@ struct HostPrefixCacheCoordinator::SharedState {
         std::uint32_t min_free_page_handles,
         std::uint32_t max_scan_nodes);
     PrefixEvictionResult ClearUnprotected();
+    PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
     HostPrefixCacheStats GetStats() const;
 
     HostPrefixCacheConfig config;
@@ -383,6 +385,8 @@ struct HostPrefixCacheCoordinator::SharedState {
     void UpdateAttachmentLoadRefsLocked(SharedAttachment* attachment,
                                         int delta);
     void FinalizeAttachmentReleaseLocked(SharedAttachment* attachment);
+    void EvictNodeLocked(SharedPrefixNode* node,
+                         PrefixEvictionResult* result);
     void AppendEvictedPagesLocked(const SharedPrefixNode& node,
                                   PrefixEvictionResult* result) const;
     bool ResidentNodeReferencesPageLocked(std::uint32_t group_id,
@@ -790,6 +794,24 @@ void HostPrefixCacheCoordinator::SharedState::
     attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
 }
 
+void HostPrefixCacheCoordinator::SharedState::EvictNodeLocked(
+    SharedPrefixNode* node, PrefixEvictionResult* result) {
+    AppendEvictedPagesLocked(*node, result);
+    result->freed_group_entries += node->group_entry_count;
+    for (std::uint32_t offset = 0; offset < node->group_entry_count;
+         ++offset) {
+        const SharedGroupEntry& entry =
+            group_entries[node->first_group_entry + offset];
+        if (entry.state ==
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            result->freed_page_handles += entry.page_handle_count;
+        }
+    }
+    *node = SharedPrefixNode();
+    node->state = static_cast<std::uint32_t>(EntryState::kTombstone);
+    ++result->evicted_nodes;
+}
+
 void HostPrefixCacheCoordinator::SharedState::AppendEvictedPagesLocked(
     const SharedPrefixNode& node, PrefixEvictionResult* result) const {
     std::map<std::uint32_t, std::vector<HostPageHandle>> pages_by_group;
@@ -895,6 +917,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
     };
     struct NodeSnapshot {
         std::uint32_t node_index = 0;
+        PrefixDigest namespace_digest{};
         PrefixDigest digest{};
         std::uint32_t raw_end_token = 0;
         std::uint64_t last_access_epoch = 0;
@@ -912,6 +935,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
         }
         NodeSnapshot snapshot;
         snapshot.node_index = node_index;
+        snapshot.namespace_digest = node.namespace_digest;
         snapshot.digest = node.digest;
         snapshot.raw_end_token = node.raw_end_token;
         snapshot.last_access_epoch = node.last_access_epoch;
@@ -953,6 +977,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
     for (const NodeSnapshot& snapshot : snapshots) {
         SharedPrefixNode& node = nodes[snapshot.node_index];
         node.state = static_cast<std::uint32_t>(EntryState::kResident);
+        node.namespace_digest = snapshot.namespace_digest;
         node.digest = snapshot.digest;
         node.raw_end_token = snapshot.raw_end_token;
         node.first_group_entry = next_group_entry;
@@ -1162,6 +1187,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         const std::uint32_t node_index = AllocateNodeLocked();
         SharedPrefixNode& node = nodes[node_index];
         node.state = static_cast<std::uint32_t>(EntryState::kResident);
+        node.namespace_digest = namespace_digest;
         node.digest = digest;
         node.raw_end_token = raw_end_token;
         node.first_group_entry = first_group_entry;
@@ -1370,20 +1396,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
             continue;
         }
 
-        AppendEvictedPagesLocked(node, &result);
-        result.freed_group_entries += node.group_entry_count;
-        for (std::uint32_t offset = 0; offset < node.group_entry_count;
-             ++offset) {
-            const SharedGroupEntry& entry =
-                group_entries[node.first_group_entry + offset];
-            if (entry.state ==
-                static_cast<std::uint32_t>(EntryState::kResident)) {
-                result.freed_page_handles += entry.page_handle_count;
-            }
-        }
-        node = SharedPrefixNode();
-        node.state = static_cast<std::uint32_t>(EntryState::kTombstone);
-        ++result.evicted_nodes;
+        EvictNodeLocked(&node, &result);
 
         if (has_enough_free_capacity()) {
             break;
@@ -1417,20 +1430,41 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearUnprotected()
             ++result.protected_nodes;
             continue;
         }
-        AppendEvictedPagesLocked(node, &result);
-        result.freed_group_entries += node.group_entry_count;
-        for (std::uint32_t offset = 0; offset < node.group_entry_count;
-             ++offset) {
-            const SharedGroupEntry& entry =
-                group_entries[node.first_group_entry + offset];
-            if (entry.state ==
-                static_cast<std::uint32_t>(EntryState::kResident)) {
-                result.freed_page_handles += entry.page_handle_count;
-            }
+        EvictNodeLocked(&node, &result);
+    }
+
+    if (result.evicted_nodes != 0) {
+        FilterEvictedPagesStillReferencedLocked(&result);
+        CompactArenasLocked();
+    }
+    header->evicted_nodes.fetch_add(result.evicted_nodes,
+                                    std::memory_order_relaxed);
+    header->eviction_protected_skips.fetch_add(
+        result.protected_nodes, std::memory_order_relaxed);
+    return result;
+}
+
+PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
+    PrefixDigest namespace_digest) {
+    PrefixEvictionResult result;
+    ScopedMutexLock lock(&header->mutex);
+    CompactArenasLocked();
+
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
         }
-        node = SharedPrefixNode();
-        node.state = static_cast<std::uint32_t>(EntryState::kTombstone);
-        ++result.evicted_nodes;
+        if (!DigestEquals(node.namespace_digest, namespace_digest)) {
+            continue;
+        }
+        if (NodeIsProtectedLocked(node)) {
+            ++result.protected_nodes;
+            continue;
+        }
+        EvictNodeLocked(&node, &result);
     }
 
     if (result.evicted_nodes != 0) {
@@ -1587,6 +1621,11 @@ PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilFree(
 
 PrefixEvictionResult HostPrefixCacheCoordinator::ClearUnprotected() {
     return state_->ClearUnprotected();
+}
+
+PrefixEvictionResult HostPrefixCacheCoordinator::ClearNamespace(
+    PrefixDigest namespace_digest) {
+    return state_->ClearNamespace(namespace_digest);
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::GetStats() const {

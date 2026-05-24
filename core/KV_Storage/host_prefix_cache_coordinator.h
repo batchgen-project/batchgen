@@ -131,6 +131,7 @@ class HostPrefixCacheCoordinator {
         std::uint32_t max_scan_nodes);
 
     PrefixEvictionResult ClearUnprotected();
+    PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
 
     HostPrefixCacheStats GetStats() const;
 

@@ -260,6 +260,44 @@ def test_host_prefix_cache_pending_load_protects_after_release():
         _shm_unlink(shm_name)
 
 
+def test_host_prefix_cache_clear_namespace_only_removes_matching_domain():
+    shm_name = _random_shm_name()
+    namespace_a = [1, 3, 5, 7]
+    namespace_b = [2, 4, 6, 8]
+    token_ids = list(range(8))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace_a,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(0, 0), _page(0, 1)]),
+                _group_pages(1, [_page(1, 0)]),
+            ],
+        )
+        coordinator.commit_prefix_pages(
+            namespace_b,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(0, 10), _page(0, 11)]),
+                _group_pages(1, [_page(1, 10)]),
+            ],
+        )
+
+        cleared = coordinator.clear_namespace(namespace_a)
+        assert cleared.evicted_nodes == 1
+        miss = coordinator.estimate_lookup(namespace_a, token_ids)
+        hit = coordinator.estimate_lookup(namespace_b, token_ids)
+        assert miss.miss_reason_mask
+        assert hit.common_cached_tokens == 8
+        assert coordinator.get_stats().resident_nodes == 1
+    finally:
+        _shm_unlink(shm_name)
+
+
 def test_host_prefix_cache_is_shared_across_process_attachments():
     shm_name = _random_shm_name()
     namespace = [7, 8, 9, 10]
