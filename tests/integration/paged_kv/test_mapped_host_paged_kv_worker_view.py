@@ -211,6 +211,37 @@ def test_mapped_mla_view_routes_logical_layers_after_cpu_write(bg):
                         _expected_token(expected_value),
                     )
 
+        range_sequence_id = 404
+        range_logical_layer = 4
+        all_k_ptrs, all_v_ptrs = view.get_sequence_layer_page_pointers(
+            range_sequence_id, range_logical_layer, None
+        )
+        range_k_ptrs, range_v_ptrs = (
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, 1, 2
+            )
+        )
+        assert all_v_ptrs is None
+        assert range_v_ptrs is None
+        assert range_k_ptrs == all_k_ptrs[1:3]
+
+        empty_k_ptrs, empty_v_ptrs = (
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, len(all_k_ptrs), 0
+            )
+        )
+        assert empty_k_ptrs == []
+        assert empty_v_ptrs is None
+
+        with pytest.raises(IndexError):
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, 0, 1, 1
+            )
+        with pytest.raises(IndexError):
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, len(all_k_ptrs), 1
+            )
+
         with pytest.raises(IndexError):
             view.resolve_physical_layer(len(LOGICAL_TO_PHYSICAL))
 

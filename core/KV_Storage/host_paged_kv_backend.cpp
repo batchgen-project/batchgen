@@ -205,6 +205,9 @@ struct HostPagedKVBackend::SharedState {
                                                  std::size_t num_pages);
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
+    std::vector<std::int32_t> SequencePageRange(
+        std::int64_t sequence_id, std::size_t start_page,
+        std::size_t page_count) const;
     HostPagedKVStats CollectStats() const;
 
     std::byte* DataBase() { return data_base; }
@@ -848,6 +851,53 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePages(
     return pages;
 }
 
+std::vector<std::int32_t> HostPagedKVBackend::SharedState::SequencePageRange(
+    std::int64_t sequence_id, std::size_t start_page,
+    std::size_t page_count) const {
+    ScopedMutexLock lock(&header->sequence_mutex);
+    SequenceEntry* entry = FindSequenceEntryLocked(sequence_id);
+    if (entry == nullptr) {
+        throw std::out_of_range("Sequence ID " + std::to_string(sequence_id) +
+                                " not found when fetching page range");
+    }
+    const std::size_t available_pages = entry->num_pages;
+    if (start_page > available_pages) {
+        throw std::out_of_range(
+            "Requested page range starting at " + std::to_string(start_page) +
+            " but sequence " + std::to_string(sequence_id) + " only owns " +
+            std::to_string(available_pages) + " pages");
+    }
+    if (page_count > available_pages - start_page) {
+        throw std::out_of_range(
+            "Requested " + std::to_string(page_count) +
+            " pages from offset " + std::to_string(start_page) +
+            " but sequence " + std::to_string(sequence_id) + " only has " +
+            std::to_string(available_pages) + " pages");
+    }
+
+    std::vector<std::int32_t> pages;
+    pages.reserve(page_count);
+    std::int32_t page = entry->head_page;
+    for (std::size_t skipped = 0; skipped < start_page; ++skipped) {
+        if (page == kInvalidPageIndex) {
+            throw std::logic_error(
+                "Corrupt page chain while skipping to page range for sequence " +
+                std::to_string(sequence_id));
+        }
+        page = page_links[page];
+    }
+    for (std::size_t count = 0; count < page_count; ++count) {
+        if (page == kInvalidPageIndex) {
+            throw std::logic_error(
+                "Corrupt page chain while reading page range for sequence " +
+                std::to_string(sequence_id));
+        }
+        pages.push_back(page);
+        page = page_links[page];
+    }
+    return pages;
+}
+
 HostPagedKVStats HostPagedKVBackend::SharedState::CollectStats() const {
     HostPagedKVStats stats;
     stats.num_total_pages = config.num_pages;
@@ -982,6 +1032,12 @@ std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(
 std::vector<std::int32_t> HostPagedKVBackend::SequencePages(
     std::int64_t sequence_id, std::optional<std::size_t> max_pages) const {
     return state_->SequencePages(sequence_id, max_pages);
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::SequencePageRange(
+    std::int64_t sequence_id, std::size_t start_page,
+    std::size_t page_count) const {
+    return state_->SequencePageRange(sequence_id, start_page, page_count);
 }
 
 HostPagedKVStats HostPagedKVBackend::CollectStats() const {

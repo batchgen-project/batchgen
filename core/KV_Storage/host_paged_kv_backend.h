@@ -237,6 +237,10 @@ class HostPagedKVBackend {
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
 
+    std::vector<std::int32_t> SequencePageRange(
+        std::int64_t sequence_id, std::size_t start_page,
+        std::size_t page_count) const;
+
     HostPagedKVStats CollectStats() const;
 
     std::byte* DataBase();

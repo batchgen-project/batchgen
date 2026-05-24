@@ -911,6 +911,37 @@ class HostPagedKVWorkerView : private LayerMapper {
         return {std::move(k_ptrs), std::move(v_ptrs)};
     }
 
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
+    GetSequenceLayerPageRangePointers(std::int64_t sequence_id,
+                                      std::size_t layer_idx,
+                                      std::size_t start_page,
+                                      std::size_t page_count) const {
+        const std::size_t physical_layer_idx = ResolvePhysicalLayer(
+            layer_idx,
+            "HostPagedKVWorkerView::GetSequenceLayerPageRangePointers");
+        auto page_indices =
+            backend_.SequencePageRange(sequence_id, start_page, page_count);
+        std::vector<void*> k_ptrs;
+        k_ptrs.reserve(page_indices.size());
+        std::optional<std::vector<void*>> v_ptrs;
+        if constexpr (Layout::kHasVCache) {
+            v_ptrs.emplace();
+            v_ptrs->reserve(page_indices.size());
+        }
+        std::byte* base = const_cast<std::byte*>(backend_.DataBase());
+        for (std::int32_t page : page_indices) {
+            void* k_ptr = static_cast<void*>(
+                layout_.KPageAddress(base, physical_layer_idx, page));
+            k_ptrs.emplace_back(k_ptr);
+            if constexpr (Layout::kHasVCache) {
+                void* v_ptr = static_cast<void*>(
+                    layout_.VPageAddress(base, physical_layer_idx, page));
+                v_ptrs->emplace_back(v_ptr);
+            }
+        }
+        return {std::move(k_ptrs), std::move(v_ptrs)};
+    }
+
     void RegisterSequences(const std::vector<std::int64_t>& sequence_ids) {
         if (sequence_ids.empty()) {
             return;

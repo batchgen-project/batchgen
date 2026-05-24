@@ -71,6 +71,25 @@ struct HasGrowPagesForSequences<
            std::declval<const std::vector<std::size_t>&>()))>>
     : std::true_type {};
 
+inline py::tuple PagePointersToPyTuple(
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>> result) {
+    py::list k_ptrs;
+    for (void* ptr : result.first) {
+        k_ptrs.append(
+            py::int_(reinterpret_cast<std::uintptr_t>(ptr)));
+    }
+    py::object v_ptrs = py::none();
+    if (result.second.has_value()) {
+        py::list v_list;
+        for (void* ptr : result.second.value()) {
+            v_list.append(
+                py::int_(reinterpret_cast<std::uintptr_t>(ptr)));
+        }
+        v_ptrs = std::move(v_list);
+    }
+    return py::make_tuple(std::move(k_ptrs), v_ptrs);
+}
+
 template <typename Manager>
 void BindHostPagedManager(py::module& m, const char* name) {
     py::class_<Manager>(m, name)
@@ -97,26 +116,22 @@ void BindHostPagedManager(py::module& m, const char* name) {
              [](Manager& self, std::int64_t sequence_id,
                 std::size_t layer_idx,
                 std::optional<std::size_t> max_tokens) {
-                 auto result = self.GetSequenceLayerPagePointers(
-                     sequence_id, layer_idx, max_tokens);
-                 py::list k_ptrs;
-                 for (void* ptr : result.first) {
-                     k_ptrs.append(py::int_(
-                         reinterpret_cast<std::uintptr_t>(ptr)));
-                 }
-                 py::object v_ptrs = py::none();
-                 if (result.second.has_value()) {
-                     py::list v_list;
-                     for (void* ptr : result.second.value()) {
-                         v_list.append(py::int_(
-                             reinterpret_cast<std::uintptr_t>(ptr)));
-                     }
-                     v_ptrs = std::move(v_list);
-                 }
-                 return py::make_tuple(std::move(k_ptrs), v_ptrs);
+                 return PagePointersToPyTuple(
+                     self.GetSequenceLayerPagePointers(
+                         sequence_id, layer_idx, max_tokens));
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
-             py::arg("max_tokens") = py::none());
+             py::arg("max_tokens") = py::none())
+        .def("get_sequence_layer_page_range_pointers",
+             [](Manager& self, std::int64_t sequence_id,
+                std::size_t layer_idx, std::size_t start_page,
+                std::size_t page_count) {
+                 return PagePointersToPyTuple(
+                     self.GetSequenceLayerPageRangePointers(
+                         sequence_id, layer_idx, start_page, page_count));
+             },
+             py::arg("sequence_id"), py::arg("layer_idx"),
+             py::arg("start_page"), py::arg("page_count"));
 }
 
 template <typename WorkerView>
@@ -333,30 +348,29 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
              [](WorkerView& self, std::int64_t sequence_id,
                 std::size_t layer_idx,
                 std::optional<std::size_t> max_tokens) {
-                 auto result = self.GetSequenceLayerPagePointers(
-                     sequence_id, layer_idx, max_tokens);
-                 py::list k_ptrs;
-                 for (void* ptr : result.first) {
-                     k_ptrs.append(py::int_(
-                         reinterpret_cast<std::uintptr_t>(ptr)));
-                 }
-                 py::object v_ptrs = py::none();
-                 if (result.second.has_value()) {
-                     py::list v_list;
-                     for (void* ptr : result.second.value()) {
-                         v_list.append(py::int_(
-                             reinterpret_cast<std::uintptr_t>(ptr)));
-                     }
-                     v_ptrs = std::move(v_list);
-                 }
-                 return py::make_tuple(std::move(k_ptrs), v_ptrs);
+                 return PagePointersToPyTuple(
+                     self.GetSequenceLayerPagePointers(
+                         sequence_id, layer_idx, max_tokens));
              },
              py::arg("sequence_id"), py::arg("layer_idx"),
              py::arg("max_tokens") = py::none(),
              "Return per-page K/V host pointers for one sequence and one "
              "layer. For mapped worker views, layer_idx is a logical layer id "
              "and is resolved to a physical layer id before address "
-             "calculation.");
+             "calculation.")
+        .def("get_sequence_layer_page_range_pointers",
+             [](WorkerView& self, std::int64_t sequence_id,
+                std::size_t layer_idx, std::size_t start_page,
+                std::size_t page_count) {
+                 return PagePointersToPyTuple(
+                     self.GetSequenceLayerPageRangePointers(
+                         sequence_id, layer_idx, start_page, page_count));
+             },
+             py::arg("sequence_id"), py::arg("layer_idx"),
+             py::arg("start_page"), py::arg("page_count"),
+             "Return K/V host pointers for a raw page range of one sequence "
+             "and one layer. For mapped worker views, layer_idx is a logical "
+             "layer id and is resolved before address calculation.");
 
     if constexpr (HasGrowSequencePages<WorkerView>::value) {
         cls.def("grow_sequence_pages",
