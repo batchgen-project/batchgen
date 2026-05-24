@@ -26,6 +26,11 @@ DEEPGEMM_VERSION="v2.1.1.post3"
 # Installation directory (defaults to temp, can be overridden)
 INSTALL_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_deps}"
 
+# Absolute paths to this script and the BatchGen repo root. Computed once at
+# entry so they stay valid even after install_* functions cd elsewhere.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BATCHGEN_DIR="$(dirname -- "$SCRIPT_DIR")"
+
 print_step() {
     echo -e "${BLUE}==>${NC} $1"
 }
@@ -214,9 +219,6 @@ install_deepgemm() {
 install_batchgen_kernels() {
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
-
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
         pip install . --no-build-isolation
@@ -229,13 +231,9 @@ install_batchgen_kernels() {
 install_batchgen() {
     print_step "Installing BatchGen..."
 
-    # Find BatchGen directory (script is in scripts/, BatchGen is parent)
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
-
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
-        pip install .
+        pip install . --no-build-isolation
         print_success "BatchGen installed"
     else
         print_error "Could not find BatchGen setup.py at $BATCHGEN_DIR"
