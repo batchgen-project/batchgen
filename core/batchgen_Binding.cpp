@@ -251,6 +251,14 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            "Offload one layer of prefill KV into host pages. For mapped "
            "worker views, layer_idx is a logical layer id and is resolved to "
            "a physical layer id before writing.")
+       .def("async_offload_layer_kv_range_to_host",
+           &WorkerView::AsyncOffloadLayerKVRangeToHost,
+           py::arg("layer_idx"), py::arg("sequence_ids"),
+           py::arg("k_tensor"), py::arg("v_tensor") = py::none(),
+           py::arg("raw_start_positions"), py::arg("token_counts"),
+           "Offload one layer of KV into a raw token range in host pages. "
+           "The source tensor starts at offset 0 while raw_start_positions "
+           "select each sequence's destination offset.")
        .def("async_append_decode_kv_to_host",
            &WorkerView::AsyncAppendDecodeKVToHost,
            py::arg("layer_idx"), py::arg("sequence_ids"),
