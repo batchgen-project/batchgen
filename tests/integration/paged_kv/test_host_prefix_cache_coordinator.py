@@ -68,6 +68,15 @@ def _small_config(shm_name: str):
     return config
 
 
+def _single_node_config(shm_name: str):
+    config = _config(shm_name)
+    config.max_nodes = 1
+    config.max_group_entries = 4
+    config.max_page_handles = 16
+    config.max_attachments = 2
+    return config
+
+
 def test_host_prefix_cache_lookup_attach_release():
     shm_name = _random_shm_name()
     namespace = [11, 22, 33, 44]
@@ -203,6 +212,42 @@ def test_host_prefix_cache_clear_skips_active_entries():
         assert clear.evicted_nodes == 1
         assert clear.protected_nodes == 0
         assert coordinator.get_stats().resident_nodes == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_pending_load_protects_after_release():
+    shm_name = _random_shm_name()
+    namespace = [909, 808, 707, 606]
+    token_ids = list(range(8))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(
+            _single_node_config(shm_name)
+        )
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(0, 0), _page(0, 1)]),
+                _group_pages(1, [_page(1, 0)]),
+            ],
+        )
+
+        active = coordinator.lookup_and_attach(namespace, token_ids)
+        coordinator.begin_attachment_load(active.attachment_handle)
+        coordinator.release_attachment(active.attachment_handle)
+        assert coordinator.get_stats().active_attachments == 1
+
+        evicted = coordinator.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 0
+        assert evicted.protected_nodes == 1
+
+        coordinator.end_attachment_load(active.attachment_handle)
+        assert coordinator.get_stats().active_attachments == 0
+        evicted = coordinator.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 1
     finally:
         _shm_unlink(shm_name)
 

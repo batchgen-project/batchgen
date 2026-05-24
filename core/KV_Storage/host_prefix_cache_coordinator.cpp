@@ -102,6 +102,8 @@ struct SharedAttachment {
     std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
     std::uint64_t attachment_handle = 0;
     std::uint32_t node_index = 0;
+    std::uint32_t pending_load_count = 0;
+    std::uint32_t release_requested = 0;
 };
 
 std::size_t AlignUp(std::size_t value, std::size_t alignment) {
@@ -322,6 +324,8 @@ struct HostPrefixCacheCoordinator::SharedState {
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids);
     void ReleaseAttachment(std::uint64_t attachment_handle);
+    void BeginAttachmentLoad(std::uint64_t attachment_handle);
+    void EndAttachmentLoad(std::uint64_t attachment_handle);
     PrefixEvictionResult EvictUntilFree(
         std::uint32_t min_free_nodes,
         std::uint32_t min_free_group_entries,
@@ -368,6 +372,10 @@ struct HostPrefixCacheCoordinator::SharedState {
     std::uint64_t AttachNodeLocked(std::uint32_t node_index);
     std::uint32_t CountFreeNodeSlotsLocked() const;
     bool NodeIsProtectedLocked(const SharedPrefixNode& node) const;
+    SharedAttachment* FindAttachmentLocked(std::uint64_t attachment_handle);
+    void UpdateAttachmentLoadRefsLocked(SharedAttachment* attachment,
+                                        int delta);
+    void FinalizeAttachmentReleaseLocked(SharedAttachment* attachment);
     void AppendEvictedPagesLocked(const SharedPrefixNode& node,
                                   PrefixEvictionResult* result) const;
     bool ResidentNodeReferencesPageLocked(std::uint32_t group_id,
@@ -723,6 +731,54 @@ bool HostPrefixCacheCoordinator::SharedState::NodeIsProtectedLocked(
         }
     }
     return false;
+}
+
+SharedAttachment*
+HostPrefixCacheCoordinator::SharedState::FindAttachmentLocked(
+    std::uint64_t attachment_handle) {
+    for (std::uint32_t index = 0; index < config.max_attachments; ++index) {
+        SharedAttachment& candidate = attachments[index];
+        if (candidate.state ==
+                static_cast<std::uint32_t>(EntryState::kResident) &&
+            candidate.attachment_handle == attachment_handle) {
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+void HostPrefixCacheCoordinator::SharedState::UpdateAttachmentLoadRefsLocked(
+    SharedAttachment* attachment, int delta) {
+    SharedPrefixNode& node = nodes[attachment->node_index];
+    if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+        throw std::runtime_error(
+            "host prefix cache attachment refers to non-resident node");
+    }
+    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
+        SharedGroupEntry& entry = group_entries[node.first_group_entry + offset];
+        const std::uint32_t pending =
+            entry.pending_load_count.load(std::memory_order_relaxed);
+        if (delta > 0) {
+            entry.pending_load_count.store(pending + 1,
+                                           std::memory_order_relaxed);
+        } else {
+            if (pending == 0) {
+                throw std::runtime_error(
+                    "host prefix cache pending load ref underflow");
+            }
+            entry.pending_load_count.store(pending - 1,
+                                           std::memory_order_relaxed);
+        }
+    }
+}
+
+void HostPrefixCacheCoordinator::SharedState::
+    FinalizeAttachmentReleaseLocked(SharedAttachment* attachment) {
+    if (attachment->pending_load_count != 0) {
+        attachment->release_requested = 1;
+        return;
+    }
+    attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
 }
 
 void HostPrefixCacheCoordinator::SharedState::AppendEvictedPagesLocked(
@@ -1177,18 +1233,13 @@ void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
         return;
     }
     ScopedMutexLock lock(&header->mutex);
-    SharedAttachment* attachment = nullptr;
-    for (std::uint32_t index = 0; index < config.max_attachments; ++index) {
-        SharedAttachment& candidate = attachments[index];
-        if (candidate.state ==
-                static_cast<std::uint32_t>(EntryState::kResident) &&
-            candidate.attachment_handle == attachment_handle) {
-            attachment = &candidate;
-            break;
-        }
-    }
+    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
     if (attachment == nullptr) {
         throw std::out_of_range("unknown host prefix cache attachment handle");
+    }
+    if (attachment->release_requested != 0) {
+        throw std::runtime_error(
+            "host prefix cache attachment release was already requested");
     }
     SharedPrefixNode& node = nodes[attachment->node_index];
     if (node.state == static_cast<std::uint32_t>(EntryState::kResident)) {
@@ -1204,7 +1255,50 @@ void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
             }
         }
     }
-    attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
+    FinalizeAttachmentReleaseLocked(attachment);
+}
+
+void HostPrefixCacheCoordinator::SharedState::BeginAttachmentLoad(
+    std::uint64_t attachment_handle) {
+    if (attachment_handle == 0) {
+        throw std::invalid_argument(
+            "host prefix cache load attachment handle must be non-zero");
+    }
+    ScopedMutexLock lock(&header->mutex);
+    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
+    if (attachment == nullptr) {
+        throw std::out_of_range("unknown host prefix cache attachment handle");
+    }
+    if (attachment->release_requested != 0) {
+        throw std::runtime_error(
+            "cannot begin load for a released host prefix cache attachment");
+    }
+    ++attachment->pending_load_count;
+    UpdateAttachmentLoadRefsLocked(attachment, 1);
+}
+
+void HostPrefixCacheCoordinator::SharedState::EndAttachmentLoad(
+    std::uint64_t attachment_handle) {
+    if (attachment_handle == 0) {
+        throw std::invalid_argument(
+            "host prefix cache load attachment handle must be non-zero");
+    }
+    ScopedMutexLock lock(&header->mutex);
+    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
+    if (attachment == nullptr) {
+        throw std::out_of_range("unknown host prefix cache attachment handle");
+    }
+    if (attachment->pending_load_count == 0) {
+        throw std::runtime_error(
+            "host prefix cache attachment pending load underflow");
+    }
+    --attachment->pending_load_count;
+    UpdateAttachmentLoadRefsLocked(attachment, -1);
+    if (attachment->release_requested != 0 &&
+        attachment->pending_load_count == 0) {
+        attachment->state =
+            static_cast<std::uint32_t>(EntryState::kTombstone);
+    }
 }
 
 PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
@@ -1434,6 +1528,16 @@ PrefixLookupResult HostPrefixCacheCoordinator::EstimateLookup(
 void HostPrefixCacheCoordinator::ReleaseAttachment(
     std::uint64_t attachment_handle) {
     state_->ReleaseAttachment(attachment_handle);
+}
+
+void HostPrefixCacheCoordinator::BeginAttachmentLoad(
+    std::uint64_t attachment_handle) {
+    state_->BeginAttachmentLoad(attachment_handle);
+}
+
+void HostPrefixCacheCoordinator::EndAttachmentLoad(
+    std::uint64_t attachment_handle) {
+    state_->EndAttachmentLoad(attachment_handle);
 }
 
 PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilFree(

@@ -765,6 +765,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("release_attachment",
              &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
              py::arg("attachment_handle"))
+        .def("begin_attachment_load",
+             &kv::HostPrefixCacheCoordinator::BeginAttachmentLoad,
+             py::arg("attachment_handle"))
+        .def("end_attachment_load",
+             &kv::HostPrefixCacheCoordinator::EndAttachmentLoad,
+             py::arg("attachment_handle"))
         .def("evict_until_free",
              &kv::HostPrefixCacheCoordinator::EvictUntilFree,
              py::arg("min_free_nodes"),

@@ -117,6 +117,9 @@ class HostPrefixCacheCoordinator {
 
     void ReleaseAttachment(std::uint64_t attachment_handle);
 
+    void BeginAttachmentLoad(std::uint64_t attachment_handle);
+    void EndAttachmentLoad(std::uint64_t attachment_handle);
+
     PrefixEvictionResult EvictUntilFree(
         std::uint32_t min_free_nodes,
         std::uint32_t min_free_group_entries,
