@@ -911,6 +911,37 @@ class HostPagedKVWorkerView : private LayerMapper {
         return {std::move(k_ptrs), std::move(v_ptrs)};
     }
 
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
+    GetSequenceLayerPageRangePointers(std::int64_t sequence_id,
+                                      std::size_t layer_idx,
+                                      std::size_t start_page,
+                                      std::size_t page_count) const {
+        const std::size_t physical_layer_idx = ResolvePhysicalLayer(
+            layer_idx,
+            "HostPagedKVWorkerView::GetSequenceLayerPageRangePointers");
+        auto page_indices =
+            backend_.SequencePageRange(sequence_id, start_page, page_count);
+        std::vector<void*> k_ptrs;
+        k_ptrs.reserve(page_indices.size());
+        std::optional<std::vector<void*>> v_ptrs;
+        if constexpr (Layout::kHasVCache) {
+            v_ptrs.emplace();
+            v_ptrs->reserve(page_indices.size());
+        }
+        std::byte* base = const_cast<std::byte*>(backend_.DataBase());
+        for (std::int32_t page : page_indices) {
+            void* k_ptr = static_cast<void*>(
+                layout_.KPageAddress(base, physical_layer_idx, page));
+            k_ptrs.emplace_back(k_ptr);
+            if constexpr (Layout::kHasVCache) {
+                void* v_ptr = static_cast<void*>(
+                    layout_.VPageAddress(base, physical_layer_idx, page));
+                v_ptrs->emplace_back(v_ptr);
+            }
+        }
+        return {std::move(k_ptrs), std::move(v_ptrs)};
+    }
+
     void RegisterSequences(const std::vector<std::int64_t>& sequence_ids) {
         if (sequence_ids.empty()) {
             return;
@@ -996,121 +1027,22 @@ class HostPagedKVWorkerView : private LayerMapper {
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
         // [B, S, H, D]
         SequenceLengths sequence_lengths) {
-        const std::size_t physical_layer_idx =
-            ResolvePhysicalLayer(layer_idx, "AsyncOffloadLayerKVToHost");
-        EnsureDeviceReady();
         const std::size_t batch = sequence_ids.size();
-        if (batch == 0) {
-            return LaunchAsyncTask([] {});
-        }
-        const std::size_t tokens_per_sequence =
-            ValidateKTensorShape(k_tensor, batch);
-        ValidateSequenceLengthsInput(sequence_lengths, batch,
-                                     "AsyncOffloadLayerKVToHost");
-        torch::Tensor prepared_k = k_tensor;
-        std::optional<torch::Tensor> prepared_v;
-        if (v_tensor.has_value()) {
-            if constexpr (kHasVCache) {
-                ValidateVTensorShape(*v_tensor, batch, tokens_per_sequence);
-                prepared_v = *v_tensor;
-            } else {
-                throw std::invalid_argument(
-                    "V tensor provided but V cache is disabled");
-            }
-        }
-        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
-        const auto producer_cuda_stream =
-            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        SequenceLengthVector raw_start_positions(batch, 0);
+        return AsyncOffloadLayerKVRangeToHostImpl(
+            layer_idx, std::move(sequence_ids), std::move(k_tensor),
+            std::move(v_tensor), std::move(raw_start_positions),
+            std::move(sequence_lengths), "AsyncOffloadLayerKVToHost");
+    }
 
-        return LaunchAsyncTask([this, physical_layer_idx,
-                                 sequence_ids = std::move(sequence_ids),
-                                 sequence_lengths = std::move(sequence_lengths),
-                                 prepared_k, prepared_v, tokens_per_sequence,
-                                 producer_cuda_stream]() {
-            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
-            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
-            this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
-
-            const auto* k_base =
-                static_cast<const std::byte*>(prepared_k.data_ptr());
-            const std::size_t k_token_bytes = geometry_.KTokenBytes();
-            const std::size_t k_seq_stride =
-                tokens_per_sequence * k_token_bytes;
-
-            const std::byte* v_base = nullptr;
-            std::size_t v_token_bytes = 0;
-            std::size_t v_seq_stride = 0;
-            if (prepared_v.has_value()) {
-                if constexpr (kHasVCache) {
-                    v_base =
-                        static_cast<const std::byte*>(prepared_v->data_ptr());
-                    v_token_bytes =
-                        geometry_.template VTokenBytes<kHasVCache>();
-                    v_seq_stride = tokens_per_sequence * v_token_bytes;
-                }
-            }
-
-            std::byte* host_base = backend_.DataBase();
-
-            for (std::size_t batch_idx = 0; batch_idx < sequence_ids.size();
-                 ++batch_idx) {
-                const std::int64_t sequence_id = sequence_ids[batch_idx];
-                const auto pages = page_table_.Pages(sequence_id);
-                const std::size_t tokens_to_copy = ResolveSequenceLength(
-                    sequence_lengths, batch_idx, sequence_id,
-                    tokens_per_sequence, "AsyncOffloadLayerKVToHost");
-                if (tokens_to_copy == 0) {
-                    continue;
-                }
-                geometry_.ValidatePageCapacity(pages, tokens_to_copy,
-                                               "AsyncOffloadLayerKVToHost");
-
-                const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
-
-                ForEachPageChunk(
-                    pages, 0, tokens_to_copy,
-                    [&](std::int32_t page_idx, std::size_t page_offset_tokens,
-                        std::size_t chunk_tokens,
-                        std::size_t relative_token_offset) {
-                        std::byte* dst = layout_.KPageAddress(
-                                             host_base, physical_layer_idx,
-                                             page_idx) +
-                                         page_offset_tokens * k_token_bytes;
-                        const std::byte* src =
-                            seq_k_src + relative_token_offset * k_token_bytes;
-                        EnqueueCopy(src, dst, chunk_tokens * k_token_bytes,
-                                    CopyDirection::kDeviceToHost, cuda_stream);
-                    });
-                if constexpr (kHasVCache) {
-                    if (v_base != nullptr) {
-                        const auto* seq_v_src =
-                            v_base + batch_idx * v_seq_stride;
-                        ForEachPageChunk(
-                            pages, 0, tokens_to_copy,
-                            [&](std::int32_t page_idx,
-                                std::size_t page_offset_tokens,
-                                std::size_t chunk_tokens,
-                                std::size_t relative_token_offset) {
-                                std::byte* dst =
-                                    layout_.template VPageAddress<>(
-                                        host_base, physical_layer_idx,
-                                        page_idx) +
-                                    page_offset_tokens * v_token_bytes;
-                                const std::byte* src =
-                                    seq_v_src +
-                                    relative_token_offset * v_token_bytes;
-                                EnqueueCopy(
-                                    src, dst, chunk_tokens * v_token_bytes,
-                                    CopyDirection::kDeviceToHost, cuda_stream);
-                            });
-                    }
-                }
-            }
-
-            this->SynchronizeWithEvent(cuda_stream);
-            // LogFirstTokenPerPage(layer_idx, sequence_ids, sequence_lengths,
-            //                      tokens_per_sequence, host_base);
-        });
+    KVAsyncTask AsyncOffloadLayerKVRangeToHost(
+        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
+        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
+        SequenceLengths raw_start_positions, SequenceLengths token_counts) {
+        return AsyncOffloadLayerKVRangeToHostImpl(
+            layer_idx, std::move(sequence_ids), std::move(k_tensor),
+            std::move(v_tensor), std::move(raw_start_positions),
+            std::move(token_counts), "AsyncOffloadLayerKVRangeToHost");
     }
 
     KVAsyncTask AsyncAppendDecodeKVToHost(
@@ -1555,6 +1487,144 @@ class HostPagedKVWorkerView : private LayerMapper {
 
     static inline constexpr std::string_view kClassTag =
         "HostPagedKVWorkerView";
+
+    KVAsyncTask AsyncOffloadLayerKVRangeToHostImpl(
+        std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
+        torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
+        SequenceLengths raw_start_positions, SequenceLengths token_counts,
+        std::string_view op_name) {
+        const std::size_t physical_layer_idx =
+            ResolvePhysicalLayer(layer_idx, op_name);
+        EnsureDeviceReady();
+        const std::size_t batch = sequence_ids.size();
+        if (batch == 0) {
+            return LaunchAsyncTask([] {});
+        }
+        const std::size_t tokens_per_sequence =
+            ValidateKTensorShape(k_tensor, batch);
+        ValidateSequenceLengthsInput(raw_start_positions, batch, op_name);
+        ValidateSequenceLengthsInput(token_counts, batch, op_name);
+        torch::Tensor prepared_k = std::move(k_tensor);
+        std::optional<torch::Tensor> prepared_v;
+        if (v_tensor.has_value()) {
+            if constexpr (kHasVCache) {
+                ValidateVTensorShape(*v_tensor, batch, tokens_per_sequence);
+                prepared_v = std::move(*v_tensor);
+            } else {
+                throw std::invalid_argument(
+                    "V tensor provided but V cache is disabled");
+            }
+        }
+        c10::cuda::OptionalCUDAGuard producer_guard(device_index_);
+        const auto producer_cuda_stream =
+            at::cuda::getCurrentCUDAStream(device_index_).stream();
+        std::string op_name_string(op_name);
+
+        return LaunchAsyncTask(
+            [this, physical_layer_idx, sequence_ids = std::move(sequence_ids),
+             raw_start_positions = std::move(raw_start_positions),
+             token_counts = std::move(token_counts), prepared_k, prepared_v,
+             tokens_per_sequence, producer_cuda_stream,
+             op_name = std::move(op_name_string)]() {
+                c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+                const auto cuda_stream =
+                    CopyStream(CopyDirection::kDeviceToHost);
+                this->WaitForProducerStream(cuda_stream, producer_cuda_stream);
+
+                const auto* k_base =
+                    static_cast<const std::byte*>(prepared_k.data_ptr());
+                const std::size_t k_token_bytes = geometry_.KTokenBytes();
+                const std::size_t k_seq_stride =
+                    tokens_per_sequence * k_token_bytes;
+
+                const std::byte* v_base = nullptr;
+                std::size_t v_token_bytes = 0;
+                std::size_t v_seq_stride = 0;
+                if (prepared_v.has_value()) {
+                    if constexpr (kHasVCache) {
+                        v_base = static_cast<const std::byte*>(
+                            prepared_v->data_ptr());
+                        v_token_bytes =
+                            geometry_.template VTokenBytes<kHasVCache>();
+                        v_seq_stride = tokens_per_sequence * v_token_bytes;
+                    }
+                }
+
+                std::byte* host_base = backend_.DataBase();
+                for (std::size_t batch_idx = 0;
+                     batch_idx < sequence_ids.size(); ++batch_idx) {
+                    const std::int64_t sequence_id = sequence_ids[batch_idx];
+                    const auto pages = page_table_.Pages(sequence_id);
+                    const std::size_t raw_start = ResolveSequenceLength(
+                        raw_start_positions, batch_idx, sequence_id,
+                        std::nullopt, op_name);
+                    const std::size_t tokens_to_copy = ResolveSequenceLength(
+                        token_counts, batch_idx, sequence_id,
+                        tokens_per_sequence, op_name);
+                    if (tokens_to_copy == 0) {
+                        continue;
+                    }
+                    if (raw_start >
+                        std::numeric_limits<std::size_t>::max() -
+                            tokens_to_copy) {
+                        std::ostringstream oss;
+                        oss << op_name << ": raw range overflows size_t";
+                        throw std::out_of_range(oss.str());
+                    }
+                    geometry_.ValidatePageCapacity(
+                        pages, raw_start + tokens_to_copy, op_name);
+
+                    const auto* seq_k_src = k_base + batch_idx * k_seq_stride;
+                    ForEachPageChunk(
+                        pages, raw_start, tokens_to_copy,
+                        [&](std::int32_t page_idx,
+                            std::size_t page_offset_tokens,
+                            std::size_t chunk_tokens,
+                            std::size_t relative_token_offset) {
+                            std::byte* dst =
+                                layout_.KPageAddress(host_base,
+                                                     physical_layer_idx,
+                                                     page_idx) +
+                                page_offset_tokens * k_token_bytes;
+                            const std::byte* src =
+                                seq_k_src +
+                                relative_token_offset * k_token_bytes;
+                            EnqueueCopy(src, dst,
+                                        chunk_tokens * k_token_bytes,
+                                        CopyDirection::kDeviceToHost,
+                                        cuda_stream);
+                        });
+                    if constexpr (kHasVCache) {
+                        if (v_base != nullptr) {
+                            const auto* seq_v_src =
+                                v_base + batch_idx * v_seq_stride;
+                            ForEachPageChunk(
+                                pages, raw_start, tokens_to_copy,
+                                [&](std::int32_t page_idx,
+                                    std::size_t page_offset_tokens,
+                                    std::size_t chunk_tokens,
+                                    std::size_t relative_token_offset) {
+                                    std::byte* dst =
+                                        layout_.template VPageAddress<>(
+                                            host_base, physical_layer_idx,
+                                            page_idx) +
+                                        page_offset_tokens * v_token_bytes;
+                                    const std::byte* src =
+                                        seq_v_src +
+                                        relative_token_offset * v_token_bytes;
+                                    EnqueueCopy(
+                                        src, dst,
+                                        chunk_tokens * v_token_bytes,
+                                        CopyDirection::kDeviceToHost,
+                                        cuda_stream);
+                                });
+                        }
+                    }
+                }
+
+                this->SynchronizeWithEvent(cuda_stream);
+            });
+    }
 
     void* KPhysicalPagePtr(std::size_t physical_layer_idx,
                            std::int32_t page_idx) {
