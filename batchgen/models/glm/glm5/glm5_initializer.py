@@ -64,6 +64,23 @@ class GLM5Initializer:
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
 
+    def get_cuda_graph_adapter(self):
+        """Return the GLM-5 CUDA-graph adapter (see HasCudaGraphAdapter protocol).
+
+        The worker calls this when `--enable-cuda-graph` is set; the adapter
+        owns mode selection, capture inputs, replay inputs, KV staging, and
+        the eager reference for compare. Phase A returns the adapter but the
+        worker does not call it yet — see Phase B (dual-path gate).
+        """
+        from batchgen.models.glm.glm5.cuda_graph_adapter import Glm5CudaGraphAdapter
+
+        return Glm5CudaGraphAdapter(
+            model_config=self.model_config,
+            engine_config=self.engine_config,
+            world_size=self.world_size,
+            rank=self.global_rank,
+        )
+
     def _default_engine_config(self):
         props = torch.cuda.get_device_properties(
             self.engine_config.Basic_Config.device
