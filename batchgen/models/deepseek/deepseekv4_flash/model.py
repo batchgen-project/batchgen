@@ -29,10 +29,26 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from batchgen_kernels.common.v4_hyper_connections import hc_post, hc_pre
+
 
 _FP4_E2M1_TABLE_VALUES = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -82,9 +98,11 @@ def _dequant_weight(
     if scale is not None and scale.ndim == 2 and weight.ndim == 2:
         row_block = max(weight.shape[0] // scale.shape[0], 1)
         col_block = max(weight.shape[1] // scale.shape[1], 1)
-        expanded_scale = scale.to(torch.float32).repeat_interleave(
-            row_block, dim=0
-        ).repeat_interleave(col_block, dim=1)
+        expanded_scale = (
+            scale.to(torch.float32)
+            .repeat_interleave(row_block, dim=0)
+            .repeat_interleave(col_block, dim=1)
+        )
         expanded_scale = expanded_scale[: weight.shape[0], : weight.shape[1]]
         return (weight.to(torch.float32) * expanded_scale).to(dtype)
     return weight.to(dtype)
@@ -120,7 +138,9 @@ def _dequant_fp4_e2m1_weight(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     if scale is None:
-        raise RuntimeError("DeepSeek-V4 FP4 weight is missing its E8M0 scale tensor.")
+        raise RuntimeError(
+            "DeepSeek-V4 FP4 weight is missing its E8M0 scale tensor."
+        )
     packed = _fp4_packed_bytes(weight)
     table = torch.tensor(
         _FP4_E2M1_TABLE_VALUES,
@@ -130,13 +150,18 @@ def _dequant_fp4_e2m1_weight(
     low = packed & 0x0F
     high = (packed >> 4) & 0x0F
     unpacked_shape = packed.shape[:-1] + (packed.shape[-1] * 2,)
-    unpacked = torch.empty(unpacked_shape, dtype=torch.float32, device=packed.device)
+    unpacked = torch.empty(
+        unpacked_shape, dtype=torch.float32, device=packed.device
+    )
     unpacked[..., 0::2] = table[low.long()]
     unpacked[..., 1::2] = table[high.long()]
 
-    expanded_scale = scale.to(torch.float32).unsqueeze(-1).expand(
-        *scale.shape, 32
-    ).reshape(*scale.shape[:-1], scale.shape[-1] * 32)
+    expanded_scale = (
+        scale.to(torch.float32)
+        .unsqueeze(-1)
+        .expand(*scale.shape, 32)
+        .reshape(*scale.shape[:-1], scale.shape[-1] * 32)
+    )
     expanded_scale = expanded_scale[..., : unpacked.shape[-1]]
     return (unpacked * expanded_scale).to(dtype)
 
@@ -160,7 +185,9 @@ class DeepSeekV4FlashLinearSlot(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def set_runtime_tensors(self, tensors: Dict[str, torch.Tensor], prefix: str) -> None:
+    def set_runtime_tensors(
+        self, tensors: Dict[str, torch.Tensor], prefix: str
+    ) -> None:
         self.weight = tensors.get(f"{prefix}.weight")
         self.scale = tensors.get(f"{prefix}.scale")
 
@@ -219,12 +246,18 @@ class DeepSeekV4FlashCompressor(nn.Module):
 class DeepSeekV4FlashIndexer(nn.Module):
     def __init__(self, config: Any, compress_ratio: int):
         super().__init__()
-        hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
+        hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
         q_lora_rank = int(_cfg(config, "q_lora_rank", 1024))
         head_dim = int(_cfg(config, "index_head_dim", 128))
         n_heads = int(_cfg(config, "index_n_heads", 64))
-        rope_head_dim = int(_cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64)))
-        eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
+        rope_head_dim = int(
+            _cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64))
+        )
+        eps = float(
+            _cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6))
+        )
 
         self.n_heads = n_heads
         self.head_dim = head_dim
@@ -253,20 +286,32 @@ class DeepSeekV4FlashAttention(nn.Module):
     def __init__(self, config: Any, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
-        self.n_heads = int(_cfg(config, "num_attention_heads", _cfg(config, "n_heads", 64)))
+        self.hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
+        self.n_heads = int(
+            _cfg(config, "num_attention_heads", _cfg(config, "n_heads", 64))
+        )
         self.head_dim = int(_cfg(config, "head_dim", 512))
         self.q_lora_rank = int(_cfg(config, "q_lora_rank", 1024))
         self.o_groups = int(_cfg(config, "o_groups", 8))
         self.o_lora_rank = int(_cfg(config, "o_lora_rank", 1024))
-        self.eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
-        self.softmax_scale = self.head_dim ** -0.5
+        self.eps = float(
+            _cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6))
+        )
+        self.softmax_scale = self.head_dim**-0.5
 
         ratios = list(_cfg(config, "compress_ratios", []))
-        self.compress_ratio = int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
+        self.compress_ratio = (
+            int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
+        )
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.wq_a = DeepSeekV4FlashLinearSlot(self.hidden_size, self.q_lora_rank)
+        self.attn_sink = nn.Parameter(
+            torch.empty(self.n_heads, dtype=torch.float32)
+        )
+        self.wq_a = DeepSeekV4FlashLinearSlot(
+            self.hidden_size, self.q_lora_rank
+        )
         self.q_norm = DeepSeekV4FlashRMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = DeepSeekV4FlashLinearSlot(
             self.q_lora_rank, self.n_heads * self.head_dim
@@ -282,7 +327,13 @@ class DeepSeekV4FlashAttention(nn.Module):
         )
 
         if self.compress_ratio:
-            rope_head_dim = int(_cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64)))
+            rope_head_dim = int(
+                _cfg(
+                    config,
+                    "qk_rope_head_dim",
+                    _cfg(config, "rope_head_dim", 64),
+                )
+            )
             self.compressor = DeepSeekV4FlashCompressor(
                 self.hidden_size,
                 self.head_dim,
@@ -326,7 +377,9 @@ class DeepSeekV4FlashAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, ...]] = None,
         cache_seqlens: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]
+    ]:
         del position_ids, use_cache
         bsz, q_len, _ = hidden_states.shape
         q_low = self.q_norm(self.wq_a(hidden_states))
@@ -350,22 +403,31 @@ class DeepSeekV4FlashAttention(nn.Module):
             kv_for_attn.size(1),
             past_key_value is not None,
         )
-        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(
+            q.dtype
+        )
         attn_output = torch.einsum("bhst,bthd->bshd", attn_weights, v)
 
         attn_output = attn_output.reshape(
-            bsz, q_len, self.o_groups, self.n_heads // self.o_groups * self.head_dim
+            bsz,
+            q_len,
+            self.o_groups,
+            self.n_heads // self.o_groups * self.head_dim,
         )
         wo_a_weight = self.wo_a.weight
         if wo_a_weight is None:
-            raise RuntimeError("DeepSeek-V4 attention wo_a weight is not loaded.")
+            raise RuntimeError(
+                "DeepSeek-V4 attention wo_a weight is not loaded."
+            )
         wo_a_weight = _dequant_weight(
             wo_a_weight,
             self.wo_a.scale,
             hidden_states.dtype,
         )
         wo_a = wo_a_weight.view(
-            self.o_groups, self.o_lora_rank, self.n_heads // self.o_groups * self.head_dim
+            self.o_groups,
+            self.o_lora_rank,
+            self.n_heads // self.o_groups * self.head_dim,
         )
         attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
         attn_output = self.wo_b(attn_output.flatten(2))
@@ -388,7 +450,9 @@ class DeepSeekV4FlashAttention(nn.Module):
         current_kv: torch.Tensor,
         cache_seqlens: torch.Tensor,
     ) -> None:
-        positions = (cache_seqlens.to(current_kv.device).long() - 1).clamp_min(0)
+        positions = (cache_seqlens.to(current_kv.device).long() - 1).clamp_min(
+            0
+        )
         batch_idx = torch.arange(current_kv.size(0), device=current_kv.device)
         valid = positions < past_kv.size(1)
         if valid.any():
@@ -413,7 +477,9 @@ class DeepSeekV4FlashAttention(nn.Module):
 
         if attention_mask is not None and attention_mask.dim() == 2:
             key_mask = attention_mask[:, -kv_len:].to(device) == 0
-            attn_scores = attn_scores.masked_fill(key_mask[:, None, None, :], neg_inf)
+            attn_scores = attn_scores.masked_fill(
+                key_mask[:, None, None, :], neg_inf
+            )
         elif attention_mask is not None and attention_mask.dim() == 4:
             attn_scores = attn_scores + attention_mask.to(device)
 
@@ -422,7 +488,9 @@ class DeepSeekV4FlashAttention(nn.Module):
                 torch.ones(q_len, kv_len, dtype=torch.bool, device=device),
                 diagonal=1,
             )
-            attn_scores = attn_scores.masked_fill(causal[None, None, :, :], neg_inf)
+            attn_scores = attn_scores.masked_fill(
+                causal[None, None, :, :], neg_inf
+            )
         return attn_scores
 
 
@@ -430,15 +498,45 @@ class DeepSeekV4FlashGate(nn.Module):
     def __init__(self, config: Any, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
-        self.num_experts = int(_cfg(config, "n_routed_experts", _cfg(config, "num_local_experts", 256)))
-        self.topk = int(_cfg(config, "num_experts_per_tok", _cfg(config, "n_activated_experts", 6)))
-        self.score_func = str(_cfg(config, "scoring_func", _cfg(config, "score_func", "sqrtsoftplus")))
-        self.route_scale = float(_cfg(config, "routed_scaling_factor", _cfg(config, "route_scale", 1.5)))
+        self.hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
+        self.num_experts = int(
+            _cfg(
+                config,
+                "n_routed_experts",
+                _cfg(config, "num_local_experts", 256),
+            )
+        )
+        self.topk = int(
+            _cfg(
+                config,
+                "num_experts_per_tok",
+                _cfg(config, "n_activated_experts", 6),
+            )
+        )
+        self.score_func = str(
+            _cfg(
+                config,
+                "scoring_func",
+                _cfg(config, "score_func", "sqrtsoftplus"),
+            )
+        )
+        self.route_scale = float(
+            _cfg(
+                config,
+                "routed_scaling_factor",
+                _cfg(config, "route_scale", 1.5),
+            )
+        )
         self.norm_topk_prob = bool(_cfg(config, "norm_topk_prob", True))
-        self.is_hash_layer = layer_idx < int(_cfg(config, "num_hash_layers", _cfg(config, "n_hash_layers", 3)))
+        self.is_hash_layer = layer_idx < int(
+            _cfg(config, "num_hash_layers", _cfg(config, "n_hash_layers", 3))
+        )
 
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
+        self.weight = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_size)
+        )
         if self.is_hash_layer:
             vocab_size = int(_cfg(config, "vocab_size", 129280))
             self.tid2eid = nn.Parameter(
@@ -447,7 +545,9 @@ class DeepSeekV4FlashGate(nn.Module):
             )
             self.register_parameter("bias", None)
         else:
-            self.bias = nn.Parameter(torch.empty(self.num_experts, dtype=torch.float32))
+            self.bias = nn.Parameter(
+                torch.empty(self.num_experts, dtype=torch.float32)
+            )
 
     def forward(
         self,
@@ -462,7 +562,9 @@ class DeepSeekV4FlashGate(nn.Module):
         elif self.score_func == "sqrtsoftplus":
             scores = F.softplus(scores).sqrt()
         else:
-            raise ValueError(f"Unsupported V4 gate score function: {self.score_func}")
+            raise ValueError(
+                f"Unsupported V4 gate score function: {self.score_func}"
+            )
 
         raw_scores = scores
         if self.is_hash_layer:
@@ -476,14 +578,18 @@ class DeepSeekV4FlashGate(nn.Module):
 
         topk_weights = raw_scores.gather(-1, topk_indices)
         if self.score_func != "softmax" and self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+            topk_weights = topk_weights / (
+                topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            )
         return topk_weights * self.route_scale, topk_indices
 
 
 class DeepSeekV4FlashExpertPlaceholder(nn.Module):
     """Lightweight expert slot replaced/configured by V4 expert wrappers."""
 
-    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float):
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, swiglu_limit: float
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -518,7 +624,12 @@ class DeepSeekV4FlashExpertPlaceholder(nn.Module):
         hidden_states = F.silu(gate) * up
         if weights is not None:
             hidden_states = hidden_states * weights
-        return self._linear(hidden_states.to(weights.dtype if weights is not None else gate.dtype), "w2")
+        return self._linear(
+            hidden_states.to(
+                weights.dtype if weights is not None else gate.dtype
+            ),
+            "w2",
+        )
 
 
 class DeepSeekV4FlashMoE(nn.Module):
@@ -528,10 +639,30 @@ class DeepSeekV4FlashMoE(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
-        self.intermediate_size = int(_cfg(config, "moe_intermediate_size", _cfg(config, "moe_inter_dim", 2048)))
-        self.total_experts = int(_cfg(config, "n_routed_experts", _cfg(config, "num_local_experts", 256)))
-        self.num_experts_per_tok = int(_cfg(config, "num_experts_per_tok", _cfg(config, "n_activated_experts", 6)))
+        self.hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
+        self.intermediate_size = int(
+            _cfg(
+                config,
+                "moe_intermediate_size",
+                _cfg(config, "moe_inter_dim", 2048),
+            )
+        )
+        self.total_experts = int(
+            _cfg(
+                config,
+                "n_routed_experts",
+                _cfg(config, "num_local_experts", 256),
+            )
+        )
+        self.num_experts_per_tok = int(
+            _cfg(
+                config,
+                "num_experts_per_tok",
+                _cfg(config, "n_activated_experts", 6),
+            )
+        )
         self.swiglu_limit = float(_cfg(config, "swiglu_limit", 10.0))
         self.gate = DeepSeekV4FlashGate(config, layer_idx)
         self.experts = nn.ModuleList(
@@ -554,21 +685,29 @@ class DeepSeekV4FlashMoE(nn.Module):
     def configure_ep(self, rank: int, world_size: int, comm=None) -> None:
         self.comm = comm
         self.experts_per_rank = math.ceil(self.total_experts / world_size)
-        self.routed_expert_start_idx = min(rank * self.experts_per_rank, self.total_experts)
+        self.routed_expert_start_idx = min(
+            rank * self.experts_per_rank, self.total_experts
+        )
         self.routed_expert_end_idx = min(
             (rank + 1) * self.experts_per_rank, self.total_experts
         )
         self.enable_ep_offloading = world_size > 1
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
         shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, self.hidden_size)
         flat_ids = input_ids.reshape(-1) if input_ids is not None else None
         topk_weights, topk_indices = self.gate(flat_states, flat_ids)
 
         routed = torch.zeros_like(flat_states, dtype=torch.float32)
-        counts = torch.bincount(topk_indices.reshape(-1), minlength=self.total_experts)
-        for expert_idx in range(self.routed_expert_start_idx, self.routed_expert_end_idx):
+        counts = torch.bincount(
+            topk_indices.reshape(-1), minlength=self.total_experts
+        )
+        for expert_idx in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
+        ):
             if counts[expert_idx].item() == 0:
                 continue
             token_idx, topk_pos = torch.where(topk_indices == expert_idx)
@@ -585,40 +724,19 @@ class DeepSeekV4FlashMoE(nn.Module):
         return (routed + shared).to(hidden_states.dtype).view(shape)
 
 
-def _hc_split(
-    mixes: torch.Tensor,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre = torch.sigmoid(
-        mixes[..., :hc_mult] * scale[0] + base[:hc_mult]
-    ) + eps
-    post = 2 * torch.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * scale[1]
-        + base[hc_mult : 2 * hc_mult]
-    )
-    comb_base = base[2 * hc_mult :].view(hc_mult, hc_mult)
-    comb = mixes[..., 2 * hc_mult :].view(*mixes.shape[:-1], hc_mult, hc_mult)
-    comb = torch.softmax(comb * scale[2] + comb_base, dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(max(int(sinkhorn_iters) - 1, 0)):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
-
-
 class DeepSeekV4FlashDecoderLayer(nn.Module):
     def __init__(self, config: Any, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
+        self.hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
         self.hc_mult = int(_cfg(config, "hc_mult", 4))
         self.hc_eps = float(_cfg(config, "hc_eps", 1e-6))
         self.hc_sinkhorn_iters = int(_cfg(config, "hc_sinkhorn_iters", 20))
-        self.rms_norm_eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
+        self.rms_norm_eps = float(
+            _cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6))
+        )
         hc_dim = self.hc_mult * self.hidden_size
         mix_hc = (2 + self.hc_mult) * self.hc_mult
 
@@ -626,51 +744,29 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         self.attn = self.self_attn
         self.mlp = DeepSeekV4FlashMoE(config, layer_idx)
         self.ffn = self.mlp
-        self.attn_norm = DeepSeekV4FlashRMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.ffn_norm = DeepSeekV4FlashRMSNorm(self.hidden_size, self.rms_norm_eps)
+        self.attn_norm = DeepSeekV4FlashRMSNorm(
+            self.hidden_size, self.rms_norm_eps
+        )
+        self.ffn_norm = DeepSeekV4FlashRMSNorm(
+            self.hidden_size, self.rms_norm_eps
+        )
         self.input_layernorm = self.attn_norm
         self.post_attention_layernorm = self.ffn_norm
 
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_attn_fn = nn.Parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+        )
+        self.hc_ffn_fn = nn.Parameter(
+            torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+        )
+        self.hc_attn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32)
+        )
+        self.hc_ffn_base = nn.Parameter(
+            torch.empty(mix_hc, dtype=torch.float32)
+        )
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-
-    def _hc_pre(
-        self,
-        hidden_states: torch.Tensor,
-        fn: torch.Tensor,
-        scale: torch.Tensor,
-        base: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        shape = hidden_states.shape
-        flat = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_norm_eps)
-        mixes = F.linear(flat, fn) * rsqrt
-        pre, post, comb = _hc_split(
-            mixes,
-            scale,
-            base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
-        reduced = torch.sum(pre.unsqueeze(-1) * flat.view(shape), dim=2)
-        return reduced.to(hidden_states.dtype), post, comb
-
-    def _hc_post(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-    ) -> torch.Tensor:
-        return (
-            post.unsqueeze(-1) * hidden_states.unsqueeze(-2)
-            + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        ).to(hidden_states.dtype)
 
     def forward(
         self,
@@ -683,17 +779,28 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]
+    ]:
         del output_attentions, kwargs
         collapse_hc_state = hidden_states.dim() == 3
         if collapse_hc_state:
-            hidden_states = hidden_states.unsqueeze(2).expand(
-                -1, -1, self.hc_mult, -1
-            ).contiguous()
+            hidden_states = (
+                hidden_states.unsqueeze(2)
+                .expand(-1, -1, self.hc_mult, -1)
+                .contiguous()
+            )
 
         residual = hidden_states
-        attn_input, post, comb = self._hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        attn_input, post, comb = hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+            self.rms_norm_eps,
         )
         attn_input = self.attn_norm(attn_input)
         attn_out, attn_weights, present = self.self_attn(
@@ -704,15 +811,22 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
             cache_seqlens=cache_seqlens,
             use_cache=use_cache,
         )
-        hidden_states = self._hc_post(attn_out, residual, post, comb)
+        hidden_states = hc_post(attn_out, residual, post, comb)
 
         residual = hidden_states
-        mlp_input, post, comb = self._hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        mlp_input, post, comb = hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+            self.rms_norm_eps,
         )
         mlp_input = self.ffn_norm(mlp_input)
         mlp_out = self.mlp(mlp_input, input_ids)
-        hidden_states = self._hc_post(mlp_out, residual, post, comb)
+        hidden_states = hc_post(mlp_out, residual, post, comb)
         if collapse_hc_state:
             hidden_states = hidden_states.mean(dim=2)
         return hidden_states, attn_weights, present
@@ -722,11 +836,15 @@ class DeepSeekV4FlashModel(nn.Module):
     def __init__(self, config: Any):
         super().__init__()
         self.config = config
-        self.hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
+        self.hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
         self.vocab_size = int(_cfg(config, "vocab_size", 129280))
         self.hc_mult = int(_cfg(config, "hc_mult", 4))
         self.hc_eps = float(_cfg(config, "hc_eps", 1e-6))
-        self.rms_norm_eps = float(_cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6)))
+        self.rms_norm_eps = float(
+            _cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6))
+        )
         self.embed_tokens = nn.Embedding(
             self.vocab_size,
             self.hidden_size,
@@ -736,7 +854,15 @@ class DeepSeekV4FlashModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 DeepSeekV4FlashDecoderLayer(config, layer_idx)
-                for layer_idx in range(int(_cfg(config, "num_hidden_layers", _cfg(config, "n_layers", 43))))
+                for layer_idx in range(
+                    int(
+                        _cfg(
+                            config,
+                            "num_hidden_layers",
+                            _cfg(config, "n_layers", 43),
+                        )
+                    )
+                )
             ]
         )
         self.norm = DeepSeekV4FlashRMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -744,15 +870,22 @@ class DeepSeekV4FlashModel(nn.Module):
         self.hc_head_fn = nn.Parameter(
             torch.empty(self.hc_mult, hc_dim, dtype=torch.float32)
         )
-        self.hc_head_base = nn.Parameter(torch.empty(self.hc_mult, dtype=torch.float32))
+        self.hc_head_base = nn.Parameter(
+            torch.empty(self.hc_mult, dtype=torch.float32)
+        )
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
     def _hc_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
         flat = hidden_states.flatten(2).float()
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_norm_eps)
+        rsqrt = torch.rsqrt(
+            flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
+        )
         mixes = F.linear(flat, self.hc_head_fn) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        pre = (
+            torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base)
+            + self.hc_eps
+        )
         return torch.sum(pre.unsqueeze(-1) * flat.view(shape), dim=2).to(
             hidden_states.dtype
         )
@@ -775,12 +908,16 @@ class DeepSeekV4FlashModel(nn.Module):
                 raise ValueError("input_ids or inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
 
-        hidden_states = inputs_embeds.unsqueeze(2).expand(
-            -1, -1, self.hc_mult, -1
-        ).contiguous()
+        hidden_states = (
+            inputs_embeds.unsqueeze(2)
+            .expand(-1, -1, self.hc_mult, -1)
+            .contiguous()
+        )
         presents = []
         for idx, layer in enumerate(self.layers):
-            past_kv = past_key_values[idx] if past_key_values is not None else None
+            past_kv = (
+                past_key_values[idx] if past_key_values is not None else None
+            )
             hidden_states, _, present = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -804,7 +941,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
         self.config = config
         self.model = DeepSeekV4FlashModel(config)
         self.vocab_size = int(_cfg(config, "vocab_size", 129280))
-        hidden_size = int(_cfg(config, "hidden_size", _cfg(config, "dim", 4096)))
+        hidden_size = int(
+            _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
+        )
         self.lm_head = nn.Linear(hidden_size, self.vocab_size, bias=False)
         self.head = self.lm_head
 
