@@ -238,16 +238,24 @@ def test_host_prefix_cache_pending_load_protects_after_release():
         active = coordinator.lookup_and_attach(namespace, token_ids)
         coordinator.begin_attachment_load(active.attachment_handle)
         coordinator.release_attachment(active.attachment_handle)
-        assert coordinator.get_stats().active_attachments == 1
+        stats = coordinator.get_stats()
+        assert stats.active_attachments == 1
+        assert stats.pending_load_entries == 2
+        assert stats.pending_load_refs == 2
 
         evicted = coordinator.evict_until_free(1, 0, 0, 1)
         assert evicted.evicted_nodes == 0
         assert evicted.protected_nodes == 1
+        assert coordinator.get_stats().eviction_protected_skips == 1
 
         coordinator.end_attachment_load(active.attachment_handle)
-        assert coordinator.get_stats().active_attachments == 0
+        stats = coordinator.get_stats()
+        assert stats.active_attachments == 0
+        assert stats.pending_load_entries == 0
+        assert stats.pending_load_refs == 0
         evicted = coordinator.evict_until_free(1, 0, 0, 1)
         assert evicted.evicted_nodes == 1
+        assert coordinator.get_stats().evicted_nodes == 1
     finally:
         _shm_unlink(shm_name)
 

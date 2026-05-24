@@ -721,6 +721,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                        &kv::HostPrefixCacheStats::resident_nodes)
         .def_readwrite("active_attachments",
                        &kv::HostPrefixCacheStats::active_attachments)
+        .def_readwrite("pending_load_entries",
+                       &kv::HostPrefixCacheStats::pending_load_entries)
+        .def_readwrite("pending_load_refs",
+                       &kv::HostPrefixCacheStats::pending_load_refs)
         .def_readwrite("used_group_entries",
                        &kv::HostPrefixCacheStats::used_group_entries)
         .def_readwrite("used_page_handles",
@@ -728,6 +732,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("lookup_hits", &kv::HostPrefixCacheStats::lookup_hits)
         .def_readwrite("lookup_misses",
                        &kv::HostPrefixCacheStats::lookup_misses)
+        .def_readwrite("evicted_nodes",
+                       &kv::HostPrefixCacheStats::evicted_nodes)
+        .def_readwrite("eviction_protected_skips",
+                       &kv::HostPrefixCacheStats::eviction_protected_skips)
         .def("__repr__", [](const kv::HostPrefixCacheStats& self) {
             return kv::ToString(self);
         });

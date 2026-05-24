@@ -63,6 +63,8 @@ struct SharedHeader {
     std::atomic<std::uint64_t> global_epoch{0};
     std::atomic<std::uint64_t> lookup_hits{0};
     std::atomic<std::uint64_t> lookup_misses{0};
+    std::atomic<std::uint64_t> evicted_nodes{0};
+    std::atomic<std::uint64_t> eviction_protected_skips{0};
     pthread_mutex_t mutex{};
 };
 
@@ -274,10 +276,15 @@ std::string ToString(const HostPrefixCacheStats& stats) {
     std::ostringstream oss;
     oss << "HostPrefixCacheStats(resident_nodes=" << stats.resident_nodes
         << ", active_attachments=" << stats.active_attachments
+        << ", pending_load_entries=" << stats.pending_load_entries
+        << ", pending_load_refs=" << stats.pending_load_refs
         << ", used_group_entries=" << stats.used_group_entries
         << ", used_page_handles=" << stats.used_page_handles
         << ", lookup_hits=" << stats.lookup_hits
-        << ", lookup_misses=" << stats.lookup_misses << ")";
+        << ", lookup_misses=" << stats.lookup_misses
+        << ", evicted_nodes=" << stats.evicted_nodes
+        << ", eviction_protected_skips="
+        << stats.eviction_protected_skips << ")";
     return oss.str();
 }
 
@@ -446,6 +453,8 @@ void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
     header->global_epoch.store(0, std::memory_order_relaxed);
     header->lookup_hits.store(0, std::memory_order_relaxed);
     header->lookup_misses.store(0, std::memory_order_relaxed);
+    header->evicted_nodes.store(0, std::memory_order_relaxed);
+    header->eviction_protected_skips.store(0, std::memory_order_relaxed);
 
     for (std::size_t i = 0; i < config.group_specs.size(); ++i) {
         const HostKVGroupSpec& spec = config.group_specs[i];
@@ -1385,6 +1394,10 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
         FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasLocked();
     }
+    header->evicted_nodes.fetch_add(result.evicted_nodes,
+                                    std::memory_order_relaxed);
+    header->eviction_protected_skips.fetch_add(
+        result.protected_nodes, std::memory_order_relaxed);
     return result;
 }
 
@@ -1424,6 +1437,10 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearUnprotected()
         FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasLocked();
     }
+    header->evicted_nodes.fetch_add(result.evicted_nodes,
+                                    std::memory_order_relaxed);
+    header->eviction_protected_skips.fetch_add(
+        result.protected_nodes, std::memory_order_relaxed);
     return result;
 }
 
@@ -1442,6 +1459,21 @@ HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
             ++stats.active_attachments;
         }
     }
+    for (std::uint32_t index = 0;
+         index < header->next_group_entry.load(std::memory_order_relaxed);
+         ++index) {
+        const SharedGroupEntry& entry = group_entries[index];
+        if (entry.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        const std::uint32_t pending =
+            entry.pending_load_count.load(std::memory_order_relaxed);
+        if (pending != 0) {
+            ++stats.pending_load_entries;
+            stats.pending_load_refs += pending;
+        }
+    }
     stats.used_group_entries =
         header->next_group_entry.load(std::memory_order_relaxed);
     stats.used_page_handles =
@@ -1449,6 +1481,10 @@ HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
     stats.lookup_hits = header->lookup_hits.load(std::memory_order_relaxed);
     stats.lookup_misses =
         header->lookup_misses.load(std::memory_order_relaxed);
+    stats.evicted_nodes =
+        header->evicted_nodes.load(std::memory_order_relaxed);
+    stats.eviction_protected_skips =
+        header->eviction_protected_skips.load(std::memory_order_relaxed);
     return stats;
 }
 

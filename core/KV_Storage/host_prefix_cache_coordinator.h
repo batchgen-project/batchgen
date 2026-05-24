@@ -66,10 +66,14 @@ struct PrefixEvictionResult {
 struct HostPrefixCacheStats {
     std::uint32_t resident_nodes = 0;
     std::uint32_t active_attachments = 0;
+    std::uint32_t pending_load_entries = 0;
+    std::uint32_t pending_load_refs = 0;
     std::uint32_t used_group_entries = 0;
     std::uint32_t used_page_handles = 0;
     std::uint64_t lookup_hits = 0;
     std::uint64_t lookup_misses = 0;
+    std::uint64_t evicted_nodes = 0;
+    std::uint64_t eviction_protected_skips = 0;
 };
 
 struct HostPrefixCacheConfig {
