@@ -45,6 +45,22 @@ def _make_split_inputs(T: int, seed: int = 0, batch: int = 1, hc_mult: int = 4):
     return mixes, scale, base
 
 
+def _ref_hc_split(mixes, scale, base, hc_mult, sinkhorn_iters, eps):
+    pre = torch.sigmoid(mixes[..., :hc_mult] * scale[0] + base[:hc_mult]) + eps
+    post = 2 * torch.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * scale[1]
+        + base[hc_mult : 2 * hc_mult]
+    )
+    comb_base = base[2 * hc_mult :].view(hc_mult, hc_mult)
+    comb = mixes[..., 2 * hc_mult :].view(*mixes.shape[:-1], hc_mult, hc_mult)
+    comb = torch.softmax(comb * scale[2] + comb_base, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(max(int(sinkhorn_iters) - 1, 0)):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
 def _ref_pre(
     hidden_states: torch.Tensor,
     fn_weight: torch.Tensor,
@@ -55,19 +71,17 @@ def _ref_pre(
     hc_eps: float = 1e-6,
     rms_norm_eps: float = 1e-6,
 ):
-    from batchgen.models.deepseek.deepseekv4_flash.model import (
-        DeepSeekV4FlashDecoderLayer,
-    )
+    import torch.nn.functional as F
 
-    ctx = SimpleNamespace(
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=sinkhorn_iters,
-        hc_eps=hc_eps,
-        rms_norm_eps=rms_norm_eps,
+    shape = hidden_states.shape
+    flat = hidden_states.flatten(2).float()
+    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + rms_norm_eps)
+    mixes = F.linear(flat, fn_weight) * rsqrt
+    pre, post, comb = _ref_hc_split(
+        mixes, scale, base, hc_mult, sinkhorn_iters, hc_eps
     )
-    return DeepSeekV4FlashDecoderLayer._hc_pre(
-        ctx, hidden_states, fn_weight, scale, base
-    )
+    reduced = torch.sum(pre.unsqueeze(-1) * flat.view(shape), dim=2)
+    return reduced.to(hidden_states.dtype), post, comb
 
 
 def _ref_post(
@@ -76,13 +90,10 @@ def _ref_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ):
-    from batchgen.models.deepseek.deepseekv4_flash.model import (
-        DeepSeekV4FlashDecoderLayer,
-    )
-
-    return DeepSeekV4FlashDecoderLayer._hc_post(
-        SimpleNamespace(), hidden_states, residual, post, comb
-    )
+    return (
+        post.unsqueeze(-1) * hidden_states.unsqueeze(-2)
+        + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    ).to(hidden_states.dtype)
 
 
 def test_sinkhorn_doubly_stochastic():
@@ -147,12 +158,13 @@ def test_hc_post_matches_ref(T):
 
 def test_hc_split_sigmoid_softmax_sinkhorn():
     from batchgen_kernels.common.v4_hyper_connections import hc_split
-    from batchgen.models.deepseek.deepseekv4_flash.model import _hc_split
 
     mixes, scale, base = _make_split_inputs(T=32, seed=1)
 
     pre, post, comb = hc_split(mixes, scale, base, 4, 20, 1e-6)
-    ref_pre, ref_post_out, ref_comb = _hc_split(mixes, scale, base, 4, 20, 1e-6)
+    ref_pre, ref_post_out, ref_comb = _ref_hc_split(
+        mixes, scale, base, 4, 20, 1e-6
+    )
 
     assert torch.allclose(pre, ref_pre, atol=1e-3)
     assert torch.allclose(post, ref_post_out, atol=1e-3)
