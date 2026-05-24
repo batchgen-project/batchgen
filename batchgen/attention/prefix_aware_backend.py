@@ -184,30 +184,51 @@ class GqaPrefixAwareAttentionBackend:
         if v_cache is None:
             raise RuntimeError("GQA paged full-hit prefill requires V cache")
 
-        outputs = []
         slot_indices = materialization.append_plan.slot_values
-        for seq_idx in range(len(metadata.seq_lengths)):
-            q_segment = query[seq_idx : seq_idx + 1].unsqueeze(0)
-            cache_seqlens = torch.tensor(
-                [int(metadata.full_seq_lengths[seq_idx])],
-                dtype=torch.int32,
-                device=query.device,
+        if isinstance(slot_indices, torch.Tensor):
+            slot_indices_tensor = slot_indices.to(
+                device=page_table.device,
+                dtype=torch.long,
             )
-            slot_idx = int(slot_indices[seq_idx])
-            block_table = page_table[slot_idx : slot_idx + 1]
-            attn_output, _ = gqa_decode_fa(
-                q=q_segment,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                sinks=self.sinks,
-                softmax_scale=self.softmax_scale,
-                sliding_window=self.sliding_window,
+        else:
+            slot_indices_tensor = torch.tensor(
+                [int(slot_idx) for slot_idx in slot_indices],
+                dtype=torch.long,
+                device=page_table.device,
             )
-            outputs.append(attn_output.squeeze(0))
+        block_table = page_table.index_select(0, slot_indices_tensor)
+        cache_seqlens = torch.tensor(
+            [int(seq_len) for seq_len in metadata.full_seq_lengths],
+            dtype=torch.int32,
+            device=query.device,
+        )
 
-        return torch.cat(outputs, dim=0)
+        squeeze_query_dim = False
+        if query.ndim == 3:
+            decode_query = query.unsqueeze(1)
+            squeeze_query_dim = True
+        elif query.ndim == 4 and query.shape[1] == 1:
+            decode_query = query
+        else:
+            raise RuntimeError(
+                "GQA full-hit prefix reuse expects query shape "
+                f"[batch, heads, dim] or [batch, 1, heads, dim], got "
+                f"{tuple(query.shape)}"
+            )
+
+        attn_output, _ = gqa_decode_fa(
+            q=decode_query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            sinks=self.sinks,
+            softmax_scale=self.softmax_scale,
+            sliding_window=self.sliding_window,
+        )
+        if squeeze_query_dim:
+            return attn_output.squeeze(1)
+        return attn_output
 
 
 @dataclass(frozen=True)

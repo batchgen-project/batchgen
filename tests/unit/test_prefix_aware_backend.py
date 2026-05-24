@@ -78,6 +78,26 @@ def _metadata(
     )
 
 
+def _full_hit_metadata(
+    *,
+    full_lengths: list[int],
+) -> PrefixCachePrepackMetadata:
+    batch_size = len(full_lengths)
+    cu_seqlens = torch.arange(0, batch_size + 1, dtype=torch.int32)
+    return PrefixCachePrepackMetadata(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=[int(value) for value in cu_seqlens.tolist()],
+        max_seqlen=1,
+        num_sequences=batch_size,
+        seq_lengths=[1] * batch_size,
+        global_sequence_ids=list(range(100, 100 + batch_size)),
+        prefix_reuse_mode=False,
+        full_hit_mode=True,
+        prefix_shared_tokens=list(full_lengths),
+        full_seq_lengths=list(full_lengths),
+    )
+
+
 def test_gqa_backend_no_prefix_uses_query_cu_seqlens_for_kv():
     recorded = {}
 
@@ -148,6 +168,73 @@ def test_gqa_backend_full_hit_requires_gpu_materialization():
             value=torch.ones((1, 1, 2)),
             metadata=_metadata(full_hit=True),
         )
+
+
+class _FakeGqaMaterializedManager:
+    def __init__(self):
+        self.k_cache = torch.zeros((4, 4, 1, 2))
+        self.v_cache = torch.ones((4, 4, 1, 2))
+        self.page_table = torch.tensor(
+            [
+                [0, 1],
+                [2, 3],
+            ],
+            dtype=torch.int32,
+        )
+
+    def get_layer_kv_with_page_table(self, layer_idx):
+        assert layer_idx == 2
+        return self.k_cache, self.v_cache, self.page_table
+
+
+class _FakeGqaMaterialization:
+    def __init__(self):
+        self.manager = _FakeGqaMaterializedManager()
+        self.append_plan = SimpleNamespace(
+            slot_values=torch.tensor([1, 0], dtype=torch.int32),
+        )
+        self.waited_layers = []
+
+    def wait_for_layer(self, layer_idx):
+        self.waited_layers.append(int(layer_idx))
+
+
+def test_gqa_backend_full_hit_uses_single_batched_decode(monkeypatch):
+    recorded = {}
+
+    import batchgen.attention.gqa as gqa
+
+    def fake_decode(**kwargs):
+        recorded.update(kwargs)
+        return kwargs["q"] + 10, None
+
+    monkeypatch.setattr(gqa, "gqa_decode_fa", fake_decode)
+
+    materialization = _FakeGqaMaterialization()
+    backend = GqaPrefixAwareAttentionBackend(
+        prefix_kv_builder=_FakePrefixKvBuilder(),
+        num_kv_heads=1,
+        head_dim=2,
+    )
+    query = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+
+    output = backend.forward_prefill(
+        query=query,
+        key=torch.empty((0, 1, 2)),
+        value=torch.empty((0, 1, 2)),
+        metadata=_full_hit_metadata(full_lengths=[5, 7]),
+        kv_cache_metadata=SimpleNamespace(
+            prefill_prefix_materialization=materialization
+        ),
+    )
+
+    torch.testing.assert_close(output, query + 10)
+    assert materialization.waited_layers == [2]
+    assert recorded["q"].shape == (2, 1, 2, 2)
+    assert recorded["k_cache"] is materialization.manager.k_cache
+    assert recorded["v_cache"] is materialization.manager.v_cache
+    assert recorded["cache_seqlens"].tolist() == [5, 7]
+    assert recorded["block_table"].tolist() == [[2, 3], [0, 1]]
 
 
 class _FakeGqaReplayWrapper:
