@@ -83,6 +83,15 @@ def test_host_prefix_cache_lookup_attach_release():
         assert commit.inserted_nodes == 2
         assert commit.existing_nodes == 0
 
+        estimated = coordinator.estimate_lookup(namespace, token_ids[:12])
+        assert estimated.common_cached_tokens == 8
+        assert estimated.attachment_handle == 0
+        assert [span.group_id for span in estimated.materialization_spans] == [
+            0,
+            1,
+        ]
+        assert coordinator.get_stats().active_attachments == 0
+
         attached = coordinator.lookup_and_attach(namespace, token_ids[:12])
         assert attached.common_cached_tokens == 8
         assert attached.attachment_handle != 0
