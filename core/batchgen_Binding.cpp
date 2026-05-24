@@ -747,6 +747,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("lookup_and_attach",
              &kv::HostPrefixCacheCoordinator::LookupAndAttach,
              py::arg("namespace_digest"), py::arg("token_ids"))
+        .def("estimate_lookup",
+             &kv::HostPrefixCacheCoordinator::EstimateLookup,
+             py::arg("namespace_digest"), py::arg("token_ids"))
         .def("release_attachment",
              &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
              py::arg("attachment_handle"))

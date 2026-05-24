@@ -103,6 +103,10 @@ class HostPrefixCacheCoordinator {
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids);
 
+    PrefixLookupResult EstimateLookup(
+        PrefixDigest namespace_digest,
+        const std::vector<std::int64_t>& token_ids);
+
     void ReleaseAttachment(std::uint64_t attachment_handle);
 
     HostPrefixCacheStats GetStats() const;

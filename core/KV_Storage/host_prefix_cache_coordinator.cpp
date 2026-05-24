@@ -317,6 +317,9 @@ struct HostPrefixCacheCoordinator::SharedState {
     PrefixLookupResult LookupAndAttach(
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids);
+    PrefixLookupResult EstimateLookup(
+        PrefixDigest namespace_digest,
+        const std::vector<std::int64_t>& token_ids);
     void ReleaseAttachment(std::uint64_t attachment_handle);
     HostPrefixCacheStats GetStats() const;
 
@@ -900,6 +903,34 @@ PrefixLookupResult HostPrefixCacheCoordinator::SharedState::LookupAndAttach(
     return result;
 }
 
+PrefixLookupResult HostPrefixCacheCoordinator::SharedState::EstimateLookup(
+    PrefixDigest namespace_digest,
+    const std::vector<std::int64_t>& token_ids) {
+    const auto chain = BuildPrefixHashChain(namespace_digest, token_ids,
+                                           hash_block_tokens);
+    PrefixLookupResult result;
+    ScopedMutexLock lock(&header->mutex);
+    for (auto iter = chain.rbegin(); iter != chain.rend(); ++iter) {
+        const std::uint32_t raw_end_token = iter->first;
+        if (raw_end_token % commit_boundary_tokens != 0) {
+            continue;
+        }
+        const auto node_index = FindNodeLocked(iter->second);
+        if (!node_index.has_value()) {
+            continue;
+        }
+        const SharedPrefixNode& node = nodes[node_index.value()];
+        if (!NodeHasRequiredGroupsLocked(node)) {
+            continue;
+        }
+        result.common_cached_tokens = node.raw_end_token;
+        result.materialization_spans = BuildMaterializationSpansLocked(node);
+        return result;
+    }
+    result.miss_reason_mask = 1;
+    return result;
+}
+
 void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
     std::uint64_t attachment_handle) {
     if (attachment_handle == 0) {
@@ -1026,6 +1057,12 @@ PrefixLookupResult HostPrefixCacheCoordinator::LookupAndAttach(
     PrefixDigest namespace_digest,
     const std::vector<std::int64_t>& token_ids) {
     return state_->LookupAndAttach(namespace_digest, token_ids);
+}
+
+PrefixLookupResult HostPrefixCacheCoordinator::EstimateLookup(
+    PrefixDigest namespace_digest,
+    const std::vector<std::int64_t>& token_ids) {
+    return state_->EstimateLookup(namespace_digest, token_ids);
 }
 
 void HostPrefixCacheCoordinator::ReleaseAttachment(
