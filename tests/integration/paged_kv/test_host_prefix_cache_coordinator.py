@@ -59,6 +59,15 @@ def _config(shm_name: str):
     return config
 
 
+def _small_config(shm_name: str):
+    config = _config(shm_name)
+    config.max_nodes = 2
+    config.max_group_entries = 8
+    config.max_page_handles = 32
+    config.max_attachments = 4
+    return config
+
+
 def test_host_prefix_cache_lookup_attach_release():
     shm_name = _random_shm_name()
     namespace = [11, 22, 33, 44]
@@ -106,6 +115,58 @@ def test_host_prefix_cache_lookup_attach_release():
 
         coordinator.release_attachment(attached.attachment_handle)
         assert coordinator.get_stats().active_attachments == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
+    shm_name = _random_shm_name()
+    namespace = [101, 202, 303, 404]
+    token_ids = list(range(16))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_small_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            16,
+            [
+                _group_pages(0, [_page(0, idx) for idx in range(4)]),
+                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+            ],
+        )
+
+        active = coordinator.lookup_and_attach(namespace, token_ids)
+        assert active.common_cached_tokens == 16
+
+        evicted = coordinator.evict_until_free(1, 0, 0, 2)
+        assert evicted.evicted_nodes == 1
+        assert evicted.protected_nodes == 1
+        assert evicted.freed_group_entries == 2
+        assert evicted.freed_page_handles == 3
+        assert len(evicted.evicted_group_pages) == 0
+
+        miss = coordinator.estimate_lookup(namespace, token_ids[:8])
+        hit = coordinator.estimate_lookup(namespace, token_ids)
+        assert miss.miss_reason_mask
+        assert hit.common_cached_tokens == 16
+        stats = coordinator.get_stats()
+        assert stats.resident_nodes == 1
+        assert stats.used_group_entries == 2
+        assert stats.used_page_handles == 6
+
+        coordinator.release_attachment(active.attachment_handle)
+        evicted = coordinator.evict_until_free(2, 0, 0, 2)
+        assert evicted.evicted_nodes == 1
+        assert [pages.group_id for pages in evicted.evicted_group_pages] == [
+            0,
+            1,
+        ]
+        assert [len(pages.pages) for pages in evicted.evicted_group_pages] == [
+            4,
+            2,
+        ]
+        assert coordinator.get_stats().resident_nodes == 0
     finally:
         _shm_unlink(shm_name)
 

@@ -55,6 +55,14 @@ struct PrefixCommitResult {
     std::uint32_t existing_nodes = 0;
 };
 
+struct PrefixEvictionResult {
+    std::uint32_t evicted_nodes = 0;
+    std::uint32_t protected_nodes = 0;
+    std::uint32_t freed_group_entries = 0;
+    std::uint32_t freed_page_handles = 0;
+    std::vector<GroupCommitPages> evicted_group_pages;
+};
+
 struct HostPrefixCacheStats {
     std::uint32_t resident_nodes = 0;
     std::uint32_t active_attachments = 0;
@@ -108,6 +116,12 @@ class HostPrefixCacheCoordinator {
         const std::vector<std::int64_t>& token_ids);
 
     void ReleaseAttachment(std::uint64_t attachment_handle);
+
+    PrefixEvictionResult EvictUntilFree(
+        std::uint32_t min_free_nodes,
+        std::uint32_t min_free_group_entries,
+        std::uint32_t min_free_page_handles,
+        std::uint32_t max_scan_nodes);
 
     HostPrefixCacheStats GetStats() const;
 

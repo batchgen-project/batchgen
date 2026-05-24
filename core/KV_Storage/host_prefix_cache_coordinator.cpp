@@ -13,6 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -321,6 +322,11 @@ struct HostPrefixCacheCoordinator::SharedState {
         PrefixDigest namespace_digest,
         const std::vector<std::int64_t>& token_ids);
     void ReleaseAttachment(std::uint64_t attachment_handle);
+    PrefixEvictionResult EvictUntilFree(
+        std::uint32_t min_free_nodes,
+        std::uint32_t min_free_group_entries,
+        std::uint32_t min_free_page_handles,
+        std::uint32_t max_scan_nodes);
     HostPrefixCacheStats GetStats() const;
 
     HostPrefixCacheConfig config;
@@ -359,6 +365,15 @@ struct HostPrefixCacheCoordinator::SharedState {
     std::vector<GroupMaterializationSpan> BuildMaterializationSpansLocked(
         const SharedPrefixNode& node) const;
     std::uint64_t AttachNodeLocked(std::uint32_t node_index);
+    std::uint32_t CountFreeNodeSlotsLocked() const;
+    bool NodeIsProtectedLocked(const SharedPrefixNode& node) const;
+    void AppendEvictedPagesLocked(const SharedPrefixNode& node,
+                                  PrefixEvictionResult* result) const;
+    bool ResidentNodeReferencesPageLocked(std::uint32_t group_id,
+                                          const HostPageHandle& page) const;
+    void FilterEvictedPagesStillReferencedLocked(
+        PrefixEvictionResult* result) const;
+    void CompactArenasLocked();
 };
 
 void HostPrefixCacheCoordinator::SharedState::ComputeOffsets() {
@@ -679,6 +694,230 @@ std::uint64_t HostPrefixCacheCoordinator::SharedState::AttachNodeLocked(
     return handle;
 }
 
+std::uint32_t
+HostPrefixCacheCoordinator::SharedState::CountFreeNodeSlotsLocked() const {
+    std::uint32_t free_slots = 0;
+    for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
+        const SharedPrefixNode& node = nodes[index];
+        if (node.state == static_cast<std::uint32_t>(EntryState::kEmpty) ||
+            node.state == static_cast<std::uint32_t>(EntryState::kTombstone)) {
+            ++free_slots;
+        }
+    }
+    return free_slots;
+}
+
+bool HostPrefixCacheCoordinator::SharedState::NodeIsProtectedLocked(
+    const SharedPrefixNode& node) const {
+    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
+        const SharedGroupEntry& entry =
+            group_entries[node.first_group_entry + offset];
+        if (entry.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        if (entry.active_ref_count.load(std::memory_order_relaxed) != 0 ||
+            entry.pending_load_count.load(std::memory_order_relaxed) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HostPrefixCacheCoordinator::SharedState::AppendEvictedPagesLocked(
+    const SharedPrefixNode& node, PrefixEvictionResult* result) const {
+    std::map<std::uint32_t, std::vector<HostPageHandle>> pages_by_group;
+    for (const GroupCommitPages& group_pages : result->evicted_group_pages) {
+        pages_by_group[group_pages.group_id] = group_pages.pages;
+    }
+    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
+        const SharedGroupEntry& entry =
+            group_entries[node.first_group_entry + offset];
+        if (entry.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        std::vector<HostPageHandle>& pages = pages_by_group[entry.group_id];
+        for (std::uint32_t page_idx = 0; page_idx < entry.page_handle_count;
+             ++page_idx) {
+            const SharedPageHandle& handle =
+                page_handles[entry.first_page_handle + page_idx];
+            pages.push_back({handle.host_region_id, handle.page_id});
+        }
+    }
+
+    result->evicted_group_pages.clear();
+    for (const HostKVGroupSpec& spec : config.group_specs) {
+        auto iter = pages_by_group.find(spec.group_id);
+        if (iter == pages_by_group.end() || iter->second.empty()) {
+            continue;
+        }
+        result->evicted_group_pages.push_back(
+            GroupCommitPages{iter->first, std::move(iter->second)});
+    }
+}
+
+bool HostPrefixCacheCoordinator::SharedState::ResidentNodeReferencesPageLocked(
+    std::uint32_t group_id, const HostPageHandle& page) const {
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state !=
+                    static_cast<std::uint32_t>(EntryState::kResident) ||
+                entry.group_id != group_id) {
+                continue;
+            }
+            for (std::uint32_t page_idx = 0;
+                 page_idx < entry.page_handle_count; ++page_idx) {
+                const SharedPageHandle& resident_page =
+                    page_handles[entry.first_page_handle + page_idx];
+                if (resident_page.host_region_id == page.host_region_id &&
+                    resident_page.page_id == page.page_id) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void HostPrefixCacheCoordinator::SharedState::
+    FilterEvictedPagesStillReferencedLocked(
+        PrefixEvictionResult* result) const {
+    for (GroupCommitPages& group_pages : result->evicted_group_pages) {
+        std::vector<HostPageHandle> releasable_pages;
+        for (const HostPageHandle& page : group_pages.pages) {
+            if (ResidentNodeReferencesPageLocked(group_pages.group_id, page)) {
+                continue;
+            }
+            const bool already_recorded = std::any_of(
+                releasable_pages.begin(), releasable_pages.end(),
+                [&page](const HostPageHandle& existing) {
+                    return existing.host_region_id == page.host_region_id &&
+                           existing.page_id == page.page_id;
+                });
+            if (!already_recorded) {
+                releasable_pages.push_back(page);
+            }
+        }
+        group_pages.pages = std::move(releasable_pages);
+    }
+    result->evicted_group_pages.erase(
+        std::remove_if(result->evicted_group_pages.begin(),
+                       result->evicted_group_pages.end(),
+                       [](const GroupCommitPages& group_pages) {
+                           return group_pages.pages.empty();
+                       }),
+        result->evicted_group_pages.end());
+}
+
+void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
+    struct GroupEntrySnapshot {
+        std::uint32_t group_id = 0;
+        std::uint32_t raw_end_token = 0;
+        std::uint32_t active_ref_count = 0;
+        std::uint32_t pending_load_count = 0;
+        std::vector<SharedPageHandle> pages;
+    };
+    struct NodeSnapshot {
+        std::uint32_t node_index = 0;
+        PrefixDigest digest{};
+        std::uint32_t raw_end_token = 0;
+        std::uint64_t last_access_epoch = 0;
+        std::vector<GroupEntrySnapshot> groups;
+    };
+
+    std::vector<NodeSnapshot> snapshots;
+    snapshots.reserve(config.max_nodes);
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        NodeSnapshot snapshot;
+        snapshot.node_index = node_index;
+        snapshot.digest = node.digest;
+        snapshot.raw_end_token = node.raw_end_token;
+        snapshot.last_access_epoch = node.last_access_epoch;
+        snapshot.groups.reserve(node.group_entry_count);
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state !=
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                continue;
+            }
+            GroupEntrySnapshot group;
+            group.group_id = entry.group_id;
+            group.raw_end_token = entry.raw_end_token;
+            group.active_ref_count =
+                entry.active_ref_count.load(std::memory_order_relaxed);
+            group.pending_load_count =
+                entry.pending_load_count.load(std::memory_order_relaxed);
+            group.pages.reserve(entry.page_handle_count);
+            for (std::uint32_t page_idx = 0;
+                 page_idx < entry.page_handle_count; ++page_idx) {
+                group.pages.push_back(
+                    page_handles[entry.first_page_handle + page_idx]);
+            }
+            snapshot.groups.emplace_back(std::move(group));
+        }
+        snapshots.emplace_back(std::move(snapshot));
+    }
+
+    for (std::uint32_t index = 0; index < config.max_group_entries; ++index) {
+        ResetGroupEntry(group_entries[index]);
+    }
+    std::fill(page_handles, page_handles + config.max_page_handles,
+              SharedPageHandle{});
+
+    std::uint32_t next_group_entry = 0;
+    std::uint32_t next_page_handle = 0;
+    for (const NodeSnapshot& snapshot : snapshots) {
+        SharedPrefixNode& node = nodes[snapshot.node_index];
+        node.state = static_cast<std::uint32_t>(EntryState::kResident);
+        node.digest = snapshot.digest;
+        node.raw_end_token = snapshot.raw_end_token;
+        node.first_group_entry = next_group_entry;
+        node.group_entry_count =
+            static_cast<std::uint32_t>(snapshot.groups.size());
+        node.last_access_epoch = snapshot.last_access_epoch;
+
+        for (const GroupEntrySnapshot& group : snapshot.groups) {
+            SharedGroupEntry& entry = group_entries[next_group_entry++];
+            ResetGroupEntry(entry);
+            entry.state = static_cast<std::uint32_t>(EntryState::kResident);
+            entry.group_id = group.group_id;
+            entry.raw_end_token = group.raw_end_token;
+            entry.first_page_handle = next_page_handle;
+            entry.page_handle_count =
+                static_cast<std::uint32_t>(group.pages.size());
+            entry.active_ref_count.store(group.active_ref_count,
+                                         std::memory_order_relaxed);
+            entry.pending_load_count.store(group.pending_load_count,
+                                           std::memory_order_relaxed);
+            for (const SharedPageHandle& page : group.pages) {
+                page_handles[next_page_handle++] = page;
+            }
+        }
+    }
+    header->next_group_entry.store(next_group_entry,
+                                   std::memory_order_relaxed);
+    header->next_page_handle.store(next_page_handle,
+                                   std::memory_order_relaxed);
+}
+
 PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
     PrefixDigest namespace_digest, const std::vector<std::int64_t>& token_ids,
     std::uint32_t commit_tokens,
@@ -967,6 +1206,93 @@ void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
     attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
 }
 
+PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
+    std::uint32_t min_free_nodes,
+    std::uint32_t min_free_group_entries,
+    std::uint32_t min_free_page_handles,
+    std::uint32_t max_scan_nodes) {
+    PrefixEvictionResult result;
+    ScopedMutexLock lock(&header->mutex);
+    CompactArenasLocked();
+
+    const auto has_enough_free_capacity = [&result, this, min_free_nodes,
+                                           min_free_group_entries,
+                                           min_free_page_handles]() {
+        const std::uint32_t free_nodes = CountFreeNodeSlotsLocked();
+        const std::uint32_t free_group_entries =
+            config.max_group_entries -
+            header->next_group_entry.load(std::memory_order_relaxed) +
+            result.freed_group_entries;
+        const std::uint32_t free_page_handles =
+            config.max_page_handles -
+            header->next_page_handle.load(std::memory_order_relaxed) +
+            result.freed_page_handles;
+        return free_nodes >= min_free_nodes &&
+               free_group_entries >= min_free_group_entries &&
+               free_page_handles >= min_free_page_handles;
+    };
+
+    if (has_enough_free_capacity()) {
+        return result;
+    }
+
+    std::vector<std::uint32_t> candidates;
+    candidates.reserve(config.max_nodes);
+    for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
+        if (nodes[index].state ==
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            candidates.push_back(index);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [this](std::uint32_t lhs, std::uint32_t rhs) {
+                  return nodes[lhs].last_access_epoch <
+                         nodes[rhs].last_access_epoch;
+              });
+
+    std::uint32_t scanned = 0;
+    for (std::uint32_t node_index : candidates) {
+        if (max_scan_nodes != 0 && scanned >= max_scan_nodes) {
+            break;
+        }
+        ++scanned;
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        if (NodeIsProtectedLocked(node)) {
+            ++result.protected_nodes;
+            continue;
+        }
+
+        AppendEvictedPagesLocked(node, &result);
+        result.freed_group_entries += node.group_entry_count;
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state ==
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                result.freed_page_handles += entry.page_handle_count;
+            }
+        }
+        node = SharedPrefixNode();
+        node.state = static_cast<std::uint32_t>(EntryState::kTombstone);
+        ++result.evicted_nodes;
+
+        if (has_enough_free_capacity()) {
+            break;
+        }
+    }
+
+    if (result.evicted_nodes != 0) {
+        FilterEvictedPagesStillReferencedLocked(&result);
+        CompactArenasLocked();
+    }
+    return result;
+}
+
 HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
     ScopedMutexLock lock(&header->mutex);
     HostPrefixCacheStats stats;
@@ -1068,6 +1394,15 @@ PrefixLookupResult HostPrefixCacheCoordinator::EstimateLookup(
 void HostPrefixCacheCoordinator::ReleaseAttachment(
     std::uint64_t attachment_handle) {
     state_->ReleaseAttachment(attachment_handle);
+}
+
+PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilFree(
+    std::uint32_t min_free_nodes,
+    std::uint32_t min_free_group_entries,
+    std::uint32_t min_free_page_handles,
+    std::uint32_t max_scan_nodes) {
+    return state_->EvictUntilFree(min_free_nodes, min_free_group_entries,
+                                  min_free_page_handles, max_scan_nodes);
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::GetStats() const {

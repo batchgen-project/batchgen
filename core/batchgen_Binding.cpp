@@ -703,6 +703,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readonly("existing_nodes",
                       &kv::PrefixCommitResult::existing_nodes);
 
+    py::class_<kv::PrefixEvictionResult>(m, "PrefixEvictionResult")
+        .def_readonly("evicted_nodes",
+                      &kv::PrefixEvictionResult::evicted_nodes)
+        .def_readonly("protected_nodes",
+                      &kv::PrefixEvictionResult::protected_nodes)
+        .def_readonly("freed_group_entries",
+                      &kv::PrefixEvictionResult::freed_group_entries)
+        .def_readonly("freed_page_handles",
+                      &kv::PrefixEvictionResult::freed_page_handles)
+        .def_readonly("evicted_group_pages",
+                      &kv::PrefixEvictionResult::evicted_group_pages);
+
     py::class_<kv::HostPrefixCacheStats>(m, "HostPrefixCacheStats")
         .def(py::init<>())
         .def_readwrite("resident_nodes",
@@ -753,6 +765,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("release_attachment",
              &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
              py::arg("attachment_handle"))
+        .def("evict_until_free",
+             &kv::HostPrefixCacheCoordinator::EvictUntilFree,
+             py::arg("min_free_nodes"),
+             py::arg("min_free_group_entries"),
+             py::arg("min_free_page_handles"), py::arg("max_scan_nodes"))
         .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
         .def_property_readonly(
             "hash_block_tokens",
