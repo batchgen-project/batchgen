@@ -327,6 +327,7 @@ struct HostPrefixCacheCoordinator::SharedState {
         std::uint32_t min_free_group_entries,
         std::uint32_t min_free_page_handles,
         std::uint32_t max_scan_nodes);
+    PrefixEvictionResult ClearUnprotected();
     HostPrefixCacheStats GetStats() const;
 
     HostPrefixCacheConfig config;
@@ -1293,6 +1294,45 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
     return result;
 }
 
+PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
+    PrefixEvictionResult result;
+    ScopedMutexLock lock(&header->mutex);
+    CompactArenasLocked();
+
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state !=
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        if (NodeIsProtectedLocked(node)) {
+            ++result.protected_nodes;
+            continue;
+        }
+        AppendEvictedPagesLocked(node, &result);
+        result.freed_group_entries += node.group_entry_count;
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state ==
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                result.freed_page_handles += entry.page_handle_count;
+            }
+        }
+        node = SharedPrefixNode();
+        node.state = static_cast<std::uint32_t>(EntryState::kTombstone);
+        ++result.evicted_nodes;
+    }
+
+    if (result.evicted_nodes != 0) {
+        FilterEvictedPagesStillReferencedLocked(&result);
+        CompactArenasLocked();
+    }
+    return result;
+}
+
 HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
     ScopedMutexLock lock(&header->mutex);
     HostPrefixCacheStats stats;
@@ -1403,6 +1443,10 @@ PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilFree(
     std::uint32_t max_scan_nodes) {
     return state_->EvictUntilFree(min_free_nodes, min_free_group_entries,
                                   min_free_page_handles, max_scan_nodes);
+}
+
+PrefixEvictionResult HostPrefixCacheCoordinator::ClearUnprotected() {
+    return state_->ClearUnprotected();
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::GetStats() const {
