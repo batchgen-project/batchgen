@@ -137,7 +137,7 @@ def test_compressed_ratio_host_batched_append_skips_pending_rows(bg):
         _shm_unlink(shm_name)
 
 
-def test_swa_host_view_keeps_page_aligned_tail(bg):
+def test_swa_host_view_keeps_full_history_and_exposes_window_range(bg):
     shm_name = _random_shm_name("swa_host")
     view = None
     sequence_ids = [201]
@@ -150,8 +150,8 @@ def test_swa_host_view_keeps_page_aligned_tail(bg):
         )
         view.initialize(0, True)
         view.register_sequences(sequence_ids)
-        allocations = view.allocate_pages_for_sequences([(201, 9)])
-        assert len(allocations[0]) == 3
+        allocations = view.allocate_pages_for_sequences([(201, 13)])
+        assert len(allocations[0]) == 4
         first_page = allocations[0][0]
 
         token = torch.full(
@@ -169,13 +169,41 @@ def test_swa_host_view_keeps_page_aligned_tail(bg):
         ).wait()
 
         page_table = view.build_page_table(sequence_ids)
-        assert len(page_table[0]) == 3
-        assert page_table[0][0] != first_page
+        assert len(page_table[0]) == 4
+        assert page_table[0][0] == first_page
 
-        # raw position 12 maps to page-local active position 8 after the first
-        # page is released: page ordinal 2, offset 0.
+        window_range = view.compute_swa_host_page_range(201, 13)
+        assert window_range.sequence_id == 201
+        assert window_range.raw_context_len == 13
+        assert window_range.window_start_token == 5
+        assert window_range.first_page == 1
+        assert window_range.page_count == 3
+        assert window_range.local_kv_len == 9
+        assert window_range.mask_start == 1
+
+        ranges = view.compute_swa_host_page_ranges([201], [13])
+        assert len(ranges) == 1
+        assert ranges[0].first_page == window_range.first_page
+        assert ranges[0].page_count == window_range.page_count
+
+        all_k_ptrs, all_v_ptrs = view.get_sequence_layer_page_pointers(
+            201,
+            1,
+            None,
+        )
+        window_k_ptrs, window_v_ptrs = (
+            view.get_sequence_layer_swa_window_page_pointers(
+                201,
+                1,
+                13,
+            )
+        )
+        assert all_v_ptrs is None
+        assert window_v_ptrs is None
+        assert window_k_ptrs == all_k_ptrs[1:4]
+
         k_cpu, _ = view.read_sequence_kv_to_cpu(201)
-        assert torch.equal(k_cpu[0, 2, 0], _expected_token(42.0))
+        assert torch.equal(k_cpu[0, 3, 0], _expected_token(42.0))
     finally:
         _close_view(view, sequence_ids)
         _shm_unlink(shm_name)

@@ -425,7 +425,24 @@ void BindSWAHostPagedWorkerView(py::module& m, const char* name) {
                                &WorkerView::page_size_tokens)
         .def_property_readonly("window_size_tokens",
                                &WorkerView::window_size_tokens)
-        .def_property_readonly("window_pages", &WorkerView::window_pages);
+        .def_property_readonly("window_pages", &WorkerView::window_pages)
+        .def("compute_swa_host_page_range",
+             &WorkerView::ComputeSWAHostPageRange,
+             py::arg("sequence_id"), py::arg("raw_context_len"))
+        .def("compute_swa_host_page_ranges",
+             &WorkerView::ComputeSWAHostPageRanges,
+             py::arg("sequence_ids"), py::arg("raw_context_lens"))
+        .def("get_sequence_layer_swa_window_page_pointers",
+             [](WorkerView& self, std::int64_t sequence_id,
+                std::size_t layer_idx, std::size_t raw_context_len) {
+                 return PagePointersToPyTuple(
+                     self.GetSequenceLayerSWAWindowPagePointers(
+                         sequence_id, layer_idx, raw_context_len));
+             },
+             py::arg("sequence_id"), py::arg("layer_idx"),
+             py::arg("raw_context_len"),
+             "Return K/V host pointers for the raw pages covering the current "
+             "SWA window. The underlying Host KV remains full-history.");
 }
 
 template <typename Manager>
@@ -619,6 +636,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
+
+    py::class_<kv::SWAHostPageRange>(m, "SWAHostPageRange")
+        .def_readonly("sequence_id", &kv::SWAHostPageRange::sequence_id)
+        .def_readonly("raw_context_len",
+                      &kv::SWAHostPageRange::raw_context_len)
+        .def_readonly("window_start_token",
+                      &kv::SWAHostPageRange::window_start_token)
+        .def_readonly("first_page", &kv::SWAHostPageRange::first_page)
+        .def_readonly("page_count", &kv::SWAHostPageRange::page_count)
+        .def_readonly("local_kv_len", &kv::SWAHostPageRange::local_kv_len)
+        .def_readonly("mask_start", &kv::SWAHostPageRange::mask_start)
+        .def("__repr__", [](const kv::SWAHostPageRange& range) {
+            std::ostringstream oss;
+            oss << "SWAHostPageRange(sequence_id=" << range.sequence_id
+                << ", raw_context_len=" << range.raw_context_len
+                << ", window_start_token=" << range.window_start_token
+                << ", first_page=" << range.first_page
+                << ", page_count=" << range.page_count
+                << ", local_kv_len=" << range.local_kv_len
+                << ", mask_start=" << range.mask_start << ")";
+            return oss.str();
+        });
 
     py::class_<kv::CompressedStateHostStats>(m,
                                              "CompressedStateHostStats")
