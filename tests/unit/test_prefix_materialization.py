@@ -27,6 +27,24 @@ class _FakeHostWorkerView:
         return self.task
 
 
+class _FailingHostWorkerView(_FakeHostWorkerView):
+    def async_load_prefix_pages_to_device(self, **kwargs):
+        super().async_load_prefix_pages_to_device(**kwargs)
+        raise RuntimeError("load failed")
+
+
+class _FakePrefixCoordinator:
+    def __init__(self):
+        self.begin_calls = []
+        self.end_calls = []
+
+    def begin_attachment_load(self, attachment_handle):
+        self.begin_calls.append(int(attachment_handle))
+
+    def end_attachment_load(self, attachment_handle):
+        self.end_calls.append(int(attachment_handle))
+
+
 class _FakeGpuManager:
     def __init__(self):
         self.config = SimpleNamespace(page_size_tokens=4)
@@ -148,3 +166,62 @@ def test_materialize_single_group_prefix_pages_rejects_wrong_host_region():
             ],
         )
     assert gpu_manager.allocations == []
+
+
+def test_materialize_single_group_prefix_pages_guards_attachment_load():
+    gpu_manager = _FakeGpuManager()
+    host_view = _FakeHostWorkerView()
+    coordinator = _FakePrefixCoordinator()
+
+    materialization = materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        prefix_cache_coordinator=coordinator,
+        sequences=[
+            PrefixMaterializationSequence(
+                sequence_id=101,
+                prefix_tokens=4,
+                suffix_tokens=1,
+                host_pages=[11],
+                attachment_handle=91,
+            ),
+            PrefixMaterializationSequence(
+                sequence_id=102,
+                prefix_tokens=4,
+                suffix_tokens=1,
+                host_pages=[12],
+                attachment_handle=91,
+            ),
+        ],
+    )
+
+    assert coordinator.begin_calls == [91]
+    assert coordinator.end_calls == []
+    materialization.wait_for_layer(0)
+    materialization.wait_for_layer(1)
+    assert host_view.task.wait_count == 1
+    assert coordinator.end_calls == [91]
+
+
+def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error():
+    gpu_manager = _FakeGpuManager()
+    coordinator = _FakePrefixCoordinator()
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        materialize_single_group_prefix_pages(
+            gpu_manager=gpu_manager,
+            host_worker_view=_FailingHostWorkerView(),
+            prefix_cache_coordinator=coordinator,
+            sequences=[
+                PrefixMaterializationSequence(
+                    sequence_id=101,
+                    prefix_tokens=4,
+                    suffix_tokens=1,
+                    host_pages=[11],
+                    attachment_handle=91,
+                ),
+            ],
+        )
+
+    assert coordinator.begin_calls == [91]
+    assert coordinator.end_calls == [91]

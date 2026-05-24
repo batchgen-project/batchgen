@@ -13,6 +13,12 @@ class _AsyncTask(Protocol):
     def wait(self) -> None: ...
 
 
+class _PrefixCacheCoordinator(Protocol):
+    def begin_attachment_load(self, attachment_handle: int) -> None: ...
+
+    def end_attachment_load(self, attachment_handle: int) -> None: ...
+
+
 @dataclass(frozen=True)
 class PrefixMaterializationSequence:
     """Host prefix pages needed by one target GPU sequence."""
@@ -21,6 +27,7 @@ class PrefixMaterializationSequence:
     prefix_tokens: int
     suffix_tokens: int
     host_pages: Sequence[int | object]
+    attachment_handle: int = 0
 
     @property
     def full_tokens(self) -> int:
@@ -48,12 +55,37 @@ class SingleGroupPrefixMaterialization:
         self._loaded = True
 
 
+class _AttachmentLoadTask:
+    def __init__(
+        self,
+        *,
+        load_task: _AsyncTask,
+        coordinator: _PrefixCacheCoordinator,
+        attachment_handles: Sequence[int],
+    ) -> None:
+        self._load_task = load_task
+        self._coordinator = coordinator
+        self._attachment_handles = tuple(int(handle) for handle in attachment_handles)
+        self._done = False
+
+    def wait(self) -> None:
+        if self._done:
+            return
+        try:
+            self._load_task.wait()
+        finally:
+            for handle in reversed(self._attachment_handles):
+                self._coordinator.end_attachment_load(handle)
+            self._done = True
+
+
 def materialize_single_group_prefix_pages(
     *,
     gpu_manager: object,
     host_worker_view: object,
     sequences: Sequence[PrefixMaterializationSequence],
     expected_host_region_id: int = 0,
+    prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize Host prefix pages into target GPU paged KV slots.
 
@@ -105,12 +137,41 @@ def materialize_single_group_prefix_pages(
 
     load_task = None
     if has_prefix_pages:
-        load_task = host_worker_view.async_load_prefix_pages_to_device(
-            host_page_ids=host_page_ids,
-            active_page_counts=active_page_counts,
-            k_device_ptrs=k_ptrs,
-            v_device_ptrs=v_ptrs,
+        attachment_handles = _attachment_handles_for_load(
+            sequences,
+            prefix_page_counts,
         )
+        if attachment_handles and prefix_cache_coordinator is None:
+            raise ValueError(
+                "prefix materialization sequences with attachment handles "
+                "require prefix_cache_coordinator"
+            )
+
+        begun_handles: list[int] = []
+        try:
+            if prefix_cache_coordinator is not None:
+                for handle in attachment_handles:
+                    prefix_cache_coordinator.begin_attachment_load(handle)
+                    begun_handles.append(handle)
+
+            load_task = host_worker_view.async_load_prefix_pages_to_device(
+                host_page_ids=host_page_ids,
+                active_page_counts=active_page_counts,
+                k_device_ptrs=k_ptrs,
+                v_device_ptrs=v_ptrs,
+            )
+        except Exception:
+            if prefix_cache_coordinator is not None:
+                for handle in reversed(begun_handles):
+                    prefix_cache_coordinator.end_attachment_load(handle)
+            raise
+
+        if prefix_cache_coordinator is not None and begun_handles:
+            load_task = _AttachmentLoadTask(
+                load_task=load_task,
+                coordinator=prefix_cache_coordinator,
+                attachment_handles=begun_handles,
+            )
 
     append_plan = gpu_manager.prepare_prefill_suffix_append(
         sequence_ids=sequence_ids,
@@ -162,3 +223,18 @@ def _host_page_id(handle: int | object, *, expected_host_region_id: int) -> int:
     if page_id is None:
         raise TypeError("host page handle must be an int or expose page_id")
     return int(page_id)
+
+
+def _attachment_handles_for_load(
+    sequences: Sequence[PrefixMaterializationSequence],
+    prefix_page_counts: Sequence[int],
+) -> list[int]:
+    handles: list[int] = []
+    seen: set[int] = set()
+    for item, page_count in zip(sequences, prefix_page_counts):
+        handle = int(item.attachment_handle)
+        if int(page_count) <= 0 or handle == 0 or handle in seen:
+            continue
+        seen.add(handle)
+        handles.append(handle)
+    return handles
