@@ -20,6 +20,7 @@
 
 #include "KV_Storage/host_paged_kv_manager.h"
 #include "KV_Storage/host_paged_kv_worker_view.h"
+#include "KV_Storage/host_prefix_cache_coordinator.h"
 #include "KV_Storage/compressed_state_host_manager.h"
 #include "KV_Storage/compressed_ratio_host_paged_kv_worker_view.h"
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
@@ -644,6 +645,122 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              [](const kv::HostPagedKVStats& self) {
                  return kv::ToString(self);
              });
+
+    py::enum_<kv::HostKVGroupSemantic>(m, "HostKVGroupSemantic")
+        .value("FULL_KV", kv::HostKVGroupSemantic::kFullKV)
+        .value("MLA_COMPRESSED_KV",
+               kv::HostKVGroupSemantic::kMlaCompressedKV)
+        .value("SWA_KV", kv::HostKVGroupSemantic::kSwaKV)
+        .value("COMPRESSED_RATIO_KV",
+               kv::HostKVGroupSemantic::kCompressedRatioKV);
+
+    py::class_<kv::HostKVGroupSpec>(m, "HostKVGroupSpec")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::HostKVGroupSpec::group_id)
+        .def_readwrite("semantic", &kv::HostKVGroupSpec::semantic)
+        .def_readwrite("required_for_reuse",
+                       &kv::HostKVGroupSpec::required_for_reuse)
+        .def_readwrite("raw_page_tokens",
+                       &kv::HostKVGroupSpec::raw_page_tokens)
+        .def_readwrite("compression_ratio",
+                       &kv::HostKVGroupSpec::compression_ratio)
+        .def("__repr__", [](const kv::HostKVGroupSpec& self) {
+            return kv::ToString(self);
+        });
+
+    py::class_<kv::HostPageHandle>(m, "HostPageHandle")
+        .def(py::init<>())
+        .def_readwrite("host_region_id", &kv::HostPageHandle::host_region_id)
+        .def_readwrite("page_id", &kv::HostPageHandle::page_id);
+
+    py::class_<kv::GroupCommitPages>(m, "GroupCommitPages")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::GroupCommitPages::group_id)
+        .def_readwrite("pages", &kv::GroupCommitPages::pages);
+
+    py::class_<kv::GroupMaterializationSpan>(
+        m, "GroupMaterializationSpan")
+        .def_readonly("group_id", &kv::GroupMaterializationSpan::group_id)
+        .def_readonly("raw_end_token",
+                      &kv::GroupMaterializationSpan::raw_end_token)
+        .def_readonly("pages", &kv::GroupMaterializationSpan::pages);
+
+    py::class_<kv::PrefixLookupResult>(m, "PrefixLookupResult")
+        .def_readonly("attachment_handle",
+                      &kv::PrefixLookupResult::attachment_handle)
+        .def_readonly("common_cached_tokens",
+                      &kv::PrefixLookupResult::common_cached_tokens)
+        .def_readonly("materialization_spans",
+                      &kv::PrefixLookupResult::materialization_spans)
+        .def_readonly("miss_reason_mask",
+                      &kv::PrefixLookupResult::miss_reason_mask);
+
+    py::class_<kv::PrefixCommitResult>(m, "PrefixCommitResult")
+        .def_readonly("committed_tokens",
+                      &kv::PrefixCommitResult::committed_tokens)
+        .def_readonly("inserted_nodes",
+                      &kv::PrefixCommitResult::inserted_nodes)
+        .def_readonly("existing_nodes",
+                      &kv::PrefixCommitResult::existing_nodes);
+
+    py::class_<kv::HostPrefixCacheStats>(m, "HostPrefixCacheStats")
+        .def(py::init<>())
+        .def_readwrite("resident_nodes",
+                       &kv::HostPrefixCacheStats::resident_nodes)
+        .def_readwrite("active_attachments",
+                       &kv::HostPrefixCacheStats::active_attachments)
+        .def_readwrite("used_group_entries",
+                       &kv::HostPrefixCacheStats::used_group_entries)
+        .def_readwrite("used_page_handles",
+                       &kv::HostPrefixCacheStats::used_page_handles)
+        .def_readwrite("lookup_hits", &kv::HostPrefixCacheStats::lookup_hits)
+        .def_readwrite("lookup_misses",
+                       &kv::HostPrefixCacheStats::lookup_misses)
+        .def("__repr__", [](const kv::HostPrefixCacheStats& self) {
+            return kv::ToString(self);
+        });
+
+    py::class_<kv::HostPrefixCacheConfig>(m, "HostPrefixCacheConfig")
+        .def(py::init<>())
+        .def_readwrite("shm_name", &kv::HostPrefixCacheConfig::shm_name)
+        .def_readwrite("group_specs",
+                       &kv::HostPrefixCacheConfig::group_specs)
+        .def_readwrite("hash_block_tokens",
+                       &kv::HostPrefixCacheConfig::hash_block_tokens)
+        .def_readwrite("max_nodes", &kv::HostPrefixCacheConfig::max_nodes)
+        .def_readwrite("max_group_entries",
+                       &kv::HostPrefixCacheConfig::max_group_entries)
+        .def_readwrite("max_page_handles",
+                       &kv::HostPrefixCacheConfig::max_page_handles)
+        .def_readwrite("max_attachments",
+                       &kv::HostPrefixCacheConfig::max_attachments);
+
+    py::class_<kv::HostPrefixCacheCoordinator>(
+        m, "HostPrefixCacheCoordinator")
+        .def(py::init<kv::HostPrefixCacheConfig>(), py::arg("config"))
+        .def("initialize", &kv::HostPrefixCacheCoordinator::Initialize,
+             py::arg("create_region"))
+        .def("commit_prefix_pages",
+             &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
+             py::arg("namespace_digest"), py::arg("token_ids"),
+             py::arg("commit_tokens"), py::arg("group_pages"))
+        .def("lookup_and_attach",
+             &kv::HostPrefixCacheCoordinator::LookupAndAttach,
+             py::arg("namespace_digest"), py::arg("token_ids"))
+        .def("release_attachment",
+             &kv::HostPrefixCacheCoordinator::ReleaseAttachment,
+             py::arg("attachment_handle"))
+        .def("get_stats", &kv::HostPrefixCacheCoordinator::GetStats)
+        .def_property_readonly(
+            "hash_block_tokens",
+            &kv::HostPrefixCacheCoordinator::hash_block_tokens)
+        .def_property_readonly(
+            "commit_boundary_tokens",
+            &kv::HostPrefixCacheCoordinator::commit_boundary_tokens);
+
+    m.def("build_prefix_hash_chain", &kv::BuildPrefixHashChain,
+          py::arg("namespace_digest"), py::arg("token_ids"),
+          py::arg("block_tokens"));
 
     py::class_<kv::SWAHostPageRange>(m, "SWAHostPageRange")
         .def_readonly("sequence_id", &kv::SWAHostPageRange::sequence_id)

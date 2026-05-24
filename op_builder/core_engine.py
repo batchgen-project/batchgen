@@ -32,6 +32,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/GPU_KV_Buffer/GPU_KV_Buffer.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_manager.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_backend.cpp",
+            f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_prefix_cache_coordinator.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_paged_kv_worker_view.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/host_kv_page_table.cpp",
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/uva_copy_kernel.cu",

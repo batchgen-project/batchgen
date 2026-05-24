@@ -1,0 +1,131 @@
+import ctypes
+import errno
+import random
+import string
+
+from batchgen.models.engine_loader import core_engine as bg
+
+
+_LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def _random_shm_name() -> str:
+    suffix = "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=10)
+    )
+    return f"/batchgen_prefix_cache_{suffix}"
+
+
+def _shm_unlink(name: str) -> None:
+    result = _LIBC.shm_unlink(name.encode("utf-8"))
+    if result != 0:
+        err = ctypes.get_errno()
+        if err != errno.ENOENT:
+            raise OSError(err, f"shm_unlink({name}) failed")
+
+
+def _group_spec(group_id: int, raw_page_tokens: int):
+    spec = bg.HostKVGroupSpec()
+    spec.group_id = group_id
+    spec.semantic = bg.HostKVGroupSemantic.FULL_KV
+    spec.required_for_reuse = True
+    spec.raw_page_tokens = raw_page_tokens
+    spec.compression_ratio = 1
+    return spec
+
+
+def _page(region: int, page_id: int):
+    handle = bg.HostPageHandle()
+    handle.host_region_id = region
+    handle.page_id = page_id
+    return handle
+
+
+def _group_pages(group_id: int, pages):
+    group = bg.GroupCommitPages()
+    group.group_id = group_id
+    group.pages = list(pages)
+    return group
+
+
+def _config(shm_name: str):
+    config = bg.HostPrefixCacheConfig()
+    config.shm_name = shm_name
+    config.group_specs = [_group_spec(0, 4), _group_spec(1, 8)]
+    config.max_nodes = 16
+    config.max_group_entries = 32
+    config.max_page_handles = 128
+    config.max_attachments = 16
+    return config
+
+
+def test_host_prefix_cache_lookup_attach_release():
+    shm_name = _random_shm_name()
+    namespace = [11, 22, 33, 44]
+    token_ids = list(range(16))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        coordinator.initialize(True)
+
+        assert coordinator.hash_block_tokens == 4
+        assert coordinator.commit_boundary_tokens == 8
+
+        commit = coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            16,
+            [
+                _group_pages(0, [_page(0, idx) for idx in range(4)]),
+                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+            ],
+        )
+        assert commit.committed_tokens == 16
+        assert commit.inserted_nodes == 2
+        assert commit.existing_nodes == 0
+
+        attached = coordinator.lookup_and_attach(namespace, token_ids[:12])
+        assert attached.common_cached_tokens == 8
+        assert attached.attachment_handle != 0
+        assert [span.group_id for span in attached.materialization_spans] == [0, 1]
+        assert [len(span.pages) for span in attached.materialization_spans] == [2, 1]
+
+        stats = coordinator.get_stats()
+        assert stats.resident_nodes == 2
+        assert stats.active_attachments == 1
+        assert stats.lookup_hits == 1
+        assert stats.lookup_misses == 0
+
+        coordinator.release_attachment(attached.attachment_handle)
+        assert coordinator.get_stats().active_attachments == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_is_shared_across_process_attachments():
+    shm_name = _random_shm_name()
+    namespace = [7, 8, 9, 10]
+    token_ids = list(range(8))
+    try:
+        owner = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        owner.initialize(True)
+        owner.commit_prefix_pages(
+            namespace,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(0, 0), _page(0, 1)]),
+                _group_pages(1, [_page(1, 0)]),
+            ],
+        )
+
+        worker = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        worker.initialize(False)
+        attached = worker.lookup_and_attach(namespace, token_ids)
+
+        assert attached.common_cached_tokens == 8
+        assert owner.get_stats().active_attachments == 1
+
+        worker.release_attachment(attached.attachment_handle)
+        assert owner.get_stats().active_attachments == 0
+    finally:
+        _shm_unlink(shm_name)
