@@ -40,7 +40,7 @@ def _kv_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 @pytest.mark.parametrize("T", [1, 4, 32, 128, 1024, 8192])
 def test_q_norm_no_weight(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     n_heads = 64
@@ -60,7 +60,7 @@ def test_q_norm_no_weight(T):
 
 @pytest.mark.parametrize("T", [1, 4, 32, 128, 1024, 8192])
 def test_kv_norm_with_weight(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     n_heads = 64
@@ -79,7 +79,7 @@ def test_kv_norm_with_weight(T):
 
 
 def test_fused_matches_separate():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 128
@@ -99,7 +99,7 @@ def test_fused_matches_separate():
 
 
 def test_output_dtype_bf16():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     qr = torch.randn(32, 64, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(32, 512, device="cuda", dtype=torch.bfloat16)
@@ -112,7 +112,7 @@ def test_output_dtype_bf16():
 
 
 def test_fp32_accumulation_large_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 32
@@ -144,7 +144,7 @@ def test_fp32_accumulation_large_values():
 
 
 def test_empty_tensor():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     qr = torch.empty(0, 64, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.empty(0, 512, device="cuda", dtype=torch.bfloat16)
@@ -159,7 +159,7 @@ def test_empty_tensor():
 
 
 def test_all_zero_input():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     qr = torch.zeros(32, 64, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.zeros(32, 512, device="cuda", dtype=torch.bfloat16)
@@ -172,7 +172,7 @@ def test_all_zero_input():
 
 
 def test_very_large_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     qr = torch.full((32, 64, 512), 1e6, device="cuda", dtype=torch.bfloat16)
@@ -188,7 +188,7 @@ def test_very_large_values():
 
 
 def test_very_small_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     qr = torch.full((32, 64, 512), 1e-8, device="cuda", dtype=torch.bfloat16)
@@ -205,7 +205,7 @@ def test_very_small_values():
 
 @pytest.mark.parametrize("T", [1, 128, 8192])
 def test_flash_shape(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     H = 64
     head_dim = 512
@@ -221,7 +221,7 @@ def test_flash_shape(T):
 
 @pytest.mark.parametrize("T", [1, 128, 8192])
 def test_pro_shape(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     H = 128
     head_dim = 512
@@ -248,7 +248,7 @@ def test_q_per_head_independence():
     would be wrong. Under per-head reduction each head normalizes only by
     its own variance.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 4
@@ -298,7 +298,7 @@ def test_q_per_head_independence():
 
 @pytest.mark.parametrize("n_heads", [1, 2, 8, 64, 128])
 def test_q_parametrized_n_heads(n_heads):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 16
@@ -320,7 +320,7 @@ def test_q_parametrized_n_heads(n_heads):
 
 def test_grid_parallelism_smoke():
     """Documents the new (T, n_heads+1) grid via a large-scale launch."""
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 1024
@@ -346,7 +346,7 @@ def test_non_contiguous_q_stride():
     standard strides. This test feeds a strided-but-last-contig Q to verify
     stride-aware indexing.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
 
     eps = 1e-6
     T = 32
@@ -387,7 +387,7 @@ def test_non_contiguous_q_stride():
 
 @pytest.mark.parametrize("T", [1, 128, 1024, 8192])
 def test_benchmark(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
     from tests.kernels.conftest import _bench
 
     eps = 1e-6

@@ -33,3 +33,24 @@ from batchgen_kernels.triton.fused_rmsnorm_rope import (
 from batchgen_kernels.triton.fused_dequant_gemm import fused_fp8_bf16_gemm
 from batchgen_kernels.triton.fused_q_absorb import fused_q_absorb_query_states
 from batchgen_kernels.triton.fused_out_absorb import fused_out_absorb_reshape
+from batchgen_kernels.triton.v4_fused_qk_rmsnorm import fused_qk_rmsnorm
+from batchgen_kernels.triton.v4_fused_compress_quant import (
+    fused_kv_compress_norm_rope_insert_sparse_attn,
+    fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
+    fused_indexer_q_rope_quant,
+)
+from batchgen_kernels.triton.v4_fused_indexer_q import (
+    fused_indexer_q,
+    fused_indexer_q_fp8,
+    fused_indexer_q_mxfp4,
+)
+from batchgen_kernels.triton.v4_cache_utils import (
+    quantize_and_insert_k,
+    dequantize_and_gather_k,
+    compute_global_topk_indices_and_lens,
+    combine_topk_swa_indices,
+)
+from batchgen_kernels.triton.v4_inv_rope_fp8 import (
+    apply_inverse_rope,
+    fused_inv_rope_fp8_quant,
+)

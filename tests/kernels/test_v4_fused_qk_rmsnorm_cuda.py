@@ -23,7 +23,7 @@ def test_aaa_extension_actually_loaded():
     failed to load — otherwise every subsequent test would falsely pass
     against a non-existent kernel.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         _load,
         is_cuda_backend_available,
     )
@@ -42,10 +42,10 @@ def test_aab_cuda_matches_triton():
     """Bridge test: CUDA kernel matches the in-production Triton kernel
     within bf16 tolerance.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm import (
+    from batchgen_kernels.triton.v4_fused_qk_rmsnorm import (
         fused_qk_rmsnorm as fused_qk_rmsnorm_triton,
     )
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda,
     )
 
@@ -67,7 +67,7 @@ def test_aab_cuda_matches_triton():
 def test_aac_unsupported_shape_hard_fails():
     """The CUDA kernel only instantiates n_heads in {64, 128}. Passing
     n_heads=33 must raise loudly (no silent fallback)."""
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda,
     )
 
@@ -113,7 +113,7 @@ def _kv_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 @pytest.mark.parametrize("T", [1, 4, 32, 128, 1024, 8192])
 def test_q_norm_no_weight(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -135,7 +135,7 @@ def test_q_norm_no_weight(T):
 
 @pytest.mark.parametrize("T", [1, 4, 32, 128, 1024, 8192])
 def test_kv_norm_with_weight(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -156,7 +156,7 @@ def test_kv_norm_with_weight(T):
 
 
 def test_fused_matches_separate():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -178,7 +178,7 @@ def test_fused_matches_separate():
 
 
 def test_output_dtype_bf16():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -193,7 +193,7 @@ def test_output_dtype_bf16():
 
 
 def test_fp32_accumulation_large_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -227,7 +227,7 @@ def test_fp32_accumulation_large_values():
 
 
 def test_empty_tensor():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -244,7 +244,7 @@ def test_empty_tensor():
 
 
 def test_all_zero_input():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -259,7 +259,7 @@ def test_all_zero_input():
 
 
 def test_very_large_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -277,7 +277,7 @@ def test_very_large_values():
 
 
 def test_very_small_values():
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -296,7 +296,7 @@ def test_very_small_values():
 
 @pytest.mark.parametrize("T", [1, 128, 8192])
 def test_flash_shape(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -314,7 +314,7 @@ def test_flash_shape(T):
 
 @pytest.mark.parametrize("T", [1, 128, 8192])
 def test_pro_shape(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -343,7 +343,7 @@ def test_q_per_head_independence():
     would be wrong. Under per-head reduction each head normalizes only by
     its own variance.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -386,7 +386,7 @@ def test_q_per_head_independence():
 
 @pytest.mark.parametrize("n_heads", [64, 128])
 def test_q_parametrized_n_heads(n_heads):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -410,7 +410,7 @@ def test_q_parametrized_n_heads(n_heads):
 
 def test_grid_parallelism_smoke():
     """Documents the new (T, n_heads+1) grid via a large-scale launch."""
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -438,7 +438,7 @@ def test_non_contiguous_q_stride():
     standard strides. This test feeds a strided-but-last-contig Q to verify
     stride-aware indexing.
     """
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
 
@@ -481,7 +481,7 @@ def test_non_contiguous_q_stride():
 
 @pytest.mark.parametrize("T", [1, 128, 1024, 8192])
 def test_benchmark(T):
-    from batchgen.attention.mla.v4_fused_qk_rmsnorm_cuda import (
+    from batchgen_kernels.attention.v4_fused_qk_rmsnorm_cuda import (
         fused_qk_rmsnorm_cuda as fused_qk_rmsnorm,
     )
     from tests.kernels.conftest import _bench
