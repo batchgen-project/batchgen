@@ -318,6 +318,23 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             "tables. This loads all physical layers; destination pointer "
             "tensors are indexed by physical layer id even for mapped worker "
             "views.")
+        .def(
+            "async_load_prefix_pages_to_device",
+            [](WorkerView& self, torch::Tensor host_page_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadPrefixPagesToDevice(
+                    std::move(host_page_ids), std::move(active_page_counts),
+                    std::move(k_device_ptrs), std::move(v_device_ptrs));
+            },
+            py::arg("host_page_ids"), py::arg("active_page_counts"),
+            py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load prefix-cache Host page ids into pre-allocated GPU pages. "
+            "Unlike async_load_layer_paged_kv_to_device, this reads directly "
+            "from the provided physical Host page ids instead of resolving "
+            "pages through sequence ids.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(
