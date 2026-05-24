@@ -30,6 +30,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen_kernels.common.v4_hyper_connections import hc_post, hc_pre
+from batchgen_kernels.moe.v4_hash_routing import hash_routing
+from batchgen_kernels.moe.v4_sqrtsoftplus_topk import sqrtsoftplus_topk
 
 
 _FP4_E2M1_TABLE_VALUES = (
@@ -554,34 +556,25 @@ class DeepSeekV4FlashGate(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        scores = F.linear(hidden_states.float(), self.weight.float())
-        if self.score_func == "softmax":
-            scores = scores.softmax(dim=-1)
-        elif self.score_func == "sigmoid":
-            scores = scores.sigmoid()
-        elif self.score_func == "sqrtsoftplus":
-            scores = F.softplus(scores).sqrt()
-        else:
-            raise ValueError(
-                f"Unsupported V4 gate score function: {self.score_func}"
-            )
-
-        raw_scores = scores
         if self.is_hash_layer:
-            if input_ids is None:
-                topk_indices = torch.topk(scores, k=self.topk, dim=-1)[1]
-            else:
-                topk_indices = self.tid2eid[input_ids].long()
-        else:
-            select_scores = scores + self.bias.float().unsqueeze(0)
-            topk_indices = torch.topk(select_scores, k=self.topk, dim=-1)[1]
-
-        topk_weights = raw_scores.gather(-1, topk_indices)
-        if self.score_func != "softmax" and self.norm_topk_prob:
-            topk_weights = topk_weights / (
-                topk_weights.sum(dim=-1, keepdim=True) + 1e-20
+            return hash_routing(
+                input_ids=input_ids,
+                tid2eid=self.tid2eid,
+                hidden_states=hidden_states,
+                gate_weight=self.weight,
+                topk=self.topk,
+                route_scale=self.route_scale,
+                score_func=self.score_func,
+                norm_topk_prob=self.norm_topk_prob,
             )
-        return topk_weights * self.route_scale, topk_indices
+        return sqrtsoftplus_topk(
+            hidden_states=hidden_states,
+            gate_weight=self.weight,
+            bias=self.bias,
+            topk=self.topk,
+            route_scale=self.route_scale,
+            norm_topk_prob=self.norm_topk_prob,
+        )
 
 
 class DeepSeekV4FlashExpertPlaceholder(nn.Module):
@@ -616,17 +609,31 @@ class DeepSeekV4FlashExpertPlaceholder(nn.Module):
         hidden_states: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        gate = self._linear(hidden_states, "w1").float()
-        up = self._linear(hidden_states, "w3").float()
+        gate = self._linear(hidden_states, "w1")
+        up = self._linear(hidden_states, "w3")
         if self.swiglu_limit > 0:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        hidden_states = F.silu(gate) * up
+            gate = torch.clamp(gate.float(), max=self.swiglu_limit).to(
+                gate.dtype
+            )
+            up = torch.clamp(
+                up.float(), min=-self.swiglu_limit, max=self.swiglu_limit
+            ).to(up.dtype)
+        try:
+            from batchgen_kernels.moe.silu_mul_quant import (
+                fused_silu_mul_quant_cuda,
+            )
+
+            activated_fp8, _scales = fused_silu_mul_quant_cuda(
+                gate.to(torch.bfloat16), up.to(torch.bfloat16)
+            )
+            activated = activated_fp8.float() * _scales.unsqueeze(-1)
+        except (ImportError, RuntimeError):
+            activated = F.silu(gate.float()) * up.float()
         if weights is not None:
-            hidden_states = hidden_states * weights
+            activated = activated * weights
         return self._linear(
-            hidden_states.to(
-                weights.dtype if weights is not None else gate.dtype
+            activated.to(
+                weights.dtype if weights is not None else hidden_states.dtype
             ),
             "w2",
         )

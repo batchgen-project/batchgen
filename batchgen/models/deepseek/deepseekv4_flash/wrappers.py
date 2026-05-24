@@ -15,7 +15,7 @@ slots defined in ``model.py``.
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -32,10 +32,17 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         engine_config,
         model_config,
         persistent: bool = False,
+        v4_backend: Optional[Any] = None,
     ):
-        super().__init__(module, layer_idx, core_engine, engine_config, model_config)
+        super().__init__(
+            module, layer_idx, core_engine, engine_config, model_config
+        )
         self.persistent = persistent
         self.module_key = f"attn_{layer_idx}"
+        self._v4_backend = v4_backend
+        self._layer_config = None
+        if v4_backend is not None:
+            self._layer_config = v4_backend.layer_configs[layer_idx]
 
     def _load_runtime_tensors(self) -> None:
         if self.persistent:
@@ -58,12 +65,71 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
                 kwargs["past_key_value"] = past_key_states[self.layer_idx]
         self._load_runtime_tensors()
         try:
+            if self.phase == "decode" and self._v4_backend is not None:
+                return self._forward_decode_optimized(*args, **kwargs)
             result = self.module(*args, **kwargs)
             if self.phase == "prefill":
-                self._offload_prefill_kv(result[2], kwargs.get("attention_mask"))
+                self._offload_prefill_kv(
+                    result[2], kwargs.get("attention_mask")
+                )
             return result
         finally:
             self._release_runtime_tensors()
+
+    def _forward_decode_optimized(
+        self,
+        hidden_states: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple:
+        """Optimized decode using V4 attention backend.
+
+        Computes Q/KV via the module's projection layers, then delegates
+        the attention mechanism to the backend (FlashMLA sparse/dense/compressed).
+        """
+        mod = self.module
+        bsz, q_len, _ = hidden_states.shape
+
+        # Q projection: hidden → wq_a → q_norm → wq_b → per-head RMSNorm
+        q_low = mod.q_norm(mod.wq_a(hidden_states))
+        q = mod.wq_b(q_low).view(bsz, q_len, mod.n_heads, mod.head_dim)
+        q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + mod.eps)
+
+        # KV projection: hidden → wkv → kv_norm
+        kv = mod.kv_norm(mod.wkv(hidden_states))
+
+        # Attention via backend (dispatches to FlashMLA sparse/dense/compressed)
+        attn_output = self._v4_backend.forward(
+            layer_config=self._layer_config,
+            q=q.squeeze(1),  # decode: q_len==1 → [B, H, D]
+            kv=kv.squeeze(1),  # decode: [B, D]
+            attn_sink=mod.attn_sink,
+            head_gates=kwargs.get("head_gates"),
+        )
+
+        # Output projection: wo_a → wo_b
+        attn_output = attn_output.view(
+            bsz,
+            q_len,
+            mod.o_groups,
+            mod.n_heads // mod.o_groups * mod.head_dim,
+        )
+        from batchgen.models.deepseek.deepseekv4_flash.model import (
+            _dequant_weight,
+        )
+
+        wo_a_weight = _dequant_weight(
+            mod.wo_a.weight,
+            mod.wo_a.scale,
+            hidden_states.dtype,
+        )
+        wo_a = wo_a_weight.view(
+            mod.o_groups,
+            mod.o_lora_rank,
+            mod.n_heads // mod.o_groups * mod.head_dim,
+        )
+        attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
+        attn_output = mod.wo_b(attn_output.flatten(2))
+        return attn_output, None, kv
 
     def _offload_prefill_kv(
         self,
