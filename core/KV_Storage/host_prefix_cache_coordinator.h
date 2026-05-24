@@ -123,6 +123,8 @@ class HostPrefixCacheCoordinator {
         std::uint32_t min_free_page_handles,
         std::uint32_t max_scan_nodes);
 
+    PrefixEvictionResult ClearUnprotected();
+
     HostPrefixCacheStats GetStats() const;
 
     std::uint32_t hash_block_tokens() const { return hash_block_tokens_; }

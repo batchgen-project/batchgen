@@ -171,6 +171,42 @@ def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
         _shm_unlink(shm_name)
 
 
+def test_host_prefix_cache_clear_skips_active_entries():
+    shm_name = _random_shm_name()
+    namespace = [505, 606, 707, 808]
+    token_ids = list(range(16))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_small_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            16,
+            [
+                _group_pages(0, [_page(0, idx) for idx in range(4)]),
+                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+            ],
+        )
+
+        active = coordinator.lookup_and_attach(namespace, token_ids)
+        clear = coordinator.clear_unprotected()
+        assert clear.evicted_nodes == 1
+        assert clear.protected_nodes == 1
+        assert coordinator.get_stats().resident_nodes == 1
+        miss = coordinator.estimate_lookup(namespace, token_ids[:8])
+        hit = coordinator.estimate_lookup(namespace, token_ids)
+        assert miss.miss_reason_mask
+        assert hit.common_cached_tokens == 16
+
+        coordinator.release_attachment(active.attachment_handle)
+        clear = coordinator.clear_unprotected()
+        assert clear.evicted_nodes == 1
+        assert clear.protected_nodes == 0
+        assert coordinator.get_stats().resident_nodes == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
 def test_host_prefix_cache_is_shared_across_process_attachments():
     shm_name = _random_shm_name()
     namespace = [7, 8, 9, 10]
