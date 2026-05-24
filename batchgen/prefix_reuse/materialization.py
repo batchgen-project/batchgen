@@ -186,6 +186,77 @@ def materialize_single_group_prefix_pages(
     )
 
 
+def materialize_single_group_lookup_results(
+    *,
+    gpu_manager: object,
+    host_worker_view: object,
+    lookup_results: Sequence[object],
+    sequence_ids: Sequence[int],
+    prompt_lengths: Sequence[int],
+    group_id: int,
+    expected_host_region_id: int = 0,
+    prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
+) -> SingleGroupPrefixMaterialization:
+    """Materialize a batch of C++ HostPrefixCache lookup results.
+
+    The Host prefix-cache coordinator owns lookup, attachment lifetime, and
+    eviction. This function is only the compute-path producer: it converts
+    attached lookup results for one KV group into GPU paged KV materialization.
+    """
+
+    count = len(lookup_results)
+    if len(sequence_ids) != count or len(prompt_lengths) != count:
+        raise ValueError("lookup_results, sequence_ids, and prompt_lengths differ")
+
+    sequences: list[PrefixMaterializationSequence] = []
+    for result, sequence_id, prompt_length in zip(
+        lookup_results,
+        sequence_ids,
+        prompt_lengths,
+    ):
+        prompt_len = int(prompt_length)
+        cached_tokens = int(getattr(result, "common_cached_tokens"))
+        if prompt_len <= 0:
+            raise ValueError(
+                f"prompt length must be positive for sequence {sequence_id}"
+            )
+        if cached_tokens < 0 or cached_tokens > prompt_len:
+            raise ValueError(
+                "lookup cached token count must be within prompt length for "
+                f"sequence {sequence_id}: cached={cached_tokens}, "
+                f"prompt={prompt_len}"
+            )
+        span_pages = []
+        if cached_tokens > 0:
+            span = _find_group_span(result, group_id=int(group_id))
+            span_raw_end = int(getattr(span, "raw_end_token"))
+            if span_raw_end != cached_tokens:
+                raise ValueError(
+                    "single-group prefix materialization requires lookup span "
+                    "to match cached token boundary for sequence "
+                    f"{sequence_id}: span={span_raw_end}, cached={cached_tokens}"
+                )
+            span_pages = list(getattr(span, "pages"))
+
+        sequences.append(
+            PrefixMaterializationSequence(
+                sequence_id=int(sequence_id),
+                prefix_tokens=cached_tokens,
+                suffix_tokens=prompt_len - cached_tokens,
+                host_pages=span_pages,
+                attachment_handle=int(getattr(result, "attachment_handle", 0)),
+            )
+        )
+
+    return materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_worker_view,
+        sequences=sequences,
+        expected_host_region_id=expected_host_region_id,
+        prefix_cache_coordinator=prefix_cache_coordinator,
+    )
+
+
 def _build_host_page_id_tensor(
     sequences: Sequence[PrefixMaterializationSequence],
     *,
@@ -208,6 +279,16 @@ def _build_host_page_id_tensor(
         row.extend([0] * (max_pages - len(row)))
         rows.append(row)
     return torch.tensor(rows, dtype=torch.int64)
+
+
+def _find_group_span(result: object, *, group_id: int) -> object:
+    spans = getattr(result, "materialization_spans", None)
+    if spans is None:
+        raise TypeError("lookup result must expose materialization_spans")
+    for span in spans:
+        if int(getattr(span, "group_id")) == int(group_id):
+            return span
+    raise ValueError(f"lookup result has no materialization span for group {group_id}")
 
 
 def _host_page_id(handle: int | object, *, expected_host_region_id: int) -> int:

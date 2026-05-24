@@ -5,6 +5,7 @@ import torch
 
 from batchgen.prefix_reuse.materialization import (
     PrefixMaterializationSequence,
+    materialize_single_group_lookup_results,
     materialize_single_group_prefix_pages,
 )
 
@@ -225,3 +226,62 @@ def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error(
 
     assert coordinator.begin_calls == [91]
     assert coordinator.end_calls == [91]
+
+
+def test_materialize_single_group_lookup_results_builds_sequences():
+    gpu_manager = _FakeGpuManager()
+    host_view = _FakeHostWorkerView()
+    coordinator = _FakePrefixCoordinator()
+    lookup_result = SimpleNamespace(
+        attachment_handle=91,
+        common_cached_tokens=5,
+        materialization_spans=[
+            SimpleNamespace(
+                group_id=7,
+                raw_end_token=5,
+                pages=[
+                    SimpleNamespace(host_region_id=0, page_id=11),
+                    SimpleNamespace(host_region_id=0, page_id=12),
+                ],
+            )
+        ],
+    )
+
+    materialization = materialize_single_group_lookup_results(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        prefix_cache_coordinator=coordinator,
+        lookup_results=[lookup_result],
+        sequence_ids=[101],
+        prompt_lengths=[7],
+        group_id=7,
+    )
+
+    assert materialization.append_plan is gpu_manager.append_plan
+    assert gpu_manager.allocations == [([101], [7])]
+    assert gpu_manager.prepared == [([101], [5], [2], False)]
+    assert host_view.calls[0]["host_page_ids"].tolist() == [[11, 12]]
+    assert host_view.calls[0]["active_page_counts"].tolist() == [2]
+    assert coordinator.begin_calls == [91]
+    materialization.wait()
+    assert coordinator.end_calls == [91]
+
+
+def test_materialize_single_group_lookup_results_rejects_mismatched_span():
+    lookup_result = SimpleNamespace(
+        attachment_handle=91,
+        common_cached_tokens=5,
+        materialization_spans=[
+            SimpleNamespace(group_id=7, raw_end_token=4, pages=[11])
+        ],
+    )
+
+    with pytest.raises(ValueError, match="cached token boundary"):
+        materialize_single_group_lookup_results(
+            gpu_manager=_FakeGpuManager(),
+            host_worker_view=_FakeHostWorkerView(),
+            lookup_results=[lookup_result],
+            sequence_ids=[101],
+            prompt_lengths=[7],
+            group_id=7,
+        )
