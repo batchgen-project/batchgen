@@ -134,6 +134,12 @@ def materialize_single_group_prefix_pages(
     gpu_manager.allocate_pages_for_sequences(sequence_ids, full_lens)
     gpu_manager.rebuild_page_table(sequence_ids)
     k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+    append_plan = gpu_manager.prepare_prefill_suffix_append(
+        sequence_ids=sequence_ids,
+        prefix_lens=prefix_lens,
+        suffix_lens=suffix_lens,
+        rebuild_page_table=False,
+    )
 
     load_task = None
     if has_prefix_pages:
@@ -173,12 +179,6 @@ def materialize_single_group_prefix_pages(
                 attachment_handles=begun_handles,
             )
 
-    append_plan = gpu_manager.prepare_prefill_suffix_append(
-        sequence_ids=sequence_ids,
-        prefix_lens=prefix_lens,
-        suffix_lens=suffix_lens,
-        rebuild_page_table=False,
-    )
     return SingleGroupPrefixMaterialization(
         manager=gpu_manager,
         append_plan=append_plan,
@@ -225,9 +225,15 @@ def materialize_single_group_lookup_results(
                 "lookup cached token count must be within prompt length for "
                 f"sequence {sequence_id}: cached={cached_tokens}, "
                 f"prompt={prompt_len}"
-            )
+        )
         span_pages = []
+        attachment_handle = int(getattr(result, "attachment_handle", 0))
         if cached_tokens > 0:
+            if attachment_handle == 0:
+                raise ValueError(
+                    "lookup result with cached prefix must have non-zero "
+                    f"attachment_handle for sequence {sequence_id}"
+                )
             span = _find_group_span(result, group_id=int(group_id))
             span_raw_end = int(getattr(span, "raw_end_token"))
             if span_raw_end != cached_tokens:
@@ -244,7 +250,7 @@ def materialize_single_group_lookup_results(
                 prefix_tokens=cached_tokens,
                 suffix_tokens=prompt_len - cached_tokens,
                 host_pages=span_pages,
-                attachment_handle=int(getattr(result, "attachment_handle", 0)),
+                attachment_handle=attachment_handle,
             )
         )
 

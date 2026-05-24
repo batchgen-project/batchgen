@@ -88,6 +88,12 @@ class _FakeGpuManager:
         return self.append_plan
 
 
+class _FailingAppendPlanGpuManager(_FakeGpuManager):
+    def prepare_prefill_suffix_append(self, **kwargs):
+        super().prepare_prefill_suffix_append(**kwargs)
+        raise RuntimeError("append plan failed")
+
+
 def test_materialize_single_group_prefix_pages_starts_page_id_load():
     gpu_manager = _FakeGpuManager()
     host_view = _FakeHostWorkerView()
@@ -228,6 +234,31 @@ def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error(
     assert coordinator.end_calls == [91]
 
 
+def test_materialize_single_group_prefix_pages_does_not_load_before_append_plan():
+    host_view = _FakeHostWorkerView()
+    coordinator = _FakePrefixCoordinator()
+
+    with pytest.raises(RuntimeError, match="append plan failed"):
+        materialize_single_group_prefix_pages(
+            gpu_manager=_FailingAppendPlanGpuManager(),
+            host_worker_view=host_view,
+            prefix_cache_coordinator=coordinator,
+            sequences=[
+                PrefixMaterializationSequence(
+                    sequence_id=101,
+                    prefix_tokens=4,
+                    suffix_tokens=1,
+                    host_pages=[11],
+                    attachment_handle=91,
+                ),
+            ],
+        )
+
+    assert host_view.calls == []
+    assert coordinator.begin_calls == []
+    assert coordinator.end_calls == []
+
+
 def test_materialize_single_group_lookup_results_builds_sequences():
     gpu_manager = _FakeGpuManager()
     host_view = _FakeHostWorkerView()
@@ -277,6 +308,26 @@ def test_materialize_single_group_lookup_results_rejects_mismatched_span():
     )
 
     with pytest.raises(ValueError, match="cached token boundary"):
+        materialize_single_group_lookup_results(
+            gpu_manager=_FakeGpuManager(),
+            host_worker_view=_FakeHostWorkerView(),
+            lookup_results=[lookup_result],
+            sequence_ids=[101],
+            prompt_lengths=[7],
+            group_id=7,
+        )
+
+
+def test_materialize_single_group_lookup_results_requires_attachment_for_hit():
+    lookup_result = SimpleNamespace(
+        attachment_handle=0,
+        common_cached_tokens=5,
+        materialization_spans=[
+            SimpleNamespace(group_id=7, raw_end_token=5, pages=[11])
+        ],
+    )
+
+    with pytest.raises(ValueError, match="attachment_handle"):
         materialize_single_group_lookup_results(
             gpu_manager=_FakeGpuManager(),
             host_worker_view=_FakeHostWorkerView(),
