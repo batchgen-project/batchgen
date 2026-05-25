@@ -10020,56 +10020,6 @@ class BatchGenWorker:
 			"flashmla_num_splits": num_splits,
 		}
 
-	def _run_glm5_layer_graph_forward(
-		self,
-		*,
-		input_ids: torch.Tensor,
-		local_bsz: int,
-		max_rank_bsz: int,
-		rank_token_counts: torch.Tensor,
-		gpu_manager,
-		emit_kv_callbacks: bool,
-	) -> torch.Tensor:
-		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
-		if manager is None:
-			raise RuntimeError("GLM-5 layer graph replay requested but manager is unavailable")
-		from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
-			make_glm5_layer_graph_segment_name,
-		)
-
-		bucket = manager.bucketing.get_padded_size(max_rank_bsz)
-		graph_inputs = self._prepare_glm5_layer_graph_inputs(
-			local_bsz=local_bsz,
-			bucket=bucket,
-			gpu_manager=gpu_manager,
-		)
-		hidden_states = self.model.model.embed_tokens(input_ids)
-		kv_cb = getattr(AttnWrapperBase, "kv_append_callback", None)
-		aux_cb = getattr(AttnWrapperBase, "kv_append_callback_aux", None)
-		for layer_idx, _decoder_layer in enumerate(self.model.model.layers):
-			graph_out = manager.replay(
-				make_glm5_layer_graph_segment_name(layer_idx),
-				max_rank_bsz,
-				hidden_states=hidden_states,
-				position_ids=graph_inputs["position_ids"],
-				cache_seqlens=graph_inputs["cache_seqlens"],
-				primary_slot_indices=graph_inputs["primary_slot_indices"],
-				aux_slot_indices=graph_inputs["aux_slot_indices"],
-				num_valid_tokens=graph_inputs["num_valid_tokens"],
-				rank_token_counts=rank_token_counts,
-				flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
-				flashmla_num_splits=graph_inputs["flashmla_num_splits"],
-			)
-			hidden_states = graph_out["hidden_states"][:local_bsz]
-			if emit_kv_callbacks and local_bsz > 0:
-				if kv_cb is not None:
-					kv_cb(layer_idx, graph_out["primary_k_tensor"][:local_bsz], None)
-				if aux_cb is not None:
-					aux_cb(layer_idx, graph_out["indexer_k_tensor"][:local_bsz], None)
-
-		hidden_states = self.model.model.norm(hidden_states)
-		return self.model.lm_head(hidden_states)[:, -1, :]
-
 	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
 		if not self._glm5_moe_graph_requested_for_current_batch():
 			return "disabled", None, "not_requested"
@@ -11664,24 +11614,9 @@ class BatchGenWorker:
 				)
 
 				# Forward
-				_glm5_layer_graph_requested = bool(
-					self._glm5_layer_graph_requested_for_current_batch()
-					and "glm" in (getattr(self, "model_name", "") or "").lower()
-				)
-				_glm5_layer_graph_active = False
-				_glm5_layer_bucket = None
-				_glm5_layer_reason = "not_requested"
-				if _glm5_layer_graph_requested:
-					_glm5_layer_path, _glm5_layer_bucket, _glm5_layer_reason = (
-						self._glm5_layer_graph_path_state(_max_bs)
-					)
-					_glm5_layer_graph_active = _glm5_layer_path == "graph"
-					# Phase C: BATCHGEN_GLM5_LAYER_CUDA_GRAPH is retired; layer
-					# graph mode is no longer a user-selectable path. The
-					# "required" diagnostic raise here cannot fire because
-					# _glm5_layer_graph_requested_for_current_batch returns
-					# False unconditionally → _glm5_layer_path_state returns
-					# ("disabled", None, "not_requested").
+				# Phase C: layer-graph mode retired. The whole-model graph
+				# composes per-layer captures internally; no separate
+				# layer-graph dispatch is needed.
 
 				_glm5_whole_graph_active = bool(
 					getattr(self, "_glm5_whole_model_graph", False)
@@ -11729,57 +11664,7 @@ class BatchGenWorker:
 						or _glm5_whole_graph_active
 					)
 				)
-				if _glm5_layer_graph_active:
-					_glm5_layer_compare = self._glm5_layer_graph_compare_requested_for_current_batch()
-					if _glm5_layer_compare:
-						graph_logits = self._run_glm5_layer_graph_forward(
-							input_ids=new_tokens[:len(batch)],
-							local_bsz=len(batch),
-							max_rank_bsz=_max_bs,
-							rank_token_counts=_all_rank_counts,
-							gpu_manager=gpu_manager,
-							emit_kv_callbacks=False,
-						)
-						outputs = self._glm5_decode_model_forward(new_tokens)
-						eager_logits = outputs.logits[:, -1, :]
-						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
-						from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
-							compare_glm5_whole_model_graph_logits,
-						)
-						compare = compare_glm5_whole_model_graph_logits(
-							eager_logits=eager_logits,
-							graph_logits=graph_logits,
-							eager_tokens=torch.argmax(eager_logits, dim=-1, keepdim=True),
-							graph_tokens=torch.argmax(graph_logits, dim=-1, keepdim=True),
-							atol=float(os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_ATOL", "1e-2")),
-							rtol=float(os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_RTOL", "1e-2")),
-						)
-						_log = logging.info if compare["ok"] else logging.error
-						_log(
-							"[GLM5_LAYER_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
-							"max_abs=%.6g mean_abs=%.6g argmax_mismatch=%s token_mismatch=%s",
-							self.rank,
-							_glm5_layer_bucket,
-							len(batch),
-							"OK" if compare["ok"] else "MISMATCH",
-							compare["max_abs"],
-							compare["mean_abs"],
-							compare["argmax_mismatch"],
-							compare["token_mismatch"],
-						)
-						if not compare["ok"] and self._glm5_layer_graph_compare_fail_on_mismatch():
-							raise RuntimeError(f"GLM-5 layer CUDA graph compare mismatch: {compare}")
-					else:
-						logits = self._run_glm5_layer_graph_forward(
-							input_ids=new_tokens[:len(batch)],
-							local_bsz=len(batch),
-							max_rank_bsz=_max_bs,
-							rank_token_counts=_all_rank_counts,
-							gpu_manager=gpu_manager,
-							emit_kv_callbacks=True,
-						)
-						new_tokens_out = self._select_tokens(logits, batch_sequences)
-				elif _use_graph:
+				if _use_graph:
 					_glm5_whole_compare = bool(
 						getattr(self, "_glm5_whole_model_graph", False)
 						and self._glm5_whole_model_graph_compare_requested_for_current_batch()
