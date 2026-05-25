@@ -9046,9 +9046,6 @@ class BatchGenWorker:
 			),
 		)
 
-	def _glm5_whole_model_graph_required_for_current_batch(self) -> bool:
-		return self._glm5_whole_model_graph_requested_for_current_batch()
-
 	def _glm5_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
 			return True
@@ -9524,7 +9521,7 @@ class BatchGenWorker:
 			and "glm" in model_name_l
 		)
 		if glm5_whole_graph_enabled:
-			whole_graph_required = self._glm5_whole_model_graph_required_for_current_batch()
+			whole_graph_required = self._glm5_whole_model_graph_requested_for_current_batch()
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
 			max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
 			capture_attempted = bool(
@@ -10701,7 +10698,7 @@ class BatchGenWorker:
 					else:
 						_glm5_whole_graph_over_bucket = _max_bs > configured_max_bucket
 				if (
-					self._glm5_whole_model_graph_required_for_current_batch()
+					self._glm5_whole_model_graph_requested_for_current_batch()
 					and self._glm5_whole_model_graph_requested_for_current_batch()
 					and not _glm5_whole_graph_active
 					and not _glm5_whole_graph_over_bucket
