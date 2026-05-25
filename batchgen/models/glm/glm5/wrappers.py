@@ -727,12 +727,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload KV cache per-sequence to host memory."""
-        worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-        if worker_view is None:
-            raise RuntimeError("GLM-5 primary host KV worker view is required")
         offload_glm5_prepacked_mla_kv(
             key=offload_kv,
-            worker_view=worker_view,
+            worker_view=self.core_engine.host_paged_kv_worker_view,
             layer_idx=self.layer_idx,
             metadata=self.prefix_cache_metadata(),
         )
