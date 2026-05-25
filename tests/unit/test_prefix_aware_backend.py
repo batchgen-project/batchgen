@@ -279,8 +279,6 @@ def test_gqa_backend_missing_metadata_raises():
 def test_mla_backend_prefix_reuse_requires_gpu_materialization():
     backend = MlaProjectedPrefixAwareAttentionBackend(
         layer_idx=_LAYER_IDX,
-        page_size=4,
-        kv_dim=3,
         num_heads=2,
         kv_lora_rank=1,
         softmax_scale=0.5,
@@ -350,8 +348,6 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(
     materialization = _FakeMlaMaterialization()
     backend = MlaProjectedPrefixAwareAttentionBackend(
         layer_idx=_LAYER_IDX,
-        page_size=4,
-        kv_dim=3,
         num_heads=2,
         kv_lora_rank=1,
         softmax_scale=0.5,

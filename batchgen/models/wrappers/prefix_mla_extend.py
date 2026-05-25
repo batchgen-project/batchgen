@@ -17,50 +17,12 @@ from batchgen.models.wrappers.prefix_cache import (
 class MlaExtendSpec:
     """Static MLA dimensions needed by the prefix extend-prefill path."""
 
-    kv_dim: int
     num_heads: int
     kv_lora_rank: int
     softmax_scale: float
 
 
-ProjectSuffixMlaFn = Callable[
-    [torch.Tensor, torch.Tensor, int], tuple[torch.Tensor, torch.Tensor]
-]
 OutputProjectMlaFn = Callable[[torch.Tensor], torch.Tensor]
-PrefixMlaAttentionFn = Callable[..., torch.Tensor]
-
-
-def run_prefix_mla_suffix_prefill(
-    *,
-    wrapper: object,
-    hidden_states_2d: torch.Tensor,
-    position_ids: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
-    spec: MlaExtendSpec,
-    project_suffix_query_and_kv: ProjectSuffixMlaFn,
-    output_projection: OutputProjectMlaFn,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run suffix-only MLA prefill using cached prefix KV."""
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if (
-        metadata.prefix_shared_tokens is None
-        or metadata.full_seq_lengths is None
-    ):
-        raise RuntimeError("MLA prefix extend requires prefix metadata")
-
-    query_states, offload_kv = project_suffix_query_and_kv(
-        hidden_states_2d,
-        position_ids,
-        max(metadata.full_seq_lengths),
-    )
-    return run_prefix_mla_suffix_prefill_with_projected(
-        wrapper=wrapper,
-        query_states=query_states,
-        offload_kv=offload_kv,
-        metadata=metadata,
-        spec=spec,
-        output_projection=output_projection,
-    )
 
 
 def run_prefix_mla_suffix_prefill_with_projected(
@@ -91,36 +53,6 @@ def run_prefix_mla_suffix_prefill_with_projected(
     return output_projection(attn_out), offload_kv
 
 
-def run_projected_mla_prefix_attention(
-    *,
-    layer_idx: int,
-    query_states: torch.Tensor,
-    offload_kv: torch.Tensor | None,
-    metadata: PrefixCachePrepackMetadata,
-    spec: MlaExtendSpec,
-    page_size: int,
-    attention_fn: PrefixMlaAttentionFn | None = None,
-    prefill_prefix_materialization: object | None = None,
-) -> torch.Tensor:
-    """Run MLA prefix/no-prefix attention from projected query and compressed KV."""
-
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    del page_size
-    if prefill_prefix_materialization is None:
-        raise RuntimeError(
-            "MLA prefix attention requires GPU paged materialization"
-        )
-    return run_projected_mla_prefix_attention_from_gpu_pages(
-        layer_idx=layer_idx,
-        query_states=query_states,
-        offload_kv=offload_kv,
-        metadata=metadata,
-        spec=spec,
-        materialization=prefill_prefix_materialization,
-        attention_fn=attention_fn,
-    )
-
-
 def run_projected_mla_prefix_attention_from_gpu_pages(
     *,
     layer_idx: int,
@@ -129,7 +61,6 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
     metadata: PrefixCachePrepackMetadata,
     spec: MlaExtendSpec,
     materialization: object,
-    attention_fn: PrefixMlaAttentionFn | None = None,
 ) -> torch.Tensor:
     """Run MLA prefix attention from materialized GPU compressed KV."""
 
@@ -155,11 +86,6 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
         append_plan=materialization.append_plan,
         layer_idx=layer_idx,
     )
-    if attention_fn is not None:
-        raise RuntimeError(
-            "MLA prefix-cache suffix prefill must use FlashInfer paged "
-            "MLA attention"
-        )
 
     blocked_k, blocked_v, block_table = manager.get_layer_kv_with_page_table(
         layer_idx

@@ -161,13 +161,10 @@ class MlaProjectedPrefixAwareAttentionBackend:
     """MLA backend adapter for already projected query and compressed KV."""
 
     layer_idx: int
-    page_size: int
-    kv_dim: int
     num_heads: int
     kv_lora_rank: int
     softmax_scale: float
     output_projection: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
-    attention_fn: Optional[Callable[..., torch.Tensor]] = None
 
     def forward_prefill(
         self,
@@ -181,7 +178,7 @@ class MlaProjectedPrefixAwareAttentionBackend:
         del value
         from batchgen.models.wrappers.prefix_mla_extend import (
             MlaExtendSpec,
-            run_projected_mla_prefix_attention,
+            run_projected_mla_prefix_attention_from_gpu_pages,
         )
 
         materialization = (
@@ -191,20 +188,21 @@ class MlaProjectedPrefixAwareAttentionBackend:
         )
 
         spec = MlaExtendSpec(
-            kv_dim=int(self.kv_dim),
             num_heads=int(self.num_heads),
             kv_lora_rank=int(self.kv_lora_rank),
             softmax_scale=float(self.softmax_scale),
         )
-        attn_out = run_projected_mla_prefix_attention(
+        if materialization is None:
+            raise RuntimeError(
+                "MLA prefix attention requires GPU paged materialization"
+            )
+        attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
             layer_idx=int(self.layer_idx),
             query_states=query,
             offload_kv=key,
             metadata=metadata,
             spec=spec,
-            page_size=int(self.page_size),
-            attention_fn=self.attention_fn,
-            prefill_prefix_materialization=materialization,
+            materialization=materialization,
         )
         if self.output_projection is None:
             return attn_out

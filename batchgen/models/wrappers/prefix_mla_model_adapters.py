@@ -19,10 +19,9 @@ from batchgen.attention.mla.prefix_absorb import (
     project_absorbed_mla_output,
     project_absorbed_mla_output_w8a16,
 )
-
-from .attention import AttnWrapperBase
 from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
+from .attention import AttnWrapperBase
 from .prefix_cache import (
     PrefixCachePrepackMetadata,
     ensure_prefix_cache_prepack_metadata,
@@ -156,7 +155,6 @@ def offload_glm5_prepacked_mla_kv(
 def _mla_extend_spec(wrapper: object) -> MlaExtendSpec:
     attn = wrapper.module
     return MlaExtendSpec(
-        kv_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
         num_heads=attn.num_heads,
         kv_lora_rank=attn.kv_lora_rank,
         softmax_scale=attn.softmax_scale,
