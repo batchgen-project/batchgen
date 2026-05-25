@@ -88,6 +88,10 @@ from batchgen.query_book import (
 )
 from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.prefix_reuse.prefill import (
+	build_prefix_cache_prefill_inputs,
+	lookup_prefix_cache_for_prefill,
+)
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
 	glm5_dsa_cuda_graph_requested_for_model,
@@ -742,6 +746,85 @@ class BatchGenWorker:
 			self.rank,
 			runtime_config.shm_name,
 			len(runtime_config.group_specs),
+		)
+
+	def _lookup_prefix_cache_for_prefill(
+		self,
+		*,
+		local_indices: Sequence[int],
+		input_ids_list: Sequence[torch.Tensor],
+		prompt_lengths: Sequence[int],
+	):
+		if not self.enable_prefix_cache:
+			return None
+		if self.prefix_cache_coordinator is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but coordinator is not attached"
+			)
+		if self.prefix_cache_runtime_config is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but runtime config is missing"
+			)
+
+		prompt_token_ids = []
+		for input_ids, prompt_length in zip(input_ids_list, prompt_lengths):
+			prompt_token_ids.append(
+				[
+					int(token_id)
+					for token_id in input_ids.reshape(-1)[: int(prompt_length)].tolist()
+				]
+			)
+		lookup = lookup_prefix_cache_for_prefill(
+			coordinator=self.prefix_cache_coordinator,
+			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
+			prompt_token_ids=prompt_token_ids,
+		)
+		for local_idx, cached_tokens in zip(
+			local_indices, lookup.prefix_shared_tokens
+		):
+			uuid = self._local_to_uuid_map.get(int(local_idx))
+			if uuid is None:
+				raise RuntimeError(
+					f"Missing UUID for prefix-cache prefill local_idx={local_idx}"
+				)
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					f"Missing sequence for prefix-cache prefill uuid={uuid[:8]}"
+				)
+			seq.prefix_shared_tokens = int(cached_tokens)
+		return lookup
+
+	def _build_prefix_reuse_prepack_inputs(
+		self,
+		*,
+		local_indices: Sequence[int],
+		input_ids_list: Sequence[torch.Tensor],
+		prompt_lengths: Sequence[int],
+		lookup,
+	):
+		if lookup is None:
+			return None
+
+		sequence_ids = []
+		for local_idx in local_indices:
+			uuid = self._local_to_uuid_map.get(int(local_idx))
+			if uuid is None:
+				raise RuntimeError(
+					f"Missing UUID for prefix-cache prepack local_idx={local_idx}"
+				)
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					f"Missing sequence for prefix-cache prepack uuid={uuid[:8]}"
+				)
+			sequence_ids.append(int(seq.global_idx))
+		return build_prefix_cache_prefill_inputs(
+			local_indices=local_indices,
+			sequence_ids=sequence_ids,
+			input_ids=input_ids_list,
+			prompt_lengths=prompt_lengths,
+			lookup=lookup,
 		)
 
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):

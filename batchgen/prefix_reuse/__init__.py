@@ -16,6 +16,13 @@ from .materialization import (
     materialize_single_group_lookup_results,
     materialize_single_group_prefix_pages,
 )
+from .prefill import (
+    PrefixCachePrefillInputs,
+    PrefixCachePrefillLookup,
+    build_prefix_cache_prefill_inputs,
+    lookup_prefix_cache_for_prefill,
+    release_prefix_cache_lookup_attachments,
+)
 
 __all__ = [
     "PrefixCacheRuntimeConfig",
@@ -30,4 +37,9 @@ __all__ = [
     "SingleGroupPrefixMaterialization",
     "materialize_single_group_lookup_results",
     "materialize_single_group_prefix_pages",
+    "PrefixCachePrefillInputs",
+    "PrefixCachePrefillLookup",
+    "build_prefix_cache_prefill_inputs",
+    "lookup_prefix_cache_for_prefill",
+    "release_prefix_cache_lookup_attachments",
 ]
