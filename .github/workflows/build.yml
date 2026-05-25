@@ -59,5 +59,10 @@ jobs:
           pip install build
 
       - name: Build Wheel
+        # --wheel skips the sdist round-trip; sdist doesn't ship the top-level
+        # op_builder/ / core/ / external/ dirs (CustomBuildPy expects them in
+        # source-tree mode), so wheel-from-sdist fails on setup.py's
+        # `from op_builder.all_ops import ALL_OPS`. publish-test.yml uses the
+        # same --wheel flag for the same reason.
         run: |
-          BUILD_OPS=1 python3 -m build
+          BUILD_OPS=1 python3 -m build --wheel
