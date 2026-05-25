@@ -9,6 +9,7 @@ from batchgen.prefix_reuse.config import (
     PrefixKVGroupSpec,
     build_prefix_cache_namespace_digest,
     build_prefix_cache_runtime_config_from_specs,
+    create_host_prefix_cache_coordinator,
     derive_prefix_cache_shm_name,
 )
 from batchgen.server.server_args import _build_parser
@@ -124,6 +125,59 @@ def test_prefix_cache_core_config_conversion_uses_bound_classes():
     assert core_config.group_specs[0].group_id == 3
     assert core_config.group_specs[0].semantic == "compressed"
     assert core_config.group_specs[0].compression_ratio == 4
+
+
+def test_create_host_prefix_cache_coordinator_initializes_requested_region():
+    class _CoreGroupSpec(SimpleNamespace):
+        pass
+
+    class _CoreConfig(SimpleNamespace):
+        pass
+
+    class _Coordinator:
+        instances = []
+
+        def __init__(self, config):
+            self.config = config
+            self.initialize_calls = []
+            self.instances.append(self)
+
+        def initialize(self, create_region):
+            self.initialize_calls.append(bool(create_region))
+
+    class _Core:
+        HostKVGroupSpec = _CoreGroupSpec
+        HostPrefixCacheConfig = _CoreConfig
+        HostPrefixCacheCoordinator = _Coordinator
+        HostKVGroupSemantic = SimpleNamespace(
+            FULL_KV="full",
+            MLA_COMPRESSED_KV="mla",
+            SWA_KV="swa",
+            COMPRESSED_RATIO_KV="compressed",
+        )
+
+    runtime_config = build_prefix_cache_runtime_config_from_specs(
+        model_name="test/model",
+        kv_dtype="bfloat16",
+        host_kv_pages_per_required_group=8,
+        group_specs=[
+            PrefixKVGroupSpec(
+                group_id=0,
+                semantic=PrefixKVGroupSemantic.FULL_KV,
+                required_for_reuse=True,
+                raw_page_tokens=64,
+            )
+        ],
+    )
+
+    coordinator = create_host_prefix_cache_coordinator(
+        core_engine_module=_Core,
+        runtime_config=runtime_config,
+        create_region=True,
+    )
+
+    assert coordinator.initialize_calls == [True]
+    assert coordinator.config.shm_name == runtime_config.shm_name
 
 
 def test_prefix_cache_runtime_config_rejects_no_required_group():

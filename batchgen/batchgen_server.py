@@ -259,6 +259,34 @@ class BatchGenServer:
 			daemon=True
 		)
 
+	def _initialize_prefix_cache_owner(self):
+		self.prefix_cache_runtime_config = None
+		self.prefix_cache_coordinator_owner = None
+		if not getattr(self.args, "enable_prefix_cache", False):
+			return
+		if self.args.host_kv_cache_size is None:
+			raise RuntimeError(
+				"--enable-prefix-cache requires --host-kv-cache-size"
+			)
+		from batchgen.prefix_reuse.config import (
+			build_prefix_cache_runtime_config,
+			create_host_prefix_cache_coordinator,
+		)
+
+		runtime_config = build_prefix_cache_runtime_config(
+			model_name=self.args.model,
+			kv_dtype=self.args.kv_dtype,
+			host_kv_cache_size_bytes=int(self.args.host_kv_cache_size * (1024**3)),
+			node_rank=self.args.node_rank,
+			debug_stats=getattr(self.args, "prefix_cache_debug_stats", False),
+		)
+		self.prefix_cache_runtime_config = runtime_config
+		self.prefix_cache_coordinator_owner = create_host_prefix_cache_coordinator(
+			core_engine_module=bg_lib,
+			runtime_config=runtime_config,
+			create_region=True,
+		)
+
 	def start(self):
 		"""Start the TCP Server loop"""
 		try:
@@ -271,6 +299,7 @@ class BatchGenServer:
 			# 1. Allocate KV & Load Model & Spawn Workers
 			self.allocate_host_kv_cache(self.args.host_kv_cache_size)
 			self.load_model_resources()
+			self._initialize_prefix_cache_owner()
 			self.spawn_workers()
 			
 			# 2. Start TCP Listener

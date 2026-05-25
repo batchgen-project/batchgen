@@ -142,6 +142,19 @@ def build_prefix_cache_runtime_config_from_specs(
     )
 
 
+def create_host_prefix_cache_coordinator(
+    *,
+    core_engine_module,
+    runtime_config: PrefixCacheRuntimeConfig,
+    create_region: bool,
+):
+    coordinator = core_engine_module.HostPrefixCacheCoordinator(
+        runtime_config.to_core_config(core_engine_module)
+    )
+    coordinator.initialize(bool(create_region))
+    return coordinator
+
+
 def derive_prefix_cache_shm_name(model_name: str, *, node_rank: int) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", model_name).strip("_").lower()
     normalized = normalized[:64] or "model"

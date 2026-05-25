@@ -705,8 +705,44 @@ class BatchGenWorker:
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
 		self.prefix_cache_coordinator = None
+		self._initialize_prefix_cache_worker(args)
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
+
+	def _initialize_prefix_cache_worker(
+		self, args: BatchGenWorkerArgs
+	) -> None:
+		if not self.enable_prefix_cache:
+			return
+		if args.host_kv_cache_size is None:
+			raise RuntimeError(
+				"Prefix cache worker requires resolved Host KV cache budget"
+			)
+
+		from batchgen.prefix_reuse.config import (
+			build_prefix_cache_runtime_config,
+			create_host_prefix_cache_coordinator,
+		)
+
+		runtime_config = build_prefix_cache_runtime_config(
+			model_name=args.model_name,
+			kv_dtype=args.kv_dtype,
+			host_kv_cache_size_bytes=int(args.host_kv_cache_size * (1024**3)),
+			node_rank=args.nnode_rank,
+			debug_stats=bool(args.prefix_cache_debug_stats),
+		)
+		self.prefix_cache_runtime_config = runtime_config
+		self.prefix_cache_coordinator = create_host_prefix_cache_coordinator(
+			core_engine_module=core_engine,
+			runtime_config=runtime_config,
+			create_region=False,
+		)
+		logging.info(
+			"Rank %s attached Host prefix cache: shm=%s groups=%d",
+			self.rank,
+			runtime_config.shm_name,
+			len(runtime_config.group_specs),
+		)
 
 	def Init(self, max_input_length, max_decoding_length, num_queries, max_context_length=None):
 		"""

@@ -7,6 +7,7 @@ from .config import (
     build_prefix_cache_namespace_digest,
     build_prefix_cache_runtime_config,
     build_prefix_cache_runtime_config_from_specs,
+    create_host_prefix_cache_coordinator,
     derive_prefix_cache_shm_name,
 )
 from .materialization import (
@@ -23,6 +24,7 @@ __all__ = [
     "build_prefix_cache_namespace_digest",
     "build_prefix_cache_runtime_config",
     "build_prefix_cache_runtime_config_from_specs",
+    "create_host_prefix_cache_coordinator",
     "derive_prefix_cache_shm_name",
     "PrefixMaterializationSequence",
     "SingleGroupPrefixMaterialization",

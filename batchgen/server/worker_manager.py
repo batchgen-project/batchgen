@@ -23,6 +23,7 @@ from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
 from batchgen.server.process_utils import (
+    cleanup_shm_files,
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
@@ -225,6 +226,7 @@ class WorkerManager:
         _diag("<<< _load_model_resources")
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
+        self._initialize_prefix_cache_owner()
 
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
@@ -311,6 +313,9 @@ class WorkerManager:
             clean_hugepages=self._hugepages_enabled,
             kill_workers=False,  # Already handled above
         )
+        prefix_config = getattr(self, "prefix_cache_runtime_config", None)
+        if prefix_config is not None:
+            cleanup_shm_files(prefix_config.shm_name)
 
         self.started = False
         logger.info("WorkerManager stopped")
@@ -664,6 +669,47 @@ class WorkerManager:
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
             daemon=True,
+        )
+
+    def _initialize_prefix_cache_owner(self) -> None:
+        self.prefix_cache_runtime_config = None
+        self.prefix_cache_coordinator_owner = None
+        if not self.args.enable_prefix_cache:
+            return
+        if getattr(self, "host_kv_manager", None) is None:
+            raise RuntimeError(
+                "--enable-prefix-cache requires Host KV cache allocation"
+            )
+
+        from batchgen.prefix_reuse.config import (
+            build_prefix_cache_runtime_config,
+            create_host_prefix_cache_coordinator,
+        )
+
+        host_budget_gb = self.args_dict.get("host_kv_cache_size_per_rank")
+        if host_budget_gb is None:
+            raise RuntimeError(
+                "Prefix cache requires resolved Host KV cache budget"
+            )
+        runtime_config = build_prefix_cache_runtime_config(
+            model_name=self.args.model,
+            kv_dtype=self.args.kv_dtype,
+            host_kv_cache_size_bytes=int(host_budget_gb * (1024**3)),
+            node_rank=self.args.node_rank,
+            debug_stats=self.args.prefix_cache_debug_stats,
+        )
+        self.prefix_cache_runtime_config = runtime_config
+        self.prefix_cache_coordinator_owner = create_host_prefix_cache_coordinator(
+            core_engine_module=bg_lib,
+            runtime_config=runtime_config,
+            create_region=True,
+        )
+        logger.info(
+            "Host prefix cache initialized: shm=%s groups=%d hash_block=%d publish_boundary=%d",
+            runtime_config.shm_name,
+            len(runtime_config.group_specs),
+            runtime_config.hash_block_tokens,
+            runtime_config.publish_boundary_tokens,
         )
 
     def _get_kv_memfd_pid(self) -> int:
