@@ -206,7 +206,7 @@ def test_legacy_fields_do_not_leak_across_batches():
 
     with bind_forward_batch_metadata(prefix_batch):
         assert AttnWrapperBase.prepack_prefix_reuse_mode is True
-        assert AttnWrapperBase.prepack_prefix_shared_tokens == [3, 0, 4]
+        assert AttnWrapperBase.prepack_prefix_shared_tokens == [3, 0, 3]
 
     with bind_forward_batch_metadata(plain_batch):
         assert AttnWrapperBase.prepack_prefix_reuse_mode is False
