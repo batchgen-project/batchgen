@@ -426,6 +426,9 @@ class BatchGenWorkerArgs:
 	weights_memfd_fd: int = -1
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Default enables pool mode. 0 = legacy batch-FIFO.
+	# Host-side prefix cache. Detailed runtime config is derived inside the worker.
+	enable_prefix_cache: bool = False
+	prefix_cache_debug_stats: bool = False
 
 
 class BatchGenWorker:
@@ -698,6 +701,10 @@ class BatchGenWorker:
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
 		self._shutdown_requested = False
 		self._max_pool_size = args.max_pool_size  # 0 = legacy mode
+		self.enable_prefix_cache = bool(args.enable_prefix_cache)
+		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
+		self.prefix_cache_runtime_config = None
+		self.prefix_cache_coordinator = None
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 

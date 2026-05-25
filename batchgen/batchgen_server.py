@@ -238,6 +238,8 @@ class BatchGenServer:
 			adaptive_chunk_max=getattr(self.args, 'adaptive_chunk_max', 65536),
 			adaptive_chunk_ema_alpha=getattr(self.args, 'adaptive_chunk_ema_alpha', 0.1),
 			adaptive_chunk_multiplier=getattr(self.args, 'adaptive_chunk_multiplier', 1.5),
+			enable_prefix_cache=getattr(self.args, 'enable_prefix_cache', False),
+			prefix_cache_debug_stats=getattr(self.args, 'prefix_cache_debug_stats', False),
 
 			# Place holder
 			local_rank=-1,
@@ -664,6 +666,8 @@ def parse_args():
 	parser.add_argument("--nnodes", type=int, default=1)
 	parser.add_argument("--node-rank", type=int, default=0)
 	parser.add_argument("--world-size", type=int, default=1)
+	parser.add_argument("--enable-prefix-cache", action="store_true", default=False)
+	parser.add_argument("--prefix-cache-debug-stats", action="store_true", default=False)
 	parser.add_argument(
 		"--allow-model-download",
 		action="store_true",
