@@ -31,7 +31,7 @@ on:
 jobs:
   test-node0:
     name: MMLU Test Node0
-    runs-on: [self-hosted, gpu, batchgen-ci-node0]
+    runs-on: [self-hosted, gpu, node0]
     timeout-minutes: 5760
     env:
       DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}
@@ -61,7 +61,7 @@ jobs:
 
   test-node1:
     name: MMLU Test Node1
-    runs-on: [self-hosted, gpu, batchgen-ci-node1]
+    runs-on: [self-hosted, gpu, node1]
     timeout-minutes: 5760
     env:
       DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}

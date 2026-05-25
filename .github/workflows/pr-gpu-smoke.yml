@@ -74,7 +74,7 @@ jobs:
   test-node0:
     needs: resolve
     if: needs.resolve.outputs.should_run == 'true'
-    runs-on: [self-hosted, gpu, batchgen-ci-node0]
+    runs-on: [self-hosted, gpu, node0]
     timeout-minutes: 90
     env:
       PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
@@ -124,7 +124,7 @@ jobs:
   test-node1:
     needs: resolve
     if: needs.resolve.outputs.should_run == 'true'
-    runs-on: [self-hosted, gpu, batchgen-ci-node1]
+    runs-on: [self-hosted, gpu, node1]
     timeout-minutes: 90
     env:
       PR_SHA:    ${{ needs.resolve.outputs.pr_sha }}
