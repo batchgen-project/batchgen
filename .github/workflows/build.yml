@@ -38,6 +38,12 @@ jobs:
       - name: Checkout Source Code
         uses: actions/checkout@v3
 
+      - name: Free disk space
+        # ubuntu-22.04 runners ship with ~14 GB free; torch + CUDA wheels pull
+        # ~2 GB on top of the CUDA 12.1 toolkit and overflow the root disk.
+        # Drop pre-installed toolchains we don't use before Python lands.
+        run: bash -x .github/workflows/scripts/free-disk-space.sh
+
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
