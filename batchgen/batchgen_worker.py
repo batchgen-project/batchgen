@@ -6235,27 +6235,19 @@ class BatchGenWorker:
 					self._glm5_whole_model_graph_requested_for_current_batch()
 					and "glm" in (getattr(self, "model_name", "") or "").lower()
 				)
-				glm5_layer_graph_requested = (
-					self._glm5_layer_graph_requested_for_current_batch()
-					and "glm" in (getattr(self, "model_name", "") or "").lower()
-				)
+				# Phase C: layer / DSA / MoE / segmented graph modes are retired;
+				# only the whole-model graph remains for GLM-5. Warmup triggers
+				# when (a) the generic should_warmup helper says so, or (b) the
+				# whole-model graph is requested but its bucket is missing.
 				generic_cuda_graph_warmup_needed = should_warmup_cuda_graphs_before_decode(
 					graph_manager_is_initialized=self._cuda_graph_manager is not None,
 					global_batch_has_queueing=has_queueing,
 					model_name=getattr(self, "model_name", None),
 					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 				)
-				if self._glm5_segmented_graph_capture_already_attempted_for_requested_paths():
-					generic_cuda_graph_warmup_needed = False
 				if generic_cuda_graph_warmup_needed or (
 					glm5_whole_graph_requested and self._cuda_graph_manager is None
-				) or (
-					glm5_layer_graph_requested and self._glm5_layer_graph_current_bucket_missing()
-				) or (
-					self._glm5_segmented_graph_initial_capture_missing()
-				) or self._glm5_whole_model_graph_current_bucket_missing() or (
-					self._glm5_dsa_graph_current_bucket_missing()
-				) or self._glm5_moe_graph_current_bucket_missing():
+				) or self._glm5_whole_model_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
 							f"Rank {self.rank}: warming GLM-5 CUDA graph with queued "
