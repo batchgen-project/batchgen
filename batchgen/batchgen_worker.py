@@ -8987,30 +8987,6 @@ class BatchGenWorker:
 
 		self._setup_cuda_graphs(gpu_manager)
 
-	def _glm5_configured_cuda_graph_bucket_sizes(self) -> list:
-		return self._generate_bucket_sizes(
-			self.args.cuda_graph_max_bucket_size,
-			self.args.cuda_graph_num_buckets,
-		)
-
-	def _glm5_cuda_graph_manager_missing_configured_buckets(
-		self,
-		manager,
-		failed_buckets,
-	) -> bool:
-		if manager is None:
-			return True
-		for bucket in self._glm5_configured_cuda_graph_bucket_sizes():
-			if bucket in failed_buckets:
-				continue
-			try:
-				if not manager.has_bucket_for_all_segments(bucket):
-					return True
-			except ValueError:
-				return True
-		return False
-
-	@staticmethod
 	def _glm5_dsa_graph_score_capacity_tokens(
 		primary_page_table,
 		primary_page_size: int,
@@ -9031,69 +9007,6 @@ class BatchGenWorker:
 			)
 		return capacity
 
-	def _glm5_dsa_graph_page_table_storage_changed(self) -> bool:
-		if self._cuda_graph_manager is None:
-			return False
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		if "glm" not in model_name_l:
-			return False
-		try:
-			wrapper = self.model.model.layers[0].self_attn
-		except Exception:
-			return False
-		expected_primary = getattr(wrapper, "_dsa_cuda_graph_primary_page_table_signature", None)
-		expected_aux = getattr(wrapper, "_dsa_cuda_graph_aux_page_table_signature", None)
-		if expected_primary is None or expected_aux is None:
-			return False
-		gpu_manager = self._get_cuda_graph_gpu_manager()
-		if gpu_manager is None:
-			return False
-		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-		aux_manager = getattr(
-			gpu_manager,
-			"auxiliary",
-			getattr(getattr(self, "core_engine", None), "gpu_paged_kv_manager_aux", None),
-		)
-		if aux_manager is None:
-			return False
-
-		def _sig(manager):
-			get_storage = getattr(manager, "get_cuda_graph_page_table_storage", None)
-			try:
-				if get_storage is not None:
-					table = get_storage()
-				else:
-					get_graph_table = getattr(manager, "get_cuda_graph_page_table", None)
-					table = get_graph_table() if get_graph_table is not None else None
-			except RuntimeError:
-				return None
-			if table is None:
-				return None
-			return (
-				int(table.data_ptr()),
-				tuple(int(dim) for dim in table.shape),
-				str(table.dtype),
-				str(table.device),
-			)
-
-		if _sig(primary_manager) == expected_primary and _sig(aux_manager) == expected_aux:
-			return False
-		logging.warning(
-			f"Rank {self.rank}: GLM-5 DSA CUDA graph page-table storage changed; "
-			"discarding captured graphs and recapturing before replay"
-		)
-		return True
-
-	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
-		# Phase C: segmented DSA graph mode is obsolete. The whole-model graph
-		# (driven by `--enable-cuda-graph`) is the only supported mode for
-		# GLM-5; the DSA-only / DSA-full / MoE-only / layer-only / segmented
-		# graph paths were experimental env-var gates and have been retired
-		# in favor of the adapter contract. Always return False so the gated
-		# code paths become unreachable; subsequent Phase C commits delete
-		# the methods + code paths themselves.
-		return False
-
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
 			return value
@@ -9101,22 +9014,6 @@ class BatchGenWorker:
 			return value != 0
 		if isinstance(value, str):
 			return value.strip().lower() in {"1", "true", "yes", "on"}
-		return False
-
-	def _glm5_debug_mode(self, key: str):
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return None
-		value = debug.get(key)
-		if not isinstance(value, str):
-			return None
-		mode = value.strip().lower()
-		return mode if mode in {"graph", "eager"} else None
-
-	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
-		# Phase C: MoE-only graph mode retired; always False.
-		# The whole-model graph (driven by --enable-cuda-graph) already
-		# captures MoE inside the layer-graph composition.
 		return False
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
@@ -9172,12 +9069,6 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
-	def _glm5_layer_graph_requested_for_current_batch(self) -> bool:
-		# Phase C: layer-only graph mode retired; the whole-model graph
-		# (driven by --enable-cuda-graph) composes the layer graphs as a
-		# single capturable segment via the adapter contract.
-		return False
-
 	def _glm5_force_segmented_graph_eager(self):
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
@@ -9198,19 +9089,17 @@ class BatchGenWorker:
 				use_cache=False,
 			)
 
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
+		# Phase C: layer/MoE/DSA segmented graph modes are retired; the
+		# whole-model graph composes per-layer captures internally so the
+		# eager fallback always runs through `_forward()` directly. The
+		# legacy `_glm5_force_segmented_graph_eager` wrap stays for the
+		# compare-mode eager re-run path (used in the legacy whole-model
+		# compare branch that still wraps `self.model.model(...)`).
+		model_name_l = (getattr(self, "model_name", "") or "").lower()
+		if "glm" in model_name_l and self._glm5_whole_model_graph_requested_for_current_batch():
 			with self._glm5_force_segmented_graph_eager():
 				return _forward()
 		return _forward()
-
-	def _glm5_segmented_graph_suppressed_by_composite_graph(self) -> bool:
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" not in model_name_l:
-			return False
-		return (
-			self._glm5_layer_graph_requested_for_current_batch()
-			or self._glm5_whole_model_graph_requested_for_current_batch()
-		)
 
 	def _glm5_whole_model_graph_capture_signature(self, bucket_size: Optional[int] = None):
 		gpu_manager = self._get_cuda_graph_gpu_manager()
@@ -9381,276 +9270,6 @@ class BatchGenWorker:
 			return "eager", bucket, "page_table_storage_changed"
 		return "graph", bucket, "captured"
 
-	def _glm5_layer_graph_current_bucket_missing(self) -> bool:
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		if (
-			not self._glm5_layer_graph_requested_for_current_batch()
-			or "glm" not in model_name_l
-		):
-			return False
-		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-		if max_bsz <= 0:
-			return False
-		try:
-			from batchgen.cuda_graph import BatchSizeBucketing
-			bucket = BatchSizeBucketing(
-				self._glm5_configured_cuda_graph_bucket_sizes()
-			).get_padded_size(max_bsz)
-		except ValueError:
-			return False
-		if bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
-			return False
-		signature = self._glm5_whole_model_graph_capture_signature(bucket)
-		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
-		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-		captured_max_seqlen = int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
-		if (
-			manager is not None
-			and current_max_seqlen > 0
-			and captured_max_seqlen > 0
-			and current_max_seqlen > captured_max_seqlen
-		):
-			logging.info(
-				f"Rank {self.rank}: GLM-5 layer CUDA graph max_seqlen "
-				f"{captured_max_seqlen} is below current decode max_seqlen "
-				f"{current_max_seqlen}; recapturing with current page-table capacity"
-			)
-			self._glm5_layer_cuda_graph_manager = None
-			self._glm5_layer_graph_signature = None
-			self._glm5_layer_graph_capture_attempted_for_batch = False
-			return True
-		if (
-			getattr(self, "_glm5_layer_graph_signature", None) is not None
-			and signature != getattr(self, "_glm5_layer_graph_signature", None)
-		):
-			self._glm5_layer_cuda_graph_manager = None
-			self._glm5_layer_graph_capture_attempted_for_batch = False
-			return True
-		if manager is None:
-			return not getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False)
-		return not manager.has_bucket_for_all_segments(max_bsz)
-
-	def _glm5_layer_graph_path_state(self, max_rank_bsz: int):
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if (
-			not self._glm5_layer_graph_requested_for_current_batch()
-			or "glm" not in model_name_l
-		):
-			return "disabled", None, "not_requested"
-		if max_rank_bsz <= 0:
-			return "eager", None, "empty_global_batch"
-		manager = getattr(self, "_glm5_layer_cuda_graph_manager", None)
-		if manager is None:
-			if getattr(self, "_glm5_layer_graph_capture_attempted_for_batch", False):
-				return "eager", None, "no_manager_after_initial_capture"
-			return "eager", None, "no_manager"
-		try:
-			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
-		except ValueError:
-			return "eager", None, "over_bucket"
-		if bucket in getattr(self, "_glm5_layer_graph_failed_buckets", set()):
-			return "eager", bucket, "failed_bucket"
-		if not manager.has_bucket_for_all_segments(max_rank_bsz):
-			return "eager", bucket, "bucket_not_captured"
-		current_max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-		captured_max_seqlen = int(getattr(self, "_glm5_layer_graph_max_seqlen", 0) or 0)
-		if (
-			current_max_seqlen > 0
-			and captured_max_seqlen > 0
-			and current_max_seqlen > captured_max_seqlen
-		):
-			return "eager", bucket, "max_seqlen_exceeds_capture"
-		signature = self._glm5_whole_model_graph_capture_signature(bucket)
-		if signature != getattr(self, "_glm5_layer_graph_signature", None):
-			return "eager", bucket, "page_table_storage_changed"
-		return "graph", bucket, "captured"
-
-	def _glm5_moe_graph_current_bucket_missing(self) -> bool:
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		if (
-			not self._glm5_moe_graph_requested_for_current_batch()
-			or "glm" not in model_name_l
-		):
-			return False
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return False
-		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-		if max_bsz <= 0:
-			return False
-		if self._glm5_moe_cuda_graph_manager is None:
-			return not getattr(
-				self,
-				"_glm5_moe_graph_capture_attempted_for_batch",
-				False,
-			)
-		failed_buckets = getattr(self, "_glm5_moe_graph_failed_buckets", set())
-		try:
-			bucket = self._glm5_moe_cuda_graph_manager.bucketing.get_padded_size(max_bsz)
-		except AttributeError:
-			missing = not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
-		except ValueError:
-			return False
-		else:
-			if bucket in failed_buckets:
-				return False
-			missing = not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(max_bsz)
-		if not missing:
-			self._glm5_moe_graph_capture_attempted_for_batch = True
-		return missing
-
-	def _glm5_dsa_graph_path_state(self, local_bsz: int, gpu_manager):
-		if not self._glm5_dsa_graph_requested_for_current_batch():
-			return "disabled", None, "not_requested"
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return "disabled", None, "suppressed_by_composite_graph"
-		if local_bsz <= 0:
-			return "eager", None, "empty_local_batch"
-		manager = self._cuda_graph_manager
-		if manager is None:
-			if getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False):
-				return "eager", None, "no_manager_after_initial_capture"
-			return "eager", None, "no_manager"
-		try:
-			bucket = manager.bucketing.get_padded_size(local_bsz)
-		except ValueError:
-			return "eager", None, "over_bucket"
-		model = getattr(self, "model", None)
-		layers = getattr(getattr(model, "model", None), "layers", None)
-		if not layers:
-			return "eager", bucket, "no_attention_wrapper"
-		wrapper = layers[0].self_attn
-		segment_name = getattr(wrapper, "_dsa_cuda_graph_segment_name", None)
-		if segment_name is None:
-			return "eager", bucket, "no_segment"
-		if not manager.has_graph(segment_name, local_bsz):
-			return "eager", bucket, "bucket_not_captured"
-		cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
-		max_seqlen = int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0)
-		if cache_seqlens is None:
-			return "eager", bucket, "no_decode_metadata"
-		index_topk = getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048)
-		from batchgen.models.glm.glm5.wrappers import _glm5_dsa_cuda_graph_can_replay
-		if not _glm5_dsa_cuda_graph_can_replay(
-			cache_seqlens,
-			max_seqlen,
-			index_topk,
-			captured_max_seqlen=getattr(wrapper, "_dsa_cuda_graph_max_seqlen", None),
-		):
-			return "eager", bucket, "metadata_not_graph_safe"
-		if gpu_manager is None:
-			return "eager", bucket, "no_gpu_manager"
-		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-		aux_manager = getattr(
-			gpu_manager,
-			"auxiliary",
-			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
-		)
-		if aux_manager is None:
-			return "eager", bucket, "no_aux_manager"
-		active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
-		for manager_obj, label in (
-			(primary_manager, "primary"),
-			(aux_manager, "aux"),
-		):
-			ensure_graph_table = getattr(manager_obj, "ensure_cuda_graph_page_table", None)
-			if ensure_graph_table is None:
-				continue
-			if not active_sequence_ids:
-				return "eager", bucket, "no_active_sequence_ids"
-			try:
-				ensure_graph_table(active_sequence_ids)
-			except (RuntimeError, KeyError, ValueError):
-				return "eager", bucket, f"{label}_page_table_state_invalid"
-		if not wrapper._dsa_cuda_graph_page_tables_match(primary_manager, aux_manager):
-			return "eager", bucket, "page_table_storage_changed"
-		return "graph", bucket, "captured"
-
-	def _prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
-		self,
-		local_bsz: int,
-		gpu_manager,
-	) -> None:
-		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
-		AttnWrapperBase.glm5_decode_primary_slot_indices = None
-		AttnWrapperBase.glm5_decode_aux_slot_indices = None
-		path, bucket, reason = self._glm5_dsa_graph_path_state(local_bsz, gpu_manager)
-		AttnWrapperBase.glm5_dsa_graph_forward_state = {
-			"path": path,
-			"bucket": bucket,
-			"reason": reason,
-			"local_bsz": int(local_bsz),
-			"metadata_prepared": False,
-		}
-		if path != "graph" or bucket is None:
-			return
-		model = getattr(self, "model", None)
-		layers = getattr(getattr(model, "model", None), "layers", None)
-		if not layers:
-			raise RuntimeError("GLM-5 DSA CUDA graph replay requires attention wrappers")
-		wrapper = layers[0].self_attn
-		index_topk = int(getattr(getattr(wrapper.module, "indexer", None), "index_topk", 2048))
-		cache_seqlens = getattr(AttnWrapperBase, "cache_seqlens", None)
-		if cache_seqlens is None:
-			raise RuntimeError("GLM-5 DSA CUDA graph replay requires cache_seqlens metadata")
-		bucket = int(bucket)
-		if local_bsz <= 0 or local_bsz > bucket:
-			raise RuntimeError(
-				f"GLM-5 DSA CUDA graph invalid local batch size {local_bsz} for bucket {bucket}"
-			)
-		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
-		aux_manager = getattr(
-			gpu_manager,
-			"auxiliary",
-			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
-		)
-		if aux_manager is None:
-			raise RuntimeError("GLM-5 DSA CUDA graph replay requires auxiliary GPU KV manager")
-		primary_state = primary_manager.get_cuda_graph_page_table_state()
-		aux_state = aux_manager.get_cuda_graph_page_table_state()
-		AttnWrapperBase.glm5_decode_primary_slot_indices = primary_state.slot_indices[:local_bsz].to(
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
-		AttnWrapperBase.glm5_decode_aux_slot_indices = aux_state.slot_indices[:local_bsz].to(
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
-		selected_lengths = torch.empty(
-			(bucket,),
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
-		selected_lengths[:local_bsz].copy_(
-			torch.clamp(
-				cache_seqlens[:local_bsz].to(dtype=torch.int32),
-				max=index_topk,
-			),
-			non_blocking=True,
-		)
-		if local_bsz < bucket:
-			captured_max_seqlen = int(getattr(wrapper, "_dsa_cuda_graph_max_seqlen", index_topk))
-			selected_lengths[local_bsz:].fill_(min(captured_max_seqlen, index_topk))
-		from batchgen.attention.dsa.sparse_decode_mla import (
-			prepare_sparse_flash_mla_decode_tensor_metadata,
-		)
-		tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
-			selected_lengths,
-			int(getattr(wrapper.module, "num_heads", 64)),
-		)
-		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
-			"bucket_size": bucket,
-			"selected_lengths": selected_lengths,
-			"tile_scheduler_metadata": tile_scheduler_metadata,
-			"num_splits": num_splits,
-		}
-		AttnWrapperBase.glm5_dsa_graph_forward_state = {
-			"path": path,
-			"bucket": bucket,
-			"reason": reason,
-			"local_bsz": int(local_bsz),
-			"metadata_prepared": True,
-		}
-
 	def _prepare_glm5_layer_graph_inputs(
 		self,
 		*,
@@ -9736,43 +9355,6 @@ class BatchGenWorker:
 			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
 			"flashmla_num_splits": num_splits,
 		}
-
-	def _glm5_moe_graph_path_state(self, max_rank_bsz: int):
-		if not self._glm5_moe_graph_requested_for_current_batch():
-			return "disabled", None, "not_requested"
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return "disabled", None, "suppressed_by_composite_graph"
-		if max_rank_bsz <= 0:
-			return "eager", None, "empty_global_batch"
-		manager = self._glm5_moe_cuda_graph_manager
-		if manager is None:
-			if getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False):
-				return "eager", None, "no_manager_after_initial_capture"
-			return "eager", None, "no_manager"
-		try:
-			bucket = manager.bucketing.get_padded_size(max_rank_bsz)
-		except ValueError:
-			return "eager", None, "over_bucket"
-		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
-			return "eager", bucket, "failed_bucket"
-		if not manager.has_bucket_for_all_segments(max_rank_bsz):
-			return "eager", bucket, "bucket_not_captured"
-		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_HAS_DISPATCH_3D
-		moe_layers = [
-			layer.mlp for layer in self.model.model.layers
-			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
-		]
-		if not moe_layers:
-			return "disabled", bucket, "no_moe_layers"
-		first_moe = moe_layers[0]
-		if not (
-			getattr(first_moe, "use_3d_moe", False)
-			and getattr(first_moe, "_fp8_blockwise_ready", False)
-			and Glm5MoE._3d_buf is not None
-			and _GLM5_HAS_DISPATCH_3D
-		):
-			return "eager", bucket, "3d_graph_path_not_ready"
-		return "graph", bucket, "captured"
 
 	def _log_glm5_graph_path_for_forward(
 		self,
