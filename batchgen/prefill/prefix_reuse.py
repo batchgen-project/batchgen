@@ -173,32 +173,3 @@ def split_prefix_reuse_plan_for_micro_batch(
         saved_prefill_tokens=total_prompt_tokens - total_suffix_tokens,
     )
 
-
-def validate_prefix_reuse_plan(
-    plan: PrefixReusePrefillPlan,
-    *,
-    allow_full_hits: bool = False,
-) -> None:
-    del allow_full_hits
-    if len(plan.sequences) != len(plan.suffix_input_ids):
-        raise ValueError("Plan sequence count does not match suffix_input_ids")
-    if len(plan.sequences) != len(plan.suffix_position_ids):
-        raise ValueError(
-            "Plan sequence count does not match suffix_position_ids"
-        )
-    if plan.cache_seqlens.numel() != len(plan.sequences):
-        raise ValueError("Plan sequence count does not match cache_seqlens")
-
-    for idx, item in enumerate(plan.sequences):
-        if item.prefix_shared_tokens + item.suffix_length != item.prompt_length:
-            raise ValueError(
-                f"Invalid prefix/suffix lengths for sequence {item.sequence_id}"
-            )
-        if plan.suffix_input_ids[idx].numel() != item.suffix_length:
-            raise ValueError(
-                f"Invalid suffix_input_ids length for sequence {item.sequence_id}"
-            )
-        if plan.suffix_position_ids[idx].numel() != item.suffix_length:
-            raise ValueError(
-                f"Invalid suffix_position_ids length for sequence {item.sequence_id}"
-            )

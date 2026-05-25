@@ -8,24 +8,9 @@ is prepended to freshly computed suffix KV.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional
 
 import torch
-
-
-class PrefixAwareAttentionBackend(Protocol):
-    """Common protocol for prefix-aware prefill attention backends."""
-
-    def forward_prefill(
-        self,
-        *,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: Optional[torch.Tensor],
-        metadata,
-        kv_cache_metadata=None,
-    ) -> torch.Tensor:
-        """Run prefill attention for a possibly prefix-reused batch."""
 
 
 @dataclass(frozen=True)

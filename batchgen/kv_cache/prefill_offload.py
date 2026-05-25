@@ -53,10 +53,6 @@ class PrefillHostKVOffloader:
     def _destination_starts(self) -> Optional[List[int]]:
         if not self.metadata.prefix_reuse_mode:
             return None
-        if self.metadata.prefix_shared_tokens is None:
-            raise RuntimeError(
-                "Prefill offset offload requires prefix_shared_tokens"
-            )
         if not hasattr(
             self.worker_view, "async_offload_layer_kv_to_host_with_offsets"
         ):

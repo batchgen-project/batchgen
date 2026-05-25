@@ -4,7 +4,6 @@ import torch
 from batchgen.prefill.prefix_reuse import (
     build_prefix_reuse_prefill_plan,
     split_prefix_reuse_plan_for_micro_batch,
-    validate_prefix_reuse_plan,
 )
 
 
@@ -71,7 +70,7 @@ def test_split_prefix_reuse_prefill_plan_recomputes_stats():
     assert micro.saved_prefill_tokens == 2
 
 
-def test_validate_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
+def test_build_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
     plan = build_prefix_reuse_prefill_plan(
         local_indices=[0],
         sequence_ids=[100],
@@ -80,7 +79,6 @@ def test_validate_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
         prefix_shared_tokens=[4],
     )
 
-    validate_prefix_reuse_plan(plan)
     assert plan.sequences[0].is_full_hit is True
     assert plan.sequences[0].raw_prefix_shared_tokens == 4
     assert plan.sequences[0].prefix_shared_tokens == 3
@@ -98,7 +96,6 @@ def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens(
         prefix_shared_tokens=[1],
     )
 
-    validate_prefix_reuse_plan(plan)
     assert plan.sequences[0].is_full_hit is True
     assert plan.sequences[0].raw_prefix_shared_tokens == 1
     assert plan.sequences[0].prefix_shared_tokens == 0

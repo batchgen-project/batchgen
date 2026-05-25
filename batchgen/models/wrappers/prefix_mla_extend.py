@@ -36,8 +36,6 @@ def run_prefix_mla_suffix_prefill_with_projected(
     prefill_prefix_materialization: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill from already projected suffix Q/KV."""
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
-
     if prefill_prefix_materialization is None:
         raise RuntimeError(
             "MLA prefix-cache suffix prefill requires GPU paged materialization"

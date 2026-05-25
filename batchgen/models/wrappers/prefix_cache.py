@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -222,7 +222,3 @@ class PrefixCachePrepackMetadata:
 
     def cu_seqlens_list(self) -> List[int]:
         return list(self.cu_seqlens_cpu)
-
-    def sequence_span(self, seq_idx: int) -> Tuple[int, int]:
-        cu = self.cu_seqlens_list()
-        return cu[seq_idx], cu[seq_idx + 1]

@@ -145,7 +145,7 @@ def offload_glm5_prepacked_mla_kv(
     offloader = PrefillHostKVOffloader(
         worker_view=worker_view,
         layer_idx=layer_idx,
-        metadata=ensure_prefix_cache_prepack_metadata(metadata),
+        metadata=metadata,
         track_task=AttnWrapperBase.track_prefill_offload_task,
         pin_tensor=AttnWrapperBase.pin_prefill_offload_tensor,
     )

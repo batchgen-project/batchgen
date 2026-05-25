@@ -29,10 +29,6 @@ class PrefixMaterializationSequence:
     host_pages: Sequence[int | object]
     attachment_handle: int = 0
 
-    @property
-    def full_tokens(self) -> int:
-        return int(self.prefix_tokens) + int(self.suffix_tokens)
-
 
 @dataclass
 class SingleGroupPrefixMaterialization:
