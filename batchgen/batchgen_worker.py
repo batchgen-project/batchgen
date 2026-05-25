@@ -9783,37 +9783,22 @@ class BatchGenWorker:
 		gpu_manager,
 		decode_iter: int,
 	) -> None:
+		# Phase C: layer / DSA / MoE / segmented graph modes are retired;
+		# the log shows only the whole-model graph path.
 		model_name_l = (getattr(self, "model_name", "") or "").lower()
 		if "glm" not in model_name_l or not self._glm5_graph_path_log_requested_for_current_batch():
 			return
-		dsa_path, dsa_bucket, dsa_reason = self._glm5_dsa_graph_path_state(
-			local_bsz,
-			gpu_manager,
-		)
-		moe_path, moe_bucket, moe_reason = self._glm5_moe_graph_path_state(max_rank_bsz)
-		layer_path, layer_bucket, layer_reason = self._glm5_layer_graph_path_state(max_rank_bsz)
 		whole_path, whole_bucket, whole_reason = self._glm5_whole_graph_path_state(max_rank_bsz)
 		counts_repr = None if rank_counts is None else f"device_tensor(shape={tuple(rank_counts.shape)})"
 		logging.info(
 			"[GLM5_GRAPH_PATH] rank=%s decode_iter=%s local_bsz=%s "
-			"max_rank_bsz=%s rank_counts=%s dsa=%s dsa_bucket=%s "
-			"dsa_reason=%s moe=%s moe_bucket=%s moe_reason=%s "
-			"layer=%s layer_bucket=%s layer_reason=%s "
+			"max_rank_bsz=%s rank_counts=%s "
 			"whole=%s whole_bucket=%s whole_reason=%s",
 			self.rank,
 			decode_iter,
 			local_bsz,
 			max_rank_bsz,
 			counts_repr,
-			dsa_path,
-			dsa_bucket,
-			dsa_reason,
-			moe_path,
-			moe_bucket,
-			moe_reason,
-			layer_path,
-			layer_bucket,
-			layer_reason,
 			whole_path,
 			whole_bucket,
 			whole_reason,
@@ -10849,12 +10834,7 @@ class BatchGenWorker:
 			)
 			self._configure_glm5_dispatch_trace(global_decode_sequences)
 
-			if self._glm5_moe_graph_current_bucket_missing():
-				logging.info(
-					f"Rank {self.rank}: warming GLM-5 MoE CUDA graph at decode entry "
-					"after global batch debug flags and rank counts are synchronized"
-				)
-				self._warmup_cuda_graphs()
+			# Phase C: MoE-only graph mode retired; no MoE-specific warmup needed.
 
 			# Invariant check: cache_seqlens must not exceed allocated pages.
 			# Violations cause FlashAttention to read -1 sentinel → CUDA illegal access.
@@ -10990,10 +10970,11 @@ class BatchGenWorker:
 				# Between boundaries, batch size is constant — skip the all_reduce + .item()
 				# CPU-GPU sync that drains the GPU pipeline every step.
 				# The sync is done in _page_boundary_fast and at initial setup (line ~7099).
+				# Phase C: layer-graph mode retired; only whole-model needs the
+				# globally-synced rank-count reuse.
 				if (
 					getattr(self, '_whole_model_graph', False)
 					or self._glm5_whole_model_graph_requested_for_current_batch()
-					or self._glm5_layer_graph_requested_for_current_batch()
 				):
 					# Whole-model graph needs globally synced counts for NCCL bucket
 					# matching, but the count vector only changes at decode-entry,
@@ -11076,13 +11057,8 @@ class BatchGenWorker:
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
 
-				if self._glm5_layer_graph_current_bucket_missing():
-					logging.info(
-						f"Rank {self.rank}: warming GLM-5 layer CUDA graph at "
-						"decode entry after cache metadata and page tables are bound"
-					)
-					self._warmup_cuda_graphs()
-
+				# Phase C: layer-graph mode retired; only the whole-model graph
+				# may need re-warmup here.
 				if self._glm5_whole_model_graph_current_bucket_missing():
 					logging.info(
 						f"Rank {self.rank}: GLM-5 whole-model CUDA graph was not captured "
@@ -11098,10 +11074,9 @@ class BatchGenWorker:
 					gpu_manager=gpu_manager,
 					decode_iter=self._cumulative_decode_iterations,
 				)
-				self._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
-					len(batch),
-					gpu_manager,
-				)
+				# Phase C: DSA-only graph metadata prep retired (DSA graph mode
+				# is no longer reachable). The whole-model graph builds its
+				# FlashMLA metadata in-line during prepare_replay_inputs.
 
 				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
 					local_iteration=local_iteration,
