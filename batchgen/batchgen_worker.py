@@ -19,6 +19,10 @@ from batchgen.config.tokenizer_registry import load_tokenizer
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
+# Phase C: GLM-5-specific ClassVars (dispatch_trace_*, _dsa_short_count,
+# glm5_decode_*_slot_indices, glm5_dsa_*) live on GLM5AttnWrapper, not
+# AttnWrapperBase, per audit §A finding #8.
+from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 # Aliases for backward compatibility with existing code
 Attn_Wrapper = AttnWrapperBase
 Expert_Wrapper = ExpertWrapperBase
@@ -987,19 +991,19 @@ class BatchGenWorker:
 		return os.environ.get("BATCHGEN_GLM5_DISPATCH_TRACE", "0") == "1"
 
 	def _flush_glm5_dispatch_trace_summary(self, reason: str) -> None:
-		if not getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False):
+		if not getattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False):
 			return
-		counts = dict(getattr(AttnWrapperBase, "glm5_dispatch_counts", {}) or {})
+		counts = dict(getattr(GLM5AttnWrapper, "glm5_dispatch_counts", {}) or {})
 		if not counts:
 			return
-		context = getattr(AttnWrapperBase, "glm5_dispatch_trace_context", None) or {}
+		context = getattr(GLM5AttnWrapper, "glm5_dispatch_trace_context", None) or {}
 		counts_text = ",".join(f"{key}={counts[key]}" for key in sorted(counts))
 		logging.warning(
 			"[GLM5_DISPATCH_TRACE] rank=%s summary reason=%s trace=%s "
 			"batch_ids=%s global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s counts=%s",
 			context.get("rank", self.rank),
 			reason,
-			getattr(AttnWrapperBase, "glm5_dispatch_trace_id", None) or "unknown",
+			getattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None) or "unknown",
 			context.get("batch_ids", "-"),
 			context.get("global_ids", "-"),
 			context.get("bsz", "-"),
@@ -1014,13 +1018,13 @@ class BatchGenWorker:
 			debug = {}
 		enabled = self._glm5_dispatch_trace_enabled(debug)
 		if not enabled:
-			if getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False):
+			if getattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False):
 				self._flush_glm5_dispatch_trace_summary("disabled")
-			AttnWrapperBase.glm5_dispatch_trace_enabled = False
-			AttnWrapperBase.glm5_dispatch_trace_id = None
-			AttnWrapperBase.glm5_dispatch_trace_context = None
-			AttnWrapperBase.glm5_dispatch_counts = {}
-			AttnWrapperBase.glm5_dispatch_seen = set()
+			GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
+			GLM5AttnWrapper.glm5_dispatch_trace_id = None
+			GLM5AttnWrapper.glm5_dispatch_trace_context = None
+			GLM5AttnWrapper.glm5_dispatch_counts = {}
+			GLM5AttnWrapper.glm5_dispatch_seen = set()
 			return
 
 		seqs = list(batch_sequences or [])
@@ -1046,15 +1050,15 @@ class BatchGenWorker:
 			f"router={context['glm5_moe_router_mode']}"
 		)
 		if (
-			not getattr(AttnWrapperBase, "glm5_dispatch_trace_enabled", False)
-			or getattr(AttnWrapperBase, "glm5_dispatch_trace_id", None) != trace_id
+			not getattr(GLM5AttnWrapper, "glm5_dispatch_trace_enabled", False)
+			or getattr(GLM5AttnWrapper, "glm5_dispatch_trace_id", None) != trace_id
 		):
 			self._flush_glm5_dispatch_trace_summary("switch")
-			AttnWrapperBase.glm5_dispatch_trace_enabled = True
-			AttnWrapperBase.glm5_dispatch_trace_id = trace_id
-			AttnWrapperBase.glm5_dispatch_trace_context = context
-			AttnWrapperBase.glm5_dispatch_counts = {}
-			AttnWrapperBase.glm5_dispatch_seen = set()
+			GLM5AttnWrapper.glm5_dispatch_trace_enabled = True
+			GLM5AttnWrapper.glm5_dispatch_trace_id = trace_id
+			GLM5AttnWrapper.glm5_dispatch_trace_context = context
+			GLM5AttnWrapper.glm5_dispatch_counts = {}
+			GLM5AttnWrapper.glm5_dispatch_seen = set()
 			logging.warning(
 				"[GLM5_DISPATCH_TRACE] rank=%s begin trace=%s batch_ids=%s "
 				"global_ids=%s bsz=%s debug_dsa=%s debug_moe=%s "
@@ -1069,7 +1073,7 @@ class BatchGenWorker:
 				context["glm5_moe_router_mode"],
 			)
 		else:
-			AttnWrapperBase.glm5_dispatch_trace_context = context
+			GLM5AttnWrapper.glm5_dispatch_trace_context = context
 
 	def _debug_sequences_for_decode_uuids(self, decode_uuids) -> list:
 		if self.global_batch is None:
@@ -8896,9 +8900,9 @@ class BatchGenWorker:
 		AttnWrapperBase.cur_batch = cur_batch
 		index_topk = getattr(self.model_config, "index_topk", None)
 		if index_topk is not None and cache_view.numel() > 0:
-			AttnWrapperBase._dsa_short_count = int((cache_view <= int(index_topk)).sum().item())
+			GLM5AttnWrapper._dsa_short_count = int((cache_view <= int(index_topk)).sum().item())
 		else:
-			AttnWrapperBase._dsa_short_count = 0 if cache_view.numel() == 0 else None
+			GLM5AttnWrapper._dsa_short_count = 0 if cache_view.numel() == 0 else None
 
 		gpu_manager = self._get_cuda_graph_gpu_manager()
 		if gpu_manager is not None and cur_batch:
@@ -10495,11 +10499,11 @@ class BatchGenWorker:
 					# per decode step on DSA models (GLM-5).
 					_dsa_index_topk = getattr(self.model_config, "index_topk", None)
 					if _dsa_index_topk is not None:
-						AttnWrapperBase._dsa_short_count = int(
+						GLM5AttnWrapper._dsa_short_count = int(
 							(Attn_Wrapper.cache_seqlens <= _dsa_index_topk).sum().item()
 						)
 					else:
-						AttnWrapperBase._dsa_short_count = None
+						GLM5AttnWrapper._dsa_short_count = None
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
@@ -10516,9 +10520,9 @@ class BatchGenWorker:
 					AttnWrapperBase.cache_seqlens = Attn_Wrapper.cache_seqlens
 					AttnWrapperBase.max_seqlen = 0
 					AttnWrapperBase.cur_batch = []
-					AttnWrapperBase._dsa_short_count = 0
-					AttnWrapperBase.glm5_dsa_graph_forward_state = None
-					AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+					GLM5AttnWrapper._dsa_short_count = 0
+					GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+					GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 					self._decode_metadata_batch_key = None
 					self._decode_metadata_cpu_seqlens = None
 				
@@ -11138,17 +11142,17 @@ class BatchGenWorker:
 		AttnWrapperBase.cur_batch = None
 		self._flush_glm5_dispatch_trace_summary("decode_end")
 		AttnWrapperBase.batchgen_debug = None
-		AttnWrapperBase.glm5_dispatch_trace_enabled = False
-		AttnWrapperBase.glm5_dispatch_trace_id = None
-		AttnWrapperBase.glm5_dispatch_trace_context = None
-		AttnWrapperBase.glm5_dispatch_counts = {}
-		AttnWrapperBase.glm5_dispatch_seen = set()
+		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
+		GLM5AttnWrapper.glm5_dispatch_trace_id = None
+		GLM5AttnWrapper.glm5_dispatch_trace_context = None
+		GLM5AttnWrapper.glm5_dispatch_counts = {}
+		GLM5AttnWrapper.glm5_dispatch_seen = set()
 		AttnWrapperBase.kv_append_callback = None
 		AttnWrapperBase.kv_append_callback_aux = None
-		AttnWrapperBase.glm5_decode_primary_slot_indices = None
-		AttnWrapperBase.glm5_decode_aux_slot_indices = None
-		AttnWrapperBase.glm5_dsa_graph_forward_state = None
-		AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
+		GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+		GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
+		GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+		GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
 
 		# Summary (uses cumulative counters for accurate cross-round totals)
 		# Only show when BATCHGEN_CB_LOG=DEBUG

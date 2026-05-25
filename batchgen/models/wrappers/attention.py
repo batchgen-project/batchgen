@@ -68,11 +68,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     kv_append_callback: ClassVar[Optional[callable]] = None
     kv_append_callback_aux: ClassVar[Optional[callable]] = None
     batchgen_debug: ClassVar[Optional[Dict[str, Any]]] = None
-    glm5_dispatch_trace_enabled: ClassVar[bool] = False
-    glm5_dispatch_trace_id: ClassVar[Optional[str]] = None
-    glm5_dispatch_trace_context: ClassVar[Optional[Dict[str, Any]]] = None
-    glm5_dispatch_counts: ClassVar[Dict[str, int]] = {}
-    glm5_dispatch_seen: ClassVar[Set[Tuple[str, str, str, int]]] = set()
+    # Phase C: glm5_dispatch_trace_* moved to GLM5AttnWrapper subclass
+    # (batchgen/models/glm/glm5/wrappers.py) per audit §A finding #8 — these
+    # are GLM-5-specific debug instrumentation and don't belong on the
+    # generic base wrapper.
     async_kv_load_active: ClassVar[bool] = False
     async_kv_load_task: ClassVar[Optional[object]] = None
 
@@ -213,17 +212,10 @@ class AttnWrapperBase(BaseModuleWrapper):
     scale: ClassVar[Optional[List[torch.Tensor]]] = None
     cache_seqlens: ClassVar[Optional[torch.Tensor]] = None
     max_seqlen: ClassVar[Optional[int]] = None
-    # DSA per-step dispatch hint: count of rows with cache_seqlen <= index_topk.
-    # Set once per decode step by the worker so per-layer _forward_decode_dsa
-    # branches on it without doing a D2H .sum().item() 78 times per step.
-    _dsa_short_count: ClassVar[Optional[int]] = None
-    # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
-    # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
-    # rows instead of deriving slot count from cur_batch.
-    glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
-    glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
-    glm5_dsa_graph_forward_state: ClassVar[Optional[Dict[str, Any]]] = None
-    glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
+    # Phase C: _dsa_short_count and glm5_decode_*_slot_indices /
+    # glm5_dsa_graph_forward_state / glm5_dsa_flashmla_graph_metadata
+    # moved to GLM5AttnWrapper subclass (batchgen/models/glm/glm5/wrappers.py)
+    # per audit §A finding #8.
     gpu_paged_kv_manager: ClassVar[Optional[object]] = None
     host_paged_kv_worker_view: ClassVar[Optional[object]] = None
     # DSA auxiliary caches (indexer KV for DeepSeek Sparse Attention)
