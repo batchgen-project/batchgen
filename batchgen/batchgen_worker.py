@@ -9603,59 +9603,22 @@ class BatchGenWorker:
 		return True
 
 	def _glm5_dsa_graph_requested_for_current_batch(self) -> bool:
-		mode = self._glm5_debug_mode("glm5_dsa_mode")
-		if mode == "eager":
-			return False
-		if mode == "graph":
-			return True
-		if self._glm5_dsa_full_graph_requested_for_current_batch():
-			return True
-		model_name = getattr(self, "model_name", None)
-		if glm5_dsa_cuda_graph_requested_for_model(
-			model_name,
-			enable_cuda_graph=getattr(
-				getattr(self, "args", None),
-				"enable_cuda_graph",
-				False,
-			),
-		):
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		value = debug.get("glm5_dsa_graph_compare")
-		if isinstance(value, bool):
-			return value
-		if isinstance(value, (int, float)):
-			return value != 0
-		if isinstance(value, str):
-			return value.strip().lower() in {"1", "true", "yes", "on"}
+		# Phase C: segmented DSA graph mode is obsolete. The whole-model graph
+		# (driven by `--enable-cuda-graph`) is the only supported mode for
+		# GLM-5; the DSA-only / DSA-full / MoE-only / layer-only / segmented
+		# graph paths were experimental env-var gates and have been retired
+		# in favor of the adapter contract. Always return False so the gated
+		# code paths become unreachable; subsequent Phase C commits delete
+		# the methods + code paths themselves.
 		return False
 
 	def _glm5_dsa_full_graph_requested_for_current_batch(self) -> bool:
-		if self._glm5_debug_mode("glm5_dsa_mode") == "eager":
-			return False
-		if glm5_dsa_full_cuda_graph_requested():
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return self._debug_flag_enabled(debug.get("glm5_dsa_full_graph"))
+		# Phase C: retired (see _glm5_dsa_graph_requested_for_current_batch).
+		return False
 
 	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
-		mode = self._glm5_debug_mode("glm5_dsa_mode")
-		if mode == "eager":
-			return False
-		if mode == "graph":
-			return True
-		return glm5_dsa_cuda_graph_requested_for_model(
-			getattr(self, "model_name", None),
-			enable_cuda_graph=getattr(
-				getattr(self, "args", None),
-				"enable_cuda_graph",
-				False,
-			),
-		)
+		# Phase C: DSA-only graph mode retired; always False.
+		return False
 
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
@@ -9677,43 +9640,14 @@ class BatchGenWorker:
 		return mode if mode in {"graph", "eager"} else None
 
 	def _glm5_moe_graph_output_required_for_current_batch(self) -> bool:
-		mode = self._glm5_debug_mode("glm5_moe_mode")
-		if mode == "eager":
-			return False
-		if mode == "graph":
-			return True
-		return glm5_moe_cuda_graph_requested_for_model(
-			getattr(self, "model_name", None),
-			enable_cuda_graph=getattr(
-				getattr(self, "args", None),
-				"enable_cuda_graph",
-				False,
-			),
-		)
+		# Phase C: MoE-only graph mode retired; always False.
+		return False
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
-		mode = self._glm5_debug_mode("glm5_moe_mode")
-		if mode == "eager":
-			return False
-		if mode == "graph":
-			return True
-		model_name = getattr(self, "model_name", None)
-		if (
-			glm5_moe_cuda_graph_requested_for_model(
-				model_name,
-				enable_cuda_graph=getattr(
-					getattr(self, "args", None),
-					"enable_cuda_graph",
-					False,
-				),
-			)
-			or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
-		):
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return self._debug_flag_enabled(debug.get("glm5_moe_graph_compare"))
+		# Phase C: MoE-only graph mode retired; always False.
+		# The whole-model graph (driven by --enable-cuda-graph) already
+		# captures MoE inside the layer-graph composition.
+		return False
 
 	def _glm5_graph_path_log_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_GRAPH_PATH_LOG", "0") == "1":
@@ -9724,28 +9658,21 @@ class BatchGenWorker:
 		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
 
 	def _glm5_whole_model_graph_requested_for_current_batch(self) -> bool:
+		# Phase C: whole-model graph is the only supported GLM-5 graph mode.
+		# Activation gated solely by --enable-cuda-graph CLI flag (translated
+		# into engine_config.Basic_Config.enable_cuda_graphs upstream).
+		# Old per-mode env vars (BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH etc.)
+		# are retired — `BATCHGEN_DECODE_GRAPH_COMPARE=1` (developer-only)
+		# is the supported way to enable the compare facility.
 		if getattr(getattr(self, "args", None), "disable_cuda_graphs", False):
 			return False
-		if glm5_whole_model_cuda_graph_requested_for_model(
+		return glm5_whole_model_cuda_graph_requested_for_model(
 			getattr(self, "model_name", None),
 			enable_cuda_graph=getattr(
 				getattr(self, "args", None),
 				"enable_cuda_graph",
 				False,
 			),
-		):
-			return True
-		if (
-			os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH", "0") == "1"
-			or os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1"
-		):
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return (
-			self._debug_flag_enabled(debug.get("glm5_whole_model_graph"))
-			or self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare"))
 		)
 
 	def _glm5_whole_model_graph_required_for_current_batch(self) -> bool:
@@ -9776,18 +9703,10 @@ class BatchGenWorker:
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
 	def _glm5_layer_graph_requested_for_current_batch(self) -> bool:
-		if (
-			os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1"
-			or os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "0") == "1"
-		):
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return (
-			self._debug_flag_enabled(debug.get("glm5_layer_graph"))
-			or self._debug_flag_enabled(debug.get("glm5_layer_graph_compare"))
-		)
+		# Phase C: layer-only graph mode retired; the whole-model graph
+		# (driven by --enable-cuda-graph) composes the layer graphs as a
+		# single capturable segment via the adapter contract.
+		return False
 
 	def _glm5_layer_graph_compare_requested_for_current_batch(self) -> bool:
 		if os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "0") == "1":
@@ -11297,12 +11216,12 @@ class BatchGenWorker:
 		# Whole-model graph is the default for GPT-OSS.
 		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
 		# serializes the shared expert, losing async overlap (~18ms/step regression).
+		# Phase C: K2.5 keeps the per-layer path; GLM-5 always uses whole-model
+		# (the segmented-graph BATCHGEN_SEGMENTED_GRAPH env var is retired).
 		if _is_k25:
 			use_whole_model = False
-		elif glm5_dsa_graph_enabled or glm5_moe_graph_enabled:
-			use_whole_model = False
 		else:
-			use_whole_model = os.environ.get("BATCHGEN_SEGMENTED_GRAPH", "0") != "1"
+			use_whole_model = True
 
 		if use_whole_model:
 			# Whole-model mode: single graph for entire decode pass.
@@ -12032,15 +11951,12 @@ class BatchGenWorker:
 						self._glm5_layer_graph_path_state(_max_bs)
 					)
 					_glm5_layer_graph_active = _glm5_layer_path == "graph"
-					if (
-						not _glm5_layer_graph_active
-						and os.environ.get("BATCHGEN_GLM5_LAYER_CUDA_GRAPH", "0") == "1"
-					):
-						raise RuntimeError(
-							"GLM-5 layer CUDA graph was required but no replayable "
-							"full-layer graph is available for this decode step "
-							f"(reason={_glm5_layer_reason})"
-						)
+					# Phase C: BATCHGEN_GLM5_LAYER_CUDA_GRAPH is retired; layer
+					# graph mode is no longer a user-selectable path. The
+					# "required" diagnostic raise here cannot fire because
+					# _glm5_layer_graph_requested_for_current_batch returns
+					# False unconditionally → _glm5_layer_path_state returns
+					# ("disabled", None, "not_requested").
 
 				_glm5_whole_graph_active = bool(
 					getattr(self, "_glm5_whole_model_graph", False)
