@@ -78,9 +78,12 @@ def _prefix_plan(
     suffix_position_ids = []
     if raw_prefix_lens is None:
         raw_prefix_lens = list(prefix_lens)
-    for local_idx, (global_id, prefix_len, suffix_len, raw_prefix_len) in enumerate(
-        zip(global_ids, prefix_lens, suffix_lens, raw_prefix_lens)
-    ):
+    for local_idx, (
+        global_id,
+        prefix_len,
+        suffix_len,
+        raw_prefix_len,
+    ) in enumerate(zip(global_ids, prefix_lens, suffix_lens, raw_prefix_lens)):
         prompt_length = prefix_len + suffix_len
         sequences.append(
             PrefixReuseSequencePlan(
