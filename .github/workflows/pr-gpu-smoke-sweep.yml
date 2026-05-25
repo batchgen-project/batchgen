@@ -1,0 +1,57 @@
+name: GPU CI Sweep
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 02:00 CST off-peak
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Label PRs needing GPU CI
+        run: |
+          set -euo pipefail
+          prs=$(gh pr list \
+            --repo "$REPO" \
+            --base main \
+            --state open \
+            --json number,headRefOid,labels,headRepositoryOwner,headRepository \
+            --limit 100)
+
+          echo "$prs" | jq -c '.[]' | while read -r pr; do
+            num=$(echo "$pr" | jq -r .number)
+            sha=$(echo "$pr" | jq -r .headRefOid)
+            owner=$(echo "$pr" | jq -r '.headRepositoryOwner.login')
+            repo_name=$(echo "$pr" | jq -r '.headRepository.name')
+            head_full="$owner/$repo_name"
+            already_labeled=$(echo "$pr" | jq -r '.labels[].name' | grep -Fx 'ci:run' || true)
+
+            if [[ "$head_full" != "$REPO" ]]; then
+              echo "PR #$num: fork ($head_full), skipping"
+              continue
+            fi
+            if [[ -n "$already_labeled" ]]; then
+              echo "PR #$num: already has ci:run, skipping"
+              continue
+            fi
+
+            check_status=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.name=="gpu-smoke")] | sort_by(.started_at) | last | .conclusion' 2>/dev/null || echo "null")
+
+            if [[ "$check_status" == "success" ]]; then
+              echo "PR #$num: gpu-smoke already passed on $sha, skipping"
+              continue
+            fi
+
+            echo "PR #$num ($sha): no passing gpu-smoke (status=$check_status), labeling ci:run"
+            gh pr edit "$num" --repo "$REPO" --add-label ci:run
+          done

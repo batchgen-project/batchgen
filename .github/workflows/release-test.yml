@@ -1,4 +1,4 @@
-name: MMLU Pro Test On H20 Nodes
+name: MMLU Pro Release Test
 
 on:
   workflow_dispatch:
@@ -31,16 +31,22 @@ on:
 jobs:
   test-node0:
     name: MMLU Test Node0
-    runs-on: [self-hosted, gpu, 8-gpu-h20-node0]
+    runs-on: [self-hosted, gpu, batchgen-ci-node0]
     timeout-minutes: 5760
     env:
       DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE0_MODEL_CACHE }}
+      IMAGE: ${{ github.event.inputs.image }}
+      MAX_PROMPTS: ${{ github.event.inputs.max_prompts }}
+      MAX_INPUT_LENGTH: ${{ github.event.inputs.max_input_length }}
+      MAX_DECODING_LENGTH: ${{ github.event.inputs.max_decoding_length }}
+      KV_CACHE_SIZE: ${{ github.event.inputs.kv_cache_size }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
-          echo "Labels: ${{ toJson(runner.labels) }}"
 
       - name: Check Docker
         run: |
@@ -51,42 +57,26 @@ jobs:
         run: nvidia-smi
 
       - name: Run MMLU Test in Container
-        run: |
-          docker run --rm --gpus all \
-            -e GLOO_SOCKET_IFNAME=bond0 \
-            -e NCCL_SOCKET_IFNAME=bond0 \
-            -e NCCL_IB_DISABLE='0' \
-            -e NCCL_NET="ib" \
-            -e NCCL_OOB_NET_IFNAME="mlx5_" \
-            -e NCCL_OOB_NET_ENABLE=1 \
-            -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
-            -v "${MODEL_CACHE_DIR}":/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
-            --network host \
-            --privileged \
-            --shm-size 512g \
-            --ipc=host \
-            ${{ github.event.inputs.image }} \
-            bash .github/workflows/scripts/test-mmlu.sh \
-            --node-rank 0 \
-            --dist-init-addr "${DIST_INIT_ADDR}" \
-            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
-            --max-prompts "${{ github.event.inputs.max_prompts }}" \
-            --max-input-length "${{ github.event.inputs.max_input_length }}" \
-            --max-decoding-length "${{ github.event.inputs.max_decoding_length }}" \
-            --kv-cache-size "${{ github.event.inputs.kv_cache_size }}"
+        run: bash .github/workflows/scripts/release-test-run.sh --node-rank 0
 
   test-node1:
     name: MMLU Test Node1
-    runs-on: [self-hosted, gpu, 8-gpu-h20-node1]
+    runs-on: [self-hosted, gpu, batchgen-ci-node1]
     timeout-minutes: 5760
     env:
       DIST_INIT_ADDR: ${{ github.event.inputs.dist_init_addr || secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE1_MODEL_CACHE }}
+      IMAGE: ${{ github.event.inputs.image }}
+      MAX_PROMPTS: ${{ github.event.inputs.max_prompts }}
+      MAX_INPUT_LENGTH: ${{ github.event.inputs.max_input_length }}
+      MAX_DECODING_LENGTH: ${{ github.event.inputs.max_decoding_length }}
+      KV_CACHE_SIZE: ${{ github.event.inputs.kv_cache_size }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Print runner info
         run: |
           echo "Runner: ${{ runner.name }}"
-          echo "Labels: ${{ toJson(runner.labels) }}"
 
       - name: Check Docker
         run: |
@@ -97,26 +87,4 @@ jobs:
         run: nvidia-smi
 
       - name: Run MMLU Test in Container
-        run: |
-          docker run --rm --gpus all \
-            -e GLOO_SOCKET_IFNAME=bond0 \
-            -e NCCL_SOCKET_IFNAME=bond0 \
-            -e NCCL_IB_DISABLE='0' \
-            -e NCCL_NET="ib" \
-            -e NCCL_OOB_NET_IFNAME="mlx5_" \
-            -e NCCL_OOB_NET_ENABLE=1 \
-            -e NCCL_IB_HCA=mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5,mlx5_bond_6,mlx5_bond_7 \
-            -v "${MODEL_CACHE_DIR}":/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/ \
-            --network host \
-            --privileged \
-            --shm-size 512g \
-            --ipc=host \
-            ${{ github.event.inputs.image }} \
-            bash .github/workflows/scripts/test-mmlu.sh \
-            --node-rank 1 \
-            --dist-init-addr "${DIST_INIT_ADDR}" \
-            --cache-dir "/root/.cache/huggingface/hub/models/deepseek-ai/DeepSeek-R1/" \
-            --max-prompts "${{ github.event.inputs.max_prompts }}" \
-            --max-input-length "${{ github.event.inputs.max_input_length }}" \
-            --max-decoding-length "${{ github.event.inputs.max_decoding_length }}" \
-            --kv-cache-size "${{ github.event.inputs.kv_cache_size }}"
+        run: bash .github/workflows/scripts/release-test-run.sh --node-rank 1

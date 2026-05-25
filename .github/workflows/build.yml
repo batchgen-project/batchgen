@@ -3,6 +3,7 @@ name: Build Test
 on:
   push:
     branches:
+      - main
       - master
       - dev
       - release*
@@ -11,11 +12,11 @@ on:
     paths-ignore:
       - '**.md'
       - 'examples/**'
-      - 'tests/**'
       - 'docs/**'
 
   pull_request:
     branches:
+      - main
       - master
       - dev
       - release*
@@ -23,8 +24,11 @@ on:
     paths-ignore:
       - '**.md'
       - 'examples/**'
-      - 'tests/**'
       - 'docs/**'
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
