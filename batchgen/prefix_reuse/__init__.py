@@ -26,8 +26,10 @@ from .materialization import (
 )
 from .prefill import (
     PrefixCachePrefillInputs,
+    PrefixCachePrefillEstimate,
     PrefixCachePrefillLookup,
     build_prefix_cache_prefill_inputs,
+    estimate_prefix_cache_for_prefill,
     lookup_prefix_cache_for_prefill,
     release_prefix_cache_lookup_attachments,
 )
@@ -52,8 +54,10 @@ __all__ = [
     "materialize_single_group_lookup_results",
     "materialize_single_group_prefix_pages",
     "PrefixCachePrefillInputs",
+    "PrefixCachePrefillEstimate",
     "PrefixCachePrefillLookup",
     "build_prefix_cache_prefill_inputs",
+    "estimate_prefix_cache_for_prefill",
     "lookup_prefix_cache_for_prefill",
     "release_prefix_cache_lookup_attachments",
 ]

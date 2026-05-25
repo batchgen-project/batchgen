@@ -24,6 +24,15 @@ class PrefixCachePrefillLookup:
 
 
 @dataclass(frozen=True)
+class PrefixCachePrefillEstimate:
+    prefix_shared_tokens: tuple[int, ...]
+
+    @property
+    def has_hit(self) -> bool:
+        return any(tokens > 0 for tokens in self.prefix_shared_tokens)
+
+
+@dataclass(frozen=True)
 class PrefixCachePrefillInputs:
     plan: PrefixReusePrefillPlan
     input_ids_list: list[torch.Tensor]
@@ -50,6 +59,27 @@ def lookup_prefix_cache_for_prefill(
 
     return PrefixCachePrefillLookup(
         lookup_results=tuple(lookup_results),
+        prefix_shared_tokens=tuple(prefix_shared_tokens),
+    )
+
+
+def estimate_prefix_cache_for_prefill(
+    *,
+    coordinator: object,
+    namespace_digest: Sequence[int],
+    prompt_token_ids: Sequence[Sequence[int]],
+) -> PrefixCachePrefillEstimate:
+    """Estimate reusable prefixes without attaching or pinning cache entries."""
+
+    prefix_shared_tokens = []
+    for token_ids in prompt_token_ids:
+        result = coordinator.estimate_lookup(
+            list(namespace_digest),
+            [int(token_id) for token_id in token_ids],
+        )
+        prefix_shared_tokens.append(int(result.common_cached_tokens))
+
+    return PrefixCachePrefillEstimate(
         prefix_shared_tokens=tuple(prefix_shared_tokens),
     )
 

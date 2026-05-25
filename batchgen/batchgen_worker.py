@@ -90,6 +90,7 @@ from batchgen.utils import config_torch_module_initializer
 from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.prefix_reuse.prefill import (
 	build_prefix_cache_prefill_inputs,
+	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
@@ -794,6 +795,48 @@ class BatchGenWorker:
 				)
 			seq.prefix_shared_tokens = int(cached_tokens)
 		return lookup
+
+	def _estimate_prefix_cache_for_prefill(
+		self,
+		*,
+		input_ids_list: Sequence[torch.Tensor],
+		prompt_lengths: Sequence[int],
+	):
+		if not self.enable_prefix_cache:
+			return None
+		if self.prefix_cache_coordinator is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but coordinator is not attached"
+			)
+		if self.prefix_cache_runtime_config is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but runtime config is missing"
+			)
+
+		prompt_token_ids = []
+		for input_ids, prompt_length in zip(input_ids_list, prompt_lengths):
+			prompt_token_ids.append(
+				[
+					int(token_id)
+					for token_id in input_ids.reshape(-1)[: int(prompt_length)].tolist()
+				]
+			)
+		estimate = estimate_prefix_cache_for_prefill(
+			coordinator=self.prefix_cache_coordinator,
+			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
+			prompt_token_ids=prompt_token_ids,
+		)
+		if self.rank == 0 and self.prefix_cache_debug_stats:
+			hit_count = sum(
+				1 for tokens in estimate.prefix_shared_tokens if tokens > 0
+			)
+			logging.info(
+				"Prefix cache estimate: %d/%d requests have reusable prefix "
+				"(forced miss until Host KV alias/copy is implemented)",
+				hit_count,
+				len(estimate.prefix_shared_tokens),
+			)
+		return estimate
 
 	def _build_prefix_reuse_prepack_inputs(
 		self,
@@ -7454,6 +7497,14 @@ class BatchGenWorker:
 
 			input_ids_list.append(input_ids)
 			attention_mask_list.append(attention_mask)
+
+		# Prefix cache is only observed here until the Host sequence KV table can
+		# alias or copy shared prefix pages. Running suffix-only prefill before
+		# that would make later decode see incomplete Host KV for the sequence.
+		self._estimate_prefix_cache_for_prefill(
+			input_ids_list=input_ids_list,
+			prompt_lengths=seq_lengths,
+		)
 
 		# Prepack sequences
 		# Row capacity is set by planner in config (None = no limit, use max sequence length)

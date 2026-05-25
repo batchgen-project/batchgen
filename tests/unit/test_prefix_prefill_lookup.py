@@ -6,6 +6,7 @@ import torch
 
 from batchgen.prefix_reuse.prefill import (
     build_prefix_cache_prefill_inputs,
+    estimate_prefix_cache_for_prefill,
     lookup_prefix_cache_for_prefill,
     release_prefix_cache_lookup_attachments,
 )
@@ -16,6 +17,7 @@ class _Coordinator:
         self.cached_tokens = list(cached_tokens)
         self.handles = list(handles)
         self.lookup_calls = []
+        self.estimate_calls = []
         self.release_calls = []
 
     def lookup_and_attach(self, namespace_digest, token_ids):
@@ -24,6 +26,14 @@ class _Coordinator:
         return SimpleNamespace(
             common_cached_tokens=self.cached_tokens[index],
             attachment_handle=self.handles[index],
+        )
+
+    def estimate_lookup(self, namespace_digest, token_ids):
+        index = len(self.estimate_calls)
+        self.estimate_calls.append((list(namespace_digest), list(token_ids)))
+        return SimpleNamespace(
+            common_cached_tokens=self.cached_tokens[index],
+            attachment_handle=0,
         )
 
     def release_attachment(self, handle):
@@ -50,6 +60,27 @@ def test_lookup_prefix_cache_for_prefill_preserves_request_order():
         ([1, 2, 3, 4], [20, 21]),
         ([1, 2, 3, 4], [30, 31, 32, 33, 34, 35, 36, 37]),
     ]
+
+
+def test_estimate_prefix_cache_for_prefill_does_not_attach():
+    coordinator = _Coordinator(cached_tokens=[4, 0], handles=[11, 0])
+
+    estimate = estimate_prefix_cache_for_prefill(
+        coordinator=coordinator,
+        namespace_digest=(1, 2, 3, 4),
+        prompt_token_ids=[
+            [10, 11, 12, 13, 14],
+            [20, 21],
+        ],
+    )
+
+    assert estimate.prefix_shared_tokens == (4, 0)
+    assert estimate.has_hit is True
+    assert coordinator.estimate_calls == [
+        ([1, 2, 3, 4], [10, 11, 12, 13, 14]),
+        ([1, 2, 3, 4], [20, 21]),
+    ]
+    assert coordinator.lookup_calls == []
 
 
 def test_build_prefix_cache_prefill_inputs_uses_suffix_only_tokens():
