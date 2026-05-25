@@ -8987,252 +8987,6 @@ class BatchGenWorker:
 
 		self._setup_cuda_graphs(gpu_manager)
 
-	def _setup_glm5_moe_cuda_graphs(self, bucket_sizes):
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" not in model_name_l or not self._glm5_moe_graph_requested_for_current_batch():
-			return
-		if (
-			self._glm5_moe_cuda_graph_manager is None
-			and getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False)
-		):
-			logging.info(
-				f"Rank {self.rank}: GLM-5 MoE CUDA graph manager is unavailable after "
-				"the configured buckets were already captured for this batch; using eager "
-				"MoE instead of recapturing"
-			)
-			return
-		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-		if max_bsz <= 0:
-			logging.info(f"Rank {self.rank}: no GLM-5 MoE decode rows globally; skipping MoE graph capture")
-			return
-
-		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
-		from batchgen.models.glm.glm5.model import (
-			Glm5MoE,
-			_GLM5_3D_MTP,
-			_glm5_moe_graph_compare_active,
-			_glm5_moe_graph_compare_layer_enabled,
-		)
-		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
-			Glm5MoEGraphBufferPool,
-			Glm5MoEGraphSegment,
-			make_glm5_moe_graph_segment_name,
-		)
-
-		bucketing = BatchSizeBucketing(bucket_sizes)
-		capture_buckets = self._glm5_moe_capture_buckets_for_current_decode(bucketing)
-		if not capture_buckets:
-			self._glm5_moe_graph_capture_attempted_for_batch = True
-			return
-
-		if self._glm5_moe_cuda_graph_manager is not None:
-			missing_buckets = [
-				bucket
-				for bucket in capture_buckets
-				if not self._glm5_moe_cuda_graph_manager.has_bucket_for_all_segments(bucket)
-			]
-			if not missing_buckets:
-				self._glm5_moe_graph_capture_attempted_for_batch = True
-				return
-			logging.info(
-				f"Rank {self.rank}: capturing missing GLM-5 MoE CUDA graph buckets "
-				f"{missing_buckets} at decode entry (max rank batch size {max_bsz})"
-			)
-			self._glm5_moe_graph_capture_attempted_for_batch = True
-			try:
-				self._glm5_moe_cuda_graph_manager.warmup_and_capture_buckets(missing_buckets)
-			except torch.OutOfMemoryError as exc:
-				for bucket in missing_buckets:
-					self._glm5_moe_cuda_graph_manager.drop_bucket(bucket)
-					self._glm5_moe_graph_failed_buckets.add(bucket)
-				torch.cuda.empty_cache()
-				if self._glm5_moe_graph_output_required_for_current_batch():
-					raise
-				logging.error(
-					f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
-					f"{missing_buckets} ran out of memory; using eager MoE: {exc}"
-				)
-			return
-
-		moe_layers = [
-			layer.mlp for layer in self.model.model.layers
-			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
-		]
-		if not moe_layers:
-			return
-		first_moe = moe_layers[0]
-		pool = Glm5MoEGraphBufferPool(
-			world_size=self.world_size,
-			hidden_size=first_moe.hidden_size,
-			num_experts_per_tok=first_moe.num_experts_per_tok,
-			num_local_experts=first_moe.experts_per_rank,
-			intermediate_size=first_moe.config.moe_intermediate_size,
-			device=self.torch_device,
-			bucket_sizes=bucket_sizes,
-			base_mtp=_GLM5_3D_MTP,
-		)
-		manager = CUDAGraphManager(bucketing, device=self.torch_device)
-		registered = 0
-		graph_output_required = self._glm5_moe_graph_output_required_for_current_batch()
-		compare_active = _glm5_moe_graph_compare_active()
-		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-			moe = getattr(decoder_layer, "mlp", None)
-			if not isinstance(moe, Glm5MoE):
-				continue
-			if (
-				compare_active
-				and not graph_output_required
-				and not _glm5_moe_graph_compare_layer_enabled(layer_idx)
-			):
-				continue
-			if not getattr(moe, "_fp8_blockwise_ready", False):
-				raise RuntimeError(f"Layer {layer_idx}: GLM-5 MoE graph requires FP8 blockwise weights")
-			segment = Glm5MoEGraphSegment(
-				moe,
-				pool,
-				moe.comm,
-				world_size=self.world_size,
-				rank=self.rank,
-				device=self.torch_device,
-			)
-			segment_name = make_glm5_moe_graph_segment_name(layer_idx)
-			manager.register_segment(segment_name, segment)
-			moe.enable_moe_cuda_graph(
-				manager,
-				segment_name,
-				segment,
-				bucketing,
-				graph_output_required=graph_output_required,
-			)
-			registered += 1
-		if registered == 0:
-			self._glm5_moe_graph_capture_attempted_for_batch = True
-			return
-		logging.info(
-			f"Rank {self.rank}: capturing GLM-5 MoE CUDA graph segments for "
-			f"{registered} layers with buckets {capture_buckets} "
-			f"(max rank batch size {max_bsz})"
-		)
-		self._glm5_moe_cuda_graph_manager = manager
-		self._glm5_moe_graph_capture_attempted_for_batch = True
-		try:
-			manager.warmup_and_capture_buckets(capture_buckets)
-		except torch.OutOfMemoryError as exc:
-			for bucket in capture_buckets:
-				manager.drop_bucket(bucket)
-				self._glm5_moe_graph_failed_buckets.add(bucket)
-			torch.cuda.empty_cache()
-			if self._glm5_moe_graph_output_required_for_current_batch():
-				raise
-			logging.error(
-				f"Rank {self.rank}: GLM-5 MoE CUDA graph capture for buckets "
-				f"{capture_buckets} ran out of memory; using eager MoE: {exc}"
-			)
-
-	def _glm5_moe_capture_buckets_for_current_decode(self, bucketing):
-		max_bsz = int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0)
-		if max_bsz <= 0:
-			return []
-		try:
-			bucket = int(bucketing.get_padded_size(max_bsz))
-		except ValueError:
-			logging.info(
-				f"Rank {self.rank}: GLM-5 MoE current max rank batch size "
-				f"{max_bsz} exceeds configured CUDA graph buckets; using eager MoE"
-			)
-			return []
-		if bucket in getattr(self, "_glm5_moe_graph_failed_buckets", set()):
-			return []
-		return [bucket]
-
-	def _glm5_dsa_graph_current_bucket_missing(self) -> bool:
-		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		if (
-			not self._glm5_dsa_graph_requested_for_current_batch()
-			or "glm" not in model_name_l
-		):
-			return False
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return False
-		if int(getattr(self, "_current_decode_local_batch_size", 0) or 0) <= 0:
-			return False
-		capture_attempted = bool(
-			getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False)
-		)
-		if self._glm5_dsa_graph_page_table_storage_changed():
-			self._cuda_graph_manager = None
-			if capture_attempted:
-				if not getattr(
-					self,
-					"_glm5_dsa_graph_page_table_change_after_capture_logged",
-					False,
-				):
-					logging.info(
-						f"Rank {self.rank}: GLM-5 DSA CUDA graph page-table storage "
-						"changed after the configured buckets were already captured; "
-						"using eager DSA for later decode passes instead of recapturing"
-					)
-					self._glm5_dsa_graph_page_table_change_after_capture_logged = True
-				return False
-			return True
-		if self._cuda_graph_manager is None:
-			return not capture_attempted
-		missing = self._glm5_cuda_graph_manager_missing_configured_buckets(
-			self._cuda_graph_manager,
-			getattr(self, "_glm5_dsa_graph_failed_buckets", set()),
-		)
-		if not missing:
-			self._glm5_dsa_graph_capture_attempted_for_batch = True
-		return missing
-
-	def _glm5_segmented_graph_initial_capture_missing(self) -> bool:
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" not in model_name_l:
-			return False
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return False
-		dsa_missing = (
-			self._glm5_dsa_graph_requested_for_current_batch()
-			and int(getattr(self, "_current_decode_local_batch_size", 0) or 0) > 0
-			and self._cuda_graph_manager is None
-			and not getattr(
-				self,
-				"_glm5_dsa_graph_capture_attempted_for_batch",
-				False,
-			)
-		)
-		moe_missing = (
-			self._glm5_moe_graph_requested_for_current_batch()
-			and getattr(self, "_glm5_moe_cuda_graph_manager", None) is None
-			and not getattr(
-				self,
-				"_glm5_moe_graph_capture_attempted_for_batch",
-				False,
-			)
-		)
-		return bool(dsa_missing or moe_missing)
-
-	def _glm5_segmented_graph_capture_already_attempted_for_requested_paths(self) -> bool:
-		model_name_l = (getattr(self, "model_name", "") or "").lower()
-		if "glm" not in model_name_l:
-			return False
-		if self._glm5_segmented_graph_suppressed_by_composite_graph():
-			return True
-		dsa_requested = self._glm5_dsa_graph_requested_for_current_batch()
-		moe_requested = self._glm5_moe_graph_requested_for_current_batch()
-		if not dsa_requested and not moe_requested:
-			return False
-		dsa_done = (
-			not dsa_requested
-			or int(getattr(self, "_current_decode_local_batch_size", 0) or 0) <= 0
-			or bool(getattr(self, "_glm5_dsa_graph_capture_attempted_for_batch", False))
-		)
-		moe_done = (
-			not moe_requested
-			or bool(getattr(self, "_glm5_moe_graph_capture_attempted_for_batch", False))
-		)
-		return bool(dsa_done and moe_done)
-
 	def _glm5_configured_cuda_graph_bucket_sizes(self) -> list:
 		return self._generate_bucket_sizes(
 			self.args.cuda_graph_max_bucket_size,
@@ -9340,14 +9094,6 @@ class BatchGenWorker:
 		# the methods + code paths themselves.
 		return False
 
-	def _glm5_dsa_full_graph_requested_for_current_batch(self) -> bool:
-		# Phase C: retired (see _glm5_dsa_graph_requested_for_current_batch).
-		return False
-
-	def _glm5_dsa_graph_output_required_for_current_batch(self) -> bool:
-		# Phase C: DSA-only graph mode retired; always False.
-		return False
-
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
 			return value
@@ -9366,10 +9112,6 @@ class BatchGenWorker:
 			return None
 		mode = value.strip().lower()
 		return mode if mode in {"graph", "eager"} else None
-
-	def _glm5_moe_graph_output_required_for_current_batch(self) -> bool:
-		# Phase C: MoE-only graph mode retired; always False.
-		return False
 
 	def _glm5_moe_graph_requested_for_current_batch(self) -> bool:
 		# Phase C: MoE-only graph mode retired; always False.
@@ -9436,23 +9178,6 @@ class BatchGenWorker:
 		# single capturable segment via the adapter contract.
 		return False
 
-	def _glm5_layer_graph_compare_requested_for_current_batch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE", "0") == "1":
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare"))
-
-	def _glm5_layer_graph_compare_fail_on_mismatch(self) -> bool:
-		if os.environ.get("BATCHGEN_GLM5_LAYER_GRAPH_COMPARE_FAIL", "0") == "1":
-			return True
-		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
-		if not isinstance(debug, dict):
-			return False
-		return self._debug_flag_enabled(debug.get("glm5_layer_graph_compare_fail"))
-
-	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
@@ -10094,14 +9819,6 @@ class BatchGenWorker:
 			whole_reason,
 		)
 
-	def _mark_glm5_dsa_graph_bucket_failed(self, bucket_size: int) -> None:
-		failed = getattr(self, "_glm5_dsa_graph_failed_buckets", None)
-		if failed is None:
-			failed = set()
-			self._glm5_dsa_graph_failed_buckets = failed
-		failed.add(bucket_size)
-
-	@staticmethod
 	def _generate_bucket_sizes(max_bucket: int, num_buckets: int) -> list:
 		"""Generate exactly num_buckets bucket sizes from 1 to max_bucket.
 
