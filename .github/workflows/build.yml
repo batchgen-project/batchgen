@@ -39,30 +39,49 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Free disk space
-        # ubuntu-22.04 runners ship with ~14 GB free; torch + CUDA wheels pull
-        # ~2 GB on top of the CUDA 12.1 toolkit and overflow the root disk.
-        # Drop pre-installed toolchains we don't use before Python lands.
-        run: bash -x .github/workflows/scripts/free-disk-space.sh
+        # ubuntu-22.04 runners ship with ~14 GB free; torch + CUDA wheels and
+        # the cuda-libraries-dev install overflow the root disk. Drop the
+        # pre-installed CUDA bundle + unused toolchains before anything else
+        # lands. Order matters: free-disk-space.sh wipes /opt/hostedtoolcache,
+        # so it must run before setup-python.
+        run: |
+          sudo rm -rf /usr/local/cuda-* /opt/cuda /usr/local/cuda
+          bash -x .github/workflows/scripts/free-disk-space.sh
+
+      - name: Install system libraries
+        # libnuma-dev: provides <numa.h> required by core/Parameter_Server/
+        # posix_shm.cpp and -lnuma from core_engine.py extra_ldflags.
+        # The CUDA toolkit pieces come in a later step.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends libnuma-dev
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: 3.11
 
-      - name: Install CUDA 12.1
+      - name: Install CUDA 12.1 + libcufile
+        # cuda-install.sh installs cuda-nvcc + cuda-libraries-dev. cuFile is
+        # split into its own package on the CUDA 12.x apt repos; install it
+        # explicitly so -lcufile from core_engine.py resolves.
         run: |
           bash -x .github/workflows/scripts/cuda-install.sh 12.1 ubuntu-22.04
+          sudo apt-get install -y --no-install-recommends libcufile-dev-12-1
 
-      - name: Install Dependencies
+      - name: Install build environment (no isolation)
+        # BatchGen's setup.py does `import torch` and `from op_builder.all_ops
+        # import ALL_OPS` at module load — op_builder uses
+        # torch.utils.cpp_extension. With PEP 517's isolated build env, torch
+        # isn't installed and setup.py crashes before setup() is called.
+        # Install torch + build helpers into the runner Python env and run
+        # `pip wheel --no-build-isolation` so the build env IS the runner env.
+        # cf. PR #160 which applies the same fix to scripts/install_deps.sh.
         run: |
           python -m pip install --upgrade pip
-          pip install build
+          pip install torch==2.9.0 numpy setuptools wheel ninja packaging pybind11
 
       - name: Build Wheel
-        # --wheel skips the sdist round-trip; sdist doesn't ship the top-level
-        # op_builder/ / core/ / external/ dirs (CustomBuildPy expects them in
-        # source-tree mode), so wheel-from-sdist fails on setup.py's
-        # `from op_builder.all_ops import ALL_OPS`. publish-test.yml uses the
-        # same --wheel flag for the same reason.
         run: |
-          BUILD_OPS=1 python3 -m build --wheel
+          BUILD_OPS=1 pip wheel . --no-deps --no-build-isolation -v -w dist/
+          ls -la dist/
