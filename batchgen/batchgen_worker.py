@@ -9387,6 +9387,7 @@ class BatchGenWorker:
 			whole_reason,
 		)
 
+	@staticmethod
 	def _generate_bucket_sizes(max_bucket: int, num_buckets: int) -> list:
 		"""Generate exactly num_buckets bucket sizes from 1 to max_bucket.
 
