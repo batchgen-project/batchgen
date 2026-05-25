@@ -7,6 +7,9 @@ from typing import Callable
 
 import torch
 
+from batchgen.prefix_reuse.materialization import (
+    get_prefix_materialization_for_group,
+)
 from batchgen.models.wrappers.prefix_cache import (
     PrefixCachePrepackMetadata,
     ensure_prefix_cache_prepack_metadata,
@@ -40,6 +43,11 @@ def run_prefix_mla_suffix_prefill_with_projected(
         raise RuntimeError(
             "MLA prefix-cache suffix prefill requires GPU paged materialization"
         )
+    prefill_prefix_materialization = get_prefix_materialization_for_group(
+        prefill_prefix_materialization,
+        group_id=0,
+        consumer="MLA prefix-cache suffix prefill",
+    )
     attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
         layer_idx=int(wrapper.layer_idx),
         query_states=query_states,

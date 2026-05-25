@@ -16,8 +16,10 @@ from .commit import (
     build_prefix_commit_request,
 )
 from .materialization import (
+    PrefixMaterializationBundle,
     PrefixMaterializationSequence,
     SingleGroupPrefixMaterialization,
+    get_prefix_materialization_for_group,
     materialize_single_group_lookup_results,
     materialize_single_group_prefix_pages,
 )
@@ -41,8 +43,10 @@ __all__ = [
     "PrefixCommitRequest",
     "aligned_prefix_tokens",
     "build_prefix_commit_request",
+    "PrefixMaterializationBundle",
     "PrefixMaterializationSequence",
     "SingleGroupPrefixMaterialization",
+    "get_prefix_materialization_for_group",
     "materialize_single_group_lookup_results",
     "materialize_single_group_prefix_pages",
     "PrefixCachePrefillInputs",

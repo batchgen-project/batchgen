@@ -51,6 +51,58 @@ class SingleGroupPrefixMaterialization:
         self._loaded = True
 
 
+@dataclass
+class PrefixMaterializationBundle:
+    """Materialized prefix pages keyed by logical prefix-cache group id."""
+
+    by_group_id: dict[int, SingleGroupPrefixMaterialization]
+
+    @classmethod
+    def from_single(
+        cls, group_id: int, materialization: SingleGroupPrefixMaterialization
+    ) -> "PrefixMaterializationBundle":
+        return cls(by_group_id={int(group_id): materialization})
+
+    def get(
+        self, group_id: int
+    ) -> Optional[SingleGroupPrefixMaterialization]:
+        return self.by_group_id.get(int(group_id))
+
+    def require(
+        self, group_id: int, *, consumer: str
+    ) -> SingleGroupPrefixMaterialization:
+        materialization = self.get(group_id)
+        if materialization is None:
+            raise RuntimeError(
+                f"{consumer} requires prefix materialization group {group_id}"
+            )
+        return materialization
+
+    def wait_for_layer(self, layer_idx: int) -> None:
+        for materialization in self.by_group_id.values():
+            materialization.wait_for_layer(layer_idx)
+
+
+def get_prefix_materialization_for_group(
+    materialization: object | None,
+    *,
+    group_id: int,
+    consumer: str,
+) -> SingleGroupPrefixMaterialization | None:
+    """Return the materialization consumed by one attention backend."""
+
+    if materialization is None:
+        return None
+    if isinstance(materialization, PrefixMaterializationBundle):
+        return materialization.require(group_id, consumer=consumer)
+    if int(group_id) != 0:
+        raise RuntimeError(
+            f"{consumer} requires prefix materialization group {group_id}, "
+            "but received a legacy single-group materialization"
+        )
+    return materialization
+
+
 class _AttachmentLoadTask:
     def __init__(
         self,

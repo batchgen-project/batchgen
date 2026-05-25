@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from batchgen.prefix_reuse.materialization import (
+    PrefixMaterializationBundle,
     PrefixMaterializationSequence,
+    SingleGroupPrefixMaterialization,
+    get_prefix_materialization_for_group,
     materialize_single_group_lookup_results,
     materialize_single_group_prefix_pages,
 )
@@ -92,6 +95,56 @@ class _FailingAppendPlanGpuManager(_FakeGpuManager):
     def prepare_prefill_suffix_append(self, **kwargs):
         super().prepare_prefill_suffix_append(**kwargs)
         raise RuntimeError("append plan failed")
+
+
+def test_prefix_materialization_bundle_returns_group_materialization():
+    primary = SingleGroupPrefixMaterialization(
+        manager=object(),
+        append_plan=object(),
+    )
+    aux = SingleGroupPrefixMaterialization(
+        manager=object(),
+        append_plan=object(),
+    )
+    bundle = PrefixMaterializationBundle(by_group_id={0: primary, 1: aux})
+
+    assert bundle.get(0) is primary
+    assert bundle.require(1, consumer="test") is aux
+    assert (
+        get_prefix_materialization_for_group(
+            bundle, group_id=0, consumer="test"
+        )
+        is primary
+    )
+
+
+def test_prefix_materialization_bundle_rejects_missing_group():
+    bundle = PrefixMaterializationBundle(by_group_id={})
+
+    with pytest.raises(RuntimeError, match="group 2"):
+        bundle.require(2, consumer="test")
+
+
+def test_legacy_single_group_materialization_only_represents_group_zero():
+    materialization = SingleGroupPrefixMaterialization(
+        manager=object(),
+        append_plan=object(),
+    )
+
+    assert (
+        get_prefix_materialization_for_group(
+            materialization,
+            group_id=0,
+            consumer="test",
+        )
+        is materialization
+    )
+    with pytest.raises(RuntimeError, match="legacy single-group"):
+        get_prefix_materialization_for_group(
+            materialization,
+            group_id=1,
+            consumer="test",
+        )
 
 
 def test_materialize_single_group_prefix_pages_starts_page_id_load():

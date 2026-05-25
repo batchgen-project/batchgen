@@ -12,6 +12,10 @@ from typing import Callable, Optional
 
 import torch
 
+from batchgen.prefix_reuse.materialization import (
+    get_prefix_materialization_for_group,
+)
+
 
 @dataclass(frozen=True)
 class GqaPrefixAwareAttentionBackend:
@@ -48,6 +52,11 @@ class GqaPrefixAwareAttentionBackend:
             getattr(kv_cache_metadata, "prefill_prefix_materialization", None)
             if kv_cache_metadata is not None
             else None
+        )
+        materialization = get_prefix_materialization_for_group(
+            materialization,
+            group_id=0,
+            consumer="GQA prefix-aware prefill",
         )
         if metadata.prefix_reuse_mode and materialization is None:
             raise RuntimeError(
@@ -170,6 +179,11 @@ class MlaProjectedPrefixAwareAttentionBackend:
             getattr(kv_cache_metadata, "prefill_prefix_materialization", None)
             if kv_cache_metadata is not None
             else None
+        )
+        materialization = get_prefix_materialization_for_group(
+            materialization,
+            group_id=0,
+            consumer="MLA prefix attention",
         )
 
         spec = MlaExtendSpec(
