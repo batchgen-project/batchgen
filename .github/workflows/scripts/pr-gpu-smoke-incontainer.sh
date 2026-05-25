@@ -115,4 +115,21 @@ if [[ "$BATCHGEN_CI_MMLU_THRESHOLD" != "0" ]]; then
         'BEGIN { if (a+0 < t+0) { printf "FAIL: accuracy %s%% < threshold %s%%\n", a, t; exit 1 } else { printf "PASS: accuracy %s%% >= threshold %s%%\n", a, t } }'
 fi
 
+echo "--- LongBench 512 (GLM-5-FP8, max_decoding=65536) ---"
+LONGBENCH_LOG="/workspace/longbench-512.log"
+set +e
+python tests/e2e/r1_longbench_test/longbench_dual_node.py \
+    --hugging_face_checkpoint zai-org/GLM-5-FP8 \
+    --max_prompts 512 \
+    --max_decoding_length 65536 \
+    --dataset_dir tests/e2e/r1_longbench_test/LongBench \
+    --cache_dir /models/glm5-fp8 \
+    --base_url "http://localhost:${PORT}" 2>&1 | tee "$LONGBENCH_LOG"
+longbench_rc=${PIPESTATUS[0]}
+set -e
+if [[ $longbench_rc -ne 0 ]]; then
+    echo "FAIL: longbench_dual_node exited $longbench_rc"
+    exit "$longbench_rc"
+fi
+
 echo "=== PR GPU Regression PASSED ==="
