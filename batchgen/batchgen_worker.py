@@ -8965,39 +8965,24 @@ class BatchGenWorker:
 		Only captures graphs for supported models (currently GPT-OSS-120B).
 		"""
 		# Model guard: only capture for supported models
+		# Phase C: layer / MoE / DSA / DSA-full segmented graph modes are retired
+		# (predicate functions return False); only the whole-model graph remains
+		# on GLM-5, plus K2.5's per-layer attn segment and GPT-OSS-120B's
+		# whole-model graph.
 		model_name = getattr(self, 'model_name', '') or ''
 		model_name_l = model_name.lower()
-		glm5_dsa_graph_enabled = (
-			self._glm5_dsa_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_dsa_full_graph_enabled = (
-			self._glm5_dsa_full_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_moe_graph_enabled = (
-			self._glm5_moe_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_layer_graph_enabled = (
-			self._glm5_layer_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
-			if glm5_dsa_graph_enabled or glm5_moe_graph_enabled or glm5_layer_graph_enabled or glm5_whole_graph_enabled:
+			if glm5_whole_graph_enabled:
 				self.engine_config.Basic_Config.enable_cuda_graphs = True
 			else:
 				return
 		if (
 			"gpt-oss-120b" not in model_name_l
 			and not is_kimi_k25_backend_model(model_name)
-			and not glm5_dsa_graph_enabled
-			and not glm5_moe_graph_enabled
-			and not glm5_layer_graph_enabled
 			and not glm5_whole_graph_enabled
 		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -10545,29 +10530,18 @@ class BatchGenWorker:
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		glm5_dsa_graph_enabled = (
-			self._glm5_dsa_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_dsa_full_graph_enabled = (
-			self._glm5_dsa_full_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_moe_graph_enabled = (
-			self._glm5_moe_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
-		glm5_layer_graph_enabled = (
-			self._glm5_layer_graph_requested_for_current_batch()
-			and "glm" in model_name_l
-		)
+		# Phase C: only whole-model graph remains for GLM-5 (other modes retired).
+		# The dsa/moe/dsa_full/layer enables are pinned False so the now-dead
+		# downstream branches stay typeable until a subsequent commit deletes
+		# them outright. The whole-model graph is the only live path here.
+		glm5_dsa_graph_enabled = False
+		glm5_dsa_full_graph_enabled = False
+		glm5_moe_graph_enabled = False
+		glm5_layer_graph_enabled = False
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
-		if glm5_layer_graph_enabled:
-			self._setup_glm5_layer_cuda_graphs(gpu_manager, bucket_sizes)
-			return
 		if glm5_whole_graph_enabled:
 			whole_graph_required = self._glm5_whole_model_graph_required_for_current_batch()
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
