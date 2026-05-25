@@ -1,4 +1,11 @@
+import sys
+import types
+
 import torch
+
+_FLASHINFER_STUB = types.ModuleType("flashinfer")
+_FLASHINFER_STUB.BatchMLAPagedAttentionWrapper = object
+sys.modules.setdefault("flashinfer", _FLASHINFER_STUB)
 
 from batchgen.attention.mla import flashinfer_extend
 
@@ -53,7 +60,7 @@ def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
     flashinfer_extend._reset_flashinfer_mla_extend_prefill_cache_for_tests()
     monkeypatch.setattr(
         flashinfer_extend,
-        "_WRAPPER_CLASS_FOR_TESTS",
+        "BatchMLAPagedAttentionWrapper",
         FakeWrapper,
     )
 
@@ -127,7 +134,7 @@ def test_flashinfer_mla_extend_prefill_accepts_full_hit_query_layout(
     flashinfer_extend._reset_flashinfer_mla_extend_prefill_cache_for_tests()
     monkeypatch.setattr(
         flashinfer_extend,
-        "_WRAPPER_CLASS_FOR_TESTS",
+        "BatchMLAPagedAttentionWrapper",
         FakeWrapper,
     )
 

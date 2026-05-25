@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -328,6 +330,10 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(
     monkeypatch,
 ):
     recorded = {}
+
+    flashinfer_stub = types.ModuleType("flashinfer")
+    flashinfer_stub.BatchMLAPagedAttentionWrapper = object
+    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_stub)
 
     from batchgen.attention.mla import flashinfer_extend
 

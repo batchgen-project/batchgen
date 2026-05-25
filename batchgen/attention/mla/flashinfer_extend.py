@@ -6,11 +6,11 @@ import os
 from typing import Optional
 
 import torch
+from flashinfer import BatchMLAPagedAttentionWrapper
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _WORKSPACE_CACHE: dict[tuple[str, Optional[int]], torch.Tensor] = {}
 _WRAPPER_CACHE: dict[tuple[str, Optional[int], str], object] = {}
-_WRAPPER_CLASS_FOR_TESTS = None
 
 
 def run_flashinfer_mla_extend_prefill(
@@ -150,8 +150,7 @@ def _get_flashinfer_mla_wrapper(device: torch.device) -> object:
         return wrapper
 
     workspace = _get_workspace(device)
-    wrapper_cls = _get_wrapper_class()
-    wrapper = wrapper_cls(workspace, backend=backend)
+    wrapper = BatchMLAPagedAttentionWrapper(workspace, backend=backend)
     _WRAPPER_CACHE[key] = wrapper
     return wrapper
 
@@ -167,19 +166,6 @@ def _get_workspace(device: torch.device) -> torch.Tensor:
         )
         _WORKSPACE_CACHE[key] = workspace
     return workspace
-
-
-def _get_wrapper_class():
-    if _WRAPPER_CLASS_FOR_TESTS is not None:
-        return _WRAPPER_CLASS_FOR_TESTS
-    try:
-        from flashinfer import BatchMLAPagedAttentionWrapper
-    except ImportError as exc:
-        raise ImportError(
-            "MLA prefix-cache extend prefill requires flashinfer "
-            "BatchMLAPagedAttentionWrapper"
-        ) from exc
-    return BatchMLAPagedAttentionWrapper
 
 
 def _cache_key(device: torch.device) -> tuple[str, Optional[int]]:
