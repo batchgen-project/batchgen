@@ -1,48 +1,122 @@
 name: Build Test
 
+# Runs on H20 node0, so we treat it like gpu-regression: maintainers gate
+# it via `ci:run` label or `/test` comment. The nightly sweep
+# (pr-gpu-smoke-sweep.yml) also labels stale PRs.
 on:
-  push:
-    branches:
-      - main
-      - master
-      - dev
-      - release*
-      - prepare-for-open-source
-
-    paths-ignore:
-      - '**.md'
-      - 'examples/**'
-      - 'docs/**'
-
   pull_request:
-    branches:
-      - main
-      - master
-      - dev
-      - release*
+    types: [labeled]
+    branches: [main]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
 
-    paths-ignore:
-      - '**.md'
-      - 'examples/**'
-      - 'docs/**'
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+      pr_number:  ${{ steps.gate.outputs.pr_number }}
+      pr_sha:     ${{ steps.gate.outputs.pr_sha }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABEL_NAME: ${{ github.event.label.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          IC_IS_PR: ${{ github.event.issue.pull_request != null }}
+          IC_BODY: ${{ github.event.comment.body }}
+          IC_AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+          IC_ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          should_run=false
+          pr_number=
+          pr_sha=
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            should_run=true
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if [[ "$PR_LABEL_NAME" == "ci:run" && "$PR_HEAD_REPO" == "$REPO" ]]; then
+              should_run=true
+              pr_number="$PR_NUMBER"
+              pr_sha="$PR_HEAD_SHA"
+            fi
+          elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
+            if [[ "$IC_IS_PR" == "true" ]] && [[ "$IC_BODY" =~ ^/test([[:space:]]|$) ]]; then
+              case "$IC_AUTHOR_ASSOC" in
+                OWNER|MEMBER|COLLABORATOR)
+                  pr_data=$(gh api "repos/$REPO/pulls/$IC_ISSUE_NUMBER" \
+                    --jq '{sha: .head.sha, repo: .head.repo.full_name}')
+                  head_sha=$(echo "$pr_data" | jq -r .sha)
+                  head_repo=$(echo "$pr_data" | jq -r .repo)
+                  if [[ "$head_repo" == "$REPO" ]]; then
+                    should_run=true
+                    pr_number="$IC_ISSUE_NUMBER"
+                    pr_sha="$head_sha"
+                  fi
+                  ;;
+              esac
+            fi
+          fi
+
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number"   >> "$GITHUB_OUTPUT"
+          echo "pr_sha=$pr_sha"         >> "$GITHUB_OUTPUT"
+
   build:
-    # Run on H20 node0. The image already has torch + numa + cufile + CUDA
-    # toolkit + conda env, so we skip the ~15 min of system / Python setup
-    # that ubuntu-22.04 needed. Build runs in the same image as
-    # gpu-regression so what builds here is what gets tested there.
-    # Fork-PR safety relies on the repo-level "Require approval for outside
-    # collaborators" setting (same protection gpu-regression depends on).
+    needs: resolve
+    if: needs.resolve.outputs.should_run == 'true'
     runs-on: [self-hosted, gpu, node0]
     timeout-minutes: 30
-
+    env:
+      PR_SHA:  ${{ needs.resolve.outputs.pr_sha }}
+      REPO:    ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.pr_sha }}
 
-      - name: Build wheel inside batchgen image
+      - id: check_start
+        name: Post in-progress check
+        if: needs.resolve.outputs.pr_sha != ''
+        run: |
+          set -euo pipefail
+          check_id=$(gh api -X POST "repos/$REPO/check-runs" \
+            -f name='build' \
+            -f head_sha="$PR_SHA" \
+            -f status='in_progress' \
+            --jq '.id')
+          echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
+
+      - id: run
+        name: Build wheel inside batchgen image
         run: bash .github/workflows/scripts/build.sh
+
+      - name: Finalize check
+        if: always() && steps.check_start.outputs.check_id != ''
+        env:
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          CHECK_ID: ${{ steps.check_start.outputs.check_id }}
+        run: |
+          conclusion="success"
+          if [[ "$RUN_OUTCOME" != "success" ]]; then
+            conclusion="failure"
+          fi
+          gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
+            -f status='completed' \
+            -f conclusion="$conclusion"
