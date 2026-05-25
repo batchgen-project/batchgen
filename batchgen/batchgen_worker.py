@@ -1586,6 +1586,7 @@ class BatchGenWorker:
 			"text": text,
 			"prompt_length": seq.prompt_length,
 			"decoded_length": seq.decoded_length,
+			"cached_tokens": int(getattr(seq, "prefix_shared_tokens", 0)),
 			"finish_reason": self._get_finish_reason(seq),
 		})
 
@@ -5444,7 +5445,14 @@ class BatchGenWorker:
 				if seq is not None and local_idx in self.query_book:
 					finish_reason = self._get_finish_reason(seq)
 					my_completed_tokens.append(
-						(seq.global_idx, self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length].clone(), finish_reason)
+						(
+							seq.global_idx,
+							self.query_book[local_idx].decoded_tokens[
+								:, : seq.decoded_length
+							].clone(),
+							finish_reason,
+							int(getattr(seq, "prefix_shared_tokens", 0)),
+						)
 					)
 
 		# All ranks participate in gather (NCCL collective requirement)
@@ -5456,8 +5464,13 @@ class BatchGenWorker:
 		if writer is not None:
 			for rank_tokens in all_completed_tokens:
 				if rank_tokens:
-					for global_idx, tokens, finish_reason in rank_tokens:
-						writer.submit(global_idx, tokens, finish_reason=finish_reason)
+					for global_idx, tokens, finish_reason, cached_tokens in rank_tokens:
+						writer.submit(
+							global_idx,
+							tokens,
+							finish_reason=finish_reason,
+							cached_tokens=cached_tokens,
+						)
 
 	def _try_load_new_sequences(
 		self, 
