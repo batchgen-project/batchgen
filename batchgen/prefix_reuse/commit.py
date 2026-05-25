@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from batchgen.prefix_reuse.config import PrefixKVGroupSpec
+
 
 @dataclass(frozen=True)
 class PrefixCommitRequest:
@@ -68,6 +70,36 @@ def build_prefix_commit_request(
         commit_tokens=commit_tokens,
         group_pages=group_pages,
     )
+
+
+def collect_required_group_pages_for_commit(
+    *,
+    worker_views_by_group: Mapping[int, object],
+    sequence_id: int,
+    commit_tokens: int,
+    group_specs: Sequence[PrefixKVGroupSpec],
+) -> dict[int, list[int]]:
+    """Collect existing Host KV page ids for a page-aligned commit."""
+
+    result: dict[int, list[int]] = {}
+    for spec in group_specs:
+        if not spec.required_for_reuse:
+            continue
+        worker_view = worker_views_by_group.get(int(spec.group_id))
+        if worker_view is None:
+            raise RuntimeError(
+                f"missing Host KV worker view for prefix group {spec.group_id}"
+            )
+        page_count = int(commit_tokens) // int(spec.raw_page_tokens)
+        page_table = worker_view.build_page_table([int(sequence_id)])
+        pages = list(page_table[0])[:page_count]
+        if len(pages) != page_count:
+            raise RuntimeError(
+                f"prefix group {spec.group_id} has {len(pages)} pages for "
+                f"sequence {sequence_id}, expected {page_count}"
+            )
+        result[int(spec.group_id)] = [int(page_id) for page_id in pages]
+    return result
 
 
 def _to_host_page_handle(core_engine_module: object, page: int | object):

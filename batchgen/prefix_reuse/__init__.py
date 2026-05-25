@@ -14,6 +14,7 @@ from .commit import (
     PrefixCommitRequest,
     aligned_prefix_tokens,
     build_prefix_commit_request,
+    collect_required_group_pages_for_commit,
 )
 from .materialization import (
     PrefixMaterializationBundle,
@@ -43,6 +44,7 @@ __all__ = [
     "PrefixCommitRequest",
     "aligned_prefix_tokens",
     "build_prefix_commit_request",
+    "collect_required_group_pages_for_commit",
     "PrefixMaterializationBundle",
     "PrefixMaterializationSequence",
     "SingleGroupPrefixMaterialization",

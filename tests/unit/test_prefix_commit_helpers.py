@@ -3,6 +3,11 @@ from __future__ import annotations
 from batchgen.prefix_reuse.commit import (
     aligned_prefix_tokens,
     build_prefix_commit_request,
+    collect_required_group_pages_for_commit,
+)
+from batchgen.prefix_reuse.config import (
+    PrefixKVGroupSemantic,
+    PrefixKVGroupSpec,
 )
 
 
@@ -33,6 +38,16 @@ class _Coordinator:
             (namespace_digest, token_ids, commit_tokens, group_pages)
         )
         return "committed"
+
+
+class _WorkerView:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls = []
+
+    def build_page_table(self, sequence_ids):
+        self.calls.append(list(sequence_ids))
+        return [list(self.pages) for _ in sequence_ids]
 
 
 def test_aligned_prefix_tokens_floor_to_publish_boundary():
@@ -96,3 +111,39 @@ def test_prefix_commit_request_invokes_coordinator():
     assert token_ids == [10, 11, 12, 13]
     assert commit_tokens == 4
     assert [page.page_id for page in group_pages[0].pages] == [5]
+
+
+def test_collect_required_group_pages_for_commit_reads_worker_page_tables():
+    specs = [
+        PrefixKVGroupSpec(
+            group_id=0,
+            semantic=PrefixKVGroupSemantic.FULL_KV,
+            required_for_reuse=True,
+            raw_page_tokens=4,
+        ),
+        PrefixKVGroupSpec(
+            group_id=1,
+            semantic=PrefixKVGroupSemantic.MLA_COMPRESSED_KV,
+            required_for_reuse=True,
+            raw_page_tokens=8,
+        ),
+        PrefixKVGroupSpec(
+            group_id=2,
+            semantic=PrefixKVGroupSemantic.FULL_KV,
+            required_for_reuse=False,
+            raw_page_tokens=4,
+        ),
+    ]
+    primary = _WorkerView([10, 11, 12, 13])
+    mla = _WorkerView([20, 21])
+
+    pages = collect_required_group_pages_for_commit(
+        worker_views_by_group={0: primary, 1: mla},
+        sequence_id=100,
+        commit_tokens=8,
+        group_specs=specs,
+    )
+
+    assert pages == {0: [10, 11], 1: [20]}
+    assert primary.calls == [[100]]
+    assert mla.calls == [[100]]
