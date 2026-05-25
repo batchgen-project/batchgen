@@ -32,56 +32,17 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    # Run on H20 node0. The image already has torch + numa + cufile + CUDA
+    # toolkit + conda env, so we skip the ~15 min of system / Python setup
+    # that ubuntu-22.04 needed. Build runs in the same image as
+    # gpu-regression so what builds here is what gets tested there.
+    # Fork-PR safety relies on the repo-level "Require approval for outside
+    # collaborators" setting (same protection gpu-regression depends on).
+    runs-on: [self-hosted, gpu, batchgen-ci-node0]
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Free disk space
-        # ubuntu-22.04 runners ship with ~14 GB free; torch + CUDA wheels and
-        # the cuda-libraries-dev install overflow the root disk. Drop the
-        # pre-installed CUDA bundle + unused toolchains before anything else
-        # lands. Order matters: free-disk-space.sh wipes /opt/hostedtoolcache,
-        # so it must run before setup-python.
-        run: |
-          sudo rm -rf /usr/local/cuda-* /opt/cuda /usr/local/cuda
-          bash -x .github/workflows/scripts/free-disk-space.sh
-
-      - name: Install system libraries
-        # libnuma-dev: provides <numa.h> required by core/Parameter_Server/
-        # posix_shm.cpp and -lnuma from core_engine.py extra_ldflags.
-        # The CUDA toolkit pieces come in a later step.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends libnuma-dev
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.11
-
-      - name: Install CUDA 12.1 + libcufile
-        # cuda-install.sh installs cuda-nvcc + cuda-libraries-dev. cuFile is
-        # split into its own package on the CUDA 12.x apt repos; install it
-        # explicitly so -lcufile from core_engine.py resolves.
-        run: |
-          bash -x .github/workflows/scripts/cuda-install.sh 12.1 ubuntu-22.04
-          sudo apt-get install -y --no-install-recommends libcufile-dev-12-1
-
-      - name: Install build environment (no isolation)
-        # BatchGen's setup.py does `import torch` and `from op_builder.all_ops
-        # import ALL_OPS` at module load — op_builder uses
-        # torch.utils.cpp_extension. With PEP 517's isolated build env, torch
-        # isn't installed and setup.py crashes before setup() is called.
-        # Install torch + build helpers into the runner Python env and run
-        # `pip wheel --no-build-isolation` so the build env IS the runner env.
-        # cf. PR #160 which applies the same fix to scripts/install_deps.sh.
-        run: |
-          python -m pip install --upgrade pip
-          pip install torch==2.9.0 numpy setuptools wheel ninja packaging pybind11
-
-      - name: Build Wheel
-        run: |
-          BUILD_OPS=1 pip wheel . --no-deps --no-build-isolation -v -w dist/
-          ls -la dist/
+      - name: Build wheel inside batchgen image
+        run: bash .github/workflows/scripts/build.sh
