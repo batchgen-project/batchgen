@@ -741,7 +741,13 @@ class CUDAOpBuilder(OpBuilder):
         cuda_ext = ExtensionBuilder(
             name=self.absolute_name(),
             sources=self.strip_empty_entries(self.sources()),
-            include_dirs=self.strip_empty_entries(self.include_paths()),
+            # Absolutise like the CppExtension path above. Ninja runs with
+            # cwd=build/temp.../, so relative -I flags resolve to non-existent
+            # paths under the build dir and the compile fails with
+            # `fatal error: spdlog/spdlog.h: No such file or directory`.
+            include_dirs=self.strip_empty_entries([
+                self.deepspeed_src_path(p) for p in self.include_paths()
+            ]),
             libraries=self.strip_empty_entries(self.libraries_args()),
             extra_compile_args=compile_args,
         )
