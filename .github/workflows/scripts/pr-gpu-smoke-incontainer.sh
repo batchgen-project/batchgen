@@ -1,13 +1,13 @@
 #!/bin/bash
 # PR GPU regression in-container runner.
 #
-# Launches GLM-5-FP8 server with the regression config, waits for both nodes
-# to handshake, and (on rank 0 only) runs MMLU Pro 512 via
-# batchgen_benchmark.mmlu_pro_test with an optional accuracy floor.
+# Launches GLM-5-FP8 server on each node, waits for both ranks to handshake,
+# and (on rank 0 only) runs the in-repo mixed MMLU-Pro 512 + LongBench 512
+# regression as a single batch via
+# tests/e2e/glm5_mixed_regression/mixed_mmlu_longbench.py.
 #
 # Env required: NODE_RANK, DIST_INIT_ADDR, BATCHGEN_CI_MMLU_THRESHOLD.
-# Mounts assumed: /workspace (PR checkout), /models/glm5-fp8 (weights),
-# /batchgen_benchmark (host batchgen_benchmark/ checkout).
+# Mounts assumed: /workspace (PR checkout), /models/glm5-fp8 (weights).
 set -euo pipefail
 
 : "${NODE_RANK:?}"
@@ -21,16 +21,6 @@ PORT=10900
 
 echo "[in-container] node_rank=$NODE_RANK dist=$DIST_INIT_ADDR"
 cd /workspace
-
-# batchgen_benchmark/ lives outside the repo; expose it on PYTHONPATH.
-export PYTHONPATH="/batchgen_benchmark:${PYTHONPATH:-}"
-
-# batchgen_benchmark/mmlu_pro_test.py loads test/r1_mmlu_pro_test/*.parquet
-# from $BATCHGEN_ROOT. The PR's checkout has the parquets under
-# tests/e2e/r1_mmlu_pro_test/. Bridge that with a symlink so the default
-# lookup path resolves.
-mkdir -p test
-ln -sfn /workspace/tests/e2e/r1_mmlu_pro_test test/r1_mmlu_pro_test
 
 # Install package fresh from PR source so we test the PR build, not a
 # pre-baked image.
@@ -85,51 +75,24 @@ if [[ "$NODE_RANK" != "0" ]]; then
 fi
 
 # Rank 0 only from here on.
-echo "--- MMLU Pro 512 (GLM-5-FP8, --enable-thinking, max_decoding=65536) ---"
-MMLU_LOG="/workspace/mmlu-pro-512.log"
+echo "--- mixed MMLU-Pro 512 + LongBench 512 (GLM-5-FP8, max_decoding=65536) ---"
+MIXED_LOG="/workspace/mixed-mmlu-longbench.log"
 set +e
-python -m batchgen_benchmark.mmlu_pro_test \
-    --model-type glm5 \
-    --max-prompts 512 \
-    --max-decoding-length 65536 \
-    --enable-thinking \
+python tests/e2e/glm5_mixed_regression/mixed_mmlu_longbench.py \
     --base-url "http://localhost:${PORT}" \
-    --batchgen-root /workspace 2>&1 | tee "$MMLU_LOG"
-mmlu_rc=${PIPESTATUS[0]}
+    --cache-dir /models/glm5-fp8 \
+    --mmlu-prompts 512 \
+    --longbench-prompts 512 \
+    --max-decoding-length 65536 \
+    --mmlu-threshold "$BATCHGEN_CI_MMLU_THRESHOLD" \
+    --enable-thinking \
+    --seed 0 2>&1 | tee "$MIXED_LOG"
+rc=${PIPESTATUS[0]}
 set -e
 
-if [[ $mmlu_rc -ne 0 ]]; then
-    echo "FAIL: mmlu_pro_test exited $mmlu_rc"
-    exit "$mmlu_rc"
-fi
-
-# Optional accuracy gate. batchgen_benchmark prints "Accuracy:  XX.XX%".
-if [[ "$BATCHGEN_CI_MMLU_THRESHOLD" != "0" ]]; then
-    acc_line=$(grep -E '^Accuracy:' "$MMLU_LOG" | tail -1 || true)
-    if [[ -z "$acc_line" ]]; then
-        echo "FAIL: could not parse 'Accuracy:' line from $MMLU_LOG"
-        exit 1
-    fi
-    acc_pct=$(echo "$acc_line" | sed -E 's/[^0-9.]//g' | head -c 8)
-    awk -v a="$acc_pct" -v t="$BATCHGEN_CI_MMLU_THRESHOLD" \
-        'BEGIN { if (a+0 < t+0) { printf "FAIL: accuracy %s%% < threshold %s%%\n", a, t; exit 1 } else { printf "PASS: accuracy %s%% >= threshold %s%%\n", a, t } }'
-fi
-
-echo "--- LongBench 512 (GLM-5-FP8, max_decoding=65536) ---"
-LONGBENCH_LOG="/workspace/longbench-512.log"
-set +e
-python tests/e2e/r1_longbench_test/longbench_dual_node.py \
-    --hugging_face_checkpoint zai-org/GLM-5-FP8 \
-    --max_prompts 512 \
-    --max_decoding_length 65536 \
-    --dataset_dir tests/e2e/r1_longbench_test/LongBench \
-    --cache_dir /models/glm5-fp8 \
-    --base_url "http://localhost:${PORT}" 2>&1 | tee "$LONGBENCH_LOG"
-longbench_rc=${PIPESTATUS[0]}
-set -e
-if [[ $longbench_rc -ne 0 ]]; then
-    echo "FAIL: longbench_dual_node exited $longbench_rc"
-    exit "$longbench_rc"
+if [[ $rc -ne 0 ]]; then
+    echo "FAIL: mixed_mmlu_longbench exited $rc"
+    exit "$rc"
 fi
 
 echo "=== PR GPU Regression PASSED ==="

@@ -11,7 +11,6 @@
 #   BATCHGEN_CI_IMAGE             # docker image (matches release image)
 #   BATCHGEN_CI_SHM_SIZE          # e.g. 512g
 #   BATCHGEN_CI_GLM5_MODEL_CACHE  # host path with GLM-5-FP8 weights
-#   BATCHGEN_CI_BENCHMARK_DIR     # host path to batchgen_benchmark/ checkout
 #   BATCHGEN_CI_MMLU_THRESHOLD    # accuracy floor in percent, e.g. 65.0; 0 disables
 #   GLOO_SOCKET_IFNAME / NCCL_*   # network config for distributed init
 set -euo pipefail
@@ -41,7 +40,6 @@ source "$ENV_FILE"
 : "${BATCHGEN_CI_IMAGE:?must be set in $ENV_FILE}"
 : "${BATCHGEN_CI_SHM_SIZE:=512g}"
 : "${BATCHGEN_CI_GLM5_MODEL_CACHE:?must be set in $ENV_FILE}"
-: "${BATCHGEN_CI_BENCHMARK_DIR:?must be set in $ENV_FILE}"
 : "${BATCHGEN_CI_MMLU_THRESHOLD:=0}"
 : "${DIST_INIT_ADDR:?must be passed via workflow secret}"
 
@@ -83,7 +81,6 @@ exec docker run --rm \
     -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
     -v "$REPO_DIR":/workspace:rw \
     -v "$BATCHGEN_CI_GLM5_MODEL_CACHE":/models/glm5-fp8:ro \
-    -v "$BATCHGEN_CI_BENCHMARK_DIR":/batchgen_benchmark:ro \
     -w /workspace \
     "$BATCHGEN_CI_IMAGE" \
     bash /workspace/.github/workflows/scripts/pr-gpu-smoke-incontainer.sh
