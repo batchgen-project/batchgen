@@ -110,6 +110,47 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
     def advertised_modes(self) -> List[GraphMode]:
         return [GraphMode.WHOLE_MODEL]
 
+    def attach_existing_segment(
+        self,
+        *,
+        model: torch.nn.Module,
+        whole_model_segment: CapturableSegment,
+        bucketing: BatchSizeBucketing,
+        gpu_kv_manager: Any,
+        device: torch.device,
+        max_seqlen_cap: int,
+    ) -> None:
+        """Adopt a `Glm5WholeModelSegment` already built and captured by the
+        worker. Populates `_ctx` so `eligibility()` / `prepare_replay_inputs()`
+        / `stage_post_graph_kv()` can run.
+
+        Used by `_setup_cuda_graphs` in `batchgen_worker.py` instead of
+        `build_segments(...)` so the adapter shares the captured segment with
+        the legacy code path during the Phase B dual-mode period. When Phase
+        C deletes the legacy capture code, `build_segments` becomes the only
+        entry point and this method is removed.
+        """
+        attn0 = model.model.layers[0].self_attn.module
+        indexer0 = getattr(attn0, "indexer", None)
+        if indexer0 is None:
+            raise RuntimeError(
+                "Glm5CudaGraphAdapter.attach_existing_segment: DSA indexer missing"
+            )
+        bundle = SegmentBundle(whole_model=whole_model_segment)
+        self._ctx = _Glm5AdapterContext(
+            model=model,
+            bucketing=bucketing,
+            gpu_kv_manager=gpu_kv_manager,
+            world_size=self.world_size,
+            rank=self.rank,
+            device=device,
+            max_seqlen_cap=int(max_seqlen_cap),
+            whole_model_segment=whole_model_segment,
+            bundle=bundle,
+            num_heads=int(attn0.num_heads),
+            index_topk=int(indexer0.index_topk),
+        )
+
     def build_segments(
         self,
         *,

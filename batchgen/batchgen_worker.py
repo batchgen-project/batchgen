@@ -9956,6 +9956,15 @@ class BatchGenWorker:
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
+		# Phase B: also drop the adapter's reference to the captured segment so
+		# the next /v1/reload + recapture starts from a clean adapter context.
+		if self._cuda_graph_adapter is not None:
+			try:
+				self._cuda_graph_adapter.release_all(manager=None)
+			except Exception as _exc:
+				logging.warning(
+					"Phase B: failed to release adapter state: %s", _exc,
+				)
 		manager = None
 		segment = None
 		gc.collect()
@@ -10943,12 +10952,26 @@ class BatchGenWorker:
 				)
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
-			# Phase B: inform the adapter that every bucket was captured so its
-			# eligibility() can return WHOLE_MODEL when the dual gate is active.
+			# Phase B: hand the just-captured segment to the adapter so its
+			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
+			# can run against the same captured graph the legacy path uses.
+			# Without this attach, adapter._ctx stays None and eligibility()
+			# returns EAGER/adapter_not_built every step (the worker silently
+			# falls back to the legacy path).
 			if self._cuda_graph_adapter is not None:
 				try:
 					_adapter_max_seqlen = int(getattr(whole_seg, "max_seqlen", 0) or 0)
 					_adapter_gpu_mgr = gpu_manager
+					_attach = getattr(self._cuda_graph_adapter, "attach_existing_segment", None)
+					if _attach is not None:
+						_attach(
+							model=self.model,
+							whole_model_segment=whole_seg,
+							bucketing=bucketing,
+							gpu_kv_manager=_adapter_gpu_mgr,
+							device=self.torch_device,
+							max_seqlen_cap=_adapter_max_seqlen,
+						)
 					for _bucket in capture_buckets:
 						_sig = self._cuda_graph_adapter.capture_signature(
 							bucket=int(_bucket),
@@ -10962,7 +10985,7 @@ class BatchGenWorker:
 						)
 				except Exception as _exc:
 					logging.warning(
-						"Phase B: failed to record_capture on adapter: %s", _exc,
+						"Phase B: failed to attach/record_capture on adapter: %s", _exc,
 					)
 			stats = manager.get_capture_stats()
 			logging.info(
