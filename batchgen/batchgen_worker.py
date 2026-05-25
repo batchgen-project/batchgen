@@ -8991,6 +8991,7 @@ class BatchGenWorker:
 
 		self._setup_cuda_graphs(gpu_manager)
 
+	@staticmethod
 	def _glm5_dsa_graph_score_capacity_tokens(
 		primary_page_table,
 		primary_page_size: int,
