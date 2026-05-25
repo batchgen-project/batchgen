@@ -21,7 +21,9 @@ def full_hit_attention_state(
     """Temporarily configure attention wrappers for full-hit prefix replay."""
     wrapper_classes = tuple(wrapper_classes)
     previous_materializations = {
-        wrapper_cls: getattr(wrapper_cls, "prefill_prefix_materialization", None)
+        wrapper_cls: getattr(
+            wrapper_cls, "prefill_prefix_materialization", None
+        )
         for wrapper_cls in wrapper_classes
     }
     for wrapper_cls in wrapper_classes:
@@ -36,7 +38,9 @@ def full_hit_attention_state(
         wrapper_cls.prepack_prefix_shared_tokens = prompt_lengths
         wrapper_cls.prepack_full_seq_lengths = prompt_lengths
         wrapper_cls.prepack_full_hit_mode = True
-        wrapper_cls.prefill_prefix_materialization = prefill_prefix_materialization
+        wrapper_cls.prefill_prefix_materialization = (
+            prefill_prefix_materialization
+        )
     try:
         yield
     finally:
@@ -50,6 +54,6 @@ def full_hit_attention_state(
             wrapper_cls.prepack_prefix_shared_tokens = None
             wrapper_cls.prepack_full_seq_lengths = None
             wrapper_cls.prepack_full_hit_mode = False
-            wrapper_cls.prefill_prefix_materialization = previous_materializations[
-                wrapper_cls
-            ]
+            wrapper_cls.prefill_prefix_materialization = (
+                previous_materializations[wrapper_cls]
+            )

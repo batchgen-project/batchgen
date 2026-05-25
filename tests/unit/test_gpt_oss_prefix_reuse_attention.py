@@ -19,7 +19,9 @@ class _FakeHostPagedKVWorkerView:
         array_type = ctypes.c_uint16 * len(raw)
         return array_type(*raw)
 
-    def get_sequence_layer_page_pointers(self, sequence_id, layer_idx, max_tokens=None):
+    def get_sequence_layer_page_pointers(
+        self, sequence_id, layer_idx, max_tokens=None
+    ):
         return (
             [ctypes.addressof(array) for array in self._k_arrays],
             [ctypes.addressof(array) for array in self._v_arrays],
@@ -49,7 +51,9 @@ def _reset_prefix_reuse_metadata():
     AttnWrapperBase.prepack_full_hit_mode = old_full_hit
 
 
-def _make_wrapper(k_page: torch.Tensor, v_page: torch.Tensor) -> GptOssAttnWrapper:
+def _make_wrapper(
+    k_page: torch.Tensor, v_page: torch.Tensor
+) -> GptOssAttnWrapper:
     wrapper = GptOssAttnWrapper.__new__(GptOssAttnWrapper)
     wrapper.layer_idx = 0
     wrapper.num_kv_heads = 1
@@ -98,12 +102,14 @@ def test_build_prefix_reuse_attention_kv_loads_host_prefix_and_appends_suffix():
     AttnWrapperBase.prepack_prefix_shared_tokens = [4, 0]
     AttnWrapperBase.prepack_full_seq_lengths = [6, 3]
 
-    key, value, cu_k, max_k = wrapper.prefix_attention_kv_builder().build_gqa_prefix_kv(
-        key=suffix_k,
-        value=suffix_v,
-        metadata=wrapper.prefix_cache_metadata(),
-        num_heads=wrapper.num_kv_heads,
-        head_dim=wrapper.head_dim,
+    key, value, cu_k, max_k = (
+        wrapper.prefix_attention_kv_builder().build_gqa_prefix_kv(
+            key=suffix_k,
+            value=suffix_v,
+            metadata=wrapper.prefix_cache_metadata(),
+            num_heads=wrapper.num_kv_heads,
+            head_dim=wrapper.head_dim,
+        )
     )
 
     torch.testing.assert_close(
@@ -157,12 +163,14 @@ def test_build_full_hit_attention_kv_uses_cached_full_prompt():
     AttnWrapperBase.prepack_prefix_shared_tokens = [4]
     AttnWrapperBase.prepack_full_seq_lengths = [4]
 
-    key, value, cu_k, max_k = wrapper.prefix_attention_kv_builder().build_gqa_full_hit_kv(
-        metadata=wrapper.prefix_cache_metadata(),
-        num_heads=wrapper.num_kv_heads,
-        head_dim=wrapper.head_dim,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
+    key, value, cu_k, max_k = (
+        wrapper.prefix_attention_kv_builder().build_gqa_full_hit_kv(
+            metadata=wrapper.prefix_cache_metadata(),
+            num_heads=wrapper.num_kv_heads,
+            head_dim=wrapper.head_dim,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
     )
 
     torch.testing.assert_close(key, prefix_k)

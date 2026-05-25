@@ -87,7 +87,9 @@ def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
     assert output.shape == (1, 3, 2, 4)
     assert calls["backend"] == "auto"
     assert torch.equal(plan["qo_indptr"], cu_seqlens_q)
-    assert torch.equal(plan["kv_indptr"], torch.tensor([0, 2, 5], dtype=torch.int32))
+    assert torch.equal(
+        plan["kv_indptr"], torch.tensor([0, 2, 5], dtype=torch.int32)
+    )
     assert torch.equal(
         plan["kv_indices"],
         torch.tensor([2, 0, 3, 4, 1], dtype=torch.int32),
@@ -105,7 +107,9 @@ def test_flashinfer_mla_extend_prefill_builds_wrapper_inputs(monkeypatch):
     assert calls["run"]["kpe_cache"].shape == (5, 16, 2)
 
 
-def test_flashinfer_mla_extend_prefill_accepts_full_hit_query_layout(monkeypatch):
+def test_flashinfer_mla_extend_prefill_accepts_full_hit_query_layout(
+    monkeypatch,
+):
     calls = {}
 
     class FakeWrapper:

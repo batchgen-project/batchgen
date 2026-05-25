@@ -135,7 +135,9 @@ def _sync_prefix_reuse_fields(
         for q_len, kv_len in zip(prefill.q_seq_lens, prefill.kv_seq_lens)
     ]
     full_seq_lens = [int(length) for length in prefill.kv_seq_lens]
-    wrapper_cls.prepack_prefix_reuse_mode = any(length > 0 for length in prefix_lens)
+    wrapper_cls.prepack_prefix_reuse_mode = any(
+        length > 0 for length in prefix_lens
+    )
     wrapper_cls.prepack_prefix_shared_tokens = prefix_lens
     wrapper_cls.prepack_full_seq_lengths = full_seq_lens
     wrapper_cls.prepack_full_hit_mode = bool(prefill.q_seq_lens) and all(
@@ -143,7 +145,9 @@ def _sync_prefix_reuse_fields(
     )
 
 
-def _sync_decode_fields(wrapper_cls: type, decode: DecodeAttentionMetadata) -> None:
+def _sync_decode_fields(
+    wrapper_cls: type, decode: DecodeAttentionMetadata
+) -> None:
     wrapper_cls.position_ids = None
     wrapper_cls.prepack_mode = False
     wrapper_cls.prepack_cu_seqlens = None

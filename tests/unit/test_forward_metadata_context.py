@@ -128,7 +128,9 @@ def test_bind_forward_batch_metadata_sets_and_restores_legacy_fields():
         assert AttnWrapperBase.phase == "prefill"
         assert AttnWrapperBase.cur_batch == [11, 12, 13]
         assert AttnWrapperBase.prepack_mode is True
-        assert AttnWrapperBase.prepack_cu_seqlens is metadata.prefill.cu_seqlens_q
+        assert (
+            AttnWrapperBase.prepack_cu_seqlens is metadata.prefill.cu_seqlens_q
+        )
         assert AttnWrapperBase.prepack_max_seqlen == 2
         assert AttnWrapperBase.prepack_num_sequences == 3
         assert AttnWrapperBase.prepack_seq_lengths == [2, 1, 0]
@@ -259,23 +261,34 @@ def test_prefix_cache_metadata_explicit_matches_legacy_fields():
     with bind_forward_batch_metadata(metadata):
         explicit_metadata = wrapper.prefix_cache_metadata()
 
-    assert explicit_metadata.cu_seqlens_list() == legacy_metadata.cu_seqlens_list()
+    assert (
+        explicit_metadata.cu_seqlens_list() == legacy_metadata.cu_seqlens_list()
+    )
     assert explicit_metadata.max_seqlen == legacy_metadata.max_seqlen
     assert explicit_metadata.num_sequences == legacy_metadata.num_sequences
     assert explicit_metadata.seq_lengths == legacy_metadata.seq_lengths
-    assert explicit_metadata.global_sequence_ids == legacy_metadata.global_sequence_ids
-    assert explicit_metadata.prefix_reuse_mode == legacy_metadata.prefix_reuse_mode
+    assert (
+        explicit_metadata.global_sequence_ids
+        == legacy_metadata.global_sequence_ids
+    )
+    assert (
+        explicit_metadata.prefix_reuse_mode == legacy_metadata.prefix_reuse_mode
+    )
     assert explicit_metadata.full_hit_mode == legacy_metadata.full_hit_mode
     assert (
         explicit_metadata.prefix_shared_tokens
         == legacy_metadata.prefix_shared_tokens
     )
-    assert explicit_metadata.full_seq_lengths == legacy_metadata.full_seq_lengths
+    assert (
+        explicit_metadata.full_seq_lengths == legacy_metadata.full_seq_lengths
+    )
     assert (
         ensure_prefix_cache_prepack_metadata(metadata).global_sequence_ids
         == metadata.global_sequence_ids
     )
     assert (
-        ensure_prefix_cache_prepack_metadata(metadata.prefill).global_sequence_ids
+        ensure_prefix_cache_prepack_metadata(
+            metadata.prefill
+        ).global_sequence_ids
         == metadata.global_sequence_ids
     )

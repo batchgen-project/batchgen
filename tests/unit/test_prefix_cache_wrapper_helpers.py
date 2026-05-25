@@ -80,7 +80,9 @@ def _install_torch_stub(monkeypatch):
     models_stub.__path__ = [str(REPO_ROOT / "batchgen" / "models")]
     monkeypatch.setitem(sys.modules, "batchgen.models", models_stub)
     wrappers_stub = types.ModuleType("batchgen.models.wrappers")
-    wrappers_stub.__path__ = [str(REPO_ROOT / "batchgen" / "models" / "wrappers")]
+    wrappers_stub.__path__ = [
+        str(REPO_ROOT / "batchgen" / "models" / "wrappers")
+    ]
     monkeypatch.setitem(sys.modules, "batchgen.models.wrappers", wrappers_stub)
 
 

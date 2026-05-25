@@ -43,7 +43,10 @@ def run_prefix_mla_suffix_prefill(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run suffix-only MLA prefill using cached prefix KV."""
     metadata = ensure_prefix_cache_prepack_metadata(metadata)
-    if metadata.prefix_shared_tokens is None or metadata.full_seq_lengths is None:
+    if (
+        metadata.prefix_shared_tokens is None
+        or metadata.full_seq_lengths is None
+    ):
         raise RuntimeError("MLA prefix replay requires prefix metadata")
 
     query_states, offload_kv = project_suffix_query_and_kv(
@@ -206,15 +209,17 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
             append_plan=materialization.append_plan,
             layer_idx=layer_idx,
         )
-        blocked_k, blocked_v, block_table = manager.get_layer_kv_with_page_table(
-            layer_idx
+        blocked_k, blocked_v, block_table = (
+            manager.get_layer_kv_with_page_table(layer_idx)
         )
         if blocked_v is not None:
             raise RuntimeError(
                 "MLA GPU prefix materialization unexpectedly has V cache"
             )
         if block_table is None:
-            raise RuntimeError("MLA GPU prefix materialization requires page table")
+            raise RuntimeError(
+                "MLA GPU prefix materialization requires page table"
+            )
         if attention_fn is not None:
             raise RuntimeError(
                 "MLA prefix-cache suffix prefill must use FlashInfer paged "
@@ -231,7 +236,9 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
         )
     if metadata.full_hit_mode:
         if offload_kv is not None:
-            raise RuntimeError("MLA full-hit prefix replay does not accept suffix KV")
+            raise RuntimeError(
+                "MLA full-hit prefix replay does not accept suffix KV"
+            )
         if attention_fn is not None:
             raise RuntimeError(
                 "MLA full-hit prefix replay must use FlashInfer paged MLA attention"
@@ -245,7 +252,9 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
         layer_idx
     )
     if blocked_v is not None:
-        raise RuntimeError("MLA GPU prefix materialization unexpectedly has V cache")
+        raise RuntimeError(
+            "MLA GPU prefix materialization unexpectedly has V cache"
+        )
     if block_table is None:
         raise RuntimeError("MLA GPU prefix materialization requires page table")
 

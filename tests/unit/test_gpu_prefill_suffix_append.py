@@ -20,7 +20,9 @@ def _load_gpu_manager_module():
 
     previous_config_pkg = sys.modules.get("batchgen.config")
     previous_config_module = sys.modules.get("batchgen.config.config")
-    previous_gpu_kv_kernels = sys.modules.get("batchgen.kv_cache.gpu_kv_kernels")
+    previous_gpu_kv_kernels = sys.modules.get(
+        "batchgen.kv_cache.gpu_kv_kernels"
+    )
     config_pkg = types.ModuleType("batchgen.config")
     config_pkg.__path__ = [str(repo_root / "batchgen" / "config")]
     config_pkg.config = config_module
@@ -30,14 +32,18 @@ def _load_gpu_manager_module():
     gpu_kv_kernels = types.ModuleType("batchgen.kv_cache.gpu_kv_kernels")
 
     def _unused_gpu_kernel(*args, **kwargs):
-        raise RuntimeError("GPU KV kernels are not used by this suffix append test")
+        raise RuntimeError(
+            "GPU KV kernels are not used by this suffix append test"
+        )
 
     gpu_kv_kernels.run_paged_kv_token_update = _unused_gpu_kernel
     gpu_kv_kernels.run_paged_kv_token_update_fused = _unused_gpu_kernel
     sys.modules["batchgen.kv_cache.gpu_kv_kernels"] = gpu_kv_kernels
 
     try:
-        manager_path = repo_root / "batchgen" / "kv_cache" / "gpu_paged_kv_manager.py"
+        manager_path = (
+            repo_root / "batchgen" / "kv_cache" / "gpu_paged_kv_manager.py"
+        )
         manager_spec = importlib.util.spec_from_file_location(
             "_batchgen_gpu_paged_kv_manager_for_suffix_append_test",
             manager_path,
@@ -58,7 +64,9 @@ def _load_gpu_manager_module():
         if previous_gpu_kv_kernels is None:
             sys.modules.pop("batchgen.kv_cache.gpu_kv_kernels", None)
         else:
-            sys.modules["batchgen.kv_cache.gpu_kv_kernels"] = previous_gpu_kv_kernels
+            sys.modules["batchgen.kv_cache.gpu_kv_kernels"] = (
+                previous_gpu_kv_kernels
+            )
 
 
 _gpu_manager_module = _load_gpu_manager_module()
@@ -83,12 +91,16 @@ def _make_config(
 
 
 def _make_manager(*, has_v: bool = True) -> GPUPagedKVCacheManager:
-    manager = GPUPagedKVCacheManager(config=_make_config(has_v=has_v), device="cpu")
+    manager = GPUPagedKVCacheManager(
+        config=_make_config(has_v=has_v), device="cpu"
+    )
     manager.initialize()
     return manager
 
 
-def _read_sequence_k(manager: GPUPagedKVCacheManager, sequence_id: int, length: int):
+def _read_sequence_k(
+    manager: GPUPagedKVCacheManager, sequence_id: int, length: int
+):
     k_cache, _ = manager.get_kv_tensors()
     pages = manager._sequences[sequence_id].pages.tolist()
     chunks = []
@@ -102,7 +114,9 @@ def _read_sequence_k(manager: GPUPagedKVCacheManager, sequence_id: int, length: 
     return torch.cat(chunks, dim=0)
 
 
-def _read_sequence_v(manager: GPUPagedKVCacheManager, sequence_id: int, length: int):
+def _read_sequence_v(
+    manager: GPUPagedKVCacheManager, sequence_id: int, length: int
+):
     _, v_cache = manager.get_kv_tensors()
     pages = manager._sequences[sequence_id].pages.tolist()
     chunks = []
@@ -194,11 +208,17 @@ def test_append_layer_prefill_suffix_tokens_handles_mixed_batch():
         layer_idx=0,
     )
 
-    torch.testing.assert_close(_read_sequence_k(manager, 101, 5)[3:5], suffix_k[:2])
-    torch.testing.assert_close(_read_sequence_v(manager, 101, 5)[3:5], suffix_v[:2])
+    torch.testing.assert_close(
+        _read_sequence_k(manager, 101, 5)[3:5], suffix_k[:2]
+    )
+    torch.testing.assert_close(
+        _read_sequence_v(manager, 101, 5)[3:5], suffix_v[:2]
+    )
     torch.testing.assert_close(_read_sequence_k(manager, 102, 3), suffix_k[2:5])
     torch.testing.assert_close(_read_sequence_v(manager, 102, 3), suffix_v[2:5])
-    torch.testing.assert_close(_read_sequence_k(manager, 103, 4), torch.zeros(4, 1, 2))
+    torch.testing.assert_close(
+        _read_sequence_k(manager, 103, 4), torch.zeros(4, 1, 2)
+    )
 
 
 def test_append_layer_prefill_suffix_tokens_accepts_mla_2d_k_tensor():

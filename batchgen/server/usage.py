@@ -20,9 +20,7 @@ def build_usage(
         prompt_tokens=prompt_count,
         completion_tokens=completion_count,
         total_tokens=prompt_count + completion_count,
-        prompt_tokens_details=PromptTokensDetails(
-            cached_tokens=cached_count
-        ),
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_count),
     )
 
 

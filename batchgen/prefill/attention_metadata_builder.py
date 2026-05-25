@@ -131,7 +131,9 @@ def _build_prefix_reuse_metadata(
     metadata = PrefixReuseMetadata(
         prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=device),
         suffix_lens=torch.tensor(suffix_lens, dtype=torch.int32, device=device),
-        full_seq_lens=torch.tensor(full_seq_lens, dtype=torch.int32, device=device),
+        full_seq_lens=torch.tensor(
+            full_seq_lens, dtype=torch.int32, device=device
+        ),
         saved_tokens=sum(prefix_lens),
         is_full_hit=torch.tensor(is_full_hit, dtype=torch.bool, device=device),
         global_sequence_ids=[int(seq_id) for seq_id in global_sequence_ids],

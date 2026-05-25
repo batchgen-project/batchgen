@@ -10,7 +10,9 @@ from batchgen.attention.forward_metadata import (
     KVCacheMetadata,
     PrefillAttentionMetadata,
 )
-from batchgen.attention.forward_metadata_context import bind_forward_batch_metadata
+from batchgen.attention.forward_metadata_context import (
+    bind_forward_batch_metadata,
+)
 from batchgen.attention.prefix_aware_backend import (
     GqaPrefixAwareAttentionBackend,
     MlaProjectedPrefixAwareAttentionBackend,
@@ -376,7 +378,9 @@ class _FakeMlaMaterialization:
         self.waited_layers.append(int(layer_idx))
 
 
-def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(monkeypatch):
+def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(
+    monkeypatch,
+):
     recorded = {}
 
     from batchgen.attention.mla import flashinfer_extend

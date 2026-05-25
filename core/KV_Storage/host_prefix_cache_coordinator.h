@@ -107,8 +107,7 @@ class HostPrefixCacheCoordinator {
 
     PrefixCommitResult CommitPrefixPages(
         PrefixDigest namespace_digest,
-        const std::vector<std::int64_t>& token_ids,
-        std::uint32_t commit_tokens,
+        const std::vector<std::int64_t>& token_ids, std::uint32_t commit_tokens,
         const std::vector<GroupCommitPages>& group_pages);
 
     PrefixLookupResult LookupAndAttach(
@@ -124,11 +123,10 @@ class HostPrefixCacheCoordinator {
     void BeginAttachmentLoad(std::uint64_t attachment_handle);
     void EndAttachmentLoad(std::uint64_t attachment_handle);
 
-    PrefixEvictionResult EvictUntilFree(
-        std::uint32_t min_free_nodes,
-        std::uint32_t min_free_group_entries,
-        std::uint32_t min_free_page_handles,
-        std::uint32_t max_scan_nodes);
+    PrefixEvictionResult EvictUntilFree(std::uint32_t min_free_nodes,
+                                        std::uint32_t min_free_group_entries,
+                                        std::uint32_t min_free_page_handles,
+                                        std::uint32_t max_scan_nodes);
 
     PrefixEvictionResult ClearUnprotected();
     PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);

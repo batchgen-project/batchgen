@@ -113,8 +113,14 @@ def test_host_prefix_cache_lookup_attach_release():
         attached = coordinator.lookup_and_attach(namespace, token_ids[:12])
         assert attached.common_cached_tokens == 8
         assert attached.attachment_handle != 0
-        assert [span.group_id for span in attached.materialization_spans] == [0, 1]
-        assert [len(span.pages) for span in attached.materialization_spans] == [2, 1]
+        assert [span.group_id for span in attached.materialization_spans] == [
+            0,
+            1,
+        ]
+        assert [len(span.pages) for span in attached.materialization_spans] == [
+            2,
+            1,
+        ]
 
         stats = coordinator.get_stats()
         assert stats.resident_nodes == 2

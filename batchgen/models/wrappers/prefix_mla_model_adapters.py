@@ -253,9 +253,9 @@ def _project_w8a16_absorbed_output(
         out_absorb=out_absorb,
         v_head_dim=attn.v_head_dim,
         o_proj_weight=attn.o_proj.weight.data,
-        o_proj_scale=_weight_scale(wrapper, model_label, ("o_proj.weight_scale_inv",))[
-            "o_proj.weight_scale_inv"
-        ],
+        o_proj_scale=_weight_scale(
+            wrapper, model_label, ("o_proj.weight_scale_inv",)
+        )["o_proj.weight_scale_inv"],
         gemm=select_w8a16_gemm(),
     )
 
@@ -266,7 +266,10 @@ def _w8a16_q_absorb_weights(
     model_label: str,
     use_cached_absorb: bool,
 ) -> torch.Tensor:
-    if use_cached_absorb and getattr(wrapper, "_cached_q_absorb", None) is not None:
+    if (
+        use_cached_absorb
+        and getattr(wrapper, "_cached_q_absorb", None) is not None
+    ):
         return wrapper._cached_q_absorb
     attn = wrapper.module
     if use_cached_absorb and getattr(attn, "q_absorb", None) is not None:
@@ -301,7 +304,9 @@ def _dequantized_kv_b_proj(wrapper: object, model_label: str) -> torch.Tensor:
         ("kv_b_proj.weight_scale_inv",),
     )
 
-    from batchgen.attention.mla.flashmla_backend import deepseek_v3_dequantization
+    from batchgen.attention.mla.flashmla_backend import (
+        deepseek_v3_dequantization,
+    )
 
     return deepseek_v3_dequantization(
         attn.kv_b_proj.weight.data,

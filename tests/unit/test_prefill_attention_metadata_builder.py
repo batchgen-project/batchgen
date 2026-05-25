@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from batchgen.batch_order import PrefillSequenceSpan
-from batchgen.prefill.attention_metadata_builder import build_prefill_forward_metadata
+from batchgen.prefill.attention_metadata_builder import (
+    build_prefill_forward_metadata,
+)
 from batchgen.prefill.prepack import PrepackMetadata, prepack_sequences
 from batchgen.prefill.prefix_reuse import (
     PrefixReusePrefillPlan,
@@ -12,7 +14,9 @@ from batchgen.prefill.prefix_reuse import (
 )
 
 
-def _span(row_index: int, global_seq_id: int, seq_len: int) -> PrefillSequenceSpan:
+def _span(
+    row_index: int, global_seq_id: int, seq_len: int
+) -> PrefillSequenceSpan:
     return PrefillSequenceSpan(
         row_index=row_index,
         local_idx=10 + row_index,
@@ -24,10 +28,14 @@ def _span(row_index: int, global_seq_id: int, seq_len: int) -> PrefillSequenceSp
     )
 
 
-def _spans(global_ids: list[int], seq_lens: list[int]) -> list[PrefillSequenceSpan]:
+def _spans(
+    global_ids: list[int], seq_lens: list[int]
+) -> list[PrefillSequenceSpan]:
     cursor = 0
     spans = []
-    for row_index, (global_seq_id, seq_len) in enumerate(zip(global_ids, seq_lens)):
+    for row_index, (global_seq_id, seq_len) in enumerate(
+        zip(global_ids, seq_lens)
+    ):
         spans.append(
             PrefillSequenceSpan(
                 row_index=row_index,

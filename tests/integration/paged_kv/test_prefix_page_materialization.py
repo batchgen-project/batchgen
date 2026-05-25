@@ -111,7 +111,9 @@ def test_async_load_prefix_pages_to_device_uses_host_page_ids():
         for layer_idx in range(2):
             base = float(10 * (layer_idx + 1))
             k_tensor = (
-                torch.arange(prefix_tokens * 2, dtype=torch.float32, device=device)
+                torch.arange(
+                    prefix_tokens * 2, dtype=torch.float32, device=device
+                )
                 .reshape(1, prefix_tokens, 1, 2)
                 .add(base)
                 .to(torch.bfloat16)

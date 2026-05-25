@@ -112,7 +112,9 @@ def _build_flashinfer_page_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = cache_seqlens.device
     slot_indices = slot_indices.to(device=page_table.device, dtype=torch.long)
-    selected_table = page_table.index_select(0, slot_indices).to(dtype=torch.int32)
+    selected_table = page_table.index_select(0, slot_indices).to(
+        dtype=torch.int32
+    )
     pages_per_sequence = torch.div(
         cache_seqlens + (int(page_size) - 1),
         int(page_size),
@@ -134,7 +136,9 @@ def _build_flashinfer_page_metadata(
     valid_pages = page_offsets.unsqueeze(0) < pages_per_sequence.to(
         device=selected_table.device
     ).unsqueeze(1)
-    kv_indices = selected_table[valid_pages].to(device=device, dtype=torch.int32)
+    kv_indices = selected_table[valid_pages].to(
+        device=device, dtype=torch.int32
+    )
     return kv_indptr, kv_indices.contiguous()
 
 

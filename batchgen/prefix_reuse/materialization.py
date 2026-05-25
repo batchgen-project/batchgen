@@ -65,7 +65,9 @@ class _AttachmentLoadTask:
     ) -> None:
         self._load_task = load_task
         self._coordinator = coordinator
-        self._attachment_handles = tuple(int(handle) for handle in attachment_handles)
+        self._attachment_handles = tuple(
+            int(handle) for handle in attachment_handles
+        )
         self._done = False
 
     def wait(self) -> None:
@@ -96,12 +98,16 @@ def materialize_single_group_prefix_pages(
     """
 
     if not sequences:
-        raise ValueError("prefix materialization requires at least one sequence")
+        raise ValueError(
+            "prefix materialization requires at least one sequence"
+        )
 
     sequence_ids = [int(item.sequence_id) for item in sequences]
     prefix_lens = [int(item.prefix_tokens) for item in sequences]
     suffix_lens = [int(item.suffix_tokens) for item in sequences]
-    full_lens = [prefix + suffix for prefix, suffix in zip(prefix_lens, suffix_lens)]
+    full_lens = [
+        prefix + suffix for prefix, suffix in zip(prefix_lens, suffix_lens)
+    ]
     for seq_id, prefix_len, suffix_len, full_len in zip(
         sequence_ids, prefix_lens, suffix_lens, full_lens
     ):
@@ -206,7 +212,9 @@ def materialize_single_group_lookup_results(
 
     count = len(lookup_results)
     if len(sequence_ids) != count or len(prompt_lengths) != count:
-        raise ValueError("lookup_results, sequence_ids, and prompt_lengths differ")
+        raise ValueError(
+            "lookup_results, sequence_ids, and prompt_lengths differ"
+        )
 
     sequences: list[PrefixMaterializationSequence] = []
     for result, sequence_id, prompt_length in zip(
@@ -225,7 +233,7 @@ def materialize_single_group_lookup_results(
                 "lookup cached token count must be within prompt length for "
                 f"sequence {sequence_id}: cached={cached_tokens}, "
                 f"prompt={prompt_len}"
-        )
+            )
         span_pages = []
         attachment_handle = int(getattr(result, "attachment_handle", 0))
         if cached_tokens > 0:
@@ -273,7 +281,9 @@ def _build_host_page_id_tensor(
     rows: list[list[int]] = []
     for item, page_count in zip(sequences, prefix_page_counts):
         pages = [
-            _host_page_id(handle, expected_host_region_id=expected_host_region_id)
+            _host_page_id(
+                handle, expected_host_region_id=expected_host_region_id
+            )
             for handle in item.host_pages
         ]
         if len(pages) < int(page_count):
@@ -294,7 +304,9 @@ def _find_group_span(result: object, *, group_id: int) -> object:
     for span in spans:
         if int(getattr(span, "group_id")) == int(group_id):
             return span
-    raise ValueError(f"lookup result has no materialization span for group {group_id}")
+    raise ValueError(
+        f"lookup result has no materialization span for group {group_id}"
+    )
 
 
 def _host_page_id(handle: int | object, *, expected_host_region_id: int) -> int:

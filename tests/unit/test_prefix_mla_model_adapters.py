@@ -50,7 +50,9 @@ def test_mla_model_adapters_accept_explicit_prefill_metadata():
     wrapper = _wrapper()
 
     contexts = [
-        build_deepseek_prefix_backend_context(wrapper=wrapper, metadata=metadata),
+        build_deepseek_prefix_backend_context(
+            wrapper=wrapper, metadata=metadata
+        ),
         build_glm5_prefix_backend_context(wrapper=wrapper, metadata=metadata),
         build_kimi_prefix_backend_context(wrapper=wrapper, metadata=metadata),
     ]
@@ -61,4 +63,7 @@ def test_mla_model_adapters_accept_explicit_prefill_metadata():
         assert context.metadata.global_sequence_ids == [100]
         assert context.metadata.prefix_shared_tokens == [3]
         assert context.metadata.full_seq_lengths == [5]
-        assert context.rotary_seq_len(metadata.position_ids, fallback_seq_len=2) == 5
+        assert (
+            context.rotary_seq_len(metadata.position_ids, fallback_seq_len=2)
+            == 5
+        )

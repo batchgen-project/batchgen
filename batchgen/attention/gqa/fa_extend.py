@@ -10,7 +10,9 @@ _USE_FA3 = False
 _flash_with_kvcache = None
 
 try:
-    from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
+    from flash_attn_interface import (
+        flash_attn_with_kvcache as _fa3_with_kvcache,
+    )
 
     _USE_FA3 = True
     _flash_with_kvcache = _fa3_with_kvcache

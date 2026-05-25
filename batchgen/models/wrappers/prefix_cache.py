@@ -18,7 +18,9 @@ def _build_cu_seqlens_values(seq_lengths: Sequence[int]) -> List[int]:
     return values
 
 
-def ensure_prefix_cache_prepack_metadata(metadata) -> "PrefixCachePrepackMetadata":
+def ensure_prefix_cache_prepack_metadata(
+    metadata,
+) -> "PrefixCachePrepackMetadata":
     """Normalize explicit or legacy-compatible prefix metadata."""
 
     if isinstance(metadata, PrefixCachePrepackMetadata):
@@ -80,7 +82,9 @@ class PrefixCachePrepackMetadata:
                 int(full_len) - int(query_len)
                 for query_len, full_len in zip(seq_lengths, full_seq_lengths)
             ]
-            prefix_reuse_mode = any(tokens > 0 for tokens in prefix_shared_tokens)
+            prefix_reuse_mode = any(
+                tokens > 0 for tokens in prefix_shared_tokens
+            )
             full_hit_mode = bool(seq_lengths) and all(
                 int(length) == 0 for length in seq_lengths
             )
@@ -106,7 +110,10 @@ class PrefixCachePrepackMetadata:
     ) -> "PrefixCachePrepackMetadata":
         """Build wrapper-compatible metadata from a bound forward metadata object."""
 
-        if forward_metadata.phase != "prefill" or forward_metadata.prefill is None:
+        if (
+            forward_metadata.phase != "prefill"
+            or forward_metadata.prefill is None
+        ):
             raise RuntimeError(
                 "Prefix cache prepack metadata requires bound prefill metadata"
             )
@@ -116,7 +123,9 @@ class PrefixCachePrepackMetadata:
         )
 
     @classmethod
-    def from_wrapper_cls(cls, wrapper_cls: type) -> "PrefixCachePrepackMetadata":
+    def from_wrapper_cls(
+        cls, wrapper_cls: type
+    ) -> "PrefixCachePrepackMetadata":
         """Build metadata from legacy wrapper class variables."""
 
         cu_seqlens = getattr(wrapper_cls, "prepack_cu_seqlens", None)
@@ -127,22 +136,36 @@ class PrefixCachePrepackMetadata:
         prefix_reuse_mode = bool(
             getattr(wrapper_cls, "prepack_prefix_reuse_mode", False)
         )
-        full_hit_mode = bool(getattr(wrapper_cls, "prepack_full_hit_mode", False))
+        full_hit_mode = bool(
+            getattr(wrapper_cls, "prepack_full_hit_mode", False)
+        )
         prefix_shared_tokens = getattr(
             wrapper_cls, "prepack_prefix_shared_tokens", None
         )
-        full_seq_lengths = getattr(wrapper_cls, "prepack_full_seq_lengths", None)
+        full_seq_lengths = getattr(
+            wrapper_cls, "prepack_full_seq_lengths", None
+        )
 
         if cu_seqlens is None:
-            raise RuntimeError("Prefix cache prepack metadata requires cu_seqlens")
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires cu_seqlens"
+            )
         if max_seqlen is None:
-            raise RuntimeError("Prefix cache prepack metadata requires max_seqlen")
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires max_seqlen"
+            )
         if num_sequences is None:
-            raise RuntimeError("Prefix cache prepack metadata requires num_sequences")
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires num_sequences"
+            )
         if seq_lengths is None:
-            raise RuntimeError("Prefix cache prepack metadata requires seq_lengths")
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires seq_lengths"
+            )
         if global_sequence_ids is None:
-            raise RuntimeError("Prefix cache prepack metadata requires cur_batch")
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires cur_batch"
+            )
 
         seq_lengths = [int(length) for length in seq_lengths]
         global_sequence_ids = [int(seq_id) for seq_id in global_sequence_ids]
@@ -173,7 +196,9 @@ class PrefixCachePrepackMetadata:
                 raise RuntimeError(
                     "Prefix cache mode requires prepack_full_seq_lengths"
                 )
-            prefix_shared_tokens = [int(tokens) for tokens in prefix_shared_tokens]
+            prefix_shared_tokens = [
+                int(tokens) for tokens in prefix_shared_tokens
+            ]
             full_seq_lengths = [int(length) for length in full_seq_lengths]
             if len(prefix_shared_tokens) != num_sequences:
                 raise RuntimeError(
@@ -225,7 +250,9 @@ class PrefixCachePrepackMetadata:
 class HostPrefixPageReader:
     """Read cached host KV pages for prefix-cache attention replay."""
 
-    def __init__(self, *, core_engine: object, engine_config: object, layer_idx: int):
+    def __init__(
+        self, *, core_engine: object, engine_config: object, layer_idx: int
+    ):
         self.core_engine = core_engine
         self.engine_config = engine_config
         self.layer_idx = int(layer_idx)
@@ -241,9 +268,13 @@ class HostPrefixPageReader:
         return int(host_cfg.page_size)
 
     def worker_view(self) -> object:
-        worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
+        worker_view = getattr(
+            self.core_engine, "host_paged_kv_worker_view", None
+        )
         if worker_view is None:
-            raise RuntimeError("Prefix cache requires host_paged_kv_worker_view")
+            raise RuntimeError(
+                "Prefix cache requires host_paged_kv_worker_view"
+            )
         return worker_view
 
     def _load_tensor(
@@ -260,7 +291,9 @@ class HostPrefixPageReader:
         num_heads = int(num_heads)
         head_dim = int(head_dim)
         if num_tokens == 0:
-            return torch.empty((0, num_heads, head_dim), dtype=dtype, device=device)
+            return torch.empty(
+                (0, num_heads, head_dim), dtype=dtype, device=device
+            )
         if dtype not in (torch.bfloat16, torch.float16):
             raise RuntimeError(
                 f"Prefix cache host KV loader supports 16-bit KV only, got {dtype}"
@@ -372,7 +405,9 @@ class PrefixAttentionKvBuilder:
         head_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if metadata.prefix_shared_tokens is None:
-            raise RuntimeError("GQA prefix KV build requires prefix token metadata")
+            raise RuntimeError(
+                "GQA prefix KV build requires prefix token metadata"
+            )
 
         device = key.device
         cu_cpu = metadata.cu_seqlens_list()
@@ -459,7 +494,9 @@ class PrefixAttentionKvBuilder:
         kv_dim: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         if metadata.prefix_shared_tokens is None:
-            raise RuntimeError("MLA prefix KV build requires prefix token metadata")
+            raise RuntimeError(
+                "MLA prefix KV build requires prefix token metadata"
+            )
 
         device = key.device
         cu_cpu = metadata.cu_seqlens_list()
@@ -542,7 +579,9 @@ class PrefixAwarePrefillOffloader:
         pin_tensor: Optional[Callable[[torch.Tensor, int], None]] = None,
     ):
         if worker_view is None:
-            raise RuntimeError("Prefix-aware prefill offload requires host KV view")
+            raise RuntimeError(
+                "Prefix-aware prefill offload requires host KV view"
+            )
         self.worker_view = worker_view
         self.layer_idx = int(layer_idx)
         self.metadata = ensure_prefix_cache_prepack_metadata(metadata)
@@ -572,7 +611,9 @@ class PrefixAwarePrefillOffloader:
             return None
         if self.metadata.prefix_shared_tokens is None:
             raise RuntimeError("Prefix offload requires prefix_shared_tokens")
-        if not hasattr(self.worker_view, "async_offload_layer_kv_to_host_with_offsets"):
+        if not hasattr(
+            self.worker_view, "async_offload_layer_kv_to_host_with_offsets"
+        ):
             raise RuntimeError(
                 "Prefix offload requires async_offload_layer_kv_to_host_with_offsets"
             )
@@ -619,7 +660,9 @@ class PrefixAwarePrefillOffloader:
         self._pin_parent_tensors(key, value)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
-        for seq_idx, sequence_id in enumerate(self.metadata.global_sequence_ids):
+        for seq_idx, sequence_id in enumerate(
+            self.metadata.global_sequence_ids
+        ):
             start_idx = int(cu[seq_idx])
             end_idx = int(cu[seq_idx + 1])
             seq_len = end_idx - start_idx
@@ -628,14 +671,18 @@ class PrefixAwarePrefillOffloader:
             self._pin(seq_key)
             self._pin(seq_value)
             if sequence_callback is not None:
-                sequence_callback(seq_idx, sequence_id, seq_len, seq_key, seq_value)
+                sequence_callback(
+                    seq_idx, sequence_id, seq_len, seq_key, seq_value
+                )
             self._offload_one(
                 sequence_id=sequence_id,
                 k_tensor=seq_key,
                 v_tensor=seq_value,
                 sequence_length=seq_len,
                 destination_start=(
-                    None if destination_starts is None else destination_starts[seq_idx]
+                    None
+                    if destination_starts is None
+                    else destination_starts[seq_idx]
                 ),
             )
 
@@ -650,7 +697,9 @@ class PrefixAwarePrefillOffloader:
         self._pin_parent_tensors(key)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
-        for seq_idx, sequence_id in enumerate(self.metadata.global_sequence_ids):
+        for seq_idx, sequence_id in enumerate(
+            self.metadata.global_sequence_ids
+        ):
             start_idx = int(cu[seq_idx])
             end_idx = int(cu[seq_idx + 1])
             seq_len = end_idx - start_idx
@@ -672,6 +721,8 @@ class PrefixAwarePrefillOffloader:
                 v_tensor=None,
                 sequence_length=seq_len,
                 destination_start=(
-                    None if destination_starts is None else destination_starts[seq_idx]
+                    None
+                    if destination_starts is None
+                    else destination_starts[seq_idx]
                 ),
             )

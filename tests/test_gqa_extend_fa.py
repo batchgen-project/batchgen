@@ -12,7 +12,9 @@ def test_gqa_extend_fa_passes_paged_extend_metadata(monkeypatch):
         return torch.ones_like(args[0])
 
     monkeypatch.setattr(fa_extend, "_USE_FA3", True)
-    monkeypatch.setattr(fa_extend, "_flash_with_kvcache", fake_flash_with_kvcache)
+    monkeypatch.setattr(
+        fa_extend, "_flash_with_kvcache", fake_flash_with_kvcache
+    )
 
     q = torch.zeros(5, 4, 8)
     k_cache = torch.zeros(3, 64, 1, 8)
