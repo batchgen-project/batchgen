@@ -13,6 +13,7 @@ class PrefixReuseSequencePlan:
     local_idx: int
     sequence_id: int
     prompt_length: int
+    raw_prefix_shared_tokens: int
     prefix_shared_tokens: int
     suffix_start_pos: int
     suffix_length: int
@@ -87,6 +88,10 @@ def build_prefix_reuse_prefill_plan(
         prompt_length = int(prompt_lengths[idx])
         shared_tokens = int(prefix_shared_tokens[idx])
         prompt_ids = _normalize_input_ids(input_ids[idx], prompt_length)
+        if prompt_length <= 0:
+            raise ValueError(
+                f"prompt_length must be positive for prefix reuse, got {prompt_length}"
+            )
         if shared_tokens < 0:
             raise ValueError(
                 f"prefix_shared_tokens must be non-negative, got {shared_tokens}"
@@ -96,6 +101,8 @@ def build_prefix_reuse_prefill_plan(
                 f"prefix_shared_tokens {shared_tokens} exceeds prompt_length {prompt_length}"
             )
 
+        raw_shared_tokens = shared_tokens
+        shared_tokens = min(raw_shared_tokens, prompt_length - 1)
         suffix_start = shared_tokens
         suffix_length = prompt_length - shared_tokens
         target_device = device if device is not None else prompt_ids.device
@@ -112,11 +119,12 @@ def build_prefix_reuse_prefill_plan(
                 local_idx=int(local_indices[idx]),
                 sequence_id=int(sequence_ids[idx]),
                 prompt_length=prompt_length,
+                raw_prefix_shared_tokens=raw_shared_tokens,
                 prefix_shared_tokens=shared_tokens,
                 suffix_start_pos=suffix_start,
                 suffix_length=suffix_length,
                 full_logical_context_length=prompt_length,
-                is_full_hit=(suffix_length == 0),
+                is_full_hit=(raw_shared_tokens == prompt_length),
             )
         )
         suffix_input_ids.append(suffix_ids)
@@ -171,6 +179,7 @@ def validate_prefix_reuse_plan(
     *,
     allow_full_hits: bool = False,
 ) -> None:
+    del allow_full_hits
     if len(plan.sequences) != len(plan.suffix_input_ids):
         raise ValueError("Plan sequence count does not match suffix_input_ids")
     if len(plan.sequences) != len(plan.suffix_position_ids):
@@ -192,9 +201,4 @@ def validate_prefix_reuse_plan(
         if plan.suffix_position_ids[idx].numel() != item.suffix_length:
             raise ValueError(
                 f"Invalid suffix_position_ids length for sequence {item.sequence_id}"
-            )
-        if not allow_full_hits and item.is_full_hit:
-            raise RuntimeError(
-                "Exact full prefix hit is not implemented for suffix-only prefill; "
-                f"sequence_id={item.sequence_id}"
             )

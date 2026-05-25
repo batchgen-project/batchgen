@@ -31,14 +31,14 @@ def restore_legacy_attention_fields():
 
 def _prefill_metadata(prefix_reuse: bool = True) -> ForwardBatchMetadata:
     prefix = None
-    q_seq_lens = [2, 1, 0]
+    q_seq_lens = [2, 1, 1]
     kv_seq_lens = [5, 1, 4]
     if prefix_reuse:
         prefix = PrefixReuseMetadata(
-            prefix_lens=torch.tensor([3, 0, 4], dtype=torch.int32),
+            prefix_lens=torch.tensor([3, 0, 3], dtype=torch.int32),
             suffix_lens=torch.tensor(q_seq_lens, dtype=torch.int32),
             full_seq_lens=torch.tensor(kv_seq_lens, dtype=torch.int32),
-            saved_tokens=7,
+            saved_tokens=6,
             is_full_hit=torch.tensor([False, False, True], dtype=torch.bool),
             global_sequence_ids=[11, 12, 13],
         )
@@ -47,13 +47,13 @@ def _prefill_metadata(prefix_reuse: bool = True) -> ForwardBatchMetadata:
         phase="prefill",
         global_sequence_ids=[11, 12, 13],
         prefill=PrefillAttentionMetadata(
-            cu_seqlens_q=torch.tensor([0, 2, 3, 3], dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, 2, 3, 4], dtype=torch.int32),
             cu_seqlens_k=torch.tensor([0, 5, 6, 10], dtype=torch.int32),
             max_seqlen_q=2,
             max_seqlen_k=5,
             q_seq_lens=q_seq_lens,
             kv_seq_lens=kv_seq_lens,
-            position_ids=torch.tensor([3, 4, 0], dtype=torch.int64),
+            position_ids=torch.tensor([3, 4, 0, 3], dtype=torch.int64),
             prefix_reuse=prefix,
         ),
         kv_cache=KVCacheMetadata(
@@ -133,9 +133,9 @@ def test_bind_forward_batch_metadata_sets_and_restores_legacy_fields():
         )
         assert AttnWrapperBase.prepack_max_seqlen == 2
         assert AttnWrapperBase.prepack_num_sequences == 3
-        assert AttnWrapperBase.prepack_seq_lengths == [2, 1, 0]
+        assert AttnWrapperBase.prepack_seq_lengths == [2, 1, 1]
         assert AttnWrapperBase.prepack_prefix_reuse_mode is True
-        assert AttnWrapperBase.prepack_prefix_shared_tokens == [3, 0, 4]
+        assert AttnWrapperBase.prepack_prefix_shared_tokens == [3, 0, 3]
         assert AttnWrapperBase.prepack_full_seq_lengths == [5, 1, 4]
         assert AttnWrapperBase.prepack_full_hit_mode is False
         assert AttnWrapperBase.position_ids is metadata.prefill.position_ids
@@ -230,8 +230,8 @@ def test_prefix_cache_metadata_prefers_bound_forward_metadata():
         prefix_metadata = wrapper.prefix_cache_metadata()
 
     assert prefix_metadata.global_sequence_ids == [11, 12, 13]
-    assert prefix_metadata.seq_lengths == [2, 1, 0]
-    assert prefix_metadata.prefix_shared_tokens == [3, 0, 4]
+    assert prefix_metadata.seq_lengths == [2, 1, 1]
+    assert prefix_metadata.prefix_shared_tokens == [3, 0, 3]
     assert prefix_metadata.full_seq_lengths == [5, 1, 4]
     assert prefix_metadata.prefix_reuse_mode is True
     assert prefix_metadata.full_hit_mode is False

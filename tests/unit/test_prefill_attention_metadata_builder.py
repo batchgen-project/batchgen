@@ -71,12 +71,15 @@ def _prefix_plan(
     global_ids: list[int],
     prefix_lens: list[int],
     suffix_lens: list[int],
+    raw_prefix_lens: list[int] | None = None,
 ) -> PrefixReusePrefillPlan:
     sequences = []
     suffix_input_ids = []
     suffix_position_ids = []
-    for local_idx, (global_id, prefix_len, suffix_len) in enumerate(
-        zip(global_ids, prefix_lens, suffix_lens)
+    if raw_prefix_lens is None:
+        raw_prefix_lens = list(prefix_lens)
+    for local_idx, (global_id, prefix_len, suffix_len, raw_prefix_len) in enumerate(
+        zip(global_ids, prefix_lens, suffix_lens, raw_prefix_lens)
     ):
         prompt_length = prefix_len + suffix_len
         sequences.append(
@@ -84,11 +87,12 @@ def _prefix_plan(
                 local_idx=local_idx,
                 sequence_id=global_id,
                 prompt_length=prompt_length,
+                raw_prefix_shared_tokens=raw_prefix_len,
                 prefix_shared_tokens=prefix_len,
                 suffix_start_pos=prefix_len,
                 suffix_length=suffix_len,
                 full_logical_context_length=prompt_length,
-                is_full_hit=(suffix_len == 0),
+                is_full_hit=(raw_prefix_len == prompt_length),
             )
         )
         suffix_input_ids.append(torch.arange(suffix_len, dtype=torch.long))
@@ -171,29 +175,31 @@ def test_build_prefill_forward_metadata_with_prefix_reuse_slice():
 
 
 def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
-    prepack = _prepack_metadata([2, 1, 0])
+    prepack = _prepack_metadata([2, 1, 1])
     plan = _prefix_plan(
         global_ids=[100, 101, 102],
-        prefix_lens=[3, 0, 4],
-        suffix_lens=[2, 1, 0],
+        prefix_lens=[3, 0, 3],
+        suffix_lens=[2, 1, 1],
+        raw_prefix_lens=[3, 0, 4],
     )
 
     metadata = build_prefill_forward_metadata(
         prepack_metadata=prepack,
-        batch_spans=_spans([100, 101, 102], [2, 1, 0]),
+        batch_spans=_spans([100, 101, 102], [2, 1, 1]),
         seq_start=0,
         seq_end=3,
-        position_ids=torch.tensor([3, 4, 0], dtype=torch.long),
+        position_ids=torch.tensor([3, 4, 0, 3], dtype=torch.long),
         device=torch.device("cpu"),
         prefix_reuse_plan=plan,
     )
 
     prefix_reuse = metadata.prefill.prefix_reuse
-    assert metadata.prefill.q_seq_lens == [2, 1, 0]
+    assert metadata.prefill.q_seq_lens == [2, 1, 1]
     assert metadata.prefill.kv_seq_lens == [5, 1, 4]
-    assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3, 3]
+    assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3, 4]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 5, 6, 10]
-    assert prefix_reuse.prefix_lens.tolist() == [3, 0, 4]
+    assert prefix_reuse.prefix_lens.tolist() == [3, 0, 3]
+    assert prefix_reuse.suffix_lens.tolist() == [2, 1, 1]
     assert prefix_reuse.is_full_hit.tolist() == [False, False, True]
 
 

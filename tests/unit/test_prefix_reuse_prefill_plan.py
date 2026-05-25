@@ -22,22 +22,27 @@ def test_build_prefix_reuse_prefill_plan_mixed_hit_and_miss():
         prefix_shared_tokens=[4, 0, 5],
     )
 
-    assert [item.suffix_length for item in plan.sequences] == [2, 4, 0]
-    assert [item.suffix_start_pos for item in plan.sequences] == [4, 0, 5]
+    assert [item.raw_prefix_shared_tokens for item in plan.sequences] == [
+        4,
+        0,
+        5,
+    ]
+    assert [item.suffix_length for item in plan.sequences] == [2, 4, 1]
+    assert [item.suffix_start_pos for item in plan.sequences] == [4, 0, 4]
     assert [tensor.tolist() for tensor in plan.suffix_input_ids] == [
         [14, 15],
         [20, 21, 22, 23],
-        [],
+        [34],
     ]
     assert [tensor.tolist() for tensor in plan.suffix_position_ids] == [
         [4, 5],
         [0, 1, 2, 3],
-        [],
+        [4],
     ]
-    assert plan.cache_seqlens.tolist() == [4, 0, 5]
+    assert plan.cache_seqlens.tolist() == [4, 0, 4]
     assert plan.total_prompt_tokens == 15
-    assert plan.total_suffix_tokens == 6
-    assert plan.saved_prefill_tokens == 9
+    assert plan.total_suffix_tokens == 7
+    assert plan.saved_prefill_tokens == 8
 
 
 def test_split_prefix_reuse_prefill_plan_recomputes_stats():
@@ -66,7 +71,7 @@ def test_split_prefix_reuse_prefill_plan_recomputes_stats():
     assert micro.saved_prefill_tokens == 2
 
 
-def test_validate_prefix_reuse_prefill_plan_rejects_full_hit_by_default():
+def test_validate_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
     plan = build_prefix_reuse_prefill_plan(
         local_indices=[0],
         sequence_ids=[100],
@@ -75,10 +80,13 @@ def test_validate_prefix_reuse_prefill_plan_rejects_full_hit_by_default():
         prefix_shared_tokens=[4],
     )
 
-    with pytest.raises(RuntimeError, match="Exact full prefix hit"):
-        validate_prefix_reuse_plan(plan)
-
-    validate_prefix_reuse_plan(plan, allow_full_hits=True)
+    validate_prefix_reuse_plan(plan)
+    assert plan.sequences[0].is_full_hit is True
+    assert plan.sequences[0].raw_prefix_shared_tokens == 4
+    assert plan.sequences[0].prefix_shared_tokens == 3
+    assert plan.sequences[0].suffix_start_pos == 3
+    assert plan.sequences[0].suffix_length == 1
+    assert plan.suffix_input_ids[0].tolist() == [3]
 
 
 def test_build_prefix_reuse_prefill_plan_validates_lengths():
