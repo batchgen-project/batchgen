@@ -234,9 +234,10 @@ def materialize_single_group_lookup_results(
                 f"sequence {sequence_id}: cached={cached_tokens}, "
                 f"prompt={prompt_len}"
             )
+        effective_cached_tokens = min(cached_tokens, prompt_len - 1)
         span_pages = []
         attachment_handle = int(getattr(result, "attachment_handle", 0))
-        if cached_tokens > 0:
+        if effective_cached_tokens > 0:
             if attachment_handle == 0:
                 raise ValueError(
                     "lookup result with cached prefix must have non-zero "
@@ -244,19 +245,20 @@ def materialize_single_group_lookup_results(
                 )
             span = _find_group_span(result, group_id=int(group_id))
             span_raw_end = int(getattr(span, "raw_end_token"))
-            if span_raw_end != cached_tokens:
+            if span_raw_end < effective_cached_tokens:
                 raise ValueError(
                     "single-group prefix materialization requires lookup span "
-                    "to match cached token boundary for sequence "
-                    f"{sequence_id}: span={span_raw_end}, cached={cached_tokens}"
+                    "to cover the effective cached token boundary for sequence "
+                    f"{sequence_id}: span={span_raw_end}, "
+                    f"effective_cached={effective_cached_tokens}"
                 )
             span_pages = list(getattr(span, "pages"))
 
         sequences.append(
             PrefixMaterializationSequence(
                 sequence_id=int(sequence_id),
-                prefix_tokens=cached_tokens,
-                suffix_tokens=prompt_len - cached_tokens,
+                prefix_tokens=effective_cached_tokens,
+                suffix_tokens=prompt_len - effective_cached_tokens,
                 host_pages=span_pages,
                 attachment_handle=attachment_handle,
             )

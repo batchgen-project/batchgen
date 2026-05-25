@@ -298,6 +298,71 @@ def test_materialize_single_group_lookup_results_builds_sequences():
     assert coordinator.end_calls == [91]
 
 
+def test_materialize_single_group_lookup_results_clamps_full_hit_to_extend_one():
+    gpu_manager = _FakeGpuManager()
+    host_view = _FakeHostWorkerView()
+    coordinator = _FakePrefixCoordinator()
+    lookup_result = SimpleNamespace(
+        attachment_handle=91,
+        common_cached_tokens=7,
+        materialization_spans=[
+            SimpleNamespace(
+                group_id=7,
+                raw_end_token=7,
+                pages=[
+                    SimpleNamespace(host_region_id=0, page_id=11),
+                    SimpleNamespace(host_region_id=0, page_id=12),
+                ],
+            )
+        ],
+    )
+
+    materialize_single_group_lookup_results(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        prefix_cache_coordinator=coordinator,
+        lookup_results=[lookup_result],
+        sequence_ids=[101],
+        prompt_lengths=[7],
+        group_id=7,
+    )
+
+    assert gpu_manager.allocations == [([101], [7])]
+    assert gpu_manager.prepared == [([101], [6], [1], False)]
+    assert host_view.calls[0]["host_page_ids"].tolist() == [[11, 12]]
+    assert host_view.calls[0]["active_page_counts"].tolist() == [2]
+    assert coordinator.begin_calls == [91]
+
+
+def test_materialize_single_group_lookup_results_skips_load_for_one_token_full_hit():
+    gpu_manager = _FakeGpuManager()
+    host_view = _FakeHostWorkerView()
+    lookup_result = SimpleNamespace(
+        attachment_handle=91,
+        common_cached_tokens=1,
+        materialization_spans=[
+            SimpleNamespace(
+                group_id=7,
+                raw_end_token=1,
+                pages=[SimpleNamespace(host_region_id=0, page_id=11)],
+            )
+        ],
+    )
+
+    materialize_single_group_lookup_results(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        lookup_results=[lookup_result],
+        sequence_ids=[101],
+        prompt_lengths=[1],
+        group_id=7,
+    )
+
+    assert gpu_manager.allocations == [([101], [1])]
+    assert gpu_manager.prepared == [([101], [0], [1], False)]
+    assert host_view.calls == []
+
+
 def test_materialize_single_group_lookup_results_rejects_mismatched_span():
     lookup_result = SimpleNamespace(
         attachment_handle=91,
@@ -307,7 +372,7 @@ def test_materialize_single_group_lookup_results_rejects_mismatched_span():
         ],
     )
 
-    with pytest.raises(ValueError, match="cached token boundary"):
+    with pytest.raises(ValueError, match="effective cached token boundary"):
         materialize_single_group_lookup_results(
             gpu_manager=_FakeGpuManager(),
             host_worker_view=_FakeHostWorkerView(),
