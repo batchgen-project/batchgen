@@ -2,7 +2,9 @@ name: GPU CI Sweep
 
 on:
   schedule:
-    - cron: '0 18 * * *'  # 02:00 CST off-peak
+    # 01:00 UTC = 02:00 UK (BST, late Mar–late Oct) / 01:00 UK (GMT, rest of year).
+    # Both within POIS's 01:00–03:00 UK off-peak window across DST transitions.
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 permissions:

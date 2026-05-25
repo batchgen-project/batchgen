@@ -22,6 +22,16 @@ PORT=10900
 echo "[in-container] node_rank=$NODE_RANK dist=$DIST_INIT_ADDR"
 cd /workspace
 
+# Activate the conda env if the image ships one — node1's image uses conda;
+# node0's relies on a venv already on PATH. Either path provides batchgen.
+if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+    # shellcheck disable=SC1091
+    source /root/miniconda3/etc/profile.d/conda.sh
+    conda activate batchgen
+fi
+
+echo "Using python: $(which python)"
+
 # Install package fresh from PR source so we test the PR build, not a
 # pre-baked image.
 echo "--- pip install -e . ---"
