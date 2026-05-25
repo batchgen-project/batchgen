@@ -206,6 +206,37 @@ def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
     assert prefix_reuse.is_full_hit.tolist() == [False, False, True]
 
 
+def test_build_prefill_forward_metadata_one_token_full_hit_is_plain_query():
+    prepack = _prepack_metadata([1])
+    plan = _prefix_plan(
+        global_ids=[100],
+        prefix_lens=[0],
+        suffix_lens=[1],
+        raw_prefix_lens=[1],
+    )
+
+    metadata = build_prefill_forward_metadata(
+        prepack_metadata=prepack,
+        batch_spans=_spans([100], [1]),
+        seq_start=0,
+        seq_end=1,
+        position_ids=torch.tensor([0], dtype=torch.long),
+        device=torch.device("cpu"),
+        prefix_reuse_plan=plan,
+    )
+
+    prefix_reuse = metadata.prefill.prefix_reuse
+    assert metadata.prefill.q_seq_lens == [1]
+    assert metadata.prefill.kv_seq_lens == [1]
+    assert metadata.prefill.cu_seqlens_q.tolist() == [0, 1]
+    assert metadata.prefill.cu_seqlens_k.tolist() == [0, 1]
+    assert prefix_reuse.prefix_lens.tolist() == [0]
+    assert prefix_reuse.suffix_lens.tolist() == [1]
+    assert prefix_reuse.full_seq_lens.tolist() == [1]
+    assert prefix_reuse.saved_tokens == 0
+    assert prefix_reuse.is_full_hit.tolist() == [True]
+
+
 def test_build_prefill_forward_metadata_rejects_suffix_length_mismatch():
     prepack = _prepack_metadata([3])
     plan = _prefix_plan(global_ids=[100], prefix_lens=[2], suffix_lens=[1])

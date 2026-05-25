@@ -89,6 +89,29 @@ def test_validate_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
     assert plan.suffix_input_ids[0].tolist() == [3]
 
 
+def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens():
+    plan = build_prefix_reuse_prefill_plan(
+        local_indices=[0],
+        sequence_ids=[100],
+        input_ids=[torch.tensor([42])],
+        prompt_lengths=[1],
+        prefix_shared_tokens=[1],
+    )
+
+    validate_prefix_reuse_plan(plan)
+    assert plan.sequences[0].is_full_hit is True
+    assert plan.sequences[0].raw_prefix_shared_tokens == 1
+    assert plan.sequences[0].prefix_shared_tokens == 0
+    assert plan.sequences[0].suffix_start_pos == 0
+    assert plan.sequences[0].suffix_length == 1
+    assert plan.cache_seqlens.tolist() == [0]
+    assert plan.total_prompt_tokens == 1
+    assert plan.total_suffix_tokens == 1
+    assert plan.saved_prefill_tokens == 0
+    assert plan.suffix_input_ids[0].tolist() == [42]
+    assert plan.suffix_position_ids[0].tolist() == [0]
+
+
 def test_build_prefix_reuse_prefill_plan_validates_lengths():
     with pytest.raises(ValueError, match="exceeds prompt_length"):
         build_prefix_reuse_prefill_plan(
