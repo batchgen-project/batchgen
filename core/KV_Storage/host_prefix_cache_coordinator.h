@@ -27,7 +27,6 @@ struct HostKVGroupSpec {
 };
 
 struct HostPageHandle {
-    std::uint32_t host_region_id = 0;
     std::uint32_t page_id = 0;
 };
 

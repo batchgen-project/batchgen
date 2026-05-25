@@ -93,7 +93,6 @@ struct SharedGroupEntry {
 };
 
 struct SharedPageHandle {
-    std::uint32_t host_region_id = 0;
     std::uint32_t page_id = 0;
 };
 
@@ -610,7 +609,7 @@ HostPrefixCacheCoordinator::SharedState::BuildMaterializationSpansLocked(
              ++page_idx) {
             const SharedPageHandle& page =
                 page_handles[entry.first_page_handle + page_idx];
-            span.pages.push_back({page.host_region_id, page.page_id});
+            span.pages.push_back({page.page_id});
         }
         spans.emplace_back(std::move(span));
     }
@@ -749,7 +748,7 @@ void HostPrefixCacheCoordinator::SharedState::AppendEvictedPagesLocked(
              ++page_idx) {
             const SharedPageHandle& handle =
                 page_handles[entry.first_page_handle + page_idx];
-            pages.push_back({handle.host_region_id, handle.page_id});
+            pages.push_back({handle.page_id});
         }
     }
 
@@ -785,8 +784,7 @@ bool HostPrefixCacheCoordinator::SharedState::ResidentNodeReferencesPageLocked(
                  ++page_idx) {
                 const SharedPageHandle& resident_page =
                     page_handles[entry.first_page_handle + page_idx];
-                if (resident_page.host_region_id == page.host_region_id &&
-                    resident_page.page_id == page.page_id) {
+                if (resident_page.page_id == page.page_id) {
                     return true;
                 }
             }
@@ -807,8 +805,7 @@ void HostPrefixCacheCoordinator::SharedState::
             const bool already_recorded = std::any_of(
                 releasable_pages.begin(), releasable_pages.end(),
                 [&page](const HostPageHandle& existing) {
-                    return existing.host_region_id == page.host_region_id &&
-                           existing.page_id == page.page_id;
+                    return existing.page_id == page.page_id;
                 });
             if (!already_recorded) {
                 releasable_pages.push_back(page);
@@ -1093,7 +1090,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
                  ++page_idx) {
                 const HostPageHandle& handle = (*iter->second)[page_idx];
                 page_handles[next_page_handle++] =
-                    SharedPageHandle{handle.host_region_id, handle.page_id};
+                    SharedPageHandle{handle.page_id};
             }
         }
 

@@ -34,9 +34,8 @@ def _group_spec(group_id: int, raw_page_tokens: int):
     return spec
 
 
-def _page(region: int, page_id: int):
+def _page(page_id: int):
     handle = bg.HostPageHandle()
-    handle.host_region_id = region
     handle.page_id = page_id
     return handle
 
@@ -93,8 +92,8 @@ def test_host_prefix_cache_lookup_attach_release():
             token_ids,
             16,
             [
-                _group_pages(0, [_page(0, idx) for idx in range(4)]),
-                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
             ],
         )
         assert commit.committed_tokens == 16
@@ -146,8 +145,8 @@ def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
             token_ids,
             16,
             [
-                _group_pages(0, [_page(0, idx) for idx in range(4)]),
-                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
             ],
         )
 
@@ -198,8 +197,8 @@ def test_host_prefix_cache_clear_skips_active_entries():
             token_ids,
             16,
             [
-                _group_pages(0, [_page(0, idx) for idx in range(4)]),
-                _group_pages(1, [_page(1, idx) for idx in range(2)]),
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
             ],
         )
 
@@ -236,8 +235,8 @@ def test_host_prefix_cache_pending_load_protects_after_release():
             token_ids,
             8,
             [
-                _group_pages(0, [_page(0, 0), _page(0, 1)]),
-                _group_pages(1, [_page(1, 0)]),
+                _group_pages(0, [_page(0), _page(1)]),
+                _group_pages(1, [_page(0)]),
             ],
         )
 
@@ -279,8 +278,8 @@ def test_host_prefix_cache_clear_namespace_only_removes_matching_domain():
             token_ids,
             8,
             [
-                _group_pages(0, [_page(0, 0), _page(0, 1)]),
-                _group_pages(1, [_page(1, 0)]),
+                _group_pages(0, [_page(0), _page(1)]),
+                _group_pages(1, [_page(0)]),
             ],
         )
         coordinator.commit_prefix_pages(
@@ -288,8 +287,8 @@ def test_host_prefix_cache_clear_namespace_only_removes_matching_domain():
             token_ids,
             8,
             [
-                _group_pages(0, [_page(0, 10), _page(0, 11)]),
-                _group_pages(1, [_page(1, 10)]),
+                _group_pages(0, [_page(10), _page(11)]),
+                _group_pages(1, [_page(10)]),
             ],
         )
 
@@ -316,8 +315,8 @@ def test_host_prefix_cache_is_shared_across_process_attachments():
             token_ids,
             8,
             [
-                _group_pages(0, [_page(0, 0), _page(0, 1)]),
-                _group_pages(1, [_page(1, 0)]),
+                _group_pages(0, [_page(0), _page(1)]),
+                _group_pages(1, [_page(0)]),
             ],
         )
 

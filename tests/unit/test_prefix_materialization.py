@@ -156,25 +156,6 @@ def test_materialize_single_group_prefix_pages_skips_load_for_all_miss():
     assert gpu_manager.allocations == [([101], [3])]
 
 
-def test_materialize_single_group_prefix_pages_rejects_wrong_host_region():
-    handle = SimpleNamespace(host_region_id=3, page_id=11)
-    gpu_manager = _FakeGpuManager()
-    with pytest.raises(ValueError, match="expected region"):
-        materialize_single_group_prefix_pages(
-            gpu_manager=gpu_manager,
-            host_worker_view=_FakeHostWorkerView(),
-            sequences=[
-                PrefixMaterializationSequence(
-                    sequence_id=101,
-                    prefix_tokens=4,
-                    suffix_tokens=1,
-                    host_pages=[handle],
-                ),
-            ],
-        )
-    assert gpu_manager.allocations == []
-
-
 def test_materialize_single_group_prefix_pages_guards_attachment_load():
     gpu_manager = _FakeGpuManager()
     host_view = _FakeHostWorkerView()
@@ -271,8 +252,8 @@ def test_materialize_single_group_lookup_results_builds_sequences():
                 group_id=7,
                 raw_end_token=5,
                 pages=[
-                    SimpleNamespace(host_region_id=0, page_id=11),
-                    SimpleNamespace(host_region_id=0, page_id=12),
+                    SimpleNamespace(page_id=11),
+                    SimpleNamespace(page_id=12),
                 ],
             )
         ],
@@ -310,8 +291,8 @@ def test_materialize_single_group_lookup_results_clamps_full_hit_to_extend_one()
                 group_id=7,
                 raw_end_token=7,
                 pages=[
-                    SimpleNamespace(host_region_id=0, page_id=11),
-                    SimpleNamespace(host_region_id=0, page_id=12),
+                    SimpleNamespace(page_id=11),
+                    SimpleNamespace(page_id=12),
                 ],
             )
         ],
@@ -344,7 +325,7 @@ def test_materialize_single_group_lookup_results_skips_load_for_one_token_full_h
             SimpleNamespace(
                 group_id=7,
                 raw_end_token=1,
-                pages=[SimpleNamespace(host_region_id=0, page_id=11)],
+                pages=[SimpleNamespace(page_id=11)],
             )
         ],
     )

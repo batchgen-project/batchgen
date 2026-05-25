@@ -687,7 +687,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<kv::HostPageHandle>(m, "HostPageHandle")
         .def(py::init<>())
-        .def_readwrite("host_region_id", &kv::HostPageHandle::host_region_id)
         .def_readwrite("page_id", &kv::HostPageHandle::page_id);
 
     py::class_<kv::GroupCommitPages>(m, "GroupCommitPages")

@@ -86,7 +86,6 @@ def materialize_single_group_prefix_pages(
     gpu_manager: object,
     host_worker_view: object,
     sequences: Sequence[PrefixMaterializationSequence],
-    expected_host_region_id: int = 0,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize Host prefix pages into target GPU paged KV slots.
@@ -133,7 +132,6 @@ def materialize_single_group_prefix_pages(
         host_page_ids = _build_host_page_id_tensor(
             sequences,
             prefix_page_counts=prefix_page_counts,
-            expected_host_region_id=expected_host_region_id,
         )
         active_page_counts = torch.tensor(prefix_page_counts, dtype=torch.int64)
 
@@ -200,7 +198,6 @@ def materialize_single_group_lookup_results(
     sequence_ids: Sequence[int],
     prompt_lengths: Sequence[int],
     group_id: int,
-    expected_host_region_id: int = 0,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize a batch of C++ HostPrefixCache lookup results.
@@ -268,7 +265,6 @@ def materialize_single_group_lookup_results(
         gpu_manager=gpu_manager,
         host_worker_view=host_worker_view,
         sequences=sequences,
-        expected_host_region_id=expected_host_region_id,
         prefix_cache_coordinator=prefix_cache_coordinator,
     )
 
@@ -277,17 +273,11 @@ def _build_host_page_id_tensor(
     sequences: Sequence[PrefixMaterializationSequence],
     *,
     prefix_page_counts: Sequence[int],
-    expected_host_region_id: int,
 ) -> torch.Tensor:
     max_pages = max(int(count) for count in prefix_page_counts)
     rows: list[list[int]] = []
     for item, page_count in zip(sequences, prefix_page_counts):
-        pages = [
-            _host_page_id(
-                handle, expected_host_region_id=expected_host_region_id
-            )
-            for handle in item.host_pages
-        ]
+        pages = [_host_page_id(handle) for handle in item.host_pages]
         if len(pages) < int(page_count):
             raise ValueError(
                 "host prefix page list is shorter than required for sequence "
@@ -311,15 +301,9 @@ def _find_group_span(result: object, *, group_id: int) -> object:
     )
 
 
-def _host_page_id(handle: int | object, *, expected_host_region_id: int) -> int:
+def _host_page_id(handle: int | object) -> int:
     if isinstance(handle, int):
         return int(handle)
-    region_id = getattr(handle, "host_region_id", expected_host_region_id)
-    if int(region_id) != int(expected_host_region_id):
-        raise ValueError(
-            "prefix materialization cannot load host page from region "
-            f"{region_id}; expected region {expected_host_region_id}"
-        )
     page_id = getattr(handle, "page_id", None)
     if page_id is None:
         raise TypeError("host page handle must be an int or expose page_id")
