@@ -201,32 +201,14 @@ class AttnWrapperBase(BaseModuleWrapper):
             cls.pending_prefill_offload_tasks.append(task)
 
     def prefix_cache_metadata(self):
-        """Return validated prepack metadata for prefix-cache helpers."""
-        from batchgen.attention.forward_metadata_context import (
-            get_current_forward_batch_metadata,
-        )
+        """Return validated metadata derived from AttnWrapperBase fields."""
         from .prefix_cache import PrefixCachePrepackMetadata
 
-        forward_metadata = get_current_forward_batch_metadata()
-        if forward_metadata is not None:
-            return PrefixCachePrepackMetadata.from_forward_metadata(forward_metadata)
-        return PrefixCachePrepackMetadata.from_wrapper_cls(type(self))
-
-    def host_prefix_reader(self):
-        """Return a host prefix-cache page reader for this layer."""
-        from .prefix_cache import HostPrefixPageReader
-
-        return HostPrefixPageReader(
-            core_engine=self.core_engine,
-            engine_config=self.engine_config,
-            layer_idx=self.layer_idx,
-        )
-
-    def prefix_attention_kv_builder(self):
-        """Return a prefix-cache KV builder for this layer."""
-        from .prefix_cache import PrefixAttentionKvBuilder
-
-        return PrefixAttentionKvBuilder(self.host_prefix_reader())
+        if getattr(AttnWrapperBase, "phase", None) != "prefill":
+            raise RuntimeError(
+                "Prefix cache prepack metadata requires prefill metadata"
+            )
+        return PrefixCachePrepackMetadata.from_wrapper_cls(AttnWrapperBase)
 
     def offload_prepacked_gqa_kv(
         self,
@@ -238,12 +220,12 @@ class AttnWrapperBase(BaseModuleWrapper):
         sequence_callback=None,
     ) -> None:
         """Offload prepacked GQA KV with optional prefix-cache offsets."""
-        from .prefix_cache import PrefixAwarePrefillOffloader
+        from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
         metadata = metadata or self.prefix_cache_metadata()
         tracker = self.track_prefill_offload_task if track_tasks else None
         tensor_pinner = self.pin_prefill_offload_tensor if track_tasks else None
-        offloader = PrefixAwarePrefillOffloader(
+        offloader = PrefillHostKVOffloader(
             worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
             layer_idx=self.layer_idx,
             metadata=metadata,
@@ -264,12 +246,12 @@ class AttnWrapperBase(BaseModuleWrapper):
         track_tasks: bool = False,
     ) -> None:
         """Offload prepacked MLA primary KV with optional prefix-cache offsets."""
-        from .prefix_cache import PrefixAwarePrefillOffloader
+        from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
         metadata = metadata or self.prefix_cache_metadata()
         tracker = self.track_prefill_offload_task if track_tasks else None
         tensor_pinner = self.pin_prefill_offload_tensor if track_tasks else None
-        offloader = PrefixAwarePrefillOffloader(
+        offloader = PrefillHostKVOffloader(
             worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
             layer_idx=self.layer_idx,
             metadata=metadata,
@@ -287,7 +269,6 @@ class AttnWrapperBase(BaseModuleWrapper):
     prepack_prefix_reuse_mode: ClassVar[bool] = False
     prepack_prefix_shared_tokens: ClassVar[Optional[List[int]]] = None
     prepack_full_seq_lengths: ClassVar[Optional[List[int]]] = None
-    prepack_full_hit_mode: ClassVar[bool] = False
 
     # KV cache state
     past_key_states: ClassVar[Optional[List[torch.Tensor]]] = None

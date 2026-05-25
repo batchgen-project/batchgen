@@ -1,9 +1,9 @@
 """Model-specific MLA prefix-cache adapters.
 
-The page lookup, cached-prefix KV assembly, and FlashMLA replay live in the
+The page lookup, GPU page materialization, and paged MLA extend prefill live in
 generic prefix-cache helpers. This module keeps the remaining model glue in one
-place: how each MLA model builds prefix replay contexts and projects the replayed
-attention output.
+place: how each MLA model builds prefix extend contexts and projects attention
+output.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ from batchgen.attention.mla.prefix_absorb import (
 )
 
 from .attention import AttnWrapperBase
+from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
+
 from .prefix_cache import (
-    PrefixAwarePrefillOffloader,
     PrefixCachePrepackMetadata,
     ensure_prefix_cache_prepack_metadata,
 )
-from .prefix_mla_replay import (
-    MlaReplaySpec,
+from .prefix_mla_extend import (
+    MlaExtendSpec,
     run_prefix_mla_suffix_prefill_with_projected,
 )
 
@@ -37,11 +38,11 @@ ProjectedQueryBuilder = Callable[[object], torch.Tensor]
 
 @dataclass(frozen=True)
 class MlaPrefixBackendContext:
-    """Prefix replay callbacks consumed by the existing MLA prepack backend."""
+    """Prefix extend callbacks consumed by the existing MLA prepack backend."""
 
     wrapper: object
     metadata: PrefixCachePrepackMetadata
-    spec: MlaReplaySpec
+    spec: MlaExtendSpec
     suffix_query_builder: ProjectedQueryBuilder
     output_projection: OutputProjector
     prefill_prefix_materialization: object | None = None
@@ -89,7 +90,7 @@ def build_deepseek_prefix_backend_context(
     return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
-        model_label="DeepSeek prefix replay",
+        model_label="DeepSeek prefix extend",
         use_cached_absorb=False,
     )
 
@@ -117,7 +118,7 @@ def build_kimi_prefix_backend_context(
     return MlaPrefixBackendContext(
         wrapper=wrapper,
         metadata=metadata,
-        spec=_mla_replay_spec(wrapper),
+        spec=_mla_extend_spec(wrapper),
         prefill_prefix_materialization=_prefill_prefix_materialization(wrapper),
         suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
             q_nope=projection.q_nope,
@@ -142,7 +143,7 @@ def offload_glm5_prepacked_mla_kv(
     metadata: PrefixCachePrepackMetadata,
 ) -> None:
     """Offload prepacked GLM-5 k-only MLA/indexer KV with prefix offsets."""
-    offloader = PrefixAwarePrefillOffloader(
+    offloader = PrefillHostKVOffloader(
         worker_view=worker_view,
         layer_idx=layer_idx,
         metadata=ensure_prefix_cache_prepack_metadata(metadata),
@@ -152,9 +153,9 @@ def offload_glm5_prepacked_mla_kv(
     offloader.offload_mla(key=key)
 
 
-def _mla_replay_spec(wrapper: object) -> MlaReplaySpec:
+def _mla_extend_spec(wrapper: object) -> MlaExtendSpec:
     attn = wrapper.module
-    return MlaReplaySpec(
+    return MlaExtendSpec(
         kv_dim=attn.kv_lora_rank + attn.qk_rope_head_dim,
         num_heads=attn.num_heads,
         kv_lora_rank=attn.kv_lora_rank,
@@ -176,7 +177,7 @@ def _build_w8a16_prefix_backend_context(
     return MlaPrefixBackendContext(
         wrapper=wrapper,
         metadata=metadata,
-        spec=_mla_replay_spec(wrapper),
+        spec=_mla_extend_spec(wrapper),
         prefill_prefix_materialization=_prefill_prefix_materialization(wrapper),
         suffix_query_builder=lambda projection: build_absorbed_mla_query_states(
             q_nope=projection.q_nope,

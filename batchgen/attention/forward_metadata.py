@@ -18,20 +18,14 @@ ForwardPhase = Literal["prefill", "decode"]
 
 
 @dataclass(frozen=True)
-class PrefixReuseMetadata:
-    """Prefix reuse information for a prefill forward batch."""
-
-    prefix_lens: torch.Tensor
-    suffix_lens: torch.Tensor
-    full_seq_lens: torch.Tensor
-    saved_tokens: int
-    is_full_hit: torch.Tensor
-    global_sequence_ids: list[int]
-
-
-@dataclass(frozen=True)
 class PrefillAttentionMetadata:
-    """Attention metadata for prefill or suffix-only prefill."""
+    """Attention metadata for prefill or suffix-only prefill.
+
+    Prefix reuse is represented by q/kv length divergence:
+    ``kv_seq_lens[i] - q_seq_lens[i]`` is the cached prefix length for sequence
+    ``i``. The legacy wrapper context mirrors these derived values into
+    ``AttnWrapperBase.prepack_prefix_*`` for model wrappers.
+    """
 
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
@@ -40,7 +34,6 @@ class PrefillAttentionMetadata:
     q_seq_lens: list[int]
     kv_seq_lens: list[int]
     position_ids: torch.Tensor
-    prefix_reuse: Optional[PrefixReuseMetadata] = None
 
     @property
     def batch_size(self) -> int:

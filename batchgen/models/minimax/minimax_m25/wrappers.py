@@ -33,8 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
-from batchgen.models.wrappers.prefix_gqa_replay import (
-    GqaReplaySpec,
+from batchgen.models.wrappers.prefix_gqa_extend import (
+    GqaExtendSpec,
     run_prefix_gqa_prefill_attention,
 )
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
@@ -500,7 +500,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             key=key,
             value=value,
             metadata=metadata,
-            spec=GqaReplaySpec(
+            spec=GqaExtendSpec(
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
             ),

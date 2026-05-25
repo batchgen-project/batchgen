@@ -32,7 +32,7 @@ class PrefixAwareAttentionBackend(Protocol):
 class GqaPrefixAwareAttentionBackend:
     """GQA backend adapter for varlen prefill and paged extend prefill."""
 
-    prefix_kv_builder: object
+    layer_idx: int
     num_kv_heads: int
     head_dim: int
     sinks: Optional[torch.Tensor] = None
@@ -64,11 +64,6 @@ class GqaPrefixAwareAttentionBackend:
             if kv_cache_metadata is not None
             else None
         )
-        if metadata.full_hit_mode:
-            raise RuntimeError(
-                "Legacy GQA full-hit prefix mode is not supported; "
-                "planner must emit a one-token extend prefill row"
-            )
         if metadata.prefix_reuse_mode and materialization is None:
             raise RuntimeError(
                 "GQA partial-hit prefix reuse requires GPU paged materialization"
@@ -120,7 +115,7 @@ class GqaPrefixAwareAttentionBackend:
 
         from batchgen.attention.gqa import gqa_extend_fa
 
-        layer_idx = int(self.prefix_kv_builder.reader.layer_idx)
+        layer_idx = int(self.layer_idx)
         materialization.wait_for_layer(layer_idx)
         materialization.manager.append_layer_prefill_suffix_tokens(
             k_tensor=key,
@@ -165,7 +160,7 @@ class GqaPrefixAwareAttentionBackend:
 class MlaProjectedPrefixAwareAttentionBackend:
     """MLA backend adapter for already projected query and compressed KV."""
 
-    prefix_kv_builder: object
+    layer_idx: int
     page_size: int
     kv_dim: int
     num_heads: int
@@ -184,8 +179,8 @@ class MlaProjectedPrefixAwareAttentionBackend:
         kv_cache_metadata=None,
     ) -> torch.Tensor:
         del value
-        from batchgen.models.wrappers.prefix_mla_replay import (
-            MlaReplaySpec,
+        from batchgen.models.wrappers.prefix_mla_extend import (
+            MlaExtendSpec,
             run_projected_mla_prefix_attention,
         )
 
@@ -195,14 +190,14 @@ class MlaProjectedPrefixAwareAttentionBackend:
             else None
         )
 
-        spec = MlaReplaySpec(
+        spec = MlaExtendSpec(
             kv_dim=int(self.kv_dim),
             num_heads=int(self.num_heads),
             kv_lora_rank=int(self.kv_lora_rank),
             softmax_scale=float(self.softmax_scale),
         )
         attn_out = run_projected_mla_prefix_attention(
-            prefix_kv_builder=self.prefix_kv_builder,
+            layer_idx=int(self.layer_idx),
             query_states=query,
             offload_kv=key,
             metadata=metadata,

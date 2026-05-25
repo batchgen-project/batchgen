@@ -8,7 +8,6 @@ from batchgen.attention.forward_metadata import (
     ForwardBatchMetadata,
     KVCacheMetadata,
     PrefillAttentionMetadata,
-    PrefixReuseMetadata,
 )
 from batchgen.attention.forward_metadata_context import (
     _LEGACY_ATTENTION_FIELDS,
@@ -30,31 +29,25 @@ def restore_legacy_attention_fields():
 
 
 def _prefill_metadata(prefix_reuse: bool = True) -> ForwardBatchMetadata:
-    prefix = None
     q_seq_lens = [2, 1, 1]
-    kv_seq_lens = [5, 1, 4]
-    if prefix_reuse:
-        prefix = PrefixReuseMetadata(
-            prefix_lens=torch.tensor([3, 0, 3], dtype=torch.int32),
-            suffix_lens=torch.tensor(q_seq_lens, dtype=torch.int32),
-            full_seq_lens=torch.tensor(kv_seq_lens, dtype=torch.int32),
-            saved_tokens=6,
-            is_full_hit=torch.tensor([False, False, True], dtype=torch.bool),
-            global_sequence_ids=[11, 12, 13],
-        )
+    kv_seq_lens = [5, 1, 4] if prefix_reuse else list(q_seq_lens)
+    cu_seqlens_k = (
+        torch.tensor([0, 5, 6, 10], dtype=torch.int32)
+        if prefix_reuse
+        else torch.tensor([0, 2, 3, 4], dtype=torch.int32)
+    )
 
     return ForwardBatchMetadata(
         phase="prefill",
         global_sequence_ids=[11, 12, 13],
         prefill=PrefillAttentionMetadata(
             cu_seqlens_q=torch.tensor([0, 2, 3, 4], dtype=torch.int32),
-            cu_seqlens_k=torch.tensor([0, 5, 6, 10], dtype=torch.int32),
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=2,
-            max_seqlen_k=5,
+            max_seqlen_k=max(kv_seq_lens),
             q_seq_lens=q_seq_lens,
             kv_seq_lens=kv_seq_lens,
             position_ids=torch.tensor([3, 4, 0, 3], dtype=torch.int64),
-            prefix_reuse=prefix,
         ),
         kv_cache=KVCacheMetadata(
             gpu_paged_kv_manager=object(),
@@ -90,14 +83,6 @@ def _partial_reuse_prefill_metadata() -> ForwardBatchMetadata:
             q_seq_lens=[2, 1],
             kv_seq_lens=[5, 1],
             position_ids=torch.tensor([3, 4, 0], dtype=torch.int64),
-            prefix_reuse=PrefixReuseMetadata(
-                prefix_lens=torch.tensor([3, 0], dtype=torch.int32),
-                suffix_lens=torch.tensor([2, 1], dtype=torch.int32),
-                full_seq_lens=torch.tensor([5, 1], dtype=torch.int32),
-                saved_tokens=3,
-                is_full_hit=torch.tensor([False, False], dtype=torch.bool),
-                global_sequence_ids=[31, 32],
-            ),
         ),
     )
 
@@ -119,7 +104,6 @@ def test_bind_forward_batch_metadata_sets_and_restores_legacy_fields():
     AttnWrapperBase.prepack_prefix_reuse_mode = False
     AttnWrapperBase.prepack_prefix_shared_tokens = None
     AttnWrapperBase.prepack_full_seq_lengths = None
-    AttnWrapperBase.prepack_full_hit_mode = False
 
     metadata = _prefill_metadata()
     with bind_forward_batch_metadata(metadata) as bound:
@@ -137,7 +121,6 @@ def test_bind_forward_batch_metadata_sets_and_restores_legacy_fields():
         assert AttnWrapperBase.prepack_prefix_reuse_mode is True
         assert AttnWrapperBase.prepack_prefix_shared_tokens == [3, 0, 3]
         assert AttnWrapperBase.prepack_full_seq_lengths == [5, 1, 4]
-        assert AttnWrapperBase.prepack_full_hit_mode is False
         assert AttnWrapperBase.position_ids is metadata.prefill.position_ids
         assert AttnWrapperBase.cache_seqlens is None
         assert AttnWrapperBase.max_seqlen is None
@@ -212,7 +195,6 @@ def test_legacy_fields_do_not_leak_across_batches():
         assert AttnWrapperBase.prepack_prefix_reuse_mode is False
         assert AttnWrapperBase.prepack_prefix_shared_tokens is None
         assert AttnWrapperBase.prepack_full_seq_lengths is None
-        assert AttnWrapperBase.prepack_full_hit_mode is False
 
 
 def test_prefix_cache_metadata_prefers_bound_forward_metadata():
@@ -234,7 +216,6 @@ def test_prefix_cache_metadata_prefers_bound_forward_metadata():
     assert prefix_metadata.prefix_shared_tokens == [3, 0, 3]
     assert prefix_metadata.full_seq_lengths == [5, 1, 4]
     assert prefix_metadata.prefix_reuse_mode is True
-    assert prefix_metadata.full_hit_mode is False
 
 
 def test_prefix_cache_metadata_rejects_bound_decode_metadata():
@@ -252,7 +233,7 @@ def test_prefix_cache_metadata_explicit_matches_legacy_fields():
     )
 
     metadata = _partial_reuse_prefill_metadata()
-    legacy_metadata = PrefixCachePrepackMetadata.from_prefill_metadata(
+    wrapper_metadata = PrefixCachePrepackMetadata.from_prefill_metadata(
         metadata.prefill,
         global_sequence_ids=metadata.global_sequence_ids,
     )
@@ -262,33 +243,30 @@ def test_prefix_cache_metadata_explicit_matches_legacy_fields():
         explicit_metadata = wrapper.prefix_cache_metadata()
 
     assert (
-        explicit_metadata.cu_seqlens_list() == legacy_metadata.cu_seqlens_list()
+        explicit_metadata.cu_seqlens_list()
+        == wrapper_metadata.cu_seqlens_list()
     )
-    assert explicit_metadata.max_seqlen == legacy_metadata.max_seqlen
-    assert explicit_metadata.num_sequences == legacy_metadata.num_sequences
-    assert explicit_metadata.seq_lengths == legacy_metadata.seq_lengths
+    assert explicit_metadata.max_seqlen == wrapper_metadata.max_seqlen
+    assert explicit_metadata.num_sequences == wrapper_metadata.num_sequences
+    assert explicit_metadata.seq_lengths == wrapper_metadata.seq_lengths
     assert (
         explicit_metadata.global_sequence_ids
-        == legacy_metadata.global_sequence_ids
+        == wrapper_metadata.global_sequence_ids
     )
     assert (
-        explicit_metadata.prefix_reuse_mode == legacy_metadata.prefix_reuse_mode
+        explicit_metadata.prefix_reuse_mode
+        == wrapper_metadata.prefix_reuse_mode
     )
-    assert explicit_metadata.full_hit_mode == legacy_metadata.full_hit_mode
     assert (
         explicit_metadata.prefix_shared_tokens
-        == legacy_metadata.prefix_shared_tokens
+        == wrapper_metadata.prefix_shared_tokens
     )
     assert (
-        explicit_metadata.full_seq_lengths == legacy_metadata.full_seq_lengths
+        explicit_metadata.full_seq_lengths == wrapper_metadata.full_seq_lengths
     )
     assert (
         ensure_prefix_cache_prepack_metadata(metadata).global_sequence_ids
         == metadata.global_sequence_ids
     )
-    assert (
-        ensure_prefix_cache_prepack_metadata(
-            metadata.prefill
-        ).global_sequence_ids
-        == metadata.global_sequence_ids
-    )
+    with pytest.raises(RuntimeError, match="global sequence ids"):
+        ensure_prefix_cache_prepack_metadata(metadata.prefill)

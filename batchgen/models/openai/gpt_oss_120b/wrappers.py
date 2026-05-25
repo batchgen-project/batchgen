@@ -1819,7 +1819,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 ], dim=-1)
 
         backend = GqaPrefixAwareAttentionBackend(
-            prefix_kv_builder=self.prefix_attention_kv_builder(),
+            layer_idx=self.layer_idx,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             sinks=self.sinks,

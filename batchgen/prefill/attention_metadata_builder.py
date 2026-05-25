@@ -10,7 +10,6 @@ from batchgen.attention.forward_metadata import (
     ForwardBatchMetadata,
     KVCacheMetadata,
     PrefillAttentionMetadata,
-    PrefixReuseMetadata,
 )
 from batchgen.batch_order import PrefillSequenceSpan
 from batchgen.prefill.prepack import PrepackMetadata
@@ -58,17 +57,15 @@ def build_prefill_forward_metadata(
     position_ids = position_ids.to(device=device)
     cu_seqlens_q = _build_cu_seqlens(q_seq_lens, device=device)
 
-    prefix_reuse_metadata = None
     if prefix_reuse_plan is None:
         kv_seq_lens = list(q_seq_lens)
     else:
-        prefix_reuse_metadata, kv_seq_lens = _build_prefix_reuse_metadata(
+        kv_seq_lens = _build_prefix_reuse_kv_seq_lens(
             plan=prefix_reuse_plan,
             seq_start=seq_start,
             seq_end=seq_end,
             q_seq_lens=q_seq_lens,
             global_sequence_ids=global_sequence_ids,
-            device=device,
         )
     cu_seqlens_k = _build_cu_seqlens(kv_seq_lens, device=device)
 
@@ -83,21 +80,19 @@ def build_prefill_forward_metadata(
             q_seq_lens=q_seq_lens,
             kv_seq_lens=kv_seq_lens,
             position_ids=position_ids,
-            prefix_reuse=prefix_reuse_metadata,
         ),
         kv_cache=kv_cache_metadata,
     )
 
 
-def _build_prefix_reuse_metadata(
+def _build_prefix_reuse_kv_seq_lens(
     *,
     plan: PrefixReusePrefillPlan,
     seq_start: int,
     seq_end: int,
     q_seq_lens: Sequence[int],
     global_sequence_ids: Sequence[int],
-    device: torch.device,
-) -> tuple[PrefixReuseMetadata, list[int]]:
+) -> list[int]:
     sequence_plans = plan.sequences[seq_start:seq_end]
     if len(sequence_plans) != len(q_seq_lens):
         raise ValueError(
@@ -105,16 +100,12 @@ def _build_prefix_reuse_metadata(
             f"{len(sequence_plans)} != {len(q_seq_lens)}"
         )
 
-    prefix_lens: list[int] = []
     suffix_lens: list[int] = []
-    full_seq_lens: list[int] = []
-    is_full_hit: list[bool] = []
+    kv_seq_lens: list[int] = []
     plan_sequence_ids: list[int] = []
     for item in sequence_plans:
-        prefix_lens.append(int(item.prefix_shared_tokens))
         suffix_lens.append(int(item.suffix_length))
-        full_seq_lens.append(int(item.full_logical_context_length))
-        is_full_hit.append(bool(item.is_full_hit))
+        kv_seq_lens.append(int(item.full_logical_context_length))
         plan_sequence_ids.append(int(item.sequence_id))
 
     if suffix_lens != [int(length) for length in q_seq_lens]:
@@ -127,18 +118,7 @@ def _build_prefix_reuse_metadata(
             f"prefix reuse sequence ids do not match batch spans: "
             f"{plan_sequence_ids} != {list(global_sequence_ids)}"
         )
-
-    metadata = PrefixReuseMetadata(
-        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=device),
-        suffix_lens=torch.tensor(suffix_lens, dtype=torch.int32, device=device),
-        full_seq_lens=torch.tensor(
-            full_seq_lens, dtype=torch.int32, device=device
-        ),
-        saved_tokens=sum(prefix_lens),
-        is_full_hit=torch.tensor(is_full_hit, dtype=torch.bool, device=device),
-        global_sequence_ids=[int(seq_id) for seq_id in global_sequence_ids],
-    )
-    return metadata, full_seq_lens
+    return kv_seq_lens
 
 
 def _build_cu_seqlens(

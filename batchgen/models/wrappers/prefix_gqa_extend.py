@@ -1,4 +1,4 @@
-"""Common GQA prefix-cache replay helpers for attention wrappers."""
+"""Common GQA prefix-cache extend-prefill helpers for attention wrappers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
 
 
 @dataclass(frozen=True)
-class GqaReplaySpec:
+class GqaExtendSpec:
     """Static GQA dimensions and optional attention modifiers."""
 
     num_kv_heads: int
@@ -28,7 +28,7 @@ def run_prefix_gqa_prefill_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     metadata: PrefixCachePrepackMetadata,
-    spec: GqaReplaySpec,
+    spec: GqaExtendSpec,
 ) -> torch.Tensor:
     """Run GQA prefill attention with optional cached prefix K/V."""
     from batchgen.attention.forward_metadata_context import (
@@ -43,7 +43,7 @@ def run_prefix_gqa_prefill_attention(
         None if forward_metadata is None else forward_metadata.kv_cache
     )
     backend = GqaPrefixAwareAttentionBackend(
-        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
+        layer_idx=int(wrapper.layer_idx),
         num_kv_heads=spec.num_kv_heads,
         head_dim=spec.head_dim,
         sinks=spec.sinks,

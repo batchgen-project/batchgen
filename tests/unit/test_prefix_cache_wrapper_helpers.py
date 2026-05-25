@@ -84,11 +84,19 @@ def _install_torch_stub(monkeypatch):
         str(REPO_ROOT / "batchgen" / "models" / "wrappers")
     ]
     monkeypatch.setitem(sys.modules, "batchgen.models.wrappers", wrappers_stub)
+    kv_cache_stub = types.ModuleType("batchgen.kv_cache")
+    kv_cache_stub.__path__ = [str(REPO_ROOT / "batchgen" / "kv_cache")]
+    monkeypatch.setitem(sys.modules, "batchgen.kv_cache", kv_cache_stub)
 
 
 def _prefix_cache_module(monkeypatch):
     _install_torch_stub(monkeypatch)
     return importlib.import_module("batchgen.models.wrappers.prefix_cache")
+
+
+def _prefill_offload_module(monkeypatch):
+    _install_torch_stub(monkeypatch)
+    return importlib.import_module("batchgen.kv_cache.prefill_offload")
 
 
 class _Wrapper:
@@ -98,7 +106,6 @@ class _Wrapper:
     prepack_seq_lengths = [2, 3]
     cur_batch = [10, 20]
     prepack_prefix_reuse_mode = True
-    prepack_full_hit_mode = False
     prepack_prefix_shared_tokens = [7, 11]
     prepack_full_seq_lengths = [9, 14]
 
@@ -113,11 +120,12 @@ def test_prefix_cache_metadata_validates_prefix_lengths(monkeypatch):
 
 
 def test_prefix_offloader_uses_destination_offsets(monkeypatch):
-    mod = _prefix_cache_module(monkeypatch)
-    metadata = mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
+    prefix_mod = _prefix_cache_module(monkeypatch)
+    offload_mod = _prefill_offload_module(monkeypatch)
+    metadata = prefix_mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
     worker_view = _FakeWorkerView()
     tracked = []
-    offloader = mod.PrefixAwarePrefillOffloader(
+    offloader = offload_mod.PrefillHostKVOffloader(
         worker_view=worker_view,
         layer_idx=3,
         metadata=metadata,
@@ -136,9 +144,10 @@ def test_prefix_offloader_uses_destination_offsets(monkeypatch):
 
 
 def test_prefix_offloader_rejects_missing_offset_api(monkeypatch):
-    mod = _prefix_cache_module(monkeypatch)
-    metadata = mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
-    offloader = mod.PrefixAwarePrefillOffloader(
+    prefix_mod = _prefix_cache_module(monkeypatch)
+    offload_mod = _prefill_offload_module(monkeypatch)
+    metadata = prefix_mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
+    offloader = offload_mod.PrefillHostKVOffloader(
         worker_view=_NoOffsetWorkerView(),
         layer_idx=0,
         metadata=metadata,

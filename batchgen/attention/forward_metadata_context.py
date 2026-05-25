@@ -36,7 +36,6 @@ _LEGACY_ATTENTION_FIELDS = (
     "prepack_prefix_reuse_mode",
     "prepack_prefix_shared_tokens",
     "prepack_full_seq_lengths",
-    "prepack_full_hit_mode",
     "cache_seqlens",
     "max_seqlen",
     "gpu_paged_kv_manager",
@@ -116,13 +115,6 @@ def _sync_prefill_fields(
     wrapper_cls.cache_seqlens = None
     wrapper_cls.max_seqlen = None
 
-    if prefill.prefix_reuse is None:
-        wrapper_cls.prepack_prefix_reuse_mode = False
-        wrapper_cls.prepack_prefix_shared_tokens = None
-        wrapper_cls.prepack_full_seq_lengths = None
-        wrapper_cls.prepack_full_hit_mode = False
-        return
-
     _sync_prefix_reuse_fields(wrapper_cls, prefill)
 
 
@@ -134,13 +126,20 @@ def _sync_prefix_reuse_fields(
         int(kv_len) - int(q_len)
         for q_len, kv_len in zip(prefill.q_seq_lens, prefill.kv_seq_lens)
     ]
+    if any(length < 0 for length in prefix_lens):
+        raise ValueError(
+            "prefill kv sequence lengths must be >= query sequence lengths"
+        )
+    if not any(length > 0 for length in prefix_lens):
+        wrapper_cls.prepack_prefix_reuse_mode = False
+        wrapper_cls.prepack_prefix_shared_tokens = None
+        wrapper_cls.prepack_full_seq_lengths = None
+        return
+
     full_seq_lens = [int(length) for length in prefill.kv_seq_lens]
-    wrapper_cls.prepack_prefix_reuse_mode = any(
-        length > 0 for length in prefix_lens
-    )
+    wrapper_cls.prepack_prefix_reuse_mode = True
     wrapper_cls.prepack_prefix_shared_tokens = prefix_lens
     wrapper_cls.prepack_full_seq_lengths = full_seq_lens
-    wrapper_cls.prepack_full_hit_mode = False
 
 
 def _sync_decode_fields(
@@ -155,7 +154,6 @@ def _sync_decode_fields(
     wrapper_cls.prepack_prefix_reuse_mode = False
     wrapper_cls.prepack_prefix_shared_tokens = None
     wrapper_cls.prepack_full_seq_lengths = None
-    wrapper_cls.prepack_full_hit_mode = False
     wrapper_cls.cache_seqlens = decode.cache_seqlens
     wrapper_cls.max_seqlen = int(decode.max_seqlen)
 

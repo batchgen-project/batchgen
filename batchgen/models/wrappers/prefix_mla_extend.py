@@ -1,4 +1,4 @@
-"""Common MLA prefix-cache replay helpers for attention wrappers."""
+"""Common MLA prefix-cache extend-prefill helpers for attention wrappers."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from batchgen.models.wrappers.prefix_cache import (
 
 
 @dataclass(frozen=True)
-class MlaReplaySpec:
-    """Static MLA dimensions needed by the prefix replay kernel path."""
+class MlaExtendSpec:
+    """Static MLA dimensions needed by the prefix extend-prefill path."""
 
     kv_dim: int
     num_heads: int
@@ -36,7 +36,7 @@ def run_prefix_mla_suffix_prefill(
     hidden_states_2d: torch.Tensor,
     position_ids: torch.Tensor,
     metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
+    spec: MlaExtendSpec,
     project_suffix_query_and_kv: ProjectSuffixMlaFn,
     output_projection: OutputProjectMlaFn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,7 +46,7 @@ def run_prefix_mla_suffix_prefill(
         metadata.prefix_shared_tokens is None
         or metadata.full_seq_lengths is None
     ):
-        raise RuntimeError("MLA prefix replay requires prefix metadata")
+        raise RuntimeError("MLA prefix extend requires prefix metadata")
 
     query_states, offload_kv = project_suffix_query_and_kv(
         hidden_states_2d,
@@ -69,7 +69,7 @@ def run_prefix_mla_suffix_prefill_with_projected(
     query_states: torch.Tensor,
     offload_kv: torch.Tensor,
     metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
+    spec: MlaExtendSpec,
     output_projection: OutputProjectMlaFn,
     prefill_prefix_materialization: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -81,7 +81,7 @@ def run_prefix_mla_suffix_prefill_with_projected(
             "MLA prefix-cache suffix prefill requires GPU paged materialization"
         )
     attn_out = run_projected_mla_prefix_attention_from_gpu_pages(
-        prefix_kv_builder=wrapper.prefix_attention_kv_builder(),
+        layer_idx=int(wrapper.layer_idx),
         query_states=query_states,
         offload_kv=offload_kv,
         metadata=metadata,
@@ -93,11 +93,11 @@ def run_prefix_mla_suffix_prefill_with_projected(
 
 def run_projected_mla_prefix_attention(
     *,
-    prefix_kv_builder: object,
+    layer_idx: int,
     query_states: torch.Tensor,
     offload_kv: torch.Tensor | None,
     metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
+    spec: MlaExtendSpec,
     page_size: int,
     attention_fn: PrefixMlaAttentionFn | None = None,
     prefill_prefix_materialization: object | None = None,
@@ -111,7 +111,7 @@ def run_projected_mla_prefix_attention(
             "MLA prefix attention requires GPU paged materialization"
         )
     return run_projected_mla_prefix_attention_from_gpu_pages(
-        prefix_kv_builder=prefix_kv_builder,
+        layer_idx=layer_idx,
         query_states=query_states,
         offload_kv=offload_kv,
         metadata=metadata,
@@ -123,11 +123,11 @@ def run_projected_mla_prefix_attention(
 
 def run_projected_mla_prefix_attention_from_gpu_pages(
     *,
-    prefix_kv_builder: object,
+    layer_idx: int,
     query_states: torch.Tensor,
     offload_kv: torch.Tensor | None,
     metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
+    spec: MlaExtendSpec,
     materialization: object,
     attention_fn: PrefixMlaAttentionFn | None = None,
 ) -> torch.Tensor:
@@ -140,20 +140,15 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
             "MLA GPU prefix materialization requires K-only compressed KV pages"
         )
 
-    layer_idx = int(prefix_kv_builder.reader.layer_idx)
+    layer_idx = int(layer_idx)
     materialization.wait_for_layer(layer_idx)
 
-    if metadata.full_hit_mode:
-        raise RuntimeError(
-            "Legacy MLA full-hit prefix mode is not supported; planner must "
-            "emit a one-token extend prefill row"
-        )
     if not metadata.prefix_reuse_mode:
         raise RuntimeError(
             "MLA GPU prefix materialization requires prefix reuse"
         )
     if offload_kv is None:
-        raise RuntimeError("MLA GPU prefix replay requires suffix KV")
+        raise RuntimeError("MLA GPU prefix extend requires suffix KV")
     manager.append_layer_prefill_suffix_tokens(
         k_tensor=offload_kv,
         v_tensor=None,
@@ -195,7 +190,7 @@ def _run_flashinfer_mla_prefix_attention(
     cache_seqlens: torch.Tensor,
     slot_indices: torch.Tensor,
     metadata: PrefixCachePrepackMetadata,
-    spec: MlaReplaySpec,
+    spec: MlaExtendSpec,
 ) -> torch.Tensor:
     """Run FlashInfer MLA paged attention against materialized prefix pages."""
     from batchgen.attention.mla.flashinfer_extend import (

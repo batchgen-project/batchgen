@@ -116,6 +116,16 @@ def _prefix_plan(
     )
 
 
+def _prefix_lens(metadata) -> list[int]:
+    return [
+        int(kv_len) - int(q_len)
+        for q_len, kv_len in zip(
+            metadata.prefill.q_seq_lens,
+            metadata.prefill.kv_seq_lens,
+        )
+    ]
+
+
 def test_build_prefill_forward_metadata_without_prefix_reuse():
     prepack = prepack_sequences(
         [
@@ -144,7 +154,7 @@ def test_build_prefill_forward_metadata_without_prefix_reuse():
     assert metadata.prefill.kv_seq_lens == [3, 2]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 3, 5]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 3, 5]
-    assert metadata.prefill.prefix_reuse is None
+    assert _prefix_lens(metadata) == [0, 0]
 
 
 def test_build_prefill_forward_metadata_with_prefix_reuse_slice():
@@ -165,16 +175,11 @@ def test_build_prefill_forward_metadata_with_prefix_reuse_slice():
         prefix_reuse_plan=plan,
     )
 
-    prefix_reuse = metadata.prefill.prefix_reuse
     assert metadata.prefill.q_seq_lens == [2, 1]
     assert metadata.prefill.kv_seq_lens == [5, 1]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 5, 6]
-    assert prefix_reuse.prefix_lens.tolist() == [3, 0]
-    assert prefix_reuse.suffix_lens.tolist() == [2, 1]
-    assert prefix_reuse.full_seq_lens.tolist() == [5, 1]
-    assert prefix_reuse.saved_tokens == 3
-    assert prefix_reuse.is_full_hit.tolist() == [False, False]
+    assert _prefix_lens(metadata) == [3, 0]
 
 
 def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
@@ -196,14 +201,11 @@ def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
         prefix_reuse_plan=plan,
     )
 
-    prefix_reuse = metadata.prefill.prefix_reuse
     assert metadata.prefill.q_seq_lens == [2, 1, 1]
     assert metadata.prefill.kv_seq_lens == [5, 1, 4]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3, 4]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 5, 6, 10]
-    assert prefix_reuse.prefix_lens.tolist() == [3, 0, 3]
-    assert prefix_reuse.suffix_lens.tolist() == [2, 1, 1]
-    assert prefix_reuse.is_full_hit.tolist() == [False, False, True]
+    assert _prefix_lens(metadata) == [3, 0, 3]
 
 
 def test_build_prefill_forward_metadata_one_token_full_hit_is_plain_query():
@@ -225,16 +227,11 @@ def test_build_prefill_forward_metadata_one_token_full_hit_is_plain_query():
         prefix_reuse_plan=plan,
     )
 
-    prefix_reuse = metadata.prefill.prefix_reuse
     assert metadata.prefill.q_seq_lens == [1]
     assert metadata.prefill.kv_seq_lens == [1]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 1]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 1]
-    assert prefix_reuse.prefix_lens.tolist() == [0]
-    assert prefix_reuse.suffix_lens.tolist() == [1]
-    assert prefix_reuse.full_seq_lens.tolist() == [1]
-    assert prefix_reuse.saved_tokens == 0
-    assert prefix_reuse.is_full_hit.tolist() == [True]
+    assert _prefix_lens(metadata) == [0]
 
 
 def test_build_prefill_forward_metadata_rejects_suffix_length_mismatch():
