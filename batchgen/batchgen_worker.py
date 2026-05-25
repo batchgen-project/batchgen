@@ -508,11 +508,14 @@ class BatchGenWorker:
 
 		# CUDA graph state
 		self._cuda_graph_manager = None
-		# Phase B: cuda-graph adapter (cached from initializer.get_cuda_graph_adapter())
+		# Phase C: cuda-graph adapter (cached from initializer.get_cuda_graph_adapter())
+		# becomes the default and only decode-graph path. When an adapter is
+		# present it owns eligibility / replay-inputs / KV staging; the legacy
+		# `_glm5_*` whole-model code path is unreachable for models that ship
+		# an adapter. Phase B's BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL env gate is
+		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
-		self._cuda_graph_adapter_dual = (
-			os.environ.get("BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL", "0") == "1"
-		)
+		self._cuda_graph_adapter_dual = True
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
