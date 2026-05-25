@@ -9071,6 +9071,7 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
+	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
 		debug = dict(old_debug) if isinstance(old_debug, dict) else {}
