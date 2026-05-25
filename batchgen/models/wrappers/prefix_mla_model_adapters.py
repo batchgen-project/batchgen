@@ -15,7 +15,6 @@ import torch
 
 from batchgen.attention.mla.prefix_absorb import (
     build_absorbed_mla_query_states,
-    build_full_hit_absorbed_mla_query_states,
     prefix_rotary_seq_len,
     project_absorbed_mla_output,
     project_absorbed_mla_output_w8a16,
@@ -29,7 +28,6 @@ from .prefix_cache import (
 )
 from .prefix_mla_replay import (
     MlaReplaySpec,
-    run_prefix_mla_full_hit_prefill_with_query,
     run_prefix_mla_suffix_prefill_with_projected,
 )
 
@@ -45,17 +43,12 @@ class MlaPrefixBackendContext:
     metadata: PrefixCachePrepackMetadata
     spec: MlaReplaySpec
     suffix_query_builder: ProjectedQueryBuilder
-    full_hit_query_builder: ProjectedQueryBuilder
     output_projection: OutputProjector
     prefill_prefix_materialization: object | None = None
 
     @property
     def prefix_reuse_mode(self) -> bool:
         return self.metadata.prefix_reuse_mode
-
-    @property
-    def full_hit_mode(self) -> bool:
-        return self.metadata.full_hit_mode
 
     def rotary_seq_len(
         self,
@@ -80,16 +73,6 @@ class MlaPrefixBackendContext:
             wrapper=self.wrapper,
             query_states=self.suffix_query_builder(projection),
             offload_kv=offload_kv,
-            metadata=self.metadata,
-            spec=self.spec,
-            output_projection=self.output_projection,
-            prefill_prefix_materialization=self.prefill_prefix_materialization,
-        )
-
-    def run_full_hit_prefill(self, projection: object) -> torch.Tensor:
-        return run_prefix_mla_full_hit_prefill_with_query(
-            wrapper=self.wrapper,
-            query_states=self.full_hit_query_builder(projection),
             metadata=self.metadata,
             spec=self.spec,
             output_projection=self.output_projection,
@@ -141,14 +124,6 @@ def build_kimi_prefix_backend_context(
             q_pe=projection.q_pe,
             dtype=projection.offload_kv.dtype,
             q_absorb=_kimi_q_absorb_weights(wrapper),
-        ),
-        full_hit_query_builder=lambda projection: (
-            build_full_hit_absorbed_mla_query_states(
-                q_nope=projection.q_nope,
-                q_pe=projection.q_pe,
-                dtype=projection.q_pe.dtype,
-                q_absorb=_kimi_q_absorb_weights(wrapper),
-            )
         ),
         output_projection=lambda attn_out: project_absorbed_mla_output(
             attn_out=attn_out,
@@ -212,18 +187,6 @@ def _build_w8a16_prefix_backend_context(
                 model_label=model_label,
                 use_cached_absorb=use_cached_absorb,
             ),
-        ),
-        full_hit_query_builder=lambda projection: (
-            build_full_hit_absorbed_mla_query_states(
-                q_nope=projection.q_nope,
-                q_pe=projection.q_pe,
-                dtype=projection.q_pe.dtype,
-                q_absorb=_w8a16_q_absorb_weights(
-                    wrapper,
-                    model_label=model_label,
-                    use_cached_absorb=use_cached_absorb,
-                ),
-            )
         ),
         output_projection=lambda attn_out: _project_w8a16_absorbed_output(
             wrapper=wrapper,

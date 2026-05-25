@@ -274,7 +274,7 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
             prefix_context = None
-            if metadata.full_hit_mode or metadata.prefix_reuse_mode:
+            if metadata.prefix_reuse_mode:
                 prefix_context = build_deepseek_prefix_backend_context(
                     wrapper=self,
                     metadata=metadata,
@@ -289,9 +289,6 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
                 self.weight_dequant_scale,
                 prefix_context=prefix_context,
             )
-            if metadata.full_hit_mode:
-                return (attn_output.unsqueeze(0), None, None)
-
             # Offload KV cache per-sequence to host
             # offload_kv is [total_tokens, kv_lora_rank + qk_rope_head_dim]
             if offload_kv is None:

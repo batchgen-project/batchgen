@@ -401,7 +401,7 @@ class KimiK25AttnWrapper(AttnWrapperBase):
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
             prefix_context = None
-            if metadata.full_hit_mode or metadata.prefix_reuse_mode:
+            if metadata.prefix_reuse_mode:
                 prefix_context = build_kimi_prefix_backend_context(
                     wrapper=self,
                     metadata=metadata,
@@ -415,9 +415,6 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 metadata.num_sequences,
                 prefix_context=prefix_context,
             )
-            if metadata.full_hit_mode:
-                return (attn_output.unsqueeze(0), None, None)
-
             # Offload KV cache per-sequence to host
             if offload_kv is None:
                 raise RuntimeError("Kimi prepacked prefill returned no KV")

@@ -59,7 +59,6 @@ def test_mla_model_adapters_accept_explicit_prefill_metadata():
 
     for context in contexts:
         assert context.prefix_reuse_mode is True
-        assert context.full_hit_mode is False
         assert context.metadata.global_sequence_ids == [100]
         assert context.metadata.prefix_shared_tokens == [3]
         assert context.metadata.full_seq_lengths == [5]

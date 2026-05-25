@@ -716,30 +716,6 @@ def _apply_prepacked_mla_rope(
 	return q_pe, k_pe
 
 
-def project_bf16_mla_query_prepacked(
-	self,
-	hidden_states: torch.Tensor,
-	position_ids: torch.Tensor,
-	rotary_seq_len: int,
-) -> MlaPrepackProjection:
-	"""Project prepacked MLA query tensors using the module's BF16 linears."""
-	total_tokens = hidden_states.shape[0]
-	query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
-	q_nope, q_pe = torch.split(
-		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-	)
-	q_pe, _ = _apply_prepacked_mla_rope(
-		self,
-		q_pe,
-		None,
-		position_ids,
-		rotary_seq_len,
-		interleaved=False,
-	)
-	return MlaPrepackProjection(q_nope=q_nope, q_pe=q_pe)
-
-
 def project_bf16_mla_q_and_compressed_kv_prepacked(
 	self,
 	hidden_states: torch.Tensor,
@@ -781,45 +757,6 @@ def project_bf16_mla_q_and_compressed_kv_prepacked(
 		k_pe=k_pe,
 		offload_kv=offload_kv,
 	)
-
-
-def project_w8a16_mla_query_prepacked(
-	self,
-	hidden_states: torch.Tensor,
-	position_ids: torch.Tensor,
-	rotary_seq_len: int,
-	weight_scale: dict,
-	gemm: Optional[
-		Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-	] = None,
-) -> MlaPrepackProjection:
-	"""Project prepacked MLA query tensors using the default W8A16 GEMM path."""
-	gemm = select_w8a16_gemm() if gemm is None else gemm
-	total_tokens = hidden_states.shape[0]
-	query_states = gemm(
-		self.q_a_proj.weight.data,
-		weight_scale["q_a_proj.weight_scale_inv"],
-		hidden_states,
-	)
-	query_states = self.q_a_layernorm(query_states)
-	query_states = gemm(
-		self.q_b_proj.weight.data,
-		weight_scale["q_b_proj.weight_scale_inv"],
-		query_states,
-	)
-	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
-	q_nope, q_pe = torch.split(
-		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-	)
-	q_pe, _ = _apply_prepacked_mla_rope(
-		self,
-		q_pe,
-		None,
-		position_ids,
-		rotary_seq_len,
-		interleaved=True,
-	)
-	return MlaPrepackProjection(q_nope=q_nope, q_pe=q_pe)
 
 
 def project_w8a16_mla_q_and_compressed_kv_prepacked(
@@ -1289,14 +1226,6 @@ def mla_prefill_flashattention3_prepacked(
 	rotary_seq_len = max_seqlen
 	if prefix_context is not None:
 		rotary_seq_len = prefix_context.rotary_seq_len(position_ids, max_seqlen)
-		if prefix_context.full_hit_mode:
-			projection = project_bf16_mla_query_prepacked(
-				self,
-				hidden_states,
-				position_ids,
-				rotary_seq_len,
-			)
-			return prefix_context.run_full_hit_prefill(projection), None
 
 	projection = project_bf16_mla_q_and_compressed_kv_prepacked(
 		self,
@@ -1398,16 +1327,6 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	rotary_seq_len = max_seqlen
 	if prefix_context is not None:
 		rotary_seq_len = prefix_context.rotary_seq_len(position_ids, max_seqlen)
-		if prefix_context.full_hit_mode:
-			projection = project_w8a16_mla_query_prepacked(
-				self,
-				hidden_states,
-				position_ids,
-				rotary_seq_len,
-				weight_scale,
-				gemm=_gemm,
-			)
-			return prefix_context.run_full_hit_prefill(projection), None
 	projection = project_w8a16_mla_q_and_compressed_kv_prepacked(
 		self,
 		hidden_states,

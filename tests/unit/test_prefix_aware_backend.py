@@ -27,7 +27,6 @@ from batchgen.models.wrappers.prefix_gqa_replay import (
 class _FakePrefixKvBuilder:
     def __init__(self):
         self.prefix_calls = []
-        self.full_hit_calls = []
         self.reader = SimpleNamespace(layer_idx=2)
 
     def build_gqa_prefix_kv(self, **kwargs):
@@ -35,12 +34,6 @@ class _FakePrefixKvBuilder:
         key = torch.full((5, 1, 2), 2.0)
         value = torch.full((5, 1, 2), 3.0)
         return key, value, torch.tensor([0, 5], dtype=torch.int32), 5
-
-    def build_gqa_full_hit_kv(self, **kwargs):
-        self.full_hit_calls.append(kwargs)
-        key = torch.full((4, 1, 2), 4.0)
-        value = torch.full((4, 1, 2), 5.0)
-        return key, value, torch.tensor([0, 4], dtype=torch.int32), 4
 
     def build_mla_prefix_kv(self, **kwargs):
         self.prefix_calls.append(kwargs)
@@ -80,23 +73,18 @@ def _metadata(
     )
 
 
-def _full_hit_metadata(
-    *,
-    full_lengths: list[int],
-) -> PrefixCachePrepackMetadata:
-    batch_size = len(full_lengths)
-    cu_seqlens = torch.arange(0, batch_size + 1, dtype=torch.int32)
+def _clamped_full_hit_metadata() -> PrefixCachePrepackMetadata:
     return PrefixCachePrepackMetadata(
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=[int(value) for value in cu_seqlens.tolist()],
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        cu_seqlens_cpu=[0, 1],
         max_seqlen=1,
-        num_sequences=batch_size,
-        seq_lengths=[1] * batch_size,
-        global_sequence_ids=list(range(100, 100 + batch_size)),
-        prefix_reuse_mode=False,
-        full_hit_mode=True,
-        prefix_shared_tokens=list(full_lengths),
-        full_seq_lengths=list(full_lengths),
+        num_sequences=1,
+        seq_lengths=[1],
+        global_sequence_ids=[100],
+        prefix_reuse_mode=True,
+        full_hit_mode=False,
+        prefix_shared_tokens=[4],
+        full_seq_lengths=[5],
     )
 
 
@@ -155,7 +143,7 @@ def test_gqa_backend_prefix_reuse_requires_gpu_materialization():
         )
 
 
-def test_gqa_backend_full_hit_requires_gpu_materialization():
+def test_gqa_backend_legacy_full_hit_rejected():
     builder = _FakePrefixKvBuilder()
     backend = GqaPrefixAwareAttentionBackend(
         prefix_kv_builder=builder,
@@ -163,7 +151,7 @@ def test_gqa_backend_full_hit_requires_gpu_materialization():
         head_dim=2,
     )
 
-    with pytest.raises(RuntimeError, match="GPU paged materialization"):
+    with pytest.raises(RuntimeError, match="Legacy GQA full-hit"):
         backend.forward_prefill(
             query=torch.zeros((1, 2, 2)),
             key=torch.ones((1, 1, 2)),
@@ -176,6 +164,7 @@ class _FakeGqaMaterializedManager:
     def __init__(self):
         self.k_cache = torch.zeros((4, 4, 1, 2))
         self.v_cache = torch.ones((4, 4, 1, 2))
+        self.append_calls = []
         self.page_table = torch.tensor(
             [
                 [0, 1],
@@ -188,12 +177,16 @@ class _FakeGqaMaterializedManager:
         assert layer_idx == 2
         return self.k_cache, self.v_cache, self.page_table
 
+    def append_layer_prefill_suffix_tokens(self, **kwargs):
+        self.append_calls.append(kwargs)
+
 
 class _FakeGqaMaterialization:
     def __init__(self):
         self.manager = _FakeGqaMaterializedManager()
         self.append_plan = SimpleNamespace(
-            slot_values=torch.tensor([1, 0], dtype=torch.int32),
+            slot_values=torch.tensor([0], dtype=torch.int32),
+            cache_seqlens=torch.tensor([5], dtype=torch.int32),
         )
         self.waited_layers = []
 
@@ -201,16 +194,16 @@ class _FakeGqaMaterialization:
         self.waited_layers.append(int(layer_idx))
 
 
-def test_gqa_backend_full_hit_uses_single_batched_decode(monkeypatch):
+def test_gqa_backend_clamped_full_hit_uses_extend_prefill(monkeypatch):
     recorded = {}
 
     import batchgen.attention.gqa as gqa
 
-    def fake_decode(**kwargs):
+    def fake_extend(**kwargs):
         recorded.update(kwargs)
         return kwargs["q"] + 10, None
 
-    monkeypatch.setattr(gqa, "gqa_decode_fa", fake_decode)
+    monkeypatch.setattr(gqa, "gqa_extend_fa", fake_extend)
 
     materialization = _FakeGqaMaterialization()
     backend = GqaPrefixAwareAttentionBackend(
@@ -218,13 +211,15 @@ def test_gqa_backend_full_hit_uses_single_batched_decode(monkeypatch):
         num_kv_heads=1,
         head_dim=2,
     )
-    query = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+    query = torch.arange(4, dtype=torch.float32).reshape(1, 2, 2)
+    key = torch.ones((1, 1, 2))
+    value = key + 1
 
     output = backend.forward_prefill(
         query=query,
-        key=torch.empty((0, 1, 2)),
-        value=torch.empty((0, 1, 2)),
-        metadata=_full_hit_metadata(full_lengths=[5, 7]),
+        key=key,
+        value=value,
+        metadata=_clamped_full_hit_metadata(),
         kv_cache_metadata=SimpleNamespace(
             prefill_prefix_materialization=materialization
         ),
@@ -232,11 +227,12 @@ def test_gqa_backend_full_hit_uses_single_batched_decode(monkeypatch):
 
     torch.testing.assert_close(output, query + 10)
     assert materialization.waited_layers == [2]
-    assert recorded["q"].shape == (2, 1, 2, 2)
+    assert materialization.manager.append_calls[0]["k_tensor"] is key
+    assert materialization.manager.append_calls[0]["v_tensor"] is value
+    assert recorded["q"] is query
     assert recorded["k_cache"] is materialization.manager.k_cache
     assert recorded["v_cache"] is materialization.manager.v_cache
-    assert recorded["cache_seqlens"].tolist() == [5, 7]
-    assert recorded["block_table"].tolist() == [[2, 3], [0, 1]]
+    assert recorded["cache_seqlens"].tolist() == [5]
 
 
 class _FakeGqaReplayWrapper:
@@ -432,21 +428,7 @@ def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(
     assert recorded["slot_indices"].tolist() == [0]
 
 
-def test_mla_backend_full_hit_uses_flashinfer_gpu_materialization(monkeypatch):
-    recorded = {}
-
-    from batchgen.attention.mla import flashinfer_extend
-
-    def flashinfer_fn(**kwargs):
-        recorded.update(kwargs)
-        return torch.full((1, 1, 2, 1), 4.0)
-
-    monkeypatch.setattr(
-        flashinfer_extend,
-        "run_flashinfer_mla_extend_prefill",
-        flashinfer_fn,
-    )
-
+def test_mla_backend_legacy_full_hit_rejected():
     materialization = _FakeMlaMaterialization()
     backend = MlaProjectedPrefixAwareAttentionBackend(
         prefix_kv_builder=_FakePrefixKvBuilder(),
@@ -457,20 +439,13 @@ def test_mla_backend_full_hit_uses_flashinfer_gpu_materialization(monkeypatch):
         softmax_scale=0.5,
     )
 
-    output = backend.forward_prefill(
-        query=torch.zeros((1, 1, 2, 3)),
-        key=None,
-        value=None,
-        metadata=_metadata(full_hit=True),
-        kv_cache_metadata=SimpleNamespace(
-            prefill_prefix_materialization=materialization
-        ),
-    )
-
-    torch.testing.assert_close(output, torch.full((1, 1, 2, 1), 4.0))
-    assert materialization.waited_layers == [2]
-    assert materialization.manager.append_calls == []
-    assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
-    assert recorded["page_table"] is materialization.manager.block_table
-    assert recorded["cache_seqlens"].tolist() == [5]
-    assert recorded["slot_indices"].tolist() == [0]
+    with pytest.raises(RuntimeError, match="Legacy MLA full-hit"):
+        backend.forward_prefill(
+            query=torch.zeros((1, 1, 2, 3)),
+            key=None,
+            value=None,
+            metadata=_metadata(full_hit=True),
+            kv_cache_metadata=SimpleNamespace(
+                prefill_prefix_materialization=materialization
+            ),
+        )

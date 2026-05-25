@@ -666,7 +666,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             metadata = self.prefix_cache_metadata()
             position_ids = self.position_ids.to(hidden_states_2d.device)
             prefix_context = None
-            if metadata.full_hit_mode or metadata.prefix_reuse_mode:
+            if metadata.prefix_reuse_mode:
                 prefix_context = build_glm5_prefix_backend_context(
                     wrapper=self,
                     metadata=metadata,
@@ -680,9 +680,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 self.weight_dequant_scale,
                 prefix_context=prefix_context,
             )
-            if metadata.full_hit_mode:
-                return (attn_output.unsqueeze(0), None, None)
-
             # DSA: compute indexer K and offload to auxiliary host cache.
             # This path MUST run for every prompt token during prefill — otherwise
             # aux cache is unpopulated and any later decode past 2048 tokens reads

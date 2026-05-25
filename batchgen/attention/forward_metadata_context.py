@@ -140,9 +140,7 @@ def _sync_prefix_reuse_fields(
     )
     wrapper_cls.prepack_prefix_shared_tokens = prefix_lens
     wrapper_cls.prepack_full_seq_lengths = full_seq_lens
-    wrapper_cls.prepack_full_hit_mode = bool(prefill.q_seq_lens) and all(
-        int(length) == 0 for length in prefill.q_seq_lens
-    )
+    wrapper_cls.prepack_full_hit_mode = False
 
 
 def _sync_decode_fields(

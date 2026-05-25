@@ -5,7 +5,6 @@ import torch
 from batchgen.attention.mla.prefix_absorb import (
     absorb_mla_attention_output,
     build_absorbed_mla_query_states,
-    build_full_hit_absorbed_mla_query_states,
     prefix_rotary_seq_len,
     project_absorbed_mla_output,
     project_absorbed_mla_output_w8a16,
@@ -28,28 +27,6 @@ def test_build_absorbed_mla_query_states_matches_manual_einsum():
     expected[0, :, :, :4] = torch.einsum("thd,hdc->thc", q_nope, q_absorb)
     expected[0, :, :, 4:] = q_pe
     assert torch.equal(actual, expected.contiguous())
-
-
-def test_build_full_hit_absorbed_mla_query_states_uses_full_hit_layout():
-    q_nope = torch.arange(12, dtype=torch.float32).view(2, 2, 3)
-    q_pe = torch.arange(8, dtype=torch.float32).view(2, 2, 2)
-    q_absorb = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
-
-    actual = build_full_hit_absorbed_mla_query_states(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        q_absorb=q_absorb,
-        dtype=torch.float32,
-    )
-
-    suffix_layout = build_absorbed_mla_query_states(
-        q_nope=q_nope,
-        q_pe=q_pe,
-        q_absorb=q_absorb,
-        dtype=torch.float32,
-    )
-    expected = suffix_layout.view(2, 1, 2, 6).contiguous()
-    assert torch.equal(actual, expected)
 
 
 def test_project_absorbed_mla_output_uses_common_absorb_layout():

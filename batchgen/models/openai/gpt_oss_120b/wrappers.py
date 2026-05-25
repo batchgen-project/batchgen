@@ -1699,10 +1699,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
         num_sequences = metadata.num_sequences
         seq_lengths = metadata.seq_lengths
         prefix_reuse_mode = metadata.prefix_reuse_mode
-        full_hit_mode = metadata.full_hit_mode
         global_sequence_ids = metadata.global_sequence_ids
         full_seq_lengths = metadata.full_seq_lengths
-        if (prefix_reuse_mode or full_hit_mode) and full_seq_lengths:
+        if prefix_reuse_mode and full_seq_lengths:
             rotary_seq_len = max(max(int(length) for length in full_seq_lengths), int(max_seqlen))
         else:
             rotary_seq_len = int(max_seqlen)
@@ -1893,15 +1892,6 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     print(f"[PREFILL L0] *** WARNING: seq0 and seq1 have IDENTICAL K at position 0! ***")
                 else:
                     print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT K at position 0")
-
-        if full_hit_mode:
-            logging.debug(
-                f"[Layer {self.layer_idx}] GPT-OSS exact full-hit prefill "
-                f"used cached host KV for {num_sequences} sequences"
-            )
-            if input_was_3d:
-                attn_output = attn_output.unsqueeze(0)
-            return attn_output, None, None
 
         def _debug_offload_sequence(seq_idx, sequence_id, seq_len, seq_key, seq_value):
             del seq_value

@@ -85,9 +85,7 @@ class PrefixCachePrepackMetadata:
             prefix_reuse_mode = any(
                 tokens > 0 for tokens in prefix_shared_tokens
             )
-            full_hit_mode = bool(seq_lengths) and all(
-                int(length) == 0 for length in seq_lengths
-            )
+            full_hit_mode = False
 
         metadata = cls(
             cu_seqlens=prefill_metadata.cu_seqlens_q,
@@ -139,6 +137,11 @@ class PrefixCachePrepackMetadata:
         full_hit_mode = bool(
             getattr(wrapper_cls, "prepack_full_hit_mode", False)
         )
+        if full_hit_mode:
+            raise RuntimeError(
+                "Legacy full-hit prefix mode is no longer supported; "
+                "planner must clamp full hits to one-token extend prefill"
+            )
         prefix_shared_tokens = getattr(
             wrapper_cls, "prepack_prefix_shared_tokens", None
         )
@@ -186,7 +189,7 @@ class PrefixCachePrepackMetadata:
                 f"{len(cu_seqlens)} != {num_sequences + 1}"
             )
 
-        needs_prefix_metadata = prefix_reuse_mode or full_hit_mode
+        needs_prefix_metadata = prefix_reuse_mode
         if needs_prefix_metadata:
             if prefix_shared_tokens is None:
                 raise RuntimeError(
@@ -213,11 +216,7 @@ class PrefixCachePrepackMetadata:
             for idx, (query_len, prefix_tokens, full_length) in enumerate(
                 zip(seq_lengths, prefix_shared_tokens, full_seq_lengths)
             ):
-                expected_full_length = (
-                    int(prefix_tokens)
-                    if full_hit_mode
-                    else int(query_len) + int(prefix_tokens)
-                )
+                expected_full_length = int(query_len) + int(prefix_tokens)
                 if expected_full_length != int(full_length):
                     raise RuntimeError(
                         "Prefix cache full length mismatch at sequence "
@@ -449,43 +448,6 @@ class PrefixAttentionKvBuilder:
             max_seqlen_k,
         )
 
-    def build_gqa_full_hit_kv(
-        self,
-        *,
-        metadata: PrefixCachePrepackMetadata,
-        num_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("GQA full-hit KV build requires full lengths")
-
-        k_segments = []
-        v_segments = []
-        cu_k = [0]
-        max_seqlen_k = 0
-        for seq_idx, full_length in enumerate(metadata.full_seq_lengths):
-            prefix_k, prefix_v = self.reader.load_gqa_kv(
-                metadata.global_sequence_ids[seq_idx],
-                int(full_length),
-                num_heads=num_heads,
-                head_dim=head_dim,
-                dtype=dtype,
-                device=device,
-            )
-            k_segments.append(prefix_k)
-            v_segments.append(prefix_v)
-            cu_k.append(cu_k[-1] + int(full_length))
-            max_seqlen_k = max(max_seqlen_k, int(full_length))
-
-        return (
-            torch.cat(k_segments, dim=0),
-            torch.cat(v_segments, dim=0),
-            torch.tensor(cu_k, dtype=torch.int32, device=device),
-            max_seqlen_k,
-        )
-
     def build_mla_prefix_kv(
         self,
         *,
@@ -526,38 +488,6 @@ class PrefixAttentionKvBuilder:
             k_segments.append(seq_k)
             cu_k.append(cu_k[-1] + int(seq_k.shape[0]))
             max_seqlen_k = max(max_seqlen_k, int(seq_k.shape[0]))
-
-        return (
-            torch.cat(k_segments, dim=0),
-            torch.tensor(cu_k, dtype=torch.int32, device=device),
-            max_seqlen_k,
-        )
-
-    def build_mla_full_hit_kv(
-        self,
-        *,
-        metadata: PrefixCachePrepackMetadata,
-        kv_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        if metadata.full_seq_lengths is None:
-            raise RuntimeError("MLA full-hit KV build requires full lengths")
-
-        k_segments = []
-        cu_k = [0]
-        max_seqlen_k = 0
-        for seq_idx, full_length in enumerate(metadata.full_seq_lengths):
-            prefix_k = self.reader.load_mla_kv(
-                metadata.global_sequence_ids[seq_idx],
-                int(full_length),
-                kv_dim=kv_dim,
-                dtype=dtype,
-                device=device,
-            )
-            k_segments.append(prefix_k)
-            cu_k.append(cu_k[-1] + int(full_length))
-            max_seqlen_k = max(max_seqlen_k, int(full_length))
 
         return (
             torch.cat(k_segments, dim=0),

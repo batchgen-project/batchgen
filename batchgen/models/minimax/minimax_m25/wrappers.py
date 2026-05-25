@@ -442,7 +442,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         max_seqlen = metadata.max_seqlen
         position_ids = self.position_ids.to(hidden_states_2d.device)
         full_seq_lengths = metadata.full_seq_lengths
-        if (metadata.prefix_reuse_mode or metadata.full_hit_mode) and full_seq_lengths:
+        if metadata.prefix_reuse_mode and full_seq_lengths:
             rotary_seq_len = max(max(int(length) for length in full_seq_lengths), int(max_seqlen))
         else:
             rotary_seq_len = int(max_seqlen)
@@ -514,10 +514,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         if not self.persistent:
             torch.cuda.current_stream().synchronize()
             self.free_weights(self.module_key)
-
-        if metadata.full_hit_mode:
-            attn_output = attn_output.unsqueeze(0)
-            return (attn_output, None, None)
 
         # Offload KV cache to host
         torch.cuda.current_stream().synchronize()

@@ -141,7 +141,7 @@ def test_build_prefix_reuse_attention_kv_rejects_inconsistent_lengths():
         wrapper.prefix_cache_metadata()
 
 
-def test_build_full_hit_attention_kv_uses_cached_full_prompt():
+def test_build_full_hit_attention_kv_rejects_legacy_query_only_mode():
     prefix_k = torch.tensor(
         [
             [[1.0, 1.5]],
@@ -163,17 +163,5 @@ def test_build_full_hit_attention_kv_uses_cached_full_prompt():
     AttnWrapperBase.prepack_prefix_shared_tokens = [4]
     AttnWrapperBase.prepack_full_seq_lengths = [4]
 
-    key, value, cu_k, max_k = (
-        wrapper.prefix_attention_kv_builder().build_gqa_full_hit_kv(
-            metadata=wrapper.prefix_cache_metadata(),
-            num_heads=wrapper.num_kv_heads,
-            head_dim=wrapper.head_dim,
-            dtype=torch.bfloat16,
-            device=torch.device("cpu"),
-        )
-    )
-
-    torch.testing.assert_close(key, prefix_k)
-    torch.testing.assert_close(value, prefix_v)
-    assert cu_k.tolist() == [0, 4]
-    assert max_k == 4
+    with pytest.raises(RuntimeError, match="Legacy full-hit prefix mode"):
+        wrapper.prefix_cache_metadata()
