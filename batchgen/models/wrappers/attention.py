@@ -103,19 +103,24 @@ class AttnWrapperBase(BaseModuleWrapper):
         bsz: int,
         reason: str,
     ) -> None:
-        if not cls.glm5_dispatch_trace_enabled:
+        # Phase C: the underlying ClassVars (glm5_dispatch_trace_*) live on
+        # GLM5AttnWrapper, not AttnWrapperBase. Read through it directly so
+        # callers can keep calling AttnWrapperBase.record_glm5_dispatch(...).
+        # Lazy-import the subclass to avoid a circular import at module load.
+        from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper as _G
+        if not _G.glm5_dispatch_trace_enabled:
             return
-        counts = cls.glm5_dispatch_counts
+        counts = _G.glm5_dispatch_counts
         counter_key = f"{kind}_{path}"
         counts[counter_key] = counts.get(counter_key, 0) + 1
 
-        trace_id = cls.glm5_dispatch_trace_id or "unknown"
+        trace_id = _G.glm5_dispatch_trace_id or "unknown"
         seen_key = (trace_id, kind, path, int(bsz))
-        if seen_key in cls.glm5_dispatch_seen:
+        if seen_key in _G.glm5_dispatch_seen:
             return
-        cls.glm5_dispatch_seen.add(seen_key)
+        _G.glm5_dispatch_seen.add(seen_key)
 
-        context = cls.glm5_dispatch_trace_context or {}
+        context = _G.glm5_dispatch_trace_context or {}
         logging.warning(
             "[GLM5_DISPATCH_TRACE] rank=%s trace=%s kind=%s path=%s "
             "layer=%s bsz=%s batch_ids=%s global_ids=%s debug_dsa=%s "
