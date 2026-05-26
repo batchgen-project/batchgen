@@ -84,9 +84,23 @@ jobs:
       DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE0_MODEL_CACHE }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.pr_sha }}
+      - name: SSH clone PR HEAD
+        # HTTPS to github.com is flaky from H20 (TLS connections terminate
+        # mid-handshake). Port 22 is reliable. Runner host SSH key already
+        # auths to github; bypass actions/checkout to use it.
+        env:
+          PR_SHA: ${{ needs.resolve.outputs.pr_sha }}
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$GITHUB_WORKSPACE")"
+          rm -rf "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git init -q
+          git remote add origin "git@github.com:${{ github.repository }}.git"
+          git fetch --no-tags --prune --depth=1 origin "$PR_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
 
       - id: check_start
         name: Post in-progress check
@@ -131,9 +145,23 @@ jobs:
       DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE1_MODEL_CACHE }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.pr_sha }}
+      - name: SSH clone PR HEAD
+        # HTTPS to github.com is flaky from H20 (TLS connections terminate
+        # mid-handshake). Port 22 is reliable. Runner host SSH key already
+        # auths to github; bypass actions/checkout to use it.
+        env:
+          PR_SHA: ${{ needs.resolve.outputs.pr_sha }}
+        run: |
+          set -euo pipefail
+          cd "$(dirname "$GITHUB_WORKSPACE")"
+          rm -rf "$GITHUB_WORKSPACE"
+          mkdir -p "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
+          git init -q
+          git remote add origin "git@github.com:${{ github.repository }}.git"
+          git fetch --no-tags --prune --depth=1 origin "$PR_SHA"
+          git checkout -q FETCH_HEAD
+          git log -1 --oneline
 
       - name: Run GLM-5-FP8 regression (rank 1)
         run: bash .github/workflows/scripts/pr-gpu-smoke.sh --node-rank 1
