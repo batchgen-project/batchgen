@@ -87,26 +87,6 @@ jobs:
       REPO:    ${{ github.repository }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: SSH clone PR HEAD
-        # HTTPS to github.com is flaky from H20 (TLS connections terminate
-        # mid-handshake). Port 22 is reliable. The runner user (luzhan) has
-        # SSH keys to github.com already, so bypass actions/checkout and
-        # clone manually. Org policy disables deploy keys; relying on the
-        # existing host SSH config avoids needing a new key+secret.
-        env:
-          PR_SHA: ${{ needs.resolve.outputs.pr_sha }}
-        run: |
-          set -euo pipefail
-          cd "$(dirname "$GITHUB_WORKSPACE")"
-          rm -rf "$GITHUB_WORKSPACE"
-          mkdir -p "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          git init -q
-          git remote add origin "git@github.com:${{ github.repository }}.git"
-          git fetch --no-tags --prune --depth=1 origin "$PR_SHA"
-          git checkout -q FETCH_HEAD
-          git log -1 --oneline
-
       - id: check_start
         name: Post in-progress check
         if: needs.resolve.outputs.pr_sha != ''
@@ -120,8 +100,53 @@ jobs:
           echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
 
       - id: run
-        name: Build wheel inside batchgen image
-        run: bash .github/workflows/scripts/build.sh
+        name: Build wheel inside tairan's container
+        # The workflow has no actions/checkout — it relies on tairan's
+        # long-running container having working SSH-egress to github
+        # and a clone of this repo at $BATCHGEN_CI_WORKSPACE. We do
+        # `git fetch + git worktree add $PR_SHA` inside the container,
+        # then `pip wheel` against the worktree. All work is inside
+        # tairan's env (conda batchgen, pre-installed deps).
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source /opt/batchgen-ci/env.sh
+          WORKTREE="$(dirname "$BATCHGEN_CI_WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
+
+          cleanup() {
+              docker exec "$BATCHGEN_CI_CONTAINER" bash -lc "
+                  cd '$BATCHGEN_CI_WORKSPACE' 2>/dev/null && \
+                  git worktree remove --force '$WORKTREE' 2>/dev/null || true
+              " 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker exec \
+              -e PR_SHA="$PR_SHA" \
+              -e WORKTREE="$WORKTREE" \
+              -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
+              "$BATCHGEN_CI_CONTAINER" \
+              bash -lc '
+                  set -euo pipefail
+                  if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+                      source /root/miniconda3/etc/profile.d/conda.sh
+                      conda activate batchgen
+                  fi
+                  echo "python: $(which python) ($(python --version 2>&1))"
+
+                  cd "$WORKSPACE"
+                  echo "--- git fetch $PR_SHA ---"
+                  git fetch --no-tags origin "$PR_SHA"
+                  rm -rf "$WORKTREE"
+                  echo "--- git worktree add ---"
+                  git worktree add "$WORKTREE" "$PR_SHA"
+
+                  cd "$WORKTREE"
+                  git log -1 --oneline
+                  echo "--- pip wheel ---"
+                  BUILD_OPS=1 pip wheel . --no-deps --no-build-isolation -v -w dist/
+                  ls -la dist/
+              '
 
       - name: Finalize check
         if: always() && steps.check_start.outputs.check_id != ''

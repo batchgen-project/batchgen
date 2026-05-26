@@ -84,24 +84,6 @@ jobs:
       DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE0_MODEL_CACHE }}
     steps:
-      - name: SSH clone PR HEAD
-        # HTTPS to github.com is flaky from H20 (TLS connections terminate
-        # mid-handshake). Port 22 is reliable. Runner host SSH key already
-        # auths to github; bypass actions/checkout to use it.
-        env:
-          PR_SHA: ${{ needs.resolve.outputs.pr_sha }}
-        run: |
-          set -euo pipefail
-          cd "$(dirname "$GITHUB_WORKSPACE")"
-          rm -rf "$GITHUB_WORKSPACE"
-          mkdir -p "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          git init -q
-          git remote add origin "git@github.com:${{ github.repository }}.git"
-          git fetch --no-tags --prune --depth=1 origin "$PR_SHA"
-          git checkout -q FETCH_HEAD
-          git log -1 --oneline
-
       - id: check_start
         name: Post in-progress check
         run: |
@@ -115,7 +97,57 @@ jobs:
 
       - id: run
         name: Run GLM-5-FP8 regression (rank 0)
-        run: bash .github/workflows/scripts/pr-gpu-smoke.sh --node-rank 0
+        # No actions/checkout; tairan's container has the clone + working
+        # SSH to github. docker exec does git fetch + worktree add + runs
+        # the in-container script from inside the worktree.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source /opt/batchgen-ci/env.sh
+          WORKTREE="$(dirname "$BATCHGEN_CI_WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
+
+          NCCL_ARGS=()
+          for var in GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_NET \
+                     NCCL_OOB_NET_IFNAME NCCL_OOB_NET_ENABLE NCCL_IB_HCA; do
+              if [[ -n "${!var:-}" ]]; then
+                  NCCL_ARGS+=(-e "$var=${!var}")
+              fi
+          done
+
+          cleanup() {
+              docker exec "$BATCHGEN_CI_CONTAINER" bash -lc "
+                  cd '$BATCHGEN_CI_WORKSPACE' 2>/dev/null && \
+                  git worktree remove --force '$WORKTREE' 2>/dev/null || true
+              " 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker exec \
+              "${NCCL_ARGS[@]}" \
+              -e NODE_RANK=0 \
+              -e DIST_INIT_ADDR="$DIST_INIT_ADDR" \
+              -e PR_SHA="$PR_SHA" \
+              -e WORKTREE_PATH="$WORKTREE" \
+              -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
+              -e BATCHGEN_CI_GLM5_MODEL_DIR="$BATCHGEN_CI_GLM5_MODEL_DIR" \
+              -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
+              -e BATCHGEN_LONGBENCH_DIR="$BATCHGEN_CI_WORKSPACE/tests/e2e/r1_longbench_test/LongBench" \
+              -e BATCHGEN_MMLU_PRO_DIR="$BATCHGEN_CI_WORKSPACE/tests/e2e/r1_mmlu_pro_test" \
+              "$BATCHGEN_CI_CONTAINER" \
+              bash -lc '
+                  set -euo pipefail
+                  if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+                      source /root/miniconda3/etc/profile.d/conda.sh
+                      conda activate batchgen
+                  fi
+                  cd "$WORKSPACE"
+                  git fetch --no-tags origin "$PR_SHA"
+                  rm -rf "$WORKTREE_PATH"
+                  git worktree add "$WORKTREE_PATH" "$PR_SHA"
+                  cd "$WORKTREE_PATH"
+                  git log -1 --oneline
+                  bash .github/workflows/scripts/pr-gpu-smoke-incontainer.sh
+              '
 
       - name: Finalize check
         if: always() && steps.check_start.outputs.check_id != ''
@@ -145,23 +177,52 @@ jobs:
       DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
       MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE1_MODEL_CACHE }}
     steps:
-      - name: SSH clone PR HEAD
-        # HTTPS to github.com is flaky from H20 (TLS connections terminate
-        # mid-handshake). Port 22 is reliable. Runner host SSH key already
-        # auths to github; bypass actions/checkout to use it.
-        env:
-          PR_SHA: ${{ needs.resolve.outputs.pr_sha }}
+      - name: Run GLM-5-FP8 regression (rank 1)
+        # Same shape as test-node0: docker exec into tairan's container,
+        # git fetch + worktree, then invoke the in-container script.
         run: |
           set -euo pipefail
-          cd "$(dirname "$GITHUB_WORKSPACE")"
-          rm -rf "$GITHUB_WORKSPACE"
-          mkdir -p "$GITHUB_WORKSPACE"
-          cd "$GITHUB_WORKSPACE"
-          git init -q
-          git remote add origin "git@github.com:${{ github.repository }}.git"
-          git fetch --no-tags --prune --depth=1 origin "$PR_SHA"
-          git checkout -q FETCH_HEAD
-          git log -1 --oneline
+          # shellcheck disable=SC1091
+          source /opt/batchgen-ci/env.sh
+          WORKTREE="$(dirname "$BATCHGEN_CI_WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
 
-      - name: Run GLM-5-FP8 regression (rank 1)
-        run: bash .github/workflows/scripts/pr-gpu-smoke.sh --node-rank 1
+          NCCL_ARGS=()
+          for var in GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_NET \
+                     NCCL_OOB_NET_IFNAME NCCL_OOB_NET_ENABLE NCCL_IB_HCA; do
+              if [[ -n "${!var:-}" ]]; then
+                  NCCL_ARGS+=(-e "$var=${!var}")
+              fi
+          done
+
+          cleanup() {
+              docker exec "$BATCHGEN_CI_CONTAINER" bash -lc "
+                  cd '$BATCHGEN_CI_WORKSPACE' 2>/dev/null && \
+                  git worktree remove --force '$WORKTREE' 2>/dev/null || true
+              " 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          docker exec \
+              "${NCCL_ARGS[@]}" \
+              -e NODE_RANK=1 \
+              -e DIST_INIT_ADDR="$DIST_INIT_ADDR" \
+              -e PR_SHA="$PR_SHA" \
+              -e WORKTREE_PATH="$WORKTREE" \
+              -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
+              -e BATCHGEN_CI_GLM5_MODEL_DIR="$BATCHGEN_CI_GLM5_MODEL_DIR" \
+              -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
+              "$BATCHGEN_CI_CONTAINER" \
+              bash -lc '
+                  set -euo pipefail
+                  if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+                      source /root/miniconda3/etc/profile.d/conda.sh
+                      conda activate batchgen
+                  fi
+                  cd "$WORKSPACE"
+                  git fetch --no-tags origin "$PR_SHA"
+                  rm -rf "$WORKTREE_PATH"
+                  git worktree add "$WORKTREE_PATH" "$PR_SHA"
+                  cd "$WORKTREE_PATH"
+                  git log -1 --oneline
+                  bash .github/workflows/scripts/pr-gpu-smoke-incontainer.sh
+              '
