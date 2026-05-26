@@ -42,7 +42,10 @@ jobs:
           if [[ -n "${PR_HEAD_SHA:-}" ]]; then
             sha="$PR_HEAD_SHA"
           else
-            sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+            sha=$(curl -sS -f -H "Authorization: token $GH_TOKEN" \
+                       -H "Accept: application/vnd.github+json" \
+                       "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["head"]["sha"])')
           fi
           echo "pr_sha=$sha" >> "$GITHUB_OUTPUT"
 
@@ -52,11 +55,11 @@ jobs:
           PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
         run: |
           set -euo pipefail
-          check_id=$(gh api -X POST "repos/$REPO/check-runs" \
-            -f name='build' \
-            -f head_sha="$PR_SHA" \
-            -f status='in_progress' \
-            --jq '.id')
+          check_id=$(curl -sS -f -X POST -H "Authorization: token $GH_TOKEN" \
+                       -H "Accept: application/vnd.github+json" \
+                       -d "{\"name\":\"build\",\"head_sha\":\"$PR_SHA\",\"status\":\"in_progress\"}" \
+                       "https://api.github.com/repos/$REPO/check-runs" \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
           echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
 
       - id: run
@@ -114,6 +117,7 @@ jobs:
           if [[ "$RUN_OUTCOME" != "success" ]]; then
             conclusion="failure"
           fi
-          gh api -X PATCH "repos/$REPO/check-runs/$CHECK_ID" \
-            -f status='completed' \
-            -f conclusion="$conclusion"
+          curl -sS -f -X PATCH -H "Authorization: token $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               -d "{\"status\":\"completed\",\"conclusion\":\"$conclusion\"}" \
+               "https://api.github.com/repos/$REPO/check-runs/$CHECK_ID" >/dev/null
