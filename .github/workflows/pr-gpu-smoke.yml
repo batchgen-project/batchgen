@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: pr-gpu-regression-global
+  group: pr-gpu-regression-global-v2
   cancel-in-progress: true
 
 jobs:
