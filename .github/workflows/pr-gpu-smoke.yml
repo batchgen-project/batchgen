@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: pr-gpu-regression-global
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   resolve:
