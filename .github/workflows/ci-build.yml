@@ -1,4 +1,4 @@
-name: Build Test
+name: Build Test v2
 
 # Runs on H20 node0, so we treat it like gpu-regression: maintainers gate
 # it via `ci:run` label or `/test` comment. The nightly sweep

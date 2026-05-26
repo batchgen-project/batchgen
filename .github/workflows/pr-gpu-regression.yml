@@ -1,4 +1,4 @@
-name: PR GPU Regression
+name: PR GPU Regression v2
 
 on:
   pull_request:
