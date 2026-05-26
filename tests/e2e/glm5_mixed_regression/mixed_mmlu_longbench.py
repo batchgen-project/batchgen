@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
 import re
 import sys
@@ -33,10 +34,21 @@ from batchgen.batchgen_client import BatchGenHttpClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Dataset paths are env-var-driven so the same script works in CI (data
+# mounted from a runner-staged path outside the repo) and on dev machines
+# (where the parquets may still live under tests/e2e/). The parquets
+# themselves are NOT tracked in git — see .gitignore.
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MMLU_TEST_PARQUET = REPO_ROOT / "tests/e2e/r1_mmlu_pro_test/mmlu_pro_test.parquet"
-MMLU_VAL_PARQUET = REPO_ROOT / "tests/e2e/r1_mmlu_pro_test/mmlu_pro_validation.parquet"
-LONGBENCH_DIR = REPO_ROOT / "tests/e2e/r1_longbench_test/LongBench"
+MMLU_PRO_DIR = Path(os.environ.get(
+    "BATCHGEN_MMLU_PRO_DIR",
+    REPO_ROOT / "tests/e2e/r1_mmlu_pro_test",
+))
+LONGBENCH_DIR = Path(os.environ.get(
+    "BATCHGEN_LONGBENCH_DIR",
+    REPO_ROOT / "tests/e2e/r1_longbench_test/LongBench",
+))
+MMLU_TEST_PARQUET = MMLU_PRO_DIR / "mmlu_pro_test.parquet"
+MMLU_VAL_PARQUET = MMLU_PRO_DIR / "mmlu_pro_validation.parquet"
 
 GLM5_SYSTEM = (
     "You are an expert at answering multiple-choice questions. "

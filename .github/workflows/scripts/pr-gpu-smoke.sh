@@ -11,6 +11,7 @@
 #   BATCHGEN_CI_IMAGE             # docker image (matches release image)
 #   BATCHGEN_CI_SHM_SIZE          # e.g. 512g
 #   BATCHGEN_CI_GLM5_MODEL_CACHE  # host path with GLM-5-FP8 weights
+#   BATCHGEN_CI_DATASETS_DIR      # host path with longbench/ and mmlu_pro/ subdirs
 #   BATCHGEN_CI_MMLU_THRESHOLD    # accuracy floor in percent, e.g. 65.0; 0 disables
 #   GLOO_SOCKET_IFNAME / NCCL_*   # network config for distributed init
 set -euo pipefail
@@ -40,6 +41,7 @@ source "$ENV_FILE"
 : "${BATCHGEN_CI_IMAGE:?must be set in $ENV_FILE}"
 : "${BATCHGEN_CI_SHM_SIZE:=512g}"
 : "${BATCHGEN_CI_GLM5_MODEL_CACHE:?must be set in $ENV_FILE}"
+: "${BATCHGEN_CI_DATASETS_DIR:?must be set in $ENV_FILE — populated by huggingface-cli download}"
 : "${BATCHGEN_CI_MMLU_THRESHOLD:=0}"
 : "${DIST_INIT_ADDR:?must be passed via workflow secret}"
 
@@ -79,8 +81,12 @@ exec docker run --rm \
     -e NODE_RANK="$NODE_RANK" \
     -e DIST_INIT_ADDR="$DIST_INIT_ADDR" \
     -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
+    -e BATCHGEN_LONGBENCH_DIR=/datasets/longbench \
+    -e BATCHGEN_MMLU_PRO_DIR=/datasets/mmlu_pro \
     -v "$REPO_DIR":/workspace:rw \
     -v "$BATCHGEN_CI_GLM5_MODEL_CACHE":/models/glm5-fp8:ro \
+    -v "$BATCHGEN_CI_DATASETS_DIR/longbench":/datasets/longbench:ro \
+    -v "$BATCHGEN_CI_DATASETS_DIR/mmlu_pro":/datasets/mmlu_pro:ro \
     -w /workspace \
     "$BATCHGEN_CI_IMAGE" \
     bash /workspace/.github/workflows/scripts/pr-gpu-smoke-incontainer.sh
