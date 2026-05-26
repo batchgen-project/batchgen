@@ -1,92 +1,57 @@
-name: PR GPU Regression v2
+name: PR GPU Regression
 
+# Triggers:
+#   - PR labeled `ci:run` by a maintainer
+#   - workflow_dispatch from the Actions UI (manual rerun without re-labeling)
+# No issue_comment, no resolve fan-out, no concurrency group.
 on:
   pull_request:
     types: [labeled]
-    branches: [main]
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test (so the check-run + label-cleanup target the right PR)"
+        required: true
+        type: string
 
 permissions:
   contents: read
   checks: write
   pull-requests: write
 
-concurrency:
-  group: pr-gpu-regression-global-v2
-  cancel-in-progress: true
-
 jobs:
-  resolve:
-    # Self-hosted — see comment in build.yml.
-    runs-on: self-hosted
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      pr_number:  ${{ steps.gate.outputs.pr_number }}
-      pr_sha:     ${{ steps.gate.outputs.pr_sha }}
-    steps:
-      - id: gate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_LABEL_NAME: ${{ github.event.label.name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          IC_IS_PR: ${{ github.event.issue.pull_request != null }}
-          IC_BODY: ${{ github.event.comment.body }}
-          IC_AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
-          IC_ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          set -euo pipefail
-          should_run=false
-          pr_number=
-          pr_sha=
-
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            if [[ "$PR_LABEL_NAME" == "ci:run" && "$PR_HEAD_REPO" == "$REPO" ]]; then
-              should_run=true
-              pr_number="$PR_NUMBER"
-              pr_sha="$PR_HEAD_SHA"
-            fi
-          elif [[ "$EVENT_NAME" == "issue_comment" ]]; then
-            if [[ "$IC_IS_PR" == "true" ]] && [[ "$IC_BODY" =~ ^/test([[:space:]]|$) ]]; then
-              case "$IC_AUTHOR_ASSOC" in
-                OWNER|MEMBER|COLLABORATOR)
-                  pr_data=$(gh api "repos/$REPO/pulls/$IC_ISSUE_NUMBER" \
-                    --jq '{sha: .head.sha, repo: .head.repo.full_name}')
-                  head_sha=$(echo "$pr_data" | jq -r .sha)
-                  head_repo=$(echo "$pr_data" | jq -r .repo)
-                  if [[ "$head_repo" == "$REPO" ]]; then
-                    should_run=true
-                    pr_number="$IC_ISSUE_NUMBER"
-                    pr_sha="$head_sha"
-                  fi
-                  ;;
-              esac
-            fi
-          fi
-
-          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$pr_number"   >> "$GITHUB_OUTPUT"
-          echo "pr_sha=$pr_sha"         >> "$GITHUB_OUTPUT"
-
   test-node0:
-    needs: resolve
-    if: needs.resolve.outputs.should_run == 'true'
+    # Gate: workflow_dispatch always runs; pull_request only when the new
+    # label is `ci:run` AND the PR head is in this repo (fork-PR safety).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'ci:run' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, gpu, node0]
     timeout-minutes: 90
     env:
-      PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
-      PR_SHA:    ${{ needs.resolve.outputs.pr_sha }}
-      REPO:      ${{ github.repository }}
-      GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
-      DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
-      MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE0_MODEL_CACHE }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
     steps:
+      - id: resolve_sha
+        name: Resolve PR HEAD SHA
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PR_HEAD_SHA:-}" ]]; then
+            sha="$PR_HEAD_SHA"
+          else
+            sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+          fi
+          echo "pr_sha=$sha" >> "$GITHUB_OUTPUT"
+
       - id: check_start
         name: Post in-progress check
+        env:
+          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
         run: |
           set -euo pipefail
           check_id=$(gh api -X POST "repos/$REPO/check-runs" \
@@ -98,9 +63,9 @@ jobs:
 
       - id: run
         name: Run GLM-5-FP8 regression (rank 0)
-        # No actions/checkout; tairan's container has the clone + working
-        # SSH to github. docker exec does git fetch + worktree add + runs
-        # the in-container script from inside the worktree.
+        env:
+          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
+          DIST_INIT_ADDR: ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
@@ -165,22 +130,40 @@ jobs:
             -f conclusion="$conclusion"
 
       - name: Remove ci:run label
-        if: always()
+        if: always() && github.event_name == 'pull_request'
         run: gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label ci:run || true
 
   test-node1:
-    needs: resolve
-    if: needs.resolve.outputs.should_run == 'true'
+    # Same gate as test-node0; runs in parallel on node1.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'ci:run' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, gpu, node1]
     timeout-minutes: 90
     env:
-      PR_SHA:    ${{ needs.resolve.outputs.pr_sha }}
-      DIST_INIT_ADDR:  ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
-      MODEL_CACHE_DIR: ${{ secrets.BATCHGEN_NODE1_MODEL_CACHE }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
     steps:
+      - id: resolve_sha
+        name: Resolve PR HEAD SHA
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${PR_HEAD_SHA:-}" ]]; then
+            sha="$PR_HEAD_SHA"
+          else
+            sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .head.sha)
+          fi
+          echo "pr_sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Run GLM-5-FP8 regression (rank 1)
-        # Same shape as test-node0: docker exec into tairan's container,
-        # git fetch + worktree, then invoke the in-container script.
+        env:
+          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
+          DIST_INIT_ADDR: ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
