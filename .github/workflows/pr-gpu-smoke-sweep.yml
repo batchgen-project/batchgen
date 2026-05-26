@@ -46,14 +46,17 @@ jobs:
               continue
             fi
 
-            check_status=$(gh api "repos/$REPO/commits/$sha/check-runs" \
-              --jq '[.check_runs[] | select(.name=="gpu-smoke")] | sort_by(.started_at) | last | .conclusion' 2>/dev/null || echo "null")
+            # Re-label if EITHER required check is missing or not green.
+            gpu_status=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.name=="gpu-regression")] | sort_by(.started_at) | last | .conclusion' 2>/dev/null || echo "null")
+            build_status=$(gh api "repos/$REPO/commits/$sha/check-runs" \
+              --jq '[.check_runs[] | select(.name=="build")] | sort_by(.started_at) | last | .conclusion' 2>/dev/null || echo "null")
 
-            if [[ "$check_status" == "success" ]]; then
-              echo "PR #$num: gpu-smoke already passed on $sha, skipping"
+            if [[ "$gpu_status" == "success" && "$build_status" == "success" ]]; then
+              echo "PR #$num: both checks green on $sha, skipping"
               continue
             fi
 
-            echo "PR #$num ($sha): no passing gpu-smoke (status=$check_status), labeling ci:run"
+            echo "PR #$num ($sha): build=$build_status gpu-regression=$gpu_status, labeling ci:run"
             gh pr edit "$num" --repo "$REPO" --add-label ci:run
           done
