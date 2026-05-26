@@ -3,26 +3,22 @@ name: PR GPU Regression
 # Triggers:
 #   - PR labeled `ci:run` by a maintainer
 #   - workflow_dispatch from the Actions UI (manual rerun without re-labeling)
-# No issue_comment, no resolve fan-out, no concurrency group.
+# SHA + worktree are resolved inside tairan's container; no GitHub API calls.
 on:
   pull_request:
     types: [labeled]
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "PR number to test (so the check-run + label-cleanup target the right PR)"
+        description: "PR number to test"
         required: true
         type: string
 
 permissions:
   contents: read
-  checks: write
-  pull-requests: write
 
 jobs:
   test-node0:
-    # Gate: workflow_dispatch always runs; pull_request only when the new
-    # label is `ci:run` AND the PR head is in this repo (fork-PR safety).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -31,49 +27,16 @@ jobs:
     runs-on: [self-hosted, gpu, node0]
     timeout-minutes: 90
     env:
-      REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
     steps:
-      - id: resolve_sha
-        name: Resolve PR HEAD SHA
+      - name: Run GLM-5-FP8 regression (rank 0)
         env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${PR_HEAD_SHA:-}" ]]; then
-            sha="$PR_HEAD_SHA"
-          else
-            sha=$(curl -sS -f -H "Authorization: token $GH_TOKEN" \
-                       -H "Accept: application/vnd.github+json" \
-                       "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
-                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["head"]["sha"])')
-          fi
-          echo "pr_sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - id: check_start
-        name: Post in-progress check
-        env:
-          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
-        run: |
-          set -euo pipefail
-          check_id=$(curl -sS -f -X POST -H "Authorization: token $GH_TOKEN" \
-                       -H "Accept: application/vnd.github+json" \
-                       -d "{\"name\":\"gpu-regression\",\"head_sha\":\"$PR_SHA\",\"status\":\"in_progress\"}" \
-                       "https://api.github.com/repos/$REPO/check-runs" \
-                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
-          echo "check_id=$check_id" >> "$GITHUB_OUTPUT"
-
-      - id: run
-        name: Run GLM-5-FP8 regression (rank 0)
-        env:
-          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
           DIST_INIT_ADDR: ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
           source /opt/batchgen-ci/env.sh
-          WORKTREE="$(dirname "$BATCHGEN_CI_WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
 
           NCCL_ARGS=()
           for var in GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_NET \
@@ -83,20 +46,12 @@ jobs:
               fi
           done
 
-          cleanup() {
-              docker exec "$BATCHGEN_CI_CONTAINER" bash -lc "
-                  cd '$BATCHGEN_CI_WORKSPACE' 2>/dev/null && \
-                  git worktree remove --force '$WORKTREE' 2>/dev/null || true
-              " 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
           docker exec \
               "${NCCL_ARGS[@]}" \
               -e NODE_RANK=0 \
               -e DIST_INIT_ADDR="$DIST_INIT_ADDR" \
-              -e PR_SHA="$PR_SHA" \
-              -e WORKTREE_PATH="$WORKTREE" \
+              -e PR_HEAD_SHA="$PR_HEAD_SHA" \
+              -e PR_NUMBER="$PR_NUMBER" \
               -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
               -e BATCHGEN_CI_GLM5_MODEL_DIR="$BATCHGEN_CI_GLM5_MODEL_DIR" \
               -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
@@ -110,7 +65,22 @@ jobs:
                       conda activate batchgen
                   fi
                   cd "$WORKSPACE"
-                  git fetch --no-tags origin "$PR_SHA"
+                  if [[ -n "${PR_HEAD_SHA:-}" ]]; then
+                      git fetch --no-tags origin "$PR_HEAD_SHA"
+                      PR_SHA="$PR_HEAD_SHA"
+                  else
+                      git fetch --no-tags origin "pull/$PR_NUMBER/head"
+                      PR_SHA=$(git rev-parse FETCH_HEAD)
+                  fi
+                  export WORKTREE_PATH="$(dirname "$WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
+                  echo "PR_SHA=$PR_SHA WORKTREE_PATH=$WORKTREE_PATH"
+
+                  cleanup() {
+                      cd "$WORKSPACE"
+                      git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+                  }
+                  trap cleanup EXIT
+
                   rm -rf "$WORKTREE_PATH"
                   git worktree add "$WORKTREE_PATH" "$PR_SHA"
                   cd "$WORKTREE_PATH"
@@ -118,30 +88,7 @@ jobs:
                   bash .github/workflows/scripts/pr-gpu-smoke-incontainer.sh
               '
 
-      - name: Finalize check
-        if: always() && steps.check_start.outputs.check_id != ''
-        env:
-          RUN_OUTCOME: ${{ steps.run.outcome }}
-          CHECK_ID: ${{ steps.check_start.outputs.check_id }}
-        run: |
-          conclusion="success"
-          if [[ "$RUN_OUTCOME" != "success" ]]; then
-            conclusion="failure"
-          fi
-          curl -sS -f -X PATCH -H "Authorization: token $GH_TOKEN" \
-               -H "Accept: application/vnd.github+json" \
-               -d "{\"status\":\"completed\",\"conclusion\":\"$conclusion\"}" \
-               "https://api.github.com/repos/$REPO/check-runs/$CHECK_ID" >/dev/null
-
-      - name: Remove ci:run label
-        if: always() && github.event_name == 'pull_request'
-        run: |
-          curl -sS -X DELETE -H "Authorization: token $GH_TOKEN" \
-               -H "Accept: application/vnd.github+json" \
-               "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels/ci:run" >/dev/null || true
-
   test-node1:
-    # Same gate as test-node0; runs in parallel on node1.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -150,35 +97,16 @@ jobs:
     runs-on: [self-hosted, gpu, node1]
     timeout-minutes: 90
     env:
-      REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
     steps:
-      - id: resolve_sha
-        name: Resolve PR HEAD SHA
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          if [[ -n "${PR_HEAD_SHA:-}" ]]; then
-            sha="$PR_HEAD_SHA"
-          else
-            sha=$(curl -sS -f -H "Authorization: token $GH_TOKEN" \
-                       -H "Accept: application/vnd.github+json" \
-                       "https://api.github.com/repos/$REPO/pulls/$PR_NUMBER" \
-                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["head"]["sha"])')
-          fi
-          echo "pr_sha=$sha" >> "$GITHUB_OUTPUT"
-
       - name: Run GLM-5-FP8 regression (rank 1)
         env:
-          PR_SHA: ${{ steps.resolve_sha.outputs.pr_sha }}
           DIST_INIT_ADDR: ${{ secrets.BATCHGEN_DIST_INIT_ADDR }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
           source /opt/batchgen-ci/env.sh
-          WORKTREE="$(dirname "$BATCHGEN_CI_WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
 
           NCCL_ARGS=()
           for var in GLOO_SOCKET_IFNAME NCCL_SOCKET_IFNAME NCCL_IB_DISABLE NCCL_NET \
@@ -188,20 +116,12 @@ jobs:
               fi
           done
 
-          cleanup() {
-              docker exec "$BATCHGEN_CI_CONTAINER" bash -lc "
-                  cd '$BATCHGEN_CI_WORKSPACE' 2>/dev/null && \
-                  git worktree remove --force '$WORKTREE' 2>/dev/null || true
-              " 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
           docker exec \
               "${NCCL_ARGS[@]}" \
               -e NODE_RANK=1 \
               -e DIST_INIT_ADDR="$DIST_INIT_ADDR" \
-              -e PR_SHA="$PR_SHA" \
-              -e WORKTREE_PATH="$WORKTREE" \
+              -e PR_HEAD_SHA="$PR_HEAD_SHA" \
+              -e PR_NUMBER="$PR_NUMBER" \
               -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
               -e BATCHGEN_CI_GLM5_MODEL_DIR="$BATCHGEN_CI_GLM5_MODEL_DIR" \
               -e BATCHGEN_CI_MMLU_THRESHOLD="$BATCHGEN_CI_MMLU_THRESHOLD" \
@@ -213,7 +133,22 @@ jobs:
                       conda activate batchgen
                   fi
                   cd "$WORKSPACE"
-                  git fetch --no-tags origin "$PR_SHA"
+                  if [[ -n "${PR_HEAD_SHA:-}" ]]; then
+                      git fetch --no-tags origin "$PR_HEAD_SHA"
+                      PR_SHA="$PR_HEAD_SHA"
+                  else
+                      git fetch --no-tags origin "pull/$PR_NUMBER/head"
+                      PR_SHA=$(git rev-parse FETCH_HEAD)
+                  fi
+                  export WORKTREE_PATH="$(dirname "$WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
+                  echo "PR_SHA=$PR_SHA WORKTREE_PATH=$WORKTREE_PATH"
+
+                  cleanup() {
+                      cd "$WORKSPACE"
+                      git worktree remove --force "$WORKTREE_PATH" 2>/dev/null || true
+                  }
+                  trap cleanup EXIT
+
                   rm -rf "$WORKTREE_PATH"
                   git worktree add "$WORKTREE_PATH" "$PR_SHA"
                   cd "$WORKTREE_PATH"
