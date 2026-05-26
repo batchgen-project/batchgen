@@ -22,7 +22,11 @@ concurrency:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    # Self-hosted (not github-hosted) so the resolve gate doesn't depend on
+    # ubuntu-latest pool availability. Light shell-only work; any of our
+    # runners can handle it. Needs `gh` on PATH (installed at
+    # /home/ubuntu/.local/bin/gh and exported in /opt/batchgen-ci/env.sh).
+    runs-on: self-hosted
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       pr_number:  ${{ steps.gate.outputs.pr_number }}

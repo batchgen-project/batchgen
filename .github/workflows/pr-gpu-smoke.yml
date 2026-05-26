@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    # Self-hosted — see comment in build.yml.
+    runs-on: self-hosted
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       pr_number:  ${{ steps.gate.outputs.pr_number }}
