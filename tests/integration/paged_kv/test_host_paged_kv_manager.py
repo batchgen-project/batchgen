@@ -148,6 +148,53 @@ def test_parallel_worker_allocate_sequences():
             _shm_unlink(shm_name)
 
 
+def test_worker_view_attaches_shared_prefix_pages_without_owning_them():
+    shm_name = _random_shm_name()
+    cfg = _make_deepseek_r1_config(shm_name)
+    cfg.num_pages = 32
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(0, True)
+        source_seq = 101
+        target_seq = 202
+        worker.register_sequences([source_seq, target_seq])
+
+        shared_pages = worker.allocate_pages_for_sequences(
+            [(source_seq, cfg.page_size_tokens * 2)]
+        )[0]
+        worker.attach_shared_prefix_pages(target_seq, shared_pages)
+        private_pages = worker.allocate_pages_for_sequences(
+            [(target_seq, cfg.page_size_tokens)]
+        )[0]
+
+        assert worker.build_page_table([target_seq]) == [
+            shared_pages + private_pages
+        ]
+
+        before_release = worker.get_stats()
+        worker.release_sequence_pages([target_seq])
+        after_release = worker.get_stats()
+
+        assert (
+            after_release.num_used_pages
+            == before_release.num_used_pages - len(private_pages)
+        )
+        assert worker.build_page_table([source_seq]) == [shared_pages]
+    finally:
+        for sequence_id in (202, 101):
+            try:
+                worker.release_sequence_pages([sequence_id])
+            except Exception:
+                pass
+        try:
+            worker.shutdown()
+        except Exception:
+            pass
+        del worker
+        _shm_unlink(shm_name)
+
+
 def _worker_proc_copy_prefill(shm_name, device_index, requests):
     # 每个进程里重新构造 cfg，shm_name 必须一致
     cfg = _make_deepseek_r1_config(shm_name)

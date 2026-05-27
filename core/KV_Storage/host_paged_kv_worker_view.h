@@ -359,6 +359,33 @@ class HostPagedKVWorkerView : private LayerMapper {
         return new_pages;
     }
 
+    void AttachSharedPrefixPages(
+        std::int64_t sequence_id,
+        const std::vector<std::int32_t>& page_ids) {
+        if (page_ids.empty()) {
+            return;
+        }
+        EnsureSequenceRegistered(sequence_id);
+        page_table_.PrependPages(sequence_id, page_ids);
+    }
+
+    void AttachSharedPrefixPagesForSequences(
+        const std::vector<std::int64_t>& sequence_ids,
+        const std::vector<std::vector<std::int32_t>>& page_ids_by_sequence) {
+        if (sequence_ids.size() != page_ids_by_sequence.size()) {
+            throw std::invalid_argument(
+                "sequence_ids and page_ids_by_sequence must have the same "
+                "length");
+        }
+        EnsureSequencesRegistered(sequence_ids);
+        for (std::size_t i = 0; i < sequence_ids.size(); ++i) {
+            if (!page_ids_by_sequence[i].empty()) {
+                page_table_.PrependPages(sequence_ids[i],
+                                         page_ids_by_sequence[i]);
+            }
+        }
+    }
+
     std::vector<std::vector<std::int32_t>> GrowPagesForSequences(
         const std::vector<std::int64_t>& sequence_ids,
         const std::vector<std::size_t>& num_pages) {
