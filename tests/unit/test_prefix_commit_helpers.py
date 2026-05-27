@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from batchgen.prefix_reuse.commit import (
     aligned_prefix_tokens,
+    build_committable_prefix_token_ids,
     build_prefix_commit_request,
     collect_required_group_pages_for_commit,
 )
@@ -55,6 +56,28 @@ def test_aligned_prefix_tokens_floor_to_publish_boundary():
     assert aligned_prefix_tokens(63, 64) == 0
     assert aligned_prefix_tokens(64, 64) == 64
     assert aligned_prefix_tokens(191, 64) == 128
+
+
+def test_build_committable_prefix_token_ids_appends_only_new_decode_tokens():
+    token_ids = build_committable_prefix_token_ids(
+        prompt_token_ids=[1, 2, 3, 4],
+        decoded_token_ids=[10, 11, 12],
+        decoded_start=2,
+        max_tokens=5,
+    )
+
+    assert token_ids == [1, 2, 3, 4, 12]
+
+
+def test_build_committable_prefix_token_ids_clamps_negative_inputs():
+    token_ids = build_committable_prefix_token_ids(
+        prompt_token_ids=[1, 2],
+        decoded_token_ids=[3, 4],
+        decoded_start=-8,
+        max_tokens=-1,
+    )
+
+    assert token_ids == []
 
 
 def test_build_prefix_commit_request_skips_unaligned_short_prefix():

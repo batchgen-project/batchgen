@@ -13,6 +13,7 @@ from .config import (
 from .commit import (
     PrefixCommitRequest,
     aligned_prefix_tokens,
+    build_committable_prefix_token_ids,
     build_prefix_commit_request,
     collect_required_group_pages_for_commit,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "derive_prefix_cache_shm_name",
     "PrefixCommitRequest",
     "aligned_prefix_tokens",
+    "build_committable_prefix_token_ids",
     "build_prefix_commit_request",
     "collect_required_group_pages_for_commit",
     "PrefixMaterializationBundle",

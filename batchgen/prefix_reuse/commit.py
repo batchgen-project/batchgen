@@ -34,6 +34,24 @@ def aligned_prefix_tokens(total_tokens: int, publish_boundary_tokens: int) -> in
     return (token_count // boundary) * boundary
 
 
+def build_committable_prefix_token_ids(
+    *,
+    prompt_token_ids: Sequence[int],
+    decoded_token_ids: Sequence[int] = (),
+    decoded_start: int = 0,
+    max_tokens: int | None = None,
+) -> list[int]:
+    """Build the logical token prefix represented by a sequence Host KV table."""
+
+    tokens = [int(token_id) for token_id in prompt_token_ids]
+    start = max(0, int(decoded_start))
+    if start < len(decoded_token_ids):
+        tokens.extend(int(token_id) for token_id in decoded_token_ids[start:])
+    if max_tokens is not None:
+        return tokens[: max(0, int(max_tokens))]
+    return tokens
+
+
 def build_prefix_commit_request(
     *,
     core_engine_module: object,

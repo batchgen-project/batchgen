@@ -94,6 +94,12 @@ from batchgen.prefix_reuse.prefill import (
 	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
 )
+from batchgen.prefix_reuse.commit import (
+	aligned_prefix_tokens,
+	build_committable_prefix_token_ids,
+	build_prefix_commit_request,
+	collect_required_group_pages_for_commit,
+)
 from batchgen.prefix_reuse.materialization import (
 	PrefixMaterializationBundle,
 	materialize_single_group_lookup_results,
@@ -998,6 +1004,160 @@ class BatchGenWorker:
 				handles.append(int(handle))
 		for handle in dict.fromkeys(handles):
 			self.prefix_cache_coordinator.release_attachment(handle)
+
+	def _prefix_cache_prompt_token_ids(
+		self,
+		seq: SequenceEntry,
+		*,
+		max_tokens: Optional[int] = None,
+	) -> List[int]:
+		token_count = int(seq.prompt_length)
+		if max_tokens is not None:
+			token_count = min(token_count, max(0, int(max_tokens)))
+		return [
+			int(token_id)
+			for token_id in seq.input_ids.reshape(-1)[:token_count].tolist()
+		]
+
+	def _prefix_cache_decoded_token_ids(self, seq: SequenceEntry) -> List[int]:
+		if seq.decoded_tokens is None or int(seq.decoded_length) <= 0:
+			return []
+		return [
+			int(token_id)
+			for token_id in seq.decoded_tokens.reshape(-1)[
+				: int(seq.decoded_length)
+			].tolist()
+		]
+
+	def _prefix_cache_token_ids_for_commit(
+		self,
+		seq: SequenceEntry,
+		*,
+		include_new_decode_tokens: bool,
+		max_tokens: int,
+	) -> List[int]:
+		decoded_token_ids = (
+			self._prefix_cache_decoded_token_ids(seq)
+			if include_new_decode_tokens
+			else []
+		)
+		decoded_start = (
+			int(seq.reentry_decoded_baseline)
+			if include_new_decode_tokens
+			else 0
+		)
+		return build_committable_prefix_token_ids(
+			prompt_token_ids=self._prefix_cache_prompt_token_ids(seq),
+			decoded_token_ids=decoded_token_ids,
+			decoded_start=decoded_start,
+			max_tokens=max_tokens,
+		)
+
+	def _commit_prefix_cache_for_sequences(
+		self,
+		uuids: Sequence[str],
+		*,
+		include_new_decode_tokens: bool,
+		reason: str,
+	) -> None:
+		if not self.enable_prefix_cache:
+			return
+		if self.prefix_cache_coordinator is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but coordinator is not attached"
+			)
+		if self.prefix_cache_runtime_config is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but runtime config is missing"
+			)
+
+		worker_views_by_group = self._prefix_cache_worker_views_by_group()
+		boundary = int(
+			self.prefix_cache_runtime_config.publish_boundary_tokens
+		)
+		group_specs = self.prefix_cache_runtime_config.group_specs
+		namespace_digest = self.prefix_cache_runtime_config.namespace_digest
+
+		for uuid in uuids:
+			if uuid not in self._uuid_to_local_map:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			decoded_start = int(seq.reentry_decoded_baseline)
+			new_decode_tokens = (
+				max(0, int(seq.decoded_length) - decoded_start)
+				if include_new_decode_tokens
+				else 0
+			)
+			total_tokens = int(seq.prompt_length) + new_decode_tokens
+			commit_tokens = aligned_prefix_tokens(total_tokens, boundary)
+			if commit_tokens <= 0:
+				continue
+
+			shared_tokens = int(getattr(seq, "prefix_shared_tokens", 0))
+			if commit_tokens <= shared_tokens:
+				continue
+
+			token_ids = self._prefix_cache_token_ids_for_commit(
+				seq,
+				include_new_decode_tokens=include_new_decode_tokens,
+				max_tokens=commit_tokens,
+			)
+			if len(token_ids) < commit_tokens:
+				raise RuntimeError(
+					f"Rank {self.rank}: prefix cache {reason} commit for "
+					f"{uuid[:8]} has only {len(token_ids)} token ids, "
+					f"expected {commit_tokens}"
+				)
+
+			pages_by_group = collect_required_group_pages_for_commit(
+				worker_views_by_group=worker_views_by_group,
+				sequence_id=int(seq.global_idx),
+				commit_tokens=commit_tokens,
+				group_specs=group_specs,
+			)
+			request = build_prefix_commit_request(
+				core_engine_module=core_engine,
+				namespace_digest=namespace_digest,
+				token_ids=token_ids,
+				publish_boundary_tokens=boundary,
+				pages_by_group=pages_by_group,
+			)
+			if request is None:
+				continue
+			result = request.commit(self.prefix_cache_coordinator)
+			if self.prefix_cache_debug_stats and self.rank == 0:
+				logging.info(
+					"Prefix cache %s commit: seq=%s gid=%s tokens=%s "
+					"inserted=%s existing=%s",
+					reason,
+					uuid[:8],
+					seq.global_idx,
+					getattr(result, "committed_tokens", commit_tokens),
+					getattr(result, "inserted_nodes", "?"),
+					getattr(result, "existing_nodes", "?"),
+				)
+
+	def _commit_prefix_cache_prompt_pages(
+		self,
+		uuids: Sequence[str],
+	) -> None:
+		self._commit_prefix_cache_for_sequences(
+			uuids,
+			include_new_decode_tokens=False,
+			reason="prompt",
+		)
+
+	def _commit_prefix_cache_completed_pages(
+		self,
+		uuids: Sequence[str],
+	) -> None:
+		self._commit_prefix_cache_for_sequences(
+			uuids,
+			include_new_decode_tokens=True,
+			reason="completion",
+		)
 
 	def _estimate_prefix_cache_for_prefill(
 		self,
@@ -6417,6 +6577,7 @@ class BatchGenWorker:
 							logging.info(
 								f"[PREFILL_SYNC] waited on {num_retired} async KV offload tasks"
 							)
+						self._commit_prefix_cache_prompt_pages(prefill_uuids)
 
 					# Cleanup & Status Update
 					self._unregister_fp8_weights()
@@ -6510,8 +6671,11 @@ class BatchGenWorker:
 					# pops local_map entries. See matching fix in _page_boundary_fast
 					# Phase 4.A and in the legacy decode path.
 					completed_list = list(global_completed)
+					if self.enable_prefix_cache:
+						self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 					my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
 					if my_completed:
+						self._commit_prefix_cache_completed_pages(my_completed)
 						# Only release GPU pages for seqs that were actually GPU-allocated.
 						# prefill_prepacked writes KV directly to host (never registers
 						# with the GPU paged manager), so zero-tok-EOS prefill completions
@@ -8691,6 +8855,7 @@ class BatchGenWorker:
 			# _report_completion (see ordering fix note above).
 			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
 			if my_completed:
+				self._commit_prefix_cache_completed_pages(my_completed)
 				# Only release GPU pages for seqs that were actually GPU-allocated.
 				# See note at the matching site (~line 5435) — zero-tok-EOS
 				# prefill completions are in _uuid_to_local_map but never
