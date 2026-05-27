@@ -10,6 +10,8 @@ import torch
 
 
 class _AsyncTask(Protocol):
+    def wait_for_layer(self, layer_idx: int) -> None: ...
+
     def wait(self) -> None: ...
 
 
@@ -40,8 +42,13 @@ class SingleGroupPrefixMaterialization:
     _loaded: bool = False
 
     def wait_for_layer(self, layer_idx: int) -> None:
-        del layer_idx
-        self.wait()
+        if self._loaded or self.load_task is None:
+            return
+        wait_for_layer = getattr(self.load_task, "wait_for_layer", None)
+        if wait_for_layer is None:
+            self.wait()
+            return
+        wait_for_layer(int(layer_idx))
 
     def wait(self) -> None:
         if self._loaded:
@@ -81,6 +88,10 @@ class PrefixMaterializationBundle:
     def wait_for_layer(self, layer_idx: int) -> None:
         for materialization in self.by_group_id.values():
             materialization.wait_for_layer(layer_idx)
+
+    def wait(self) -> None:
+        for materialization in self.by_group_id.values():
+            materialization.wait()
 
 
 def get_prefix_materialization_for_group(
@@ -127,6 +138,15 @@ class _AttachmentLoadTask:
             for handle in reversed(self._attachment_handles):
                 self._coordinator.end_attachment_load(handle)
             self._done = True
+
+    def wait_for_layer(self, layer_idx: int) -> None:
+        if self._done:
+            return
+        wait_for_layer = getattr(self._load_task, "wait_for_layer", None)
+        if wait_for_layer is None:
+            self.wait()
+            return
+        wait_for_layer(int(layer_idx))
 
 
 def materialize_single_group_prefix_pages(

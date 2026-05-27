@@ -8110,6 +8110,7 @@ class BatchGenWorker:
 		AttnWrapperBase.prefill_prefix_materialization = None
 
 		if prefix_materialization is not None:
+			prefix_materialization.wait()
 			self._destroy_gpu_paged_kv_cache()
 
 		# Log timing summary for GPT-OSS if timing was enabled

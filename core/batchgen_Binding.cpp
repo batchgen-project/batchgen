@@ -906,6 +906,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("done", &kv::KVAsyncTask::done)
         .def("result", &kv::KVAsyncTask::result);
 
+    py::class_<kv::KVLayeredAsyncTask>(m, "KVLayeredAsyncTask")
+        .def_property_readonly("id", &kv::KVLayeredAsyncTask::id)
+        .def_property_readonly("num_layers",
+                               &kv::KVLayeredAsyncTask::num_layers)
+        .def("wait", &kv::KVLayeredAsyncTask::wait)
+        .def("wait_for_layer", &kv::KVLayeredAsyncTask::wait_for_layer)
+        .def("done", &kv::KVLayeredAsyncTask::done)
+        .def("result", &kv::KVLayeredAsyncTask::result);
+
     BindHostPagedManager<kv::DefaultHostPagedKVManager>(
         m, "DefaultHostPagedKVManager");
     BindHostPagedManager<kv::MHAHostPagedKVManager>(

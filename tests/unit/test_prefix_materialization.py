@@ -16,6 +16,18 @@ from batchgen.prefix_reuse.materialization import (
 class _FakeTask:
     def __init__(self):
         self.wait_count = 0
+        self.waited_layers = []
+
+    def wait(self):
+        self.wait_count += 1
+
+    def wait_for_layer(self, layer_idx):
+        self.waited_layers.append(int(layer_idx))
+
+
+class _LegacyFakeTask:
+    def __init__(self):
+        self.wait_count = 0
 
     def wait(self):
         self.wait_count += 1
@@ -35,6 +47,12 @@ class _FailingHostWorkerView(_FakeHostWorkerView):
     def async_load_prefix_pages_to_device(self, **kwargs):
         super().async_load_prefix_pages_to_device(**kwargs)
         raise RuntimeError("load failed")
+
+
+class _LegacyFakeHostWorkerView(_FakeHostWorkerView):
+    def __init__(self):
+        super().__init__()
+        self.task = _LegacyFakeTask()
 
 
 class _FakePrefixCoordinator:
@@ -184,7 +202,8 @@ def test_materialize_single_group_prefix_pages_starts_page_id_load():
 
     materialization.wait_for_layer(0)
     materialization.wait_for_layer(1)
-    assert host_view.task.wait_count == 1
+    assert host_view.task.waited_layers == [0, 1]
+    assert host_view.task.wait_count == 0
 
 
 def test_materialize_single_group_prefix_pages_skips_load_for_all_miss():
@@ -240,8 +259,56 @@ def test_materialize_single_group_prefix_pages_guards_attachment_load():
     assert coordinator.end_calls == []
     materialization.wait_for_layer(0)
     materialization.wait_for_layer(1)
+    assert host_view.task.waited_layers == [0, 1]
+    assert host_view.task.wait_count == 0
+    assert coordinator.end_calls == []
+    materialization.wait()
     assert host_view.task.wait_count == 1
     assert coordinator.end_calls == [91]
+
+
+def test_materialization_falls_back_to_full_wait_for_legacy_task():
+    gpu_manager = _FakeGpuManager()
+    host_view = _LegacyFakeHostWorkerView()
+
+    materialization = materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        sequences=[
+            PrefixMaterializationSequence(
+                sequence_id=101,
+                prefix_tokens=4,
+                suffix_tokens=1,
+                host_pages=[11],
+            ),
+        ],
+    )
+
+    materialization.wait_for_layer(0)
+    materialization.wait_for_layer(1)
+    assert host_view.task.wait_count == 1
+
+
+def test_bundle_full_wait_waits_all_groups():
+    primary = SingleGroupPrefixMaterialization(
+        manager=object(),
+        append_plan=object(),
+        load_task=_FakeTask(),
+    )
+    aux = SingleGroupPrefixMaterialization(
+        manager=object(),
+        append_plan=object(),
+        load_task=_FakeTask(),
+    )
+    bundle = PrefixMaterializationBundle(by_group_id={0: primary, 1: aux})
+
+    bundle.wait_for_layer(3)
+    assert primary.load_task.waited_layers == [3]
+    assert aux.load_task.waited_layers == [3]
+
+    bundle.wait()
+    assert primary.load_task.wait_count == 1
+    assert aux.load_task.wait_count == 1
 
 
 def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error():
