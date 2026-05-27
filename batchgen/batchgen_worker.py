@@ -6922,7 +6922,7 @@ class BatchGenWorker:
 		# CRITICAL: Destroy GPU KV cache BEFORE configure_prefill (Bug Fix 7.2)
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
-		self._destroy_gpu_paged_kv_cache()
+		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
 
 		if torch.cuda.is_available():
 			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
