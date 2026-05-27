@@ -34,6 +34,10 @@ from .prefill import (
     lookup_prefix_cache_for_prefill,
     release_prefix_cache_lookup_attachments,
 )
+from .worker_commit import (
+    build_sequence_prefix_commit_request,
+    sequence_token_ids_for_prefix_commit,
+)
 
 __all__ = [
     "PrefixCacheRuntimeConfig",
@@ -62,4 +66,6 @@ __all__ = [
     "estimate_prefix_cache_for_prefill",
     "lookup_prefix_cache_for_prefill",
     "release_prefix_cache_lookup_attachments",
+    "build_sequence_prefix_commit_request",
+    "sequence_token_ids_for_prefix_commit",
 ]

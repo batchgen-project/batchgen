@@ -94,15 +94,12 @@ from batchgen.prefix_reuse.prefill import (
 	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
 )
-from batchgen.prefix_reuse.commit import (
-	aligned_prefix_tokens,
-	build_committable_prefix_token_ids,
-	build_prefix_commit_request,
-	collect_required_group_pages_for_commit,
-)
 from batchgen.prefix_reuse.materialization import (
 	PrefixMaterializationBundle,
 	materialize_single_group_lookup_results,
+)
+from batchgen.prefix_reuse.worker_commit import (
+	build_sequence_prefix_commit_request,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
@@ -1005,54 +1002,6 @@ class BatchGenWorker:
 		for handle in dict.fromkeys(handles):
 			self.prefix_cache_coordinator.release_attachment(handle)
 
-	def _prefix_cache_prompt_token_ids(
-		self,
-		seq: SequenceEntry,
-		*,
-		max_tokens: Optional[int] = None,
-	) -> List[int]:
-		token_count = int(seq.prompt_length)
-		if max_tokens is not None:
-			token_count = min(token_count, max(0, int(max_tokens)))
-		return [
-			int(token_id)
-			for token_id in seq.input_ids.reshape(-1)[:token_count].tolist()
-		]
-
-	def _prefix_cache_decoded_token_ids(self, seq: SequenceEntry) -> List[int]:
-		if seq.decoded_tokens is None or int(seq.decoded_length) <= 0:
-			return []
-		return [
-			int(token_id)
-			for token_id in seq.decoded_tokens.reshape(-1)[
-				: int(seq.decoded_length)
-			].tolist()
-		]
-
-	def _prefix_cache_token_ids_for_commit(
-		self,
-		seq: SequenceEntry,
-		*,
-		include_new_decode_tokens: bool,
-		max_tokens: int,
-	) -> List[int]:
-		decoded_token_ids = (
-			self._prefix_cache_decoded_token_ids(seq)
-			if include_new_decode_tokens
-			else []
-		)
-		decoded_start = (
-			int(seq.reentry_decoded_baseline)
-			if include_new_decode_tokens
-			else 0
-		)
-		return build_committable_prefix_token_ids(
-			prompt_token_ids=self._prefix_cache_prompt_token_ids(seq),
-			decoded_token_ids=decoded_token_ids,
-			decoded_start=decoded_start,
-			max_tokens=max_tokens,
-		)
-
 	def _commit_prefix_cache_for_sequences(
 		self,
 		uuids: Sequence[str],
@@ -1072,11 +1021,6 @@ class BatchGenWorker:
 			)
 
 		worker_views_by_group = self._prefix_cache_worker_views_by_group()
-		boundary = int(
-			self.prefix_cache_runtime_config.publish_boundary_tokens
-		)
-		group_specs = self.prefix_cache_runtime_config.group_specs
-		namespace_digest = self.prefix_cache_runtime_config.namespace_digest
 
 		for uuid in uuids:
 			if uuid not in self._uuid_to_local_map:
@@ -1084,48 +1028,16 @@ class BatchGenWorker:
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
-			decoded_start = int(seq.reentry_decoded_baseline)
-			new_decode_tokens = (
-				max(0, int(seq.decoded_length) - decoded_start)
-				if include_new_decode_tokens
-				else 0
-			)
-			total_tokens = int(seq.prompt_length) + new_decode_tokens
-			commit_tokens = aligned_prefix_tokens(total_tokens, boundary)
-			if commit_tokens <= 0:
-				continue
-
-			shared_tokens = int(getattr(seq, "prefix_shared_tokens", 0))
-			if commit_tokens <= shared_tokens:
-				continue
-
-			token_ids = self._prefix_cache_token_ids_for_commit(
-				seq,
-				include_new_decode_tokens=include_new_decode_tokens,
-				max_tokens=commit_tokens,
-			)
-			if len(token_ids) < commit_tokens:
-				raise RuntimeError(
-					f"Rank {self.rank}: prefix cache {reason} commit for "
-					f"{uuid[:8]} has only {len(token_ids)} token ids, "
-					f"expected {commit_tokens}"
-				)
-
-			pages_by_group = collect_required_group_pages_for_commit(
-				worker_views_by_group=worker_views_by_group,
-				sequence_id=int(seq.global_idx),
-				commit_tokens=commit_tokens,
-				group_specs=group_specs,
-			)
-			request = build_prefix_commit_request(
+			request_pair = build_sequence_prefix_commit_request(
 				core_engine_module=core_engine,
-				namespace_digest=namespace_digest,
-				token_ids=token_ids,
-				publish_boundary_tokens=boundary,
-				pages_by_group=pages_by_group,
+				runtime_config=self.prefix_cache_runtime_config,
+				worker_views_by_group=worker_views_by_group,
+				seq=seq,
+				include_new_decode_tokens=include_new_decode_tokens,
 			)
-			if request is None:
+			if request_pair is None:
 				continue
+			request, commit_tokens = request_pair
 			result = request.commit(self.prefix_cache_coordinator)
 			if self.prefix_cache_debug_stats and self.rank == 0:
 				logging.info(
