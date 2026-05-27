@@ -54,13 +54,16 @@ class PrefillHostKVOffloader:
         if not self.metadata.prefix_reuse_mode:
             return None
         if not hasattr(
-            self.worker_view, "async_offload_layer_kv_to_host_with_offsets"
+            self.worker_view, "async_offload_layer_kv_range_to_host"
         ):
             raise RuntimeError(
                 "Prefill offset offload requires "
-                "async_offload_layer_kv_to_host_with_offsets"
+                "async_offload_layer_kv_range_to_host"
             )
         return [int(tokens) for tokens in self.metadata.prefix_shared_tokens]
+
+    def _append_lengths(self) -> List[int]:
+        return self.metadata.append_seq_lengths_list()
 
     def _offload_one(
         self,
@@ -80,14 +83,13 @@ class PrefillHostKVOffloader:
                 sequence_lengths=[int(sequence_length)],
             )
         else:
-            task = self.worker_view.async_offload_layer_kv_to_host_with_offsets(
+            task = self.worker_view.async_offload_layer_kv_range_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=[int(sequence_id)],
                 k_tensor=k_tensor,
                 v_tensor=v_tensor,
-                sequence_lengths=[int(sequence_length)],
-                source_token_starts=[0],
-                destination_token_starts=[int(destination_start)],
+                raw_start_positions=[int(destination_start)],
+                token_counts=[int(sequence_length)],
             )
         self._track(task)
 
@@ -103,14 +105,24 @@ class PrefillHostKVOffloader:
         self._pin_parent_tensors(key, value)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
+        append_lengths = self._append_lengths()
         for seq_idx, sequence_id in enumerate(
             self.metadata.global_sequence_ids
         ):
             start_idx = int(cu[seq_idx])
             end_idx = int(cu[seq_idx + 1])
-            seq_len = end_idx - start_idx
-            seq_key = key[start_idx:end_idx].unsqueeze(0)
-            seq_value = value[start_idx:end_idx].unsqueeze(0)
+            query_len = end_idx - start_idx
+            seq_len = int(append_lengths[seq_idx])
+            if seq_len < 0 or seq_len > query_len:
+                raise RuntimeError(
+                    "Prefill offload append length must be within query length: "
+                    f"sequence={sequence_id}, append={seq_len}, query={query_len}"
+                )
+            if seq_len == 0:
+                continue
+            append_start = end_idx - seq_len
+            seq_key = key[append_start:end_idx].unsqueeze(0)
+            seq_value = value[append_start:end_idx].unsqueeze(0)
             self._pin(seq_key)
             self._pin(seq_value)
             if sequence_callback is not None:
@@ -140,13 +152,23 @@ class PrefillHostKVOffloader:
         self._pin_parent_tensors(key)
         cu = self.metadata.cu_seqlens_list()
         destination_starts = self._destination_starts()
+        append_lengths = self._append_lengths()
         for seq_idx, sequence_id in enumerate(
             self.metadata.global_sequence_ids
         ):
             start_idx = int(cu[seq_idx])
             end_idx = int(cu[seq_idx + 1])
-            seq_len = end_idx - start_idx
-            seq_key = key[start_idx:end_idx]
+            query_len = end_idx - start_idx
+            seq_len = int(append_lengths[seq_idx])
+            if seq_len < 0 or seq_len > query_len:
+                raise RuntimeError(
+                    "Prefill offload append length must be within query length: "
+                    f"sequence={sequence_id}, append={seq_len}, query={query_len}"
+                )
+            if seq_len == 0:
+                continue
+            append_start = end_idx - seq_len
+            seq_key = key[append_start:end_idx]
             if seq_key.dim() == 2:
                 seq_key = seq_key.unsqueeze(0).unsqueeze(2)
             elif seq_key.dim() == 3:

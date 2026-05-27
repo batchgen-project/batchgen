@@ -118,9 +118,9 @@ def _prefix_plan(
 
 def _prefix_lens(metadata) -> list[int]:
     return [
-        int(kv_len) - int(q_len)
-        for q_len, kv_len in zip(
-            metadata.prefill.q_seq_lens,
+        int(kv_len) - int(append_len)
+        for append_len, kv_len in zip(
+            metadata.prefill.append_seq_lens,
             metadata.prefill.kv_seq_lens,
         )
     ]
@@ -151,6 +151,7 @@ def test_build_prefill_forward_metadata_without_prefix_reuse():
     assert metadata.phase == "prefill"
     assert metadata.global_sequence_ids == [100, 101]
     assert metadata.prefill.q_seq_lens == [3, 2]
+    assert metadata.prefill.append_seq_lens == [3, 2]
     assert metadata.prefill.kv_seq_lens == [3, 2]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 3, 5]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 3, 5]
@@ -176,6 +177,7 @@ def test_build_prefill_forward_metadata_with_prefix_reuse_slice():
     )
 
     assert metadata.prefill.q_seq_lens == [2, 1]
+    assert metadata.prefill.append_seq_lens == [2, 1]
     assert metadata.prefill.kv_seq_lens == [5, 1]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 5, 6]
@@ -202,6 +204,7 @@ def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
     )
 
     assert metadata.prefill.q_seq_lens == [2, 1, 1]
+    assert metadata.prefill.append_seq_lens == [2, 1, 1]
     assert metadata.prefill.kv_seq_lens == [5, 1, 4]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 2, 3, 4]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 5, 6, 10]
@@ -228,26 +231,31 @@ def test_build_prefill_forward_metadata_one_token_full_hit_is_plain_query():
     )
 
     assert metadata.prefill.q_seq_lens == [1]
+    assert metadata.prefill.append_seq_lens == [1]
     assert metadata.prefill.kv_seq_lens == [1]
     assert metadata.prefill.cu_seqlens_q.tolist() == [0, 1]
     assert metadata.prefill.cu_seqlens_k.tolist() == [0, 1]
     assert _prefix_lens(metadata) == [0]
 
 
-def test_build_prefill_forward_metadata_rejects_suffix_length_mismatch():
+def test_build_prefill_forward_metadata_allows_shorter_append_length():
     prepack = _prepack_metadata([3])
     plan = _prefix_plan(global_ids=[100], prefix_lens=[2], suffix_lens=[1])
 
-    with pytest.raises(ValueError, match="suffix lengths"):
-        build_prefill_forward_metadata(
-            prepack_metadata=prepack,
-            batch_spans=[_span(0, 100, 3)],
-            seq_start=0,
-            seq_end=1,
-            position_ids=torch.tensor([2, 3, 4], dtype=torch.long),
-            device=torch.device("cpu"),
-            prefix_reuse_plan=plan,
-        )
+    metadata = build_prefill_forward_metadata(
+        prepack_metadata=prepack,
+        batch_spans=[_span(0, 100, 3)],
+        seq_start=0,
+        seq_end=1,
+        position_ids=torch.tensor([2, 3, 4], dtype=torch.long),
+        device=torch.device("cpu"),
+        prefix_reuse_plan=plan,
+    )
+
+    assert metadata.prefill.q_seq_lens == [3]
+    assert metadata.prefill.append_seq_lens == [1]
+    assert metadata.prefill.kv_seq_lens == [3]
+    assert _prefix_lens(metadata) == [2]
 
 
 def test_build_prefill_forward_metadata_rejects_sequence_id_mismatch():

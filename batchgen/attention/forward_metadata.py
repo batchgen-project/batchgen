@@ -34,6 +34,7 @@ class PrefillAttentionMetadata:
     q_seq_lens: list[int]
     kv_seq_lens: list[int]
     position_ids: torch.Tensor
+    append_seq_lens: Optional[list[int]] = None
 
     @property
     def batch_size(self) -> int:

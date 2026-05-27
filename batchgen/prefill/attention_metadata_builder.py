@@ -59,6 +59,7 @@ def build_prefill_forward_metadata(
 
     if prefix_reuse_plan is None:
         kv_seq_lens = list(q_seq_lens)
+        append_seq_lens = list(q_seq_lens)
     else:
         kv_seq_lens = _build_prefix_reuse_kv_seq_lens(
             plan=prefix_reuse_plan,
@@ -66,6 +67,12 @@ def build_prefill_forward_metadata(
             seq_end=seq_end,
             q_seq_lens=q_seq_lens,
             global_sequence_ids=global_sequence_ids,
+        )
+        append_seq_lens = _build_prefix_reuse_append_seq_lens(
+            plan=prefix_reuse_plan,
+            seq_start=seq_start,
+            seq_end=seq_end,
+            q_seq_lens=q_seq_lens,
         )
     cu_seqlens_k = _build_cu_seqlens(kv_seq_lens, device=device)
 
@@ -80,6 +87,7 @@ def build_prefill_forward_metadata(
             q_seq_lens=q_seq_lens,
             kv_seq_lens=kv_seq_lens,
             position_ids=position_ids,
+            append_seq_lens=append_seq_lens,
         ),
         kv_cache=kv_cache_metadata,
     )
@@ -108,17 +116,46 @@ def _build_prefix_reuse_kv_seq_lens(
         kv_seq_lens.append(int(item.full_logical_context_length))
         plan_sequence_ids.append(int(item.sequence_id))
 
-    if suffix_lens != [int(length) for length in q_seq_lens]:
+    if len(suffix_lens) != len(q_seq_lens):
         raise ValueError(
-            f"prefix reuse suffix lengths do not match query lengths: "
-            f"{suffix_lens} != {list(q_seq_lens)}"
+            f"prefix reuse suffix length count does not match query lengths: "
+            f"{len(suffix_lens)} != {len(q_seq_lens)}"
         )
+    for idx, (suffix_len, query_len) in enumerate(zip(suffix_lens, q_seq_lens)):
+        if suffix_len < 0 or suffix_len > int(query_len):
+            raise ValueError(
+                f"prefix reuse append length must be within query length at "
+                f"sequence {idx}: append={suffix_len}, query={query_len}"
+            )
     if plan_sequence_ids != [int(seq_id) for seq_id in global_sequence_ids]:
         raise ValueError(
             f"prefix reuse sequence ids do not match batch spans: "
             f"{plan_sequence_ids} != {list(global_sequence_ids)}"
         )
     return kv_seq_lens
+
+
+def _build_prefix_reuse_append_seq_lens(
+    *,
+    plan: PrefixReusePrefillPlan,
+    seq_start: int,
+    seq_end: int,
+    q_seq_lens: Sequence[int],
+) -> list[int]:
+    sequence_plans = plan.sequences[seq_start:seq_end]
+    append_lens = [int(item.suffix_length) for item in sequence_plans]
+    if len(append_lens) != len(q_seq_lens):
+        raise ValueError(
+            f"prefix reuse append length mismatch: "
+            f"{len(append_lens)} != {len(q_seq_lens)}"
+        )
+    for idx, (append_len, query_len) in enumerate(zip(append_lens, q_seq_lens)):
+        if append_len < 0 or append_len > int(query_len):
+            raise ValueError(
+                f"prefix reuse append length must be within query length at "
+                f"sequence {idx}: append={append_len}, query={query_len}"
+            )
+    return append_lens
 
 
 def _build_cu_seqlens(

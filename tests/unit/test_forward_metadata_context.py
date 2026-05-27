@@ -213,6 +213,7 @@ def test_prefix_cache_metadata_prefers_bound_forward_metadata():
 
     assert prefix_metadata.global_sequence_ids == [11, 12, 13]
     assert prefix_metadata.seq_lengths == [2, 1, 1]
+    assert prefix_metadata.append_seq_lengths == [2, 1, 1]
     assert prefix_metadata.prefix_shared_tokens == [3, 0, 3]
     assert prefix_metadata.full_seq_lengths == [5, 1, 4]
     assert prefix_metadata.prefix_reuse_mode is True
@@ -249,6 +250,10 @@ def test_prefix_cache_metadata_explicit_matches_legacy_fields():
     assert explicit_metadata.max_seqlen == wrapper_metadata.max_seqlen
     assert explicit_metadata.num_sequences == wrapper_metadata.num_sequences
     assert explicit_metadata.seq_lengths == wrapper_metadata.seq_lengths
+    assert (
+        explicit_metadata.append_seq_lengths
+        == wrapper_metadata.append_seq_lengths
+    )
     assert (
         explicit_metadata.global_sequence_ids
         == wrapper_metadata.global_sequence_ids

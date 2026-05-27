@@ -55,7 +55,7 @@ class _FakeWorkerView:
         self.calls.append(("normal", kwargs))
         return SimpleNamespace(done=lambda: True, wait=lambda: None)
 
-    def async_offload_layer_kv_to_host_with_offsets(self, **kwargs):
+    def async_offload_layer_kv_range_to_host(self, **kwargs):
         self.calls.append(("offset", kwargs))
         return SimpleNamespace(done=lambda: True, wait=lambda: None)
 
@@ -138,8 +138,10 @@ def test_prefix_offloader_uses_destination_offsets(monkeypatch):
     )
 
     assert [kind for kind, _ in worker_view.calls] == ["offset", "offset"]
-    assert worker_view.calls[0][1]["destination_token_starts"] == [7]
-    assert worker_view.calls[1][1]["destination_token_starts"] == [11]
+    assert worker_view.calls[0][1]["raw_start_positions"] == [7]
+    assert worker_view.calls[0][1]["token_counts"] == [2]
+    assert worker_view.calls[1][1]["raw_start_positions"] == [11]
+    assert worker_view.calls[1][1]["token_counts"] == [3]
     assert [layer_idx for _, layer_idx in tracked] == [3, 3]
 
 
@@ -153,5 +155,5 @@ def test_prefix_offloader_rejects_missing_offset_api(monkeypatch):
         metadata=metadata,
     )
 
-    with pytest.raises(RuntimeError, match="with_offsets"):
+    with pytest.raises(RuntimeError, match="range_to_host"):
         offloader.offload_mla(key=_FakeFlatTensor("kv", dim=2))

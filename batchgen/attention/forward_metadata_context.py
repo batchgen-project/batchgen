@@ -33,6 +33,7 @@ _LEGACY_ATTENTION_FIELDS = (
     "prepack_max_seqlen",
     "prepack_num_sequences",
     "prepack_seq_lengths",
+    "prepack_append_seq_lengths",
     "prepack_prefix_reuse_mode",
     "prepack_prefix_shared_tokens",
     "prepack_full_seq_lengths",
@@ -112,6 +113,7 @@ def _sync_prefill_fields(
     wrapper_cls.prepack_max_seqlen = int(prefill.max_seqlen_q)
     wrapper_cls.prepack_num_sequences = prefill.batch_size
     wrapper_cls.prepack_seq_lengths = list(prefill.q_seq_lens)
+    wrapper_cls.prepack_append_seq_lengths = _append_seq_lens(prefill)
     wrapper_cls.cache_seqlens = None
     wrapper_cls.max_seqlen = None
 
@@ -151,6 +153,7 @@ def _sync_decode_fields(
     wrapper_cls.prepack_max_seqlen = None
     wrapper_cls.prepack_num_sequences = None
     wrapper_cls.prepack_seq_lengths = None
+    wrapper_cls.prepack_append_seq_lengths = None
     wrapper_cls.prepack_prefix_reuse_mode = False
     wrapper_cls.prepack_prefix_shared_tokens = None
     wrapper_cls.prepack_full_seq_lengths = None
@@ -166,3 +169,9 @@ def _sync_kv_cache_fields(wrapper_cls: type, kv_cache: KVCacheMetadata) -> None:
     )
     wrapper_cls.gpu_paged_kv_manager_aux = kv_cache.aux_gpu_paged_kv_manager
     wrapper_cls.host_paged_kv_worker_view_aux = kv_cache.aux_host_worker_view
+
+
+def _append_seq_lens(prefill: PrefillAttentionMetadata) -> list[int]:
+    if prefill.append_seq_lens is None:
+        return list(prefill.q_seq_lens)
+    return [int(length) for length in prefill.append_seq_lens]
