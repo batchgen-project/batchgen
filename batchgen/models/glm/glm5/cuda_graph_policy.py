@@ -1,15 +1,21 @@
-"""GLM-5 CUDA graph routing policy helpers."""
+"""GLM-5 CUDA graph routing policy helpers.
+
+Phase C: layer / MoE / DSA / DSA-full / segmented graph modes are retired.
+The whole-model graph (driven by ``--enable-cuda-graph`` on GLM-5-FP8) is
+the only supported mode. Mode env vars (``BATCHGEN_GLM5_*_CUDA_GRAPH``,
+``BATCHGEN_SEGMENTED_GRAPH``) are no longer read here; the predicates for
+the retired modes return ``False`` unconditionally.
+
+The compare-only debug env var ``BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE``
+remains in this file for the developer-facing compare facility (renaming
+to the ``BATCHGEN_DECODE_GRAPH_COMPARE`` namespace lands in a follow-up).
+"""
 
 from __future__ import annotations
 
 import os
 from collections.abc import Mapping
 
-GLM5_DSA_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_CUDA_GRAPH"
-GLM5_DSA_FULL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_DSA_FULL_CUDA_GRAPH"
-GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
-GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
-GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH"
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
 GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
 
@@ -41,16 +47,6 @@ def _env_flag_enabled(env: Mapping[str, str], name: str) -> bool:
     return env.get(name, "0") == "1"
 
 
-def _glm5_segmented_override_requested(
-    model_name: str | None,
-    env: Mapping[str, str],
-) -> bool:
-    return (
-        _env_flag_enabled(env, GLM5_SEGMENTED_CUDA_GRAPH_ENV)
-        and _is_glm5_fp8_graph_default_model(model_name)
-    )
-
-
 def is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     return _is_glm5_fp8_graph_default_model(model_name)
 
@@ -61,23 +57,16 @@ def glm5_dsa_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    env = os.environ if environ is None else environ
-    return (
-        (
-            _env_flag_enabled(env, GLM5_DSA_CUDA_GRAPH_ENV)
-            or _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
-            or _glm5_segmented_override_requested(model_name, env)
-        )
-        and _is_glm_model(model_name)
-    )
+    # Phase C: DSA-only graph mode retired. Always False.
+    return False
 
 
 def glm5_dsa_full_cuda_graph_requested(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    env = os.environ if environ is None else environ
-    return _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
+    # Phase C: DSA-full graph mode retired. Always False.
+    return False
 
 
 def glm5_moe_cuda_graph_requested_for_model(
@@ -86,14 +75,8 @@ def glm5_moe_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    env = os.environ if environ is None else environ
-    return (
-        (
-            _env_flag_enabled(env, GLM5_MOE_CUDA_GRAPH_ENV)
-            or _glm5_segmented_override_requested(model_name, env)
-        )
-        and _is_glm_model(model_name)
-    )
+    # Phase C: MoE-only graph mode retired. Always False.
+    return False
 
 
 def glm5_whole_model_cuda_graph_requested_for_model(
@@ -102,19 +85,13 @@ def glm5_whole_model_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    env = os.environ if environ is None else environ
+    # Phase C: whole-model graph activates iff `--enable-cuda-graph` is set
+    # on a GLM-5-FP8 model. No env-var path; the legacy
+    # `BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH` and `BATCHGEN_SEGMENTED_GRAPH`
+    # mode env vars are retired.
     if not _is_glm_model(model_name):
         return False
-    if _env_flag_enabled(env, GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV):
-        return True
-    if not enable_cuda_graph or not _is_glm5_fp8_graph_default_model(model_name):
-        return False
-    return not (
-        _glm5_segmented_override_requested(model_name, env)
-        or _env_flag_enabled(env, GLM5_DSA_CUDA_GRAPH_ENV)
-        or _env_flag_enabled(env, GLM5_DSA_FULL_CUDA_GRAPH_ENV)
-        or _env_flag_enabled(env, GLM5_MOE_CUDA_GRAPH_ENV)
-    )
+    return bool(enable_cuda_graph) and _is_glm5_fp8_graph_default_model(model_name)
 
 
 def glm5_whole_model_cuda_graph_compare_requested_for_model(
@@ -132,18 +109,8 @@ def glm5_segmented_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    return (
-        glm5_dsa_cuda_graph_requested_for_model(
-            model_name,
-            enable_cuda_graph=enable_cuda_graph,
-            environ=environ,
-        )
-        or glm5_moe_cuda_graph_requested_for_model(
-            model_name,
-            enable_cuda_graph=enable_cuda_graph,
-            environ=environ,
-        )
-    )
+    # Phase C: segmented (DSA-only + MoE-only) graph mode retired.
+    return False
 
 
 def glm5_any_cuda_graph_requested_for_model(
@@ -152,17 +119,17 @@ def glm5_any_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
+    # Phase C: only the whole-model graph remains. Compare debug also
+    # activates the warmup path so users running compare without
+    # `--enable-cuda-graph` still get the captured graph to compare against.
     return (
         glm5_whole_model_cuda_graph_requested_for_model(
             model_name,
             enable_cuda_graph=enable_cuda_graph,
             environ=environ,
         )
-        or glm5_whole_model_cuda_graph_compare_requested_for_model(model_name, environ=environ)
-        or glm5_segmented_cuda_graph_requested_for_model(
-            model_name,
-            enable_cuda_graph=enable_cuda_graph,
-            environ=environ,
+        or glm5_whole_model_cuda_graph_compare_requested_for_model(
+            model_name, environ=environ,
         )
     )
 

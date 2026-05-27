@@ -42,8 +42,8 @@ def test_abc_abstract_method_set():
 
 
 def test_default_methods_concrete():
-    # debug_options and release_all have default impls per the contract.
-    for name in ("debug_options", "release_all"):
+    # debug_options, release_all, and release_context have default impls per the contract.
+    for name in ("debug_options", "release_all", "release_context"):
         assert name in ModelCudaGraphAdapter.__dict__
         assert name not in ModelCudaGraphAdapter.__abstractmethods__
 
@@ -97,3 +97,29 @@ def test_capture_signature_is_hashable():
     a = Glm5CudaGraphAdapter(model_config=None, engine_config=None, world_size=1, rank=0)
     sig = a.capture_signature(bucket=4, gpu_kv_manager=None, max_seqlen=512)
     hash(sig)  # must not raise
+
+
+def test_release_context_drops_ctx_and_clears_capture_state():
+    """`release_context` is the decode→prefill cleanup hook called from
+    `deep_free_model_memory`. It MUST null `_ctx` (so the adapter no longer
+    pins model / segment / KV manager) and clear capture-tracking state.
+    `_failed_buckets` is preserved so a stale bucket isn't re-attempted."""
+    from batchgen.models.glm.glm5.cuda_graph_adapter import Glm5CudaGraphAdapter
+
+    a = Glm5CudaGraphAdapter(model_config=None, engine_config=None, world_size=1, rank=0)
+
+    # Simulate a fully-populated post-capture state.
+    a._ctx = object()  # placeholder ref — release_context just nulls it
+    a._captured_signatures[("glm5_whole_model", 4)] = ("sig",)
+    a._capture_attempted = True
+    a._state_change_logged = True
+    a._failed_buckets.add(3)
+
+    a.release_context()
+
+    assert a._ctx is None
+    assert a._captured_signatures == {}
+    assert a._capture_attempted is False
+    assert a._state_change_logged is False
+    # _failed_buckets is preserved across batches by design.
+    assert 3 in a._failed_buckets

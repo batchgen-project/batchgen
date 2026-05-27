@@ -31,6 +31,9 @@ from batchgen.models.glm.glm5.decode_utils import (
     reorder_block_table_to_batch_slots,
 )
 from batchgen.models.wrappers import AttnWrapperBase
+# Phase C: _dsa_short_count moved from AttnWrapperBase to GLM5AttnWrapper
+# (audit §A finding #8).
+from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 from batchgen.timing import get_decode_timer
 
 
@@ -39,7 +42,12 @@ def _slot_indices_override(
     batch_size: int,
     device: torch.device,
 ) -> torch.Tensor | None:
-    override = getattr(AttnWrapperBase, attr_name, None)
+    # Phase C: glm5_decode_*_slot_indices moved to GLM5AttnWrapper
+    # (audit §A finding #8). The legacy AttnWrapperBase read is kept as
+    # a fallback for graph backends that may still bind via the old name.
+    override = getattr(GLM5AttnWrapper, attr_name, None)
+    if override is None:
+        override = getattr(AttnWrapperBase, attr_name, None)
     if override is None:
         return None
     if override.shape[0] < batch_size:
@@ -521,7 +529,7 @@ def _select_glm5_dsa_indices(
 
     # This hint is computed once per decode step in the worker. Falling back to
     # a local reduction keeps unit tests and legacy callers functional.
-    short_count = AttnWrapperBase._dsa_short_count
+    short_count = GLM5AttnWrapper._dsa_short_count
     if short_count is None:
         short_count = int(short_mask.sum().item())
 

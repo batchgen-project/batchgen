@@ -21,6 +21,9 @@ import torch
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
 from batchgen.models.wrappers import AttnWrapperBase
+# Phase C: GLM-5-specific ClassVars (_dsa_short_count, glm5_decode_*_slot_indices)
+# moved from AttnWrapperBase to GLM5AttnWrapper per audit §A finding #8.
+from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 
 
 class Glm5WholeModelSegment:
@@ -396,18 +399,18 @@ class Glm5WholeModelSegment:
         old_max_seqlen = AttnWrapperBase.max_seqlen
         old_kv_cb = AttnWrapperBase.kv_append_callback
         old_aux_cb = AttnWrapperBase.kv_append_callback_aux
-        old_dsa_short_count = AttnWrapperBase._dsa_short_count
-        old_primary_slots = AttnWrapperBase.glm5_decode_primary_slot_indices
-        old_aux_slots = AttnWrapperBase.glm5_decode_aux_slot_indices
+        old_dsa_short_count = GLM5AttnWrapper._dsa_short_count
+        old_primary_slots = GLM5AttnWrapper.glm5_decode_primary_slot_indices
+        old_aux_slots = GLM5AttnWrapper.glm5_decode_aux_slot_indices
         try:
             AttnWrapperBase.cache_seqlens = cache_seqlens
             AttnWrapperBase.position_ids = position_ids
             AttnWrapperBase.max_seqlen = self.max_seqlen
             AttnWrapperBase.kv_append_callback = self._copy_primary_kv
             AttnWrapperBase.kv_append_callback_aux = self._copy_aux_kv
-            AttnWrapperBase._dsa_short_count = self._capture_dsa_short_count
-            AttnWrapperBase.glm5_decode_primary_slot_indices = primary_slot_indices
-            AttnWrapperBase.glm5_decode_aux_slot_indices = aux_slot_indices
+            GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
+            GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
+            GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
             outputs = self.run_model_with_probes(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -425,9 +428,9 @@ class Glm5WholeModelSegment:
             AttnWrapperBase.max_seqlen = old_max_seqlen
             AttnWrapperBase.kv_append_callback = old_kv_cb
             AttnWrapperBase.kv_append_callback_aux = old_aux_cb
-            AttnWrapperBase._dsa_short_count = old_dsa_short_count
-            AttnWrapperBase.glm5_decode_primary_slot_indices = old_primary_slots
-            AttnWrapperBase.glm5_decode_aux_slot_indices = old_aux_slots
+            GLM5AttnWrapper._dsa_short_count = old_dsa_short_count
+            GLM5AttnWrapper.glm5_decode_primary_slot_indices = old_primary_slots
+            GLM5AttnWrapper.glm5_decode_aux_slot_indices = old_aux_slots
 
         return outputs
 
