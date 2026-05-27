@@ -508,6 +508,11 @@ class BatchGenWorker:
 
 		# CUDA graph state
 		self._cuda_graph_manager = None
+		# Phase B: cuda-graph adapter (cached from initializer.get_cuda_graph_adapter())
+		self._cuda_graph_adapter = None
+		self._cuda_graph_adapter_dual = (
+			os.environ.get("BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL", "0") == "1"
+		)
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -2451,6 +2456,18 @@ class BatchGenWorker:
 		self.core_engine, self.engine_config, self.model_config, self.loaded_model_config = (
 			self.initializer.Init(self.weights_storage)
 		)
+		# Phase B: pull the cuda-graph adapter from the initializer (None if not implemented).
+		# Worker uses `_cuda_graph_adapter` only when `BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1`
+		# (dual-path migration gate). Legacy `_glm5_*` path is the default until Phase C.
+		self._cuda_graph_adapter = getattr(
+			self.initializer, "get_cuda_graph_adapter", lambda: None
+		)()
+		if self._cuda_graph_adapter is not None:
+			logging.info(
+				"Cuda-graph adapter discovered: %s (advertises %s)",
+				type(self._cuda_graph_adapter).__name__,
+				[m.value for m in self._cuda_graph_adapter.advertised_modes()],
+			)
 
 		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view.primary
@@ -9939,6 +9956,15 @@ class BatchGenWorker:
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
+		# Phase B: also drop the adapter's reference to the captured segment so
+		# the next /v1/reload + recapture starts from a clean adapter context.
+		if self._cuda_graph_adapter is not None:
+			try:
+				self._cuda_graph_adapter.release_all(manager=None)
+			except Exception as _exc:
+				logging.warning(
+					"Phase B: failed to release adapter state: %s", _exc,
+				)
 		manager = None
 		segment = None
 		gc.collect()
@@ -10926,6 +10952,41 @@ class BatchGenWorker:
 				)
 				return
 			self._glm5_whole_model_graph_signature = self._glm5_whole_model_graph_capture_signature()
+			# Phase B: hand the just-captured segment to the adapter so its
+			# eligibility() / prepare_replay_inputs() / stage_post_graph_kv()
+			# can run against the same captured graph the legacy path uses.
+			# Without this attach, adapter._ctx stays None and eligibility()
+			# returns EAGER/adapter_not_built every step (the worker silently
+			# falls back to the legacy path).
+			if self._cuda_graph_adapter is not None:
+				try:
+					_adapter_max_seqlen = int(getattr(whole_seg, "max_seqlen", 0) or 0)
+					_adapter_gpu_mgr = gpu_manager
+					_attach = getattr(self._cuda_graph_adapter, "attach_existing_segment", None)
+					if _attach is not None:
+						_attach(
+							model=self.model,
+							whole_model_segment=whole_seg,
+							bucketing=bucketing,
+							gpu_kv_manager=_adapter_gpu_mgr,
+							device=self.torch_device,
+							max_seqlen_cap=_adapter_max_seqlen,
+						)
+					for _bucket in capture_buckets:
+						_sig = self._cuda_graph_adapter.capture_signature(
+							bucket=int(_bucket),
+							gpu_kv_manager=_adapter_gpu_mgr,
+							max_seqlen=_adapter_max_seqlen,
+						)
+						self._cuda_graph_adapter.record_capture(
+							segment_name=segment_name,
+							bucket=int(_bucket),
+							signature=_sig,
+						)
+				except Exception as _exc:
+					logging.warning(
+						"Phase B: failed to attach/record_capture on adapter: %s", _exc,
+					)
 			stats = manager.get_capture_stats()
 			logging.info(
 				f"Rank {self.rank}: GLM-5 whole-model CUDA graph ready in "
@@ -12092,7 +12153,57 @@ class BatchGenWorker:
 					# otherwise mismatched NCCL ops cause deadlock.
 					batch_size = len(batch)
 					bucket = self._whole_model_bucketing.get_padded_size(_max_bs)
-					if getattr(self, "_glm5_whole_model_graph", False):
+					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
+					# and an adapter is present, route replay through it. Legacy path
+					# (default) preserves today's behavior exactly.
+					_adapter_dual_active = (
+						self._cuda_graph_adapter_dual
+						and self._cuda_graph_adapter is not None
+						and getattr(self, "_glm5_whole_model_graph", False)
+					)
+					_adapter_decision = None
+					_adapter_batch_state = None
+					if _adapter_dual_active:
+						from batchgen.cuda_graph.adapter import BatchState as _BatchState
+						_adapter_batch_state = _BatchState(
+							local_bsz=batch_size,
+							max_rank_bsz=_max_bs,
+							rank_token_counts=_all_rank_counts,
+							cache_seqlens=AttnWrapperBase.cache_seqlens,
+							position_ids=AttnWrapperBase.position_ids,
+							max_seqlen=int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+							cur_batch_sequence_ids=tuple(getattr(AttnWrapperBase, "cur_batch", None) or ()),
+							gpu_kv_manager=gpu_manager,
+							decode_iter=0,
+							input_ids=new_tokens,
+							device=self.torch_device,
+						)
+						_adapter_decision = self._cuda_graph_adapter.eligibility(_adapter_batch_state)
+						if _adapter_decision.mode.value != "whole_model":
+							logging.info(
+								"Phase B: adapter eligibility=%s/%s; using legacy path for parity",
+								_adapter_decision.mode.value, _adapter_decision.reason,
+							)
+							_adapter_dual_active = False
+					if _adapter_dual_active:
+						# ADAPTER PATH (Phase B dual gate)
+						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
+							decision=_adapter_decision,
+							batch_state=_adapter_batch_state,
+							segment_name="glm5_whole_model",
+						)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_replay_start = time.perf_counter()
+						graph_out = self._cuda_graph_manager.replay(
+							"glm5_whole_model", _max_bs, **replay_inputs,
+						)
+						if _glm5_whole_timing:
+							torch.cuda.synchronize(self.torch_device)
+							_glm5_whole_timing_items["replay_ms"] = (
+								time.perf_counter() - _glm5_replay_start
+							) * 1000.0
+					elif getattr(self, "_glm5_whole_model_graph", False):
 						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
 						aux_manager = getattr(
 							gpu_manager,
@@ -12243,7 +12354,21 @@ class BatchGenWorker:
 					else:
 						new_tokens_out = self._select_tokens(logits, batch_sequences)
 
-					if not _glm5_skip_graph_kv_offload:
+					if not _glm5_skip_graph_kv_offload and _adapter_dual_active:
+						# Phase B: adapter owns post-graph KV staging (audit §A finding #6:
+						# contiguous-only clone path; no per-layer fallback branch).
+						if _glm5_whole_timing:
+							_glm5_offload_start = time.perf_counter()
+						self._cuda_graph_adapter.stage_post_graph_kv(
+							decision=_adapter_decision,
+							batch_state=_adapter_batch_state,
+							graph_outputs=graph_out,
+						)
+						if _glm5_whole_timing:
+							_glm5_whole_timing_items["offload_callback_ms"] = (
+								time.perf_counter() - _glm5_offload_start
+							) * 1000.0
+					elif not _glm5_skip_graph_kv_offload:
 						if _glm5_whole_timing:
 							_glm5_offload_start = time.perf_counter()
 						# Fire KV host offload callbacks for all layers.

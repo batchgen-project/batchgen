@@ -77,6 +77,8 @@ class BatchState:
     cur_batch_sequence_ids: Tuple[int, ...]
     gpu_kv_manager: Any
     decode_iter: int
+    input_ids: Optional[torch.Tensor] = None
+    device: Optional[torch.device] = None
 
 
 # ---------------------------------------------------------------------------
