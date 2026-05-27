@@ -608,6 +608,7 @@ class BatchGenWorker:
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)
 		self.host_kv_cache_size = args.host_kv_cache_size
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
+		self.host_paged_kv_worker_view_aux = None
 
 		# DSA models: create DualHostKVCoordinator with proportional budget split.
 		# Non-DSA models get a single-view worker below.
@@ -890,17 +891,17 @@ class BatchGenWorker:
 		*,
 		group_id: int,
 	) -> List[int]:
-		if int(getattr(result, "common_cached_tokens", 0)) <= 0:
+		if int(result.common_cached_tokens) <= 0:
 			return []
-		spans = getattr(result, "materialization_spans", None)
+		spans = result.materialization_spans
 		if spans is None:
 			raise RuntimeError("Prefix lookup result has no materialization spans")
 		for span in spans:
-			if int(getattr(span, "group_id")) != int(group_id):
+			if int(span.group_id) != int(group_id):
 				continue
 			return [
-				int(getattr(page, "page_id", page))
-				for page in getattr(span, "pages")
+				int(page.page_id)
+				for page in span.pages
 			]
 		raise RuntimeError(
 			f"Prefix lookup hit has no materialization span for group {group_id}"
@@ -908,7 +909,7 @@ class BatchGenWorker:
 
 	def _prefix_cache_worker_views_by_group(self) -> Dict[int, object]:
 		views = {0: self.core_engine.host_paged_kv_worker_view}
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		aux_view = self.host_paged_kv_worker_view_aux
 		if aux_view is not None:
 			views[1] = aux_view
 		return views
@@ -932,7 +933,7 @@ class BatchGenWorker:
 				if page_ids:
 					worker_view.attach_shared_prefix_pages(global_idx, page_ids)
 
-			attachment_handle = int(getattr(result, "attachment_handle", 0))
+			attachment_handle = int(result.attachment_handle)
 			if attachment_handle:
 				self._prefix_cache_attachment_by_global_idx[global_idx] = (
 					attachment_handle
@@ -971,7 +972,7 @@ class BatchGenWorker:
 		)
 		by_group = {0: primary_materialization}
 
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		aux_view = self.host_paged_kv_worker_view_aux
 		if isinstance(manager, DualKVCacheCoordinator) and aux_view is not None:
 			by_group[1] = materialize_single_group_lookup_results(
 				gpu_manager=manager.auxiliary,
@@ -1046,9 +1047,9 @@ class BatchGenWorker:
 					reason,
 					uuid[:8],
 					seq.global_idx,
-					getattr(result, "committed_tokens", commit_tokens),
-					getattr(result, "inserted_nodes", "?"),
-					getattr(result, "existing_nodes", "?"),
+					result.committed_tokens,
+					result.inserted_nodes,
+					result.existing_nodes,
 				)
 
 	def _commit_prefix_cache_prompt_pages(
@@ -2774,7 +2775,7 @@ class BatchGenWorker:
 		Mirrors _append_decode_kv_to_host_async but uses the auxiliary host
 		worker view. Shares the same pending task list for unified flushing.
 		"""
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		aux_view = self.host_paged_kv_worker_view_aux
 		if aux_view is None or not batch:
 			return
 
@@ -3232,7 +3233,7 @@ class BatchGenWorker:
 		effects. The returned task must be .wait()'d before the first decode
 		step that consumes the aux cache.
 		"""
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		aux_view = self.host_paged_kv_worker_view_aux
 		if aux_view is None:
 			return None
 		if not isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
@@ -4002,7 +4003,7 @@ class BatchGenWorker:
 		# mirrored explicitly below — the coordinator does not implement
 		# read/write_sequence_kv_to_cpu, so go direct on primary and aux.
 		worker_view = self.core_engine.host_paged_kv_worker_view
-		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+		aux_view = self.host_paged_kv_worker_view_aux
 
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
@@ -7189,7 +7190,7 @@ class BatchGenWorker:
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+			aux_view = self.host_paged_kv_worker_view_aux
 			if aux_view is not None:
 				aux_view.register_sequences(global_sequence_ids)
 			if prefix_lookup is not None:
@@ -7605,7 +7606,7 @@ class BatchGenWorker:
 			# so we don't need to call unregister_sequences separately
 			worker_view.release_sequence_pages(global_sequence_ids)
 			# DSA: release auxiliary host KV pages too
-			aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+			aux_view = self.host_paged_kv_worker_view_aux
 			if aux_view is not None:
 				aux_view.release_sequence_pages(global_sequence_ids)
 			self._release_prefix_cache_attachments_for_global_ids(
@@ -7644,7 +7645,7 @@ class BatchGenWorker:
 		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
 		# the host aux cache instead of early-returning on a None view.
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view_aux
 
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
@@ -7779,7 +7780,7 @@ class BatchGenWorker:
 		# ensures `_offload_prepacked_indexer_kv` actually pushes indexer K to
 		# the host aux cache instead of early-returning on a None view.
 		AttnWrapperBase.host_paged_kv_worker_view = getattr(self.core_engine, "host_paged_kv_worker_view", None)
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view_aux
 
 		if "deepseek" in self.model_config.model_type:
 			self.model.model._use_flash_attention_2 = False
@@ -8880,7 +8881,7 @@ class BatchGenWorker:
 					worker_view.release_sequence_pages(evicted_global_ids)
 					worker_view.unregister_sequences(evicted_global_ids)
 					# DSA: mirror release + unregister on auxiliary host KV
-					aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+					aux_view = self.host_paged_kv_worker_view_aux
 					if aux_view is not None:
 						aux_view.release_sequence_pages(evicted_global_ids)
 						aux_view.unregister_sequences(evicted_global_ids)
@@ -8949,7 +8950,7 @@ class BatchGenWorker:
 			if host_grow_requests and worker_view is not None:
 				worker_view.grow_pages_for_sequences(host_grow_requests)
 				# DSA: mirror growth on auxiliary host KV
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+				aux_view = self.host_paged_kv_worker_view_aux
 				if aux_view is not None:
 					aux_view.grow_pages_for_sequences(host_grow_requests)
 				if self.rank == 0:
@@ -11992,7 +11993,7 @@ class BatchGenWorker:
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = None
 		AttnWrapperBase.host_paged_kv_worker_view = worker_view
-		AttnWrapperBase.host_paged_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+		AttnWrapperBase.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view_aux
 		AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
 		# CRITICAL FIX: Ensure page table matches cur_batch at entry
@@ -12431,7 +12432,7 @@ class BatchGenWorker:
 					self._deferred_kv_entries = []
 					self._deferred_kv_entries_aux = []
 					self._deferred_kv_worker_view = _kv_worker_view
-					self._deferred_kv_worker_view_aux = getattr(self, "host_paged_kv_worker_view_aux", None)
+					self._deferred_kv_worker_view_aux = self.host_paged_kv_worker_view_aux
 
 				if BATCHGEN_SYNC_KV and _kv_worker_view is not None:
 					# SYNC MODE: Immediately write each layer's KV to host (no deferral)
@@ -12465,7 +12466,7 @@ class BatchGenWorker:
 				# In deferred mode (BATCHGEN_SYNC_KV=0, the default) layers push
 				# to _deferred_kv_entries_aux; a single event.synchronize in
 				# _flush_deferred_kv_to_host covers both primary and aux caches.
-				aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
+				aux_view = self.host_paged_kv_worker_view_aux
 				if aux_view is not None:
 					if BATCHGEN_SYNC_KV:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
@@ -14675,7 +14676,7 @@ class BatchGenWorker:
 						)
 						# Try to release each sequence individually to handle already-released ones
 						released_count = 0
-						aux_view_shutdown = getattr(self, "host_paged_kv_worker_view_aux", None)
+						aux_view_shutdown = self.host_paged_kv_worker_view_aux
 						for seq_id in global_ids_to_release:
 							try:
 								worker_view.release_sequence_pages([seq_id])

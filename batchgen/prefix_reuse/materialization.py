@@ -268,7 +268,7 @@ def materialize_single_group_lookup_results(
         prompt_lengths,
     ):
         prompt_len = int(prompt_length)
-        cached_tokens = int(getattr(result, "common_cached_tokens"))
+        cached_tokens = int(result.common_cached_tokens)
         if prompt_len <= 0:
             raise ValueError(
                 f"prompt length must be positive for sequence {sequence_id}"
@@ -281,7 +281,7 @@ def materialize_single_group_lookup_results(
             )
         effective_cached_tokens = min(cached_tokens, prompt_len - 1)
         span_pages = []
-        attachment_handle = int(getattr(result, "attachment_handle", 0))
+        attachment_handle = int(result.attachment_handle)
         if effective_cached_tokens > 0:
             if attachment_handle == 0:
                 raise ValueError(
@@ -289,7 +289,7 @@ def materialize_single_group_lookup_results(
                     f"attachment_handle for sequence {sequence_id}"
                 )
             span = _find_group_span(result, group_id=int(group_id))
-            span_raw_end = int(getattr(span, "raw_end_token"))
+            span_raw_end = int(span.raw_end_token)
             if span_raw_end < effective_cached_tokens:
                 raise ValueError(
                     "single-group prefix materialization requires lookup span "
@@ -297,7 +297,7 @@ def materialize_single_group_lookup_results(
                     f"{sequence_id}: span={span_raw_end}, "
                     f"effective_cached={effective_cached_tokens}"
                 )
-            span_pages = list(getattr(span, "pages"))
+            span_pages = list(span.pages)
 
         sequences.append(
             PrefixMaterializationSequence(
@@ -338,11 +338,11 @@ def _build_host_page_id_tensor(
 
 
 def _find_group_span(result: object, *, group_id: int) -> object:
-    spans = getattr(result, "materialization_spans", None)
+    spans = result.materialization_spans
     if spans is None:
         raise TypeError("lookup result must expose materialization_spans")
     for span in spans:
-        if int(getattr(span, "group_id")) == int(group_id):
+        if int(span.group_id) == int(group_id):
             return span
     raise ValueError(
         f"lookup result has no materialization span for group {group_id}"

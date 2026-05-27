@@ -124,7 +124,7 @@ def release_prefix_cache_lookup_attachments(
 
     seen_handles: set[int] = set()
     for result in lookup.lookup_results:
-        handle = int(getattr(result, "attachment_handle", 0))
+        handle = int(result.attachment_handle)
         if handle == 0 or handle in seen_handles:
             continue
         seen_handles.add(handle)
