@@ -3139,16 +3139,24 @@ class BatchGenWorker:
 
 		manager = self.gpu_paged_kv_cache_manager
 		required_pages = gpu_config.num_pages
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
+		current_pages = int(manager.config.num_pages) if manager is not None else 0
 
 		if manager is not None and current_pages >= required_pages:
-			manager.initialize()
-			self._bind_gpu_paged_kv_manager(manager)
-			return manager
+			if manager.is_initialized or current_pages == required_pages:
+				manager.initialize()
+				self._bind_gpu_paged_kv_manager(manager)
+				return manager
+			logging.info(
+				"Rank %s discarding oversized uninitialized GPU KV manager on %s: "
+				"current pages=%d, required pages=%d",
+				self.rank,
+				self.local_rank,
+				current_pages,
+				required_pages,
+			)
+			manager.destroy(empty_cuda_cache=True)
+			manager = None
+			current_pages = 0
 
 		if manager is not None:
 			manager.destroy()
