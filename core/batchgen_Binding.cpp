@@ -225,6 +225,16 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            py::arg("sequence_ids"))
        .def("register_sequences", &WorkerView::RegisterSequences,
            py::arg("sequence_ids"))
+       .def("attach_shared_prefix_pages",
+            &WorkerView::AttachSharedPrefixPages,
+            py::arg("sequence_id"), py::arg("page_ids"),
+            "Prepend shared prefix Host page ids to a registered sequence's "
+            "logical page table. Ownership remains with the prefix cache.")
+       .def("attach_shared_prefix_pages_for_sequences",
+            &WorkerView::AttachSharedPrefixPagesForSequences,
+            py::arg("sequence_ids"), py::arg("page_ids_by_sequence"),
+            "Prepend shared prefix Host pages for multiple registered "
+            "sequences.")
        .def("unregister_sequence", &WorkerView::UnregisterSequence,
            py::arg("sequence_id"))
        .def("unregister_sequences", &WorkerView::UnregisterSequences,
