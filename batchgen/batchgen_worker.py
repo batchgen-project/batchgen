@@ -1848,16 +1848,22 @@ class BatchGenWorker:
 				continue
 			self._bind_local_sequence_to_query_book(uuid)
 
-	def _report_completion(self, uuid: str, gathered_text: str = None) -> None:
+	def _report_completion(
+		self,
+		uuid: str,
+		gathered_text: str = None,
+		cached_tokens: Optional[int] = None,
+	) -> None:
 		"""Report a single sequence completion to the response queue.
 
 		Also frees the QueryBook buffer slot so it can be reused by new admissions.
 
 		Args:
 			uuid: Sequence UUID.
-			gathered_text: Pre-gathered decoded text from _gather_completed_tokens.
+			gathered_text: Pre-gathered decoded text from _gather_completed_outputs.
 				If provided, uses this instead of reading from local decoded_tokens
 				(which may be empty on rank 0 for sequences owned by other ranks).
+			cached_tokens: Prefix-cache hit tokens gathered from the owner rank.
 		"""
 		seq = self.global_batch.get_sequence(uuid)
 		if seq is None:
@@ -1897,6 +1903,11 @@ class BatchGenWorker:
 				text = self.tokenizer.decode(token_ids)
 			except Exception:
 				text = ""
+		reported_cached_tokens = (
+			int(cached_tokens)
+			if cached_tokens is not None
+			else int(getattr(seq, "prefix_shared_tokens", 0))
+		)
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
@@ -1905,46 +1916,53 @@ class BatchGenWorker:
 			"text": text,
 			"prompt_length": seq.prompt_length,
 			"decoded_length": seq.decoded_length,
-			"cached_tokens": int(getattr(seq, "prefix_shared_tokens", 0)),
+			"cached_tokens": reported_cached_tokens,
 			"finish_reason": self._get_finish_reason(seq),
 		})
 
-	def _gather_completed_tokens(self, completed_uuids: List[str]) -> dict:
-		"""Gather decoded tokens from owning ranks for completed sequences.
+	def _gather_completed_outputs(self, completed_uuids: List[str]) -> dict:
+		"""Gather completion outputs from owning ranks for completed sequences.
 
-		Each rank writes decoded tokens only for sequences it owns. This method
-		uses all_gather_object to collect tokens from all ranks so rank 0 can
-		report them correctly.
+		Each rank writes decoded tokens and prefix-cache metadata only for
+		sequences it owns. This method uses all_gather_object to collect that
+		owner-rank state so rank 0 reports correct text and usage.
 
 		Returns:
-			Dict mapping uuid -> decoded text string.
+			Dict mapping uuid -> {"text": str, "cached_tokens": int}.
 		"""
 		if not completed_uuids:
 			return {}
 
-		# Each rank provides tokens for its locally-owned completed sequences
-		my_tokens = {}
+		# Each rank provides outputs for its locally-owned completed sequences.
+		my_outputs = {}
 		for uuid in completed_uuids:
 			if uuid in self._uuid_to_local_map:
 				local_idx = self._uuid_to_local_map[uuid]
 				seq = self.global_batch.get_sequence(uuid)
 				if seq is not None and local_idx in self.query_book:
-					token_ids = self.query_book[local_idx].decoded_tokens[0, :seq.decoded_length].tolist()
+					token_ids = self.query_book[local_idx].decoded_tokens[
+						0, :seq.decoded_length
+					].tolist()
 					try:
 						text = self.tokenizer.decode(token_ids)
 					except Exception:
 						text = ""
-					my_tokens[uuid] = text
+					my_outputs[uuid] = {
+						"text": text,
+						"cached_tokens": int(
+							getattr(seq, "prefix_shared_tokens", 0)
+						),
+					}
 
 		# All ranks participate in gather
-		all_tokens = [None] * self.world_size
-		dist.all_gather_object(all_tokens, my_tokens)
+		all_outputs = [None] * self.world_size
+		dist.all_gather_object(all_outputs, my_outputs)
 
 		# Merge: each uuid is owned by exactly one rank
 		merged = {}
-		for rank_tokens in all_tokens:
-			if rank_tokens:
-				merged.update(rank_tokens)
+		for rank_outputs in all_outputs:
+			if rank_outputs:
+				merged.update(rank_outputs)
 		return merged
 
 	# ============ End Request Pool Methods ============
@@ -6585,9 +6603,9 @@ class BatchGenWorker:
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
 					self._submit_completed_to_incremental_writer(list(global_completed))
-					# Gather decoded tokens from owning ranks before reporting
-					# (each rank only writes decoded tokens for its own sequences)
-					gathered_texts = self._gather_completed_tokens(list(global_completed))
+					# Gather decoded tokens and usage metadata from owning ranks
+					# before reporting. Each rank only writes its own sequences.
+					gathered_outputs = self._gather_completed_outputs(list(global_completed))
 					# ORDERING FIX: release resources BEFORE _report_completion
 					# pops local_map entries. See matching fix in _page_boundary_fast
 					# Phase 4.A and in the legacy decode path.
@@ -6625,7 +6643,12 @@ class BatchGenWorker:
 					for uuid in completed_list:
 						seq = self.global_batch.get_sequence(uuid)
 						if seq is not None and seq.status == SequenceStatus.COMPLETED:
-							self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+							output = gathered_outputs.get(uuid, {})
+							self._report_completion(
+								uuid,
+								gathered_text=output.get("text"),
+								cached_tokens=output.get("cached_tokens"),
+							)
 						elif seq is not None:
 							logging.warning(
 								f"Rank {self.rank}: Skipping _report_completion for {uuid[:8]} "
@@ -8769,8 +8792,8 @@ class BatchGenWorker:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 			# Incremental write: gather completed tokens to rank 0
 			self._submit_completed_to_incremental_writer(completed_uuids)
-			# Gather decoded tokens from owning ranks before reporting
-			gathered_texts = self._gather_completed_tokens(completed_uuids)
+			# Gather decoded tokens and usage metadata from owning ranks before reporting
+			gathered_outputs = self._gather_completed_outputs(completed_uuids)
 
 			# Release resources on owners BEFORE popping local_map entries via
 			# _report_completion (see ordering fix note above).
@@ -8801,7 +8824,12 @@ class BatchGenWorker:
 			# Must run LAST so the _release_*_pages calls above see the
 			# correct local_map state.
 			for uuid in completed_uuids:
-				self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+				output = gathered_outputs.get(uuid, {})
+				self._report_completion(
+					uuid,
+					gathered_text=output.get("text"),
+					cached_tokens=output.get("cached_tokens"),
+				)
 			# Report completions to adaptive chunk sizer
 			if self.adaptive_chunk_sizer is not None:
 				for uuid in completed_uuids:
@@ -13839,8 +13867,8 @@ class BatchGenWorker:
 					self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
 					# Incremental write: gather completed tokens to rank 0
 					self._submit_completed_to_incremental_writer(completed_uuids)
-					# Gather decoded tokens from owning ranks before reporting
-					gathered_texts = self._gather_completed_tokens(completed_uuids)
+					# Gather decoded tokens and usage metadata from owning ranks before reporting
+					gathered_outputs = self._gather_completed_outputs(completed_uuids)
 					# ORDERING FIX: release GPU/host KV BEFORE _report_completion
 					# pops local_map entries. Previously the filter below
 					# captured an empty list because _report_completion ran
@@ -13855,7 +13883,12 @@ class BatchGenWorker:
 					self._release_host_kv_pages_for_batch(completed_uuids)
 					# Report completions (this pops local_map; must run LAST).
 					for uuid in completed_uuids:
-						self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+						output = gathered_outputs.get(uuid, {})
+						self._report_completion(
+							uuid,
+							gathered_text=output.get("text"),
+							cached_tokens=output.get("cached_tokens"),
+						)
 				
 				if decode_uuids:
 					decode_uuids, batch = self._try_load_new_sequences(decode_uuids, batch)
