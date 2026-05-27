@@ -12776,6 +12776,12 @@ class BatchGenWorker:
 				if hasattr(pm, attr):
 					delattr(pm, attr)
 
+		# Adapter holds Python refs to model/segment/KV manager via _ctx;
+		# without release_context() the captured segment's static KV buffers
+		# survive empty_cache() and prefill OOMs on the next batch.
+		if getattr(self, '_cuda_graph_adapter', None) is not None:
+			self._cuda_graph_adapter.release_context()
+
 		# Release memory
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()

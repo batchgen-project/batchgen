@@ -354,6 +354,19 @@ class ModelCudaGraphAdapter(ABC):
         for bucket in list(bucketing.bucket_sizes):
             manager.drop_bucket(int(bucket))
 
+    def release_context(self) -> None:
+        """Drop per-batch Python references collected at `build_segments`.
+
+        Worker calls this from `deep_free_model_memory()` on the decode→
+        prefill edge, BEFORE `torch.cuda.empty_cache()`. The adapter MUST
+        null out references to model / segments / KV manager / bucketing
+        so the allocator can release their backing tensors; captured CUDA
+        graphs are released via `release_all` on the boot path and are
+        not in scope here.
+
+        Default no-op for adapters that hold no per-batch state."""
+        return
+
 
 # ---------------------------------------------------------------------------
 # Initializer protocol (duck-typed; no inheritance required)

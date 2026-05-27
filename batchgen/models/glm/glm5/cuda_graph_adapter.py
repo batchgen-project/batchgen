@@ -564,6 +564,16 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         self._fallback_warned.clear()
         self._state_change_logged = False
 
+    def release_context(self) -> None:
+        # _ctx pins model + whole_model_segment + gpu_kv_manager + bundle;
+        # they must drop here so deep_free_model_memory's empty_cache can
+        # release the segment's static KV buffers and the decode model.
+        # _failed_buckets is preserved so a stale bucket isn't retried.
+        self._ctx = None
+        self._captured_signatures.clear()
+        self._capture_attempted = False
+        self._state_change_logged = False
+
     # ---- Capture-context attrs (worker wraps replay with CaptureContext) ---
 
     def capture_context_attrs(
