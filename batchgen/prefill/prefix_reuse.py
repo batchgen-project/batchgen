@@ -20,7 +20,6 @@ class PrefixReuseSequencePlan:
     full_logical_context_length: int
     is_full_hit: bool
     fallback_reason: Optional[str] = None
-    attached_shared_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -66,7 +65,6 @@ def build_prefix_reuse_prefill_plan(
     prompt_lengths: Sequence[int],
     prefix_shared_tokens: Sequence[int],
     device: Optional[torch.device] = None,
-    page_size_tokens: Optional[int] = None,
 ) -> PrefixReusePrefillPlan:
     """Build suffix-only prefill metadata without mutating runtime state."""
 
@@ -85,13 +83,6 @@ def build_prefix_reuse_prefill_plan(
     cache_seqlens: list[int] = []
     total_prompt_tokens = 0
     total_suffix_tokens = 0
-    page_size = None
-    if page_size_tokens is not None:
-        page_size = int(page_size_tokens)
-        if page_size <= 0:
-            raise ValueError(
-                f"page_size_tokens must be positive, got {page_size}"
-            )
 
     for idx in range(count):
         prompt_length = int(prompt_lengths[idx])
@@ -111,18 +102,11 @@ def build_prefix_reuse_prefill_plan(
             )
 
         raw_shared_tokens = shared_tokens
-        attached_shared_tokens = raw_shared_tokens
-        if page_size is not None:
-            attached_shared_tokens = (
-                raw_shared_tokens // page_size
-            ) * page_size
-        attached_shared_tokens = min(attached_shared_tokens, prompt_length)
-
         is_full_hit = raw_shared_tokens == prompt_length
-        if is_full_hit and attached_shared_tokens == prompt_length:
+        if is_full_hit:
             suffix_start = max(prompt_length - 1, 0)
         else:
-            suffix_start = attached_shared_tokens
+            suffix_start = raw_shared_tokens
         suffix_length = prompt_length - suffix_start
         target_device = device if device is not None else prompt_ids.device
         suffix_ids = prompt_ids[suffix_start:prompt_length].to(target_device)
@@ -144,7 +128,6 @@ def build_prefix_reuse_prefill_plan(
                 suffix_length=suffix_length,
                 full_logical_context_length=prompt_length,
                 is_full_hit=is_full_hit,
-                attached_shared_tokens=attached_shared_tokens,
             )
         )
         suffix_input_ids.append(suffix_ids)

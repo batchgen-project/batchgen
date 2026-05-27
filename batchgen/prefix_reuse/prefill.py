@@ -91,7 +91,6 @@ def build_prefix_cache_prefill_inputs(
     input_ids: Sequence[torch.Tensor],
     prompt_lengths: Sequence[int],
     lookup: PrefixCachePrefillLookup,
-    page_size_tokens: int | None = None,
 ) -> PrefixCachePrefillInputs:
     """Build suffix-only prepack inputs from prefix lookup results."""
 
@@ -101,7 +100,6 @@ def build_prefix_cache_prefill_inputs(
         input_ids=input_ids,
         prompt_lengths=prompt_lengths,
         prefix_shared_tokens=lookup.prefix_shared_tokens,
-        page_size_tokens=page_size_tokens,
     )
     suffix_inputs = []
     suffix_masks = []
