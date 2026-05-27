@@ -129,6 +129,43 @@ def test_build_prefix_cache_prefill_inputs_uses_suffix_only_tokens():
     ]
 
 
+def test_build_prefix_cache_prefill_inputs_honors_page_aligned_plan():
+    coordinator = _Coordinator(cached_tokens=[6, 4], handles=[11, 12])
+    lookup = lookup_prefix_cache_for_prefill(
+        coordinator=coordinator,
+        namespace_digest=(1, 2, 3, 4),
+        prompt_token_ids=[
+            [10, 11, 12, 13, 14, 15, 16],
+            [20, 21, 22, 23],
+        ],
+    )
+
+    inputs = build_prefix_cache_prefill_inputs(
+        local_indices=[7, 8],
+        sequence_ids=[100, 101],
+        input_ids=[
+            torch.tensor([[10, 11, 12, 13, 14, 15, 16]]),
+            torch.tensor([[20, 21, 22, 23]]),
+        ],
+        prompt_lengths=[7, 4],
+        lookup=lookup,
+        page_size_tokens=4,
+    )
+
+    assert lookup.prefix_shared_tokens == (6, 4)
+    assert [
+        item.attached_shared_tokens for item in inputs.plan.sequences
+    ] == [4, 4]
+    assert [item.prefix_shared_tokens for item in inputs.plan.sequences] == [
+        4,
+        3,
+    ]
+    assert [item.tolist() for item in inputs.input_ids_list] == [
+        [[14, 15, 16]],
+        [[23]],
+    ]
+
+
 def test_release_prefix_cache_lookup_attachments_deduplicates_handles():
     coordinator = _Coordinator(cached_tokens=[4, 4, 0], handles=[11, 11, 0])
     lookup = lookup_prefix_cache_for_prefill(

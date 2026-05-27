@@ -85,6 +85,7 @@ def test_build_prefix_reuse_prefill_plan_accepts_clamped_full_hit():
     assert plan.sequences[0].suffix_start_pos == 3
     assert plan.sequences[0].suffix_length == 1
     assert plan.suffix_input_ids[0].tolist() == [3]
+    assert plan.sequences[0].attached_shared_tokens == 4
 
 
 def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens():
@@ -107,6 +108,36 @@ def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens(
     assert plan.saved_prefill_tokens == 0
     assert plan.suffix_input_ids[0].tolist() == [42]
     assert plan.suffix_position_ids[0].tolist() == [0]
+
+
+def test_build_prefix_reuse_prefill_plan_page_aligns_attached_prefix():
+    plan = build_prefix_reuse_prefill_plan(
+        local_indices=[0, 1],
+        sequence_ids=[100, 101],
+        input_ids=[torch.arange(0, 7), torch.arange(10, 14)],
+        prompt_lengths=[7, 4],
+        prefix_shared_tokens=[6, 4],
+        page_size_tokens=4,
+    )
+
+    first, second = plan.sequences
+    assert first.raw_prefix_shared_tokens == 6
+    assert first.attached_shared_tokens == 4
+    assert first.prefix_shared_tokens == 4
+    assert first.suffix_start_pos == 4
+    assert first.suffix_length == 3
+    assert plan.suffix_input_ids[0].tolist() == [4, 5, 6]
+    assert plan.suffix_position_ids[0].tolist() == [4, 5, 6]
+
+    assert second.is_full_hit is True
+    assert second.attached_shared_tokens == 4
+    assert second.prefix_shared_tokens == 3
+    assert second.suffix_start_pos == 3
+    assert second.suffix_length == 1
+    assert plan.suffix_input_ids[1].tolist() == [13]
+    assert plan.suffix_position_ids[1].tolist() == [3]
+    assert plan.cache_seqlens.tolist() == [4, 3]
+    assert plan.saved_prefill_tokens == 7
 
 
 def test_build_prefix_reuse_prefill_plan_validates_lengths():
