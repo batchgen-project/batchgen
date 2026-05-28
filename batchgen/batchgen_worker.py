@@ -104,6 +104,11 @@ from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.completion import CompletionContext, CompletionHandler
+from batchgen.worker.sync import (
+	SyncContext,
+	SyncCoordinator,
+	TorchDistCollectiveBackend,
+)
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
@@ -522,6 +527,16 @@ class BatchGenWorker:
 		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
 		self._cuda_graph_adapter_dual = True
+		# Phase 3.2 of worker decouple (issue #173): dual-path gate for the
+		# SyncCoordinator slice. NATIVE=1 routes the 2 tensor-based sync
+		# helpers through `batchgen.worker.sync.SyncCoordinator`. COMPARE=1
+		# runs both paths and asserts byte-equal results (the cost is 2× NCCL
+		# collectives during the migration window — acceptable).
+		self._sync_native = os.environ.get("BATCHGEN_WORKER_SYNC_NATIVE", "0") == "1"
+		self._sync_compare = os.environ.get("BATCHGEN_WORKER_SYNC_COMPARE", "0") == "1"
+		# SyncCoordinator instantiated lazily on first use so we don't
+		# touch torch.distributed before it's initialized.
+		self._sync_coordinator: Optional[SyncCoordinator] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -4151,7 +4166,45 @@ class BatchGenWorker:
 								require_owner_tensors=False,
 							)
 
+	# Phase 3.2 of worker decouple (issue #173): the 2 tensor-based sync
+	# helpers below are now dual-path gate wrappers. Each routes through
+	# `batchgen.worker.sync.SyncCoordinator` when BATCHGEN_WORKER_SYNC_NATIVE=1
+	# and asserts byte-equal parity with the legacy body when
+	# BATCHGEN_WORKER_SYNC_COMPARE=1. Phase 3.3 deletes the `_legacy_*`
+	# bodies after parity validation.
+
+	def _make_sync_coordinator(self) -> SyncCoordinator:
+		"""Lazy-construct on first use; reuse across calls."""
+		if self._sync_coordinator is None:
+			self._sync_coordinator = SyncCoordinator(backend=TorchDistCollectiveBackend())
+		return self._sync_coordinator
+
+	def _make_sync_context(self) -> SyncContext:
+		return SyncContext(
+			rank=self.rank,
+			uuid_to_local=self._uuid_to_local_map,
+			global_batch=self.global_batch,
+			torch_device=self.torch_device,
+		)
+
 	def _sync_completion_status_tensor(
+		self,
+		decode_uuids: List[str],
+	) -> Tuple[Set[str], List[str]]:
+		if self._sync_compare:
+			legacy = self._legacy_sync_completion_status_tensor(decode_uuids)
+			native = self._make_sync_coordinator().sync_completion_status_tensor(
+				self._make_sync_context(), decode_uuids
+			)
+			assert legacy == native, f"sync compare mismatch: sync_completion_status_tensor legacy={legacy} native={native}"
+			return native if self._sync_native else legacy
+		if self._sync_native:
+			return self._make_sync_coordinator().sync_completion_status_tensor(
+				self._make_sync_context(), decode_uuids
+			)
+		return self._legacy_sync_completion_status_tensor(decode_uuids)
+
+	def _legacy_sync_completion_status_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> Tuple[Set[str], List[str]]:
@@ -4224,6 +4277,23 @@ class BatchGenWorker:
 		return global_completed, active_uuids
 
 	def _sync_decode_uuids_tensor(
+		self,
+		decode_uuids: List[str],
+	) -> List[str]:
+		if self._sync_compare:
+			legacy = self._legacy_sync_decode_uuids_tensor(decode_uuids)
+			native = self._make_sync_coordinator().sync_decode_uuids_tensor(
+				self._make_sync_context(), decode_uuids
+			)
+			assert legacy == native, f"sync compare mismatch: sync_decode_uuids_tensor legacy={legacy} native={native}"
+			return native if self._sync_native else legacy
+		if self._sync_native:
+			return self._make_sync_coordinator().sync_decode_uuids_tensor(
+				self._make_sync_context(), decode_uuids
+			)
+		return self._legacy_sync_decode_uuids_tensor(decode_uuids)
+
+	def _legacy_sync_decode_uuids_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> List[str]:
