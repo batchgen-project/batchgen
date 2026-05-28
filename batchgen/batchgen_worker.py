@@ -110,6 +110,12 @@ from batchgen.worker.sync import (
 	TorchDistCollectiveBackend,
 )
 from batchgen.worker.batch_formation import BatchFormation, BatchFormationContext
+from batchgen.worker.kv_manager import (
+	KVCacheManager,
+	KVStats,
+	KVUtilizationRequest,
+)
+import dataclasses as _dataclasses
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
@@ -531,6 +537,13 @@ class BatchGenWorker:
 		# SyncCoordinator instantiated lazily on first use so we don't
 		# touch torch.distributed before it's initialized.
 		self._sync_coordinator: Optional[SyncCoordinator] = None
+		# Phase 5.1b of worker decouple (issue #175): dual-path gate for the
+		# KVCacheManager stats tier. NATIVE=1 routes the 3 read-only stat
+		# helpers through `batchgen.worker.kv_manager.KVCacheManager`.
+		# COMPARE=1 runs both paths and asserts equal results.
+		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
+		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
+		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -3000,7 +3013,57 @@ class BatchGenWorker:
 					f"Rank {self.rank}: Reset GPU allocation state for {reset_count} sequences"
 				)
 
+	# Phase 5.1b of worker decouple (issue #175): the 3 read-only KV stat
+	# helpers below route through `KVCacheManager` when
+	# BATCHGEN_WORKER_KV_STATS_NATIVE=1; COMPARE=1 runs both paths and
+	# asserts equal results. Phase 5.1c deletes the legacy bodies after
+	# parity validation.
+
+	def _make_kv_cache_manager(self) -> KVCacheManager:
+		"""Lazy-construct: KV managers may not be bound at __init__ time."""
+		if self._kv_cache_manager is None:
+			worker = self
+			class _TorchKVStatsBackend:
+				def get_host_stats(self) -> KVStats:
+					s = worker.host_paged_kv_worker_view.get_stats()
+					return KVStats(
+						num_free_pages=s.num_free_pages,
+						num_used_pages=s.num_used_pages,
+						num_total_pages=s.num_total_pages,
+					)
+				def get_gpu_stats(self) -> "Optional[KVStats]":
+					m = worker.gpu_paged_kv_cache_manager
+					if m is None:
+						return None
+					s = m.get_stats()
+					return KVStats(
+						num_free_pages=s.num_free_pages,
+						num_used_pages=s.num_used_pages,
+						num_total_pages=s.num_total_pages,
+					)
+			self._kv_cache_manager = KVCacheManager(backend=_TorchKVStatsBackend())
+		return self._kv_cache_manager
+
+	def _make_kv_utilization_request(self) -> KVUtilizationRequest:
+		return KVUtilizationRequest(
+			rank=self.rank,
+			world_size=self.world_size,
+			local_rank=self.local_rank,
+			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			global_batch=self.global_batch,
+		)
+
 	def _get_host_kv_free_pages(self) -> int:
+		if self._kv_stats_compare:
+			legacy = self._legacy_get_host_kv_free_pages()
+			native = self._make_kv_cache_manager().get_host_free_pages()
+			assert legacy == native, f"kv_stats compare mismatch: get_host_kv_free_pages legacy={legacy} native={native}"
+			return native if self._kv_stats_native else legacy
+		if self._kv_stats_native:
+			return self._make_kv_cache_manager().get_host_free_pages()
+		return self._legacy_get_host_kv_free_pages()
+
+	def _legacy_get_host_kv_free_pages(self) -> int:
 		"""Get current free pages from host KV cache."""
 		stats = self.host_paged_kv_worker_view.get_stats()
 		return stats.num_free_pages
@@ -3025,6 +3088,18 @@ class BatchGenWorker:
 		return self._gloo_migration_group
 
 	def _get_host_kv_utilization(self) -> Dict[str, int]:
+		if self._kv_stats_compare:
+			legacy = self._legacy_get_host_kv_utilization()
+			native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
+			native = _dataclasses.asdict(native_obj)
+			assert legacy == native, f"kv_stats compare mismatch: get_host_kv_utilization legacy={legacy} native={native}"
+			return native if self._kv_stats_native else legacy
+		if self._kv_stats_native:
+			native_obj = self._make_kv_cache_manager().get_host_utilization(self._make_kv_utilization_request())
+			return _dataclasses.asdict(native_obj)
+		return self._legacy_get_host_kv_utilization()
+
+	def _legacy_get_host_kv_utilization(self) -> Dict[str, int]:
 		"""Get host KV stats counting sequences with KV in host memory.
 
 		Valid sequences = PREFILLED, ON_HOLD, and IN_DECODE (all have KV in host).
@@ -3050,14 +3125,14 @@ class BatchGenWorker:
 
 		# CRITICAL FIX: IN_DECODE sequences also have KV in host (streams after each layer)
 		valid_statuses = {SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD, SequenceStatus.IN_DECODE}
-		
+
 		# Count sequences per status for detailed logging
 		status_counts = {status: [] for status in valid_statuses}
 		for rank_on_node in range(node_rank_start, node_rank_end):
 			for status in valid_statuses:
 				seqs = self.global_batch.get_sequences_for_rank_with_status(rank_on_node, status)
 				status_counts[status].extend(seqs)
-		
+
 		valid_sequences = []
 		for seqs in status_counts.values():
 			valid_sequences.extend(seqs)
@@ -3858,6 +3933,16 @@ class BatchGenWorker:
 				)
 
 	def _get_gpu_kv_free_pages(self) -> int:
+		if self._kv_stats_compare:
+			legacy = self._legacy_get_gpu_kv_free_pages()
+			native = self._make_kv_cache_manager().get_gpu_free_pages()
+			assert legacy == native, f"kv_stats compare mismatch: get_gpu_kv_free_pages legacy={legacy} native={native}"
+			return native if self._kv_stats_native else legacy
+		if self._kv_stats_native:
+			return self._make_kv_cache_manager().get_gpu_free_pages()
+		return self._legacy_get_gpu_kv_free_pages()
+
+	def _legacy_get_gpu_kv_free_pages(self) -> int:
 		"""Get current free pages from GPU KV cache."""
 		manager = self.gpu_paged_kv_cache_manager
 		if manager is None:
