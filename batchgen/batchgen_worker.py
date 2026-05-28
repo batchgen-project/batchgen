@@ -527,13 +527,6 @@ class BatchGenWorker:
 		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
 		self._cuda_graph_adapter_dual = True
-		# Phase 3.2 of worker decouple (issue #173): dual-path gate for the
-		# SyncCoordinator slice. NATIVE=1 routes the 2 tensor-based sync
-		# helpers through `batchgen.worker.sync.SyncCoordinator`. COMPARE=1
-		# runs both paths and asserts byte-equal results (the cost is 2× NCCL
-		# collectives during the migration window — acceptable).
-		self._sync_native = os.environ.get("BATCHGEN_WORKER_SYNC_NATIVE", "0") == "1"
-		self._sync_compare = os.environ.get("BATCHGEN_WORKER_SYNC_COMPARE", "0") == "1"
 		# SyncCoordinator instantiated lazily on first use so we don't
 		# touch torch.distributed before it's initialized.
 		self._sync_coordinator: Optional[SyncCoordinator] = None
@@ -4166,15 +4159,13 @@ class BatchGenWorker:
 								require_owner_tensors=False,
 							)
 
-	# Phase 3.2 of worker decouple (issue #173): the 2 tensor-based sync
-	# helpers below are now dual-path gate wrappers. Each routes through
-	# `batchgen.worker.sync.SyncCoordinator` when BATCHGEN_WORKER_SYNC_NATIVE=1
-	# and asserts byte-equal parity with the legacy body when
-	# BATCHGEN_WORKER_SYNC_COMPARE=1. Phase 3.3 deletes the `_legacy_*`
-	# bodies after parity validation.
+	# Thin delegations to `batchgen.worker.sync.SyncCoordinator`. The worker
+	# owns the canonical state; `_make_sync_context` snapshots it into a
+	# frozen `SyncContext` per call. `SyncCoordinator` itself is constructed
+	# lazily on first use so we don't touch `torch.distributed` before the
+	# process group is initialized.
 
 	def _make_sync_coordinator(self) -> SyncCoordinator:
-		"""Lazy-construct on first use; reuse across calls."""
 		if self._sync_coordinator is None:
 			self._sync_coordinator = SyncCoordinator(backend=TorchDistCollectiveBackend())
 		return self._sync_coordinator
@@ -4191,147 +4182,17 @@ class BatchGenWorker:
 		self,
 		decode_uuids: List[str],
 	) -> Tuple[Set[str], List[str]]:
-		if self._sync_compare:
-			legacy = self._legacy_sync_completion_status_tensor(decode_uuids)
-			native = self._make_sync_coordinator().sync_completion_status_tensor(
-				self._make_sync_context(), decode_uuids
-			)
-			assert legacy == native, f"sync compare mismatch: sync_completion_status_tensor legacy={legacy} native={native}"
-			return native if self._sync_native else legacy
-		if self._sync_native:
-			return self._make_sync_coordinator().sync_completion_status_tensor(
-				self._make_sync_context(), decode_uuids
-			)
-		return self._legacy_sync_completion_status_tensor(decode_uuids)
-
-	def _legacy_sync_completion_status_tensor(
-		self,
-		decode_uuids: List[str],
-	) -> Tuple[Set[str], List[str]]:
-		"""
-		Synchronize completion status across all ranks using tensor operations.
-
-		OPTIMIZATION: Replaces expensive all_gather_object with tensor-based all_reduce.
-		- all_gather_object requires Python serialization (pickle) - ~1-5ms per call
-		- all_reduce on tensors is pure NCCL - ~0.1ms per call
-
-		Returns:
-			(global_completed_uuids, active_decode_uuids) - both sorted by global_idx
-		"""
-		if not decode_uuids:
-			return set(), []
-
-		# Build global_idx to uuid mapping for decode candidates
-		idx_to_uuid = {}
-		uuid_to_idx = {}
-		for uuid in decode_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				idx_to_uuid[seq.global_idx] = uuid
-				uuid_to_idx[uuid] = seq.global_idx
-
-		if not idx_to_uuid:
-			return set(), []
-
-		# Get max global_idx to size the tensor
-		max_idx = max(idx_to_uuid.keys())
-
-		# Create completion tensor: 1 = completed, 0 = not completed
-		# Each rank marks its LOCAL sequences' completion status
-		completion_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
-
-		for uuid in decode_uuids:
-			if uuid in self._uuid_to_local_map:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None and uuid in uuid_to_idx:
-					is_completed = (seq.status == SequenceStatus.COMPLETED or seq.eos_reached)
-					if is_completed:
-						completion_tensor[uuid_to_idx[uuid]] = 1
-
-		# all_reduce with MAX: if ANY rank marks a sequence complete, result is 1
-		dist.all_reduce(completion_tensor, op=dist.ReduceOp.MAX)
-
-		# Decode back to UUIDs
-		global_completed = set()
-		active_uuids = []
-
-		# Sort by global_idx for deterministic ordering
-		for global_idx in sorted(idx_to_uuid.keys()):
-			uuid = idx_to_uuid[global_idx]
-			if completion_tensor[global_idx].item() == 1:
-				global_completed.add(uuid)
-				# Update local sequence status
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None:
-					seq.eos_reached = True
-					if seq.status != SequenceStatus.COMPLETED:
-						try:
-							self.global_batch.update_status(uuid, SequenceStatus.COMPLETED)
-						except ValueError as e:
-							logging.debug(
-								f"Rank {self.rank}: Could not update {uuid[:8]} to COMPLETED: {e}"
-							)
-			else:
-				active_uuids.append(uuid)
-
-		return global_completed, active_uuids
+		return self._make_sync_coordinator().sync_completion_status_tensor(
+			self._make_sync_context(), decode_uuids
+		)
 
 	def _sync_decode_uuids_tensor(
 		self,
 		decode_uuids: List[str],
 	) -> List[str]:
-		if self._sync_compare:
-			legacy = self._legacy_sync_decode_uuids_tensor(decode_uuids)
-			native = self._make_sync_coordinator().sync_decode_uuids_tensor(
-				self._make_sync_context(), decode_uuids
-			)
-			assert legacy == native, f"sync compare mismatch: sync_decode_uuids_tensor legacy={legacy} native={native}"
-			return native if self._sync_native else legacy
-		if self._sync_native:
-			return self._make_sync_coordinator().sync_decode_uuids_tensor(
-				self._make_sync_context(), decode_uuids
-			)
-		return self._legacy_sync_decode_uuids_tensor(decode_uuids)
-
-	def _legacy_sync_decode_uuids_tensor(
-		self,
-		decode_uuids: List[str],
-	) -> List[str]:
-		"""
-		Synchronize decode_uuids across all ranks using tensor operations.
-
-		Uses global_idx as the common identifier and all_reduce to find intersection.
-		Returns sorted list of UUIDs that ALL ranks agree on.
-		"""
-		if not decode_uuids:
-			return []
-
-		# Build global_idx to uuid mapping
-		idx_to_uuid = {}
-		uuid_to_idx = {}
-		for seq in self.global_batch:
-			idx_to_uuid[seq.global_idx] = seq.uuid
-			uuid_to_idx[seq.uuid] = seq.global_idx
-
-		max_idx = max(idx_to_uuid.keys()) if idx_to_uuid else 0
-
-		# Create presence tensor: 1 = in decode_uuids, 0 = not
-		presence_tensor = torch.zeros(max_idx + 1, dtype=torch.int32, device=self.torch_device)
-		for uuid in decode_uuids:
-			if uuid in uuid_to_idx:
-				presence_tensor[uuid_to_idx[uuid]] = 1
-
-		# all_reduce with MIN: only sequences present on ALL ranks will have value world_size
-		# First broadcast local counts, then sum
-		dist.all_reduce(presence_tensor, op=dist.ReduceOp.MIN)
-
-		# Extract UUIDs where all ranks agree (value == 1 after MIN means all had 1)
-		synced_uuids = []
-		for global_idx in sorted(idx_to_uuid.keys()):
-			if presence_tensor[global_idx].item() == 1:
-				synced_uuids.append(idx_to_uuid[global_idx])
-
-		return synced_uuids
+		return self._make_sync_coordinator().sync_decode_uuids_tensor(
+			self._make_sync_context(), decode_uuids
+		)
 
 	# ============ Tokenization and Assignment ============
 
