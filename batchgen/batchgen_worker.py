@@ -522,12 +522,6 @@ class BatchGenWorker:
 		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
 		self._cuda_graph_adapter_dual = True
-		# Phase 2.2 of worker decouple (issue #172): dual-path gate for the
-		# CompletionHandler slice. NATIVE=1 routes the 3 pure-predicate
-		# completion helpers through `batchgen.worker.completion.CompletionHandler`.
-		# COMPARE=1 runs both paths and asserts byte-equal results.
-		self._completion_native = os.environ.get("BATCHGEN_WORKER_COMPLETION_NATIVE", "0") == "1"
-		self._completion_compare = os.environ.get("BATCHGEN_WORKER_COMPLETION_COMPARE", "0") == "1"
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -1684,18 +1678,11 @@ class BatchGenWorker:
 		else:
 			yield
 
-	# Phase 2.2 of worker decouple (issue #172): the 3 completion-detection
-	# predicates below are now dual-path gate wrappers. Each routes through
-	# `batchgen.worker.completion.CompletionHandler` when BATCHGEN_WORKER_COMPLETION_NATIVE=1
-	# and asserts byte-equal parity with the legacy body when
-	# BATCHGEN_WORKER_COMPLETION_COMPARE=1. Phase 2.3 deletes the `_legacy_*`
-	# bodies after parity validation.
-	#
-	# Note: `_get_finish_reason` has lifespan-logging side effects gated
-	# on `BATCHGEN_SEQ_LIFESPAN=1`. In default runs both paths are no-ops
-	# for logging, so compare-mode is safe. With lifespan tracking on,
-	# compare-mode would produce double-log entries — acceptable for the
-	# migration window since lifespan logs are diagnostic.
+	# Thin delegations to `batchgen.worker.completion.CompletionHandler`.
+	# The worker owns the canonical config (`self._ignore_eos`,
+	# `self.eos_token_ids`, `self.model_context_length`, `self.rank`);
+	# `_make_completion_context` snapshots them into a frozen
+	# `CompletionContext` per call.
 
 	def _make_completion_context(self) -> CompletionContext:
 		return CompletionContext(
@@ -1706,104 +1693,13 @@ class BatchGenWorker:
 		)
 
 	def _should_stop_at_eos(self, token_id: int) -> bool:
-		if self._completion_compare:
-			legacy = self._legacy_should_stop_at_eos(token_id)
-			native = CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
-			assert legacy == native, f"completion compare mismatch: should_stop_at_eos({token_id}) legacy={legacy} native={native}"
-			return native if self._completion_native else legacy
-		if self._completion_native:
-			return CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
-		return self._legacy_should_stop_at_eos(token_id)
-
-	def _legacy_should_stop_at_eos(self, token_id: int) -> bool:
-		"""
-		Check if we should stop at this token.
-
-		Returns True if token is EOS AND we're not ignoring EOS.
-		"""
-		if self._ignore_eos:
-			return False
-		return token_id in self.eos_token_ids
+		return CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
 
 	def _is_sequence_completed(self, seq) -> bool:
-		if self._completion_compare:
-			legacy = self._legacy_is_sequence_completed(seq)
-			native = CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
-			assert legacy == native, f"completion compare mismatch: is_sequence_completed(uuid={seq.uuid!r}) legacy={legacy} native={native}"
-			return native if self._completion_native else legacy
-		if self._completion_native:
-			return CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
-		return self._legacy_is_sequence_completed(seq)
-
-	def _legacy_is_sequence_completed(self, seq) -> bool:
-		"""
-		Unified completion check that respects ignore_eos.
-
-		A sequence is completed if:
-		1. It reached max_decoding_length (always checked), OR
-		2. It hit EOS AND ignore_eos is False, OR
-		3. current_context_length >= model_context_length (context limit reached)
-		"""
-		# Always complete at per-sequence max decoding length
-		if seq.decoded_length >= seq.max_decode_length:
-			return True
-
-		# Complete if context length limit reached (prompt + decoded >= model max)
-		if seq.current_context_length >= self.model_context_length:
-			return True
-
-		# Only complete at EOS if not ignoring EOS
-		if seq.eos_reached and not self._ignore_eos:
-			return True
-
-		# Repetition detected
-		if seq._rep_detected:
-			return True
-
-		return False
+		return CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
 
 	def _get_finish_reason(self, seq) -> str:
-		if self._completion_compare:
-			# Both paths emit lifespan log entries (only when BATCHGEN_SEQ_LIFESPAN=1);
-			# returning value drives the parity check.
-			legacy = self._legacy_get_finish_reason(seq)
-			native = CompletionHandler.get_finish_reason(self._make_completion_context(), seq)
-			assert legacy == native, f"completion compare mismatch: get_finish_reason(uuid={seq.uuid!r}) legacy={legacy!r} native={native!r}"
-			return native if self._completion_native else legacy
-		if self._completion_native:
-			return CompletionHandler.get_finish_reason(self._make_completion_context(), seq)
-		return self._legacy_get_finish_reason(seq)
-
-	def _legacy_get_finish_reason(self, seq) -> str:
-		"""Return OpenAI-compatible finish_reason for a completed sequence.
-
-		Note: seq.eos_reached is overloaded elsewhere as a generic
-		"sequence is done" flag (set on length limit, rep detection,
-		and cross-rank completion sync — not just real EOS). So we
-		must look at the true cause of completion here, not just the
-		eos_reached bit.
-		"""
-		# Repetition detected — dump lifespan for root cause analysis
-		if seq._rep_detected:
-			seq.log_event(SeqEvent.COMPLETED, self.rank, "finish_reason=repetition")
-			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, "REPETITION_COMPLETE")
-			return "repetition"
-		# Length truncation — per-sequence decode budget or model context limit
-		if seq.decoded_length >= seq.max_decode_length:
-			finish = "length"
-		elif seq.current_context_length >= self.model_context_length:
-			finish = "length"
-		# Real EOS only — the token at seq.decoded_length-1 matches an EOS id
-		elif seq.eos_reached and not self._ignore_eos:
-			finish = "stop"
-		else:
-			finish = "length"
-		# Log completion event
-		seq.log_event(SeqEvent.COMPLETED, self.rank, f"finish_reason={finish}")
-		# Dump lifespan if non-stop or any ctx mismatch was recorded
-		if finish != "stop" or lifespan.has_ctx_mismatch(seq._lifespan_log):
-			lifespan.dump_lifespan(seq.uuid, seq.global_idx, seq._lifespan_log, f"COMPLETE_{finish.upper()}")
-		return finish
+		return CompletionHandler.get_finish_reason(self._make_completion_context(), seq)
 
 	def _compute_two_page_buffer_allocation(
 		self, 
