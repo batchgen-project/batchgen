@@ -8,6 +8,7 @@ from batchgen.prefix_reuse.config import (
     PrefixKVGroupSemantic,
     PrefixKVGroupSpec,
     build_prefix_cache_namespace_digest,
+    build_prefix_cache_runtime_config,
     build_prefix_cache_runtime_config_from_specs,
     create_host_prefix_cache_coordinator,
     derive_prefix_cache_shm_name,
@@ -42,6 +43,31 @@ def test_prefix_cache_runtime_config_derives_boundaries_and_capacities():
     assert config.max_group_entries == config.max_nodes * 2
     assert config.max_page_handles >= config.max_group_entries
     assert config.max_attachments >= 1024
+
+
+def test_prefix_cache_runtime_config_uses_multi_rate_kv_groups():
+    config = build_prefix_cache_runtime_config(
+        model_name="deepseek-v4-flash",
+        kv_dtype="bfloat16",
+        host_kv_cache_size_bytes=1 << 30,
+    )
+
+    assert config.hash_block_tokens == 64
+    assert config.publish_boundary_tokens == 256
+    assert [
+        (
+            spec.group_id,
+            spec.semantic,
+            spec.raw_page_tokens,
+            spec.compression_ratio,
+        )
+        for spec in config.group_specs
+    ] == [
+        (0, PrefixKVGroupSemantic.SWA_KV, 64, 1),
+        (1, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 4),
+        (2, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 128),
+        (3, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 4),
+    ]
 
 
 def test_prefix_cache_namespace_digest_is_stable_and_group_sensitive():

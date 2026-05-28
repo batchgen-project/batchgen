@@ -195,6 +195,74 @@ def test_worker_view_attaches_shared_prefix_pages_without_owning_them():
         _shm_unlink(shm_name)
 
 
+def test_worker_view_retains_prefix_resident_pages_until_eviction_release():
+    shm_name = _random_shm_name()
+    cfg = _make_deepseek_r1_config(shm_name)
+    cfg.num_pages = 16
+    worker = bg.MLAHostPagedKVWorkerView(cfg)
+
+    try:
+        worker.initialize(0, True)
+        sequence_id = 303
+        worker.register_sequences([sequence_id])
+
+        pages = worker.allocate_pages_for_sequences(
+            [(sequence_id, cfg.page_size_tokens * 3)]
+        )[0]
+        retained = worker.retain_sequence_prefix_pages(sequence_id, 2)
+
+        assert retained == pages[:2]
+        assert worker.build_page_table([sequence_id]) == [pages]
+
+        before_release = worker.get_stats()
+        worker.release_sequence_pages([sequence_id])
+        after_sequence_release = worker.get_stats()
+
+        assert (
+            after_sequence_release.num_used_pages
+            == before_release.num_used_pages - 1
+        )
+        assert after_sequence_release.num_active_sequences == 0
+
+        worker.release_resident_pages(retained)
+        after_eviction_release = worker.get_stats()
+
+        assert after_eviction_release.num_used_pages == 0
+
+        grow_sequence_id = 404
+        worker.register_sequences([grow_sequence_id])
+        prefix_pages = worker.allocate_pages_for_sequences(
+            [(grow_sequence_id, cfg.page_size_tokens * 2)]
+        )[0]
+        retained_prefix = worker.retain_sequence_prefix_pages(
+            grow_sequence_id, 2
+        )
+        grown_pages = worker.grow_sequence_pages(grow_sequence_id, 1)
+
+        assert retained_prefix == prefix_pages
+        assert worker.build_page_table([grow_sequence_id]) == [
+            prefix_pages + grown_pages
+        ]
+
+        before_grow_release = worker.get_stats()
+        worker.release_sequence_pages([grow_sequence_id])
+        after_grow_sequence_release = worker.get_stats()
+
+        assert (
+            after_grow_sequence_release.num_used_pages
+            == before_grow_release.num_used_pages - len(grown_pages)
+        )
+        worker.release_resident_pages(retained_prefix)
+        assert worker.get_stats().num_used_pages == 0
+    finally:
+        try:
+            worker.shutdown()
+        except Exception:
+            pass
+        del worker
+        _shm_unlink(shm_name)
+
+
 def _worker_proc_copy_prefill(shm_name, device_index, requests):
     # 每个进程里重新构造 cfg，shm_name 必须一致
     cfg = _make_deepseek_r1_config(shm_name)

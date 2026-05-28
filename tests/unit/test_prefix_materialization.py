@@ -206,6 +206,37 @@ def test_materialize_single_group_prefix_pages_starts_page_id_load():
     assert host_view.task.wait_count == 0
 
 
+def test_materialize_prefix_pages_uses_raw_page_tokens_for_compressed_groups():
+    gpu_manager = _FakeGpuManager()
+    gpu_manager.config.page_size_tokens = 2
+    host_view = _FakeHostWorkerView()
+
+    materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        raw_page_tokens=256,
+        sequences=[
+            PrefixMaterializationSequence(
+                sequence_id=101,
+                prefix_tokens=256,
+                suffix_tokens=8,
+                host_pages=[11],
+            ),
+            PrefixMaterializationSequence(
+                sequence_id=102,
+                prefix_tokens=512,
+                suffix_tokens=8,
+                host_pages=[21, 22],
+            ),
+        ],
+    )
+
+    assert len(host_view.calls) == 1
+    call = host_view.calls[0]
+    assert call["host_page_ids"].tolist() == [[11, 0], [21, 22]]
+    assert call["active_page_counts"].tolist() == [1, 2]
+
+
 def test_materialize_single_group_prefix_pages_skips_load_for_all_miss():
     gpu_manager = _FakeGpuManager()
     host_view = _FakeHostWorkerView()
