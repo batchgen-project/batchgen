@@ -521,13 +521,6 @@ class BatchGenWorker:
 		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
 		self._cuda_graph_adapter_dual = True
-		# Phase 1.2 of worker decouple (issue #171): dual-path gate for the
-		# IndexManager slice. NATIVE=1 routes the 5 pure-index helpers through
-		# `batchgen.worker.indexing.IndexManager`. COMPARE=1 runs both paths
-		# and asserts byte-equal results — used during the migration window
-		# to catch any divergence at the call site.
-		self._indexing_native = os.environ.get("BATCHGEN_WORKER_INDEXING_NATIVE", "0") == "1"
-		self._indexing_compare = os.environ.get("BATCHGEN_WORKER_INDEXING_COMPARE", "0") == "1"
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -4052,12 +4045,10 @@ class BatchGenWorker:
 
 	# ============ UUID/Index Conversion Helpers ============
 	#
-	# Phase 1.2 of worker decouple (issue #171): the 5 pure-index helpers
-	# below are now dual-path gate wrappers. Each routes through
-	# `batchgen.worker.indexing.IndexManager` when BATCHGEN_WORKER_INDEXING_NATIVE=1
-	# and additionally asserts byte-equal parity with the legacy body when
-	# BATCHGEN_WORKER_INDEXING_COMPARE=1. After parity validation, Phase 1.3
-	# hardcodes the native path and deletes the `_legacy_*` bodies.
+	# Thin delegations to `batchgen.worker.indexing.IndexManager`. The worker
+	# owns the canonical maps (`self._local_to_uuid_map`, `self._uuid_to_local_map`,
+	# `self.global_batch`); `_make_index_lookup_req` snapshots them into a
+	# frozen `IndexLookupRequest` per call.
 
 	def _make_index_lookup_req(self) -> IndexLookupRequest:
 		return IndexLookupRequest(
@@ -4068,99 +4059,19 @@ class BatchGenWorker:
 		)
 
 	def _local_to_uuid(self, local_idx: int) -> str:
-		if self._indexing_compare:
-			legacy = self._legacy_local_to_uuid(local_idx)
-			native = IndexManager.local_to_uuid(self._make_index_lookup_req(), local_idx)
-			assert legacy == native, f"indexing compare mismatch: local_to_uuid({local_idx}) legacy={legacy!r} native={native!r}"
-			return native if self._indexing_native else legacy
-		if self._indexing_native:
-			return IndexManager.local_to_uuid(self._make_index_lookup_req(), local_idx)
-		return self._legacy_local_to_uuid(local_idx)
-
-	def _legacy_local_to_uuid(self, local_idx: int) -> str:
-		return self._local_to_uuid_map.get(local_idx, "")
+		return IndexManager.local_to_uuid(self._make_index_lookup_req(), local_idx)
 
 	def _uuid_to_local(self, uuid: str) -> int:
-		if self._indexing_compare:
-			legacy = self._legacy_uuid_to_local(uuid)
-			native = IndexManager.uuid_to_local(self._make_index_lookup_req(), uuid)
-			assert legacy == native, f"indexing compare mismatch: uuid_to_local({uuid!r}) legacy={legacy} native={native}"
-			return native if self._indexing_native else legacy
-		if self._indexing_native:
-			return IndexManager.uuid_to_local(self._make_index_lookup_req(), uuid)
-		return self._legacy_uuid_to_local(uuid)
-
-	def _legacy_uuid_to_local(self, uuid: str) -> int:
-		return self._uuid_to_local_map.get(uuid, -1)
+		return IndexManager.uuid_to_local(self._make_index_lookup_req(), uuid)
 
 	def _local_indices_to_global_seq_ids(self, local_indices: List[int]) -> List[int]:
-		if self._indexing_compare:
-			legacy = self._legacy_local_indices_to_global_seq_ids(local_indices)
-			native = IndexManager.local_indices_to_global_seq_ids(self._make_index_lookup_req(), local_indices)
-			assert legacy == native, f"indexing compare mismatch: local_indices_to_global_seq_ids({local_indices!r}) legacy={legacy} native={native}"
-			return native if self._indexing_native else legacy
-		if self._indexing_native:
-			return IndexManager.local_indices_to_global_seq_ids(self._make_index_lookup_req(), local_indices)
-		return self._legacy_local_indices_to_global_seq_ids(local_indices)
-
-	def _legacy_local_indices_to_global_seq_ids(self, local_indices: List[int]) -> List[int]:
-		"""Convert local indices to global sequence IDs (global_idx from SequenceEntry)."""
-		global_seq_ids = []
-		missing_indices = []
-		for local_idx in local_indices:
-			uuid = self._local_to_uuid_map.get(local_idx)
-			if uuid:
-				seq = self.global_batch.get_sequence(uuid)
-				global_seq_ids.append(seq.global_idx)
-			else:
-				missing_indices.append(local_idx)
-
-		# CRITICAL: Log if any local indices are missing - this causes length mismatch
-		# which leads to KV corruption (wrong sequence KV read for wrong batch position)
-		if missing_indices:
-			logging.error(
-				f"Rank {self.rank}: MISSING LOCAL INDICES in _local_indices_to_global_seq_ids! "
-				f"input_len={len(local_indices)}, output_len={len(global_seq_ids)}, "
-				f"missing={missing_indices[:10]}..."
-			)
-		return global_seq_ids
+		return IndexManager.local_indices_to_global_seq_ids(self._make_index_lookup_req(), local_indices)
 
 	def _get_my_sequences_by_status(self, status: SequenceStatus) -> List[str]:
-		if self._indexing_compare:
-			legacy = self._legacy_get_my_sequences_by_status(status)
-			native = IndexManager.get_my_sequences_by_status(self._make_index_lookup_req(), status)
-			assert legacy == native, f"indexing compare mismatch: get_my_sequences_by_status({status!r}) legacy={legacy} native={native}"
-			return native if self._indexing_native else legacy
-		if self._indexing_native:
-			return IndexManager.get_my_sequences_by_status(self._make_index_lookup_req(), status)
-		return self._legacy_get_my_sequences_by_status(status)
-
-	def _legacy_get_my_sequences_by_status(self, status: SequenceStatus) -> List[str]:
-		"""Get UUIDs of sequences assigned to this rank with given status."""
-		return self.global_batch.get_sequences_for_rank_with_status(self.rank, status)
+		return IndexManager.get_my_sequences_by_status(self._make_index_lookup_req(), status)
 
 	def _get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
-		if self._indexing_compare:
-			legacy = self._legacy_get_local_indices_for_uuids(uuids)
-			native = IndexManager.get_local_indices_for_uuids(self._make_index_lookup_req(), uuids)
-			assert legacy == native, f"indexing compare mismatch: get_local_indices_for_uuids({uuids!r}) legacy={legacy} native={native}"
-			return native if self._indexing_native else legacy
-		if self._indexing_native:
-			return IndexManager.get_local_indices_for_uuids(self._make_index_lookup_req(), uuids)
-		return self._legacy_get_local_indices_for_uuids(uuids)
-
-	def _legacy_get_local_indices_for_uuids(self, uuids: List[str]) -> List[int]:
-		"""Convert global UUIDs to local indices for sequences assigned to this rank.
-
-		Non-owned UUIDs are silently skipped — callers typically pass the full
-		cross-rank decode_uuids list and each rank resolves only its own slice.
-		"""
-		local_indices = []
-		for uuid in uuids:
-			local_idx = self._uuid_to_local_map.get(uuid)
-			if local_idx is not None:
-				local_indices.append(local_idx)
-		return local_indices
+		return IndexManager.get_local_indices_for_uuids(self._make_index_lookup_req(), uuids)
 
 	def _update_batch_status(self, uuids: List[str], new_status: SequenceStatus):
 		"""Update status for sequences, skipping if already in target status."""
