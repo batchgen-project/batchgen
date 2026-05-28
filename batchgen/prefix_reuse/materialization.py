@@ -70,9 +70,7 @@ class PrefixMaterializationBundle:
     ) -> "PrefixMaterializationBundle":
         return cls(by_group_id={int(group_id): materialization})
 
-    def get(
-        self, group_id: int
-    ) -> Optional[SingleGroupPrefixMaterialization]:
+    def get(self, group_id: int) -> Optional[SingleGroupPrefixMaterialization]:
         return self.by_group_id.get(int(group_id))
 
     def require(
@@ -154,6 +152,7 @@ def materialize_single_group_prefix_pages(
     gpu_manager: object,
     host_worker_view: object,
     sequences: Sequence[PrefixMaterializationSequence],
+    raw_page_tokens: int | None = None,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize Host prefix pages into target GPU paged KV slots.
@@ -188,7 +187,13 @@ def materialize_single_group_prefix_pages(
                 f"full sequence length must be positive for sequence {seq_id}"
             )
 
-    page_size = int(gpu_manager.config.page_size_tokens)
+    page_size = int(
+        raw_page_tokens
+        if raw_page_tokens is not None
+        else gpu_manager.config.page_size_tokens
+    )
+    if page_size <= 0:
+        raise ValueError("raw_page_tokens must be positive")
     prefix_page_counts = [
         int(math.ceil(prefix_len / page_size)) if prefix_len > 0 else 0
         for prefix_len in prefix_lens
@@ -266,6 +271,7 @@ def materialize_single_group_lookup_results(
     sequence_ids: Sequence[int],
     prompt_lengths: Sequence[int],
     group_id: int,
+    raw_page_tokens: int | None = None,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize a batch of C++ HostPrefixCache lookup results.
@@ -333,6 +339,7 @@ def materialize_single_group_lookup_results(
         gpu_manager=gpu_manager,
         host_worker_view=host_worker_view,
         sequences=sequences,
+        raw_page_tokens=raw_page_tokens,
         prefix_cache_coordinator=prefix_cache_coordinator,
     )
 

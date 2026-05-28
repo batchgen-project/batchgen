@@ -17,6 +17,11 @@ from .commit import (
     build_prefix_commit_request,
     collect_required_group_pages_for_commit,
 )
+from .eviction import (
+    PrefixCommitRetryResult,
+    commit_prefix_pages_with_capacity_retry,
+    release_evicted_prefix_pages,
+)
 from .materialization import (
     PrefixMaterializationBundle,
     PrefixMaterializationSequence,
@@ -36,6 +41,7 @@ from .prefill import (
 )
 from .worker_commit import (
     build_sequence_prefix_commit_request,
+    retain_newly_committed_prefix_pages,
     sequence_token_ids_for_prefix_commit,
 )
 
@@ -53,6 +59,9 @@ __all__ = [
     "build_committable_prefix_token_ids",
     "build_prefix_commit_request",
     "collect_required_group_pages_for_commit",
+    "PrefixCommitRetryResult",
+    "commit_prefix_pages_with_capacity_retry",
+    "release_evicted_prefix_pages",
     "PrefixMaterializationBundle",
     "PrefixMaterializationSequence",
     "SingleGroupPrefixMaterialization",
@@ -67,5 +76,6 @@ __all__ = [
     "lookup_prefix_cache_for_prefill",
     "release_prefix_cache_lookup_attachments",
     "build_sequence_prefix_commit_request",
+    "retain_newly_committed_prefix_pages",
     "sequence_token_ids_for_prefix_commit",
 ]

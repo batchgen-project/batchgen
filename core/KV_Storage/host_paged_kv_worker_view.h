@@ -1081,6 +1081,28 @@ class HostPagedKVWorkerView : private LayerMapper {
         return released;
     }
 
+    std::vector<std::int32_t> RetainSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages) {
+        if (num_pages == 0) {
+            return {};
+        }
+        EnsureSequenceRegistered(sequence_id);
+        const auto current_pages = page_table_.Pages(sequence_id);
+        if (num_pages > current_pages.size()) {
+            std::ostringstream oss;
+            oss << "RetainSequencePrefixPages: cannot retain " << num_pages
+                << " prefix pages from sequence " << sequence_id
+                << " with only " << current_pages.size()
+                << " pages in the worker page table";
+            throw std::out_of_range(oss.str());
+        }
+        return backend_.RetainSequencePrefixPages(sequence_id, num_pages);
+    }
+
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {
+        backend_.ReleaseResidentPages(page_ids);
+    }
+
     KVAsyncTask AsyncOffloadLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,

@@ -53,6 +53,18 @@ class DeepSeekV4HostKVCoordinator:
         self.compressor_c128_state = compressor_c128_state
         self.indexer_c4_state = indexer_c4_state
 
+    def views_by_group(self) -> dict[int, Any]:
+        return {
+            group_id: manager
+            for group_id, manager in (
+                (0, self.swa),
+                (1, self.compressor_c4),
+                (2, self.compressor_c128),
+                (3, self.indexer_c4),
+            )
+            if manager is not None
+        }
+
     def initialize(
         self, device_index: int, create_region: bool = False
     ) -> dict[str, Any]:
@@ -104,6 +116,18 @@ class DeepSeekV4GPUKVCoordinator:
         self.compressor_c4_state = compressor_c4_state
         self.compressor_c128_state = compressor_c128_state
         self.indexer_c4_state = indexer_c4_state
+
+    def managers_by_group(self) -> dict[int, Any]:
+        return {
+            group_id: manager
+            for group_id, manager in (
+                (0, self.swa),
+                (1, self.compressor_c4),
+                (2, self.compressor_c128),
+                (3, self.indexer_c4),
+            )
+            if manager is not None
+        }
 
     def initialize(self) -> dict[str, Any]:
         results: dict[str, Any] = {}

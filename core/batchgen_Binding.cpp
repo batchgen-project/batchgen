@@ -241,6 +241,15 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
            py::arg("sequence_ids"))
        .def("release_sequence_pages", &WorkerView::ReleaseSequencePages,
             py::arg("sequence_ids"))
+       .def("retain_sequence_prefix_pages",
+            &WorkerView::RetainSequencePrefixPages,
+            py::arg("sequence_id"), py::arg("num_pages"),
+            "Move sequence-owned prefix pages into prefix-cache resident "
+            "ownership without changing the worker logical page table.")
+       .def("release_resident_pages", &WorkerView::ReleaseResidentPages,
+            py::arg("page_ids"),
+            "Release prefix-cache resident pages returned by coordinator "
+            "eviction.")
        .def("read_sequence_kv_to_cpu", &WorkerView::ReadSequenceKVToCPU,
             py::arg("sequence_id"),
             "Read all KV pages for a sequence directly to CPU tensors (no GPU). "

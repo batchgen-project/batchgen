@@ -76,8 +76,11 @@ def build_sequence_prefix_commit_request(
     if commit_tokens <= 0:
         return None
 
-    shared_tokens = int(seq.prefix_shared_tokens)
-    if commit_tokens <= shared_tokens:
+    already_committed_tokens = max(
+        int(seq.prefix_shared_tokens),
+        int(seq.prefix_committed_tokens),
+    )
+    if commit_tokens <= already_committed_tokens:
         return None
 
     token_ids = sequence_token_ids_for_prefix_commit(
@@ -103,7 +106,42 @@ def build_sequence_prefix_commit_request(
         token_ids=token_ids,
         publish_boundary_tokens=int(runtime_config.publish_boundary_tokens),
         pages_by_group=pages_by_group,
+        raw_page_tokens_by_group={
+            int(spec.group_id): int(spec.raw_page_tokens)
+            for spec in runtime_config.group_specs
+        },
     )
     if request is None:
         return None
     return request, commit_tokens
+
+
+def retain_newly_committed_prefix_pages(
+    *,
+    runtime_config: PrefixCacheRuntimeConfig,
+    worker_views_by_group: Mapping[int, object],
+    sequence_id: int,
+    previous_committed_tokens: int,
+    commit_tokens: int,
+) -> int:
+    """Move newly published sequence-owned pages into prefix-resident ownership."""
+
+    previous = max(0, int(previous_committed_tokens))
+    target = int(commit_tokens)
+    if target <= previous:
+        return previous
+
+    for spec in runtime_config.group_specs:
+        if not spec.required_for_reuse:
+            continue
+        raw_page_tokens = int(spec.raw_page_tokens)
+        previous_pages = previous // raw_page_tokens
+        target_pages = target // raw_page_tokens
+        new_pages = target_pages - previous_pages
+        if new_pages <= 0:
+            continue
+        worker_views_by_group[int(spec.group_id)].retain_sequence_prefix_pages(
+            int(sequence_id),
+            int(new_pages),
+        )
+    return target

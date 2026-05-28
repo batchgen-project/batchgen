@@ -234,6 +234,11 @@ class HostPagedKVBackend {
     std::vector<std::int32_t> ReleaseSequencePrefixPages(
         std::int64_t sequence_id, std::size_t num_pages);
 
+    std::vector<std::int32_t> RetainSequencePrefixPages(
+        std::int64_t sequence_id, std::size_t num_pages);
+
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids);
+
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
 

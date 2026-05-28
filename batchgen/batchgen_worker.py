@@ -98,8 +98,12 @@ from batchgen.prefix_reuse.materialization import (
 	PrefixMaterializationBundle,
 	materialize_single_group_lookup_results,
 )
+from batchgen.prefix_reuse.eviction import (
+	commit_prefix_pages_with_capacity_retry,
+)
 from batchgen.prefix_reuse.worker_commit import (
 	build_sequence_prefix_commit_request,
+	retain_newly_committed_prefix_pages,
 )
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
@@ -816,6 +820,7 @@ class BatchGenWorker:
 					f"{uuid[:8]}: cached={cached_tokens}, page_size={seq.PAGE_SIZE}"
 				)
 			seq.prefix_shared_tokens = cached_tokens
+			seq.prefix_committed_tokens = cached_tokens
 		return lookup
 
 	def _prefill_inputs_for_local_indices(
@@ -908,11 +913,45 @@ class BatchGenWorker:
 		)
 
 	def _prefix_cache_worker_views_by_group(self) -> Dict[int, object]:
-		views = {0: self.core_engine.host_paged_kv_worker_view}
+		host_view = self.core_engine.host_paged_kv_worker_view
+		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+			return self.host_paged_kv_worker_view.views_by_group()
+		if hasattr(host_view, "views_by_group"):
+			return host_view.views_by_group()
+		views = {0: host_view}
 		aux_view = self.host_paged_kv_worker_view_aux
 		if aux_view is not None:
 			views[1] = aux_view
 		return views
+
+	def _prefix_cache_raw_page_tokens_by_group(self) -> Dict[int, int]:
+		runtime_config = self.prefix_cache_runtime_config
+		if runtime_config is None:
+			return {}
+		return {
+			int(spec.group_id): int(spec.raw_page_tokens)
+			for spec in runtime_config.group_specs
+		}
+
+	def _prefix_cache_required_group_ids(self) -> Set[int]:
+		runtime_config = self.prefix_cache_runtime_config
+		if runtime_config is None:
+			return set()
+		return {
+			int(spec.group_id)
+			for spec in runtime_config.group_specs
+			if spec.required_for_reuse
+		}
+
+	def _prefix_cache_gpu_managers_by_group(
+		self,
+		manager: object,
+	) -> Dict[int, object]:
+		if isinstance(manager, DualKVCacheCoordinator):
+			return manager.managers_by_group()
+		if hasattr(manager, "managers_by_group"):
+			return manager.managers_by_group()
+		return {0: manager}
 
 	def _attach_prefix_cache_lookup_pages(
 		self,
@@ -956,31 +995,38 @@ class BatchGenWorker:
 			for item in prefix_plan.sequences
 		]
 		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
-		primary_manager = (
-			manager.primary
-			if isinstance(manager, DualKVCacheCoordinator)
-			else manager
-		)
-		primary_materialization = materialize_single_group_lookup_results(
-			gpu_manager=primary_manager,
-			host_worker_view=self.core_engine.host_paged_kv_worker_view,
-			lookup_results=lookup.lookup_results,
-			sequence_ids=sequence_ids,
-			prompt_lengths=prompt_lengths,
-			group_id=0,
-			prefix_cache_coordinator=self.prefix_cache_coordinator,
-		)
-		by_group = {0: primary_materialization}
+		host_views_by_group = self._prefix_cache_worker_views_by_group()
+		gpu_managers_by_group = self._prefix_cache_gpu_managers_by_group(manager)
+		raw_page_tokens_by_group = self._prefix_cache_raw_page_tokens_by_group()
+		required_group_ids = self._prefix_cache_required_group_ids()
+		missing_host_groups = required_group_ids - set(host_views_by_group)
+		if missing_host_groups:
+			raise RuntimeError(
+				"Missing Host KV worker views for required prefix cache "
+				f"groups: {sorted(missing_host_groups)}"
+			)
+		missing_gpu_groups = required_group_ids - set(gpu_managers_by_group)
+		if missing_gpu_groups:
+			raise RuntimeError(
+				"Missing GPU KV managers for required prefix cache groups: "
+				f"{sorted(missing_gpu_groups)}"
+			)
 
-		aux_view = self.host_paged_kv_worker_view_aux
-		if isinstance(manager, DualKVCacheCoordinator) and aux_view is not None:
-			by_group[1] = materialize_single_group_lookup_results(
-				gpu_manager=manager.auxiliary,
-				host_worker_view=aux_view,
+		by_group = {}
+		for group_id in sorted(required_group_ids):
+			gpu_group_manager = gpu_managers_by_group.get(group_id)
+			if gpu_group_manager is None:
+				raise RuntimeError(
+					f"Missing GPU KV manager for prefix cache group {group_id}"
+				)
+			by_group[group_id] = materialize_single_group_lookup_results(
+				gpu_manager=gpu_group_manager,
+				host_worker_view=host_views_by_group[group_id],
 				lookup_results=lookup.lookup_results,
 				sequence_ids=sequence_ids,
 				prompt_lengths=prompt_lengths,
-				group_id=1,
+				group_id=group_id,
+				raw_page_tokens=raw_page_tokens_by_group.get(group_id),
 				prefix_cache_coordinator=self.prefix_cache_coordinator,
 			)
 
@@ -1039,17 +1085,37 @@ class BatchGenWorker:
 			if request_pair is None:
 				continue
 			request, commit_tokens = request_pair
-			result = request.commit(self.prefix_cache_coordinator)
+			retry_result = commit_prefix_pages_with_capacity_retry(
+				request=request,
+				coordinator=self.prefix_cache_coordinator,
+				worker_views_by_group=worker_views_by_group,
+			)
+			result = retry_result.commit_result
+			if int(result.inserted_nodes) > 0:
+				seq.prefix_committed_tokens = (
+					retain_newly_committed_prefix_pages(
+						runtime_config=self.prefix_cache_runtime_config,
+						worker_views_by_group=worker_views_by_group,
+						sequence_id=int(seq.global_idx),
+						previous_committed_tokens=int(
+							seq.prefix_committed_tokens
+						),
+						commit_tokens=int(commit_tokens),
+					)
+				)
 			if self.prefix_cache_debug_stats and self.rank == 0:
 				logging.info(
 					"Prefix cache %s commit: seq=%s gid=%s tokens=%s "
-					"inserted=%s existing=%s",
+					"inserted=%s existing=%s evicted=%s",
 					reason,
 					uuid[:8],
 					seq.global_idx,
 					result.committed_tokens,
 					result.inserted_nodes,
 					result.existing_nodes,
+					0
+					if retry_result.eviction_result is None
+					else retry_result.eviction_result.evicted_nodes,
 				)
 
 	def _commit_prefix_cache_prompt_pages(
@@ -7161,6 +7227,7 @@ class BatchGenWorker:
 				)
 				if not self.enable_prefix_cache:
 					seq.prefix_shared_tokens = 0
+					seq.prefix_committed_tokens = 0
 				if shared_prefix_tokens > int(seq.prompt_length):
 					raise RuntimeError(
 						f"Rank {self.rank}: prefix cache hit exceeds prompt "

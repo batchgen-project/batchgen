@@ -77,6 +77,7 @@ class SequenceEntry:
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
         'prefix_shared_tokens',  # Tokens reused from prefix cache for this prefill
+        'prefix_committed_tokens',  # Tokens already owned by prefix cache metadata
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -154,6 +155,7 @@ class SequenceEntry:
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
         self.prefix_shared_tokens: int = 0
+        self.prefix_committed_tokens: int = 0
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None

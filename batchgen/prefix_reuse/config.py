@@ -192,47 +192,49 @@ def _derive_group_specs_and_page_count(
     *, model_name: str, host_kv_cache_size_bytes: int
 ) -> tuple[tuple[PrefixKVGroupSpec, ...], int]:
     from batchgen.kv_cache.host_kv_mananger_config import (
-        _resolve_indexer_profile,
-        _resolve_profile,
+        resolve_host_kv_group_profiles,
     )
 
-    primary_profile = _resolve_profile(model_name)
-    aux_profile = _resolve_indexer_profile(model_name)
-    profiles = [primary_profile]
-    if aux_profile is not None:
-        profiles.append(aux_profile)
-
-    bytes_per_logical_page = sum(
-        profile.bytes_per_page() * profile.num_layers for profile in profiles
+    group_profiles = resolve_host_kv_group_profiles(model_name)
+    specs = tuple(
+        PrefixKVGroupSpec(
+            group_id=profile.group_id,
+            semantic=_semantic_from_group_profile(profile),
+            required_for_reuse=profile.required_for_reuse,
+            raw_page_tokens=profile.raw_page_tokens,
+            compression_ratio=profile.compression_ratio,
+        )
+        for profile in group_profiles
     )
-    pages_per_group = int(host_kv_cache_size_bytes) // bytes_per_logical_page
-    if pages_per_group <= 0:
+    required_profiles = tuple(
+        profile for profile in group_profiles if profile.required_for_reuse
+    )
+    if not required_profiles:
+        raise ValueError("prefix cache requires at least one required KV group")
+
+    publish_boundary_tokens = _lcm(
+        profile.raw_page_tokens for profile in required_profiles
+    )
+    bytes_per_publish_boundary = sum(
+        profile.bytes_per_page()
+        * profile.num_layers
+        * (publish_boundary_tokens // profile.raw_page_tokens)
+        for profile in required_profiles
+    )
+    publish_units = int(host_kv_cache_size_bytes) // bytes_per_publish_boundary
+    if publish_units <= 0:
         raise ValueError("host KV cache is too small for prefix cache")
 
-    specs = [
-        PrefixKVGroupSpec(
-            group_id=0,
-            semantic=_semantic_from_profile(primary_profile),
-            required_for_reuse=True,
-            raw_page_tokens=primary_profile.page_size,
-        )
-    ]
-    if aux_profile is not None:
-        specs.append(
-            PrefixKVGroupSpec(
-                group_id=1,
-                semantic=PrefixKVGroupSemantic.FULL_KV,
-                required_for_reuse=True,
-                raw_page_tokens=aux_profile.page_size,
-            )
-        )
-    return tuple(specs), pages_per_group
+    return specs, publish_units
 
 
-def _semantic_from_profile(profile) -> PrefixKVGroupSemantic:
-    if int(profile.num_v_heads) == 0:
-        return PrefixKVGroupSemantic.MLA_COMPRESSED_KV
-    return PrefixKVGroupSemantic.FULL_KV
+def _semantic_from_group_profile(profile) -> PrefixKVGroupSemantic:
+    try:
+        return PrefixKVGroupSemantic(profile.semantic)
+    except ValueError as exc:
+        raise ValueError(
+            f"unsupported prefix KV group semantic {profile.semantic!r}"
+        ) from exc
 
 
 def _to_core_group_spec(core_engine_module, spec: PrefixKVGroupSpec):

@@ -13,7 +13,9 @@ class PrefixCommitRequest:
     namespace_digest: tuple[int, int, int, int]
     token_ids: list[int]
     commit_tokens: int
+    publish_boundary_tokens: int
     group_pages: list[object]
+    raw_page_tokens_by_group: dict[int, int]
 
     def commit(self, coordinator: object):
         return coordinator.commit_prefix_pages(
@@ -22,6 +24,33 @@ class PrefixCommitRequest:
             int(self.commit_tokens),
             self.group_pages,
         )
+
+    def capacity_requirements(self) -> tuple[int, int, int]:
+        """Return worst-case metadata slots needed for this commit.
+
+        The coordinator skips entries that already exist, so this intentionally
+        overestimates on the capacity-failure path. It avoids inspecting
+        shared-memory internals from Python while still evicting enough metadata
+        before retrying once.
+        """
+
+        boundary = int(self.publish_boundary_tokens)
+        commit_tokens = int(self.commit_tokens)
+        node_count = commit_tokens // boundary
+        group_entry_count = 0
+        page_handle_count = 0
+        for raw_end_token in range(boundary, commit_tokens + 1, boundary):
+            for group_pages in self.group_pages:
+                group_id = int(group_pages.group_id)
+                raw_page_tokens = int(self.raw_page_tokens_by_group[group_id])
+                if raw_end_token % raw_page_tokens != 0:
+                    continue
+                page_count = raw_end_token // raw_page_tokens
+                if len(group_pages.pages) < page_count:
+                    continue
+                group_entry_count += 1
+                page_handle_count += page_count
+        return node_count, group_entry_count, page_handle_count
 
 
 def aligned_prefix_tokens(total_tokens: int, publish_boundary_tokens: int) -> int:
@@ -59,6 +88,7 @@ def build_prefix_commit_request(
     token_ids: Sequence[int],
     publish_boundary_tokens: int,
     pages_by_group: Mapping[int, Sequence[int | object]],
+    raw_page_tokens_by_group: Mapping[int, int],
 ) -> PrefixCommitRequest | None:
     """Build a page-aligned prefix cache commit request.
 
@@ -86,7 +116,12 @@ def build_prefix_commit_request(
         namespace_digest=tuple(int(value) for value in namespace_digest),
         token_ids=[int(token_id) for token_id in token_ids],
         commit_tokens=commit_tokens,
+        publish_boundary_tokens=int(publish_boundary_tokens),
         group_pages=group_pages,
+        raw_page_tokens_by_group={
+            int(group_id): int(raw_page_tokens)
+            for group_id, raw_page_tokens in raw_page_tokens_by_group.items()
+        },
     )
 
 
