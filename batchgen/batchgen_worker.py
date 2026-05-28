@@ -103,6 +103,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.models.engine_loader import core_engine
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
+from batchgen.worker.completion import CompletionContext, CompletionHandler
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
@@ -521,6 +522,12 @@ class BatchGenWorker:
 		# retired — adapters are now the production path, not a migration toggle.
 		self._cuda_graph_adapter = None
 		self._cuda_graph_adapter_dual = True
+		# Phase 2.2 of worker decouple (issue #172): dual-path gate for the
+		# CompletionHandler slice. NATIVE=1 routes the 3 pure-predicate
+		# completion helpers through `batchgen.worker.completion.CompletionHandler`.
+		# COMPARE=1 runs both paths and asserts byte-equal results.
+		self._completion_native = os.environ.get("BATCHGEN_WORKER_COMPLETION_NATIVE", "0") == "1"
+		self._completion_compare = os.environ.get("BATCHGEN_WORKER_COMPLETION_COMPARE", "0") == "1"
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -1677,10 +1684,41 @@ class BatchGenWorker:
 		else:
 			yield
 
+	# Phase 2.2 of worker decouple (issue #172): the 3 completion-detection
+	# predicates below are now dual-path gate wrappers. Each routes through
+	# `batchgen.worker.completion.CompletionHandler` when BATCHGEN_WORKER_COMPLETION_NATIVE=1
+	# and asserts byte-equal parity with the legacy body when
+	# BATCHGEN_WORKER_COMPLETION_COMPARE=1. Phase 2.3 deletes the `_legacy_*`
+	# bodies after parity validation.
+	#
+	# Note: `_get_finish_reason` has lifespan-logging side effects gated
+	# on `BATCHGEN_SEQ_LIFESPAN=1`. In default runs both paths are no-ops
+	# for logging, so compare-mode is safe. With lifespan tracking on,
+	# compare-mode would produce double-log entries — acceptable for the
+	# migration window since lifespan logs are diagnostic.
+
+	def _make_completion_context(self) -> CompletionContext:
+		return CompletionContext(
+			ignore_eos=self._ignore_eos,
+			eos_token_ids=frozenset(self.eos_token_ids),
+			model_context_length=self.model_context_length,
+			rank=self.rank,
+		)
+
 	def _should_stop_at_eos(self, token_id: int) -> bool:
+		if self._completion_compare:
+			legacy = self._legacy_should_stop_at_eos(token_id)
+			native = CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
+			assert legacy == native, f"completion compare mismatch: should_stop_at_eos({token_id}) legacy={legacy} native={native}"
+			return native if self._completion_native else legacy
+		if self._completion_native:
+			return CompletionHandler.should_stop_at_eos(self._make_completion_context(), token_id)
+		return self._legacy_should_stop_at_eos(token_id)
+
+	def _legacy_should_stop_at_eos(self, token_id: int) -> bool:
 		"""
 		Check if we should stop at this token.
-		
+
 		Returns True if token is EOS AND we're not ignoring EOS.
 		"""
 		if self._ignore_eos:
@@ -1688,6 +1726,16 @@ class BatchGenWorker:
 		return token_id in self.eos_token_ids
 
 	def _is_sequence_completed(self, seq) -> bool:
+		if self._completion_compare:
+			legacy = self._legacy_is_sequence_completed(seq)
+			native = CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
+			assert legacy == native, f"completion compare mismatch: is_sequence_completed(uuid={seq.uuid!r}) legacy={legacy} native={native}"
+			return native if self._completion_native else legacy
+		if self._completion_native:
+			return CompletionHandler.is_sequence_completed(self._make_completion_context(), seq)
+		return self._legacy_is_sequence_completed(seq)
+
+	def _legacy_is_sequence_completed(self, seq) -> bool:
 		"""
 		Unified completion check that respects ignore_eos.
 
@@ -1715,6 +1763,18 @@ class BatchGenWorker:
 		return False
 
 	def _get_finish_reason(self, seq) -> str:
+		if self._completion_compare:
+			# Both paths emit lifespan log entries (only when BATCHGEN_SEQ_LIFESPAN=1);
+			# returning value drives the parity check.
+			legacy = self._legacy_get_finish_reason(seq)
+			native = CompletionHandler.get_finish_reason(self._make_completion_context(), seq)
+			assert legacy == native, f"completion compare mismatch: get_finish_reason(uuid={seq.uuid!r}) legacy={legacy!r} native={native!r}"
+			return native if self._completion_native else legacy
+		if self._completion_native:
+			return CompletionHandler.get_finish_reason(self._make_completion_context(), seq)
+		return self._legacy_get_finish_reason(seq)
+
+	def _legacy_get_finish_reason(self, seq) -> str:
 		"""Return OpenAI-compatible finish_reason for a completed sequence.
 
 		Note: seq.eos_reached is overloaded elsewhere as a generic
