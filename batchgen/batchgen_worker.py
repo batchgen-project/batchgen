@@ -109,6 +109,7 @@ from batchgen.worker.sync import (
 	SyncCoordinator,
 	TorchDistCollectiveBackend,
 )
+from batchgen.worker.batch_formation import BatchFormation, BatchFormationContext
 
 from batchgen.kv_cache.host_kv_mananger_config import (
 	build_gpu_kv_config,
@@ -530,6 +531,12 @@ class BatchGenWorker:
 		# SyncCoordinator instantiated lazily on first use so we don't
 		# touch torch.distributed before it's initialized.
 		self._sync_coordinator: Optional[SyncCoordinator] = None
+		# Phase 4.2 of worker decouple (issue #174): dual-path gate for the
+		# BatchFormation slice. NATIVE=1 routes rank-assignment through
+		# `batchgen.worker.batch_formation.BatchFormation.plan_rank_assignment`.
+		# COMPARE=1 runs both paths and asserts byte-equal results.
+		self._batch_formation_native = os.environ.get("BATCHGEN_WORKER_BATCH_FORMATION_NATIVE", "0") == "1"
+		self._batch_formation_compare = os.environ.get("BATCHGEN_WORKER_BATCH_FORMATION_COMPARE", "0") == "1"
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -4425,7 +4432,67 @@ class BatchGenWorker:
 
 		logging.info(f"Rank {self.rank}: Tokenized {len(self.global_batch)} sequences")
 
+	# Phase 4.2 of worker decouple (issue #174): rank assignment routes
+	# through `BatchFormation.plan_rank_assignment` under NATIVE=1, with
+	# COMPARE=1 running both paths and asserting equal assignments.
+	# Phase 4.3 deletes the legacy body once parity is validated.
+
 	def _assign_sequences_to_ranks(self) -> None:
+		if self._batch_formation_compare:
+			# Snapshot global_batch state before legacy path mutates it
+			pre_assigned = {seq.uuid: seq.assigned_rank for seq in self.global_batch}
+
+			# Run legacy: mutates global_batch.assign_rank
+			self._legacy_assign_sequences_to_ranks()
+			legacy_assignments = {seq.uuid: seq.assigned_rank for seq in self.global_batch}
+
+			# Run native: pure planner — produces the same assignment
+			ctx = BatchFormationContext(
+				world_size=self.world_size, rank=self.rank, global_batch=self.global_batch,
+			)
+			native_plan = BatchFormation.plan_rank_assignment(ctx)
+			# Re-derive what global_batch WOULD look like after applying native plan
+			native_assignments = dict(pre_assigned)
+			for uuid, target in native_plan.assignments.items():
+				native_assignments[uuid] = target
+
+			assert legacy_assignments == native_assignments, (
+				f"batch_formation compare mismatch: rank assignment differs. "
+				f"legacy={legacy_assignments} native={native_assignments}"
+			)
+			# Final global_batch state is whichever the gate selects. Since both
+			# converge to the same assignment and legacy already wrote them,
+			# nothing else to do here under compare-mode.
+			return
+
+		if self._batch_formation_native:
+			if self.global_batch is None:
+				raise RuntimeError("Global batch not initialized")
+			ctx = BatchFormationContext(
+				world_size=self.world_size, rank=self.rank, global_batch=self.global_batch,
+			)
+			plan = BatchFormation.plan_rank_assignment(ctx)
+			# Worker is the sole mutator: apply the plan to global_batch.
+			for uuid, target in plan.assignments.items():
+				self.global_batch.assign_rank(uuid, target)
+			# Log balance quality (matches legacy logging surface)
+			rank_tiles = plan.tiles_per_rank
+			my_seqs = self.global_batch.get_sequences_for_rank(self.rank)
+			if self.rank == 0:
+				imbalance = (max(rank_tiles) - min(rank_tiles)) / max(rank_tiles) * 100 if max(rank_tiles) > 0 else 0
+				logging.info(
+					f"Workload distribution (tiles per rank): {list(rank_tiles)}, "
+					f"imbalance: {imbalance:.1f}%"
+				)
+			logging.info(
+				f"Rank {self.rank}: Assigned {len(my_seqs)} sequences, "
+				f"tiles={rank_tiles[self.rank]}"
+			)
+			return
+
+		self._legacy_assign_sequences_to_ranks()
+
+	def _legacy_assign_sequences_to_ranks(self) -> None:
 		"""
 		Assign sequences to ranks balancing predicted attention tile workload.
 		All ranks execute this identically to maintain consistent assignment.
