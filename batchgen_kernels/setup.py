@@ -28,6 +28,7 @@ import torch
 
 # ── Version (single source of truth: _version.py) ──
 
+
 def _get_version():
     version_file = os.path.join(_this_dir, "_version.py")
     ns = {"__file__": version_file}
@@ -49,6 +50,7 @@ _nvcc_threads = os.getenv("NVCC_THREADS", "4")
 
 # ── ccache / sccache integration ──
 
+
 def _setup_ccache():
     """Detect and configure ccache/sccache for faster incremental builds."""
     for tool in ("sccache", "ccache"):
@@ -60,6 +62,7 @@ def _setup_ccache():
             print(f"[batchgen_kernels] Using {tool} for compilation cache")
             return tool
     return None
+
 
 _cache_tool = _setup_ccache()
 
@@ -86,8 +89,15 @@ _build_sm100 = _build_arch in ("sm100", "all")
 
 # ── Architecture flag sets ──
 
-_sm90a_flags = ["-std=c++17", "-arch=sm_90a", "-O3", "--ptxas-options=-v",
-                "-lineinfo", "--threads", _nvcc_threads]
+_sm90a_flags = [
+    "-std=c++17",
+    "-arch=sm_90a",
+    "-O3",
+    "--ptxas-options=-v",
+    "-lineinfo",
+    "--threads",
+    _nvcc_threads,
+]
 
 if _build_arch == "sm90a":
     _sm80_gencode = ["-gencode", "arch=compute_90a,code=sm_90a"]
@@ -95,13 +105,17 @@ elif _build_arch == "sm100":
     _sm80_gencode = ["-gencode", "arch=compute_100,code=sm_100"]
 elif _build_arch == "all":
     _sm80_gencode = [
-        "-gencode", "arch=compute_80,code=sm_80",
-        "-gencode", "arch=compute_90,code=sm_90",
+        "-gencode",
+        "arch=compute_80,code=sm_80",
+        "-gencode",
+        "arch=compute_90,code=sm_90",
     ]
     # Add SM100 gencode if CUDA toolkit >= 12.8
     _cuda_version = getattr(torch.version, "cuda", None)
     if _cuda_version:
-        _cuda_major, _cuda_minor = (int(x) for x in _cuda_version.split(".")[:2])
+        _cuda_major, _cuda_minor = (
+            int(x) for x in _cuda_version.split(".")[:2]
+        )
         if (_cuda_major, _cuda_minor) >= (12, 8):
             _sm80_gencode += ["-gencode", "arch=compute_100,code=sm_100"]
 else:
@@ -115,7 +129,6 @@ _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
 _sm90a_extensions = [
     # ── SM90a WGMMA kernels ──
-
     # MoE WGMMA kernels (MXFP4)
     CUDAExtension(
         name="batchgen_kernels.moe._C_expert_mxfp4_wgmma",
@@ -151,27 +164,41 @@ _sm90a_extensions = [
         sources=["src/moe/marlin_grouped_gemm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
-                     "--use_fast_math", "-lineinfo",
-                     "-DUSE_BF16_COMPUTE",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-arch=sm_90a",
+                "--use_fast_math",
+                "-lineinfo",
+                "-DUSE_BF16_COMPUTE",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # FP8 blockwise grouped GEMM (CuTe persistent, adaptive TileM)
     CUDAExtension(
         name="batchgen_kernels.moe._C_fp8_blockwise_gemm",
         sources=["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
-        include_dirs=[os.path.join(_this_dir, "3rd/cutlass/include"),
-                     _this_dir],
+        include_dirs=[
+            os.path.join(_this_dir, "3rd/cutlass/include"),
+            _this_dir,
+        ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
-                     "-lineinfo", "--expt-relaxed-constexpr",
-                     "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
-                     "-DNDEBUG",
-                     "-Xptxas=-v",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-arch=sm_90a",
+                "-lineinfo",
+                "--expt-relaxed-constexpr",
+                "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                "-DNDEBUG",
+                "-Xptxas=-v",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # FP8 blockwise MoE pipeline ops (act_quant_3d, silu_mul_3d, fused_silu_quant_3d)
@@ -180,9 +207,14 @@ _sm90a_extensions = [
         sources=["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
-                     "-lineinfo",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-arch=sm_90a",
+                "-lineinfo",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # Marlin <-> WGMMA weight transform
@@ -191,9 +223,14 @@ _sm90a_extensions = [
         sources=["src/moe/marlin_transform_kernel.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
-                     "--use_fast_math",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-arch=sm_90a",
+                "--use_fast_math",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # QKV WGMMA fused projection
@@ -217,9 +254,15 @@ _sm90a_extensions = [
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "-gencode", "arch=compute_90a,code=sm_90a",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # 3D dispatch scatter + reduce (strided MoE buffer)
@@ -228,22 +271,31 @@ _sm90a_extensions = [
         sources=["src/moe/dispatch_scatter_3d.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # ── AOT MLA attention kernels (SM90a, BF16-only) ──
-
     # Fused RMSNorm + RoPE + cache write (KV + Q)
     CUDAExtension(
         name="batchgen_kernels.attention._C_fused_kv_norm_rope",
         sources=["src/attention/fused_kv_norm_rope_cache.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "-gencode", "arch=compute_90a,code=sm_90a",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # Fused q_absorb GEMV + q_pe copy
@@ -252,9 +304,15 @@ _sm90a_extensions = [
         sources=["src/attention/fused_q_absorb.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "-gencode", "arch=compute_90a,code=sm_90a",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # Fused q_b split into q_nope + q_pe
@@ -263,16 +321,21 @@ _sm90a_extensions = [
         sources=["src/attention/fused_q_split.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "-gencode", "arch=compute_90a,code=sm_90a",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
 ]
 
 _sm80_extensions = [
     # ── SM80+ universal kernels ──
-
     # Attention fused ops (RMSNorm, RoPE, QKV split)
     CUDAExtension(
         name="batchgen_kernels.attention._C_fused_ops",
@@ -284,9 +347,15 @@ _sm80_extensions = [
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads] + _sm80_gencode,
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "--expt-relaxed-constexpr",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                _nvcc_threads,
+            ]
+            + _sm80_gencode,
         },
     ),
     # CuTe MXFP4 dequantization
@@ -295,8 +364,13 @@ _sm80_extensions = [
         sources=["src/moe/mxfp4_dequant_cute.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-lineinfo",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # MXFP4 dequant with shared memory LUT
@@ -305,8 +379,13 @@ _sm80_extensions = [
         sources=["src/moe/mxfp4_dequant.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-lineinfo",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # RMSNorm (multi-dtype: BF16/FP16/FP32) — common
@@ -315,12 +394,17 @@ _sm80_extensions = [
         sources=["src/common/rmsnorm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "-U__CUDA_NO_HALF_OPERATORS__",
-                     "-U__CUDA_NO_HALF_CONVERSIONS__",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # CUDA RMSNorm + Add+RMSNorm (from cuda_rmsnorm.py)
@@ -329,12 +413,36 @@ _sm80_extensions = [
         sources=["src/common/cuda_rmsnorm.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
-                     "-U__CUDA_NO_HALF_OPERATORS__",
-                     "-U__CUDA_NO_HALF_CONVERSIONS__",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--threads",
+                _nvcc_threads,
+            ],
+        },
+    ),
+    # Fused per-head Q + global KV RMSNorm (Path A native CUDA replacement
+    # for batchgen/attention/mla/v4_fused_qk_rmsnorm.py Triton kernel)
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_qk_rmsnorm",
+        sources=["src/attention/csrc/fused_qk_rmsnorm.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--threads",
+                _nvcc_threads,
+            ],
         },
     ),
     # MGN (MoE General Native) ops — token dispatch, fused gate, bincount, rmsnorm
@@ -347,27 +455,38 @@ _sm80_extensions = [
             "src/moe/mgn/expert_bin_count.cu",
             "src/moe/mgn/rmsnorm.cu",
         ],
-        include_dirs=[os.path.join(_this_dir, "src/moe/mgn"),
-                     os.path.join(_this_dir, "3rd/cutlass/include")],
+        include_dirs=[
+            os.path.join(_this_dir, "src/moe/mgn"),
+            os.path.join(_this_dir, "3rd/cutlass/include"),
+        ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "-std=c++17",
-                     "-U__CUDA_NO_HALF_OPERATORS__",
-                     "-U__CUDA_NO_HALF_CONVERSIONS__",
-                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads] + _sm80_gencode,
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                _nvcc_threads,
+            ]
+            + _sm80_gencode,
         },
     ),
-
     # ── AOT MoE token permutation (SM80+, multi-dtype) ──
-
     CUDAExtension(
         name="batchgen_kernels.moe._C_fused_moe_token_permutation",
         sources=["src/moe/fused_moe_token_permutation.cu"],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
-                     "--threads", _nvcc_threads] + _sm80_gencode,
+            "nvcc": [
+                "-O3",
+                "--use_fast_math",
+                "-std=c++17",
+                "--threads",
+                _nvcc_threads,
+            ]
+            + _sm80_gencode,
         },
     ),
 ]
@@ -377,7 +496,9 @@ _ext_modules = []
 if _build_sm90a:
     _ext_modules.extend(_sm90a_extensions)
 else:
-    print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
+    print(
+        f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels"
+    )
 _ext_modules.extend(_sm80_extensions)
 
 setup(
@@ -393,11 +514,15 @@ setup(
         "batchgen_kernels.common": "common",
         "batchgen_kernels.triton": "triton",
     },
-    packages=["batchgen_kernels", "batchgen_kernels.attention",
-              "batchgen_kernels.attention.dsa",
-              "batchgen_kernels.attention.dsa.indexer",
-              "batchgen_kernels.moe", "batchgen_kernels.common",
-              "batchgen_kernels.triton"],
+    packages=[
+        "batchgen_kernels",
+        "batchgen_kernels.attention",
+        "batchgen_kernels.attention.dsa",
+        "batchgen_kernels.attention.dsa.indexer",
+        "batchgen_kernels.moe",
+        "batchgen_kernels.common",
+        "batchgen_kernels.triton",
+    ],
     package_data={
         "batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"],
         "batchgen_kernels.attention.dsa.indexer": [

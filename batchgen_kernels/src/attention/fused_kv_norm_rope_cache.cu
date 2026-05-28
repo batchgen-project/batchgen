@@ -176,7 +176,162 @@ torch::Tensor fused_kv_norm_rope_cache_forward(
     return offload;
 }
 
+// ── 512-dim variant (HF convention) ──
+// Reads kv [B, 1, head_dim=512]. Norms ALL 512 dims with weight, then RoPEs
+// the last rope_dim=64 dims of the NORMED output (not raw input).
+// Cache/offload are also 512-dim. Matches HuggingFace DeepseekV4Attention.
+__global__ void fused_kv_norm_rope_cache_512_kernel(
+    const __nv_bfloat16* __restrict__ new_kv_ptr,     // [B, 1, head_dim]
+    __nv_bfloat16* __restrict__ cache_ptr,             // [B, max_seq_len, head_dim]
+    __nv_bfloat16* __restrict__ offload_ptr,           // [B, 1, head_dim]
+    __nv_bfloat16* __restrict__ q_pe_ptr,              // [B, H, 1, rope_dim]
+    const __nv_bfloat16* __restrict__ cos_ptr,         // [max_pos, rope_dim]
+    const __nv_bfloat16* __restrict__ sin_ptr,         // [max_pos, rope_dim]
+    const int64_t* __restrict__ position_ids_ptr,      // [B, 1]
+    const __nv_bfloat16* __restrict__ norm_weight_ptr, // [head_dim]
+    int B, int H, int max_seq_len,
+    int head_dim,        // 512
+    int rope_dim,        // 64
+    float eps
+) {
+    int batch = blockIdx.x;
+    if (batch >= B) return;
+
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;  // 256
+    int nope_dim = head_dim - rope_dim;  // 448
+    int half_rope = rope_dim / 2;  // 32
+    int64_t pos_id = position_ids_ptr[batch];
+
+    extern __shared__ char smem_raw[];
+    float* smem_float = reinterpret_cast<float*>(smem_raw);
+    __nv_bfloat16* smem_kv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 256 * sizeof(float));
+
+    const __nv_bfloat16* kv_in = new_kv_ptr + batch * head_dim;
+
+    // Stage 1: RMSNorm on ALL head_dim=512 dims (HF convention)
+    float local_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += nthreads) {
+        float val = __bfloat162float(kv_in[i]);
+        local_sq += val * val;
+    }
+
+    smem_float[tid] = local_sq;
+    __syncthreads();
+
+    for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem_float[tid] += smem_float[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float variance = smem_float[0] / head_dim;
+    float inv_rms = rsqrtf(variance + eps);
+
+    // Write normed NoPE dims [0:nope_dim] to smem
+    for (int i = tid; i < nope_dim; i += nthreads) {
+        float val = __bfloat162float(kv_in[i]);
+        float w = __bfloat162float(norm_weight_ptr[i]);
+        smem_kv[i] = __float2bfloat16(val * inv_rms * w);
+    }
+
+    // Stage 2: Norm + RoPE on last rope_dim dims [nope_dim:head_dim]
+    // RoPE is applied to the NORMED values (HF convention: norm all, then rotate)
+    int cos_sin_base = pos_id * rope_dim;
+
+    if (tid < half_rope) {
+        int even_idx = tid * 2;
+        int odd_idx = tid * 2 + 1;
+
+        // Norm the rope dims first (same inv_rms as NoPE)
+        float val_even = __bfloat162float(kv_in[nope_dim + even_idx]) * inv_rms
+                       * __bfloat162float(norm_weight_ptr[nope_dim + even_idx]);
+        float val_odd  = __bfloat162float(kv_in[nope_dim + odd_idx]) * inv_rms
+                       * __bfloat162float(norm_weight_ptr[nope_dim + odd_idx]);
+
+        float cos_first  = __bfloat162float(cos_ptr[cos_sin_base + tid]);
+        float sin_first  = __bfloat162float(sin_ptr[cos_sin_base + tid]);
+        float cos_second = __bfloat162float(cos_ptr[cos_sin_base + half_rope + tid]);
+        float sin_second = __bfloat162float(sin_ptr[cos_sin_base + half_rope + tid]);
+
+        smem_kv[nope_dim + tid]            = __float2bfloat16(val_even * cos_first - val_odd * sin_first);
+        smem_kv[nope_dim + half_rope + tid] = __float2bfloat16(val_odd * cos_second + val_even * sin_second);
+    }
+    __syncthreads();
+
+    // Stage 3: Write to cache + offload (head_dim=512, not 576)
+    __nv_bfloat16* cache_dst = cache_ptr + batch * max_seq_len * head_dim + pos_id * head_dim;
+    __nv_bfloat16* offload_dst = offload_ptr + batch * head_dim;
+
+    for (int i = tid; i < head_dim; i += nthreads) {
+        cache_dst[i] = smem_kv[i];
+        offload_dst[i] = smem_kv[i];
+    }
+
+    // Stage 4: RoPE on all Q heads (in-place) — identical to 576-dim variant
+    int q_pe_batch_stride = H * rope_dim;
+
+    for (int idx = tid; idx < H * half_rope; idx += nthreads) {
+        int head = idx / half_rope;
+        int r = idx % half_rope;
+
+        int even_idx = r * 2;
+        int odd_idx = r * 2 + 1;
+
+        int q_base = batch * q_pe_batch_stride + head * rope_dim;
+        float q_even = __bfloat162float(q_pe_ptr[q_base + even_idx]);
+        float q_odd  = __bfloat162float(q_pe_ptr[q_base + odd_idx]);
+
+        float cos_first  = __bfloat162float(cos_ptr[cos_sin_base + r]);
+        float sin_first  = __bfloat162float(sin_ptr[cos_sin_base + r]);
+        float cos_second = __bfloat162float(cos_ptr[cos_sin_base + half_rope + r]);
+        float sin_second = __bfloat162float(sin_ptr[cos_sin_base + half_rope + r]);
+
+        q_pe_ptr[q_base + r]            = __float2bfloat16(q_even * cos_first - q_odd * sin_first);
+        q_pe_ptr[q_base + half_rope + r] = __float2bfloat16(q_odd * cos_second + q_even * sin_second);
+    }
+}
+
+torch::Tensor fused_kv_norm_rope_cache_512_forward(
+    torch::Tensor new_kv,           // [B, 1, 512]
+    torch::Tensor cache,            // [B, max_seq_len, 512]
+    torch::Tensor q_pe,             // [B, H, 1, rope_dim]
+    torch::Tensor cos_cache,        // [max_pos, rope_dim]
+    torch::Tensor sin_cache,        // [max_pos, rope_dim]
+    torch::Tensor position_ids,     // [B, 1]
+    torch::Tensor norm_weight,      // [head_dim]
+    int head_dim,
+    int rope_dim,
+    float eps
+) {
+    int B = new_kv.size(0);
+    int H = q_pe.size(1);
+    int max_seq_len = cache.size(1);
+
+    auto offload = torch::empty({B, 1, head_dim}, new_kv.options());
+
+    int threads = 256;
+    int smem_bytes = threads * sizeof(float) + head_dim * sizeof(__nv_bfloat16);
+
+    fused_kv_norm_rope_cache_512_kernel<<<B, threads, smem_bytes>>>(
+        reinterpret_cast<const __nv_bfloat16*>(new_kv.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(offload.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(q_pe.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(cos_cache.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(sin_cache.data_ptr<at::BFloat16>()),
+        position_ids.data_ptr<int64_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr<at::BFloat16>()),
+        B, H, max_seq_len, head_dim, rope_dim, eps
+    );
+
+    return offload;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_kv_norm_rope_cache_forward", &fused_kv_norm_rope_cache_forward,
-          "Fused RMSNorm + RoPE + cache write for KV and Q");
+          "Fused RMSNorm + RoPE + cache write for KV and Q (576-dim input)");
+    m.def("fused_kv_norm_rope_cache_512_forward", &fused_kv_norm_rope_cache_512_forward,
+          "Fused RMSNorm + RoPE + cache write for KV and Q (512-dim input, HF convention)");
 }

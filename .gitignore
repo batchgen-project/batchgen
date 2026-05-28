@@ -270,6 +270,9 @@ memory/
 session-state/
 *.session.jsonl
 task_queue.jsonl
+.sisyphus
+CLAUDE.md
 
 # Kernel-development tree (lives in Andrewxu313/batchgen_kernel_dev, not here)
 batchgen_kernel_dev/
+benchmarks/
