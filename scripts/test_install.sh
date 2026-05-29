@@ -87,6 +87,15 @@ FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
 DEEPGEMM_VERSION="v2.1.1.post3"
 
+# ── Build target arch (sm90a default / sm100 / all) ──
+# Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
+# (requires nvcc >= 12.9).
+BUILD_ARCH="${BUILD_ARCH:-sm90a}"
+FLASH_MLA_ENV=()
+if [[ "$BUILD_ARCH" == "sm90a" ]]; then
+    FLASH_MLA_ENV=(FLASH_MLA_DISABLE_SM100=1)
+fi
+
 # ============================================================================ #
 # Build-wheels mode: build wheels from source repos, then exit
 # ============================================================================ #
@@ -118,7 +127,7 @@ if [[ $BUILD_WHEELS -eq 1 ]]; then
         git clone --recursive https://github.com/deepseek-ai/FlashMLA.git
     fi
     cd FlashMLA && git checkout "$FLASHMLA_COMMIT" && git submodule update --init --recursive
-    FLASH_MLA_DISABLE_SM100=1 pip wheel . --no-build-isolation -w "$WHEEL_DIR"
+    env "${FLASH_MLA_ENV[@]}" pip wheel . --no-build-isolation -w "$WHEEL_DIR"
     ok "FlashMLA wheel built"
 
     # DeepGEMM
@@ -245,7 +254,7 @@ else
 
     # FlashMLA
     step "Building FlashMLA..."
-    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    env "${FLASH_MLA_ENV[@]}" pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
     ok "FlashMLA installed"
 
     # DeepGEMM
