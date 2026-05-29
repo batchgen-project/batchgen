@@ -114,6 +114,7 @@ from batchgen.worker.kv_manager import (
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
+	PageTableCapacityRequest,
 )
 import dataclasses as _dataclasses
 
@@ -544,6 +545,13 @@ class BatchGenWorker:
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
+		# Phase 5.2.2 of worker decouple (issue #175): dual-path gate for the
+		# KVCacheManager page-table capacity helpers. NATIVE=1 routes through
+		# `KVCacheManager.{page_table_token_capacity, page_table_slot_capacity,
+		# apply_page_table_capacity}`; COMPARE=1 runs both paths and asserts
+		# equal results. Phase 5.2.3 deletes the legacy bodies after parity.
+		self._kv_capacity_native = os.environ.get("BATCHGEN_WORKER_KV_CAPACITY_NATIVE", "0") == "1"
+		self._kv_capacity_compare = os.environ.get("BATCHGEN_WORKER_KV_CAPACITY_COMPARE", "0") == "1"
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
 		self._glm5_layer_graph_failed_buckets = set()
@@ -2608,7 +2616,66 @@ class BatchGenWorker:
 			return manager
 		return getattr(self.core_engine, "gpu_paged_kv_manager", None)
 
+	# Phase 5.2.2 of worker decouple (issue #175): the 3 page-table capacity
+	# helpers below route through `KVCacheManager` when
+	# BATCHGEN_WORKER_KV_CAPACITY_NATIVE=1; COMPARE=1 runs both paths and
+	# asserts equal results. Phase 5.2.3 deletes the legacy bodies after parity.
+
+	def _make_page_table_capacity_request(
+		self, sequence_tokens: Optional[Sequence[int]] = None,
+	) -> PageTableCapacityRequest:
+		st = tuple(int(t) for t in (sequence_tokens or ()))
+		max_input_length = int(getattr(self, "max_input_length", 0) or 0)
+		max_decoding_length = int(getattr(self, "max_decoding_length", 0) or 0)
+		engine_config = getattr(self, "engine_config", None)
+		engine_max_prompt: Optional[int] = None
+		engine_max_decode: Optional[int] = None
+		engine_module_global_batch_size: Optional[int] = None
+		engine_module_attn_decoding_micro_batch_size: Optional[int] = None
+		engine_basic_num_queries: Optional[int] = None
+		if engine_config is not None:
+			basic = engine_config.Basic_Config
+			module_batching = engine_config.Module_Batching_Config
+			engine_max_prompt = basic.get_max_prompt_length()
+			engine_max_decode = getattr(basic, "max_decoding_length", None)
+			engine_module_global_batch_size = module_batching.global_batch_size
+			engine_module_attn_decoding_micro_batch_size = module_batching.attn_decoding_micro_batch_size
+			engine_basic_num_queries = basic.num_queries
+		model_config = getattr(self, "model_config", None)
+		model_max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+		args = getattr(self, "args", None)
+		args_cuda_graph_max_bucket_size = getattr(args, "cuda_graph_max_bucket_size", None) if args is not None else None
+		return PageTableCapacityRequest(
+			sequence_tokens=st,
+			max_input_length=max_input_length,
+			max_decoding_length=max_decoding_length,
+			engine_max_prompt=engine_max_prompt,
+			engine_max_decode=engine_max_decode,
+			engine_module_global_batch_size=engine_module_global_batch_size,
+			engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
+			engine_basic_num_queries=engine_basic_num_queries,
+			model_max_position_embeddings=model_max_position_embeddings,
+			args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
+		)
+
 	def _cuda_graph_page_table_token_capacity(
+		self,
+		sequence_tokens: Optional[Sequence[int]] = None,
+	) -> int:
+		if self._kv_capacity_compare:
+			legacy = self._legacy_cuda_graph_page_table_token_capacity(sequence_tokens)
+			native = KVCacheManager.page_table_token_capacity(
+				self._make_page_table_capacity_request(sequence_tokens)
+			)
+			assert legacy == native, f"kv_capacity compare mismatch: token_capacity legacy={legacy} native={native}"
+			return native if self._kv_capacity_native else legacy
+		if self._kv_capacity_native:
+			return KVCacheManager.page_table_token_capacity(
+				self._make_page_table_capacity_request(sequence_tokens)
+			)
+		return self._legacy_cuda_graph_page_table_token_capacity(sequence_tokens)
+
+	def _legacy_cuda_graph_page_table_token_capacity(
 		self,
 		sequence_tokens: Optional[Sequence[int]] = None,
 	) -> int:
@@ -2637,6 +2704,20 @@ class BatchGenWorker:
 		return max(candidates)
 
 	def _cuda_graph_page_table_slot_capacity(self) -> int:
+		if self._kv_capacity_compare:
+			legacy = self._legacy_cuda_graph_page_table_slot_capacity()
+			native = KVCacheManager.page_table_slot_capacity(
+				self._make_page_table_capacity_request()
+			)
+			assert legacy == native, f"kv_capacity compare mismatch: slot_capacity legacy={legacy} native={native}"
+			return native if self._kv_capacity_native else legacy
+		if self._kv_capacity_native:
+			return KVCacheManager.page_table_slot_capacity(
+				self._make_page_table_capacity_request()
+			)
+		return self._legacy_cuda_graph_page_table_slot_capacity()
+
+	def _legacy_cuda_graph_page_table_slot_capacity(self) -> int:
 		candidates: List[int] = []
 		args = getattr(self, "args", None)
 		if args is not None:
@@ -2661,7 +2742,25 @@ class BatchGenWorker:
 		config,
 		sequence_tokens: Optional[Sequence[int]] = None,
 	):
-		token_capacity = self._cuda_graph_page_table_token_capacity(sequence_tokens)
+		if self._kv_capacity_compare:
+			legacy = self._legacy_with_cuda_graph_page_table_capacity(config, sequence_tokens)
+			native = KVCacheManager.apply_page_table_capacity(
+				self._make_page_table_capacity_request(sequence_tokens), config
+			)
+			assert legacy == native, f"kv_capacity compare mismatch: apply_capacity legacy={legacy} native={native}"
+			return native if self._kv_capacity_native else legacy
+		if self._kv_capacity_native:
+			return KVCacheManager.apply_page_table_capacity(
+				self._make_page_table_capacity_request(sequence_tokens), config
+			)
+		return self._legacy_with_cuda_graph_page_table_capacity(config, sequence_tokens)
+
+	def _legacy_with_cuda_graph_page_table_capacity(
+		self,
+		config,
+		sequence_tokens: Optional[Sequence[int]] = None,
+	):
+		token_capacity = self._legacy_cuda_graph_page_table_token_capacity(sequence_tokens)
 		page_capacity = max(
 			1,
 			min(
@@ -2671,7 +2770,7 @@ class BatchGenWorker:
 		)
 		slot_capacity = max(
 			1,
-			min(int(config.num_pages), self._cuda_graph_page_table_slot_capacity()),
+			min(int(config.num_pages), self._legacy_cuda_graph_page_table_slot_capacity()),
 		)
 		return replace(
 			config,
