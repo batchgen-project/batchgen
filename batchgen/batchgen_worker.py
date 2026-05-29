@@ -545,13 +545,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 5.3.2 (issue #175): dual-path gate for the KV token-budget
-		# cache helpers. NATIVE=1 routes `_get_sequence_token_budget` through
-		# `KVCacheManager.get_sequence_token_budget`. COMPARE=1 saves the
-		# per-entry cache state, runs legacy, restores, runs native, and
-		# asserts equality — so both paths exercise the compute branch.
-		self._kv_budget_native = os.environ.get("BATCHGEN_WORKER_KV_BUDGET_NATIVE", "0") == "1"
-		self._kv_budget_compare = os.environ.get("BATCHGEN_WORKER_KV_BUDGET_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -2580,61 +2573,14 @@ class BatchGenWorker:
 		)
 
 	def _get_sequence_token_budget(self, sequence_id: int) -> int:
-		if self._kv_budget_compare:
-			# Save cache state so legacy and native both exercise compute path
-			entry = (
-				self.query_book.get(sequence_id)
-				if getattr(self, "query_book", None) is not None
-				else None
-			)
-			cached_before = entry.kv_token_budget if entry is not None else None
-			legacy = self._legacy_get_sequence_token_budget(sequence_id)
-			if entry is not None:
-				entry.kv_token_budget = cached_before
-			native = KVCacheManager.get_sequence_token_budget(
-				self._make_token_budget_request(), sequence_id
-			)
-			assert legacy == native, (
-				f"kv_budget compare mismatch: "
-				f"_get_sequence_token_budget({sequence_id}) "
-				f"legacy={legacy} native={native}"
-			)
-			return native if self._kv_budget_native else legacy
-		if self._kv_budget_native:
-			return KVCacheManager.get_sequence_token_budget(
-				self._make_token_budget_request(), sequence_id
-			)
-		return self._legacy_get_sequence_token_budget(sequence_id)
-
-	def _legacy_get_sequence_token_budget(self, sequence_id: int) -> int:
-		"""Return cached host allocation tokens for a sequence, computing once."""
-		if not hasattr(self, "query_book") or self.query_book is None:
-			raise RuntimeError("query_book is not initialized before KV allocation")
-		query_entry = self.query_book.get(sequence_id)
-		if query_entry is None or query_entry.encoded is None:
-			raise KeyError(f"Missing query entry for sequence {sequence_id}")
-		if query_entry.kv_token_budget is not None:
-			return query_entry.kv_token_budget
-		# Fallback: compute from sequence metadata (attention_mask removed)
-		uuid = self._local_to_uuid_map.get(sequence_id, "")
-		seq = self.global_batch.get_sequence(uuid) if uuid else None
-		if seq is None:
-			raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
-		# NO truncation: KV budget must cover the FULL prompt + decode budget.
-		# An earlier min(...) here silently undersized KV when max_input_length
-		# lagged behind the actual prompt length on multi-batch admits.
-		input_tokens = seq.prompt_length
-		total_tokens = input_tokens + self.max_decoding_length
-		query_entry.kv_token_budget = total_tokens
-		return total_tokens
+		return KVCacheManager.get_sequence_token_budget(
+			self._make_token_budget_request(), sequence_id
+		)
 
 	def _compute_host_kv_sequence_tokens(self, sequence_ids: List[int]) -> List[int]:
-		"""Reuse cached token budgets so host/GPU allocations stay consistent.
-
-		Routes through the gated singular `_get_sequence_token_budget`, so
-		bulk callers inherit native/compare behavior automatically.
-		"""
-		return [self._get_sequence_token_budget(sequence_id) for sequence_id in sequence_ids]
+		return KVCacheManager.compute_host_kv_sequence_tokens(
+			self._make_token_budget_request(), sequence_ids
+		)
 
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
 		"""Bind GPU KV manager to both worker and core_engine.
