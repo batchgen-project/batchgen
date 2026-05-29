@@ -103,8 +103,8 @@ class MiniMaxM25Initializer:
 
         # GPU arch
         gpu_arch = getattr(args, 'gpu_arch', 'hopper')
-        if gpu_arch and gpu_arch.lower() not in ['hopper', 'ampere']:
-            raise ValueError("Currently gpu_arch must be 'hopper' or 'ampere'")
+        if gpu_arch and gpu_arch.lower() not in ['hopper', 'ampere', 'blackwell']:
+            raise ValueError("Currently gpu_arch must be 'hopper', 'ampere', or 'blackwell'")
         engine_config.Basic_Config.gpu_arch = gpu_arch.lower() if gpu_arch else 'hopper'
 
         # EP offloading

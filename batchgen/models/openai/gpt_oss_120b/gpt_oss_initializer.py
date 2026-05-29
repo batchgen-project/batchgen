@@ -131,7 +131,12 @@ class GptOssInitializer:
         engine_config.Basic_Config.num_queries = getattr(args, 'num_queries', 1)
         engine_config.Basic_Config.module_types = ["attn", "routed_expert"]
         engine_config.Basic_Config.num_threads = 0
-        engine_config.Basic_Config.gpu_arch = getattr(args, 'gpu_arch', 'hopper')
+        gpu_arch = getattr(args, 'gpu_arch', None) or 'hopper'
+        if gpu_arch.lower() not in ['hopper', 'ampere', 'blackwell']:
+            raise ValueError(
+                "Currently gpu_arch must be 'hopper', 'ampere', or 'blackwell'"
+            )
+        engine_config.Basic_Config.gpu_arch = gpu_arch.lower()
 
         return engine_config
 

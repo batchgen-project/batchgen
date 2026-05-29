@@ -22,6 +22,7 @@ from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
+from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
     cleanup_resources,
     get_hugepage_size,
@@ -54,39 +55,6 @@ def _validate_shmem_enabled() -> None:
         raise RuntimeError(
             f"--fast-init requires THP support. {sysfs_path} not found."
         )
-
-
-def detect_gpu_arch() -> str:
-    """Auto-detect GPU architecture based on CUDA compute capability.
-
-    Returns:
-        'hopper' for compute capability >= 9.0 (H100, H20, etc.)
-        'ampere' for compute capability 8.x (A100, A5000, RTX 4090, etc.)
-
-    Raises:
-        RuntimeError: If no CUDA devices found or unsupported architecture
-    """
-    if not torch.cuda.is_available():
-        raise RuntimeError("No CUDA devices available for GPU architecture detection")
-
-    major, minor = torch.cuda.get_device_capability(0)
-    device_name = torch.cuda.get_device_name(0)
-
-    if major >= 9:
-        arch = "hopper"
-    elif major == 8:
-        arch = "ampere"
-    else:
-        raise RuntimeError(
-            f"Unsupported GPU architecture: compute capability {major}.{minor} "
-            f"({device_name}). BatchGen requires Hopper (sm_90+) or Ampere (sm_80+)."
-        )
-
-    logger.info(
-        "Auto-detected GPU architecture: %s (compute capability %d.%d, %s)",
-        arch, major, minor, device_name,
-    )
-    return arch
 
 
 class WorkerExitState:

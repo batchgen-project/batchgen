@@ -94,8 +94,8 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 
     if not input_arguments.get('gpu_arch', None):
         raise ValueError("GPU architecture must be specified")
-    if input_arguments.gpu_arch.lower() not in ['hopper', 'ampere']:
-        raise ValueError("Currently gpu_arch must be 'hopper' or 'ampere'")
+    if input_arguments.gpu_arch.lower() not in ['hopper', 'ampere', 'blackwell']:
+        raise ValueError("Currently gpu_arch must be 'hopper', 'ampere', or 'blackwell'")
     engine_config.Basic_Config.gpu_arch = input_arguments.gpu_arch.lower()
 
     # EP offloading
