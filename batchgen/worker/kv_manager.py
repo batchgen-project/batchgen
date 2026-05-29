@@ -29,11 +29,25 @@ the ``QueryBookEntry`` passed via snapshot. That mutation is *on the
 entry object the worker passes in*, not on worker state — handler stays
 stateless w.r.t. worker.
 
+Sub-slice 5.4a adds the GPU-KV-manager allocation *planning* extracted
+from ``_ensure_gpu_paged_kv_manager``:
+
+  - ``KVCacheManager.plan_gpu_kv_manager`` — builds the primary (+ aux,
+    for DSA models) ``GPUPagedKVConfig`` and decides whether the worker
+    can reuse the existing manager or must destroy + recreate it.
+
+Only the *decision* (config sizing + reuse/recreate) is ported; the GPU
+side effects (``GPUPagedKVCacheManager`` create / destroy / initialize /
+bind) stay on the worker, which applies the returned ``GpuKvManagerPlan``.
+The allocation/IO methods are ~90% irreducible side effects, so wrapping
+them behind a Backend Protocol would add scaffolding without testability
+gain — we extract only the genuinely pure planning step here.
+
 The KV Cache Helper section has 27 methods totaling ~1330 LOC; they
 span four distinct concerns (read-only stats, allocation, planning,
 migration execution). Porting them all in one slice would be too risky.
-Allocators, planners, and migration executors land in later sub-slices
-(5.4+).
+Watermark/eviction planners and migration executors land in later
+sub-slices (5.5+).
 
 Design follows the per-slice Backend Protocol pattern introduced by
 ``SyncCoordinator`` (Slice 3): the handler takes a ``KVStatsBackend``
@@ -48,6 +62,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 if TYPE_CHECKING:
+    from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
     from batchgen.query_book import QueryBookEntry
     from batchgen.sequence import SequenceBatch
 
@@ -163,6 +178,47 @@ class TokenBudgetRequest:
     local_to_uuid: Mapping[int, str]
     global_batch: "SequenceBatch"
     max_decoding_length: int
+
+
+# ---------------------------------------------------------------------------
+# GPU-KV-manager allocation planning (Phase 5.4a): frozen request + plan
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GpuKvManagerRequest:
+    """Frozen snapshot for ``plan_gpu_kv_manager``.
+
+    ``current_num_pages`` is the page count of the manager the worker
+    currently holds (0 when none is bound). ``capacity`` carries the
+    page-table capacity inputs so the plan can populate the CUDA-graph
+    fields on the configs it returns.
+    """
+
+    model_name: str
+    sequence_tokens: Tuple[int, ...]
+    has_manager: bool
+    current_num_pages: int
+    capacity: PageTableCapacityRequest
+
+
+@dataclass(frozen=True)
+class GpuKvManagerPlan:
+    """What ``plan_gpu_kv_manager`` returns; the worker applies it.
+
+    * ``reuse`` — the existing manager already has enough pages; the
+      worker just re-initializes and binds it (no configs needed).
+    * ``destroy_existing`` — an existing manager must be torn down before
+      the new one is created (only set when ``reuse`` is False).
+    * ``primary_config`` / ``aux_config`` — sized configs for the new
+      managers. ``aux_config`` is non-None only for DSA models. Both are
+      ``None`` when ``reuse`` is True.
+    """
+
+    reuse: bool
+    destroy_existing: bool
+    primary_config: Optional["GPUPagedKVConfig"]
+    aux_config: Optional["GPUPagedKVConfig"]
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +443,60 @@ class KVCacheManager:
             KVCacheManager.get_sequence_token_budget(req, sequence_id)
             for sequence_id in sequence_ids
         ]
+
+    # ------------------------------------------------------------------
+    # GPU-KV-manager allocation planning (Phase 5.4a)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def plan_gpu_kv_manager(req: GpuKvManagerRequest) -> GpuKvManagerPlan:
+        """Decide whether to reuse or recreate the GPU paged KV manager.
+
+        Builds the primary (and, for DSA models, auxiliary) ``GPUPagedKVConfig``
+        sized for ``req.sequence_tokens`` with the CUDA-graph page-table
+        capacity applied. If the worker already holds a manager with at least
+        ``primary_config.num_pages`` pages, the plan says to reuse it; otherwise
+        the worker must (destroy the old manager and) create new ones.
+
+        Pure: calls the pure ``build_gpu_kv_config`` / ``build_gpu_kv_config_aux``
+        config builders and ``apply_page_table_capacity``. No GPU allocation, no
+        worker state — the worker applies the returned plan.
+        """
+        # Local import: the config builders pull torch + the model registry,
+        # which are heavy at module-load time and could cycle back here.
+        from batchgen.kv_cache.host_kv_mananger_config import (
+            build_gpu_kv_config,
+            build_gpu_kv_config_aux,
+        )
+
+        primary_config = build_gpu_kv_config(
+            model_name=req.model_name,
+            sequence_tokens=req.sequence_tokens,
+        )
+        primary_config = KVCacheManager.apply_page_table_capacity(
+            req.capacity, primary_config
+        )
+        required_pages = primary_config.num_pages
+
+        if req.has_manager and req.current_num_pages >= required_pages:
+            return GpuKvManagerPlan(
+                reuse=True,
+                destroy_existing=False,
+                primary_config=None,
+                aux_config=None,
+            )
+
+        aux_config = build_gpu_kv_config_aux(
+            model_name=req.model_name,
+            sequence_tokens=req.sequence_tokens,
+        )
+        if aux_config is not None:
+            aux_config = KVCacheManager.apply_page_table_capacity(
+                req.capacity, aux_config
+            )
+
+        return GpuKvManagerPlan(
+            reuse=False,
+            destroy_existing=req.has_manager,
+            primary_config=primary_config,
+            aux_config=aux_config,
+        )
