@@ -1,10 +1,12 @@
-"""Unit tests for `batchgen.worker.kv_manager` (Phase 5.1 stats tier).
+"""Unit tests for `batchgen.worker.kv_manager` (Phases 5.1 stats + 5.2 capacity).
 
 Single-rank tests with a fake ``KVStatsBackend``. Real ``SequenceBatch``
 fixtures — no mocks of the underlying batch / status enum per Phase A §G.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pytest
 
@@ -15,6 +17,7 @@ from batchgen.worker.kv_manager import (
     KVStats,
     KVStatsBackend,
     KVUtilizationRequest,
+    PageTableCapacityRequest,
 )
 
 
@@ -231,3 +234,218 @@ def test_can_swap_backend():
     mgr.get_host_free_pages()
     mgr.get_gpu_free_pages()
     assert backend.events == ["host", "gpu"]
+
+
+# ===========================================================================
+# Phase 5.2 — Page-table capacity helpers
+# ===========================================================================
+
+
+def _make_cap_req(
+    *,
+    sequence_tokens=(),
+    max_input_length=0,
+    max_decoding_length=0,
+    engine_max_prompt=None,
+    engine_max_decode=None,
+    engine_module_global_batch_size=None,
+    engine_module_attn_decoding_micro_batch_size=None,
+    engine_basic_num_queries=None,
+    model_max_position_embeddings=None,
+    args_cuda_graph_max_bucket_size=None,
+) -> PageTableCapacityRequest:
+    return PageTableCapacityRequest(
+        sequence_tokens=tuple(sequence_tokens),
+        max_input_length=max_input_length,
+        max_decoding_length=max_decoding_length,
+        engine_max_prompt=engine_max_prompt,
+        engine_max_decode=engine_max_decode,
+        engine_module_global_batch_size=engine_module_global_batch_size,
+        engine_module_attn_decoding_micro_batch_size=engine_module_attn_decoding_micro_batch_size,
+        engine_basic_num_queries=engine_basic_num_queries,
+        model_max_position_embeddings=model_max_position_embeddings,
+        args_cuda_graph_max_bucket_size=args_cuda_graph_max_bucket_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# page_table_token_capacity
+# ---------------------------------------------------------------------------
+
+
+def test_token_capacity_floor_is_16384():
+    """With no other inputs, the floor of 16384 wins."""
+    req = _make_cap_req()
+    assert KVCacheManager.page_table_token_capacity(req) == 16384
+
+
+def test_token_capacity_sequence_tokens_dominate():
+    req = _make_cap_req(sequence_tokens=(8000, 32000, 4096))
+    assert KVCacheManager.page_table_token_capacity(req) == 32000
+
+
+def test_token_capacity_skips_nonpositive_seq_tokens():
+    req = _make_cap_req(sequence_tokens=(0, -1, 100))
+    # Floor 16384 still wins
+    assert KVCacheManager.page_table_token_capacity(req) == 16384
+
+
+def test_token_capacity_includes_max_input_plus_decode():
+    req = _make_cap_req(max_input_length=20000, max_decoding_length=4096)
+    assert KVCacheManager.page_table_token_capacity(req) == 24096
+
+
+def test_token_capacity_max_input_zero_uses_floor():
+    """max_input_length=0 is treated as "unset"; doesn't contribute."""
+    req = _make_cap_req(max_input_length=0, max_decoding_length=99999)
+    # max_input=0 path is skipped → only floor 16384 vs sequence/model
+    assert KVCacheManager.page_table_token_capacity(req) == 16384
+
+
+def test_token_capacity_engine_max_prompt_and_decode():
+    req = _make_cap_req(engine_max_prompt=5000, engine_max_decode=2000)
+    # 5000 + 2000 = 7000, but floor 16384 still wins
+    assert KVCacheManager.page_table_token_capacity(req) == 16384
+    # Larger engine values
+    req = _make_cap_req(engine_max_prompt=20000, engine_max_decode=8000)
+    assert KVCacheManager.page_table_token_capacity(req) == 28000
+
+
+def test_token_capacity_engine_max_prompt_only():
+    req = _make_cap_req(engine_max_prompt=20000)
+    assert KVCacheManager.page_table_token_capacity(req) == 20000
+
+
+def test_token_capacity_engine_max_decode_only():
+    req = _make_cap_req(engine_max_decode=20000)
+    assert KVCacheManager.page_table_token_capacity(req) == 20000
+
+
+def test_token_capacity_model_max_position():
+    req = _make_cap_req(model_max_position_embeddings=131072)
+    assert KVCacheManager.page_table_token_capacity(req) == 131072
+
+
+def test_token_capacity_max_of_all():
+    """When multiple sources contribute, return the max."""
+    req = _make_cap_req(
+        sequence_tokens=(50000,),
+        max_input_length=10000,
+        max_decoding_length=10000,
+        engine_max_prompt=30000,
+        engine_max_decode=5000,
+        model_max_position_embeddings=40000,
+    )
+    # candidates = [16384, 50000, 20000, 35000, 40000] → max 50000
+    assert KVCacheManager.page_table_token_capacity(req) == 50000
+
+
+# ---------------------------------------------------------------------------
+# page_table_slot_capacity
+# ---------------------------------------------------------------------------
+
+
+def test_slot_capacity_defaults_to_one():
+    """No candidates → fallback 1 (legacy semantics)."""
+    req = _make_cap_req()
+    assert KVCacheManager.page_table_slot_capacity(req) == 1
+
+
+def test_slot_capacity_args_bucket_size():
+    req = _make_cap_req(args_cuda_graph_max_bucket_size=256)
+    assert KVCacheManager.page_table_slot_capacity(req) == 256
+
+
+def test_slot_capacity_max_of_all():
+    req = _make_cap_req(
+        args_cuda_graph_max_bucket_size=128,
+        engine_module_global_batch_size=64,
+        engine_module_attn_decoding_micro_batch_size=512,
+        engine_basic_num_queries=256,
+    )
+    assert KVCacheManager.page_table_slot_capacity(req) == 512
+
+
+def test_slot_capacity_skips_nonpositive():
+    """0 / None values are skipped, not coerced."""
+    req = _make_cap_req(
+        args_cuda_graph_max_bucket_size=0,
+        engine_module_global_batch_size=128,
+        engine_module_attn_decoding_micro_batch_size=None,
+        engine_basic_num_queries=0,
+    )
+    assert KVCacheManager.page_table_slot_capacity(req) == 128
+
+
+# ---------------------------------------------------------------------------
+# apply_page_table_capacity (returns updated config dataclass)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeCudaGraphConfig:
+    """Stand-in for whatever real config dataclass the worker uses.
+
+    Production callers pass a richer config; we only depend on these 4
+    fields, so a minimal local dataclass is enough.
+    """
+    num_pages: int
+    page_size_tokens: int
+    cuda_graph_max_pages_per_sequence: int = 0
+    cuda_graph_max_slots: int = 0
+
+
+def test_apply_capacity_normal_case():
+    req = _make_cap_req(
+        max_input_length=16000,
+        max_decoding_length=8000,  # → token_capacity = max(16384, 24000) = 24000
+        args_cuda_graph_max_bucket_size=64,
+    )
+    config = _FakeCudaGraphConfig(num_pages=1000, page_size_tokens=64)
+    out = KVCacheManager.apply_page_table_capacity(req, config)
+    # ceil(24000 / 64) = 375. min(1000, 375) = 375.
+    assert out.cuda_graph_max_pages_per_sequence == 375
+    # min(1000, 64) = 64.
+    assert out.cuda_graph_max_slots == 64
+
+
+def test_apply_capacity_token_capacity_exceeds_num_pages():
+    """When ceil(tokens/page_size) > num_pages, clamped to num_pages."""
+    req = _make_cap_req(model_max_position_embeddings=1_000_000)
+    config = _FakeCudaGraphConfig(num_pages=100, page_size_tokens=64)
+    out = KVCacheManager.apply_page_table_capacity(req, config)
+    assert out.cuda_graph_max_pages_per_sequence == 100
+    assert out.cuda_graph_max_slots == 1  # no slot inputs → fallback 1
+
+
+def test_apply_capacity_zero_floor():
+    """Page-capacity and slot-capacity always clamp to at least 1."""
+    req = _make_cap_req()
+    # With huge page_size_tokens, ceil(16384 / 99999999) = 1
+    config = _FakeCudaGraphConfig(num_pages=10, page_size_tokens=99_999_999)
+    out = KVCacheManager.apply_page_table_capacity(req, config)
+    assert out.cuda_graph_max_pages_per_sequence == 1
+    assert out.cuda_graph_max_slots == 1
+
+
+def test_apply_capacity_does_not_mutate_input():
+    req = _make_cap_req(args_cuda_graph_max_bucket_size=32)
+    config = _FakeCudaGraphConfig(num_pages=100, page_size_tokens=64)
+    out = KVCacheManager.apply_page_table_capacity(req, config)
+    # Original input unchanged
+    assert config.cuda_graph_max_pages_per_sequence == 0
+    assert config.cuda_graph_max_slots == 0
+    # Output has new values
+    assert out is not config
+    assert out.cuda_graph_max_slots == 32
+
+
+# ---------------------------------------------------------------------------
+# Frozen dataclass semantics
+# ---------------------------------------------------------------------------
+
+
+def test_capacity_request_is_frozen():
+    req = _make_cap_req()
+    with pytest.raises((AttributeError, Exception)):
+        req.max_input_length = 99  # type: ignore[misc]
