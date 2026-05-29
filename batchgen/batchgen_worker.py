@@ -122,8 +122,6 @@ from batchgen.worker.kv_manager import (
 import dataclasses as _dataclasses
 
 from batchgen.kv_cache.host_kv_mananger_config import (
-	build_gpu_kv_config,
-	build_gpu_kv_config_aux,
 	build_host_kv_config,
 	is_dsa_model,
 )
@@ -547,14 +545,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 5.4a.2 (issue #175): dual-path gate for GPU-KV-manager
-		# allocation planning. NATIVE=1 routes the reuse/recreate decision
-		# through `KVCacheManager.plan_gpu_kv_manager`. COMPARE=1 computes
-		# both the legacy and native plans and asserts they're equal — the
-		# GPU side effects (create/destroy/init/bind) are applied exactly
-		# once, from the chosen plan, regardless of mode.
-		self._kv_alloc_native = os.environ.get("BATCHGEN_WORKER_KV_ALLOC_NATIVE", "0") == "1"
-		self._kv_alloc_compare = os.environ.get("BATCHGEN_WORKER_KV_ALLOC_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -2700,55 +2690,6 @@ class BatchGenWorker:
 			capacity=self._make_page_table_capacity_request(sequence_tokens),
 		)
 
-	def _legacy_gpu_kv_manager_plan(
-		self, sequence_tokens: Sequence[int]
-	) -> GpuKvManagerPlan:
-		"""Inline reuse/recreate decision, returning a `GpuKvManagerPlan`.
-
-		Mirrors `KVCacheManager.plan_gpu_kv_manager` so compare-mode can assert
-		the two plans are byte-equal before any GPU side effect runs.
-		"""
-		gpu_config = build_gpu_kv_config(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=sequence_tokens,
-		)
-		gpu_config = self._with_cuda_graph_page_table_capacity(
-			gpu_config,
-			sequence_tokens,
-		)
-
-		manager = self.gpu_paged_kv_cache_manager
-		required_pages = gpu_config.num_pages
-		current_pages = (
-			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
-			else 0
-		)
-
-		if manager is not None and current_pages >= required_pages:
-			return GpuKvManagerPlan(
-				reuse=True,
-				destroy_existing=False,
-				primary_config=None,
-				aux_config=None,
-			)
-
-		aux_config = build_gpu_kv_config_aux(
-			model_name=self.huggingface_ckpt_name,
-			sequence_tokens=sequence_tokens,
-		)
-		if aux_config is not None:
-			aux_config = self._with_cuda_graph_page_table_capacity(
-				aux_config,
-				sequence_tokens,
-			)
-		return GpuKvManagerPlan(
-			reuse=False,
-			destroy_existing=manager is not None,
-			primary_config=gpu_config,
-			aux_config=aux_config,
-		)
-
 	def _apply_gpu_kv_manager_plan(
 		self, plan: GpuKvManagerPlan
 	) -> GPUPagedKVCacheManager:
@@ -2815,23 +2756,14 @@ class BatchGenWorker:
 
 		For DSA models, returns a DualKVCacheCoordinator wrapping both primary
 		(MLA) and auxiliary (indexer) managers.
+
+		The reuse/recreate decision is delegated to
+		``KVCacheManager.plan_gpu_kv_manager``; ``_apply_gpu_kv_manager_plan``
+		performs the GPU side effects.
 		"""
-		if self._kv_alloc_compare:
-			legacy_plan = self._legacy_gpu_kv_manager_plan(sequence_tokens)
-			native_plan = KVCacheManager.plan_gpu_kv_manager(
-				self._make_gpu_kv_manager_request(sequence_tokens)
-			)
-			assert legacy_plan == native_plan, (
-				f"kv_alloc compare mismatch: _ensure_gpu_paged_kv_manager "
-				f"legacy={legacy_plan} native={native_plan}"
-			)
-			plan = native_plan if self._kv_alloc_native else legacy_plan
-		elif self._kv_alloc_native:
-			plan = KVCacheManager.plan_gpu_kv_manager(
-				self._make_gpu_kv_manager_request(sequence_tokens)
-			)
-		else:
-			plan = self._legacy_gpu_kv_manager_plan(sequence_tokens)
+		plan = KVCacheManager.plan_gpu_kv_manager(
+			self._make_gpu_kv_manager_request(sequence_tokens)
+		)
 		return self._apply_gpu_kv_manager_plan(plan)
 
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
