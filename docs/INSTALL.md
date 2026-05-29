@@ -1,13 +1,14 @@
 # BatchGen Installation Guide
 
 ## Prerequisites
-- **GPU**: Hopper (H100/H20) or newer, SM90+
-- **CUDA**: 12.8+ toolkit installed
+- **GPU**: Hopper (H100/H20), Blackwell (B200), or newer — SM90+
+- **CUDA**: 12.8+ toolkit installed (Blackwell/B200 requires **12.9+**, see below)
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
 
 All three options below have been validated end-to-end on a fresh 2-node (16×H20) cluster
-with Kimi-K2.5. Pick whichever fits your workflow.
+with Kimi-K2.5. Pick whichever fits your workflow. For Blackwell (B200), see the
+[Blackwell (B200) section](#blackwell-b200--sm_100) for the additional `BUILD_ARCH=sm100` knob.
 
 ## Option A: Docker (Recommended for Production)
 
@@ -81,6 +82,50 @@ Then upload to a GitHub Release:
 gh release create v1.0.4.post1 --title "BatchGen v1.0.4.post1"
 gh release upload v1.0.4.post1 /path/to/wheels/*.whl
 ```
+
+## Blackwell (B200 / sm_100)
+
+BatchGen runs on NVIDIA Blackwell (B200, compute capability `10.0`). The engine
+auto-detects the architecture (`detect_gpu_arch()` returns `blackwell`) and the
+MLA models (DeepSeek-R1 / GLM-5 / Kimi-K2.5) route attention through the
+FlashAttention-3 + FlashMLA path, the same as Hopper.
+
+### Requirements
+- **CUDA toolkit / `nvcc` ≥ 12.9** — required to build FlashMLA's SM100 kernels.
+  The Docker image (Option A) uses a CUDA 12.9 base for this reason.
+- PyTorch stays `2.9.0+cu128`; only the build-time `nvcc` needs to be 12.9+.
+
+### Install
+Set `BUILD_ARCH=sm100` so the Blackwell build paths are selected. This both
+enables FlashMLA's SM100 kernels and builds `batchgen_kernels` for `sm_100`:
+
+```bash
+# Bare metal / conda (Option B):
+BUILD_ARCH=sm100 ./scripts/install_deps.sh --all
+
+# Docker (Option A) — pass it as a build arg:
+docker build --build-arg BUILD_ARCH=sm100 -t batchgen:b200 -f docker/Dockerfile .
+```
+
+With the default `BUILD_ARCH=sm90a`, the scripts/Dockerfile behave exactly as
+the Hopper instructions above (FlashMLA SM100 disabled).
+
+### Run
+Use the B200 engine config, which sets `"gpu_arch": "blackwell"`:
+
+```bash
+cd /root   # not the source dir (see below)
+python -m batchgen.launch_http_server \
+  --engine-config configurations/DeepSeek-R1/engine_config_B200_8.json \
+  ...
+```
+
+> **Note (kernel coverage):** The dedicated SM100 port of the `batchgen_kernels`
+> WGMMA MoE/attention kernels is tracked as a separate effort. Until it lands,
+> `BUILD_ARCH=sm100` builds the SM80-class fused ops retargeted to `sm_100`; the
+> WGMMA-only kernels are not yet built for Blackwell, and code paths that probe
+> for them (e.g. `is_qkv_wgmma_available()`) fall back automatically. The MLA
+> attention path (FlashAttention-3 / FlashMLA) is the intended Blackwell route.
 
 ## Important: Do Not Run from the Source Directory
 
@@ -169,14 +214,15 @@ FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 ```
 
 ### FlashMLA build fails with SM100 errors
-FlashMLA's SM100 (Blackwell) codepath requires NVCC 12.9+. If your CUDA toolkit is
-12.8, disable SM100 support:
+FlashMLA's SM100 (Blackwell) codepath requires NVCC 12.9+. If you are building for
+Hopper (the default, `BUILD_ARCH=sm90a`) the install scripts disable SM100 automatically:
 
 ```bash
 FLASH_MLA_DISABLE_SM100=1 pip install . --no-build-isolation
 ```
 
-The install scripts set this automatically.
+For Blackwell, build with `BUILD_ARCH=sm100` (which leaves SM100 enabled) and a CUDA
+12.9+ toolkit. See the [Blackwell (B200) section](#blackwell-b200--sm_100).
 
 ### nvcc: "A single input file is required"
 Ensure `TORCH_CUDA_ARCH_LIST` is set correctly (e.g., `9.0a` for H20).
