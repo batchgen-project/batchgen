@@ -23,6 +23,19 @@ FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
 DEEPGEMM_VERSION="v2.1.1.post3"
 
+# Build target architecture for batchgen_kernels and FlashMLA.
+#   sm90a (default) -> Hopper; FlashMLA SM100 kernels are disabled.
+#   sm100 / all     -> Blackwell (B200); FlashMLA SM100 kernels are enabled
+#                      (requires nvcc >= 12.9).
+# This is consumed unchanged by batchgen_kernels/setup.py via the environment.
+BUILD_ARCH="${BUILD_ARCH:-sm90a}"
+
+# FlashMLA: only disable its SM100 (Blackwell) kernels for the Hopper build.
+FLASH_MLA_ENV=()
+if [[ "$BUILD_ARCH" == "sm90a" ]]; then
+    FLASH_MLA_ENV=(FLASH_MLA_DISABLE_SM100=1)
+fi
+
 # Installation directory (defaults to temp, can be overridden)
 INSTALL_DIR="${BATCHGEN_INSTALL_DIR:-/tmp/batchgen_deps}"
 
@@ -174,7 +187,7 @@ install_flashmla() {
     fi
 
     print_step "Installing FlashMLA from git (this may take 5-10 minutes)..."
-    FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
+    env "${FLASH_MLA_ENV[@]}" pip install "git+https://github.com/deepseek-ai/FlashMLA.git@${FLASHMLA_COMMIT}" --no-build-isolation
 
     print_success "FlashMLA installed"
 }
