@@ -1,5 +1,6 @@
-"""Unit tests for `batchgen.worker.kv_manager` (Phases 5.1 stats + 5.2 capacity).
+"""Unit tests for `batchgen.worker.kv_manager`.
 
+Covers Phases 5.1 stats, 5.2 page-table capacity, and 5.3 token-budget cache.
 Single-rank tests with a fake ``KVStatsBackend``. Real ``SequenceBatch``
 fixtures — no mocks of the underlying batch / status enum per Phase A §G.
 """
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from batchgen.query_book import QueryBookEntry
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import (
     HostKVUtilization,
@@ -18,6 +20,7 @@ from batchgen.worker.kv_manager import (
     KVStatsBackend,
     KVUtilizationRequest,
     PageTableCapacityRequest,
+    TokenBudgetRequest,
 )
 
 
@@ -449,3 +452,179 @@ def test_capacity_request_is_frozen():
     req = _make_cap_req()
     with pytest.raises((AttributeError, Exception)):
         req.max_input_length = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Token-budget cache (Phase 5.3)
+# ---------------------------------------------------------------------------
+
+
+def _make_token_budget_req(
+    *,
+    query_book=None,
+    local_to_uuid=None,
+    sequences=(),
+    max_decoding_length: int = 16,
+) -> TokenBudgetRequest:
+    """Build a TokenBudgetRequest from explicit pieces.
+
+    ``sequences`` is an iterable of ``(uuid, prompt_length)`` pairs which is
+    materialized into a real ``SequenceBatch`` so the handler exercises the
+    same ``get_sequence`` path the worker uses.
+    """
+    batch = SequenceBatch()
+    for uuid, prompt_length in sequences:
+        seq = SequenceEntry(
+            uuid=uuid,
+            global_idx=0,
+            prompt_length=prompt_length,
+            max_decode_length=max_decoding_length,
+        )
+        batch.add_sequence(seq)
+    return TokenBudgetRequest(
+        query_book=query_book if query_book is not None else {},
+        local_to_uuid=local_to_uuid if local_to_uuid is not None else {},
+        global_batch=batch,
+        max_decoding_length=max_decoding_length,
+    )
+
+
+def _make_entry(*, kv_token_budget=None) -> QueryBookEntry:
+    return QueryBookEntry(
+        text="dummy",
+        encoded={"input_ids": [1, 2, 3]},
+        decoded_tokens=None,
+        kv_token_budget=kv_token_budget,
+    )
+
+
+def test_token_budget_uses_cached_value_when_set():
+    """If the entry already has kv_token_budget, return it without recomputing."""
+    entry = _make_entry(kv_token_budget=999)
+    req = _make_token_budget_req(query_book={42: entry})
+    assert KVCacheManager.get_sequence_token_budget(req, 42) == 999
+
+
+def test_token_budget_computes_and_memoizes_when_missing():
+    """When the entry has no budget, compute from sequence metadata and cache."""
+    entry = _make_entry(kv_token_budget=None)
+    req = _make_token_budget_req(
+        query_book={7: entry},
+        local_to_uuid={7: "uuid-7"},
+        sequences=[("uuid-7", 100)],
+        max_decoding_length=512,
+    )
+    budget = KVCacheManager.get_sequence_token_budget(req, 7)
+    assert budget == 100 + 512  # prompt_length + max_decoding_length
+    # Memoized on the entry the worker passed in
+    assert entry.kv_token_budget == 612
+
+
+def test_token_budget_second_call_returns_cache_hit():
+    """Second call must hit the just-memoized value (no re-read of metadata)."""
+    entry = _make_entry(kv_token_budget=None)
+    req = _make_token_budget_req(
+        query_book={3: entry},
+        local_to_uuid={3: "uuid-3"},
+        sequences=[("uuid-3", 50)],
+        max_decoding_length=16,
+    )
+    first = KVCacheManager.get_sequence_token_budget(req, 3)
+    # Drop the sequence from the batch — cache hit must not need it
+    req.global_batch.sequences.clear()
+    second = KVCacheManager.get_sequence_token_budget(req, 3)
+    assert first == second == 66
+
+
+def test_token_budget_raises_runtime_error_when_query_book_empty():
+    """Empty query_book ⇒ worker has not initialized it. Legacy raised RuntimeError."""
+    req = _make_token_budget_req(query_book={})
+    with pytest.raises(RuntimeError, match="query_book is not initialized"):
+        KVCacheManager.get_sequence_token_budget(req, 0)
+
+
+def test_token_budget_raises_keyerror_for_missing_entry():
+    """Sequence id not in query_book ⇒ KeyError (legacy parity)."""
+    entry = _make_entry(kv_token_budget=42)
+    req = _make_token_budget_req(query_book={0: entry})
+    with pytest.raises(KeyError, match="Missing query entry for sequence 7"):
+        KVCacheManager.get_sequence_token_budget(req, 7)
+
+
+def test_token_budget_raises_keyerror_for_entry_without_encoded():
+    """encoded=None ⇒ entry not ready ⇒ KeyError (legacy parity)."""
+    entry = QueryBookEntry(text="x", encoded=None, kv_token_budget=None)
+    req = _make_token_budget_req(query_book={5: entry})
+    with pytest.raises(KeyError, match="Missing query entry for sequence 5"):
+        KVCacheManager.get_sequence_token_budget(req, 5)
+
+
+def test_token_budget_raises_keyerror_when_sequence_metadata_missing():
+    """Compute path needs sequence metadata; missing ⇒ KeyError (legacy parity)."""
+    entry = _make_entry(kv_token_budget=None)
+    req = _make_token_budget_req(
+        query_book={9: entry},
+        local_to_uuid={9: "uuid-9"},
+        sequences=[],  # No sequence with uuid-9
+    )
+    with pytest.raises(KeyError, match="No sequence metadata available for sequence 9"):
+        KVCacheManager.get_sequence_token_budget(req, 9)
+
+
+def test_token_budget_raises_keyerror_when_uuid_unknown():
+    """If local_to_uuid has no entry for the sequence_id, uuid="" → no metadata."""
+    entry = _make_entry(kv_token_budget=None)
+    req = _make_token_budget_req(
+        query_book={11: entry},
+        local_to_uuid={},  # 11 not present
+        sequences=[("anything", 100)],
+    )
+    with pytest.raises(KeyError, match="No sequence metadata available for sequence 11"):
+        KVCacheManager.get_sequence_token_budget(req, 11)
+
+
+def test_token_budget_no_truncation_against_max_input_length():
+    """Budget is prompt + max_decode regardless of any worker max_input_length.
+
+    Legacy had an earlier min(...) here which silently undersized KV when
+    max_input_length lagged behind the actual prompt length on multi-batch
+    admits. The handler must NOT re-introduce that.
+    """
+    entry = _make_entry(kv_token_budget=None)
+    # Prompt is 4096 but no max_input_length in the request — handler must
+    # not clamp against any external limit.
+    req = _make_token_budget_req(
+        query_book={1: entry},
+        local_to_uuid={1: "uuid-1"},
+        sequences=[("uuid-1", 4096)],
+        max_decoding_length=512,
+    )
+    assert KVCacheManager.get_sequence_token_budget(req, 1) == 4096 + 512
+
+
+def test_compute_host_kv_sequence_tokens_returns_list_in_order():
+    """Bulk variant preserves input ordering and reuses the cache."""
+    e1 = _make_entry(kv_token_budget=111)
+    e2 = _make_entry(kv_token_budget=222)
+    e3 = _make_entry(kv_token_budget=None)
+    req = _make_token_budget_req(
+        query_book={1: e1, 2: e2, 3: e3},
+        local_to_uuid={3: "uuid-3"},
+        sequences=[("uuid-3", 60)],
+        max_decoding_length=40,
+    )
+    out = KVCacheManager.compute_host_kv_sequence_tokens(req, [2, 1, 3])
+    assert out == [222, 111, 100]
+    # The miss path also memoized:
+    assert e3.kv_token_budget == 100
+
+
+def test_compute_host_kv_sequence_tokens_empty_input():
+    req = _make_token_budget_req(query_book={})
+    assert KVCacheManager.compute_host_kv_sequence_tokens(req, []) == []
+
+
+def test_token_budget_request_is_frozen():
+    req = _make_token_budget_req(query_book={})
+    with pytest.raises((AttributeError, Exception)):
+        req.max_decoding_length = 99  # type: ignore[misc]

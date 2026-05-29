@@ -17,11 +17,23 @@ state mutation, no backend, no NCCL):
   - ``_with_cuda_graph_page_table_capacity`` (22 LOC) →
     ``KVCacheManager.apply_page_table_capacity``
 
+Sub-slice 5.3 adds the token-budget cache helpers:
+
+  - ``_get_sequence_token_budget`` (20 LOC) →
+    ``KVCacheManager.get_sequence_token_budget``
+  - ``_compute_host_kv_sequence_tokens`` (3 LOC) →
+    ``KVCacheManager.compute_host_kv_sequence_tokens``
+
+The token-budget helpers memoize a per-sequence ``kv_token_budget`` on
+the ``QueryBookEntry`` passed via snapshot. That mutation is *on the
+entry object the worker passes in*, not on worker state — handler stays
+stateless w.r.t. worker.
+
 The KV Cache Helper section has 27 methods totaling ~1330 LOC; they
 span four distinct concerns (read-only stats, allocation, planning,
 migration execution). Porting them all in one slice would be too risky.
 Allocators, planners, and migration executors land in later sub-slices
-(5.3+).
+(5.4+).
 
 Design follows the per-slice Backend Protocol pattern introduced by
 ``SyncCoordinator`` (Slice 3): the handler takes a ``KVStatsBackend``
@@ -33,9 +45,10 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 if TYPE_CHECKING:
+    from batchgen.query_book import QueryBookEntry
     from batchgen.sequence import SequenceBatch
 
 
@@ -130,6 +143,26 @@ class PageTableCapacityRequest:
     engine_basic_num_queries: Optional[int]
     model_max_position_embeddings: Optional[int]
     args_cuda_graph_max_bucket_size: Optional[int]
+
+
+# ---------------------------------------------------------------------------
+# Token-budget cache (Phase 5.3): frozen request snapshot
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TokenBudgetRequest:
+    """Frozen snapshot for the per-sequence host-KV token-budget cache.
+
+    The handler memoizes the computed budget on
+    ``query_book[sequence_id].kv_token_budget``. That mutation is on the
+    entry object the worker passes in; worker state is not touched.
+    """
+
+    query_book: Mapping[int, "QueryBookEntry"]
+    local_to_uuid: Mapping[int, str]
+    global_batch: "SequenceBatch"
+    max_decoding_length: int
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +343,47 @@ class KVCacheManager:
             cuda_graph_max_pages_per_sequence=page_capacity,
             cuda_graph_max_slots=slot_capacity,
         )
+
+    # ------------------------------------------------------------------
+    # Token-budget cache (Phase 5.3)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_sequence_token_budget(req: TokenBudgetRequest, sequence_id: int) -> int:
+        """Return cached host-allocation tokens for a sequence, computing once.
+
+        Reads ``query_book[sequence_id]``; if ``kv_token_budget`` is set,
+        returns it. Otherwise computes ``prompt_length + max_decoding_length``
+        from sequence metadata and memoizes it on the entry.
+
+        Raises ``RuntimeError`` if ``query_book`` is empty (means the worker
+        has not initialized it yet) or ``KeyError`` if the sequence is missing.
+        """
+        if not req.query_book:
+            raise RuntimeError("query_book is not initialized before KV allocation")
+        query_entry = req.query_book.get(sequence_id)
+        if query_entry is None or query_entry.encoded is None:
+            raise KeyError(f"Missing query entry for sequence {sequence_id}")
+        if query_entry.kv_token_budget is not None:
+            return query_entry.kv_token_budget
+        # Fallback: compute from sequence metadata (attention_mask removed)
+        uuid = req.local_to_uuid.get(sequence_id, "")
+        seq = req.global_batch.get_sequence(uuid) if uuid else None
+        if seq is None:
+            raise KeyError(f"No sequence metadata available for sequence {sequence_id}")
+        # NO truncation: KV budget must cover the FULL prompt + decode budget.
+        # An earlier min(...) here silently undersized KV when max_input_length
+        # lagged behind the actual prompt length on multi-batch admits.
+        input_tokens = seq.prompt_length
+        total_tokens = input_tokens + req.max_decoding_length
+        query_entry.kv_token_budget = total_tokens
+        return total_tokens
+
+    @staticmethod
+    def compute_host_kv_sequence_tokens(
+        req: TokenBudgetRequest, sequence_ids: Sequence[int]
+    ) -> List[int]:
+        """Reuse cached token budgets so host/GPU allocations stay consistent."""
+        return [
+            KVCacheManager.get_sequence_token_budget(req, sequence_id)
+            for sequence_id in sequence_ids
+        ]
