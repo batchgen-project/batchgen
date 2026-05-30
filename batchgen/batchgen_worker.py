@@ -115,6 +115,7 @@ from batchgen.worker.prefill import (
 	PrefillScheduler,
 	PrefillSelectionRequest,
 )
+from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.kv_manager import (
 	GpuKvManagerPlan,
 	GpuKvManagerRequest,
@@ -553,6 +554,12 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
+		# Phase 7.2 (issue #175): dual-path gate for the host-KV migration
+		# round-grouping. NATIVE=1 routes through
+		# `HostKVRebalancer.group_migrations_for_parallel_execution`.
+		# COMPARE=1 runs both and asserts the round structure is equal.
+		self._rebalance_native = os.environ.get("BATCHGEN_WORKER_REBALANCE_NATIVE", "0") == "1"
+		self._rebalance_compare = os.environ.get("BATCHGEN_WORKER_REBALANCE_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -3444,6 +3451,24 @@ class BatchGenWorker:
 			logging.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
 
 	def _group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
+		"""Group migrations into conflict-free parallel rounds (gated)."""
+		if self._rebalance_compare:
+			legacy = self._legacy_group_migrations_for_parallel_execution(migrations)
+			native = HostKVRebalancer.group_migrations_for_parallel_execution(
+				migrations, NUM_GPUS_PER_NODE
+			)
+			assert legacy == native, (
+				f"rebalance compare mismatch: _group_migrations_for_parallel_execution "
+				f"legacy={legacy} native={native}"
+			)
+			return native if self._rebalance_native else legacy
+		if self._rebalance_native:
+			return HostKVRebalancer.group_migrations_for_parallel_execution(
+				migrations, NUM_GPUS_PER_NODE
+			)
+		return self._legacy_group_migrations_for_parallel_execution(migrations)
+
+	def _legacy_group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
 		"""Group migrations into rounds that can execute in parallel.
 
 		Migrations in the same round must not share any source or destination ranks.
