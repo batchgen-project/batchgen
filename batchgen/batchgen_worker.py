@@ -554,12 +554,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 7.2 (issue #175): dual-path gate for the host-KV migration
-		# round-grouping. NATIVE=1 routes through
-		# `HostKVRebalancer.group_migrations_for_parallel_execution`.
-		# COMPARE=1 runs both and asserts the round structure is equal.
-		self._rebalance_native = os.environ.get("BATCHGEN_WORKER_REBALANCE_NATIVE", "0") == "1"
-		self._rebalance_compare = os.environ.get("BATCHGEN_WORKER_REBALANCE_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -3451,65 +3445,14 @@ class BatchGenWorker:
 			logging.info(f"MIGRATION: All {len(rounds)} parallel rounds completed")
 
 	def _group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
-		"""Group migrations into conflict-free parallel rounds (gated)."""
-		if self._rebalance_compare:
-			legacy = self._legacy_group_migrations_for_parallel_execution(migrations)
-			native = HostKVRebalancer.group_migrations_for_parallel_execution(
-				migrations, NUM_GPUS_PER_NODE
-			)
-			assert legacy == native, (
-				f"rebalance compare mismatch: _group_migrations_for_parallel_execution "
-				f"legacy={legacy} native={native}"
-			)
-			return native if self._rebalance_native else legacy
-		if self._rebalance_native:
-			return HostKVRebalancer.group_migrations_for_parallel_execution(
-				migrations, NUM_GPUS_PER_NODE
-			)
-		return self._legacy_group_migrations_for_parallel_execution(migrations)
+		"""Group migrations into conflict-free parallel rounds.
 
-	def _legacy_group_migrations_for_parallel_execution(self, migrations: List[MigrationOp]) -> List[List[MigrationOp]]:
-		"""Group migrations into rounds that can execute in parallel.
-
-		Migrations in the same round must not share any source or destination ranks.
-		This ensures no rank is involved in multiple send/recv operations simultaneously.
-
-		Args:
-			migrations: List of MigrationOp objects
-
-		Returns:
-			List of rounds, where each round is a list of migrations that can run in parallel
+		Delegates to ``HostKVRebalancer``; the NCCL execution of the rounds
+		stays in ``_execute_kv_migrations_parallel``.
 		"""
-		rounds = []
-		remaining = list(migrations)
-
-		while remaining:
-			round_migrations = []
-			used_ranks = set()
-			used_src_nodes = set()
-
-			for mig in remaining[:]:  # Iterate over copy
-				from_rank = mig.from_rank
-				to_rank = mig.to_rank
-				src_node = from_rank // NUM_GPUS_PER_NODE
-
-				# Check rank exclusivity AND source node exclusivity.
-				# Source node limit: migration uses GPU KV as staging buffer
-				# (host→GPU→extract→CPU→send). Multiple source ranks on the same
-				# node share GPU KV pages. Without this limit, parallel migrations
-				# from the same node exhaust GPU KV staging pages.
-				if (from_rank not in used_ranks
-					and to_rank not in used_ranks
-					and src_node not in used_src_nodes):
-					round_migrations.append(mig)
-					used_ranks.add(from_rank)
-					used_ranks.add(to_rank)
-					used_src_nodes.add(src_node)
-					remaining.remove(mig)
-
-			rounds.append(round_migrations)
-
-		return rounds
+		return HostKVRebalancer.group_migrations_for_parallel_execution(
+			migrations, NUM_GPUS_PER_NODE
+		)
 
 	def _execute_single_kv_migration(self, uuid: str, from_rank: int, to_rank: int) -> None:
 		"""Migrate KV cache for one sequence from source to dest rank.
