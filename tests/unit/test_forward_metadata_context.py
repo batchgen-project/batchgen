@@ -229,49 +229,32 @@ def test_prefix_cache_metadata_rejects_bound_decode_metadata():
 
 def test_prefix_cache_metadata_explicit_matches_legacy_fields():
     from batchgen.models.wrappers.prefix_cache import (
-        PrefixCachePrepackMetadata,
-        ensure_prefix_cache_prepack_metadata,
+        ensure_prefix_cache_forward_metadata,
     )
 
     metadata = _partial_reuse_prefill_metadata()
-    wrapper_metadata = PrefixCachePrepackMetadata.from_prefill_metadata(
-        metadata.prefill,
-        global_sequence_ids=metadata.global_sequence_ids,
-    )
     wrapper = object.__new__(AttnWrapperBase)
 
     with bind_forward_batch_metadata(metadata):
         explicit_metadata = wrapper.prefix_cache_metadata()
 
-    assert (
-        explicit_metadata.cu_seqlens_list()
-        == wrapper_metadata.cu_seqlens_list()
+    assert explicit_metadata.cu_seqlens_list() == [0, 2, 3]
+    assert explicit_metadata.max_seqlen == 2
+    assert explicit_metadata.num_sequences == 2
+    assert explicit_metadata.seq_lengths == [2, 1]
+    expected_append_lens = (
+        metadata.prefill.append_seq_lens
+        if metadata.prefill.append_seq_lens is not None
+        else metadata.prefill.q_seq_lens
     )
-    assert explicit_metadata.max_seqlen == wrapper_metadata.max_seqlen
-    assert explicit_metadata.num_sequences == wrapper_metadata.num_sequences
-    assert explicit_metadata.seq_lengths == wrapper_metadata.seq_lengths
+    assert explicit_metadata.append_seq_lengths == expected_append_lens
+    assert explicit_metadata.global_sequence_ids == metadata.global_sequence_ids
+    assert explicit_metadata.prefix_reuse_mode is True
+    assert explicit_metadata.prefix_shared_tokens == [3, 0]
+    assert explicit_metadata.full_seq_lengths == [5, 1]
     assert (
-        explicit_metadata.append_seq_lengths
-        == wrapper_metadata.append_seq_lengths
-    )
-    assert (
-        explicit_metadata.global_sequence_ids
-        == wrapper_metadata.global_sequence_ids
-    )
-    assert (
-        explicit_metadata.prefix_reuse_mode
-        == wrapper_metadata.prefix_reuse_mode
-    )
-    assert (
-        explicit_metadata.prefix_shared_tokens
-        == wrapper_metadata.prefix_shared_tokens
-    )
-    assert (
-        explicit_metadata.full_seq_lengths == wrapper_metadata.full_seq_lengths
-    )
-    assert (
-        ensure_prefix_cache_prepack_metadata(metadata).global_sequence_ids
+        ensure_prefix_cache_forward_metadata(metadata).global_sequence_ids
         == metadata.global_sequence_ids
     )
     with pytest.raises(RuntimeError, match="global sequence ids"):
-        ensure_prefix_cache_prepack_metadata(metadata.prefill)
+        ensure_prefix_cache_forward_metadata(metadata.prefill)

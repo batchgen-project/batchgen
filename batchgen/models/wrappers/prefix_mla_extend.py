@@ -7,12 +7,11 @@ from typing import Callable
 
 import torch
 
+from batchgen.models.wrappers.prefix_cache import (
+    ensure_prefix_cache_forward_metadata,
+)
 from batchgen.prefix_reuse.materialization import (
     get_prefix_materialization_for_group,
-)
-from batchgen.models.wrappers.prefix_cache import (
-    PrefixCachePrepackMetadata,
-    ensure_prefix_cache_prepack_metadata,
 )
 
 
@@ -33,7 +32,7 @@ def run_prefix_mla_suffix_prefill_with_projected(
     wrapper: object,
     query_states: torch.Tensor,
     offload_kv: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
     spec: MlaExtendSpec,
     output_projection: OutputProjectMlaFn,
     prefill_prefix_materialization: object | None = None,
@@ -64,13 +63,13 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
     layer_idx: int,
     query_states: torch.Tensor,
     offload_kv: torch.Tensor | None,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
     spec: MlaExtendSpec,
     materialization: object,
 ) -> torch.Tensor:
     """Run MLA prefix attention from materialized GPU compressed KV."""
 
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    metadata = ensure_prefix_cache_forward_metadata(metadata)
     manager = materialization.manager
     if manager.config.has_v_cache:
         raise RuntimeError(
@@ -121,7 +120,7 @@ def _run_flashinfer_mla_prefix_attention(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     slot_indices: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
     spec: MlaExtendSpec,
 ) -> torch.Tensor:
     """Run FlashInfer MLA paged attention against materialized prefix pages."""

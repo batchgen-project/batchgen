@@ -202,13 +202,9 @@ class AttnWrapperBase(BaseModuleWrapper):
 
     def prefix_cache_metadata(self):
         """Return validated metadata derived from AttnWrapperBase fields."""
-        from .prefix_cache import PrefixCachePrepackMetadata
+        from .prefix_cache import current_or_legacy_prefix_cache_metadata
 
-        if getattr(AttnWrapperBase, "phase", None) != "prefill":
-            raise RuntimeError(
-                "Prefix cache prepack metadata requires prefill metadata"
-            )
-        return PrefixCachePrepackMetadata.from_wrapper_cls(AttnWrapperBase)
+        return current_or_legacy_prefix_cache_metadata(AttnWrapperBase)
 
     def offload_prepacked_gqa_kv(
         self,

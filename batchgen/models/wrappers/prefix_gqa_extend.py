@@ -7,8 +7,6 @@ from typing import Optional
 
 import torch
 
-from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
-
 
 @dataclass(frozen=True)
 class GqaExtendSpec:
@@ -27,7 +25,7 @@ def run_prefix_gqa_prefill_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
     spec: GqaExtendSpec,
 ) -> torch.Tensor:
     """Run GQA prefill attention with optional cached prefix K/V."""

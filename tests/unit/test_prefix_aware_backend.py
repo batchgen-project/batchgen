@@ -19,7 +19,6 @@ from batchgen.attention.prefix_aware_backend import (
     GqaPrefixAwareAttentionBackend,
     MlaProjectedPrefixAwareAttentionBackend,
 )
-from batchgen.models.wrappers.prefix_cache import PrefixCachePrepackMetadata
 from batchgen.models.wrappers.prefix_gqa_extend import (
     GqaExtendSpec,
     run_prefix_gqa_prefill_attention,
@@ -31,38 +30,44 @@ _LAYER_IDX = 2
 def _metadata(
     *,
     prefix_reuse: bool = False,
-) -> PrefixCachePrepackMetadata:
+) -> ForwardBatchMetadata:
     cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
     max_seqlen = 2
     seq_lengths = [2]
-    prefix_tokens = [3] if prefix_reuse else None
-    full_lengths = [5] if prefix_reuse else None
-    return PrefixCachePrepackMetadata(
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=[int(value) for value in cu_seqlens.tolist()],
-        max_seqlen=max_seqlen,
-        num_sequences=1,
-        seq_lengths=seq_lengths,
-        append_seq_lengths=seq_lengths,
+    kv_seq_lengths = [5] if prefix_reuse else list(seq_lengths)
+    return ForwardBatchMetadata(
+        phase="prefill",
         global_sequence_ids=[100],
-        prefix_reuse_mode=prefix_reuse,
-        prefix_shared_tokens=prefix_tokens,
-        full_seq_lengths=full_lengths,
+        prefill=PrefillAttentionMetadata(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=torch.tensor(
+                [0, kv_seq_lengths[0]],
+                dtype=torch.int32,
+            ),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max(kv_seq_lengths),
+            q_seq_lens=seq_lengths,
+            kv_seq_lens=kv_seq_lengths,
+            position_ids=torch.tensor([0, 1], dtype=torch.int64),
+            append_seq_lens=seq_lengths,
+        ),
     )
 
 
-def _clamped_full_hit_metadata() -> PrefixCachePrepackMetadata:
-    return PrefixCachePrepackMetadata(
-        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
-        cu_seqlens_cpu=[0, 1],
-        max_seqlen=1,
-        num_sequences=1,
-        seq_lengths=[1],
-        append_seq_lengths=[1],
+def _clamped_full_hit_metadata() -> ForwardBatchMetadata:
+    return ForwardBatchMetadata(
+        phase="prefill",
         global_sequence_ids=[100],
-        prefix_reuse_mode=True,
-        prefix_shared_tokens=[4],
-        full_seq_lengths=[5],
+        prefill=PrefillAttentionMetadata(
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 5], dtype=torch.int32),
+            max_seqlen_q=1,
+            max_seqlen_k=5,
+            q_seq_lens=[1],
+            kv_seq_lens=[5],
+            position_ids=torch.tensor([4], dtype=torch.int64),
+            append_seq_lens=[1],
+        ),
     )
 
 

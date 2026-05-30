@@ -42,10 +42,10 @@ class GqaPrefixAwareAttentionBackend:
             raise RuntimeError("GQA prefix-aware prefill requires value tensor")
 
         from batchgen.models.wrappers.prefix_cache import (
-            ensure_prefix_cache_prepack_metadata,
+            ensure_prefix_cache_forward_metadata,
         )
 
-        metadata = ensure_prefix_cache_prepack_metadata(metadata)
+        metadata = ensure_prefix_cache_forward_metadata(metadata)
 
         cu_q = metadata.cu_seqlens.to(query.device)
         materialization = (

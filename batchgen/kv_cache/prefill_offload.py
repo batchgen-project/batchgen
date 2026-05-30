@@ -6,9 +6,9 @@ from typing import Callable, List, Optional
 
 import torch
 
+from batchgen.attention.forward_metadata import ForwardBatchMetadata
 from batchgen.models.wrappers.prefix_cache import (
-    PrefixCachePrepackMetadata,
-    ensure_prefix_cache_prepack_metadata,
+    ensure_prefix_cache_forward_metadata,
 )
 
 
@@ -20,7 +20,7 @@ class PrefillHostKVOffloader:
         *,
         worker_view: object,
         layer_idx: int,
-        metadata: PrefixCachePrepackMetadata,
+        metadata: ForwardBatchMetadata,
         track_task: Optional[Callable[[object, int], None]] = None,
         pin_tensor: Optional[Callable[[torch.Tensor, int], None]] = None,
     ):
@@ -28,7 +28,7 @@ class PrefillHostKVOffloader:
             raise RuntimeError("Prefill offload requires host KV view")
         self.worker_view = worker_view
         self.layer_idx = int(layer_idx)
-        self.metadata = ensure_prefix_cache_prepack_metadata(metadata)
+        self.metadata = ensure_prefix_cache_forward_metadata(metadata)
         self.track_task = track_task
         self.pin_tensor = pin_tensor
 

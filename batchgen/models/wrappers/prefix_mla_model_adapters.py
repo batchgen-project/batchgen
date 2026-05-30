@@ -22,10 +22,7 @@ from batchgen.attention.mla.prefix_absorb import (
 from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
 from .attention import AttnWrapperBase
-from .prefix_cache import (
-    PrefixCachePrepackMetadata,
-    ensure_prefix_cache_prepack_metadata,
-)
+from .prefix_cache import ensure_prefix_cache_forward_metadata
 from .prefix_mla_extend import (
     MlaExtendSpec,
     run_prefix_mla_suffix_prefill_with_projected,
@@ -40,7 +37,7 @@ class MlaPrefixBackendContext:
     """Prefix extend callbacks consumed by the existing MLA prepack backend."""
 
     wrapper: object
-    metadata: PrefixCachePrepackMetadata
+    metadata: object
     spec: MlaExtendSpec
     suffix_query_builder: ProjectedQueryBuilder
     output_projection: OutputProjector
@@ -83,9 +80,9 @@ class MlaPrefixBackendContext:
 def build_deepseek_prefix_backend_context(
     *,
     wrapper: object,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
 ) -> MlaPrefixBackendContext:
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    metadata = ensure_prefix_cache_forward_metadata(metadata)
     return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
@@ -97,9 +94,9 @@ def build_deepseek_prefix_backend_context(
 def build_glm5_prefix_backend_context(
     *,
     wrapper: object,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
 ) -> MlaPrefixBackendContext:
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    metadata = ensure_prefix_cache_forward_metadata(metadata)
     return _build_w8a16_prefix_backend_context(
         wrapper=wrapper,
         metadata=metadata,
@@ -111,9 +108,9 @@ def build_glm5_prefix_backend_context(
 def build_kimi_prefix_backend_context(
     *,
     wrapper: object,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
 ) -> MlaPrefixBackendContext:
-    metadata = ensure_prefix_cache_prepack_metadata(metadata)
+    metadata = ensure_prefix_cache_forward_metadata(metadata)
     return MlaPrefixBackendContext(
         wrapper=wrapper,
         metadata=metadata,
@@ -139,7 +136,7 @@ def offload_glm5_prepacked_mla_kv(
     key: torch.Tensor,
     worker_view: object,
     layer_idx: int,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
 ) -> None:
     """Offload prepacked GLM-5 k-only MLA/indexer KV with prefix offsets."""
     offloader = PrefillHostKVOffloader(
@@ -168,7 +165,7 @@ def _prefill_prefix_materialization(wrapper: object) -> object | None:
 def _build_w8a16_prefix_backend_context(
     *,
     wrapper: object,
-    metadata: PrefixCachePrepackMetadata,
+    metadata: object,
     model_label: str,
     use_cached_absorb: bool,
 ) -> MlaPrefixBackendContext:

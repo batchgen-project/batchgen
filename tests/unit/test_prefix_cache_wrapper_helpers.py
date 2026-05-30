@@ -113,7 +113,7 @@ class _Wrapper:
 def test_prefix_cache_metadata_validates_prefix_lengths(monkeypatch):
     mod = _prefix_cache_module(monkeypatch)
 
-    metadata = mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
+    metadata = mod.build_prefix_cache_forward_metadata_from_wrapper_cls(_Wrapper)
 
     assert metadata.global_sequence_ids == [10, 20]
     assert metadata.prefix_shared_tokens == [7, 11]
@@ -122,7 +122,9 @@ def test_prefix_cache_metadata_validates_prefix_lengths(monkeypatch):
 def test_prefix_offloader_uses_destination_offsets(monkeypatch):
     prefix_mod = _prefix_cache_module(monkeypatch)
     offload_mod = _prefill_offload_module(monkeypatch)
-    metadata = prefix_mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
+    metadata = prefix_mod.build_prefix_cache_forward_metadata_from_wrapper_cls(
+        _Wrapper
+    )
     worker_view = _FakeWorkerView()
     tracked = []
     offloader = offload_mod.PrefillHostKVOffloader(
@@ -148,7 +150,9 @@ def test_prefix_offloader_uses_destination_offsets(monkeypatch):
 def test_prefix_offloader_rejects_missing_offset_api(monkeypatch):
     prefix_mod = _prefix_cache_module(monkeypatch)
     offload_mod = _prefill_offload_module(monkeypatch)
-    metadata = prefix_mod.PrefixCachePrepackMetadata.from_wrapper_cls(_Wrapper)
+    metadata = prefix_mod.build_prefix_cache_forward_metadata_from_wrapper_cls(
+        _Wrapper
+    )
     offloader = offload_mod.PrefillHostKVOffloader(
         worker_view=_NoOffsetWorkerView(),
         layer_idx=0,

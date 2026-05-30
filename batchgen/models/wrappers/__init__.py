@@ -40,11 +40,9 @@ Usage:
 from .attention import AttnWrapperBase
 from .base import BaseModuleWrapper
 from .expert import ExpertWrapperBase
-from .prefix_cache import PrefixCachePrepackMetadata
 
 __all__ = [
     "BaseModuleWrapper",
     "ExpertWrapperBase",
     "AttnWrapperBase",
-    "PrefixCachePrepackMetadata",
 ]
