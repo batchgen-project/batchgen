@@ -111,6 +111,94 @@ else:
 
 _sm80_flags = ["-std=c++17", "-O3", "--threads", _nvcc_threads] + _sm80_gencode
 
+# ── SM100 (Blackwell / B200) build flags ─────────────────────────────────────
+
+_sm100_flags = [
+    "-std=c++17",
+    "-arch=sm_100a",
+    "-O3",
+    "--use_fast_math",
+    "-lineinfo",
+    "--ptxas-options=-v",
+    "--threads", _nvcc_threads,
+]
+
+# ── SM100 extensions: generic CUDA + SM80 mma.sync kernels (no WGMMA) ────────
+# Kernels that use SM90a WGMMA/TMA are EXCLUDED from this list and replaced by
+# Triton kernels (qkv_proj_rope, fused_router_gemm) or torch._scaled_mm (fp8).
+
+_sm100_extensions = [
+    # Marlin W4A16 grouped GEMM — SM80 mma.sync, backward compatible with SM100
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_marlin_grouped_gemm",
+        sources=["src/moe/marlin_grouped_gemm.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": _sm100_flags + [
+                "-DUSE_BF16_COMPUTE",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            ],
+        },
+    ),
+    # FP8 blockwise pipeline ops (act_quant_3d, silu_mul_3d, fused_silu_quant_3d)
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_fp8_blockwise_ops",
+        sources=["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
+        extra_compile_args={"cxx": ["-O3"], "nvcc": _sm100_flags},
+    ),
+    # Marlin weight-format transform — generic CUDA, no ISA deps
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_marlin_transform",
+        sources=["src/moe/marlin_transform_kernel.cu"],
+        extra_compile_args={"cxx": ["-O3"], "nvcc": _sm100_flags},
+    ),
+    # Routing bundle (generic kernels only; fused_gate.cu EXCLUDED — WGMMA source;
+    # replaced by batchgen_kernels/triton/fused_router_gemm.py on SM100)
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_routing",
+        sources=[
+            "src/moe/routing/routing_extension.cc",
+            "src/moe/routing/gate_topk_softmax.cu",
+            "src/moe/routing/dispatch_count_gather.cu",
+            "src/moe/routing/reduce_weighted_scatter.cu",
+            "src/moe/routing/router_epilogue.cu",
+            "src/moe/routing/gate_sigmoid_topk.cu",
+            "src/moe/routing/glm5_router_gemm.cu",   # generic CUDA, no WGMMA
+        ],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": _sm100_flags,
+        },
+    ),
+    # 3D dispatch scatter + reduce (strided MoE buffer) — generic CUDA
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_dispatch_scatter_3d",
+        sources=["src/moe/dispatch_scatter_3d.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": _sm100_flags + ["-U__CUDA_NO_BFLOAT16_CONVERSIONS__"],
+        },
+    ),
+    # Fused RMSNorm + RoPE + KV cache write — generic CUDA
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_kv_norm_rope",
+        sources=["src/attention/fused_kv_norm_rope_cache.cu"],
+        extra_compile_args={"cxx": ["-O3"], "nvcc": _sm100_flags},
+    ),
+    # Fused q_absorb GEMV + q_pe copy — generic CUDA
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_q_absorb",
+        sources=["src/attention/fused_q_absorb.cu"],
+        extra_compile_args={"cxx": ["-O3"], "nvcc": _sm100_flags},
+    ),
+    # Fused q_b split into q_nope + q_pe — generic CUDA
+    CUDAExtension(
+        name="batchgen_kernels.attention._C_fused_q_split",
+        sources=["src/attention/fused_q_split.cu"],
+        extra_compile_args={"cxx": ["-O3"], "nvcc": _sm100_flags},
+    ),
+]
+
 # ── Build extension list ──
 
 _sm90a_extensions = [
@@ -216,8 +304,9 @@ _sm90a_extensions = [
             "src/moe/routing/fused_gate.cu",
         ],
         extra_compile_args={
-            "cxx": ["-O3"],
+            "cxx": ["-O3", "-DBATCHGEN_HAS_FUSED_GATE"],
             "nvcc": ["-O3", "--use_fast_math", "-std=c++17",
+                     "-DBATCHGEN_HAS_FUSED_GATE",
                      "-gencode", "arch=compute_90a,code=sm_90a",
                      "--threads", _nvcc_threads],
         },
@@ -376,8 +465,10 @@ _sm80_extensions = [
 _ext_modules = []
 if _build_sm90a:
     _ext_modules.extend(_sm90a_extensions)
+elif _build_sm100:
+    _ext_modules.extend(_sm100_extensions)
 else:
-    print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels")
+    print(f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping arch-specific kernels")
 _ext_modules.extend(_sm80_extensions)
 
 setup(
