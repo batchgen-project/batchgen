@@ -553,14 +553,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 6.2 (issue #175): dual-path gate for the prefill selection
-		# decision. NATIVE=1 routes the greedy per-node admission through
-		# `PrefillScheduler.select_prefill_batch`. COMPARE=1 runs both the
-		# legacy (global_batch-direct) and native (snapshot) selections from
-		# the same gathered per-node free pages and asserts the uuid lists
-		# are equal. The NCCL gather + logging run once.
-		self._prefill_native = os.environ.get("BATCHGEN_WORKER_PREFILL_NATIVE", "0") == "1"
-		self._prefill_compare = os.environ.get("BATCHGEN_WORKER_PREFILL_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -4582,33 +4574,14 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
 
-		# Step 3: Select sequences considering per-node host KV capacity (gated).
+		# Step 3: Select sequences considering per-node host KV capacity.
 		# The NCCL gather above and the logging below stay here; the greedy
-		# per-node admission is the gated decision.
-		if self._prefill_compare:
-			legacy = self._legacy_prefill_selection(
+		# per-node admission is delegated to PrefillScheduler.
+		prefill_batch = PrefillScheduler.select_prefill_batch(
+			self._make_prefill_selection_request(
 				all_candidates, per_node_host_free, num_nodes, chunk_size
 			)
-			native = PrefillScheduler.select_prefill_batch(
-				self._make_prefill_selection_request(
-					all_candidates, per_node_host_free, num_nodes, chunk_size
-				)
-			)
-			assert legacy == native, (
-				f"prefill compare mismatch: _prepare_prefill_batch "
-				f"legacy={legacy} native={native}"
-			)
-			prefill_batch = native if self._prefill_native else legacy
-		elif self._prefill_native:
-			prefill_batch = PrefillScheduler.select_prefill_batch(
-				self._make_prefill_selection_request(
-					all_candidates, per_node_host_free, num_nodes, chunk_size
-				)
-			)
-		else:
-			prefill_batch = self._legacy_prefill_selection(
-				all_candidates, per_node_host_free, num_nodes, chunk_size
-			)
+		)
 
 		if self.rank == 0:
 			n_evicted = sum(
@@ -4651,44 +4624,6 @@ class BatchGenWorker:
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
 		)
-
-	def _legacy_prefill_selection(
-		self, all_candidates: List[str], per_node_host_free: List[int],
-		num_nodes: int, chunk_size: int,
-	) -> List[str]:
-		"""Inline greedy per-node admission over ``global_batch``.
-
-		Mirrors ``PrefillScheduler.select_prefill_batch`` (queries
-		``global_batch`` directly), so compare-mode validates both the
-		candidate enumeration and the algorithm transcription.
-		"""
-		per_node_effective_free = list(per_node_host_free)
-		node_pages_used = [0] * num_nodes
-		prefill_batch: List[str] = []
-
-		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			assigned_rank = seq.assigned_rank
-			seq_node = self._get_node_for_rank(assigned_rank)
-
-			# NOTE: For EVICTED sequences, seq.prompt_length has already been
-			# updated to the reconstructed re-entry length (= original prompt +
-			# previously-decoded tokens) at eviction time in _page_boundary_fast,
-			# and propagated to all ranks via _sync_sequence_metadata before we
-			# get here. So we can use seq.prompt_length uniformly.
-			post_prefill_length = seq.prompt_length + 1
-			gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-			initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-			initial_capacity = min(initial_capacity, seq.kv_token_budget)
-			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
-
-			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
-				prefill_batch.append(uuid)
-				node_pages_used[seq_node] += req_pages
-
-		return prefill_batch
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
