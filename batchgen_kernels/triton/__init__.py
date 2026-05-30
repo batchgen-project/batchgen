@@ -39,3 +39,13 @@ from batchgen_kernels.triton.qkv_proj_rope import (
     apply_rope_qk,
 )
 from batchgen_kernels.triton.fused_router_gemm import router_gemm_bias
+from batchgen_kernels.triton.int4_grouped_gemm import (
+    int4_grouped_gemm,
+    int4_moe_grouped_gemm,
+)
+from batchgen_kernels.triton.fused_int4_grouped_silu import (
+    fused_int4_grouped_silu,
+    silu_mul,
+    int4_expert_mlp,
+    int4_grouped_moe_forward,
+)
