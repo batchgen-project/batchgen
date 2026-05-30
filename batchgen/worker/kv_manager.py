@@ -43,11 +43,23 @@ The allocation/IO methods are ~90% irreducible side effects, so wrapping
 them behind a Backend Protocol would add scaffolding without testability
 gain — we extract only the genuinely pure planning step here.
 
+Sub-slice 5.5 adds the host-KV watermark *trigger decision* extracted
+from ``_check_host_kv_watermark_trigger``:
+
+  - ``KVCacheManager.plan_watermark_trigger`` — given the per-node host-KV
+    stats gathered across ranks, decides whether decode should be
+    preempted for prefill (free space above watermark AND work waiting),
+    and aggregates the global page stats for logging.
+
+Only the *decision* is ported; the cross-rank ``dist.all_gather_object``
+that collects the per-node stats stays on the worker (NCCL side effect).
+The worker applies the returned ``WatermarkTriggerPlan`` — stores the
+aggregated stats and emits the log lines.
+
 The KV Cache Helper section has 27 methods totaling ~1330 LOC; they
 span four distinct concerns (read-only stats, allocation, planning,
 migration execution). Porting them all in one slice would be too risky.
-Watermark/eviction planners and migration executors land in later
-sub-slices (5.5+).
+Migration executors land in later sub-slices (5.6+).
 
 Design follows the per-slice Backend Protocol pattern introduced by
 ``SyncCoordinator`` (Slice 3): the handler takes a ``KVStatsBackend``
@@ -219,6 +231,56 @@ class GpuKvManagerPlan:
     destroy_existing: bool
     primary_config: Optional["GPUPagedKVConfig"]
     aux_config: Optional["GPUPagedKVConfig"]
+
+
+# ---------------------------------------------------------------------------
+# Host-KV watermark trigger (Phase 5.5): frozen request + plan
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WatermarkTriggerRequest:
+    """Frozen snapshot for ``plan_watermark_trigger``.
+
+    ``node_stats`` is the per-node host-KV utilization view, one entry per
+    node representative (already gathered across ranks by the worker via
+    ``dist.all_gather_object`` and filtered to non-None). Each entry is the
+    dict produced by ``get_host_utilization`` (``HostKVUtilization`` fields):
+    ``free_percent``, ``num_used_pages``, ``num_total_pages``,
+    ``num_free_pages``, ``node_id``.
+    """
+
+    node_stats: Tuple[Mapping[str, int], ...]
+    host_kv_watermark: int
+    has_queued: bool
+    has_evicted: bool
+
+
+@dataclass(frozen=True)
+class WatermarkGlobalStats:
+    """Aggregated host-KV page stats across all nodes (for logging)."""
+
+    used: int
+    total: int
+    free_percent: int
+    num_nodes: int
+
+
+@dataclass(frozen=True)
+class WatermarkTriggerPlan:
+    """What ``plan_watermark_trigger`` returns; the worker applies it.
+
+    * ``should_trigger`` — interrupt decode and switch to prefill.
+    * ``max_free_percent`` — highest per-node free %; ``None`` when there
+      are no node stats (worker returns False without aggregating).
+    * ``global_stats`` — aggregated page stats the worker stores on
+      ``self._host_kv_page_stats`` (rank-0 logging). ``None`` when there
+      are no node stats.
+    """
+
+    should_trigger: bool
+    max_free_percent: Optional[int]
+    global_stats: Optional[WatermarkGlobalStats]
 
 
 # ---------------------------------------------------------------------------
@@ -499,4 +561,48 @@ class KVCacheManager:
             destroy_existing=req.has_manager,
             primary_config=primary_config,
             aux_config=aux_config,
+        )
+
+    # ------------------------------------------------------------------
+    # Host-KV watermark trigger (Phase 5.5)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def plan_watermark_trigger(req: WatermarkTriggerRequest) -> WatermarkTriggerPlan:
+        """Decide whether to preempt decode for prefill based on host-KV free %.
+
+        Trigger when ANY node's free space exceeds the watermark (host KV is
+        underutilized) AND there is work waiting (queued or, if eviction is
+        enabled, evicted sequences). Also aggregates the global page stats the
+        worker logs on rank 0.
+
+        Pure: reads only the gathered ``node_stats`` + scalar inputs. The
+        cross-rank ``dist.all_gather_object`` stays on the worker.
+        """
+        if not req.node_stats:
+            return WatermarkTriggerPlan(
+                should_trigger=False,
+                max_free_percent=None,
+                global_stats=None,
+            )
+
+        max_free_percent = max(int(s["free_percent"]) for s in req.node_stats)
+        above_watermark = max_free_percent > req.host_kv_watermark
+        should_trigger = above_watermark and (req.has_queued or req.has_evicted)
+
+        total_used_pages = sum(int(s["num_used_pages"]) for s in req.node_stats)
+        total_pages = sum(int(s["num_total_pages"]) for s in req.node_stats)
+        global_used_percent = (
+            int((total_used_pages / total_pages) * 100) if total_pages > 0 else 0
+        )
+        global_stats = WatermarkGlobalStats(
+            used=total_used_pages,
+            total=total_pages,
+            free_percent=100 - global_used_percent,
+            num_nodes=len(req.node_stats),
+        )
+
+        return WatermarkTriggerPlan(
+            should_trigger=should_trigger,
+            max_free_percent=max_free_percent,
+            global_stats=global_stats,
         )
