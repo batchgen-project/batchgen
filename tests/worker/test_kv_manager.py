@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
+from batchgen.migration import MigrationOp
 from batchgen.query_book import QueryBookEntry
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus
 from batchgen.worker.kv_manager import (
@@ -24,6 +25,8 @@ from batchgen.worker.kv_manager import (
     KVStats,
     KVStatsBackend,
     KVUtilizationRequest,
+    MigrationCandidate,
+    MigrationPlanRequest,
     PageTableCapacityRequest,
     TokenBudgetRequest,
     WatermarkGlobalStats,
@@ -979,3 +982,167 @@ def test_watermark_request_and_plan_are_frozen():
     plan = WatermarkTriggerPlan(should_trigger=True, max_free_percent=80, global_stats=None)
     with pytest.raises((AttributeError, Exception)):
         plan.should_trigger = False  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Host-KV migration planning (Phase 5.6)
+# ---------------------------------------------------------------------------
+
+_GPUS_PER_NODE = 8
+_WORLD = 16  # 2 nodes
+
+
+def _node(used, total):
+    return {"num_used_pages": used, "num_total_pages": total}
+
+
+def _cand(uuid, rank, gidx, budget, host_pages):
+    return MigrationCandidate(
+        uuid=uuid,
+        assigned_rank=rank,
+        global_idx=gidx,
+        kv_token_budget=budget,
+        host_pages_allocated=host_pages,
+    )
+
+
+def _mig_req(node_stats, candidates, *, gpus_per_node=_GPUS_PER_NODE, world=_WORLD):
+    return MigrationPlanRequest(
+        node_stats=node_stats,
+        candidates=tuple(candidates),
+        num_gpus_per_node=gpus_per_node,
+        world_size=world,
+    )
+
+
+def test_migration_single_node_no_migration():
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req({0: _node(100, 200)}, [_cand("a", 0, 0, 128, 60)])
+    )
+    assert plan == []
+
+
+def test_migration_already_balanced():
+    # both nodes at 50 == target → no overloaded/underutilized
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req({0: _node(50, 200), 1: _node(50, 200)}, [])
+    )
+    assert plan == []
+
+
+def test_migration_basic_single_move():
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(100, 200), 1: _node(0, 200)},
+            [_cand("a", 0, 0, 128, 60)],
+        )
+    )
+    assert plan == [
+        MigrationOp(uuid="a", from_rank=0, to_rank=8, pages=60, host_pages=60)
+    ]
+
+
+def test_migration_selects_smallest_budget():
+    """Among candidates, the smallest kv_token_budget is migrated first."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(100, 400), 1: _node(0, 400)},
+            [
+                _cand("big", 0, 0, 256, 30),
+                _cand("small", 1, 1, 64, 30),
+            ],
+        )
+    )
+    # target = 50; node0 used 100. First move picks "small" (budget 64).
+    assert plan[0].uuid == "small"
+
+
+def test_migration_global_idx_tiebreak():
+    """Equal budget → lower global_idx wins."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(100, 400), 1: _node(0, 400)},
+            [
+                _cand("later", 1, 5, 64, 30),
+                _cand("earlier", 0, 2, 64, 30),
+            ],
+        )
+    )
+    assert plan[0].uuid == "earlier"
+
+
+def test_migration_round_robin_dest_ranks():
+    """Two moves to the same dest node distribute across ranks 8, 9."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(120, 400), 1: _node(0, 400)},
+            [
+                _cand("a", 0, 0, 64, 30),
+                _cand("b", 1, 1, 64, 30),
+            ],
+        )
+    )
+    # target = 60; node0 120 → migrate a (rank8) then b (rank9) until node0=60.
+    assert [m.uuid for m in plan] == ["a", "b"]
+    assert [m.to_rank for m in plan] == [8, 9]
+
+
+def test_migration_skips_dest_with_insufficient_pages():
+    """A dest node without room is dropped; migration goes to the next node."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(90, 300), 1: _node(10, 20), 2: _node(10, 300)},
+            [_cand("a", 0, 0, 64, 50)],
+            world=24,  # 3 nodes
+        )
+    )
+    # target = 36; node1 has only 10 free (< 50 needed) → skip → dest node2 rank16.
+    assert plan == [
+        MigrationOp(uuid="a", from_rank=0, to_rank=16, pages=50, host_pages=50)
+    ]
+
+
+def test_migration_skips_zero_host_pages():
+    """A candidate with no host pages allocated is skipped, not migrated."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(100, 200), 1: _node(0, 200)},
+            [_cand("empty", 0, 0, 128, 0)],
+        )
+    )
+    assert plan == []
+
+
+def test_migration_multi_move_until_balanced():
+    """Keeps migrating until the source node reaches target."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req(
+            {0: _node(120, 400), 1: _node(0, 400)},
+            [
+                _cand("a", 0, 0, 64, 20),
+                _cand("b", 1, 1, 64, 20),
+                _cand("c", 2, 2, 64, 20),
+                _cand("d", 3, 3, 64, 20),
+            ],
+        )
+    )
+    # target = 60; node0 120 → migrate 3×20 = 60 to reach 60.
+    assert len(plan) == 3
+    assert {m.uuid for m in plan} == {"a", "b", "c"}
+
+
+def test_migration_no_candidates_returns_empty():
+    """Overloaded node but no movable sequences → no migrations."""
+    plan = KVCacheManager.plan_kv_migration(
+        _mig_req({0: _node(100, 200), 1: _node(0, 200)}, [])
+    )
+    assert plan == []
+
+
+def test_migration_request_and_candidate_are_frozen():
+    req = _mig_req({0: _node(1, 2)}, [_cand("a", 0, 0, 1, 1)])
+    with pytest.raises((AttributeError, Exception)):
+        req.world_size = 8  # type: ignore[misc]
+    c = _cand("a", 0, 0, 1, 1)
+    with pytest.raises((AttributeError, Exception)):
+        c.uuid = "b"  # type: ignore[misc]

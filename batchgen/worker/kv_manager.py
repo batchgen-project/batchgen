@@ -56,10 +56,23 @@ that collects the per-node stats stays on the worker (NCCL side effect).
 The worker applies the returned ``WatermarkTriggerPlan`` — stores the
 aggregated stats and emits the log lines.
 
+Sub-slice 5.6 adds the host-KV migration *planner* extracted from
+``_plan_kv_migration``:
+
+  - ``KVCacheManager.plan_kv_migration`` — greedy rebalance of host-KV
+    pages across nodes: pick the smallest sequences off overloaded nodes
+    and assign them (round-robin across ranks) to the least-loaded nodes
+    until balanced.
+
+Only the *decision* is ported; the cross-rank ``dist.all_gather_object``
+that gathers per-node stats and the candidate enumeration over
+``global_batch`` stay on the worker, which builds the request and applies
+the returned ``MigrationOp`` list via the NCCL migration executors.
+
 The KV Cache Helper section has 27 methods totaling ~1330 LOC; they
 span four distinct concerns (read-only stats, allocation, planning,
-migration execution). Porting them all in one slice would be too risky.
-Migration executors land in later sub-slices (5.6+).
+migration execution). Porting them all in one slice would be too risky —
+each concern landed in its own sub-slice (5.1–5.6).
 
 Design follows the per-slice Backend Protocol pattern introduced by
 ``SyncCoordinator`` (Slice 3): the handler takes a ``KVStatsBackend``
@@ -75,6 +88,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Protocol, Sequen
 
 if TYPE_CHECKING:
     from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
+    from batchgen.migration import MigrationOp
     from batchgen.query_book import QueryBookEntry
     from batchgen.sequence import SequenceBatch
 
@@ -281,6 +295,42 @@ class WatermarkTriggerPlan:
     should_trigger: bool
     max_free_percent: Optional[int]
     global_stats: Optional[WatermarkGlobalStats]
+
+
+# ---------------------------------------------------------------------------
+# Host-KV migration planning (Phase 5.6): frozen request
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MigrationCandidate:
+    """A sequence eligible for host-KV migration (PREFILLED or ON_HOLD).
+
+    The worker enumerates these from ``global_batch`` (one snapshot per
+    candidate); the planner buckets them by source node and selects.
+    """
+
+    uuid: str
+    assigned_rank: int
+    global_idx: int
+    kv_token_budget: int
+    host_pages_allocated: int
+
+
+@dataclass(frozen=True)
+class MigrationPlanRequest:
+    """Frozen snapshot for ``plan_kv_migration``.
+
+    ``node_stats`` maps ``node_id -> {num_used_pages, num_total_pages}``
+    (gathered across ranks). ``candidates`` is every PREFILLED / ON_HOLD
+    sequence across all ranks; the planner sorts them by ``global_idx`` so
+    enumeration order is irrelevant.
+    """
+
+    node_stats: Mapping[int, Mapping[str, int]]
+    candidates: Tuple[MigrationCandidate, ...]
+    num_gpus_per_node: int
+    world_size: int
 
 
 # ---------------------------------------------------------------------------
@@ -606,3 +656,135 @@ class KVCacheManager:
             max_free_percent=max_free_percent,
             global_stats=global_stats,
         )
+
+    # ------------------------------------------------------------------
+    # Host-KV migration planning (Phase 5.6)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def plan_kv_migration(req: MigrationPlanRequest) -> List["MigrationOp"]:
+        """Greedily rebalance host-KV pages across nodes.
+
+        Target = total used pages / num nodes. Repeatedly take the smallest
+        (by ``kv_token_budget``, then ``global_idx``) PREFILLED / ON_HOLD
+        sequence off the most-overloaded node and assign it — round-robin
+        across the destination node's ranks — to the least-loaded node that
+        still has room, until every node is at or below target.
+
+        Pure: reads only the gathered ``node_stats`` + the candidate
+        snapshots. The cross-rank gather, the candidate enumeration over
+        ``global_batch``, and the NCCL migration execution stay on the
+        worker. Deterministic across ranks (candidates sorted by
+        ``global_idx``; ties broken by node id), so every rank produces the
+        identical plan without communication.
+        """
+        from batchgen.migration import MigrationOp
+
+        node_stats = req.node_stats
+        if len(node_stats) <= 1:
+            return []
+
+        total_used = sum(s["num_used_pages"] for s in node_stats.values())
+        num_nodes = len(node_stats)
+        target_per_node = total_used // num_nodes
+
+        overloaded = [
+            (nid, s) for nid, s in node_stats.items()
+            if s["num_used_pages"] > target_per_node
+        ]
+        underutilized = [
+            (nid, s) for nid, s in node_stats.items()
+            if s["num_used_pages"] < target_per_node
+        ]
+        if not overloaded or not underutilized:
+            return []
+
+        overloaded.sort(key=lambda x: x[1]["num_used_pages"], reverse=True)
+        underutilized.sort(key=lambda x: x[1]["num_used_pages"])
+
+        # Bucket candidates by source node (assigned_rank // gpus_per_node).
+        cand_by_node: dict = {}
+        for c in req.candidates:
+            nid = c.assigned_rank // req.num_gpus_per_node
+            cand_by_node.setdefault(nid, []).append(c)
+
+        migrations: list = []
+        used_by_node = {nid: s["num_used_pages"] for nid, s in node_stats.items()}
+        migrated_uuids: set = set()
+        dest_rank_counter: dict = {}
+
+        for src_node_id, _ in overloaded:
+            while used_by_node[src_node_id] > target_per_node and underutilized:
+                candidate_sequences = [
+                    c for c in cand_by_node.get(src_node_id, [])
+                    if c.uuid not in migrated_uuids
+                ]
+                if not candidate_sequences:
+                    break
+
+                # Deterministic selection: smallest budget, global_idx tie-break.
+                candidate_sequences.sort(key=lambda c: c.global_idx)
+                cand = min(
+                    candidate_sequences,
+                    key=lambda c: (c.kv_token_budget, c.global_idx),
+                )
+
+                # Use actual host pages allocated (chunked growth means this
+                # is < ceil(kv_token_budget / page_size)).
+                pages_needed = cand.host_pages_allocated
+                if pages_needed <= 0:
+                    migrated_uuids.add(cand.uuid)  # don't retry
+                    continue
+
+                # Dest node = most free space (lowest used), node id tie-break.
+                dest_node_id = min(
+                    underutilized, key=lambda x: (used_by_node[x[0]], x[0])
+                )[0]
+
+                dest_total = node_stats[dest_node_id]["num_total_pages"]
+                dest_free = dest_total - used_by_node[dest_node_id]
+                if pages_needed > dest_free:
+                    underutilized = [
+                        (nid, s) for nid, s in underutilized if nid != dest_node_id
+                    ]
+                    if not underutilized:
+                        break
+                    continue
+
+                # Round-robin across dest node's ranks for load balancing.
+                if dest_node_id not in dest_rank_counter:
+                    dest_rank_counter[dest_node_id] = 0
+                dest_rank_offset = dest_rank_counter[dest_node_id] % req.num_gpus_per_node
+                dest_rank = dest_node_id * req.num_gpus_per_node + dest_rank_offset
+                if dest_rank >= req.world_size:
+                    dest_rank = dest_node_id * req.num_gpus_per_node  # fallback
+                dest_rank_counter[dest_node_id] += 1
+
+                migrations.append(MigrationOp(
+                    uuid=cand.uuid,
+                    from_rank=cand.assigned_rank,
+                    to_rank=dest_rank,
+                    pages=pages_needed,
+                    host_pages=pages_needed,
+                ))
+                migrated_uuids.add(cand.uuid)
+
+                used_by_node[src_node_id] -= pages_needed
+                used_by_node[dest_node_id] += pages_needed
+
+                if used_by_node[dest_node_id] >= target_per_node:
+                    underutilized = [
+                        (nid, s) for nid, s in underutilized if nid != dest_node_id
+                    ]
+
+        # Defensive dedup (mirrors legacy): keep first occurrence per uuid.
+        migration_uuids = [m.uuid for m in migrations]
+        if len(migration_uuids) != len(set(migration_uuids)):
+            seen: set = set()
+            unique: list = []
+            for mig in migrations:
+                if mig.uuid not in seen:
+                    seen.add(mig.uuid)
+                    unique.append(mig)
+            migrations = unique
+
+        return migrations
