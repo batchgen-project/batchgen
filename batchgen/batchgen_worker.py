@@ -5329,6 +5329,23 @@ class BatchGenWorker:
 		chunk = math.ceil(chunk / SequenceEntry.PAGE_SIZE) * SequenceEntry.PAGE_SIZE
 		return chunk
 
+	def _get_prefill_initial_capacity_tokens(
+		self,
+		seq: SequenceEntry,
+		chunk_size: int,
+	) -> int:
+		post_prefill_length = seq.prompt_length + 1
+		gpu_initial_pages = (
+			math.ceil(post_prefill_length / seq.PAGE_SIZE)
+			+ INITIAL_GPU_PAGE_BUFFER
+		)
+		gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
+		initial_capacity = max(
+			seq.prompt_length + chunk_size,
+			gpu_initial_tokens,
+		)
+		return min(initial_capacity, seq.kv_token_budget)
+
 	def _prepare_prefill_batch(self) -> List[str]:
 		"""
 		Select sequences for prefill based on HOST KV cache capacity.
@@ -5405,7 +5422,6 @@ class BatchGenWorker:
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
 
-		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
 			assigned_rank = seq.assigned_rank
@@ -5416,16 +5432,47 @@ class BatchGenWorker:
 			# previously-decoded tokens) at eviction time in _page_boundary_fast,
 			# and propagated to all ranks via _sync_sequence_metadata before we
 			# get here. So we can use seq.prompt_length uniformly.
-			post_prefill_length = seq.prompt_length + 1
-			gpu_initial_pages = math.ceil(post_prefill_length / seq.PAGE_SIZE) + INITIAL_GPU_PAGE_BUFFER
-			gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
-			initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
-			initial_capacity = min(initial_capacity, seq.kv_token_budget)
+			initial_capacity = self._get_prefill_initial_capacity_tokens(
+				seq,
+				chunk_size,
+			)
 			req_pages = math.ceil(initial_capacity / seq.PAGE_SIZE)
 
 			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
+
+		if (
+			not prefill_batch
+			and all_candidates
+			and not self.global_batch.has_prefilled()
+			and not self.global_batch.has_in_decode()
+			and not self.global_batch.has_on_hold()
+		):
+			# Avoid a scheduler deadlock when physical Host KV free pages are
+			# exhausted by evictable cached prefix pages. The allocator remains
+			# the source of truth: it will evict prefix pages if possible, or
+			# raise a concrete allocation error.
+			for uuid in all_candidates:
+				seq = self.global_batch.get_sequence(uuid)
+				seq_node = self._get_node_for_rank(seq.assigned_rank)
+				if 0 <= seq_node < num_nodes:
+					initial_capacity = self._get_prefill_initial_capacity_tokens(
+						seq,
+						chunk_size,
+					)
+					node_pages_used[seq_node] = math.ceil(
+						initial_capacity / seq.PAGE_SIZE
+					)
+					prefill_batch.append(uuid)
+					if self.rank == 0:
+						logging.info(
+							"[PREFILL] Forcing one sequence to allocation "
+							"path with low Host KV free pages: "
+							f"uuid={uuid[:8]} node={seq_node} "
+							f"free_pages={per_node_effective_free}"
+						)
+					break
 
 		if self.rank == 0:
 			n_evicted = sum(1 for u in prefill_batch if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED)
