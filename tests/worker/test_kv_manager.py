@@ -26,6 +26,9 @@ from batchgen.worker.kv_manager import (
     KVUtilizationRequest,
     PageTableCapacityRequest,
     TokenBudgetRequest,
+    WatermarkGlobalStats,
+    WatermarkTriggerPlan,
+    WatermarkTriggerRequest,
 )
 
 # NOTE: we deliberately do NOT import GPUPagedKVConfig (or anything under
@@ -858,3 +861,121 @@ def test_plan_gpu_kv_real_gptoss_non_dsa_no_aux():
     assert plan.reuse is False
     assert plan.primary_config is not None and plan.primary_config.num_pages > 0
     assert plan.aux_config is None
+
+
+# ---------------------------------------------------------------------------
+# Host-KV watermark trigger (Phase 5.5)
+# ---------------------------------------------------------------------------
+
+
+def _node_stat(*, free_percent, num_used_pages=0, num_total_pages=100, node_id=0):
+    """A per-node host-KV stat dict (shape of get_host_utilization output)."""
+    return {
+        "free_percent": free_percent,
+        "num_used_pages": num_used_pages,
+        "num_total_pages": num_total_pages,
+        "num_free_pages": num_total_pages - num_used_pages,
+        "node_id": node_id,
+    }
+
+
+def _wm_req(node_stats, *, watermark=70, has_queued=False, has_evicted=False):
+    return WatermarkTriggerRequest(
+        node_stats=tuple(node_stats),
+        host_kv_watermark=watermark,
+        has_queued=has_queued,
+        has_evicted=has_evicted,
+    )
+
+
+def test_watermark_empty_node_stats_no_trigger():
+    plan = KVCacheManager.plan_watermark_trigger(_wm_req([]))
+    assert plan.should_trigger is False
+    assert plan.max_free_percent is None
+    assert plan.global_stats is None
+
+
+def test_watermark_above_threshold_with_queued_triggers():
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=85)], watermark=70, has_queued=True)
+    )
+    assert plan.should_trigger is True
+    assert plan.max_free_percent == 85
+
+
+def test_watermark_above_threshold_with_evicted_triggers():
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=85)], watermark=70, has_evicted=True)
+    )
+    assert plan.should_trigger is True
+
+
+def test_watermark_above_threshold_no_work_no_trigger():
+    """Free space high but nothing waiting → no preemption."""
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=85)], watermark=70,
+                has_queued=False, has_evicted=False)
+    )
+    assert plan.should_trigger is False
+    assert plan.max_free_percent == 85
+
+
+def test_watermark_below_threshold_no_trigger():
+    """Free space below watermark → busy, keep decoding even with queued work."""
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=50)], watermark=70, has_queued=True)
+    )
+    assert plan.should_trigger is False
+    assert plan.max_free_percent == 50
+
+
+def test_watermark_boundary_strictly_greater():
+    """`free > watermark` is strict — equal does NOT trigger (legacy parity)."""
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=70)], watermark=70, has_queued=True)
+    )
+    assert plan.should_trigger is False
+
+
+def test_watermark_uses_max_across_nodes():
+    """ANY node above watermark triggers; max_free_percent is the highest."""
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req(
+            [_node_stat(free_percent=40, node_id=0),
+             _node_stat(free_percent=88, node_id=1)],
+            watermark=70, has_queued=True,
+        )
+    )
+    assert plan.should_trigger is True
+    assert plan.max_free_percent == 88
+
+
+def test_watermark_global_stats_aggregation():
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req(
+            [_node_stat(free_percent=60, num_used_pages=40, num_total_pages=100, node_id=0),
+             _node_stat(free_percent=80, num_used_pages=20, num_total_pages=100, node_id=1)],
+            watermark=70, has_queued=True,
+        )
+    )
+    gs = plan.global_stats
+    assert gs == WatermarkGlobalStats(used=60, total=200, free_percent=70, num_nodes=2)
+
+
+def test_watermark_global_stats_total_zero_safe():
+    """num_total_pages == 0 → no ZeroDivision; used%=0 → free%=100."""
+    plan = KVCacheManager.plan_watermark_trigger(
+        _wm_req([_node_stat(free_percent=0, num_used_pages=0, num_total_pages=0)],
+                watermark=70, has_queued=True)
+    )
+    assert plan.global_stats.free_percent == 100
+    assert plan.global_stats.total == 0
+
+
+def test_watermark_request_and_plan_are_frozen():
+    req = _wm_req([_node_stat(free_percent=80)])
+    with pytest.raises((AttributeError, Exception)):
+        req.host_kv_watermark = 50  # type: ignore[misc]
+    plan = WatermarkTriggerPlan(should_trigger=True, max_free_percent=80, global_stats=None)
+    with pytest.raises((AttributeError, Exception)):
+        plan.should_trigger = False  # type: ignore[misc]
