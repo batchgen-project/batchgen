@@ -8,6 +8,8 @@ from typing import Optional, Protocol, Sequence
 
 import torch
 
+from batchgen.prefix_reuse.prefill import effective_prefix_shared_tokens
+
 
 class _AsyncTask(Protocol):
     def wait_for_layer(self, layer_idx: int) -> None: ...
@@ -271,6 +273,7 @@ def materialize_single_group_lookup_results(
     sequence_ids: Sequence[int],
     prompt_lengths: Sequence[int],
     group_id: int,
+    prefix_shared_tokens: Sequence[int] | None = None,
     raw_page_tokens: int | None = None,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
 ) -> SingleGroupPrefixMaterialization:
@@ -286,29 +289,45 @@ def materialize_single_group_lookup_results(
         raise ValueError(
             "lookup_results, sequence_ids, and prompt_lengths differ"
         )
+    if prefix_shared_tokens is not None and len(prefix_shared_tokens) != count:
+        raise ValueError(
+            "prefix_shared_tokens length differs from lookup_results"
+        )
 
     sequences: list[PrefixMaterializationSequence] = []
-    for result, sequence_id, prompt_length in zip(
+    for idx, (result, sequence_id, prompt_length) in enumerate(zip(
         lookup_results,
         sequence_ids,
         prompt_lengths,
-    ):
+    )):
         prompt_len = int(prompt_length)
-        cached_tokens = int(result.common_cached_tokens)
+        raw_cached_tokens = int(result.common_cached_tokens)
         if prompt_len <= 0:
             raise ValueError(
                 f"prompt length must be positive for sequence {sequence_id}"
             )
-        if cached_tokens < 0 or cached_tokens > prompt_len:
+        if raw_cached_tokens < 0 or raw_cached_tokens > prompt_len:
             raise ValueError(
                 "lookup cached token count must be within prompt length for "
-                f"sequence {sequence_id}: cached={cached_tokens}, "
+                f"sequence {sequence_id}: cached={raw_cached_tokens}, "
                 f"prompt={prompt_len}"
             )
-        effective_cached_tokens = min(cached_tokens, prompt_len - 1)
+        if prefix_shared_tokens is None:
+            cached_tokens = effective_prefix_shared_tokens(
+                raw_cached_tokens=raw_cached_tokens,
+                prompt_length=prompt_len,
+            )
+        else:
+            cached_tokens = int(prefix_shared_tokens[idx])
+        if cached_tokens < 0 or cached_tokens >= prompt_len:
+            raise ValueError(
+                "effective cached token count must be within compute bounds "
+                f"for sequence {sequence_id}: cached={cached_tokens}, "
+                f"prompt={prompt_len}"
+            )
         span_pages = []
         attachment_handle = int(result.attachment_handle)
-        if effective_cached_tokens > 0:
+        if cached_tokens > 0:
             if attachment_handle == 0:
                 raise ValueError(
                     "lookup result with cached prefix must have non-zero "
@@ -316,20 +335,20 @@ def materialize_single_group_lookup_results(
                 )
             span = _find_group_span(result, group_id=int(group_id))
             span_raw_end = int(span.raw_end_token)
-            if span_raw_end < effective_cached_tokens:
+            if span_raw_end < cached_tokens:
                 raise ValueError(
                     "single-group prefix materialization requires lookup span "
                     "to cover the effective cached token boundary for sequence "
                     f"{sequence_id}: span={span_raw_end}, "
-                    f"effective_cached={effective_cached_tokens}"
+                    f"effective_cached={cached_tokens}"
                 )
             span_pages = list(span.pages)
 
         sequences.append(
             PrefixMaterializationSequence(
                 sequence_id=int(sequence_id),
-                prefix_tokens=effective_cached_tokens,
-                suffix_tokens=prompt_len - effective_cached_tokens,
+                prefix_tokens=cached_tokens,
+                suffix_tokens=prompt_len - cached_tokens,
                 host_pages=span_pages,
                 attachment_handle=attachment_handle,
             )

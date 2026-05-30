@@ -35,6 +35,11 @@ struct GroupCommitPages {
     std::vector<HostPageHandle> pages;
 };
 
+struct GroupPageRequirement {
+    std::uint32_t group_id = 0;
+    std::uint32_t min_pages = 0;
+};
+
 struct GroupMaterializationSpan {
     std::uint32_t group_id = 0;
     std::uint32_t raw_end_token = 0;
@@ -126,6 +131,9 @@ class HostPrefixCacheCoordinator {
                                         std::uint32_t min_free_group_entries,
                                         std::uint32_t min_free_page_handles,
                                         std::uint32_t max_scan_nodes);
+    PrefixEvictionResult EvictUntilReleasablePages(
+        const std::vector<GroupPageRequirement>& requirements,
+        std::uint32_t max_scan_nodes);
 
     PrefixEvictionResult ClearUnprotected();
     PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);

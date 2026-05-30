@@ -91,6 +91,7 @@ from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.prefix_reuse.prefill import (
 	PrefixCachePrefillLookup,
 	build_prefix_cache_prefill_inputs,
+	effective_prefix_shared_tokens,
 	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
 )
@@ -100,6 +101,7 @@ from batchgen.prefix_reuse.materialization import (
 )
 from batchgen.prefix_reuse.eviction import (
 	commit_prefix_pages_with_capacity_retry,
+	evict_prefix_pages_for_host_allocation,
 )
 from batchgen.prefix_reuse.worker_commit import (
 	build_sequence_prefix_commit_request,
@@ -795,8 +797,8 @@ class BatchGenWorker:
 			namespace_digest=self.prefix_cache_runtime_config.namespace_digest,
 			prompt_token_ids=prompt_token_ids,
 		)
-		for local_idx, cached_tokens in zip(
-			local_indices, lookup.prefix_shared_tokens
+		for local_idx, cached_tokens, result in zip(
+			local_indices, lookup.prefix_shared_tokens, lookup.lookup_results
 		):
 			uuid = self._local_to_uuid_map.get(int(local_idx))
 			if uuid is None:
@@ -808,16 +810,23 @@ class BatchGenWorker:
 				raise RuntimeError(
 					f"Missing sequence for prefix-cache prefill uuid={uuid[:8]}"
 				)
+			raw_cached_tokens = int(result.common_cached_tokens)
 			cached_tokens = int(cached_tokens)
-			if cached_tokens < 0 or cached_tokens > int(seq.prompt_length):
+			if raw_cached_tokens < 0 or raw_cached_tokens > int(seq.prompt_length):
 				raise RuntimeError(
 					f"Prefix cache returned invalid hit for {uuid[:8]}: "
-					f"cached={cached_tokens}, prompt={seq.prompt_length}"
+					f"cached={raw_cached_tokens}, prompt={seq.prompt_length}"
 				)
-			if cached_tokens % int(seq.PAGE_SIZE) != 0:
+			if raw_cached_tokens % int(seq.PAGE_SIZE) != 0:
 				raise RuntimeError(
 					f"Prefix cache returned non-page-aligned hit for "
-					f"{uuid[:8]}: cached={cached_tokens}, page_size={seq.PAGE_SIZE}"
+					f"{uuid[:8]}: cached={raw_cached_tokens}, page_size={seq.PAGE_SIZE}"
+				)
+			if cached_tokens < 0 or cached_tokens >= int(seq.prompt_length):
+				raise RuntimeError(
+					f"Prefix cache normalized invalid effective hit for "
+					f"{uuid[:8]}: cached={cached_tokens}, "
+					f"prompt={seq.prompt_length}"
 				)
 			seq.prefix_shared_tokens = cached_tokens
 			seq.prefix_committed_tokens = cached_tokens
@@ -884,7 +893,18 @@ class BatchGenWorker:
 					f"local_idx={local_idx}"
 				)
 			lookup_results.append(result)
-			prefix_shared_tokens.append(int(result.common_cached_tokens))
+			uuid = self._local_to_uuid_map[int(local_idx)]
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				raise RuntimeError(
+					f"Missing sequence for prefix-cache prefill uuid={uuid[:8]}"
+				)
+			prefix_shared_tokens.append(
+				effective_prefix_shared_tokens(
+					raw_cached_tokens=int(result.common_cached_tokens),
+					prompt_length=int(seq.prompt_length),
+				)
+			)
 		return PrefixCachePrefillLookup(
 			lookup_results=tuple(lookup_results),
 			prefix_shared_tokens=tuple(prefix_shared_tokens),
@@ -943,6 +963,115 @@ class BatchGenWorker:
 			if spec.required_for_reuse
 		}
 
+	def _prefix_cache_private_page_requirements_by_group(
+		self,
+		sequence_tokens: Sequence[int],
+	) -> Dict[int, int]:
+		runtime_config = self.prefix_cache_runtime_config
+		if runtime_config is None:
+			return {}
+		required_pages_by_group: Dict[int, int] = {}
+		for spec in runtime_config.group_specs:
+			if not spec.required_for_reuse:
+				continue
+			group_id = int(spec.group_id)
+			raw_page_tokens = int(spec.raw_page_tokens)
+			compression_ratio = max(1, int(spec.compression_ratio))
+			if raw_page_tokens <= 0:
+				raise RuntimeError(
+					f"Invalid prefix cache raw_page_tokens for group {group_id}: "
+					f"{raw_page_tokens}"
+				)
+			storage_page_tokens = max(1, raw_page_tokens // compression_ratio)
+			pages = 0
+			for raw_tokens in sequence_tokens:
+				raw_tokens = int(raw_tokens)
+				if raw_tokens <= 0:
+					continue
+				if compression_ratio == 1:
+					storage_tokens = raw_tokens
+				else:
+					storage_tokens = max(1, raw_tokens // compression_ratio)
+				pages += math.ceil(storage_tokens / storage_page_tokens)
+			required_pages_by_group[group_id] = pages
+		return required_pages_by_group
+
+	def _ensure_prefix_cache_host_pages_for_allocation(
+		self,
+		*,
+		sequence_tokens: Sequence[int],
+		reason: str,
+	) -> None:
+		if not self.enable_prefix_cache:
+			return
+		if self.prefix_cache_coordinator is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but coordinator is not attached"
+			)
+		if self.prefix_cache_runtime_config is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but runtime config is missing"
+			)
+
+		worker_views_by_group = self._prefix_cache_worker_views_by_group()
+		required_pages_by_group = (
+			self._prefix_cache_private_page_requirements_by_group(sequence_tokens)
+		)
+		page_deficit_by_group: Dict[int, int] = {}
+		for group_id, required_pages in required_pages_by_group.items():
+			worker_view = worker_views_by_group.get(group_id)
+			if worker_view is None:
+				raise RuntimeError(
+					f"Missing Host KV worker view for prefix cache group {group_id}"
+				)
+			free_pages = int(worker_view.get_stats().num_free_pages)
+			deficit = int(required_pages) - free_pages
+			if deficit > 0:
+				page_deficit_by_group[group_id] = deficit
+
+		if not page_deficit_by_group:
+			return
+
+		eviction = evict_prefix_pages_for_host_allocation(
+			core_engine_module=core_engine,
+			coordinator=self.prefix_cache_coordinator,
+			worker_views_by_group=worker_views_by_group,
+			page_deficit_by_group=page_deficit_by_group,
+		)
+		if self.prefix_cache_debug_stats and self.rank == 0:
+			evicted_nodes = (
+				0
+				if eviction.eviction_result is None
+				else int(eviction.eviction_result.evicted_nodes)
+			)
+			protected_nodes = (
+				0
+				if eviction.eviction_result is None
+				else int(eviction.eviction_result.protected_nodes)
+			)
+			logging.info(
+				"Prefix cache allocation eviction: reason=%s deficits=%s "
+				"released=%s evicted_nodes=%s protected_nodes=%s",
+				reason,
+				page_deficit_by_group,
+				eviction.released_pages_by_group,
+				evicted_nodes,
+				protected_nodes,
+			)
+
+		remaining_deficits: Dict[int, int] = {}
+		for group_id, required_pages in required_pages_by_group.items():
+			worker_view = worker_views_by_group[group_id]
+			free_pages = int(worker_view.get_stats().num_free_pages)
+			deficit = int(required_pages) - free_pages
+			if deficit > 0:
+				remaining_deficits[group_id] = deficit
+		if remaining_deficits:
+			raise RuntimeError(
+				"Prefix cache eviction did not free enough Host KV pages for "
+				f"{reason}: remaining={remaining_deficits}"
+			)
+
 	def _prefix_cache_gpu_managers_by_group(
 		self,
 		manager: object,
@@ -994,6 +1123,9 @@ class BatchGenWorker:
 			int(item.full_logical_context_length)
 			for item in prefix_plan.sequences
 		]
+		prefix_shared_tokens = [
+			int(item.prefix_shared_tokens) for item in prefix_plan.sequences
+		]
 		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
 		host_views_by_group = self._prefix_cache_worker_views_by_group()
 		gpu_managers_by_group = self._prefix_cache_gpu_managers_by_group(manager)
@@ -1026,6 +1158,7 @@ class BatchGenWorker:
 				sequence_ids=sequence_ids,
 				prompt_lengths=prompt_lengths,
 				group_id=group_id,
+				prefix_shared_tokens=prefix_shared_tokens,
 				raw_page_tokens=raw_page_tokens_by_group.get(group_id),
 				prefix_cache_coordinator=self.prefix_cache_coordinator,
 			)
@@ -7201,6 +7334,7 @@ class BatchGenWorker:
 				self._uuid_to_local_map[uuid] for uuid in my_prefill_uuids
 			]
 			prefix_lookup = None
+			lookup_results_by_uuid = {}
 			chunk_size = self._get_effective_chunk_size()
 			if self.enable_prefix_cache:
 				input_ids_for_lookup, _, prompt_lengths_for_lookup = (
@@ -7216,6 +7350,9 @@ class BatchGenWorker:
 					prefix_lookup.lookup_results,
 				):
 					self._prefix_prefill_lookup_by_local_idx[int(local_idx)] = result
+				lookup_results_by_uuid = dict(
+					zip(my_prefill_uuids, prefix_lookup.lookup_results)
+				)
 
 			for uuid in my_prefill_uuids:
 				seq = self.global_batch.get_sequence(uuid)
@@ -7228,11 +7365,28 @@ class BatchGenWorker:
 				if not self.enable_prefix_cache:
 					seq.prefix_shared_tokens = 0
 					seq.prefix_committed_tokens = 0
-				if shared_prefix_tokens > int(seq.prompt_length):
+				if shared_prefix_tokens >= int(seq.prompt_length):
 					raise RuntimeError(
 						f"Rank {self.rank}: prefix cache hit exceeds prompt "
 						f"for gid={seq.global_idx}: hit={shared_prefix_tokens}, "
 						f"prompt={seq.prompt_length}"
+					)
+				lookup_result = lookup_results_by_uuid.get(uuid)
+				shared_pages = 0
+				if lookup_result is not None:
+					shared_pages = len(
+						self._host_page_ids_from_prefix_lookup_group(
+							lookup_result,
+							group_id=0,
+						)
+					)
+				shared_page_tokens = shared_pages * seq.PAGE_SIZE
+				if shared_page_tokens < shared_prefix_tokens:
+					raise RuntimeError(
+						f"Rank {self.rank}: prefix cache shared pages do not "
+						f"cover effective hit for gid={seq.global_idx}: "
+						f"pages={shared_pages}, page_size={seq.PAGE_SIZE}, "
+						f"hit={shared_prefix_tokens}"
 					)
 				# Dynamic reservation: allocate prompt + chunk_size, not full budget.
 				# Must also cover the GPU initial load which needs
@@ -7244,20 +7398,20 @@ class BatchGenWorker:
 				gpu_initial_tokens = gpu_initial_pages * seq.PAGE_SIZE
 				initial_capacity = max(seq.prompt_length + chunk_size, gpu_initial_tokens)
 				initial_capacity = min(initial_capacity, seq.kv_token_budget)
-				append_tokens = (
-					1
-					if shared_prefix_tokens == int(seq.prompt_length)
-					else int(seq.prompt_length) - shared_prefix_tokens
-				)
+				append_tokens = int(seq.prompt_length) - shared_prefix_tokens
 				private_capacity = max(
-					initial_capacity - shared_prefix_tokens,
+					initial_capacity - shared_page_tokens,
 					append_tokens,
 				)
 				private_pages = math.ceil(private_capacity / seq.PAGE_SIZE)
-				shared_pages = shared_prefix_tokens // seq.PAGE_SIZE
 				seq.host_pages_allocated = shared_pages + private_pages
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
 				sequence_tokens.append(private_pages * seq.PAGE_SIZE)
+
+			self._ensure_prefix_cache_host_pages_for_allocation(
+				sequence_tokens=sequence_tokens,
+				reason="prefill_private_allocation",
+			)
 
 			# Safety assertion: log if selection over-admitted. This should not
 			# happen after the EVICTED-length fix in _prepare_prefill_batch —

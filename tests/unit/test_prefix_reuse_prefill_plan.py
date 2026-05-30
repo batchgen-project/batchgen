@@ -18,14 +18,9 @@ def test_build_prefix_reuse_prefill_plan_mixed_hit_and_miss():
         sequence_ids=[100, 101, 102],
         input_ids=input_ids,
         prompt_lengths=[6, 4, 5],
-        prefix_shared_tokens=[4, 0, 5],
+        prefix_shared_tokens=[4, 0, 4],
     )
 
-    assert [item.raw_prefix_shared_tokens for item in plan.sequences] == [
-        4,
-        0,
-        5,
-    ]
     assert [item.suffix_length for item in plan.sequences] == [2, 4, 1]
     assert [item.suffix_start_pos for item in plan.sequences] == [4, 0, 4]
     assert [tensor.tolist() for tensor in plan.suffix_input_ids] == [
@@ -70,17 +65,15 @@ def test_split_prefix_reuse_prefill_plan_recomputes_stats():
     assert micro.saved_prefill_tokens == 2
 
 
-def test_build_prefix_reuse_prefill_plan_recomputes_final_full_hit_token():
+def test_build_prefix_reuse_prefill_plan_uses_effective_full_hit_tokens():
     plan = build_prefix_reuse_prefill_plan(
         local_indices=[0],
         sequence_ids=[100],
         input_ids=[torch.arange(0, 4)],
         prompt_lengths=[4],
-        prefix_shared_tokens=[4],
+        prefix_shared_tokens=[3],
     )
 
-    assert plan.sequences[0].is_full_hit is True
-    assert plan.sequences[0].raw_prefix_shared_tokens == 4
     assert plan.sequences[0].prefix_shared_tokens == 3
     assert plan.sequences[0].suffix_start_pos == 3
     assert plan.sequences[0].suffix_length == 1
@@ -93,11 +86,9 @@ def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens(
         sequence_ids=[100],
         input_ids=[torch.tensor([42])],
         prompt_lengths=[1],
-        prefix_shared_tokens=[1],
+        prefix_shared_tokens=[0],
     )
 
-    assert plan.sequences[0].is_full_hit is True
-    assert plan.sequences[0].raw_prefix_shared_tokens == 1
     assert plan.sequences[0].prefix_shared_tokens == 0
     assert plan.sequences[0].suffix_start_pos == 0
     assert plan.sequences[0].suffix_length == 1
@@ -110,7 +101,7 @@ def test_build_prefix_reuse_prefill_plan_one_token_full_hit_has_no_saved_tokens(
 
 
 def test_build_prefix_reuse_prefill_plan_validates_lengths():
-    with pytest.raises(ValueError, match="exceeds prompt_length"):
+    with pytest.raises(ValueError, match="must be smaller than prompt_length"):
         build_prefix_reuse_prefill_plan(
             local_indices=[0],
             sequence_ids=[100],

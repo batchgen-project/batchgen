@@ -418,6 +418,7 @@ def test_materialize_single_group_lookup_results_builds_sequences():
         sequence_ids=[101],
         prompt_lengths=[7],
         group_id=7,
+        prefix_shared_tokens=[6],
     )
 
     assert materialization.append_plan is gpu_manager.append_plan
@@ -488,6 +489,7 @@ def test_materialize_single_group_lookup_results_skips_load_for_one_token_full_h
         sequence_ids=[101],
         prompt_lengths=[1],
         group_id=7,
+        prefix_shared_tokens=[0],
     )
 
     assert gpu_manager.allocations == [([101], [1])]

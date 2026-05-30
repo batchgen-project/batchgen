@@ -71,31 +71,23 @@ def _prefix_plan(
     global_ids: list[int],
     prefix_lens: list[int],
     suffix_lens: list[int],
-    raw_prefix_lens: list[int] | None = None,
 ) -> PrefixReusePrefillPlan:
     sequences = []
     suffix_input_ids = []
     suffix_position_ids = []
-    if raw_prefix_lens is None:
-        raw_prefix_lens = list(prefix_lens)
-    for local_idx, (
-        global_id,
-        prefix_len,
-        suffix_len,
-        raw_prefix_len,
-    ) in enumerate(zip(global_ids, prefix_lens, suffix_lens, raw_prefix_lens)):
+    for local_idx, (global_id, prefix_len, suffix_len) in enumerate(
+        zip(global_ids, prefix_lens, suffix_lens)
+    ):
         prompt_length = prefix_len + suffix_len
         sequences.append(
             PrefixReuseSequencePlan(
                 local_idx=local_idx,
                 sequence_id=global_id,
                 prompt_length=prompt_length,
-                raw_prefix_shared_tokens=raw_prefix_len,
                 prefix_shared_tokens=prefix_len,
                 suffix_start_pos=prefix_len,
                 suffix_length=suffix_len,
                 full_logical_context_length=prompt_length,
-                is_full_hit=(raw_prefix_len == prompt_length),
             )
         )
         suffix_input_ids.append(torch.arange(suffix_len, dtype=torch.long))
@@ -190,7 +182,6 @@ def test_build_prefill_forward_metadata_with_mixed_hit_miss_and_full_hit():
         global_ids=[100, 101, 102],
         prefix_lens=[3, 0, 3],
         suffix_lens=[2, 1, 1],
-        raw_prefix_lens=[3, 0, 4],
     )
 
     metadata = build_prefill_forward_metadata(
@@ -217,7 +208,6 @@ def test_build_prefill_forward_metadata_one_token_full_hit_is_plain_query():
         global_ids=[100],
         prefix_lens=[0],
         suffix_lens=[1],
-        raw_prefix_lens=[1],
     )
 
     metadata = build_prefill_forward_metadata(

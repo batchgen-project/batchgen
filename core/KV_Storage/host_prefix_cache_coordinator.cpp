@@ -169,6 +169,40 @@ std::uint32_t Lcm(std::uint32_t lhs, std::uint32_t rhs) {
     return static_cast<std::uint32_t>(std::lcm(lhs, rhs));
 }
 
+std::map<std::uint32_t, std::uint32_t> NormalizePageRequirements(
+    const std::vector<GroupPageRequirement>& requirements) {
+    std::map<std::uint32_t, std::uint32_t> result;
+    for (const GroupPageRequirement& requirement : requirements) {
+        if (requirement.min_pages == 0) {
+            continue;
+        }
+        result[requirement.group_id] += requirement.min_pages;
+    }
+    return result;
+}
+
+bool HasEnoughReleasablePages(
+    const PrefixEvictionResult& result,
+    const std::map<std::uint32_t, std::uint32_t>& requirements) {
+    if (requirements.empty()) {
+        return true;
+    }
+    std::map<std::uint32_t, std::uint32_t> released_by_group;
+    for (const GroupCommitPages& group_pages : result.evicted_group_pages) {
+        released_by_group[group_pages.group_id] +=
+            static_cast<std::uint32_t>(group_pages.pages.size());
+    }
+    for (const auto& [group_id, min_pages] : requirements) {
+        const auto iter = released_by_group.find(group_id);
+        const std::uint32_t released =
+            iter == released_by_group.end() ? 0 : iter->second;
+        if (released < min_pages) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ValidateGroupSpec(const HostKVGroupSpec& spec) {
     if (spec.raw_page_tokens == 0) {
         throw std::invalid_argument(
@@ -283,6 +317,9 @@ struct HostPrefixCacheCoordinator::SharedState {
                                         std::uint32_t min_free_group_entries,
                                         std::uint32_t min_free_page_handles,
                                         std::uint32_t max_scan_nodes);
+    PrefixEvictionResult EvictUntilReleasablePages(
+        const std::vector<GroupPageRequirement>& requirements,
+        std::uint32_t max_scan_nodes);
     PrefixEvictionResult ClearUnprotected();
     PrefixEvictionResult ClearNamespace(PrefixDigest namespace_digest);
     HostPrefixCacheStats GetStats() const;
@@ -1319,6 +1356,66 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
 }
 
 PrefixEvictionResult
+HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
+    const std::vector<GroupPageRequirement>& requirements,
+    std::uint32_t max_scan_nodes) {
+    const auto required_pages = NormalizePageRequirements(requirements);
+    PrefixEvictionResult result;
+    if (required_pages.empty()) {
+        return result;
+    }
+
+    ScopedPthreadMutexLock lock(&header->mutex);
+    CompactArenasLocked();
+
+    std::vector<std::uint32_t> candidates;
+    candidates.reserve(config.max_nodes);
+    for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
+        if (nodes[index].state ==
+            static_cast<std::uint32_t>(EntryState::kResident)) {
+            candidates.push_back(index);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [this](std::uint32_t lhs, std::uint32_t rhs) {
+                  return nodes[lhs].last_access_epoch <
+                         nodes[rhs].last_access_epoch;
+              });
+
+    std::uint32_t scanned = 0;
+    for (std::uint32_t node_index : candidates) {
+        if (max_scan_nodes != 0 && scanned >= max_scan_nodes) {
+            break;
+        }
+        ++scanned;
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        if (NodeIsProtectedLocked(node)) {
+            ++result.protected_nodes;
+            continue;
+        }
+
+        EvictNodeLocked(&node, &result);
+        FilterEvictedPagesStillReferencedLocked(&result);
+
+        if (HasEnoughReleasablePages(result, required_pages)) {
+            break;
+        }
+    }
+
+    if (result.evicted_nodes != 0) {
+        CompactArenasLocked();
+    }
+    header->evicted_nodes.fetch_add(result.evicted_nodes,
+                                    std::memory_order_relaxed);
+    header->eviction_protected_skips.fetch_add(result.protected_nodes,
+                                               std::memory_order_relaxed);
+    return result;
+}
+
+PrefixEvictionResult
 HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
     PrefixEvictionResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
@@ -1512,6 +1609,12 @@ PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilFree(
     std::uint32_t min_free_page_handles, std::uint32_t max_scan_nodes) {
     return state_->EvictUntilFree(min_free_nodes, min_free_group_entries,
                                   min_free_page_handles, max_scan_nodes);
+}
+
+PrefixEvictionResult HostPrefixCacheCoordinator::EvictUntilReleasablePages(
+    const std::vector<GroupPageRequirement>& requirements,
+    std::uint32_t max_scan_nodes) {
+    return state_->EvictUntilReleasablePages(requirements, max_scan_nodes);
 }
 
 PrefixEvictionResult HostPrefixCacheCoordinator::ClearUnprotected() {

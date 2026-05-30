@@ -28,6 +28,12 @@ class PrefixCommitRetryResult:
     released_pages_by_group: dict[int, int] | None = None
 
 
+@dataclass(frozen=True)
+class PrefixAllocationEvictionResult:
+    eviction_result: object | None
+    released_pages_by_group: dict[int, int]
+
+
 def commit_prefix_pages_with_capacity_retry(
     *,
     request: PrefixCommitRequest,
@@ -56,6 +62,66 @@ def commit_prefix_pages_with_capacity_retry(
             eviction_result=eviction_result,
             released_pages_by_group=released,
         )
+
+
+def evict_prefix_pages_for_host_allocation(
+    *,
+    core_engine_module: object,
+    coordinator: object,
+    worker_views_by_group: Mapping[int, object],
+    page_deficit_by_group: Mapping[int, int],
+    max_scan_nodes: int = 0,
+) -> PrefixAllocationEvictionResult:
+    """Evict common prefix nodes until enough physical Host pages are released.
+
+    The input is per-group pressure, but the coordinator still evicts whole
+    prefix nodes. The returned pages are filtered by the coordinator so only
+    pages no longer referenced by any resident prefix node are released.
+    """
+
+    requirements = []
+    for group_id, deficit in sorted(page_deficit_by_group.items()):
+        deficit = int(deficit)
+        if deficit <= 0:
+            continue
+        requirement = core_engine_module.GroupPageRequirement()
+        requirement.group_id = int(group_id)
+        requirement.min_pages = deficit
+        requirements.append(requirement)
+    if not requirements:
+        return PrefixAllocationEvictionResult(
+            eviction_result=None,
+            released_pages_by_group={},
+        )
+
+    eviction_result = coordinator.evict_until_releasable_pages(
+        requirements,
+        int(max_scan_nodes),
+    )
+    released = release_evicted_prefix_pages(
+        eviction_result=eviction_result,
+        worker_views_by_group=worker_views_by_group,
+    )
+
+    missing = {
+        int(requirement.group_id): int(requirement.min_pages)
+        - int(released.get(int(requirement.group_id), 0))
+        for requirement in requirements
+        if int(released.get(int(requirement.group_id), 0))
+        < int(requirement.min_pages)
+    }
+    if missing:
+        raise RuntimeError(
+            "prefix cache eviction could not release enough Host KV pages "
+            f"for allocation: missing={missing}, released={released}, "
+            f"evicted_nodes={int(eviction_result.evicted_nodes)}, "
+            f"protected_nodes={int(eviction_result.protected_nodes)}"
+        )
+
+    return PrefixAllocationEvictionResult(
+        eviction_result=eviction_result,
+        released_pages_by_group=released,
+    )
 
 
 def release_evicted_prefix_pages(

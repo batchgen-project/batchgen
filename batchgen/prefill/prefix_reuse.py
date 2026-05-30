@@ -13,12 +13,10 @@ class PrefixReuseSequencePlan:
     local_idx: int
     sequence_id: int
     prompt_length: int
-    raw_prefix_shared_tokens: int
     prefix_shared_tokens: int
     suffix_start_pos: int
     suffix_length: int
     full_logical_context_length: int
-    is_full_hit: bool
     fallback_reason: Optional[str] = None
 
 
@@ -66,7 +64,13 @@ def build_prefix_reuse_prefill_plan(
     prefix_shared_tokens: Sequence[int],
     device: Optional[torch.device] = None,
 ) -> PrefixReusePrefillPlan:
-    """Build suffix-only prefill metadata without mutating runtime state."""
+    """Build suffix-only prefill metadata without mutating runtime state.
+
+    ``prefix_shared_tokens`` must already use the canonical compute semantic:
+    it is the prefix length actually reused by this prefill. A raw full hit is
+    normalized by the lookup layer to ``prompt_length - 1`` so the final prompt
+    token is represented as a regular one-token extend prefill.
+    """
 
     count = len(local_indices)
     if not (
@@ -96,17 +100,15 @@ def build_prefix_reuse_prefill_plan(
             raise ValueError(
                 f"prefix_shared_tokens must be non-negative, got {shared_tokens}"
             )
-        if shared_tokens > prompt_length:
+        if shared_tokens >= prompt_length:
             raise ValueError(
-                f"prefix_shared_tokens {shared_tokens} exceeds prompt_length {prompt_length}"
+                "prefix_shared_tokens must be smaller than prompt_length; "
+                f"got prefix_shared_tokens={shared_tokens}, "
+                f"prompt_length={prompt_length}. Raw full hits must be "
+                "normalized to prompt_length - 1 before planning."
             )
 
-        raw_shared_tokens = shared_tokens
-        is_full_hit = raw_shared_tokens == prompt_length
-        if is_full_hit:
-            suffix_start = max(prompt_length - 1, 0)
-        else:
-            suffix_start = raw_shared_tokens
+        suffix_start = shared_tokens
         suffix_length = prompt_length - suffix_start
         target_device = device if device is not None else prompt_ids.device
         suffix_ids = prompt_ids[suffix_start:prompt_length].to(target_device)
@@ -122,12 +124,10 @@ def build_prefix_reuse_prefill_plan(
                 local_idx=int(local_indices[idx]),
                 sequence_id=int(sequence_ids[idx]),
                 prompt_length=prompt_length,
-                raw_prefix_shared_tokens=raw_shared_tokens,
                 prefix_shared_tokens=suffix_start,
                 suffix_start_pos=suffix_start,
                 suffix_length=suffix_length,
                 full_logical_context_length=prompt_length,
-                is_full_hit=is_full_hit,
             )
         )
         suffix_input_ids.append(suffix_ids)

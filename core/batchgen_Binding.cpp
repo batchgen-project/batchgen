@@ -713,6 +713,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("group_id", &kv::GroupCommitPages::group_id)
         .def_readwrite("pages", &kv::GroupCommitPages::pages);
 
+    py::class_<kv::GroupPageRequirement>(m, "GroupPageRequirement")
+        .def(py::init<>())
+        .def_readwrite("group_id", &kv::GroupPageRequirement::group_id)
+        .def_readwrite("min_pages", &kv::GroupPageRequirement::min_pages);
+
     py::class_<kv::GroupMaterializationSpan>(
         m, "GroupMaterializationSpan")
         .def_readonly("group_id", &kv::GroupMaterializationSpan::group_id)
@@ -819,6 +824,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("min_free_nodes"),
              py::arg("min_free_group_entries"),
              py::arg("min_free_page_handles"), py::arg("max_scan_nodes"))
+        .def("evict_until_releasable_pages",
+             &kv::HostPrefixCacheCoordinator::EvictUntilReleasablePages,
+             py::arg("requirements"), py::arg("max_scan_nodes"))
         .def("clear_unprotected",
              &kv::HostPrefixCacheCoordinator::ClearUnprotected)
         .def("clear_namespace",

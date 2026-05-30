@@ -15,6 +15,7 @@ from batchgen.prefix_reuse.config import (
 )
 from batchgen.prefix_reuse.eviction import (
     commit_prefix_pages_with_capacity_retry,
+    evict_prefix_pages_for_host_allocation,
     release_evicted_prefix_pages,
 )
 from batchgen.prefix_reuse.worker_commit import (
@@ -35,9 +36,16 @@ class _GroupCommitPages:
         self.pages = []
 
 
+class _GroupPageRequirement:
+    def __init__(self):
+        self.group_id = 0
+        self.min_pages = 0
+
+
 class _Core:
     HostPageHandle = _HostPageHandle
     GroupCommitPages = _GroupCommitPages
+    GroupPageRequirement = _GroupPageRequirement
 
 
 class _Coordinator:
@@ -81,6 +89,18 @@ class _Coordinator:
         )
         return self.eviction_result
 
+    def evict_until_releasable_pages(self, requirements, max_scan_nodes):
+        self.evict_calls.append(
+            (
+                [
+                    (int(requirement.group_id), int(requirement.min_pages))
+                    for requirement in requirements
+                ],
+                max_scan_nodes,
+            )
+        )
+        return self.eviction_result
+
 
 class _WorkerView:
     def __init__(self, pages):
@@ -104,6 +124,7 @@ class _WorkerView:
 class _EvictionResult:
     def __init__(self, evicted_group_pages):
         self.evicted_nodes = len(evicted_group_pages)
+        self.protected_nodes = 0
         self.evicted_group_pages = evicted_group_pages
 
 
@@ -410,6 +431,50 @@ def test_commit_prefix_pages_retries_after_capacity_eviction():
     assert len(coordinator.calls) == 2
     assert primary.released == [[100, 101]]
     assert compressed.released == [[200]]
+
+
+def test_evict_prefix_pages_for_host_allocation_uses_page_requirements():
+    evicted = _EvictionResult(
+        [
+            _group_pages(0, [_page(100), _page(101)]),
+            _group_pages(1, [_page(200), _page(201), _page(201)]),
+        ]
+    )
+    coordinator = _Coordinator(eviction_result=evicted)
+    primary = _WorkerView([])
+    compressed = _WorkerView([])
+
+    result = evict_prefix_pages_for_host_allocation(
+        core_engine_module=_Core,
+        coordinator=coordinator,
+        worker_views_by_group={0: primary, 1: compressed},
+        page_deficit_by_group={0: 2, 1: 1, 2: 0},
+        max_scan_nodes=9,
+    )
+
+    assert result.eviction_result is evicted
+    assert result.released_pages_by_group == {0: 2, 1: 2}
+    assert coordinator.evict_calls == [([(0, 2), (1, 1)], 9)]
+    assert primary.released == [[100, 101]]
+    assert compressed.released == [[200, 201]]
+
+
+def test_evict_prefix_pages_for_host_allocation_raises_when_short():
+    evicted = _EvictionResult([_group_pages(0, [_page(100)])])
+    coordinator = _Coordinator(eviction_result=evicted)
+
+    try:
+        evict_prefix_pages_for_host_allocation(
+            core_engine_module=_Core,
+            coordinator=coordinator,
+            worker_views_by_group={0: _WorkerView([])},
+            page_deficit_by_group={0: 2},
+        )
+    except RuntimeError as exc:
+        assert "could not release enough Host KV pages" in str(exc)
+        assert "missing={0: 1}" in str(exc)
+    else:  # pragma: no cover - failure path assertion
+        raise AssertionError("short eviction result should fail")
 
 
 def test_commit_prefix_pages_does_not_retry_non_capacity_errors():

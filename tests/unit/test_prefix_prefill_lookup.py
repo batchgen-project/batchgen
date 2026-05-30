@@ -53,7 +53,7 @@ def test_lookup_prefix_cache_for_prefill_preserves_request_order():
         ],
     )
 
-    assert lookup.prefix_shared_tokens == (4, 0, 8)
+    assert lookup.prefix_shared_tokens == (4, 0, 7)
     assert lookup.has_hit is True
     assert coordinator.lookup_calls == [
         ([1, 2, 3, 4], [10, 11, 12, 13, 14]),
@@ -83,6 +83,18 @@ def test_estimate_prefix_cache_for_prefill_does_not_attach():
     assert coordinator.lookup_calls == []
 
 
+def test_lookup_prefix_cache_for_prefill_normalizes_full_hit():
+    coordinator = _Coordinator(cached_tokens=[5], handles=[11])
+
+    lookup = lookup_prefix_cache_for_prefill(
+        coordinator=coordinator,
+        namespace_digest=(1, 2, 3, 4),
+        prompt_token_ids=[[10, 11, 12, 13, 14]],
+    )
+
+    assert lookup.prefix_shared_tokens == (4,)
+
+
 def test_build_prefix_cache_prefill_inputs_uses_suffix_only_tokens():
     coordinator = _Coordinator(cached_tokens=[3, 0, 5], handles=[11, 0, 12])
     lookup = lookup_prefix_cache_for_prefill(
@@ -107,6 +119,7 @@ def test_build_prefix_cache_prefill_inputs_uses_suffix_only_tokens():
         lookup=lookup,
     )
 
+    assert lookup.prefix_shared_tokens == (3, 0, 4)
     assert [item.tolist() for item in inputs.plan.suffix_input_ids] == [
         [13, 14],
         [20, 21],

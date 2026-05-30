@@ -76,7 +76,7 @@ class SequenceEntry:
         # Dynamic host KV reservation tracking
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
-        'prefix_shared_tokens',  # Tokens reused from prefix cache for this prefill
+        'prefix_shared_tokens',  # Effective tokens reused by this prefill
         'prefix_committed_tokens',  # Tokens already owned by prefix cache metadata
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction

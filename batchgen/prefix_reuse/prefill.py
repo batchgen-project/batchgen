@@ -39,6 +39,33 @@ class PrefixCachePrefillInputs:
     attention_mask_list: list[torch.Tensor]
 
 
+def effective_prefix_shared_tokens(
+    *, raw_cached_tokens: int, prompt_length: int
+) -> int:
+    """Normalize coordinator lookup tokens to the compute-path semantic.
+
+    The coordinator reports raw page-cache hits. The prefill compute path always
+    runs at least one query token, so an exact full hit becomes a one-token
+    extend with ``prompt_length - 1`` cached tokens. After this boundary,
+    callers should propagate only the normalized value.
+    """
+
+    prompt_len = int(prompt_length)
+    cached = int(raw_cached_tokens)
+    if prompt_len <= 0:
+        raise ValueError(
+            f"prompt_length must be positive for prefix lookup, got {prompt_len}"
+        )
+    if cached < 0 or cached > prompt_len:
+        raise ValueError(
+            "raw_cached_tokens must be within prompt length: "
+            f"cached={cached}, prompt_length={prompt_len}"
+        )
+    if cached == prompt_len:
+        return max(prompt_len - 1, 0)
+    return cached
+
+
 def lookup_prefix_cache_for_prefill(
     *,
     coordinator: object,
@@ -55,7 +82,12 @@ def lookup_prefix_cache_for_prefill(
             [int(token_id) for token_id in token_ids],
         )
         lookup_results.append(result)
-        prefix_shared_tokens.append(int(result.common_cached_tokens))
+        prefix_shared_tokens.append(
+            effective_prefix_shared_tokens(
+                raw_cached_tokens=int(result.common_cached_tokens),
+                prompt_length=len(token_ids),
+            )
+        )
 
     return PrefixCachePrefillLookup(
         lookup_results=tuple(lookup_results),
@@ -77,7 +109,12 @@ def estimate_prefix_cache_for_prefill(
             list(namespace_digest),
             [int(token_id) for token_id in token_ids],
         )
-        prefix_shared_tokens.append(int(result.common_cached_tokens))
+        prefix_shared_tokens.append(
+            effective_prefix_shared_tokens(
+                raw_cached_tokens=int(result.common_cached_tokens),
+                prompt_length=len(token_ids),
+            )
+        )
 
     return PrefixCachePrefillEstimate(
         prefix_shared_tokens=tuple(prefix_shared_tokens),

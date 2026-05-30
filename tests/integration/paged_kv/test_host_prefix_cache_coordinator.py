@@ -47,6 +47,13 @@ def _group_pages(group_id: int, pages):
     return group
 
 
+def _requirement(group_id: int, min_pages: int):
+    requirement = bg.GroupPageRequirement()
+    requirement.group_id = group_id
+    requirement.min_pages = min_pages
+    return requirement
+
+
 def _config(shm_name: str):
     config = bg.HostPrefixCacheConfig()
     config.shm_name = shm_name
@@ -179,6 +186,49 @@ def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
         assert [len(pages.pages) for pages in evicted.evicted_group_pages] == [
             4,
             2,
+        ]
+        assert coordinator.get_stats().resident_nodes == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_evicts_common_nodes_until_pages_releasable():
+    shm_name = _random_shm_name()
+    namespace = [301, 302, 303, 304]
+    token_ids = list(range(16))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_small_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            16,
+            [
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
+            ],
+        )
+
+        evicted = coordinator.evict_until_releasable_pages(
+            [_requirement(0, 1)],
+            0,
+        )
+
+        # The first LRU node owns prefix pages that are also referenced by the
+        # deeper node, so no physical page is releasable until the deeper common
+        # prefix node is evicted as well.
+        assert evicted.evicted_nodes == 2
+        assert evicted.protected_nodes == 0
+        assert [pages.group_id for pages in evicted.evicted_group_pages] == [
+            0,
+            1,
+        ]
+        assert [
+            [page.page_id for page in pages.pages]
+            for pages in evicted.evicted_group_pages
+        ] == [
+            [0, 1, 2, 3],
+            [0, 1],
         ]
         assert coordinator.get_stats().resident_nodes == 0
     finally:

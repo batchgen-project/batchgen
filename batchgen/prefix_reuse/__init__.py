@@ -18,8 +18,10 @@ from .commit import (
     collect_required_group_pages_for_commit,
 )
 from .eviction import (
+    PrefixAllocationEvictionResult,
     PrefixCommitRetryResult,
     commit_prefix_pages_with_capacity_retry,
+    evict_prefix_pages_for_host_allocation,
     release_evicted_prefix_pages,
 )
 from .materialization import (
@@ -35,6 +37,7 @@ from .prefill import (
     PrefixCachePrefillEstimate,
     PrefixCachePrefillLookup,
     build_prefix_cache_prefill_inputs,
+    effective_prefix_shared_tokens,
     estimate_prefix_cache_for_prefill,
     lookup_prefix_cache_for_prefill,
     release_prefix_cache_lookup_attachments,
@@ -59,8 +62,10 @@ __all__ = [
     "build_committable_prefix_token_ids",
     "build_prefix_commit_request",
     "collect_required_group_pages_for_commit",
+    "PrefixAllocationEvictionResult",
     "PrefixCommitRetryResult",
     "commit_prefix_pages_with_capacity_retry",
+    "evict_prefix_pages_for_host_allocation",
     "release_evicted_prefix_pages",
     "PrefixMaterializationBundle",
     "PrefixMaterializationSequence",
@@ -72,6 +77,7 @@ __all__ = [
     "PrefixCachePrefillEstimate",
     "PrefixCachePrefillLookup",
     "build_prefix_cache_prefill_inputs",
+    "effective_prefix_shared_tokens",
     "estimate_prefix_cache_for_prefill",
     "lookup_prefix_cache_for_prefill",
     "release_prefix_cache_lookup_attachments",
