@@ -128,6 +128,19 @@ class _EvictionResult:
         self.evicted_group_pages = evicted_group_pages
 
 
+def _page(page_id: int) -> _HostPageHandle:
+    handle = _HostPageHandle()
+    handle.page_id = int(page_id)
+    return handle
+
+
+def _group_pages(group_id: int, pages) -> _GroupCommitPages:
+    group = _GroupCommitPages()
+    group.group_id = int(group_id)
+    group.pages = list(pages)
+    return group
+
+
 class _Seq:
     def __init__(
         self,
