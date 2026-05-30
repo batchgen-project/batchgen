@@ -116,6 +116,8 @@ from batchgen.worker.kv_manager import (
 	KVCacheManager,
 	KVStats,
 	KVUtilizationRequest,
+	MigrationCandidate,
+	MigrationPlanRequest,
 	PageTableCapacityRequest,
 	TokenBudgetRequest,
 	WatermarkTriggerRequest,
@@ -546,6 +548,14 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
+		# Phase 5.6.2 (issue #175): dual-path gate for the host-KV migration
+		# planner. NATIVE=1 routes the greedy rebalance through
+		# `KVCacheManager.plan_kv_migration`. COMPARE=1 runs both the legacy
+		# (global_batch-direct) plan and the native (snapshot-based) plan and
+		# asserts the MigrationOp lists are equal. NCCL gather + migration
+		# execution run once regardless of mode.
+		self._migration_native = os.environ.get("BATCHGEN_WORKER_MIGRATION_NATIVE", "0") == "1"
+		self._migration_compare = os.environ.get("BATCHGEN_WORKER_MIGRATION_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -3303,13 +3313,47 @@ class BatchGenWorker:
 
 		return should_trigger
 
+	def _make_migration_plan_request(self, node_stats: dict) -> MigrationPlanRequest:
+		"""Enumerate PREFILLED / ON_HOLD candidates the planner consumes.
+
+		Mirrors the legacy candidate pool: every PREFILLED / ON_HOLD sequence
+		across all ranks, snapshotted with the metadata the greedy planner
+		reads. Status is stable during one planning round, so this static
+		pre-gather reproduces the legacy lazy enumeration (both sort by
+		``global_idx``).
+		"""
+		candidates = []
+		for rank in range(self.world_size):
+			for status in (SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD):
+				for uuid in self.global_batch.get_sequences_for_rank_with_status(rank, status):
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is None:
+						continue
+					candidates.append(MigrationCandidate(
+						uuid=uuid,
+						assigned_rank=seq.assigned_rank,
+						global_idx=seq.global_idx,
+						kv_token_budget=seq.kv_token_budget,
+						host_pages_allocated=seq.host_pages_allocated,
+					))
+		return MigrationPlanRequest(
+			node_stats=node_stats,
+			candidates=tuple(candidates),
+			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			world_size=self.world_size,
+		)
+
 	def _plan_kv_migration(self) -> List[MigrationOp]:
 		"""Plan sequence migrations to rebalance host KV across nodes.
+
+		Gathers per-node host-KV stats (NCCL) then delegates the greedy
+		rebalance decision; the NCCL migration execution is applied by the
+		caller (``_rebalance_host_kv``).
 
 		Returns:
 			List of MigrationOp objects describing planned migrations.
 		"""
-		# Gather host KV stats from all local_rank 0
+		# Gather host KV stats from all local_rank 0 (NCCL side effect)
 		if self.local_rank == 0:
 			local_stats = self._get_host_kv_utilization()
 		else:
@@ -3325,6 +3369,29 @@ class BatchGenWorker:
 				logging.info("MIGRATION: Single node detected, skipping rebalancing")
 			return []
 
+		if self._migration_compare:
+			legacy = self._legacy_kv_migration_plan(node_stats)
+			native = KVCacheManager.plan_kv_migration(
+				self._make_migration_plan_request(node_stats)
+			)
+			assert legacy == native, (
+				f"migration compare mismatch: _plan_kv_migration "
+				f"legacy={legacy} native={native}"
+			)
+			return native if self._migration_native else legacy
+		if self._migration_native:
+			return KVCacheManager.plan_kv_migration(
+				self._make_migration_plan_request(node_stats)
+			)
+		return self._legacy_kv_migration_plan(node_stats)
+
+	def _legacy_kv_migration_plan(self, node_stats: dict) -> List[MigrationOp]:
+		"""Inline greedy rebalance over gathered ``node_stats``.
+
+		Mirrors ``KVCacheManager.plan_kv_migration`` but queries
+		``global_batch`` directly, so compare-mode validates both the
+		candidate enumeration and the algorithm transcription.
+		"""
 		# Calculate target pages per node
 		total_used = sum(s['num_used_pages'] for s in node_stats.values())
 		num_nodes = len(node_stats)
