@@ -5379,46 +5379,49 @@ class BatchGenWorker:
 		if not all_candidates:
 			return []
 
-		gpus_per_node = NUM_GPUS_PER_NODE
 		num_nodes = self._get_num_nodes()
 		chunk_size = self._get_effective_chunk_size()
 
-		# Step 1: Get this node's host KV free pages
-		local_host_free = self._get_host_kv_free_pages()
-
-		# Step 2: Gather host KV free pages from first rank on each node
-		# Only rank 0, 8, 16, ... (first on each node) reports actual value
-		if self.local_rank == 0:
-			report_node = self.rank // gpus_per_node
-			report_free = local_host_free
-		else:
-			report_node = -1
-			report_free = 0  # Non-first ranks report 0
-
-		free_tensor = torch.tensor([report_node, report_free], dtype=torch.int64, device=self.torch_device)
-		gathered = [torch.zeros_like(free_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, free_tensor)
-
-		# Extract per-node host KV free pages
-		reports_by_node = {}
-		for item in gathered:
-			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = int(item[1].item())
-		per_node_host_free = []
-		for node in range(num_nodes):
-			per_node_host_free.append(reports_by_node.get(node, 0))
+		# Step 1: Gather host KV stats from the first rank on each node.
+		node_host_stats = self._gather_host_kv_stats_by_node(
+			self.host_paged_kv_worker_view
+		)
+		per_node_host_free = [
+			int(stats["num_free_pages"]) for stats in node_host_stats
+		]
+		per_node_host_total = [
+			int(stats["num_total_pages"]) for stats in node_host_stats
+		]
 
 		if self.rank == 0:
 			logging.info(f"Per-node host KV free pages: {per_node_host_free} (chunk_size={chunk_size})")
 
 		# Step 3: Select sequences considering per-node host KV capacity
 		# Use chunk-based pages instead of full kv_token_budget
-		# Use exact free pages — no safety margin. Selection and allocation use
-		# the same formula, so the estimate should match exactly. If page
-		# exhaustion occurs, it indicates a logic bug in the selection/allocation
-		# mismatch that should be fixed directly.
-		per_node_effective_free = list(per_node_host_free)
+		# Use exact capacity — no safety margin. When live sequences hold Host KV
+		# pages this is the free-page count. When only prefix-resident pages
+		# occupy the pool, selection can use total capacity and allocation will
+		# evict cached prefix pages on demand.
+		has_active_work = (
+			self.global_batch.has_prefilled()
+			or self.global_batch.has_in_decode()
+			or self.global_batch.has_on_hold()
+		)
+		if self.enable_prefix_cache and not has_active_work:
+			# With no live sequences, used Host KV pages are reclaimable
+			# prefix-resident pages. Keep admission prefix-agnostic: select up
+			# to physical capacity, then let the actual allocation path evict
+			# cached prefix pages if the current free stack is insufficient.
+			per_node_effective_free = list(per_node_host_total)
+			if self.rank == 0 and per_node_effective_free != per_node_host_free:
+				logging.info(
+					"[PREFILL] Using Host KV total capacity for selection "
+					"because no live sequences are holding Host KV pages: "
+					f"total_pages={per_node_effective_free}, "
+					f"free_pages={per_node_host_free}"
+				)
+		else:
+			per_node_effective_free = list(per_node_host_free)
 		node_pages_used = [0] * num_nodes
 		prefill_batch = []
 
@@ -5441,38 +5444,6 @@ class BatchGenWorker:
 			if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
 				prefill_batch.append(uuid)
 				node_pages_used[seq_node] += req_pages
-
-		if (
-			not prefill_batch
-			and all_candidates
-			and not self.global_batch.has_prefilled()
-			and not self.global_batch.has_in_decode()
-			and not self.global_batch.has_on_hold()
-		):
-			# Avoid a scheduler deadlock when physical Host KV free pages are
-			# exhausted by evictable cached prefix pages. The allocator remains
-			# the source of truth: it will evict prefix pages if possible, or
-			# raise a concrete allocation error.
-			for uuid in all_candidates:
-				seq = self.global_batch.get_sequence(uuid)
-				seq_node = self._get_node_for_rank(seq.assigned_rank)
-				if 0 <= seq_node < num_nodes:
-					initial_capacity = self._get_prefill_initial_capacity_tokens(
-						seq,
-						chunk_size,
-					)
-					node_pages_used[seq_node] = math.ceil(
-						initial_capacity / seq.PAGE_SIZE
-					)
-					prefill_batch.append(uuid)
-					if self.rank == 0:
-						logging.info(
-							"[PREFILL] Forcing one sequence to allocation "
-							"path with low Host KV free pages: "
-							f"uuid={uuid[:8]} node={seq_node} "
-							f"free_pages={per_node_effective_free}"
-						)
-					break
 
 		if self.rank == 0:
 			n_evicted = sum(1 for u in prefill_batch if self.global_batch.get_sequence(u).status == SequenceStatus.EVICTED)
