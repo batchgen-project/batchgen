@@ -1,1 +1,1 @@
-# WIP: [wip] blackwell: sm100 setup.py _sm100_extensions infra skeleton
+# WIP: blackwell sm100 kernel port (integration)
