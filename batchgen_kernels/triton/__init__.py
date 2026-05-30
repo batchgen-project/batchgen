@@ -38,3 +38,4 @@ from batchgen_kernels.triton.qkv_proj_rope import (
     qkv_proj_rope,
     apply_rope_qk,
 )
+from batchgen_kernels.triton.fused_router_gemm import router_gemm_bias
