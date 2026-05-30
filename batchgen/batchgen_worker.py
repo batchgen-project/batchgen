@@ -118,7 +118,6 @@ from batchgen.worker.kv_manager import (
 	KVUtilizationRequest,
 	PageTableCapacityRequest,
 	TokenBudgetRequest,
-	WatermarkTriggerPlan,
 	WatermarkTriggerRequest,
 )
 import dataclasses as _dataclasses
@@ -547,13 +546,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 5.5.2 (issue #175): dual-path gate for the host-KV watermark
-		# trigger decision. NATIVE=1 routes the aggregate+threshold decision
-		# through `KVCacheManager.plan_watermark_trigger`. COMPARE=1 computes
-		# both plans from the same gathered node_stats and asserts equality —
-		# the NCCL all_gather and the apply (store stats + logs) run once.
-		self._watermark_native = os.environ.get("BATCHGEN_WORKER_WATERMARK_NATIVE", "0") == "1"
-		self._watermark_compare = os.environ.get("BATCHGEN_WORKER_WATERMARK_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -3239,43 +3231,15 @@ class BatchGenWorker:
 			has_evicted=self.enable_host_kv_eviction and self.global_batch.has_evicted(),
 		)
 
-	def _legacy_watermark_trigger_decision(
-		self, req: WatermarkTriggerRequest
-	) -> WatermarkTriggerPlan:
-		"""Inline watermark decision, returning a `WatermarkTriggerPlan`.
-
-		Mirrors `KVCacheManager.plan_watermark_trigger` so compare-mode can
-		assert the two plans are byte-equal.
-		"""
-		from batchgen.worker.kv_manager import WatermarkGlobalStats
-
-		if not req.node_stats:
-			return WatermarkTriggerPlan(
-				should_trigger=False, max_free_percent=None, global_stats=None
-			)
-		max_free_percent = max(s['free_percent'] for s in req.node_stats)
-		above_watermark = max_free_percent > req.host_kv_watermark
-		should_trigger = above_watermark and (req.has_queued or req.has_evicted)
-		total_used_pages = sum(s['num_used_pages'] for s in req.node_stats)
-		total_pages = sum(s['num_total_pages'] for s in req.node_stats)
-		global_used_percent = int((total_used_pages / total_pages) * 100) if total_pages > 0 else 0
-		global_stats = WatermarkGlobalStats(
-			used=total_used_pages,
-			total=total_pages,
-			free_percent=100 - global_used_percent,
-			num_nodes=len(req.node_stats),
-		)
-		return WatermarkTriggerPlan(
-			should_trigger=should_trigger,
-			max_free_percent=max_free_percent,
-			global_stats=global_stats,
-		)
-
 	def _check_host_kv_watermark_trigger(self) -> bool:
 		"""Check if any node exceeds host KV free page watermark.
 
 		Watermark = 70% FREE (underutilized).
 		Only checks if this rank is local_rank 0 (one check per node).
+
+		The aggregate+threshold decision is delegated to
+		``KVCacheManager.plan_watermark_trigger``; the NCCL gather and the
+		apply (store stats + logs) stay here.
 
 		Returns:
 			True if should interrupt decode and switch to prefill
@@ -3299,20 +3263,10 @@ class BatchGenWorker:
 		if not node_stats:
 			return False
 
-		# Decide (gated): aggregate + threshold. NCCL gather + apply stay here.
-		req = self._make_watermark_trigger_request(node_stats)
-		if self._watermark_compare:
-			legacy_plan = self._legacy_watermark_trigger_decision(req)
-			native_plan = KVCacheManager.plan_watermark_trigger(req)
-			assert legacy_plan == native_plan, (
-				f"watermark compare mismatch: _check_host_kv_watermark_trigger "
-				f"legacy={legacy_plan} native={native_plan}"
-			)
-			plan = native_plan if self._watermark_native else legacy_plan
-		elif self._watermark_native:
-			plan = KVCacheManager.plan_watermark_trigger(req)
-		else:
-			plan = self._legacy_watermark_trigger_decision(req)
+		# Decide: aggregate + threshold. NCCL gather + apply stay here.
+		plan = KVCacheManager.plan_watermark_trigger(
+			self._make_watermark_trigger_request(node_stats)
+		)
 
 		should_trigger = plan.should_trigger
 		max_free_percent = plan.max_free_percent
