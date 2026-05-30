@@ -271,6 +271,22 @@ class FusedGateContext:
             router_bias: [E] BF16 (or empty tensor if no bias)
             topk: number of top experts (2, 4, or 8)
         """
+        import batchgen_kernels as _bk
+        self._is_sm100 = _bk.get_device_arch() == "sm100"
+        self._topk = topk
+
+        if self._is_sm100:
+            # SM100 (Blackwell): the WGMMA fused-gate .cu is not built. Keep the
+            # weight/bias in Python and run a Triton GEMM + generic-CUDA TopK.
+            self._weight = router_weight
+            if router_bias is not None and router_bias.numel() > 0:
+                self._bias = router_bias
+            else:
+                self._bias = None
+            self._ctx = None
+            self._ext = None
+            return
+
         ext = _get_ext()
         bias = router_bias if router_bias is not None else torch.empty(
             0, dtype=torch.bfloat16, device=router_weight.device)
@@ -288,6 +304,8 @@ class FusedGateContext:
         Args:
             base_buffer: [WB_max, H] BF16 — the full allocated buffer
         """
+        if self._is_sm100:
+            return  # no TMA descriptor on the Triton path
         self._ext.fused_gate_warmup(self._ctx, base_buffer)
 
     def forward(self, hidden_states, logits=None, topk_indices=None,
@@ -305,6 +323,20 @@ class FusedGateContext:
             topk_indices: [N, K] int32
             topk_weights: [N, K] FP32
         """
+        if self._is_sm100:
+            from batchgen_kernels.triton.fused_router_gemm import router_gemm_bias
+            computed_logits = router_gemm_bias(hidden_states, self._weight, self._bias)
+            if logits is not None and logits.numel() > 0:
+                logits.copy_(computed_logits)
+                computed_logits = logits
+            return gate_topk_softmax_cuda(
+                computed_logits,
+                topk_indices=topk_indices,
+                topk_weights=topk_weights,
+                k=self._topk,
+                num_valid_tokens=num_valid_tokens,
+            )
+
         _empty = torch.empty(0)
         result = self._ext.fused_gate_forward(
             self._ctx,
@@ -317,8 +349,9 @@ class FusedGateContext:
         return result[0], result[1]
 
     def __del__(self):
-        if hasattr(self, '_ctx') and hasattr(self, '_ext'):
-            self._ext.destroy_fused_gate_context(self._ctx)
+        if not getattr(self, '_is_sm100', False) and hasattr(self, '_ctx') and hasattr(self, '_ext'):
+            if self._ctx is not None and self._ext is not None:
+                self._ext.destroy_fused_gate_context(self._ctx)
 
 
 def reduce_weighted_scatter_cuda(
