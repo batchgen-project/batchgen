@@ -24,6 +24,80 @@ logger = logging.getLogger("batchgen.moe.fp8_blockwise")
 _warned_import = False
 _warned_fused_s1 = False
 
+_arch = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ("sm100" / "sm90a" / ...) via batchgen_kernels."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels as _bk
+        _arch = _bk.get_device_arch()
+    return _arch
+
+
+def _grouped_fp8_blockwise_gemm_sm100(
+    x_fp8: Tensor,
+    weight_3d: Tensor,
+    x_scale: Tensor,
+    w_scale_3d: Tensor,
+    output: Optional[Tensor] = None,
+) -> Tensor:
+    """SM100 (Blackwell) fallback for the FP8 blockwise grouped GEMM.
+
+    The compiled SM90a CuTe kernel is unavailable on sm_100, and cuBLAS in
+    torch 2.9+cu129 does not yet support 1x128/128x128 blockwise FP8 scaling
+    (the heuristic returns CUBLAS_STATUS_NOT_SUPPORTED). Only row-wise FP8
+    GEMM is supported, so we emulate deepseek-style blockwise scaling exactly
+    by splitting the contraction dim K into 128-wide blocks and issuing one
+    row-wise ``torch._scaled_mm`` per block, accumulating partials in fp32.
+
+    Within a single K-block the activation scale is constant per token row
+    (1x128) and the weight scale is constant per 128-output-row block
+    (128x128, expanded here to per-output-column), so the row-wise GEMM is
+    numerically identical to true blockwise scaling for that block.
+
+    Processes the full uniform ``mtp`` reserved rows for every expert so the
+    control flow is static (CUDA-graph compatible — no data-dependent shapes
+    or host syncs on ``seqlens``). Padding rows produce values in output rows
+    that downstream gather ignores.
+    """
+    E, N, K = weight_3d.shape
+    g = 128
+    assert K % g == 0, f"FP8 sm100 GEMM requires K (={K}) multiple of 128"
+    assert N % g == 0, f"FP8 sm100 GEMM requires N (={N}) multiple of 128"
+    EM = x_fp8.shape[0]
+    assert EM % E == 0, f"x_fp8 rows (={EM}) not divisible by E (={E})"
+    mtp = EM // E
+    nblk = K // g
+    assert x_scale.shape[0] >= nblk, (
+        f"x_scale dim0 (={x_scale.shape[0]}) < K/128 (={nblk})")
+    assert w_scale_3d.shape[1] == N // g, (
+        f"w_scale dim1 (={w_scale_3d.shape[1]}) != N/128 (={N // g})")
+    assert w_scale_3d.shape[2] >= nblk, (
+        f"w_scale dim2 (={w_scale_3d.shape[2]}) < K/128 (={nblk})")
+
+    if output is None:
+        output = torch.empty((EM, N), dtype=torch.bfloat16, device=x_fp8.device)
+
+    for e in range(E):
+        start = e * mtp
+        x_e = x_fp8[start:start + mtp]            # [mtp, K] fp8
+        w_e = weight_3d[e]                        # [N, K] fp8
+        xs_e = x_scale[:, start:start + mtp]      # [>=nblk, mtp] f32 (transposed)
+        ws_e = w_scale_3d[e]                      # [N/128, >=nblk] f32
+        acc = torch.zeros((mtp, N), dtype=torch.float32, device=x_fp8.device)
+        for j in range(nblk):
+            a_blk = x_e[:, j * g:(j + 1) * g]            # [mtp, 128] row-major view
+            b_blk = w_e[:, j * g:(j + 1) * g].t()        # [128, N] col-major view
+            sa = xs_e[j].contiguous().view(mtp, 1)       # [mtp, 1] act scale
+            sb = ws_e[:, j].repeat_interleave(g)[:N].contiguous().view(1, N)
+            o = torch._scaled_mm(
+                a_blk, b_blk, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
+            acc += o.float()
+        output[start:start + mtp] = acc.to(torch.bfloat16)
+    return output
+
 
 def _get_kernel():
     """Load the compiled FP8 blockwise GEMM kernel."""
@@ -88,6 +162,10 @@ def grouped_fp8_blockwise_gemm(
     Returns:
         [E*mtp, N] bf16 output
     """
+    if _get_arch() == "sm100":
+        return _grouped_fp8_blockwise_gemm_sm100(
+            x_fp8, weight_3d, x_scale, w_scale_3d, output)
+
     kernel = _get_kernel()
     if kernel is None:
         raise RuntimeError(
