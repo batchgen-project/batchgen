@@ -548,14 +548,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 5.6.2 (issue #175): dual-path gate for the host-KV migration
-		# planner. NATIVE=1 routes the greedy rebalance through
-		# `KVCacheManager.plan_kv_migration`. COMPARE=1 runs both the legacy
-		# (global_batch-direct) plan and the native (snapshot-based) plan and
-		# asserts the MigrationOp lists are equal. NCCL gather + migration
-		# execution run once regardless of mode.
-		self._migration_native = os.environ.get("BATCHGEN_WORKER_MIGRATION_NATIVE", "0") == "1"
-		self._migration_compare = os.environ.get("BATCHGEN_WORKER_MIGRATION_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -3369,190 +3361,9 @@ class BatchGenWorker:
 				logging.info("MIGRATION: Single node detected, skipping rebalancing")
 			return []
 
-		if self._migration_compare:
-			legacy = self._legacy_kv_migration_plan(node_stats)
-			native = KVCacheManager.plan_kv_migration(
-				self._make_migration_plan_request(node_stats)
-			)
-			assert legacy == native, (
-				f"migration compare mismatch: _plan_kv_migration "
-				f"legacy={legacy} native={native}"
-			)
-			return native if self._migration_native else legacy
-		if self._migration_native:
-			return KVCacheManager.plan_kv_migration(
-				self._make_migration_plan_request(node_stats)
-			)
-		return self._legacy_kv_migration_plan(node_stats)
-
-	def _legacy_kv_migration_plan(self, node_stats: dict) -> List[MigrationOp]:
-		"""Inline greedy rebalance over gathered ``node_stats``.
-
-		Mirrors ``KVCacheManager.plan_kv_migration`` but queries
-		``global_batch`` directly, so compare-mode validates both the
-		candidate enumeration and the algorithm transcription.
-		"""
-		# Calculate target pages per node
-		total_used = sum(s['num_used_pages'] for s in node_stats.values())
-		num_nodes = len(node_stats)
-		target_per_node = total_used // num_nodes
-
-		if self.rank == 0:
-			logging.info(
-				f"MIGRATION: Planning rebalance: {total_used} total pages across {num_nodes} nodes, "
-				f"target {target_per_node} pages/node"
-			)
-			for nid, s in sorted(node_stats.items()):
-				imbalance = s['num_used_pages'] - target_per_node
-				logging.info(
-					f"MIGRATION:   Node {nid}: {s['num_used_pages']} pages "
-					f"({'+' if imbalance > 0 else ''}{imbalance} vs target)"
-				)
-
-		# Identify overloaded and underutilized nodes
-		overloaded = [(nid, s) for nid, s in node_stats.items() if s['num_used_pages'] > target_per_node]
-		underutilized = [(nid, s) for nid, s in node_stats.items() if s['num_used_pages'] < target_per_node]
-
-		if not overloaded or not underutilized:
-			# Already balanced
-			if self.rank == 0:
-				logging.info("MIGRATION: Already balanced, no migrations needed")
-			return []
-
-		overloaded.sort(key=lambda x: x[1]['num_used_pages'], reverse=True)
-		underutilized.sort(key=lambda x: x[1]['num_used_pages'])
-
-		# Greedy migration planning
-		migrations = []
-		used_by_node = {nid: s['num_used_pages'] for nid, s in node_stats.items()}
-		# Track sequences already selected for migration to avoid duplicates
-		migrated_uuids = set()
-
-		# CRITICAL: Reset dest_rank_counter at start of each planning round
-		# to ensure deterministic behavior across all ranks
-		self._dest_rank_counter = {}
-
-		for src_node_id, _ in overloaded:
-			while used_by_node[src_node_id] > target_per_node and underutilized:
-				# Find sequences to migrate from src_node (excluding already selected)
-				src_rank_base = src_node_id * NUM_GPUS_PER_NODE
-				candidate_sequences = []
-				for gpu_offset in range(NUM_GPUS_PER_NODE):
-					src_rank = src_rank_base + gpu_offset
-					if src_rank >= self.world_size:
-						break
-					for status in [SequenceStatus.PREFILLED, SequenceStatus.ON_HOLD]:
-						for uuid in self.global_batch.get_sequences_for_rank_with_status(src_rank, status):
-							if uuid not in migrated_uuids:
-								candidate_sequences.append(uuid)
-
-				if not candidate_sequences:
-					if self.rank == 0:
-						if BATCHGEN_CB_DEBUG:
-							logging.debug(f"MIGRATION: No more candidates on node {src_node_id}, stopping")
-					break
-
-				# CRITICAL: Sort candidates deterministically before selection
-				# Set operations (get_sequences_for_rank_with_status) don't preserve order,
-				# so we must sort to ensure all ranks pick the same sequence
-				candidate_sequences.sort(key=lambda u: self.global_batch.get_sequence(u).global_idx)
-
-				# Pick smallest sequence (better packing), with global_idx as tie-breaker
-				# This ensures deterministic selection across all ranks
-				uuid = min(candidate_sequences, key=lambda u: (
-					self.global_batch.get_sequence(u).kv_token_budget,
-					self.global_batch.get_sequence(u).global_idx  # Tie-breaker
-				))
-				seq = self.global_batch.get_sequence(uuid)
-				# CRITICAL FIX: Use actual host pages allocated, not full kv_token_budget.
-				# Host KV uses chunked growth, so host_pages_allocated < ceil(kv_token_budget/PAGE_SIZE).
-				# Using kv_token_budget causes IndexError when loading more pages than host has.
-				pages_needed = seq.host_pages_allocated
-				if pages_needed <= 0:
-					if self.rank == 0:
-						logging.warning(
-							f"MIGRATION: Skipping seq {uuid[:8]}... - no host pages allocated"
-						)
-					migrated_uuids.add(uuid)  # Don't retry
-					continue
-
-				if self.rank == 0:
-					if BATCHGEN_CB_DEBUG:
-						logging.debug(
-							f"MIGRATION: Selected seq {uuid[:8]}... from {len(candidate_sequences)} candidates "
-							f"(global_idx={seq.global_idx}, from_rank={seq.assigned_rank}, "
-							f"host_pages={pages_needed}, budget_pages={math.ceil(seq.kv_token_budget / self.PAGE_SIZE)})"
-						)
-
-				# Find dest node with most free space (lowest used pages)
-				# Use node_id as tie-breaker for determinism
-				dest_node_id = min(underutilized, key=lambda x: (used_by_node[x[0]], x[0]))[0]
-
-				# Check dest node has enough free pages for this migration
-				dest_total = node_stats[dest_node_id]['num_total_pages']
-				dest_free = dest_total - used_by_node[dest_node_id]
-				if pages_needed > dest_free:
-					if self.rank == 0:
-						logging.info(
-							f"MIGRATION: Dest node {dest_node_id} has insufficient free pages "
-							f"({dest_free} free, need {pages_needed}), removing from candidates"
-						)
-					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
-					if not underutilized:
-						break
-					continue
-
-				# Distribute across ranks on dest node for load balancing
-				# Use round-robin based on migration count to this node
-				# (counter is reset at start of each planning round)
-				if dest_node_id not in self._dest_rank_counter:
-					self._dest_rank_counter[dest_node_id] = 0
-
-				dest_rank_offset = self._dest_rank_counter[dest_node_id] % NUM_GPUS_PER_NODE
-				dest_rank = dest_node_id * NUM_GPUS_PER_NODE + dest_rank_offset
-				if dest_rank >= self.world_size:
-					dest_rank = dest_node_id * NUM_GPUS_PER_NODE  # Fallback to rank 0
-				self._dest_rank_counter[dest_node_id] += 1
-
-				# Record migration using MigrationOp dataclass
-				migrations.append(MigrationOp(
-					uuid=uuid,
-					from_rank=seq.assigned_rank,
-					to_rank=dest_rank,
-					pages=pages_needed,
-					host_pages=pages_needed,
-				))
-
-				# Mark as migrated to avoid selecting again
-				migrated_uuids.add(uuid)
-
-				# Update bookkeeping
-				used_by_node[src_node_id] -= pages_needed
-				used_by_node[dest_node_id] += pages_needed
-
-				# Check if dest node is now balanced
-				if used_by_node[dest_node_id] >= target_per_node:
-					underutilized = [(nid, s) for nid, s in underutilized if nid != dest_node_id]
-
-		# Sanity check: ensure no duplicate UUIDs in migrations
-		migration_uuids = [m.uuid for m in migrations]
-		if len(migration_uuids) != len(set(migration_uuids)):
-			duplicate_uuids = [u for u in migration_uuids if migration_uuids.count(u) > 1]
-			logging.error(
-				f"[MIGRATION] BUG DETECTED: Duplicate sequences in migration plan! "
-				f"Duplicates: {[u[:8] for u in set(duplicate_uuids)]}"
-			)
-			# Remove duplicates, keep only first occurrence
-			seen = set()
-			unique_migrations = []
-			for mig in migrations:
-				if mig.uuid not in seen:
-					seen.add(mig.uuid)
-					unique_migrations.append(mig)
-			migrations = unique_migrations
-			if self.rank == 0:
-				logging.warning(f"MIGRATION: Removed duplicates, {len(migrations)} unique migrations remain")
-
+		migrations = KVCacheManager.plan_kv_migration(
+			self._make_migration_plan_request(node_stats)
+		)
 		if self.rank == 0:
 			if migrations:
 				logging.info(f"MIGRATION: Planned {len(migrations)} sequence migrations")
@@ -3565,7 +3376,6 @@ class BatchGenWorker:
 					logging.info(f"MIGRATION:   ... and {len(migrations)-5} more")
 			else:
 				logging.info("MIGRATION: No migrations needed after planning")
-
 		return migrations
 
 	def _execute_kv_migrations_parallel(self, migrations: List[MigrationOp]) -> None:
