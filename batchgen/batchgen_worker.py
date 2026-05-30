@@ -116,6 +116,11 @@ from batchgen.worker.prefill import (
 	PrefillSelectionRequest,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
+from batchgen.worker.boundary import (
+	BoundaryDecisionRequest,
+	BoundaryHandler,
+	BoundarySeqMeta,
+)
 from batchgen.worker.kv_manager import (
 	GpuKvManagerPlan,
 	GpuKvManagerRequest,
@@ -554,6 +559,13 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
+		# Phase 8.2 (issue #175): dual-path gate for the rank-0 page-boundary
+		# decision. NATIVE=1 routes through `BoundaryHandler.compute_decisions`.
+		# COMPARE=1 runs both and asserts the BoundaryDecisions are equal — and
+		# since this runs on every decode boundary, COMPARE exercises it
+		# continuously with real cluster inputs.
+		self._boundary_native = os.environ.get("BATCHGEN_WORKER_BOUNDARY_NATIVE", "0") == "1"
+		self._boundary_compare = os.environ.get("BATCHGEN_WORKER_BOUNDARY_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -7012,7 +7024,79 @@ class BatchGenWorker:
 
 	# ============ RANK-0 BOUNDARY DECISION COMPUTATION ============
 
+	def _make_boundary_decision_request(
+		self,
+		decode_uuids: List[str],
+		global_seq_state: Dict[str, Dict],
+		global_candidate_info: Dict[str, Dict],
+		per_rank_free: List[int],
+		chunk_size: int,
+		per_node_host_stats: Optional[List[Dict[str, int]]],
+	) -> BoundaryDecisionRequest:
+		"""Snapshot the boundary-decision inputs (rank 0 only).
+
+		``seq_meta`` is sourced from ``global_batch`` (rank 0 holds every
+		sequence) for the union of decode + loadable-candidate uuids,
+		replacing the handler's direct ``global_batch`` reads. Entries are
+		omitted for uuids with no sequence — the handler treats a missing
+		entry as ``global_idx = inf`` / ``priority = 0``, matching the
+		legacy ``if seq is not None else ...`` fallbacks.
+		"""
+		seq_meta: Dict[str, BoundarySeqMeta] = {}
+		for uuid in set(decode_uuids) | set(global_candidate_info.keys()):
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			seq_meta[uuid] = BoundarySeqMeta(
+				global_idx=seq.global_idx,
+				priority=getattr(seq, 'priority', 0),
+				current_context_length=getattr(seq, 'current_context_length', 0),
+				host_token_capacity=getattr(seq, 'host_token_capacity', 0),
+				host_pages_allocated=getattr(seq, 'host_pages_allocated', 0),
+			)
+		return BoundaryDecisionRequest(
+			decode_uuids=tuple(decode_uuids),
+			global_seq_state=global_seq_state,
+			global_candidate_info=global_candidate_info,
+			per_rank_free=tuple(per_rank_free),
+			chunk_size=chunk_size,
+			per_node_host_stats=tuple(per_node_host_stats) if per_node_host_stats else None,
+			seq_meta=seq_meta,
+			world_size=self.world_size,
+			num_gpus_per_node=NUM_GPUS_PER_NODE,
+			enable_host_kv_eviction=self.enable_host_kv_eviction,
+			host_kv_eviction_watermark=self.host_kv_eviction_watermark,
+		)
+
 	def _compute_boundary_decisions(
+		self,
+		decode_uuids: List[str],
+		global_seq_state: Dict[str, Dict],
+		global_candidate_info: Dict[str, Dict],
+		per_rank_free: List[int],
+		chunk_size: int,
+		per_node_host_stats: Optional[List[Dict[str, int]]],
+	) -> 'BoundaryDecisions':
+		"""Compute the rank-0 page-boundary decision (gated)."""
+		args = (decode_uuids, global_seq_state, global_candidate_info,
+				per_rank_free, chunk_size, per_node_host_stats)
+		if self._boundary_compare:
+			legacy = self._legacy_compute_boundary_decisions(*args)
+			native = BoundaryHandler.compute_decisions(
+				self._make_boundary_decision_request(*args)
+			)
+			assert legacy == native, (
+				f"boundary compare mismatch: _compute_boundary_decisions "
+				f"legacy={legacy} native={native}"
+			)
+			return native if self._boundary_native else legacy
+		if self._boundary_native:
+			return BoundaryHandler.compute_decisions(
+				self._make_boundary_decision_request(*args)
+			)
+		return self._legacy_compute_boundary_decisions(*args)
+
+	def _legacy_compute_boundary_decisions(
 		self,
 		decode_uuids: List[str],
 		global_seq_state: Dict[str, Dict],
