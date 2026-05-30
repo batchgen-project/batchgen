@@ -3264,9 +3264,8 @@ class BatchGenWorker:
 			return False
 
 		# Decide: aggregate + threshold. NCCL gather + apply stay here.
-		plan = KVCacheManager.plan_watermark_trigger(
-			self._make_watermark_trigger_request(node_stats)
-		)
+		req = self._make_watermark_trigger_request(node_stats)
+		plan = KVCacheManager.plan_watermark_trigger(req)
 
 		should_trigger = plan.should_trigger
 		max_free_percent = plan.max_free_percent
