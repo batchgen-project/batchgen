@@ -1014,63 +1014,110 @@ class BatchGenWorker:
 			)
 
 		worker_views_by_group = self._prefix_cache_worker_views_by_group()
-		required_pages_by_group = (
+		local_required_pages_by_group = (
 			self._prefix_cache_private_page_requirements_by_group(sequence_tokens)
 		)
+		group_ids = sorted(worker_views_by_group)
+		required_pages_by_group = {group_id: 0 for group_id in group_ids}
+		if self.world_size > 1 and dist.is_initialized():
+			node_id = self.rank // NUM_GPUS_PER_NODE
+			payload = torch.tensor(
+				[
+					node_id,
+					*[
+						int(local_required_pages_by_group.get(group_id, 0))
+						for group_id in group_ids
+					],
+				],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			gathered = [torch.zeros_like(payload) for _ in range(self.world_size)]
+			dist.all_gather(gathered, payload)
+			for item in gathered:
+				if int(item[0].item()) != node_id:
+					continue
+				for index, group_id in enumerate(group_ids, start=1):
+					required_pages_by_group[group_id] += int(item[index].item())
+		else:
+			required_pages_by_group.update(local_required_pages_by_group)
+
 		page_deficit_by_group: Dict[int, int] = {}
-		for group_id, required_pages in required_pages_by_group.items():
-			worker_view = worker_views_by_group.get(group_id)
-			if worker_view is None:
+		eviction_error = ""
+		if self.local_rank == 0:
+			try:
+				for group_id, required_pages in required_pages_by_group.items():
+					worker_view = worker_views_by_group.get(group_id)
+					if worker_view is None:
+						raise RuntimeError(
+							"Missing Host KV worker view for prefix cache "
+							f"group {group_id}"
+						)
+					free_pages = int(worker_view.get_stats().num_free_pages)
+					deficit = int(required_pages) - free_pages
+					if deficit > 0:
+						page_deficit_by_group[group_id] = deficit
+
+				if page_deficit_by_group:
+					eviction = evict_prefix_pages_for_host_allocation(
+						core_engine_module=core_engine,
+						coordinator=self.prefix_cache_coordinator,
+						worker_views_by_group=worker_views_by_group,
+						page_deficit_by_group=page_deficit_by_group,
+					)
+					if self.prefix_cache_debug_stats and self.rank == 0:
+						evicted_nodes = (
+							0
+							if eviction.eviction_result is None
+							else int(eviction.eviction_result.evicted_nodes)
+						)
+						protected_nodes = (
+							0
+							if eviction.eviction_result is None
+							else int(eviction.eviction_result.protected_nodes)
+						)
+						logging.info(
+							"Prefix cache allocation eviction: reason=%s "
+							"deficits=%s released=%s evicted_nodes=%s "
+							"protected_nodes=%s",
+							reason,
+							page_deficit_by_group,
+							eviction.released_pages_by_group,
+							evicted_nodes,
+							protected_nodes,
+						)
+
+				remaining_deficits: Dict[int, int] = {}
+				for group_id, required_pages in required_pages_by_group.items():
+					worker_view = worker_views_by_group[group_id]
+					free_pages = int(worker_view.get_stats().num_free_pages)
+					deficit = int(required_pages) - free_pages
+					if deficit > 0:
+						remaining_deficits[group_id] = deficit
+				if remaining_deficits:
+					raise RuntimeError(
+						"Prefix cache eviction did not free enough Host KV "
+						f"pages for {reason}: remaining={remaining_deficits}"
+					)
+			except Exception as exc:
+				eviction_error = str(exc)
+				logging.exception("Prefix cache allocation eviction failed")
+
+		if self.world_size > 1 and dist.is_initialized():
+			error_flag = torch.tensor(
+				[1 if eviction_error else 0],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
+			if int(error_flag.item()) != 0:
+				if eviction_error:
+					raise RuntimeError(eviction_error)
 				raise RuntimeError(
-					f"Missing Host KV worker view for prefix cache group {group_id}"
+					"Prefix cache allocation eviction failed on another rank"
 				)
-			free_pages = int(worker_view.get_stats().num_free_pages)
-			deficit = int(required_pages) - free_pages
-			if deficit > 0:
-				page_deficit_by_group[group_id] = deficit
-
-		if not page_deficit_by_group:
-			return
-
-		eviction = evict_prefix_pages_for_host_allocation(
-			core_engine_module=core_engine,
-			coordinator=self.prefix_cache_coordinator,
-			worker_views_by_group=worker_views_by_group,
-			page_deficit_by_group=page_deficit_by_group,
-		)
-		if self.prefix_cache_debug_stats and self.rank == 0:
-			evicted_nodes = (
-				0
-				if eviction.eviction_result is None
-				else int(eviction.eviction_result.evicted_nodes)
-			)
-			protected_nodes = (
-				0
-				if eviction.eviction_result is None
-				else int(eviction.eviction_result.protected_nodes)
-			)
-			logging.info(
-				"Prefix cache allocation eviction: reason=%s deficits=%s "
-				"released=%s evicted_nodes=%s protected_nodes=%s",
-				reason,
-				page_deficit_by_group,
-				eviction.released_pages_by_group,
-				evicted_nodes,
-				protected_nodes,
-			)
-
-		remaining_deficits: Dict[int, int] = {}
-		for group_id, required_pages in required_pages_by_group.items():
-			worker_view = worker_views_by_group[group_id]
-			free_pages = int(worker_view.get_stats().num_free_pages)
-			deficit = int(required_pages) - free_pages
-			if deficit > 0:
-				remaining_deficits[group_id] = deficit
-		if remaining_deficits:
-			raise RuntimeError(
-				"Prefix cache eviction did not free enough Host KV pages for "
-				f"{reason}: remaining={remaining_deficits}"
-			)
+		elif eviction_error:
+			raise RuntimeError(eviction_error)
 
 	def _prefix_cache_gpu_managers_by_group(
 		self,
@@ -7343,17 +7390,19 @@ class BatchGenWorker:
 						f"(local_idx={new_local_idx})"
 					)
 
+		if self.enable_prefix_cache:
+			self._prefix_prefill_lookup_by_local_idx.clear()
+		global_sequence_ids = []
+		sequence_tokens = []
+		prefill_local_indices = []
+		prefix_lookup = None
+		lookup_results_by_uuid = {}
+		chunk_size = self._get_effective_chunk_size()
+
 		if my_prefill_uuids:
-			if self.enable_prefix_cache:
-				self._prefix_prefill_lookup_by_local_idx.clear()
-			global_sequence_ids = []
-			sequence_tokens = []
 			prefill_local_indices = [
 				self._uuid_to_local_map[uuid] for uuid in my_prefill_uuids
 			]
-			prefix_lookup = None
-			lookup_results_by_uuid = {}
-			chunk_size = self._get_effective_chunk_size()
 			if self.enable_prefix_cache:
 				input_ids_for_lookup, _, prompt_lengths_for_lookup = (
 					self._prefill_inputs_for_local_indices(prefill_local_indices)
@@ -7426,34 +7475,13 @@ class BatchGenWorker:
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
 				sequence_tokens.append(private_pages * seq.PAGE_SIZE)
 
+		if self.enable_prefix_cache:
 			self._ensure_prefix_cache_host_pages_for_allocation(
 				sequence_tokens=sequence_tokens,
 				reason="prefill_private_allocation",
 			)
 
-			# Safety assertion: log if selection over-admitted. This should not
-			# happen after the EVICTED-length fix in _prepare_prefill_batch —
-			# if it fires, there's another selection bug to investigate.
-			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
-			total_pages_needed = sum(math.ceil(t / seq.PAGE_SIZE) for t in sequence_tokens)
-			if total_pages_needed > kv_stats.num_free_pages:
-				# Log per-sequence breakdown to help diagnose the selection bug.
-				seq_details = []
-				for gid, tokens in list(zip(global_sequence_ids, sequence_tokens))[:10]:
-					s = self.global_batch.get_sequence(
-						next(u for u in my_prefill_uuids if self.global_batch.get_sequence(u).global_idx == gid)
-					)
-					seq_details.append(
-						f"gid={gid} prompt_len={s.prompt_length} "
-						f"was_evicted={s.total_decoded_before_eviction > 0} "
-						f"tokens={tokens}"
-					)
-				logging.error(
-					f"Rank {self.rank}: Host KV OVER-ADMISSION: need {total_pages_needed} pages, "
-					f"have {kv_stats.num_free_pages}. Selection should have prevented this. "
-					f"First 10 seqs: {seq_details}"
-				)
-
+		if my_prefill_uuids:
 			logging.debug(
 				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
 				f"(chunk_size={chunk_size})"
