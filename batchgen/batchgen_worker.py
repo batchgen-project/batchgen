@@ -564,12 +564,6 @@ class BatchGenWorker:
 		# COMPARE=1 runs both paths and asserts equal results.
 		self._kv_stats_native = os.environ.get("BATCHGEN_WORKER_KV_STATS_NATIVE", "0") == "1"
 		self._kv_stats_compare = os.environ.get("BATCHGEN_WORKER_KV_STATS_COMPARE", "0") == "1"
-		# Phase 9.2 (issue #175): dual-path gate for the decode batch
-		# selection. NATIVE=1 routes the greedy per-rank fill through
-		# `DecodeScheduler.select_decode_batch`. COMPARE=1 runs both and
-		# asserts the uuid lists are equal.
-		self._decode_native = os.environ.get("BATCHGEN_WORKER_DECODE_NATIVE", "0") == "1"
-		self._decode_compare = os.environ.get("BATCHGEN_WORKER_DECODE_COMPARE", "0") == "1"
 		self._kv_cache_manager: Optional[KVCacheManager] = None
 		self._glm5_moe_cuda_graph_manager = None
 		self._glm5_layer_cuda_graph_manager = None
@@ -4690,24 +4684,11 @@ class BatchGenWorker:
 			)
 		total_pages = self.gpu_paged_kv_cache_manager.get_stats().num_total_pages
 
-		# Greedy per-rank 90%-watermark fill (gated). The candidate
-		# enumeration above and the logging below stay here.
-		if self._decode_compare:
-			legacy = self._legacy_decode_batch_selection(all_candidates, total_pages)
-			native = DecodeScheduler.select_decode_batch(
-				self._make_decode_batch_request(all_candidates, total_pages)
-			)
-			assert legacy == native, (
-				f"decode compare mismatch: _prepare_decode_batch "
-				f"legacy={legacy} native={native}"
-			)
-			decode_batch = native if self._decode_native else legacy
-		elif self._decode_native:
-			decode_batch = DecodeScheduler.select_decode_batch(
-				self._make_decode_batch_request(all_candidates, total_pages)
-			)
-		else:
-			decode_batch = self._legacy_decode_batch_selection(all_candidates, total_pages)
+		# Greedy per-rank 90%-watermark fill. The candidate enumeration above
+		# and the logging below stay here; the selection is delegated.
+		decode_batch = DecodeScheduler.select_decode_batch(
+			self._make_decode_batch_request(all_candidates, total_pages)
+		)
 
 		if self.rank == 0:
 			logging.info(
@@ -4734,33 +4715,6 @@ class BatchGenWorker:
 			total_pages=total_pages,
 			world_size=self.world_size,
 		)
-
-	def _legacy_decode_batch_selection(
-		self, all_candidates: List[str], total_pages: int,
-	) -> List[str]:
-		"""Inline greedy per-rank 90%-watermark fill over ``global_batch``.
-
-		Mirrors ``DecodeScheduler.select_decode_batch`` (queries
-		``global_batch`` directly) so compare-mode validates both the
-		candidate enumeration and the algorithm transcription.
-		"""
-		# 90% watermark
-		capacity_per_rank = int(total_pages * 0.9)
-
-		# Greedily fill
-		rank_pages_used = [0] * self.world_size
-		decode_batch = []
-
-		for uuid in all_candidates:
-			seq = self.global_batch.get_sequence(uuid)
-			assigned_rank = seq.assigned_rank
-			req_pages = seq.get_gpu_pages_for_two_page_buffer()
-
-			if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
-				decode_batch.append(uuid)
-				rank_pages_used[assigned_rank] += req_pages
-
-		return decode_batch
 
 	def _check_and_handle_completions(
 		self, 
