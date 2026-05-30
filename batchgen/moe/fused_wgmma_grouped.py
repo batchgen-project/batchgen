@@ -55,6 +55,18 @@ def _check_wgmma_support() -> bool:
     return True
 
 
+_arch = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ('sm90a' / 'sm100')."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels
+        _arch = batchgen_kernels.get_device_arch()
+    return _arch
+
+
 def _load_grouped_module():
     """Load the grouped WGMMA CUDA module (pre-compiled via pip install)."""
     global _grouped_module
@@ -88,9 +100,79 @@ def is_grouped_wgmma_available() -> bool:
         _grouped_wgmma_available = False
         return False
 
+    # SM100 (Blackwell): grouped MXFP4 is served by the model-level Triton path
+    # (fused_mxfp4_grouped_moe_forward_triton). Report available without loading
+    # the Hopper-only _C extension.
+    if _get_arch() == "sm100":
+        _grouped_wgmma_available = True
+        return True
+
     mod = _load_grouped_module()
     _grouped_wgmma_available = mod is not None
     return _grouped_wgmma_available
+
+
+def fused_mxfp4_grouped_moe_forward_triton(
+    hidden_states: torch.Tensor,       # [num_tokens, hidden] BF16
+    topk_indices: torch.Tensor,        # [num_tokens, topk] int
+    topk_weights: torch.Tensor,        # [num_tokens, topk] float
+    expert_indices,                    # iterable of global expert idx to process
+    gate_weights, gate_scales,         # List[Tensor] indexed by global expert idx
+    up_weights, up_scales,
+    down_weights, down_scales,
+    gate_biases=None, up_biases=None, down_biases=None,
+) -> torch.Tensor:
+    """SM100 grouped MXFP4 MoE forward using the pure-Triton expert MLP.
+
+    Correctness-first port of the Hopper grouped WGMMA path for Blackwell. The
+    CUDA path sorts tokens by expert and applies a weighted scatter-add reduce;
+    here we process each expert over its routed tokens via a boolean mask and
+    accumulate the slot-specific routing-weighted contribution. Mathematically
+    equivalent to the grouped CUDA reduce (per-token contributions summed across
+    the experts it routes to).
+
+    Returns:
+        Output [num_tokens, hidden] BF16 (routing-weighted sum of expert outputs).
+    """
+    from batchgen.triton_kernels.fused_mxfp4_gemm import fused_mxfp4_mlp_forward
+
+    num_tokens, hidden_size = hidden_states.shape
+    # Accumulate in fp32 to match the CUDA grouped reduce precision, then cast.
+    output = torch.zeros(
+        num_tokens, hidden_size,
+        dtype=torch.float32, device=hidden_states.device,
+    )
+
+    # Single CPU-GPU sync: which experts have any routed token.
+    active_experts = set(topk_indices.flatten().tolist())
+
+    for e in expert_indices:
+        if e not in active_experts:
+            continue
+
+        mask = (topk_indices == e).any(dim=-1)
+        x_e = hidden_states[mask].contiguous()
+
+        out_e = fused_mxfp4_mlp_forward(
+            x_e,
+            gate_weights[e], gate_scales[e],
+            gate_biases[e] if gate_biases is not None else None,
+            up_weights[e], up_scales[e],
+            up_biases[e] if up_biases is not None else None,
+            down_weights[e], down_scales[e],
+            down_biases[e] if down_biases is not None else None,
+        )
+
+        # Slot-specific routing weight for expert e on each selected token.
+        sel_idx = topk_indices[mask]
+        sel_w = topk_weights[mask]
+        w_e = torch.where(
+            sel_idx == e, sel_w, torch.zeros_like(sel_w)
+        ).sum(dim=-1).float()
+
+        output[mask] += out_e.float() * w_e.unsqueeze(-1)
+
+    return output.to(hidden_states.dtype)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
