@@ -149,8 +149,22 @@ class BatchGenServer:
 		indexer, splitting the budget proportionally between primary and aux.
 		"""
 		from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+		from batchgen.kv_cache.glm5_kv_coordinator import GLM5HostKVCoordinator
 
-		# DSA models: split budget into primary + auxiliary
+		# GLM-5 uses a model-specific group coordinator so prefix cache can
+		# manage primary/indexer pages independently.
+		glm5 = GLM5HostKVCoordinator.create_managers(
+			model_name=self.args.model,
+			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+		)
+		if glm5 is not None:
+			primary_mgr, indexer_mgr = glm5
+			logging.info(
+				"Allocated GLM-5 host KV cache: primary + indexer"
+			)
+			return primary_mgr, indexer_mgr
+
+		# Other DSA models keep the existing dual coordinator path.
 		dual = DualHostKVCoordinator.create_managers(
 			model_name=self.args.model,
 			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
@@ -277,7 +291,6 @@ class BatchGenServer:
 			model_name=self.args.model,
 			kv_dtype=self.args.kv_dtype,
 			host_kv_cache_size_bytes=int(self.args.host_kv_cache_size * (1024**3)),
-			node_rank=self.args.node_rank,
 			debug_stats=getattr(self.args, "prefix_cache_debug_stats", False),
 		)
 		self.prefix_cache_runtime_config = runtime_config

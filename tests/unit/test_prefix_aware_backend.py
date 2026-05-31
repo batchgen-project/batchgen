@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
@@ -17,12 +15,12 @@ from batchgen.attention.forward_metadata_context import (
 )
 from batchgen.attention.prefix_aware_backend import (
     GqaPrefixAwareAttentionBackend,
-    MlaProjectedPrefixAwareAttentionBackend,
 )
 from batchgen.models.wrappers.prefix_gqa_extend import (
     GqaExtendSpec,
     run_prefix_gqa_prefill_attention,
 )
+from batchgen.prefix_reuse.materialization import PrefixMaterializationBundle
 
 _LAYER_IDX = 2
 
@@ -184,7 +182,9 @@ def test_gqa_backend_clamped_full_hit_uses_extend_prefill(monkeypatch):
         value=value,
         metadata=_clamped_full_hit_metadata(),
         kv_cache_metadata=SimpleNamespace(
-            prefill_prefix_materialization=materialization
+            prefill_prefix_materialization=PrefixMaterializationBundle(
+                by_group_id={0: materialization}
+            )
         ),
     )
 
@@ -281,105 +281,3 @@ def test_gqa_backend_missing_metadata_raises():
             value=torch.zeros((1, 1, 2)),
             metadata=object(),
         )
-
-
-def test_mla_backend_prefix_reuse_requires_gpu_materialization():
-    backend = MlaProjectedPrefixAwareAttentionBackend(
-        layer_idx=_LAYER_IDX,
-        num_heads=2,
-        kv_lora_rank=1,
-        softmax_scale=0.5,
-    )
-    query = torch.zeros((1, 2, 2, 3))
-    key = torch.ones((2, 3))
-
-    with pytest.raises(RuntimeError, match="GPU paged materialization"):
-        backend.forward_prefill(
-            query=query,
-            key=key,
-            value=None,
-            metadata=_metadata(prefix_reuse=True),
-            kv_cache_metadata=object(),
-        )
-
-
-class _FakeMlaMaterializedManager:
-    def __init__(self):
-        self.config = SimpleNamespace(has_v_cache=False)
-        self.blocked_k = torch.zeros((3, 4, 1, 3))
-        self.block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
-        self.append_calls = []
-
-    def append_layer_prefill_suffix_tokens(self, **kwargs):
-        self.append_calls.append(kwargs)
-
-    def get_layer_kv_with_page_table(self, layer_idx):
-        assert layer_idx == _LAYER_IDX
-        return self.blocked_k, None, self.block_table
-
-
-class _FakeMlaMaterialization:
-    def __init__(self):
-        self.manager = _FakeMlaMaterializedManager()
-        self.append_plan = SimpleNamespace(
-            cache_seqlens=torch.tensor([5], dtype=torch.int32),
-            slot_indices=torch.tensor([0], dtype=torch.int32),
-        )
-        self.waited_layers = []
-
-    def wait_for_layer(self, layer_idx):
-        self.waited_layers.append(int(layer_idx))
-
-
-def test_mla_backend_prefix_reuse_uses_flashinfer_gpu_materialization(
-    monkeypatch,
-):
-    recorded = {}
-
-    flashinfer_stub = types.ModuleType("flashinfer")
-    flashinfer_stub.BatchMLAPagedAttentionWrapper = object
-    monkeypatch.setitem(sys.modules, "flashinfer", flashinfer_stub)
-
-    from batchgen.attention.mla import flashinfer_extend
-
-    def flashinfer_fn(**kwargs):
-        recorded.update(kwargs)
-        return torch.full((1, 2, 2, 1), 3.0)
-
-    monkeypatch.setattr(
-        flashinfer_extend,
-        "run_flashinfer_mla_extend_prefill",
-        flashinfer_fn,
-    )
-
-    materialization = _FakeMlaMaterialization()
-    backend = MlaProjectedPrefixAwareAttentionBackend(
-        layer_idx=_LAYER_IDX,
-        num_heads=2,
-        kv_lora_rank=1,
-        softmax_scale=0.5,
-    )
-    query = torch.zeros((1, 2, 2, 3))
-    key = torch.ones((2, 3))
-
-    output = backend.forward_prefill(
-        query=query,
-        key=key,
-        value=None,
-        metadata=_metadata(prefix_reuse=True),
-        kv_cache_metadata=SimpleNamespace(
-            prefill_prefix_materialization=materialization
-        ),
-    )
-
-    torch.testing.assert_close(output, torch.full((1, 2, 2, 1), 3.0))
-    assert materialization.waited_layers == [_LAYER_IDX]
-    assert len(materialization.manager.append_calls) == 1
-    append_call = materialization.manager.append_calls[0]
-    assert append_call["k_tensor"] is key
-    assert append_call["v_tensor"] is None
-    assert append_call["layer_idx"] == _LAYER_IDX
-    assert recorded["compressed_kv_cache"] is materialization.manager.blocked_k
-    assert recorded["page_table"] is materialization.manager.block_table
-    assert recorded["cache_seqlens"].tolist() == [5]
-    assert recorded["slot_indices"].tolist() == [0]

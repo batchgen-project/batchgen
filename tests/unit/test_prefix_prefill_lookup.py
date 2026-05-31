@@ -8,7 +8,6 @@ from batchgen.prefix_reuse.prefill import (
     build_prefix_cache_prefill_inputs,
     estimate_prefix_cache_for_prefill,
     lookup_prefix_cache_for_prefill,
-    release_prefix_cache_lookup_attachments,
 )
 
 
@@ -18,7 +17,6 @@ class _Coordinator:
         self.handles = list(handles)
         self.lookup_calls = []
         self.estimate_calls = []
-        self.release_calls = []
 
     def lookup_and_attach(self, namespace_digest, token_ids):
         index = len(self.lookup_calls)
@@ -35,9 +33,6 @@ class _Coordinator:
             common_cached_tokens=self.cached_tokens[index],
             attachment_handle=0,
         )
-
-    def release_attachment(self, handle):
-        self.release_calls.append(int(handle))
 
 
 def test_lookup_prefix_cache_for_prefill_preserves_request_order():
@@ -140,23 +135,3 @@ def test_build_prefix_cache_prefill_inputs_uses_suffix_only_tokens():
         [[1, 1]],
         [[1]],
     ]
-
-
-def test_release_prefix_cache_lookup_attachments_deduplicates_handles():
-    coordinator = _Coordinator(cached_tokens=[4, 4, 0], handles=[11, 11, 0])
-    lookup = lookup_prefix_cache_for_prefill(
-        coordinator=coordinator,
-        namespace_digest=(1, 2, 3, 4),
-        prompt_token_ids=[
-            [10, 11, 12, 13],
-            [10, 11, 12, 13],
-            [20, 21],
-        ],
-    )
-
-    release_prefix_cache_lookup_attachments(
-        coordinator=coordinator,
-        lookup=lookup,
-    )
-
-    assert coordinator.release_calls == [11]

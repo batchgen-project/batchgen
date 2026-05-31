@@ -695,7 +695,6 @@ class WorkerManager:
             model_name=self.args.model,
             kv_dtype=self.args.kv_dtype,
             host_kv_cache_size_bytes=int(host_budget_gb * (1024**3)),
-            node_rank=self.args.node_rank,
             debug_stats=self.args.prefix_cache_debug_stats,
         )
         self.prefix_cache_runtime_config = runtime_config
@@ -1073,8 +1072,21 @@ class WorkerManager:
         enable_memfd: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+        from batchgen.kv_cache.glm5_kv_coordinator import GLM5HostKVCoordinator
 
-        # DSA models: split budget into primary + auxiliary
+        # GLM-5 uses model-specific logical KV groups so prefix cache can
+        # manage primary/indexer pages independently.
+        glm5 = GLM5HostKVCoordinator.create_managers(
+            model_name=model_name,
+            host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+            enable_memfd=enable_memfd,
+        )
+        if glm5 is not None:
+            primary_mgr, indexer_mgr = glm5
+            logger.info("Allocated GLM-5 host KV cache: primary + indexer")
+            return primary_mgr, indexer_mgr
+
+        # Other DSA models keep the existing dual coordinator path.
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),

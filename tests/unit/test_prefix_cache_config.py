@@ -223,13 +223,11 @@ def test_prefix_cache_runtime_config_rejects_no_required_group():
         )
 
 
-def test_prefix_cache_shm_name_is_sanitized_and_node_scoped():
-    shm_name = derive_prefix_cache_shm_name(
-        "Org/Model-Name", node_rank=2
-    )
+def test_prefix_cache_shm_name_is_sanitized_and_node_agnostic():
+    shm_name = derive_prefix_cache_shm_name("Org/Model-Name")
 
     assert shm_name.startswith("batchgen_prefix_cache_org_model_name_")
-    assert shm_name.endswith("_node2")
+    assert "_node" not in shm_name
 
 
 def test_server_parser_exposes_only_prefix_cache_user_flags():

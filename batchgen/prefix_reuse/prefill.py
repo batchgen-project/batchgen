@@ -150,19 +150,3 @@ def build_prefix_cache_prefill_inputs(
         input_ids_list=suffix_inputs,
         attention_mask_list=suffix_masks,
     )
-
-
-def release_prefix_cache_lookup_attachments(
-    *,
-    coordinator: object,
-    lookup: PrefixCachePrefillLookup,
-) -> None:
-    """Release lookup attachments after dependent loads are complete."""
-
-    seen_handles: set[int] = set()
-    for result in lookup.lookup_results:
-        handle = int(result.attachment_handle)
-        if handle == 0 or handle in seen_handles:
-            continue
-        seen_handles.add(handle)
-        coordinator.release_attachment(handle)

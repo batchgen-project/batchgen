@@ -22,6 +22,12 @@ from batchgen.kv_cache.deepseek_v4_kv_coordinator import (
     DeepSeekV4GPUKVCoordinator,
     DeepSeekV4HostKVCoordinator,
 )
+from batchgen.kv_cache.glm5_kv_coordinator import (
+    GLM5_INDEXER_GROUP_ID,
+    GLM5_PRIMARY_GROUP_ID,
+    GLM5GPUKVCoordinator,
+    GLM5HostKVCoordinator,
+)
 from batchgen.kv_cache.swa_gpu_paged_kv_manager import (
     SWAGPUPagedKVCacheManager,
 )
@@ -40,5 +46,9 @@ __all__ = [
     "CompressedStateGPUStats",
     "DeepSeekV4GPUKVCoordinator",
     "DeepSeekV4HostKVCoordinator",
+    "GLM5_INDEXER_GROUP_ID",
+    "GLM5_PRIMARY_GROUP_ID",
+    "GLM5GPUKVCoordinator",
+    "GLM5HostKVCoordinator",
     "SWAGPUPagedKVCacheManager",
 ]

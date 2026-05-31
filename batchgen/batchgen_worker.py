@@ -126,6 +126,12 @@ from batchgen.kv_cache.host_kv_mananger_config import (
 )
 from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
+from batchgen.kv_cache.glm5_kv_coordinator import (
+	GLM5AsyncKVTask,
+	GLM5GPUKVCoordinator,
+	GLM5HostKVCoordinator,
+	is_glm5_dual_kv_model,
+)
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import (
 	prepack_sequences,
@@ -247,6 +253,11 @@ class _DualKVLoadPointers:
 	aux_k_ptrs: torch.Tensor
 	aux_v_ptrs: Optional[torch.Tensor]
 	aux_page_counts: torch.Tensor
+
+
+GroupedGPUKVCoordinator = (DualKVCacheCoordinator, GLM5GPUKVCoordinator)
+GroupedHostKVCoordinator = (DualHostKVCoordinator, GLM5HostKVCoordinator)
+GroupedAsyncKVTask = (DualAsyncKVTask, GLM5AsyncKVTask)
 
 
 class QueryBookBufferPool:
@@ -616,10 +627,11 @@ class BatchGenWorker:
 		self.global_host_kv_cache_size_gb = args.global_host_kv_cache_size_gb
 		self.host_paged_kv_worker_view_aux = None
 
-		# DSA models: create DualHostKVCoordinator with proportional budget split.
-		# Non-DSA models get a single-view worker below.
+		# GLM-5 uses a model-specific primary/indexer coordinator so prefix
+		# cache can manage each logical KV group independently. Other DSA models
+		# keep the existing DualHostKVCoordinator path.
 		host_budget_bytes = int(args.global_host_kv_cache_size_gb * (1024**3))
-		dual_host = DualHostKVCoordinator.from_budget(
+		glm5_host = GLM5HostKVCoordinator.from_budget(
 			model_name=args.model_name,
 			host_kv_cache_size=host_budget_bytes,
 			core_engine_module=core_engine,
@@ -628,11 +640,34 @@ class BatchGenWorker:
 			memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
 			aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
 		)
-		if dual_host is not None:
-			self.host_paged_kv_worker_view = dual_host
-			logging.info(f"Rank {self.rank}: Initializing DualHostKVCoordinator with parallel cudaHostRegister (local_rank={self.local_rank})")
-			dual_host.initialize(device_index=self.local_rank, create_region=False)
-			logging.info(f"Rank {self.rank}: DualHostKVCoordinator cudaHostRegister completed (local_rank={self.local_rank})")
+		dual_host = None
+		if glm5_host is None:
+			dual_host = DualHostKVCoordinator.from_budget(
+				model_name=args.model_name,
+				host_kv_cache_size=host_budget_bytes,
+				core_engine_module=core_engine,
+				enable_memfd=args.fast_init,
+				memfd_creator_pid=args.kv_memfd_pid if args.fast_init else -1,
+				memfd_fd=args.kv_memfd_fd if args.fast_init else -1,
+				aux_memfd_fd=args.kv_aux_memfd_fd if args.fast_init else -1,
+			)
+		grouped_host = glm5_host if glm5_host is not None else dual_host
+		if grouped_host is not None:
+			self.host_paged_kv_worker_view = grouped_host
+			logging.info(
+				"Rank %s: Initializing %s with parallel cudaHostRegister "
+				"(local_rank=%s)",
+				self.rank,
+				type(grouped_host).__name__,
+				self.local_rank,
+			)
+			grouped_host.initialize(device_index=self.local_rank, create_region=False)
+			logging.info(
+				"Rank %s: %s cudaHostRegister completed (local_rank=%s)",
+				self.rank,
+				type(grouped_host).__name__,
+				self.local_rank,
+			)
 		else:
 			worker_kv_config = build_host_kv_config(
 				model_name=args.model_name,
@@ -750,7 +785,6 @@ class BatchGenWorker:
 			model_name=args.model_name,
 			kv_dtype=args.kv_dtype,
 			host_kv_cache_size_bytes=int(args.host_kv_cache_size * (1024**3)),
-			node_rank=args.nnode_rank,
 			debug_stats=bool(args.prefix_cache_debug_stats),
 		)
 		self.prefix_cache_runtime_config = runtime_config
@@ -934,7 +968,7 @@ class BatchGenWorker:
 
 	def _prefix_cache_worker_views_by_group(self) -> Dict[int, object]:
 		host_view = self.core_engine.host_paged_kv_worker_view
-		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+		if isinstance(self.host_paged_kv_worker_view, GroupedHostKVCoordinator):
 			return self.host_paged_kv_worker_view.views_by_group()
 		if hasattr(host_view, "views_by_group"):
 			return host_view.views_by_group()
@@ -1123,7 +1157,7 @@ class BatchGenWorker:
 		self,
 		manager: object,
 	) -> Dict[int, object]:
-		if isinstance(manager, DualKVCacheCoordinator):
+		if isinstance(manager, GroupedGPUKVCoordinator):
 			return manager.managers_by_group()
 		if hasattr(manager, "managers_by_group"):
 			return manager.managers_by_group()
@@ -1505,7 +1539,9 @@ class BatchGenWorker:
 		Called once at the start of decoding.
 
 		For DSA models, splits the memory budget between primary (MLA) and
-		auxiliary (indexer) caches, wrapping both in a DualKVCacheCoordinator.
+		auxiliary/indexer caches. GLM-5 uses GLM5GPUKVCoordinator so prefix
+		cache can address each logical KV group independently; other DSA
+		models keep DualKVCacheCoordinator.
 		"""
 		from batchgen.kv_cache.host_kv_mananger_config import (
 			build_gpu_kv_config_fixed_size,
@@ -1561,14 +1597,17 @@ class BatchGenWorker:
 			primary.initialize()
 			auxiliary = GPUPagedKVCacheManager(config=aux_config, device=self.local_rank)
 			auxiliary.initialize()
-			manager = DualKVCacheCoordinator(primary, auxiliary)
+			if is_glm5_dual_kv_model(self.huggingface_ckpt_name):
+				manager = GLM5GPUKVCoordinator(primary, auxiliary)
+			else:
+				manager = DualKVCacheCoordinator(primary, auxiliary)
 			self._bind_gpu_paged_kv_manager(manager)
 
 			if self.rank == 0:
 				primary_gb = (primary_bytes_per_page * num_pages) / (1024 ** 3)
 				aux_gb = (aux_bytes_per_page * num_pages) / (1024 ** 3)
 				logging.info(
-					f"[GPU-KV] DualKVCacheCoordinator initialized: "
+					f"[GPU-KV] {type(manager).__name__} initialized: "
 					f"{num_pages} pages, primary={primary_gb:.2f} GB (dim={primary_profile.k_head_dim}), "
 					f"auxiliary={aux_gb:.2f} GB (dim={aux_profile.k_head_dim})"
 				)
@@ -3162,7 +3201,7 @@ class BatchGenWorker:
 			self.initializer.Init(self.weights_storage)
 		)
 
-		if isinstance(self.host_paged_kv_worker_view, DualHostKVCoordinator):
+		if isinstance(self.host_paged_kv_worker_view, GroupedHostKVCoordinator):
 			self.core_engine.host_paged_kv_worker_view = self.host_paged_kv_worker_view.primary
 			self.host_paged_kv_worker_view_aux = self.host_paged_kv_worker_view.auxiliary
 		else:
@@ -3292,12 +3331,12 @@ class BatchGenWorker:
 	def _bind_gpu_paged_kv_manager(self, manager) -> None:
 		"""Bind GPU KV manager to both worker and core_engine.
 
-		If manager is a DualKVCacheCoordinator, the primary manager is bound
-		to existing gpu_paged_kv_manager slots and the auxiliary (indexer) is
-		bound to gpu_paged_kv_manager_aux slots.
+		If manager owns multiple logical KV groups, the primary manager is
+		bound to existing gpu_paged_kv_manager slots and the indexer/auxiliary
+		manager is bound to gpu_paged_kv_manager_aux slots.
 		"""
 		self.gpu_paged_kv_cache_manager = manager
-		if isinstance(manager, DualKVCacheCoordinator):
+		if isinstance(manager, GroupedGPUKVCoordinator):
 			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
 				self.core_engine.gpu_paged_kv_manager = manager.primary
 			if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
@@ -3309,7 +3348,7 @@ class BatchGenWorker:
 	def _get_cuda_graph_gpu_manager(self):
 		"""Return the GPU KV manager object to use for CUDA graph setup."""
 		manager = self.gpu_paged_kv_cache_manager
-		if isinstance(manager, DualKVCacheCoordinator):
+		if isinstance(manager, GroupedGPUKVCoordinator):
 			return manager
 		if manager is not None:
 			return manager
@@ -3389,8 +3428,8 @@ class BatchGenWorker:
 	def _ensure_gpu_paged_kv_manager(self, sequence_tokens: Sequence[int]) -> GPUPagedKVCacheManager:
 		"""Return a GPU paged KV manager with enough pages for `sequence_tokens`.
 
-		For DSA models, returns a DualKVCacheCoordinator wrapping both primary
-		(MLA) and auxiliary (indexer) managers.
+		For DSA models, returns a grouped coordinator wrapping both primary
+		(MLA) and auxiliary/indexer managers.
 		"""
 		gpu_config = build_gpu_kv_config(
 			model_name=self.huggingface_ckpt_name,
@@ -3450,14 +3489,17 @@ class BatchGenWorker:
 				config=aux_config,
 				device=self.local_rank,
 			)
-			manager = DualKVCacheCoordinator(primary, auxiliary)
+			if is_glm5_dual_kv_model(self.huggingface_ckpt_name):
+				manager = GLM5GPUKVCoordinator(primary, auxiliary)
+			else:
+				manager = DualKVCacheCoordinator(primary, auxiliary)
 			manager.initialize()
 			self._bind_gpu_paged_kv_manager(manager)
 
 			logging.info(
-				"Rank %s initialized DualKVCacheCoordinator on %s: "
+				"Rank %s initialized %s on %s: "
 				"primary=%d pages (dim=%d), auxiliary=%d pages (dim=%d)",
-				self.rank, self.local_rank,
+				self.rank, type(manager).__name__, self.local_rank,
 				gpu_config.num_pages, gpu_config.k_head_dim,
 				aux_config.num_pages, aux_config.k_head_dim,
 			)
@@ -3508,7 +3550,7 @@ class BatchGenWorker:
 		aux_view = self.host_paged_kv_worker_view_aux
 		if aux_view is None:
 			return None
-		if not isinstance(self.gpu_paged_kv_cache_manager, DualKVCacheCoordinator):
+		if not isinstance(self.gpu_paged_kv_cache_manager, GroupedGPUKVCoordinator):
 			return None
 		aux_mgr = self.gpu_paged_kv_cache_manager.auxiliary
 		k_ptrs_aux, v_ptrs_aux = aux_mgr.get_padded_3d_page_pointers()
@@ -3522,12 +3564,12 @@ class BatchGenWorker:
 
 	def _prepare_dual_kv_load_pointers(
 		self,
-		gpu_manager: DualKVCacheCoordinator,
+		gpu_manager,
 		new_global_ids: List[int],
 		existing_global_ids: Optional[List[int]] = None,
 	) -> _DualKVLoadPointers:
-		if not isinstance(gpu_manager, DualKVCacheCoordinator):
-			raise RuntimeError("DSA dual KV load requires DualKVCacheCoordinator")
+		if not isinstance(gpu_manager, GroupedGPUKVCoordinator):
+			raise RuntimeError("Grouped KV load requires a grouped GPU KV coordinator")
 		if not new_global_ids:
 			raise ValueError("_prepare_dual_kv_load_pointers requires non-empty sequence ids")
 
@@ -3568,10 +3610,10 @@ class BatchGenWorker:
 			else:
 				gpu_manager.clear_page_table()
 
-	def _launch_dual_host_kv_load(self, pointers: _DualKVLoadPointers) -> DualAsyncKVTask:
+	def _launch_dual_host_kv_load(self, pointers: _DualKVLoadPointers):
 		host_view = self.host_paged_kv_worker_view
-		if not isinstance(host_view, DualHostKVCoordinator):
-			raise RuntimeError("DSA dual KV load requires DualHostKVCoordinator")
+		if not isinstance(host_view, GroupedHostKVCoordinator):
+			raise RuntimeError("Grouped KV load requires a grouped Host KV coordinator")
 		return host_view.async_load_layer_paged_kv_to_device_dual(
 			sequence_ids=pointers.sequence_tensor,
 			primary_active_page_counts=pointers.primary_page_counts,
@@ -3620,7 +3662,7 @@ class BatchGenWorker:
 			f"{len(global_sequence_ids)} sequences..."
 		)
 
-		if isinstance(manager, DualKVCacheCoordinator):
+		if isinstance(manager, GroupedGPUKVCoordinator):
 			pointers = self._prepare_dual_kv_load_pointers(manager, global_sequence_ids)
 			load_task = self._launch_dual_host_kv_load(pointers)
 		else:
@@ -9404,7 +9446,7 @@ class BatchGenWorker:
 					t_launch = time.perf_counter()
 					if worker_view is not None:
 						existing_global_ids = self._local_indices_to_global_seq_ids(batch)
-						if isinstance(gpu_manager, DualKVCacheCoordinator):
+						if isinstance(gpu_manager, GroupedGPUKVCoordinator):
 							pointers = self._prepare_dual_kv_load_pointers(
 								gpu_manager, new_load_global, existing_global_ids
 							)
@@ -9559,10 +9601,10 @@ class BatchGenWorker:
 		Attn_Wrapper.async_kv_load_active = False
 		Attn_Wrapper.async_kv_load_task = None
 
-		if pending_local_indices and isinstance(gpu_manager, DualKVCacheCoordinator):
-			if not isinstance(async_task, DualAsyncKVTask):
+		if pending_local_indices and isinstance(gpu_manager, GroupedGPUKVCoordinator):
+			if not isinstance(async_task, GroupedAsyncKVTask):
 				raise RuntimeError(
-					"DSA async load finalize requires a completed DualAsyncKVTask"
+					"Grouped KV async load finalize requires a completed grouped task"
 				)
 
 		pending_local_uuid_set = {
@@ -12290,7 +12332,7 @@ class BatchGenWorker:
 		Attn_Wrapper.cur_batch = self._local_indices_to_global_seq_ids(batch) if batch else []
 
 		# Also bind to AttnWrapperBase for models using new wrapper system (e.g., GPT-OSS)
-		if isinstance(gpu_manager, DualKVCacheCoordinator):
+		if isinstance(gpu_manager, GroupedGPUKVCoordinator):
 			AttnWrapperBase.gpu_paged_kv_manager = gpu_manager.primary
 			AttnWrapperBase.gpu_paged_kv_manager_aux = gpu_manager.auxiliary
 		else:
@@ -13621,7 +13663,7 @@ class BatchGenWorker:
 				gpu_manager.rebuild_page_table(existing_global_ids)
 			return None, new_uuids, new_local_indices, new_global_ids
 
-		if isinstance(gpu_manager, DualKVCacheCoordinator):
+		if isinstance(gpu_manager, GroupedGPUKVCoordinator):
 			pointers = self._prepare_dual_kv_load_pointers(
 				gpu_manager, new_global_ids, existing_global_ids
 			)
@@ -13776,7 +13818,7 @@ class BatchGenWorker:
 		# Capture existing batch for later restoration
 		existing_global_ids = self._local_indices_to_global_seq_ids(current_batch)
 
-		if isinstance(gpu_manager, DualKVCacheCoordinator):
+		if isinstance(gpu_manager, GroupedGPUKVCoordinator):
 			pointers = self._prepare_dual_kv_load_pointers(
 				gpu_manager, new_global_ids, existing_global_ids
 			)
@@ -13802,7 +13844,7 @@ class BatchGenWorker:
 			timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 			return None, new_uuids, new_local_indices, new_global_ids, timing
 
-		if isinstance(gpu_manager, DualKVCacheCoordinator):
+		if isinstance(gpu_manager, GroupedGPUKVCoordinator):
 			async_task = self._launch_dual_host_kv_load(pointers)
 		else:
 			async_task = worker_view.async_load_layer_paged_kv_to_device(
@@ -13820,7 +13862,7 @@ class BatchGenWorker:
 		timing['launch_ms'] = (time.perf_counter() - t0) * 1000
 		
 		# Store tensor references to prevent GC during async operation
-		self._async_load_tensors = pointers if isinstance(gpu_manager, DualKVCacheCoordinator) else {
+		self._async_load_tensors = pointers if isinstance(gpu_manager, GroupedGPUKVCoordinator) else {
 			'k_ptrs': k_ptrs,
 			'v_ptrs': v_ptrs,
 			'sequence_tensor': sequence_tensor,

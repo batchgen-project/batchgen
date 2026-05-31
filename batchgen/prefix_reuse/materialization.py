@@ -46,11 +46,7 @@ class SingleGroupPrefixMaterialization:
     def wait_for_layer(self, layer_idx: int) -> None:
         if self._loaded or self.load_task is None:
             return
-        wait_for_layer = getattr(self.load_task, "wait_for_layer", None)
-        if wait_for_layer is None:
-            self.wait()
-            return
-        wait_for_layer(int(layer_idx))
+        self.load_task.wait_for_layer(int(layer_idx))
 
     def wait(self) -> None:
         if self._loaded:
@@ -65,12 +61,6 @@ class PrefixMaterializationBundle:
     """Materialized prefix pages keyed by logical prefix-cache group id."""
 
     by_group_id: dict[int, SingleGroupPrefixMaterialization]
-
-    @classmethod
-    def from_single(
-        cls, group_id: int, materialization: SingleGroupPrefixMaterialization
-    ) -> "PrefixMaterializationBundle":
-        return cls(by_group_id={int(group_id): materialization})
 
     def get(self, group_id: int) -> Optional[SingleGroupPrefixMaterialization]:
         return self.by_group_id.get(int(group_id))
@@ -106,12 +96,10 @@ def get_prefix_materialization_for_group(
         return None
     if isinstance(materialization, PrefixMaterializationBundle):
         return materialization.require(group_id, consumer=consumer)
-    if int(group_id) != 0:
-        raise RuntimeError(
-            f"{consumer} requires prefix materialization group {group_id}, "
-            "but received a legacy single-group materialization"
-        )
-    return materialization
+    raise RuntimeError(
+        f"{consumer} requires PrefixMaterializationBundle, "
+        f"got {type(materialization).__name__}"
+    )
 
 
 class _AttachmentLoadTask:
@@ -142,11 +130,7 @@ class _AttachmentLoadTask:
     def wait_for_layer(self, layer_idx: int) -> None:
         if self._done:
             return
-        wait_for_layer = getattr(self._load_task, "wait_for_layer", None)
-        if wait_for_layer is None:
-            self.wait()
-            return
-        wait_for_layer(int(layer_idx))
+        self._load_task.wait_for_layer(int(layer_idx))
 
 
 def materialize_single_group_prefix_pages(

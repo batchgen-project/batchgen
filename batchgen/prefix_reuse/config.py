@@ -67,7 +67,6 @@ def build_prefix_cache_runtime_config(
     model_name: str,
     kv_dtype: str,
     host_kv_cache_size_bytes: int,
-    node_rank: int = 0,
     debug_stats: bool = False,
 ) -> PrefixCacheRuntimeConfig:
     """Derive a Host prefix-cache config from existing Host KV profiles."""
@@ -80,7 +79,6 @@ def build_prefix_cache_runtime_config(
         model_name=model_name,
         kv_dtype=kv_dtype,
         host_kv_pages_per_required_group=required_pages,
-        node_rank=node_rank,
         group_specs=group_specs,
         debug_stats=debug_stats,
     )
@@ -91,7 +89,6 @@ def build_prefix_cache_runtime_config_from_specs(
     model_name: str,
     kv_dtype: str,
     host_kv_pages_per_required_group: int,
-    node_rank: int = 0,
     group_specs: Sequence[PrefixKVGroupSpec],
     debug_stats: bool = False,
 ) -> PrefixCacheRuntimeConfig:
@@ -125,7 +122,7 @@ def build_prefix_cache_runtime_config_from_specs(
     max_attachments = max(1024, max_nodes // 4)
 
     return PrefixCacheRuntimeConfig(
-        shm_name=derive_prefix_cache_shm_name(model_name, node_rank=node_rank),
+        shm_name=derive_prefix_cache_shm_name(model_name),
         namespace_digest=build_prefix_cache_namespace_digest(
             model_name=model_name,
             kv_dtype=kv_dtype,
@@ -155,12 +152,12 @@ def create_host_prefix_cache_coordinator(
     return coordinator
 
 
-def derive_prefix_cache_shm_name(model_name: str, *, node_rank: int) -> str:
+def derive_prefix_cache_shm_name(model_name: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", model_name).strip("_").lower()
     normalized = normalized[:64] or "model"
     digest = hashlib.blake2b(model_name.encode("utf-8"), digest_size=4)
     suffix = int.from_bytes(digest.digest(), "little")
-    return f"batchgen_prefix_cache_{normalized}_{suffix:08x}_node{node_rank}"
+    return f"batchgen_prefix_cache_{normalized}_{suffix:08x}"
 
 
 def build_prefix_cache_namespace_digest(

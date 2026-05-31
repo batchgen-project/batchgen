@@ -40,7 +40,6 @@ from .prefill import (
     effective_prefix_shared_tokens,
     estimate_prefix_cache_for_prefill,
     lookup_prefix_cache_for_prefill,
-    release_prefix_cache_lookup_attachments,
 )
 from .worker_commit import (
     build_sequence_prefix_commit_request,
@@ -80,7 +79,6 @@ __all__ = [
     "effective_prefix_shared_tokens",
     "estimate_prefix_cache_for_prefill",
     "lookup_prefix_cache_for_prefill",
-    "release_prefix_cache_lookup_attachments",
     "build_sequence_prefix_commit_request",
     "retain_newly_committed_prefix_pages",
     "sequence_token_ids_for_prefix_commit",

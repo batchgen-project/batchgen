@@ -25,14 +25,6 @@ class _FakeTask:
         self.waited_layers.append(int(layer_idx))
 
 
-class _LegacyFakeTask:
-    def __init__(self):
-        self.wait_count = 0
-
-    def wait(self):
-        self.wait_count += 1
-
-
 class _FakeHostWorkerView:
     def __init__(self):
         self.task = _FakeTask()
@@ -47,12 +39,6 @@ class _FailingHostWorkerView(_FakeHostWorkerView):
     def async_load_prefix_pages_to_device(self, **kwargs):
         super().async_load_prefix_pages_to_device(**kwargs)
         raise RuntimeError("load failed")
-
-
-class _LegacyFakeHostWorkerView(_FakeHostWorkerView):
-    def __init__(self):
-        super().__init__()
-        self.task = _LegacyFakeTask()
 
 
 class _FakePrefixCoordinator:
@@ -143,24 +129,16 @@ def test_prefix_materialization_bundle_rejects_missing_group():
         bundle.require(2, consumer="test")
 
 
-def test_legacy_single_group_materialization_only_represents_group_zero():
+def test_get_prefix_materialization_rejects_legacy_single_group():
     materialization = SingleGroupPrefixMaterialization(
         manager=object(),
         append_plan=object(),
     )
 
-    assert (
+    with pytest.raises(RuntimeError, match="PrefixMaterializationBundle"):
         get_prefix_materialization_for_group(
             materialization,
             group_id=0,
-            consumer="test",
-        )
-        is materialization
-    )
-    with pytest.raises(RuntimeError, match="legacy single-group"):
-        get_prefix_materialization_for_group(
-            materialization,
-            group_id=1,
             consumer="test",
         )
 
@@ -296,28 +274,6 @@ def test_materialize_single_group_prefix_pages_guards_attachment_load():
     materialization.wait()
     assert host_view.task.wait_count == 1
     assert coordinator.end_calls == [91]
-
-
-def test_materialization_falls_back_to_full_wait_for_legacy_task():
-    gpu_manager = _FakeGpuManager()
-    host_view = _LegacyFakeHostWorkerView()
-
-    materialization = materialize_single_group_prefix_pages(
-        gpu_manager=gpu_manager,
-        host_worker_view=host_view,
-        sequences=[
-            PrefixMaterializationSequence(
-                sequence_id=101,
-                prefix_tokens=4,
-                suffix_tokens=1,
-                host_pages=[11],
-            ),
-        ],
-    )
-
-    materialization.wait_for_layer(0)
-    materialization.wait_for_layer(1)
-    assert host_view.task.wait_count == 1
 
 
 def test_bundle_full_wait_waits_all_groups():
