@@ -122,6 +122,7 @@ def create_batch_input_file(
     random_max_completion_tokens: bool = False,
     min_completion_tokens: Optional[int] = None,
     max_completion_tokens: Optional[int] = None,
+    ignore_eos: bool = False,
 ) -> Optional[List[int]]:
     """Create JSONL file in OpenAI batch format.
 
@@ -154,6 +155,10 @@ def create_batch_input_file(
                 body["max_completion_tokens"] = per_seq_limits[idx]
             else:
                 body["max_tokens"] = max_tokens
+
+            # extra_body: force full-length decode (fixed-output-length BCT benchmark)
+            if ignore_eos:
+                body["ignore_eos"] = True
 
             # Per-request sampling params
             if random_sampling_params:
@@ -320,6 +325,11 @@ if __name__ == "__main__":
         help="Generate random per-request sampling params (temperature, top_p, top_k) for each request",
     )
     parser.add_argument(
+        "--ignore_eos", action="store_true",
+        help="Set ignore_eos=true in each request body (extra_body) so every "
+             "sequence decodes its full output length (fixed-length BCT benchmark).",
+    )
+    parser.add_argument(
         "--random_max_completion_tokens",
         action="store_true",
         help="Generate random per-request max_completion_tokens for each request",
@@ -390,6 +400,7 @@ if __name__ == "__main__":
         random_max_completion_tokens=args.random_max_completion_tokens,
         min_completion_tokens=args.min_completion_tokens,
         max_completion_tokens=args.max_completion_tokens,
+        ignore_eos=args.ignore_eos,
     )
 
     # Run batch workflow
