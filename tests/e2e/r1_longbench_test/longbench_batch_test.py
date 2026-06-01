@@ -376,39 +376,46 @@ if __name__ == "__main__":
     query_df = load_longbench_datasets(longbench_path)
 
     # Extract queries: combine context + question fields
-    queries: List[str] = []
+    all_queries: List[str] = []
     for _, row in query_df.iterrows():
-        prompt = row['context'] + "\n\n" + row['question']
-        queries.append(prompt)
-        if args.max_prompts is not None and len(queries) >= args.max_prompts:
-            break
+        all_queries.append(row['context'] + "\n\n" + row['question'])
 
-    if args.max_prompts is not None:
-        logger.info(f"Using top {args.max_prompts} prompts from dataset")
-    else:
-        logger.info(f"Running whole dataset ({len(queries)} prompts)")
-
-    # Client-side head-truncation to a fixed input length (peak-performance BCT
-    # workloads need exactly ~N input tokens; output length is fixed via --ignore_eos).
     if args.max_input_length is not None:
-        # Use BatchGen's tokenizer registry (GLM-5/Kimi/etc. use custom tokenizers
-        # that AutoTokenizer cannot load); matches what the server tokenizes with.
+        # Peak-performance fixed-input workload: keep only prompts with >= N input
+        # tokens, head-truncate each to EXACTLY N, then cycle the pool to reach
+        # max_prompts. Output length is fixed separately via --ignore_eos. Uses
+        # BatchGen's tokenizer registry (GLM-5/Kimi use custom tokenizers that
+        # AutoTokenizer cannot load); matches what the server tokenizes with.
         from batchgen.config import load_tokenizer
+        N = args.max_input_length
         logger.info(
-            f"Head-truncating {len(queries)} prompts to {args.max_input_length} "
-            f"tokens using BatchGen tokenizer for {hugging_face_checkpoint}"
+            f"Filtering {len(all_queries)} prompts to those >= {N} tokens and "
+            f"truncating to exactly {N} (tokenizer for {hugging_face_checkpoint})"
         )
         tok = load_tokenizer(hugging_face_checkpoint)
-        n_trunc = 0
-        for i, q in enumerate(queries):
+        pool: List[str] = []
+        for q in all_queries:
             ids = tok.encode(q, add_special_tokens=False)
-            if len(ids) > args.max_input_length:
-                queries[i] = tok.decode(ids[:args.max_input_length])
-                n_trunc += 1
+            if len(ids) >= N:
+                pool.append(tok.decode(ids[:N]))
+        if not pool:
+            raise RuntimeError(
+                f"No LongBench prompts have >= {N} tokens; cannot build a uniform "
+                f"{N}-token input workload."
+            )
+        target = args.max_prompts if args.max_prompts is not None else len(pool)
+        queries = [pool[i % len(pool)] for i in range(target)]
         logger.info(
-            f"Truncated {n_trunc}/{len(queries)} prompts to <= "
-            f"{args.max_input_length} input tokens"
+            f"Built {len(queries)} prompts at exactly {N} input tokens from a pool "
+            f"of {len(pool)} long prompts (repeated {target / len(pool):.2f}x)"
         )
+    else:
+        if args.max_prompts is not None:
+            queries = all_queries[:args.max_prompts]
+            logger.info(f"Using top {args.max_prompts} prompts from dataset")
+        else:
+            queries = all_queries
+            logger.info(f"Running whole dataset ({len(queries)} prompts)")
 
     # Create temp file for batch input (will be uploaded to server)
     temp_dir = Path(tempfile.gettempdir())
