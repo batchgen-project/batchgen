@@ -8046,15 +8046,22 @@ class BatchGenWorker:
 			return
 
 		capacity = max(1, batch_size)
-		self._decode_cache_seqlens_i32 = torch.empty(
-			(capacity,), dtype=torch.int32, device=self.torch_device
-		)
-		self._decode_position_ids_i64 = torch.empty(
-			(capacity, 1), dtype=torch.int64, device=self.torch_device
-		)
-		self._decode_cache_seqlens_cpu_staging = torch.empty(
-			(capacity,), dtype=torch.int32, pin_memory=True
-		)
+		# Allocate OUTSIDE inference_mode so these persistent, reused buffers are
+		# normal tensors. Otherwise, when this lazily (re)allocates inside the
+		# decode loop's inference_mode, they become "inference tensors" and the
+		# later configure-time bind (_bind_decode_attention_metadata_for_graph_config,
+		# called from generate() outside inference_mode on each new prefill wave)
+		# fails with "Inplace update to inference tensor outside InferenceMode".
+		with torch.inference_mode(False):
+			self._decode_cache_seqlens_i32 = torch.empty(
+				(capacity,), dtype=torch.int32, device=self.torch_device
+			)
+			self._decode_position_ids_i64 = torch.empty(
+				(capacity, 1), dtype=torch.int64, device=self.torch_device
+			)
+			self._decode_cache_seqlens_cpu_staging = torch.empty(
+				(capacity,), dtype=torch.int32, pin_memory=True
+			)
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
 
