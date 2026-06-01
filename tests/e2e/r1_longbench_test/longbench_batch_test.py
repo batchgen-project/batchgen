@@ -391,13 +391,14 @@ if __name__ == "__main__":
     # Client-side head-truncation to a fixed input length (peak-performance BCT
     # workloads need exactly ~N input tokens; output length is fixed via --ignore_eos).
     if args.max_input_length is not None:
-        from transformers import AutoTokenizer
-        tok_path = args.cache_dir or getattr(args, "hf_cache_dir", None) or hugging_face_checkpoint
+        # Use BatchGen's tokenizer registry (GLM-5/Kimi/etc. use custom tokenizers
+        # that AutoTokenizer cannot load); matches what the server tokenizes with.
+        from batchgen.config import load_tokenizer
         logger.info(
             f"Head-truncating {len(queries)} prompts to {args.max_input_length} "
-            f"tokens using tokenizer from {tok_path}"
+            f"tokens using BatchGen tokenizer for {hugging_face_checkpoint}"
         )
-        tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+        tok = load_tokenizer(hugging_face_checkpoint)
         n_trunc = 0
         for i, q in enumerate(queries):
             ids = tok.encode(q, add_special_tokens=False)
