@@ -67,6 +67,14 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Preserve prior assistant reasoning_content in Kimi-style chat templates",
     )
+    ignore_eos: bool = Field(
+        default=False,
+        description=(
+            "BatchGen extra_body extension (vLLM/SGLang convention; not standard OpenAI): "
+            "if true, ignore EOS tokens and decode to the output-token limit. For "
+            "fixed-length benchmarking."
+        ),
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:
@@ -94,6 +102,14 @@ class CompletionRequest(BaseModel):
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     user: Optional[str] = None
+    ignore_eos: bool = Field(
+        default=False,
+        description=(
+            "BatchGen extra_body extension (vLLM/SGLang convention; not standard OpenAI): "
+            "if true, ignore EOS tokens and decode to the output-token limit. For "
+            "fixed-length benchmarking."
+        ),
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:

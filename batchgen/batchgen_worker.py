@@ -1222,6 +1222,12 @@ class BatchGenWorker:
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
 
+		# ignore_eos (extra_body, applied batch-level): the completion check reads
+		# the global self._ignore_eos, so force it on if any admitted sequence
+		# requested it. For homogeneous benchmark batches every entry sets it.
+		if any(entry.get("ignore_eos", False) for entry in entries):
+			self.set_ignore_eos(True)
+
 		# Step 2: Tokenize new sequences (all ranks, parallel)
 		self._tokenize_admitted_sequences(new_uuids)
 
