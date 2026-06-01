@@ -330,6 +330,11 @@ if __name__ == "__main__":
              "sequence decodes its full output length (fixed-length BCT benchmark).",
     )
     parser.add_argument(
+        "--max_input_length", type=int, default=None,
+        help="Head-truncate each prompt to this many input tokens (client-side, "
+             "via the model tokenizer) for fixed-input BCT workloads (e.g. 8000).",
+    )
+    parser.add_argument(
         "--random_max_completion_tokens",
         action="store_true",
         help="Generate random per-request max_completion_tokens for each request",
@@ -382,6 +387,27 @@ if __name__ == "__main__":
         logger.info(f"Using top {args.max_prompts} prompts from dataset")
     else:
         logger.info(f"Running whole dataset ({len(queries)} prompts)")
+
+    # Client-side head-truncation to a fixed input length (peak-performance BCT
+    # workloads need exactly ~N input tokens; output length is fixed via --ignore_eos).
+    if args.max_input_length is not None:
+        from transformers import AutoTokenizer
+        tok_path = args.cache_dir or getattr(args, "hf_cache_dir", None) or hugging_face_checkpoint
+        logger.info(
+            f"Head-truncating {len(queries)} prompts to {args.max_input_length} "
+            f"tokens using tokenizer from {tok_path}"
+        )
+        tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
+        n_trunc = 0
+        for i, q in enumerate(queries):
+            ids = tok.encode(q, add_special_tokens=False)
+            if len(ids) > args.max_input_length:
+                queries[i] = tok.decode(ids[:args.max_input_length])
+                n_trunc += 1
+        logger.info(
+            f"Truncated {n_trunc}/{len(queries)} prompts to <= "
+            f"{args.max_input_length} input tokens"
+        )
 
     # Create temp file for batch input (will be uploaded to server)
     temp_dir = Path(tempfile.gettempdir())
