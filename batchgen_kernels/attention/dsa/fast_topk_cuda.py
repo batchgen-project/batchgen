@@ -16,8 +16,7 @@ void fast_topk_2048_out(
     torch::Tensor score,
     torch::Tensor lengths,
     torch::Tensor indices,
-    torch::Tensor num_valid_tokens,
-    bool has_valid_tokens);
+    c10::optional<torch::Tensor> num_valid_tokens);
 """
 
 
@@ -245,28 +244,37 @@ void fast_topk_2048_out(
     torch::Tensor score,
     torch::Tensor lengths,
     torch::Tensor indices,
-    torch::Tensor num_valid_tokens,
-    bool has_valid_tokens) {
+    c10::optional<torch::Tensor> num_valid_tokens) {
   TORCH_CHECK(score.is_cuda(), "score must be CUDA");
   TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA");
   TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
   TORCH_CHECK(score.dtype() == torch::kFloat32, "score must be float32");
   TORCH_CHECK(lengths.dtype() == torch::kInt32, "lengths must be int32");
   TORCH_CHECK(indices.dtype() == torch::kInt32, "indices must be int32");
-  TORCH_CHECK(num_valid_tokens.dtype() == torch::kInt32, "num_valid_tokens must be int32");
   TORCH_CHECK(score.dim() == 2 && score.is_contiguous(), "score must be contiguous [B, N]");
   TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous(), "lengths must be contiguous [B]");
   TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous(), "indices must be contiguous [B, 2048]");
-  TORCH_CHECK(num_valid_tokens.numel() == 1, "num_valid_tokens must contain one element");
   TORCH_CHECK(score.size(0) == lengths.size(0), "score and lengths batch mismatch");
   TORCH_CHECK(indices.size(0) == score.size(0) && indices.size(1) == TopK, "indices shape must be [B, 2048]");
+
+  // num_valid_tokens is optional: it bounds the live rows for CUDA-graph
+  // bucketed replay (padded batch). It is validated and used ONLY when present;
+  // the eager path passes no value (no padding -> all rows valid).
+  const int32_t* num_valid_ptr = nullptr;
+  const bool has_valid_tokens = num_valid_tokens.has_value() && num_valid_tokens->defined();
+  if (has_valid_tokens) {
+    TORCH_CHECK(num_valid_tokens->is_cuda(), "num_valid_tokens must be CUDA");
+    TORCH_CHECK(num_valid_tokens->dtype() == torch::kInt32, "num_valid_tokens must be int32");
+    TORCH_CHECK(num_valid_tokens->numel() == 1, "num_valid_tokens must contain one element");
+    num_valid_ptr = num_valid_tokens->data_ptr<int32_t>();
+  }
 
   c10::cuda::CUDAGuard device_guard(score.device());
   FastTopKParams params{
       score.data_ptr<float>(),
       indices.data_ptr<int32_t>(),
       lengths.data_ptr<int32_t>(),
-      num_valid_tokens.data_ptr<int32_t>(),
+      num_valid_ptr,
       score.stride(0),
       has_valid_tokens,
   };
@@ -330,8 +338,7 @@ def fast_topk_2048_out(
         score.contiguous(),
         lengths.contiguous(),
         indices,
-        num_valid_tokens.contiguous() if num_valid_tokens is not None else lengths,
-        num_valid_tokens is not None,
+        num_valid_tokens.contiguous() if num_valid_tokens is not None else None,
     )
     return indices
 
