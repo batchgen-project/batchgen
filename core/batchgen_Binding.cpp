@@ -294,6 +294,23 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             "tables. This loads all physical layers; destination pointer "
             "tensors are indexed by physical layer id even for mapped worker "
             "views.")
+        .def(
+            "async_offload_paged_kv_to_host",
+            [](WorkerView& self, torch::Tensor gpu_page_ptrs,
+               torch::Tensor host_page_ptrs, std::size_t page_bytes) {
+                return self.AsyncOffloadPagedKVToHost(
+                    std::move(gpu_page_ptrs), std::move(host_page_ptrs),
+                    page_bytes);
+            },
+            py::arg("gpu_page_ptrs"), py::arg("host_page_ptrs"),
+            py::arg("page_bytes"),
+            "Whole-page device->host offload. gpu_page_ptrs/host_page_ptrs are "
+            "equal-length int64 CPU tensors of raw per-page addresses (GPU "
+            "_k_cache pages as sources, host pages as destinations); copies "
+            "page_bytes raw bytes/page via the direction-agnostic page-copy "
+            "kernel on the d2h stream. The caller decides page selection, so "
+            "this is a verbatim byte copy with no re-quantize (used for the "
+            "GLM-5 DSA FP8 page-split indexer aux cache).")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(

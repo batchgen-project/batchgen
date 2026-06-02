@@ -720,6 +720,18 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "boundaries"
             )
 
+    # TODO(fp8-indexer): the decode flush now offloads the GPU aux _k_cache
+    # whole-page DtoH (no CPU re-quantize) via async_offload_paged_kv_to_host.
+    # Prefill is intentionally NOT converted: during prefill the GPU aux
+    # _k_cache is not populated with the prompt's indexer K (gpu_paged_kv_manager_aux
+    # is not bound on the worker here, see the comment below) and GPU aux pages
+    # for the full prompt context are not allocated (the GPU cache holds only the
+    # decode working set; host holds full context). Converting would require first
+    # writing the prompt indexer K to GPU then copying back, which needs GPU aux
+    # pages for the entire prompt and defeats the host-offload design. Prefill
+    # also runs ONCE per prompt (not the 78-layers-per-step decode hot path), so
+    # it is left on the CPU-quantize write_host_indexer_fp8_pages path. See
+    # OPEN QUESTIONS.
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
         """Offload indexer KV cache per-sequence to auxiliary host memory.
 

@@ -2131,53 +2131,73 @@ class BatchGenWorker:
 		sequence_lengths,
 		assert_rows,
 	) -> None:
-		"""Write deferred DSA indexer aux entries as FP8 page-split host bytes.
+		"""Offload DSA indexer aux pages GPU->host as whole-page FP8 byte copies.
 
-		entries_aux rows are batch-row-ordered matching sequence_ids /
-		sequence_lengths (write_pos per row). Each k_tensor is [B(,1,1),128] bf16
-		indexer K. Quantize per-token and scatter into the host SHM pages in the
-		uint8/132 page-split (SoA) layout deep_gemm / the GPU decode write use, so
-		the host->GPU reload stays a verbatim per-page byte copy. Synchronous CPU
-		write (no C++ async task), so nothing is added to the pending-task list.
+		The GPU aux ``_k_cache`` is ALREADY the exact page-split FP8 byte image
+		(written in place by ``_write_indexer_k_fp8_paged`` / ``split_write_fp8``
+		during the decode score forward), byte-identical to the host aux page
+		layout (both uint8, ``page_size*132`` bytes/page). So offload is a verbatim
+		device->host page copy — no ``.to("cpu")``, no CPU re-quantize, no per-token
+		ctypes scatter. We collect, per (layer, flushed sequence), the single GPU
+		page and host page containing ``write_pos`` (page = write_pos // page_size,
+		mirroring how the host->GPU reload selects pages), then issue ONE async
+		whole-page DtoH copy through ``async_offload_paged_kv_to_host``.
 
-		R2: ONE D2H per flush. Gather every (layer, row) indexer-K vector into a
-		SINGLE [total, 128] GPU tensor, do a SINGLE .to("cpu"), then a SINGLE
-		vectorized quantize on CPU; the per-token page-split scatter is a pure CPU
-		write into the host SHM pages. The prior async batched aux path
-		(async_append_decode_kv_to_host_batched_kernel) likewise batched the D2H
-		across all entries/layers in one task — this matches that granularity.
+		``entries_aux`` is now used only for its (layer_idx) ordering and row-count
+		assertion; the BF16 K it carries is no longer read (the GPU FP8 cache is the
+		source of truth).
 		"""
-		from batchgen.attention.dsa.indexer_fp8 import (
-			quantize_indexer_k,
-			write_host_indexer_fp8_token_prequant,
-		)
+		from batchgen.attention.dsa.indexer_fp8 import HEAD_DIM, SF_BYTES
+
+		gpu_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+		if gpu_aux is None:
+			gpu_aux = getattr(AttnWrapperBase, "gpu_paged_kv_manager_aux", None)
+		if gpu_aux is None:
+			raise RuntimeError(
+				"DSA aux GPU->host offload requires gpu_paged_kv_manager_aux "
+				"(source of the FP8 page-split bytes)"
+			)
 
 		page_size = self._dsa_aux_page_size()
-		# Gather all (layer, row) K rows + their destinations (no D2H yet).
-		gpu_rows = []
-		dests = []  # (layer_idx, global_idx, write_pos)
+		page_bytes = page_size * (HEAD_DIM + SF_BYTES)  # page_size * 132
+
+		# Gather per-page (gpu_src_ptr, host_dst_ptr) for the page holding write_pos
+		# of each (layer, flushed sequence). No D2H / no math beyond page indexing.
+		gpu_page_ptrs: List[int] = []
+		host_page_ptrs: List[int] = []
 		for layer_idx, k_tensor, _v in entries_aux:
 			if k_tensor.dim() == 3:
 				k_tensor = k_tensor.unsqueeze(2)
 			assert_rows("aux", layer_idx, k_tensor)
-			k_rows = k_tensor.reshape(k_tensor.shape[0], -1)
-			for row, (global_idx, write_pos) in enumerate(
-				zip(sequence_ids, sequence_lengths)
-			):
-				gpu_rows.append(k_rows[row])
-				dests.append((layer_idx, int(global_idx), int(write_pos)))
-		if not gpu_rows:
+			for global_idx, write_pos in zip(sequence_ids, sequence_lengths):
+				global_idx = int(global_idx)
+				write_pos = int(write_pos)
+				page = write_pos // page_size
+				gpu_k_ptrs, _ = gpu_aux.get_sequence_layer_page_pointers(
+					global_idx, layer_idx
+				)
+				host_k_ptrs, _ = aux_view.get_sequence_layer_page_pointers(
+					global_idx, layer_idx, write_pos + 1
+				)
+				if len(gpu_k_ptrs) <= page or len(host_k_ptrs) <= page:
+					raise RuntimeError(
+						f"DSA aux offload: seq {global_idx} layer {layer_idx} "
+						f"write_pos {write_pos} needs page {page} but have "
+						f"gpu_pages={len(gpu_k_ptrs)} host_pages={len(host_k_ptrs)}"
+					)
+				gpu_page_ptrs.append(int(gpu_k_ptrs[page]))
+				host_page_ptrs.append(int(host_k_ptrs[page]))
+		if not gpu_page_ptrs:
 			return
-		# SINGLE D2H for the whole flush, then SINGLE vectorized quantize on CPU.
-		k_cpu = torch.stack(gpu_rows, dim=0).detach().to(
-			"cpu", dtype=torch.bfloat16
-		)  # [total, 128]
-		k_fp8, k_scale = quantize_indexer_k(k_cpu)  # [total,128] e4m3, [total] fp32
-		for i, (layer_idx, global_idx, write_pos) in enumerate(dests):
-			write_host_indexer_fp8_token_prequant(
-				aux_view, layer_idx, global_idx, k_fp8[i], k_scale[i],
-				write_pos, page_size=page_size,
-			)
+		gpu_ptr_t = torch.tensor(gpu_page_ptrs, dtype=torch.int64, device="cpu")
+		host_ptr_t = torch.tensor(host_page_ptrs, dtype=torch.int64, device="cpu")
+		task = aux_view.async_offload_paged_kv_to_host(
+			gpu_page_ptrs=gpu_ptr_t,
+			host_page_ptrs=host_ptr_t,
+			page_bytes=page_bytes,
+		)
+		if task is not None:
+			self._pending_kv_append_tasks.append(task)
 
 	def _ensure_host_kv_append_capacity(
 		self,

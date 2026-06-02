@@ -797,6 +797,95 @@ class HostPagedKVWorkerView : private LayerMapper {
         });
     }
 
+    // Whole-page device->host offload mirror of AsyncLoadLayerPagedKVToDevice.
+    //
+    // The reload path builds a per-page (host_src -> device_dst) plan and copies
+    // page_bytes raw bytes/page with the direction-agnostic UvaPageCopyKernel.
+    // This is the reverse: the caller supplies explicit, already-paired per-page
+    // pointer arrays (GPU _k_cache page ptrs as sources, host KPageAddress page
+    // ptrs as destinations) and we copy page_bytes raw bytes/page device->host on
+    // the dedicated d2h stream. Used for the GLM-5 DSA FP8 indexer aux cache,
+    // whose GPU _k_cache is already the exact page-split FP8 byte image (written
+    // by split_write_fp8); offload is therefore a verbatim byte copy with no
+    // re-quantize. The pointer-array uploads are HtoD (the arrays live on host)
+    // regardless of the page-copy direction, matching the batched-append path.
+    //
+    // gpu_page_ptrs / host_page_ptrs: equal-length 1-D int64 CPU tensors of raw
+    // page addresses (uintptr_t). Page selection (which GPU page maps to which
+    // host page, e.g. only the page containing the decode write_pos) is done by
+    // the Python caller, so this method stays a thin verbatim byte mover.
+    KVAsyncTask AsyncOffloadPagedKVToHost(torch::Tensor gpu_page_ptrs,
+                                          torch::Tensor host_page_ptrs,
+                                          std::size_t page_bytes) {
+        EnsureDeviceReady();
+        constexpr std::string_view kOpName = "AsyncOffloadPagedKVToHost";
+
+        auto gpu_ptrs = ValidateCpuTensor1D(std::move(gpu_page_ptrs),
+                                            torch::kInt64, "gpu_page_ptrs",
+                                            kOpName);
+        auto host_ptrs = ValidateCpuTensor1D(std::move(host_page_ptrs),
+                                             torch::kInt64, "host_page_ptrs",
+                                             kOpName);
+        const auto num_pages = static_cast<std::size_t>(gpu_ptrs.size(0));
+        if (host_ptrs.size(0) != gpu_ptrs.size(0)) {
+            std::ostringstream oss;
+            oss << kOpName << ": gpu_page_ptrs (" << gpu_ptrs.size(0)
+                << ") and host_page_ptrs (" << host_ptrs.size(0)
+                << ") must have equal length";
+            throw std::invalid_argument(oss.str());
+        }
+        if (num_pages == 0 || page_bytes == 0) {
+            return LaunchAsyncTask([] {});
+        }
+        const auto kernel_limit =
+            static_cast<std::size_t>(std::numeric_limits<int>::max());
+        if (num_pages > kernel_limit) {
+            std::ostringstream oss;
+            oss << kOpName << ": num_pages=" << num_pages
+                << " exceeds kernel limit=" << kernel_limit;
+            throw std::invalid_argument(oss.str());
+        }
+
+        // Materialize host-resident src(GPU)/dst(host) pointer arrays. The plan
+        // is fully decided by the caller; no per-token offset math here.
+        std::vector<uint8_t*> src_host(num_pages);
+        std::vector<uint8_t*> dst_host(num_pages);
+        const std::int64_t* gpu_raw = gpu_ptrs.data_ptr<std::int64_t>();
+        const std::int64_t* host_raw = host_ptrs.data_ptr<std::int64_t>();
+        for (std::size_t i = 0; i < num_pages; ++i) {
+            if (gpu_raw[i] == 0 || host_raw[i] == 0) {
+                std::ostringstream oss;
+                oss << kOpName << ": null page pointer at index " << i;
+                throw std::runtime_error(oss.str());
+            }
+            src_host[i] = reinterpret_cast<uint8_t*>(
+                static_cast<std::uintptr_t>(gpu_raw[i]));
+            dst_host[i] = reinterpret_cast<uint8_t*>(
+                static_cast<std::uintptr_t>(host_raw[i]));
+        }
+
+        return LaunchAsyncTask([this, src_host = std::move(src_host),
+                                dst_host = std::move(dst_host), num_pages,
+                                page_bytes]() mutable {
+            c10::cuda::OptionalCUDAGuard device_guard(device_index_);
+            const auto cuda_stream = CopyStream(CopyDirection::kDeviceToHost);
+
+            worker_detail::DeviceBuffer<uint8_t*> src_buf(num_pages);
+            worker_detail::DeviceBuffer<uint8_t*> dst_buf(num_pages);
+            const std::size_t ptr_bytes = num_pages * sizeof(uint8_t*);
+            EnqueueCopy(reinterpret_cast<const std::byte*>(src_host.data()),
+                        reinterpret_cast<std::byte*>(src_buf.get()), ptr_bytes,
+                        CopyDirection::kHostToDevice, cuda_stream);
+            EnqueueCopy(reinterpret_cast<const std::byte*>(dst_host.data()),
+                        reinterpret_cast<std::byte*>(dst_buf.get()), ptr_bytes,
+                        CopyDirection::kHostToDevice, cuda_stream);
+            worker_detail::LaunchUvaPageCopyKernel(
+                src_buf.get(), dst_buf.get(), page_bytes,
+                static_cast<int>(num_pages), cuda_stream);
+            this->SynchronizeWithEvent(cuda_stream);
+        });
+    }
+
     std::byte* DataBase() { return backend_.DataBase(); }
     const std::byte* DataBase() const { return backend_.DataBase(); }
 
