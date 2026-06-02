@@ -11,7 +11,11 @@ from torch import nn
 class _RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.register_buffer(
+            "weight",
+            torch.ones(hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -19,7 +23,24 @@ class _RMSNorm(nn.Module):
         x = x.float()
         variance = x.square().mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
-        return (x * self.weight).to(dtype)
+        return (x * self.weight.float()).to(dtype)
+
+
+def _runtime_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    name: str,
+) -> torch.Tensor:
+    if weight is None:
+        raise RuntimeError(
+            f"DeepSeek-V4 compressor {name} weight is not loaded."
+        )
+    from batchgen.models.deepseek.deepseekv4_flash.model import (
+        _linear_from_weight,
+    )
+
+    return _linear_from_weight(x, weight, scale)
 
 
 class DeepSeekV4Compressor(nn.Module):
@@ -31,6 +52,8 @@ class DeepSeekV4Compressor(nn.Module):
         compress_ratio: int,
         eps: float,
         overlap: bool = False,
+        rotate: bool = False,
+        init_weights: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -38,35 +61,45 @@ class DeepSeekV4Compressor(nn.Module):
         self.rope_head_dim = rope_head_dim
         self.compress_ratio = compress_ratio
         self.overlap = overlap
+        self.rotate = rotate
         self.coeff = 2 if overlap else 1
-        self.ape = nn.Parameter(
+        self.register_buffer(
+            "ape",
             torch.empty(
                 compress_ratio, self.coeff * head_dim, dtype=torch.float32
-            )
+            ),
+            persistent=False,
         )
-        self.wkv = nn.Linear(hidden_size, self.coeff * head_dim, bias=False)
-        self.wgate = nn.Linear(hidden_size, self.coeff * head_dim, bias=False)
+        self.register_buffer(
+            "wkv_weight",
+            torch.empty(
+                self.coeff * head_dim, hidden_size, dtype=torch.float32
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "wgate_weight",
+            torch.empty(
+                self.coeff * head_dim, hidden_size, dtype=torch.float32
+            ),
+            persistent=False,
+        )
+        self.register_buffer("wkv_scale", None, persistent=False)
+        self.register_buffer("wgate_scale", None, persistent=False)
         self.norm = _RMSNorm(head_dim, eps)
-        self.reset_parameters()
+        if init_weights:
+            self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.ape, std=0.02)
-        nn.init.xavier_uniform_(self.wkv.weight)
-        nn.init.xavier_uniform_(self.wgate.weight)
+        nn.init.xavier_uniform_(self.wkv_weight)
+        nn.init.xavier_uniform_(self.wgate_weight)
 
     def _reshape_projected(self, x: torch.Tensor) -> torch.Tensor:
         return x.view(x.shape[0], self.coeff, self.head_dim)
 
     def _chunk_positions(self, positions: torch.Tensor) -> torch.Tensor:
-        chunk_positions = positions.view(-1, self.compress_ratio)[:, -1]
-        return (
-            torch.div(
-                chunk_positions,
-                self.compress_ratio,
-                rounding_mode="floor",
-            )
-            * self.compress_ratio
-        )
+        return positions.view(-1, self.compress_ratio)[:, 0].to(torch.int64)
 
     def _compress_chunks(
         self,
@@ -86,10 +119,22 @@ class DeepSeekV4Compressor(nn.Module):
         ape = ape.float().reshape(
             self.compress_ratio * self.coeff, self.head_dim
         )
-        weights = F.softmax(gate, dim=1)
-        pooled = ((kv + ape.unsqueeze(0)) * weights).sum(dim=1)
+        score = gate + ape.unsqueeze(0)
+        weights = F.softmax(score, dim=1)
+        pooled = (kv * weights).sum(dim=1)
         pooled = self.norm(pooled)
-        return self._apply_rope(pooled, positions, cos_sin_cache)
+        pooled = self._apply_rope(pooled, positions, cos_sin_cache)
+        return self._maybe_rotate(pooled)
+
+    def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.rotate or x.numel() == 0:
+            return x
+        from batchgen_kernels.attention.dsa.fused_indexer_score import (
+            get_hadamard_matrix,
+        )
+
+        H = get_hadamard_matrix(x.shape[-1], x.device, torch.float32)
+        return (x.float() @ H).to(x.dtype)
 
     def _apply_rope(
         self,
@@ -128,13 +173,21 @@ class DeepSeekV4Compressor(nn.Module):
         tokens = num_chunks * self.compress_ratio
         hidden_states = hidden_states[:tokens]
         positions = positions[:tokens]
-        kv = self._reshape_projected(self.wkv(hidden_states)).view(
+        kv = self._reshape_projected(
+            _runtime_linear(
+                hidden_states, self.wkv_weight, self.wkv_scale, "wkv"
+            )
+        ).view(
             num_chunks,
             self.compress_ratio,
             self.coeff,
             self.head_dim,
         )
-        gate = self._reshape_projected(self.wgate(hidden_states)).view(
+        gate = self._reshape_projected(
+            _runtime_linear(
+                hidden_states, self.wgate_weight, self.wgate_scale, "wgate"
+            )
+        ).view(
             num_chunks,
             self.compress_ratio,
             self.coeff,
@@ -157,24 +210,20 @@ class DeepSeekV4Compressor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         outputs = []
         for hidden_state, position in zip(hidden_states, positions):
-            kv = self.wkv(hidden_state.unsqueeze(0)).squeeze(0)
-            gate = self.wgate(hidden_state.unsqueeze(0)).squeeze(0)
+            hidden = hidden_state.unsqueeze(0)
+            kv = _runtime_linear(
+                hidden, self.wkv_weight, self.wkv_scale, "wkv"
+            ).squeeze(0)
+            gate = _runtime_linear(
+                hidden, self.wgate_weight, self.wgate_scale, "wgate"
+            ).squeeze(0)
             slot = int(position.item()) % self.compress_ratio
             kv_state[slot].copy_(kv)
-            score_state[slot].copy_(gate)
+            if self.overlap:
+                score_state[slot].copy_(gate)
+            else:
+                score_state[slot].copy_(gate + self.ape[slot])
             if slot == self.compress_ratio - 1:
-                chunk_kv = kv_state.view(
-                    1,
-                    self.compress_ratio,
-                    self.coeff,
-                    self.head_dim,
-                )
-                chunk_gate = score_state.view(
-                    1,
-                    self.compress_ratio,
-                    self.coeff,
-                    self.head_dim,
-                )
                 chunk_pos = (
                     torch.div(
                         position.view(1),
@@ -183,16 +232,60 @@ class DeepSeekV4Compressor(nn.Module):
                     )
                     * self.compress_ratio
                 )
-                outputs.append(
-                    self._compress_chunks(
-                        chunk_kv,
-                        chunk_gate,
-                        chunk_pos,
-                        cos_sin_cache,
+                if self.overlap:
+                    chunk_kv = kv_state.view(
+                        1,
+                        self.compress_ratio,
+                        self.coeff,
+                        self.head_dim,
                     )
-                )
+                    chunk_gate = score_state.view(
+                        1,
+                        self.compress_ratio,
+                        self.coeff,
+                        self.head_dim,
+                    )
+                    outputs.append(
+                        self._compress_chunks(
+                            chunk_kv,
+                            chunk_gate,
+                            chunk_pos,
+                            cos_sin_cache,
+                        )
+                    )
+                else:
+                    pooled = (
+                        kv_state.float()
+                        * torch.softmax(score_state.float(), dim=0)
+                    ).sum(dim=0, keepdim=True)
+                    pooled = self.norm(pooled)
+                    pooled = self._apply_rope(pooled, chunk_pos, cos_sin_cache)
+                    outputs.append(self._maybe_rotate(pooled))
         if outputs:
             output = torch.cat(outputs, dim=0)
         else:
             output = hidden_states.new_empty(0, self.head_dim)
         return output, kv_state, score_state
+
+    def seed_decode_state(
+        self,
+        hidden_states: torch.Tensor,
+        kv_state: torch.Tensor,
+        score_state: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for hidden_state, position in zip(hidden_states, positions):
+            hidden = hidden_state.unsqueeze(0)
+            kv = _runtime_linear(
+                hidden, self.wkv_weight, self.wkv_scale, "wkv"
+            ).squeeze(0)
+            gate = _runtime_linear(
+                hidden, self.wgate_weight, self.wgate_scale, "wgate"
+            ).squeeze(0)
+            slot = int(position.item()) % self.compress_ratio
+            kv_state[slot].copy_(kv)
+            if self.overlap:
+                score_state[slot].copy_(gate)
+            else:
+                score_state[slot].copy_(gate + self.ape[slot])
+        return kv_state, score_state
