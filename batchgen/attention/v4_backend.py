@@ -210,17 +210,20 @@ class DeepseekV4AttnBackend:
                 "c4 sparse path requires head_gates: pass kwargs['head_gates']"
             )
 
+        q_attn = kwargs.pop("q_attn", q)
+        current_kv = kwargs.pop("current_kv", kv)
+
         top_k_indices = self._fused_indexer(
             q=q,
             cached_k=kv,
             head_gates=head_gates,
-            cache_seqlens=meta.seq_lens_casual,
+            cache_seqlens=meta.c4_topk_lengths_clamp1,
             topk=meta.c4_sparse_topk,
         )
 
         return self._flashmla(
-            q=q,
-            kv=kv,
+            q=q_attn,
+            kv=current_kv,
             attn_sink=attn_sink,
             metadata=meta,
             layer_idx=layer_config.layer_idx,
