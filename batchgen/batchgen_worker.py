@@ -2378,12 +2378,12 @@ class BatchGenWorker:
 		gpu_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
 		if gpu_aux is None:
 			gpu_aux = getattr(AttnWrapperBase, "gpu_paged_kv_manager_aux", None)
-		if gpu_aux is None:
-			raise RuntimeError(
-				"DSA aux host write requires gpu_paged_kv_manager_aux to resolve "
-				"the page-split page size"
-			)
-		return int(gpu_aux.config.page_size_tokens)
+		if gpu_aux is not None:
+			return int(gpu_aux.config.page_size_tokens)
+		# Fallback when the aux manager isn't bound yet: the indexer profile is the
+		# canonical page-size source (host == GPU == profile == 64).
+		from batchgen.kv_cache.host_kv_mananger_config import _GLM5_INDEXER_PROFILE
+		return int(_GLM5_INDEXER_PROFILE.page_size)
 
 	def _append_decode_kv_to_host_aux_async(
 		self,

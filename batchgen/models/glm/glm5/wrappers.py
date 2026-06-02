@@ -749,13 +749,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         # are asserted equal in DualHostKVCoordinator) and the GPU aux cache the
         # decode path writes; the GPU aux manager config is the canonical source
         # (the base MLA host worker view does not bind page_size_tokens).
+        # gpu_paged_kv_manager_aux is the preferred source but is not bound on the
+        # worker during prefill, so fall back to the indexer profile constant
+        # (host aux/GPU aux/profile page sizes are all the canonical 64).
         gpu_aux = AttnWrapperBase.gpu_paged_kv_manager_aux
-        if gpu_aux is None:
-            raise RuntimeError(
-                "GLM-5 DSA indexer offload requires gpu_paged_kv_manager_aux to "
-                "resolve the page-split page size"
-            )
-        page_size = int(gpu_aux.config.page_size_tokens)
+        if gpu_aux is not None:
+            page_size = int(gpu_aux.config.page_size_tokens)
+        else:
+            from batchgen.kv_cache.host_kv_mananger_config import _GLM5_INDEXER_PROFILE
+            page_size = int(_GLM5_INDEXER_PROFILE.page_size)
 
         # The host write below copies offload_kv to CPU (torch .to("cpu")), which
         # is a synchronizing D2H, so the FA3 prefill kernel that produced
