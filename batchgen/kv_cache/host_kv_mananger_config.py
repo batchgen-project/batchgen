@@ -26,7 +26,7 @@ def _dtype_size_bytes(dtype: str) -> int:
 		return 2
 	if normalized == "float32":
 		return 4
-	if normalized in {"float8_e4m3fn", "float8_e5m2"}:
+	if normalized in {"float8_e4m3fn", "float8_e5m2", "uint8"}:
 		return 1
 	raise ValueError(f"Unsupported kv dtype '{dtype}'")
 
@@ -38,6 +38,7 @@ def _torch_dtype_from_string(dtype: str) -> torch.dtype:
 		"bfloat16": torch.bfloat16,
 		"float8_e4m3fn": torch.float8_e4m3fn,
 		"float8_e5m2": torch.float8_e5m2,
+		"uint8": torch.uint8,
 	}
 	key = dtype.strip().lower()
 	if key not in mapping:
@@ -135,14 +136,29 @@ _GLM5_MLA_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
-# GLM-5 DSA: indexer cache (78 layers, MQA single-head K, head_dim=128)
+# GLM-5 DSA: indexer cache (78 layers, MQA single-head K, logical head_dim=128).
+#
+# FP8 page-split (deep_gemm) layout, SINGLE layout end-to-end (host AND GPU). Each
+# token slot is 132 uint8: 128 e4m3 K bytes + 4 fp32 scale bytes (one fp32
+# scale/token, block_size==head_dim). Per-page byte total = page_size*132, laid out
+# page-split / SoA (NOT token-contiguous): [page_size*128 K | page_size*4 scale].
+# _k_cache (host SHM and GPU) is sized [num_layers, num_pages, page_size, 1, 132]
+# uint8 so KPageBytes == GPU page bytes == page_size*132, and the host->GPU reload
+# (async_load_layer_paged_kv_to_device) is a verbatim per-page byte copy with no
+# conversion on the decode hot path. Quantization + page-split packing happen ONCE,
+# at prefill offload / decode host-append (see wrappers.py:_offload_prepacked_indexer_kv
+# and batchgen/attention/dsa/indexer_fp8.py:split_write_fp8).
+#
+# NOTE: k_head_dim here is the PHYSICAL byte stride per token (132), not the logical
+# indexer head_dim (128). num_k_heads=1, kv_dtype=uint8 so bytes_per_page() ==
+# page_size*132 == the deep_gemm page-split page size.
 _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	num_layers=78,
 	num_k_heads=1,
-	k_head_dim=128,
+	k_head_dim=132,  # 128 e4m3 K bytes + 4 fp32 scale bytes (page-split, SoA)
 	num_v_heads=0,
 	v_head_dim=0,
-	kv_dtype="bfloat16",
+	kv_dtype="uint8",
 )
 
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
@@ -373,7 +389,17 @@ def build_gpu_kv_config_aux(
 	profile = _resolve_indexer_profile(model_name)
 	if profile is None:
 		return None
+	# GLM-5 DSA: _GLM5_INDEXER_PROFILE is now the unified FP8 page-split layout
+	# (uint8/132) for BOTH host and GPU, so host->GPU reload is a verbatim page-byte
+	# copy and deep_gemm fp8_paged_mqa_logits scores the GPU pages in place. No
+	# GPU-specific override needed (the prior _GLM5_INDEXER_GPU_PROFILE split was the
+	# fp8-indexer offload/reload incoherence bug; collapsed here).
 	num_pages = _compute_gpu_page_capacity(sequence_tokens, profile.page_size)
+	# R3a: reserve one extra page as scratch (page num_pages-1) so the GLM-5 DSA
+	# FP8 indexer graph write can redirect invalid/padded decode rows (slot == -1)
+	# there without corrupting a live sequence page. Grow the pool by 1 so the
+	# usable capacity is unchanged, then exclude the last page from allocation.
+	num_pages += 1
 	return GPUPagedKVConfig(
 		num_layers=profile.num_layers,
 		num_pages=num_pages,
@@ -383,6 +409,7 @@ def build_gpu_kv_config_aux(
 		num_v_heads=profile.num_v_heads,
 		v_head_dim=profile.v_head_dim,
 		kv_dtype=_torch_dtype_from_string(profile.kv_dtype),
+		reserve_last_page_as_scratch=True,
 	)
 
 

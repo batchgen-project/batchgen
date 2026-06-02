@@ -2073,20 +2073,14 @@ class BatchGenWorker:
 					self._pending_kv_append_tasks.append(task)
 
 			if entries_aux and aux_view is not None and sequence_ids is not None:
-				_prepared_aux = []
-				for layer_idx, k_tensor, v_tensor in entries_aux:
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
-					_prepared_aux.append((layer_idx, k_tensor, None))
-					self._pending_kv_append_tensors.append(k_tensor)
-				task = aux_view.async_append_decode_kv_to_host_batched_kernel(
-					entries=_prepared_aux,
-					sequence_ids=sequence_ids,
-					sequence_lengths=sequence_lengths,
+				# FP8 page-split: write the indexer K aux entries straight into
+				# the host SHM pages (uint8/132 SoA), same layout as the GPU decode
+				# write / deep_gemm. This is a synchronous CPU write, not a C++
+				# async task, so it bypasses the UVA-batched BF16 AoS append.
+				self._flush_deferred_aux_kv_fp8(
+					entries_aux, aux_view, sequence_ids, sequence_lengths,
+					_assert_deferred_kv_rows,
 				)
-				if task is not None:
-					self._pending_kv_append_tasks.append(task)
 		else:
 			if entries and worker_view is not None and sequence_ids is not None:
 				for layer_idx, k_tensor, v_tensor in entries:
@@ -2113,22 +2107,11 @@ class BatchGenWorker:
 						self._pending_kv_append_tasks.append(task)
 
 			if entries_aux and aux_view is not None and sequence_ids is not None:
-				for layer_idx, k_tensor, v_tensor in entries_aux:
-					if k_tensor.dim() == 3:
-						k_tensor = k_tensor.unsqueeze(2)
-					_assert_deferred_kv_rows("aux", layer_idx, k_tensor)
-
-					task = aux_view.async_append_decode_kv_to_host(
-						layer_idx=layer_idx,
-						sequence_ids=sequence_ids,
-						k_tensor=k_tensor,
-						v_tensor=None,
-						sequence_lengths=sequence_lengths,
-					)
-
-					self._pending_kv_append_tensors.append(k_tensor)
-					if task is not None:
-						self._pending_kv_append_tasks.append(task)
+				# FP8 page-split host write (see UVA branch above for rationale).
+				self._flush_deferred_aux_kv_fp8(
+					entries_aux, aux_view, sequence_ids, sequence_lengths,
+					_assert_deferred_kv_rows,
+				)
 
 		# Throttle: prevent thread exhaustion from std::async
 		if len(self._pending_kv_append_tasks) >= 256:
@@ -2139,6 +2122,62 @@ class BatchGenWorker:
 		self._deferred_kv_batch = None
 		self._deferred_kv_worker_view = None
 		self._deferred_kv_worker_view_aux = None
+
+	def _flush_deferred_aux_kv_fp8(
+		self,
+		entries_aux,
+		aux_view,
+		sequence_ids,
+		sequence_lengths,
+		assert_rows,
+	) -> None:
+		"""Write deferred DSA indexer aux entries as FP8 page-split host bytes.
+
+		entries_aux rows are batch-row-ordered matching sequence_ids /
+		sequence_lengths (write_pos per row). Each k_tensor is [B(,1,1),128] bf16
+		indexer K. Quantize per-token and scatter into the host SHM pages in the
+		uint8/132 page-split (SoA) layout deep_gemm / the GPU decode write use, so
+		the host->GPU reload stays a verbatim per-page byte copy. Synchronous CPU
+		write (no C++ async task), so nothing is added to the pending-task list.
+
+		R2: ONE D2H per flush. Gather every (layer, row) indexer-K vector into a
+		SINGLE [total, 128] GPU tensor, do a SINGLE .to("cpu"), then a SINGLE
+		vectorized quantize on CPU; the per-token page-split scatter is a pure CPU
+		write into the host SHM pages. The prior async batched aux path
+		(async_append_decode_kv_to_host_batched_kernel) likewise batched the D2H
+		across all entries/layers in one task — this matches that granularity.
+		"""
+		from batchgen.attention.dsa.indexer_fp8 import (
+			quantize_indexer_k,
+			write_host_indexer_fp8_token_prequant,
+		)
+
+		page_size = self._dsa_aux_page_size()
+		# Gather all (layer, row) K rows + their destinations (no D2H yet).
+		gpu_rows = []
+		dests = []  # (layer_idx, global_idx, write_pos)
+		for layer_idx, k_tensor, _v in entries_aux:
+			if k_tensor.dim() == 3:
+				k_tensor = k_tensor.unsqueeze(2)
+			assert_rows("aux", layer_idx, k_tensor)
+			k_rows = k_tensor.reshape(k_tensor.shape[0], -1)
+			for row, (global_idx, write_pos) in enumerate(
+				zip(sequence_ids, sequence_lengths)
+			):
+				gpu_rows.append(k_rows[row])
+				dests.append((layer_idx, int(global_idx), int(write_pos)))
+		if not gpu_rows:
+			return
+		# SINGLE D2H for the whole flush, then SINGLE vectorized quantize on CPU.
+		k_cpu = torch.stack(gpu_rows, dim=0).detach().to(
+			"cpu", dtype=torch.bfloat16
+		)  # [total, 128]
+		k_fp8, k_scale = quantize_indexer_k(k_cpu)  # [total,128] e4m3, [total] fp32
+		for i, (layer_idx, global_idx, write_pos) in enumerate(dests):
+			write_host_indexer_fp8_token_prequant(
+				aux_view, layer_idx, global_idx, k_fp8[i], k_scale[i],
+				write_pos, page_size=page_size,
+			)
 
 	def _ensure_host_kv_append_capacity(
 		self,
@@ -2329,6 +2368,23 @@ class BatchGenWorker:
 		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
 			self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
 
+	def _dsa_aux_page_size(self) -> int:
+		"""Page size for the DSA indexer aux cache (host == GPU == profile page_size).
+
+		Sourced from the GPU aux manager config; the host primary/aux page sizes
+		are asserted equal in DualHostKVCoordinator so this is the single page
+		size used by the FP8 page-split host write helpers.
+		"""
+		gpu_aux = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+		if gpu_aux is None:
+			gpu_aux = getattr(AttnWrapperBase, "gpu_paged_kv_manager_aux", None)
+		if gpu_aux is None:
+			raise RuntimeError(
+				"DSA aux host write requires gpu_paged_kv_manager_aux to resolve "
+				"the page-split page size"
+			)
+		return int(gpu_aux.config.page_size_tokens)
+
 	def _append_decode_kv_to_host_aux_async(
 		self,
 		layer_idx: int,
@@ -2345,37 +2401,36 @@ class BatchGenWorker:
 		if aux_view is None or not batch:
 			return
 
-		sequence_ids = []
-		sequence_lengths = []
+		# FP8 page-split (Option C): the host aux cache is uint8/132 page-split,
+		# the SAME layout the GPU decode write (_write_indexer_k_fp8_paged) and
+		# deep_gemm use. Quantize the new token's indexer K and scatter the
+		# page-split bytes straight into the host SHM page, instead of the old C++
+		# async_append_decode_kv_to_host (BF16 AoS, incoherent with FP8 page-split).
+		#
+		# R2: ONE D2H for the whole layer's batch — copy all B rows to CPU in a
+		# single .to("cpu"), quantize the [B,128] block once (vectorized), then do
+		# the pure-CPU page-split scatter per row (no per-row D2H/sync).
+		from batchgen.attention.dsa.indexer_fp8 import (
+			quantize_indexer_k,
+			write_host_indexer_fp8_token_prequant,
+		)
+
+		# k_tensor: [B, 1(, 1), 128] bf16 indexer K, batch-row order == `batch`.
+		k_rows = k_tensor.reshape(k_tensor.shape[0], -1)
+		page_size = self._dsa_aux_page_size()
+		write_targets = []  # (global_idx, write_pos) per batch row
 		for local_idx in batch:
 			uuid = self._local_to_uuid_map[local_idx]
 			seq = self.global_batch.get_sequence(uuid)
-			sequence_ids.append(seq.global_idx)
-			write_pos = seq.current_context_length - 1
-			sequence_lengths.append(write_pos)
-
-		if k_tensor.dim() == 3:
-			k_tensor = k_tensor.unsqueeze(2)
-
-		# Launch async D2H — no CPU-side sync needed (same as primary path).
-		task = aux_view.async_append_decode_kv_to_host(
-			layer_idx=layer_idx,
-			sequence_ids=sequence_ids,
-			k_tensor=k_tensor,
-			v_tensor=None,
-			sequence_lengths=sequence_lengths,
-		)
-
-		if not hasattr(self, '_pending_kv_append_tensors'):
-			self._pending_kv_append_tensors = []
-		self._pending_kv_append_tensors.append(k_tensor)
-
-		if task is not None:
-			self._pending_kv_append_tasks.append(task)
-
-		MAX_PENDING_KV_TASKS = 256
-		if len(self._pending_kv_append_tasks) >= MAX_PENDING_KV_TASKS:
-			self._wait_pending_kv_append_tasks()
+			write_targets.append((seq.global_idx, seq.current_context_length - 1))
+		# SINGLE D2H + SINGLE vectorized quantize for the whole batch.
+		k_cpu = k_rows.detach().to("cpu", dtype=torch.bfloat16)  # [B, 128]
+		k_fp8, k_scale = quantize_indexer_k(k_cpu)
+		for row, (global_idx, write_pos) in enumerate(write_targets):
+			write_host_indexer_fp8_token_prequant(
+				aux_view, layer_idx, global_idx, k_fp8[row], k_scale[row],
+				write_pos, page_size=page_size,
+			)
 
 	def _initialize_core_components(self, num_queries: int) -> None:
 		"""
@@ -3492,6 +3547,21 @@ class BatchGenWorker:
 		worker_view = self.core_engine.host_paged_kv_worker_view
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 
+		# R1 (scope guard): the GLM-5 DSA indexer aux cache is now uint8/132
+		# FP8 page-split. C++ ReadSequenceKVToCPU / WriteSequenceKVFromCPU infer the
+		# dtype from element_size and treat uint8 (element_size==1) as float32, so the
+		# read/recv/write byte sizes no longer match KPageBytes — a cross-node migration
+		# would silently corrupt the aux cache. We do NOT fix the C++ here; refuse the
+		# migration loudly instead. (Decode offload/reload and prefill offload ARE
+		# byte-coherent — only cross-node sequence migration is affected.)
+		if aux_view is not None:
+			raise RuntimeError(
+				"FP8 indexer aux cache cross-node migration not supported; needs C++ "
+				"ReadSequenceKVToCPU fix (uint8/132 page-split read as float32). "
+				f"Refused migration of seq {uuid[:8]}... from rank {from_rank} to "
+				f"rank {to_rank}. See OPEN QUESTIONS (R1)."
+			)
+
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
 			# No GPU staging needed — uses C++ ReadSequenceKVToCPU (memcpy from shared memory)
@@ -3577,6 +3647,13 @@ class BatchGenWorker:
 			)
 
 			# Mirror aux KV: recv aux K and write into aux host pages.
+			# TODO(fp8-indexer): the GLM-5 DSA aux cache is now uint8/132
+			# page-split. C++ ReadSequenceKVToCPU infers dtype as float32 for
+			# element_size==1 (uint8) and sizes the buffer by k_dim floats, so
+			# the read/recv/write byte sizes no longer match KPageBytes. Cross-node
+			# migration of the FP8 aux cache is therefore NOT byte-coherent until
+			# ReadSequenceKVToCPU/WriteSequenceKVFromCPU handle uint8 (1-byte)
+			# element size. See OPEN QUESTIONS. (Decode offload/reload IS coherent.)
 			if aux_view is not None:
 				k_recv_aux = aux_view.read_sequence_kv_to_cpu(global_idx)[0]
 				dist.recv(tensor=k_recv_aux, src=from_rank, group=gloo_group)
@@ -8544,6 +8621,19 @@ class BatchGenWorker:
 		)
 		num_valid_tokens = torch.empty((1,), dtype=torch.int32, device=self.torch_device)
 		num_valid_tokens.fill_(local_bsz)
+		# deep_gemm paged-MQA schedule metadata for the FP8 indexer score. Computed
+		# ONCE per decode step (shared across all 78 layers) from the real
+		# cache_seqlens, OUTSIDE the captured graph. The manager.replay() copies it
+		# into the persistent static buffer, so the captured pointer stays stable.
+		# get_paged_mqa_logits_metadata allocates a fresh tensor each call.
+		from batchgen.attention.dsa.indexer_fp8 import make_schedule_metadata
+		aux_page_size = int(aux_manager.config.page_size_tokens)
+		schedule_seqlens = (
+			cache_seqlens_i32
+			if local_bsz > 0
+			else torch.ones((1,), dtype=torch.int32, device=self.torch_device)
+		)
+		schedule_metadata = make_schedule_metadata(schedule_seqlens, aux_page_size)
 		return {
 			"cache_seqlens": cache_seqlens_i32,
 			"position_ids": position_ids_i64,
@@ -8552,6 +8642,7 @@ class BatchGenWorker:
 			"num_valid_tokens": num_valid_tokens,
 			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
 			"flashmla_num_splits": num_splits,
+			"schedule_metadata": schedule_metadata,
 		}
 
 	def _log_glm5_graph_path_for_forward(
@@ -8644,6 +8735,7 @@ class BatchGenWorker:
 		*,
 		bucket: int,
 		num_heads: int,
+		aux_page_size: int = 64,
 	):
 		from batchgen.attention.dsa.sparse_decode_mla import (
 			prepare_sparse_flash_mla_decode_tensor_metadata,
@@ -8659,6 +8751,13 @@ class BatchGenWorker:
 			selected_lengths,
 			int(num_heads),
 		)
+		# Capture-time deep_gemm schedule metadata (real shape, dummy contents). The
+		# per-step replay recomputes-into the static buffer outside the graph.
+		from batchgen.attention.dsa.indexer_fp8 import make_schedule_metadata
+		schedule_metadata = make_schedule_metadata(
+			torch.ones((max(bucket, 1),), dtype=torch.int32, device=self.torch_device),
+			int(aux_page_size),
+		)
 		return {
 			"input_ids": torch.empty((0, 1), dtype=torch.int64, device=self.torch_device),
 			"cache_seqlens": torch.empty((0,), dtype=torch.int32, device=self.torch_device),
@@ -8669,6 +8768,7 @@ class BatchGenWorker:
 			"num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=self.torch_device),
 			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
 			"flashmla_num_splits": num_splits,
+			"schedule_metadata": schedule_metadata,
 		}
 
 	def _setup_cuda_graphs(self, gpu_manager):
@@ -9001,6 +9101,7 @@ class BatchGenWorker:
 						**self._make_glm5_whole_model_capture_inputs(
 							bucket=capture_bucket,
 							num_heads=num_heads,
+							aux_page_size=aux_page_size,
 						)
 					)
 					manager.warmup_and_capture_buckets([capture_bucket])
@@ -10013,6 +10114,7 @@ class BatchGenWorker:
 							num_valid_tokens=graph_inputs["num_valid_tokens"],
 							flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
 							flashmla_num_splits=graph_inputs["flashmla_num_splits"],
+							schedule_metadata=graph_inputs["schedule_metadata"],
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)

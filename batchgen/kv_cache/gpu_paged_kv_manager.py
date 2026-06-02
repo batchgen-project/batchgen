@@ -126,6 +126,12 @@ class GPUPagedKVConfig:
 	cuda_graph_max_pages_per_sequence: Optional[int] = None
 	cuda_graph_max_slots: Optional[int] = None
 	logical_to_physical_layer: Optional[Sequence[int]] = None
+	# When True, the LAST physical page (index num_pages-1) is excluded from the
+	# allocatable free-page pool and reserved as scratch. The GLM-5 DSA FP8 indexer
+	# graph write (cuda_graph_segments._write_indexer_k_fp8_paged_graph) redirects
+	# invalid/padded decode rows (slot == -1) to this page so they never corrupt a
+	# live sequence page. See R3a.
+	reserve_last_page_as_scratch: bool = False
 
 	@classmethod
 	def from_device_config(
@@ -233,11 +239,16 @@ def _normalize_gpu_layer_mapping(
 class _TensorStack:
 	"""A lightweight stack backed by a tensor for deterministic page allocation."""
 
-	def __init__(self, capacity: int):
+	def __init__(self, capacity: int, num_initial: Optional[int] = None):
+		# ``num_initial`` (defaults to ``capacity``) is how many of the lowest page
+		# indices [0, num_initial) are seeded as free. Pages [num_initial, capacity)
+		# stay reserved (never handed out) — used to reserve a scratch page. Buffer
+		# capacity stays ``capacity`` so reserved pages can still be pushed back.
 		self._buffer = torch.empty(capacity, dtype=torch.int32)
 		self._size = 0
-		if capacity > 0:
-			self.push(torch.arange(capacity - 1, -1, -1, dtype=torch.int32))
+		count = capacity if num_initial is None else int(num_initial)
+		if count > 0:
+			self.push(torch.arange(count - 1, -1, -1, dtype=torch.int32))
 
 	@property
 	def size(self) -> int:
@@ -1619,7 +1630,16 @@ class GPUPagedKVCacheManager:
 		self._active_page_indices = None
 		self._k_active_page_ptr_table = None
 		self._v_active_page_ptr_table = None
-		self._free_pages = _TensorStack(self.config.num_pages)
+		# R3a: when reserve_last_page_as_scratch is set (GLM-5 DSA FP8 aux cache),
+		# exclude page num_pages-1 from the allocatable pool so the graph aux write
+		# can redirect invalid (slot==-1) decode rows there without corrupting a
+		# live page. Seed only pages [0, num_pages-1) as free.
+		num_initial = (
+			self.config.num_pages - 1
+			if getattr(self.config, "reserve_last_page_as_scratch", False)
+			else None
+		)
+		self._free_pages = _TensorStack(self.config.num_pages, num_initial=num_initial)
 		self._sequences: Dict[int, _SequenceState] = {}
 		max_pages_per_seq = self._resolve_page_table_max_pages_per_sequence()
 		max_slots = self._resolve_page_table_max_slots()

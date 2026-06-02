@@ -37,6 +37,58 @@ from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 from batchgen.timing import get_decode_timer
 
 
+def _write_indexer_k_fp8_paged(
+    gpu_paged_kv_manager_aux,
+    layer_idx: int,
+    k_normed_bf16: torch.Tensor,
+    new_token_pos: torch.Tensor,
+    aux_slot_indices: torch.Tensor,
+) -> None:
+    """Quantize indexer K to FP8 and scatter it into the page-split aux cache.
+
+    Bypasses ``update_layer_decode_new_token`` (which writes an INTERLEAVED bf16
+    layout) and instead writes the page-split FP8 layout deep_gemm expects:
+    per page ``[page_size*128 e4m3 K | page_size*4 fp32 scale]``.
+
+    Physical-slot mapping reproduces ``update_layer_decode_new_token`` /
+    ``run_paged_kv_token_update_fused``: for batch row i,
+        slot = aux_slot_indices[i]              (row of the page table)
+        pos  = new_token_pos[i]                 (position of the new token)
+        physical_page = page_table[slot, pos // page_size]
+        offset        = pos %  page_size
+        loc           = physical_page * page_size + offset
+    ``loc`` is the absolute PHYSICAL token slot consumed by ``split_write_fp8``.
+
+    k_normed_bf16 : [B, 128] bf16, post k_norm + RoPE + Hadamard.
+    """
+    from batchgen.attention.dsa.indexer_fp8 import quantize_indexer_k, split_write_fp8
+
+    physical_layer = gpu_paged_kv_manager_aux.resolve_physical_layer(layer_idx)
+    k_cache = gpu_paged_kv_manager_aux._k_cache  # [L, num_pages, page_size, 1, 132] uint8
+    page_size = int(gpu_paged_kv_manager_aux.config.page_size_tokens)
+    head_dim = k_normed_bf16.shape[-1]
+    page_table = gpu_paged_kv_manager_aux._gpu_page_table_manager.gpu_table
+    if page_table is None:
+        raise RuntimeError(
+            "GLM-5 DSA FP8 aux write: GPU page table is not initialized; "
+            "call allocate_pages_for_sequences before scoring"
+        )
+
+    num_pages = k_cache.shape[1]
+    page_bytes = page_size * (head_dim + 4)  # head_dim e4m3 + 4 fp32 scale bytes
+    buf_u8 = k_cache[physical_layer].view(num_pages, page_bytes)
+
+    slots = aux_slot_indices.to(device=page_table.device, dtype=torch.int64)
+    pos = new_token_pos.to(device=page_table.device, dtype=torch.int64)
+    page_col = pos // page_size
+    offset = pos % page_size
+    physical_page = page_table[slots, page_col].to(torch.int64)
+    loc = (physical_page * page_size + offset).to(torch.int32)
+
+    k_fp8, k_scale = quantize_indexer_k(k_normed_bf16.to(buf_u8.device))
+    split_write_fp8(buf_u8, loc, k_fp8, k_scale, page_size=page_size, head_dim=head_dim)
+
+
 def _slot_indices_override(
     attr_name: str,
     batch_size: int,
@@ -227,21 +279,20 @@ def build_glm5_dsa_graph_segment_inputs(
             wrapper._indexer_cuda_module,
         )
         k_normed = indexer.k_norm(k_raw)
-        indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
+        # Post k_norm + RoPE + Hadamard indexer K. Keep [B,128] for FP8 quant and
+        # [B,1,1,128] for host callbacks / downstream consumers.
+        indexer_k_bf16 = indexer._fused_rope_hadamard_or_fallback(
             k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
-        ).unsqueeze(2)
-        seq_lengths_i32_aux = (
-            seq_lengths_i32
-            if aux_device == manager_device
-            else new_token_pos.to(dtype=torch.int32, device=aux_device)
-        )
+        ).squeeze(1)  # [B, 128]
+        indexer_k_tensor = indexer_k_bf16.view(bsz, 1, 1, indexer_k_bf16.shape[-1])
         if write_kv:
-            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-                k_tensor=indexer_k_tensor,
-                v_tensor=None,
-                sequence_lengths=seq_lengths_i32_aux,
-                layer_idx=li,
-                slot_indices=aux_slot_indices,
+            # FP8 page-split write (bypass interleaved update_layer_decode_new_token).
+            _write_indexer_k_fp8_paged(
+                gpu_paged_kv_manager_aux,
+                li,
+                indexer_k_bf16,
+                new_token_pos,
+                aux_slot_indices,
             )
 
 
@@ -414,26 +465,24 @@ def build_glm5_dsa_flashmla_inputs(
                 wrapper._indexer_cuda_module,
             )
             k_normed = indexer.k_norm(k_raw)
-            indexer_kv = indexer._fused_rope_hadamard_or_fallback(
+            # Post k_norm + RoPE + Hadamard indexer K, [B, 128] bf16.
+            indexer_k_bf16 = indexer._fused_rope_hadamard_or_fallback(
                 k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
-            ).unsqueeze(2)
+            ).squeeze(1)
         else:
             raise RuntimeError(
                 f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP2 "
                 "fused indexer KV projection; PyTorch fallback is disabled"
             )
-        indexer_k_tensor = indexer_kv
-        seq_lengths_i32_aux = (
-            seq_lengths_i32
-            if aux_device == manager_device
-            else new_token_pos.to(dtype=torch.int32, device=aux_device)
-        )
-        gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-            k_tensor=indexer_k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32_aux,
-            layer_idx=li,
-            slot_indices=aux_slot_indices,
+        # indexer_k_tensor kept as [B,1,1,128] bf16 for host callbacks below; the
+        # GPU aux cache is now FP8 page-split, written via _write_indexer_k_fp8_paged.
+        indexer_k_tensor = indexer_k_bf16.view(bsz, 1, 1, indexer_k_bf16.shape[-1])
+        _write_indexer_k_fp8_paged(
+            gpu_paged_kv_manager_aux,
+            li,
+            indexer_k_bf16,
+            new_token_pos,
+            aux_slot_indices,
         )
         if AttnWrapperBase.kv_append_callback_aux is not None:
             AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)

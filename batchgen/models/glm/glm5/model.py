@@ -648,52 +648,81 @@ class Glm5Indexer(nn.Module):
         batch_size = block_table.shape[0]
         if max_seqlen is None:
             raise RuntimeError("GLM-5 DSA paged scoring requires explicit max_seqlen")
-        num_k_heads = indexer_blocked_k.shape[2]
-        k_head_dim = indexer_blocked_k.shape[3]
 
-        from batchgen_kernels.attention.dsa import fused_dense_paged_gather
-
-        # Gather dense logical range [0, max_seqlen) without building token indices.
-        gathered = fused_dense_paged_gather(
-            indexer_blocked_k,
-            block_table,
-            max_seqlen,
-            page_size,
-        ).view(batch_size, max_seqlen, num_k_heads, k_head_dim)
-
-        gathered_k = gathered.squeeze(2)
-
-        # WP4: Fused scoring pipeline (CUDA WGMMA wq_b + RoPE + Hadamard + scoring + topk)
-        if hasattr(self, '_fused_score_weights') and self._fused_score_weights is not None:
-            from batchgen_kernels.attention.dsa.fused_indexer_score import fused_score_pipeline
-            # Get RoPE cos/sin tables
-            seq_len = max_seqlen if max_seqlen is not None else int(positions.max()) + 1
-            cos, sin = self.rotary_emb(
-                gathered_k[:1, :1, :self.rope_head_dim],  # dummy for dtype/device
-                seq_len,
-            )
-            top_k_indices, _ = fused_score_pipeline(
-                q_a=q_a.squeeze(1),                      # [B, q_lora_rank]
-                hidden_states=hidden_states.squeeze(1),   # [B, hidden_size]
-                cached_k=gathered_k,                      # [B, max_seqlen, 128]
-                cache_seqlens=cache_seqlens.int(),
-                wq_b_weights=self._fused_score_weights,
-                weights_proj_weight=self.weights_proj.weight.data,  # [32, 6144]
-                cos_table=cos.to(torch.bfloat16),
-                sin_table=sin.to(torch.bfloat16),
-                positions=positions,
-                module=self._fused_score_module,
-                n_heads=self.index_n_heads,
-                head_dim=self.index_head_dim,
-                rope_dim=self.rope_head_dim,
-                topk=min(self.index_topk, max_seqlen),
-            )
-            return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
-        else:
+        # FP8 page-split + deep_gemm scoring (no gather, no BF16 K-score).
+        # indexer_blocked_k is the uint8 aux cache [num_pages, page_size, 1, 132].
+        # We keep ONLY the WP4 q-build half (wq_b GEMM + RoPE + Hadamard) and the
+        # top-k; logits come from deep_gemm fp8_paged_mqa_logits (relu-gated).
+        if not (hasattr(self, '_fused_score_weights') and self._fused_score_weights is not None):
             raise RuntimeError(
                 f"[layer {self.layer_idx}] GLM-5 DSA selector requires WP4 fused "
                 "indexer scoring; PyTorch fallback is disabled"
             )
+
+        from batchgen_kernels.attention.dsa.fused_indexer_score import (
+            cuda_wq_b_proj,
+            rope_hadamard_q,
+            compute_head_gates,
+        )
+        from batchgen_kernels.attention.dsa.fast_topk_cuda import fast_topk_2048_out
+        from batchgen.attention.dsa.indexer_fp8 import (
+            make_schedule_metadata,
+            score_paged_fp8,
+        )
+
+        # --- WP4 q-build half (kept): wq_b WGMMA + RoPE + Hadamard -> q [B,32,128] ---
+        q_flat = cuda_wq_b_proj(
+            q_a.squeeze(1), self._fused_score_weights, self._fused_score_module,
+        )  # [B, n_heads*head_dim]
+        q = q_flat.view(batch_size, self.index_n_heads, self.index_head_dim)
+        # rotary_emb sizes cos/sin tables by max_seqlen; the input only supplies
+        # dtype/device (matches the BF16 score_and_select path).
+        cos, sin = self.rotary_emb(
+            q.view(-1, 1, self.rope_head_dim), max_seqlen,
+        )
+        q = rope_hadamard_q(
+            q, cos.to(torch.bfloat16), sin.to(torch.bfloat16),
+            positions, self.rope_head_dim,
+        )  # [B, 32, 128] bf16
+
+        # head_gates already folds n_heads^-0.5 * softmax_scale (== head_dim^-0.5).
+        head_gates = compute_head_gates(
+            hidden_states.squeeze(1),
+            self.weights_proj.weight.data,
+            self.index_n_heads,
+            self.index_head_dim,
+        )
+
+        cache_seqlens_i32 = cache_seqlens.int()
+        # NOTE (eager only): schedule_metadata is recomputed per call. It depends
+        # solely on cache_seqlens + page_size and is shared across all 78 layers, so
+        # a per-step hoist would save work; left per-call here because the eager path
+        # is not graph-captured (no pointer-stability constraint). The graph path
+        # uses a persistent static buffer (see cuda_graph_segments).
+        schedule_metadata = make_schedule_metadata(cache_seqlens_i32, page_size)
+        logits = score_paged_fp8(
+            q, indexer_blocked_k, block_table, head_gates,
+            cache_seqlens_i32, schedule_metadata, max_seqlen, page_size,
+        )  # [B, max_seqlen] fp32, relu-gated, -inf past cache_seqlens
+
+        effective_topk = min(self.index_topk, max_seqlen)
+        # Production top-k expects an explicit num_valid_tokens (no-arg fast_topk_2048
+        # only handles B==1); mirror fused_paged_score_and_topk_with_slots_out.
+        num_valid_tokens = torch.tensor(
+            [batch_size], dtype=torch.int32, device=logits.device,
+        )
+        if effective_topk == self.index_topk == 2048:
+            top_k_indices = torch.empty(
+                batch_size, 2048, dtype=torch.int32, device=logits.device,
+            )
+            fast_topk_2048_out(
+                logits, cache_seqlens_i32, top_k_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+        else:
+            # Short / non-2048 top-k: fall back to torch.topk on the deep_gemm logits.
+            _, top_k_indices = torch.topk(logits, effective_topk, dim=-1)
+        return clamp_token_indices_to_seqlens(top_k_indices, cache_seqlens)
 
 
 # ============================================================================

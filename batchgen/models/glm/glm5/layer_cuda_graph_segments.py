@@ -101,6 +101,7 @@ class Glm5DecoderLayerGraphSegment:
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
             "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
             "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
+            "schedule_metadata": self.dsa_segment.schedule_metadata_spec(bucket_size),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -163,6 +164,7 @@ class Glm5DecoderLayerGraphSegment:
         rank_token_counts: torch.Tensor,
         flashmla_tile_scheduler_metadata: torch.Tensor,
         flashmla_num_splits: torch.Tensor,
+        schedule_metadata: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
 
@@ -177,6 +179,7 @@ class Glm5DecoderLayerGraphSegment:
             num_valid_tokens=num_valid_tokens,
             flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
             flashmla_num_splits=flashmla_num_splits,
+            schedule_metadata=schedule_metadata,
         )
         hidden_states, residual = cuda_add_rmsnorm(
             residual,

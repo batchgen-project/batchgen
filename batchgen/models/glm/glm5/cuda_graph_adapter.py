@@ -291,6 +291,15 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
         tile_scheduler_metadata, num_splits = prepare_sparse_flash_mla_decode_tensor_metadata(
             selected_lengths, int(num_heads),
         )
+        from batchgen.attention.dsa.indexer_fp8 import make_schedule_metadata
+        aux_manager = getattr(self._ctx.gpu_kv_manager, "auxiliary", None)
+        aux_page_size = int(
+            getattr(getattr(aux_manager, "config", None), "page_size_tokens", 64)
+        )
+        schedule_metadata = make_schedule_metadata(
+            torch.ones((max(int(bucket), 1),), dtype=torch.int32, device=device),
+            aux_page_size,
+        )
         return {
             "input_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
             "cache_seqlens": torch.empty((0,), dtype=torch.int32, device=device),
@@ -303,6 +312,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=device),
             "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
             "flashmla_num_splits": num_splits,
+            "schedule_metadata": schedule_metadata,
         }
 
     # ---- Step-time ------------------------------------------------------
@@ -452,6 +462,28 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
                 "(next-token tensor for this step)"
             )
 
+        # deep_gemm schedule metadata for FP8 indexer scoring — computed once per
+        # step from real cache_seqlens, OUTSIDE the graph; replay() copies it into
+        # the persistent static buffer (pointer-stable across replays).
+        # R3b: shape is [num_sms+1, 2] int32, INDEPENDENT of batch size (depends only
+        # on deep_gemm.get_num_sms()), so it always exactly matches the static buffer
+        # and replay() does a full copy_ (no partial-copy/pad path). It is built from
+        # the real local_bsz cache_seqlens while the captured kernel runs over the
+        # bucket-padded safe_cache_seqlens; this is consistent because padded rows
+        # have safe_cache_seqlens==0 (zero KV segments), so the SM work-partition the
+        # metadata encodes is identical whether batch_size==local_bsz or ==bucket,
+        # and padded-row logits (never scheduled / -inf via clean_logits) are dropped
+        # by the num_valid_tokens-gated top-k. Row order matches (same cache_seqlens
+        # order as safe_cache_seqlens and the safe_aux_slot_indices block-table remap).
+        from batchgen.attention.dsa.indexer_fp8 import make_schedule_metadata
+        aux_page_size = int(aux_manager.config.page_size_tokens)
+        schedule_seqlens = (
+            cache_seqlens_i32
+            if local_bsz > 0
+            else torch.ones((1,), dtype=torch.int32, device=device)
+        )
+        schedule_metadata = make_schedule_metadata(schedule_seqlens, aux_page_size)
+
         return {
             "input_ids": input_ids[:local_bsz],
             "cache_seqlens": cache_seqlens_i32,
@@ -462,6 +494,7 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "num_valid_tokens": num_valid_tokens,
             "flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
             "flashmla_num_splits": num_splits,
+            "schedule_metadata": schedule_metadata,
         }
 
     def stage_post_graph_kv(

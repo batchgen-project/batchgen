@@ -53,6 +53,58 @@ from batchgen_kernels.attention.dsa.query_pack import pack_flashmla_query_out
 from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
 
 
+def _write_indexer_k_fp8_paged_graph(
+    aux_blocked_k_u8: torch.Tensor,
+    aux_page_table: torch.Tensor,
+    kv_aux_slot_indices: torch.Tensor,
+    token_indices: torch.Tensor,
+    indexer_k_bf16: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Graph-safe FP8 page-split write of indexer K into the uint8 aux cache.
+
+    aux_blocked_k_u8 : [num_pages, page_size, 1, 132] uint8 (page-split layout).
+    kv_aux_slot_indices : [B] int32, == -1 for padding/invalid rows (the graph
+        forward fills these via torch.where(valid_mask, slot, -1)).
+    token_indices : [B] int32 new-token positions.
+
+    Physical slot mapping (mirrors run_paged_kv_token_update_fused):
+        page = aux_page_table[slot, pos // page_size]; offset = pos % page_size;
+        loc  = page * page_size + offset.
+
+    Static-shape index scatter (no boolean masking) so it is CUDA-graph capturable.
+
+    R3a (resolved): invalid rows (slot == -1) are redirected to the LAST physical
+    page (index num_pages-1). That page is now a RESERVED scratch page: the aux GPU
+    config is built with reserve_last_page_as_scratch=True (host_kv_mananger_config
+    .build_gpu_kv_config_aux grows num_pages by 1) and GPUPagedKVCacheManager
+    excludes page num_pages-1 from its allocatable free-page pool, so it is never
+    present in any sequence's page table and these writes are harmless. The non-graph
+    eager path never produces -1 slots (it scores/writes only valid batch rows).
+    """
+    from batchgen.attention.dsa.indexer_fp8 import quantize_indexer_k, split_write_fp8
+
+    num_pages = aux_blocked_k_u8.shape[0]
+    head_dim = indexer_k_bf16.shape[-1]
+    page_bytes = page_size * (head_dim + 4)
+    buf_u8 = aux_blocked_k_u8.view(num_pages, page_bytes)
+
+    slots = kv_aux_slot_indices.to(torch.int64)
+    pos = token_indices.to(torch.int64)
+    page_col = pos // page_size
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    physical_page = aux_page_table[safe_slots, page_col].to(torch.int64)
+    offset = pos % page_size
+    loc = physical_page * page_size + offset
+    # Redirect invalid rows to the reserved scratch slot (last flat token slot).
+    scratch_loc = torch.full_like(loc, num_pages * page_size - 1)
+    loc = torch.where(valid, loc, scratch_loc).to(torch.int32)
+
+    k_fp8, k_scale = quantize_indexer_k(indexer_k_bf16)
+    split_write_fp8(buf_u8, loc, k_fp8, k_scale, page_size=page_size, head_dim=head_dim)
+
+
 @dataclass
 class _Glm5DsaSegmentBuffers:
     q_x_fp8: torch.Tensor
@@ -104,6 +156,7 @@ class _Glm5FullDsaSegmentBuffers:
     head_gates: torch.Tensor
     positions_expanded: torch.Tensor
     agg_scores: torch.Tensor
+    aux_block_table_reordered: torch.Tensor
     top_k_indices: torch.Tensor
     selected_mla_kv: torch.Tensor
     selected_lengths: torch.Tensor
@@ -128,6 +181,13 @@ class Glm5DsaAttnSegment:
     ``index_topk`` selected-token buffer, while ``selected_lengths`` carries the
     runtime valid length into FlashMLA. This keeps short, boundary, mixed, and
     long decode rows on the same graph-safe path.
+
+    NOTE: This legacy per-layer DSA segment is NOT instantiated anywhere; the live
+    production graph path is ``Glm5FullDsaAttnSegment`` (whole-model graph). It was
+    left on the BF16 fused_paged_score path and the BF16 aux layout. With the FP8
+    page-split aux cache it would mis-score (uint8 aux read as bf16).
+    TODO(fp8-indexer): port to score_paged_fp8 + split_write_fp8 if this segment is
+    ever reactivated, mirroring Glm5FullDsaAttnSegment.
     """
 
     def __init__(
@@ -631,6 +691,25 @@ class Glm5FullDsaAttnSegment:
         self._flashmla_metadata_specs[bucket_size] = spec
         return spec
 
+    def schedule_metadata_spec(self, bucket_size: int) -> TensorSpec:
+        """TensorSpec for the deep_gemm paged-MQA schedule metadata static input.
+
+        The metadata tensor shape is GPU-dependent (a function of num_sms, not the
+        batch), so we probe it once via make_schedule_metadata with a dummy
+        cache_seqlens. It is recomputed-into this static buffer each decode step
+        OUTSIDE the captured region (pointer-stable across replays).
+        """
+        cached = getattr(self, "_schedule_metadata_spec_cache", None)
+        if cached is not None:
+            return cached
+        from batchgen.attention.dsa.indexer_fp8 import make_schedule_metadata
+
+        dummy = torch.ones(bucket_size, dtype=torch.int32, device=self.aux_blocked_k.device)
+        meta = make_schedule_metadata(dummy, self.aux_page_size)
+        spec = TensorSpec(tuple(meta.shape), meta.dtype)
+        self._schedule_metadata_spec_cache = spec
+        return spec
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         tile_shape, tile_dtype, num_splits_shape, num_splits_dtype = (
             self._flashmla_tensor_metadata_specs(bucket_size)
@@ -655,6 +734,7 @@ class Glm5FullDsaAttnSegment:
             "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
             "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
             "flashmla_num_splits": TensorSpec(num_splits_shape, num_splits_dtype),
+            "schedule_metadata": self.schedule_metadata_spec(bucket_size),
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
@@ -784,6 +864,12 @@ class Glm5FullDsaAttnSegment:
             head_gates=torch.empty(bucket_size, indexer.index_n_heads, dtype=torch.float32, device=device),
             positions_expanded=torch.empty(bucket_size, indexer.index_n_heads, dtype=torch.int64, device=device),
             agg_scores=torch.empty(bucket_size, self.max_seqlen, dtype=torch.float32, device=device),
+            aux_block_table_reordered=torch.empty(
+                bucket_size,
+                self.aux_page_table.shape[1],
+                dtype=self.aux_page_table.dtype,
+                device=device,
+            ),
             top_k_indices=torch.empty(bucket_size, self.index_topk, dtype=torch.int32, device=device),
             selected_mla_kv=selected_mla_kv,
             selected_lengths=selected_lengths,
@@ -873,6 +959,7 @@ class Glm5FullDsaAttnSegment:
         aux_slot_indices: torch.Tensor,
         flashmla_tile_scheduler_metadata: torch.Tensor,
         flashmla_num_splits: torch.Tensor,
+        schedule_metadata: torch.Tensor,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         attn = self.attn
@@ -1013,20 +1100,27 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
         )
         k_normed = indexer.k_norm(buffers.indexer_k_raw)
-        indexer_k_tensor = indexer._fused_rope_hadamard_or_fallback(
+        # [B, 128] bf16, post k_norm + RoPE + Hadamard.
+        indexer_k_bf16 = indexer._fused_rope_hadamard_or_fallback(
             k_normed.unsqueeze(1),
             position_ids.view(batch_size),
             max_seqlen=self.max_seqlen,
-        ).unsqueeze(2)
-        outputs.indexer_k_tensor.copy_(indexer_k_tensor)
-        run_paged_kv_token_update_fused(
-            k_cache=self.aux_blocked_k,
-            k_tokens=outputs.indexer_k_tensor.view(batch_size, -1),
-            page_table=self.aux_page_table,
-            slot_indices=buffers.kv_aux_slot_indices,
-            token_indices=token_indices,
-            page_size_tokens=self.aux_page_size,
-            num_valid_tokens=num_valid_tokens,
+        ).squeeze(1)
+        # Keep the bf16 [B,1,1,128] copy for the host-offload callback (host aux
+        # cache remains BF16; see OPEN QUESTIONS re prefix-aware host layout).
+        outputs.indexer_k_tensor.copy_(indexer_k_bf16.view(batch_size, 1, 1, -1))
+        # FP8 page-split write into the uint8 GPU aux cache (bypass the interleaved
+        # run_paged_kv_token_update_fused). Graph-safe: static shapes, index scatter.
+        # Physical slot: page = aux_page_table[kv_aux_slot, pos // page_size],
+        # offset = pos % page_size, loc = page*page_size + offset. Rows masked out
+        # by kv_aux_slot_indices == -1 must not corrupt the cache; see TODO below.
+        _write_indexer_k_fp8_paged_graph(
+            self.aux_blocked_k,
+            self.aux_page_table,
+            buffers.kv_aux_slot_indices,
+            token_indices,
+            indexer_k_bf16,
+            self.aux_page_size,
         )
 
         head_gates_out(
@@ -1056,18 +1150,48 @@ class Glm5FullDsaAttnSegment:
             buffers.positions_expanded.view(-1),
             buffers.q_index,
         )
-        fused_paged_score_and_topk_with_slots_out(
+        # FP8 deep_gemm scoring (replaces BF16 fused_paged_score_and_topk). q-build
+        # half above (cuda_wq_b_proj_out + rope_hadamard_q_out) is kept; logits come
+        # from deep_gemm fp8_paged_mqa_logits, then the SAME 2048 top-k as before.
+        if schedule_metadata is None:
+            raise RuntimeError(
+                "GLM-5 DSA FP8 graph score requires a persistent schedule_metadata "
+                "buffer (recomputed each step outside the captured region)"
+            )
+        from batchgen.attention.dsa.indexer_fp8 import score_paged_fp8
+        from batchgen_kernels.attention.dsa.fast_topk_cuda import fast_topk_2048_out
+
+        # R3c (verified): deep_gemm fp8_paged_mqa_logits indexes block_table by ROW i
+        # for batch row i (references/DeepGEMM/tests/test_attention.py uses
+        # block_tables[i] for context_lens[i]; csrc/apis/attention.hpp asserts
+        # batch_size == block_table.size(0)). self.aux_page_table is in slot order, so
+        # row j == aux page-table slot j. reorder_block_table_to_batch_slots
+        # (glm5/decode_utils.py) is exactly block_table.index_select(0, slot_indices);
+        # the eager path calls it before score_paged_fp8 with aux_slot_indices. We
+        # reproduce the SAME index_select here into a static buffer, mapping batch-row
+        # i -> aux page-table-row safe_aux_slot_indices[i], so block_table rows align
+        # with the batch. Mapping verified correct.
+        torch.index_select(
+            self.aux_page_table,
+            0,
+            buffers.safe_aux_slot_indices.to(torch.int64),
+            out=buffers.aux_block_table_reordered,
+        )
+        logits = score_paged_fp8(
             buffers.q_index,
             self.aux_blocked_k,
-            self.aux_page_table,
-            buffers.safe_aux_slot_indices,
+            buffers.aux_block_table_reordered,
             buffers.head_gates,
             buffers.safe_cache_seqlens,
+            schedule_metadata,
+            self.max_seqlen,
+            self.aux_page_size,
+        )  # [B, max_seqlen] fp32, relu-gated
+        buffers.agg_scores.copy_(logits)
+        fast_topk_2048_out(
             buffers.agg_scores,
+            buffers.safe_cache_seqlens,
             buffers.top_k_indices,
-            topk=self.index_topk,
-            page_size=self.aux_page_size,
-            max_seqlen=self.max_seqlen,
             num_valid_tokens=num_valid_tokens,
         )
         select_mla_kv_for_flashmla_bf16_out(

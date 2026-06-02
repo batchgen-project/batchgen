@@ -256,6 +256,12 @@ class Glm5WholeModelSegment:
                     "num_valid_tokens": TensorSpec((1,), torch.int32, fill_value=float(bucket_size)),
                     "flashmla_tile_scheduler_metadata": TensorSpec(tile_shape, tile_dtype),
                     "flashmla_num_splits": TensorSpec(splits_shape, splits_dtype),
+                    # deep_gemm paged-MQA schedule metadata. Shape is GPU-dependent
+                    # (num_sms), shared across all 78 layers, recomputed-into this
+                    # persistent static buffer each step OUTSIDE the captured region.
+                    "schedule_metadata": first_layer.dsa_segment.schedule_metadata_spec(
+                        bucket_size
+                    ),
                 }
             )
         return specs
@@ -324,6 +330,7 @@ class Glm5WholeModelSegment:
         rank_token_counts: torch.Tensor | None = None,
         flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
         flashmla_num_splits: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
         use_layer_segments: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         hidden_states = self.model.model.embed_tokens(input_ids)
@@ -337,6 +344,7 @@ class Glm5WholeModelSegment:
                 "rank_token_counts": rank_token_counts,
                 "flashmla_tile_scheduler_metadata": flashmla_tile_scheduler_metadata,
                 "flashmla_num_splits": flashmla_num_splits,
+                "schedule_metadata": schedule_metadata,
             }
             missing = [name for name, value in required.items() if value is None]
             if missing:
@@ -355,6 +363,7 @@ class Glm5WholeModelSegment:
                     rank_token_counts=rank_token_counts,
                     flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
                     flashmla_num_splits=flashmla_num_splits,
+                    schedule_metadata=schedule_metadata,
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
@@ -390,6 +399,7 @@ class Glm5WholeModelSegment:
         num_valid_tokens: torch.Tensor | None = None,
         flashmla_tile_scheduler_metadata: torch.Tensor | None = None,
         flashmla_num_splits: torch.Tensor | None = None,
+        schedule_metadata: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
         bucket_size = int(input_ids.shape[0])
         self._set_moe_bucket_state(bucket_size, rank_token_counts)
@@ -421,6 +431,7 @@ class Glm5WholeModelSegment:
                 rank_token_counts=rank_token_counts,
                 flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
                 flashmla_num_splits=flashmla_num_splits,
+                schedule_metadata=schedule_metadata,
             )
         finally:
             AttnWrapperBase.cache_seqlens = old_cache_seqlens

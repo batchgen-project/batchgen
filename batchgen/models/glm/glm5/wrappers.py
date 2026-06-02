@@ -721,8 +721,23 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
 
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
-        """Offload indexer KV cache per-sequence to auxiliary host memory."""
-        if AttnWrapperBase.host_paged_kv_worker_view_aux is None:
+        """Offload indexer KV cache per-sequence to auxiliary host memory.
+
+        FP8 page-split (Option C): the host aux cache is uint8/132 page-split
+        (deep_gemm SoA layout), the SAME layout the decode path writes to the GPU
+        aux cache and that deep_gemm.fp8_paged_mqa_logits reads. We therefore
+        quantize the prompt's indexer K to FP8 + per-token fp32 scale ONCE here
+        and scatter the page-split bytes straight into the host SHM pages, instead
+        of the old C++ async_offload_layer_kv_to_host (which packs BF16 tokens
+        AoS/token-contiguous — incoherent with the FP8 page-split GPU cache and
+        with a verbatim per-page reload). The host->GPU reload
+        (async_load_layer_paged_kv_to_device) is then a dtype-agnostic per-page
+        byte copy that needs no conversion on the decode hot path.
+        """
+        from batchgen.attention.dsa.indexer_fp8 import write_host_indexer_fp8_pages
+
+        aux_view = AttnWrapperBase.host_paged_kv_worker_view_aux
+        if aux_view is None:
             raise RuntimeError(
                 "GLM-5 DSA auxiliary host KV worker view is required for "
                 "indexer KV offload"
@@ -730,42 +745,41 @@ class GLM5AttnWrapper(AttnWrapperBase):
         cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
+        # Page size must match the host aux profile (host primary/aux page sizes
+        # are asserted equal in DualHostKVCoordinator) and the GPU aux cache the
+        # decode path writes; the GPU aux manager config is the canonical source
+        # (the base MLA host worker view does not bind page_size_tokens).
+        gpu_aux = AttnWrapperBase.gpu_paged_kv_manager_aux
+        if gpu_aux is None:
+            raise RuntimeError(
+                "GLM-5 DSA indexer offload requires gpu_paged_kv_manager_aux to "
+                "resolve the page-split page size"
+            )
+        page_size = int(gpu_aux.config.page_size_tokens)
 
-        # Lifespan management mirrored from decode-side `_pending_kv_append_*`
-        # (worker.py:1898-1925). Drain compute stream via a CUDA event so the
-        # FA3 prefill kernel that wrote `offload_kv` has fully retired before
-        # the C++ async lambda's d2h memcpy reads the source memory; pin the
-        # source tensor (and the parent `offload_kv`) in the class-level list
-        # so PyTorch's caching allocator cannot re-hand the same physical
-        # pages to a later layer's K/V tensor while the d2h is in flight.
-        AttnWrapperBase.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
+        # The host write below copies offload_kv to CPU (torch .to("cpu")), which
+        # is a synchronizing D2H, so the FA3 prefill kernel that produced
+        # offload_kv has fully retired by the time bytes are read. No async C++
+        # task / allocator-pinning dance is needed (unlike the old fire-and-forget
+        # async_offload path), so this offload is fully synchronous per layer.
         evt = torch.cuda.Event()
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
 
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
         cu = cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
             start_idx = cu[seq_idx]
             end_idx = cu[seq_idx + 1]
-            seq_len = end_idx - start_idx
-            # indexer_kv is already [T, H=1, D=128] after caller's .squeeze(0),
-            # so only .unsqueeze(0) is needed to add the B dim; don't also
-            # .unsqueeze(2) (that would make 5D — the primary-MLA path copy-paste
-            # of this code was for a 2D [T, kv_lora+rope] input).
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-            task = AttnWrapperBase.host_paged_kv_worker_view_aux.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
-                v_tensor=None,
-                sequence_lengths=[seq_len],
+            # offload_kv is [T, H=1, D=128] after the caller's .squeeze(0); flatten
+            # the singleton head for the [T, 128] indexer-K view the packer wants.
+            seq_kv = offload_kv[start_idx:end_idx].reshape(end_idx - start_idx, -1)
+            write_host_indexer_fp8_pages(
+                aux_view,
+                self.layer_idx,
+                int(global_sequence_ids[seq_idx]),
+                seq_kv,
+                page_size=page_size,
             )
-            # Pin both the per-seq view AND the parent offload_kv (already
-            # pinned outside the loop) so neither's storage is reclaimed.
-            AttnWrapperBase.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            AttnWrapperBase.track_prefill_offload_task(task, self.layer_idx)
 
     def _offload_prepacked_kv(self, offload_kv: torch.Tensor):
         """Offload KV cache per-sequence to host memory."""
