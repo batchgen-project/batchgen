@@ -720,7 +720,9 @@ class BatchGenWorker:
 		self.model_context_length = None  # Updated from model config during init
 		self.num_global_queries = 0
 		self.num_local_queries = 0
-		self._ignore_eos: bool = False
+		# BATCHGEN_IGNORE_EOS=1 forces ignore_eos for ALL batches (benchmark knob;
+		# the batch API doesn't plumb ignore_eos — batch_scheduler hardcodes False).
+		self._ignore_eos: bool = os.environ.get("BATCHGEN_IGNORE_EOS", "0") == "1"
 		self._temperature: Optional[float] = None  # Sampling temperature (None = greedy)
 		self._top_p: Optional[float] = None  # Nucleus sampling threshold (None = disabled)
 		self._logged_greedy: bool = False  # Track if we've logged greedy mode this batch
@@ -970,8 +972,10 @@ class BatchGenWorker:
 		Args:
 			ignore_eos: If True, ignore EOS tokens
 		"""
-		self._ignore_eos = ignore_eos
-		logging.info(f"Rank {self.rank}: ignore_eos set to {ignore_eos}")
+		# OR the env override so a batch payload (which hardcodes ignore_eos=False
+		# through batch_scheduler) cannot turn off a benchmark-wide BATCHGEN_IGNORE_EOS=1.
+		self._ignore_eos = ignore_eos or os.environ.get("BATCHGEN_IGNORE_EOS", "0") == "1"
+		logging.info(f"Rank {self.rank}: ignore_eos set to {self._ignore_eos} (arg={ignore_eos})")
 
 	def set_sampling_params(self, temperature: Optional[float] = None, top_p: Optional[float] = None) -> None:
 		"""
