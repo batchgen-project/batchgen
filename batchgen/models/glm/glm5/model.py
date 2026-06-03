@@ -2352,6 +2352,13 @@ class Glm5Model(nn.Module):
                 hidden_states, attention_mask, position_ids, past_kv, use_cache,
             )
         hidden_states = self.norm(hidden_states)
+        # Signal step done to the decode timer so per-step timed() events resolve
+        # (BATCHGEN_DECODE_TIMING). Mirrors kimi_k25 model.py; GLM-5 lacked this so
+        # the timer accumulated unresolved events and emitted no table.
+        from batchgen.timing import get_decode_timer
+        _dt = get_decode_timer()
+        if _dt is not None and _dt.enabled:
+            _dt.step_done()
         return (hidden_states,)
 
 
