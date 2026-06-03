@@ -287,9 +287,9 @@ class Glm5DsaAttnSegment:
             raise ValueError(
                 f"aux_blocked_k page size {aux_blocked_k.shape[1]} != {self.aux_page_size}"
             )
-        if aux_blocked_k.shape[3] != self.index_head_dim:
+        if aux_blocked_k.shape[3] != self.index_head_dim + 4:
             raise ValueError(
-                f"aux_blocked_k head dim {aux_blocked_k.shape[3]} != {self.index_head_dim}"
+                f"aux_blocked_k head dim {aux_blocked_k.shape[3]} != {self.index_head_dim}+4 (fp8 page-split)"
             )
         if cos_table.dtype != torch.float32 or sin_table.dtype != torch.float32:
             raise TypeError("cos_table and sin_table must be float32 for graph capture")
@@ -658,8 +658,10 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("aux_blocked_k page size does not match aux_page_size")
         if self.primary_blocked_k.shape[3] != self.attn.kv_lora_rank + self.attn.qk_rope_head_dim:
             raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
-        if self.aux_blocked_k.shape[3] != self.attn.indexer.index_head_dim:
-            raise ValueError("aux_blocked_k last dimension does not match GLM-5 indexer K")
+        # FP8 page-split aux cache: last dim is index_head_dim e4m3 bytes + 4 fp32 scale
+        # bytes/token (uint8), not the bf16 index_head_dim.
+        if self.aux_blocked_k.shape[3] != self.attn.indexer.index_head_dim + 4:
+            raise ValueError("aux_blocked_k last dimension does not match GLM-5 indexer K (fp8 page-split, +4)")
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
