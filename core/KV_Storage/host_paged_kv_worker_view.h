@@ -1514,8 +1514,14 @@ class HostPagedKVWorkerView : private LayerMapper {
         const std::size_t k_elem = config_.k_element_size_bytes;
         const std::size_t k_page_bytes = layout_.KPageBytes();
 
-        // Determine torch dtype from element size
-        auto k_dtype = (k_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+        // Determine torch dtype from element size. element_size==1 is the
+        // GLM-5 DSA FP8 page-split aux cache (uint8/132); it MUST map to kUInt8
+        // so the staging tensor is exactly num_layers*num_pages*KPageBytes and
+        // the page memcpys stay byte-coherent (treating it as float32 over-
+        // allocated 4x and broke cross-node aux migration — OPEN QUESTIONS R1).
+        auto k_dtype = (k_elem == 2)   ? torch::kBFloat16
+                       : (k_elem == 1) ? torch::kUInt8
+                                       : torch::kFloat32;
 
         auto k_out = torch::empty(
             {(int64_t)num_layers, (int64_t)num_pages, (int64_t)page_tokens,
@@ -1541,7 +1547,9 @@ class HostPagedKVWorkerView : private LayerMapper {
             const std::size_t v_dim = config_.v_head_dim;
             const std::size_t v_elem = config_.v_element_size_bytes;
             const std::size_t v_page_bytes = layout_.VPageBytes();
-            auto v_dtype = (v_elem == 2) ? torch::kBFloat16 : torch::kFloat32;
+            auto v_dtype = (v_elem == 2)   ? torch::kBFloat16
+                           : (v_elem == 1) ? torch::kUInt8
+                                           : torch::kFloat32;
 
             v_out = torch::empty(
                 {(int64_t)num_layers, (int64_t)num_pages,

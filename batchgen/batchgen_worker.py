@@ -3571,20 +3571,11 @@ class BatchGenWorker:
 		worker_view = self.core_engine.host_paged_kv_worker_view
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 
-		# R1 (scope guard): the GLM-5 DSA indexer aux cache is now uint8/132
-		# FP8 page-split. C++ ReadSequenceKVToCPU / WriteSequenceKVFromCPU infer the
-		# dtype from element_size and treat uint8 (element_size==1) as float32, so the
-		# read/recv/write byte sizes no longer match KPageBytes — a cross-node migration
-		# would silently corrupt the aux cache. We do NOT fix the C++ here; refuse the
-		# migration loudly instead. (Decode offload/reload and prefill offload ARE
-		# byte-coherent — only cross-node sequence migration is affected.)
-		if aux_view is not None:
-			raise RuntimeError(
-				"FP8 indexer aux cache cross-node migration not supported; needs C++ "
-				"ReadSequenceKVToCPU fix (uint8/132 page-split read as float32). "
-				f"Refused migration of seq {uuid[:8]}... from rank {from_rank} to "
-				f"rank {to_rank}. See OPEN QUESTIONS (R1)."
-			)
+		# R1 (FIXED): the GLM-5 DSA indexer aux cache is uint8/132 FP8 page-split.
+		# ReadSequenceKVToCPU now maps element_size==1 -> kUInt8 (was float32), so the
+		# staging tensor is exactly num_layers*num_pages*KPageBytes and the aux page
+		# memcpy/send/recv/write are byte-coherent. Cross-node aux migration below
+		# (read_sequence_kv_to_cpu / write_sequence_kv_from_cpu on aux_view) is enabled.
 
 		if self.rank == from_rank:
 			# ===== SOURCE RANK: Read host KV directly to CPU, send via Gloo =====
