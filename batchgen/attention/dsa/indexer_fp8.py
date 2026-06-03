@@ -195,12 +195,9 @@ def write_host_indexer_fp8_pages(aux_view, layer_idx, sequence_id, k_bf16,
     k_bf16       : [T, head_dim] bf16 indexer K (post k_norm + RoPE + Hadamard),
                    on any device; moved to CPU here for the host SHM write.
     """
-    k_cpu = k_bf16.detach().to("cpu", dtype=torch.bfloat16).reshape(-1, head_dim)
-    num_tokens = k_cpu.shape[0]
+    num_tokens = k_bf16.shape[0]
     if num_tokens == 0:
         return
-    k_fp8, k_scale = quantize_indexer_k(k_cpu)  # [T,head_dim] e4m3, [T] fp32
-
     page_bytes = page_size * head_dim + page_size * SF_BYTES
     # Per-page host pointers for this (sequence, layer). max_tokens=num_tokens
     # bounds the returned page list to the pages this prompt actually fills.
@@ -213,15 +210,21 @@ def write_host_indexer_fp8_pages(aux_view, layer_idx, sequence_id, k_bf16,
             f"has {len(k_ptrs)} host pages but needs {num_pages} for {num_tokens} "
             "tokens; host aux pages were not allocated before offload"
         )
+    # Quantize + page-split on the GPU (fused kernel, ONE launch) into a transient
+    # scratch buffer, then one bulk DtoH + per-page byte copy into the host SHM
+    # pages. The prompt's indexer K stays on the GPU — no CPU `.to(cpu)`+quantize
+    # and no per-page CPU `index_put` scatter, which previously stalled prefill at
+    # ~200 hot cores with the GPU idle (per-layer x per-seq x per-page). The scratch
+    # buffer is transient (~num_pages*page_bytes), so the host-offload design is
+    # unchanged (host still holds full context; GPU holds no managed aux pages here).
+    # Byte layout matches split_write_fp8 (the fused kernel is validated byte-equiv).
+    k_gpu = k_bf16.reshape(num_tokens, head_dim).to(torch.bfloat16)
+    scratch = torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=k_gpu.device)
+    loc = torch.arange(num_tokens, dtype=torch.int32, device=k_gpu.device)
+    fused_indexer_k_write_fp8(scratch, loc, k_gpu, page_size=page_size)
+    scratch_cpu = scratch.to("cpu")  # single bulk DtoH for the whole sequence/layer
     for p in range(num_pages):
-        start = p * page_size
-        end = min(start + page_size, num_tokens)
-        n = end - start
-        page_t = _wrap_host_page_u8(k_ptrs[p], page_bytes).view(1, page_bytes)
-        # Page-local slots [0, n): split_write_fp8 with page_idx==0 (loc==offset).
-        loc = torch.arange(n, dtype=torch.int32)
-        split_write_fp8(page_t, loc, k_fp8[start:end], k_scale[start:end],
-                        page_size=page_size, head_dim=head_dim)
+        _wrap_host_page_u8(k_ptrs[p], page_bytes).copy_(scratch_cpu[p])
 
 
 def write_host_indexer_fp8_token(aux_view, layer_idx, sequence_id, k_bf16_1tok,

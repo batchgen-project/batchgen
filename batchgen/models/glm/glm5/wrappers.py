@@ -720,18 +720,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "boundaries"
             )
 
-    # TODO(fp8-indexer): the decode flush now offloads the GPU aux _k_cache
-    # whole-page DtoH (no CPU re-quantize) via async_offload_paged_kv_to_host.
-    # Prefill is intentionally NOT converted: during prefill the GPU aux
-    # _k_cache is not populated with the prompt's indexer K (gpu_paged_kv_manager_aux
-    # is not bound on the worker here, see the comment below) and GPU aux pages
-    # for the full prompt context are not allocated (the GPU cache holds only the
-    # decode working set; host holds full context). Converting would require first
-    # writing the prompt indexer K to GPU then copying back, which needs GPU aux
-    # pages for the entire prompt and defeats the host-offload design. Prefill
-    # also runs ONCE per prompt (not the 78-layers-per-step decode hot path), so
-    # it is left on the CPU-quantize write_host_indexer_fp8_pages path. See
-    # OPEN QUESTIONS.
+    # Prefill indexer-K offload: the GPU aux _k_cache is NOT populated with the
+    # prompt's indexer K (gpu_paged_kv_manager_aux is unbound here; the managed GPU
+    # cache holds only the decode working set, host holds full context), so we can't
+    # reuse the decode whole-page DtoH (async_offload_paged_kv_to_host). Instead
+    # write_host_indexer_fp8_pages does the quantize+page-split on the GPU into a
+    # TRANSIENT scratch buffer (the fused kernel, one launch) and bulk-copies the
+    # page bytes DtoH to the host SHM — no managed GPU aux pages, host still holds
+    # full context. This replaced the old CPU `.to(cpu)`+quantize+per-page index_put
+    # scatter, which stalled prefill on the CPU (GPU idle, ~200 hot cores).
     def _offload_prepacked_indexer_kv(self, offload_kv: torch.Tensor):
         """Offload indexer KV cache per-sequence to auxiliary host memory.
 
@@ -771,15 +768,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
             from batchgen.kv_cache.host_kv_mananger_config import _GLM5_INDEXER_PROFILE
             page_size = int(_GLM5_INDEXER_PROFILE.page_size)
 
-        # The host write below copies offload_kv to CPU (torch .to("cpu")), which
-        # is a synchronizing D2H, so the FA3 prefill kernel that produced
-        # offload_kv has fully retired by the time bytes are read. No async C++
-        # task / allocator-pinning dance is needed (unlike the old fire-and-forget
-        # async_offload path), so this offload is fully synchronous per layer.
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
-
+        # The indexer K stays on the GPU: write_host_indexer_fp8_pages runs the
+        # fused quantize+page-split kernel (stream-ordered after compute_indexer_kv)
+        # into a transient GPU scratch buffer, then a single bulk DtoH (.to("cpu"))
+        # copies the page bytes to the host SHM. That DtoH is the only sync needed,
+        # so no explicit per-layer cuda.Event().synchronize() is required (the old
+        # CPU-quantize path needed it before reading offload_kv on the host).
         cu = cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
             start_idx = cu[seq_idx]
