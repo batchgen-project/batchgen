@@ -136,28 +136,6 @@ void fp8_blockwise_grouped_gemm_async(void *y_ptr, const void *x_ptr, const void
   constexpr int kSwizzleW = 128;
   constexpr int kSwizzleY = 64;
 
-  // v20 wide-output decode arm (MoE down-projection): n>=4096 (e.g. 6144) with
-  // small M. The down-proj (n=6144,k=2048) tiles the OUTPUT at kTileN=128 -> 48
-  // N-tiles, each with only k/128=16 WGMMA K-iters to hide the per-tile
-  // scheduling/epilogue cost; the gate/up (out 2048, k 6144) gets 16 N-tiles x 48
-  // K-iters, so a single down-proj is paradoxically slower than the fused gate+up.
-  // kTileN=256 halves the N-tile count (6144/256=24) -> halves the fixed per-tile
-  // tax. kStage capped at 4 to fit SM90 SMEM: shm_xw = (kTileM+kTileN)*kTileK*kStage
-  // = (16+256)*128*4 ~= 136KB (+8KB Y + scales) < 227KB cap; kStage=8 would need
-  // 256KB for the W tile alone. RISK: each math WG now issues an n128 WGMMA (64
-  // accumulators) — the v5_wide_n path that hit 162 regs -> 1 CTA/SM. MUST be
-  // benchmarked on H20 (calc_diff<1e-3 + decode sweep vs the kTileN=128 arm);
-  // gated to decode down-proj so it is trivially revertable.
-  if (n >= 4096 && (n % 256) == 0 && num_seq_per_group_avg <= 16) {
-    constexpr int kTileM = 16;
-    constexpr int kStage = 4;
-    launch_fp8_blockwise_gemm<kTileM, /*kTileN=*/256, kTileK, kTileS, kStage, kWarpgroupM,
-                               kWarpgroupN, kSwizzleX, kSwizzleW, kSwizzleY>(
-        y_ptr, x_ptr, w_ptr, seqlens_ptr, cu_seqlens_ptr, xscale_ptr, wscale_ptr, tmas_ptr,
-        tiles_ptr, cu_tiles_ptr, num_group, m, n, k, m_pad, num_block_k_pad4, update_tma, stream);
-    return;
-  }
-
   if (num_seq_per_group_avg <= 16) {
     constexpr int kTileM = 16;
     constexpr int kStage = 8;
