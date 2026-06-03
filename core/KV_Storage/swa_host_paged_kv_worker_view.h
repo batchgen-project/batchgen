@@ -208,6 +208,13 @@ class SWAHostPagedKVWorkerView {
             std::move(k_device_ptrs), std::move(v_device_ptrs));
     }
 
+    KVAsyncTask AsyncOffloadPagedKVToHost(
+        torch::Tensor gpu_page_ptrs, torch::Tensor host_page_ptrs,
+        std::size_t page_bytes) {
+        return base_view_.AsyncOffloadPagedKVToHost(
+            std::move(gpu_page_ptrs), std::move(host_page_ptrs), page_bytes);
+    }
+
     KVAsyncTask AsyncOffloadLayerKVToHost(
         std::size_t layer_idx, std::vector<std::int64_t> sequence_ids,
         torch::Tensor k_tensor, std::optional<torch::Tensor> v_tensor,
