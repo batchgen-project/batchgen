@@ -1107,9 +1107,11 @@ class Glm5FullDsaAttnSegment:
             position_ids.view(batch_size),
             max_seqlen=self.max_seqlen,
         ).squeeze(1)
-        # Keep the bf16 [B,1,1,128] copy for the host-offload callback (host aux
-        # cache remains BF16; see OPEN QUESTIONS re prefix-aware host layout).
-        outputs.indexer_k_tensor.copy_(indexer_k_bf16.view(batch_size, 1, 1, -1))
+        # NOTE: the indexer K host offload no longer reads this BF16 tensor's
+        # VALUES — the decode aux flush (_flush_deferred_aux_kv_fp8) does a
+        # whole-page DtoH of the GPU FP8 aux cache (the source of truth); it uses
+        # outputs.indexer_k_tensor only for (layer, row-count) bookkeeping. So we
+        # skip the per-layer value copy (dead work); the buffer's shape suffices.
         # FP8 page-split write into the uint8 GPU aux cache (bypass the interleaved
         # run_paged_kv_token_update_fused). Graph-safe: static shapes, index scatter.
         # Physical slot: page = aux_page_table[kv_aux_slot, pos // page_size],
