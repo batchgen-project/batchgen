@@ -2173,19 +2173,23 @@ class BatchGenWorker:
 				global_idx = int(global_idx)
 				write_pos = int(write_pos)
 				page = write_pos // page_size
-				gpu_k_ptrs, _ = gpu_aux.get_sequence_layer_page_pointers(
-					global_idx, layer_idx
+				# O(1) single-page lookup (NOT get_sequence_layer_page_pointers,
+				# which does state.pages.tolist() + a per-page data_ptr listcomp —
+				# called per layer x seq each step, that was an O(layers*seqs*pages)
+				# CPU bottleneck idling the GPU during decode).
+				gpu_k_ptr, _ = gpu_aux.get_sequence_layer_single_page_pointer(
+					global_idx, layer_idx, page
 				)
 				host_k_ptrs, _ = aux_view.get_sequence_layer_page_pointers(
 					global_idx, layer_idx, write_pos + 1
 				)
-				if len(gpu_k_ptrs) <= page or len(host_k_ptrs) <= page:
+				if len(host_k_ptrs) <= page:
 					raise RuntimeError(
 						f"DSA aux offload: seq {global_idx} layer {layer_idx} "
 						f"write_pos {write_pos} needs page {page} but have "
-						f"gpu_pages={len(gpu_k_ptrs)} host_pages={len(host_k_ptrs)}"
+						f"host_pages={len(host_k_ptrs)}"
 					)
-				gpu_page_ptrs.append(int(gpu_k_ptrs[page]))
+				gpu_page_ptrs.append(int(gpu_k_ptr))
 				host_page_ptrs.append(int(host_k_ptrs[page]))
 		if not gpu_page_ptrs:
 			return

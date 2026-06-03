@@ -1086,6 +1086,33 @@ class GPUPagedKVCacheManager:
 		]
 		return k_ptrs, v_ptrs
 
+	def get_sequence_layer_single_page_pointer(
+		self, sequence_id: int, layer_idx: int, page: int
+	) -> Tuple[int, Optional[int]]:
+		"""O(1) pointer for ONE page of (sequence, layer).
+
+		Avoids the full ``state.pages.tolist()`` + per-page ``data_ptr()`` listcomp
+		that ``get_sequence_layer_page_pointers`` does. The decode aux host-flush
+		needs only the single page holding ``write_pos`` and is called per
+		(layer x sequence) every step, so building the whole page list there was an
+		O(layers*seqs*pages) per-step CPU bottleneck that idled the GPU.
+		"""
+		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		state = self._get_sequence_state(sequence_id)
+		if page >= state.pages.numel():
+			raise ValueError(
+				f"Sequence {sequence_id} layer {layer_idx}: page {page} out of "
+				f"range ({state.pages.numel()} pages allocated)"
+			)
+		idx = int(state.pages[page])
+		k_ptr = self._k_cache[layer_idx, idx].data_ptr()
+		v_ptr = (
+			self._v_cache[layer_idx, idx].data_ptr()
+			if self._v_cache is not None else None
+		)
+		return k_ptr, v_ptr
+
 	def update_layer_decode_new_token(
 		self,
 		k_tensor: torch.Tensor,
