@@ -1960,15 +1960,18 @@ class Glm5MoE(nn.Module):
             inter_quant, inter_scale = _act_quant(intermediate)
             inter_scale_t = inter_scale.t().contiguous()
 
-        # S3: down projection
+        # S3: down projection — write IN-PLACE into buf.expert_out (output=),
+        # not into a fresh `result` + a 25MB .copy_ back. grouped_fp8_blockwise_s3
+        # forwards output= to the kernel's TMA store, so the down-proj lands
+        # directly in the expert-output buffer reduce_weighted_scatter reads.
         with (dt.timed("moe_gemm_s3", li) if dt else _nullctx()):
-            result = grouped_fp8_blockwise_s3(
+            grouped_fp8_blockwise_s3(
                 inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
                 self.fp8_down_w3d.view(torch.float8_e4m3fn),
                 self.fp8_down_ws3d,
                 seqlens, cu_seqlens, avg,
+                output=buf.expert_out[:E * mtp],
             )
-            buf.expert_out[:E * mtp].copy_(result[:E * mtp])
 
     # ── Gate + Expert Compute ──
 
