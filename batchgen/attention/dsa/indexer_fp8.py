@@ -54,6 +54,94 @@ def split_write_fp8(buf_u8, loc, k_fp8, k_scale, page_size=64, head_dim=HEAD_DIM
     return buf_u8
 
 
+# --- Fused CUDA: quantize + page-split write in one kernel (replaces the Python
+# quantize_indexer_k + split_write_fp8 on the per-layer x78 decode critical path).
+# One warp/token: warp-amax -> scale=max(amax,1e-4)/448 -> e4m3 = cvt(k*(1/scale))
+# -> write 128 FP8 bytes to the page K-region + the fp32 scale to the page tail.
+# Functionally validated: top-2048 overlap identical to split_write_fp8 (dev harness).
+_FUSED_K_WRITE_MODULE = None
+
+_FUSED_K_WRITE_CUDA = r"""
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+__global__ void fused_indexer_k_write_fp8_kernel(
+    const __nv_bfloat16* __restrict__ k_bf16, const int32_t* __restrict__ loc,
+    uint8_t* __restrict__ buf, int N, int head_dim, int page_size) {
+  const int token = blockIdx.x;
+  if (token >= N) return;
+  const int lane = threadIdx.x;
+  const int per_lane = head_dim >> 5;
+  const __nv_bfloat16* krow = k_bf16 + (long long)token * head_dim;
+  float vals[8];
+  float local_max = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < per_lane; ++i) {
+    float v = __bfloat162float(krow[lane * per_lane + i]);
+    vals[i] = v; local_max = fmaxf(local_max, fabsf(v));
+  }
+  #pragma unroll
+  for (int off = 16; off >= 1; off >>= 1)
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, off));
+  const float scale = fmaxf(local_max, 1e-4f) / 448.0f;
+  const float inv = 1.0f / scale;
+  const long long page_bytes = (long long)page_size * (head_dim + 4);
+  const int l = loc[token];
+  const int page = l / page_size, offset = l % page_size;
+  uint8_t* kdst = buf + page * page_bytes + (long long)offset * head_dim;
+  #pragma unroll
+  for (int i = 0; i < per_lane; ++i)
+    kdst[lane * per_lane + i] = __nv_cvt_float_to_fp8(vals[i] * inv, __NV_SATFINITE, __NV_E4M3);
+  if (lane == 0) {
+    uint8_t* sdst = buf + page * page_bytes + (long long)page_size * head_dim + (long long)offset * 4;
+    *reinterpret_cast<float*>(sdst) = scale;
+  }
+}
+
+void fused_indexer_k_write_fp8(torch::Tensor k_bf16, torch::Tensor loc,
+                               torch::Tensor buf, int64_t page_size) {
+  const int N = loc.size(0);
+  const int head_dim = k_bf16.size(1);
+  TORCH_CHECK(head_dim % 32 == 0 && head_dim <= 256, "head_dim must be %32 and <=256");
+  TORCH_CHECK(buf.size(1) == page_size * (head_dim + 4), "buf page_bytes mismatch");
+  if (N == 0) return;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  fused_indexer_k_write_fp8_kernel<<<N, 32, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(k_bf16.data_ptr()),
+      loc.data_ptr<int32_t>(), reinterpret_cast<uint8_t*>(buf.data_ptr()),
+      N, head_dim, (int)page_size);
+}
+"""
+
+_FUSED_K_WRITE_CPP = "void fused_indexer_k_write_fp8(torch::Tensor, torch::Tensor, torch::Tensor, int64_t);"
+
+
+def _fused_k_write_module():
+    global _FUSED_K_WRITE_MODULE
+    if _FUSED_K_WRITE_MODULE is None:
+        from torch.utils.cpp_extension import load_inline
+        _FUSED_K_WRITE_MODULE = load_inline(
+            name="fused_indexer_k_write_fp8",
+            cpp_sources=[_FUSED_K_WRITE_CPP],
+            cuda_sources=[_FUSED_K_WRITE_CUDA],
+            functions=["fused_indexer_k_write_fp8"],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-arch=sm_90a"],
+        )
+    return _FUSED_K_WRITE_MODULE
+
+
+def fused_indexer_k_write_fp8(buf_u8, loc, k_bf16, page_size=64):
+    """Fused quantize+page-split write. buf_u8: [num_pages, page_size*132] uint8;
+    loc: [N] int32 physical slot; k_bf16: [N, head_dim] bf16 (post RoPE/Hadamard)."""
+    _fused_k_write_module().fused_indexer_k_write_fp8(
+        k_bf16.contiguous(), loc.to(torch.int32).contiguous(), buf_u8, int(page_size))
+    return buf_u8
+
+
 def score_paged_fp8(q_bf16, aux_cache_u8, block_table, head_gates, cache_seqlens,
                     schedule_metadata, max_seqlen, page_size=64):
     """Relu-gated paged MQA logits via deep_gemm (no gather).

@@ -61,7 +61,7 @@ def _write_indexer_k_fp8_paged(
 
     k_normed_bf16 : [B, 128] bf16, post k_norm + RoPE + Hadamard.
     """
-    from batchgen.attention.dsa.indexer_fp8 import quantize_indexer_k, split_write_fp8
+    from batchgen.attention.dsa.indexer_fp8 import fused_indexer_k_write_fp8
 
     physical_layer = gpu_paged_kv_manager_aux.resolve_physical_layer(layer_idx)
     k_cache = gpu_paged_kv_manager_aux._k_cache  # [L, num_pages, page_size, 1, 132] uint8
@@ -85,8 +85,7 @@ def _write_indexer_k_fp8_paged(
     physical_page = page_table[slots, page_col].to(torch.int64)
     loc = (physical_page * page_size + offset).to(torch.int32)
 
-    k_fp8, k_scale = quantize_indexer_k(k_normed_bf16.to(buf_u8.device))
-    split_write_fp8(buf_u8, loc, k_fp8, k_scale, page_size=page_size, head_dim=head_dim)
+    fused_indexer_k_write_fp8(buf_u8, loc, k_normed_bf16.to(buf_u8.device), page_size=page_size)
 
 
 def _slot_indices_override(

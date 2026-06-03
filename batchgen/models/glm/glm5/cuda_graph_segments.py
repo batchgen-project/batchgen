@@ -82,7 +82,7 @@ def _write_indexer_k_fp8_paged_graph(
     present in any sequence's page table and these writes are harmless. The non-graph
     eager path never produces -1 slots (it scores/writes only valid batch rows).
     """
-    from batchgen.attention.dsa.indexer_fp8 import quantize_indexer_k, split_write_fp8
+    from batchgen.attention.dsa.indexer_fp8 import fused_indexer_k_write_fp8
 
     num_pages = aux_blocked_k_u8.shape[0]
     head_dim = indexer_k_bf16.shape[-1]
@@ -101,8 +101,7 @@ def _write_indexer_k_fp8_paged_graph(
     scratch_loc = torch.full_like(loc, num_pages * page_size - 1)
     loc = torch.where(valid, loc, scratch_loc).to(torch.int32)
 
-    k_fp8, k_scale = quantize_indexer_k(indexer_k_bf16)
-    split_write_fp8(buf_u8, loc, k_fp8, k_scale, page_size=page_size, head_dim=head_dim)
+    fused_indexer_k_write_fp8(buf_u8, loc, indexer_k_bf16, page_size=page_size)
 
 
 @dataclass
