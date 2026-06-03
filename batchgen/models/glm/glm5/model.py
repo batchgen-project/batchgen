@@ -694,23 +694,24 @@ class Glm5Indexer(nn.Module):
         )
 
         cache_seqlens_i32 = cache_seqlens.int()
-        # NOTE (eager only): schedule_metadata is recomputed per call. It depends
-        # solely on cache_seqlens + page_size and is shared across all 78 layers, so
-        # a per-step hoist would save work; left per-call here because the eager path
-        # is not graph-captured (no pointer-stability constraint). The graph path
-        # uses a persistent static buffer (see cuda_graph_segments).
-        schedule_metadata = make_schedule_metadata(cache_seqlens_i32, page_size)
+        # Hoist schedule_metadata + num_valid_tokens to once/decode-step (eager path):
+        # both are identical across all 78 layers (same cache_seqlens / batch_size),
+        # so memoize by the decode-step id (bumped in Glm5Model.forward) — removes 77
+        # redundant deep_gemm.get_paged_mqa_logits_metadata calls/step. No host sync.
+        if _DSA_SCHED_STATE["memo_step"] != _DSA_SCHED_STATE["step"]:
+            _DSA_SCHED_STATE["meta"] = make_schedule_metadata(cache_seqlens_i32, page_size)
+            _DSA_SCHED_STATE["nvt"] = torch.tensor(
+                [batch_size], dtype=torch.int32, device=cache_seqlens_i32.device)
+            _DSA_SCHED_STATE["memo_step"] = _DSA_SCHED_STATE["step"]
+        schedule_metadata = _DSA_SCHED_STATE["meta"]
         logits = score_paged_fp8(
             q, indexer_blocked_k, block_table, head_gates,
             cache_seqlens_i32, schedule_metadata, max_seqlen, page_size,
         )  # [B, max_seqlen] fp32, relu-gated, -inf past cache_seqlens
 
         effective_topk = min(self.index_topk, max_seqlen)
-        # Production top-k expects an explicit num_valid_tokens (no-arg fast_topk_2048
-        # only handles B==1); mirror fused_paged_score_and_topk_with_slots_out.
-        num_valid_tokens = torch.tensor(
-            [batch_size], dtype=torch.int32, device=logits.device,
-        )
+        # num_valid_tokens hoisted once/step above (mirrors fused_paged_score_and_topk).
+        num_valid_tokens = _DSA_SCHED_STATE["nvt"]
         if effective_topk == self.index_topk == 2048:
             top_k_indices = torch.empty(
                 batch_size, 2048, dtype=torch.int32, device=logits.device,
@@ -2304,6 +2305,12 @@ class Glm5DecoderLayer(nn.Module):
 # Main Model
 # ============================================================================
 
+# Per-decode-step state for hoisting the DSA indexer schedule_metadata (eager path):
+# all 78 layers in one Glm5Model.forward share the same cache_seqlens, so the deep_gemm
+# paged-mqa metadata is computed once/step (memoized by `step`) instead of 78x.
+_DSA_SCHED_STATE = {"step": 0, "memo_step": -1, "meta": None, "nvt": None}
+
+
 class Glm5Model(nn.Module):
     """GLM-5 transformer (no CausalLM wrapper verbosity)."""
 
@@ -2345,6 +2352,10 @@ class Glm5Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
+
+        # New decode step: bump the id so score_and_select_paged recomputes the DSA
+        # schedule_metadata once for this step (then reuses it across all 78 layers).
+        _DSA_SCHED_STATE["step"] += 1
 
         for idx, layer in enumerate(self.layers):
             past_kv = past_key_values[idx] if past_key_values is not None else None
