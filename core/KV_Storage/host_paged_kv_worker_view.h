@@ -850,8 +850,10 @@ class HostPagedKVWorkerView : private LayerMapper {
         // is fully decided by the caller; no per-token offset math here.
         std::vector<uint8_t*> src_host(num_pages);
         std::vector<uint8_t*> dst_host(num_pages);
-        const std::int64_t* gpu_raw = gpu_ptrs.data_ptr<std::int64_t>();
-        const std::int64_t* host_raw = host_ptrs.data_ptr<std::int64_t>();
+        const std::int64_t* gpu_raw =
+            static_cast<const std::int64_t*>(gpu_ptrs.data_ptr());
+        const std::int64_t* host_raw =
+            static_cast<const std::int64_t*>(host_ptrs.data_ptr());
         for (std::size_t i = 0; i < num_pages; ++i) {
             if (gpu_raw[i] == 0 || host_raw[i] == 0) {
                 std::ostringstream oss;
