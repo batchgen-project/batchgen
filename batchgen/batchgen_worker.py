@@ -9150,11 +9150,58 @@ class BatchGenWorker:
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
+		# K2.5: whole-model graph via the cuda-graph adapter (minimal parallel
+		# path). POIS decision: serialize the shared expert inline to reclaim
+		# the eager-MoE launch overhead. Self-contained; leaves the GLM-5 /
+		# GPT-OSS whole-model paths byte-for-byte untouched. Falls back to the
+		# legacy per-layer K2.5 path below if no adapter is present.
+		if _is_k25 and self._cuda_graph_adapter is not None:
+			from batchgen.models.moonshotai.kimi_k25.cuda_graph_adapter import (
+				SEGMENT_NAME_WHOLE_MODEL as _K25_WM_NAME,
+			)
+			bundle = self._cuda_graph_adapter.build_segments(
+				model=self.model,
+				bucketing=bucketing,
+				gpu_kv_manager=gpu_manager,
+				world_size=self.world_size,
+				rank=self.rank,
+				device=self.torch_device,
+				max_seqlen_cap=max_rope_len,
+			)
+			whole_seg = bundle.whole_model
+			manager.register_segment(_K25_WM_NAME, whole_seg)
+			if self.rank == 0:
+				logging.info(
+					f"CUDA graph capture (K2.5 whole-model): segment={_K25_WM_NAME} "
+					f"× {len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+				)
+			# NCCL collectives are baked into the graph — all ranks must capture
+			# the same buckets simultaneously.
+			torch.cuda.synchronize(self.torch_device)
+			dist.barrier()
+			manager.warmup_and_capture_all()
+			for _bucket in bucketing.bucket_sizes:
+				_sig = self._cuda_graph_adapter.capture_signature(
+					bucket=_bucket, gpu_kv_manager=gpu_manager, max_seqlen=max_rope_len,
+				)
+				self._cuda_graph_adapter.record_capture(
+					segment_name=_K25_WM_NAME, bucket=_bucket, signature=_sig,
+				)
+			self._cuda_graph_manager = manager
+			self._whole_model_graph = True
+			self._k25_whole_model_graph = True
+			self._whole_model_segment_name = _K25_WM_NAME
+			self._whole_model_bucketing = bucketing
+			self._whole_model_segment = whole_seg
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"CUDA graphs ready (K2.5 whole-model): {stats['total_capture_time_ms']:.0f}ms"
+				)
+			return
+
 		# Whole-model graph is the default for GPT-OSS.
-		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
-		# serializes the shared expert, losing async overlap (~18ms/step regression).
-		# Phase C: K2.5 keeps the per-layer path; GLM-5 always uses whole-model
-		# (the segmented-graph BATCHGEN_SEGMENTED_GRAPH env var is retired).
+		# K2.5 without an adapter falls back to per-layer (segmented) mode.
 		if _is_k25:
 			use_whole_model = False
 		else:
@@ -9937,10 +9984,21 @@ class BatchGenWorker:
 					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
 					# and an adapter is present, route replay through it. Legacy path
 					# (default) preserves today's behavior exactly.
+					# K2.5 always routes whole-model replay through the adapter
+					# (no legacy non-adapter K2.5 whole-model path exists).
+					_k25_whole_active = getattr(self, "_k25_whole_model_graph", False)
 					_adapter_dual_active = (
-						self._cuda_graph_adapter_dual
-						and self._cuda_graph_adapter is not None
-						and getattr(self, "_glm5_whole_model_graph", False)
+						self._cuda_graph_adapter is not None
+						and (
+							_k25_whole_active
+							or (
+								self._cuda_graph_adapter_dual
+								and getattr(self, "_glm5_whole_model_graph", False)
+							)
+						)
+					)
+					_wm_seg_name = getattr(
+						self, "_whole_model_segment_name", "glm5_whole_model"
 					)
 					_adapter_decision = None
 					_adapter_batch_state = None
@@ -9971,19 +10029,62 @@ class BatchGenWorker:
 						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
 							decision=_adapter_decision,
 							batch_state=_adapter_batch_state,
-							segment_name="glm5_whole_model",
+							segment_name=_wm_seg_name,
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
 						graph_out = self._cuda_graph_manager.replay(
-							"glm5_whole_model", _max_bs, **replay_inputs,
+							_wm_seg_name, _max_bs, **replay_inputs,
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
 								time.perf_counter() - _glm5_replay_start
 							) * 1000.0
+						# K2.5 whole-model eager-vs-graph compare via the standard
+						# model-agnostic facility (observability-only; does NOT change
+						# token selection). GLM-5 keeps its own bespoke compare block
+						# below; this path serves any adapter that has no such block.
+						if _k25_whole_active:
+							_dbg = self._cuda_graph_adapter.debug_options(_adapter_batch_state)
+							if _dbg.compare_against_eager:
+								from batchgen.cuda_graph.compare import compare_decode_outputs
+								# graph_out has padded bucket rows; the eager reference
+								# produces local_bsz (=batch_size) rows. Slice to align.
+								# Graph probe keys are `probe_layer_<NNN>_hidden`; the
+								# eager reference uses `hidden_states_layer_<i>` — remap
+								# so the diff aligns by key.
+								_graph_cmp = {}
+								for _k, _v in graph_out.items():
+									_vs = _v[:batch_size]
+									if _k.startswith("probe_layer_") and _k.endswith("_hidden"):
+										_idx = int(_k[len("probe_layer_"):-len("_hidden")])
+										_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
+									else:
+										_graph_cmp[_k] = _vs
+								_report = compare_decode_outputs(
+									adapter=self._cuda_graph_adapter,
+									decision=_adapter_decision,
+									batch_state=_adapter_batch_state,
+									segment_name=_wm_seg_name,
+									captured_inputs=replay_inputs,
+									graph_outputs=_graph_cmp,
+									probe_layers=_dbg.probe_layers,
+									atol=_dbg.compare_atol,
+									rtol=_dbg.compare_rtol,
+									fail_on_mismatch=_dbg.fail_on_mismatch,
+								)
+								_log = logging.info if _report.passed else logging.error
+								_log(
+									"[K25_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s "
+									"status=%s max_abs=%.6g max_rel=%.6g mismatched=%s "
+									"probes=%s",
+									self.rank, _adapter_decision.bucket, batch_size,
+									"OK" if _report.passed else "MISMATCH",
+									_report.max_abs, _report.max_rel,
+									_report.mismatched_keys, _report.probe_results,
+								)
 					elif getattr(self, "_glm5_whole_model_graph", False):
 						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
 						aux_manager = getattr(

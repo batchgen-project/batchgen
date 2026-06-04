@@ -87,6 +87,24 @@ class KimiK25Initializer:
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
 
+    def get_cuda_graph_adapter(self):
+        """Return the K2.5 CUDA-graph adapter (see HasCudaGraphAdapter protocol).
+
+        The worker calls this when `--enable-cuda-graph` is set; the adapter
+        owns mode selection, capture inputs, replay inputs, KV staging, and the
+        eager reference for compare. Advertises WHOLE_MODEL.
+        """
+        from batchgen.models.moonshotai.kimi_k25.cuda_graph_adapter import (
+            KimiK25CudaGraphAdapter,
+        )
+
+        return KimiK25CudaGraphAdapter(
+            model_config=self.model_config,
+            engine_config=self.engine_config,
+            world_size=self.world_size,
+            rank=self.global_rank,
+        )
+
     def _set_basic_config(self, engine_config: EngineConfig, args) -> EngineConfig:
         """Set basic engine configuration for K2.5.
 
