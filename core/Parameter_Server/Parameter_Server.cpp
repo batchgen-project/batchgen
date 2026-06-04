@@ -376,6 +376,8 @@ void Parameter_Server::_load_cus_format_file_to_host_mem(
                     dtype = torch::kBFloat16;
                 } else if (tensor_info.dtype == "float8_e4m3fn") {
                     dtype = torch::kFloat8_e4m3fn;
+                } else if (tensor_info.dtype == "float8_e8m0fnu") {
+                    dtype = torch::kFloat8_e8m0fnu;
                 } else if (tensor_info.dtype == "uint8") {
                     dtype = torch::kUInt8;
                 } else if (tensor_info.dtype == "int32") {
