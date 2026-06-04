@@ -43,6 +43,7 @@ try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
     from batchgen.models.engine_loader import core_engine as loader_module
+
     core_engine = loader_module.batchgen
 
 
@@ -57,27 +58,39 @@ class KimiK25Initializer:
 
     def __init__(self, input_arguments):
         # Load BatchGen config (single source of truth for K2.5 params)
-        self.batchgen_config = load_config(input_arguments.huggingface_ckpt_name)
+        self.batchgen_config = load_config(
+            input_arguments.huggingface_ckpt_name
+        )
 
         # Create BatchGen config for model instantiation.
         self.loaded_model_config = KimiK25Config()
-        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.loaded_model_config._name_or_path = (
+            input_arguments.huggingface_ckpt_name
+        )
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
-        self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
-        self.global_kv_cache_size_gb = input_arguments.global_host_kv_cache_size_gb
+        self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (
+            1024**3
+        )
+        self.global_kv_cache_size_gb = (
+            input_arguments.global_host_kv_cache_size_gb
+        )
 
         self.local_rank = input_arguments.local_rank
         self.global_rank = input_arguments.global_rank
         self.world_size = input_arguments.world_size
-        self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        self.enable_hugetlbfs = (
+            os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        )
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
         self.model_config = self._parse_model_config()
 
         self.engine_config = EngineConfig()
         logging.info(f"device: {input_arguments.device}")
-        self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
+        self.engine_config = self._set_basic_config(
+            self.engine_config, input_arguments
+        )
         self._default_engine_config()
         self.planner = KimiK25Planner()
         self.engine_config = self.planner.generate_config(self.engine_config)
@@ -87,7 +100,9 @@ class KimiK25Initializer:
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
 
-    def _set_basic_config(self, engine_config: EngineConfig, args) -> EngineConfig:
+    def _set_basic_config(
+        self, engine_config: EngineConfig, args
+    ) -> EngineConfig:
         """Set basic engine configuration for K2.5.
 
         K2.5 differences from DeepSeek-V3:
@@ -96,7 +111,9 @@ class KimiK25Initializer:
         - module_types: same (attn, routed_expert, shared_expert)
         """
         engine_config.Basic_Config.device = args.device
-        engine_config.Basic_Config.device_torch = torch.device(f"cuda:{args.device}")
+        engine_config.Basic_Config.device_torch = torch.device(
+            f"cuda:{args.device}"
+        )
 
         # K2.5 uses BF16 for attention and shared experts
         # Routed expert packed weights are uint8, overridden in weight_dtypes
@@ -104,9 +121,11 @@ class KimiK25Initializer:
         engine_config.Basic_Config.weight_dtype_torch = torch.bfloat16
 
         # KV cache: BF16 (K2.5 attention is BF16, no FP8 option)
-        kv_dtype = getattr(args, 'kv_dtype', None)
-        if kv_dtype and kv_dtype.lower() in ['fp8', 'float8', 'float8_e4m3fn']:
-            logging.warning("K2.5 attention is BF16 — ignoring FP8 kv_dtype, using BF16")
+        kv_dtype = getattr(args, "kv_dtype", None)
+        if kv_dtype and kv_dtype.lower() in ["fp8", "float8", "float8_e4m3fn"]:
+            logging.warning(
+                "K2.5 attention is BF16 — ignoring FP8 kv_dtype, using BF16"
+            )
         engine_config.Basic_Config.kv_dtype = "bfloat16"
         engine_config.Basic_Config.kv_dtype_torch = torch.bfloat16
 
@@ -115,26 +134,42 @@ class KimiK25Initializer:
         engine_config.Basic_Config.activation_dtype_torch = torch.bfloat16
 
         # Module types
-        engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
+        engine_config.Basic_Config.module_types = [
+            "attn",
+            "routed_expert",
+            "shared_expert",
+        ]
 
         # Standard planner inputs
         engine_config.Basic_Config.padding_length = args.padding_length
-        engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
+        engine_config.Basic_Config.max_decoding_length = (
+            args.max_decoding_length
+        )
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
-        engine_config.Basic_Config.num_queries = getattr(args, 'num_queries', 1)
+        engine_config.Basic_Config.num_queries = getattr(args, "num_queries", 1)
         engine_config.Basic_Config.num_threads = 0
 
         # GPU arch
-        gpu_arch = getattr(args, 'gpu_arch', 'hopper')
-        if gpu_arch and gpu_arch.lower() not in ['hopper', 'ampere']:
-            raise ValueError("Currently gpu_arch must be 'hopper' or 'ampere'")
-        engine_config.Basic_Config.gpu_arch = gpu_arch.lower() if gpu_arch else 'hopper'
+        gpu_arch = getattr(args, "gpu_arch", "hopper")
+        if gpu_arch and gpu_arch.lower() not in [
+            "blackwell",
+            "hopper",
+            "ampere",
+        ]:
+            raise ValueError(
+                "Currently gpu_arch must be 'blackwell', 'hopper' or 'ampere'"
+            )
+        engine_config.Basic_Config.gpu_arch = (
+            gpu_arch.lower() if gpu_arch else "hopper"
+        )
 
         # EP offloading
-        if getattr(args, 'enable_ep_with_offloading', False):
+        if getattr(args, "enable_ep_with_offloading", False):
             engine_config.EP_Config.enable_offloading = True
-            engine_config.EP_Config.offloading_ratio = getattr(args, 'ep_offloading_ratio', 0.0)
+            engine_config.EP_Config.offloading_ratio = getattr(
+                args, "ep_offloading_ratio", 0.0
+            )
             logging.info(
                 f"EP offloading config set: enable_offloading=True, "
                 f"offloading_ratio={engine_config.EP_Config.offloading_ratio}"
@@ -164,7 +199,8 @@ class KimiK25Initializer:
         self.engine_config.KV_Storage_Config.slot_byte_size = (
             self.engine_config.KV_Storage_Config.reserved_length
             * self.model_config.compressed_kv_dim
-            * torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits // 8
+            * torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits
+            // 8
         )
         self.engine_config.KV_Storage_Config.num_host_slots = (
             self.host_kv_cache_byte_size
@@ -190,8 +226,8 @@ class KimiK25Initializer:
         cfg = self.batchgen_config
         hidden_size = cfg.hidden_size
         moe_intermediate = cfg.moe_intermediate_size
-        packed_hidden = hidden_size // 8       # INT4 packed in int32
-        scale_hidden = hidden_size // 32       # INT4 scale groups
+        packed_hidden = hidden_size // 8  # INT4 packed in int32
+        scale_hidden = hidden_size // 32  # INT4 scale groups
         packed_intermediate = moe_intermediate // 8
         scale_intermediate = moe_intermediate // 32
 
@@ -200,7 +236,7 @@ class KimiK25Initializer:
         kv_lora_rank = cfg.kv_lora_rank
         compressed_kv_dim = cfg.compressed_kv_dim
         num_heads = cfg.num_attention_heads
-        head_dim = cfg.head_dim               # qk_nope_head_dim + qk_rope_head_dim
+        head_dim = cfg.head_dim  # qk_nope_head_dim + qk_rope_head_dim
         v_head_dim = cfg.v_head_dim
 
         # Module shapes
@@ -212,7 +248,10 @@ class KimiK25Initializer:
                 "q_b_proj.weight": [num_heads * head_dim, q_lora_rank],
                 "kv_a_proj_with_mqa.weight": [compressed_kv_dim, hidden_size],
                 "kv_a_layernorm.weight": [kv_lora_rank],
-                "kv_b_proj.weight": [num_heads * (v_head_dim + cfg.qk_nope_head_dim), kv_lora_rank],
+                "kv_b_proj.weight": [
+                    num_heads * (v_head_dim + cfg.qk_nope_head_dim),
+                    kv_lora_rank,
+                ],
                 "o_proj.weight": [hidden_size, num_heads * v_head_dim],
             },
             # Routed experts — INT4 packed (int32) + scale (bf16)
@@ -292,7 +331,9 @@ class KimiK25Initializer:
             )
 
             logging.info("Core engine created")
-            logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
+            logging.info(
+                f"_name_or_path: {self.loaded_model_config._name_or_path}"
+            )
 
             self.core_engine.Init()
             logging.info("Core engine initialized")

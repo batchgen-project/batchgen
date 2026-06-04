@@ -29,31 +29,44 @@ try:
     from batchgen.core_engine import batchgen as core_engine
 except ImportError:
     from batchgen.models.engine_loader import core_engine as loader_module
+
     core_engine = loader_module.batchgen
 
 
 class MiniMaxM25Initializer:
     def __init__(self, input_arguments):
-        self.batchgen_config = load_config(input_arguments.huggingface_ckpt_name)
+        self.batchgen_config = load_config(
+            input_arguments.huggingface_ckpt_name
+        )
 
         self.loaded_model_config = MiniMaxM25Config()
-        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.loaded_model_config._name_or_path = (
+            input_arguments.huggingface_ckpt_name
+        )
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
-        self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
-        self.global_kv_cache_size_gb = input_arguments.global_host_kv_cache_size_gb
+        self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (
+            1024**3
+        )
+        self.global_kv_cache_size_gb = (
+            input_arguments.global_host_kv_cache_size_gb
+        )
 
         self.local_rank = input_arguments.local_rank
         self.global_rank = input_arguments.global_rank
         self.world_size = input_arguments.world_size
-        self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        self.enable_hugetlbfs = (
+            os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
+        )
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
         self.model_config = self._parse_model_config()
 
         self.engine_config = EngineConfig()
         logging.info(f"device: {input_arguments.device}")
-        self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
+        self.engine_config = self._set_basic_config(
+            self.engine_config, input_arguments
+        )
         self._default_engine_config()
         self.planner = MiniMaxM25Planner()
         self.engine_config = self.planner.generate_config(self.engine_config)
@@ -67,7 +80,9 @@ class MiniMaxM25Initializer:
         self.shm_name = input_arguments.shm_name
         self.tensor_meta_shm_name = input_arguments.tensor_meta_shm_name
 
-    def _set_basic_config(self, engine_config: EngineConfig, args) -> EngineConfig:
+    def _set_basic_config(
+        self, engine_config: EngineConfig, args
+    ) -> EngineConfig:
         """Set basic engine configuration for M2.5.
 
         M2.5 differences from Kimi K2.5:
@@ -95,22 +110,34 @@ class MiniMaxM25Initializer:
 
         # Standard planner inputs
         engine_config.Basic_Config.padding_length = args.padding_length
-        engine_config.Basic_Config.max_decoding_length = args.max_decoding_length
+        engine_config.Basic_Config.max_decoding_length = (
+            args.max_decoding_length
+        )
         engine_config.Basic_Config.world_size = args.world_size
         engine_config.Basic_Config.rank = args.rank
-        engine_config.Basic_Config.num_queries = getattr(args, 'num_queries', 1)
+        engine_config.Basic_Config.num_queries = getattr(args, "num_queries", 1)
         engine_config.Basic_Config.num_threads = 0
 
         # GPU arch
-        gpu_arch = getattr(args, 'gpu_arch', 'hopper')
-        if gpu_arch and gpu_arch.lower() not in ['hopper', 'ampere']:
-            raise ValueError("Currently gpu_arch must be 'hopper' or 'ampere'")
-        engine_config.Basic_Config.gpu_arch = gpu_arch.lower() if gpu_arch else 'hopper'
+        gpu_arch = getattr(args, "gpu_arch", "hopper")
+        if gpu_arch and gpu_arch.lower() not in [
+            "blackwell",
+            "hopper",
+            "ampere",
+        ]:
+            raise ValueError(
+                "Currently gpu_arch must be 'blackwell', 'hopper' or 'ampere'"
+            )
+        engine_config.Basic_Config.gpu_arch = (
+            gpu_arch.lower() if gpu_arch else "hopper"
+        )
 
         # EP offloading
-        if getattr(args, 'enable_ep_with_offloading', False):
+        if getattr(args, "enable_ep_with_offloading", False):
             engine_config.EP_Config.enable_offloading = True
-            engine_config.EP_Config.offloading_ratio = getattr(args, 'ep_offloading_ratio', 0.0)
+            engine_config.EP_Config.offloading_ratio = getattr(
+                args, "ep_offloading_ratio", 0.0
+            )
             logging.info(
                 f"EP offloading config set: enable_offloading=True, "
                 f"offloading_ratio={engine_config.EP_Config.offloading_ratio}"
@@ -125,16 +152,23 @@ class MiniMaxM25Initializer:
         # kv_buffer_num_tokens depends on attn_decoding_micro_batch_size (set by planner)
         ec.GPU_Buffer_Config.kv_buffer_num_tokens = (
             ec.Module_Batching_Config.attn_decoding_micro_batch_size
-            * (ec.Basic_Config.max_decoding_length + ec.Basic_Config.padding_length)
+            * (
+                ec.Basic_Config.max_decoding_length
+                + ec.Basic_Config.padding_length
+            )
         )
 
         # attn_mode: always 3 for MiniMax-M2.5 (uses decoding_continuous path)
         ec.Basic_Config.attn_mode = 3
 
         # For attn_mode=3 (EP decode), zero out module buffers (all weights persistent on GPU)
-        if ec.Basic_Config.attn_mode == 3 and not ec.EP_Config.enable_offloading:
+        if (
+            ec.Basic_Config.attn_mode == 3
+            and not ec.EP_Config.enable_offloading
+        ):
             ec.GPU_Buffer_Config.num_decoding_module_buffer = {
-                "attn": 0, "routed_expert": 0,
+                "attn": 0,
+                "routed_expert": 0,
             }
             ec.GPU_Buffer_Config.num_k_buffer = 0
             ec.GPU_Buffer_Config.kv_buffer_num_tokens = 0
@@ -159,7 +193,10 @@ class MiniMaxM25Initializer:
         # Per-token KV size = num_kv_heads × head_dim × 2 (K+V) × dtype_bytes
         cfg = self.batchgen_config
         kv_dim_per_token = cfg.num_key_value_heads * cfg.head_dim * 2  # K + V
-        kv_dtype_bytes = torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits // 8
+        kv_dtype_bytes = (
+            torch.finfo(self.engine_config.Basic_Config.kv_dtype_torch).bits
+            // 8
+        )
 
         self.engine_config.KV_Storage_Config.reserved_length = (
             self.engine_config.Basic_Config.padding_length
@@ -185,34 +222,55 @@ class MiniMaxM25Initializer:
         # Note: kv_buffer_num_tokens is set after planner runs (depends on attn_decoding_micro_batch_size)
 
         # Module shapes
-        hidden_size = cfg.hidden_size       # 3072
+        hidden_size = cfg.hidden_size  # 3072
         intermediate = cfg.moe_intermediate_size  # 1536
         num_heads = cfg.num_attention_heads  # 48
         num_kv_heads = cfg.num_key_value_heads  # 8
-        head_dim = cfg.head_dim              # 128
+        head_dim = cfg.head_dim  # 128
 
         self.engine_config.GPU_Buffer_Config.module_shapes = {
             # GQA attention (FP8 weights + F32 scales + BF16 norms)
             "attn": {
                 "q_proj.weight": [num_heads * head_dim, hidden_size],
-                "q_proj.weight_scale_inv": [num_heads * head_dim // 128, hidden_size // 128],
+                "q_proj.weight_scale_inv": [
+                    num_heads * head_dim // 128,
+                    hidden_size // 128,
+                ],
                 "k_proj.weight": [num_kv_heads * head_dim, hidden_size],
-                "k_proj.weight_scale_inv": [num_kv_heads * head_dim // 128, hidden_size // 128],
+                "k_proj.weight_scale_inv": [
+                    num_kv_heads * head_dim // 128,
+                    hidden_size // 128,
+                ],
                 "v_proj.weight": [num_kv_heads * head_dim, hidden_size],
-                "v_proj.weight_scale_inv": [num_kv_heads * head_dim // 128, hidden_size // 128],
+                "v_proj.weight_scale_inv": [
+                    num_kv_heads * head_dim // 128,
+                    hidden_size // 128,
+                ],
                 "o_proj.weight": [hidden_size, num_heads * head_dim],
-                "o_proj.weight_scale_inv": [hidden_size // 128, num_heads * head_dim // 128],
+                "o_proj.weight_scale_inv": [
+                    hidden_size // 128,
+                    num_heads * head_dim // 128,
+                ],
                 "q_norm.weight": [num_heads * head_dim],
                 "k_norm.weight": [num_kv_heads * head_dim],
             },
             # Routed experts — FP8 (float8_e4m3fn)
             "routed_expert": {
-                "w1.weight": [intermediate, hidden_size],       # gate_proj
-                "w1.weight_scale_inv": [intermediate // 128, hidden_size // 128],
-                "w2.weight": [hidden_size, intermediate],       # down_proj
-                "w2.weight_scale_inv": [hidden_size // 128, intermediate // 128],
-                "w3.weight": [intermediate, hidden_size],       # up_proj
-                "w3.weight_scale_inv": [intermediate // 128, hidden_size // 128],
+                "w1.weight": [intermediate, hidden_size],  # gate_proj
+                "w1.weight_scale_inv": [
+                    intermediate // 128,
+                    hidden_size // 128,
+                ],
+                "w2.weight": [hidden_size, intermediate],  # down_proj
+                "w2.weight_scale_inv": [
+                    hidden_size // 128,
+                    intermediate // 128,
+                ],
+                "w3.weight": [intermediate, hidden_size],  # up_proj
+                "w3.weight_scale_inv": [
+                    intermediate // 128,
+                    hidden_size // 128,
+                ],
             },
         }
 
@@ -268,7 +326,9 @@ class MiniMaxM25Initializer:
             )
 
             logging.info("Core engine created")
-            logging.info(f"_name_or_path: {self.loaded_model_config._name_or_path}")
+            logging.info(
+                f"_name_or_path: {self.loaded_model_config._name_or_path}"
+            )
 
             self.core_engine.Init()
             logging.info("Core engine initialized")
