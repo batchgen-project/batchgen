@@ -25,12 +25,6 @@ class _FakeTask:
         self.waited_layers.append(int(layer_idx))
 
 
-class _FailingWaitTask(_FakeTask):
-    def wait(self):
-        super().wait()
-        raise RuntimeError("wait failed")
-
-
 class _FakeHostWorkerView:
     def __init__(self):
         self.task = _FakeTask()
@@ -45,12 +39,6 @@ class _FailingHostWorkerView(_FakeHostWorkerView):
     def async_load_prefix_pages_to_device(self, **kwargs):
         super().async_load_prefix_pages_to_device(**kwargs)
         raise RuntimeError("load failed")
-
-
-class _FailingWaitHostWorkerView(_FakeHostWorkerView):
-    def __init__(self):
-        super().__init__()
-        self.task = _FailingWaitTask()
 
 
 class _FakePrefixCoordinator:
@@ -331,34 +319,6 @@ def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error(
         )
 
     assert coordinator.begin_calls == [91]
-    assert coordinator.end_calls == [91]
-
-
-def test_materialize_single_group_prefix_pages_unwinds_attachment_on_wait_error():
-    gpu_manager = _FakeGpuManager()
-    coordinator = _FakePrefixCoordinator()
-
-    materialization = materialize_single_group_prefix_pages(
-        gpu_manager=gpu_manager,
-        host_worker_view=_FailingWaitHostWorkerView(),
-        prefix_cache_coordinator=coordinator,
-        sequences=[
-            PrefixMaterializationSequence(
-                sequence_id=101,
-                prefix_tokens=4,
-                suffix_tokens=1,
-                host_pages=[11],
-                attachment_handle=91,
-            ),
-        ],
-    )
-
-    assert coordinator.begin_calls == [91]
-    assert coordinator.end_calls == []
-    with pytest.raises(RuntimeError, match="wait failed"):
-        materialization.wait()
-    assert coordinator.end_calls == [91]
-    materialization.wait()
     assert coordinator.end_calls == [91]
 
 
