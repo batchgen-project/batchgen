@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     HF_ENDPOINT=https://hf-mirror.com \
-    ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 
 # RDMA Python UV
 RUN apt-get update && apt-get install -y --no-install-recommends \

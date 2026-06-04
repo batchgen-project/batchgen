@@ -8,7 +8,11 @@ Usage:
     from batchgen_kernels.moe.grouped_mxfp4 import grouped_mxfp4_stage1_swiglu
 """
 
-from batchgen_kernels._version import __version__, __version_full__, version_info
+from batchgen_kernels._version import (
+    __version__,
+    __version_full__,
+    version_info,
+)
 
 import os
 import importlib
@@ -36,7 +40,9 @@ def load_extension(module_name: str):
         if not _DEV_MODE:
             raise
 
-    logger.warning(f"[DEV] AOT import failed for {module_name}, attempting JIT...")
+    logger.warning(
+        f"[DEV] AOT import failed for {module_name}, attempting JIT..."
+    )
     return _jit_compile(module_name)
 
 
@@ -55,7 +61,9 @@ def _jit_compile(module_name: str):
     cfg = registry[module_name]
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     sources = [os.path.join(pkg_dir, s) for s in cfg["sources"]]
-    include_dirs = [os.path.join(pkg_dir, d) for d in cfg.get("include_dirs", [])]
+    include_dirs = [
+        os.path.join(pkg_dir, d) for d in cfg.get("include_dirs", [])
+    ]
 
     short_name = module_name.rsplit(".", 1)[-1]
 
@@ -74,7 +82,9 @@ def get_device_arch() -> str:
     if not torch.cuda.is_available():
         raise RuntimeError("batchgen_kernels requires CUDA")
     cc = torch.cuda.get_device_capability()
-    if cc[0] >= 10:
+    if cc[0] == 12:
+        return "sm120"
+    elif cc[0] >= 10:
         return "sm100"
     elif cc[0] >= 9:
         return "sm90a"

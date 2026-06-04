@@ -96,7 +96,7 @@ def get_default_compute_capabilities():
             compute_caps += ";8.0"
         else:
             compute_caps += ";8.0;8.6"
-        
+
         if installed_cuda_version()[0] >= 12:
             compute_caps += ";9.0"
     return compute_caps
@@ -674,7 +674,8 @@ class CUDAOpBuilder(OpBuilder):
         args = []
         self.enable_bf16 = True
         for cc in ccs:
-            num = cc[0] + cc[2]
+            major, minor = cc.rstrip("+PTX").split(".")
+            num = major + minor
             args.append(f"-gencode=arch=compute_{num},code=sm_{num}")
             if cc.endswith("+PTX"):
                 args.append(f"-gencode=arch=compute_{num},code=compute_{num}")
