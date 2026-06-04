@@ -38,11 +38,12 @@ PARAMETER_SERVER_ENDPOINT_ENV = "BATCHGEN_PARAMETER_SERVER_ENDPOINT"
 def _validate_shmem_enabled() -> None:
     """Check that THP shmem is enabled for --fast-init. Raises RuntimeError if not."""
     import re
+
     sysfs_path = "/sys/kernel/mm/transparent_hugepage/shmem_enabled"
     try:
         with open(sysfs_path) as f:
             line = f.read().strip()
-        match = re.search(r'\[(\w+)\]', line)
+        match = re.search(r"\[(\w+)\]", line)
         active = match.group(1) if match else "unknown"
         if active not in ("always", "within_size"):
             raise RuntimeError(
@@ -60,31 +61,39 @@ def detect_gpu_arch() -> str:
     """Auto-detect GPU architecture based on CUDA compute capability.
 
     Returns:
-        'hopper' for compute capability >= 9.0 (H100, H20, etc.)
+        'blackwell' for compute capability >= 12.0
+        'hopper' for compute capability 9.x (H100, H20, etc.)
         'ampere' for compute capability 8.x (A100, A5000, RTX 4090, etc.)
 
     Raises:
         RuntimeError: If no CUDA devices found or unsupported architecture
     """
     if not torch.cuda.is_available():
-        raise RuntimeError("No CUDA devices available for GPU architecture detection")
+        raise RuntimeError(
+            "No CUDA devices available for GPU architecture detection"
+        )
 
     major, minor = torch.cuda.get_device_capability(0)
     device_name = torch.cuda.get_device_name(0)
 
-    if major >= 9:
+    if major >= 12:
+        arch = "blackwell"
+    elif major >= 9:
         arch = "hopper"
     elif major == 8:
         arch = "ampere"
     else:
         raise RuntimeError(
             f"Unsupported GPU architecture: compute capability {major}.{minor} "
-            f"({device_name}). BatchGen requires Hopper (sm_90+) or Ampere (sm_80+)."
+            f"({device_name}). BatchGen requires Blackwell (sm_120+), Hopper (sm_90+), or Ampere (sm_80+)."
         )
 
     logger.info(
         "Auto-detected GPU architecture: %s (compute capability %d.%d, %s)",
-        arch, major, minor, device_name,
+        arch,
+        major,
+        minor,
+        device_name,
     )
     return arch
 
@@ -160,13 +169,19 @@ class WorkerManager:
 
     def _cleanup_skeleton_state_dict_file(self) -> None:
         """Clean up temporary skeleton state dict file."""
-        if self.skeleton_state_dict_file and os.path.exists(self.skeleton_state_dict_file):
+        if self.skeleton_state_dict_file and os.path.exists(
+            self.skeleton_state_dict_file
+        ):
             try:
-                logging.debug(f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}")
+                logging.debug(
+                    f"Cleaning up skeleton state dict temp file: {self.skeleton_state_dict_file}"
+                )
                 os.remove(self.skeleton_state_dict_file)
                 self.skeleton_state_dict_file = None
             except Exception as e:
-                logging.warning(f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}")
+                logging.warning(
+                    f"Failed to cleanup temp file {self.skeleton_state_dict_file}: {e}"
+                )
 
     # ---------------------- Public API ----------------------
     def start(self) -> None:
@@ -191,6 +206,7 @@ class WorkerManager:
             self._hugepages_enabled = True
 
         import sys as _diag_sys
+
         def _diag(msg):
             print(f"[DIAG {_time.time():.3f}] {msg}", flush=True)
             _diag_sys.stdout.flush()
@@ -203,7 +219,8 @@ class WorkerManager:
             try:
                 _diag(">>> allocate_host_kv_cache")
                 result = self.allocate_host_kv_cache(
-                    self.args.host_kv_cache_size, self.args.model,
+                    self.args.host_kv_cache_size,
+                    self.args.model,
                     enable_memfd=self.args.fast_init,
                 )
                 _diag("<<< allocate_host_kv_cache")
@@ -216,15 +233,19 @@ class WorkerManager:
                 logger.warning("Host KV cache allocation failed: %s", exc)
                 self.host_kv_manager = None
                 self.host_kv_aux_manager = None
-            logger.info("[startup] Host KV cache allocated in %.2fs",
-                        _time.monotonic() - kv_start)
+            logger.info(
+                "[startup] Host KV cache allocated in %.2fs",
+                _time.monotonic() - kv_start,
+            )
 
         model_start = _time.monotonic()
         _diag(">>> _load_model_resources")
         self._load_model_resources()
         _diag("<<< _load_model_resources")
-        logger.info("[startup] Model resources loaded in %.2fs",
-                    _time.monotonic() - model_start)
+        logger.info(
+            "[startup] Model resources loaded in %.2fs",
+            _time.monotonic() - model_start,
+        )
 
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
@@ -236,8 +257,9 @@ class WorkerManager:
         _diag(">>> _wait_for_workers_ready")
         self._wait_for_workers_ready()
         _diag("<<< _wait_for_workers_ready")
-        logger.info("[startup] Workers ready in %.2fs",
-                    _time.monotonic() - spawn_start)
+        logger.info(
+            "[startup] Workers ready in %.2fs", _time.monotonic() - spawn_start
+        )
 
         self.started = True
         logger.info(
@@ -265,7 +287,9 @@ class WorkerManager:
         # This is critical for Node 1 workers that may be blocked in NCCL
         # waiting for Node 0 (which may already be shutting down)
         if worker_pids:
-            logger.info("Sending SIGTERM to %d worker processes...", len(worker_pids))
+            logger.info(
+                "Sending SIGTERM to %d worker processes...", len(worker_pids)
+            )
             for pid in worker_pids:
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -290,9 +314,7 @@ class WorkerManager:
 
         # Force-kill workers that didn't exit after SIGTERM
         if not workers_joined and worker_pids:
-            logger.warning(
-                "Workers did not exit gracefully, force-killing..."
-            )
+            logger.warning("Workers did not exit gracefully, force-killing...")
             for pid in worker_pids:
                 try:
                     proc = psutil.Process(pid)
@@ -387,7 +409,9 @@ class WorkerManager:
             result = self.response_queue.get()
         return result
 
-    def send_reload_command(self, reload_deps: bool = True, timeout: float = 30.0) -> dict:
+    def send_reload_command(
+        self, reload_deps: bool = True, timeout: float = 30.0
+    ) -> dict:
         """Send hot-reload command to all worker ranks (legacy sync RPC path).
 
         Used by the non-pool-mode worker main loop (one request → one response
@@ -395,15 +419,22 @@ class WorkerManager:
         send_pool_reload() instead — pool mode never returns to the main loop.
         """
         import queue as _queue
+
         with self._lock:
-            self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+            self.request_queue.put(
+                {"command": "reload", "reload_deps": reload_deps}
+            )
             try:
                 return self.response_queue.get(timeout=timeout)
             except _queue.Empty:
                 return {"status": "reload_timeout", "timeout_s": timeout}
 
-    def send_pool_reload(self, reload_deps: bool = True, timeout: float = 30.0,
-                         expected_ranks: Optional[int] = None) -> dict:
+    def send_pool_reload(
+        self,
+        reload_deps: bool = True,
+        timeout: float = 30.0,
+        expected_ranks: Optional[int] = None,
+    ) -> dict:
         """Send hot-reload to pool-mode workers via fire-and-forget queue +
         status file polling.
 
@@ -432,7 +463,9 @@ class WorkerManager:
         os.makedirs(status_dir, exist_ok=True)
 
         # Send the command (no lock — pool admission queue is fire-and-forget)
-        self.request_queue.put({"command": "reload", "reload_deps": reload_deps})
+        self.request_queue.put(
+            {"command": "reload", "reload_deps": reload_deps}
+        )
 
         # Poll for status files
         if expected_ranks is None:
@@ -443,9 +476,11 @@ class WorkerManager:
         while _time.monotonic() < deadline:
             try:
                 for entry in os.listdir(status_dir):
-                    if not entry.startswith("rank_") or not entry.endswith(".json"):
+                    if not entry.startswith("rank_") or not entry.endswith(
+                        ".json"
+                    ):
                         continue
-                    rank_str = entry[len("rank_"):-len(".json")]
+                    rank_str = entry[len("rank_") : -len(".json")]
                     if rank_str in seen_ranks:
                         continue
                     path = os.path.join(status_dir, entry)
@@ -464,7 +499,9 @@ class WorkerManager:
         # Aggregate
         all_success = all(r.get("status") == "reload_success" for r in results)
         return {
-            "status": "reload_success" if all_success and len(results) >= expected_ranks else "reload_partial",
+            "status": "reload_success"
+            if all_success and len(results) >= expected_ranks
+            else "reload_partial",
             "ranks_reported": len(results),
             "ranks_expected": expected_ranks,
             "elapsed_s": timeout - max(0, deadline - _time.monotonic()),
@@ -476,14 +513,23 @@ class WorkerManager:
         """Drop page cache and compact memory for stable THP allocation."""
         import subprocess
         import time as _time
+
         t0 = _time.monotonic()
         try:
-            subprocess.run(["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
-            subprocess.run(["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True)
-            logger.info("[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
-                        _time.monotonic() - t0)
+            subprocess.run(
+                ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True
+            )
+            subprocess.run(
+                ["sh", "-c", "echo 1 > /proc/sys/vm/compact_memory"], check=True
+            )
+            logger.info(
+                "[fast-init] Memory compaction completed in %.2fs (drop_caches + compact_memory)",
+                _time.monotonic() - t0,
+            )
         except (subprocess.CalledProcessError, PermissionError) as e:
-            logger.warning("[fast-init] Memory compaction failed (requires root): %s", e)
+            logger.warning(
+                "[fast-init] Memory compaction failed (requires root): %s", e
+            )
 
     def _config_hugepages(self, byte_size: int = None) -> None:
         """Configure hugepages for shared memory.
@@ -521,6 +567,7 @@ class WorkerManager:
 
     def _load_model_resources(self) -> None:
         import sys as _diag_sys, time as _diag_time
+
         def _diag(msg):
             print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
             _diag_sys.stdout.flush()
@@ -537,7 +584,9 @@ class WorkerManager:
             or Path(self.args.cache_dir or ".") / "converted_ckpt"
         )
         self.args.converted_ckpt_dir = converted_ckpt_dir
-        _diag(f"  paths resolved: endpoint={endpoint!r}, cache_dir={self.args.cache_dir!r}")
+        _diag(
+            f"  paths resolved: endpoint={endpoint!r}, cache_dir={self.args.cache_dir!r}"
+        )
 
         if not endpoint and self.args.cache_dir is None:
             _diag("  >>> _download_model_snapshot")
@@ -585,7 +634,9 @@ class WorkerManager:
 
         logger.info(
             "Spawning %d DDP workers (world_size=%d, nnodes=%d)",
-            local_world_size, world_size, self.args.nnodes
+            local_world_size,
+            world_size,
+            self.args.nnodes,
         )
 
         # Auto-detect GPU architecture if not specified
@@ -651,6 +702,7 @@ class WorkerManager:
             weights_memfd_fd=self._get_weights_memfd_fd(),
         )
         from batchgen.server_worker_main_loop import server_worker_main
+
         self.worker_process = mp.spawn(
             server_worker_main,
             args=(
@@ -665,22 +717,31 @@ class WorkerManager:
         )
 
     def _get_kv_memfd_pid(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if (
+            self.args.fast_init
+            and getattr(self, "host_kv_manager", None) is not None
+        ):
             return os.getpid()
         return -1
 
     def _get_kv_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_manager', None) is not None:
+        if (
+            self.args.fast_init
+            and getattr(self, "host_kv_manager", None) is not None
+        ):
             return self.host_kv_manager.memfd_fd()
         return -1
 
     def _get_kv_aux_memfd_fd(self) -> int:
-        if self.args.fast_init and getattr(self, 'host_kv_aux_manager', None) is not None:
+        if (
+            self.args.fast_init
+            and getattr(self, "host_kv_aux_manager", None) is not None
+        ):
             return self.host_kv_aux_manager.memfd_fd()
         return -1
 
     def _get_weights_memfd_pid(self) -> int:
-        ps = getattr(self, 'parameter_server_instance', None)
+        ps = getattr(self, "parameter_server_instance", None)
         if self.args.fast_init and ps is not None:
             fd = ps.parameter_server.weights_memfd_fd()
             if fd >= 0:
@@ -688,7 +749,7 @@ class WorkerManager:
         return -1
 
     def _get_weights_memfd_fd(self) -> int:
-        ps = getattr(self, 'parameter_server_instance', None)
+        ps = getattr(self, "parameter_server_instance", None)
         if self.args.fast_init and ps is not None:
             return ps.parameter_server.weights_memfd_fd()
         return -1
@@ -820,7 +881,9 @@ class WorkerManager:
             )
 
             parameter_server = Mixtral_Parameter_Server(
-                self.args.model, self.args.cache_dir, converted_ckpt_dir,
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
                 enable_memfd=self.args.fast_init,
             )
         elif "gpt-oss-120b" in self.args.model.lower():
@@ -859,15 +922,21 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
-        elif "glm-5" in self.args.model.lower() or "glm5" in self.args.model.lower():
+        elif (
+            "glm-5" in self.args.model.lower()
+            or "glm5" in self.args.model.lower()
+        ):
             import sys as _diag_sys, time as _diag_time
+
             def _diag(msg):
                 print(f"[DIAG {_diag_time.time():.3f}] {msg}", flush=True)
                 _diag_sys.stdout.flush()
+
             _diag("    glm5: importing GLM5_Parameter_Server")
             from batchgen.models.glm.glm5.glm5_parameter_server import (
                 GLM5_Parameter_Server,
             )
+
             _diag("    glm5: constructing GLM5_Parameter_Server")
             parameter_server = GLM5_Parameter_Server(
                 self.args.model,
@@ -883,26 +952,36 @@ class WorkerManager:
             )
 
         import sys as _diag_sys2, time as _diag_time2
+
         def _diag2(msg):
             print(f"[DIAG {_diag_time2.time():.3f}] {msg}", flush=True)
             _diag_sys2.stdout.flush()
+
         _diag2("    >>> parameter_server.Init()")
         shm_name, tensor_meta_shm_name = parameter_server.Init()
         _diag2("    <<< parameter_server.Init() returned")
         ps_size = parameter_server.parameter_server.byte_size()
-        _diag2(f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict")
+        _diag2(
+            f"    ps_size={ps_size / 1024**3:.2f} GB; getting skeleton_state_dict"
+        )
 
         # Get skeleton_state_dict and save to temp file to avoid passing tensors through mp.spawn
-        skeleton_state_dict = parameter_server.parameter_server.get_skeleton_state_dict()
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)...")
+        skeleton_state_dict = (
+            parameter_server.parameter_server.get_skeleton_state_dict()
+        )
+        logger.info(
+            f"Saving skeleton state dict to temp file ({len(skeleton_state_dict)} keys)..."
+        )
 
         # Create temp file for skeleton state dict
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        fd, file_path = tempfile.mkstemp(suffix=".pt", prefix="batchgen_skel_")
         os.close(fd)  # Close fd, torch.save will open its own handle
 
         torch.save(skeleton_state_dict, file_path)
         actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
+        logger.info(
+            f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)"
+        )
 
         self.skeleton_state_dict_file = file_path
         self.skeleton_state_dict = None  # Don't keep tensors in memory
@@ -945,13 +1024,17 @@ class WorkerManager:
             )
 
         # Save skeleton_state_dict to temp file to avoid passing tensors through mp.spawn
-        logger.info(f"Saving skeleton state dict to temp file ({len(skeleton)} keys)...")
-        fd, file_path = tempfile.mkstemp(suffix='.pt', prefix='batchgen_skel_')
+        logger.info(
+            f"Saving skeleton state dict to temp file ({len(skeleton)} keys)..."
+        )
+        fd, file_path = tempfile.mkstemp(suffix=".pt", prefix="batchgen_skel_")
         os.close(fd)  # Close fd, torch.save will open its own handle
 
         torch.save(skeleton, file_path)
         actual_size = os.path.getsize(file_path)
-        logger.info(f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)")
+        logger.info(
+            f"Skeleton state dict saved to {file_path} ({actual_size / (1024**2):.2f} MB)"
+        )
 
         self.skeleton_state_dict_file = file_path
         self.skeleton_state_dict = None  # Don't keep tensors in memory
@@ -962,12 +1045,18 @@ class WorkerManager:
             ),
             "shm_name": info["shm_name"],
             "tensor_meta_shm_name": info["tensor_meta_shm_name"],
-            "converted_ckpt_dir": info.get("converted_ckpt_dir", converted_ckpt_dir),
+            "converted_ckpt_dir": info.get(
+                "converted_ckpt_dir", converted_ckpt_dir
+            ),
             "parameter_server_size": info["parameter_server_size"],
         }
-        self.args.converted_ckpt_dir = Path(self.model_info["converted_ckpt_dir"])
+        self.args.converted_ckpt_dir = Path(
+            self.model_info["converted_ckpt_dir"]
+        )
         if not self.args.cache_dir:
-            self.args.cache_dir = info.get("cache_dir") or self.args.converted_ckpt_dir
+            self.args.cache_dir = (
+                info.get("cache_dir") or self.args.converted_ckpt_dir
+            )
         logger.info(
             "Fetched shared memory handles from remote parameter server"
         )
@@ -981,7 +1070,9 @@ class WorkerManager:
 
             # Calculate host memory based budget: host_mem * 0.9 - model_size
             mem = psutil.virtual_memory()
-            model_size_gb = self.model_info.get("parameter_server_size", 0) / (1024**3)
+            model_size_gb = self.model_info.get("parameter_server_size", 0) / (
+                1024**3
+            )
             host_mem_budget = int(mem.total * 0.9 / (1024**3) - model_size_gb)
 
             # Check /dev/shm free space
@@ -989,7 +1080,9 @@ class WorkerManager:
                 shm_stat = shutil.disk_usage("/dev/shm")
                 shm_free_gb = shm_stat.free // (1024**3)
             except (OSError, FileNotFoundError):
-                shm_free_gb = host_mem_budget  # Fallback if /dev/shm not available
+                shm_free_gb = (
+                    host_mem_budget  # Fallback if /dev/shm not available
+                )
 
             # Use minimum of host memory budget and /dev/shm free space
             available_mem = min(host_mem_budget, shm_free_gb)
@@ -1021,10 +1114,13 @@ class WorkerManager:
 
     @staticmethod
     def allocate_host_kv_cache(
-        host_kv_cache_size_gb: int, model_name: str,
+        host_kv_cache_size_gb: int,
+        model_name: str,
         enable_memfd: bool = False,
     ) -> Any:
-        from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+        from batchgen.kv_cache.dual_host_kv_coordinator import (
+            DualHostKVCoordinator,
+        )
 
         # DSA models: split budget into primary + auxiliary
         dual = DualHostKVCoordinator.create_managers(

@@ -14047,6 +14047,7 @@ class BatchGenWorker:
 
             _dt = get_decode_timer()
             if _dt and _dt.enabled:
+                _dt.step_done()
                 _dt.log_summary()
                 _dt.reset()
 

@@ -19,10 +19,10 @@ logger = logging.getLogger(__name__)
 # Known BatchGen shared memory prefixes
 # These are used for safe cleanup to avoid deleting files from other applications
 BATCHGEN_SHM_PREFIXES = (
-    "shm_",           # Parameter server main memory: /shm_<uuid>
-    "skel_",          # Skeleton state dict: skel_<timestamp>_<random>
-    "batchgen_skel_", # Temp skeleton files: batchgen_skel_*.pt
-    "batchgen_",      # General BatchGen prefix
+    "shm_",  # Parameter server main memory: /shm_<uuid>
+    "skel_",  # Skeleton state dict: skel_<timestamp>_<random>
+    "batchgen_skel_",  # Temp skeleton files: batchgen_skel_*.pt
+    "batchgen_",  # General BatchGen prefix
 )
 
 # Default hugepage size (2MB) used as fallback if detection fails
@@ -39,7 +39,7 @@ MODEL_BYTE_SIZES = {
     "deepseek-ai/DeepSeek-V2": 472 * 1024**3,
     "deepseek-ai/DeepSeek-V3": 675 * 1024**3,
     "deepseek-ai/DeepSeek-R1": 675 * 1024**3,  # Same as V3
-    "deepseek-ai/DeepSeek-V4-Flash": 180 * 1024**3,
+    "deepseek-ai/DeepSeek-V4-Flash": 320 * 1024**3,
     "deepseek-ai/DeepSeek-V4-Pro": 700 * 1024**3,
     # Mixtral models
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 96 * 1024**3,
@@ -126,7 +126,9 @@ def calculate_hugepages(byte_size: int) -> int:
         Number of hugepages required
     """
     hugepage_size = get_hugepage_size()
-    num_pages = (byte_size + hugepage_size - 1) // hugepage_size  # ceil division
+    num_pages = (
+        byte_size + hugepage_size - 1
+    ) // hugepage_size  # ceil division
 
     logger.info(
         f"Hugepages: {byte_size / (1024**3):.1f} GB model, "
@@ -271,9 +273,13 @@ def cleanup_hugepages_files(prefix: Optional[str] = None) -> int:
                 logger.debug(f"Removed /dev/hugepages/{entry.name}")
                 removed += 1
             except PermissionError:
-                logger.warning(f"Permission denied: /dev/hugepages/{entry.name}")
+                logger.warning(
+                    f"Permission denied: /dev/hugepages/{entry.name}"
+                )
             except OSError as e:
-                logger.warning(f"Failed to remove /dev/hugepages/{entry.name}: {e}")
+                logger.warning(
+                    f"Failed to remove /dev/hugepages/{entry.name}: {e}"
+                )
 
     except (PermissionError, OSError) as e:
         logger.warning(f"Error accessing /dev/hugepages: {e}")
@@ -379,7 +385,9 @@ def reset_hugepages_allocation() -> bool:
         logger.info("Reset vm.nr_hugepages to 0 via /proc")
         success = True
     except PermissionError:
-        logger.warning("Permission denied writing to /proc/sys/vm/nr_hugepages (need root)")
+        logger.warning(
+            "Permission denied writing to /proc/sys/vm/nr_hugepages (need root)"
+        )
     except Exception as e:
         logger.warning(f"Failed to reset hugepages via /proc: {e}")
 
@@ -448,6 +456,7 @@ def install_worker_signal_handlers(
     Args:
         shutdown_callback: Optional callback to execute before exiting.
     """
+
     def signal_handler(signum, frame):
         sig_name = signal.Signals(signum).name
         logger.info(f"Worker received {sig_name}, initiating shutdown...")
