@@ -8099,6 +8099,42 @@ class BatchGenWorker:
 
 		return new_tokens
 
+	def _reset_prefill_prepack_runtime_state(self) -> None:
+		# Reset prepack mode
+		Attn_Wrapper.prepack_mode = False
+		Attn_Wrapper.prepack_cu_seqlens = None
+		Attn_Wrapper.prepack_max_seqlen = None
+		Attn_Wrapper.prepack_num_sequences = None
+		Attn_Wrapper.prepack_seq_lengths = None
+		Attn_Wrapper.prepack_append_seq_lengths = None
+		Attn_Wrapper.prepack_prefix_reuse_mode = False
+		Attn_Wrapper.prepack_prefix_shared_tokens = None
+		Attn_Wrapper.prepack_full_seq_lengths = None
+
+		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
+		AttnWrapperBase.prepack_mode = False
+		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_max_seqlen = None
+		AttnWrapperBase.prepack_num_sequences = None
+		AttnWrapperBase.prepack_seq_lengths = None
+		AttnWrapperBase.prepack_append_seq_lengths = None
+		AttnWrapperBase.prepack_prefix_reuse_mode = False
+		AttnWrapperBase.prepack_prefix_shared_tokens = None
+		AttnWrapperBase.prepack_full_seq_lengths = None
+		AttnWrapperBase.prefill_prefix_materialization = None
+
+	@contextmanager
+	def _prefill_prepack_runtime_scope(self, prefix_materialization):
+		try:
+			yield
+		finally:
+			self._reset_prefill_prepack_runtime_state()
+			if prefix_materialization is not None:
+				try:
+					prefix_materialization.wait()
+				finally:
+					self._destroy_gpu_paged_kv_cache()
+
 	def prefill_prepacked(self, batch: list[int]):
 		"""
 		Handle prefill for a batch using prepack optimization.
@@ -8225,7 +8261,10 @@ class BatchGenWorker:
 
 		output_tokens = []
 
-		with torch.inference_mode():
+		with (
+			self._prefill_prepack_runtime_scope(prefix_materialization),
+			torch.inference_mode(),
+		):
 			for batch_idx, (seq_start, seq_end) in tqdm(
 				enumerate(micro_batches),
 				total=len(micro_batches),
@@ -8394,33 +8433,6 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
-
-		# Reset prepack mode
-		Attn_Wrapper.prepack_mode = False
-		Attn_Wrapper.prepack_cu_seqlens = None
-		Attn_Wrapper.prepack_max_seqlen = None
-		Attn_Wrapper.prepack_num_sequences = None
-		Attn_Wrapper.prepack_seq_lengths = None
-		Attn_Wrapper.prepack_append_seq_lengths = None
-		Attn_Wrapper.prepack_prefix_reuse_mode = False
-		Attn_Wrapper.prepack_prefix_shared_tokens = None
-		Attn_Wrapper.prepack_full_seq_lengths = None
-
-		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
-		AttnWrapperBase.prepack_mode = False
-		AttnWrapperBase.prepack_cu_seqlens = None
-		AttnWrapperBase.prepack_max_seqlen = None
-		AttnWrapperBase.prepack_num_sequences = None
-		AttnWrapperBase.prepack_seq_lengths = None
-		AttnWrapperBase.prepack_append_seq_lengths = None
-		AttnWrapperBase.prepack_prefix_reuse_mode = False
-		AttnWrapperBase.prepack_prefix_shared_tokens = None
-		AttnWrapperBase.prepack_full_seq_lengths = None
-		AttnWrapperBase.prefill_prefix_materialization = None
-
-		if prefix_materialization is not None:
-			prefix_materialization.wait()
-			self._destroy_gpu_paged_kv_cache()
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
