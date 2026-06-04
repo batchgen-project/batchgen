@@ -16,6 +16,7 @@ slots defined in ``model.py``.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ import torch.nn as nn
 
 from batchgen.ckpt_converter.metadata_loader import resolve_torch_dtype
 from batchgen.models.wrappers import AttnWrapperBase, ExpertWrapperBase
+from batchgen.timing import get_decode_timer
 
 
 class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
@@ -266,26 +268,31 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             getattr(mod, "_prefill_full_tensors", None)
         )
         n_attn_heads = mod.n_heads if dp_attention else mod.n_local_heads
-        q_low = mod.q_norm(mod.wq_a(hidden_states))
-        if dp_attention:
-            from batchgen.models.deepseek.deepseekv4_flash.model import (
-                _linear_from_weight,
-            )
+        _dt = get_decode_timer()
+        with _dt.timed("attn_q_proj", self.layer_idx) if _dt else nullcontext():
+            q_low = mod.q_norm(mod.wq_a(hidden_states))
+            if dp_attention:
+                from batchgen.models.deepseek.deepseekv4_flash.model import (
+                    _linear_from_weight,
+                )
 
-            q = _linear_from_weight(
-                q_low,
-                mod._get_prefill_full_tensor("wq_b.weight"),
-                mod._prefill_full_tensors.get("wq_b.scale"),
-            )
-            attn_sink = mod._get_prefill_full_tensor("attn_sink")
-        else:
-            q = mod.wq_b(q_low)
-            attn_sink = mod.attn_sink
-        q = q.view(bsz, q_len, n_attn_heads, mod.head_dim)
-        q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + mod.eps)
+                q = _linear_from_weight(
+                    q_low,
+                    mod._get_prefill_full_tensor("wq_b.weight"),
+                    mod._prefill_full_tensors.get("wq_b.scale"),
+                )
+                attn_sink = mod._get_prefill_full_tensor("attn_sink")
+            else:
+                q = mod.wq_b(q_low)
+                attn_sink = mod.attn_sink
+            q = q.view(bsz, q_len, n_attn_heads, mod.head_dim)
+            q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + mod.eps)
 
         # KV projection: hidden → wkv → kv_norm
-        kv = mod.kv_norm(mod.wkv(hidden_states))
+        with (
+            _dt.timed("attn_kv_proj", self.layer_idx) if _dt else nullcontext()
+        ):
+            kv = mod.kv_norm(mod.wkv(hidden_states))
 
         dense_q = q.squeeze(1)
         dense_kv = kv.squeeze(1)
@@ -295,56 +302,83 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             if self._layer_config is not None
             else 0
         )
-        if ratio == 4 and getattr(mod, "indexer", None) is not None:
-            index_q, index_k, head_gates = self._v4_c4_indexer_inputs(
-                q_low.squeeze(1), hidden_states.squeeze(1)
-            )
-            backend_kwargs.update(
-                head_gates=head_gates,
-                q_attn=dense_q,
-                current_kv=dense_kv,
-            )
-            score_q, score_kv = index_q, index_k
-        elif ratio == 128 and getattr(mod, "compressor", None) is not None:
-            score_q, score_kv = dense_q, dense_kv
-            backend_kwargs.update(
-                compress_hidden_states=hidden_states.squeeze(1),
-                compressor=self._runtime_kernel_compressor(
-                    mod.compressor, rotate=False
-                ),
-                rope_cache=self._v4_compressed_rope_cache(hidden_states.device),
-                current_kv=dense_kv,
-            )
-        else:
-            score_q, score_kv = dense_q, dense_kv
-            if "head_gates" in kwargs:
-                backend_kwargs["head_gates"] = kwargs["head_gates"]
+        with (
+            _dt.timed("attn_indexer", self.layer_idx) if _dt else nullcontext()
+        ):
+            if ratio == 4 and getattr(mod, "indexer", None) is not None:
+                index_q, index_k, head_gates = self._v4_c4_indexer_inputs(
+                    q_low.squeeze(1), hidden_states.squeeze(1)
+                )
+                backend_kwargs.update(
+                    head_gates=head_gates,
+                    q_attn=dense_q,
+                    current_kv=dense_kv,
+                )
+                score_q, score_kv = index_q, index_k
+            elif ratio == 128 and getattr(mod, "compressor", None) is not None:
+                score_q, score_kv = dense_q, dense_kv
+                backend_kwargs.update(
+                    compress_hidden_states=hidden_states.squeeze(1),
+                    compressor=self._runtime_kernel_compressor(
+                        mod.compressor, rotate=False
+                    ),
+                    rope_cache=self._v4_compressed_rope_cache(
+                        hidden_states.device
+                    ),
+                    current_kv=dense_kv,
+                )
+            else:
+                score_q, score_kv = dense_q, dense_kv
+                if "head_gates" in kwargs:
+                    backend_kwargs["head_gates"] = kwargs["head_gates"]
 
         # Attention via backend (dispatches to FlashMLA sparse/dense/compressed)
-        attn_output = self._v4_backend.forward(
-            layer_config=self._layer_config,
-            q=score_q,
-            kv=score_kv,
-            attn_sink=attn_sink,
-            **backend_kwargs,
-        )
+        with (
+            _dt.timed("attn_backend", self.layer_idx) if _dt else nullcontext()
+        ):
+            attn_output = self._v4_backend.forward(
+                layer_config=self._layer_config,
+                q=score_q,
+                kv=score_kv,
+                attn_sink=attn_sink,
+                **backend_kwargs,
+            )
 
         from batchgen.models.deepseek.deepseekv4_flash.model import (
             _dequant_weight,
             _linear_from_weight,
         )
 
-        n_groups = mod.o_groups if dp_attention else mod.n_local_groups
-        attn_output = attn_output.view(
-            bsz,
-            q_len,
-            n_groups,
-            n_attn_heads // n_groups * mod.head_dim,
-        )
-        if dp_attention:
+        with _dt.timed("attn_o_proj", self.layer_idx) if _dt else nullcontext():
+            n_groups = mod.o_groups if dp_attention else mod.n_local_groups
+            attn_output = attn_output.view(
+                bsz,
+                q_len,
+                n_groups,
+                n_attn_heads // n_groups * mod.head_dim,
+            )
+            if dp_attention:
+                wo_a_weight = _dequant_weight(
+                    mod._get_prefill_full_tensor("wo_a.weight"),
+                    None,
+                    hidden_states.dtype,
+                )
+                wo_a = wo_a_weight.view(
+                    n_groups,
+                    mod.o_lora_rank,
+                    n_attn_heads // n_groups * mod.head_dim,
+                )
+                attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
+                attn_output = _linear_from_weight(
+                    attn_output.flatten(2),
+                    mod._get_prefill_full_tensor("wo_b.weight"),
+                    mod._prefill_full_tensors.get("wo_b.scale"),
+                )
+                return attn_output, None, kv
+
             wo_a_weight = _dequant_weight(
-                mod._get_prefill_full_tensor("wo_a.weight"),
-                None,
+                mod.wo_a.weight,
+                mod.wo_a.scale,
                 hidden_states.dtype,
             )
             wo_a = wo_a_weight.view(
@@ -353,26 +387,8 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
                 n_attn_heads // n_groups * mod.head_dim,
             )
             attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
-            attn_output = _linear_from_weight(
-                attn_output.flatten(2),
-                mod._get_prefill_full_tensor("wo_b.weight"),
-                mod._prefill_full_tensors.get("wo_b.scale"),
-            )
+            attn_output = mod.wo_b(attn_output.flatten(2))
             return attn_output, None, kv
-
-        wo_a_weight = _dequant_weight(
-            mod.wo_a.weight,
-            mod.wo_a.scale,
-            hidden_states.dtype,
-        )
-        wo_a = wo_a_weight.view(
-            n_groups,
-            mod.o_lora_rank,
-            n_attn_heads // n_groups * mod.head_dim,
-        )
-        attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
-        attn_output = mod.wo_b(attn_output.flatten(2))
-        return attn_output, None, kv
 
     def _v4_coordinator(self):
         manager = getattr(self.core_engine, "gpu_paged_kv_manager", None)

@@ -58,7 +58,9 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
 
     attention_dtype = _get_arg(input_arguments, "attention_dtype")
     if not attention_dtype:
-        logging.info("attention_dtype is not provided, using bfloat16 as default")
+        logging.info(
+            "attention_dtype is not provided, using bfloat16 as default"
+        )
         engine_config.Basic_Config.attention_dtype = "bfloat16"
     else:
         normalized = attention_dtype.lower()
@@ -86,7 +88,11 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
         raise ValueError("Currently attn_mode must be 1, 2, or 3")
     engine_config.Basic_Config.attn_mode = attn_mode
 
-    engine_config.Basic_Config.module_types = ["attn", "routed_expert", "shared_expert"]
+    engine_config.Basic_Config.module_types = [
+        "attn",
+        "routed_expert",
+        "shared_expert",
+    ]
     engine_config.Basic_Config.num_threads = 0
 
     padding_length = _get_arg(input_arguments, "padding_length")
@@ -117,8 +123,10 @@ def set_basic_config(engine_config: EngineConfig, input_arguments):
     gpu_arch = _get_arg(input_arguments, "gpu_arch")
     if not gpu_arch:
         raise ValueError("GPU architecture must be specified")
-    if gpu_arch.lower() not in ["hopper", "ampere"]:
-        raise ValueError("Currently gpu_arch must be 'hopper', or 'ampere'")
+    if gpu_arch.lower() not in ["blackwell", "hopper", "ampere"]:
+        raise ValueError(
+            "Currently gpu_arch must be 'blackwell', 'hopper', or 'ampere'"
+        )
     engine_config.Basic_Config.gpu_arch = gpu_arch.lower()
 
     if _get_arg(input_arguments, "enable_ep_with_offloading", False):
