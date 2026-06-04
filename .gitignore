@@ -9,6 +9,12 @@ log
 runner.sh
 install.sh
 
+# Test datasets — staged on dev machines and CI runners separately
+# (see tests/e2e/glm5_mixed_regression/mixed_mmlu_longbench.py).
+# Source: HuggingFace `Xnhyacinth/LongBench` + MMLU-Pro test/validation parquets.
+/tests/e2e/r1_longbench_test/LongBench/**/*.parquet
+/tests/e2e/r1_mmlu_pro_test/*.parquet
+
 # Prerequisites
 *.d
 

@@ -1,8 +1,14 @@
-ARG CUDA_VERSION=12.8.0
+ARG CUDA_VERSION=12.9.1
 ARG PYTHON_VERSION=3.11.13
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ARG PYTHON_VERSION
+# Build target arch for FlashMLA + batchgen_kernels:
+#   sm90a (default) -> Hopper; FlashMLA SM100 kernels disabled.
+#   sm100 / all     -> Blackwell (B200); FlashMLA SM100 kernels enabled
+#                      (requires the CUDA 12.9+ base image above).
+# Override at build time: docker build --build-arg BUILD_ARCH=sm100 ...
+ARG BUILD_ARCH=sm90a
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -44,11 +50,17 @@ RUN git clone --recursive https://github.com/Dao-AILab/flash-attention.git \
     && uv cache clean
 
 # Install FlashMLA
+# SM100 (Blackwell) kernels are only built for sm100/all targets; the default
+# Hopper (sm90a) build disables them to match upstream's Hopper-only path.
 RUN git clone --recursive https://github.com/deepseek-ai/FlashMLA.git \
     && cd FlashMLA \
     && git checkout 1408756a88e52a25196b759eaf8db89d2b51b5a1 \
     && git submodule update --init --recursive \
-    && FLASH_MLA_DISABLE_SM100=1 uv pip install -v . --no-build-isolation \
+    && if [ "$BUILD_ARCH" = "sm90a" ]; then \
+         FLASH_MLA_DISABLE_SM100=1 uv pip install -v . --no-build-isolation; \
+       else \
+         uv pip install -v . --no-build-isolation; \
+       fi \
     && uv cache clean
 
 # Install DeepGEMM
@@ -63,8 +75,9 @@ RUN git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git \
 COPY . /root/moegen
 
 # Install batchgen_kernels (AOT-compiled CUDA extensions)
+# BUILD_ARCH selects the kernel target (sm90a default / sm100 for Blackwell).
 RUN cd /root/moegen/batchgen_kernels \
-    && uv pip install . --no-build-isolation \
+    && BUILD_ARCH=${BUILD_ARCH} uv pip install . --no-build-isolation \
     && uv cache clean
 
 # Install BatchGen

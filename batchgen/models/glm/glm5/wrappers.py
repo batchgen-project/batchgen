@@ -19,7 +19,7 @@ Key differences from DeepSeek:
 import logging
 import os
 from contextlib import nullcontext as _nullctx
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -401,6 +401,29 @@ class GLM5AttnWrapper(AttnWrapperBase):
       decode uses indexer scoring for sparse attention
     - MLA dims: qk_nope=192, v_head=256, q_lora_rank=2048
     """
+
+    # Phase C (audit §A finding #8): GLM-5-specific ClassVars previously
+    # lived on `AttnWrapperBase` and leaked into every other model's class
+    # scope. They are now owned by this GLM-5 subclass.
+    #
+    # Dispatch-trace instrumentation (per-step counts of GLM-5 dispatch
+    # paths; toggled by `batchgen_debug.glm5_dispatch_trace`).
+    glm5_dispatch_trace_enabled: ClassVar[bool] = False
+    glm5_dispatch_trace_id: ClassVar[Optional[str]] = None
+    glm5_dispatch_trace_context: ClassVar[Optional[Dict[str, Any]]] = None
+    glm5_dispatch_counts: ClassVar[Dict[str, int]] = {}
+    glm5_dispatch_seen: ClassVar[Set[Tuple[str, str, str, int]]] = set()
+    # DSA per-step dispatch hint: count of rows with cache_seqlen <= index_topk.
+    # Set once per decode step by the worker so per-layer _forward_decode_dsa
+    # branches on it without doing a D2H .sum().item() 78 times per step.
+    _dsa_short_count: ClassVar[Optional[int]] = None
+    # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
+    # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
+    # rows instead of deriving slot count from cur_batch.
+    glm5_decode_primary_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_decode_aux_slot_indices: ClassVar[Optional[torch.Tensor]] = None
+    glm5_dsa_graph_forward_state: ClassVar[Optional[Dict[str, Any]]] = None
+    glm5_dsa_flashmla_graph_metadata: ClassVar[Optional[Dict[str, Any]]] = None
 
     def __init__(
         self,
@@ -954,7 +977,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if self._dsa_cuda_graph_manager is None:
             return False, "no graph manager"
         bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
-        state = getattr(AttnWrapperBase, "glm5_dsa_graph_forward_state", None)
+        state = getattr(GLM5AttnWrapper, "glm5_dsa_graph_forward_state", None)
         if not isinstance(state, dict):
             return False, "missing per-forward graph state"
         if state.get("path") != "graph":
@@ -967,7 +990,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             )
         if not bool(state.get("metadata_prepared", False)):
             return False, "per-forward FlashMLA metadata was not prepared"
-        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        metadata = getattr(GLM5AttnWrapper, "glm5_dsa_flashmla_graph_metadata", None)
         if not isinstance(metadata, dict):
             return False, "missing per-forward FlashMLA metadata"
         if int(metadata.get("bucket_size", -1)) != int(bucket_size):
@@ -994,7 +1017,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "without a graph manager"
             )
         bucket_size = self._dsa_cuda_graph_manager.bucketing.get_padded_size(batch_size)
-        metadata = getattr(AttnWrapperBase, "glm5_dsa_flashmla_graph_metadata", None)
+        metadata = getattr(GLM5AttnWrapper, "glm5_dsa_flashmla_graph_metadata", None)
         if not isinstance(metadata, dict):
             raise RuntimeError(
                 f"[layer {self.layer_idx}] GLM-5 DSA CUDA graph replay requires "

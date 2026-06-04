@@ -1,53 +1,76 @@
 name: Build Test
 
+# Triggers:
+#   - PR labeled `ci:run` by a maintainer
+#   - workflow_dispatch from the Actions UI (manual rerun without re-labeling)
+# SHA + worktree are resolved inside tairan's container; no GitHub API calls.
 on:
-  push:
-    branches:
-      - master
-      - dev
-      - release*
-      - prepare-for-open-source
-
-    paths-ignore:
-      - '**.md'
-      - 'examples/**'
-      - 'tests/**'
-      - 'docs/**'
-
   pull_request:
-    branches:
-      - master
-      - dev
-      - release*
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test"
+        required: true
+        type: string
 
-    paths-ignore:
-      - '**.md'
-      - 'examples/**'
-      - 'tests/**'
-      - 'docs/**'
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.label.name == 'ci:run' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, gpu, node0]
+    timeout-minutes: 30
+    env:
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v3
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v4
-        with:
-          python-version: 3.11
-
-      - name: Install CUDA 12.1
+      - name: Build wheel inside tairan's container
         run: |
-          bash -x .github/workflows/scripts/cuda-install.sh 12.1 ubuntu-22.04
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source /opt/batchgen-ci/env.sh
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build
+          docker exec \
+              -e PR_HEAD_SHA="$PR_HEAD_SHA" \
+              -e PR_NUMBER="$PR_NUMBER" \
+              -e WORKSPACE="$BATCHGEN_CI_WORKSPACE" \
+              "$BATCHGEN_CI_CONTAINER" \
+              bash -lc '
+                  set -euo pipefail
+                  if [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then
+                      source /root/miniconda3/etc/profile.d/conda.sh
+                      conda activate batchgen
+                  fi
+                  echo "python: $(which python) ($(python --version 2>&1))"
 
-      - name: Build Wheel
-        run: |
-          BUILD_OPS=1 python3 -m build
+                  cd "$WORKSPACE"
+                  if [[ -n "${PR_HEAD_SHA:-}" ]]; then
+                      git fetch --no-tags origin "$PR_HEAD_SHA"
+                      PR_SHA="$PR_HEAD_SHA"
+                  else
+                      git fetch --no-tags origin "pull/$PR_NUMBER/head"
+                      PR_SHA=$(git rev-parse FETCH_HEAD)
+                  fi
+                  WORKTREE="$(dirname "$WORKSPACE")/BatchGen-ci-${PR_SHA:0:12}"
+                  echo "PR_SHA=$PR_SHA WORKTREE=$WORKTREE"
+
+                  cleanup() {
+                      cd "$WORKSPACE"
+                      git worktree remove --force "$WORKTREE" 2>/dev/null || true
+                  }
+                  trap cleanup EXIT
+
+                  rm -rf "$WORKTREE"
+                  git worktree add "$WORKTREE" "$PR_SHA"
+                  cd "$WORKTREE"
+                  git log -1 --oneline
+                  echo "--- pip wheel ---"
+                  BUILD_OPS=1 pip wheel . --no-deps --no-build-isolation -v -w dist/
+                  ls -la dist/
+              '

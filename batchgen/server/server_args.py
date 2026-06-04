@@ -8,11 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 from batchgen.models.glm.glm5.cuda_graph_policy import (
-    GLM5_DSA_CUDA_GRAPH_ENV,
-    GLM5_DSA_FULL_CUDA_GRAPH_ENV,
-    GLM5_MOE_CUDA_GRAPH_ENV,
-    GLM5_SEGMENTED_CUDA_GRAPH_ENV,
-    GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV,
     GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV,
     is_glm5_fp8_graph_default_model,
 )
@@ -63,15 +58,13 @@ def _is_glm_model(model_name: Optional[str]) -> bool:
 
 
 def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
-    if args.enable_cuda_graph and is_glm5_fp8_graph_default_model(args.model):
-        return
-
+    # Phase C: mode env vars retired. Activation is gated by the
+    # `--enable-cuda-graph` / `--disable-cuda-graphs` CLI flags directly,
+    # consumed by the worker's `_glm5_whole_model_graph_requested_for_current_batch`
+    # via `args.enable_cuda_graph` / `args.disable_cuda_graphs`. Only the
+    # developer compare env var is still pinned here when graphs are
+    # explicitly disabled, to keep the compare facility off.
     if args.disable_cuda_graphs and _is_glm_model(args.model):
-        os.environ[GLM5_SEGMENTED_CUDA_GRAPH_ENV] = "0"
-        os.environ[GLM5_DSA_CUDA_GRAPH_ENV] = "0"
-        os.environ[GLM5_DSA_FULL_CUDA_GRAPH_ENV] = "0"
-        os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
-        os.environ[GLM5_WHOLE_MODEL_CUDA_GRAPH_ENV] = "0"
         os.environ[GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV] = "0"
 
 

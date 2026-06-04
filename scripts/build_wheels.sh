@@ -40,6 +40,15 @@ FLASH_ATTN_VERSION="v2.8.2"
 FLASHMLA_COMMIT="1408756a88e52a25196b759eaf8db89d2b51b5a1"
 DEEPGEMM_VERSION="v2.1.1.post3"
 
+# ── Build target arch (sm90a default / sm100 / all) ──
+# Hopper (sm90a) disables FlashMLA SM100 kernels; sm100/all enable them
+# (requires nvcc >= 12.9).
+BUILD_ARCH="${BUILD_ARCH:-sm90a}"
+FLASH_MLA_ENV=()
+if [[ "$BUILD_ARCH" == "sm90a" ]]; then
+    FLASH_MLA_ENV=(FLASH_MLA_DISABLE_SM100=1)
+fi
+
 # ── Defaults ──
 OUTPUT_DIR=""
 DEPS_DIR="${BATCHGEN_DEPS_DIR:-/tmp/batchgen_wheel_build}"
@@ -130,7 +139,7 @@ if [[ $ONLY_KERNELS -eq 0 && $SKIP_FLASHMLA -eq 0 ]]; then
         "https://github.com/deepseek-ai/FlashMLA.git" \
         "$FLASHMLA_COMMIT"
     cd "$DEPS_DIR/FlashMLA"
-    FLASH_MLA_DISABLE_SM100=1 pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
+    env "${FLASH_MLA_ENV[@]}" pip wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
     ok "FlashMLA wheel built"
 else
     warn "Skipping FlashMLA"
