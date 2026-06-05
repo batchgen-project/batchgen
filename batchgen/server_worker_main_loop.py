@@ -138,6 +138,24 @@ def _setup_nccl_env():
 			"NCCL_ALGO not forced — NCCL auto-select "
 			"(ring/tree per payload; ~1.3-2× faster than pinned tree)")
 
+	# NCCL_NVLS_ENABLE: disable NVLS (NVLink-SHARP, in-switch reduction) by
+	# default. NVLS requires multicast buffer registration, and NCCL registers
+	# buffers *during CUDA-graph capture*. Our decode path captures allreduce
+	# across all MoE layers for every bucket (e.g. K2.5 / GLM-5 whole-model
+	# graph = 16 buckets × 60 layers), so NVLS adds ~88 ms/op of multicast
+	# registration → ~5.5 s/bucket, ~80 s total capture. NVLS gives no runtime
+	# benefit at our small decode allreduce sizes (≤7 MB; measured replay equal
+	# or slightly faster with NVLS off), so it is pure cost here. Disabling it
+	# cuts whole-model capture ~80 s → ~4 s with no decode-throughput/accuracy
+	# regression (validated on K2.5 L2). NVLS targets large-tensor training
+	# allreduce; export NCCL_NVLS_ENABLE=1 to re-enable for such workloads.
+	# Must be set before NCCL comm init (ncclCommInitRank reads it per-comm).
+	if os.environ.get("NCCL_NVLS_ENABLE") is None:
+		os.environ["NCCL_NVLS_ENABLE"] = "0"
+		logging.info(
+			"NCCL_NVLS_ENABLE=0 (NVLS off — avoids multicast registration cost "
+			"during CUDA-graph capture; export NCCL_NVLS_ENABLE=1 to re-enable)")
+
 
 def server_worker_main(
 	rank_idx: int,
