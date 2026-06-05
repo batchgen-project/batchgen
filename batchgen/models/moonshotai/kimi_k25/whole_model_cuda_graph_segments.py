@@ -246,6 +246,13 @@ class K25WholeModelSegment:
         rank_token_counts: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         hidden_states = self.model.model.embed_tokens(input_ids)
+        # Hoist layer-invariant decode quantities (RoPE cos/sin, FlashMLA metadata,
+        # position/token ids) — all derive from the shared cache_seqlens / shared
+        # rotary instance, so they are identical for every layer. Compute once and
+        # thread into all layers instead of recomputing x61 inside the graph.
+        shared_ctx = self.layer_segments[0].attn_segment.compute_shared_decode_ctx(
+            cache_seqlens, hidden_states
+        )
         outputs: dict[str, torch.Tensor] = {}
         for layer_idx, layer_segment in enumerate(self.layer_segments):
             graph_out = layer_segment.forward(
@@ -254,6 +261,7 @@ class K25WholeModelSegment:
                 page_table=page_table,
                 slot_indices=slot_indices,
                 rank_token_counts=rank_token_counts,
+                shared_ctx=shared_ctx,
             )
             hidden_states = graph_out["hidden_states"]
             self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"])
