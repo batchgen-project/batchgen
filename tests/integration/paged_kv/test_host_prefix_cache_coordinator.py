@@ -385,13 +385,13 @@ def test_host_prefix_cache_is_shared_across_process_attachments():
         assert attached.common_cached_tokens == 8
         assert owner.get_stats().active_attachments == 0
         assert worker.get_stats().active_attachments == 1
-        evicted = owner.evict_until_free(1, 0, 0, 1)
+        evicted = owner.evict_until_free(16, 0, 0, 1)
         assert evicted.evicted_nodes == 0
         assert evicted.protected_nodes == 1
 
         worker.release_attachment(attached.attachment_handle)
         assert worker.get_stats().active_attachments == 0
-        evicted = owner.evict_until_free(1, 0, 0, 1)
+        evicted = owner.evict_until_free(16, 0, 0, 1)
         assert evicted.evicted_nodes == 1
     finally:
         _shm_unlink(shm_name)
