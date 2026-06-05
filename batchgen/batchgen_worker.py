@@ -1601,6 +1601,22 @@ class BatchGenWorker:
 		)
 		return temps, top_ps, top_ks
 
+	def _decode_batch_all_greedy(self, batch_sequences: list) -> bool:
+		"""True iff every decode-batch sequence is greedy (effective temperature
+		<= 0), resolving params exactly as _build_sampling_tensors. Pure host-side
+		check (no device sync), so an all-greedy batch can skip sample_tokens and
+		its per-token .any() syncs / H2D param builds.
+		"""
+		for seq in batch_sequences:
+			seq_params = getattr(seq, "sampling_params", None)
+			if seq_params is None and self._per_sequence_sampling_params is not None:
+				global_idx = getattr(seq, "global_idx", -1)
+				if 0 <= global_idx < len(self._per_sequence_sampling_params):
+					seq_params = self._per_sequence_sampling_params[global_idx]
+			if ((seq_params or {}).get('temperature', 0.0) or 0.0) > 0:
+				return False
+		return True
+
 	def _select_tokens(self, logits: torch.Tensor, batch_sequences: Optional[list] = None) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
@@ -1625,6 +1641,15 @@ class BatchGenWorker:
 			)
 		):
 			active_sequences = batch_sequences or []
+			# All-greedy fast path: if every sequence's effective temperature is
+			# <= 0, argmax directly (fp32, bit-identical to sample_tokens' greedy
+			# branch) instead of entering sample_tokens. This skips its two per-
+			# token .any() device->host syncs (sampling.py:84,88) and the three
+			# per-token H2D sampling-tensor builds — pure pipeline stalls for a
+			# temp-0 batch. Host-side check (no device sync), recomputed each step
+			# so no membership-invalidation hazard.
+			if self._decode_batch_all_greedy(active_sequences):
+				return logits.float().argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -2004,6 +2029,12 @@ class BatchGenWorker:
 		copies. Replaces N per-layer syncs with a single post-forward
 		sync for both caches.
 		"""
+		# Whether this call reached the event.synchronize() below. The caller
+		# enqueues the token-readback copy before calling us and relies on this
+		# flag to know if our single sync already drained that copy (so it can
+		# skip a second sync). Set False up-front so every early-return path
+		# leaves it False.
+		self._kv_offload_synced_this_step = False
 		entries = getattr(self, '_deferred_kv_entries', [])
 		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
 		if not entries and not entries_aux:
@@ -2041,6 +2072,9 @@ class BatchGenWorker:
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
+		# Recorded after the caller's token-readback copy (enqueued before this
+		# call), so this one sync covers it too.
+		self._kv_offload_synced_this_step = True
 
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -10335,15 +10369,21 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# Flush deferred KV entries — single sync for all layers
-			self._flush_deferred_kv_to_host()
-
-			# P1: Non-blocking GPU→CPU transfer via pinned memory
+			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Enqueue
+			# the copy BEFORE flushing KV so _flush_deferred_kv_to_host's single
+			# event.synchronize() (recorded after this copy on the same stream)
+			# covers it too — collapses the two per-step host syncs into one.
 			bs = new_tokens.shape[0]
 			if bs > _new_tokens_pinned.shape[0]:
 				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
 			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
-			torch.cuda.current_stream(self.torch_device).synchronize()
+
+			# Flush deferred KV entries — its single sync covers all layers plus
+			# the token copy above. Only sync again if it had nothing to flush
+			# (early return without syncing) so the token copy isn't read stale.
+			self._flush_deferred_kv_to_host()
+			if not getattr(self, '_kv_offload_synced_this_step', False):
+				torch.cuda.current_stream(self.torch_device).synchronize()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
