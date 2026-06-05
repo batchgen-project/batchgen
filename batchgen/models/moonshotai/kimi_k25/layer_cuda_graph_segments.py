@@ -58,7 +58,8 @@ class K25DecoderLayerGraphSegment:
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
-            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            # -1 sentinel: padded bucket rows skip the in-graph KV write.
+            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
         }
         if self.moe_segment is not None:
             specs["rank_token_counts"] = TensorSpec(

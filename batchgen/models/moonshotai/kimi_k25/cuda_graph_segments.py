@@ -84,7 +84,7 @@ class K25AttnSegment:
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
             "slot_indices": TensorSpec(
-                ("batch_size",), torch.int32, fill_value=0
+                ("batch_size",), torch.int32, fill_value=-1
             ),
         }
 
