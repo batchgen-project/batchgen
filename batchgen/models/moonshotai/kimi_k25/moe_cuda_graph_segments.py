@@ -344,7 +344,11 @@ class K25MoEGraphSegment:
         )
 
         # 4) 3D dispatch scatter into strided expert buffer.
-        bufs.dispatched_x.zero_()
+        # No pre-zero: dispatch_scatter_3d writes exactly expert_counts[e] rows
+        # per expert (starting at e*mtp), and the Marlin S1 GEMM never reads the
+        # padding rows beyond that — each CTA early-exits when m_start >= expert_m
+        # and predicates its A-load by prob_m. (If a future Marlin variant drops
+        # that predicate / loads full 16-row M-tiles, restore this zero_.)
         expert_counts, topk_pos = dispatch_scatter_3d(
             bufs.all_tokens,
             bufs.topk_masked_indices,
@@ -378,7 +382,10 @@ class K25MoEGraphSegment:
         )
 
         # 6) Reduce weighted scatter -> flat global output.
-        bufs.routed_global_output.zero_()
+        # No pre-zero: reduce_weighted_scatter's kernel UNCONDITIONALLY stores
+        # every output row (acc inits to 0; the pos>=0 guard only gates the
+        # accumulate, not the store), and H=7168=28*256 so all columns are
+        # covered. The buffer is fully overwritten regardless of routing.
         routed_global_output = reduce_weighted_scatter(
             bufs.expert_out,
             topk_pos,
