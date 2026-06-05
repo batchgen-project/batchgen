@@ -2497,6 +2497,14 @@ class BatchGenWorker:
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
+		elif (
+			is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
+			and getattr(self.args, "enable_cuda_graph", False)
+		):
+			# K2.5 whole-model decode graph (cuda-graph adapter). The config flag
+			# defaults off; --enable-cuda-graph flips it on (mirrors GLM-5's
+			# force-enable) so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
