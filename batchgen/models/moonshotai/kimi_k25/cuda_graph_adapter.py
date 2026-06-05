@@ -334,6 +334,19 @@ class KimiK25CudaGraphAdapter(ModelCudaGraphAdapter):
         if ensure_graph_table is not None:
             ensure_graph_table(active_sequence_ids)
         page_table = primary_manager.get_cuda_graph_page_table()
+        # The captured static page_table buffer is [bucket, max_pages_per_seq]
+        # (max_pages from full context). The runtime page table is rebuilt with
+        # a varying column count, so pad/truncate to the captured width or the
+        # manager's copy_ into the static buffer mismatches on dim 1. Mirrors the
+        # GLM-5 whole-model replay path and the per-layer K25AttnSegment.
+        wm_max_pages = int(self._ctx.whole_model_segment.max_pages_per_seq)
+        page_table = page_table[:local_bsz].to(dtype=torch.int32, device=device)
+        if page_table.shape[1] < wm_max_pages:
+            page_table = torch.nn.functional.pad(
+                page_table, (0, wm_max_pages - page_table.shape[1]), value=0
+            )
+        elif page_table.shape[1] > wm_max_pages:
+            page_table = page_table[:, :wm_max_pages]
         slot_indices = primary_manager._gpu_page_table_manager._slot_index_tensor
         if slot_indices is None:
             slot_indices = torch.arange(local_bsz, dtype=torch.int32, device=device)
@@ -357,7 +370,7 @@ class KimiK25CudaGraphAdapter(ModelCudaGraphAdapter):
         return {
             "input_ids": input_ids[:local_bsz],
             "cache_seqlens": cache_seqlens[:local_bsz].to(dtype=torch.int32, device=device),
-            "page_table": page_table[:local_bsz].to(dtype=torch.int32, device=device),
+            "page_table": page_table,
             "slot_indices": slot_indices[:local_bsz].to(dtype=torch.int32, device=device),
             "rank_token_counts": rank_token_counts,
         }
