@@ -136,6 +136,17 @@ def test_host_prefix_cache_lookup_attach_release():
 
         coordinator.release_attachment(attached.attachment_handle)
         assert coordinator.get_stats().active_attachments == 0
+
+        full = coordinator.lookup_and_attach(namespace, token_ids)
+        assert full.common_cached_tokens == 16
+        assert [
+            [page.page_id for page in span.pages]
+            for span in full.materialization_spans
+        ] == [
+            [0, 1, 2, 3],
+            [0, 1],
+        ]
+        coordinator.release_attachment(full.attachment_handle)
     finally:
         _shm_unlink(shm_name)
 
@@ -161,24 +172,24 @@ def test_host_prefix_cache_evicts_lru_and_preserves_active_attachment():
         assert active.common_cached_tokens == 16
 
         evicted = coordinator.evict_until_free(2, 0, 0, 2)
-        assert evicted.evicted_nodes == 1
-        assert evicted.protected_nodes == 1
-        assert evicted.freed_group_entries == 2
-        assert evicted.freed_page_handles == 3
+        assert evicted.evicted_nodes == 0
+        assert evicted.protected_nodes == 2
+        assert evicted.freed_group_entries == 0
+        assert evicted.freed_page_handles == 0
         assert len(evicted.evicted_group_pages) == 0
 
         miss = coordinator.estimate_lookup(namespace, token_ids[:8])
         hit = coordinator.estimate_lookup(namespace, token_ids)
-        assert miss.miss_reason_mask
+        assert miss.common_cached_tokens == 8
         assert hit.common_cached_tokens == 16
         stats = coordinator.get_stats()
-        assert stats.resident_nodes == 1
-        assert stats.used_group_entries == 2
+        assert stats.resident_nodes == 2
+        assert stats.used_group_entries == 4
         assert stats.used_page_handles == 6
 
         coordinator.release_attachment(active.attachment_handle)
         evicted = coordinator.evict_until_free(2, 0, 0, 2)
-        assert evicted.evicted_nodes == 1
+        assert evicted.evicted_nodes == 2
         assert [pages.group_id for pages in evicted.evicted_group_pages] == [
             0,
             1,
@@ -214,10 +225,9 @@ def test_host_prefix_cache_evicts_common_nodes_until_pages_releasable():
             0,
         )
 
-        # The first LRU node owns prefix pages that are also referenced by the
-        # deeper node, so no physical page is releasable until the deeper common
-        # prefix node is evicted as well.
-        assert evicted.evicted_nodes == 2
+        # Nodes store only their own block interval, so the first LRU node can
+        # release physical pages immediately.
+        assert evicted.evicted_nodes == 1
         assert evicted.protected_nodes == 0
         assert [pages.group_id for pages in evicted.evicted_group_pages] == [
             0,
@@ -227,10 +237,10 @@ def test_host_prefix_cache_evicts_common_nodes_until_pages_releasable():
             [page.page_id for page in pages.pages]
             for pages in evicted.evicted_group_pages
         ] == [
-            [0, 1, 2, 3],
             [0, 1],
+            [0],
         ]
-        assert coordinator.get_stats().resident_nodes == 0
+        assert coordinator.get_stats().resident_nodes == 1
     finally:
         _shm_unlink(shm_name)
 
@@ -254,17 +264,17 @@ def test_host_prefix_cache_clear_skips_active_entries():
 
         active = coordinator.lookup_and_attach(namespace, token_ids)
         clear = coordinator.clear_unprotected()
-        assert clear.evicted_nodes == 1
-        assert clear.protected_nodes == 1
-        assert coordinator.get_stats().resident_nodes == 1
+        assert clear.evicted_nodes == 0
+        assert clear.protected_nodes == 2
+        assert coordinator.get_stats().resident_nodes == 2
         miss = coordinator.estimate_lookup(namespace, token_ids[:8])
         hit = coordinator.estimate_lookup(namespace, token_ids)
-        assert miss.miss_reason_mask
+        assert miss.common_cached_tokens == 8
         assert hit.common_cached_tokens == 16
 
         coordinator.release_attachment(active.attachment_handle)
         clear = coordinator.clear_unprotected()
-        assert clear.evicted_nodes == 1
+        assert clear.evicted_nodes == 2
         assert clear.protected_nodes == 0
         assert coordinator.get_stats().resident_nodes == 0
     finally:
@@ -274,19 +284,17 @@ def test_host_prefix_cache_clear_skips_active_entries():
 def test_host_prefix_cache_pending_load_protects_after_release():
     shm_name = _random_shm_name()
     namespace = [909, 808, 707, 606]
-    token_ids = list(range(8))
+    token_ids = list(range(16))
     try:
-        coordinator = bg.HostPrefixCacheCoordinator(
-            _single_node_config(shm_name)
-        )
+        coordinator = bg.HostPrefixCacheCoordinator(_small_config(shm_name))
         coordinator.initialize(True)
         coordinator.commit_prefix_pages(
             namespace,
             token_ids,
-            8,
+            16,
             [
-                _group_pages(0, [_page(0), _page(1)]),
-                _group_pages(1, [_page(0)]),
+                _group_pages(0, [_page(idx) for idx in range(4)]),
+                _group_pages(1, [_page(idx) for idx in range(2)]),
             ],
         )
 
@@ -295,22 +303,22 @@ def test_host_prefix_cache_pending_load_protects_after_release():
         coordinator.release_attachment(active.attachment_handle)
         stats = coordinator.get_stats()
         assert stats.active_attachments == 1
-        assert stats.pending_load_entries == 2
-        assert stats.pending_load_refs == 2
+        assert stats.pending_load_entries == 4
+        assert stats.pending_load_refs == 4
 
-        evicted = coordinator.evict_until_free(1, 0, 0, 1)
+        evicted = coordinator.evict_until_free(2, 0, 0, 2)
         assert evicted.evicted_nodes == 0
-        assert evicted.protected_nodes == 1
-        assert coordinator.get_stats().eviction_protected_skips == 1
+        assert evicted.protected_nodes == 2
+        assert coordinator.get_stats().eviction_protected_skips == 2
 
         coordinator.end_attachment_load(active.attachment_handle)
         stats = coordinator.get_stats()
         assert stats.active_attachments == 0
         assert stats.pending_load_entries == 0
         assert stats.pending_load_refs == 0
-        evicted = coordinator.evict_until_free(1, 0, 0, 1)
-        assert evicted.evicted_nodes == 1
-        assert coordinator.get_stats().evicted_nodes == 1
+        evicted = coordinator.evict_until_free(2, 0, 0, 2)
+        assert evicted.evicted_nodes == 2
+        assert coordinator.get_stats().evicted_nodes == 2
     finally:
         _shm_unlink(shm_name)
 
@@ -375,9 +383,15 @@ def test_host_prefix_cache_is_shared_across_process_attachments():
         attached = worker.lookup_and_attach(namespace, token_ids)
 
         assert attached.common_cached_tokens == 8
-        assert owner.get_stats().active_attachments == 1
+        assert owner.get_stats().active_attachments == 0
+        assert worker.get_stats().active_attachments == 1
+        evicted = owner.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 0
+        assert evicted.protected_nodes == 1
 
         worker.release_attachment(attached.attachment_handle)
-        assert owner.get_stats().active_attachments == 0
+        assert worker.get_stats().active_attachments == 0
+        evicted = owner.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 1
     finally:
         _shm_unlink(shm_name)

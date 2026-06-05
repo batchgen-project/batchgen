@@ -16,6 +16,7 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -30,7 +31,7 @@ namespace batchgen::kv {
 namespace {
 
 constexpr std::uint64_t kPrefixCacheMagic = 0x484f535450434348ULL;
-constexpr std::uint32_t kPrefixCacheAbiVersion = 1;
+constexpr std::uint32_t kPrefixCacheAbiVersion = 2;
 
 enum class EntryState : std::uint32_t {
     kEmpty = 0,
@@ -51,11 +52,9 @@ struct SharedHeader {
     std::uint32_t max_nodes = 0;
     std::uint32_t max_group_entries = 0;
     std::uint32_t max_page_handles = 0;
-    std::uint32_t max_attachments = 0;
 
     std::atomic<std::uint32_t> next_group_entry{0};
     std::atomic<std::uint32_t> next_page_handle{0};
-    std::atomic<std::uint64_t> next_attachment_handle{1};
     std::atomic<std::uint64_t> global_epoch{0};
     std::atomic<std::uint64_t> lookup_hits{0};
     std::atomic<std::uint64_t> lookup_misses{0};
@@ -76,6 +75,7 @@ struct SharedPrefixNode {
     std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
     PrefixDigest namespace_digest{};
     PrefixDigest digest{};
+    std::uint32_t raw_start_token = 0;
     std::uint32_t raw_end_token = 0;
     std::uint32_t first_group_entry = 0;
     std::uint32_t group_entry_count = 0;
@@ -85,6 +85,7 @@ struct SharedPrefixNode {
 struct SharedGroupEntry {
     std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
     std::uint32_t group_id = 0;
+    std::uint32_t raw_start_token = 0;
     std::uint32_t raw_end_token = 0;
     std::uint32_t first_page_handle = 0;
     std::uint32_t page_handle_count = 0;
@@ -94,14 +95,6 @@ struct SharedGroupEntry {
 
 struct SharedPageHandle {
     std::uint32_t page_id = 0;
-};
-
-struct SharedAttachment {
-    std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
-    std::uint64_t attachment_handle = 0;
-    std::uint32_t node_index = 0;
-    std::uint32_t pending_load_count = 0;
-    std::uint32_t release_requested = 0;
 };
 
 std::uint64_t NowNs() {
@@ -151,6 +144,7 @@ bool DigestEquals(const PrefixDigest& lhs, const PrefixDigest& rhs) {
 void ResetGroupEntry(SharedGroupEntry& entry) {
     entry.state = static_cast<std::uint32_t>(EntryState::kEmpty);
     entry.group_id = 0;
+    entry.raw_start_token = 0;
     entry.raw_end_token = 0;
     entry.first_page_handle = 0;
     entry.page_handle_count = 0;
@@ -290,6 +284,12 @@ std::vector<std::pair<std::uint32_t, PrefixDigest>> BuildPrefixHashChain(
 }
 
 struct HostPrefixCacheCoordinator::SharedState {
+    struct LocalAttachment {
+        std::vector<std::uint32_t> node_indices;
+        std::uint32_t pending_load_count = 0;
+        bool release_requested = false;
+    };
+
     explicit SharedState(HostPrefixCacheConfig cfg,
                          std::uint32_t hash_block_tokens,
                          std::uint32_t commit_boundary_tokens)
@@ -336,17 +336,19 @@ struct HostPrefixCacheCoordinator::SharedState {
     SharedPrefixNode* nodes = nullptr;
     SharedGroupEntry* group_entries = nullptr;
     SharedPageHandle* page_handles = nullptr;
-    SharedAttachment* attachments = nullptr;
 
     std::size_t header_offset = 0;
     std::size_t group_spec_offset = 0;
     std::size_t node_offset = 0;
     std::size_t group_entry_offset = 0;
     std::size_t page_handle_offset = 0;
-    std::size_t attachment_offset = 0;
     std::size_t total_bytes_unaligned = 0;
 
    private:
+    mutable std::mutex local_attachment_mutex;
+    std::unordered_map<std::uint64_t, LocalAttachment> local_attachments;
+    std::uint64_t next_local_attachment_handle = 1;
+
     void ComputeOffsets();
     void MapPointers();
     void ConstructSharedState();
@@ -355,17 +357,19 @@ struct HostPrefixCacheCoordinator::SharedState {
     std::optional<std::uint32_t> FindNodeLocked(
         const PrefixDigest& digest) const;
     std::uint32_t AllocateNodeLocked();
-    std::uint32_t AllocateAttachmentLocked();
     bool NodeHasRequiredGroupsLocked(const SharedPrefixNode& node) const;
     std::vector<GroupMaterializationSpan> BuildMaterializationSpansLocked(
-        const SharedPrefixNode& node) const;
-    std::uint64_t AttachNodeLocked(std::uint32_t node_index);
+        const std::vector<std::uint32_t>& node_indices) const;
+    std::uint64_t AttachNodesLocked(
+        const std::vector<std::uint32_t>& node_indices);
     std::uint32_t CountFreeNodeSlotsLocked() const;
     bool NodeIsProtectedLocked(const SharedPrefixNode& node) const;
-    SharedAttachment* FindAttachmentLocked(std::uint64_t attachment_handle);
-    void UpdateAttachmentLoadRefsLocked(SharedAttachment* attachment,
-                                        int delta);
-    void FinalizeAttachmentReleaseLocked(SharedAttachment* attachment);
+    void IncrementActiveRefsLocked(
+        const std::vector<std::uint32_t>& node_indices);
+    void DecrementActiveRefsLocked(
+        const std::vector<std::uint32_t>& node_indices);
+    void UpdateLoadRefsLocked(const std::vector<std::uint32_t>& node_indices,
+                              int delta);
     void EvictNodeLocked(SharedPrefixNode* node, PrefixEvictionResult* result);
     void AppendEvictedPagesLocked(const SharedPrefixNode& node,
                                   PrefixEvictionResult* result) const;
@@ -398,10 +402,6 @@ void HostPrefixCacheCoordinator::SharedState::ComputeOffsets() {
     page_handle_offset = offset;
     offset += sizeof(SharedPageHandle) * config.max_page_handles;
 
-    offset = AlignUp(offset, alignof(SharedAttachment));
-    attachment_offset = offset;
-    offset += sizeof(SharedAttachment) * config.max_attachments;
-
     total_bytes_unaligned = offset;
 }
 
@@ -414,8 +414,6 @@ void HostPrefixCacheCoordinator::SharedState::MapPointers() {
         reinterpret_cast<SharedGroupEntry*>(mapping + group_entry_offset);
     page_handles =
         reinterpret_cast<SharedPageHandle*>(mapping + page_handle_offset);
-    attachments =
-        reinterpret_cast<SharedAttachment*>(mapping + attachment_offset);
 }
 
 void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
@@ -430,10 +428,8 @@ void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
     header->max_nodes = config.max_nodes;
     header->max_group_entries = config.max_group_entries;
     header->max_page_handles = config.max_page_handles;
-    header->max_attachments = config.max_attachments;
     header->next_group_entry.store(0, std::memory_order_relaxed);
     header->next_page_handle.store(0, std::memory_order_relaxed);
-    header->next_attachment_handle.store(1, std::memory_order_relaxed);
     header->global_epoch.store(0, std::memory_order_relaxed);
     header->lookup_hits.store(0, std::memory_order_relaxed);
     header->lookup_misses.store(0, std::memory_order_relaxed);
@@ -481,8 +477,7 @@ void HostPrefixCacheCoordinator::SharedState::ValidateSharedState() const {
         header->commit_boundary_tokens != commit_boundary_tokens ||
         header->max_nodes != config.max_nodes ||
         header->max_group_entries != config.max_group_entries ||
-        header->max_page_handles != config.max_page_handles ||
-        header->max_attachments != config.max_attachments) {
+        header->max_page_handles != config.max_page_handles) {
         throw std::runtime_error("Host prefix cache config mismatch");
     }
     for (std::size_t i = 0; i < config.group_specs.size(); ++i) {
@@ -584,21 +579,6 @@ std::uint32_t HostPrefixCacheCoordinator::SharedState::AllocateNodeLocked() {
     throw std::runtime_error("Host prefix cache node table is full");
 }
 
-std::uint32_t
-HostPrefixCacheCoordinator::SharedState::AllocateAttachmentLocked() {
-    for (std::uint32_t index = 0; index < config.max_attachments; ++index) {
-        SharedAttachment& attachment = attachments[index];
-        if (attachment.state ==
-                static_cast<std::uint32_t>(EntryState::kEmpty) ||
-            attachment.state ==
-                static_cast<std::uint32_t>(EntryState::kTombstone)) {
-            attachment = SharedAttachment();
-            return index;
-        }
-    }
-    throw std::runtime_error("Host prefix cache attachment table is full");
-}
-
 bool HostPrefixCacheCoordinator::SharedState::NodeHasRequiredGroupsLocked(
     const SharedPrefixNode& node) const {
     for (std::size_t spec_idx = 0; spec_idx < config.group_specs.size();
@@ -615,6 +595,7 @@ bool HostPrefixCacheCoordinator::SharedState::NodeHasRequiredGroupsLocked(
             if (entry.state ==
                     static_cast<std::uint32_t>(EntryState::kResident) &&
                 entry.group_id == spec.group_id &&
+                entry.raw_start_token <= node.raw_start_token &&
                 entry.raw_end_token >= node.raw_end_token) {
                 found = true;
                 break;
@@ -629,50 +610,88 @@ bool HostPrefixCacheCoordinator::SharedState::NodeHasRequiredGroupsLocked(
 
 std::vector<GroupMaterializationSpan>
 HostPrefixCacheCoordinator::SharedState::BuildMaterializationSpansLocked(
-    const SharedPrefixNode& node) const {
+    const std::vector<std::uint32_t>& node_indices) const {
+    std::map<std::uint32_t, GroupMaterializationSpan> spans_by_group;
+    for (std::uint32_t node_index : node_indices) {
+        if (node_index >= config.max_nodes) {
+            throw std::out_of_range("prefix cache node index out of range");
+        }
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            throw std::runtime_error(
+                "prefix cache materialization refers to non-resident node");
+        }
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state !=
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                continue;
+            }
+            GroupMaterializationSpan& span = spans_by_group[entry.group_id];
+            span.group_id = entry.group_id;
+            span.raw_end_token = std::max(span.raw_end_token,
+                                          entry.raw_end_token);
+            span.pages.reserve(span.pages.size() + entry.page_handle_count);
+            for (std::uint32_t page_idx = 0;
+                 page_idx < entry.page_handle_count; ++page_idx) {
+                const SharedPageHandle& page =
+                    page_handles[entry.first_page_handle + page_idx];
+                span.pages.push_back({page.page_id});
+            }
+        }
+    }
+
     std::vector<GroupMaterializationSpan> spans;
-    spans.reserve(node.group_entry_count);
-    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
-        const SharedGroupEntry& entry =
-            group_entries[node.first_group_entry + offset];
-        if (entry.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+    spans.reserve(spans_by_group.size());
+    for (std::size_t spec_idx = 0; spec_idx < config.group_specs.size();
+         ++spec_idx) {
+        const std::uint32_t group_id = group_specs[spec_idx].group_id;
+        auto iter = spans_by_group.find(group_id);
+        if (iter == spans_by_group.end()) {
             continue;
         }
-        GroupMaterializationSpan span;
-        span.group_id = entry.group_id;
-        span.raw_end_token = entry.raw_end_token;
-        span.pages.reserve(entry.page_handle_count);
-        for (std::uint32_t page_idx = 0; page_idx < entry.page_handle_count;
-             ++page_idx) {
-            const SharedPageHandle& page =
-                page_handles[entry.first_page_handle + page_idx];
-            span.pages.push_back({page.page_id});
-        }
+        spans.emplace_back(std::move(iter->second));
+        spans_by_group.erase(iter);
+    }
+    for (auto& [_, span] : spans_by_group) {
         spans.emplace_back(std::move(span));
     }
     return spans;
 }
 
-std::uint64_t HostPrefixCacheCoordinator::SharedState::AttachNodeLocked(
-    std::uint32_t node_index) {
-    SharedPrefixNode& node = nodes[node_index];
-    const std::uint32_t attachment_index = AllocateAttachmentLocked();
-    const std::uint64_t handle =
-        header->next_attachment_handle.fetch_add(1, std::memory_order_relaxed);
-    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
-        SharedGroupEntry& entry =
-            group_entries[node.first_group_entry + offset];
-        entry.active_ref_count.fetch_add(1, std::memory_order_relaxed);
+std::uint64_t HostPrefixCacheCoordinator::SharedState::AttachNodesLocked(
+    const std::vector<std::uint32_t>& node_indices) {
+    if (node_indices.empty()) {
+        throw std::invalid_argument(
+            "prefix cache attach needs at least one node");
     }
+    LocalAttachment attachment;
+    attachment.node_indices = node_indices;
     const std::uint64_t epoch =
         header->global_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
-    node.last_access_epoch = epoch;
-
-    SharedAttachment& attachment = attachments[attachment_index];
-    attachment.state = static_cast<std::uint32_t>(EntryState::kResident);
-    attachment.attachment_handle = handle;
-    attachment.node_index = node_index;
-    return handle;
+    for (std::uint32_t node_index : attachment.node_indices) {
+        if (node_index >= config.max_nodes) {
+            throw std::out_of_range("prefix cache node index out of range");
+        }
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            throw std::runtime_error(
+                "prefix cache attach refers to non-resident node");
+        }
+        node.last_access_epoch = epoch;
+    }
+    IncrementActiveRefsLocked(attachment.node_indices);
+    try {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        const std::uint64_t handle = next_local_attachment_handle++;
+        local_attachments.emplace(handle, std::move(attachment));
+        return handle;
+    } catch (...) {
+        DecrementActiveRefsLocked(node_indices);
+        throw;
+    }
 }
 
 std::uint32_t
@@ -704,52 +723,72 @@ bool HostPrefixCacheCoordinator::SharedState::NodeIsProtectedLocked(
     return false;
 }
 
-SharedAttachment* HostPrefixCacheCoordinator::SharedState::FindAttachmentLocked(
-    std::uint64_t attachment_handle) {
-    for (std::uint32_t index = 0; index < config.max_attachments; ++index) {
-        SharedAttachment& candidate = attachments[index];
-        if (candidate.state ==
-                static_cast<std::uint32_t>(EntryState::kResident) &&
-            candidate.attachment_handle == attachment_handle) {
-            return &candidate;
+void HostPrefixCacheCoordinator::SharedState::IncrementActiveRefsLocked(
+    const std::vector<std::uint32_t>& node_indices) {
+    for (std::uint32_t node_index : node_indices) {
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            throw std::runtime_error(
+                "host prefix cache attachment refers to non-resident node");
+        }
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            entry.active_ref_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    return nullptr;
 }
 
-void HostPrefixCacheCoordinator::SharedState::UpdateAttachmentLoadRefsLocked(
-    SharedAttachment* attachment, int delta) {
-    SharedPrefixNode& node = nodes[attachment->node_index];
-    if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
-        throw std::runtime_error(
-            "host prefix cache attachment refers to non-resident node");
-    }
-    for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
-        SharedGroupEntry& entry =
-            group_entries[node.first_group_entry + offset];
-        const std::uint32_t pending =
-            entry.pending_load_count.load(std::memory_order_relaxed);
-        if (delta > 0) {
-            entry.pending_load_count.store(pending + 1,
-                                           std::memory_order_relaxed);
-        } else {
-            if (pending == 0) {
+void HostPrefixCacheCoordinator::SharedState::DecrementActiveRefsLocked(
+    const std::vector<std::uint32_t>& node_indices) {
+    for (std::uint32_t node_index : node_indices) {
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            const std::uint32_t refs =
+                entry.active_ref_count.load(std::memory_order_relaxed);
+            if (refs == 0) {
                 throw std::runtime_error(
-                    "host prefix cache pending load ref underflow");
+                    "host prefix cache active attachment ref underflow");
             }
-            entry.pending_load_count.store(pending - 1,
-                                           std::memory_order_relaxed);
+            entry.active_ref_count.store(refs - 1, std::memory_order_relaxed);
         }
     }
 }
 
-void HostPrefixCacheCoordinator::SharedState::FinalizeAttachmentReleaseLocked(
-    SharedAttachment* attachment) {
-    if (attachment->pending_load_count != 0) {
-        attachment->release_requested = 1;
-        return;
+void HostPrefixCacheCoordinator::SharedState::UpdateLoadRefsLocked(
+    const std::vector<std::uint32_t>& node_indices, int delta) {
+    for (std::uint32_t node_index : node_indices) {
+        SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            throw std::runtime_error(
+                "host prefix cache attachment refers to non-resident node");
+        }
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            const std::uint32_t pending =
+                entry.pending_load_count.load(std::memory_order_relaxed);
+            if (delta > 0) {
+                entry.pending_load_count.store(pending + 1,
+                                               std::memory_order_relaxed);
+            } else {
+                if (pending == 0) {
+                    throw std::runtime_error(
+                        "host prefix cache pending load ref underflow");
+                }
+                entry.pending_load_count.store(pending - 1,
+                                               std::memory_order_relaxed);
+            }
+        }
     }
-    attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
 }
 
 void HostPrefixCacheCoordinator::SharedState::EvictNodeLocked(
@@ -862,6 +901,7 @@ void HostPrefixCacheCoordinator::SharedState::
 void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
     struct GroupEntrySnapshot {
         std::uint32_t group_id = 0;
+        std::uint32_t raw_start_token = 0;
         std::uint32_t raw_end_token = 0;
         std::uint32_t active_ref_count = 0;
         std::uint32_t pending_load_count = 0;
@@ -871,6 +911,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
         std::uint32_t node_index = 0;
         PrefixDigest namespace_digest{};
         PrefixDigest digest{};
+        std::uint32_t raw_start_token = 0;
         std::uint32_t raw_end_token = 0;
         std::uint64_t last_access_epoch = 0;
         std::vector<GroupEntrySnapshot> groups;
@@ -888,6 +929,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
         snapshot.node_index = node_index;
         snapshot.namespace_digest = node.namespace_digest;
         snapshot.digest = node.digest;
+        snapshot.raw_start_token = node.raw_start_token;
         snapshot.raw_end_token = node.raw_end_token;
         snapshot.last_access_epoch = node.last_access_epoch;
         snapshot.groups.reserve(node.group_entry_count);
@@ -901,6 +943,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
             }
             GroupEntrySnapshot group;
             group.group_id = entry.group_id;
+            group.raw_start_token = entry.raw_start_token;
             group.raw_end_token = entry.raw_end_token;
             group.active_ref_count =
                 entry.active_ref_count.load(std::memory_order_relaxed);
@@ -930,6 +973,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
         node.state = static_cast<std::uint32_t>(EntryState::kResident);
         node.namespace_digest = snapshot.namespace_digest;
         node.digest = snapshot.digest;
+        node.raw_start_token = snapshot.raw_start_token;
         node.raw_end_token = snapshot.raw_end_token;
         node.first_group_entry = next_group_entry;
         node.group_entry_count =
@@ -941,6 +985,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
             ResetGroupEntry(entry);
             entry.state = static_cast<std::uint32_t>(EntryState::kResident);
             entry.group_id = group.group_id;
+            entry.raw_start_token = group.raw_start_token;
             entry.raw_end_token = group.raw_end_token;
             entry.first_page_handle = next_page_handle;
             entry.page_handle_count =
@@ -1003,12 +1048,14 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
     std::uint32_t new_nodes_needed = 0;
     std::uint32_t group_entries_needed = 0;
     std::uint32_t page_handles_needed = 0;
+    std::uint32_t raw_start_token = 0;
     for (const auto& [raw_end_token, digest] : chain) {
         if (raw_end_token > commit_tokens ||
             raw_end_token % commit_boundary_tokens != 0) {
             continue;
         }
         if (FindNodeLocked(digest).has_value()) {
+            raw_start_token = raw_end_token;
             continue;
         }
         ++new_nodes_needed;
@@ -1017,17 +1064,21 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
             if (iter == pages_by_group.end()) {
                 continue;
             }
-            if (raw_end_token % spec.raw_page_tokens != 0) {
+            if (raw_start_token % spec.raw_page_tokens != 0 ||
+                raw_end_token % spec.raw_page_tokens != 0) {
                 continue;
             }
+            const std::uint32_t first_page =
+                raw_start_token / spec.raw_page_tokens;
             const std::uint32_t pages_needed =
-                raw_end_token / spec.raw_page_tokens;
-            if (iter->second->size() < pages_needed) {
+                (raw_end_token - raw_start_token) / spec.raw_page_tokens;
+            if (iter->second->size() < first_page + pages_needed) {
                 continue;
             }
             ++group_entries_needed;
             page_handles_needed += pages_needed;
         }
+        raw_start_token = raw_end_token;
     }
 
     std::uint32_t free_node_slots = 0;
@@ -1052,6 +1103,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         throw std::runtime_error("Host prefix cache page handle arena is full");
     }
 
+    raw_start_token = 0;
     for (const auto& [raw_end_token, digest] : chain) {
         if (raw_end_token > commit_tokens ||
             raw_end_token % commit_boundary_tokens != 0) {
@@ -1059,6 +1111,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         }
         if (FindNodeLocked(digest).has_value()) {
             ++result.existing_nodes;
+            raw_start_token = raw_end_token;
             continue;
         }
 
@@ -1069,16 +1122,19 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
             if (iter == pages_by_group.end()) {
                 continue;
             }
-            if (raw_end_token % spec.raw_page_tokens != 0) {
+            if (raw_start_token % spec.raw_page_tokens != 0 ||
+                raw_end_token % spec.raw_page_tokens != 0) {
                 if (spec.required_for_reuse) {
                     throw std::runtime_error(
                         "required group is not aligned to raw page tokens");
                 }
                 continue;
             }
+            const std::uint32_t first_page =
+                raw_start_token / spec.raw_page_tokens;
             const std::uint32_t pages_needed =
-                raw_end_token / spec.raw_page_tokens;
-            if (iter->second->size() < pages_needed) {
+                (raw_end_token - raw_start_token) / spec.raw_page_tokens;
+            if (iter->second->size() < first_page + pages_needed) {
                 if (spec.required_for_reuse) {
                     throw std::runtime_error(
                         "required group page list became too short");
@@ -1107,12 +1163,15 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         for (const auto& spec : config.group_specs) {
             const auto iter = pages_by_group.find(spec.group_id);
             if (iter == pages_by_group.end() ||
+                raw_start_token % spec.raw_page_tokens != 0 ||
                 raw_end_token % spec.raw_page_tokens != 0) {
                 continue;
             }
+            const std::uint32_t first_page =
+                raw_start_token / spec.raw_page_tokens;
             const std::uint32_t pages_needed =
-                raw_end_token / spec.raw_page_tokens;
-            if (iter->second->size() < pages_needed) {
+                (raw_end_token - raw_start_token) / spec.raw_page_tokens;
+            if (iter->second->size() < first_page + pages_needed) {
                 continue;
             }
 
@@ -1120,12 +1179,14 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
             ResetGroupEntry(entry);
             entry.state = static_cast<std::uint32_t>(EntryState::kResident);
             entry.group_id = spec.group_id;
+            entry.raw_start_token = raw_start_token;
             entry.raw_end_token = raw_end_token;
             entry.first_page_handle = next_page_handle;
             entry.page_handle_count = pages_needed;
             for (std::uint32_t page_idx = 0; page_idx < pages_needed;
                  ++page_idx) {
-                const HostPageHandle& handle = (*iter->second)[page_idx];
+                const HostPageHandle& handle =
+                    (*iter->second)[first_page + page_idx];
                 page_handles[next_page_handle++] =
                     SharedPageHandle{handle.page_id};
             }
@@ -1136,6 +1197,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         node.state = static_cast<std::uint32_t>(EntryState::kResident);
         node.namespace_digest = namespace_digest;
         node.digest = digest;
+        node.raw_start_token = raw_start_token;
         node.raw_end_token = raw_end_token;
         node.first_group_entry = first_group_entry;
         node.group_entry_count = group_entry_count;
@@ -1146,6 +1208,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
         header->next_page_handle.store(next_page_handle,
                                        std::memory_order_relaxed);
         ++result.inserted_nodes;
+        raw_start_token = raw_end_token;
     }
     return result;
 }
@@ -1156,22 +1219,26 @@ PrefixLookupResult HostPrefixCacheCoordinator::SharedState::LookupAndAttach(
         BuildPrefixHashChain(namespace_digest, token_ids, hash_block_tokens);
     PrefixLookupResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
-    for (auto iter = chain.rbegin(); iter != chain.rend(); ++iter) {
-        const std::uint32_t raw_end_token = iter->first;
+    std::vector<std::uint32_t> hit_node_indices;
+    for (const auto& [raw_end_token, digest] : chain) {
         if (raw_end_token % commit_boundary_tokens != 0) {
             continue;
         }
-        const auto node_index = FindNodeLocked(iter->second);
+        const auto node_index = FindNodeLocked(digest);
         if (!node_index.has_value()) {
-            continue;
+            break;
         }
         SharedPrefixNode& node = nodes[node_index.value()];
         if (!NodeHasRequiredGroupsLocked(node)) {
-            continue;
+            break;
         }
-        result.attachment_handle = AttachNodeLocked(node_index.value());
+        hit_node_indices.push_back(node_index.value());
         result.common_cached_tokens = node.raw_end_token;
-        result.materialization_spans = BuildMaterializationSpansLocked(node);
+    }
+    if (!hit_node_indices.empty()) {
+        result.attachment_handle = AttachNodesLocked(hit_node_indices);
+        result.materialization_spans =
+            BuildMaterializationSpansLocked(hit_node_indices);
         header->lookup_hits.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
@@ -1186,21 +1253,25 @@ PrefixLookupResult HostPrefixCacheCoordinator::SharedState::EstimateLookup(
         BuildPrefixHashChain(namespace_digest, token_ids, hash_block_tokens);
     PrefixLookupResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
-    for (auto iter = chain.rbegin(); iter != chain.rend(); ++iter) {
-        const std::uint32_t raw_end_token = iter->first;
+    std::vector<std::uint32_t> hit_node_indices;
+    for (const auto& [raw_end_token, digest] : chain) {
         if (raw_end_token % commit_boundary_tokens != 0) {
             continue;
         }
-        const auto node_index = FindNodeLocked(iter->second);
+        const auto node_index = FindNodeLocked(digest);
         if (!node_index.has_value()) {
-            continue;
+            break;
         }
         const SharedPrefixNode& node = nodes[node_index.value()];
         if (!NodeHasRequiredGroupsLocked(node)) {
-            continue;
+            break;
         }
+        hit_node_indices.push_back(node_index.value());
         result.common_cached_tokens = node.raw_end_token;
-        result.materialization_spans = BuildMaterializationSpansLocked(node);
+    }
+    if (!hit_node_indices.empty()) {
+        result.materialization_spans =
+            BuildMaterializationSpansLocked(hit_node_indices);
         return result;
     }
     result.miss_reason_mask = 1;
@@ -1212,30 +1283,27 @@ void HostPrefixCacheCoordinator::SharedState::ReleaseAttachment(
     if (attachment_handle == 0) {
         return;
     }
-    ScopedPthreadMutexLock lock(&header->mutex);
-    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
-    if (attachment == nullptr) {
-        throw std::out_of_range("unknown host prefix cache attachment handle");
-    }
-    if (attachment->release_requested != 0) {
-        throw std::runtime_error(
-            "host prefix cache attachment release was already requested");
-    }
-    SharedPrefixNode& node = nodes[attachment->node_index];
-    if (node.state == static_cast<std::uint32_t>(EntryState::kResident)) {
-        for (std::uint32_t offset = 0; offset < node.group_entry_count;
-             ++offset) {
-            SharedGroupEntry& entry =
-                group_entries[node.first_group_entry + offset];
-            const std::uint32_t refs =
-                entry.active_ref_count.load(std::memory_order_relaxed);
-            if (refs > 0) {
-                entry.active_ref_count.store(refs - 1,
-                                             std::memory_order_relaxed);
-            }
+    LocalAttachment attachment;
+    {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        auto iter = local_attachments.find(attachment_handle);
+        if (iter == local_attachments.end()) {
+            throw std::out_of_range(
+                "unknown host prefix cache attachment handle");
         }
+        if (iter->second.release_requested) {
+            throw std::runtime_error(
+                "host prefix cache attachment release was already requested");
+        }
+        if (iter->second.pending_load_count != 0) {
+            iter->second.release_requested = true;
+            return;
+        }
+        attachment = std::move(iter->second);
+        local_attachments.erase(iter);
     }
-    FinalizeAttachmentReleaseLocked(attachment);
+    ScopedPthreadMutexLock lock(&header->mutex);
+    DecrementActiveRefsLocked(attachment.node_indices);
 }
 
 void HostPrefixCacheCoordinator::SharedState::BeginAttachmentLoad(
@@ -1244,17 +1312,33 @@ void HostPrefixCacheCoordinator::SharedState::BeginAttachmentLoad(
         throw std::invalid_argument(
             "host prefix cache load attachment handle must be non-zero");
     }
-    ScopedPthreadMutexLock lock(&header->mutex);
-    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
-    if (attachment == nullptr) {
-        throw std::out_of_range("unknown host prefix cache attachment handle");
+    std::vector<std::uint32_t> node_indices;
+    {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        auto iter = local_attachments.find(attachment_handle);
+        if (iter == local_attachments.end()) {
+            throw std::out_of_range(
+                "unknown host prefix cache attachment handle");
+        }
+        if (iter->second.release_requested) {
+            throw std::runtime_error(
+                "cannot begin load for a released host prefix cache attachment");
+        }
+        ++iter->second.pending_load_count;
+        node_indices = iter->second.node_indices;
     }
-    if (attachment->release_requested != 0) {
-        throw std::runtime_error(
-            "cannot begin load for a released host prefix cache attachment");
+    try {
+        ScopedPthreadMutexLock lock(&header->mutex);
+        UpdateLoadRefsLocked(node_indices, 1);
+    } catch (...) {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        auto iter = local_attachments.find(attachment_handle);
+        if (iter != local_attachments.end() &&
+            iter->second.pending_load_count != 0) {
+            --iter->second.pending_load_count;
+        }
+        throw;
     }
-    ++attachment->pending_load_count;
-    UpdateAttachmentLoadRefsLocked(attachment, 1);
 }
 
 void HostPrefixCacheCoordinator::SharedState::EndAttachmentLoad(
@@ -1263,20 +1347,31 @@ void HostPrefixCacheCoordinator::SharedState::EndAttachmentLoad(
         throw std::invalid_argument(
             "host prefix cache load attachment handle must be non-zero");
     }
+    std::vector<std::uint32_t> node_indices;
+    bool finalize_release = false;
+    {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        auto iter = local_attachments.find(attachment_handle);
+        if (iter == local_attachments.end()) {
+            throw std::out_of_range(
+                "unknown host prefix cache attachment handle");
+        }
+        if (iter->second.pending_load_count == 0) {
+            throw std::runtime_error(
+                "host prefix cache attachment pending load underflow");
+        }
+        --iter->second.pending_load_count;
+        node_indices = iter->second.node_indices;
+        finalize_release = iter->second.release_requested &&
+                           iter->second.pending_load_count == 0;
+        if (finalize_release) {
+            local_attachments.erase(iter);
+        }
+    }
     ScopedPthreadMutexLock lock(&header->mutex);
-    SharedAttachment* attachment = FindAttachmentLocked(attachment_handle);
-    if (attachment == nullptr) {
-        throw std::out_of_range("unknown host prefix cache attachment handle");
-    }
-    if (attachment->pending_load_count == 0) {
-        throw std::runtime_error(
-            "host prefix cache attachment pending load underflow");
-    }
-    --attachment->pending_load_count;
-    UpdateAttachmentLoadRefsLocked(attachment, -1);
-    if (attachment->release_requested != 0 &&
-        attachment->pending_load_count == 0) {
-        attachment->state = static_cast<std::uint32_t>(EntryState::kTombstone);
+    UpdateLoadRefsLocked(node_indices, -1);
+    if (finalize_release) {
+        DecrementActiveRefsLocked(node_indices);
     }
 }
 
@@ -1479,43 +1574,48 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
 }
 
 HostPrefixCacheStats HostPrefixCacheCoordinator::SharedState::GetStats() const {
-    ScopedPthreadMutexLock lock(&header->mutex);
     HostPrefixCacheStats stats;
-    for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
-        if (nodes[index].state ==
-            static_cast<std::uint32_t>(EntryState::kResident)) {
-            ++stats.resident_nodes;
+    {
+        ScopedPthreadMutexLock lock(&header->mutex);
+        for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
+            if (nodes[index].state ==
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                ++stats.resident_nodes;
+            }
         }
+        for (std::uint32_t index = 0;
+             index < header->next_group_entry.load(std::memory_order_relaxed);
+             ++index) {
+            const SharedGroupEntry& entry = group_entries[index];
+            if (entry.state !=
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                continue;
+            }
+            const std::uint32_t pending =
+                entry.pending_load_count.load(std::memory_order_relaxed);
+            if (pending != 0) {
+                ++stats.pending_load_entries;
+                stats.pending_load_refs += pending;
+            }
+        }
+        stats.used_group_entries =
+            header->next_group_entry.load(std::memory_order_relaxed);
+        stats.used_page_handles =
+            header->next_page_handle.load(std::memory_order_relaxed);
+        stats.lookup_hits =
+            header->lookup_hits.load(std::memory_order_relaxed);
+        stats.lookup_misses =
+            header->lookup_misses.load(std::memory_order_relaxed);
+        stats.evicted_nodes =
+            header->evicted_nodes.load(std::memory_order_relaxed);
+        stats.eviction_protected_skips =
+            header->eviction_protected_skips.load(std::memory_order_relaxed);
     }
-    for (std::uint32_t index = 0; index < config.max_attachments; ++index) {
-        if (attachments[index].state ==
-            static_cast<std::uint32_t>(EntryState::kResident)) {
-            ++stats.active_attachments;
-        }
+    {
+        std::lock_guard<std::mutex> attachment_lock(local_attachment_mutex);
+        stats.active_attachments =
+            static_cast<std::uint32_t>(local_attachments.size());
     }
-    for (std::uint32_t index = 0;
-         index < header->next_group_entry.load(std::memory_order_relaxed);
-         ++index) {
-        const SharedGroupEntry& entry = group_entries[index];
-        if (entry.state != static_cast<std::uint32_t>(EntryState::kResident)) {
-            continue;
-        }
-        const std::uint32_t pending =
-            entry.pending_load_count.load(std::memory_order_relaxed);
-        if (pending != 0) {
-            ++stats.pending_load_entries;
-            stats.pending_load_refs += pending;
-        }
-    }
-    stats.used_group_entries =
-        header->next_group_entry.load(std::memory_order_relaxed);
-    stats.used_page_handles =
-        header->next_page_handle.load(std::memory_order_relaxed);
-    stats.lookup_hits = header->lookup_hits.load(std::memory_order_relaxed);
-    stats.lookup_misses = header->lookup_misses.load(std::memory_order_relaxed);
-    stats.evicted_nodes = header->evicted_nodes.load(std::memory_order_relaxed);
-    stats.eviction_protected_skips =
-        header->eviction_protected_skips.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -1530,7 +1630,7 @@ HostPrefixCacheCoordinator::HostPrefixCacheCoordinator(
             "HostPrefixCacheConfig.group_specs is empty");
     }
     if (config_.max_nodes == 0 || config_.max_group_entries == 0 ||
-        config_.max_page_handles == 0 || config_.max_attachments == 0) {
+        config_.max_page_handles == 0) {
         throw std::invalid_argument(
             "HostPrefixCacheConfig capacities must be positive");
     }

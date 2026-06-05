@@ -39,17 +39,25 @@ class PrefixCommitRequest:
         node_count = commit_tokens // boundary
         group_entry_count = 0
         page_handle_count = 0
+        raw_start_token = 0
         for raw_end_token in range(boundary, commit_tokens + 1, boundary):
             for group_pages in self.group_pages:
                 group_id = int(group_pages.group_id)
                 raw_page_tokens = int(self.raw_page_tokens_by_group[group_id])
-                if raw_end_token % raw_page_tokens != 0:
+                if (
+                    raw_start_token % raw_page_tokens != 0
+                    or raw_end_token % raw_page_tokens != 0
+                ):
                     continue
-                page_count = raw_end_token // raw_page_tokens
-                if len(group_pages.pages) < page_count:
+                first_page = raw_start_token // raw_page_tokens
+                page_count = (
+                    raw_end_token - raw_start_token
+                ) // raw_page_tokens
+                if len(group_pages.pages) < first_page + page_count:
                     continue
                 group_entry_count += 1
                 page_handle_count += page_count
+            raw_start_token = raw_end_token
         return node_count, group_entry_count, page_handle_count
 
 
