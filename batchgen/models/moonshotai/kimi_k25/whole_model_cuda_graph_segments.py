@@ -198,7 +198,10 @@ class K25WholeModelSegment:
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
-            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=0),
+            # -1 sentinel: padded bucket rows skip the in-graph KV write
+            # (run_paged_kv_token_update_fused skips slot<0), so padding never
+            # corrupts real sequences' KV. Matches the GLM-5 whole-model path.
+            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64, fill_value=0),
         }
 
