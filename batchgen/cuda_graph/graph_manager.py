@@ -154,6 +154,12 @@ class CUDAGraphManager:
     """
 
     WARMUP_ITERATIONS = 2
+    # Warmup iterations for buckets after the first. The first bucket's full
+    # warmup JIT-warms all kernels and primes the shared graph pool; later
+    # buckets reuse the same warm kernels, so one iter suffices to fault in any
+    # bucket-specific workspace before capture without re-running the full eager
+    # forward N times per bucket (the dominant whole-model capture cost).
+    WARMUP_ITERATIONS_SUBSEQUENT = 1
 
     def __init__(
         self,
@@ -224,10 +230,19 @@ class CUDAGraphManager:
         num_buckets = len(capture_sizes)
 
         for i, bucket_size in enumerate(capture_sizes):
+            # Full warmup only for the first bucket (JIT-warms kernels + primes
+            # the graph pool); reduced warmup for the rest avoids re-running the
+            # full eager forward N times per bucket — the dominant capture cost.
+            warmup_iters = (
+                self.WARMUP_ITERATIONS if i == 0
+                else self.WARMUP_ITERATIONS_SUBSEQUENT
+            )
             for seg_name, segment in self._segments.items():
                 if bucket_size in self._graphs.get(seg_name, {}):
                     continue
-                self._capture_one(seg_name, segment, bucket_size)
+                self._capture_one(
+                    seg_name, segment, bucket_size, warmup_iters=warmup_iters
+                )
             done = i + 1
             bar = "█" * done + "░" * (num_buckets - done)
             logger.info(
@@ -240,9 +255,19 @@ class CUDAGraphManager:
         self._is_captured = any(self._graphs[name] for name in self._segments)
 
     def _capture_one(
-        self, name: str, segment: CapturableSegment, bucket_size: int
+        self, name: str, segment: CapturableSegment, bucket_size: int,
+        warmup_iters: Optional[int] = None,
     ) -> None:
-        """Warmup and capture a single graph for one segment at one bucket size."""
+        """Warmup and capture a single graph for one segment at one bucket size.
+
+        warmup_iters defaults to WARMUP_ITERATIONS. Callers capturing many
+        buckets pass a reduced count for buckets after the first, since kernels
+        are JIT-warm and per-segment workspaces are pool-preallocated after the
+        first bucket — re-running the full eager forward N times per bucket is
+        the dominant capture cost for whole-model graphs.
+        """
+        if warmup_iters is None:
+            warmup_iters = self.WARMUP_ITERATIONS
         memory_record = self._new_capture_memory_record(name, bucket_size)
         phase_start = self._capture_memory_snapshot()
         overall_start = phase_start
@@ -272,18 +297,29 @@ class CUDAGraphManager:
         )
 
         # 2. Warmup on current stream
-        for _ in range(self.WARMUP_ITERATIONS):
+        torch.cuda.synchronize(self.device)
+        _warmup_start = time.perf_counter()
+        for _ in range(warmup_iters):
             with torch.inference_mode():
                 segment.forward(**static_inputs)
+        torch.cuda.synchronize(self.device)
+        _warmup_s = time.perf_counter() - _warmup_start
         phase_start = self._record_capture_memory_phase(
             memory_record, "warmup", phase_start
         )
 
         # 3. Capture on current stream with shared pool
+        _capture_start = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._pool):
             with torch.inference_mode():
                 static_outputs = segment.forward(**static_inputs)
+        torch.cuda.synchronize(self.device)
+        _capture_s = time.perf_counter() - _capture_start
+        logger.info(
+            "  capture %s BS=%d: warmup=%.2fs (%d iters) graph_capture=%.2fs",
+            name, bucket_size, _warmup_s, warmup_iters, _capture_s,
+        )
         phase_start = self._record_capture_memory_phase(
             memory_record, "graph_capture", phase_start
         )
