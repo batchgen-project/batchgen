@@ -14,6 +14,7 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 )
 
 _GLM5_SEGMENTED_CUDA_GRAPH_ENV = "BATCHGEN_SEGMENTED_GRAPH"
+_ENABLE_PREPACK_ENV = "BATCHGEN_ENABLE_PREPACK"
 
 
 def is_port_available(port: int) -> bool:
@@ -73,6 +74,13 @@ def _apply_cuda_graph_cli_env_defaults(args: "ServerArgs") -> None:
         os.environ[GLM5_MOE_CUDA_GRAPH_ENV] = "0"
 
 
+def _env_bool_default(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 @dataclass
 class ServerArgs:
     """Server configuration."""
@@ -108,21 +116,37 @@ class ServerArgs:
     # GPU page buffer settings for decode scheduling
     initial_gpu_page_buffer: int = 32  # Pages to reserve on first GPU load
     extension_gpu_page_buffer: int = 4  # Pages to add at boundaries
-    decision_frequency_pages: int = 2  # How often to make scheduling decisions (in pages)
+    decision_frequency_pages: int = (
+        2  # How often to make scheduling decisions (in pages)
+    )
     # EP with offloading settings
-    enable_ep_with_offloading: bool = False  # Enable EP with partial expert offloading
+    enable_ep_with_offloading: bool = (
+        False  # Enable EP with partial expert offloading
+    )
     ep_offloading_ratio: float = 0.0  # Ratio of experts to offload (0.0-1.0)
-    pre_dequantize_weights: bool = False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+    pre_dequantize_weights: bool = (
+        False  # Pre-dequantize MoE routed expert MXFP4 weights to BF16
+    )
     parse_thinking: bool = False  # Extract reasoning_content from model output
     parse_tool_call: bool = False  # Extract tool_calls from model output
-    enable_cuda_graph: bool = False  # Explicitly enable CUDA graph capture for supported models
+    enable_cuda_graph: bool = (
+        False  # Explicitly enable CUDA graph capture for supported models
+    )
     disable_cuda_graphs: bool = True  # Disable CUDA graph capture for decode attention (128K+ crash: corrupted num_tokens_per_rank)
-    cuda_graph_max_bucket_size: int = 128  # Max batch size per rank for CUDA graph capture
+    cuda_graph_max_bucket_size: int = (
+        128  # Max batch size per rank for CUDA graph capture
+    )
     cuda_graph_num_buckets: int = 16  # Number of CUDA graph bucket sizes
-    detokenization_include_special_tokens: bool = False  # When True, include special tokens in detokenized output
+    detokenization_include_special_tokens: bool = (
+        False  # When True, include special tokens in detokenized output
+    )
     # Dynamic host KV reservation settings
-    host_kv_chunk_size: int = 8192  # Initial host KV chunk size in tokens (default: 8K)
-    host_kv_eviction_watermark: int = 10  # Trigger host KV eviction when free pages < this %
+    host_kv_chunk_size: int = (
+        8192  # Initial host KV chunk size in tokens (default: 8K)
+    )
+    host_kv_eviction_watermark: int = (
+        10  # Trigger host KV eviction when free pages < this %
+    )
     enable_host_kv_eviction: bool = False  # Deprecated: eviction is always enabled when chunked host KV is active
     adaptive_chunk: bool = True  # EMA-based adaptive chunk sizing
     adaptive_chunk_min: int = 1024  # Minimum adaptive chunk size in tokens
@@ -130,12 +154,20 @@ class ServerArgs:
     adaptive_chunk_ema_alpha: float = 0.1  # EMA smoothing factor
     adaptive_chunk_multiplier: float = 1.5  # Headroom multiplier on EMA
     # Incremental result saving (crash-resilient output)
-    incremental_output_dir: Optional[str] = None  # Directory for incremental JSONL; None = auto
-    no_incremental_save: bool = False  # Opt-out flag to disable incremental saving
+    incremental_output_dir: Optional[str] = (
+        None  # Directory for incremental JSONL; None = auto
+    )
+    no_incremental_save: bool = (
+        False  # Opt-out flag to disable incremental saving
+    )
     # Decode step watchdog
-    decode_step_timeout: Optional[float] = None  # Max seconds per decode step (None = disabled)
+    decode_step_timeout: Optional[float] = (
+        None  # Max seconds per decode step (None = disabled)
+    )
     # Startup timeout
-    startup_timeout: Optional[float] = None  # Max seconds from launch to server ready (None = disabled)
+    startup_timeout: Optional[float] = (
+        None  # Max seconds from launch to server ready (None = disabled)
+    )
     # Request pool: max QueryBook capacity. Default 10240 enables pool mode.
     # Set to 0 to force legacy batch-FIFO mode.
     max_pool_size: int = 10240
@@ -194,10 +226,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fast-init",
         action="store_true",
         help="Use memfd_create + THP for fast memory registration. "
-             "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
-             "(2) root access (for pre-allocation memory compaction). "
-             "Automatically runs drop_caches + compact_memory before allocation "
-             "to defragment physical memory for stable 2MB THP pages.",
+        "Requires: (1) echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled, "
+        "(2) root access (for pre-allocation memory compaction). "
+        "Automatically runs drop_caches + compact_memory before allocation "
+        "to defragment physical memory for stable 2MB THP pages.",
     )
     parser.add_argument(
         "--dist-init-addr",
@@ -277,20 +309,27 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10240,
         help="Max QueryBook pool capacity for persistent request scheduling. "
-             "Default: 10240 (pool mode enabled). Set to 0 for legacy batch-FIFO mode.",
+        "Default: 10240 (pool mode enabled). Set to 0 for legacy batch-FIFO mode.",
     )
     parser.add_argument(
         "--max-intake-capacity",
         type=int,
         default=1_000_000,
         help="Max total requests in the intake pool. Prevents OOM under high load. "
-             "Default: 1000000. Set to 0 for unlimited (not recommended).",
+        "Default: 1000000. Set to 0 for unlimited (not recommended).",
     )
     parser.add_argument(
         "--enable-prepack",
+        dest="enable_prepack",
         action="store_true",
-        default=True,
+        default=_env_bool_default(_ENABLE_PREPACK_ENV, True),
         help="Enable prepack optimization for efficient prefill batching (default: enabled, recommended always on)",
+    )
+    parser.add_argument(
+        "--no-prepack",
+        dest="enable_prepack",
+        action="store_false",
+        help="Disable prepack optimization; useful for isolating prepacked prefill issues",
     )
     parser.add_argument(
         "--host-kv-watermark",
@@ -452,7 +491,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Directory for incremental JSONL results (crash-resilient). "
-             "Default: {storage_path}/incremental/",
+        "Default: {storage_path}/incremental/",
     )
     parser.add_argument(
         "--no-incremental-save",
@@ -523,13 +562,19 @@ def validate_server_args(args: ServerArgs) -> None:
         )
     if args.host_kv_chunk_size <= 0:
         raise ValueError("host_kv_chunk_size must be positive")
-    if args.host_kv_eviction_watermark < 0 or args.host_kv_eviction_watermark > 100:
+    if (
+        args.host_kv_eviction_watermark < 0
+        or args.host_kv_eviction_watermark > 100
+    ):
         raise ValueError("host_kv_eviction_watermark must be between 0 and 100")
     if args.adaptive_chunk_min <= 0:
         raise ValueError("adaptive_chunk_min must be positive")
     if args.adaptive_chunk_max < args.adaptive_chunk_min:
         raise ValueError("adaptive_chunk_max must be >= adaptive_chunk_min")
-    if args.adaptive_chunk_ema_alpha <= 0 or args.adaptive_chunk_ema_alpha > 1.0:
+    if (
+        args.adaptive_chunk_ema_alpha <= 0
+        or args.adaptive_chunk_ema_alpha > 1.0
+    ):
         raise ValueError("adaptive_chunk_ema_alpha must be in (0, 1]")
     if args.adaptive_chunk_multiplier <= 0:
         raise ValueError("adaptive_chunk_multiplier must be positive")
@@ -543,7 +588,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
 
     # Handle watchdog disable options
     watchdog_timeout = parsed.watchdog_timeout
-    if getattr(parsed, 'no_watchdog', False) or watchdog_timeout == 0:
+    if getattr(parsed, "no_watchdog", False) or watchdog_timeout == 0:
         watchdog_timeout = None
 
     server_args = ServerArgs(
@@ -566,7 +611,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         watchdog_timeout=watchdog_timeout,
         watchdog_test_stuck_time=parsed.watchdog_test_stuck_time,
         watchdog_heartbeat_interval=parsed.watchdog_heartbeat_interval,
-        enable_prepack=True,  # Always enabled, recommended for all use cases
+        enable_prepack=parsed.enable_prepack,
         host_kv_watermark=parsed.host_kv_watermark,
         enable_decode_preemption=True,  # Always enabled, recommended for all use cases
         gpu_memory_frac=parsed.gpu_memory_frac,
@@ -586,7 +631,7 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         host_kv_chunk_size=parsed.host_kv_chunk_size,
         host_kv_eviction_watermark=parsed.host_kv_eviction_watermark,
         enable_host_kv_eviction=parsed.enable_host_kv_eviction,
-        adaptive_chunk=not getattr(parsed, 'no_adaptive_chunk', False),
+        adaptive_chunk=not getattr(parsed, "no_adaptive_chunk", False),
         adaptive_chunk_min=parsed.adaptive_chunk_min,
         adaptive_chunk_max=parsed.adaptive_chunk_max,
         adaptive_chunk_ema_alpha=parsed.adaptive_chunk_ema_alpha,
