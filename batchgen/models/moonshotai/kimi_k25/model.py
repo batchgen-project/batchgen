@@ -975,7 +975,7 @@ class KimiK25MoE(nn.Module):
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
                 buf.dispatched_x,
-                self.routed_expert_start_idx, self.experts_per_rank,
+                self.routed_expert_start_idx, self.num_persistent_local_experts,
                 buf.max_tokens_padded,
                 buf.expert_counts, buf.expert_counters,
                 buf.topk_pos[:total_real * topk],
@@ -1084,6 +1084,28 @@ class KimiK25MoE(nn.Module):
                 dispatched_x, topk_pos, topk_weight,
                 total_real, H, topk,
             )
+
+        # 5b) Offloaded (non-persistent) experts. The fused path above covers only the
+        # persistent experts: the dispatch uses num_persistent_local_experts, so tokens routed
+        # to offloaded experts get topk_pos=-1 and are skipped by reduce_weighted_scatter. Add
+        # their contribution via the per-expert offload path — wrapper(persistent=False).forward
+        # loads the expert from host, transforms Marlin->raw, runs the single-expert WGMMA, then
+        # frees. Must land in global_results BEFORE the all-reduce below (offloaded experts are
+        # this rank's). nonpersistent_expert_ids is empty when offloading is off -> zero overhead.
+        nonpersistent = getattr(self, 'nonpersistent_expert_ids', None)
+        if nonpersistent:
+            flat_idx = topk_idx.reshape(-1)
+            tok_idx = torch.arange(total_real, device=device).repeat_interleave(topk)
+            tk_pos = torch.arange(topk, device=device).repeat(total_real)
+            for global_e in nonpersistent:
+                mask = flat_idx == global_e
+                if not mask.any():
+                    continue
+                et = tok_idx[mask]
+                expert_out_e = self.experts[global_e](all_tokens[et])
+                w = topk_weight[et, tk_pos[mask]]
+                global_results.index_add_(
+                    0, et, (expert_out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
 
         if timer is not None:
             ev[6].record()  # after reduce, before allreduce
