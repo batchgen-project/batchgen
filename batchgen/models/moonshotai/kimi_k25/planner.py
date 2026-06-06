@@ -46,26 +46,28 @@ class KimiK25Planner(BasePlanner):
         Override expert memory calculations.
         """
         # INT4 expert size: ~30MB per expert (vs 2.4GB for FP8/BF16)
-        # With 384 experts / 8 ranks = 48 experts per rank
-        # 48 * 0.03GB = 1.44GB total expert cache (fits easily in GPU memory)
-        expert_per_rank = self.NUM_EXPERTS // self.world_size  # 48
+        # With 384 experts / 8 ranks = 48 experts per rank.
+        expert_per_rank = self.NUM_EXPERTS // self.world_size
 
-        # For K2.5 INT4, all experts can fit in GPU memory
-        # Override the memory-based calculation from base class
-        self.config.EP_Config.num_local_expert_per_layer = expert_per_rank
-
-        # No need for expert offloading buffers - all experts are persistent
-        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
-
-        # K2.5 requires attn_mode=3 for modern decoding path (decoding_continuous)
-        # Override base planner logic that sets attn_mode=1 when enable_offloading=False
+        # K2.5 requires attn_mode=3 for the modern decoding path (decoding_continuous),
+        # regardless of offloading. Override base planner's attn_mode=1 default.
         self.config.Basic_Config.attn_mode = 3
-
-        # EP offloading is disabled for K2.5 (all experts resident on GPU)
-        self.config.EP_Config.enable_offloading = False
 
         # K2.5 context window: max_position_embeddings=262144 (YaRN: 4096 * factor=64)
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
+
+        if self.config.EP_Config.enable_offloading:
+            # EP offloading requested (e.g. single-node 8-GPU where 48 INT4 experts/rank
+            # do not fit alongside the MoE dispatch buffers + KV). Keep the base planner's
+            # offloading split from _compute_batch_configs() — num_local_expert_per_layer
+            # and the routed_expert staging buffers, both derived from offloading_ratio.
+            # Do NOT force all-persistent here.
+            return
+
+        # Default (no offloading): K2.5 INT4 experts all fit on GPU -> all persistent.
+        self.config.EP_Config.num_local_expert_per_layer = expert_per_rank
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
+        self.config.EP_Config.enable_offloading = False
 
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""
