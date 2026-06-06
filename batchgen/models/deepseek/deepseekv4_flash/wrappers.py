@@ -609,10 +609,22 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         mod = self.module if ratio else None
         device = prefill_kv.device
 
-        if attention_mask is None:
+        # Prepacked prefill flattens all sequences into a single row:
+        # prefill_kv / hidden_states are [1, total_tokens, H] and per-sequence
+        # boundaries live in prepack_cu_seqlens. The padded path keeps the
+        # [num_seqs, max_seq, H] layout where seq_idx indexes dim 0.
+        prepack = bool(getattr(AttnWrapperBase, "prepack_mode", False))
+        cu_seqlens = None
+        if prepack:
+            seq_lens = list(AttnWrapperBase.prepack_seq_lengths or [])
+            cu = AttnWrapperBase.prepack_cu_seqlens
+            cu_seqlens = cu.tolist() if cu is not None else None
+        elif attention_mask is None:
             attention_mask = AttnWrapperBase.attention_mask
-        if attention_mask is None:
-            seq_lens = [prefill_kv.size(1)] * prefill_kv.size(0)
+            if attention_mask is None:
+                seq_lens = [prefill_kv.size(1)] * prefill_kv.size(0)
+            else:
+                seq_lens = attention_mask.to(device).sum(dim=1).tolist()
         else:
             seq_lens = attention_mask.to(device).sum(dim=1).tolist()
 
@@ -624,13 +636,19 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             populate_v4_prefill_coordinator,
         )
 
+        def _seq_slice(t: torch.Tensor, i: int, slen: int) -> torch.Tensor:
+            if prepack and cu_seqlens is not None:
+                start = cu_seqlens[i]
+                return t[0, start : start + slen]
+            return t[i, :slen]
+
         for seq_idx, seq_len in enumerate(seq_lens):
             seq_len = int(seq_len)
             if seq_len <= 0:
                 continue
             sequence_id = int(AttnWrapperBase.cur_batch[seq_idx])
             coordinator.allocate_pages_for_sequences([sequence_id], [seq_len])
-            swa_kv = prefill_kv[seq_idx, :seq_len]
+            swa_kv = _seq_slice(prefill_kv, seq_idx, seq_len)
             prompt_positions = torch.arange(
                 seq_len, device=device, dtype=torch.long
             )
@@ -639,7 +657,7 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
             c128_hidden = None
             c128_compressor = None
             if ratio == 4 and hidden_states is not None:
-                seq_hidden = hidden_states[seq_idx, :seq_len].float()
+                seq_hidden = _seq_slice(hidden_states, seq_idx, seq_len).float()
                 main_comp = self._runtime_kernel_compressor(
                     mod.compressor, rotate=False
                 )
@@ -653,7 +671,9 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
                     seq_hidden, prompt_positions, compress_rope
                 )
             elif ratio == 128 and hidden_states is not None:
-                c128_hidden = hidden_states[seq_idx, :seq_len].float()
+                c128_hidden = _seq_slice(
+                    hidden_states, seq_idx, seq_len
+                ).float()
                 c128_compressor = self._runtime_kernel_compressor(
                     mod.compressor, rotate=False
                 )
