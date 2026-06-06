@@ -60,6 +60,9 @@ _HEAD_DIM = 512
 _TOPK_ALIGN = 64
 _SOFTMAX_SCALE = 512**-0.5
 _SWA_WINDOW = 128
+_V4_MLA_VALIDATE_INDICES = (
+    os.environ.get("BATCHGEN_V4_MLA_VALIDATE_INDICES", "0") == "1"
+)
 
 
 def _select_v4_mla_backend() -> str:
@@ -348,32 +351,15 @@ def _physicalize_positions_with_page_table(
     logical_positions = logical_positions.to(device=device, dtype=torch.long)
     valid = logical_positions >= 0
     lengths = valid.sum(dim=1).to(dtype=torch.int32)
-    padded_topk = (
-        _aligned_topk(int(lengths.max().item())) if lengths.numel() else 0
-    )
+    padded_topk = logical_positions.shape[1]
     if padded_topk == 0:
         out = torch.empty(
             logical_positions.shape[0], 1, 0, dtype=torch.int32, device=device
         )
         return out, lengths
-    if logical_positions.shape[1] < padded_topk:
-        pad = torch.full(
-            (
-                logical_positions.shape[0],
-                padded_topk - logical_positions.shape[1],
-            ),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-        logical_positions = torch.cat([logical_positions, pad], dim=1)
-        valid = logical_positions >= 0
-    elif logical_positions.shape[1] > padded_topk:
-        logical_positions = logical_positions[:, :padded_topk]
-        valid = logical_positions >= 0
 
     page_size = int(pool.page_size_tokens)
-    page_table = page_table.to(device=device, dtype=torch.long)
+    page_table = page_table.to(device=device)
     page_offsets = torch.div(
         torch.clamp_min(logical_positions, 0), page_size, rounding_mode="floor"
     )
@@ -383,8 +369,9 @@ def _physicalize_positions_with_page_table(
     in_page_table = page_offsets < page_table.shape[1]
     safe_page_offsets = page_offsets.clamp(max=max(page_table.shape[1] - 1, 0))
     pages = torch.gather(page_table, 1, safe_page_offsets)
-    slot_valid = valid & in_page_table & (pages >= 0)
-    slots = pages * page_size + token_offsets
+    pages_i64 = pages.to(torch.long)
+    slot_valid = valid & in_page_table & (pages_i64 >= 0)
+    slots = pages_i64 * page_size + token_offsets
     slots = torch.where(slot_valid, slots, torch.full_like(slots, -1))
     return slots.unsqueeze(1).to(dtype=torch.int32), lengths
 
@@ -504,24 +491,19 @@ def _physicalize_existing_indices(
         raise ValueError(
             f"expected indices [B,1,T] or [B,T], got {tuple(indices.shape)}"
         )
-    lengths = torch.tensor(
-        [int((row[0] >= 0).sum().item()) for row in indices],
-        dtype=torch.int32,
-        device=device,
-    )
-    padded_topk = (
-        _aligned_topk(int(lengths.max().item())) if lengths.numel() else 0
-    )
-    out = torch.full(
-        (indices.shape[0], 1, padded_topk),
+    indices = indices.to(device=device, dtype=torch.int32)
+    valid = indices[:, 0, :] >= 0
+    lengths = valid.sum(dim=1).to(dtype=torch.int32)
+    padded_topk = _aligned_topk(indices.shape[2]) if indices.shape[2] else 0
+    if padded_topk == indices.shape[2]:
+        return indices, lengths
+    pad = torch.full(
+        (indices.shape[0], 1, padded_topk - indices.shape[2]),
         -1,
         dtype=torch.int32,
         device=device,
     )
-    for batch_idx, row in enumerate(indices):
-        valid = row[0][row[0] >= 0].to(dtype=torch.int32, device=device)
-        out[batch_idx, 0, : valid.numel()] = valid
-    return out, lengths
+    return torch.cat([indices, pad], dim=2), lengths
 
 
 def _v4_emit_attn_probe(
@@ -818,35 +800,53 @@ class DeepSeekV4FlashMLADecodeAdapter:
             raise ValueError(
                 "compress_hidden_states must have shape [B, hidden_size] for c128 decode"
             )
-        for batch_idx, seq_id in enumerate(sequence_ids):
-            kv_state, score_state = self._get_c128_state(
+        states = [
+            self._get_c128_state(
                 layer_idx=route.c128_layer_idx,
                 sequence_id=seq_id,
                 compressor=compressor,
                 device=compress_hidden_states.device,
             )
-            emitted, kv_state, score_state = compressor.forward_decode(
-                compress_hidden_states[batch_idx : batch_idx + 1],
+            for seq_id in sequence_ids
+        ]
+        kv_state = torch.stack([state[0] for state in states], dim=0)
+        score_state = torch.stack([state[1] for state in states], dim=0)
+        emitted, kv_state, score_state, emit_mask = (
+            compressor.forward_decode_batch(
+                compress_hidden_states,
                 kv_state,
                 score_state,
-                positions[batch_idx : batch_idx + 1],
+                positions,
                 rope_cache,
             )
+        )
+        for batch_idx, seq_id in enumerate(sequence_ids):
             self._c128_decode_state[(route.c128_layer_idx, seq_id)] = (
-                kv_state,
-                score_state,
+                kv_state[batch_idx],
+                score_state[batch_idx],
             )
-            if emitted.numel() == 0:
-                continue
-            out_loc = int(metadata.c128_out_loc[batch_idx].item())
-            token_slot = self.coordinator.c128.sequence_token_slots(
-                seq_id, [out_loc]
-            )
-            self.coordinator.c128.store_kv(
-                layer_idx=route.c128_layer_idx,
-                token_slots=token_slot,
-                kv_processed=emitted.to(torch.bfloat16),
-            )
+        if emitted.numel() == 0:
+            return
+        out_locs = metadata.c128_out_loc.to(
+            device=compress_hidden_states.device, dtype=torch.long
+        ).unsqueeze(1)
+        slot_indices, _slot_lengths = _physicalize_positions_with_page_table(
+            self.coordinator.c128,
+            sequence_ids,
+            out_locs,
+            device=compress_hidden_states.device,
+        ) or _build_extra_indices_from_logical_positions(
+            self.coordinator.c128,
+            sequence_ids,
+            out_locs,
+            device=compress_hidden_states.device,
+        )
+        token_slots = slot_indices[:, 0, 0][emit_mask].to(dtype=torch.int64)
+        self.coordinator.c128.store_kv(
+            layer_idx=route.c128_layer_idx,
+            token_slots=token_slots,
+            kv_processed=emitted.to(torch.bfloat16),
+        )
 
     def __call__(
         self,
@@ -1052,14 +1052,17 @@ class DeepSeekV4FlashMLADecodeAdapter:
             raise AssertionError(
                 f"page stride must be 576-byte aligned, got {k_cache.stride(0)}"
             )
-        with _dt.timed("attn_validate", layer_idx) if _dt else nullcontext():
-            _validate_sparse_indices(
-                main_indices,
-                main_lengths,
-                capacity=self.coordinator.swa.num_pages
-                * self.coordinator.swa.page_size_tokens,
-                name="indices_in_kvcache",
-            )
+        if _V4_MLA_VALIDATE_INDICES:
+            with (
+                _dt.timed("attn_validate", layer_idx) if _dt else nullcontext()
+            ):
+                _validate_sparse_indices(
+                    main_indices,
+                    main_lengths,
+                    capacity=self.coordinator.swa.num_pages
+                    * self.coordinator.swa.page_size_tokens,
+                    name="indices_in_kvcache",
+                )
         if (
             attn_sink is not None
             and torch.isfinite(attn_sink).logical_not().any()
@@ -1070,17 +1073,19 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 raise AssertionError(
                     "extra_k_cache requires extra indices/lengths"
                 )
-            with (
-                _dt.timed("attn_validate_extra", layer_idx)
-                if _dt
-                else nullcontext()
-            ):
-                _validate_sparse_indices(
-                    extra_indices,
-                    extra_lengths,
-                    capacity=extra_k_cache.shape[0] * extra_k_cache.shape[1],
-                    name="extra_indices_in_kvcache",
-                )
+            if _V4_MLA_VALIDATE_INDICES:
+                with (
+                    _dt.timed("attn_validate_extra", layer_idx)
+                    if _dt
+                    else nullcontext()
+                ):
+                    _validate_sparse_indices(
+                        extra_indices,
+                        extra_lengths,
+                        capacity=extra_k_cache.shape[0]
+                        * extra_k_cache.shape[1],
+                        name="extra_indices_in_kvcache",
+                    )
 
         if _V4_ATTN_PROBE:
             _v4_emit_attn_probe(
