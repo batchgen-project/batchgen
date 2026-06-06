@@ -8,17 +8,18 @@ Usage:
     from batchgen_kernels.moe.grouped_mxfp4 import grouped_mxfp4_stage1_swiglu
 """
 
+import importlib
+import logging
+import os
+
+import torch
+
+from batchgen_kernels._jit_registry import get_registry
 from batchgen_kernels._version import (
     __version__,
     __version_full__,
     version_info,
 )
-
-import os
-import importlib
-import logging
-
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,6 @@ def load_extension(module_name: str):
 def _jit_compile(module_name: str):
     """JIT compile a CUDA extension from source (dev mode only)."""
     from torch.utils.cpp_extension import load as jit_load
-    from batchgen_kernels._jit_registry import get_registry
 
     registry = get_registry()
     if module_name not in registry:
@@ -66,11 +66,26 @@ def _jit_compile(module_name: str):
     ]
 
     short_name = module_name.rsplit(".", 1)[-1]
+    nvcc_flags = list(cfg.get("nvcc_flags", []))
+    if (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 12
+    ):
+        nvcc_flags = [
+            "-arch=sm_120" if flag == "-arch=sm_90a" else flag
+            for flag in nvcc_flags
+        ]
+        nvcc_flags = [
+            "arch=compute_120,code=sm_120"
+            if flag == "arch=compute_90a,code=sm_90a"
+            else flag
+            for flag in nvcc_flags
+        ]
 
     return jit_load(
         name=short_name,
         sources=sources,
-        extra_cuda_cflags=cfg.get("nvcc_flags", []),
+        extra_cuda_cflags=nvcc_flags,
         extra_cflags=cfg.get("cxx_flags", ["-O3"]),
         extra_include_paths=include_dirs,
         verbose=True,
