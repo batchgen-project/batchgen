@@ -7130,7 +7130,28 @@ class BatchGenWorker:
                     )
 
                     # B. Execute Prefill
-                    if local_prefill_indices:
+                    needs_empty_vocab_parallel_lm_head = False
+                    if (
+                        not local_prefill_indices
+                        and "deepseek" in self.model_config.model_type
+                    ):
+                        lm_head = getattr(self.model, "lm_head", None)
+                        model_vocab = getattr(
+                            getattr(self.model, "model", None),
+                            "vocab_size",
+                            None,
+                        )
+                        needs_empty_vocab_parallel_lm_head = (
+                            lm_head is not None
+                            and model_vocab is not None
+                            and lm_head.weight.shape[0] < int(model_vocab)
+                            and torch.distributed.is_initialized()
+                        )
+
+                    if (
+                        local_prefill_indices
+                        or needs_empty_vocab_parallel_lm_head
+                    ):
                         if torch.cuda.is_available():
                             free_mem, total_mem = torch.cuda.mem_get_info(
                                 self.local_rank
@@ -8687,6 +8708,38 @@ class BatchGenWorker:
         if "deepseek" in self.model_config.model_type:
             self.model.model._use_flash_attention_2 = False
 
+        if not batch:
+            if "deepseek" in self.model_config.model_type:
+                from batchgen.models.deepseek.deepseekv4_flash.model import (
+                    vocab_parallel_embedding,
+                    vocab_parallel_lm_head,
+                )
+
+                hidden_size = int(self.model.model.hidden_size)
+                empty_ids = torch.empty(
+                    (0,), dtype=torch.long, device=self.torch_device
+                )
+                vocab_parallel_embedding(
+                    self.model.model.embed_tokens,
+                    empty_ids,
+                    self.model.model.vocab_size,
+                )
+                empty_hidden = torch.empty(
+                    (0, hidden_size),
+                    dtype=self.model.lm_head.weight.dtype,
+                    device=self.torch_device,
+                )
+                vocab_parallel_lm_head(
+                    self.model.lm_head,
+                    empty_hidden,
+                    self.model.model.vocab_size,
+                    force_fp32=os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0")
+                    == "1",
+                )
+            return torch.empty(
+                (0, 1), dtype=torch.long, device=self.torch_device
+            )
+
         # Dynamic padding: find max length within THIS batch, not global max
         # This is critical for long-tailed distributions
         batch_seq_lengths = [
@@ -9079,8 +9132,14 @@ class BatchGenWorker:
                 AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
 
                 # Embed tokens
-                inputs_embeds = self.model.model.embed_tokens(
-                    batch_input_ids_flat.to(self.torch_device)
+                from batchgen.models.deepseek.deepseekv4_flash.model import (
+                    vocab_parallel_embedding,
+                )
+
+                inputs_embeds = vocab_parallel_embedding(
+                    self.model.model.embed_tokens,
+                    batch_input_ids_flat.to(self.torch_device),
+                    self.model.model.vocab_size,
                 )
 
                 # Reshape to 3D: [1, batch_total_tokens, hidden_dim]
@@ -9107,25 +9166,20 @@ class BatchGenWorker:
                 last_token_hidden = hidden_states[0, last_token_indices, :]
 
                 # lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-                # Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-                if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-                    logits = torch.nn.functional.linear(
-                        last_token_hidden.float(),
-                        self.model.lm_head.weight.float(),
-                        self.model.lm_head.bias.float()
-                        if hasattr(self.model.lm_head, "bias")
-                        and self.model.lm_head.bias is not None
-                        else None,
-                    )
-                else:
-                    logits = torch.nn.functional.linear(
-                        last_token_hidden,
-                        self.model.lm_head.weight,
-                        self.model.lm_head.bias
-                        if hasattr(self.model.lm_head, "bias")
-                        and self.model.lm_head.bias is not None
-                        else None,
-                    ).float()
+                # V4 shards head.weight by vocab, so gather logits before
+                # sampling. Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1
+                # for debugging.
+                from batchgen.models.deepseek.deepseekv4_flash.model import (
+                    vocab_parallel_lm_head,
+                )
+
+                logits = vocab_parallel_lm_head(
+                    self.model.lm_head,
+                    last_token_hidden,
+                    self.model.model.vocab_size,
+                    force_fp32=os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0")
+                    == "1",
+                ).float()
 
                 batch_sequences = [
                     self.global_batch.get_sequence(

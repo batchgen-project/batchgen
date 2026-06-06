@@ -79,6 +79,7 @@ _FP4_E2M1_TABLE_VALUES = (
 # Env-gated grouped-MoE slot kernel for sm120 decode (default OFF). When enabled,
 # _run_owned_experts uses the fused FP4 slot-GEMV path instead of the per-expert loop.
 _V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
+_V4_GROUPED_MOE_3D = os.environ.get("BATCHGEN_V4_GROUPED_MOE_3D", "0") == "1"
 _V4_GROUPED_MOE_MAX_TOKENS = int(
     os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
 )
@@ -97,6 +98,153 @@ _v4_divtrace_final_calls = 0
 _v4_divtrace_batch_note_emitted = False
 _v4_divtrace_records: list[dict[str, Any]] = []
 _v4_divtrace_dump_written = False
+
+
+def vocab_parallel_embedding(
+    embed: nn.Embedding,
+    input_ids: torch.Tensor,
+    full_vocab_size: int,
+) -> torch.Tensor:
+    """Embedding lookup that tolerates a vocab-parallel sharded table.
+
+    The V4 checkpoint shards embed_tokens by vocab across TP ranks: each rank
+    holds rows [rank*local, (rank+1)*local) of the full vocab. A naive
+    ``embed(global_id)`` then indexes out of bounds. When the loaded table is a
+    shard (rows < full_vocab_size), restrict to this rank's id range, look up
+    locally, zero out-of-range rows, and all-reduce the partial embeddings.
+    When the table is full (rows == full_vocab_size), this is a plain lookup.
+    """
+    local_vocab = embed.weight.shape[0]
+    if local_vocab >= full_vocab_size or not dist.is_initialized():
+        return embed(input_ids)
+    world_size = dist.get_world_size()
+    if local_vocab * world_size < full_vocab_size:
+        return embed(input_ids)
+
+    original_shape = input_ids.shape
+    flat_ids = input_ids.reshape(-1).contiguous()
+    local_rows = torch.tensor(
+        [flat_ids.shape[0]], dtype=torch.int64, device=input_ids.device
+    )
+    row_counts = [torch.empty_like(local_rows) for _ in range(world_size)]
+    dist.all_gather(row_counts, local_rows)
+    row_counts_int = [int(count.item()) for count in row_counts]
+    max_rows = max(row_counts_int)
+    if max_rows == 0:
+        return embed.weight.new_empty(*original_shape, embed.weight.shape[1])
+
+    if flat_ids.shape[0] < max_rows:
+        pad = flat_ids.new_zeros(max_rows - flat_ids.shape[0])
+        padded_ids = torch.cat([flat_ids, pad], dim=0)
+    else:
+        padded_ids = flat_ids
+
+    gathered_ids = [torch.empty_like(padded_ids) for _ in range(world_size)]
+    dist.all_gather(gathered_ids, padded_ids)
+    global_ids = torch.cat(
+        [ids[:count] for ids, count in zip(gathered_ids, row_counts_int)],
+        dim=0,
+    )
+
+    start = dist.get_rank() * local_vocab
+    mask = (global_ids >= start) & (global_ids < start + local_vocab)
+    local_ids = torch.where(
+        mask, global_ids - start, torch.zeros_like(global_ids)
+    )
+    out = embed(local_ids)
+    out = out * mask.unsqueeze(-1).to(out.dtype)
+    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+    rank = dist.get_rank()
+    row_start = sum(row_counts_int[:rank])
+    row_end = row_start + row_counts_int[rank]
+    return out[row_start:row_end].reshape(
+        *original_shape, embed.weight.shape[1]
+    )
+
+
+def vocab_parallel_lm_head(
+    lm_head: nn.Linear,
+    hidden_states: torch.Tensor,
+    full_vocab_size: int,
+    force_fp32: bool = False,
+) -> torch.Tensor:
+    """LM-head projection for vocab-parallel V4 checkpoint shards.
+
+    V4 shards ``head.weight`` across the vocab dimension.  Each rank computes
+    local logits for its shard, then all ranks gather those local logits in rank
+    order so downstream sampling sees global token ids.
+    """
+    local_vocab = lm_head.weight.shape[0]
+    if local_vocab == full_vocab_size:
+        if force_fp32:
+            bias = lm_head.bias.float() if lm_head.bias is not None else None
+            return F.linear(hidden_states.float(), lm_head.weight.float(), bias)
+        return F.linear(hidden_states, lm_head.weight, lm_head.bias)
+
+    if local_vocab > full_vocab_size:
+        raise RuntimeError(
+            f"lm_head rows {local_vocab} exceed full vocab {full_vocab_size}"
+        )
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "vocab-parallel lm_head requires torch.distributed to be initialized"
+        )
+
+    world_size = dist.get_world_size()
+    if local_vocab * world_size != full_vocab_size:
+        raise RuntimeError(
+            "invalid vocab-parallel lm_head layout: "
+            f"local={local_vocab}, world_size={world_size}, "
+            f"full_vocab={full_vocab_size}"
+        )
+
+    original_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    local_hidden = hidden_states.reshape(-1, hidden_size).contiguous()
+    local_rows = torch.tensor(
+        [local_hidden.shape[0]], dtype=torch.int64, device=hidden_states.device
+    )
+    row_counts = [torch.empty_like(local_rows) for _ in range(world_size)]
+    dist.all_gather(row_counts, local_rows)
+    row_counts_int = [int(count.item()) for count in row_counts]
+    max_rows = max(row_counts_int)
+    if max_rows == 0:
+        return hidden_states.new_empty(*original_shape, full_vocab_size)
+
+    if local_hidden.shape[0] < max_rows:
+        pad = local_hidden.new_zeros(
+            max_rows - local_hidden.shape[0], hidden_size
+        )
+        padded_hidden = torch.cat([local_hidden, pad], dim=0)
+    else:
+        padded_hidden = local_hidden
+
+    gathered_hidden = [
+        torch.empty_like(padded_hidden) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered_hidden, padded_hidden)
+    global_hidden = torch.cat(
+        [rows[:count] for rows, count in zip(gathered_hidden, row_counts_int)],
+        dim=0,
+    )
+
+    if force_fp32:
+        bias = lm_head.bias.float() if lm_head.bias is not None else None
+        local_logits = F.linear(
+            global_hidden.float(), lm_head.weight.float(), bias
+        )
+    else:
+        local_logits = F.linear(global_hidden, lm_head.weight, lm_head.bias)
+    gathered_logits = [
+        torch.empty_like(local_logits) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered_logits, local_logits.contiguous())
+    global_logits = torch.cat(gathered_logits, dim=-1)
+
+    rank = dist.get_rank()
+    start = sum(row_counts_int[:rank])
+    end = start + row_counts_int[rank]
+    return global_logits[start:end].reshape(*original_shape, full_vocab_size)
 
 
 def _v4_divtrace_note(message: str) -> None:
@@ -1314,6 +1462,16 @@ class DeepSeekV4FlashMoE(nn.Module):
         self.enable_ep_offloading = world_size > 1
 
     def _use_pynccl(self) -> bool:
+        # PyNCCL collectives are validated only for single-token EP decode (PR#2).
+        # Prepacked prefill and multi-sequence batches use a different/larger
+        # all-gather that deadlocks via PyNcclCommunicator, so fall back to
+        # torch.distributed there.
+        if AttnWrapperBase is not None and getattr(
+            AttnWrapperBase, "prepack_mode", False
+        ):
+            return False
+        if getattr(self, "_cur_real_tokens", 1) != 1:
+            return False
         return _V4_PYNCCL_COMM and getattr(self, "comm", None) is not None
 
     def _ep_all_gather(self, output: torch.Tensor, inp: torch.Tensor) -> None:
@@ -1398,11 +1556,12 @@ class DeepSeekV4FlashMoE(nn.Module):
         return load(key)
 
     def _stage_owned_expert_weights(self) -> bool:
-        # Fill a SHARED scratch buffer (one allocation reused across all layers,
-        # keyed by shape on the class) with this layer's already-resident owned
-        # experts. Decode is sequential so only one layer is active at a time;
-        # this bounds extra memory to ONE layer (~1.4GB) instead of 43x. The D2D
-        # copy from resident experts is cheap vs the eliminated per-expert loop.
+        # Build small pointer arrays to this layer's already-resident owned
+        # experts. Experts are persistent/resident (loaded via get_tensor), so
+        # their data_ptr() values are stable; keeping pointers avoids the
+        # per-layer torch.stack copies that duplicate tens of GB at ws=2.
+        if self._grouped_staged is not None:
+            return True
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
         if owned_count <= 0:
             return False
@@ -1416,59 +1575,14 @@ class DeepSeekV4FlashMoE(nn.Module):
                 return False
             dicts.append(rw)
 
-        d0 = dicts[0]
-        I2 = d0["w1.weight"].shape[0] + d0["w3.weight"].shape[0]
-        kh = d0["w1.weight"].shape[1]
-        ds_n = d0["w2.weight"].shape[0]
-        ds_k = d0["w2.weight"].shape[1]
-        dev = d0["w1.weight"].device
-        gate_n = d0["w1.weight"].shape[0]
+        try:
+            from batchgen.moe.v4_slot_moe_sm120 import (
+                setup_v4_expert_weight_pointers,
+            )
 
-        key = (
-            owned_count,
-            I2,
-            kh,
-            ds_n,
-            ds_k,
-            d0["w1.scale"].shape[1],
-            d0["w2.scale"].shape[1],
-            str(dev),
-            d0["w1.weight"].dtype,
-            d0["w1.scale"].dtype,
-        )
-        buf = DeepSeekV4FlashMoE._grouped_scratch
-        if buf is None or DeepSeekV4FlashMoE._grouped_scratch_key != key:
-            w13_p = torch.empty(
-                (owned_count, I2, kh), dtype=d0["w1.weight"].dtype, device=dev
-            )
-            w13_s = torch.empty(
-                (owned_count, I2, d0["w1.scale"].shape[1]),
-                dtype=d0["w1.scale"].dtype,
-                device=dev,
-            )
-            w2_p = torch.empty(
-                (owned_count, ds_n, ds_k),
-                dtype=d0["w2.weight"].dtype,
-                device=dev,
-            )
-            w2_s = torch.empty(
-                (owned_count, ds_n, d0["w2.scale"].shape[1]),
-                dtype=d0["w2.scale"].dtype,
-                device=dev,
-            )
-            DeepSeekV4FlashMoE._grouped_scratch = (w13_p, w13_s, w2_p, w2_s)
-            DeepSeekV4FlashMoE._grouped_scratch_key = key
-        w13_p, w13_s, w2_p, w2_s = DeepSeekV4FlashMoE._grouped_scratch
-
-        for i, rw in enumerate(dicts):
-            w13_p[i, :gate_n].copy_(rw["w1.weight"])
-            w13_p[i, gate_n:].copy_(rw["w3.weight"])
-            w13_s[i, :gate_n].copy_(rw["w1.scale"])
-            w13_s[i, gate_n:].copy_(rw["w3.scale"])
-            w2_p[i].copy_(rw["w2.weight"])
-            w2_s[i].copy_(rw["w2.scale"])
-
-        self._grouped_staged = (w13_p, w13_s, w2_p, w2_s)
+            self._grouped_staged = setup_v4_expert_weight_pointers(dicts)
+        except (KeyError, ValueError):
+            return False
         return True
 
     def _run_owned_experts_grouped(
@@ -1484,18 +1598,23 @@ class DeepSeekV4FlashMoE(nn.Module):
             return None
         if not self._stage_owned_expert_weights():
             return None
-        from batchgen.moe.v4_slot_moe_sm120 import v4_slot_moe_forward
+        if _V4_GROUPED_MOE_3D:
+            from batchgen.moe.v4_slot_moe_sm120 import (
+                v4_grouped_mxfp4_moe_forward_3d_ptrs,
+            )
 
-        w13_p, w13_s, w2_p, w2_s = self._grouped_staged
+            moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
+        else:
+            from batchgen.moe.v4_slot_moe_sm120 import v4_slot_moe_forward_ptrs
+
+            moe_forward = v4_slot_moe_forward_ptrs
+
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
-        return v4_slot_moe_forward(
+        return moe_forward(
             token_states,
             topk_weights,
             topk_indices,
-            w13_p,
-            w13_s,
-            w2_p,
-            w2_s,
+            self._grouped_staged,
             self.routed_expert_start_idx,
             owned_count,
             self.swiglu_limit,
@@ -1516,6 +1635,7 @@ class DeepSeekV4FlashMoE(nn.Module):
                 "configure_decoding must call init_num_tokens before EP decode."
             )
         real_tokens = flat_states.shape[0]
+        self._cur_real_tokens = real_tokens
         ntpr = int(self.num_tokens_per_rank)
         if real_tokens > ntpr:
             raise RuntimeError(
@@ -1593,6 +1713,7 @@ class DeepSeekV4FlashMoE(nn.Module):
                     "configure_decoding must call init_num_tokens before EP decode."
                 )
             real_tokens = flat_states.shape[0]
+            self._cur_real_tokens = real_tokens
             ntpr = int(self.num_tokens_per_rank)
             if real_tokens > ntpr:
                 raise RuntimeError(
@@ -2007,7 +2128,9 @@ class DeepSeekV4FlashModel(nn.Module):
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = vocab_parallel_embedding(
+                self.embed_tokens, input_ids, self.vocab_size
+            )
 
         hidden_states = (
             inputs_embeds.unsqueeze(2)
@@ -2072,7 +2195,9 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             return_dict=return_dict,
         )
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        logits = vocab_parallel_lm_head(
+            self.lm_head, hidden_states, self.vocab_size
+        )
         if _V4_DIVTRACE and _v4_divtrace_should_trace_final(
             hidden_states, past_key_values
         ):
