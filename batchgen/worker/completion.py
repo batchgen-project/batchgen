@@ -68,7 +68,11 @@ class CompletionHandler:
             return True
         if seq.current_context_length >= ctx.model_context_length:
             return True
-        if seq.eos_reached and not ctx.ignore_eos:
+        # ignore_eos honored per-sequence (vendor extension via extra_body),
+        # OR'd with the server-global flag.
+        if seq.eos_reached and not (
+            ctx.ignore_eos or getattr(seq, "ignore_eos", False)
+        ):
             return True
         if seq._rep_detected:
             return True
@@ -100,7 +104,10 @@ class CompletionHandler:
         elif seq.current_context_length >= ctx.model_context_length:
             finish = "length"
         # Real EOS only — the token at seq.decoded_length-1 matches an EOS id
-        elif seq.eos_reached and not ctx.ignore_eos:
+        # (ignore_eos honored per-sequence OR globally).
+        elif seq.eos_reached and not (
+            ctx.ignore_eos or getattr(seq, "ignore_eos", False)
+        ):
             finish = "stop"
         else:
             finish = "length"

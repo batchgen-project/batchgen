@@ -67,6 +67,13 @@ class ChatCompletionRequest(BaseModel):
         default=None,
         description="Preserve prior assistant reasoning_content in Kimi-style chat templates",
     )
+    # Vendor extension — pass via the OpenAI SDK `extra_body` (or as a top-level
+    # body key in a Batch JSONL line). Per-request; falls back to the batch-level
+    # CreateBatchRequest.ignore_eos when None.
+    ignore_eos: Optional[bool] = Field(
+        default=None,
+        description="If true, ignore EOS and decode to the max output length (vendor extension via extra_body).",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:
@@ -94,6 +101,11 @@ class CompletionRequest(BaseModel):
     presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
     user: Optional[str] = None
+    # Vendor extension (see ChatCompletionRequest.ignore_eos).
+    ignore_eos: Optional[bool] = Field(
+        default=None,
+        description="If true, ignore EOS and decode to the max output length (vendor extension via extra_body).",
+    )
 
     @validator("stream")
     def validate_stream(cls, value: Optional[bool]) -> Optional[bool]:
