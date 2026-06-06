@@ -446,6 +446,18 @@ def main():
         default="default",
         help="Model identifier for OpenAI-compatible APIs (vllm/sglang)",
     )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=0,
+        help="Cap number of prompts from the workload (0 = use all)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=0,
+        help="Override workload max_output_len (0 = workload default)",
+    )
 
     args = parser.parse_args()
 
@@ -455,6 +467,10 @@ def main():
     )
 
     prompts, max_tokens, temperature = _build_workload(args.workload)
+    if args.num_prompts > 0:
+        prompts = prompts[: args.num_prompts]
+    if args.max_tokens > 0:
+        max_tokens = args.max_tokens
     logger.info(
         "Workload=%s  prompts=%d  max_tokens=%d  temp=%.1f  concurrency=%d  framework=%s",
         args.workload,
