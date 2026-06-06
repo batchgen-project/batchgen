@@ -242,6 +242,7 @@ cython_debug/
 #.idea/
 
 # Server runtime storage (batch metadata, uploaded files, outputs)
+batchgen/storage/
 batchgen/storage/batches/
 batchgen/storage/files/
 batchgen/storage/files_meta/
