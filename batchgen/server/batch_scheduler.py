@@ -294,7 +294,7 @@ class BatchScheduler:
                 prompts,
                 None,  # max_input_len: dynamically determined from prompts
                 max_tokens,
-                False,  # ignore_eos
+                bool(getattr(batch, "ignore_eos", False)),  # ignore_eos (batch-level; per-request honored in pool mode)
                 None,  # temperature: handled via per-request sampling_params
                 None,  # top_p: handled via per-request sampling_params
                 max_context_length=batch.max_context_length,
@@ -885,7 +885,14 @@ class BatchScheduler:
 
         # Build IntakeEntry objects and push to IntakePool
         entries = []
+        batch_ignore_eos = bool(getattr(batch, "ignore_eos", False))
         for idx, req in enumerate(requests):
+            # Per-request ignore_eos (vendor extension via extra_body), falling
+            # back to the batch-level CreateBatchRequest.ignore_eos.
+            req_ignore_eos = getattr(req.body, "ignore_eos", None)
+            eff_ignore_eos = (
+                req_ignore_eos if req_ignore_eos is not None else batch_ignore_eos
+            )
             entries.append(IntakeEntry(
                 request_id=req.custom_id or f"{batch_id}_req_{idx}",
                 batch_id=batch_id,
@@ -894,6 +901,7 @@ class BatchScheduler:
                     "max_tokens": per_request_max_tokens[idx],
                     "priority": 0,  # TODO: support per-batch priority from API
                     "sampling_params": sampling_params[idx] if sampling_params else {},
+                    "ignore_eos": eff_ignore_eos,
                     "batchgen_debug": batch.batchgen_debug or {},
                 },
                 priority=Priority.NORMAL,
@@ -1042,6 +1050,7 @@ class BatchScheduler:
                     "batch_id": entry.batch_id,
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
+                    "ignore_eos": entry.raw_request.get("ignore_eos", False),
                     "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
                 })
 
