@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
@@ -15,6 +16,7 @@ from batchgen.attention.dsa.v4_mla_torch_ref import (
 )
 from batchgen.attention.v4_backend import DSV4AttnMetadata
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import DeepSeekV4KVCoordinator
+from batchgen.timing import get_decode_timer
 
 # Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
 _V4_ATTN_PROBE = os.environ.get("BATCHGEN_V4_ATTN_PROBE", "0") == "1"
@@ -58,6 +60,14 @@ _HEAD_DIM = 512
 _TOPK_ALIGN = 64
 _SOFTMAX_SCALE = 512**-0.5
 _SWA_WINDOW = 128
+
+
+def _select_v4_mla_backend() -> str:
+    if _V4_MLA_SM120_TRITON:
+        return "sm120_triton"
+    if _V4_MLA_TORCH:
+        return "torch_ref"
+    return "flashmla"
 
 
 def build_v4_rope_cache(
@@ -312,6 +322,73 @@ def _build_slot_indices_from_positions(
     return indices, lengths
 
 
+def _pool_active_order_matches(pool: Any, sequence_ids: Sequence[int]) -> bool:
+    active = getattr(pool, "_active_sequence_ids", None)
+    if active is None:
+        return False
+    return tuple(int(seq_id) for seq_id in sequence_ids) == tuple(active)
+
+
+def _physicalize_positions_with_page_table(
+    pool: Any,
+    sequence_ids: Sequence[int],
+    logical_positions: torch.Tensor,
+    *,
+    device: torch.device,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    page_table = getattr(pool, "_page_table", None)
+    if page_table is None or not _pool_active_order_matches(pool, sequence_ids):
+        return None
+    if logical_positions.ndim == 1:
+        logical_positions = logical_positions.unsqueeze(1)
+    if logical_positions.ndim != 2:
+        raise ValueError(
+            f"logical_positions must have shape [B,T], got {tuple(logical_positions.shape)}"
+        )
+    logical_positions = logical_positions.to(device=device, dtype=torch.long)
+    valid = logical_positions >= 0
+    lengths = valid.sum(dim=1).to(dtype=torch.int32)
+    padded_topk = (
+        _aligned_topk(int(lengths.max().item())) if lengths.numel() else 0
+    )
+    if padded_topk == 0:
+        out = torch.empty(
+            logical_positions.shape[0], 1, 0, dtype=torch.int32, device=device
+        )
+        return out, lengths
+    if logical_positions.shape[1] < padded_topk:
+        pad = torch.full(
+            (
+                logical_positions.shape[0],
+                padded_topk - logical_positions.shape[1],
+            ),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        logical_positions = torch.cat([logical_positions, pad], dim=1)
+        valid = logical_positions >= 0
+    elif logical_positions.shape[1] > padded_topk:
+        logical_positions = logical_positions[:, :padded_topk]
+        valid = logical_positions >= 0
+
+    page_size = int(pool.page_size_tokens)
+    page_table = page_table.to(device=device, dtype=torch.long)
+    page_offsets = torch.div(
+        torch.clamp_min(logical_positions, 0), page_size, rounding_mode="floor"
+    )
+    token_offsets = torch.remainder(
+        torch.clamp_min(logical_positions, 0), page_size
+    )
+    in_page_table = page_offsets < page_table.shape[1]
+    safe_page_offsets = page_offsets.clamp(max=max(page_table.shape[1] - 1, 0))
+    pages = torch.gather(page_table, 1, safe_page_offsets)
+    slot_valid = valid & in_page_table & (pages >= 0)
+    slots = pages * page_size + token_offsets
+    slots = torch.where(slot_valid, slots, torch.full_like(slots, -1))
+    return slots.unsqueeze(1).to(dtype=torch.int32), lengths
+
+
 def _build_full_prefix_indices(
     coordinator: DeepSeekV4KVCoordinator,
     sequence_ids: Sequence[int],
@@ -338,21 +415,39 @@ def _build_swa_window_indices(
     *,
     window: int = _SWA_WINDOW,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    logical_positions = []
-    for seq_len in cache_seqlens.tolist():
-        start = max(0, int(seq_len) - window)
-        logical_positions.append(
-            torch.arange(
-                start,
-                int(seq_len),
-                device=cache_seqlens.device,
-                dtype=torch.long,
-            )
-        )
-    return _build_slot_indices_from_positions(
+    lengths = torch.minimum(
+        cache_seqlens.to(dtype=torch.long),
+        torch.full_like(cache_seqlens.to(dtype=torch.long), int(window)),
+    )
+    padded_topk = (
+        _aligned_topk(int(lengths.max().item())) if lengths.numel() else 0
+    )
+    starts = (cache_seqlens.to(dtype=torch.long) - lengths).clamp_min(0)
+    offsets = torch.arange(
+        padded_topk, device=cache_seqlens.device, dtype=torch.long
+    )
+    logical_positions = starts[:, None] + offsets[None, :]
+    logical_positions = torch.where(
+        offsets[None, :] < lengths[:, None],
+        logical_positions,
+        torch.full_like(logical_positions, -1),
+    )
+    fast = _physicalize_positions_with_page_table(
         coordinator.swa,
         sequence_ids,
         logical_positions,
+        device=cache_seqlens.device,
+    )
+    if fast is not None:
+        return fast
+    fallback_positions = [
+        row[row >= 0].to(dtype=torch.long, device=cache_seqlens.device)
+        for row in logical_positions
+    ]
+    return _build_slot_indices_from_positions(
+        coordinator.swa,
+        sequence_ids,
+        fallback_positions,
         device=cache_seqlens.device,
     )
 
@@ -366,6 +461,11 @@ def _build_extra_indices_from_logical_positions(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if logical_positions.ndim == 1:
         logical_positions = logical_positions.unsqueeze(1)
+    fast = _physicalize_positions_with_page_table(
+        pool, sequence_ids, logical_positions, device=device
+    )
+    if fast is not None:
+        return fast
     lengths = torch.tensor(
         [int((row >= 0).sum().item()) for row in logical_positions],
         dtype=torch.int32,
@@ -507,6 +607,10 @@ def _validate_sparse_indices(
     if valid.numel() and valid.max().item() >= capacity:
         raise AssertionError(f"{name} exceed physical slot capacity")
     for batch_idx, seq_len in enumerate(lengths.tolist()):
+        if seq_len and (indices[batch_idx, 0, :seq_len] < 0).any():
+            raise AssertionError(
+                f"{name} entries inside valid length must be non-negative"
+            )
         if (indices[batch_idx, 0, seq_len:] != -1).any():
             raise AssertionError(
                 f"{name} entries after valid length must be -1"
@@ -775,6 +879,7 @@ class DeepSeekV4FlashMLADecodeAdapter:
         cache_seqlens = metadata.seq_lens_casual.to(
             device=q.device, dtype=torch.int32
         )
+        _dt = get_decode_timer()
 
         q_attn = kwargs.pop("q_attn", None)
         attn_q = _resolve_attention_q(q, q_attn=q_attn)
@@ -783,36 +888,41 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 f"attention q must have shape [B,H,{_HEAD_DIM}], got {tuple(attn_q.shape)}"
             )
 
-        q_roped = _apply_rope(attn_q, positions, rope_cache)
+        with _dt.timed("attn_q_rope", layer_idx) if _dt else nullcontext():
+            q_roped = _apply_rope(attn_q, positions, rope_cache)
 
         route = self.coordinator.get_layer_routing(layer_idx)
         current_kv = kwargs.pop("current_kv", None)
         if current_kv is None and kv.ndim == 2 and kv.shape[-1] == _HEAD_DIM:
             current_kv = kv
         if current_kv is not None:
-            current_kv = current_kv.to(device=q.device)
-            if current_kv.shape != (q.shape[0], _HEAD_DIM):
-                raise ValueError(
-                    f"current_kv must have shape {(q.shape[0], _HEAD_DIM)}, got {tuple(current_kv.shape)}"
+            with (
+                _dt.timed("attn_kv_store", layer_idx) if _dt else nullcontext()
+            ):
+                current_kv = current_kv.to(device=q.device)
+                if current_kv.shape != (q.shape[0], _HEAD_DIM):
+                    raise ValueError(
+                        f"current_kv must have shape {(q.shape[0], _HEAD_DIM)}, got {tuple(current_kv.shape)}"
+                    )
+                kv_roped = _apply_rope(current_kv, positions, rope_cache)
+                token_slots = metadata.extras.get("swa_token_slots")
+                if token_slots is None:
+                    token_slots = _resolve_swa_token_slots(
+                        self.coordinator, sequence_ids, positions
+                    )
+                token_slots = token_slots.to(device=q.device, dtype=torch.int32)
+                self.coordinator.swa.store_kv(
+                    layer_idx=route.swa_layer_idx,
+                    token_slots=token_slots,
+                    kv_processed=kv_roped.contiguous(),
                 )
-            kv_roped = _apply_rope(current_kv, positions, rope_cache)
-            token_slots = metadata.extras.get("swa_token_slots")
-            if token_slots is None:
-                token_slots = _resolve_swa_token_slots(
-                    self.coordinator, sequence_ids, positions
-                )
-            token_slots = token_slots.to(device=q.device, dtype=torch.int32)
-            self.coordinator.swa.store_kv(
-                layer_idx=route.swa_layer_idx,
-                token_slots=token_slots,
-                kv_processed=kv_roped.contiguous(),
-            )
 
-        k_cache, _, _block_table = (
-            self.coordinator.swa.get_layer_kv_with_page_table(
-                route.swa_layer_idx
+        with _dt.timed("attn_kv_fetch", layer_idx) if _dt else nullcontext():
+            k_cache, _, _block_table = (
+                self.coordinator.swa.get_layer_kv_with_page_table(
+                    route.swa_layer_idx
+                )
             )
-        )
         del _block_table
         softmax_scale = kwargs.pop("softmax_scale", _SOFTMAX_SCALE)
 
@@ -828,62 +938,102 @@ class DeepSeekV4FlashMLADecodeAdapter:
         if sparse_indices is not None:
             if route.c4_layer_idx is None:
                 raise RuntimeError("c4 sparse path requires c4 routing")
-            main_indices, main_lengths = _build_swa_window_indices(
-                self.coordinator, sequence_ids, cache_seqlens
-            )
-            extra_indices, extra_lengths = (
-                _build_extra_indices_from_logical_positions(
-                    self.coordinator.c4,
-                    sequence_ids,
-                    sparse_indices.to(device=q.device),
-                    device=q.device,
+            with (
+                _dt.timed("attn_build_main_indices", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                main_indices, main_lengths = _build_swa_window_indices(
+                    self.coordinator, sequence_ids, cache_seqlens
                 )
-            )
-            extra_k_cache, _, _ = (
-                self.coordinator.c4.get_layer_kv_with_page_table(
-                    route.c4_layer_idx
+            with (
+                _dt.timed("attn_build_extra_indices", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                extra_indices, extra_lengths = (
+                    _build_extra_indices_from_logical_positions(
+                        self.coordinator.c4,
+                        sequence_ids,
+                        sparse_indices.to(device=q.device),
+                        device=q.device,
+                    )
                 )
-            )
+            with (
+                _dt.timed("attn_extra_kv_fetch", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                extra_k_cache, _, _ = (
+                    self.coordinator.c4.get_layer_kv_with_page_table(
+                        route.c4_layer_idx
+                    )
+                )
         elif compressed_page_indices is not None:
             if route.c128_layer_idx is None:
                 raise RuntimeError("c128 compressed path requires c128 routing")
-            self._maybe_store_c128_emission(
-                route=route,
-                sequence_ids=sequence_ids,
-                positions=positions,
-                metadata=metadata,
-                rope_cache=rope_cache,
-                compress_hidden_states=compress_hidden_states,
-                compressor=compressor,
-            )
-            main_indices, main_lengths = _build_swa_window_indices(
-                self.coordinator, sequence_ids, cache_seqlens
-            )
+            with (
+                _dt.timed("attn_c128_store", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                self._maybe_store_c128_emission(
+                    route=route,
+                    sequence_ids=sequence_ids,
+                    positions=positions,
+                    metadata=metadata,
+                    rope_cache=rope_cache,
+                    compress_hidden_states=compress_hidden_states,
+                    compressor=compressor,
+                )
+            with (
+                _dt.timed("attn_build_main_indices", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                main_indices, main_lengths = _build_swa_window_indices(
+                    self.coordinator, sequence_ids, cache_seqlens
+                )
             if compressed_lengths is None:
                 raise ValueError(
                     "compressed_lengths are required with compressed_page_indices"
                 )
-            extra_indices, extra_lengths = _physicalize_existing_indices(
-                compressed_page_indices.to(device=q.device),
-                device=q.device,
-            )
-            expected_lengths = compressed_lengths.to(
-                device=q.device, dtype=torch.int32
-            )
-            extra_lengths = torch.minimum(extra_lengths, expected_lengths)
-            extra_k_cache, _, _ = (
-                self.coordinator.c128.get_layer_kv_with_page_table(
-                    route.c128_layer_idx
+            with (
+                _dt.timed("attn_build_extra_indices", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                extra_indices, extra_lengths = _physicalize_existing_indices(
+                    compressed_page_indices.to(device=q.device),
+                    device=q.device,
                 )
-            )
+                expected_lengths = compressed_lengths.to(
+                    device=q.device, dtype=torch.int32
+                )
+                extra_lengths = torch.minimum(extra_lengths, expected_lengths)
+            with (
+                _dt.timed("attn_extra_kv_fetch", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                extra_k_cache, _, _ = (
+                    self.coordinator.c128.get_layer_kv_with_page_table(
+                        route.c128_layer_idx
+                    )
+                )
             if extra_lengths.numel() and int(extra_lengths.max().item()) == 0:
                 extra_k_cache = None
                 extra_indices = None
                 extra_lengths = None
         else:
-            main_indices, main_lengths = _build_full_prefix_indices(
-                self.coordinator, sequence_ids, cache_seqlens
-            )
+            with (
+                _dt.timed("attn_build_main_indices", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                main_indices, main_lengths = _build_full_prefix_indices(
+                    self.coordinator, sequence_ids, cache_seqlens
+                )
 
         valid_indices = main_indices[main_indices >= 0]
 
@@ -902,13 +1052,14 @@ class DeepSeekV4FlashMLADecodeAdapter:
             raise AssertionError(
                 f"page stride must be 576-byte aligned, got {k_cache.stride(0)}"
             )
-        _validate_sparse_indices(
-            main_indices,
-            main_lengths,
-            capacity=self.coordinator.swa.num_pages
-            * self.coordinator.swa.page_size_tokens,
-            name="indices_in_kvcache",
-        )
+        with _dt.timed("attn_validate", layer_idx) if _dt else nullcontext():
+            _validate_sparse_indices(
+                main_indices,
+                main_lengths,
+                capacity=self.coordinator.swa.num_pages
+                * self.coordinator.swa.page_size_tokens,
+                name="indices_in_kvcache",
+            )
         if (
             attn_sink is not None
             and torch.isfinite(attn_sink).logical_not().any()
@@ -919,12 +1070,17 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 raise AssertionError(
                     "extra_k_cache requires extra indices/lengths"
                 )
-            _validate_sparse_indices(
-                extra_indices,
-                extra_lengths,
-                capacity=extra_k_cache.shape[0] * extra_k_cache.shape[1],
-                name="extra_indices_in_kvcache",
-            )
+            with (
+                _dt.timed("attn_validate_extra", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                _validate_sparse_indices(
+                    extra_indices,
+                    extra_lengths,
+                    capacity=extra_k_cache.shape[0] * extra_k_cache.shape[1],
+                    name="extra_indices_in_kvcache",
+                )
 
         if _V4_ATTN_PROBE:
             _v4_emit_attn_probe(
@@ -942,24 +1098,31 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 coordinator=self.coordinator,
             )
 
-        if _V4_MLA_SM120_TRITON:
+        backend_name = _select_v4_mla_backend()
+        if backend_name == "sm120_triton":
             from batchgen.attention.dsa.v4_mla_sm120_triton import (
                 flash_mla_sparse_decode_sm120,
             )
 
-            attn_out = flash_mla_sparse_decode_sm120(
-                q=q_roped.unsqueeze(1).contiguous(),
-                k_cache=k_cache,
-                indices=main_indices,
-                topk_length=main_lengths,
-                attn_sink=attn_sink,
-                head_dim_v=q_roped.shape[-1],
-                softmax_scale=softmax_scale,
-                extra_k_cache=extra_k_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_lengths,
-            )
-        elif _V4_MLA_TORCH:
+            with (
+                _dt.timed("attn_sm120_kernel_total", layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                attn_out = flash_mla_sparse_decode_sm120(
+                    q=q_roped.unsqueeze(1).contiguous(),
+                    k_cache=k_cache,
+                    indices=main_indices,
+                    topk_length=main_lengths,
+                    attn_sink=attn_sink,
+                    head_dim_v=q_roped.shape[-1],
+                    softmax_scale=softmax_scale,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_lengths,
+                    layer_idx=layer_idx,
+                )
+        elif backend_name == "torch_ref":
             attn_out = flashmla_decode_torch_reference(
                 q=q_roped.unsqueeze(1).contiguous(),
                 k_cache=k_cache,
@@ -998,9 +1161,12 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 topk_length=main_lengths,
                 extra_topk_length=extra_lengths,
             )
-        return _apply_rope(
-            attn_out.squeeze(1), positions, rope_cache, inverse=True
-        )
+        with (
+            _dt.timed("attn_inverse_rope", layer_idx) if _dt else nullcontext()
+        ):
+            return _apply_rope(
+                attn_out.squeeze(1), positions, rope_cache, inverse=True
+            )
 
 
 __all__ = [

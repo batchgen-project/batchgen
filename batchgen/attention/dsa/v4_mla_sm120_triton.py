@@ -12,11 +12,14 @@ Validated numerically against flashmla_decode_torch_reference (same correctness 
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+from batchgen.timing import get_decode_timer
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
@@ -273,6 +276,7 @@ def flash_mla_sparse_decode_sm120(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """SM120 sparse MLA decode. Returns attn_out [B, 1, H, head_dim_v] bf16.
 
@@ -282,17 +286,26 @@ def flash_mla_sparse_decode_sm120(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    out, lse = _run_triton_sparse_decode(
-        q, k_cache, indices, topk_length, softmax_scale
-    )
+    _dt = get_decode_timer()
+    with _dt.timed("attn_sm120_main", layer_idx) if _dt else nullcontext():
+        out, lse = _run_triton_sparse_decode(
+            q, k_cache, indices, topk_length, softmax_scale
+        )
 
     if extra_k_cache is not None and extra_indices is not None:
-        out_extra, lse_extra = _run_triton_sparse_decode(
-            q, extra_k_cache, extra_indices, extra_topk_length, softmax_scale
-        )
-        out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
+        with _dt.timed("attn_sm120_extra", layer_idx) if _dt else nullcontext():
+            out_extra, lse_extra = _run_triton_sparse_decode(
+                q,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_length,
+                softmax_scale,
+            )
+        with _dt.timed("attn_sm120_merge", layer_idx) if _dt else nullcontext():
+            out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
 
     if attn_sink is not None:
-        out, lse = _apply_attn_sink(out, lse, attn_sink)
+        with _dt.timed("attn_sm120_sink", layer_idx) if _dt else nullcontext():
+            out, lse = _apply_attn_sink(out, lse, attn_sink)
 
     return out[..., :head_dim_v]
