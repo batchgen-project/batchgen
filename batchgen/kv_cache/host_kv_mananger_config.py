@@ -9,7 +9,9 @@ import torch
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.models.engine_loader import core_engine as bg_lib
 
-HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
+HOST_KV_SHM_NAME = os.environ.get(
+    "BATCHGEN_HOST_KV_SHM_NAME", "batchgen_host_kv_cache"
+)
 
 __all__ = [
     "build_host_kv_config",
@@ -313,7 +315,9 @@ def build_host_kv_config(
 
     num_pages_per_layer = host_budget // denom
     config = bg_lib.HostPagedKVConfig()
-    config.shm_name = HOST_KV_SHM_NAME
+    config.shm_name = os.environ.get(
+        "BATCHGEN_HOST_KV_SHM_NAME", HOST_KV_SHM_NAME
+    )
     config.num_layers = profile.num_layers
     config.num_pages = num_pages_per_layer
     config.page_size_tokens = profile.page_size
