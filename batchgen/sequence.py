@@ -97,6 +97,7 @@ class SequenceEntry:
         'pool_slot_index',       # Index in SchedulingPool's pre-allocated QueryBook
         'priority',              # 0=NORMAL, 1=HIGH (inherited from batch)
         'sampling_params',       # Per-request sampling params for this sequence
+        'ignore_eos',            # Per-request ignore_eos (vendor extension via extra_body)
         # Lifespan monitoring (BATCHGEN_SEQ_LIFESPAN=1)
         '_lifespan_log',   # List[SeqEventRecord], ring buffer
         '_lifespan_idx',   # int, next write position
@@ -171,6 +172,7 @@ class SequenceEntry:
         self.pool_slot_index: int = -1
         self.priority: int = 0  # 0=NORMAL, 1=HIGH
         self.sampling_params: Optional[Dict] = None
+        self.ignore_eos: bool = False  # per-request vendor extension (extra_body)
 
         # Lifespan monitoring
         self._lifespan_log: list = []

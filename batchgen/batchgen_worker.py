@@ -1219,6 +1219,9 @@ class BatchGenWorker:
 			seq.batchgen_debug = entry.get("batchgen_debug")
 			seq.priority = entry.get("priority", 0)
 			seq.sampling_params = entry.get("sampling_params")
+			# Per-request ignore_eos (vendor extension via extra_body). Honored
+			# per-sequence at the decode EOS check; OR'd with the global flag.
+			seq.ignore_eos = bool(entry.get("ignore_eos", False))
 			self.global_batch.add_sequence(seq)
 			new_uuids.append(seq.uuid)
 
@@ -4744,7 +4747,11 @@ class BatchGenWorker:
 			decoded_lens[i] = seq.decoded_length
 			max_lens[i] = seq.max_decode_length
 			ctx_lens[i] = seq.current_context_length
-			eos_flags[i] = seq.eos_reached and not ignore_eos
+			# Honor ignore_eos per-sequence (vendor extension via extra_body),
+			# OR'd with the server-global flag.
+			eos_flags[i] = seq.eos_reached and not (
+				ignore_eos or getattr(seq, "ignore_eos", False)
+			)
 
 		# Variable-length N-gram repetition detection at decision boundary
 		# Catches repeating patterns of length 2-100 tokens (32 repetitions required)

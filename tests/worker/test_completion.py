@@ -181,3 +181,26 @@ def test_handler_is_stateless(ctx_strict):
     # seq fields we read (not written) unchanged
     assert seq.decoded_length == 4
     assert seq.eos_reached is False
+
+
+def test_is_sequence_completed_honors_per_sequence_ignore_eos(ctx_strict):
+    """Per-sequence ignore_eos (vendor extension via extra_body) overrides a real
+    EOS even when the global ctx.ignore_eos is False; length limits still apply."""
+    seq = _make_seq(eos_reached=True)
+    # Baseline under strict (global ignore_eos=False) ctx: real EOS completes.
+    assert CompletionHandler.is_sequence_completed(ctx_strict, seq) is True
+    # Per-sequence override: not completed by EOS.
+    seq.ignore_eos = True
+    assert CompletionHandler.is_sequence_completed(ctx_strict, seq) is False
+    # Length limit still completes regardless of ignore_eos.
+    seq.decoded_length = seq.max_decode_length
+    assert CompletionHandler.is_sequence_completed(ctx_strict, seq) is True
+
+
+def test_get_finish_reason_per_sequence_ignore_eos_becomes_length(ctx_strict):
+    """A real EOS reports finish_reason 'stop' under strict ctx, but 'length' when
+    the sequence sets ignore_eos (per-request), without touching the global flag."""
+    seq = _make_seq(eos_reached=True, decoded_length=4, max_decode_length=16)
+    assert CompletionHandler.get_finish_reason(ctx_strict, seq) == "stop"
+    seq.ignore_eos = True
+    assert CompletionHandler.get_finish_reason(ctx_strict, seq) == "length"
