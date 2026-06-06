@@ -18,522 +18,614 @@ from batchgen.server.watchdog import Watchdog
 
 
 def _reload_worker_module(reload_deps=False):
-	"""
-	Hot-reload the batchgen_worker module to pick up code changes.
-	This reloads the module but doesn't affect already-instantiated objects.
-	For method-level changes, we rebind all methods to the existing worker.
+    """
+    Hot-reload the batchgen_worker module to pick up code changes.
+    This reloads the module but doesn't affect already-instantiated objects.
+    For method-level changes, we rebind all methods to the existing worker.
 
-	Args:
-		reload_deps: If True, also reload commonly-changed dependent modules
-			(batch_scheduler, intake_pool, scheduling_pool, gpu_paged_kv_manager)
-			before reloading batchgen_worker. This ensures cross-module changes
-			take effect.
-	"""
-	if reload_deps:
-		dep_modules = [
-			"batchgen.server.batch_scheduler",
-			"batchgen.server.intake_pool",
-			"batchgen.server.scheduling_pool",
-			"batchgen.kv_cache.gpu_paged_kv_manager",
-		]
-		for mod_name in dep_modules:
-			if mod_name in sys.modules:
-				importlib.reload(sys.modules[mod_name])
-				logging.info(f"  Reloaded dependency: {mod_name}")
-	import batchgen.batchgen_worker as worker_module
-	importlib.reload(worker_module)
-	return worker_module
+    Args:
+            reload_deps: If True, also reload commonly-changed dependent modules
+                    (batch_scheduler, intake_pool, scheduling_pool, gpu_paged_kv_manager)
+                    before reloading batchgen_worker. This ensures cross-module changes
+                    take effect.
+    """
+    if reload_deps:
+        dep_modules = [
+            "batchgen.server.batch_scheduler",
+            "batchgen.server.intake_pool",
+            "batchgen.server.scheduling_pool",
+            "batchgen.kv_cache.gpu_paged_kv_manager",
+        ]
+        for mod_name in dep_modules:
+            if mod_name in sys.modules:
+                importlib.reload(sys.modules[mod_name])
+                logging.info(f"  Reloaded dependency: {mod_name}")
+    import batchgen.batchgen_worker as worker_module
+
+    importlib.reload(worker_module)
+    return worker_module
 
 
 def _rebind_all_methods(worker, NewClass):
-	"""Rebind all methods from NewClass onto existing worker instance.
+    """Rebind all methods from NewClass onto existing worker instance.
 
-	Skips __init__ and dunder methods. Returns (rebound, skipped) counts.
-	"""
-	import inspect
-	rebound = 0
-	skipped = 0
-	for name, method in inspect.getmembers(NewClass, predicate=inspect.isfunction):
-		if name == "__init__":
-			skipped += 1
-			continue
-		try:
-			setattr(worker, name, method.__get__(worker, type(worker)))
-			rebound += 1
-		except Exception:
-			skipped += 1
-	return rebound, skipped
+    Skips __init__ and dunder methods. Returns (rebound, skipped) counts.
+    """
+    import inspect
+
+    rebound = 0
+    skipped = 0
+    for name, method in inspect.getmembers(
+        NewClass, predicate=inspect.isfunction
+    ):
+        if name == "__init__":
+            skipped += 1
+            continue
+        try:
+            setattr(worker, name, method.__get__(worker, type(worker)))
+            rebound += 1
+        except Exception:
+            skipped += 1
+    return rebound, skipped
 
 
 def _validate_reload(worker, NewClass):
-	"""Warn if new __init__ references instance attrs missing on existing worker.
+    """Warn if new __init__ references instance attrs missing on existing worker.
 
-	Returns list of missing attribute names (empty if safe).
-	"""
-	import inspect
-	import re
-	try:
-		old_init_src = inspect.getsource(type(worker).__init__)
-		new_init_src = inspect.getsource(NewClass.__init__)
-	except (OSError, TypeError):
-		return []
-	if old_init_src == new_init_src:
-		return []
-	new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
-	missing = [a for a in sorted(new_attrs) if not hasattr(worker, a)]
-	if missing:
-		logging.warning(
-			f"RELOAD WARNING: New __init__ has {len(missing)} attrs "
-			f"missing on existing worker: {missing[:10]}. "
-			f"These will cause AttributeError if accessed."
-		)
-	return missing
+    Returns list of missing attribute names (empty if safe).
+    """
+    import inspect
+    import re
+
+    try:
+        old_init_src = inspect.getsource(type(worker).__init__)
+        new_init_src = inspect.getsource(NewClass.__init__)
+    except (OSError, TypeError):
+        return []
+    if old_init_src == new_init_src:
+        return []
+    new_attrs = set(re.findall(r"self\.(\w+)\s*=", new_init_src))
+    missing = [a for a in sorted(new_attrs) if not hasattr(worker, a)]
+    if missing:
+        logging.warning(
+            f"RELOAD WARNING: New __init__ has {len(missing)} attrs "
+            f"missing on existing worker: {missing[:10]}. "
+            f"These will cause AttributeError if accessed."
+        )
+    return missing
 
 
 def _setup_nccl_env():
-	"""
-	Set up NCCL environment variables for better reliability in multi-node setups.
-	These should be set before any NCCL operations.
-	"""
-	# Increase connection timeout and retry attempts
-	# NCCL_SOCKET_TIMEOUT: timeout in milliseconds for socket operations (default: varies)
-	if "NCCL_SOCKET_TIMEOUT" not in os.environ:
-		os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minutes in ms
+    """
+    Set up NCCL environment variables for better reliability in multi-node setups.
+    These should be set before any NCCL operations.
+    """
+    # Increase connection timeout and retry attempts
+    # NCCL_SOCKET_TIMEOUT: timeout in milliseconds for socket operations (default: varies)
+    if "NCCL_SOCKET_TIMEOUT" not in os.environ:
+        os.environ["NCCL_SOCKET_TIMEOUT"] = "300000"  # 5 minutes in ms
 
-	# NCCL_NET_RETRY_COUNT: number of retries for network operations
-	if "NCCL_NET_RETRY_COUNT" not in os.environ:
-		os.environ["NCCL_NET_RETRY_COUNT"] = "100"  # More retries (default is ~10)
+    # NCCL_NET_RETRY_COUNT: number of retries for network operations
+    if "NCCL_NET_RETRY_COUNT" not in os.environ:
+        os.environ["NCCL_NET_RETRY_COUNT"] = (
+            "100"  # More retries (default is ~10)
+        )
 
-	# TORCH_NCCL_ENABLE_MONITORING: Disable NCCL HeartbeatMonitor entirely
-	# The default 60s timeout can cause false positives during CPU-bound operations
-	# (e.g., tokenizing large batches). Setting TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=0
-	# does NOT disable it - it sets timeout to 0 which fails immediately.
-	# Use TORCH_NCCL_ENABLE_MONITORING=0 to actually disable monitoring.
-	if os.environ.get("TORCH_NCCL_ENABLE_MONITORING") is None:
-		os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
-		logging.info("Disabled NCCL HeartbeatMonitor (TORCH_NCCL_ENABLE_MONITORING=0)")
+    # TORCH_NCCL_ENABLE_MONITORING: Disable NCCL HeartbeatMonitor entirely
+    # The default 60s timeout can cause false positives during CPU-bound operations
+    # (e.g., tokenizing large batches). Setting TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=0
+    # does NOT disable it - it sets timeout to 0 which fails immediately.
+    # Use TORCH_NCCL_ENABLE_MONITORING=0 to actually disable monitoring.
+    if os.environ.get("TORCH_NCCL_ENABLE_MONITORING") is None:
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        logging.info(
+            "Disabled NCCL HeartbeatMonitor (TORCH_NCCL_ENABLE_MONITORING=0)"
+        )
 
-	# NCCL_BUFFSIZE: buffer size for NCCL operations (default: 4MB)
-	# Larger buffer improves throughput for multi-node communication
-	if "NCCL_BUFFSIZE" not in os.environ:
-		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
+    # NCCL_BUFFSIZE: buffer size for NCCL operations (default: 4MB)
+    # Larger buffer improves throughput for multi-node communication
+    if "NCCL_BUFFSIZE" not in os.environ:
+        os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
 
-	# NCCL_ALGO: force deterministic tree algorithm only when
-	# BATCHGEN_DETERMINISTIC is set. Tree has fixed reduction order but
-	# ~1.3-2× slower than ring on intra-node NVLink for the ~1.5 MiB MoE
-	# allreduce payloads we issue per layer. Default (unset) lets NCCL
-	# auto-select per payload size — measured 49 ms/step → expected
-	# 20-30 ms/step on the MoE allreduce tail.
-	# Enable BATCHGEN_DETERMINISTIC=1 to re-pin tree for repetition-
-	# regression reproductions.
-	_deterministic = os.environ.get("BATCHGEN_DETERMINISTIC", "0").lower() in (
-		"1", "true", "yes", "on")
-	if _deterministic:
-		os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
-		logging.info(
-			"BATCHGEN_DETERMINISTIC=1 → NCCL_ALGO=allreduce:tree "
-			"(deterministic reductions)")
-	else:
-		logging.info(
-			"NCCL_ALGO not forced — NCCL auto-select "
-			"(ring/tree per payload; ~1.3-2× faster than pinned tree)")
+    # NCCL_ALGO: force deterministic tree algorithm only when
+    # BATCHGEN_DETERMINISTIC is set. Tree has fixed reduction order but
+    # ~1.3-2× slower than ring on intra-node NVLink for the ~1.5 MiB MoE
+    # allreduce payloads we issue per layer. Default (unset) lets NCCL
+    # auto-select per payload size — measured 49 ms/step → expected
+    # 20-30 ms/step on the MoE allreduce tail.
+    # Enable BATCHGEN_DETERMINISTIC=1 to re-pin tree for repetition-
+    # regression reproductions.
+    _deterministic = os.environ.get("BATCHGEN_DETERMINISTIC", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if _deterministic:
+        os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
+        logging.info(
+            "BATCHGEN_DETERMINISTIC=1 → NCCL_ALGO=allreduce:tree "
+            "(deterministic reductions)"
+        )
+    else:
+        logging.info(
+            "NCCL_ALGO not forced — NCCL auto-select "
+            "(ring/tree per payload; ~1.3-2× faster than pinned tree)"
+        )
 
 
 def server_worker_main(
-	rank_idx: int,
-	request_queue: mp.Queue,
-	response_queue: mp.Queue,
-	args: BatchGenWorkerArgs,
-	ready_event: Optional[mp.Event] = None,
+    rank_idx: int,
+    request_queue: mp.Queue,
+    response_queue: mp.Queue,
+    args: BatchGenWorkerArgs,
+    ready_event: Optional[mp.Event] = None,
 ):
-	try:
-		_server_worker_main_impl(rank_idx, request_queue, response_queue, args, ready_event)
-	except Exception as e:
-		global_rank = getattr(args, "global_rank", None)
-		logging.error(f"[FATAL] Unhandled exception in worker "
-					  f"rank_idx={rank_idx}, global_rank={global_rank}: {e}")
-		traceback.print_exc()
-		try:
-			if dist.is_available() and dist.is_initialized():
-				dist.destroy_process_group()
-		except Exception:
-			pass
-		os._exit(1)
+    try:
+        _server_worker_main_impl(
+            rank_idx, request_queue, response_queue, args, ready_event
+        )
+    except Exception as e:
+        global_rank = getattr(args, "global_rank", None)
+        logging.error(
+            f"[FATAL] Unhandled exception in worker "
+            f"rank_idx={rank_idx}, global_rank={global_rank}: {e}"
+        )
+        traceback.print_exc()
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+        os._exit(1)
 
 
 def _setup_worker_logging(rank_idx: int, global_rank: int = -1):
-	"""
-	Configure logging for worker processes.
-	Spawned processes don't inherit logging config from the parent process.
-	"""
-	# Use global_rank if available, otherwise fall back to rank_idx
-	rank_label = global_rank if global_rank >= 0 else rank_idx
-	logging.basicConfig(
-		level=logging.INFO,
-		format=f'%(asctime)s - [BatchGenWorker-{rank_label}] - %(levelname)s - %(message)s',
-		force=True,  # Override any existing configuration
-	)
+    """
+    Configure logging for worker processes.
+    Spawned processes don't inherit logging config from the parent process.
+    """
+    # Use global_rank if available, otherwise fall back to rank_idx
+    rank_label = global_rank if global_rank >= 0 else rank_idx
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s - [BatchGenWorker-{rank_label}] - %(levelname)s - %(message)s",
+        force=True,  # Override any existing configuration
+    )
 
 
 def _server_worker_main_impl(
-	rank_idx: int,
-	request_queue: mp.Queue,
-	response_queue: mp.Queue,
-	args: BatchGenWorkerArgs,
-	ready_event: Optional[mp.Event] = None,
+    rank_idx: int,
+    request_queue: mp.Queue,
+    response_queue: mp.Queue,
+    args: BatchGenWorkerArgs,
+    ready_event: Optional[mp.Event] = None,
 ):
-	"""
-	The main loop for the GPU workers.
-	Rank 0 acts as the coordinator, reading from the master process queue.
-	All ranks receive the full global batch for coordinated scheduling.
-	"""
-	# Step 0: Configure logging for this worker process first
-	_setup_worker_logging(rank_idx)
+    """
+    The main loop for the GPU workers.
+    Rank 0 acts as the coordinator, reading from the master process queue.
+    All ranks receive the full global batch for coordinated scheduling.
+    """
+    # Step 0: Configure logging for this worker process first
+    _setup_worker_logging(rank_idx)
 
-	# Step 0.1: Install signal handlers so workers respond to Ctrl+C
-	# This is critical for multi-node setups where node 1 workers might be
-	# blocked in NCCL operations when node 0 is killed.
-	def _worker_shutdown_callback():
-		"""Cleanup callback when worker receives termination signal."""
-		try:
-			if dist.is_available() and dist.is_initialized():
-				dist.destroy_process_group()
-		except Exception:
-			pass
+    # Step 0.1: Install signal handlers so workers respond to Ctrl+C
+    # This is critical for multi-node setups where node 1 workers might be
+    # blocked in NCCL operations when node 0 is killed.
+    def _worker_shutdown_callback():
+        """Cleanup callback when worker receives termination signal."""
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
-	install_worker_signal_handlers(_worker_shutdown_callback)
+    install_worker_signal_handlers(_worker_shutdown_callback)
 
-	# Step 0.5: Set up NCCL environment for reliability
-	_setup_nccl_env()
-	
-	# Step 1: Hydrate the rank of this process
-	num_gpus_per_node = torch.cuda.device_count()
-	args.local_rank = rank_idx
-	args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
-	args.device = args.local_rank
+    # Step 0.5: Set up NCCL environment for reliability
+    _setup_nccl_env()
 
-	# Reconfigure logging with actual global rank for clearer log output
-	_setup_worker_logging(rank_idx, args.global_rank)
+    # Step 1: Hydrate the rank of this process
+    num_gpus_per_node = torch.cuda.device_count()
+    args.local_rank = rank_idx
+    args.global_rank = num_gpus_per_node * args.nnode_rank + rank_idx
+    args.device = args.local_rank
 
-	# 2. Initialize Process Group
-	logging.info(f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}")
+    # Reconfigure logging with actual global rank for clearer log output
+    _setup_worker_logging(rank_idx, args.global_rank)
 
-	# Set CUDA device before init_process_group so NCCL uses the correct device context
-	torch.cuda.set_device(args.local_rank)
+    # 2. Initialize Process Group
+    logging.info(
+        f"Starting BatchGen Worker on local rank {args.local_rank}, global rank {args.global_rank}"
+    )
 
-	try:
-		pg_kwargs = dict(
-			backend="nccl",
-			init_method="tcp://" + args.dist_init_addr,
-			world_size=args.world_size,
-			rank=args.global_rank,
-			timeout=timedelta(seconds=3600),
-		)
-		# device_id requires torch >= 2.8
-		import inspect
-		if 'device_id' in inspect.signature(dist.init_process_group).parameters:
-			pg_kwargs['device_id'] = torch.device(f"cuda:{args.local_rank}")
-		dist.init_process_group(**pg_kwargs)
-	except Exception as e:
-		logging.error(f"Failed to initialize process group: {e}")
-		sys.exit(1)
-	logging.info(f"Process group initialized for rank {args.global_rank}/{args.world_size}.")
+    # Set CUDA device before init_process_group so NCCL uses the correct device context
+    torch.cuda.set_device(args.local_rank)
 
-	# CRITICAL: Warmup NCCL connections before entering server loop
-	# This ensures all inter-node NCCL connections are fully established
-	# before any application-level communication happens.
-	# Without this, the first collective may fail with "Connection refused"
-	# if remote ranks haven't fully initialized their NCCL listeners.
-	try:
-		logging.debug(f"Rank {args.global_rank}: Starting NCCL connection warmup...")
+    try:
+        pg_kwargs = dict(
+            backend="nccl",
+            init_method="tcp://" + args.dist_init_addr,
+            world_size=args.world_size,
+            rank=args.global_rank,
+            timeout=timedelta(seconds=3600),
+        )
+        # device_id requires torch >= 2.8
+        import inspect
 
-		# Step 1: Simple barrier to ensure all ranks have reached this point
-		dist.barrier()
-		logging.debug(f"Rank {args.global_rank}: Barrier 1 passed")
+        if "device_id" in inspect.signature(dist.init_process_group).parameters:
+            pg_kwargs["device_id"] = torch.device(f"cuda:{args.local_rank}")
+        dist.init_process_group(**pg_kwargs)
+    except Exception as e:
+        logging.error(f"Failed to initialize process group: {e}")
+        sys.exit(1)
+    logging.info(
+        f"Process group initialized for rank {args.global_rank}/{args.world_size}."
+    )
 
-		# Step 2: Small all_reduce to establish actual NCCL connections
-		# NCCL lazily establishes connections, so we force it here
-		warmup_tensor = torch.ones(1, device=f"cuda:{args.local_rank}")
-		dist.all_reduce(warmup_tensor, op=dist.ReduceOp.SUM)
-		torch.cuda.synchronize()
+    # CRITICAL: Warmup NCCL connections before entering server loop
+    # This ensures all inter-node NCCL connections are fully established
+    # before any application-level communication happens.
+    # Without this, the first collective may fail with "Connection refused"
+    # if remote ranks haven't fully initialized their NCCL listeners.
+    try:
+        logging.debug(
+            f"Rank {args.global_rank}: Starting NCCL connection warmup..."
+        )
 
-		expected = float(args.world_size)
-		if abs(warmup_tensor.item() - expected) > 1e-6:
-			raise RuntimeError(f"NCCL warmup failed: expected {expected}, got {warmup_tensor.item()}")
-		logging.debug(f"Rank {args.global_rank}: all_reduce warmup passed")
+        # Step 1: Simple barrier to ensure all ranks have reached this point
+        dist.barrier()
+        logging.debug(f"Rank {args.global_rank}: Barrier 1 passed")
 
-		# Step 3: Test broadcast_object_list specifically since that's what fails
-		test_obj = [args.global_rank] if args.global_rank == 0 else [None]
-		dist.broadcast_object_list(test_obj, src=0)
-		if test_obj[0] != 0:
-			raise RuntimeError(f"broadcast_object_list warmup failed: got {test_obj[0]}")
-		logging.debug(f"Rank {args.global_rank}: broadcast_object_list warmup passed")
+        # Step 2: Small all_reduce to establish actual NCCL connections
+        # NCCL lazily establishes connections, so we force it here
+        warmup_tensor = torch.ones(1, device=f"cuda:{args.local_rank}")
+        dist.all_reduce(warmup_tensor, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize()
 
-		# Final barrier to ensure all warmup is complete
-		dist.barrier()
-		logging.info(f"Rank {args.global_rank}: NCCL warmup complete")
-		
-	except Exception as e:
-		logging.error(f"Rank {args.global_rank}: NCCL warmup failed: {e}")
-		logging.error(f"This usually indicates a network issue or startup race condition.")
-		logging.error(f"Try restarting the server or check network connectivity between nodes.")
-		sys.exit(1)
+        expected = float(args.world_size)
+        if abs(warmup_tensor.item() - expected) > 1e-6:
+            raise RuntimeError(
+                f"NCCL warmup failed: expected {expected}, got {warmup_tensor.item()}"
+            )
+        logging.debug(f"Rank {args.global_rank}: all_reduce warmup passed")
 
-	# 2. Instantiate the BatchGenWorker
-	worker = BatchGenWorker(args)
+        # Step 3: Test broadcast_object_list specifically since that's what fails
+        test_obj = [args.global_rank] if args.global_rank == 0 else [None]
+        dist.broadcast_object_list(test_obj, src=0)
+        if test_obj[0] != 0:
+            raise RuntimeError(
+                f"broadcast_object_list warmup failed: got {test_obj[0]}"
+            )
+        logging.debug(
+            f"Rank {args.global_rank}: broadcast_object_list warmup passed"
+        )
 
-	# 2.5. Initialize watchdog for stuck process detection
-	watchdog_timeout = getattr(args, 'watchdog_timeout', None)
-	watchdog_test_stuck_time = getattr(args, 'watchdog_test_stuck_time', 0.0)
-	watchdog = Watchdog.create(
-		debug_name=f"worker-{args.global_rank}",
-		watchdog_timeout=watchdog_timeout,
-		soft=False,  # Hard mode: kill parent process on timeout
-		test_stuck_time=watchdog_test_stuck_time,
-	)
-	if watchdog_timeout:
-		logging.info(f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s")
+        # Final barrier to ensure all warmup is complete
+        dist.barrier()
+        logging.info(f"Rank {args.global_rank}: NCCL warmup complete")
 
-	# Pass watchdog to worker for fine-grained feeding during inference
-	worker.set_watchdog(watchdog)
+    except Exception as e:
+        logging.error(f"Rank {args.global_rank}: NCCL warmup failed: {e}")
+        logging.error(
+            f"This usually indicates a network issue or startup race condition."
+        )
+        logging.error(
+            f"Try restarting the server or check network connectivity between nodes."
+        )
+        sys.exit(1)
 
-	# CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
-	# The Host KV pinned memory registration can take 200+ seconds and varies per rank.
-	# Without this barrier, faster ranks will start the main loop and attempt collective
-	# operations while slower ranks are still initializing, causing NCCL errors.
-	logging.info(f"Rank {args.global_rank}: Worker initialized, waiting for all ranks at barrier...")
-	dist.barrier()
-	logging.info(f"Rank {args.global_rank}: All ranks ready, entering main loop.")
+    # 2. Instantiate the BatchGenWorker
+    worker = BatchGenWorker(args)
 
-	# Signal that workers are ready (only rank 0 sets the event to avoid race conditions)
-	if ready_event is not None and args.global_rank == 0:
-		ready_event.set()
-		logging.info(f"Rank {args.global_rank}: Signaled ready event to WorkerManager")
+    # 2.5. Initialize watchdog for stuck process detection
+    watchdog_timeout = getattr(args, "watchdog_timeout", None)
+    watchdog_test_stuck_time = getattr(args, "watchdog_test_stuck_time", 0.0)
+    watchdog = Watchdog.create(
+        debug_name=f"worker-{args.global_rank}",
+        watchdog_timeout=watchdog_timeout,
+        soft=False,  # Hard mode: kill parent process on timeout
+        test_stuck_time=watchdog_test_stuck_time,
+    )
+    if watchdog_timeout:
+        logging.info(
+            f"Rank {args.global_rank}: Watchdog initialized with timeout={watchdog_timeout}s"
+        )
 
-	# 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
-	# not worker init, CUDA graph capture, or NCCL warmup.
-	decode_step_timeout = getattr(args, 'decode_step_timeout', None)
-	decode_watchdog = Watchdog.create(
-		debug_name=f"decode-{args.global_rank}",
-		watchdog_timeout=decode_step_timeout,
-		soft=False,  # Hard mode: kill parent process on timeout
-	)
-	if decode_step_timeout:
-		logging.info(f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s")
-	worker.set_decode_watchdog(decode_watchdog)
+    # Pass watchdog to worker for fine-grained feeding during inference
+    worker.set_watchdog(watchdog)
 
-	# 3. Long-lived server loop
-	global_rank = args.global_rank
-	world_size = args.world_size
-	
-	# NCCL timeout prevention strategy:
-	# The problem: NCCL watchdog times out if a collective operation doesn't complete within timeout.
-	# When Rank 0 is blocking on request_queue.get() while other ranks wait on broadcast, 
-	# NCCL will timeout if no work arrives.
-	#
-	# Solution: Rank 0 uses non-blocking queue.get with timeout, then all ranks periodically 
-	# perform a lightweight collective to keep NCCL alive (heartbeat pattern).
-	QUEUE_POLL_TIMEOUT = 30.0  # Rank 0 polls queue every 30 seconds
+    # CRITICAL: Barrier after worker init to ensure all ranks complete cudaHostRegister
+    # The Host KV pinned memory registration can take 200+ seconds and varies per rank.
+    # Without this barrier, faster ranks will start the main loop and attempt collective
+    # operations while slower ranks are still initializing, causing NCCL errors.
+    logging.info(
+        f"Rank {args.global_rank}: Worker initialized, waiting for all ranks at barrier..."
+    )
+    dist.barrier()
+    logging.info(
+        f"Rank {args.global_rank}: All ranks ready, entering main loop."
+    )
 
-	logging.info(f"Entering main server loop on rank {global_rank}.")
-	while True:
-		# --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
-		task_data = None
-		work_available = False
+    # Signal that workers are ready (only rank 0 sets the event to avoid race conditions)
+    if ready_event is not None and args.global_rank == 0:
+        ready_event.set()
+        logging.info(
+            f"Rank {args.global_rank}: Signaled ready event to WorkerManager"
+        )
 
-		while not work_available:
-			if global_rank == 0:
-				# Rank 0: Non-blocking poll on queue with timeout
-				try:
-					task_data = request_queue.get(timeout=QUEUE_POLL_TIMEOUT)
-					work_available = True
-				except Exception:
-					# Queue.get timeout - no work yet, signal others
-					work_available = False
-			
-			# All ranks synchronize on work availability status
-			# This is a fast broadcast (single int) that keeps NCCL alive
-			status_tensor = torch.tensor([1 if work_available else 0], dtype=torch.int32, device='cuda')
-			dist.broadcast(status_tensor, src=0)
-			work_available = status_tensor.item() == 1
-			
-			if not work_available:
-				# No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
-				# Also feed watchdog to prevent false stuck detection during idle periods
-				watchdog.feed()
-				# Loop back and poll again
-				continue
+    # 2.6. Initialize decode watchdog AFTER barrier — only monitors decode steps,
+    # not worker init, CUDA graph capture, or NCCL warmup.
+    decode_step_timeout = getattr(args, "decode_step_timeout", None)
+    decode_watchdog = Watchdog.create(
+        debug_name=f"decode-{args.global_rank}",
+        watchdog_timeout=decode_step_timeout,
+        soft=False,  # Hard mode: kill parent process on timeout
+    )
+    if decode_step_timeout:
+        logging.info(
+            f"Rank {args.global_rank}: Decode watchdog initialized with timeout={decode_step_timeout}s"
+        )
+    worker.set_decode_watchdog(decode_watchdog)
 
-		# --- STEP 2: Broadcast full task to all ranks ---
-		task_container = [task_data]
-		dist.broadcast_object_list(task_container, src=0)
-		task_data = task_container[0]
+    # 3. Long-lived server loop
+    global_rank = args.global_rank
+    world_size = args.world_size
 
-		# --- STEP 3: Shutdown Check ---
-		if task_data is None:
-			logging.info(f"Rank {global_rank} received shutdown signal. Exiting worker.")
-			break
-		
-		# --- STEP 3.5: Hot Reload Command ---
-		if isinstance(task_data, dict) and task_data.get("command") == "reload":
-			reload_deps = task_data.get("reload_deps", True)
-			logging.info(f"Rank {global_rank}: Received reload command (reload_deps={reload_deps}), hot-reloading...")
-			try:
-				new_module = _reload_worker_module(reload_deps=reload_deps)
-				NewClass = new_module.BatchGenWorker
-				missing = _validate_reload(worker, NewClass)
-				rebound, skipped = _rebind_all_methods(worker, NewClass)
-				logging.info(
-					f"Rank {global_rank}: Hot reload successful! "
-					f"Rebound {rebound} methods, skipped {skipped}"
-					+ (f", {len(missing)} missing attrs" if missing else "")
-				)
-				if global_rank == 0:
-					response_queue.put({
-						"status": "reload_success",
-						"rebound": rebound,
-						"skipped": skipped,
-						"missing_attrs": missing,
-					})
-			except Exception as e:
-				logging.error(f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True)
-				if global_rank == 0:
-					response_queue.put({"status": "reload_failed", "error": str(e)})
-			continue
+    # NCCL timeout prevention strategy:
+    # The problem: NCCL watchdog times out if a collective operation doesn't complete within timeout.
+    # When Rank 0 is blocking on request_queue.get() while other ranks wait on broadcast,
+    # NCCL will timeout if no work arrives.
+    #
+    # Solution: Rank 0 uses non-blocking queue.get with timeout, then all ranks periodically
+    # perform a lightweight collective to keep NCCL alive (heartbeat pattern).
+    QUEUE_POLL_TIMEOUT = 30.0  # Rank 0 polls queue every 30 seconds
 
-		# --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
-		if isinstance(task_data, dict) and task_data.get("type") == "init":
-			logging.info(f"Rank {global_rank}: Pool mode init received")
-			try:
-				current_max_output = task_data.get("max_output_len", 4096)
-				max_context_length = task_data.get("max_context_length", None)
+    logging.info(f"Entering main server loop on rank {global_rank}.")
+    while True:
+        # --- STEP 1: Data Acquisition with heartbeat to prevent NCCL timeout ---
+        task_data = None
+        work_available = False
 
-				# Initialize worker with pool capacity (no sequences yet)
-				worker.Init(None, current_max_output, 0,
-					max_context_length=max_context_length)
+        while not work_available:
+            if global_rank == 0:
+                # Rank 0: Non-blocking poll on queue with timeout
+                try:
+                    task_data = request_queue.get(timeout=QUEUE_POLL_TIMEOUT)
+                    work_available = True
+                except Exception:
+                    # Queue.get timeout - no work yet, signal others
+                    work_available = False
 
-				# Set admission and response queues for persistent generate()
-				worker.set_admission_queue(request_queue)
-				worker.set_response_queue(response_queue)
+            # All ranks synchronize on work availability status
+            # This is a fast broadcast (single int) that keeps NCCL alive
+            status_tensor = torch.tensor(
+                [1 if work_available else 0], dtype=torch.int32, device="cuda"
+            )
+            dist.broadcast(status_tensor, src=0)
+            work_available = status_tensor.item() == 1
 
-				if global_rank == 0:
-					logging.info(
-						f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
-						f"Entering persistent generate() loop."
-					)
+            if not work_available:
+                # No work yet - this broadcast acts as a heartbeat to prevent NCCL timeout
+                # Also feed watchdog to prevent false stuck detection during idle periods
+                watchdog.feed()
+                # Loop back and poll again
+                continue
 
-				# Enter persistent generate() — blocks until shutdown
-				# generate() starts with empty global_batch, polls for admissions
-				worker.generate_persistent()
+        # --- STEP 2: Broadcast full task to all ranks ---
+        task_container = [task_data]
+        dist.broadcast_object_list(task_container, src=0)
+        task_data = task_container[0]
 
-			except Exception as e:
-				logging.error(f"Error in pool mode on rank {global_rank}: {e}", exc_info=True)
-				if global_rank == 0:
-					response_queue.put({"type": "pool_shutdown", "error": str(e)})
+        # --- STEP 3: Shutdown Check ---
+        if task_data is None:
+            logging.info(
+                f"Rank {global_rank} received shutdown signal. Exiting worker."
+            )
+            break
 
-			# Pool mode exits here — send shutdown sentinel and break
-			if global_rank == 0:
-				response_queue.put({"type": "pool_shutdown"})
-			break
+        # --- STEP 3.5: Hot Reload Command ---
+        if isinstance(task_data, dict) and task_data.get("command") == "reload":
+            reload_deps = task_data.get("reload_deps", True)
+            logging.info(
+                f"Rank {global_rank}: Received reload command (reload_deps={reload_deps}), hot-reloading..."
+            )
+            try:
+                new_module = _reload_worker_module(reload_deps=reload_deps)
+                NewClass = new_module.BatchGenWorker
+                missing = _validate_reload(worker, NewClass)
+                rebound, skipped = _rebind_all_methods(worker, NewClass)
+                logging.info(
+                    f"Rank {global_rank}: Hot reload successful! "
+                    f"Rebound {rebound} methods, skipped {skipped}"
+                    + (f", {len(missing)} missing attrs" if missing else "")
+                )
+                if global_rank == 0:
+                    response_queue.put(
+                        {
+                            "status": "reload_success",
+                            "rebound": rebound,
+                            "skipped": skipped,
+                            "missing_attrs": missing,
+                        }
+                    )
+            except Exception as e:
+                logging.error(
+                    f"Rank {global_rank}: Hot reload failed: {e}", exc_info=True
+                )
+                if global_rank == 0:
+                    response_queue.put(
+                        {"status": "reload_failed", "error": str(e)}
+                    )
+            continue
 
-		# --- STEP 4: Legacy inference with full global batch ---
-		local_results = []
-		inference_error = None
-		try:
-			global_prompts = task_data.get("prompts", [])
-			current_max_input = task_data.get("max_input_len", None)
-			current_max_output = task_data.get("max_output_len")
-			max_context_length = task_data.get("max_context_length", None)
-			ignore_eos = task_data.get("ignore_eos", False)
-			temperature = task_data.get("temperature", None)
-			top_p = task_data.get("top_p", None)
-			sampling_params = task_data.get("sampling_params", None)
-			per_sequence_max_tokens = task_data.get("per_sequence_max_tokens", None)
-			batchgen_debug = task_data.get("batchgen_debug", None)
-			if global_rank == 0:
-				if sampling_params:
-					logging.info(f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts")
-				else:
-					logging.info(f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}")
+        # --- STEP 3.6: Pool mode — "init" message triggers persistent generate() ---
+        if isinstance(task_data, dict) and task_data.get("type") == "init":
+            logging.info(f"Rank {global_rank}: Pool mode init received")
+            try:
+                current_max_output = task_data.get("max_output_len", 4096)
+                max_context_length = task_data.get("max_context_length", None)
 
-			incr_output_dir = task_data.get("incremental_output_dir")
-			incr_custom_ids = task_data.get("custom_id_map")
-			if global_rank == 0 and incr_output_dir and incr_custom_ids:
-				worker._incremental_writer_config = {
-					"output_dir": incr_output_dir,
-					"batch_id": task_data.get("batch_id", "unknown"),
-					"model_name": task_data.get("model_name", "unknown"),
-					"custom_id_map": incr_custom_ids,
-					"request_urls": task_data.get("request_url_map", {}),
-					"prompt_texts": task_data.get("prompt_text_map", {}),
-					"parse_thinking": task_data.get("parse_thinking", False),
-					"parse_tool_call": task_data.get("parse_tool_call", False),
-				}
+                # Initialize worker with pool capacity (no sequences yet)
+                worker.Init(
+                    None,
+                    current_max_output,
+                    0,
+                    max_context_length=max_context_length,
+                )
 
-			if hasattr(worker, 'reset_runtime_state'):
-				worker.reset_runtime_state()
+                # Set admission and response queues for persistent generate()
+                worker.set_admission_queue(request_queue)
+                worker.set_response_queue(response_queue)
 
-			if len(global_prompts) > 0:
-				worker.Init(current_max_input, current_max_output, len(global_prompts),
-					max_context_length=max_context_length)
-				worker.set_ignore_eos(ignore_eos)
-				if sampling_params:
-					worker.set_per_sequence_sampling_params(sampling_params)
-				else:
-					worker.set_sampling_params(temperature=temperature, top_p=top_p)
-				worker.set_batchgen_debug(batchgen_debug)
-				local_results = worker.process_new_batch(
-					global_prompts,
-					per_sequence_max_tokens=per_sequence_max_tokens,
-				)
-			else:
-				local_results = []
+                if global_rank == 0:
+                    logging.info(
+                        f"[POOL] Worker initialized (max_pool_size={args.max_pool_size}). "
+                        f"Entering persistent generate() loop."
+                    )
 
-		except Exception as e:
-			logging.error(f"Error during inference on rank {global_rank}: {e}", exc_info=True)
-			inference_error = str(e)
-			local_results = []
-		finally:
-			if getattr(worker, '_incremental_writer', None) is not None:
-				worker._incremental_writer.close()
-				worker._incremental_writer = None
-			if hasattr(worker, '_incremental_writer_config'):
-				del worker._incremental_writer_config
+                # Enter persistent generate() — blocks until shutdown
+                # generate() starts with empty global_batch, polls for admissions
+                worker.generate_persistent()
 
-		# --- STEP 5: Synchronize and check for errors ---
-		try:
-			torch.cuda.synchronize()
-		except RuntimeError as e:
-			logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
-			inference_error = str(e)
+            except Exception as e:
+                logging.error(
+                    f"Error in pool mode on rank {global_rank}: {e}",
+                    exc_info=True,
+                )
+                if global_rank == 0:
+                    response_queue.put(
+                        {"type": "pool_shutdown", "error": str(e)}
+                    )
 
-		dist.barrier()
+            # Pool mode exits here — send shutdown sentinel and break
+            if global_rank == 0:
+                response_queue.put({"type": "pool_shutdown"})
+            break
 
-		error_flag = torch.tensor([1 if inference_error else 0], dtype=torch.int32, device='cuda')
-		dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
-		has_any_error = error_flag.item() > 0
+        # --- STEP 4: Legacy inference with full global batch ---
+        local_results = []
+        inference_error = None
+        try:
+            global_prompts = task_data.get("prompts", [])
+            current_max_input = task_data.get("max_input_len", None)
+            current_max_output = task_data.get("max_output_len")
+            max_context_length = task_data.get("max_context_length", None)
+            ignore_eos = task_data.get("ignore_eos", False)
+            temperature = task_data.get("temperature", None)
+            top_p = task_data.get("top_p", None)
+            sampling_params = task_data.get("sampling_params", None)
+            per_sequence_max_tokens = task_data.get(
+                "per_sequence_max_tokens", None
+            )
+            batchgen_debug = task_data.get("batchgen_debug", None)
+            if global_rank == 0:
+                if sampling_params:
+                    logging.info(
+                        f"[PAYLOAD] Per-request sampling params for {len(sampling_params)} prompts"
+                    )
+                else:
+                    logging.info(
+                        f"[PAYLOAD] Global sampling: temperature={temperature}, top_p={top_p}"
+                    )
 
-		if has_any_error:
-			error_list = [None for _ in range(world_size)] if global_rank == 0 else None
-			dist.gather_object(inference_error, error_list, dst=0)
-			if global_rank == 0:
-				errors = [e for e in error_list if e is not None]
-				logging.error(f"Inference failed with errors from ranks: {errors}")
-				response_queue.put({"error": errors[0], "all_errors": errors})
-			continue
+            incr_output_dir = task_data.get("incremental_output_dir")
+            incr_custom_ids = task_data.get("custom_id_map")
+            if global_rank == 0 and incr_output_dir and incr_custom_ids:
+                worker._incremental_writer_config = {
+                    "output_dir": incr_output_dir,
+                    "batch_id": task_data.get("batch_id", "unknown"),
+                    "model_name": task_data.get("model_name", "unknown"),
+                    "custom_id_map": incr_custom_ids,
+                    "request_urls": task_data.get("request_url_map", {}),
+                    "prompt_texts": task_data.get("prompt_text_map", {}),
+                    "parse_thinking": task_data.get("parse_thinking", False),
+                    "parse_tool_call": task_data.get("parse_tool_call", False),
+                }
 
-		# --- STEP 6: Legacy Response (Rank 0 Only) ---
-		if global_rank == 0:
-			final_results = local_results if local_results else {}
-			if not final_results and len(task_data.get("prompts", [])) > 0:
-				rejected = getattr(worker, '_rejected_sequences', None)
-				if rejected:
-					logging.info(f"All {len(rejected)} sequences rejected (context length exceeded).")
-				else:
-					logging.error(f"Results are unexpectedly empty!")
-					response_queue.put({"error": "Results unexpectedly empty after inference"})
-					continue
-			response_queue.put(final_results)
+            if hasattr(worker, "reset_runtime_state"):
+                worker.reset_runtime_state()
 
-	# Cleanup
-	dist.destroy_process_group()
+            if len(global_prompts) > 0:
+                worker.Init(
+                    current_max_input,
+                    current_max_output,
+                    len(global_prompts),
+                    max_context_length=max_context_length,
+                )
+                worker.set_ignore_eos(ignore_eos)
+                if sampling_params:
+                    worker.set_per_sequence_sampling_params(sampling_params)
+                else:
+                    worker.set_sampling_params(
+                        temperature=temperature, top_p=top_p
+                    )
+                worker.set_batchgen_debug(batchgen_debug)
+                local_results = worker.process_new_batch(
+                    global_prompts,
+                    per_sequence_max_tokens=per_sequence_max_tokens,
+                )
+            else:
+                local_results = []
+
+        except Exception as e:
+            logging.error(
+                f"Error during inference on rank {global_rank}: {e}",
+                exc_info=True,
+            )
+            inference_error = str(e)
+            local_results = []
+        finally:
+            if getattr(worker, "_incremental_writer", None) is not None:
+                worker._incremental_writer.close()
+                worker._incremental_writer = None
+            if hasattr(worker, "_incremental_writer_config"):
+                del worker._incremental_writer_config
+
+        # --- STEP 5: Synchronize and check for errors ---
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            logging.error(f"[DEBUG] CUDA sync error on rank {global_rank}: {e}")
+            inference_error = str(e)
+
+        dist.barrier()
+
+        error_flag = torch.tensor(
+            [1 if inference_error else 0], dtype=torch.int32, device="cuda"
+        )
+        dist.all_reduce(error_flag, op=dist.ReduceOp.SUM)
+        has_any_error = error_flag.item() > 0
+
+        if has_any_error:
+            error_list = (
+                [None for _ in range(world_size)] if global_rank == 0 else None
+            )
+            dist.gather_object(inference_error, error_list, dst=0)
+            if global_rank == 0:
+                errors = [e for e in error_list if e is not None]
+                logging.error(
+                    f"Inference failed with errors from ranks: {errors}"
+                )
+                response_queue.put({"error": errors[0], "all_errors": errors})
+            continue
+
+        # --- STEP 6: Legacy Response (Rank 0 Only) ---
+        if global_rank == 0:
+            final_results = local_results if local_results else {}
+            if not final_results and len(task_data.get("prompts", [])) > 0:
+                rejected = getattr(worker, "_rejected_sequences", None)
+                if rejected:
+                    logging.info(
+                        f"All {len(rejected)} sequences rejected (context length exceeded)."
+                    )
+                else:
+                    logging.error(f"Results are unexpectedly empty!")
+                    response_queue.put(
+                        {"error": "Results unexpectedly empty after inference"}
+                    )
+                    continue
+            response_queue.put(final_results)
+
+    # Cleanup
+    dist.destroy_process_group()
