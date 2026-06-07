@@ -1097,15 +1097,25 @@ class KimiK25MoE(nn.Module):
             flat_idx = topk_idx.reshape(-1)
             tok_idx = torch.arange(total_real, device=device).repeat_interleave(topk)
             tk_pos = torch.arange(topk, device=device).repeat(total_real)
+            # Defer the per-expert staging-buffer free: the routed_expert pool has
+            # num_offloaded+2 slots (>= the offloaded experts here), so each expert loads
+            # into its own slot with no reuse-race. Compute all, then ONE device sync +
+            # free all — replaces the per-expert synchronize() that dominated decode-offload.
+            deferred = []
             for global_e in nonpersistent:
                 mask = flat_idx == global_e
                 if not mask.any():
                     continue
                 et = tok_idx[mask]
-                expert_out_e = self.experts[global_e](all_tokens[et])
+                expert_out_e = self.experts[global_e](all_tokens[et], defer_free=True)
                 w = topk_weight[et, tk_pos[mask]]
                 global_results.index_add_(
                     0, et, (expert_out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
+                deferred.append(global_e)
+            if deferred:
+                torch.cuda.current_stream(device).synchronize()
+                for global_e in deferred:
+                    self.experts[global_e].free_loaded()
 
         if timer is not None:
             ev[6].record()  # after reduce, before allreduce

@@ -228,7 +228,7 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         return output
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, defer_free: bool = False) -> torch.Tensor:
         """Forward pass with INT4 dequant + BF16 GEMM.
 
         Routes to appropriate implementation:
@@ -278,11 +278,12 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             # Routed experts: Dequant INT4 → BF16 and do GEMM
             result = self._forward_int4(hidden_states, weights)
 
-        # Non-persistent experts use a shared GPU buffer that gets recycled.
-        # Must sync before free_weights() to prevent the next expert's load_weights()
-        # from overwriting the buffer while this expert's matmuls are still running.
-        # Persistent experts use static module attributes — no buffer recycling, no sync needed.
-        if not self.persistent:
+        # Non-persistent experts use a GPU staging buffer from a pool. Normally we sync
+        # then free immediately so the next expert's load_weights() can reuse the slot.
+        # When defer_free=True (decode offloaded loop), the caller keeps multiple experts'
+        # buffers live at once (the pool has num_offloaded+2 slots) and does ONE sync +
+        # frees them all afterwards via free_loaded() — avoiding a per-expert device sync.
+        if not self.persistent and not defer_free:
             torch.cuda.current_stream(
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()
@@ -294,6 +295,14 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         )
 
         return result
+
+    def free_loaded(self) -> None:
+        """Release a deferred (defer_free=True) non-persistent staging buffer.
+
+        No device sync here — the caller must synchronize the compute stream once
+        before releasing the batch of deferred buffers.
+        """
+        self.core_engine.free_weights_buffer(self.module_key)
 
     def _forward_int4(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
         """INT4 forward using fused WGMMA kernel (preferred) or dequant+mm fallback."""
