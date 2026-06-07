@@ -1264,6 +1264,32 @@ class BatchGenWorker:
 		prefix_shared_tokens = [
 			int(item.prefix_shared_tokens) for item in prefix_plan.sequences
 		]
+		if self.rank == 0 or any(tokens > 0 for tokens in prefix_shared_tokens):
+			page_size = int(SequenceEntry.PAGE_SIZE)
+			planned_pages = [
+				(math.ceil(max(1, int(tokens)) / page_size))
+				for tokens in prompt_lengths
+			]
+			try:
+				free_mem_bytes, total_mem_bytes = torch.cuda.mem_get_info(
+					self.local_rank
+				)
+				hbm_msg = (
+					f"hbm_free_gb={free_mem_bytes / (1024**3):.2f} "
+					f"hbm_total_gb={total_mem_bytes / (1024**3):.2f}"
+				)
+			except Exception:
+				hbm_msg = "hbm_free_gb=<unavailable>"
+			logging.info(
+				"Rank %s prefix materialization sizing: seq_ids=%s "
+				"prompt_lengths=%s shared_tokens=%s planned_pages=%s %s",
+				self.rank,
+				sequence_ids,
+				prompt_lengths,
+				prefix_shared_tokens,
+				planned_pages,
+				hbm_msg,
+			)
 		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
 		host_views_by_group = self._prefix_cache_worker_views_by_group()
 		gpu_managers_by_group = self._prefix_cache_gpu_managers_by_group(manager)
