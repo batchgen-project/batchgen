@@ -233,6 +233,13 @@ _BLOCK_M = 64  # TMA constraint: global tensor M >= BLOCK_M
 _DEFAULT_MTP = 4096  # Default max_tokens_padded (stride per expert in 3D buffer)
 
 
+def round_moe_buffer_tokens(num_tokens: int) -> int:
+    """Round MoE 3D-stride capacity to the WGMMA/TMA tile requirement."""
+    if num_tokens <= 0:
+        return _BLOCK_M
+    return max(_BLOCK_M, ((num_tokens + _BLOCK_M - 1) // _BLOCK_M) * _BLOCK_M)
+
+
 class KimiK25MoEBufferManager:
     """Pre-allocated buffers for K2.5 MoE decode pipeline (3D strided layout).
 
@@ -265,10 +272,10 @@ class KimiK25MoEBufferManager:
         self.max_global_bsz = max_global_bsz
         self.num_tokens_per_rank = num_tokens_per_rank
         self.device = device
-        self.max_tokens_padded = max_tokens_padded
+        self.max_tokens_padded = round_moe_buffer_tokens(max_tokens_padded)
 
         NK = max_global_bsz * topk
-        buf_rows = E_local * max_tokens_padded  # 3D strided: E * mtp
+        buf_rows = E_local * self.max_tokens_padded  # 3D strided: E * mtp
 
         # Communication buffers
         self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
@@ -296,7 +303,7 @@ class KimiK25MoEBufferManager:
         self._init_tma_descriptors()
 
         logging.debug(
-            f"[MoEBufferManager] 3D strided layout: E_local={E_local}, mtp={max_tokens_padded}, "
+            f"[MoEBufferManager] 3D strided layout: E_local={E_local}, mtp={self.max_tokens_padded}, "
             f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
             f"total={self._total_bytes() / (1024**3):.2f} GiB"
         )
@@ -327,7 +334,7 @@ class KimiK25MoEBufferManager:
 
         # Resize 3D buffers only if needed
         if global_bsz > self.max_tokens_padded:
-            new_mtp = ((global_bsz + _BLOCK_M - 1) // _BLOCK_M) * _BLOCK_M
+            new_mtp = round_moe_buffer_tokens(global_bsz)
             logging.info(f"[MoEBufferManager] Resizing 3D buffers: mtp {self.max_tokens_padded} → {new_mtp}")
             self.max_tokens_padded = new_mtp
             buf_rows = self.E_local * new_mtp
