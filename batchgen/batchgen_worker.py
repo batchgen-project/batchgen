@@ -3621,15 +3621,18 @@ class BatchGenWorker:
 	) -> GpuKvManagerRequest:
 		"""Snapshot the worker state `plan_gpu_kv_manager` consumes."""
 		manager = self.gpu_paged_kv_cache_manager
+		manager_initialized = (
+			manager is not None and bool(getattr(manager, "is_initialized", False))
+		)
 		current_pages = (
 			getattr(getattr(manager, "config", None), "num_pages", 0)
-			if manager is not None
+			if manager_initialized
 			else 0
 		)
 		return GpuKvManagerRequest(
 			model_name=self.huggingface_ckpt_name,
 			sequence_tokens=tuple(int(t) for t in sequence_tokens),
-			has_manager=manager is not None,
+			has_manager=manager_initialized,
 			current_num_pages=int(current_pages),
 			capacity=self._make_page_table_capacity_request(sequence_tokens),
 		)
