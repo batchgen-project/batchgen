@@ -2417,6 +2417,156 @@ class BatchGenWorker:
 		except ImportError:
 			pass  # Not GPT-OSS or module not available
 
+	def _reduce_runtime_metrics(
+		self,
+		values: Sequence[float],
+		op: "dist.ReduceOp",
+	) -> List[float]:
+		if not dist.is_initialized():
+			return [float(value) for value in values]
+		tensor = torch.tensor(
+			[float(value) for value in values],
+			dtype=torch.float64,
+			device=self.torch_device,
+		)
+		dist.all_reduce(tensor, op=op)
+		return [float(value) for value in tensor.cpu().tolist()]
+
+	def _log_prefill_phase_metrics(
+		self,
+		*,
+		prefill_uuids: Sequence[str],
+		local_prefill_indices: Sequence[int],
+		config_s: float,
+		prefill_s: float,
+		total_s: float,
+	) -> None:
+		local_sequence_count = 0
+		local_prompt_tokens = 0
+		local_cached_tokens = 0
+		local_requests_with_cache = 0
+		for local_idx in local_prefill_indices:
+			uuid = self._local_to_uuid_map.get(int(local_idx))
+			if uuid is None:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			prompt_tokens = int(seq.prompt_length)
+			cached_tokens = int(getattr(seq, "prefix_shared_tokens", 0))
+			local_sequence_count += 1
+			local_prompt_tokens += prompt_tokens
+			local_cached_tokens += cached_tokens
+			if cached_tokens > 0:
+				local_requests_with_cache += 1
+
+		(
+			global_sequence_count,
+			global_prompt_tokens,
+			global_cached_tokens,
+			global_requests_with_cache,
+		) = self._reduce_runtime_metrics(
+			[
+				local_sequence_count,
+				local_prompt_tokens,
+				local_cached_tokens,
+				local_requests_with_cache,
+			],
+			dist.ReduceOp.SUM,
+		)
+		(
+			max_config_s,
+			max_prefill_s,
+			max_total_s,
+		) = self._reduce_runtime_metrics(
+			[config_s, prefill_s, total_s],
+			dist.ReduceOp.MAX,
+		)
+
+		if self.rank != 0:
+			return
+		token_hit_rate = (
+			global_cached_tokens / global_prompt_tokens
+			if global_prompt_tokens > 0
+			else 0.0
+		)
+		request_hit_rate = (
+			global_requests_with_cache / global_sequence_count
+			if global_sequence_count > 0
+			else 0.0
+		)
+		prefill_tps = (
+			(global_prompt_tokens - global_cached_tokens) / max_prefill_s
+			if max_prefill_s > 0
+			else 0.0
+		)
+		logging.info(
+			"[PREFILL_METRICS] completed sequences=%d selected=%d "
+			"prompt_tokens=%d cached_tokens=%d token_hit_rate=%.2f%% "
+			"request_hit_rate=%.2f%% config_s=%.3f prefill_s=%.3f "
+			"total_s=%.3f effective_prefill_tps=%.1f",
+			int(global_sequence_count),
+			len(prefill_uuids),
+			int(global_prompt_tokens),
+			int(global_cached_tokens),
+			token_hit_rate * 100.0,
+			request_hit_rate * 100.0,
+			max_config_s,
+			max_prefill_s,
+			max_total_s,
+			prefill_tps,
+		)
+
+	def _log_decode_phase_metrics(
+		self,
+		*,
+		active_start: int,
+		local_generated_tokens: int,
+		elapsed_s: float,
+		iteration_delta: int,
+		boundary_delta: int,
+		forward_ms_delta: float,
+		boundary_ms_delta: float,
+	) -> None:
+		(global_generated_tokens,) = self._reduce_runtime_metrics(
+			[local_generated_tokens],
+			dist.ReduceOp.SUM,
+		)
+		(max_elapsed_s,) = self._reduce_runtime_metrics(
+			[elapsed_s],
+			dist.ReduceOp.MAX,
+		)
+		if self.rank != 0:
+			return
+		decode_tps = (
+			global_generated_tokens / max_elapsed_s
+			if max_elapsed_s > 0
+			else 0.0
+		)
+		avg_forward_ms = (
+			forward_ms_delta / iteration_delta
+			if iteration_delta > 0
+			else 0.0
+		)
+		avg_boundary_ms = (
+			boundary_ms_delta / boundary_delta
+			if boundary_delta > 0
+			else 0.0
+		)
+		logging.info(
+			"[DECODE_METRICS] completed active_start=%d generated_tokens=%d "
+			"elapsed_s=%.3f decode_tps=%.1f iterations=%d boundaries=%d "
+			"avg_forward_ms=%.3f avg_boundary_ms=%.3f",
+			active_start,
+			int(global_generated_tokens),
+			max_elapsed_s,
+			decode_tps,
+			iteration_delta,
+			boundary_delta,
+			avg_forward_ms,
+			avg_boundary_ms,
+		)
+
 	def set_watchdog(self, watchdog) -> None:
 		"""
 		Set the watchdog for stuck detection during inference.
@@ -6250,6 +6400,7 @@ class BatchGenWorker:
 				if prefill_uuids:
 					if self.rank == 0:
 						logging.info(f"[PREFILL] Starting for {len(prefill_uuids)} sequences")
+					prefill_phase_start = time.perf_counter()
 					for uuid in prefill_uuids:
 						seq = self.global_batch.get_sequence(uuid)
 						is_reentry = seq.evicted_token_ids is not None
@@ -6260,12 +6411,14 @@ class BatchGenWorker:
 					# A. Config Prefill (this adds new sequences to _uuid_to_local_map)
 					config_start = time.perf_counter()
 					self._config_prefill_for_batch(prefill_uuids)
-					config_prefill_time += time.perf_counter() - config_start
+					config_elapsed = time.perf_counter() - config_start
+					config_prefill_time += config_elapsed
 
 					# Get local indices AFTER config (new sequences now in map)
 					local_prefill_indices = self._get_local_indices_for_uuids(prefill_uuids)
 
 					# B. Execute Prefill
+					prefill_elapsed = 0.0
 					if local_prefill_indices:
 						if torch.cuda.is_available():
 							free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
@@ -6280,7 +6433,8 @@ class BatchGenWorker:
 								self.prefill_prepacked(local_prefill_indices)
 							else:
 								self.prefill(local_prefill_indices)
-						prefill_time += time.perf_counter() - prefill_start
+						prefill_elapsed = time.perf_counter() - prefill_start
+						prefill_time += prefill_elapsed
 
 						# CRITICAL: Wait for all async KV offloads to complete before decode.
 						# async_offload_layer_kv_to_host returns a future backed by a
@@ -6307,6 +6461,13 @@ class BatchGenWorker:
 						seq.log_event(SeqEvent.PREFILL_DONE, self.rank,
 							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
+					self._log_prefill_phase_metrics(
+						prefill_uuids=prefill_uuids,
+						local_prefill_indices=local_prefill_indices,
+						config_s=config_elapsed,
+						prefill_s=prefill_elapsed,
+						total_s=time.perf_counter() - prefill_phase_start,
+					)
 					dist.barrier()
 
 				# After prefill completes, poll for newly arrived sequences.
@@ -10318,6 +10479,13 @@ class BatchGenWorker:
 			self._cumulative_forward_ms = 0.0
 
 		# Local iteration counter (for boundary interval tracking within this decode round)
+		decode_round_start = time.perf_counter()
+		round_start_iterations = self._cumulative_decode_iterations
+		round_start_boundaries = self._cumulative_decode_boundaries
+		round_start_forward_ms = self._cumulative_forward_ms
+		round_start_boundary_ms = self._cumulative_boundary_ms
+		active_start = len(decode_uuids)
+		local_generated_tokens = 0
 		local_iteration = 0
 		last_boundary = 0
 		global_batch_size = len(self.global_batch)
@@ -11147,6 +11315,7 @@ class BatchGenWorker:
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)
+			step_generated_tokens = 0
 			for i, (local_idx, seq) in enumerate(zip(batch, batch_sequences)):
 				if self._is_sequence_completed(seq):
 					continue
@@ -11165,6 +11334,7 @@ class BatchGenWorker:
 
 				seq.decoded_length += 1
 				seq.current_context_length += 1
+				step_generated_tokens += 1
 
 				# Use CPU tensor to avoid GPU sync
 				token_id = new_tokens_cpu[i].item()
@@ -11210,6 +11380,7 @@ class BatchGenWorker:
 								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
+			local_generated_tokens += step_generated_tokens
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 
@@ -11274,6 +11445,15 @@ class BatchGenWorker:
 				f"{'='*50}"
 			)
 
+		self._log_decode_phase_metrics(
+			active_start=active_start,
+			local_generated_tokens=local_generated_tokens,
+			elapsed_s=time.perf_counter() - decode_round_start,
+			iteration_delta=self._cumulative_decode_iterations - round_start_iterations,
+			boundary_delta=self._cumulative_decode_boundaries - round_start_boundaries,
+			forward_ms_delta=self._cumulative_forward_ms - round_start_forward_ms,
+			boundary_ms_delta=self._cumulative_boundary_ms - round_start_boundary_ms,
+		)
 		self.disable_decode_watchdog()
 		return decode_uuids, batch
 

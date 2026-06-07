@@ -136,3 +136,56 @@ def test_pool_completion_writes_cached_tokens(tmp_path, monkeypatch):
     assert usage["completion_tokens"] == 8
     assert usage["total_tokens"] == 136
     assert usage["prompt_tokens_details"] == {"cached_tokens": 64}
+
+
+def test_batch_output_metrics_summarize_cached_tokens(tmp_path, monkeypatch):
+    batch_scheduler = _load_batch_scheduler(monkeypatch)
+    output_path = tmp_path / "batch.jsonl"
+    rows = [
+        {
+            "custom_id": "req-1",
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 10,
+                        "total_tokens": 110,
+                        "prompt_tokens_details": {"cached_tokens": 40},
+                    }
+                },
+            },
+            "error": None,
+        },
+        {
+            "custom_id": "req-2",
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "usage": {
+                        "prompt_tokens": 50,
+                        "completion_tokens": 5,
+                        "total_tokens": 55,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                    }
+                },
+            },
+            "error": None,
+        },
+        {"custom_id": "req-3", "response": None, "error": {"message": "bad"}},
+    ]
+    output_path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    metrics = batch_scheduler._summarize_batch_output_file(output_path)
+
+    assert metrics.rows == 3
+    assert metrics.errors == 1
+    assert metrics.prompt_tokens == 150
+    assert metrics.completion_tokens == 15
+    assert metrics.total_tokens == 165
+    assert metrics.cached_tokens == 40
+    assert metrics.requests_with_cache == 1
+    assert metrics.cache_hit_rate == 40 / 150

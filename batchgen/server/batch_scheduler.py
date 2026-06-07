@@ -7,6 +7,8 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from batchgen.server.intake_pool import IntakeEntry, IntakePool, Priority
@@ -40,6 +42,80 @@ from batchgen.server.usage import build_usage_dict
 from batchgen.server.worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BatchOutputMetrics:
+    rows: int = 0
+    errors: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cached_tokens: int = 0
+    requests_with_cache: int = 0
+
+    @property
+    def cache_hit_rate(self) -> float:
+        if self.prompt_tokens <= 0:
+            return 0.0
+        return self.cached_tokens / self.prompt_tokens
+
+
+def _summarize_batch_output_file(path: Path) -> BatchOutputMetrics:
+    metrics = BatchOutputMetrics()
+    if not path.exists() or path.stat().st_size == 0:
+        return metrics
+
+    rows = 0
+    errors = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    cached_tokens = 0
+    requests_with_cache = 0
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            rows += 1
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                errors += 1
+                continue
+
+            response = item.get("response") or {}
+            status_code = int(response.get("status_code") or 0)
+            body = response.get("body") or {}
+            if item.get("error") is not None or status_code >= 400 or not body:
+                errors += 1
+                continue
+
+            usage = body.get("usage") or {}
+            prompt = int(usage.get("prompt_tokens") or 0)
+            completion = int(usage.get("completion_tokens") or 0)
+            total = int(usage.get("total_tokens") or (prompt + completion))
+            details = usage.get("prompt_tokens_details") or {}
+            cached = int(details.get("cached_tokens") or 0)
+
+            prompt_tokens += prompt
+            completion_tokens += completion
+            total_tokens += total
+            cached_tokens += cached
+            if cached > 0:
+                requests_with_cache += 1
+
+    return BatchOutputMetrics(
+        rows=rows,
+        errors=errors,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        cached_tokens=cached_tokens,
+        requests_with_cache=requests_with_cache,
+    )
 
 
 def completion_prompt_to_text(prompt: str | List[str]) -> str:
@@ -351,6 +427,12 @@ class BatchScheduler:
         self.storage.save_metadata(output_file_id, output_meta.dict())
 
         completed_at = int(time.time())
+        self._log_completed_batch_metrics(
+            batch_id=batch_id,
+            mode="legacy",
+            request_count=len(requests),
+            output_path=output_path,
+        )
         self.storage.update_batch_status(
             batch_id,
             BatchStatus.COMPLETED,
@@ -486,6 +568,49 @@ class BatchScheduler:
             )
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **kwargs
+        )
+
+    def _log_completed_batch_metrics(
+        self,
+        *,
+        batch_id: str,
+        mode: str,
+        request_count: int,
+        output_path: Path,
+    ) -> None:
+        metrics = _summarize_batch_output_file(output_path)
+        batch = self.storage.load_batch(batch_id)
+        started_at = getattr(batch, "started_at", None) if batch else None
+        elapsed_s = (
+            max(0.0, time.time() - float(started_at))
+            if started_at is not None
+            else None
+        )
+        elapsed_text = (
+            f"{elapsed_s:.3f}" if elapsed_s is not None else "unknown"
+        )
+        avg_cached = (
+            metrics.cached_tokens / metrics.rows if metrics.rows else 0.0
+        )
+        logger.info(
+            "[BATCH_METRICS] batch=%s mode=%s requests=%d rows=%d errors=%d "
+            "elapsed_s=%s prompt_tokens=%d completion_tokens=%d "
+            "total_tokens=%d cached_tokens=%d cache_hit_rate=%.2f%% "
+            "requests_with_cache=%d avg_cached_tokens=%.1f output_bytes=%d",
+            batch_id,
+            mode,
+            request_count,
+            metrics.rows,
+            metrics.errors,
+            elapsed_text,
+            metrics.prompt_tokens,
+            metrics.completion_tokens,
+            metrics.total_tokens,
+            metrics.cached_tokens,
+            metrics.cache_hit_rate * 100.0,
+            metrics.requests_with_cache,
+            avg_cached,
+            output_path.stat().st_size if output_path.exists() else 0,
         )
 
     def _build_output_items(
@@ -1261,6 +1386,12 @@ class BatchScheduler:
         self.storage.save_metadata(output_file_id, output_meta.dict())
 
         completed_at = int(time.time())
+        self._log_completed_batch_metrics(
+            batch_id=batch_id,
+            mode="pool",
+            request_count=len(requests),
+            output_path=output_path,
+        )
         self.storage.update_batch_status(
             batch_id,
             BatchStatus.COMPLETED,
