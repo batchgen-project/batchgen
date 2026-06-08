@@ -7997,7 +7997,7 @@ class BatchGenWorker:
 				try:
 					prefix_materialization.wait()
 				finally:
-					self._destroy_gpu_paged_kv_cache()
+					self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
 
 	def prefill_prepacked(self, batch: list[int]):
 		"""
@@ -8325,6 +8325,7 @@ class BatchGenWorker:
 							f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 						)
 					output_tokens.append(batch_new_tokens)
+					del inputs_embeds, hidden_states, last_token_hidden, logits
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
