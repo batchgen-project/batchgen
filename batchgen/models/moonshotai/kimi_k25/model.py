@@ -1088,24 +1088,27 @@ class KimiK25MoE(nn.Module):
         # 5b) Offloaded (non-persistent) experts. The fused path above covers only the
         # persistent experts: the dispatch uses num_persistent_local_experts, so tokens routed
         # to offloaded experts get topk_pos=-1 and are skipped by reduce_weighted_scatter. Add
-        # their contribution via the per-expert offload path — wrapper(persistent=False).forward
-        # loads the expert from host, transforms Marlin->raw, runs the single-expert WGMMA, then
-        # frees. Must land in global_results BEFORE the all-reduce below (offloaded experts are
-        # this rank's). nonpersistent_expert_ids is empty when offloading is off -> zero overhead.
+        # their contribution via the per-expert streamed path. CONTRACT (see
+        # batchgen_design/weight_loading/gpu_weight_buffer_copy_contract.md): the copy engine
+        # streams EVERY offloaded expert into a slot in task order (layer-major, ascending)
+        # regardless of tokens, so we MUST drive the wrapper for EVERY offloaded expert in that
+        # order — including 0-token ones (load+free, no compute) — or the producer stalls.
+        # wrapper.forward_decode_offloaded handles load -> (Marlin E=1 GEMM or 0-token free) ->
+        # free. Must land in global_results BEFORE the all-reduce below. nonpersistent_expert_ids
+        # is empty when offloading is off -> zero overhead.
         nonpersistent = getattr(self, 'nonpersistent_expert_ids', None)
         if nonpersistent:
             flat_idx = topk_idx.reshape(-1)
             tok_idx = torch.arange(total_real, device=device).repeat_interleave(topk)
             tk_pos = torch.arange(topk, device=device).repeat(total_real)
-            for global_e in nonpersistent:
+            for global_e in nonpersistent:          # ascending == task order; NO skips
                 mask = flat_idx == global_e
-                if not mask.any():
-                    continue
-                et = tok_idx[mask]
-                expert_out_e = self.experts[global_e](all_tokens[et])
-                w = topk_weight[et, tk_pos[mask]]
-                global_results.index_add_(
-                    0, et, (expert_out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
+                et = tok_idx[mask]                  # may be empty (0-token)
+                out_e = self.experts[global_e].forward_decode_offloaded(all_tokens[et])
+                if et.numel() > 0:
+                    w = topk_weight[et, tk_pos[mask]]
+                    global_results.index_add_(
+                        0, et, (out_e.float() * w.unsqueeze(-1)).to(global_results.dtype))
 
         if timer is not None:
             ev[6].record()  # after reduce, before allreduce
