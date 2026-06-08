@@ -98,8 +98,8 @@ from batchgen.prefix_reuse.prefill import (
 	effective_prefix_shared_tokens,
 	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
-	split_prefix_reuse_plan_for_micro_batch,
 )
+from batchgen.prefill.prefix_reuse import split_prefix_reuse_plan_for_micro_batch
 from batchgen.prefix_reuse.materialization import (
 	PrefixMaterializationBundle,
 	materialize_single_group_lookup_results,
