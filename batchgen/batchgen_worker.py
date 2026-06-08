@@ -98,6 +98,7 @@ from batchgen.prefix_reuse.prefill import (
 	effective_prefix_shared_tokens,
 	estimate_prefix_cache_for_prefill,
 	lookup_prefix_cache_for_prefill,
+	split_prefix_reuse_plan_for_micro_batch,
 )
 from batchgen.prefix_reuse.materialization import (
 	PrefixMaterializationBundle,
@@ -8115,19 +8116,9 @@ class BatchGenWorker:
 				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
 
-		prefix_materialization = None
-		if prefix_lookup is not None and prefix_plan is not None:
-			prefix_materialization = self._materialize_prefix_cache_prefill(
-				lookup=prefix_lookup,
-				prefix_plan=prefix_plan,
-			)
-
 		output_tokens = []
 
-		with (
-			self._prefill_prepack_runtime_scope(prefix_materialization),
-			torch.inference_mode(),
-		):
+		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in tqdm(
 				enumerate(micro_batches),
 				total=len(micro_batches),
@@ -8207,95 +8198,121 @@ class BatchGenWorker:
 						tokens > 0 for tokens in batch_prefix_shared_tokens
 					)
 
-				# Set up Attn_Wrapper for this micro-batch
-				Attn_Wrapper.prepack_mode = True
-				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
-				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
-				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
-				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
-				Attn_Wrapper.prepack_append_seq_lengths = batch_append_seq_lengths
-				Attn_Wrapper.prepack_prefix_reuse_mode = batch_prefix_reuse_mode
-				Attn_Wrapper.prepack_prefix_shared_tokens = (
-					batch_prefix_shared_tokens if batch_prefix_reuse_mode else None
-				)
-				Attn_Wrapper.prepack_full_seq_lengths = (
-					batch_full_seq_lengths if batch_prefix_reuse_mode else None
-				)
-				Attn_Wrapper.position_ids = batch_position_ids_flat
-				Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
-
-				# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
-				# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
-				# which does NOT offload KV to host, causing decode to read garbage.
-				AttnWrapperBase.prepack_mode = True
-				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
-				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
-				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
-				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
-				AttnWrapperBase.prepack_append_seq_lengths = batch_append_seq_lengths
-				AttnWrapperBase.prepack_prefix_reuse_mode = batch_prefix_reuse_mode
-				AttnWrapperBase.prepack_prefix_shared_tokens = (
-					batch_prefix_shared_tokens if batch_prefix_reuse_mode else None
-				)
-				AttnWrapperBase.prepack_full_seq_lengths = (
-					batch_full_seq_lengths if batch_prefix_reuse_mode else None
-				)
-				AttnWrapperBase.position_ids = batch_position_ids_flat
-				AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
-				AttnWrapperBase.prefill_prefix_materialization = (
-					prefix_materialization
-				)
-
-				# Embed tokens
-				inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
-
-				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
-				hidden_states = inputs_embeds.unsqueeze(0)
-
-				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					layer_outputs = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
+				batch_prefix_materialization = None
+				if (
+					prefix_lookup is not None
+					and prefix_plan is not None
+					and batch_prefix_reuse_mode
+				):
+					batch_lookup = PrefixCachePrefillLookup(
+						lookup_results=tuple(
+							prefix_lookup.lookup_results[seq_start:seq_end]
+						),
+						prefix_shared_tokens=tuple(
+							prefix_lookup.prefix_shared_tokens[seq_start:seq_end]
+						),
 					)
-					hidden_states = layer_outputs[0]
-
-				# Final norm
-				hidden_states = self.model.model.norm(hidden_states)
-
-				# Extract last token hidden states for each sequence
-				last_token_indices = batch_cu_seqlens[1:] - 1
-				last_token_hidden = hidden_states[0, last_token_indices, :]
-
-				# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
-				# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
-				if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
-					logits = torch.nn.functional.linear(
-						last_token_hidden.float(),
-						self.model.lm_head.weight.float(),
-						self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+					batch_prefix_materialization = (
+						self._materialize_prefix_cache_prefill(
+							lookup=batch_lookup,
+							prefix_plan=split_prefix_reuse_plan_for_micro_batch(
+								prefix_plan,
+								seq_start,
+								seq_end,
+							),
+						)
 					)
-				else:
-					logits = torch.nn.functional.linear(
-						last_token_hidden,
-						self.model.lm_head.weight,
-						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
-					).float()
 
-				batch_sequences = [
-					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
-					for local_idx in batch_local_indices
-				]
-				batch_new_tokens = self._select_tokens(logits, batch_sequences)
-				if batch_new_tokens.shape[0] != batch_num_seqs:
-					raise RuntimeError(
-						f"Rank {self.rank}: prefill token selection shape mismatch, "
-						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+				with self._prefill_prepack_runtime_scope(batch_prefix_materialization):
+					# Set up Attn_Wrapper for this micro-batch
+					Attn_Wrapper.prepack_mode = True
+					Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
+					Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
+					Attn_Wrapper.prepack_num_sequences = batch_num_seqs
+					Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
+					Attn_Wrapper.prepack_append_seq_lengths = batch_append_seq_lengths
+					Attn_Wrapper.prepack_prefix_reuse_mode = batch_prefix_reuse_mode
+					Attn_Wrapper.prepack_prefix_shared_tokens = (
+						batch_prefix_shared_tokens if batch_prefix_reuse_mode else None
 					)
-				output_tokens.append(batch_new_tokens)
+					Attn_Wrapper.prepack_full_seq_lengths = (
+						batch_full_seq_lengths if batch_prefix_reuse_mode else None
+					)
+					Attn_Wrapper.position_ids = batch_position_ids_flat
+					Attn_Wrapper.cur_batch = prefill_sequence_spans_to_global_seq_ids(batch_spans)
+
+					# CRITICAL: Also bind to AttnWrapperBase for models using new wrapper system (GPT-OSS)
+					# Without this, GPT-OSS uses _forward_prefill instead of _forward_prefill_prepacked,
+					# which does NOT offload KV to host, causing decode to read garbage.
+					AttnWrapperBase.prepack_mode = True
+					AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+					AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
+					AttnWrapperBase.prepack_num_sequences = batch_num_seqs
+					AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
+					AttnWrapperBase.prepack_append_seq_lengths = batch_append_seq_lengths
+					AttnWrapperBase.prepack_prefix_reuse_mode = batch_prefix_reuse_mode
+					AttnWrapperBase.prepack_prefix_shared_tokens = (
+						batch_prefix_shared_tokens if batch_prefix_reuse_mode else None
+					)
+					AttnWrapperBase.prepack_full_seq_lengths = (
+						batch_full_seq_lengths if batch_prefix_reuse_mode else None
+					)
+					AttnWrapperBase.position_ids = batch_position_ids_flat
+					AttnWrapperBase.cur_batch = Attn_Wrapper.cur_batch
+					AttnWrapperBase.prefill_prefix_materialization = (
+						batch_prefix_materialization
+					)
+
+					# Embed tokens
+					inputs_embeds = self.model.model.embed_tokens(batch_input_ids_flat.to(self.torch_device))
+
+					# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
+					hidden_states = inputs_embeds.unsqueeze(0)
+
+					for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+						layer_outputs = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)
+						hidden_states = layer_outputs[0]
+
+					# Final norm
+					hidden_states = self.model.model.norm(hidden_states)
+
+					# Extract last token hidden states for each sequence
+					last_token_indices = batch_cu_seqlens[1:] - 1
+					last_token_hidden = hidden_states[0, last_token_indices, :]
+
+					# lm_head matmul: BF16 by default (matches HF / SGLang / vLLM).
+					# Opt into FP32-cast via BATCHGEN_GLM5_LMHEAD_FP32=1 for debugging.
+					if os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1":
+						logits = torch.nn.functional.linear(
+							last_token_hidden.float(),
+							self.model.lm_head.weight.float(),
+							self.model.lm_head.bias.float() if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						)
+					else:
+						logits = torch.nn.functional.linear(
+							last_token_hidden,
+							self.model.lm_head.weight,
+							self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
+						).float()
+
+					batch_sequences = [
+						self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+						for local_idx in batch_local_indices
+					]
+					batch_new_tokens = self._select_tokens(logits, batch_sequences)
+					if batch_new_tokens.shape[0] != batch_num_seqs:
+						raise RuntimeError(
+							f"Rank {self.rank}: prefill token selection shape mismatch, "
+							f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
+						)
+					output_tokens.append(batch_new_tokens)
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
