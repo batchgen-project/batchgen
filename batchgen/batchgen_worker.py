@@ -3559,10 +3559,6 @@ class BatchGenWorker:
 	def _unbind_gpu_paged_kv_manager(self) -> None:
 		"""Clear stale GPU KV manager references after destroying the manager."""
 		self.gpu_paged_kv_cache_manager = None
-		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
-			self.core_engine.gpu_paged_kv_manager = None
-		if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
-			self.core_engine.gpu_paged_kv_manager_aux = None
 		Attn_Wrapper.gpu_paged_kv_manager = None
 		AttnWrapperBase.gpu_paged_kv_manager = None
 		AttnWrapperBase.gpu_paged_kv_manager_aux = None
