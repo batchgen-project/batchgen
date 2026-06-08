@@ -1255,6 +1255,9 @@ class BatchGenWorker:
 		if lookup is None or not lookup.has_hit:
 			return None
 
+		if self.gpu_paged_kv_cache_manager is not None:
+			self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
+
 		sequence_ids = [
 			int(item.sequence_id) for item in prefix_plan.sequences
 		]
@@ -3553,6 +3556,17 @@ class BatchGenWorker:
 			if hasattr(self.core_engine, "gpu_paged_kv_manager"):
 				self.core_engine.gpu_paged_kv_manager = manager
 
+	def _unbind_gpu_paged_kv_manager(self) -> None:
+		"""Clear stale GPU KV manager references after destroying the manager."""
+		self.gpu_paged_kv_cache_manager = None
+		if hasattr(self.core_engine, "gpu_paged_kv_manager"):
+			self.core_engine.gpu_paged_kv_manager = None
+		if hasattr(self.core_engine, "gpu_paged_kv_manager_aux"):
+			self.core_engine.gpu_paged_kv_manager_aux = None
+		Attn_Wrapper.gpu_paged_kv_manager = None
+		AttnWrapperBase.gpu_paged_kv_manager = None
+		AttnWrapperBase.gpu_paged_kv_manager_aux = None
+
 	def _get_cuda_graph_gpu_manager(self):
 		"""Return the GPU KV manager object to use for CUDA graph setup."""
 		manager = self.gpu_paged_kv_cache_manager
@@ -3956,8 +3970,11 @@ class BatchGenWorker:
 					f"First 5: {seqs_with_gpu_alloc[:5]}"
 				)
 
+		if empty_cuda_cache:
+			torch.cuda.synchronize(self.torch_device)
 		manager.destroy(empty_cuda_cache=empty_cuda_cache)
-		
+		self._unbind_gpu_paged_kv_manager()
+
 		# FIX Bug 2: Clear tracking set when GPU KV is destroyed
 		self._sequences_with_gpu_kv.clear()
 		
