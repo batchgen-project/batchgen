@@ -48,3 +48,15 @@ def test_prefill_prepacked_uses_cleanup_scope_around_inference_loop():
         scope_call
     )
     assert body.index(scope_call) > body.index("Prepacked Prefill")
+
+
+def test_prefix_reuse_prefill_uses_smaller_default_microbatch_cap():
+    source = _source()
+    body = _method_body(
+        source,
+        "prefill_prepacked",
+        "_compute_boundary_decisions",
+    )
+
+    assert "BATCHGEN_PREFIX_REUSE_PREFILL_MICRO_BATCH_TOKEN_CAP" in body
+    assert '"65536"' in body

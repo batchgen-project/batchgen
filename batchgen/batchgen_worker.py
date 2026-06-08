@@ -8111,7 +8111,7 @@ class BatchGenWorker:
 			prefix_reuse_cap = int(
 				os.environ.get(
 					"BATCHGEN_PREFIX_REUSE_PREFILL_MICRO_BATCH_TOKEN_CAP",
-					"131072",
+					"65536",
 				)
 			)
 			if prefix_reuse_cap > 0:
