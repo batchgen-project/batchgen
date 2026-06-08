@@ -6880,6 +6880,31 @@ class BatchGenWorker:
 		in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
 		on_hold = self.global_batch.get_sequences_by_status(SequenceStatus.ON_HOLD)
 		prefilling = self.global_batch.get_sequences_by_status(SequenceStatus.PREFILLED)
+		if self.rank == 0:
+			evicted_prefill = [
+				uuid for uuid in prefill_uuids
+				if self.global_batch.get_sequence(uuid).status == SequenceStatus.EVICTED
+			]
+			prompt_lengths = [
+				int(self.global_batch.get_sequence(uuid).prompt_length)
+				for uuid in prefill_uuids
+			]
+			decoded_before = [
+				int(self.global_batch.get_sequence(uuid).total_decoded_before_eviction)
+				for uuid in evicted_prefill
+			]
+			prompt_min = min(prompt_lengths) if prompt_lengths else 0
+			prompt_max = max(prompt_lengths) if prompt_lengths else 0
+			decoded_max = max(decoded_before) if decoded_before else 0
+			logging.info(
+				"[PREFILL_REENTRY] selected_batch: "
+				f"total={len(prefill_uuids)} evicted={len(evicted_prefill)} "
+				f"queueing={len(prefill_uuids) - len(evicted_prefill)} "
+				f"in_decode={len(in_decode)} on_hold={len(on_hold)} "
+				f"prefilled={len(prefilling)} prompt_tokens={sum(prompt_lengths)} "
+				f"prompt_len_range=[{prompt_min},{prompt_max}] "
+				f"max_decoded_before_eviction={decoded_max}"
+			)
 		if (in_decode or on_hold) and BATCHGEN_CB_DEBUG:
 			logging.debug(
 				f"Rank {self.rank}: _config_prefill_for_batch called while "
@@ -6965,6 +6990,10 @@ class BatchGenWorker:
 		# until the next _sync_sequence_metadata call.
 
 		# (a) All-ranks scalar metadata update for re-entering sequences.
+		reentry_scalar_start = time.perf_counter()
+		reentry_scalar_count = 0
+		reentry_scalar_prompt_tokens = 0
+		reentry_scalar_decoded_max = 0
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			# total_decoded_before_eviction > 0 identifies sequences that have
@@ -7008,7 +7037,40 @@ class BatchGenWorker:
 			if hasattr(seq, '_rep_detected'):
 				seq._rep_detected = False
 
+			reentry_scalar_count += 1
+			reentry_scalar_prompt_tokens += int(seq.prompt_length)
+			reentry_scalar_decoded_max = max(
+				reentry_scalar_decoded_max,
+				int(seq.total_decoded_before_eviction),
+			)
+
+		if reentry_scalar_count:
+			logging.info(
+				"[PREFILL_REENTRY] "
+				f"Rank {self.rank}: scalar update end: "
+				f"seqs={reentry_scalar_count} "
+				f"prompt_tokens={reentry_scalar_prompt_tokens} "
+				f"max_decoded_before_eviction={reentry_scalar_decoded_max} "
+				f"elapsed_ms={(time.perf_counter() - reentry_scalar_start) * 1000:.1f}"
+			)
+
 		# (b) Owner-only tensor buffer setup. Also clears seq.evicted_token_ids.
+		owner_reentry_start = time.perf_counter()
+		owner_reentry_count = sum(
+			1
+			for uuid in prefill_uuids
+			if self.global_batch.get_sequence(uuid).evicted_token_ids is not None
+		)
+		if owner_reentry_count:
+			logging.info(
+				"[PREFILL_REENTRY] "
+				f"Rank {self.rank}: owner tensor setup begin: "
+				f"owner_seqs={owner_reentry_count}"
+			)
+		owner_prompt_tokens = 0
+		owner_prompt_min = None
+		owner_prompt_max = 0
+		owner_prev_decoded_max = 0
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
 			# Gate on evicted_token_ids (owner-only tensor); non-owners fall
@@ -7019,6 +7081,14 @@ class BatchGenWorker:
 			evicted_ids = seq.evicted_token_ids  # 1D tensor
 			new_prompt_len = len(evicted_ids)
 			prev_decoded = seq.total_decoded_before_eviction
+			owner_prompt_tokens += int(new_prompt_len)
+			owner_prompt_min = (
+				int(new_prompt_len)
+				if owner_prompt_min is None
+				else min(owner_prompt_min, int(new_prompt_len))
+			)
+			owner_prompt_max = max(owner_prompt_max, int(new_prompt_len))
+			owner_prev_decoded_max = max(owner_prev_decoded_max, int(prev_decoded))
 			seq.log_event(SeqEvent.REENTRY_START, self.rank,
 				f"new_prompt_len={new_prompt_len}, prev_decoded={prev_decoded}")
 
@@ -7069,10 +7139,21 @@ class BatchGenWorker:
 				local_idx = self._uuid_to_local_map[uuid]
 				self.query_book[local_idx] = make_query_book_entry(seq)
 
+				logging.info(
+					f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
+					f"new_prompt={new_prompt_len}, prev_decoded={prev_decoded}, "
+					f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
+				)
+
+		if owner_reentry_count:
 			logging.info(
-				f"Rank {self.rank}: Prepared EVICTED seq {uuid[:8]} for re-entry: "
-				f"new_prompt={new_prompt_len}, prev_decoded={prev_decoded}, "
-				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
+				"[PREFILL_REENTRY] "
+				f"Rank {self.rank}: owner tensor setup end: "
+				f"owner_seqs={owner_reentry_count} "
+				f"prompt_tokens={owner_prompt_tokens} "
+				f"prompt_len_range=[{owner_prompt_min},{owner_prompt_max}] "
+				f"max_prev_decoded={owner_prev_decoded_max} "
+				f"elapsed_ms={(time.perf_counter() - owner_reentry_start) * 1000:.1f}"
 			)
 
 		# STEP 4: Allocate host KV pages for sequences (only THIS RANK's sequences)
@@ -7098,6 +7179,9 @@ class BatchGenWorker:
 		prefix_lookup = None
 		lookup_results_by_uuid = {}
 		chunk_size = self._get_effective_chunk_size()
+		total_private_pages = 0
+		total_shared_pages = 0
+		total_append_tokens = 0
 
 		if my_prefill_uuids:
 			prefill_local_indices = [
@@ -7107,10 +7191,37 @@ class BatchGenWorker:
 				input_ids_for_lookup, _, prompt_lengths_for_lookup = (
 					self._prefill_inputs_for_local_indices(prefill_local_indices)
 				)
+				lookup_start = time.perf_counter()
+				logging.info(
+					"[PREFIX_LOOKUP] "
+					f"Rank {self.rank}: prefill lookup begin: "
+					f"local_seqs={len(prefill_local_indices)} "
+					f"prompt_tokens={sum(prompt_lengths_for_lookup)} "
+					f"prompt_len_range=[{min(prompt_lengths_for_lookup)},"
+					f"{max(prompt_lengths_for_lookup)}]"
+				)
 				prefix_lookup = self._lookup_prefix_cache_for_prefill(
 					local_indices=prefill_local_indices,
 					input_ids_list=input_ids_for_lookup,
 					prompt_lengths=prompt_lengths_for_lookup,
+				)
+				lookup_hits = sum(
+					1 for tokens in prefix_lookup.prefix_shared_tokens
+					if int(tokens) > 0
+				)
+				raw_cached_tokens = sum(
+					int(result.common_cached_tokens)
+					for result in prefix_lookup.lookup_results
+				)
+				logging.info(
+					"[PREFIX_LOOKUP] "
+					f"Rank {self.rank}: prefill lookup end: "
+					f"local_seqs={len(prefill_local_indices)} "
+					f"hit_seqs={lookup_hits} "
+					f"effective_cached_tokens="
+					f"{sum(int(t) for t in prefix_lookup.prefix_shared_tokens)} "
+					f"raw_cached_tokens={raw_cached_tokens} "
+					f"elapsed_ms={(time.perf_counter() - lookup_start) * 1000:.1f}"
 				)
 				for local_idx, result in zip(
 					prefill_local_indices,
@@ -7174,17 +7285,39 @@ class BatchGenWorker:
 				seq.host_pages_allocated = shared_pages + private_pages
 				seq.host_token_capacity = seq.host_pages_allocated * seq.PAGE_SIZE
 				sequence_tokens.append(private_pages * seq.PAGE_SIZE)
+				total_private_pages += private_pages
+				total_shared_pages += shared_pages
+				total_append_tokens += append_tokens
 
 		if self.enable_prefix_cache:
+			if sequence_tokens:
+				logging.info(
+					"[PREFILL_ALLOC] "
+					f"Rank {self.rank}: ensure private host pages begin: "
+					f"local_seqs={len(sequence_tokens)} "
+					f"private_pages={total_private_pages} "
+					f"shared_pages={total_shared_pages} "
+					f"append_tokens={total_append_tokens}"
+				)
+			ensure_start = time.perf_counter()
 			self._ensure_prefix_cache_host_pages_for_allocation(
 				sequence_tokens=sequence_tokens,
 				reason="prefill_private_allocation",
 			)
+			if sequence_tokens:
+				logging.info(
+					"[PREFILL_ALLOC] "
+					f"Rank {self.rank}: ensure private host pages end: "
+					f"elapsed_ms={(time.perf_counter() - ensure_start) * 1000:.1f}"
+				)
 
 		if my_prefill_uuids:
-			logging.debug(
-				f"Rank {self.rank}: Registering {len(global_sequence_ids)} sequences for host KV "
-				f"(chunk_size={chunk_size})"
+			alloc_start = time.perf_counter()
+			logging.info(
+				"[PREFILL_ALLOC] "
+				f"Rank {self.rank}: host KV allocation begin: "
+				f"local_seqs={len(global_sequence_ids)} chunk_size={chunk_size} "
+				f"private_pages={total_private_pages} shared_pages={total_shared_pages}"
 			)
 
 			self.core_engine.host_paged_kv_worker_view.register_sequences(global_sequence_ids)
@@ -7192,9 +7325,20 @@ class BatchGenWorker:
 			if aux_view is not None:
 				aux_view.register_sequences(global_sequence_ids)
 			if prefix_lookup is not None:
+				attach_start = time.perf_counter()
+				logging.info(
+					"[PREFILL_ALLOC] "
+					f"Rank {self.rank}: prefix attachment begin: "
+					f"local_seqs={len(prefill_local_indices)}"
+				)
 				self._attach_prefix_cache_lookup_pages(
 					local_indices=prefill_local_indices,
 					lookup=prefix_lookup,
+				)
+				logging.info(
+					"[PREFILL_ALLOC] "
+					f"Rank {self.rank}: prefix attachment end: "
+					f"elapsed_ms={(time.perf_counter() - attach_start) * 1000:.1f}"
 				)
 			self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
 				list(zip(global_sequence_ids, sequence_tokens))
@@ -7206,6 +7350,12 @@ class BatchGenWorker:
 				)
 
 			kv_stats = self.core_engine.host_paged_kv_worker_view.get_stats()
+			logging.info(
+				"[PREFILL_ALLOC] "
+				f"Rank {self.rank}: host KV allocation end: "
+				f"used={kv_stats.num_used_pages}/{kv_stats.num_total_pages} "
+				f"elapsed_ms={(time.perf_counter() - alloc_start) * 1000:.1f}"
+			)
 			if self.rank == 0:
 				logging.info(f"[PREFILL] Host KV allocated: {kv_stats.num_used_pages}/{kv_stats.num_total_pages} pages")
 
