@@ -1107,6 +1107,16 @@ class HostPagedKVWorkerView : private LayerMapper {
                                                 num_pages);
     }
 
+    std::vector<std::int32_t> RetainSequencePages(
+        std::int64_t sequence_id,
+        const std::vector<std::int32_t>& page_ids) {
+        if (page_ids.empty()) {
+            return {};
+        }
+        EnsureSequenceRegistered(sequence_id);
+        return backend_.RetainSequencePages(sequence_id, page_ids);
+    }
+
     void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {
         backend_.ReleaseResidentPages(page_ids);
     }

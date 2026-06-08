@@ -125,6 +125,10 @@ class _WorkerView:
         end = start + int(num_pages)
         return self.pages[start:end]
 
+    def retain_sequence_pages(self, sequence_id, page_ids):
+        self.retained.append((int(sequence_id), list(page_ids)))
+        return list(page_ids)
+
     def release_resident_pages(self, page_ids):
         self.released.append(list(page_ids))
 
@@ -566,8 +570,8 @@ def test_retain_newly_committed_prefix_pages_uses_group_raw_page_rates():
     )
 
     assert committed == 16
-    assert primary.retained == [(123, 2, 2)]
-    assert compressed.retained == [(123, 1, 1)]
+    assert primary.retained == [(123, [2, 3])]
+    assert compressed.retained == [(123, [11])]
 
 
 def test_retain_newly_committed_prefix_pages_skips_already_committed_tokens():

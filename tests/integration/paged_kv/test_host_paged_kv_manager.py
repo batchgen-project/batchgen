@@ -277,6 +277,30 @@ def test_worker_view_retains_prefix_resident_pages_until_eviction_release():
         )
         worker.release_resident_pages(retained_range)
         assert worker.get_stats().num_used_pages == 0
+
+        exact_sequence_id = 606
+        worker.register_sequences([exact_sequence_id])
+        exact_pages = worker.allocate_pages_for_sequences(
+            [(exact_sequence_id, cfg.page_size_tokens * 4)]
+        )[0]
+        retained_exact = worker.retain_sequence_pages(
+            exact_sequence_id,
+            [exact_pages[1], exact_pages[3]],
+        )
+
+        assert retained_exact == [exact_pages[1], exact_pages[3]]
+        assert worker.build_page_table([exact_sequence_id]) == [exact_pages]
+
+        before_exact_release = worker.get_stats()
+        worker.release_sequence_pages([exact_sequence_id])
+        after_exact_sequence_release = worker.get_stats()
+
+        assert (
+            after_exact_sequence_release.num_used_pages
+            == before_exact_release.num_used_pages - 2
+        )
+        worker.release_resident_pages(retained_exact)
+        assert worker.get_stats().num_used_pages == 0
     finally:
         try:
             worker.shutdown()
