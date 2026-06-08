@@ -71,7 +71,6 @@ def gqa_extend_fa(
         v_cache,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
         softmax_scale=softmax_scale,
         causal=True,
