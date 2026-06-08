@@ -385,7 +385,7 @@ def test_prefix_commit_request_capacity_requirements_use_raw_page_rates():
     )
 
     assert request is not None
-    assert request.capacity_requirements() == (2, 4, 9)
+    assert request.capacity_requirements() == (2, 4, 6)
 
 
 def test_prefix_commit_request_capacity_requirements_cover_c128_groups():
@@ -403,7 +403,7 @@ def test_prefix_commit_request_capacity_requirements_cover_c128_groups():
     )
 
     assert request is not None
-    assert request.capacity_requirements() == (2, 6, 18)
+    assert request.capacity_requirements() == (2, 6, 12)
 
 
 def test_release_evicted_prefix_pages_requires_matching_worker_view():
@@ -452,7 +452,7 @@ def test_commit_prefix_pages_retries_after_capacity_eviction():
     assert result.commit_result == "committed"
     assert result.eviction_result is evicted
     assert result.released_pages_by_group == {0: 2, 1: 1}
-    assert coordinator.evict_calls == [(2, 4, 9, 7)]
+    assert coordinator.evict_calls == [(2, 4, 6, 7)]
     assert len(coordinator.calls) == 2
     assert primary.released == [[100, 101]]
     assert compressed.released == [[200]]
