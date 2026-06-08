@@ -120,7 +120,10 @@ from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_segmented_cuda_graph_requested_for_model,
 	glm5_whole_model_cuda_graph_requested_for_model,
 )
-from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
+from batchgen.kv_cache.gpu_paged_kv_manager import (
+	GPUPagedKVCacheManager,
+	GPUPagedKVConfig,
+)
 from batchgen.models.engine_loader import core_engine
 from batchgen.worker.indexing import IndexLookupRequest, IndexManager
 from batchgen.worker.completion import CompletionContext, CompletionHandler
@@ -1294,7 +1297,9 @@ class BatchGenWorker:
 				planned_pages,
 				hbm_msg,
 			)
-		manager = self._ensure_gpu_paged_kv_manager(prompt_lengths)
+		manager, rolling_layers_by_group = (
+			self._ensure_prefix_prefill_gpu_manager(prompt_lengths)
+		)
 		host_views_by_group = self._prefix_cache_worker_views_by_group()
 		gpu_managers_by_group = self._prefix_cache_gpu_managers_by_group(manager)
 		raw_page_tokens_by_group = self._prefix_cache_raw_page_tokens_by_group()
@@ -1329,6 +1334,9 @@ class BatchGenWorker:
 				prefix_shared_tokens=prefix_shared_tokens,
 				raw_page_tokens=raw_page_tokens_by_group.get(group_id),
 				prefix_cache_coordinator=self.prefix_cache_coordinator,
+				rolling_logical_layer_count=(
+					rolling_layers_by_group.get(group_id)
+				),
 			)
 
 		return PrefixMaterializationBundle(by_group_id=by_group)
@@ -3735,6 +3743,75 @@ class BatchGenWorker:
 			self._make_gpu_kv_manager_request(sequence_tokens)
 		)
 		return self._apply_gpu_kv_manager_plan(plan)
+
+	def _rolling_prefix_prefill_config(
+		self,
+		config: GPUPagedKVConfig,
+	) -> tuple[GPUPagedKVConfig, Optional[int]]:
+		"""Return a two-slot layer-mapped config for GQA prefix-hit prefill."""
+
+		if not config.has_v_cache:
+			return config, None
+		logical_layer_count = int(config.num_layers)
+		physical_layer_count = min(2, logical_layer_count)
+		layer_mapping = tuple(
+			layer_idx % physical_layer_count
+			for layer_idx in range(logical_layer_count)
+		)
+		return (
+			replace(
+				config,
+				num_layers=physical_layer_count,
+				logical_to_physical_layer=layer_mapping,
+			),
+			logical_layer_count,
+		)
+
+	def _ensure_prefix_prefill_gpu_manager(
+		self,
+		sequence_tokens: Sequence[int],
+	) -> tuple[object, Dict[int, int]]:
+		"""Create the temporary GPU KV manager used by prefix-hit prefill."""
+
+		plan = KVCacheManager.plan_gpu_kv_manager(
+			self._make_gpu_kv_manager_request(sequence_tokens)
+		)
+		if plan.aux_config is not None:
+			return self._apply_gpu_kv_manager_plan(plan), {}
+
+		config, logical_layer_count = self._rolling_prefix_prefill_config(
+			plan.primary_config
+		)
+		if logical_layer_count is None:
+			return self._apply_gpu_kv_manager_plan(plan), {}
+
+		manager = self.gpu_paged_kv_cache_manager
+		current_pages = (
+			getattr(getattr(manager, "config", None), "num_pages", 0)
+			if manager is not None
+			else 0
+		)
+		if manager is not None:
+			manager.destroy()
+
+		logging.info(
+			"Rank %s creating rolling prefix prefill GPUPagedKVCacheManager "
+			"on %s: current pages=%d, required pages=%d, "
+			"logical_layers=%d, physical_layers=%d",
+			self.rank,
+			self.local_rank,
+			current_pages,
+			config.num_pages,
+			logical_layer_count,
+			config.num_layers,
+		)
+		manager = GPUPagedKVCacheManager(
+			config=config,
+			device=self.local_rank,
+		)
+		manager.initialize()
+		self._bind_gpu_paged_kv_manager(manager)
+		return manager, {0: logical_layer_count}
 
 	def _prepare_gpu_paged_kv_cache(self, local_sequence_ids: List[int]) -> None:
 		"""Allocate GPU KV pages and load host-resident KV for the batch."""
@@ -8111,7 +8188,7 @@ class BatchGenWorker:
 			prefix_reuse_cap = int(
 				os.environ.get(
 					"BATCHGEN_PREFIX_REUSE_PREFILL_MICRO_BATCH_TOKEN_CAP",
-					"65536",
+					"131072",
 				)
 			)
 			if prefix_reuse_cap > 0:

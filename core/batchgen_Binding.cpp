@@ -365,6 +365,24 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             "Unlike async_load_layer_paged_kv_to_device, this reads directly "
             "from the provided physical Host page ids instead of resolving "
             "pages through sequence ids.")
+        .def(
+            "async_load_prefix_layers_to_device",
+            [](WorkerView& self, torch::Tensor host_page_ids,
+               torch::Tensor active_page_counts,
+               torch::Tensor logical_layer_ids,
+               torch::Tensor k_device_ptrs,
+               std::optional<torch::Tensor> v_device_ptrs) {
+                return self.AsyncLoadPrefixLayersToDevice(
+                    std::move(host_page_ids), std::move(active_page_counts),
+                    std::move(logical_layer_ids), std::move(k_device_ptrs),
+                    std::move(v_device_ptrs));
+            },
+            py::arg("host_page_ids"), py::arg("active_page_counts"),
+            py::arg("logical_layer_ids"), py::arg("k_device_ptrs"),
+            py::arg("v_device_ptrs") = py::none(),
+            "Load selected logical prefix-cache Host layers into provided "
+            "GPU destination pointer rows. The destination tensor first "
+            "dimension must match logical_layer_ids length.")
         .def("__repr__",
              [](const WorkerView& self) { return self.DebugString(); })
         .def(

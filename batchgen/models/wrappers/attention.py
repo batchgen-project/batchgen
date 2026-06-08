@@ -237,6 +237,11 @@ class AttnWrapperBase(BaseModuleWrapper):
             value=value,
             sequence_callback=sequence_callback,
         )
+        if (
+            metadata.prefix_reuse_mode
+            and self.prefill_prefix_materialization is not None
+        ):
+            self.prefill_prefix_materialization.finish_layer(self.layer_idx)
 
     def offload_prepacked_mla_kv(
         self,

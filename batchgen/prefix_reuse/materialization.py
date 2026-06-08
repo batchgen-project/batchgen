@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Protocol, Sequence
 
 import torch
@@ -74,6 +74,137 @@ class SingleGroupPrefixMaterialization:
             if manager is not None:
                 manager.destroy(empty_cuda_cache=empty_cuda_cache)
 
+    def finish_layer(self, layer_idx: int) -> None:
+        """Notify materialization that a logical layer no longer needs GPU KV."""
+
+        del layer_idx
+
+
+@dataclass
+class RollingSingleGroupPrefixMaterialization(SingleGroupPrefixMaterialization):
+    """Two-slot logical-layer materialization for prefix-hit prefill.
+
+    The manager owns a small physical layer window and maps logical layers onto
+    those slots. Prefix pages are loaded layer-by-layer from Host KV, so prefill
+    does not retain full-model GPU KV for every layer.
+    """
+
+    host_worker_view: object | None = None
+    host_page_ids: torch.Tensor | None = None
+    active_page_counts: torch.Tensor | None = None
+    logical_layer_count: int = 0
+    prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None
+    attachment_handles: Sequence[int] = ()
+    _scheduled_tasks: dict[int, _AsyncTask] = field(default_factory=dict)
+    _begun_handles: list[int] = field(default_factory=list)
+    _attachments_released: bool = False
+
+    def start(self) -> None:
+        """Begin attachment protection and prefetch the first two layers."""
+
+        if self.host_page_ids is None or self.active_page_counts is None:
+            return
+        self._begin_attachment_loads()
+        try:
+            self._schedule_layer(0)
+            self._schedule_layer(1)
+        except Exception:
+            self.wait()
+            raise
+
+    def wait_for_layer(self, layer_idx: int) -> None:
+        if self._closed:
+            raise RuntimeError("prefix materialization is already closed")
+        layer_idx = int(layer_idx)
+        self._schedule_layer(layer_idx)
+        task = self._scheduled_tasks.get(layer_idx)
+        if task is not None:
+            task.wait_for_layer(layer_idx)
+
+    def finish_layer(self, layer_idx: int) -> None:
+        if self._closed:
+            return
+        # Reuse the just-consumed physical slot for the next non-resident
+        # logical layer. Callers invoke this after the layer's attention output
+        # and suffix offload have consumed the temporary GPU KV.
+        self._schedule_layer(int(layer_idx) + 2)
+
+    def wait(self) -> None:
+        if self._loaded:
+            return
+        try:
+            for task in self._scheduled_tasks.values():
+                task.wait()
+        finally:
+            self._release_attachment_loads()
+            self._loaded = True
+
+    def close(self, *, empty_cuda_cache: bool = False) -> None:
+        if self._closed:
+            return
+        manager = self.manager
+        try:
+            self.wait()
+        finally:
+            self.manager = None
+            self.append_plan = None
+            self.load_task = None
+            self.host_worker_view = None
+            self.host_page_ids = None
+            self.active_page_counts = None
+            self._scheduled_tasks.clear()
+            self._closed = True
+            if manager is not None:
+                manager.destroy(empty_cuda_cache=empty_cuda_cache)
+
+    def _begin_attachment_loads(self) -> None:
+        if self._begun_handles or self.prefix_cache_coordinator is None:
+            return
+        for handle in self.attachment_handles:
+            self.prefix_cache_coordinator.begin_attachment_load(int(handle))
+            self._begun_handles.append(int(handle))
+
+    def _release_attachment_loads(self) -> None:
+        if self._attachments_released:
+            return
+        coordinator = self.prefix_cache_coordinator
+        if coordinator is not None:
+            for handle in reversed(self._begun_handles):
+                coordinator.end_attachment_load(int(handle))
+        self._begun_handles.clear()
+        self._attachments_released = True
+
+    def _schedule_layer(self, layer_idx: int) -> None:
+        if (
+            layer_idx < 0
+            or layer_idx >= int(self.logical_layer_count)
+            or layer_idx in self._scheduled_tasks
+            or self.host_page_ids is None
+            or self.active_page_counts is None
+        ):
+            return
+        if self.manager is None or self.host_worker_view is None:
+            raise RuntimeError("rolling prefix materialization is not active")
+
+        physical_layer = int(self.manager.resolve_physical_layer(layer_idx))
+        selected_rows = torch.tensor([physical_layer], dtype=torch.int64)
+        k_ptrs, v_ptrs = self.manager.get_padded_3d_page_pointers()
+        selected_k_ptrs = k_ptrs.index_select(0, selected_rows).contiguous()
+        selected_v_ptrs = (
+            None
+            if v_ptrs is None
+            else v_ptrs.index_select(0, selected_rows).contiguous()
+        )
+        logical_layers = torch.tensor([layer_idx], dtype=torch.int64)
+        task = self.host_worker_view.async_load_prefix_layers_to_device(
+            host_page_ids=self.host_page_ids,
+            active_page_counts=self.active_page_counts,
+            logical_layer_ids=logical_layers,
+            k_device_ptrs=selected_k_ptrs,
+            v_device_ptrs=selected_v_ptrs,
+        )
+        self._scheduled_tasks[layer_idx] = task
+
 
 @dataclass
 class PrefixMaterializationBundle:
@@ -101,6 +232,10 @@ class PrefixMaterializationBundle:
     def wait(self) -> None:
         for materialization in self.by_group_id.values():
             materialization.wait()
+
+    def finish_layer(self, layer_idx: int) -> None:
+        for materialization in self.by_group_id.values():
+            materialization.finish_layer(layer_idx)
 
     def close(self, *, empty_cuda_cache: bool = False) -> None:
         for materialization in self.by_group_id.values():
@@ -163,6 +298,7 @@ def materialize_single_group_prefix_pages(
     sequences: Sequence[PrefixMaterializationSequence],
     raw_page_tokens: int | None = None,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
+    rolling_logical_layer_count: int | None = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize Host prefix pages into target GPU paged KV slots.
 
@@ -227,6 +363,33 @@ def materialize_single_group_prefix_pages(
         rebuild_page_table=False,
     )
 
+    if rolling_logical_layer_count is not None:
+        attachment_handles = _attachment_handles_for_load(
+            sequences,
+            prefix_page_counts,
+        )
+        if attachment_handles and prefix_cache_coordinator is None:
+            raise ValueError(
+                "prefix materialization sequences with attachment handles "
+                "require prefix_cache_coordinator"
+            )
+        materialization = RollingSingleGroupPrefixMaterialization(
+            manager=gpu_manager,
+            append_plan=append_plan,
+            host_worker_view=host_worker_view,
+            host_page_ids=host_page_ids,
+            active_page_counts=active_page_counts,
+            logical_layer_count=int(rolling_logical_layer_count),
+            prefix_cache_coordinator=prefix_cache_coordinator,
+            attachment_handles=tuple(attachment_handles),
+        )
+        try:
+            materialization.start()
+        except Exception:
+            materialization.close()
+            raise
+        return materialization
+
     load_task = None
     if has_prefix_pages:
         attachment_handles = _attachment_handles_for_load(
@@ -283,6 +446,7 @@ def materialize_single_group_lookup_results(
     prefix_shared_tokens: Sequence[int] | None = None,
     raw_page_tokens: int | None = None,
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None,
+    rolling_logical_layer_count: int | None = None,
 ) -> SingleGroupPrefixMaterialization:
     """Materialize a batch of C++ HostPrefixCache lookup results.
 
@@ -367,6 +531,7 @@ def materialize_single_group_lookup_results(
         sequences=sequences,
         raw_page_tokens=raw_page_tokens,
         prefix_cache_coordinator=prefix_cache_coordinator,
+        rolling_logical_layer_count=rolling_logical_layer_count,
     )
 
 

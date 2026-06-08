@@ -29,10 +29,18 @@ class _FakeHostWorkerView:
     def __init__(self):
         self.task = _FakeTask()
         self.calls = []
+        self.layer_calls = []
+        self.layer_tasks = []
 
     def async_load_prefix_pages_to_device(self, **kwargs):
         self.calls.append(kwargs)
         return self.task
+
+    def async_load_prefix_layers_to_device(self, **kwargs):
+        task = _FakeTask()
+        self.layer_calls.append(kwargs)
+        self.layer_tasks.append(task)
+        return task
 
 
 class _FailingHostWorkerView(_FakeHostWorkerView):
@@ -97,6 +105,9 @@ class _FakeGpuManager:
 
     def destroy(self, *, empty_cuda_cache=False):
         self.destroy_calls.append(bool(empty_cuda_cache))
+
+    def resolve_physical_layer(self, layer_idx):
+        return int(layer_idx) % int(self.k_ptrs.shape[0])
 
 
 class _FailingAppendPlanGpuManager(_FakeGpuManager):
@@ -217,6 +228,54 @@ def test_materialize_prefix_pages_uses_raw_page_tokens_for_compressed_groups():
     call = host_view.calls[0]
     assert call["host_page_ids"].tolist() == [[11, 0], [21, 22]]
     assert call["active_page_counts"].tolist() == [1, 2]
+
+
+def test_rolling_materialization_prefetches_two_layers_and_advances():
+    gpu_manager = _FakeGpuManager()
+    host_view = _FakeHostWorkerView()
+    coordinator = _FakePrefixCoordinator()
+
+    materialization = materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        prefix_cache_coordinator=coordinator,
+        rolling_logical_layer_count=4,
+        sequences=[
+            PrefixMaterializationSequence(
+                sequence_id=101,
+                prefix_tokens=4,
+                suffix_tokens=2,
+                host_pages=[11],
+                attachment_handle=91,
+            ),
+        ],
+    )
+
+    assert coordinator.begin_calls == [91]
+    assert coordinator.end_calls == []
+    assert len(host_view.layer_calls) == 2
+    assert host_view.layer_calls[0]["logical_layer_ids"].tolist() == [0]
+    assert host_view.layer_calls[1]["logical_layer_ids"].tolist() == [1]
+    assert host_view.layer_calls[0]["k_device_ptrs"].tolist() == [
+        gpu_manager.k_ptrs[0].tolist()
+    ]
+    assert host_view.layer_calls[1]["k_device_ptrs"].tolist() == [
+        gpu_manager.k_ptrs[1].tolist()
+    ]
+
+    materialization.wait_for_layer(0)
+    assert host_view.layer_tasks[0].waited_layers == [0]
+
+    materialization.finish_layer(0)
+    assert len(host_view.layer_calls) == 3
+    assert host_view.layer_calls[2]["logical_layer_ids"].tolist() == [2]
+    assert host_view.layer_calls[2]["k_device_ptrs"].tolist() == [
+        gpu_manager.k_ptrs[0].tolist()
+    ]
+
+    materialization.close(empty_cuda_cache=True)
+    assert coordinator.end_calls == [91]
+    assert gpu_manager.destroy_calls == [True]
 
 
 def test_materialize_single_group_prefix_pages_skips_load_for_all_miss():

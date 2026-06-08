@@ -27,6 +27,7 @@ from .eviction import (
 from .materialization import (
     PrefixMaterializationBundle,
     PrefixMaterializationSequence,
+    RollingSingleGroupPrefixMaterialization,
     SingleGroupPrefixMaterialization,
     get_prefix_materialization_for_group,
     materialize_single_group_lookup_results,
@@ -68,6 +69,7 @@ __all__ = [
     "release_evicted_prefix_pages",
     "PrefixMaterializationBundle",
     "PrefixMaterializationSequence",
+    "RollingSingleGroupPrefixMaterialization",
     "SingleGroupPrefixMaterialization",
     "get_prefix_materialization_for_group",
     "materialize_single_group_lookup_results",

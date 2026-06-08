@@ -1021,6 +1021,7 @@ class GPUPagedKVCacheManager:
 
 		op_name = "append_layer_prefill_suffix_tokens"
 		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
 		self._geometry.ensure_layer_bounds(layer_idx, op_name)
 		k_tensor = self._prepare_flat_suffix_tensor(
 			k_tensor,
