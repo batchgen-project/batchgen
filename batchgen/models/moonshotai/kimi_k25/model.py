@@ -1104,7 +1104,8 @@ class KimiK25MoE(nn.Module):
             for global_e in nonpersistent:          # ascending == task order; NO skips
                 mask = flat_idx == global_e
                 et = tok_idx[mask]                  # may be empty (0-token)
-                out_e = self.experts[global_e].forward_decode_offloaded(all_tokens[et])
+                out_e = self.experts[global_e].forward_decode_offloaded(
+                    all_tokens[et], self.moe_intermediate_size, self.hidden_size)
                 if et.numel() > 0:
                     w = topk_weight[et, tk_pos[mask]]
                     global_results.index_add_(

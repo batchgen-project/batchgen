@@ -295,8 +295,11 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         return result
 
-    def forward_decode_offloaded(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_decode_offloaded(self, hidden_states: torch.Tensor, N: int, K: int) -> torch.Tensor:
         """Streamed (non-persistent) routed-expert DECODE path.
+
+        N = moe_intermediate_size, K = hidden_size (passed by the caller — the MoE layer
+        has them; the wrapper's model_config does not expose moe_intermediate_size).
 
         Contract: see batchgen_design/weight_loading/gpu_weight_buffer_copy_contract.md.
         The copy engine streams EVERY offloaded expert into a slot regardless of token
@@ -318,8 +321,6 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         from batchgen.moe.marlin_grouped_moe import single_expert_marlin_decode
         if hidden_states.dtype != torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
-        N = self.model_config.moe_intermediate_size
-        K = self.model_config.hidden_size
         out = single_expert_marlin_decode(
             hidden_states,
             weights["gate_proj.weight_packed"], weights["gate_proj.weight_scale"],
