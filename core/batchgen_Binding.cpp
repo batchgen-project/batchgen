@@ -246,6 +246,12 @@ void BindCommonHostPagedWorkerViewMethods(py::class_<WorkerView>& cls) {
             py::arg("sequence_id"), py::arg("num_pages"),
             "Move sequence-owned prefix pages into prefix-cache resident "
             "ownership without changing the worker logical page table.")
+       .def("retain_sequence_page_range",
+            &WorkerView::RetainSequencePageRange,
+            py::arg("sequence_id"), py::arg("start_page"),
+            py::arg("num_pages"),
+            "Move a sequence-owned page range into prefix-cache resident "
+            "ownership without changing the worker logical page table.")
        .def("release_resident_pages", &WorkerView::ReleaseResidentPages,
             py::arg("page_ids"),
             "Release prefix-cache resident pages returned by coordinator "

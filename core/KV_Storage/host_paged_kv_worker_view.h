@@ -1083,20 +1083,28 @@ class HostPagedKVWorkerView : private LayerMapper {
 
     std::vector<std::int32_t> RetainSequencePrefixPages(
         std::int64_t sequence_id, std::size_t num_pages) {
+        return RetainSequencePageRange(sequence_id, 0, num_pages);
+    }
+
+    std::vector<std::int32_t> RetainSequencePageRange(
+        std::int64_t sequence_id, std::size_t start_page,
+        std::size_t num_pages) {
         if (num_pages == 0) {
             return {};
         }
         EnsureSequenceRegistered(sequence_id);
         const auto current_pages = page_table_.Pages(sequence_id);
-        if (num_pages > current_pages.size()) {
+        if (start_page > current_pages.size() ||
+            num_pages > current_pages.size() - start_page) {
             std::ostringstream oss;
-            oss << "RetainSequencePrefixPages: cannot retain " << num_pages
-                << " prefix pages from sequence " << sequence_id
-                << " with only " << current_pages.size()
+            oss << "RetainSequencePageRange: cannot retain " << num_pages
+                << " pages from offset " << start_page << " for sequence "
+                << sequence_id << " with only " << current_pages.size()
                 << " pages in the worker page table";
             throw std::out_of_range(oss.str());
         }
-        return backend_.RetainSequencePrefixPages(sequence_id, num_pages);
+        return backend_.RetainSequencePageRange(sequence_id, start_page,
+                                                num_pages);
     }
 
     void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {

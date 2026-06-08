@@ -254,6 +254,29 @@ def test_worker_view_retains_prefix_resident_pages_until_eviction_release():
         )
         worker.release_resident_pages(retained_prefix)
         assert worker.get_stats().num_used_pages == 0
+
+        range_sequence_id = 505
+        worker.register_sequences([range_sequence_id])
+        range_pages = worker.allocate_pages_for_sequences(
+            [(range_sequence_id, cfg.page_size_tokens * 4)]
+        )[0]
+        retained_range = worker.retain_sequence_page_range(
+            range_sequence_id, 2, 2
+        )
+
+        assert retained_range == range_pages[2:4]
+        assert worker.build_page_table([range_sequence_id]) == [range_pages]
+
+        before_range_release = worker.get_stats()
+        worker.release_sequence_pages([range_sequence_id])
+        after_range_sequence_release = worker.get_stats()
+
+        assert (
+            after_range_sequence_release.num_used_pages
+            == before_range_release.num_used_pages - 2
+        )
+        worker.release_resident_pages(retained_range)
+        assert worker.get_stats().num_used_pages == 0
     finally:
         try:
             worker.shutdown()

@@ -151,6 +151,9 @@ struct HostPagedKVBackend::SharedState {
                                                  std::size_t num_pages);
     std::vector<std::int32_t> RetainPrefixPages(std::int64_t sequence_id,
                                                 std::size_t num_pages);
+    std::vector<std::int32_t> RetainPageRange(std::int64_t sequence_id,
+                                              std::size_t start_page,
+                                              std::size_t num_pages);
     void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids);
     std::vector<std::int32_t> SequencePages(
         std::int64_t sequence_id, std::optional<std::size_t> max_pages) const;
@@ -751,6 +754,11 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::ReleasePrefixPages(
 
 std::vector<std::int32_t> HostPagedKVBackend::SharedState::RetainPrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
+    return RetainPageRange(sequence_id, 0, num_pages);
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::SharedState::RetainPageRange(
+    std::int64_t sequence_id, std::size_t start_page, std::size_t num_pages) {
     if (num_pages == 0) {
         return {};
     }
@@ -763,19 +771,33 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::RetainPrefixPages(
                                     std::to_string(sequence_id) +
                                     " not found during prefix retain");
         }
-        if (num_pages > entry->num_pages) {
+        if (start_page > entry->num_pages ||
+            num_pages > entry->num_pages - start_page) {
             throw std::out_of_range(
-                "Requested prefix retain of " + std::to_string(num_pages) +
-                " pages but sequence " + std::to_string(sequence_id) +
-                " only owns " + std::to_string(entry->num_pages) + " pages");
+                "Requested retain of " + std::to_string(num_pages) +
+                " pages from offset " + std::to_string(start_page) +
+                " but sequence " + std::to_string(sequence_id) +
+                " only owns " + std::to_string(entry->num_pages) +
+                " pages");
         }
 
         pages.reserve(num_pages);
         std::int32_t page = entry->head_page;
+        std::int32_t previous_page = kInvalidPageIndex;
+        for (std::size_t i = 0; i < start_page; ++i) {
+            if (page == kInvalidPageIndex) {
+                throw std::logic_error(
+                    "Corrupt page chain before retained range for sequence " +
+                    std::to_string(sequence_id));
+            }
+            previous_page = page;
+            page = page_links[page];
+        }
+
         for (std::size_t i = 0; i < num_pages; ++i) {
             if (page == kInvalidPageIndex) {
                 throw std::logic_error(
-                    "Corrupt page chain during prefix retain for sequence " +
+                    "Corrupt page chain during range retain for sequence " +
                     std::to_string(sequence_id));
             }
             pages.push_back(page);
@@ -785,10 +807,16 @@ std::vector<std::int32_t> HostPagedKVBackend::SharedState::RetainPrefixPages(
             page = next;
         }
 
-        entry->head_page = page;
+        if (previous_page == kInvalidPageIndex) {
+            entry->head_page = page;
+        } else {
+            page_links[previous_page] = page;
+        }
         entry->num_pages -= static_cast<std::uint32_t>(num_pages);
         if (entry->num_pages == 0) {
             entry->tail_page = kInvalidPageIndex;
+        } else if (page == kInvalidPageIndex) {
+            entry->tail_page = previous_page;
         }
     }
     return pages;
@@ -1039,6 +1067,12 @@ std::vector<std::int32_t> HostPagedKVBackend::ReleaseSequencePrefixPages(
 std::vector<std::int32_t> HostPagedKVBackend::RetainSequencePrefixPages(
     std::int64_t sequence_id, std::size_t num_pages) {
     return state_->RetainPrefixPages(sequence_id, num_pages);
+}
+
+std::vector<std::int32_t> HostPagedKVBackend::RetainSequencePageRange(
+    std::int64_t sequence_id, std::size_t start_page,
+    std::size_t num_pages) {
+    return state_->RetainPageRange(sequence_id, start_page, num_pages);
 }
 
 void HostPagedKVBackend::ReleaseResidentPages(

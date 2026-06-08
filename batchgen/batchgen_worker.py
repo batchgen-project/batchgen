@@ -1388,18 +1388,27 @@ class BatchGenWorker:
 				worker_views_by_group=worker_views_by_group,
 			)
 			result = retry_result.commit_result
-			if int(result.inserted_nodes) > 0:
-				seq.prefix_committed_tokens = (
-					retain_newly_committed_prefix_pages(
-						runtime_config=self.prefix_cache_runtime_config,
-						worker_views_by_group=worker_views_by_group,
-						sequence_id=int(seq.global_idx),
-						previous_committed_tokens=int(
-							seq.prefix_committed_tokens
-						),
-						commit_tokens=int(commit_tokens),
-					)
+			existing_tokens = (
+				int(result.existing_nodes)
+				* int(request.publish_boundary_tokens)
+			)
+			retain_start_tokens = max(
+				int(seq.prefix_committed_tokens),
+				int(seq.prefix_shared_tokens),
+				existing_tokens,
+			)
+			if (
+				int(result.inserted_nodes) > 0
+				and int(commit_tokens) > retain_start_tokens
+			):
+				retain_newly_committed_prefix_pages(
+					runtime_config=self.prefix_cache_runtime_config,
+					worker_views_by_group=worker_views_by_group,
+					sequence_id=int(seq.global_idx),
+					previous_committed_tokens=retain_start_tokens,
+					commit_tokens=int(commit_tokens),
 				)
+			seq.prefix_committed_tokens = int(commit_tokens)
 			if self.prefix_cache_debug_stats and self.rank == 0:
 				logging.info(
 					"Prefix cache %s commit: seq=%s gid=%s tokens=%s "

@@ -124,7 +124,7 @@ def retain_newly_committed_prefix_pages(
     previous_committed_tokens: int,
     commit_tokens: int,
 ) -> int:
-    """Move newly published sequence-owned pages into prefix-resident ownership."""
+    """Move newly published sequence-owned page ranges into resident ownership."""
 
     previous = max(0, int(previous_committed_tokens))
     target = int(commit_tokens)
@@ -140,8 +140,9 @@ def retain_newly_committed_prefix_pages(
         new_pages = target_pages - previous_pages
         if new_pages <= 0:
             continue
-        worker_views_by_group[int(spec.group_id)].retain_sequence_prefix_pages(
+        worker_views_by_group[int(spec.group_id)].retain_sequence_page_range(
             int(sequence_id),
+            int(previous_pages),
             int(new_pages),
         )
     return target
