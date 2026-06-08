@@ -220,8 +220,6 @@ def build_prefill_micro_batches(
     seq_lengths: List[int],
     token_cap: int,
     *,
-    page_lengths: Optional[List[int]] = None,
-    page_cap: Optional[int] = None,
     l2_balance: bool = True,
     l2_slack: float = 1.2,
     single_sequence_only: bool = False,
@@ -242,12 +240,6 @@ def build_prefill_micro_batches(
     if num_sequences == 0:
         return [], 0
 
-    use_page_cap = page_lengths is not None and page_cap is not None and page_cap > 0
-    if use_page_cap and len(page_lengths) != num_sequences:
-        raise ValueError(
-            "page_lengths must have the same length as seq_lengths when page_cap is set"
-        )
-
     if single_sequence_only:
         return [(seq_idx, seq_idx + 1) for seq_idx in range(num_sequences)], 0
 
@@ -264,27 +256,19 @@ def build_prefill_micro_batches(
     current_batch_start = 0
     current_batch_tokens = 0
     current_batch_l2 = 0
-    current_batch_pages = 0
 
     for seq_idx, seq_len in enumerate(seq_lengths):
         seq_l2 = seq_len * seq_len
-        seq_pages = int(page_lengths[seq_idx]) if use_page_cap else 0
         over_tokens = current_batch_tokens + seq_len > token_cap
         over_l2 = (l2_cap > 0) and (current_batch_l2 + seq_l2 > l2_cap)
-        over_pages = (
-            use_page_cap
-            and current_batch_pages + seq_pages > int(page_cap)
-        )
-        if (over_tokens or over_l2 or over_pages) and current_batch_tokens > 0:
+        if (over_tokens or over_l2) and current_batch_tokens > 0:
             micro_batches.append((current_batch_start, seq_idx))
             current_batch_start = seq_idx
             current_batch_tokens = 0
             current_batch_l2 = 0
-            current_batch_pages = 0
 
         current_batch_tokens += seq_len
         current_batch_l2 += seq_l2
-        current_batch_pages += seq_pages
 
     if current_batch_start < num_sequences:
         micro_batches.append((current_batch_start, num_sequences))

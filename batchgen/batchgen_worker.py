@@ -8121,24 +8121,12 @@ class BatchGenWorker:
 				)
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
-		prefix_page_lengths = None
-		prefix_page_cap = None
+		micro_batch_admission_lengths = seq_lengths_list
 		if prefix_plan is not None and prefix_plan.saved_prefill_tokens > 0:
-			page_size = max(1, int(SequenceEntry.PAGE_SIZE))
-			prefix_page_lengths = [
-				math.ceil(
-					max(1, int(item.full_logical_context_length)) / page_size
-				)
+			micro_batch_admission_lengths = [
+				max(1, int(item.full_logical_context_length))
 				for item in prefix_plan.sequences
 			]
-			prefix_page_cap_env = os.environ.get(
-				"BATCHGEN_PREFIX_REUSE_PREFILL_MICRO_BATCH_PAGE_CAP"
-			)
-			prefix_page_cap = (
-				int(prefix_page_cap_env)
-				if prefix_page_cap_env is not None
-				else max(1, MAX_TOKENS_PER_MICRO_BATCH // page_size // 2)
-			)
 
 		# Create micro-batches bounded by token count, optionally also by sum(L^2)
 		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
@@ -8146,19 +8134,22 @@ class BatchGenWorker:
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 		micro_batches, l2_cap = build_prefill_micro_batches(
-			seq_lengths_list,
+			micro_batch_admission_lengths,
 			MAX_TOKENS_PER_MICRO_BATCH,
-			page_lengths=prefix_page_lengths,
-			page_cap=prefix_page_cap,
 			l2_balance=_USE_L2_MB,
 		)
 		total_tokens_all = sum(seq_lengths_list)
+		total_admission_tokens = sum(micro_batch_admission_lengths)
 
 		if self.rank == 0:
 			logging.info(
 				f"Prepacked prefill: {len(micro_batches)} micro batches, "
 				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
-				+ (f", page_cap={prefix_page_cap}" if prefix_page_cap else "")
+				+ (
+					f", admission_tokens={total_admission_tokens:,}"
+					if total_admission_tokens != total_tokens_all
+					else ""
+				)
 				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
 
