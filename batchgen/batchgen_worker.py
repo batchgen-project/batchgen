@@ -8094,6 +8094,18 @@ class BatchGenWorker:
 		# This prevents OOM when sequences have varying lengths
 		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
 		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
+		if prefix_plan is not None and prefix_plan.saved_prefill_tokens > 0:
+			prefix_reuse_cap = int(
+				os.environ.get(
+					"BATCHGEN_PREFIX_REUSE_PREFILL_MICRO_BATCH_TOKEN_CAP",
+					"131072",
+				)
+			)
+			if prefix_reuse_cap > 0:
+				MAX_TOKENS_PER_MICRO_BATCH = min(
+					MAX_TOKENS_PER_MICRO_BATCH,
+					prefix_reuse_cap,
+				)
 		num_sequences = prepack_meta.num_original_sequences
 		seq_lengths_list = prepack_meta.original_seq_lengths
 
