@@ -3747,11 +3747,18 @@ class BatchGenWorker:
 	def _rolling_prefix_prefill_config(
 		self,
 		config: GPUPagedKVConfig,
+		sequence_tokens: Sequence[int],
 	) -> tuple[GPUPagedKVConfig, Optional[int]]:
 		"""Return a two-slot layer-mapped config for GQA prefix-hit prefill."""
 
 		if not config.has_v_cache:
 			return config, None
+		page_size_tokens = int(config.page_size_tokens)
+		fa_page_size_tokens = self._fa_paged_kv_page_size_tokens(page_size_tokens)
+		num_pages = sum(
+			math.ceil(max(1, int(tokens)) / fa_page_size_tokens)
+			for tokens in sequence_tokens
+		)
 		logical_layer_count = int(config.num_layers)
 		physical_layer_count = min(2, logical_layer_count)
 		layer_mapping = tuple(
@@ -3761,11 +3768,22 @@ class BatchGenWorker:
 		return (
 			replace(
 				config,
+				num_pages=max(1, int(num_pages)),
+				page_size_tokens=fa_page_size_tokens,
 				num_layers=physical_layer_count,
 				logical_to_physical_layer=layer_mapping,
 			),
 			logical_layer_count,
 		)
+
+	def _fa_paged_kv_page_size_tokens(self, page_size_tokens: int) -> int:
+		"""Return a GPU page size accepted by FlashAttention paged KV."""
+
+		page_size_tokens = int(page_size_tokens)
+		fa_block = 256
+		if page_size_tokens >= fa_block and page_size_tokens % fa_block == 0:
+			return page_size_tokens
+		return math.ceil(max(page_size_tokens, fa_block) / fa_block) * fa_block
 
 	def _ensure_prefix_prefill_gpu_manager(
 		self,
@@ -3780,7 +3798,8 @@ class BatchGenWorker:
 			return self._apply_gpu_kv_manager_plan(plan), {}
 
 		config, logical_layer_count = self._rolling_prefix_prefill_config(
-			plan.primary_config
+			plan.primary_config,
+			sequence_tokens,
 		)
 		if logical_layer_count is None:
 			return self._apply_gpu_kv_manager_plan(plan), {}

@@ -63,13 +63,26 @@ class _FakePrefixCoordinator:
 
 class _FakeGpuManager:
     def __init__(self):
-        self.config = SimpleNamespace(page_size_tokens=4)
+        self.config = SimpleNamespace(
+            page_size_tokens=4,
+            num_k_heads=1,
+            k_head_dim=1,
+            num_v_heads=1,
+            v_head_dim=1,
+            kv_dtype=torch.bfloat16,
+        )
         self.allocations = []
         self.rebuilt = []
         self.prepared = []
         self.destroy_calls = []
-        self.k_ptrs = torch.ones((2, 2, 3), dtype=torch.int64)
-        self.v_ptrs = torch.ones((2, 2, 3), dtype=torch.int64) * 2
+        self.k_ptrs = torch.tensor(
+            [
+                [[1000, 2000, 3000], [4000, 5000, 6000]],
+                [[7000, 8000, 9000], [10000, 11000, 12000]],
+            ],
+            dtype=torch.int64,
+        )
+        self.v_ptrs = self.k_ptrs + 100000
         self.append_plan = SimpleNamespace(
             cache_seqlens=torch.tensor([7, 3], dtype=torch.int32),
             slot_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -228,6 +241,45 @@ def test_materialize_prefix_pages_uses_raw_page_tokens_for_compressed_groups():
     call = host_view.calls[0]
     assert call["host_page_ids"].tolist() == [[11, 0], [21, 22]]
     assert call["active_page_counts"].tolist() == [1, 2]
+
+
+def test_materialize_prefix_pages_offsets_host_pages_inside_larger_gpu_pages():
+    gpu_manager = _FakeGpuManager()
+    gpu_manager.config.page_size_tokens = 4
+    host_view = _FakeHostWorkerView()
+
+    materialize_single_group_prefix_pages(
+        gpu_manager=gpu_manager,
+        host_worker_view=host_view,
+        raw_page_tokens=2,
+        sequences=[
+            PrefixMaterializationSequence(
+                sequence_id=101,
+                prefix_tokens=6,
+                suffix_tokens=2,
+                host_pages=[11, 12, 13],
+            ),
+            PrefixMaterializationSequence(
+                sequence_id=102,
+                prefix_tokens=2,
+                suffix_tokens=2,
+                host_pages=[21],
+            ),
+        ],
+    )
+
+    call = host_view.calls[0]
+    assert call["host_page_ids"].tolist() == [[11, 12, 13], [21, 0, 0]]
+    assert call["active_page_counts"].tolist() == [3, 1]
+    # raw_page_tokens=2, BF16, 1 head, dim=1 -> 4 bytes per Host page.
+    assert call["k_device_ptrs"].tolist() == [
+        [[1000, 1004, 2000], [4000, 4004, 5000]],
+        [[7000, 7004, 8000], [10000, 10004, 11000]],
+    ]
+    assert call["v_device_ptrs"].tolist() == [
+        [[101000, 101004, 102000], [104000, 104004, 105000]],
+        [[107000, 107004, 108000], [110000, 110004, 111000]],
+    ]
 
 
 def test_rolling_materialization_prefetches_two_layers_and_advances():

@@ -92,6 +92,7 @@ class RollingSingleGroupPrefixMaterialization(SingleGroupPrefixMaterialization):
     host_worker_view: object | None = None
     host_page_ids: torch.Tensor | None = None
     active_page_counts: torch.Tensor | None = None
+    host_page_tokens: int | None = None
     logical_layer_count: int = 0
     prefix_cache_coordinator: Optional[_PrefixCacheCoordinator] = None
     attachment_handles: Sequence[int] = ()
@@ -194,6 +195,13 @@ class RollingSingleGroupPrefixMaterialization(SingleGroupPrefixMaterialization):
             None
             if v_ptrs is None
             else v_ptrs.index_select(0, selected_rows).contiguous()
+        )
+        selected_k_ptrs, selected_v_ptrs = _expand_device_ptrs_for_host_pages(
+            gpu_manager=self.manager,
+            k_device_ptrs=selected_k_ptrs,
+            v_device_ptrs=selected_v_ptrs,
+            active_page_counts=self.active_page_counts,
+            host_page_tokens=self.host_page_tokens,
         )
         logical_layers = torch.tensor([layer_idx], dtype=torch.int64)
         task = self.host_worker_view.async_load_prefix_layers_to_device(
@@ -332,15 +340,15 @@ def materialize_single_group_prefix_pages(
                 f"full sequence length must be positive for sequence {seq_id}"
             )
 
-    page_size = int(
+    host_page_tokens = int(
         raw_page_tokens
         if raw_page_tokens is not None
         else gpu_manager.config.page_size_tokens
     )
-    if page_size <= 0:
+    if host_page_tokens <= 0:
         raise ValueError("raw_page_tokens must be positive")
     prefix_page_counts = [
-        int(math.ceil(prefix_len / page_size)) if prefix_len > 0 else 0
+        int(math.ceil(prefix_len / host_page_tokens)) if prefix_len > 0 else 0
         for prefix_len in prefix_lens
     ]
     has_prefix_pages = any(count > 0 for count in prefix_page_counts)
@@ -356,6 +364,13 @@ def materialize_single_group_prefix_pages(
     gpu_manager.allocate_pages_for_sequences(sequence_ids, full_lens)
     gpu_manager.rebuild_page_table(sequence_ids)
     k_ptrs, v_ptrs = gpu_manager.get_padded_3d_page_pointers()
+    copy_k_ptrs, copy_v_ptrs = _expand_device_ptrs_for_host_pages(
+        gpu_manager=gpu_manager,
+        k_device_ptrs=k_ptrs,
+        v_device_ptrs=v_ptrs,
+        active_page_counts=active_page_counts,
+        host_page_tokens=host_page_tokens,
+    )
     append_plan = gpu_manager.prepare_prefill_suffix_append(
         sequence_ids=sequence_ids,
         prefix_lens=prefix_lens,
@@ -379,6 +394,7 @@ def materialize_single_group_prefix_pages(
             host_worker_view=host_worker_view,
             host_page_ids=host_page_ids,
             active_page_counts=active_page_counts,
+            host_page_tokens=host_page_tokens,
             logical_layer_count=int(rolling_logical_layer_count),
             prefix_cache_coordinator=prefix_cache_coordinator,
             attachment_handles=tuple(attachment_handles),
@@ -412,8 +428,8 @@ def materialize_single_group_prefix_pages(
             load_task = host_worker_view.async_load_prefix_pages_to_device(
                 host_page_ids=host_page_ids,
                 active_page_counts=active_page_counts,
-                k_device_ptrs=k_ptrs,
-                v_device_ptrs=v_ptrs,
+                k_device_ptrs=copy_k_ptrs,
+                v_device_ptrs=copy_v_ptrs,
             )
         except Exception:
             if prefix_cache_coordinator is not None:
@@ -553,6 +569,124 @@ def _build_host_page_id_tensor(
         row.extend([0] * (max_pages - len(row)))
         rows.append(row)
     return torch.tensor(rows, dtype=torch.int64)
+
+
+def _expand_device_ptrs_for_host_pages(
+    *,
+    gpu_manager: object,
+    k_device_ptrs: torch.Tensor,
+    v_device_ptrs: torch.Tensor | None,
+    active_page_counts: torch.Tensor | None,
+    host_page_tokens: int | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Map host-page copy slots onto potentially larger GPU pages.
+
+    Host prefix pages are indexed by the Host KV group's raw page size. Some
+    GPU kernels impose a larger paged-cache block size; for example FA3 paged
+    ``flash_attn_with_kvcache`` requires a 256-token GPU page. In that case
+    each Host page is copied into a subrange of the larger GPU page by adding a
+    byte offset to the destination page pointer. The C++ copy path remains
+    asynchronous and still copies one Host page per entry.
+    """
+
+    gpu_page_tokens = int(gpu_manager.config.page_size_tokens)
+    host_tokens = int(
+        host_page_tokens if host_page_tokens is not None else gpu_page_tokens
+    )
+    if (
+        host_tokens == gpu_page_tokens
+        or host_tokens > gpu_page_tokens
+        or active_page_counts is None
+    ):
+        return k_device_ptrs, v_device_ptrs
+    if host_tokens <= 0 or gpu_page_tokens <= 0:
+        raise ValueError("host and GPU page sizes must be positive")
+    if gpu_page_tokens % host_tokens != 0:
+        raise ValueError(
+            "GPU page size must be a multiple of Host page size for prefix "
+            f"materialization, got gpu={gpu_page_tokens}, host={host_tokens}"
+        )
+
+    k_page_bytes = _host_page_bytes(
+        gpu_manager=gpu_manager,
+        host_page_tokens=host_tokens,
+        is_value=False,
+    )
+    expanded_k = _expand_pointer_tensor_for_host_pages(
+        k_device_ptrs,
+        active_page_counts=active_page_counts,
+        host_page_bytes=k_page_bytes,
+        host_pages_per_gpu_page=gpu_page_tokens // host_tokens,
+    )
+
+    expanded_v = None
+    if v_device_ptrs is not None:
+        v_page_bytes = _host_page_bytes(
+            gpu_manager=gpu_manager,
+            host_page_tokens=host_tokens,
+            is_value=True,
+        )
+        expanded_v = _expand_pointer_tensor_for_host_pages(
+            v_device_ptrs,
+            active_page_counts=active_page_counts,
+            host_page_bytes=v_page_bytes,
+            host_pages_per_gpu_page=gpu_page_tokens // host_tokens,
+        )
+
+    return expanded_k, expanded_v
+
+
+def _host_page_bytes(
+    *,
+    gpu_manager: object,
+    host_page_tokens: int,
+    is_value: bool,
+) -> int:
+    config = gpu_manager.config
+    if is_value:
+        heads = int(config.num_v_heads)
+        head_dim = int(config.v_head_dim)
+    else:
+        heads = int(config.num_k_heads)
+        head_dim = int(config.k_head_dim)
+    element_size = torch.empty((), dtype=config.kv_dtype).element_size()
+    return int(host_page_tokens) * heads * head_dim * int(element_size)
+
+
+def _expand_pointer_tensor_for_host_pages(
+    pointer_tensor: torch.Tensor,
+    *,
+    active_page_counts: torch.Tensor,
+    host_page_bytes: int,
+    host_pages_per_gpu_page: int,
+) -> torch.Tensor:
+    if int(active_page_counts.numel()) == 0:
+        return pointer_tensor[:, :, :0].contiguous()
+    max_host_pages = int(active_page_counts.max().item())
+    if max_host_pages == 0:
+        return pointer_tensor[:, :, :0].contiguous()
+
+    host_slots = torch.arange(max_host_pages, dtype=torch.long)
+    gpu_slots = torch.div(
+        host_slots,
+        int(host_pages_per_gpu_page),
+        rounding_mode="floor",
+    )
+    if int(gpu_slots[-1].item()) >= int(pointer_tensor.shape[2]):
+        raise ValueError(
+            "GPU page pointer tensor is too small for Host prefix pages: "
+            f"max_host_pages={max_host_pages}, "
+            f"host_pages_per_gpu_page={host_pages_per_gpu_page}, "
+            f"gpu_pointer_pages={pointer_tensor.shape[2]}"
+        )
+    offsets = (
+        torch.remainder(host_slots, int(host_pages_per_gpu_page)).to(
+            dtype=torch.int64
+        )
+        * int(host_page_bytes)
+    )
+    expanded = pointer_tensor.index_select(2, gpu_slots).contiguous()
+    return expanded + offsets.view(1, 1, -1)
 
 
 def _find_group_span(result: object, *, group_id: int) -> object:
