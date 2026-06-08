@@ -780,6 +780,8 @@ class GPUPagedKVCacheManager:
 				"GPUPagedKVCacheManager.destroy called while uninitialized; "
 				"no-op (state was already reset by a prior destroy call)"
 			)
+			if empty_cuda_cache:
+				self._release_cached_cuda_memory()
 			return
 
 		self._reset_runtime_state()
