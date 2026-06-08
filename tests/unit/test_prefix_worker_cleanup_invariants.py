@@ -26,8 +26,8 @@ def test_prefill_prepack_scope_cleans_global_state_in_finally():
 
     assert "\n\t\tfinally:\n" in scope
     assert "self._reset_prefill_prepack_runtime_state()" in scope
-    assert "prefix_materialization.wait()" in scope
-    assert "self._destroy_gpu_paged_kv_cache()" in scope
+    assert "prefix_materialization.close(empty_cuda_cache=False)" in scope
+    assert "self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)" in scope
 
 
 def test_prefill_prepacked_uses_cleanup_scope_around_inference_loop():
@@ -37,7 +37,9 @@ def test_prefill_prepacked_uses_cleanup_scope_around_inference_loop():
         "prefill_prepacked",
         "_compute_boundary_decisions",
     )
-    scope_call = "self._prefill_prepack_runtime_scope(prefix_materialization)"
+    scope_call = (
+        "self._prefill_prepack_runtime_scope(batch_prefix_materialization)"
+    )
     inference_call = "torch.inference_mode()"
 
     assert scope_call in body

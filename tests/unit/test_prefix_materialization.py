@@ -59,6 +59,7 @@ class _FakeGpuManager:
         self.allocations = []
         self.rebuilt = []
         self.prepared = []
+        self.destroy_calls = []
         self.k_ptrs = torch.ones((2, 2, 3), dtype=torch.int64)
         self.v_ptrs = torch.ones((2, 2, 3), dtype=torch.int64) * 2
         self.append_plan = SimpleNamespace(
@@ -93,6 +94,9 @@ class _FakeGpuManager:
             )
         )
         return self.append_plan
+
+    def destroy(self, *, empty_cuda_cache=False):
+        self.destroy_calls.append(bool(empty_cuda_cache))
 
 
 class _FailingAppendPlanGpuManager(_FakeGpuManager):
@@ -277,13 +281,15 @@ def test_materialize_single_group_prefix_pages_guards_attachment_load():
 
 
 def test_bundle_full_wait_waits_all_groups():
+    primary_manager = _FakeGpuManager()
+    aux_manager = _FakeGpuManager()
     primary = SingleGroupPrefixMaterialization(
-        manager=object(),
+        manager=primary_manager,
         append_plan=object(),
         load_task=_FakeTask(),
     )
     aux = SingleGroupPrefixMaterialization(
-        manager=object(),
+        manager=aux_manager,
         append_plan=object(),
         load_task=_FakeTask(),
     )
@@ -296,6 +302,13 @@ def test_bundle_full_wait_waits_all_groups():
     bundle.wait()
     assert primary.load_task.wait_count == 1
     assert aux.load_task.wait_count == 1
+
+    bundle.close(empty_cuda_cache=True)
+    assert primary_manager.destroy_calls == [True]
+    assert aux_manager.destroy_calls == [True]
+    assert primary.manager is None
+    assert primary.append_plan is None
+    assert primary.load_task is None
 
 
 def test_materialize_single_group_prefix_pages_unwinds_attachment_on_load_error():

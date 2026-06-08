@@ -38,12 +38,15 @@ class PrefixMaterializationSequence:
 class SingleGroupPrefixMaterialization:
     """Single KV-group materialization view consumed by current adapters."""
 
-    manager: object
-    append_plan: object
+    manager: object | None
+    append_plan: object | None
     load_task: Optional[_AsyncTask] = None
     _loaded: bool = False
+    _closed: bool = False
 
     def wait_for_layer(self, layer_idx: int) -> None:
+        if self._closed:
+            raise RuntimeError("prefix materialization is already closed")
         if self._loaded or self.load_task is None:
             return
         self.load_task.wait_for_layer(int(layer_idx))
@@ -54,6 +57,22 @@ class SingleGroupPrefixMaterialization:
         if self.load_task is not None:
             self.load_task.wait()
         self._loaded = True
+
+    def close(self, *, empty_cuda_cache: bool = False) -> None:
+        """Wait for outstanding loads and release GPU materialization buffers."""
+
+        if self._closed:
+            return
+        manager = self.manager
+        try:
+            self.wait()
+        finally:
+            self.manager = None
+            self.append_plan = None
+            self.load_task = None
+            self._closed = True
+            if manager is not None:
+                manager.destroy(empty_cuda_cache=empty_cuda_cache)
 
 
 @dataclass
@@ -82,6 +101,10 @@ class PrefixMaterializationBundle:
     def wait(self) -> None:
         for materialization in self.by_group_id.values():
             materialization.wait()
+
+    def close(self, *, empty_cuda_cache: bool = False) -> None:
+        for materialization in self.by_group_id.values():
+            materialization.close(empty_cuda_cache=empty_cuda_cache)
 
 
 def get_prefix_materialization_for_group(

@@ -8008,7 +8008,7 @@ class BatchGenWorker:
 			self._reset_prefill_prepack_runtime_state()
 			if prefix_materialization is not None:
 				try:
-					prefix_materialization.wait()
+					prefix_materialization.close(empty_cuda_cache=False)
 				finally:
 					self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
 
@@ -8306,6 +8306,7 @@ class BatchGenWorker:
 					# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 					hidden_states = inputs_embeds.unsqueeze(0)
 
+					layer_outputs = None
 					for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 						layer_outputs = decoder_layer(
 							hidden_states,
@@ -8349,8 +8350,15 @@ class BatchGenWorker:
 							f"Rank {self.rank}: prefill token selection shape mismatch, "
 							f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 						)
-					output_tokens.append(batch_new_tokens)
-					del inputs_embeds, hidden_states, last_token_hidden, logits
+					output_tokens.append(batch_new_tokens.cpu())
+					del (
+						inputs_embeds,
+						hidden_states,
+						layer_outputs,
+						last_token_hidden,
+						logits,
+						batch_new_tokens,
+					)
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
