@@ -94,6 +94,16 @@ class AttnWrapperBase(BaseModuleWrapper):
     pending_prefill_offload_layer_idx: ClassVar[Optional[int]] = None
 
     @classmethod
+    def _finish_pending_prefix_materialization_layer(
+        cls,
+        layer_idx: Optional[int],
+    ) -> None:
+        materialization = cls.prefill_prefix_materialization
+        if layer_idx is None or materialization is None:
+            return
+        materialization.finish_layer(int(layer_idx))
+
+    @classmethod
     def record_glm5_dispatch(
         cls,
         *,
@@ -169,6 +179,7 @@ class AttnWrapperBase(BaseModuleWrapper):
         pinned.clear()
 
         layer_idx = cls.pending_prefill_offload_layer_idx
+        cls._finish_pending_prefix_materialization_layer(layer_idx)
         cls.pending_prefill_offload_layer_idx = None
         if num_tasks:
             suffix = f" ({reason})" if reason else ""
@@ -223,8 +234,13 @@ class AttnWrapperBase(BaseModuleWrapper):
         from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
         metadata = metadata or self.prefix_cache_metadata()
-        tracker = self.track_prefill_offload_task if track_tasks else None
-        tensor_pinner = self.pin_prefill_offload_tensor if track_tasks else None
+        prefix_materialization_active = (
+            metadata.prefix_reuse_mode
+            and self.prefill_prefix_materialization is not None
+        )
+        should_track = track_tasks or prefix_materialization_active
+        tracker = self.track_prefill_offload_task if should_track else None
+        tensor_pinner = self.pin_prefill_offload_tensor if should_track else None
         offloader = PrefillHostKVOffloader(
             worker_view=getattr(self.core_engine, "host_paged_kv_worker_view", None),
             layer_idx=self.layer_idx,
@@ -238,8 +254,8 @@ class AttnWrapperBase(BaseModuleWrapper):
             sequence_callback=sequence_callback,
         )
         if (
-            metadata.prefix_reuse_mode
-            and self.prefill_prefix_materialization is not None
+            prefix_materialization_active
+            and self.pending_prefill_offload_layer_idx != self.layer_idx
         ):
             self.prefill_prefix_materialization.finish_layer(self.layer_idx)
 
