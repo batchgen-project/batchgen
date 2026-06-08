@@ -1493,14 +1493,23 @@ HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
         }
 
         EvictNodeLocked(&node, &result);
-        FilterEvictedPagesStillReferencedLocked(&result);
 
+        // Filtering evicted pages scans resident nodes to remove pages still
+        // referenced by protected or non-evicted prefix entries. Doing that
+        // after every single victim is O(nodes * pages * victims) and can make
+        // large allocation-pressure evictions appear stalled. First accumulate
+        // enough potential pages, then run the expensive exact filter only when
+        // the current candidate set might satisfy the request.
         if (HasEnoughReleasablePages(result, required_pages)) {
-            break;
+            FilterEvictedPagesStillReferencedLocked(&result);
+            if (HasEnoughReleasablePages(result, required_pages)) {
+                break;
+            }
         }
     }
 
     if (result.evicted_nodes != 0) {
+        FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasLocked();
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
