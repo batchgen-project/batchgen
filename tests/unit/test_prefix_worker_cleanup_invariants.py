@@ -44,6 +44,7 @@ def test_prefill_prepacked_uses_cleanup_scope_around_inference_loop():
 
     assert scope_call in body
     assert inference_call in body
-    assert body.index(scope_call) < body.index(
-        "Prepacked Prefill",
+    assert body.index("batch_prefix_materialization = None") < body.index(
+        scope_call
     )
+    assert body.index(scope_call) > body.index("Prepacked Prefill")
