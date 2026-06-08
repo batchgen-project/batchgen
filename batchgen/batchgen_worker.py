@@ -5086,6 +5086,66 @@ class BatchGenWorker:
 			self._make_sync_context(), decode_uuids
 		)
 
+	def _handle_completed_decode_uuids(
+		self,
+		completed_uuids: Sequence[str],
+	) -> None:
+		if not completed_uuids:
+			return
+
+		completed_list = sorted(
+			dict.fromkeys(completed_uuids),
+			key=lambda uuid: (
+				self.global_batch.get_sequence(uuid).global_idx
+				if self.global_batch.get_sequence(uuid) is not None
+				else 2**63 - 1
+			),
+		)
+		self._submit_completed_to_incremental_writer(completed_list)
+		gathered_outputs = self._gather_completed_outputs(completed_list)
+
+		if self.enable_prefix_cache:
+			self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
+
+		my_completed = [
+			uuid for uuid in completed_list if uuid in self._uuid_to_local_map
+		]
+		if my_completed:
+			self._commit_prefix_cache_completed_pages(my_completed)
+			gpu_allocated = [
+				uuid for uuid in my_completed if uuid in self._sequences_with_gpu_kv
+			]
+			if gpu_allocated:
+				self._release_gpu_kv_pages(
+					self._get_local_indices_for_uuids(gpu_allocated)
+				)
+			self._release_host_kv_pages_for_batch(my_completed)
+
+		for uuid in completed_list:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.gpu_pages_allocated = 0
+				seq.host_pages_allocated = 0
+				seq.host_token_capacity = 0
+				self._sequences_with_gpu_kv.discard(uuid)
+
+		for uuid in completed_list:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None and seq.status == SequenceStatus.COMPLETED:
+				output = gathered_outputs.get(uuid, {})
+				self._report_completion(
+					uuid,
+					gathered_text=output.get("text"),
+					cached_tokens=output.get("cached_tokens"),
+				)
+			elif seq is not None:
+				logging.warning(
+					f"Rank {self.rank}: Skipping _report_completion for "
+					f"{uuid[:8]} (status={seq.status.name}, expected "
+					"COMPLETED). Likely stale eos_reached from pre-eviction "
+					"cycle."
+				)
+
 	# ============ Tokenization and Assignment ============
 
 	def _tokenize_global_batch(self) -> None:
@@ -6574,59 +6634,7 @@ class BatchGenWorker:
 
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
-					self._submit_completed_to_incremental_writer(list(global_completed))
-					# Gather decoded tokens and usage metadata from owning ranks
-					# before reporting. Each rank only writes its own sequences.
-					gathered_outputs = self._gather_completed_outputs(list(global_completed))
-					# ORDERING FIX: release resources BEFORE _report_completion
-					# pops local_map entries. See matching fix in _page_boundary_fast
-					# Phase 4.A and in the legacy decode path.
-					completed_list = list(global_completed)
-					if self.enable_prefix_cache:
-						self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
-					my_completed = [u for u in completed_list if u in self._uuid_to_local_map]
-					if my_completed:
-						self._commit_prefix_cache_completed_pages(my_completed)
-						# Only release GPU pages for seqs that were actually GPU-allocated.
-						# prefill_prepacked writes KV directly to host (never registers
-						# with the GPU paged manager), so zero-tok-EOS prefill completions
-						# are in _uuid_to_local_map but never in manager._sequences.
-						# _sequences_with_gpu_kv is the source-of-truth tracking set
-						# (added at :1619/:4904/:6191, discarded on release/eviction).
-						gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
-						if gpu_allocated:
-							self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-						self._release_host_kv_pages_for_batch(my_completed)
-					# All-ranks scalar cleanup
-					for uuid in completed_list:
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None:
-							seq.gpu_pages_allocated = 0
-							seq.host_pages_allocated = 0
-							seq.host_token_capacity = 0
-							self._sequences_with_gpu_kv.discard(uuid)
-					# Report completions (pops local_map; runs LAST).
-					# Guard: only report if status actually reached COMPLETED.
-					# _sync_completion_status_tensor may detect eos_reached=True
-					# for a PREFILLED sequence (stale from pre-eviction), but
-					# PREFILLED→COMPLETED is an invalid transition. Without this
-					# guard, _report_completion pops local_map for a sequence
-					# whose status never changed, creating an orphan.
-					for uuid in completed_list:
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None and seq.status == SequenceStatus.COMPLETED:
-							output = gathered_outputs.get(uuid, {})
-							self._report_completion(
-								uuid,
-								gathered_text=output.get("text"),
-								cached_tokens=output.get("cached_tokens"),
-							)
-						elif seq is not None:
-							logging.warning(
-								f"Rank {self.rank}: Skipping _report_completion for {uuid[:8]} "
-								f"(status={seq.status.name}, expected COMPLETED). "
-								f"Likely stale eos_reached from pre-eviction cycle."
-							)
+					self._handle_completed_decode_uuids(global_completed)
 
 				if not decode_uuids:
 					break
@@ -6709,6 +6717,9 @@ class BatchGenWorker:
 						new_tokens = torch.empty((0, 1), dtype=torch.int64, device=self.torch_device)
 
 					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
+				global_completed, decode_uuids = self._sync_completion_status_tensor(decode_uuids)
+				if global_completed:
+					self._handle_completed_decode_uuids(global_completed)
 				decoding_time += time.perf_counter() - decode_start
 
 				# D. Cleanup
