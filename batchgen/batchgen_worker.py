@@ -8082,6 +8082,10 @@ class BatchGenWorker:
 		try:
 			yield
 		finally:
+			AttnWrapperBase.retire_pending_prefill_offloads(
+				device=self.torch_device,
+				reason="end of prepack microbatch",
+			)
 			self._reset_prefill_prepack_runtime_state()
 			if prefix_materialization is not None:
 				try:
@@ -8385,6 +8389,10 @@ class BatchGenWorker:
 
 					layer_outputs = None
 					for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+						AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+							layer_idx,
+							device=self.torch_device,
+						)
 						layer_outputs = decoder_layer(
 							hidden_states,
 							attention_mask=None,
