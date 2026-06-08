@@ -5110,7 +5110,31 @@ class BatchGenWorker:
 		my_completed = [
 			uuid for uuid in completed_list if uuid in self._uuid_to_local_map
 		]
+		host_kv_stats_before = None
+		if my_completed and self.host_paged_kv_worker_view is not None:
+			host_kv_stats_before = self.host_paged_kv_worker_view.get_stats()
 		if my_completed:
+			if self.rank == 0 or self.prefix_cache_debug_stats:
+				global_ids = [
+					self.global_batch.get_sequence(uuid).global_idx
+					for uuid in my_completed
+					if self.global_batch.get_sequence(uuid) is not None
+				]
+				before_msg = ""
+				if host_kv_stats_before is not None:
+					before_msg = (
+						f" before_used={host_kv_stats_before.num_used_pages}"
+						f" before_free={host_kv_stats_before.num_free_pages}"
+						f" total={host_kv_stats_before.num_total_pages}"
+					)
+				logging.info(
+					"[DECODE_RELEASE] Rank %s: releasing completed host KV "
+					"local=%d global_ids_sample=%s%s",
+					self.rank,
+					len(my_completed),
+					global_ids[:8],
+					before_msg,
+				)
 			self._commit_prefix_cache_completed_pages(my_completed)
 			gpu_allocated = [
 				uuid for uuid in my_completed if uuid in self._sequences_with_gpu_kv
@@ -5120,6 +5144,17 @@ class BatchGenWorker:
 					self._get_local_indices_for_uuids(gpu_allocated)
 				)
 			self._release_host_kv_pages_for_batch(my_completed)
+			if self.rank == 0 or self.prefix_cache_debug_stats:
+				stats_after = self.host_paged_kv_worker_view.get_stats()
+				logging.info(
+					"[DECODE_RELEASE] Rank %s: completed host KV release "
+					"local=%d after_used=%d after_free=%d total=%d",
+					self.rank,
+					len(my_completed),
+					stats_after.num_used_pages,
+					stats_after.num_free_pages,
+					stats_after.num_total_pages,
+				)
 
 		for uuid in completed_list:
 			seq = self.global_batch.get_sequence(uuid)
@@ -8669,46 +8704,7 @@ class BatchGenWorker:
 		completed_uuids = decisions.completed_uuids
 		if completed_uuids:
 			self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
-			# Incremental write: gather completed tokens to rank 0
-			self._submit_completed_to_incremental_writer(completed_uuids)
-			# Gather decoded tokens and usage metadata from owning ranks before reporting
-			gathered_outputs = self._gather_completed_outputs(completed_uuids)
-
-			# Release resources on owners BEFORE popping local_map entries via
-			# _report_completion (see ordering fix note above).
-			my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
-			if my_completed:
-				self._commit_prefix_cache_completed_pages(my_completed)
-				# Only release GPU pages for seqs that were actually GPU-allocated.
-				# See note at the matching site (~line 5435) — zero-tok-EOS
-				# prefill completions are in _uuid_to_local_map but never
-				# registered with the GPU paged manager.
-				gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
-				if gpu_allocated:
-					self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
-				self._release_host_kv_pages_for_batch(my_completed)
-
-			# All-ranks: zero scalar counters so downstream reads (e.g.
-			# migration planning iterating all sequences) never see a stale
-			# non-zero page count for completed sequences.
-			for uuid in completed_uuids:
-				seq = self.global_batch.get_sequence(uuid)
-				if seq is not None:
-					seq.gpu_pages_allocated = 0
-					seq.host_pages_allocated = 0
-					seq.host_token_capacity = 0
-					self._sequences_with_gpu_kv.discard(uuid)
-
-			# Report completions (this is what pops local_map on the owner).
-			# Must run LAST so the _release_*_pages calls above see the
-			# correct local_map state.
-			for uuid in completed_uuids:
-				output = gathered_outputs.get(uuid, {})
-				self._report_completion(
-					uuid,
-					gathered_text=output.get("text"),
-					cached_tokens=output.get("cached_tokens"),
-				)
+			self._handle_completed_decode_uuids(completed_uuids)
 			# Report completions to adaptive chunk sizer
 			if self.adaptive_chunk_sizer is not None:
 				for uuid in completed_uuids:
