@@ -128,6 +128,56 @@ def marlin_grouped_stage1_fused(
     )
 
 
+def single_expert_marlin_decode(
+    x: torch.Tensor,
+    gate_qw: torch.Tensor, gate_scale: torch.Tensor,
+    up_qw: torch.Tensor, up_scale: torch.Tensor,
+    down_qw: torch.Tensor, down_scale: torch.Tensor,
+    N: int, K: int,
+) -> torch.Tensor:
+    """Grouped-Marlin W4A16 decode for ONE expert (E=1), for streamed/offloaded experts.
+
+    The fused decode kernel is the same one the persistent path uses; here it runs over a
+    single expert with `expert_starts=[0]`, `expert_counts=[t]`. The weight tensors come
+    straight from the weight-buffer slot in **Marlin layout** — the kernel only reads their
+    `.data_ptr()` (tensor .shape is ignored), so no Marlin->raw transform / reshape is needed.
+
+    Args:
+        x: [t, K] BF16 gathered tokens routed to this expert.
+        *_qw / *_scale: the expert's Marlin INT4 packed weights (int32) + BF16 scales.
+        N: moe_intermediate_size; K: hidden_size.
+    Returns: [t, K] BF16.
+    """
+    mod = _load_module()
+    device = x.device
+    t = x.shape[0]
+    x = x.contiguous()
+
+    def _p(tensor):
+        return torch.tensor([tensor.data_ptr()], dtype=torch.int64, device=device)
+
+    gate_B, up_B, down_B = _p(gate_qw), _p(up_qw), _p(down_qw)
+    gate_sB, up_sB, down_sB = _p(gate_scale), _p(up_scale), _p(down_scale)
+    expert_starts = torch.zeros(1, dtype=torch.int32, device=device)
+    expert_counts = torch.tensor([t], dtype=torch.int32, device=device)
+    intermediate = torch.empty(t, N, dtype=torch.bfloat16, device=device)
+    expert_out = torch.empty(t, K, dtype=torch.bfloat16, device=device)
+    s1_C, s3_C = _p(intermediate), _p(expert_out)
+    s1_ws = torch.zeros(N // 256 + 17, dtype=torch.int32, device=device)
+    s3_ws = torch.zeros(K // 256 + 17, dtype=torch.int32, device=device)
+    max_m_tiles = (t + 15) // 16
+
+    # Stage 1: fused gate + up + SiLU -> intermediate [t, N]
+    mod.grouped_marlin_gemm_m16_s1(
+        x, gate_B, up_B, s1_C, gate_sB, up_sB,
+        expert_starts, expert_counts, 1, N, K, s1_ws, N // 256, max_m_tiles)
+    # Stage 3: down -> expert_out [t, K]
+    mod.grouped_marlin_gemm_m16(
+        intermediate, down_B, s3_C, down_sB, expert_starts, expert_counts,
+        1, K, N, s3_ws, 1, K // 256, max_m_tiles)
+    return expert_out
+
+
 def marlin_grouped_stage1_unified(
     dispatched_x_3d: torch.Tensor,
     intermediate_3d: torch.Tensor,
