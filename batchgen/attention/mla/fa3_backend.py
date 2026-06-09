@@ -618,11 +618,12 @@ def w8a16_gemm(
 	# act_quant now routes bf16 inputs to the validated batchgen_kernels quant;
 	# non-bf16 / empty sub-batches fall back to the legacy in-file Triton path.
 	x_fp8 = act_quant(x)
-	# disable_ue8m0_cast removed — on Hopper (SM90) the flag is a no-op
-	# (layout.hpp:22 early-exits for arch_major==9 regardless), and omitting
-	# lets DeepGEMM's default handling apply (same as SGLang). This also
-	# ensures Blackwell upgrade path uses UE8M0 natively when appropriate.
-	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out)
+	# disable_ue8m0_cast=True: use DeepGEMM's regular blockwise-FP8 scale path.
+	# The default (False) selects the UE8M0/MXFP8 path on Blackwell (sm_100), which
+	# expects UE8M0 (power-of-2) scales that act_quant / checkpoint scale_inv do NOT
+	# provide -> all-NaN output (verified on B200). True is a no-op on Hopper.
+	# Matches w8a8_deepgemm.py. See batchgen_design/blackwell/numerical_debug_plan.md.
+	deep_gemm.fp8_gemm_nt(x_fp8, y_fp8, out, disable_ue8m0_cast=True)
 	if activation_bf16.dim() == 3:
 		out = out.view(n_group, l, n)
 	else:
@@ -654,7 +655,9 @@ def w8a16_gemm_dequant(
 	x = activation_bf16.view(-1, activation_bf16.size(-1))
 	out = torch.mm(x, weight_bf16.T)
 	if is_3d:
-		out = out.view(n_group, l, -1)
+		# explicit N (not -1): -1 is ambiguous for 0-element / empty sub-batches
+		# (ranks with 0 tokens), which the deep_gemm path avoided via explicit n.
+		out = out.view(n_group, l, out.size(-1))
 	return out
 
 
