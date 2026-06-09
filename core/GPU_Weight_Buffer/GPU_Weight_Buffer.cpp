@@ -110,6 +110,13 @@ void GPU_Weight_Buffer::Init() {
                 this->engine_config_.basic_config,
                 module_type,
                 buffer_name);
+            // FP4 (float4_e2m1fn_x2) is a packed storage dtype with no CUDA
+            // fill/zero kernel; store it as uint8 (same byte layout, same shape)
+            // and let the dequant path re-view it. Buffers are fully overwritten
+            // by the checkpoint copy, so empty() is correct and avoids fill_cuda.
+            if (tensor_dtype == torch::kFloat4_e2m1fn_x2) {
+                tensor_dtype = torch::kUInt8;
+            }
             auto options =
                 torch::TensorOptions()
                     .dtype(tensor_dtype)
@@ -119,7 +126,7 @@ void GPU_Weight_Buffer::Init() {
             for (int64_t buffer_idx = 0; buffer_idx < num_buffer;
                  buffer_idx++) {
                 this->buffers_[module_type][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
+                    torch::empty(buffer_shape, options);
             }
         }
     }
@@ -145,6 +152,9 @@ void GPU_Weight_Buffer::resize_buffer() {
                     this->engine_config_.basic_config,
                     "routed_expert",
                     buffer_name);
+                if (tensor_dtype == torch::kFloat4_e2m1fn_x2) {
+                    tensor_dtype = torch::kUInt8;
+                }
                 auto options =
                     torch::TensorOptions()
                         .dtype(tensor_dtype)
@@ -152,7 +162,7 @@ void GPU_Weight_Buffer::resize_buffer() {
                                 this->engine_config_.basic_config.device)
                         .requires_grad(false)
                         .memory_format(torch::MemoryFormat::Contiguous);
-                new_buffer[buffer_name] = torch::zeros(buffer_shape, options);
+                new_buffer[buffer_name] = torch::empty(buffer_shape, options);
             }
             this->buffers_["routed_expert"].push_back(new_buffer);
             this->buffer_status_["routed_expert"].push_back(0);
@@ -583,6 +593,9 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 this->engine_config_.basic_config,
                 "routed_expert",
                 buffer_name);
+            if (tensor_dtype == torch::kFloat4_e2m1fn_x2) {
+                tensor_dtype = torch::kUInt8;
+            }
             auto options = torch::TensorOptions()
                 .dtype(tensor_dtype)
                 .device(torch::kCUDA, this->engine_config_.basic_config.device)
@@ -590,7 +603,7 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
                 .memory_format(torch::MemoryFormat::Contiguous);
             for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
                 this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
+                    torch::empty(buffer_shape, options);
             }
         }
 
@@ -835,6 +848,9 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 this->engine_config_.basic_config,
                 "routed_expert",
                 buffer_name);
+            if (tensor_dtype == torch::kFloat4_e2m1fn_x2) {
+                tensor_dtype = torch::kUInt8;
+            }
             auto options = torch::TensorOptions()
                 .dtype(tensor_dtype)
                 .device(torch::kCUDA, this->engine_config_.basic_config.device)
@@ -842,7 +858,7 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
                 .memory_format(torch::MemoryFormat::Contiguous);
             for (int64_t buffer_idx = 0; buffer_idx < num_buffers["routed_expert"]; buffer_idx++) {
                 this->buffers_["routed_expert"][buffer_idx][buffer_name] =
-                    torch::zeros(buffer_shape, options);
+                    torch::empty(buffer_shape, options);
             }
         }
 

@@ -267,6 +267,108 @@ class DeepSeekV4Compressor(nn.Module):
             output = hidden_states.new_empty(0, self.head_dim)
         return output, kv_state, score_state
 
+    def forward_decode_batch(
+        self,
+        hidden_states: torch.Tensor,
+        kv_state: torch.Tensor,
+        score_state: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                f"hidden_states must be [B,H], got {tuple(hidden_states.shape)}"
+            )
+        return_flat_state = False
+        if kv_state.ndim == 3 and score_state.ndim == 3:
+            return_flat_state = True
+            kv_state = kv_state.view(
+                kv_state.shape[0],
+                self.compress_ratio,
+                self.coeff,
+                self.head_dim,
+            )
+            score_state = score_state.view(
+                score_state.shape[0],
+                self.compress_ratio,
+                self.coeff,
+                self.head_dim,
+            )
+        elif kv_state.ndim != 4 or score_state.ndim != 4:
+            raise ValueError(
+                "kv_state and score_state must be [B,R,C*D] or [B,R,C,D]"
+            )
+        if hidden_states.shape[0] != kv_state.shape[0]:
+            raise ValueError("hidden_states and state batch sizes must match")
+        positions = positions.to(device=hidden_states.device, dtype=torch.long)
+        kv = _runtime_linear(
+            hidden_states, self.wkv_weight, self.wkv_scale, "wkv"
+        )
+        gate = _runtime_linear(
+            hidden_states, self.wgate_weight, self.wgate_scale, "wgate"
+        )
+        batch_ids = torch.arange(
+            hidden_states.shape[0],
+            device=hidden_states.device,
+            dtype=torch.long,
+        )
+        slots = torch.remainder(positions, self.compress_ratio)
+        kv_state[batch_ids, slots] = kv.to(kv_state.dtype).view(
+            hidden_states.shape[0], self.coeff, self.head_dim
+        )
+        gate_view = gate.to(score_state.dtype).view(
+            hidden_states.shape[0], self.coeff, self.head_dim
+        )
+        if self.overlap:
+            score_state[batch_ids, slots] = gate_view
+        else:
+            score_state[batch_ids, slots] = gate_view + self.ape[
+                slots
+            ].unsqueeze(1)
+
+        emit_mask = slots == (self.compress_ratio - 1)
+        if bool(emit_mask.any()):
+            chunk_pos = (
+                torch.div(
+                    positions[emit_mask],
+                    self.compress_ratio,
+                    rounding_mode="floor",
+                )
+                * self.compress_ratio
+            )
+            if self.overlap:
+                output = self._compress_chunks(
+                    kv_state[emit_mask],
+                    score_state[emit_mask],
+                    chunk_pos,
+                    cos_sin_cache,
+                )
+            else:
+                pooled = (
+                    kv_state[emit_mask].float()
+                    * torch.softmax(score_state[emit_mask].float(), dim=1)
+                ).sum(dim=1)
+                pooled = pooled.reshape(
+                    pooled.shape[0], self.coeff * self.head_dim
+                )
+                pooled = self.norm(pooled)
+                pooled = self._apply_rope(pooled, chunk_pos, cos_sin_cache)
+                output = self._maybe_rotate(pooled)
+        else:
+            output = hidden_states.new_empty(0, self.head_dim)
+        if return_flat_state:
+            kv_state = kv_state.reshape(
+                kv_state.shape[0],
+                self.compress_ratio,
+                self.coeff * self.head_dim,
+            )
+            score_state = score_state.reshape(
+                score_state.shape[0],
+                self.compress_ratio,
+                self.coeff * self.head_dim,
+            )
+        return output, kv_state, score_state, emit_mask
+
     def seed_decode_state(
         self,
         hidden_states: torch.Tensor,

@@ -8,13 +8,18 @@ Usage:
     from batchgen_kernels.moe.grouped_mxfp4 import grouped_mxfp4_stage1_swiglu
 """
 
-from batchgen_kernels._version import __version__, __version_full__, version_info
-
-import os
 import importlib
 import logging
+import os
 
 import torch
+
+from batchgen_kernels._jit_registry import get_registry
+from batchgen_kernels._version import (
+    __version__,
+    __version_full__,
+    version_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +41,15 @@ def load_extension(module_name: str):
         if not _DEV_MODE:
             raise
 
-    logger.warning(f"[DEV] AOT import failed for {module_name}, attempting JIT...")
+    logger.warning(
+        f"[DEV] AOT import failed for {module_name}, attempting JIT..."
+    )
     return _jit_compile(module_name)
 
 
 def _jit_compile(module_name: str):
     """JIT compile a CUDA extension from source (dev mode only)."""
     from torch.utils.cpp_extension import load as jit_load
-    from batchgen_kernels._jit_registry import get_registry
 
     registry = get_registry()
     if module_name not in registry:
@@ -55,14 +61,31 @@ def _jit_compile(module_name: str):
     cfg = registry[module_name]
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     sources = [os.path.join(pkg_dir, s) for s in cfg["sources"]]
-    include_dirs = [os.path.join(pkg_dir, d) for d in cfg.get("include_dirs", [])]
+    include_dirs = [
+        os.path.join(pkg_dir, d) for d in cfg.get("include_dirs", [])
+    ]
 
     short_name = module_name.rsplit(".", 1)[-1]
+    nvcc_flags = list(cfg.get("nvcc_flags", []))
+    if (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 12
+    ):
+        nvcc_flags = [
+            "-arch=sm_120" if flag == "-arch=sm_90a" else flag
+            for flag in nvcc_flags
+        ]
+        nvcc_flags = [
+            "arch=compute_120,code=sm_120"
+            if flag == "arch=compute_90a,code=sm_90a"
+            else flag
+            for flag in nvcc_flags
+        ]
 
     return jit_load(
         name=short_name,
         sources=sources,
-        extra_cuda_cflags=cfg.get("nvcc_flags", []),
+        extra_cuda_cflags=nvcc_flags,
         extra_cflags=cfg.get("cxx_flags", ["-O3"]),
         extra_include_paths=include_dirs,
         verbose=True,
@@ -74,7 +97,9 @@ def get_device_arch() -> str:
     if not torch.cuda.is_available():
         raise RuntimeError("batchgen_kernels requires CUDA")
     cc = torch.cuda.get_device_capability()
-    if cc[0] >= 10:
+    if cc[0] == 12:
+        return "sm120"
+    elif cc[0] >= 10:
         return "sm100"
     elif cc[0] >= 9:
         return "sm90a"

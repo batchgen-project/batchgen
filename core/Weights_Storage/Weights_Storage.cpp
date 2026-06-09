@@ -209,6 +209,9 @@ py::dict Weights_Storage::get_tensor(std::string module_key) {
         } else if (tb.dtype == "float8_e4m3fn") {
             torch_dtype = torch::kFloat8_e4m3fn;
             resolved_dtype_name = "float8_e4m3fn";
+        } else if (tb.dtype == "float8_e8m0fnu") {
+            torch_dtype = torch::kFloat8_e8m0fnu;
+            resolved_dtype_name = "float8_e8m0fnu";
         } else if (tb.dtype == "float32") {
             torch_dtype = torch::kFloat32;
             resolved_dtype_name = "float32";

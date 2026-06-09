@@ -54,6 +54,7 @@ torch::ScalarType str_to_torch_dtype(const std::string& dtype_str) {
         {"bfloat16", torch::kBFloat16},
         {"float8_e4m3fn", torch::kFloat8_e4m3fn},
         {"float8_e5m2", torch::kFloat8_e5m2},
+        {"float8_e8m0fnu", torch::kFloat8_e8m0fnu},
         {"uint8", torch::kUInt8}
     };
 

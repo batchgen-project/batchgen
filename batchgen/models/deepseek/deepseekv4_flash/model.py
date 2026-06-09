@@ -21,6 +21,8 @@ strategy manager assigns to per-rank expert-parallel ranges.
 from __future__ import annotations
 
 import math
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -29,10 +31,31 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from batchgen.models.wrappers.attention import AttnWrapperBase
+from batchgen.timing import get_decode_timer, init_decode_timer
 from batchgen_kernels.common.v4_hyper_connections import hc_post, hc_pre
 from batchgen_kernels.moe.v4_hash_routing import hash_routing
 from batchgen_kernels.moe.v4_sqrtsoftplus_topk import sqrtsoftplus_topk
 
+# Per-op decode timing (BATCHGEN_DECODE_TIMING=1). Initializes the shared
+# decode-timer singleton consumed here and in wrappers.py via
+# get_decode_timer(). Categories only control summary display ordering;
+# any op_name is accepted at record time. Disabled timer => pure no-op.
+_V4_DECODE_TIMER_CATEGORIES = [
+    "self_attn",
+    "moe",
+    "attn_q_proj",
+    "attn_kv_proj",
+    "attn_indexer",
+    "attn_backend",
+    "attn_o_proj",
+    "moe_allgather",
+    "moe_gate",
+    "moe_expert_loop",
+    "moe_allreduce",
+    "moe_shared",
+]
+init_decode_timer("DeepSeek-V4-Flash", _V4_DECODE_TIMER_CATEGORIES)
 
 _FP4_E2M1_TABLE_VALUES = (
     0.0,
@@ -52,6 +75,623 @@ _FP4_E2M1_TABLE_VALUES = (
     -4.0,
     -6.0,
 )
+
+# Env-gated grouped-MoE for sm120 decode (default OFF). When enabled,
+# _run_owned_experts uses the 3D grouped MXFP4 GEMM path instead of the
+# per-expert loop, and owned experts are made resident (see PSM persistence).
+_V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
+_V4_GROUPED_MOE_MAX_TOKENS = int(
+    os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
+)
+# Use PyNcclCommunicator for EP-decode collectives instead of torch.distributed
+# (default ON; set 0 to fall back to dist.*). See _ep_all_gather.
+_V4_PYNCCL_COMM = os.environ.get("BATCHGEN_V4_PYNCCL_COMM", "1") == "1"
+
+# Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
+_V4_DIVTRACE = os.environ.get("BATCHGEN_V4_DIVTRACE", "0") == "1"
+_V4_DIVTRACE_DUMP_PATH = "/data3/leyangxue/v4-repro-artifacts"
+_V4_DIVTRACE_FFN_ATTRIB_LAYERS = {4, 5, 6}
+_V4_DIVTRACE_MOE_INTERNALS_LAYERS = {4, 5, 6}
+_v4_divtrace_calls: dict[int, int] = {}
+_v4_divtrace_active_layers: set[int] = set()
+_v4_divtrace_final_calls = 0
+_v4_divtrace_batch_note_emitted = False
+_v4_divtrace_records: list[dict[str, Any]] = []
+_v4_divtrace_dump_written = False
+
+
+def vocab_parallel_embedding(
+    embed: nn.Embedding,
+    input_ids: torch.Tensor,
+    full_vocab_size: int,
+) -> torch.Tensor:
+    """Embedding lookup that tolerates a vocab-parallel sharded table.
+
+    The V4 checkpoint shards embed_tokens by vocab across TP ranks: each rank
+    holds rows [rank*local, (rank+1)*local) of the full vocab. A naive
+    ``embed(global_id)`` then indexes out of bounds. When the loaded table is a
+    shard (rows < full_vocab_size), restrict to this rank's id range, look up
+    locally, zero out-of-range rows, and all-reduce the partial embeddings.
+    When the table is full (rows == full_vocab_size), this is a plain lookup.
+    """
+    local_vocab = embed.weight.shape[0]
+    if local_vocab >= full_vocab_size or not dist.is_initialized():
+        return embed(input_ids)
+    world_size = dist.get_world_size()
+    if local_vocab * world_size < full_vocab_size:
+        return embed(input_ids)
+
+    original_shape = input_ids.shape
+    flat_ids = input_ids.reshape(-1).contiguous()
+    local_rows = torch.tensor(
+        [flat_ids.shape[0]], dtype=torch.int64, device=input_ids.device
+    )
+    row_counts = [torch.empty_like(local_rows) for _ in range(world_size)]
+    dist.all_gather(row_counts, local_rows)
+    row_counts_int = [int(count.item()) for count in row_counts]
+    max_rows = max(row_counts_int)
+    if max_rows == 0:
+        return embed.weight.new_empty(*original_shape, embed.weight.shape[1])
+
+    if flat_ids.shape[0] < max_rows:
+        pad = flat_ids.new_zeros(max_rows - flat_ids.shape[0])
+        padded_ids = torch.cat([flat_ids, pad], dim=0)
+    else:
+        padded_ids = flat_ids
+
+    gathered_ids = [torch.empty_like(padded_ids) for _ in range(world_size)]
+    dist.all_gather(gathered_ids, padded_ids)
+    global_ids = torch.cat(
+        [ids[:count] for ids, count in zip(gathered_ids, row_counts_int)],
+        dim=0,
+    )
+
+    start = dist.get_rank() * local_vocab
+    mask = (global_ids >= start) & (global_ids < start + local_vocab)
+    local_ids = torch.where(
+        mask, global_ids - start, torch.zeros_like(global_ids)
+    )
+    out = embed(local_ids)
+    out = out * mask.unsqueeze(-1).to(out.dtype)
+    dist.all_reduce(out, op=dist.ReduceOp.SUM)
+    rank = dist.get_rank()
+    row_start = sum(row_counts_int[:rank])
+    row_end = row_start + row_counts_int[rank]
+    return out[row_start:row_end].reshape(
+        *original_shape, embed.weight.shape[1]
+    )
+
+
+def vocab_parallel_lm_head(
+    lm_head: nn.Linear,
+    hidden_states: torch.Tensor,
+    full_vocab_size: int,
+    force_fp32: bool = False,
+) -> torch.Tensor:
+    """LM-head projection for vocab-parallel V4 checkpoint shards.
+
+    V4 shards ``head.weight`` across the vocab dimension.  Each rank computes
+    local logits for its shard, then all ranks gather those local logits in rank
+    order so downstream sampling sees global token ids.
+    """
+    local_vocab = lm_head.weight.shape[0]
+    if local_vocab == full_vocab_size:
+        if force_fp32:
+            bias = lm_head.bias.float() if lm_head.bias is not None else None
+            return F.linear(hidden_states.float(), lm_head.weight.float(), bias)
+        return F.linear(hidden_states, lm_head.weight, lm_head.bias)
+
+    if local_vocab > full_vocab_size:
+        raise RuntimeError(
+            f"lm_head rows {local_vocab} exceed full vocab {full_vocab_size}"
+        )
+    if not dist.is_initialized():
+        raise RuntimeError(
+            "vocab-parallel lm_head requires torch.distributed to be initialized"
+        )
+
+    world_size = dist.get_world_size()
+    if local_vocab * world_size != full_vocab_size:
+        raise RuntimeError(
+            "invalid vocab-parallel lm_head layout: "
+            f"local={local_vocab}, world_size={world_size}, "
+            f"full_vocab={full_vocab_size}"
+        )
+
+    original_shape = hidden_states.shape[:-1]
+    hidden_size = hidden_states.shape[-1]
+    local_hidden = hidden_states.reshape(-1, hidden_size).contiguous()
+    local_rows = torch.tensor(
+        [local_hidden.shape[0]], dtype=torch.int64, device=hidden_states.device
+    )
+    row_counts = [torch.empty_like(local_rows) for _ in range(world_size)]
+    dist.all_gather(row_counts, local_rows)
+    row_counts_int = [int(count.item()) for count in row_counts]
+    max_rows = max(row_counts_int)
+    if max_rows == 0:
+        return hidden_states.new_empty(*original_shape, full_vocab_size)
+
+    if local_hidden.shape[0] < max_rows:
+        pad = local_hidden.new_zeros(
+            max_rows - local_hidden.shape[0], hidden_size
+        )
+        padded_hidden = torch.cat([local_hidden, pad], dim=0)
+    else:
+        padded_hidden = local_hidden
+
+    gathered_hidden = [
+        torch.empty_like(padded_hidden) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered_hidden, padded_hidden)
+    global_hidden = torch.cat(
+        [rows[:count] for rows, count in zip(gathered_hidden, row_counts_int)],
+        dim=0,
+    )
+
+    if force_fp32:
+        bias = lm_head.bias.float() if lm_head.bias is not None else None
+        local_logits = F.linear(
+            global_hidden.float(), lm_head.weight.float(), bias
+        )
+    else:
+        local_logits = F.linear(global_hidden, lm_head.weight, lm_head.bias)
+    gathered_logits = [
+        torch.empty_like(local_logits) for _ in range(world_size)
+    ]
+    dist.all_gather(gathered_logits, local_logits.contiguous())
+    global_logits = torch.cat(gathered_logits, dim=-1)
+
+    rank = dist.get_rank()
+    start = sum(row_counts_int[:rank])
+    end = start + row_counts_int[rank]
+    return global_logits[start:end].reshape(*original_shape, full_vocab_size)
+
+
+def _v4_divtrace_note(message: str) -> None:
+    print(f"[V4_DIVTRACE] {message}", flush=True)
+
+
+def _v4_divtrace_note_batch_skip(batch_size: int) -> None:
+    global _v4_divtrace_batch_note_emitted
+    if _v4_divtrace_batch_note_emitted:
+        return
+    _v4_divtrace_batch_note_emitted = True
+    _v4_divtrace_note(f"skip trace: batch size {batch_size} < 1")
+
+
+def _v4_divtrace_rank() -> int:
+    if dist.is_initialized():
+        return int(dist.get_rank())
+    return 0
+
+
+def _v4_divtrace_sequence_ids() -> Optional[list[int]]:
+    cur_batch = getattr(AttnWrapperBase, "cur_batch", None)
+    if cur_batch is None:
+        return None
+    if isinstance(cur_batch, torch.Tensor):
+        return [int(v) for v in cur_batch.detach().cpu().tolist()]
+    try:
+        return [int(v) for v in cur_batch]
+    except TypeError:
+        return None
+
+
+def _v4_divtrace_cache_seqlens(
+    cache_seqlens: Optional[torch.Tensor],
+) -> Optional[list[int]]:
+    source = cache_seqlens
+    if source is None:
+        source = getattr(AttnWrapperBase, "cache_seqlens", None)
+    if source is None:
+        return None
+    if isinstance(source, torch.Tensor):
+        return [int(v) for v in source.detach().cpu().tolist()]
+    try:
+        return [int(v) for v in source]
+    except TypeError:
+        return None
+
+
+def _v4_divtrace_metadata(
+    cache_seqlens: Optional[torch.Tensor],
+    batch_idx: int = 0,
+) -> dict[str, Optional[int]]:
+    seq_id = None
+    sequence_ids = _v4_divtrace_sequence_ids()
+    if sequence_ids is not None and batch_idx < len(sequence_ids):
+        seq_id = int(sequence_ids[batch_idx])
+    cache_seqlen = None
+    cache_seqlens_list = _v4_divtrace_cache_seqlens(cache_seqlens)
+    if cache_seqlens_list is not None and batch_idx < len(cache_seqlens_list):
+        cache_seqlen = int(cache_seqlens_list[batch_idx])
+    return {"seq_id": seq_id, "cache_seqlen": cache_seqlen}
+
+
+def _v4_divtrace_append(record: dict[str, Any]) -> None:
+    _v4_divtrace_records.append(record)
+
+
+def _v4_divtrace_dump_tensor(
+    layer_idx: int,
+    name: str,
+    tensor: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor],
+) -> None:
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    _v4_divtrace_append(
+        {
+            "kind": "boundary",
+            "rank": _v4_divtrace_rank(),
+            "layer_idx": int(layer_idx),
+            "name": name,
+            "seq_id": meta["seq_id"],
+            "cache_seqlen": meta["cache_seqlen"],
+            "tensor": tensor[:1].detach().to(torch.float32).cpu().clone(),
+        }
+    )
+
+
+def _v4_divtrace_flush() -> None:
+    global _v4_divtrace_dump_written
+    if _v4_divtrace_dump_written:
+        return
+    os.makedirs(_V4_DIVTRACE_DUMP_PATH, exist_ok=True)
+    rank = _v4_divtrace_rank()
+    path = os.path.join(_V4_DIVTRACE_DUMP_PATH, f"divtrace_rank{rank}.pt")
+    torch.save(_v4_divtrace_records, path)
+    _v4_divtrace_dump_written = True
+    _v4_divtrace_note(
+        f"wrote {len(_v4_divtrace_records)} trace records to {path}"
+    )
+
+
+def _v4_divtrace_is_decode_token(
+    tensor: torch.Tensor,
+    past_key_value: Optional[Tuple[torch.Tensor, ...]],
+) -> bool:
+    del past_key_value
+    return tensor.dim() >= 2 and tensor.size(1) == 1
+
+
+def _v4_divtrace_begin_layer(
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    past_key_value: Optional[Tuple[torch.Tensor, ...]],
+) -> bool:
+    if not _v4_divtrace_is_decode_token(hidden_states, past_key_value):
+        return False
+    if hidden_states.size(0) < 1:
+        _v4_divtrace_note_batch_skip(hidden_states.size(0))
+        return False
+    if _v4_divtrace_calls.get(layer_idx, 0) > 0:
+        return False
+    _v4_divtrace_active_layers.add(layer_idx)
+    return True
+
+
+def _v4_divtrace_end_layer(layer_idx: int) -> None:
+    _v4_divtrace_active_layers.discard(layer_idx)
+    _v4_divtrace_calls[layer_idx] = _v4_divtrace_calls.get(layer_idx, 0) + 1
+
+
+def _v4_divtrace_should_trace_final(
+    hidden_states: torch.Tensor,
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor, ...], ...]],
+) -> bool:
+    global _v4_divtrace_final_calls
+    if not _v4_divtrace_is_decode_token(hidden_states, past_key_values):
+        return False
+    if hidden_states.size(0) < 1:
+        _v4_divtrace_note_batch_skip(hidden_states.size(0))
+        return False
+    if _v4_divtrace_final_calls > 0:
+        return False
+    _v4_divtrace_final_calls += 1
+    return True
+
+
+def _v4_divtrace_tensor_summary(
+    tensor: torch.Tensor,
+) -> tuple[float, float, float, bool]:
+    flat = tensor.detach().to(torch.float32).reshape(-1)
+    abs_mean = flat.abs().mean().item()
+    rms = flat.square().mean().sqrt().item()
+    max_abs = flat.abs().max().item()
+    finite = bool(torch.isfinite(flat).all().item())
+    return abs_mean, rms, max_abs, finite
+
+
+def _v4_divtrace_l2_rms_max_abs(tensor: torch.Tensor) -> dict[str, float]:
+    flat = tensor.detach().to(torch.float32).reshape(-1)
+    return {
+        "l2": float(torch.linalg.vector_norm(flat).item()),
+        "rms": float(flat.square().mean().sqrt().item()),
+        "max_abs": float(flat.abs().max().item()),
+    }
+
+
+def _v4_divtrace_stats(tensor: torch.Tensor) -> dict[str, float | int]:
+    flat = tensor.detach().to(torch.float32).reshape(-1)
+    if flat.numel() == 0:
+        return {
+            "l2": 0.0,
+            "rms": 0.0,
+            "max_abs": 0.0,
+            "mean": 0.0,
+            "nan_count": 0,
+            "inf_count": 0,
+        }
+
+    finite = torch.isfinite(flat)
+    finite_flat = flat[finite]
+    if finite_flat.numel() == 0:
+        mean = float("nan")
+        rms = float("nan")
+        max_abs = float("nan")
+        l2 = float("nan")
+    else:
+        mean = float(finite_flat.mean().item())
+        rms = float(finite_flat.square().mean().sqrt().item())
+        max_abs = float(finite_flat.abs().max().item())
+        l2 = float(torch.linalg.vector_norm(finite_flat).item())
+    return {
+        "l2": l2,
+        "rms": rms,
+        "max_abs": max_abs,
+        "mean": mean,
+        "nan_count": int(torch.isnan(flat).sum().item()),
+        "inf_count": int(torch.isinf(flat).sum().item()),
+    }
+
+
+def _v4_divtrace_first_row(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 0:
+        return tensor.detach().to(torch.float32).reshape(1, 1).cpu().clone()
+    last_dim = tensor.shape[-1]
+    return (
+        tensor.detach()
+        .to(torch.float32)
+        .reshape(-1, last_dim)[:1]
+        .cpu()
+        .clone()
+    )
+
+
+def _v4_divtrace_segment_norms(
+    tensor: torch.Tensor, segment_size: int
+) -> list[dict[str, float | int]]:
+    rows = tensor.detach().to(torch.float32).reshape(-1, tensor.shape[-1])
+    if segment_size <= 0:
+        return []
+    out: list[dict[str, float | int]] = []
+    for segment_idx, start in enumerate(range(0, rows.size(0), segment_size)):
+        segment = rows[start : start + segment_size]
+        stats = _v4_divtrace_stats(segment)
+        out.append(
+            {
+                "segment_idx": int(segment_idx),
+                "rows": int(segment.size(0)),
+                "l2": float(stats["l2"]),
+                "rms": float(stats["rms"]),
+                "max_abs": float(stats["max_abs"]),
+            }
+        )
+    return out
+
+
+def _v4_divtrace_cross_summary(
+    tensor_a: torch.Tensor,
+    tensor_b: torch.Tensor,
+) -> tuple[float, float]:
+    a = tensor_a.detach().to(torch.float32).reshape(-1)
+    b = tensor_b.detach().to(torch.float32).reshape(-1)
+    diff = a - b
+    rel_l2 = (
+        torch.linalg.vector_norm(diff) / (torch.linalg.vector_norm(a) + 1e-6)
+    ).item()
+    cosine = F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0), dim=1).item()
+    return rel_l2, cosine
+
+
+def _v4_divtrace_emit_boundary(
+    layer_idx: int,
+    name: str,
+    tensor: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor] = None,
+) -> None:
+    first = tensor[0]
+    abs_mean, rms, max_abs, finite = _v4_divtrace_tensor_summary(first)
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    _v4_divtrace_dump_tensor(layer_idx, name, tensor, cache_seqlens)
+    _v4_divtrace_note(
+        f"layer={layer_idx:02d} {name} "
+        f"rank={_v4_divtrace_rank()} "
+        f"seq_id={meta['seq_id']} cache_seqlen={meta['cache_seqlen']} "
+        f"abs_mean={abs_mean:.6e},rms={rms:.6e},max_abs={max_abs:.6e},finite={int(finite)}"
+    )
+
+
+def _v4_divtrace_emit_router(
+    layer_idx: int,
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor] = None,
+) -> None:
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    ids = topk_indices[0].detach().to(torch.int64).cpu().tolist()
+    weights = [
+        float(v)
+        for v in topk_weights[0].detach().to(torch.float32).cpu().tolist()
+    ]
+    _v4_divtrace_append(
+        {
+            "kind": "router",
+            "rank": _v4_divtrace_rank(),
+            "layer_idx": int(layer_idx),
+            "name": "router",
+            "seq_id": meta["seq_id"],
+            "cache_seqlen": meta["cache_seqlen"],
+            "ids": ids,
+            "weights": weights,
+        }
+    )
+    _v4_divtrace_note(
+        f"layer={layer_idx:02d} router "
+        f"rank={_v4_divtrace_rank()} "
+        f"seq_id={meta['seq_id']} cache_seqlen={meta['cache_seqlen']} "
+        f"ids={ids},weights={[round(v, 6) for v in weights]}"
+    )
+
+
+def _v4_divtrace_emit_ffn_attrib(
+    layer_idx: int,
+    residual: torch.Tensor,
+    mlp_out: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor] = None,
+) -> None:
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    residual0 = residual[:1].detach().to(torch.float32)
+    mlp_out0 = mlp_out[:1].detach().to(torch.float32)
+    post0 = post[:1].detach().to(torch.float32)
+    comb0 = comb[:1].detach().to(torch.float32)
+    post_term = post0.unsqueeze(-1) * mlp_out0.unsqueeze(-2)
+    comb_term = torch.sum(comb0.unsqueeze(-1) * residual0.unsqueeze(-2), dim=2)
+    y = post_term + comb_term
+
+    token_comb = comb0[0, 0]
+    row_sums = token_comb.sum(dim=-1)
+    col_sums = token_comb.sum(dim=-2)
+    svdvals = torch.linalg.svdvals(token_comb)
+
+    _v4_divtrace_append(
+        {
+            "kind": "ffn_attrib",
+            "rank": _v4_divtrace_rank(),
+            "layer_idx": int(layer_idx),
+            "name": "ffn_attrib",
+            "seq_id": meta["seq_id"],
+            "cache_seqlen": meta["cache_seqlen"],
+            "residual": residual0.cpu().clone(),
+            "mlp_out": mlp_out0.cpu().clone(),
+            "post": post0.cpu().clone(),
+            "comb": comb0.cpu().clone(),
+            "post_term": post_term.cpu().clone(),
+            "comb_term": comb_term.cpu().clone(),
+            "stats": {
+                "residual": _v4_divtrace_l2_rms_max_abs(residual0),
+                "mlp_out": _v4_divtrace_l2_rms_max_abs(mlp_out0),
+                "post_term": _v4_divtrace_l2_rms_max_abs(post_term),
+                "comb_term": _v4_divtrace_l2_rms_max_abs(comb_term),
+                "y": _v4_divtrace_l2_rms_max_abs(y),
+            },
+            "comb_diag": {
+                "row_sums": row_sums.cpu().tolist(),
+                "col_sums": col_sums.cpu().tolist(),
+                "min": float(token_comb.min().item()),
+                "max": float(token_comb.max().item()),
+                "num_negatives": int((token_comb < 0).sum().item()),
+                "max_row_sum_err": float((row_sums - 1).abs().max().item()),
+                "max_col_sum_err": float((col_sums - 1).abs().max().item()),
+                "max_singular": float(svdvals.max().item()),
+            },
+            "post_diag": {
+                "min": float(post0.min().item()),
+                "max": float(post0.max().item()),
+                "mean": float(post0.mean().item()),
+            },
+        }
+    )
+    _v4_divtrace_note(
+        f"layer={layer_idx:02d} ffn_attrib "
+        f"rank={_v4_divtrace_rank()} "
+        f"seq_id={meta['seq_id']} cache_seqlen={meta['cache_seqlen']} "
+        f"||R||={_v4_divtrace_l2_rms_max_abs(residual0)['l2']:.6e},"
+        f"||U||={_v4_divtrace_l2_rms_max_abs(mlp_out0)['l2']:.6e},"
+        f"||post_term||={_v4_divtrace_l2_rms_max_abs(post_term)['l2']:.6e},"
+        f"||comb_term||={_v4_divtrace_l2_rms_max_abs(comb_term)['l2']:.6e},"
+        f"||Y||={_v4_divtrace_l2_rms_max_abs(y)['l2']:.6e}"
+    )
+
+
+def _v4_divtrace_emit_moe_internals(
+    layer_idx: int,
+    tensors: Dict[str, torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor] = None,
+    extras: Optional[dict[str, Any]] = None,
+) -> None:
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    captured = {
+        name: _v4_divtrace_first_row(tensor) for name, tensor in tensors.items()
+    }
+    stats = {
+        name: _v4_divtrace_stats(tensor) for name, tensor in captured.items()
+    }
+    record: dict[str, Any] = {
+        "kind": "moe_internals",
+        "rank": _v4_divtrace_rank(),
+        "layer_idx": int(layer_idx),
+        "name": "moe_internals",
+        "seq_id": meta["seq_id"],
+        "cache_seqlen": meta["cache_seqlen"],
+        "stats": stats,
+    }
+    record.update(captured)
+    if extras is not None:
+        record["extras"] = extras
+    _v4_divtrace_append(record)
+
+    summary_names = [
+        "reduced",
+        "mlp_input",
+        "routed_before_allreduce",
+        "routed_after_allreduce",
+        "shared",
+        "mlp_out",
+    ]
+    summary = ",".join(
+        f"{name}.l2={float(stats[name]['l2']):.6e}"
+        for name in summary_names
+        if name in stats
+    )
+    _v4_divtrace_note(
+        f"layer={layer_idx:02d} moe_internals "
+        f"rank={_v4_divtrace_rank()} "
+        f"seq_id={meta['seq_id']} cache_seqlen={meta['cache_seqlen']} "
+        f"{summary}"
+    )
+
+
+def _v4_divtrace_emit_final(
+    hidden_states: torch.Tensor,
+    logits: torch.Tensor,
+    cache_seqlens: Optional[torch.Tensor] = None,
+) -> None:
+    meta = _v4_divtrace_metadata(cache_seqlens)
+    _v4_divtrace_emit_boundary(-1, "final_norm", hidden_states, cache_seqlens)
+    topk = min(20, logits.size(-1))
+    vals, idx = torch.topk(logits[0, -1].detach().to(torch.float32), k=topk)
+    _v4_divtrace_append(
+        {
+            "kind": "final_topk",
+            "rank": _v4_divtrace_rank(),
+            "layer_idx": -1,
+            "name": "logits_topk",
+            "seq_id": meta["seq_id"],
+            "cache_seqlen": meta["cache_seqlen"],
+            "ids": idx.to(torch.int64).cpu().tolist(),
+            "values": [float(v) for v in vals.cpu().tolist()],
+        }
+    )
+    _v4_divtrace_note(
+        f"final logits_top{topk} "
+        f"rank={_v4_divtrace_rank()} "
+        f"seq_id={meta['seq_id']} cache_seqlen={meta['cache_seqlen']} "
+        f"ids={idx.to(torch.int64).cpu().tolist()},values={[round(float(v), 6) for v in vals.cpu().tolist()]}"
+    )
+    _v4_divtrace_flush()
 
 
 @dataclass
@@ -751,6 +1391,9 @@ class DeepSeekV4FlashExpertPlaceholder(nn.Module):
 class DeepSeekV4FlashMoE(nn.Module):
     """V4 EP-MoE surface with global expert slots."""
 
+    _grouped_scratch = None
+    _grouped_scratch_key = None
+
     def __init__(self, config: Any, layer_idx: int):
         super().__init__()
         self.config = config
@@ -802,6 +1445,8 @@ class DeepSeekV4FlashMoE(nn.Module):
         self.num_tokens_per_rank = None
         self.max_num_tokens_per_rank = None
         self.pad_token_id = int(_cfg(config, "pad_token_id", 0))
+        self._grouped_staged = None
+        self._divtrace_pending_moe: Optional[dict[str, torch.Tensor]] = None
 
     def configure_ep(self, rank: int, world_size: int, comm=None) -> None:
         self.comm = comm
@@ -815,6 +1460,43 @@ class DeepSeekV4FlashMoE(nn.Module):
             (rank + 1) * self.experts_per_rank, self.total_experts
         )
         self.enable_ep_offloading = world_size > 1
+
+    def _use_pynccl(self) -> bool:
+        # PyNCCL collectives are validated only for single-token EP decode (PR#2).
+        # Prepacked prefill and multi-sequence batches use a different/larger
+        # all-gather that deadlocks via PyNcclCommunicator, so fall back to
+        # torch.distributed there.
+        if AttnWrapperBase is not None and getattr(
+            AttnWrapperBase, "prepack_mode", False
+        ):
+            return False
+        if getattr(self, "_cur_real_tokens", 1) != 1:
+            return False
+        return _V4_PYNCCL_COMM and getattr(self, "comm", None) is not None
+
+    def _ep_all_gather(self, output: torch.Tensor, inp: torch.Tensor) -> None:
+        # torch.distributed.all_gather_into_tensor adds ~8ms/call CPU launch+sync
+        # overhead (measured: 340ms/token across 43 layers for a ~7MB transfer).
+        # PyNcclCommunicator submits NCCL directly on the current stream (GLM5
+        # pattern), avoiding that overhead and staying CUDA-graph-safe.
+        if self._use_pynccl():
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    output, inp, stream=torch.cuda.current_stream()
+                )
+        else:
+            dist.all_gather_into_tensor(output, inp)
+
+    def _ep_all_reduce(self, tensor: torch.Tensor) -> None:
+        if self._use_pynccl():
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    tensor,
+                    op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.current_stream(),
+                )
+        else:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     def init_num_tokens(self, num_tokens_per_rank: int) -> None:
         self.num_tokens_per_rank = int(num_tokens_per_rank)
@@ -835,6 +1517,15 @@ class DeepSeekV4FlashMoE(nn.Module):
         topk_weights: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
+        # Grouped staging clones owned experts resident; only viable in the EP
+        # decode phase (world_size>1, 64 owned experts/rank, ~97GB free). Prefill
+        # runs world_size=1 owning all 256 experts at a high memory peak -> skip.
+        if _V4_GROUPED_MOE and self.enable_ep_offloading:
+            grouped = self._run_owned_experts_grouped(
+                token_states, topk_weights, topk_indices
+            )
+            if grouped is not None:
+                return grouped
         routed = torch.zeros_like(token_states, dtype=torch.float32)
         counts = torch.bincount(
             topk_indices.reshape(-1), minlength=self.total_experts
@@ -852,6 +1543,78 @@ class DeepSeekV4FlashMoE(nn.Module):
             routed[token_idx] += expert_out.float()
         return routed
 
+    def _expert_weight_dict(self, expert_idx: int):
+        wrapper = self.experts[expert_idx]
+        module = getattr(wrapper, "module", wrapper)
+        rw = getattr(module, "runtime_weights", None)
+        if rw is not None:
+            return rw
+        load = getattr(wrapper, "load_weights", None)
+        key = getattr(wrapper, "module_key", None)
+        if load is None or key is None:
+            return None
+        return load(key)
+
+    def _stage_owned_expert_weights(self) -> bool:
+        # Build small pointer arrays to this layer's already-resident owned
+        # experts. Experts are persistent/resident (loaded via get_tensor), so
+        # their data_ptr() values are stable; keeping pointers avoids the
+        # per-layer torch.stack copies that duplicate tens of GB at ws=2.
+        if self._grouped_staged is not None:
+            return True
+        owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
+        if owned_count <= 0:
+            return False
+
+        dicts = []
+        for e in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
+        ):
+            rw = self._expert_weight_dict(e)
+            if rw is None or "w1.weight" not in rw:
+                return False
+            dicts.append(rw)
+
+        try:
+            from batchgen.moe.v4_slot_moe_sm120 import (
+                setup_v4_expert_weight_pointers,
+            )
+
+            self._grouped_staged = setup_v4_expert_weight_pointers(dicts)
+        except (KeyError, ValueError):
+            return False
+        return True
+
+    def _run_owned_experts_grouped(
+        self,
+        token_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        # The slot kernel allocates [tokens*topk, 2*I] / [tokens*topk, hidden]
+        # buffers, which only fit the small-token decode regime. Prefill packs
+        # thousands of tokens, so fall back to the loop there.
+        if token_states.shape[0] > _V4_GROUPED_MOE_MAX_TOKENS:
+            return None
+        if not self._stage_owned_expert_weights():
+            return None
+        from batchgen.moe.v4_slot_moe_sm120 import (
+            v4_grouped_mxfp4_moe_forward_3d_ptrs,
+        )
+
+        moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
+
+        owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
+        return moe_forward(
+            token_states,
+            topk_weights,
+            topk_indices,
+            self._grouped_staged,
+            self.routed_expert_start_idx,
+            owned_count,
+            self.swiglu_limit,
+        )
+
     def _forward_local_routed(
         self, flat_states: torch.Tensor, flat_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -867,6 +1630,7 @@ class DeepSeekV4FlashMoE(nn.Module):
                 "configure_decoding must call init_num_tokens before EP decode."
             )
         real_tokens = flat_states.shape[0]
+        self._cur_real_tokens = real_tokens
         ntpr = int(self.num_tokens_per_rank)
         if real_tokens > ntpr:
             raise RuntimeError(
@@ -880,7 +1644,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         global_states = flat_states.new_empty(
             (self.world_size * ntpr, self.hidden_size)
         )
-        dist.all_gather_into_tensor(global_states, padded)
+        self._ep_all_gather(global_states, padded)
 
         global_ids = None
         if flat_ids is not None:
@@ -897,7 +1661,7 @@ class DeepSeekV4FlashMoE(nn.Module):
                 dtype=flat_ids.dtype,
                 device=flat_ids.device,
             )
-            dist.all_gather_into_tensor(global_ids, padded_ids)
+            self._ep_all_gather(global_ids, padded_ids)
         elif getattr(self.gate, "is_hash_layer", False):
             raise RuntimeError(
                 "DeepSeek-V4 hash-routing MoE requires input_ids during EP decode."
@@ -907,7 +1671,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         global_routed = self._run_owned_experts(
             global_states, topk_weights, topk_indices
         )
-        dist.all_reduce(global_routed, op=dist.ReduceOp.SUM)
+        self._ep_all_reduce(global_routed)
 
         start = self.rank * ntpr
         return global_routed[start : start + real_tokens]
@@ -918,14 +1682,203 @@ class DeepSeekV4FlashMoE(nn.Module):
         shape = hidden_states.shape
         flat_states = hidden_states.reshape(-1, self.hidden_size)
         flat_ids = input_ids.reshape(-1) if input_ids is not None else None
+        trace_moe = (
+            _V4_DIVTRACE
+            and self.layer_idx in _v4_divtrace_active_layers
+            and self.layer_idx in _V4_DIVTRACE_MOE_INTERNALS_LAYERS
+        )
+        pending = self._divtrace_pending_moe if trace_moe else None
+
+        _dt = get_decode_timer()
+        topk_weights = None
+        topk_indices = None
+        if _V4_DIVTRACE and self.layer_idx in _v4_divtrace_active_layers:
+            topk_weights, topk_indices = self.gate(flat_states, flat_ids)
+            _v4_divtrace_emit_router(
+                self.layer_idx,
+                topk_indices,
+                topk_weights,
+                getattr(AttnWrapperBase, "cache_seqlens", None),
+            )
 
         if self.enable_ep_offloading and dist.is_initialized():
-            routed = self._forward_ep_decode_routed(flat_states, flat_ids)
-        else:
-            routed = self._forward_local_routed(flat_states, flat_ids)
+            if self.num_tokens_per_rank is None:
+                raise RuntimeError(
+                    "DeepSeek-V4 MoE num_tokens_per_rank is not initialized; "
+                    "configure_decoding must call init_num_tokens before EP decode."
+                )
+            real_tokens = flat_states.shape[0]
+            self._cur_real_tokens = real_tokens
+            ntpr = int(self.num_tokens_per_rank)
+            if real_tokens > ntpr:
+                raise RuntimeError(
+                    f"DeepSeek-V4 MoE buffer overflow: real_tokens={real_tokens} > "
+                    f"num_tokens_per_rank={ntpr}"
+                )
 
-        shared = self.shared_experts(flat_states).float()
-        return (routed + shared).to(hidden_states.dtype).view(shape)
+            padded = flat_states.new_zeros((ntpr, self.hidden_size))
+            if real_tokens > 0:
+                padded[:real_tokens] = flat_states
+            global_states = flat_states.new_empty(
+                (self.world_size * ntpr, self.hidden_size)
+            )
+            with (
+                _dt.timed("moe_allgather", self.layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                with (
+                    _dt.timed("mc_states_ag", self.layer_idx)
+                    if _dt
+                    else nullcontext()
+                ):
+                    self._ep_all_gather(global_states, padded)
+
+                global_ids = None
+                if flat_ids is not None:
+                    padded_ids = torch.full(
+                        (ntpr,),
+                        self.pad_token_id,
+                        dtype=flat_ids.dtype,
+                        device=flat_ids.device,
+                    )
+                    if real_tokens > 0:
+                        padded_ids[:real_tokens] = flat_ids
+                    global_ids = torch.empty(
+                        (self.world_size * ntpr,),
+                        dtype=flat_ids.dtype,
+                        device=flat_ids.device,
+                    )
+                    with (
+                        _dt.timed("mc_ids_ag", self.layer_idx)
+                        if _dt
+                        else nullcontext()
+                    ):
+                        self._ep_all_gather(global_ids, padded_ids)
+                elif getattr(self.gate, "is_hash_layer", False):
+                    raise RuntimeError(
+                        "DeepSeek-V4 hash-routing MoE requires input_ids during EP decode."
+                    )
+
+            with (
+                _dt.timed("moe_gate", self.layer_idx) if _dt else nullcontext()
+            ):
+                topk_weights, topk_indices = self.gate(
+                    global_states, global_ids
+                )
+            routed_before_allreduce = None
+            routed_after_allreduce = None
+            routed_extras: dict[str, Any] = {
+                "ep_mode": True,
+                "real_tokens": int(real_tokens),
+                "num_tokens_per_rank": int(ntpr),
+            }
+            with (
+                _dt.timed("moe_expert_loop", self.layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                routed = self._run_owned_experts(
+                    global_states, topk_weights, topk_indices
+                )
+            if trace_moe:
+                start = self.rank * ntpr
+                routed_before_allreduce = routed[
+                    start : start + real_tokens
+                ].clone()
+                routed_extras["routed_before_allreduce_global"] = (
+                    _v4_divtrace_stats(routed)
+                )
+                routed_extras["routed_before_allreduce_segments"] = (
+                    _v4_divtrace_segment_norms(routed, ntpr)
+                )
+            with (
+                _dt.timed("moe_allreduce", self.layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                self._ep_all_reduce(routed)
+            if trace_moe:
+                routed_extras["routed_after_allreduce_global"] = (
+                    _v4_divtrace_stats(routed)
+                )
+                routed_extras["routed_after_allreduce_segments"] = (
+                    _v4_divtrace_segment_norms(routed, ntpr)
+                )
+            start = self.rank * ntpr
+            routed = routed[start : start + real_tokens]
+            if trace_moe:
+                routed_after_allreduce = routed.clone()
+        else:
+            routed_before_allreduce = None
+            routed_after_allreduce = None
+            routed_extras = {
+                "ep_mode": False,
+                "real_tokens": int(flat_states.shape[0]),
+            }
+            with (
+                _dt.timed("moe_gate", self.layer_idx) if _dt else nullcontext()
+            ):
+                if topk_weights is None or topk_indices is None:
+                    topk_weights, topk_indices = self.gate(
+                        flat_states, flat_ids
+                    )
+            with (
+                _dt.timed("moe_expert_loop", self.layer_idx)
+                if _dt
+                else nullcontext()
+            ):
+                routed = self._run_owned_experts(
+                    flat_states, topk_weights, topk_indices
+                )
+            if trace_moe:
+                routed_before_allreduce = routed.clone()
+                routed_after_allreduce = routed.clone()
+                routed_extras["routed_before_allreduce_global"] = (
+                    _v4_divtrace_stats(routed)
+                )
+                routed_extras["routed_before_allreduce_segments"] = [
+                    {
+                        "segment_idx": 0,
+                        "rows": int(routed.size(0)),
+                        "l2": float(_v4_divtrace_stats(routed)["l2"]),
+                        "rms": float(_v4_divtrace_stats(routed)["rms"]),
+                        "max_abs": float(_v4_divtrace_stats(routed)["max_abs"]),
+                    }
+                ]
+                routed_extras["routed_after_allreduce_global"] = (
+                    _v4_divtrace_stats(routed)
+                )
+                routed_extras["routed_after_allreduce_segments"] = [
+                    {
+                        "segment_idx": 0,
+                        "rows": int(routed.size(0)),
+                        "l2": float(_v4_divtrace_stats(routed)["l2"]),
+                        "rms": float(_v4_divtrace_stats(routed)["rms"]),
+                        "max_abs": float(_v4_divtrace_stats(routed)["max_abs"]),
+                    }
+                ]
+
+        with _dt.timed("moe_shared", self.layer_idx) if _dt else nullcontext():
+            shared = self.shared_experts(flat_states).float()
+        mlp_out = routed + shared
+        if trace_moe:
+            tensors: Dict[str, torch.Tensor] = {
+                "flat_states": flat_states,
+                "routed_before_allreduce": routed_before_allreduce,
+                "routed_after_allreduce": routed_after_allreduce,
+                "shared": shared,
+                "mlp_out": mlp_out,
+            }
+            if pending is not None:
+                tensors.update(pending)
+            _v4_divtrace_emit_moe_internals(
+                self.layer_idx,
+                tensors,
+                getattr(AttnWrapperBase, "cache_seqlens", None),
+                routed_extras,
+            )
+        return mlp_out.to(hidden_states.dtype).view(shape)
 
 
 class DeepSeekV4FlashDecoderLayer(nn.Module):
@@ -995,45 +1948,105 @@ class DeepSeekV4FlashDecoderLayer(nn.Module):
                 .contiguous()
             )
 
-        residual = hidden_states
-        attn_input, post, comb = hc_pre(
-            hidden_states,
-            self.hc_attn_fn,
-            self.hc_attn_scale,
-            self.hc_attn_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-            self.rms_norm_eps,
-        )
-        attn_input = self.attn_norm(attn_input)
-        attn_out, attn_weights, present = self.self_attn(
-            attn_input,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            cache_seqlens=cache_seqlens,
-            use_cache=use_cache,
-        )
-        hidden_states = hc_post(attn_out, residual, post, comb)
+        trace_layer = False
+        if _V4_DIVTRACE:
+            trace_layer = _v4_divtrace_begin_layer(
+                self.layer_idx, hidden_states, past_key_value
+            )
+            if trace_layer:
+                _v4_divtrace_emit_boundary(
+                    self.layer_idx, "h_in", hidden_states, cache_seqlens
+                )
 
-        residual = hidden_states
-        mlp_input, post, comb = hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-            self.rms_norm_eps,
-        )
-        mlp_input = self.ffn_norm(mlp_input)
-        mlp_out = self.mlp(mlp_input, input_ids)
-        hidden_states = hc_post(mlp_out, residual, post, comb)
-        if collapse_hc_state:
-            hidden_states = hidden_states.mean(dim=2)
-        return hidden_states, attn_weights, present
+        try:
+            residual = hidden_states
+            attn_input, post, comb = hc_pre(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+                self.rms_norm_eps,
+            )
+            attn_input = self.attn_norm(attn_input)
+            _dt = get_decode_timer()
+            with (
+                _dt.timed("self_attn", self.layer_idx) if _dt else nullcontext()
+            ):
+                attn_out, attn_weights, present = self.self_attn(
+                    attn_input,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    cache_seqlens=cache_seqlens,
+                    use_cache=use_cache,
+                )
+            if trace_layer:
+                _v4_divtrace_emit_boundary(
+                    self.layer_idx, "attn_out", attn_out, cache_seqlens
+                )
+            hidden_states = hc_post(attn_out, residual, post, comb)
+            if trace_layer:
+                _v4_divtrace_emit_boundary(
+                    self.layer_idx,
+                    "h_after_attn",
+                    hidden_states,
+                    cache_seqlens,
+                )
+
+            residual = hidden_states
+            mlp_input, post, comb = hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+                self.rms_norm_eps,
+            )
+            mlp_reduced = mlp_input
+            mlp_input = self.ffn_norm(mlp_input)
+            trace_moe_internals = (
+                trace_layer
+                and self.layer_idx in _V4_DIVTRACE_MOE_INTERNALS_LAYERS
+            )
+            if trace_moe_internals:
+                self.mlp._divtrace_pending_moe = {
+                    "reduced": mlp_reduced,
+                    "mlp_input": mlp_input,
+                }
+            try:
+                with _dt.timed("moe", self.layer_idx) if _dt else nullcontext():
+                    mlp_out = self.mlp(mlp_input, input_ids)
+            finally:
+                if trace_moe_internals:
+                    self.mlp._divtrace_pending_moe = None
+            hidden_states = hc_post(mlp_out, residual, post, comb)
+            if trace_layer:
+                if self.layer_idx in _V4_DIVTRACE_FFN_ATTRIB_LAYERS:
+                    _v4_divtrace_emit_ffn_attrib(
+                        self.layer_idx,
+                        residual,
+                        mlp_out,
+                        post,
+                        comb,
+                        cache_seqlens,
+                    )
+                _v4_divtrace_emit_boundary(
+                    self.layer_idx,
+                    "h_after_ffn",
+                    hidden_states,
+                    cache_seqlens,
+                )
+            if collapse_hc_state:
+                hidden_states = hidden_states.mean(dim=2)
+            return hidden_states, attn_weights, present
+        finally:
+            if trace_layer:
+                _v4_divtrace_end_layer(self.layer_idx)
 
 
 class DeepSeekV4FlashModel(nn.Module):
@@ -1110,7 +2123,9 @@ class DeepSeekV4FlashModel(nn.Module):
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("input_ids or inputs_embeds must be provided")
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = vocab_parallel_embedding(
+                self.embed_tokens, input_ids, self.vocab_size
+            )
 
         hidden_states = (
             inputs_embeds.unsqueeze(2)
@@ -1175,5 +2190,15 @@ class DeepSeekV4FlashForCausalLM(nn.Module):
             return_dict=return_dict,
         )
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        logits = vocab_parallel_lm_head(
+            self.lm_head, hidden_states, self.vocab_size
+        )
+        if _V4_DIVTRACE and _v4_divtrace_should_trace_final(
+            hidden_states, past_key_values
+        ):
+            _v4_divtrace_emit_final(
+                hidden_states,
+                logits,
+                getattr(AttnWrapperBase, "cache_seqlens", None),
+            )
         return _CausalLMOutput(logits=logits)

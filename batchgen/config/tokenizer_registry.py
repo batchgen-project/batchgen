@@ -99,10 +99,14 @@ def register_tokenizer(tokenizer_type: str):
     Returns:
         Decorator function
     """
+
     def decorator(cls: Type["BaseTokenizer"]) -> Type["BaseTokenizer"]:
         TOKENIZER_REGISTRY[tokenizer_type] = cls
-        logger.debug(f"Registered tokenizer class {cls.__name__} for type={tokenizer_type}")
+        logger.debug(
+            f"Registered tokenizer class {cls.__name__} for type={tokenizer_type}"
+        )
         return cls
+
     return decorator
 
 
@@ -129,7 +133,9 @@ def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
     for pattern, tokenizer_type in TOKENIZER_NAME_PATTERNS.items():
         if pattern in model_identifier:
             if tokenizer_type in TOKENIZER_REGISTRY:
-                logger.info(f"Using registered tokenizer for type={tokenizer_type}")
+                logger.info(
+                    f"Using registered tokenizer for type={tokenizer_type}"
+                )
                 # Tokenizer loads from its own package directory (no path argument)
                 return TOKENIZER_REGISTRY[tokenizer_type]()
 
@@ -152,51 +158,31 @@ def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
 # Import model-specific tokenizers to register them
 # These imports trigger the @register_tokenizer decorators
 def _import_tokenizers():
-    """Import all model-specific tokenizer modules to register them."""
-    try:
-        from batchgen.models.deepseek.deepseekv4_flash import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
+    """Import all model-specific tokenizer modules to register them.
 
-    try:
-        from batchgen.models.deepseek.deepseekv3 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.deepseek.deepseekv2 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.openai.gpt_oss_120b import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.mixtral import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.moonshotai.kimi_k25 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.minimax.minimax_m25 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
+    Failures are logged at WARNING (not silently ignored) so missing-file
+    regressions in the packaging surface immediately at import time.
+    """
+    _TOKENIZER_MODULES = [
+        "batchgen.models.deepseek.deepseekv4_flash.tokenizer",
+        "batchgen.models.deepseek.deepseekv3.tokenizer",
+        "batchgen.models.deepseek.deepseekv2.tokenizer",
+        "batchgen.models.openai.gpt_oss_120b.tokenizer",
+        "batchgen.models.mixtral.tokenizer",
+        "batchgen.models.moonshotai.kimi_k25.tokenizer",
+        "batchgen.models.glm.glm5.tokenizer",
+        "batchgen.models.minimax.minimax_m25.tokenizer",
+    ]
+    for mod in _TOKENIZER_MODULES:
+        try:
+            __import__(mod)
+        except ImportError as exc:
+            logger.warning(
+                "Tokenizer module %s failed to import (tokenizer will be "
+                "unavailable for matching model names): %s",
+                mod,
+                exc,
+            )
 
 
 # Auto-import on module load

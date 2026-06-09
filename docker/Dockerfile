@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.8.0
+ARG CUDA_VERSION=12.9.0
 ARG PYTHON_VERSION=3.11.13
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     HF_ENDPOINT=https://hf-mirror.com \
-    ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 
 # RDMA Python UV
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,7 +33,7 @@ RUN uv venv --python ${PYTHON_VERSION} --seed
 ENV PATH="/root/moegen/.venv/bin:$PATH"
 
 # Make sure to install ninja to enable fast builds
-RUN uv pip install torch==2.9.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128 \
+RUN uv pip install torch==2.9.0+cu129 --extra-index-url https://download.pytorch.org/whl/cu129 \
     setuptools wheel packaging ninja \
     && uv cache clean
     
@@ -66,13 +66,14 @@ COPY . /root/moegen
 
 # Install batchgen_kernels (AOT-compiled CUDA extensions)
 RUN cd /root/moegen/batchgen_kernels \
-    && TORCH_CUDA_ARCH_LIST="9.0a" MAX_JOBS=16 uv pip install . --no-build-isolation \
+    && BUILD_ARCH=sm120 TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS=16 uv pip install . --no-build-isolation \
     && uv cache clean
 
 # Install BatchGen (filter out torch/nvidia/triton — already installed with CUDA variant in step 6)
 RUN grep -vE '^(torch==|triton==|nvidia-)' requirements.txt > /tmp/reqs-filtered.txt \
     && uv pip install -r /tmp/reqs-filtered.txt \
     && uv pip install . -v --no-deps \
+    && uv pip install flashinfer-python==0.6.12 \
     && uv pip install pytest \
     && uv cache clean
 

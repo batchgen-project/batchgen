@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVConfig
 from batchgen.models.engine_loader import core_engine as bg_lib
 
-HOST_KV_SHM_NAME = "batchgen_host_kv_cache"
+HOST_KV_SHM_NAME = os.environ.get(
+    "BATCHGEN_HOST_KV_SHM_NAME", "batchgen_host_kv_cache"
+)
 
 __all__ = [
     "build_host_kv_config",
     "build_gpu_kv_config",
     "HOST_KV_SHM_NAME",
+    "is_dsa_model",
+    "is_v4_model",
 ]
 
 
@@ -262,8 +266,17 @@ def _resolve_profile(model_name: str) -> _HostKVModelProfile:
     return _PROFILE_REGISTRY[_PROFILE_ALIASES[alias]]
 
 
-def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
-    """Builds a core HostPagedKVConfig for the given model and host budget."""
+def build_host_kv_config(
+    model_name: str,
+    host_kv_cache_size: int,
+    kv_dtype_override: Optional[str] = None,
+) -> Any:
+    """Builds a core HostPagedKVConfig for the given model and host budget.
+
+    ``kv_dtype_override`` lets the caller honor the user's ``--kv-dtype`` launch
+    flag instead of the profile default (e.g. V4-Flash defaults to fp8 to match
+    the upstream memory-saving design, but a user can opt into bf16).
+    """
 
     if host_kv_cache_size is None:
         raise ValueError("host_kv_cache_size must be a positive integer")
@@ -278,7 +291,19 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
         raise ValueError("host_kv_cache_size must be a positive integer")
 
     profile = _resolve_profile(model_name)
-    bytes_per_page = profile.bytes_per_page()
+    effective_kv_dtype = kv_dtype_override or profile.kv_dtype
+    k_element_size_bytes = _dtype_size_bytes(effective_kv_dtype)
+    bytes_per_page = (
+        profile.page_size
+        * profile.num_k_heads
+        * profile.k_head_dim
+        * k_element_size_bytes
+    ) + (
+        profile.page_size
+        * profile.num_v_heads
+        * profile.v_head_dim
+        * k_element_size_bytes
+    )
     if bytes_per_page <= 0:
         raise ValueError(f"Invalid profile definition for '{model_name}'")
 
@@ -290,7 +315,9 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
 
     num_pages_per_layer = host_budget // denom
     config = bg_lib.HostPagedKVConfig()
-    config.shm_name = HOST_KV_SHM_NAME
+    config.shm_name = os.environ.get(
+        "BATCHGEN_HOST_KV_SHM_NAME", HOST_KV_SHM_NAME
+    )
     config.num_layers = profile.num_layers
     config.num_pages = num_pages_per_layer
     config.page_size_tokens = profile.page_size
@@ -298,7 +325,7 @@ def build_host_kv_config(model_name: str, host_kv_cache_size: int) -> Any:
     config.k_head_dim = profile.k_head_dim
     config.num_v_heads = profile.num_v_heads
     config.v_head_dim = profile.v_head_dim
-    config.k_element_size_bytes = _dtype_size_bytes(profile.kv_dtype)
+    config.k_element_size_bytes = k_element_size_bytes
     config.v_element_size_bytes = (
         0 if profile.num_v_heads == 0 else config.k_element_size_bytes
     )
@@ -368,6 +395,14 @@ HOST_KV_AUX_SHM_NAME = "batchgen_host_kv_cache_aux"
 def is_dsa_model(model_name: str) -> bool:
     """Returns True if the model uses DeepSeek Sparse Attention (has indexer cache)."""
     return _resolve_indexer_profile(model_name) is not None
+
+
+def is_v4_model(model_name: str) -> bool:
+    """Returns True for DeepSeek-V4 Flash/Pro model aliases."""
+    if not isinstance(model_name, str):
+        return False
+    canonical = _PROFILE_ALIASES.get(model_name.strip().lower())
+    return canonical in {"deepseek_v4_flash", "deepseek_v4_pro"}
 
 
 def build_gpu_kv_config_aux(

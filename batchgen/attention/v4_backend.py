@@ -23,10 +23,13 @@ The actual kernel calls go through:
 from __future__ import annotations
 
 import enum
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
+
+from batchgen.timing import get_decode_timer
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -212,24 +215,35 @@ class DeepseekV4AttnBackend:
 
         q_attn = kwargs.pop("q_attn", q)
         current_kv = kwargs.pop("current_kv", kv)
+        _dt = get_decode_timer()
 
-        top_k_indices = self._fused_indexer(
-            q=q,
-            cached_k=kv,
-            head_gates=head_gates,
-            cache_seqlens=meta.c4_topk_lengths_clamp1,
-            topk=meta.c4_sparse_topk,
-        )
+        with (
+            _dt.timed("attn_c4_fused_indexer", layer_config.layer_idx)
+            if _dt
+            else nullcontext()
+        ):
+            top_k_indices = self._fused_indexer(
+                q=q,
+                cached_k=kv,
+                head_gates=head_gates,
+                cache_seqlens=meta.c4_topk_lengths_clamp1,
+                topk=meta.c4_sparse_topk,
+            )
 
-        return self._flashmla(
-            q=q_attn,
-            kv=current_kv,
-            attn_sink=attn_sink,
-            metadata=meta,
-            layer_idx=layer_config.layer_idx,
-            sparse_indices=top_k_indices,
-            **kwargs,
-        )
+        with (
+            _dt.timed("attn_c4_flashmla", layer_config.layer_idx)
+            if _dt
+            else nullcontext()
+        ):
+            return self._flashmla(
+                q=q_attn,
+                kv=current_kv,
+                attn_sink=attn_sink,
+                metadata=meta,
+                layer_idx=layer_config.layer_idx,
+                sparse_indices=top_k_indices,
+                **kwargs,
+            )
 
     def _forward_c128_compress(
         self,
@@ -262,16 +276,22 @@ class DeepseekV4AttnBackend:
                 "compressed FlashMLA call after HCA compression"
             )
 
-        return self._flashmla(
-            q=q,
-            kv=kv,
-            attn_sink=attn_sink,
-            metadata=meta,
-            layer_idx=layer_config.layer_idx,
-            compressed_page_indices=meta.c128_page_indices,
-            compressed_lengths=meta.c128_topk_lengths_clamp1,
-            **kwargs,
-        )
+        _dt = get_decode_timer()
+        with (
+            _dt.timed("attn_c128_flashmla", layer_config.layer_idx)
+            if _dt
+            else nullcontext()
+        ):
+            return self._flashmla(
+                q=q,
+                kv=kv,
+                attn_sink=attn_sink,
+                metadata=meta,
+                layer_idx=layer_config.layer_idx,
+                compressed_page_indices=meta.c128_page_indices,
+                compressed_lengths=meta.c128_topk_lengths_clamp1,
+                **kwargs,
+            )
 
 
 def build_layer_configs_from_compress_ratios(

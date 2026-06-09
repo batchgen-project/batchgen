@@ -16,7 +16,7 @@ intentionally does not import DeepSeek-V3 modeling code.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # Checkpoint-to-BatchGen naming convention
@@ -59,7 +59,6 @@ BASE_ATTN_TENSORS: Tuple[str, ...] = (
     "q_norm.weight",
     "wkv.scale",
     "wkv.weight",
-    "wo_a.scale",
     "wo_a.weight",
     "wo_b.scale",
     "wo_b.weight",
@@ -101,7 +100,6 @@ MTP_BASE_TENSORS: Tuple[str, ...] = (
     "attn.q_norm.weight",
     "attn.wkv.scale",
     "attn.wkv.weight",
-    "attn.wo_a.scale",
     "attn.wo_a.weight",
     "attn.wo_b.scale",
     "attn.wo_b.weight",
@@ -136,6 +134,50 @@ MTP_BASE_TENSORS: Tuple[str, ...] = (
     "hnorm.weight",
     "norm.weight",
 )
+
+
+def compress_ratio_to_attn_type(compress_ratio: int) -> str:
+    """Map a layer's compress_ratio to its attn module type.
+
+    Layers with different compress_ratios have heterogeneous compressor/indexer
+    tensor shapes. Each distinct ratio gets its own GPU buffer type so that
+    GPU_Weight_Buffer can allocate one homogeneous shape set per type.
+
+    Returns:
+        ``"attn"`` for ratio-0 (no compressor), ``"attn_c{N}"`` otherwise.
+    """
+    if compress_ratio == 0:
+        return "attn"
+    return f"attn_c{compress_ratio}"
+
+
+def get_v4_attn_module_types(config: Any) -> List[str]:
+    """Return sorted list of distinct attn module types from *config*.
+
+    Used to populate ``engine_config.Basic_Config.module_types`` so the
+    HtoD worker and GPU_Weight_Buffer know about every attn buffer variant.
+    """
+    num_layers = int(_get_config_value(config, "num_hidden_layers", 43))
+    compress_ratios = list(_get_config_value(config, "compress_ratios", []))
+    if len(compress_ratios) < num_layers:
+        compress_ratios.extend([0] * (num_layers - len(compress_ratios)))
+    types: set[str] = set()
+    for cr in compress_ratios[:num_layers]:
+        types.add(compress_ratio_to_attn_type(int(cr)))
+    return sorted(types)
+
+
+def layer_idx_to_attn_type(
+    layer_idx: int,
+    compress_ratios: List[int],
+) -> str:
+    """Return the attn module type for a specific layer."""
+    cr = (
+        int(compress_ratios[layer_idx])
+        if layer_idx < len(compress_ratios)
+        else 0
+    )
+    return compress_ratio_to_attn_type(cr)
 
 
 def model_key_to_checkpoint_key(model_key: str) -> str:
@@ -191,26 +233,39 @@ def build_v4_weight_contract(
 
     num_layers = int(_get_config_value(config, "num_hidden_layers", 43))
     num_experts = int(_get_config_value(config, "n_routed_experts", 256))
-    num_mtp_layers = int(_get_config_value(config, "num_nextn_predict_layers", 1))
+    num_mtp_layers = int(
+        _get_config_value(config, "num_nextn_predict_layers", 1)
+    )
     compress_ratios = list(_get_config_value(config, "compress_ratios", []))
     if len(compress_ratios) < num_layers:
         compress_ratios.extend([0] * (num_layers - len(compress_ratios)))
 
     state_dict_name_map: Dict[str, Dict[str, str]] = {}
+
+    # Per-compress-ratio attn module types so each GPU buffer has homogeneous
+    # tensor shapes (Bug 8 fix: ratio-4 vs ratio-128 compressor shapes differ).
+    attn_types: set[str] = set()
+    for layer_idx in range(num_layers):
+        attn_types.add(
+            compress_ratio_to_attn_type(int(compress_ratios[layer_idx]))
+        )
     weight_copy_task: Dict[str, List[str]] = {
-        "attn": [],
-        "routed_expert": [],
-        "shared_expert": [],
+        mt: [] for mt in sorted(attn_types)
     }
+    weight_copy_task["routed_expert"] = []
+    weight_copy_task["shared_expert"] = []
 
     for layer_idx in range(num_layers):
+        cr = int(compress_ratios[layer_idx])
+        attn_type = compress_ratio_to_attn_type(cr)
         attn_key = f"attn_{layer_idx}"
-        for tensor_name in iter_attention_tensor_names(int(compress_ratios[layer_idx])):
+        for tensor_name in iter_attention_tensor_names(cr):
             state_dict_name_map[f"layers.{layer_idx}.attn.{tensor_name}"] = {
                 "module_key": attn_key,
                 "tensor_key": tensor_name,
+                "module_type": attn_type,
             }
-        weight_copy_task["attn"].append(attn_key)
+        weight_copy_task[attn_type].append(attn_key)
 
         shared_key = f"shared_expert_{layer_idx}"
         for tensor_name in EXPERT_TENSORS:
@@ -252,7 +307,9 @@ def build_v4_weight_contract(
     return state_dict_name_map, weight_copy_task
 
 
-def checkpoint_names_from_metadata_rows(rows: Iterable[Dict[str, Any]]) -> List[str]:
+def checkpoint_names_from_metadata_rows(
+    rows: Iterable[Dict[str, Any]],
+) -> List[str]:
     """Extract checkpoint tensor names from extractor JSONL rows."""
 
     return [str(row["name"]) for row in rows]

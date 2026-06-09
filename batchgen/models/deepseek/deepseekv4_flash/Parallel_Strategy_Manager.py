@@ -82,8 +82,10 @@ class DeepSeekV4FlashParallelStrategyManager:
         self._configure_moe_ranges(prefill=False, comm=comm)
         effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
         self._init_decoding_padding_bsz(effective_padding_bsz)
+        self._mark_local_experts_persistent()
         self._config_attn_module()
         self._config_expert_module()
+        self._load_local_routed_experts()
         self._config_lm_head_hook()
         self.model.eval()
         self.model.to(self.engine_config.Basic_Config.device_torch)
@@ -105,6 +107,63 @@ class DeepSeekV4FlashParallelStrategyManager:
             )
         for layer in self.model.model.layers:
             layer.mlp.init_num_tokens(max_rank_bsz)
+
+    def _grouped_moe_enabled(self) -> bool:
+        return os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
+
+    def _local_routed_expert_keys(self):
+        keys = []
+        for layer in self.model.model.layers:
+            mlp = layer.mlp
+            layer_idx = mlp.layer_idx
+            for e in range(
+                mlp.routed_expert_start_idx, mlp.routed_expert_end_idx
+            ):
+                keys.append((layer_idx, e, f"routed_expert_{layer_idx}_{e}"))
+        return keys
+
+    def _mark_local_experts_persistent(self) -> None:
+        # Grouped MoE needs owned experts resident (not streamed through the
+        # rolling buffer pool), mirroring GLM5/DeepSeek-V3. Remove them from the
+        # weight-copy (streaming) task so _config_expert_module marks them
+        # persistent. Gated: default path keeps all experts streamed.
+        if not self._grouped_moe_enabled():
+            return
+        local = {k for _, _, k in self._local_routed_expert_keys()}
+        self.weight_copy_task["routed_expert"] = [
+            k
+            for k in self.weight_copy_task.get("routed_expert", [])
+            if k not in local
+        ]
+
+    def _load_local_routed_experts(self) -> None:
+        # Load persistent owned-expert weights resident from the host parameter
+        # store via core_engine.get_tensor (stable, not the recyclable get_weights
+        # buffer pool), mirroring GLM5._load_local_routed_experts.
+        if not self._grouped_moe_enabled():
+            return
+        device = self.engine_config.Basic_Config.device_torch
+        resident_bytes = 0
+        for layer_idx, expert_idx, key in self._local_routed_expert_keys():
+            tensors = self.core_engine.get_tensor(key)
+            moved = {k: v.to(device) for k, v in tensors.items()}
+            for v in moved.values():
+                if v.is_cuda:
+                    resident_bytes += v.numel() * v.element_size()
+            placeholder = (
+                self.model.model.layers[layer_idx]
+                .mlp.experts[expert_idx]
+                .module
+            )
+            placeholder.set_runtime_tensors(moved)
+        if self.rank == 0:
+            logging.info(
+                "[V4 GROUPED] persistent expert resident bytes: %.2f GiB",
+                resident_bytes / 1024**3,
+            )
+            placeholder.set_runtime_tensors(
+                {k: v.to(device) for k, v in tensors.items()}
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         for layer in self.model.model.layers:

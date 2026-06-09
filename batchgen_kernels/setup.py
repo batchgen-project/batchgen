@@ -81,17 +81,21 @@ if not os.environ.get("CUDA_HOME"):
 
 
 # ── Architecture build gating ──
-# BUILD_ARCH: "sm90a" (default), "sm100", "all"
+# BUILD_ARCH: "sm90a" (default), "sm100", "sm120", "all"
 
 _build_arch = os.environ.get("BUILD_ARCH", "sm90a")
 _build_sm90a = _build_arch in ("sm90a", "all")
 _build_sm100 = _build_arch in ("sm100", "all")
+_build_sm120 = _build_arch == "sm120"
 
 # ── Architecture flag sets ──
+# On sm120 (Blackwell), the "sm90a" WGMMA extensions are retargeted to sm_120 so the
+# compiler reveals exactly which Hopper-only kernels fail (recompile-only baseline).
+_sm90a_arch_flag = "-arch=sm_120" if _build_sm120 else "-arch=sm_90a"
 
 _sm90a_flags = [
     "-std=c++17",
-    "-arch=sm_90a",
+    _sm90a_arch_flag,
     "-O3",
     "--ptxas-options=-v",
     "-lineinfo",
@@ -103,6 +107,8 @@ if _build_arch == "sm90a":
     _sm80_gencode = ["-gencode", "arch=compute_90a,code=sm_90a"]
 elif _build_arch == "sm100":
     _sm80_gencode = ["-gencode", "arch=compute_100,code=sm_100"]
+elif _build_arch == "sm120":
+    _sm80_gencode = ["-gencode", "arch=compute_120,code=sm_120"]
 elif _build_arch == "all":
     _sm80_gencode = [
         "-gencode",
@@ -493,11 +499,15 @@ _sm80_extensions = [
 
 # Assemble final extension list based on build flags
 _ext_modules = []
-if _build_sm90a:
+_include_wgmma = _build_sm90a or (
+    _build_sm120 and os.environ.get("SM120_WGMMA", "0") == "1"
+)
+if _include_wgmma:
     _ext_modules.extend(_sm90a_extensions)
 else:
     print(
-        f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping SM90a-only kernels"
+        f"[batchgen_kernels] BUILD_ARCH={_build_arch}: skipping WGMMA kernels "
+        f"(set SM120_WGMMA=1 to attempt the sm_120 port build)"
     )
 _ext_modules.extend(_sm80_extensions)
 
