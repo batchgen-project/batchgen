@@ -78,6 +78,10 @@ class SequenceEntry:
         'host_pages_allocated',  # Current host page count
         'prefix_shared_tokens',  # Effective tokens reused by this prefill
         'prefix_committed_tokens',  # Tokens already owned by prefix cache metadata
+        'prefix_prompt_token_ids',  # Cached prompt token ids for prefix commit
+        'prefix_prompt_cache_data_ptr',  # input_ids pointer for cached tokens
+        'prefix_prompt_cache_length',  # prompt length for cached tokens
+        'prefix_prompt_cache_version',  # input_ids tensor version for cache
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -156,6 +160,10 @@ class SequenceEntry:
         self.host_pages_allocated: int = 0
         self.prefix_shared_tokens: int = 0
         self.prefix_committed_tokens: int = 0
+        self.prefix_prompt_token_ids: Optional[List[int]] = None
+        self.prefix_prompt_cache_data_ptr: int = 0
+        self.prefix_prompt_cache_length: int = 0
+        self.prefix_prompt_cache_version: int = -1
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None

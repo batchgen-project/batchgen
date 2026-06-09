@@ -133,6 +133,16 @@ class _WorkerView:
         self.released.append(list(page_ids))
 
 
+class _FastCoordinator(_Coordinator):
+    def commit_prefix_page_ids(
+        self, namespace_digest, token_ids, commit_tokens, group_page_ids
+    ):
+        self.calls.append(
+            (namespace_digest, token_ids, commit_tokens, group_page_ids)
+        )
+        return "committed-fast"
+
+
 class _EvictionResult:
     def __init__(self, evicted_group_pages):
         self.evicted_nodes = len(evicted_group_pages)
@@ -182,6 +192,10 @@ class _Seq:
         self.reentry_decoded_baseline = reentry_decoded_baseline
         self.prefix_shared_tokens = prefix_shared_tokens
         self.prefix_committed_tokens = prefix_committed_tokens
+        self.prefix_prompt_token_ids = None
+        self.prefix_prompt_cache_data_ptr = 0
+        self.prefix_prompt_cache_length = 0
+        self.prefix_prompt_cache_version = -1
 
 
 def _runtime_config() -> PrefixCacheRuntimeConfig:
@@ -271,6 +285,7 @@ def test_build_sequence_prefix_commit_request_collects_logical_pages():
     request, commit_tokens = request_pair
     assert commit_tokens == 8
     assert request.token_ids == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert request.page_ids_by_group == {0: [100, 101]}
     assert [page.page_id for page in request.group_pages[0].pages] == [
         100,
         101,
@@ -374,6 +389,64 @@ def test_prefix_commit_request_invokes_coordinator():
     assert [page.page_id for page in group_pages[0].pages] == [5]
 
 
+def test_prefix_commit_request_uses_page_id_fast_path_when_available():
+    request = build_prefix_commit_request(
+        core_engine_module=_Core,
+        namespace_digest=(1, 2, 3, 4),
+        token_ids=[10, 11, 12, 13],
+        publish_boundary_tokens=4,
+        pages_by_group={0: [5]},
+        raw_page_tokens_by_group={0: 4},
+    )
+    coordinator = _FastCoordinator()
+
+    result = request.commit(coordinator)
+
+    assert result == "committed-fast"
+    assert coordinator.calls == [
+        ([1, 2, 3, 4], [10, 11, 12, 13], 4, [(0, [5])])
+    ]
+
+
+def test_sequence_token_ids_for_prefix_commit_reuses_prompt_cache():
+    seq = _Seq(prompt=[1, 2, 3, 4], decoded=[5], decoded_length=1)
+
+    first = sequence_token_ids_for_prefix_commit(
+        seq,
+        include_new_decode_tokens=True,
+        max_tokens=5,
+    )
+    cached_prompt_ids = seq.prefix_prompt_token_ids
+    second = sequence_token_ids_for_prefix_commit(
+        seq,
+        include_new_decode_tokens=True,
+        max_tokens=5,
+    )
+
+    assert first == [1, 2, 3, 4, 5]
+    assert second == [1, 2, 3, 4, 5]
+    assert seq.prefix_prompt_token_ids is cached_prompt_ids
+
+
+def test_sequence_token_ids_for_prefix_commit_invalidates_mutated_prompt_cache():
+    seq = _Seq(prompt=[1, 2, 3, 4], decoded=[5], decoded_length=1)
+
+    first = sequence_token_ids_for_prefix_commit(
+        seq,
+        include_new_decode_tokens=True,
+        max_tokens=5,
+    )
+    seq.input_ids[0, 0] = 99
+    second = sequence_token_ids_for_prefix_commit(
+        seq,
+        include_new_decode_tokens=True,
+        max_tokens=5,
+    )
+
+    assert first == [1, 2, 3, 4, 5]
+    assert second == [99, 2, 3, 4, 5]
+
+
 def test_prefix_commit_request_capacity_requirements_use_raw_page_rates():
     request = build_prefix_commit_request(
         core_engine_module=_Core,
@@ -386,6 +459,23 @@ def test_prefix_commit_request_capacity_requirements_use_raw_page_rates():
 
     assert request is not None
     assert request.capacity_requirements() == (2, 4, 6)
+
+
+def test_retain_newly_committed_prefix_pages_reuses_collected_page_ids():
+    worker_view = _WorkerView([100, 101, 102, 103])
+
+    retained = retain_newly_committed_prefix_pages(
+        runtime_config=_runtime_config(),
+        worker_views_by_group={0: worker_view},
+        sequence_id=42,
+        previous_committed_tokens=4,
+        commit_tokens=12,
+        page_ids_by_group={0: [100, 101, 102]},
+    )
+
+    assert retained == 12
+    assert worker_view.calls == []
+    assert worker_view.retained == [(42, [101, 102])]
 
 
 def test_prefix_commit_request_capacity_requirements_cover_c128_groups():

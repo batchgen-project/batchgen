@@ -24,10 +24,24 @@ def sequence_token_ids_for_prefix_commit(
 
     prompt_token_count = int(seq.prompt_length)
     prompt_tensor = seq.input_ids.reshape(-1)
-    prompt_token_ids = [
-        int(token_id)
-        for token_id in prompt_tensor[:prompt_token_count].tolist()
-    ]
+    prompt_data_ptr = int(prompt_tensor.data_ptr())
+    prompt_version = int(prompt_tensor._version)
+    if (
+        seq.prefix_prompt_token_ids is not None
+        and int(seq.prefix_prompt_cache_data_ptr) == prompt_data_ptr
+        and int(seq.prefix_prompt_cache_length) == prompt_token_count
+        and int(seq.prefix_prompt_cache_version) == prompt_version
+    ):
+        prompt_token_ids = seq.prefix_prompt_token_ids
+    else:
+        prompt_token_ids = [
+            int(token_id)
+            for token_id in prompt_tensor[:prompt_token_count].tolist()
+        ]
+        seq.prefix_prompt_token_ids = prompt_token_ids
+        seq.prefix_prompt_cache_data_ptr = prompt_data_ptr
+        seq.prefix_prompt_cache_length = prompt_token_count
+        seq.prefix_prompt_cache_version = prompt_version
 
     decoded_token_ids: list[int] = []
     decoded_start = 0
@@ -123,6 +137,7 @@ def retain_newly_committed_prefix_pages(
     sequence_id: int,
     previous_committed_tokens: int,
     commit_tokens: int,
+    page_ids_by_group: Mapping[int, list[int]] | None = None,
 ) -> int:
     """Move newly published sequence-owned pages into resident ownership."""
 
@@ -141,8 +156,13 @@ def retain_newly_committed_prefix_pages(
         if new_pages <= 0:
             continue
         worker_view = worker_views_by_group[int(spec.group_id)]
-        logical_pages = worker_view.build_page_table([int(sequence_id)])[0]
-        retained_pages = logical_pages[previous_pages:target_pages]
+        if page_ids_by_group is None:
+            logical_pages = worker_view.build_page_table([int(sequence_id)])[0]
+            retained_pages = logical_pages[previous_pages:target_pages]
+        else:
+            retained_pages = page_ids_by_group[int(spec.group_id)][
+                previous_pages:target_pages
+            ]
         worker_view.retain_sequence_pages(
             int(sequence_id),
             [int(page_id) for page_id in retained_pages],

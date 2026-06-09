@@ -15,9 +15,22 @@ class PrefixCommitRequest:
     commit_tokens: int
     publish_boundary_tokens: int
     group_pages: list[object]
+    page_ids_by_group: dict[int, list[int]]
     raw_page_tokens_by_group: dict[int, int]
 
     def commit(self, coordinator: object):
+        if hasattr(coordinator, "commit_prefix_page_ids"):
+            return coordinator.commit_prefix_page_ids(
+                list(self.namespace_digest),
+                self.token_ids,
+                int(self.commit_tokens),
+                [
+                    (int(group_id), list(page_ids))
+                    for group_id, page_ids in sorted(
+                        self.page_ids_by_group.items()
+                    )
+                ],
+            )
         return coordinator.commit_prefix_pages(
             list(self.namespace_digest),
             self.token_ids,
@@ -111,7 +124,10 @@ def build_prefix_commit_request(
         return None
 
     group_pages = []
+    page_ids_by_group = {}
     for group_id, page_handles in sorted(pages_by_group.items()):
+        page_ids = [_host_page_id(page) for page in page_handles]
+        page_ids_by_group[int(group_id)] = page_ids
         group = core_engine_module.GroupCommitPages()
         group.group_id = int(group_id)
         group.pages = [
@@ -126,6 +142,7 @@ def build_prefix_commit_request(
         commit_tokens=commit_tokens,
         publish_boundary_tokens=int(publish_boundary_tokens),
         group_pages=group_pages,
+        page_ids_by_group=page_ids_by_group,
         raw_page_tokens_by_group={
             int(group_id): int(raw_page_tokens)
             for group_id, raw_page_tokens in raw_page_tokens_by_group.items()
@@ -169,3 +186,9 @@ def _to_host_page_handle(core_engine_module: object, page: int | object):
     handle = core_engine_module.HostPageHandle()
     handle.page_id = int(page)
     return handle
+
+
+def _host_page_id(page: int | object) -> int:
+    if hasattr(page, "page_id"):
+        return int(page.page_id)
+    return int(page)

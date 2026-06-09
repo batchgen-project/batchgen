@@ -83,6 +83,13 @@ def _single_node_config(shm_name: str):
     return config
 
 
+def _compact_pressure_config(shm_name: str):
+    config = _single_node_config(shm_name)
+    config.max_group_entries = 2
+    config.max_page_handles = 3
+    return config
+
+
 def test_host_prefix_cache_lookup_attach_release():
     shm_name = _random_shm_name()
     namespace = [11, 22, 33, 44]
@@ -393,5 +400,81 @@ def test_host_prefix_cache_is_shared_across_process_attachments():
         assert worker.get_stats().active_attachments == 0
         evicted = owner.evict_until_free(16, 0, 0, 1)
         assert evicted.evicted_nodes == 1
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_index_drops_evicted_nodes():
+    shm_name = _random_shm_name()
+    namespace = [17, 18, 19, 20]
+    token_ids = list(range(8))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(
+            _single_node_config(shm_name)
+        )
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(0), _page(1)]),
+                _group_pages(1, [_page(0)]),
+            ],
+        )
+
+        evicted = coordinator.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 1
+
+        miss = coordinator.estimate_lookup(namespace, token_ids)
+        assert miss.common_cached_tokens == 0
+        assert miss.miss_reason_mask
+    finally:
+        _shm_unlink(shm_name)
+
+
+def test_host_prefix_cache_compacts_lazily_when_arena_tail_is_full():
+    shm_name = _random_shm_name()
+    namespace = [21, 22, 23, 24]
+    first_tokens = list(range(8))
+    second_tokens = list(range(10, 18))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(
+            _compact_pressure_config(shm_name)
+        )
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace,
+            first_tokens,
+            8,
+            [
+                _group_pages(0, [_page(0), _page(1)]),
+                _group_pages(1, [_page(0)]),
+            ],
+        )
+
+        evicted = coordinator.evict_until_free(1, 0, 0, 1)
+        assert evicted.evicted_nodes == 1
+        # The eviction itself does not compact small dead arenas.
+        assert coordinator.get_stats().used_group_entries == 2
+        assert coordinator.get_stats().used_page_handles == 3
+
+        committed = coordinator.commit_prefix_pages(
+            namespace,
+            second_tokens,
+            8,
+            [
+                _group_pages(0, [_page(2), _page(3)]),
+                _group_pages(1, [_page(1)]),
+            ],
+        )
+
+        assert committed.inserted_nodes == 1
+        assert coordinator.estimate_lookup(
+            namespace,
+            second_tokens,
+        ).common_cached_tokens == 8
+        assert coordinator.get_stats().used_group_entries == 2
+        assert coordinator.get_stats().used_page_handles == 3
     finally:
         _shm_unlink(shm_name)

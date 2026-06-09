@@ -1378,12 +1378,23 @@ class BatchGenWorker:
 
 		worker_views_by_group = self._prefix_cache_worker_views_by_group()
 
+		total_start = time.perf_counter()
+		build_seconds = 0.0
+		commit_seconds = 0.0
+		retain_seconds = 0.0
+		planned_count = 0
+		committed_count = 0
+		inserted_nodes = 0
+		existing_nodes = 0
+		evicted_nodes = 0
+
 		for uuid in uuids:
 			if uuid not in self._uuid_to_local_map:
 				continue
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
 				continue
+			build_start = time.perf_counter()
 			request_pair = build_sequence_prefix_commit_request(
 				core_engine_module=core_engine,
 				runtime_config=self.prefix_cache_runtime_config,
@@ -1391,15 +1402,24 @@ class BatchGenWorker:
 				seq=seq,
 				include_new_decode_tokens=include_new_decode_tokens,
 			)
+			build_seconds += time.perf_counter() - build_start
 			if request_pair is None:
 				continue
+			planned_count += 1
 			request, commit_tokens = request_pair
+			commit_start = time.perf_counter()
 			retry_result = commit_prefix_pages_with_capacity_retry(
 				request=request,
 				coordinator=self.prefix_cache_coordinator,
 				worker_views_by_group=worker_views_by_group,
 			)
+			commit_seconds += time.perf_counter() - commit_start
 			result = retry_result.commit_result
+			committed_count += 1
+			inserted_nodes += int(result.inserted_nodes)
+			existing_nodes += int(result.existing_nodes)
+			if retry_result.eviction_result is not None:
+				evicted_nodes += int(retry_result.eviction_result.evicted_nodes)
 			existing_tokens = (
 				int(result.existing_nodes)
 				* int(request.publish_boundary_tokens)
@@ -1413,13 +1433,16 @@ class BatchGenWorker:
 				int(result.inserted_nodes) > 0
 				and int(commit_tokens) > retain_start_tokens
 			):
+				retain_start = time.perf_counter()
 				retain_newly_committed_prefix_pages(
 					runtime_config=self.prefix_cache_runtime_config,
 					worker_views_by_group=worker_views_by_group,
 					sequence_id=int(seq.global_idx),
 					previous_committed_tokens=retain_start_tokens,
 					commit_tokens=int(commit_tokens),
+					page_ids_by_group=request.page_ids_by_group,
 				)
+				retain_seconds += time.perf_counter() - retain_start
 			seq.prefix_committed_tokens = int(commit_tokens)
 			if self.prefix_cache_debug_stats and self.rank == 0:
 				logging.info(
@@ -1435,6 +1458,29 @@ class BatchGenWorker:
 					if retry_result.eviction_result is None
 					else retry_result.eviction_result.evicted_nodes,
 				)
+
+		total_seconds = time.perf_counter() - total_start
+		if planned_count > 0 and (
+			self.prefix_cache_debug_stats or total_seconds >= 1.0
+		):
+			logging.info(
+				"Prefix cache %s commit timings: rank=%s uuids=%d "
+				"planned=%d committed=%d inserted=%d existing=%d "
+				"evicted=%d total_s=%.3f build_s=%.3f "
+				"coordinator_s=%.3f retain_s=%.3f",
+				reason,
+				self.rank,
+				len(uuids),
+				planned_count,
+				committed_count,
+				inserted_nodes,
+				existing_nodes,
+				evicted_nodes,
+				total_seconds,
+				build_seconds,
+				commit_seconds,
+				retain_seconds,
+			)
 
 	def _commit_prefix_cache_prompt_pages(
 		self,

@@ -31,9 +31,18 @@ namespace batchgen::kv {
 namespace {
 
 constexpr std::uint64_t kPrefixCacheMagic = 0x484f535450434348ULL;
-constexpr std::uint32_t kPrefixCacheAbiVersion = 2;
+constexpr std::uint32_t kPrefixCacheAbiVersion = 3;
+constexpr std::uint32_t kNodeIndexRebuildMinTombstones = 1024;
+constexpr std::uint32_t kArenaCompactMinDeadGroupEntries = 1024;
+constexpr std::uint32_t kArenaCompactMinDeadPageHandles = 4096;
 
 enum class EntryState : std::uint32_t {
+    kEmpty = 0,
+    kResident = 1,
+    kTombstone = 2,
+};
+
+enum class IndexSlotState : std::uint32_t {
     kEmpty = 0,
     kResident = 1,
     kTombstone = 2,
@@ -50,6 +59,7 @@ struct SharedHeader {
     std::uint32_t hash_block_tokens = 0;
     std::uint32_t commit_boundary_tokens = 0;
     std::uint32_t max_nodes = 0;
+    std::uint32_t max_node_index_slots = 0;
     std::uint32_t max_group_entries = 0;
     std::uint32_t max_page_handles = 0;
 
@@ -82,6 +92,12 @@ struct SharedPrefixNode {
     std::uint64_t last_access_epoch = 0;
 };
 
+struct SharedNodeIndexSlot {
+    std::uint32_t state = static_cast<std::uint32_t>(IndexSlotState::kEmpty);
+    std::uint32_t node_index = 0;
+    PrefixDigest digest{};
+};
+
 struct SharedGroupEntry {
     std::uint32_t state = static_cast<std::uint32_t>(EntryState::kEmpty);
     std::uint32_t group_id = 0;
@@ -108,6 +124,27 @@ std::uint64_t SplitMix64(std::uint64_t value) {
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31);
+}
+
+std::uint32_t NextPowerOfTwo(std::uint32_t value) {
+    if (value <= 1) {
+        return 1;
+    }
+    --value;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    return value + 1;
+}
+
+std::uint64_t DigestHash(const PrefixDigest& digest) {
+    std::uint64_t value = 0x9e3779b97f4a7c15ULL;
+    for (std::size_t lane = 0; lane < digest.size(); ++lane) {
+        value ^= SplitMix64(digest[lane] + lane);
+    }
+    return SplitMix64(value);
 }
 
 PrefixDigest HashPrefixBlock(PrefixDigest namespace_digest,
@@ -289,6 +326,10 @@ struct HostPrefixCacheCoordinator::SharedState {
         std::uint32_t pending_load_count = 0;
         bool release_requested = false;
     };
+    struct ArenaUsage {
+        std::uint32_t group_entries = 0;
+        std::uint32_t page_handles = 0;
+    };
 
     explicit SharedState(HostPrefixCacheConfig cfg,
                          std::uint32_t hash_block_tokens,
@@ -334,12 +375,14 @@ struct HostPrefixCacheCoordinator::SharedState {
     SharedHeader* header = nullptr;
     SharedGroupSpec* group_specs = nullptr;
     SharedPrefixNode* nodes = nullptr;
+    SharedNodeIndexSlot* node_index_slots = nullptr;
     SharedGroupEntry* group_entries = nullptr;
     SharedPageHandle* page_handles = nullptr;
 
     std::size_t header_offset = 0;
     std::size_t group_spec_offset = 0;
     std::size_t node_offset = 0;
+    std::size_t node_index_offset = 0;
     std::size_t group_entry_offset = 0;
     std::size_t page_handle_offset = 0;
     std::size_t total_bytes_unaligned = 0;
@@ -378,6 +421,25 @@ struct HostPrefixCacheCoordinator::SharedState {
     void FilterEvictedPagesStillReferencedLocked(
         PrefixEvictionResult* result) const;
     void CompactArenasLocked();
+    std::uint32_t MaxNodeIndexSlots() const;
+    std::optional<std::uint32_t> FindNodeIndexSlotLocked(
+        const PrefixDigest& digest) const;
+    void InsertNodeIndexLocked(const PrefixDigest& digest,
+                               std::uint32_t node_index);
+    void RemoveNodeIndexLocked(const PrefixDigest& digest);
+    void RebuildNodeIndexLocked();
+    std::uint32_t CountNodeIndexTombstonesLocked() const;
+    ArenaUsage ResidentArenaUsageLocked() const;
+    bool TailArenaCapacityEnoughLocked(std::uint32_t min_group_entries,
+                                       std::uint32_t min_page_handles) const;
+    bool CompactedArenaCapacityEnoughLocked(
+        std::uint32_t min_group_entries,
+        std::uint32_t min_page_handles) const;
+    void CompactArenasForCapacityLocked(std::uint32_t min_group_entries,
+                                        std::uint32_t min_page_handles);
+    void CompactArenasAfterEvictionIfUsefulLocked(
+        std::uint32_t min_group_entries, std::uint32_t min_page_handles);
+    void RebuildNodeIndexIfNeededLocked();
 };
 
 void HostPrefixCacheCoordinator::SharedState::ComputeOffsets() {
@@ -393,6 +455,10 @@ void HostPrefixCacheCoordinator::SharedState::ComputeOffsets() {
     offset = AlignUp(offset, alignof(SharedPrefixNode));
     node_offset = offset;
     offset += sizeof(SharedPrefixNode) * config.max_nodes;
+
+    offset = AlignUp(offset, alignof(SharedNodeIndexSlot));
+    node_index_offset = offset;
+    offset += sizeof(SharedNodeIndexSlot) * MaxNodeIndexSlots();
 
     offset = AlignUp(offset, alignof(SharedGroupEntry));
     group_entry_offset = offset;
@@ -410,6 +476,8 @@ void HostPrefixCacheCoordinator::SharedState::MapPointers() {
     group_specs =
         reinterpret_cast<SharedGroupSpec*>(mapping + group_spec_offset);
     nodes = reinterpret_cast<SharedPrefixNode*>(mapping + node_offset);
+    node_index_slots = reinterpret_cast<SharedNodeIndexSlot*>(
+        mapping + node_index_offset);
     group_entries =
         reinterpret_cast<SharedGroupEntry*>(mapping + group_entry_offset);
     page_handles =
@@ -426,6 +494,7 @@ void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
     header->hash_block_tokens = hash_block_tokens;
     header->commit_boundary_tokens = commit_boundary_tokens;
     header->max_nodes = config.max_nodes;
+    header->max_node_index_slots = MaxNodeIndexSlots();
     header->max_group_entries = config.max_group_entries;
     header->max_page_handles = config.max_page_handles;
     header->next_group_entry.store(0, std::memory_order_relaxed);
@@ -476,6 +545,7 @@ void HostPrefixCacheCoordinator::SharedState::ValidateSharedState() const {
     if (header->hash_block_tokens != hash_block_tokens ||
         header->commit_boundary_tokens != commit_boundary_tokens ||
         header->max_nodes != config.max_nodes ||
+        header->max_node_index_slots != MaxNodeIndexSlots() ||
         header->max_group_entries != config.max_group_entries ||
         header->max_page_handles != config.max_page_handles) {
         throw std::runtime_error("Host prefix cache config mismatch");
@@ -554,17 +624,233 @@ void HostPrefixCacheCoordinator::SharedState::Initialize(bool create_region) {
     }
 }
 
+std::uint32_t
+HostPrefixCacheCoordinator::SharedState::MaxNodeIndexSlots() const {
+    if (config.max_nodes == 0) {
+        return 1;
+    }
+    return NextPowerOfTwo(config.max_nodes * 2);
+}
+
 std::optional<std::uint32_t>
-HostPrefixCacheCoordinator::SharedState::FindNodeLocked(
+HostPrefixCacheCoordinator::SharedState::FindNodeIndexSlotLocked(
     const PrefixDigest& digest) const {
-    for (std::uint32_t index = 0; index < config.max_nodes; ++index) {
-        const SharedPrefixNode& node = nodes[index];
-        if (node.state == static_cast<std::uint32_t>(EntryState::kResident) &&
-            DigestEquals(node.digest, digest)) {
-            return index;
+    const std::uint32_t slot_count = MaxNodeIndexSlots();
+    const std::uint32_t start =
+        static_cast<std::uint32_t>(DigestHash(digest) & (slot_count - 1));
+    for (std::uint32_t probe = 0; probe < slot_count; ++probe) {
+        const std::uint32_t slot_index = (start + probe) & (slot_count - 1);
+        const SharedNodeIndexSlot& slot = node_index_slots[slot_index];
+        const auto state = static_cast<IndexSlotState>(slot.state);
+        if (state == IndexSlotState::kEmpty) {
+            return std::nullopt;
+        }
+        if (state == IndexSlotState::kResident &&
+            DigestEquals(slot.digest, digest)) {
+            return slot_index;
         }
     }
     return std::nullopt;
+}
+
+void HostPrefixCacheCoordinator::SharedState::InsertNodeIndexLocked(
+    const PrefixDigest& digest, std::uint32_t node_index) {
+    const std::uint32_t slot_count = MaxNodeIndexSlots();
+    const std::uint32_t start =
+        static_cast<std::uint32_t>(DigestHash(digest) & (slot_count - 1));
+    std::optional<std::uint32_t> first_tombstone;
+    for (std::uint32_t probe = 0; probe < slot_count; ++probe) {
+        const std::uint32_t slot_index = (start + probe) & (slot_count - 1);
+        SharedNodeIndexSlot& slot = node_index_slots[slot_index];
+        const auto state = static_cast<IndexSlotState>(slot.state);
+        if (state == IndexSlotState::kResident) {
+            if (DigestEquals(slot.digest, digest)) {
+                slot.node_index = node_index;
+                return;
+            }
+            continue;
+        }
+        if (state == IndexSlotState::kTombstone) {
+            if (!first_tombstone.has_value()) {
+                first_tombstone = slot_index;
+            }
+            continue;
+        }
+        const std::uint32_t target =
+            first_tombstone.has_value() ? first_tombstone.value() : slot_index;
+        SharedNodeIndexSlot& target_slot = node_index_slots[target];
+        target_slot.state =
+            static_cast<std::uint32_t>(IndexSlotState::kResident);
+        target_slot.node_index = node_index;
+        target_slot.digest = digest;
+        return;
+    }
+
+    if (first_tombstone.has_value()) {
+        SharedNodeIndexSlot& slot = node_index_slots[first_tombstone.value()];
+        slot.state = static_cast<std::uint32_t>(IndexSlotState::kResident);
+        slot.node_index = node_index;
+        slot.digest = digest;
+        return;
+    }
+    throw std::runtime_error("Host prefix cache node index table is full");
+}
+
+void HostPrefixCacheCoordinator::SharedState::RemoveNodeIndexLocked(
+    const PrefixDigest& digest) {
+    const auto slot_index = FindNodeIndexSlotLocked(digest);
+    if (!slot_index.has_value()) {
+        return;
+    }
+    SharedNodeIndexSlot& slot = node_index_slots[slot_index.value()];
+    slot.state = static_cast<std::uint32_t>(IndexSlotState::kTombstone);
+    slot.node_index = 0;
+    slot.digest = PrefixDigest{};
+}
+
+void HostPrefixCacheCoordinator::SharedState::RebuildNodeIndexLocked() {
+    std::fill(node_index_slots, node_index_slots + MaxNodeIndexSlots(),
+              SharedNodeIndexSlot{});
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state == static_cast<std::uint32_t>(EntryState::kResident)) {
+            InsertNodeIndexLocked(node.digest, node_index);
+        }
+    }
+}
+
+std::uint32_t
+HostPrefixCacheCoordinator::SharedState::CountNodeIndexTombstonesLocked()
+    const {
+    std::uint32_t tombstones = 0;
+    for (std::uint32_t slot_index = 0; slot_index < MaxNodeIndexSlots();
+         ++slot_index) {
+        if (node_index_slots[slot_index].state ==
+            static_cast<std::uint32_t>(IndexSlotState::kTombstone)) {
+            ++tombstones;
+        }
+    }
+    return tombstones;
+}
+
+HostPrefixCacheCoordinator::SharedState::ArenaUsage
+HostPrefixCacheCoordinator::SharedState::ResidentArenaUsageLocked() const {
+    ArenaUsage usage;
+    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
+         ++node_index) {
+        const SharedPrefixNode& node = nodes[node_index];
+        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
+            continue;
+        }
+        usage.group_entries += node.group_entry_count;
+        for (std::uint32_t offset = 0; offset < node.group_entry_count;
+             ++offset) {
+            const SharedGroupEntry& entry =
+                group_entries[node.first_group_entry + offset];
+            if (entry.state ==
+                static_cast<std::uint32_t>(EntryState::kResident)) {
+                usage.page_handles += entry.page_handle_count;
+            }
+        }
+    }
+    return usage;
+}
+
+bool HostPrefixCacheCoordinator::SharedState::TailArenaCapacityEnoughLocked(
+    std::uint32_t min_group_entries,
+    std::uint32_t min_page_handles) const {
+    const std::uint32_t next_group_entry =
+        header->next_group_entry.load(std::memory_order_relaxed);
+    const std::uint32_t next_page_handle =
+        header->next_page_handle.load(std::memory_order_relaxed);
+    return config.max_group_entries - next_group_entry >= min_group_entries &&
+           config.max_page_handles - next_page_handle >= min_page_handles;
+}
+
+bool HostPrefixCacheCoordinator::SharedState::
+    CompactedArenaCapacityEnoughLocked(std::uint32_t min_group_entries,
+                                       std::uint32_t min_page_handles) const {
+    const ArenaUsage usage = ResidentArenaUsageLocked();
+    return config.max_group_entries - usage.group_entries >=
+               min_group_entries &&
+           config.max_page_handles - usage.page_handles >= min_page_handles;
+}
+
+void HostPrefixCacheCoordinator::SharedState::CompactArenasForCapacityLocked(
+    std::uint32_t min_group_entries, std::uint32_t min_page_handles) {
+    if (TailArenaCapacityEnoughLocked(min_group_entries, min_page_handles)) {
+        return;
+    }
+    if (CompactedArenaCapacityEnoughLocked(min_group_entries,
+                                           min_page_handles)) {
+        CompactArenasLocked();
+    }
+}
+
+void HostPrefixCacheCoordinator::SharedState::
+    RebuildNodeIndexIfNeededLocked() {
+    const std::uint32_t tombstones = CountNodeIndexTombstonesLocked();
+    const std::uint32_t threshold = std::max(
+        kNodeIndexRebuildMinTombstones, MaxNodeIndexSlots() / 4);
+    if (tombstones >= threshold) {
+        RebuildNodeIndexLocked();
+    }
+}
+
+void HostPrefixCacheCoordinator::SharedState::
+    CompactArenasAfterEvictionIfUsefulLocked(
+        std::uint32_t min_group_entries, std::uint32_t min_page_handles) {
+    if (!TailArenaCapacityEnoughLocked(min_group_entries, min_page_handles) &&
+        CompactedArenaCapacityEnoughLocked(min_group_entries,
+                                           min_page_handles)) {
+        CompactArenasLocked();
+        return;
+    }
+
+    const ArenaUsage usage = ResidentArenaUsageLocked();
+    const std::uint32_t next_group_entry =
+        header->next_group_entry.load(std::memory_order_relaxed);
+    const std::uint32_t next_page_handle =
+        header->next_page_handle.load(std::memory_order_relaxed);
+    const std::uint32_t dead_group_entries =
+        next_group_entry >= usage.group_entries
+            ? next_group_entry - usage.group_entries
+            : 0;
+    const std::uint32_t dead_page_handles =
+        next_page_handle >= usage.page_handles
+            ? next_page_handle - usage.page_handles
+            : 0;
+    const std::uint32_t group_threshold = std::max(
+        kArenaCompactMinDeadGroupEntries, config.max_group_entries / 4);
+    const std::uint32_t page_threshold = std::max(
+        kArenaCompactMinDeadPageHandles, config.max_page_handles / 4);
+    if (dead_group_entries >= group_threshold ||
+        dead_page_handles >= page_threshold) {
+        CompactArenasLocked();
+        return;
+    }
+
+    RebuildNodeIndexIfNeededLocked();
+}
+
+std::optional<std::uint32_t>
+HostPrefixCacheCoordinator::SharedState::FindNodeLocked(
+    const PrefixDigest& digest) const {
+    const auto slot_index = FindNodeIndexSlotLocked(digest);
+    if (!slot_index.has_value()) {
+        return std::nullopt;
+    }
+    const SharedNodeIndexSlot& slot = node_index_slots[slot_index.value()];
+    if (slot.node_index >= config.max_nodes) {
+        return std::nullopt;
+    }
+    const SharedPrefixNode& node = nodes[slot.node_index];
+    if (node.state != static_cast<std::uint32_t>(EntryState::kResident) ||
+        !DigestEquals(node.digest, digest)) {
+        return std::nullopt;
+    }
+    return slot.node_index;
 }
 
 std::uint32_t HostPrefixCacheCoordinator::SharedState::AllocateNodeLocked() {
@@ -794,6 +1080,7 @@ void HostPrefixCacheCoordinator::SharedState::UpdateLoadRefsLocked(
 void HostPrefixCacheCoordinator::SharedState::EvictNodeLocked(
     SharedPrefixNode* node, PrefixEvictionResult* result) {
     AppendEvictedPagesLocked(*node, result);
+    RemoveNodeIndexLocked(node->digest);
     result->freed_group_entries += node->group_entry_count;
     for (std::uint32_t offset = 0; offset < node->group_entry_count; ++offset) {
         const SharedGroupEntry& entry =
@@ -1001,6 +1288,7 @@ void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
     }
     header->next_group_entry.store(next_group_entry, std::memory_order_relaxed);
     header->next_page_handle.store(next_page_handle, std::memory_order_relaxed);
+    RebuildNodeIndexLocked();
 }
 
 PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
@@ -1092,6 +1380,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
     if (free_node_slots < new_nodes_needed) {
         throw std::runtime_error("Host prefix cache node table is full");
     }
+    CompactArenasForCapacityLocked(group_entries_needed, page_handles_needed);
     const std::uint32_t first_group_entry =
         header->next_group_entry.load(std::memory_order_relaxed);
     const std::uint32_t first_page_handle =
@@ -1207,6 +1496,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
                                        std::memory_order_relaxed);
         header->next_page_handle.store(next_page_handle,
                                        std::memory_order_relaxed);
+        InsertNodeIndexLocked(digest, node_index);
         ++result.inserted_nodes;
         raw_start_token = raw_end_token;
     }
@@ -1380,25 +1670,29 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
     std::uint32_t min_free_page_handles, std::uint32_t max_scan_nodes) {
     PrefixEvictionResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
-    CompactArenasLocked();
 
-    const auto has_enough_free_capacity = [&result, this, min_free_nodes,
+    const auto has_enough_free_capacity = [this, min_free_nodes,
                                            min_free_group_entries,
                                            min_free_page_handles]() {
         const std::uint32_t free_nodes = CountFreeNodeSlotsLocked();
-        const std::uint32_t free_group_entries =
-            config.max_group_entries -
-            header->next_group_entry.load(std::memory_order_relaxed) +
-            result.freed_group_entries;
-        const std::uint32_t free_page_handles =
-            config.max_page_handles -
-            header->next_page_handle.load(std::memory_order_relaxed) +
-            result.freed_page_handles;
+        return free_nodes >= min_free_nodes && TailArenaCapacityEnoughLocked(
+                                                   min_free_group_entries,
+                                                   min_free_page_handles);
+    };
+    const auto can_satisfy_after_compact = [this, min_free_nodes,
+                                            min_free_group_entries,
+                                            min_free_page_handles]() {
+        const std::uint32_t free_nodes = CountFreeNodeSlotsLocked();
         return free_nodes >= min_free_nodes &&
-               free_group_entries >= min_free_group_entries &&
-               free_page_handles >= min_free_page_handles;
+               CompactedArenaCapacityEnoughLocked(min_free_group_entries,
+                                                  min_free_page_handles);
     };
 
+    if (has_enough_free_capacity()) {
+        return result;
+    }
+    CompactArenasForCapacityLocked(min_free_group_entries,
+                                   min_free_page_handles);
     if (has_enough_free_capacity()) {
         return result;
     }
@@ -1434,14 +1728,15 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
 
         EvictNodeLocked(&node, &result);
 
-        if (has_enough_free_capacity()) {
+        if (has_enough_free_capacity() || can_satisfy_after_compact()) {
             break;
         }
     }
 
     if (result.evicted_nodes != 0) {
         FilterEvictedPagesStillReferencedLocked(&result);
-        CompactArenasLocked();
+        CompactArenasAfterEvictionIfUsefulLocked(min_free_group_entries,
+                                                 min_free_page_handles);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
                                     std::memory_order_relaxed);
@@ -1461,7 +1756,6 @@ HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
     }
 
     ScopedPthreadMutexLock lock(&header->mutex);
-    CompactArenasLocked();
 
     std::vector<std::uint32_t> candidates;
     candidates.reserve(config.max_nodes);
@@ -1510,7 +1804,7 @@ HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
 
     if (result.evicted_nodes != 0) {
         FilterEvictedPagesStillReferencedLocked(&result);
-        CompactArenasLocked();
+        CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
                                     std::memory_order_relaxed);
@@ -1523,7 +1817,6 @@ PrefixEvictionResult
 HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
     PrefixEvictionResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
-    CompactArenasLocked();
 
     for (std::uint32_t node_index = 0; node_index < config.max_nodes;
          ++node_index) {
@@ -1540,7 +1833,7 @@ HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
 
     if (result.evicted_nodes != 0) {
         FilterEvictedPagesStillReferencedLocked(&result);
-        CompactArenasLocked();
+        CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
                                     std::memory_order_relaxed);
@@ -1553,7 +1846,6 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
     PrefixDigest namespace_digest) {
     PrefixEvictionResult result;
     ScopedPthreadMutexLock lock(&header->mutex);
-    CompactArenasLocked();
 
     for (std::uint32_t node_index = 0; node_index < config.max_nodes;
          ++node_index) {
@@ -1573,7 +1865,7 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
 
     if (result.evicted_nodes != 0) {
         FilterEvictedPagesStillReferencedLocked(&result);
-        CompactArenasLocked();
+        CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
                                     std::memory_order_relaxed);

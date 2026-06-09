@@ -833,6 +833,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              &kv::HostPrefixCacheCoordinator::CommitPrefixPages,
              py::arg("namespace_digest"), py::arg("token_ids"),
              py::arg("commit_tokens"), py::arg("group_pages"))
+        .def(
+            "commit_prefix_page_ids",
+            [](kv::HostPrefixCacheCoordinator& self,
+               kv::PrefixDigest namespace_digest,
+               const std::vector<std::int64_t>& token_ids,
+               std::uint32_t commit_tokens,
+               const std::vector<
+                   std::pair<std::uint32_t, std::vector<std::uint32_t>>>&
+                   group_page_ids) {
+                std::vector<kv::GroupCommitPages> group_pages;
+                group_pages.reserve(group_page_ids.size());
+                for (const auto& [group_id, page_ids] : group_page_ids) {
+                    kv::GroupCommitPages group;
+                    group.group_id = group_id;
+                    group.pages.reserve(page_ids.size());
+                    for (std::uint32_t page_id : page_ids) {
+                        group.pages.push_back(kv::HostPageHandle{page_id});
+                    }
+                    group_pages.emplace_back(std::move(group));
+                }
+                return self.CommitPrefixPages(namespace_digest, token_ids,
+                                              commit_tokens, group_pages);
+            },
+            py::arg("namespace_digest"), py::arg("token_ids"),
+            py::arg("commit_tokens"), py::arg("group_page_ids"))
         .def("lookup_and_attach",
              &kv::HostPrefixCacheCoordinator::LookupAndAttach,
              py::arg("namespace_digest"), py::arg("token_ids"))
