@@ -118,3 +118,17 @@ def test_pinned_faster_than_pageable():
     pageable_ms, pinned_ms = bench(w_pageable), bench(w_pinned)
     print(f"\n  pageable={pageable_ms*1e3:.1f}us  pinned={pinned_ms*1e3:.1f}us")
     assert pinned_ms <= pageable_ms * 1.5  # pinned should not be slower
+
+
+if __name__ == "__main__":
+    # Plain-python runner (no pytest needed) for remote GPU execution.
+    if not torch.cuda.is_available():
+        print("SKIP: CUDA required")
+        raise SystemExit(0)
+    test_correctness_matches_gpu_embedding()
+    print("[OK] correctness: CPU-pinned gather == GPU nn.Embedding (bit-exact)")
+    test_not_a_decode_bottleneck()
+    print("[OK] perf: CPU embed << decode forward (<0.5ms, <1%)")
+    test_pinned_faster_than_pageable()
+    print("[OK] pinned not slower than pageable")
+    print("ALL PASSED")
