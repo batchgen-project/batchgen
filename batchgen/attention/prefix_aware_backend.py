@@ -8,6 +8,8 @@ is prepended to freshly computed suffix KV.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import os
 from typing import Callable, Optional
 
 import torch
@@ -110,13 +112,32 @@ class GqaPrefixAwareAttentionBackend:
         from batchgen.attention.gqa import gqa_extend_fa
 
         layer_idx = int(self.layer_idx)
+        debug_sync = os.environ.get("BATCHGEN_PREFIX_DEBUG_SYNC", "0") == "1"
+        if debug_sync:
+            logging.info(
+                "[PREFIX_DEBUG] layer=%s begin q_shape=%s k_shape=%s v_shape=%s "
+                "cache_seqlens_minmax=(%s,%s) page_table_shape=%s",
+                layer_idx,
+                tuple(query.shape),
+                tuple(key.shape),
+                tuple(value.shape),
+                int(materialization.append_plan.cache_seqlens.min().item()),
+                int(materialization.append_plan.cache_seqlens.max().item()),
+                tuple(materialization.append_plan.page_table.shape),
+            )
         materialization.wait_for_layer(layer_idx)
+        if debug_sync:
+            torch.cuda.synchronize(query.device)
+            logging.info("[PREFIX_DEBUG] layer=%s prefix_load_ready", layer_idx)
         materialization.manager.append_layer_prefill_suffix_tokens(
             k_tensor=key,
             v_tensor=value,
             append_plan=materialization.append_plan,
             layer_idx=layer_idx,
         )
+        if debug_sync:
+            torch.cuda.synchronize(query.device)
+            logging.info("[PREFIX_DEBUG] layer=%s suffix_append_done", layer_idx)
         k_cache, v_cache, page_table = (
             materialization.manager.get_layer_kv_with_page_table(layer_idx)
         )
@@ -147,4 +168,7 @@ class GqaPrefixAwareAttentionBackend:
             softmax_scale=self.softmax_scale,
             sliding_window=self.sliding_window,
         )
+        if debug_sync:
+            torch.cuda.synchronize(query.device)
+            logging.info("[PREFIX_DEBUG] layer=%s extend_attention_done", layer_idx)
         return attn_output

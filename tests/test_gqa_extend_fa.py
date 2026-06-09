@@ -42,7 +42,7 @@ def test_gqa_extend_fa_passes_paged_extend_metadata(monkeypatch):
     assert calls["kwargs"]["page_table"] is page_table
     assert calls["kwargs"]["cache_seqlens"] is cache_seqlens
     assert calls["kwargs"]["cu_seqlens_q"] is cu_q
-    assert calls["kwargs"]["cu_seqlens_k_new"] is cu_q
+    assert "cu_seqlens_k_new" not in calls["kwargs"]
     assert calls["kwargs"]["max_seqlen_q"] == 3
     assert calls["kwargs"]["causal"] is True
     assert calls["kwargs"]["window_size"] == (127, 0)
