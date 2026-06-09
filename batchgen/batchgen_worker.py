@@ -6212,6 +6212,11 @@ class BatchGenWorker:
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
 		# never overflows.
 		self._decode_padding_bsz = max_num_seq
+		# Optionally relocate the embedding table to pinned host RAM, freeing ~vocab*hidden*2 B
+		# of GPU (2.19 GiB for K2.5) for the GPU KV cache. The decode loop already lands the
+		# sampled token ids on host every step, so the per-step cost is only a small host gather
+		# + H2D of the [n_tokens, hidden] result (no new D2H/sync). Opt-in, K2.5 only.
+		self._setup_cpu_embedding()
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
@@ -8293,12 +8298,13 @@ class BatchGenWorker:
 		finally:
 			AttnWrapperBase.batchgen_debug = old_debug
 
-	def _glm5_decode_model_forward(self, new_tokens: torch.Tensor):
+	def _glm5_decode_model_forward(self, new_tokens: torch.Tensor, inputs_embeds: torch.Tensor = None):
 		def _forward():
 			return self.model(
 				new_tokens,
 				attention_mask=Attn_Wrapper.attention_mask,
 				position_ids=Attn_Wrapper.position_ids,
+				inputs_embeds=inputs_embeds,
 				use_cache=False,
 			)
 
@@ -10235,7 +10241,10 @@ class BatchGenWorker:
 					# CRITICAL: Pass position_ids to model to ensure correct RoPE positioning during decode.
 					# Without this, the model generates position_ids = [[0]] for all decode steps,
 					# causing RoPE to be applied at position 0 instead of the actual token position.
-					outputs = self._glm5_decode_model_forward(new_tokens)
+					# When the embedding table lives on host (CPU-embed), gather inputs_embeds from
+					# the host token ids (already on host) instead of the freed GPU embed_tokens.
+					_inputs_embeds = self._rebuild_input_embeds(batch) if getattr(self, "_cpu_embed_weight", None) is not None else None
+					outputs = self._glm5_decode_model_forward(new_tokens, inputs_embeds=_inputs_embeds)
 					new_tokens_out = self._select_tokens(outputs.logits[:, -1, :], batch_sequences)
 				self._nsys_decode_profile_end_forward(_nsys_forward_idx)
 
@@ -11033,6 +11042,77 @@ class BatchGenWorker:
 		
 		return updated_decode_uuids, updated_batch
 
+
+	def _setup_cpu_embedding(self) -> None:
+		"""Relocate the embedding table to pinned host RAM and free its GPU copy (K2.5, opt-in).
+
+		Frees ~vocab*hidden*2 B of GPU (2.19 GiB for K2.5) so the GPU KV cache (sized right
+		after this, in _init_gpu_kv_with_actual_size) grows into it. Decode then gathers
+		inputs_embeds from the host table via _rebuild_input_embeds. Gated by
+		BATCHGEN_KIMI_CPU_EMBED=1 and K2.5 only.
+
+		NOTE: this frees the table for the DECODE phase. The single-batch prefill-then-decode
+		flow re-prefills nothing after decode config, so it is safe. Continuous-arrival servers
+		that re-prefill after decode would need the prefill embed routed through the host table
+		too (follow-up).
+		"""
+		if os.environ.get("BATCHGEN_KIMI_CPU_EMBED", "0") != "1":
+			self._cpu_embed_weight = getattr(self, "_cpu_embed_weight", None)
+			return
+		if not is_kimi_k25_backend_model(getattr(self, "model_name", "") or ""):
+			self._cpu_embed_weight = None
+			return
+		try:
+			emb = self.model.model.embed_tokens
+		except AttributeError:
+			self._cpu_embed_weight = None
+			return
+		w = emb.weight
+		# Pin the host copy once (from the checkpoint-loaded weight); reuse across reloads.
+		if getattr(self, "_cpu_embed_weight", None) is None:
+			self._cpu_embed_weight = w.detach().to("cpu").pin_memory()
+		# Free the (re-materialized) GPU weight on the module.
+		emb.weight = torch.nn.Parameter(
+			torch.empty(0, dtype=w.dtype, device=w.device), requires_grad=False
+		)
+		# PSM.skeleton_state_dict persists and aliases the same GPU tensor — drop its embed
+		# refs too, else the 2.19 GiB is not actually reclaimed. Reload skips the (now-absent)
+		# key and keeps a fresh empty weight; compute uses the cached host copy.
+		sd = getattr(getattr(self, "parallel_manager", None), "skeleton_state_dict", None)
+		if isinstance(sd, dict):
+			for k in [k for k in sd if "embed_tokens" in k]:
+				del sd[k]
+		del w
+		torch.cuda.empty_cache()
+		if self.rank == 0:
+			gib = self._cpu_embed_weight.numel() * self._cpu_embed_weight.element_size() / (1024 ** 3)
+			logging.info(f"[CPU-EMBED] embed_tokens on pinned host; freed {gib:.2f} GiB GPU")
+
+	def _rebuild_input_embeds(self, batch: List[int]) -> torch.Tensor:
+		"""Decode-step inputs_embeds gathered from the pinned-host embedding table.
+
+		Mirrors _rebuild_input_tokens but returns [n, 1, hidden] on device, gathered on host
+		from the already-host token ids (query_book.decoded_tokens) — no new D2H/sync.
+		"""
+		hid = self._cpu_embed_weight.shape[1]
+		ids = []
+		for local_idx in batch:
+			uuid = self._local_to_uuid_map.get(local_idx)
+			if uuid is None:
+				continue
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			pos = max(0, seq.decoded_length - 1)
+			query_entry = self.query_book.get(local_idx)
+			if query_entry is None:
+				continue
+			ids.append(query_entry.decoded_tokens[:, pos:pos + 1])  # host [1, 1]
+		if not ids:
+			return torch.empty((0, 1, hid), dtype=self._cpu_embed_weight.dtype, device=self.torch_device)
+		ids_host = torch.cat(ids, dim=0).view(-1).long()             # host [n]
+		emb = torch.index_select(self._cpu_embed_weight, 0, ids_host)  # host [n, hidden]
+		return emb.unsqueeze(1).to(self.torch_device, non_blocking=True)  # [n, 1, hidden]
 
 	def _rebuild_input_tokens(self, batch: List[int]) -> torch.Tensor:
 		"""Build input tokens from each sequence's last decoded position."""
