@@ -76,10 +76,10 @@ _FP4_E2M1_TABLE_VALUES = (
     -6.0,
 )
 
-# Env-gated grouped-MoE slot kernel for sm120 decode (default OFF). When enabled,
-# _run_owned_experts uses the fused FP4 slot-GEMV path instead of the per-expert loop.
+# Env-gated grouped-MoE for sm120 decode (default OFF). When enabled,
+# _run_owned_experts uses the 3D grouped MXFP4 GEMM path instead of the
+# per-expert loop, and owned experts are made resident (see PSM persistence).
 _V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
-_V4_GROUPED_MOE_3D = os.environ.get("BATCHGEN_V4_GROUPED_MOE_3D", "0") == "1"
 _V4_GROUPED_MOE_MAX_TOKENS = int(
     os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
 )
@@ -1598,16 +1598,11 @@ class DeepSeekV4FlashMoE(nn.Module):
             return None
         if not self._stage_owned_expert_weights():
             return None
-        if _V4_GROUPED_MOE_3D:
-            from batchgen.moe.v4_slot_moe_sm120 import (
-                v4_grouped_mxfp4_moe_forward_3d_ptrs,
-            )
+        from batchgen.moe.v4_slot_moe_sm120 import (
+            v4_grouped_mxfp4_moe_forward_3d_ptrs,
+        )
 
-            moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
-        else:
-            from batchgen.moe.v4_slot_moe_sm120 import v4_slot_moe_forward_ptrs
-
-            moe_forward = v4_slot_moe_forward_ptrs
+        moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
 
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
         return moe_forward(
