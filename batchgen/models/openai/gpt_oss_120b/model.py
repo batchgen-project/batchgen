@@ -1115,6 +1115,23 @@ class GptOssMoEPrefill(nn.Module):
             self._buffer_shape = shape
         return self._bf16_buffer
 
+    @staticmethod
+    def _debug_sync_mlp(label: str, tensor: torch.Tensor) -> None:
+        if os.environ.get("BATCHGEN_GPT_OSS_MLP_DEBUG_SYNC", "0") != "1":
+            return
+        logging.getLogger(__name__).info(
+            "[GPT_OSS_MLP_DEBUG] before_sync label=%s shape=%s dtype=%s device=%s",
+            label,
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+        )
+        torch.cuda.synchronize(tensor.device)
+        logging.getLogger(__name__).info(
+            "[GPT_OSS_MLP_DEBUG] after_sync label=%s",
+            label,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass: grouped WGMMA for persistent experts, per-expert loop for the rest."""
         import os
@@ -1137,20 +1154,24 @@ class GptOssMoEPrefill(nn.Module):
 
         if self._fused_gate_ctx is not None:
             topk_indices, topk_weights = self._fused_gate_ctx.forward(hidden_flat)
+            self._debug_sync_mlp("routing_fused_gate", hidden_flat)
         elif _HAS_CUDA_ROUTING:
             router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
+            self._debug_sync_mlp("routing_cuda_topk", hidden_flat)
         else:
             router_logits = self.router(hidden_flat)
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
             )
             topk_weights = F.softmax(topk_weights, dim=-1)
+            self._debug_sync_mlp("routing_torch_topk", hidden_flat)
 
         # Initialize output
         output = torch.zeros_like(hidden_flat)
+        self._debug_sync_mlp("zeros_like_output", output)
 
         # Phase 1: Grouped WGMMA for persistent experts
         num_persistent = len(self.persistent_expert_indices)
@@ -1168,6 +1189,7 @@ class GptOssMoEPrefill(nn.Module):
                 up_bias_ptrs=self.up_bias_ptrs,
                 down_bias_ptrs=self.down_bias_ptrs,
             )
+            self._debug_sync_mlp("grouped_moe", output)
             # If all experts are persistent, we're done
             if not self.non_persistent_expert_indices:
                 return output.view(batch_size, seq_len, hidden_dim)
