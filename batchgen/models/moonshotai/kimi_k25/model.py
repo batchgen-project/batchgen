@@ -256,7 +256,7 @@ class KimiK25MoEBufferManager:
         topk: int,
         num_tokens_per_rank: int,
         device: torch.device,
-        max_tokens_padded: int = _DEFAULT_MTP,
+        max_tokens_padded: int = None,
     ):
         self.E_local = E_local
         self.H = H
@@ -265,6 +265,15 @@ class KimiK25MoEBufferManager:
         self.max_global_bsz = max_global_bsz
         self.num_tokens_per_rank = num_tokens_per_rank
         self.device = device
+        # mtp (per-expert padded stride) = worst-case per-expert load. After AllGather any
+        # expert can receive ALL global tokens, so the worst case = max_global_bsz. Pre-reserve
+        # the 3D buffers at round_up(max_global_bsz); the page-boundary admission caps per-rank
+        # in-decode at max_global_bsz/world_size (= num_tokens_per_rank) so this never overflows
+        # -> no runtime resize -> no corner-case OOM. (Previously a fixed _DEFAULT_MTP=4096,
+        # which over-reserved ~6 GiB and OOM'd single-node no-offload init.)
+        if max_tokens_padded is None:
+            max_tokens_padded = max(
+                ((max_global_bsz + _BLOCK_M - 1) // _BLOCK_M) * _BLOCK_M, _BLOCK_M)
         self.max_tokens_padded = max_tokens_padded
 
         NK = max_global_bsz * topk
