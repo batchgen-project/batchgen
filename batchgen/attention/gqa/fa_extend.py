@@ -65,6 +65,13 @@ def gqa_extend_fa(
         softmax_scale = q.shape[-1] ** -0.5
 
     page_table_kwarg = "page_table" if _USE_FA3 else "block_table"
+    extra_kwargs = {page_table_kwarg: page_table}
+    if _USE_FA3:
+        # Variable-length extend prefill has two independent boundaries:
+        # suffix query tokens and newly appended suffix KV tokens. BatchGen
+        # writes suffix K/V into the paged cache before calling FA3, but FA3
+        # still needs the new-KV segmentation to map varlen rows correctly.
+        extra_kwargs["cu_seqlens_k_new"] = cu_seqlens_q
     result = _flash_with_kvcache(
         q,
         k_cache,
@@ -76,7 +83,7 @@ def gqa_extend_fa(
         causal=True,
         window_size=window_size,
         return_softmax_lse=sinks is not None,
-        **{page_table_kwarg: page_table},
+        **extra_kwargs,
     )
 
     if isinstance(result, tuple):
