@@ -1143,8 +1143,17 @@ class GptOssMoEPrefill(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
 
+        disable_fused_gate = (
+            os.environ.get("BATCHGEN_GPT_OSS_PREFILL_DISABLE_FUSED_GATE", "0")
+            == "1"
+        )
+
         # Compute routing: fused gate (WGMMA GEMM + bias + TopK + Softmax) or fallback
-        if self._fused_gate_ctx is None and _HAS_CUDA_ROUTING:
+        if (
+            not disable_fused_gate
+            and self._fused_gate_ctx is None
+            and _HAS_CUDA_ROUTING
+        ):
             w = self.router.weight  # [E, K_dim] BF16
             if w.dtype == torch.bfloat16:
                 from batchgen.moe.routing import FusedGateContext
@@ -1152,7 +1161,7 @@ class GptOssMoEPrefill(nn.Module):
                 _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
                 self._fused_gate_ctx = FusedGateContext(w, _bias_bf16, topk=self.num_experts_per_tok)
 
-        if self._fused_gate_ctx is not None:
+        if self._fused_gate_ctx is not None and not disable_fused_gate:
             topk_indices, topk_weights = self._fused_gate_ctx.forward(hidden_flat)
             self._debug_sync_mlp("routing_fused_gate", hidden_flat)
         elif _HAS_CUDA_ROUTING:
