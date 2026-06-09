@@ -204,6 +204,11 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
+# Max per-rank in-decode batch. Bounds the K2.5 MoE padded buffer (mtp = round_up(world_size *
+# this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
+# the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
+_MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
+
 # Optional Nsight Systems capture window for decode-forward profiling.
 # Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
 BATCHGEN_NSYS_DECODE_PROFILE = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE", "0") == "1"
@@ -4759,6 +4764,7 @@ class BatchGenWorker:
 			candidates=tuple(candidates),
 			total_pages=total_pages,
 			world_size=self.world_size,
+			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
 		)
 
 	def _check_and_handle_completions(
@@ -5605,6 +5611,11 @@ class BatchGenWorker:
 				max_num_seq_estimate = (total_candidates + self.world_size - 1) // self.world_size
 				# Ensure at least some minimum
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
+				# Cap per-rank decode batch so the MoE buffer's mtp (= round_up(world_size *
+				# this)) stays bounded — a large candidate pool must NOT inflate the padded
+				# buffers (that re-OOMs init). The page-boundary admission also caps in-decode
+				# at this value (decode.py max_rank_bsz), so the buffer never overflows.
+				max_num_seq_estimate = min(max_num_seq_estimate, _MAX_DECODE_RANK_BSZ)
 
 				self._load_decode_model(max_num_seq_estimate, self.comm)
 
@@ -6246,6 +6257,10 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
+		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
+		# never overflows.
+		self._decode_padding_bsz = max_num_seq
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
