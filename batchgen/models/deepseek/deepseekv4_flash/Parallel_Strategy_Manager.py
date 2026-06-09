@@ -16,12 +16,16 @@ checkpoint names, and attaches local V4 wrappers for DP attention + EP MoE.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import torch
 
 from .model import DeepSeekV4FlashForCausalLM
-from .tensor_contract import build_v4_weight_contract, model_key_to_checkpoint_key
+from .tensor_contract import (
+    build_v4_weight_contract,
+    model_key_to_checkpoint_key,
+)
 from .wrappers import DeepSeekV4FlashAttnWrapper, DeepSeekV4FlashExpertWrapper
 
 
@@ -46,8 +50,8 @@ class DeepSeekV4FlashParallelStrategyManager:
         self.global_rank = global_rank
         self.world_size = world_size
         self.rank = global_rank
-        self.state_dict_name_map, self.weight_copy_task = build_v4_weight_contract(
-            model_config
+        self.state_dict_name_map, self.weight_copy_task = (
+            build_v4_weight_contract(model_config)
         )
 
     def configure_prefill(self):
@@ -70,13 +74,14 @@ class DeepSeekV4FlashParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def configure_decoding(self, padding_bsz=None, comm=None):
-        del padding_bsz
         if self.loaded_model_config is not None:
             self.loaded_model_config.phase = "decode"
         start = time.perf_counter()
         self.model = DeepSeekV4FlashForCausalLM(self.loaded_model_config)
         self._load_model_skeleton()
         self._configure_moe_ranges(prefill=False, comm=comm)
+        effective_padding_bsz = padding_bsz if padding_bsz is not None else 128
+        self._init_decoding_padding_bsz(effective_padding_bsz)
         self._config_attn_module()
         self._config_expert_module()
         self._config_lm_head_hook()
@@ -88,6 +93,22 @@ class DeepSeekV4FlashParallelStrategyManager:
                 time.perf_counter() - start,
             )
         return self.model, self.weight_copy_task
+
+    def _init_decoding_padding_bsz(self, padding_bsz):
+        env_max_bsz = os.getenv("BATCHGEN_MAX_RANK_BSZ")
+        max_rank_bsz = int(env_max_bsz) if env_max_bsz else int(padding_bsz)
+        if self.rank == 0:
+            logging.info(
+                "[DECODE] DeepSeek-V4 padding batch size: %s%s",
+                max_rank_bsz,
+                " (from BATCHGEN_MAX_RANK_BSZ)" if env_max_bsz else "",
+            )
+        for layer in self.model.model.layers:
+            layer.mlp.init_num_tokens(max_rank_bsz)
+
+    def set_num_tokens_per_rank(self, num_tokens_per_rank):
+        for layer in self.model.model.layers:
+            layer.mlp.set_num_tokens_per_rank(int(num_tokens_per_rank))
 
     def _load_model_skeleton(self):
         loaded = 0
@@ -111,7 +132,9 @@ class DeepSeekV4FlashParallelStrategyManager:
                 len(missing),
             )
             if missing:
-                logging.warning("DeepSeek-V4 missing skeleton samples: %s", missing[:20])
+                logging.warning(
+                    "DeepSeek-V4 missing skeleton samples: %s", missing[:20]
+                )
 
     def _configure_moe_ranges(self, prefill: bool, comm) -> None:
         if prefill:
@@ -123,9 +146,17 @@ class DeepSeekV4FlashParallelStrategyManager:
         for layer in self.model.model.layers:
             layer.mlp.configure_ep(rank, world_size, comm=comm)
 
+    def _is_attn_in_weight_copy_task(self, module_key: str) -> bool:
+        for task_type, keys in self.weight_copy_task.items():
+            if task_type.startswith("attn") and module_key in keys:
+                return True
+        return False
+
     def _config_attn_module(self) -> None:
         for layer_idx, layer in enumerate(self.model.model.layers):
-            persistent = f"attn_{layer_idx}" not in self.weight_copy_task.get("attn", [])
+            persistent = not self._is_attn_in_weight_copy_task(
+                f"attn_{layer_idx}"
+            )
             layer.self_attn = DeepSeekV4FlashAttnWrapper(
                 layer.self_attn,
                 layer_idx,
@@ -171,4 +202,6 @@ class DeepSeekV4FlashParallelStrategyManager:
         return input[0][:, -1, :].unsqueeze(1)
 
     def _config_lm_head_hook(self) -> None:
-        self.model.lm_head.register_forward_pre_hook(self._lm_head_forward_pre_hook)
+        self.model.lm_head.register_forward_pre_hook(
+            self._lm_head_forward_pre_hook
+        )

@@ -297,6 +297,25 @@ class DeepSeekV4FlashAttention(nn.Module):
         self.head_dim = int(_cfg(config, "head_dim", 512))
         self.q_lora_rank = int(_cfg(config, "q_lora_rank", 1024))
         self.o_groups = int(_cfg(config, "o_groups", 8))
+        self.world_size = int(
+            _cfg(
+                config,
+                "world_size",
+                dist.get_world_size() if dist.is_initialized() else 1,
+            )
+        )
+        if self.n_heads % self.world_size != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be divisible by world_size "
+                f"({self.world_size}) for tensor-parallel attention"
+            )
+        if self.o_groups % self.world_size != 0:
+            raise ValueError(
+                f"o_groups ({self.o_groups}) must be divisible by world_size "
+                f"({self.world_size}) for tensor-parallel output projection"
+            )
+        self.n_local_heads = self.n_heads // self.world_size
+        self.n_local_groups = self.o_groups // self.world_size
         self.o_lora_rank = int(_cfg(config, "o_lora_rank", 1024))
         self.eps = float(
             _cfg(config, "rms_norm_eps", _cfg(config, "norm_eps", 1e-6))
@@ -308,8 +327,11 @@ class DeepSeekV4FlashAttention(nn.Module):
             int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
         )
 
+        self.runtime_phase = "prefill"
+        self._prefill_full_tensors: Dict[str, torch.Tensor] = {}
+
         self.attn_sink = nn.Parameter(
-            torch.empty(self.n_heads, dtype=torch.float32)
+            torch.empty(self.n_local_heads, dtype=torch.float32)
         )
         self.wq_a = DeepSeekV4FlashLinearSlot(
             self.hidden_size, self.q_lora_rank
@@ -366,10 +388,59 @@ class DeepSeekV4FlashAttention(nn.Module):
             self.kv_norm.weight.data = tensors["kv_norm.weight"].to(
                 self.kv_norm.weight.device
             )
+        self._set_compressor_runtime(self.compressor, tensors, "compressor")
+        if self.indexer is not None:
+            self.indexer.wq_b.set_runtime_tensors(tensors, "indexer.wq_b")
+            self.indexer.weights_proj.set_runtime_tensors(
+                tensors, "indexer.weights_proj"
+            )
+            self._set_compressor_runtime(
+                self.indexer.compressor, tensors, "indexer.compressor"
+            )
+
+    @staticmethod
+    def _set_compressor_runtime(comp, tensors, prefix: str) -> None:
+        if comp is None:
+            return
+        ape_key = f"{prefix}.ape"
+        norm_key = f"{prefix}.norm.weight"
+        if ape_key in tensors:
+            comp.ape.data = tensors[ape_key].to(comp.ape.device)
+        if norm_key in tensors:
+            comp.norm.weight.data = tensors[norm_key].to(
+                comp.norm.weight.device
+            )
+        comp.wkv.set_runtime_tensors(tensors, f"{prefix}.wkv")
+        comp.wgate.set_runtime_tensors(tensors, f"{prefix}.wgate")
+
+    def set_prefill_full_tensors(
+        self, tensors: Dict[str, torch.Tensor]
+    ) -> None:
+        self._prefill_full_tensors = tensors
+
+    def clear_prefill_full_tensors(self) -> None:
+        self._prefill_full_tensors = {}
+
+    def _get_prefill_full_tensor(self, name: str) -> torch.Tensor:
+        tensor = self._prefill_full_tensors.get(name)
+        if tensor is None:
+            raise RuntimeError(
+                f"DeepSeek-V4 prefill requires full replicated tensor "
+                f"'{name}' for layer {self.layer_idx}"
+            )
+        return tensor
 
     def clear_runtime_tensors(self) -> None:
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
             getattr(self, name).clear_runtime_tensors()
+        if self.compressor is not None:
+            self.compressor.wkv.clear_runtime_tensors()
+            self.compressor.wgate.clear_runtime_tensors()
+        if self.indexer is not None:
+            self.indexer.wq_b.clear_runtime_tensors()
+            self.indexer.weights_proj.clear_runtime_tensors()
+            self.indexer.compressor.wkv.clear_runtime_tensors()
+            self.indexer.compressor.wgate.clear_runtime_tensors()
 
     def forward(
         self,
@@ -384,8 +455,25 @@ class DeepSeekV4FlashAttention(nn.Module):
     ]:
         del position_ids, use_cache
         bsz, q_len, _ = hidden_states.shape
+
+        prefill_dp = self.runtime_phase == "prefill" and self.world_size > 1
+        if prefill_dp:
+            n_heads = self.n_heads
+            n_groups = self.o_groups
+        else:
+            n_heads = self.n_local_heads
+            n_groups = self.n_local_groups
+
         q_low = self.q_norm(self.wq_a(hidden_states))
-        q = self.wq_b(q_low).view(bsz, q_len, self.n_heads, self.head_dim)
+        if prefill_dp:
+            q = _linear_from_weight(
+                q_low,
+                self._get_prefill_full_tensor("wq_b.weight"),
+                self._prefill_full_tensors.get("wq_b.scale"),
+            )
+        else:
+            q = self.wq_b(q_low)
+        q = q.view(bsz, q_len, n_heads, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(dim=-1, keepdim=True) + self.eps)
 
         kv = self.kv_norm(self.wkv(hidden_states))
@@ -394,7 +482,7 @@ class DeepSeekV4FlashAttention(nn.Module):
             kv_for_attn = self._normalize_past_kv(past_key_value)
             if q_len == 1 and cache_seqlens is not None:
                 self._write_current_kv(kv_for_attn, kv, cache_seqlens)
-        k = kv_for_attn.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+        k = kv_for_attn.unsqueeze(2).expand(-1, -1, n_heads, -1)
         v = k
         attn_scores = torch.einsum("bshd,bthd->bhst", q, k) * self.softmax_scale
         attn_scores = self._apply_fallback_masks(
@@ -413,9 +501,28 @@ class DeepSeekV4FlashAttention(nn.Module):
         attn_output = attn_output.reshape(
             bsz,
             q_len,
-            self.o_groups,
-            self.n_heads // self.o_groups * self.head_dim,
+            n_groups,
+            n_heads // n_groups * self.head_dim,
         )
+        if prefill_dp:
+            wo_a_weight = _dequant_weight(
+                self._get_prefill_full_tensor("wo_a.weight"),
+                None,
+                hidden_states.dtype,
+            )
+            wo_a = wo_a_weight.view(
+                n_groups,
+                self.o_lora_rank,
+                n_heads // n_groups * self.head_dim,
+            )
+            attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
+            attn_output = _linear_from_weight(
+                attn_output.flatten(2),
+                self._get_prefill_full_tensor("wo_b.weight"),
+                self._prefill_full_tensors.get("wo_b.scale"),
+            )
+            return attn_output, None, kv
+
         wo_a_weight = self.wo_a.weight
         if wo_a_weight is None:
             raise RuntimeError(
@@ -427,12 +534,14 @@ class DeepSeekV4FlashAttention(nn.Module):
             hidden_states.dtype,
         )
         wo_a = wo_a_weight.view(
-            self.o_groups,
+            n_groups,
             self.o_lora_rank,
-            self.n_heads // self.o_groups * self.head_dim,
+            n_heads // n_groups * self.head_dim,
         )
         attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a)
         attn_output = self.wo_b(attn_output.flatten(2))
+        if self.world_size > 1 and dist.is_initialized():
+            dist.all_reduce(attn_output)
         return attn_output, None, kv
 
     @staticmethod
@@ -684,13 +793,20 @@ class DeepSeekV4FlashMoE(nn.Module):
             self.hidden_size, self.intermediate_size, 0.0
         )
         self.comm = None
+        self.rank = 0
+        self.world_size = 1
         self.routed_expert_start_idx = 0
         self.routed_expert_end_idx = self.total_experts
         self.experts_per_rank = self.total_experts
         self.enable_ep_offloading = False
+        self.num_tokens_per_rank = None
+        self.max_num_tokens_per_rank = None
+        self.pad_token_id = int(_cfg(config, "pad_token_id", 0))
 
     def configure_ep(self, rank: int, world_size: int, comm=None) -> None:
         self.comm = comm
+        self.rank = rank
+        self.world_size = world_size
         self.experts_per_rank = math.ceil(self.total_experts / world_size)
         self.routed_expert_start_idx = min(
             rank * self.experts_per_rank, self.total_experts
@@ -700,15 +816,26 @@ class DeepSeekV4FlashMoE(nn.Module):
         )
         self.enable_ep_offloading = world_size > 1
 
-    def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
-    ) -> torch.Tensor:
-        shape = hidden_states.shape
-        flat_states = hidden_states.reshape(-1, self.hidden_size)
-        flat_ids = input_ids.reshape(-1) if input_ids is not None else None
-        topk_weights, topk_indices = self.gate(flat_states, flat_ids)
+    def init_num_tokens(self, num_tokens_per_rank: int) -> None:
+        self.num_tokens_per_rank = int(num_tokens_per_rank)
+        self.max_num_tokens_per_rank = int(num_tokens_per_rank)
 
-        routed = torch.zeros_like(flat_states, dtype=torch.float32)
+    def set_num_tokens_per_rank(self, num_tokens_per_rank: int) -> None:
+        num_tokens_per_rank = int(num_tokens_per_rank)
+        if (
+            self.max_num_tokens_per_rank is None
+            or num_tokens_per_rank > self.max_num_tokens_per_rank
+        ):
+            self.max_num_tokens_per_rank = num_tokens_per_rank
+        self.num_tokens_per_rank = num_tokens_per_rank
+
+    def _run_owned_experts(
+        self,
+        token_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        routed = torch.zeros_like(token_states, dtype=torch.float32)
         counts = torch.bincount(
             topk_indices.reshape(-1), minlength=self.total_experts
         )
@@ -719,13 +846,83 @@ class DeepSeekV4FlashMoE(nn.Module):
                 continue
             token_idx, topk_pos = torch.where(topk_indices == expert_idx)
             expert_out = self.experts[expert_idx](
-                flat_states[token_idx],
+                token_states[token_idx],
                 topk_weights[token_idx, topk_pos].unsqueeze(-1),
             )
             routed[token_idx] += expert_out.float()
+        return routed
+
+    def _forward_local_routed(
+        self, flat_states: torch.Tensor, flat_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        topk_weights, topk_indices = self.gate(flat_states, flat_ids)
+        return self._run_owned_experts(flat_states, topk_weights, topk_indices)
+
+    def _forward_ep_decode_routed(
+        self, flat_states: torch.Tensor, flat_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if self.num_tokens_per_rank is None:
+            raise RuntimeError(
+                "DeepSeek-V4 MoE num_tokens_per_rank is not initialized; "
+                "configure_decoding must call init_num_tokens before EP decode."
+            )
+        real_tokens = flat_states.shape[0]
+        ntpr = int(self.num_tokens_per_rank)
+        if real_tokens > ntpr:
+            raise RuntimeError(
+                f"DeepSeek-V4 MoE buffer overflow: real_tokens={real_tokens} > "
+                f"num_tokens_per_rank={ntpr}"
+            )
+
+        padded = flat_states.new_zeros((ntpr, self.hidden_size))
+        if real_tokens > 0:
+            padded[:real_tokens] = flat_states
+        global_states = flat_states.new_empty(
+            (self.world_size * ntpr, self.hidden_size)
+        )
+        dist.all_gather_into_tensor(global_states, padded)
+
+        global_ids = None
+        if flat_ids is not None:
+            padded_ids = torch.full(
+                (ntpr,),
+                self.pad_token_id,
+                dtype=flat_ids.dtype,
+                device=flat_ids.device,
+            )
+            if real_tokens > 0:
+                padded_ids[:real_tokens] = flat_ids
+            global_ids = torch.empty(
+                (self.world_size * ntpr,),
+                dtype=flat_ids.dtype,
+                device=flat_ids.device,
+            )
+            dist.all_gather_into_tensor(global_ids, padded_ids)
+        elif getattr(self.gate, "is_hash_layer", False):
+            raise RuntimeError(
+                "DeepSeek-V4 hash-routing MoE requires input_ids during EP decode."
+            )
+
+        topk_weights, topk_indices = self.gate(global_states, global_ids)
+        global_routed = self._run_owned_experts(
+            global_states, topk_weights, topk_indices
+        )
+        dist.all_reduce(global_routed, op=dist.ReduceOp.SUM)
+
+        start = self.rank * ntpr
+        return global_routed[start : start + real_tokens]
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        shape = hidden_states.shape
+        flat_states = hidden_states.reshape(-1, self.hidden_size)
+        flat_ids = input_ids.reshape(-1) if input_ids is not None else None
 
         if self.enable_ep_offloading and dist.is_initialized():
-            dist.all_reduce(routed)
+            routed = self._forward_ep_decode_routed(flat_states, flat_ids)
+        else:
+            routed = self._forward_local_routed(flat_states, flat_ids)
 
         shared = self.shared_experts(flat_states).float()
         return (routed + shared).to(hidden_states.dtype).view(shape)
