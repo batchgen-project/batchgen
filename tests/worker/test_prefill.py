@@ -174,23 +174,25 @@ def test_no_eviction_candidates_pure_queueing_order():
 
 
 def test_prefix_estimate_reduces_admission_pages():
-    # Without prefix estimate, prompt 4096 needs 66 pages:
-    # max(prompt + chunk = 4224, gpu_tokens = (65 + 32) * 64)
-    # capped only by budget. With a 3072-token page-aligned hit, only the
-    # 1024-token append side is charged, so two candidates fit in 32 pages.
+    # Without prefix estimate, prompt 4096 needs 97 pages:
+    # max(prompt + chunk = 4224, gpu_tokens = (65 + 32) * 64).
+    # With a 3072-token page-aligned hit, the private charge drops to
+    # ceil((6208 - 3072) / 64) = 49 pages, so two candidates fit in 98 pages.
     c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072)
     c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072)
-    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [32]))
+    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [98]))
     assert plan == ["c0", "c1"]
+    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [97]))
+    assert plan == ["c0"]
 
 
 def test_non_page_aligned_prefix_estimate_is_conservative():
     # A full-hit compute path may normalize to prompt_length - 1. Admission
     # must only credit fully page-aligned shared pages.
     c = _prefix_cand("c", prompt=4096, cached=4095)
-    plan = PrefillScheduler.select_prefill_batch(_req([c], [1]))
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [33]))
     assert plan == []
-    plan = PrefillScheduler.select_prefill_batch(_req([c], [2]))
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [34]))
     assert plan == ["c"]
 
 
