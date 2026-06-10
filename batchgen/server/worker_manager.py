@@ -22,6 +22,12 @@ from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
+from batchgen.prefix_reuse.admin import (
+    clear_host_prefix_cache,
+    host_kv_views_by_prefix_group,
+    pin_host_prefix_cache,
+    unpin_host_prefix_cache,
+)
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
     cleanup_shm_files,
@@ -122,6 +128,7 @@ class WorkerManager:
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
+        self._prefix_cache_pin_handles: list[int] = []
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
@@ -303,6 +310,99 @@ class WorkerManager:
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
+
+    def clear_prefix_cache(self) -> dict[str, Any]:
+        """Clear unprotected Host prefix-cache entries and release Host pages."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+        host_kv_manager = self.host_kv_manager
+        if host_kv_manager is None:
+            raise RuntimeError("Host KV manager is not initialized")
+
+        host_kv_views = host_kv_views_by_prefix_group(
+            primary_host_kv=host_kv_manager,
+            auxiliary_host_kv=self.host_kv_aux_manager,
+        )
+        with self._lock:
+            unpin_result = self._unpin_prefix_cache_locked(coordinator)
+            clear_result = clear_host_prefix_cache(
+                coordinator=coordinator,
+                host_kv_views_by_group=host_kv_views,
+            )
+            clear_result["unpin"] = unpin_result
+            return clear_result
+
+    def pin_prefix_cache(
+        self,
+        token_id_batches: list[list[int]],
+        *,
+        replace_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Pin cache entries matching token-id batches against eviction."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+        runtime_config = self.prefix_cache_runtime_config
+        if runtime_config is None:
+            raise RuntimeError("Prefix cache runtime config is not initialized")
+
+        with self._lock:
+            unpin_result = None
+            if replace_existing:
+                unpin_result = self._unpin_prefix_cache_locked(coordinator)
+            pin_result = pin_host_prefix_cache(
+                coordinator=coordinator,
+                namespace_digest=runtime_config.namespace_digest,
+                token_id_batches=token_id_batches,
+            )
+            handles = [
+                int(handle)
+                for handle in pin_result.pop("attachment_handles")
+            ]
+            self._prefix_cache_pin_handles.extend(handles)
+            pin_result["total_pinned"] = len(self._prefix_cache_pin_handles)
+            if unpin_result is not None:
+                pin_result["unpin"] = unpin_result
+            return pin_result
+
+    def unpin_prefix_cache(self) -> dict[str, Any]:
+        """Release all server-owned prefix-cache pins."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+
+        with self._lock:
+            return self._unpin_prefix_cache_locked(coordinator)
+
+    def _unpin_prefix_cache_locked(self, coordinator: Any) -> dict[str, Any]:
+        handles = list(self._prefix_cache_pin_handles)
+        result = unpin_host_prefix_cache(
+            coordinator=coordinator,
+            attachment_handles=handles,
+        )
+        self._prefix_cache_pin_handles.clear()
+        return result
+
+    def prefix_cache_pin_status(self) -> dict[str, Any]:
+        """Return server-owned prefix-cache pin state."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        with self._lock:
+            return {
+                "status": "success",
+                "pinned": len(self._prefix_cache_pin_handles),
+            }
 
     def infer(
         self,
