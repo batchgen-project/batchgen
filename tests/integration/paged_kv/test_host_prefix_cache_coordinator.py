@@ -252,6 +252,58 @@ def test_host_prefix_cache_evicts_common_nodes_until_pages_releasable():
         _shm_unlink(shm_name)
 
 
+def test_host_prefix_cache_releases_shared_physical_page_after_last_ref():
+    shm_name = _random_shm_name()
+    namespace_a = [401, 402, 403, 404]
+    namespace_b = [501, 502, 503, 504]
+    token_ids = list(range(8))
+    try:
+        coordinator = bg.HostPrefixCacheCoordinator(_config(shm_name))
+        coordinator.initialize(True)
+        coordinator.commit_prefix_pages(
+            namespace_a,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(42), _page(43)]),
+                _group_pages(1, [_page(7)]),
+            ],
+        )
+        coordinator.commit_prefix_pages(
+            namespace_b,
+            token_ids,
+            8,
+            [
+                _group_pages(0, [_page(42), _page(44)]),
+                _group_pages(1, [_page(7)]),
+            ],
+        )
+
+        first = coordinator.clear_namespace(namespace_a)
+        assert first.evicted_nodes == 1
+        assert [
+            [page.page_id for page in pages.pages]
+            for pages in first.evicted_group_pages
+        ] == [[43]]
+        assert coordinator.estimate_lookup(
+            namespace_b,
+            token_ids,
+        ).common_cached_tokens == 8
+
+        second = coordinator.clear_namespace(namespace_b)
+        assert second.evicted_nodes == 1
+        assert [
+            [page.page_id for page in pages.pages]
+            for pages in second.evicted_group_pages
+        ] == [
+            [42, 44],
+            [7],
+        ]
+        assert coordinator.get_stats().resident_nodes == 0
+    finally:
+        _shm_unlink(shm_name)
+
+
 def test_host_prefix_cache_clear_skips_active_entries():
     shm_name = _random_shm_name()
     namespace = [505, 606, 707, 808]

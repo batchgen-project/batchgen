@@ -31,8 +31,9 @@ namespace batchgen::kv {
 namespace {
 
 constexpr std::uint64_t kPrefixCacheMagic = 0x484f535450434348ULL;
-constexpr std::uint32_t kPrefixCacheAbiVersion = 3;
+constexpr std::uint32_t kPrefixCacheAbiVersion = 4;
 constexpr std::uint32_t kNodeIndexRebuildMinTombstones = 1024;
+constexpr std::uint32_t kPageRefRebuildMinTombstones = 1024;
 constexpr std::uint32_t kArenaCompactMinDeadGroupEntries = 1024;
 constexpr std::uint32_t kArenaCompactMinDeadPageHandles = 4096;
 
@@ -60,6 +61,7 @@ struct SharedHeader {
     std::uint32_t commit_boundary_tokens = 0;
     std::uint32_t max_nodes = 0;
     std::uint32_t max_node_index_slots = 0;
+    std::uint32_t max_page_ref_slots = 0;
     std::uint32_t max_group_entries = 0;
     std::uint32_t max_page_handles = 0;
 
@@ -113,6 +115,13 @@ struct SharedPageHandle {
     std::uint32_t page_id = 0;
 };
 
+struct SharedPageRefSlot {
+    std::uint32_t state = static_cast<std::uint32_t>(IndexSlotState::kEmpty);
+    std::uint32_t group_id = 0;
+    std::uint32_t page_id = 0;
+    std::uint32_t ref_count = 0;
+};
+
 std::uint64_t NowNs() {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
@@ -145,6 +154,11 @@ std::uint64_t DigestHash(const PrefixDigest& digest) {
         value ^= SplitMix64(digest[lane] + lane);
     }
     return SplitMix64(value);
+}
+
+std::uint64_t PageRefHash(std::uint32_t group_id, std::uint32_t page_id) {
+    return SplitMix64((static_cast<std::uint64_t>(group_id) << 32) |
+                      static_cast<std::uint64_t>(page_id));
 }
 
 PrefixDigest HashPrefixBlock(PrefixDigest namespace_digest,
@@ -376,6 +390,7 @@ struct HostPrefixCacheCoordinator::SharedState {
     SharedGroupSpec* group_specs = nullptr;
     SharedPrefixNode* nodes = nullptr;
     SharedNodeIndexSlot* node_index_slots = nullptr;
+    SharedPageRefSlot* page_ref_slots = nullptr;
     SharedGroupEntry* group_entries = nullptr;
     SharedPageHandle* page_handles = nullptr;
 
@@ -383,6 +398,7 @@ struct HostPrefixCacheCoordinator::SharedState {
     std::size_t group_spec_offset = 0;
     std::size_t node_offset = 0;
     std::size_t node_index_offset = 0;
+    std::size_t page_ref_offset = 0;
     std::size_t group_entry_offset = 0;
     std::size_t page_handle_offset = 0;
     std::size_t total_bytes_unaligned = 0;
@@ -415,11 +431,7 @@ struct HostPrefixCacheCoordinator::SharedState {
                               int delta);
     void EvictNodeLocked(SharedPrefixNode* node, PrefixEvictionResult* result);
     void AppendEvictedPagesLocked(const SharedPrefixNode& node,
-                                  PrefixEvictionResult* result) const;
-    bool ResidentNodeReferencesPageLocked(std::uint32_t group_id,
-                                          const HostPageHandle& page) const;
-    void FilterEvictedPagesStillReferencedLocked(
-        PrefixEvictionResult* result) const;
+                                  PrefixEvictionResult* result);
     void CompactArenasLocked();
     std::uint32_t MaxNodeIndexSlots() const;
     std::optional<std::uint32_t> FindNodeIndexSlotLocked(
@@ -429,6 +441,16 @@ struct HostPrefixCacheCoordinator::SharedState {
     void RemoveNodeIndexLocked(const PrefixDigest& digest);
     void RebuildNodeIndexLocked();
     std::uint32_t CountNodeIndexTombstonesLocked() const;
+    std::uint32_t MaxPageRefSlots() const;
+    std::optional<std::uint32_t> FindPageRefSlotLocked(
+        std::uint32_t group_id, std::uint32_t page_id) const;
+    SharedPageRefSlot& InsertOrGetPageRefSlotLocked(std::uint32_t group_id,
+                                                    std::uint32_t page_id);
+    void IncrementPageRefLocked(std::uint32_t group_id, std::uint32_t page_id);
+    bool DecrementPageRefLocked(std::uint32_t group_id, std::uint32_t page_id);
+    void RebuildPageRefIndexLocked();
+    std::uint32_t CountPageRefTombstonesLocked() const;
+    void RebuildPageRefIndexIfNeededLocked();
     ArenaUsage ResidentArenaUsageLocked() const;
     bool TailArenaCapacityEnoughLocked(std::uint32_t min_group_entries,
                                        std::uint32_t min_page_handles) const;
@@ -460,6 +482,10 @@ void HostPrefixCacheCoordinator::SharedState::ComputeOffsets() {
     node_index_offset = offset;
     offset += sizeof(SharedNodeIndexSlot) * MaxNodeIndexSlots();
 
+    offset = AlignUp(offset, alignof(SharedPageRefSlot));
+    page_ref_offset = offset;
+    offset += sizeof(SharedPageRefSlot) * MaxPageRefSlots();
+
     offset = AlignUp(offset, alignof(SharedGroupEntry));
     group_entry_offset = offset;
     offset += sizeof(SharedGroupEntry) * config.max_group_entries;
@@ -478,6 +504,8 @@ void HostPrefixCacheCoordinator::SharedState::MapPointers() {
     nodes = reinterpret_cast<SharedPrefixNode*>(mapping + node_offset);
     node_index_slots = reinterpret_cast<SharedNodeIndexSlot*>(
         mapping + node_index_offset);
+    page_ref_slots =
+        reinterpret_cast<SharedPageRefSlot*>(mapping + page_ref_offset);
     group_entries =
         reinterpret_cast<SharedGroupEntry*>(mapping + group_entry_offset);
     page_handles =
@@ -495,6 +523,7 @@ void HostPrefixCacheCoordinator::SharedState::ConstructSharedState() {
     header->commit_boundary_tokens = commit_boundary_tokens;
     header->max_nodes = config.max_nodes;
     header->max_node_index_slots = MaxNodeIndexSlots();
+    header->max_page_ref_slots = MaxPageRefSlots();
     header->max_group_entries = config.max_group_entries;
     header->max_page_handles = config.max_page_handles;
     header->next_group_entry.store(0, std::memory_order_relaxed);
@@ -546,6 +575,7 @@ void HostPrefixCacheCoordinator::SharedState::ValidateSharedState() const {
         header->commit_boundary_tokens != commit_boundary_tokens ||
         header->max_nodes != config.max_nodes ||
         header->max_node_index_slots != MaxNodeIndexSlots() ||
+        header->max_page_ref_slots != MaxPageRefSlots() ||
         header->max_group_entries != config.max_group_entries ||
         header->max_page_handles != config.max_page_handles) {
         throw std::runtime_error("Host prefix cache config mismatch");
@@ -734,6 +764,153 @@ HostPrefixCacheCoordinator::SharedState::CountNodeIndexTombstonesLocked()
     return tombstones;
 }
 
+std::uint32_t
+HostPrefixCacheCoordinator::SharedState::MaxPageRefSlots() const {
+    if (config.max_page_handles == 0) {
+        return 1;
+    }
+    return NextPowerOfTwo(config.max_page_handles * 2);
+}
+
+std::optional<std::uint32_t>
+HostPrefixCacheCoordinator::SharedState::FindPageRefSlotLocked(
+    std::uint32_t group_id, std::uint32_t page_id) const {
+    const std::uint32_t slot_count = MaxPageRefSlots();
+    const std::uint32_t start =
+        static_cast<std::uint32_t>(PageRefHash(group_id, page_id) &
+                                   (slot_count - 1));
+    for (std::uint32_t probe = 0; probe < slot_count; ++probe) {
+        const std::uint32_t slot_index = (start + probe) & (slot_count - 1);
+        const SharedPageRefSlot& slot = page_ref_slots[slot_index];
+        const auto state = static_cast<IndexSlotState>(slot.state);
+        if (state == IndexSlotState::kEmpty) {
+            return std::nullopt;
+        }
+        if (state == IndexSlotState::kResident &&
+            slot.group_id == group_id && slot.page_id == page_id) {
+            return slot_index;
+        }
+    }
+    return std::nullopt;
+}
+
+SharedPageRefSlot&
+HostPrefixCacheCoordinator::SharedState::InsertOrGetPageRefSlotLocked(
+    std::uint32_t group_id, std::uint32_t page_id) {
+    const std::uint32_t slot_count = MaxPageRefSlots();
+    const std::uint32_t start =
+        static_cast<std::uint32_t>(PageRefHash(group_id, page_id) &
+                                   (slot_count - 1));
+    std::optional<std::uint32_t> first_tombstone;
+    for (std::uint32_t probe = 0; probe < slot_count; ++probe) {
+        const std::uint32_t slot_index = (start + probe) & (slot_count - 1);
+        SharedPageRefSlot& slot = page_ref_slots[slot_index];
+        const auto state = static_cast<IndexSlotState>(slot.state);
+        if (state == IndexSlotState::kResident) {
+            if (slot.group_id == group_id && slot.page_id == page_id) {
+                return slot;
+            }
+            continue;
+        }
+        if (state == IndexSlotState::kTombstone) {
+            if (!first_tombstone.has_value()) {
+                first_tombstone = slot_index;
+            }
+            continue;
+        }
+        const std::uint32_t target =
+            first_tombstone.has_value() ? first_tombstone.value() : slot_index;
+        SharedPageRefSlot& target_slot = page_ref_slots[target];
+        target_slot.state =
+            static_cast<std::uint32_t>(IndexSlotState::kResident);
+        target_slot.group_id = group_id;
+        target_slot.page_id = page_id;
+        target_slot.ref_count = 0;
+        return target_slot;
+    }
+
+    if (first_tombstone.has_value()) {
+        SharedPageRefSlot& slot = page_ref_slots[first_tombstone.value()];
+        slot.state = static_cast<std::uint32_t>(IndexSlotState::kResident);
+        slot.group_id = group_id;
+        slot.page_id = page_id;
+        slot.ref_count = 0;
+        return slot;
+    }
+    throw std::runtime_error("Host prefix cache page ref table is full");
+}
+
+void HostPrefixCacheCoordinator::SharedState::IncrementPageRefLocked(
+    std::uint32_t group_id, std::uint32_t page_id) {
+    SharedPageRefSlot& slot = InsertOrGetPageRefSlotLocked(group_id, page_id);
+    if (slot.ref_count == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("Host prefix cache page ref count overflow");
+    }
+    ++slot.ref_count;
+}
+
+bool HostPrefixCacheCoordinator::SharedState::DecrementPageRefLocked(
+    std::uint32_t group_id, std::uint32_t page_id) {
+    const auto slot_index = FindPageRefSlotLocked(group_id, page_id);
+    if (!slot_index.has_value()) {
+        throw std::runtime_error("Host prefix cache page ref is missing");
+    }
+    SharedPageRefSlot& slot = page_ref_slots[slot_index.value()];
+    if (slot.ref_count == 0) {
+        throw std::runtime_error("Host prefix cache page ref underflow");
+    }
+    --slot.ref_count;
+    if (slot.ref_count != 0) {
+        return false;
+    }
+    slot.state = static_cast<std::uint32_t>(IndexSlotState::kTombstone);
+    slot.group_id = 0;
+    slot.page_id = 0;
+    return true;
+}
+
+void HostPrefixCacheCoordinator::SharedState::RebuildPageRefIndexLocked() {
+    std::vector<SharedPageRefSlot> refs;
+    refs.reserve(MaxPageRefSlots());
+    for (std::uint32_t slot_index = 0; slot_index < MaxPageRefSlots();
+         ++slot_index) {
+        const SharedPageRefSlot& slot = page_ref_slots[slot_index];
+        if (slot.state == static_cast<std::uint32_t>(IndexSlotState::kResident)) {
+            refs.push_back(slot);
+        }
+    }
+    std::fill(page_ref_slots, page_ref_slots + MaxPageRefSlots(),
+              SharedPageRefSlot{});
+    for (const SharedPageRefSlot& ref : refs) {
+        SharedPageRefSlot& slot =
+            InsertOrGetPageRefSlotLocked(ref.group_id, ref.page_id);
+        slot.ref_count = ref.ref_count;
+    }
+}
+
+std::uint32_t
+HostPrefixCacheCoordinator::SharedState::CountPageRefTombstonesLocked() const {
+    std::uint32_t tombstones = 0;
+    for (std::uint32_t slot_index = 0; slot_index < MaxPageRefSlots();
+         ++slot_index) {
+        if (page_ref_slots[slot_index].state ==
+            static_cast<std::uint32_t>(IndexSlotState::kTombstone)) {
+            ++tombstones;
+        }
+    }
+    return tombstones;
+}
+
+void HostPrefixCacheCoordinator::SharedState::
+    RebuildPageRefIndexIfNeededLocked() {
+    const std::uint32_t tombstones = CountPageRefTombstonesLocked();
+    const std::uint32_t threshold =
+        std::max(kPageRefRebuildMinTombstones, MaxPageRefSlots() / 4);
+    if (tombstones >= threshold) {
+        RebuildPageRefIndexLocked();
+    }
+}
+
 HostPrefixCacheCoordinator::SharedState::ArenaUsage
 HostPrefixCacheCoordinator::SharedState::ResidentArenaUsageLocked() const {
     ArenaUsage usage;
@@ -832,6 +1009,7 @@ void HostPrefixCacheCoordinator::SharedState::
     }
 
     RebuildNodeIndexIfNeededLocked();
+    RebuildPageRefIndexIfNeededLocked();
 }
 
 std::optional<std::uint32_t>
@@ -1095,94 +1273,33 @@ void HostPrefixCacheCoordinator::SharedState::EvictNodeLocked(
 }
 
 void HostPrefixCacheCoordinator::SharedState::AppendEvictedPagesLocked(
-    const SharedPrefixNode& node, PrefixEvictionResult* result) const {
-    std::map<std::uint32_t, std::vector<HostPageHandle>> pages_by_group;
-    for (const GroupCommitPages& group_pages : result->evicted_group_pages) {
-        pages_by_group[group_pages.group_id] = group_pages.pages;
-    }
+    const SharedPrefixNode& node, PrefixEvictionResult* result) {
     for (std::uint32_t offset = 0; offset < node.group_entry_count; ++offset) {
         const SharedGroupEntry& entry =
             group_entries[node.first_group_entry + offset];
         if (entry.state != static_cast<std::uint32_t>(EntryState::kResident)) {
             continue;
         }
-        std::vector<HostPageHandle>& pages = pages_by_group[entry.group_id];
         for (std::uint32_t page_idx = 0; page_idx < entry.page_handle_count;
              ++page_idx) {
             const SharedPageHandle& handle =
                 page_handles[entry.first_page_handle + page_idx];
-            pages.push_back({handle.page_id});
-        }
-    }
-
-    result->evicted_group_pages.clear();
-    for (const HostKVGroupSpec& spec : config.group_specs) {
-        auto iter = pages_by_group.find(spec.group_id);
-        if (iter == pages_by_group.end() || iter->second.empty()) {
-            continue;
-        }
-        result->evicted_group_pages.push_back(
-            GroupCommitPages{iter->first, std::move(iter->second)});
-    }
-}
-
-bool HostPrefixCacheCoordinator::SharedState::ResidentNodeReferencesPageLocked(
-    std::uint32_t group_id, const HostPageHandle& page) const {
-    for (std::uint32_t node_index = 0; node_index < config.max_nodes;
-         ++node_index) {
-        const SharedPrefixNode& node = nodes[node_index];
-        if (node.state != static_cast<std::uint32_t>(EntryState::kResident)) {
-            continue;
-        }
-        for (std::uint32_t offset = 0; offset < node.group_entry_count;
-             ++offset) {
-            const SharedGroupEntry& entry =
-                group_entries[node.first_group_entry + offset];
-            if (entry.state !=
-                    static_cast<std::uint32_t>(EntryState::kResident) ||
-                entry.group_id != group_id) {
-                continue;
-            }
-            for (std::uint32_t page_idx = 0; page_idx < entry.page_handle_count;
-                 ++page_idx) {
-                const SharedPageHandle& resident_page =
-                    page_handles[entry.first_page_handle + page_idx];
-                if (resident_page.page_id == page.page_id) {
-                    return true;
+            if (DecrementPageRefLocked(entry.group_id, handle.page_id)) {
+                auto iter = std::find_if(
+                    result->evicted_group_pages.begin(),
+                    result->evicted_group_pages.end(),
+                    [&entry](const GroupCommitPages& group_pages) {
+                        return group_pages.group_id == entry.group_id;
+                    });
+                if (iter == result->evicted_group_pages.end()) {
+                    result->evicted_group_pages.push_back(
+                        GroupCommitPages{entry.group_id, {}});
+                    iter = result->evicted_group_pages.end() - 1;
                 }
+                iter->pages.push_back({handle.page_id});
             }
         }
     }
-    return false;
-}
-
-void HostPrefixCacheCoordinator::SharedState::
-    FilterEvictedPagesStillReferencedLocked(
-        PrefixEvictionResult* result) const {
-    for (GroupCommitPages& group_pages : result->evicted_group_pages) {
-        std::vector<HostPageHandle> releasable_pages;
-        for (const HostPageHandle& page : group_pages.pages) {
-            if (ResidentNodeReferencesPageLocked(group_pages.group_id, page)) {
-                continue;
-            }
-            const bool already_recorded = std::any_of(
-                releasable_pages.begin(), releasable_pages.end(),
-                [&page](const HostPageHandle& existing) {
-                    return existing.page_id == page.page_id;
-                });
-            if (!already_recorded) {
-                releasable_pages.push_back(page);
-            }
-        }
-        group_pages.pages = std::move(releasable_pages);
-    }
-    result->evicted_group_pages.erase(
-        std::remove_if(result->evicted_group_pages.begin(),
-                       result->evicted_group_pages.end(),
-                       [](const GroupCommitPages& group_pages) {
-                           return group_pages.pages.empty();
-                       }),
-        result->evicted_group_pages.end());
 }
 
 void HostPrefixCacheCoordinator::SharedState::CompactArenasLocked() {
@@ -1478,6 +1595,7 @@ PrefixCommitResult HostPrefixCacheCoordinator::SharedState::CommitPrefixPages(
                     (*iter->second)[first_page + page_idx];
                 page_handles[next_page_handle++] =
                     SharedPageHandle{handle.page_id};
+                IncrementPageRefLocked(spec.group_id, handle.page_id);
             }
         }
 
@@ -1734,7 +1852,6 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::EvictUntilFree(
     }
 
     if (result.evicted_nodes != 0) {
-        FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasAfterEvictionIfUsefulLocked(min_free_group_entries,
                                                  min_free_page_handles);
     }
@@ -1788,22 +1905,12 @@ HostPrefixCacheCoordinator::SharedState::EvictUntilReleasablePages(
 
         EvictNodeLocked(&node, &result);
 
-        // Filtering evicted pages scans resident nodes to remove pages still
-        // referenced by protected or non-evicted prefix entries. Doing that
-        // after every single victim is O(nodes * pages * victims) and can make
-        // large allocation-pressure evictions appear stalled. First accumulate
-        // enough potential pages, then run the expensive exact filter only when
-        // the current candidate set might satisfy the request.
         if (HasEnoughReleasablePages(result, required_pages)) {
-            FilterEvictedPagesStillReferencedLocked(&result);
-            if (HasEnoughReleasablePages(result, required_pages)) {
-                break;
-            }
+            break;
         }
     }
 
     if (result.evicted_nodes != 0) {
-        FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
@@ -1832,7 +1939,6 @@ HostPrefixCacheCoordinator::SharedState::ClearUnprotected() {
     }
 
     if (result.evicted_nodes != 0) {
-        FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
@@ -1864,7 +1970,6 @@ PrefixEvictionResult HostPrefixCacheCoordinator::SharedState::ClearNamespace(
     }
 
     if (result.evicted_nodes != 0) {
-        FilterEvictedPagesStillReferencedLocked(&result);
         CompactArenasAfterEvictionIfUsefulLocked(0, 0);
     }
     header->evicted_nodes.fetch_add(result.evicted_nodes,
