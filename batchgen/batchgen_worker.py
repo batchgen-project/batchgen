@@ -4333,37 +4333,6 @@ class BatchGenWorker:
 
 		return per_node_stats
 
-	def _gather_prefix_cache_resident_nodes_by_node(self) -> List[int]:
-		"""Gather resident prefix-cache node count for each host node."""
-		gpus_per_node = NUM_GPUS_PER_NODE
-		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
-		report_node = -1
-		report_resident = 0
-		if (
-			self.enable_prefix_cache
-			and self.prefix_cache_coordinator is not None
-			and self.local_rank == 0
-		):
-			stats = self.prefix_cache_coordinator.get_stats()
-			report_node = self.rank // gpus_per_node
-			report_resident = int(stats.resident_nodes)
-
-		stats_tensor = torch.tensor(
-			[report_node, report_resident],
-			dtype=torch.int64,
-			device=self.torch_device,
-		)
-		gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
-		dist.all_gather(gathered, stats_tensor)
-
-		reports_by_node = {}
-		for item in gathered:
-			node_id = int(item[0].item())
-			if node_id >= 0:
-				reports_by_node[node_id] = int(item[1].item())
-
-		return [reports_by_node.get(node, 0) for node in range(num_nodes)]
-
 	def _make_watermark_trigger_request(
 		self, node_stats: List[dict]
 	) -> WatermarkTriggerRequest:
@@ -5786,31 +5755,28 @@ class BatchGenWorker:
 			or self.global_batch.has_on_hold()
 		)
 		if self.enable_prefix_cache and not has_active_work:
-			per_node_prefix_resident = (
-				self._gather_prefix_cache_resident_nodes_by_node()
-			)
-			per_node_effective_free = [
-				max(0, total_pages - resident_nodes)
-				for total_pages, resident_nodes in zip(
-					per_node_host_total,
-					per_node_prefix_resident,
-				)
-			]
+			per_node_effective_free = list(per_node_host_total)
+			charge_shared_prefix_pages = True
 			if self.rank == 0 and per_node_effective_free != per_node_host_free:
 				logging.info(
 					"[PREFILL] Using Host KV total capacity for selection "
-					"minus resident prefix pages because no live sequences "
-					"are holding private Host KV pages: "
+					"because no live sequences are holding private Host KV "
+					"pages; charging unique shared prefix pages selected "
+					"for this wave: "
 					f"total_pages={per_node_effective_free}, "
-					f"free_pages={per_node_host_free}, "
-					f"resident_prefix_nodes={per_node_prefix_resident}"
+					f"free_pages={per_node_host_free}"
 				)
 		else:
 			per_node_effective_free = list(per_node_host_free)
+			charge_shared_prefix_pages = False
 
 		prefill_batch = PrefillScheduler.select_prefill_batch(
 			self._make_prefill_selection_request(
-				all_candidates, per_node_effective_free, num_nodes, chunk_size
+				all_candidates,
+				per_node_effective_free,
+				num_nodes,
+				chunk_size,
+				charge_shared_prefix_pages=charge_shared_prefix_pages,
 			)
 		)
 
@@ -5860,7 +5826,7 @@ class BatchGenWorker:
 
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
-		num_nodes: int, chunk_size: int,
+		num_nodes: int, chunk_size: int, *, charge_shared_prefix_pages: bool,
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
@@ -5870,6 +5836,9 @@ class BatchGenWorker:
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
+			estimated_cached_tokens, estimated_page_ids = (
+				prefix_estimates.get(uuid, (0, ()))
+			)
 			candidates.append(PrefillCandidate(
 				uuid=uuid,
 				assigned_rank=seq.assigned_rank,
@@ -5881,7 +5850,8 @@ class BatchGenWorker:
 				prompt_length=seq.prompt_length,
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
-				estimated_shared_prefix_tokens=prefix_estimates.get(uuid, 0),
+				estimated_shared_prefix_tokens=estimated_cached_tokens,
+				estimated_shared_prefix_page_ids=estimated_page_ids,
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -5890,12 +5860,13 @@ class BatchGenWorker:
 			num_nodes=num_nodes,
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
+			charge_shared_prefix_pages=charge_shared_prefix_pages,
 		)
 
 	def _estimate_prefix_cache_for_admission(
 		self,
 		all_candidates: Sequence[str],
-	) -> Dict[str, int]:
+	) -> Dict[str, Tuple[int, Tuple[Tuple[int, int], ...]]]:
 		"""Return per-candidate prefix-hit estimates for prefill admission.
 
 		The scheduler must be deterministic on every rank, but only the owning
@@ -5924,7 +5895,7 @@ class BatchGenWorker:
 
 			prompt_length = int(seq.prompt_length)
 			if prompt_length <= 0:
-				local_estimates[uuid] = 0
+				local_estimates[uuid] = (0, ())
 				continue
 
 			token_tensor = (
@@ -5947,7 +5918,8 @@ class BatchGenWorker:
 				raw_cached_tokens=int(result.common_cached_tokens),
 				prompt_length=prompt_length,
 			)
-			local_estimates[uuid] = int(cached_tokens)
+			shared_page_ids = self._prefix_admission_page_ids(result)
+			local_estimates[uuid] = (int(cached_tokens), shared_page_ids)
 
 		if dist.is_available() and dist.is_initialized() and self.world_size > 1:
 			gathered = [None] * int(self.world_size)
@@ -5960,18 +5932,45 @@ class BatchGenWorker:
 			prefix_estimates = dict(local_estimates)
 
 		if self.rank == 0 and prefix_estimates:
-			hit_count = sum(1 for tokens in prefix_estimates.values() if tokens > 0)
-			cached_tokens = sum(int(tokens) for tokens in prefix_estimates.values())
+			hit_count = sum(
+				1 for tokens, _ in prefix_estimates.values() if tokens > 0
+			)
+			cached_tokens = sum(
+				int(tokens) for tokens, _ in prefix_estimates.values()
+			)
+			shared_pages = len({
+				page_key
+				for _, page_ids in prefix_estimates.values()
+				for page_key in page_ids
+			})
 			logging.info(
 				"[PREFIX_ADMISSION] estimated candidates=%d hit_seqs=%d "
-				"cached_tokens=%d elapsed_ms=%.1f",
+				"cached_tokens=%d unique_shared_pages=%d elapsed_ms=%.1f",
 				len(prefix_estimates),
 				hit_count,
 				cached_tokens,
+				shared_pages,
 				(time.perf_counter() - estimate_start) * 1000,
 			)
 
 		return prefix_estimates
+
+	def _prefix_admission_page_ids(
+		self,
+		lookup_result,
+	) -> Tuple[Tuple[int, int], ...]:
+		"""Return unique ``(group_id, page_id)`` keys from an estimate result."""
+		page_ids = []
+		seen = set()
+		for span in lookup_result.materialization_spans:
+			group_id = int(span.group_id)
+			for page in span.pages:
+				page_key = (group_id, int(page.page_id))
+				if page_key in seen:
+					continue
+				seen.add(page_key)
+				page_ids.append(page_key)
+		return tuple(page_ids)
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""

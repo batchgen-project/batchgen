@@ -47,6 +47,7 @@ def _prefix_cand(
     gidx=0,
     prompt=4096,
     cached=0,
+    page_ids=(),
     budget=100000,
 ):
     return PrefillCandidate(
@@ -59,10 +60,18 @@ def _prefix_cand(
         kv_token_budget=budget,
         page_size=_PAGE,
         estimated_shared_prefix_tokens=cached,
+        estimated_shared_prefix_page_ids=tuple(page_ids),
     )
 
 
-def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
+def _req(
+    candidates,
+    per_node_free,
+    *,
+    chunk=128,
+    gpus_per_node=_GPN,
+    charge_shared_prefix_pages=False,
+):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
         per_node_host_free=tuple(per_node_free),
@@ -70,6 +79,7 @@ def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
         num_nodes=len(per_node_free),
         gpus_per_node=gpus_per_node,
         initial_gpu_page_buffer=_BUF,
+        charge_shared_prefix_pages=charge_shared_prefix_pages,
     )
 
 
@@ -194,6 +204,33 @@ def test_non_page_aligned_prefix_estimate_is_conservative():
     assert plan == []
     plan = PrefillScheduler.select_prefill_batch(_req([c], [34]))
     assert plan == ["c"]
+
+
+def test_prefix_admission_charges_unique_shared_pages_when_requested():
+    shared_pages = tuple((0, page_id) for page_id in range(48))
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072, page_ids=shared_pages)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072, page_ids=shared_pages)
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [145], charge_shared_prefix_pages=True)
+    )
+    assert plan == ["c0"]
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [146], charge_shared_prefix_pages=True)
+    )
+    assert plan == ["c0", "c1"]
+
+
+def test_prefix_admission_does_not_charge_shared_pages_against_free_capacity():
+    shared_pages = tuple((0, page_id) for page_id in range(48))
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072, page_ids=shared_pages)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072, page_ids=shared_pages)
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [98], charge_shared_prefix_pages=False)
+    )
+    assert plan == ["c0", "c1"]
 
 
 def test_request_and_candidate_are_frozen():

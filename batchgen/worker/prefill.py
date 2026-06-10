@@ -47,6 +47,7 @@ class PrefillCandidate:
     kv_token_budget: int
     page_size: int
     estimated_shared_prefix_tokens: int = 0
+    estimated_shared_prefix_page_ids: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class PrefillSelectionRequest:
     num_nodes: int
     gpus_per_node: int
     initial_gpu_page_buffer: int
+    charge_shared_prefix_pages: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,7 @@ class PrefillScheduler:
 
         per_node_effective_free = list(req.per_node_host_free)
         node_pages_used = [0] * req.num_nodes
+        protected_shared_pages = [set() for _ in range(req.num_nodes)]
         prefill_batch: List[str] = []
 
         for c in all_candidates:
@@ -161,9 +164,20 @@ class PrefillScheduler:
                 append_tokens,
             )
             req_pages = math.ceil(private_capacity / c.page_size)
+            if req.charge_shared_prefix_pages:
+                shared_pages = protected_shared_pages[seq_node]
+                req_pages += sum(
+                    1
+                    for page_key in c.estimated_shared_prefix_page_ids
+                    if page_key not in shared_pages
+                )
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
                 node_pages_used[seq_node] += req_pages
+                if req.charge_shared_prefix_pages:
+                    protected_shared_pages[seq_node].update(
+                        c.estimated_shared_prefix_page_ids
+                    )
 
         return prefill_batch
