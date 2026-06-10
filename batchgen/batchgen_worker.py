@@ -4333,6 +4333,37 @@ class BatchGenWorker:
 
 		return per_node_stats
 
+	def _gather_prefix_cache_resident_nodes_by_node(self) -> List[int]:
+		"""Gather resident prefix-cache node count for each host node."""
+		gpus_per_node = NUM_GPUS_PER_NODE
+		num_nodes = max(1, math.ceil(self.world_size / gpus_per_node))
+		report_node = -1
+		report_resident = 0
+		if (
+			self.enable_prefix_cache
+			and self.prefix_cache_coordinator is not None
+			and self.local_rank == 0
+		):
+			stats = self.prefix_cache_coordinator.get_stats()
+			report_node = self.rank // gpus_per_node
+			report_resident = int(stats.resident_nodes)
+
+		stats_tensor = torch.tensor(
+			[report_node, report_resident],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		gathered = [torch.zeros_like(stats_tensor) for _ in range(self.world_size)]
+		dist.all_gather(gathered, stats_tensor)
+
+		reports_by_node = {}
+		for item in gathered:
+			node_id = int(item[0].item())
+			if node_id >= 0:
+				reports_by_node[node_id] = int(item[1].item())
+
+		return [reports_by_node.get(node, 0) for node in range(num_nodes)]
+
 	def _make_watermark_trigger_request(
 		self, node_stats: List[dict]
 	) -> WatermarkTriggerRequest:
@@ -5755,13 +5786,24 @@ class BatchGenWorker:
 			or self.global_batch.has_on_hold()
 		)
 		if self.enable_prefix_cache and not has_active_work:
-			per_node_effective_free = list(per_node_host_total)
+			per_node_prefix_resident = (
+				self._gather_prefix_cache_resident_nodes_by_node()
+			)
+			per_node_effective_free = [
+				max(0, total_pages - resident_nodes)
+				for total_pages, resident_nodes in zip(
+					per_node_host_total,
+					per_node_prefix_resident,
+				)
+			]
 			if self.rank == 0 and per_node_effective_free != per_node_host_free:
 				logging.info(
 					"[PREFILL] Using Host KV total capacity for selection "
-					"because no live sequences are holding Host KV pages: "
+					"minus resident prefix pages because no live sequences "
+					"are holding private Host KV pages: "
 					f"total_pages={per_node_effective_free}, "
-					f"free_pages={per_node_host_free}"
+					f"free_pages={per_node_host_free}, "
+					f"resident_prefix_nodes={per_node_prefix_resident}"
 				)
 		else:
 			per_node_effective_free = list(per_node_host_free)
