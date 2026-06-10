@@ -137,6 +137,7 @@ from batchgen.worker.prefill import (
 	PrefillCandidate,
 	PrefillScheduler,
 	PrefillSelectionRequest,
+	PrefillWaveGateRequest,
 )
 from batchgen.worker.host_rebalancer import HostKVRebalancer
 from batchgen.worker.boundary import (
@@ -5785,6 +5786,38 @@ class BatchGenWorker:
 
 		return prefill_batch
 
+	def _has_active_prefill_decode_work(self) -> bool:
+		"""Return whether current live work can make a small prefill wave costly."""
+		return (
+			self.global_batch.has_prefilled()
+			or self.global_batch.has_in_decode()
+			or self.global_batch.has_on_hold()
+		)
+
+	def _should_run_selected_prefill_wave(
+		self,
+		prefill_uuids: List[str],
+		*,
+		reason: str,
+	) -> bool:
+		req = PrefillWaveGateRequest(
+			selected_count=len(prefill_uuids),
+			prefix_cache_enabled=bool(self.enable_prefix_cache),
+			has_active_work=self._has_active_prefill_decode_work(),
+			world_size=int(self.world_size),
+		)
+		should_run = PrefillScheduler.should_run_prefill_wave(req)
+		if not should_run and self.rank == 0:
+			min_sequences = PrefillScheduler.min_prefix_cache_wave_sequences(
+				self.world_size
+			)
+			logging.info(
+				"[PREFILL] Deferring small prefix-cache prefill wave: "
+				f"selected={len(prefill_uuids)} min_sequences={min_sequences} "
+				f"reason={reason}"
+			)
+		return should_run
+
 	def _make_prefill_selection_request(
 		self, all_candidates: List[str], per_node_host_free: List[int],
 		num_nodes: int, chunk_size: int,
@@ -6685,6 +6718,12 @@ class BatchGenWorker:
 						)
 
 				prefill_uuids = self._prepare_prefill_batch()
+				prefill_ran = False
+				if prefill_uuids and not self._should_run_selected_prefill_wave(
+					prefill_uuids,
+					reason="active_work",
+				):
+					prefill_uuids = []
 				
 				if prefill_uuids:
 					if self.rank == 0:
@@ -6757,6 +6796,7 @@ class BatchGenWorker:
 						prefill_s=prefill_elapsed,
 						total_s=time.perf_counter() - prefill_phase_start,
 					)
+					prefill_ran = True
 					dist.barrier()
 
 				# After prefill completes, poll for newly arrived sequences.
@@ -6764,9 +6804,15 @@ class BatchGenWorker:
 				# loop back to prefill instead of entering decode.
 				if self._admission_queue is not None:
 					self._poll_admissions()
-				if self.global_batch.has_queueing():
+				if prefill_ran and self.global_batch.has_queueing():
 					next_prefill = self._prepare_prefill_batch()
-					if next_prefill:
+					if (
+						next_prefill
+						and self._should_run_selected_prefill_wave(
+							next_prefill,
+							reason="back_to_back",
+						)
+					):
 						if self.rank == 0:
 							logging.info(
 								f"[PREFILL] Back-to-back prefill: {len(next_prefill)} new sequences ready"

@@ -19,6 +19,7 @@ from batchgen.worker.prefill import (
     PrefillCandidate,
     PrefillScheduler,
     PrefillSelectionRequest,
+    PrefillWaveGateRequest,
 )
 
 _PAGE = 64
@@ -157,3 +158,48 @@ def test_request_and_candidate_are_frozen():
     c = _cand("a")
     with pytest.raises((AttributeError, Exception)):
         c.uuid = "b"  # type: ignore[misc]
+
+
+def test_prefix_cache_wave_gate_allows_first_wave():
+    req = PrefillWaveGateRequest(
+        selected_count=1,
+        prefix_cache_enabled=True,
+        has_active_work=False,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_defers_small_wave_with_active_work():
+    req = PrefillWaveGateRequest(
+        selected_count=35,
+        prefix_cache_enabled=True,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert not PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_allows_large_wave_with_active_work():
+    req = PrefillWaveGateRequest(
+        selected_count=128,
+        prefix_cache_enabled=True,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_does_not_change_non_prefix_cache_path():
+    req = PrefillWaveGateRequest(
+        selected_count=1,
+        prefix_cache_enabled=False,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_uses_world_size_threshold():
+    assert PrefillScheduler.min_prefix_cache_wave_sequences(world_size=1) == 128
+    assert PrefillScheduler.min_prefix_cache_wave_sequences(world_size=32) == 512
