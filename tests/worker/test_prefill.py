@@ -40,6 +40,28 @@ def _cand(uuid, *, rank=0, evicted=False, gidx=0, decoded=0, prompt=100, budget=
     )
 
 
+def _prefix_cand(
+    uuid,
+    *,
+    rank=0,
+    gidx=0,
+    prompt=4096,
+    cached=0,
+    budget=100000,
+):
+    return PrefillCandidate(
+        uuid=uuid,
+        assigned_rank=rank,
+        is_evicted=False,
+        global_idx=gidx,
+        total_decoded_before_eviction=0,
+        prompt_length=prompt,
+        kv_token_budget=budget,
+        page_size=_PAGE,
+        estimated_shared_prefix_tokens=cached,
+    )
+
+
 def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
@@ -149,6 +171,27 @@ def test_no_eviction_candidates_pure_queueing_order():
     plan = PrefillScheduler.select_prefill_batch(_req(cands, [200]))
     # all fit (200 >= 3*34=102), order by global_idx ascending
     assert plan == ["q2", "q1", "q0"]  # uuids q2(gidx0), q1(gidx1), q0(gidx2)
+
+
+def test_prefix_estimate_reduces_admission_pages():
+    # Without prefix estimate, prompt 4096 needs 66 pages:
+    # max(prompt + chunk = 4224, gpu_tokens = (65 + 32) * 64)
+    # capped only by budget. With a 3072-token page-aligned hit, only the
+    # 1024-token append side is charged, so two candidates fit in 32 pages.
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072)
+    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [32]))
+    assert plan == ["c0", "c1"]
+
+
+def test_non_page_aligned_prefix_estimate_is_conservative():
+    # A full-hit compute path may normalize to prompt_length - 1. Admission
+    # must only credit fully page-aligned shared pages.
+    c = _prefix_cand("c", prompt=4096, cached=4095)
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [1]))
+    assert plan == []
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [2]))
+    assert plan == ["c"]
 
 
 def test_request_and_candidate_are_frozen():

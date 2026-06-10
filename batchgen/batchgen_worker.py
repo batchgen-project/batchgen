@@ -5822,6 +5822,9 @@ class BatchGenWorker:
 	) -> PrefillSelectionRequest:
 		"""Snapshot the candidate metadata `select_prefill_batch` consumes."""
 		from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
+		prefix_estimates = self._estimate_prefix_cache_for_admission(
+			all_candidates
+		)
 		candidates = []
 		for uuid in all_candidates:
 			seq = self.global_batch.get_sequence(uuid)
@@ -5836,6 +5839,7 @@ class BatchGenWorker:
 				prompt_length=seq.prompt_length,
 				kv_token_budget=seq.kv_token_budget,
 				page_size=seq.PAGE_SIZE,
+				estimated_shared_prefix_tokens=prefix_estimates.get(uuid, 0),
 			))
 		return PrefillSelectionRequest(
 			candidates=tuple(candidates),
@@ -5845,6 +5849,87 @@ class BatchGenWorker:
 			gpus_per_node=NUM_GPUS_PER_NODE,
 			initial_gpu_page_buffer=INITIAL_GPU_PAGE_BUFFER,
 		)
+
+	def _estimate_prefix_cache_for_admission(
+		self,
+		all_candidates: Sequence[str],
+	) -> Dict[str, int]:
+		"""Return per-candidate prefix-hit estimates for prefill admission.
+
+		The scheduler must be deterministic on every rank, but only the owning
+		rank is guaranteed to have the prompt tensor needed for lookup. Each rank
+		estimates its owned candidates and the small ``uuid -> tokens`` maps are
+		gathered before building the pure scheduler request.
+		"""
+		if not self.enable_prefix_cache:
+			return {}
+		if self.prefix_cache_coordinator is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but coordinator is not attached"
+			)
+		if self.prefix_cache_runtime_config is None:
+			raise RuntimeError(
+				"Prefix cache is enabled but runtime config is missing"
+			)
+
+		estimate_start = time.perf_counter()
+		local_estimates = {}
+
+		for uuid in all_candidates:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq.assigned_rank != self.rank:
+				continue
+
+			prompt_length = int(seq.prompt_length)
+			if prompt_length <= 0:
+				local_estimates[uuid] = 0
+				continue
+
+			token_tensor = (
+				seq.evicted_token_ids
+				if (
+					seq.status == SequenceStatus.EVICTED
+					and seq.evicted_token_ids is not None
+				)
+				else seq.input_ids
+			)
+			prompt_token_ids = [
+				int(token_id)
+				for token_id in token_tensor.reshape(-1)[:prompt_length].tolist()
+			]
+			result = self.prefix_cache_coordinator.estimate_lookup(
+				list(self.prefix_cache_runtime_config.namespace_digest),
+				prompt_token_ids,
+			)
+			cached_tokens = effective_prefix_shared_tokens(
+				raw_cached_tokens=int(result.common_cached_tokens),
+				prompt_length=prompt_length,
+			)
+			local_estimates[uuid] = int(cached_tokens)
+
+		if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+			gathered = [None] * int(self.world_size)
+			dist.all_gather_object(gathered, local_estimates)
+			prefix_estimates = {}
+			for item in gathered:
+				if item:
+					prefix_estimates.update(item)
+		else:
+			prefix_estimates = dict(local_estimates)
+
+		if self.rank == 0 and prefix_estimates:
+			hit_count = sum(1 for tokens in prefix_estimates.values() if tokens > 0)
+			cached_tokens = sum(int(tokens) for tokens in prefix_estimates.values())
+			logging.info(
+				"[PREFIX_ADMISSION] estimated candidates=%d hit_seqs=%d "
+				"cached_tokens=%d elapsed_ms=%.1f",
+				len(prefix_estimates),
+				hit_count,
+				cached_tokens,
+				(time.perf_counter() - estimate_start) * 1000,
+			)
+
+		return prefix_estimates
 
 	def _put_sequences_on_hold(self, uuids: List[str]) -> None:
 		"""Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""

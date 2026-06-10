@@ -46,6 +46,7 @@ class PrefillCandidate:
     prompt_length: int
     kv_token_budget: int
     page_size: int
+    estimated_shared_prefix_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -119,8 +120,10 @@ class PrefillScheduler:
         ``max(prompt_length + chunk_size, gpu_initial_tokens)`` capped at
         ``kv_token_budget``, rounded up to whole pages — where
         ``gpu_initial_tokens`` covers ``prompt_length + 1`` plus the GPU
-        page buffer. No safety margin: selection and allocation use the
-        same formula by design.
+        page buffer. With prefix-cache estimates, page-aligned shared prefix
+        pages are charged as already resident and only the private append
+        capacity is admitted. No safety margin: selection and allocation use
+        the same formula by design.
 
         Pure: reads only the candidate snapshots + per-node free pages.
         The NCCL gather and the ``global_batch`` enumeration stay on the
@@ -149,7 +152,15 @@ class PrefillScheduler:
             gpu_initial_tokens = gpu_initial_pages * c.page_size
             initial_capacity = max(c.prompt_length + req.chunk_size, gpu_initial_tokens)
             initial_capacity = min(initial_capacity, c.kv_token_budget)
-            req_pages = math.ceil(initial_capacity / c.page_size)
+            shared_tokens = max(0, int(c.estimated_shared_prefix_tokens))
+            shared_tokens = min(shared_tokens, int(c.prompt_length))
+            shared_page_tokens = (shared_tokens // c.page_size) * c.page_size
+            append_tokens = max(0, int(c.prompt_length) - shared_tokens)
+            private_capacity = max(
+                initial_capacity - shared_page_tokens,
+                append_tokens,
+            )
+            req_pages = math.ceil(private_capacity / c.page_size)
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
