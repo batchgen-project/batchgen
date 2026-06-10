@@ -1497,11 +1497,9 @@ class BatchGenWorker:
 		self,
 		uuids: Sequence[str],
 	) -> None:
-		self._commit_prefix_cache_for_sequences(
-			uuids,
-			include_new_decode_tokens=True,
-			reason="completion",
-		)
+		# Only prompt/prefill pages are published to prefix cache.
+		# Generated decode KV remains private runtime state.
+		return
 
 	def _estimate_prefix_cache_for_prefill(
 		self,
