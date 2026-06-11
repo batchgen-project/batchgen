@@ -2,7 +2,7 @@
 	"Basic_Config": {
 	  "log_level": "info",
 	  "weight_dtype": "float8_e4m3fn",
-	  "kv_dtype": "float8_e4m3fn",
+	  "kv_dtype": "bfloat16",
 	  "activation_dtype": "bfloat16",
 	  "module_types": ["attn", "routed_expert", "shared_expert"],
 	  "gpu_arch": "hopper"
@@ -35,7 +35,7 @@
 
 	"EP_Config":{
 		"enable": true,
-		"num_local_expert_per_layer": 26,
+		"num_local_expert_per_layer": 32,
 		"enable_offloading": false,
 		"offloading_ratio": 0.0
 	}

@@ -37,18 +37,29 @@ class DeepSeekV3Planner(BasePlanner):
         return "0.1.6"
 
     def _adjust_config_for_model(self):
-        """DeepSeek-specific config adjustments.
+        """DeepSeek-R1/V3 config adjustments.
 
-        Most config is already set by base class _compute_batch_configs().
-        This method handles any DeepSeek-specific overrides if needed.
+        The base-class memory heuristic (available_memory_for_expert_cache // 2.4) over-counts
+        FP8 expert size and, on single-node without offloading (attn_mode=1), caps persistent
+        experts below expert_per_rank. With offloading off, the remaining routed experts are
+        never loaded, so decode is silently wrong (see planner bug: num_local=26 vs 32/rank).
+
+        DeepSeek-R1 FP8 (256 experts / 8 ranks = 32/rank) fits resident on H20. Mirror the Kimi
+        planner: force all experts persistent and use the modern paged decode path (attn_mode=3).
+        This also matches the dual-node config (16/rank), which the base class already produces.
+
+        Only applies when EP offloading is OFF; when offloading is enabled the base-class
+        persistent/host split is respected.
         """
-        # Currently no additional adjustments needed beyond base class
-        # The base class handles:
-        # - EP config (num_local_expert_per_layer)
-        # - Attention mode (1 for single-node, 3 for dual-node)
-        # - Decoding buffers
-        # - Prefill batch sizes based on prompt length
-        pass
+        if self.config.EP_Config.enable_offloading:
+            return
+
+        expert_per_rank = self.NUM_EXPERTS // self.world_size
+        self.config.EP_Config.num_local_expert_per_layer = expert_per_rank
+        # Modern paged decode path (decoding_attn_mode_3_bf16); BF16 paged KV via the
+        # gpu_paged_kv_manager. All experts persistent => no routed-expert decode buffers.
+        self.config.Basic_Config.attn_mode = 3
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 0
 
     def get_module_shapes(self) -> dict:
         """Return DeepSeek-V3/R1 specific tensor shapes."""
