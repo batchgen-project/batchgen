@@ -8344,6 +8344,8 @@ class BatchGenWorker:
 			# MODIFIED: Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
 				seq.eos_reached = True
+			if seq.decoded_length >= seq.max_decode_length:
+				seq.eos_reached = True
 
 		return new_tokens
 
@@ -8762,6 +8764,8 @@ class BatchGenWorker:
 
 			# Check for EOS respecting ignore_eos flag
 			if self._should_stop_at_eos(new_tokens_cpu[i].item()):
+				seq.eos_reached = True
+			if seq.decoded_length >= seq.max_decode_length:
 				seq.eos_reached = True
 
 		return new_tokens

@@ -153,7 +153,11 @@ class SyncCoordinator:
             if uuid in ctx.uuid_to_local:
                 seq = ctx.global_batch.get_sequence(uuid)
                 if seq is not None and uuid in uuid_to_idx:
-                    is_completed = (seq.status == SequenceStatus.COMPLETED or seq.eos_reached)
+                    is_completed = (
+                        seq.status == SequenceStatus.COMPLETED
+                        or seq.eos_reached
+                        or seq.decoded_length >= seq.max_decode_length
+                    )
                     if is_completed:
                         completion_tensor[uuid_to_idx[uuid]] = 1
 
