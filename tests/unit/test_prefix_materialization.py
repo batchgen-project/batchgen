@@ -318,6 +318,7 @@ def test_rolling_materialization_prefetches_two_layers_and_advances():
     materialization.wait_for_layer(0)
     assert host_view.layer_tasks[0].waited_layers == [0]
 
+    materialization.backend_state["flashinfer"] = object()
     materialization.finish_layer(0)
     assert len(host_view.layer_calls) == 3
     assert host_view.layer_calls[2]["logical_layer_ids"].tolist() == [2]
@@ -328,6 +329,7 @@ def test_rolling_materialization_prefetches_two_layers_and_advances():
     materialization.close(empty_cuda_cache=True)
     assert coordinator.end_calls == [91]
     assert gpu_manager.destroy_calls == [True]
+    assert materialization.backend_state == {}
 
 
 def test_materialize_single_group_prefix_pages_skips_load_for_all_miss():

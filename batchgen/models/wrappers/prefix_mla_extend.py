@@ -110,6 +110,7 @@ def run_projected_mla_prefix_attention_from_gpu_pages(
         slot_indices=materialization.append_plan.slot_indices,
         metadata=metadata,
         spec=spec,
+        plan_cache=getattr(materialization, "backend_state", None),
     )
 
 
@@ -122,6 +123,7 @@ def _run_flashinfer_mla_prefix_attention(
     slot_indices: torch.Tensor,
     metadata: object,
     spec: MlaExtendSpec,
+    plan_cache: dict[str, object] | None = None,
 ) -> torch.Tensor:
     """Run FlashInfer MLA paged attention against materialized prefix pages."""
     from batchgen.attention.mla.flashinfer_extend import (
@@ -138,4 +140,5 @@ def _run_flashinfer_mla_prefix_attention(
         kv_lora_rank=int(spec.kv_lora_rank),
         num_heads=int(spec.num_heads),
         softmax_scale=float(spec.softmax_scale),
+        plan_cache=plan_cache,
     )

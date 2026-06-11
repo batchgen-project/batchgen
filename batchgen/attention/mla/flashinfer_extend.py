@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 from flashinfer import BatchMLAPagedAttentionWrapper
 
-_WORKSPACE_BYTES = 128 * 1024 * 1024
+_DEFAULT_WORKSPACE_BYTES = 384 * 1024 * 1024
 _WORKSPACE_CACHE: dict[tuple[str, Optional[int]], torch.Tensor] = {}
 _WRAPPER_CACHE: dict[tuple[str, Optional[int], str], object] = {}
+_PLAN_CACHE_KEY = "flashinfer_mla_extend_prefill"
+
+
+@dataclass
+class _FlashInferMlaExtendPlanState:
+    signature: tuple[object, ...]
+    wrapper: object
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    kv_len_arr: torch.Tensor
 
 
 def run_flashinfer_mla_extend_prefill(
@@ -24,6 +36,7 @@ def run_flashinfer_mla_extend_prefill(
     kv_lora_rank: int,
     num_heads: int,
     softmax_scale: float,
+    plan_cache: dict[str, object] | None = None,
 ) -> torch.Tensor:
     """Run prefix-hit MLA extend prefill through FlashInfer paged attention.
 
@@ -52,20 +65,20 @@ def run_flashinfer_mla_extend_prefill(
     )
     qo_indptr = cu_seqlens_q.to(device=device, dtype=torch.int32)
 
-    wrapper = _get_flashinfer_mla_wrapper(device)
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_len_arr,
-        int(num_heads),
-        int(kv_lora_rank),
-        int(q_pe.shape[-1]),
-        page_size,
-        True,
-        float(softmax_scale),
-        q_nope.dtype,
-        ckv_cache.dtype,
+    wrapper = _get_or_plan_flashinfer_mla_wrapper(
+        device=device,
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_len_arr=kv_len_arr,
+        num_heads=int(num_heads),
+        kv_lora_rank=int(kv_lora_rank),
+        rope_head_dim=int(q_pe.shape[-1]),
+        page_size=page_size,
+        softmax_scale=float(softmax_scale),
+        q_dtype=q_nope.dtype,
+        kv_dtype=ckv_cache.dtype,
+        plan_cache=plan_cache,
     )
     output = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache)
     return output.unsqueeze(0).contiguous()
@@ -155,12 +168,100 @@ def _get_flashinfer_mla_wrapper(device: torch.device) -> object:
     return wrapper
 
 
+def _get_or_plan_flashinfer_mla_wrapper(
+    *,
+    device: torch.device,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_len_arr: torch.Tensor,
+    num_heads: int,
+    kv_lora_rank: int,
+    rope_head_dim: int,
+    page_size: int,
+    softmax_scale: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    plan_cache: dict[str, object] | None,
+) -> object:
+    signature = (
+        _cache_key(device),
+        os.getenv("BATCHGEN_FLASHINFER_MLA_BACKEND", "auto"),
+        tuple(qo_indptr.shape),
+        tuple(kv_indptr.shape),
+        tuple(kv_indices.shape),
+        tuple(kv_len_arr.shape),
+        int(num_heads),
+        int(kv_lora_rank),
+        int(rope_head_dim),
+        int(page_size),
+        float(softmax_scale),
+        str(q_dtype),
+        str(kv_dtype),
+    )
+    if plan_cache is not None:
+        cached = plan_cache.get(_PLAN_CACHE_KEY)
+        if (
+            isinstance(cached, _FlashInferMlaExtendPlanState)
+            and cached.signature == signature
+        ):
+            return cached.wrapper
+
+    if plan_cache is None:
+        wrapper = _get_flashinfer_mla_wrapper(device)
+    else:
+        wrapper = _new_flashinfer_mla_wrapper(device)
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        int(num_heads),
+        int(kv_lora_rank),
+        int(rope_head_dim),
+        int(page_size),
+        True,
+        float(softmax_scale),
+        q_dtype,
+        kv_dtype,
+    )
+    if plan_cache is not None:
+        plan_cache[_PLAN_CACHE_KEY] = _FlashInferMlaExtendPlanState(
+            signature=signature,
+            wrapper=wrapper,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            kv_len_arr=kv_len_arr,
+        )
+    return wrapper
+
+
+def _new_flashinfer_mla_wrapper(device: torch.device) -> object:
+    backend = os.getenv("BATCHGEN_FLASHINFER_MLA_BACKEND", "auto")
+    return BatchMLAPagedAttentionWrapper(_get_workspace(device), backend=backend)
+
+
 def _get_workspace(device: torch.device) -> torch.Tensor:
     key = _cache_key(device)
     workspace = _WORKSPACE_CACHE.get(key)
     if workspace is None:
+        workspace_bytes = int(
+            os.getenv("BATCHGEN_FLASHINFER_WORKSPACE_BYTES", "0")
+            or "0"
+        )
+        if workspace_bytes <= 0:
+            workspace_mb = int(
+                os.getenv("BATCHGEN_FLASHINFER_WORKSPACE_MB", "0")
+                or "0"
+            )
+            workspace_bytes = (
+                workspace_mb * 1024 * 1024
+                if workspace_mb > 0
+                else _DEFAULT_WORKSPACE_BYTES
+            )
         workspace = torch.empty(
-            _WORKSPACE_BYTES,
+            workspace_bytes,
             dtype=torch.uint8,
             device=device,
         )

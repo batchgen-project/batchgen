@@ -41,6 +41,7 @@ class SingleGroupPrefixMaterialization:
     manager: object | None
     append_plan: object | None
     load_task: Optional[_AsyncTask] = None
+    backend_state: dict[str, object] = field(default_factory=dict)
     _loaded: bool = False
     _closed: bool = False
 
@@ -70,6 +71,7 @@ class SingleGroupPrefixMaterialization:
             self.manager = None
             self.append_plan = None
             self.load_task = None
+            self.backend_state.clear()
             self._closed = True
             if manager is not None:
                 manager.destroy(empty_cuda_cache=empty_cuda_cache)
@@ -158,6 +160,7 @@ class RollingSingleGroupPrefixMaterialization(SingleGroupPrefixMaterialization):
             self.host_page_ids = None
             self.active_page_counts = None
             self._scheduled_tasks.clear()
+            self.backend_state.clear()
             self._closed = True
             if manager is not None:
                 manager.destroy(empty_cuda_cache=empty_cuda_cache)
