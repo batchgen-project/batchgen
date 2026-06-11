@@ -898,14 +898,17 @@ class MoEGate(nn.Module):
 		scores = torch.sigmoid(logits)
 		
 		# Custom kernel handles MoE routing
+		# moe_fused_gate signature: (input, bias, num_expert_group, topk_group,
+		# topk, num_fused_shared_experts=0, routed_scaling_factor=0.0). It derives
+		# n_routed_experts from input.size(1); passing it explicitly (stale call)
+		# shifted top_k into the topk slot -> "Unsupported top_k=256".
 		topk_idx, topk_weight = moe_fused_gate(
 			scores,
 			self.e_score_correction_bias,
 			self.n_group,
 			self.topk_group,
-			self.n_routed_experts,
 			self.top_k,
-			self.routed_scaling_factor
+			routed_scaling_factor=self.routed_scaling_factor,
 		)
 		
 		return topk_idx, topk_weight
