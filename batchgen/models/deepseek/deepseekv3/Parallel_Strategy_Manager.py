@@ -315,8 +315,12 @@ class DeepseekV3ParallelStrategyManager:
 		self.model = None
 		torch.cuda.empty_cache()
 
+		# Decode uses the native model.py (3D-strided FP8 blockwise MoE, shared
+		# MoE buffer pool, group gate, MLA decode absorb). Prefill stays on the
+		# legacy modeling_deepseek_v3 path (configure_prefill, unchanged).
+		from .model import DeepseekV3ForCausalLM as DeepseekV3ForCausalLM_Decode
 		# Always use comm for NCCL collectives
-		self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+		self.model = DeepseekV3ForCausalLM_Decode(self.loaded_model_config, comm)
 
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
@@ -423,11 +427,12 @@ class DeepseekV3ParallelStrategyManager:
 				# DO NOT add shared_expert to weight_copy_task - it's persistent for decoding
 
 				for expert_idx in range(self.model_config.num_local_experts):
-					for name, _ in (
-						self.model.model.layers[layer_idx]
-						.mlp.experts[expert_idx]
-						.named_parameters()
-					):
+					# model.py uses None placeholders for non-local experts (EP);
+					# only local experts have real weights / need a name map.
+					expert_module = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+					if expert_module is None:
+						continue
+					for name, _ in expert_module.named_parameters():
 						tensor_full_name = (
 							"model.layers."
 							+ str(layer_idx)
@@ -457,19 +462,25 @@ class DeepseekV3ParallelStrategyManager:
 		self._config_expert_module()
 		self._config_lm_head_hook()
 
-		# Set enable_ep_offloading flag on MoE layers for loop-based execution
-		if self.enable_ep_offloading:
-			for layer_idx in range(
-				self.loaded_model_config.first_k_dense_replace,
-				self.model_config.num_hidden_layers,
-			):
-				layer = self.model.model.layers[layer_idx]
-				# layer.mlp is DeepseekV3MoE_Decoding_FP8
-				layer.mlp.enable_ep_offloading = True
-			logging.info(
-				f"Rank {self.rank}: Set enable_ep_offloading=True on MoE layers "
-				f"(layers {self.loaded_model_config.first_k_dense_replace}-{self.model_config.num_hidden_layers - 1})"
-			)
+		# Configure MoE layers for the native model.py 3D FP8 path.
+		# num_persistent_local_experts + enable_ep_offloading gate _buf allocation
+		# (init_num_tokens) and FP8 weight stacking (init); comm/device drive the
+		# EP all_gather/all_reduce. Mirrors KimiK25 PSM.
+		device = self.engine_config.Basic_Config.device_torch
+		for layer_idx in range(
+			self.loaded_model_config.first_k_dense_replace,
+			self.model_config.num_hidden_layers,
+		):
+			moe = self.model.model.layers[layer_idx].mlp
+			moe.comm = comm
+			moe.device = device
+			moe.num_persistent_local_experts = self.num_local_expert_per_layer
+			moe.enable_ep_offloading = self.enable_ep_offloading
+		logging.info(
+			f"Rank {self.rank}: Configured MoE layers "
+			f"(persistent={self.num_local_expert_per_layer}/{256 // self.world_size}, "
+			f"ep_offloading={self.enable_ep_offloading})"
+		)
 
 		self.model.eval()
 		self.model.to(self.engine_config.Basic_Config.device_torch)
@@ -537,6 +548,16 @@ class DeepseekV3ParallelStrategyManager:
 			layer = self.model.model.layers[layer_idx].mlp
 			if hasattr(layer, "set_num_tokens_per_rank"):
 				layer.set_num_tokens_per_rank(num_tokens_per_rank)
+
+	def set_rank_token_counts(self, counts: torch.Tensor):
+		"""Set per-rank real token counts so the MoE decode path can mask
+		rank-padding tokens before dispatch (see DeepseekV3MoE._forward_decode_3d).
+
+		Called by the worker each decode iteration via the model-agnostic hook
+		(batchgen_worker.py: hasattr(parallel_manager, 'set_rank_token_counts')).
+		"""
+		from .model import DeepseekV3MoE
+		DeepseekV3MoE._rank_token_counts = counts
 
 	def _init_ata_comms(self, padding_bsz):
 		# Current default ata impl is perplexity all-to-all dispatch and combine.
@@ -1113,6 +1134,10 @@ class DeepseekV3ParallelStrategyManager:
 						)
 
 			for expert_idx in range(len(layer.mlp.experts)):
+				# model.py uses None placeholders for non-local experts (EP) —
+				# only wrap real local experts.
+				if layer.mlp.experts[expert_idx] is None:
+					continue
 				# Routed expert: persistent if NOT in weight_copy_task
 				if (
 					"routed_expert_" + str(layer_idx) + "_" + str(expert_idx)

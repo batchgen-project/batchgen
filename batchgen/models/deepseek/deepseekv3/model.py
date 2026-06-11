@@ -321,6 +321,11 @@ class MoEGate(nn.Module):
         pass
 
     @torch.inference_mode()
+    def decoding_forward(self, hidden_states: torch.Tensor):
+        """Alias used by the PSM warmup path."""
+        return self.forward(hidden_states)
+
+    @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (topk_idx int32 [n, top_k], topk_weight fp32 [n, top_k])."""
         h = hidden_states.shape[-1]
