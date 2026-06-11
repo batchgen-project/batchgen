@@ -11180,6 +11180,17 @@ class BatchGenWorker:
 		local_iteration = 0
 		last_boundary = 0
 		global_batch_size = len(self.global_batch)
+		decode_terminal_sync_iteration = None
+		if decode_uuids:
+			max_remaining_decode = 0
+			for uuid in decode_uuids:
+				seq = self.global_batch.get_sequence(uuid)
+				if seq is None:
+					continue
+				remaining = int(seq.max_decode_length) - int(seq.decoded_length)
+				max_remaining_decode = max(max_remaining_decode, remaining)
+			if max_remaining_decode > 0:
+				decode_terminal_sync_iteration = max_remaining_decode
 
 		# ========== INITIAL MOE BUFFER SYNC ==========
 		# Sync buffer size BEFORE first forward pass to prevent overflow.
@@ -12132,6 +12143,33 @@ class BatchGenWorker:
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 			local_generated_tokens += step_generated_tokens
+
+			if (
+				decode_terminal_sync_iteration is not None
+				and local_iteration >= decode_terminal_sync_iteration
+			):
+				global_completed, decode_uuids = (
+					self._sync_completion_status_tensor(decode_uuids)
+				)
+				if global_completed:
+					self._handle_completed_decode_uuids(global_completed)
+				batch = self._get_local_indices_for_uuids(decode_uuids)
+				if not decode_uuids:
+					break
+				if gpu_manager is not None and gpu_manager.is_initialized:
+					self._rebuild_page_table_for_batch(batch, gpu_manager)
+				max_remaining_decode = 0
+				for uuid in decode_uuids:
+					seq = self.global_batch.get_sequence(uuid)
+					if seq is None:
+						continue
+					remaining = int(seq.max_decode_length) - int(seq.decoded_length)
+					max_remaining_decode = max(max_remaining_decode, remaining)
+				decode_terminal_sync_iteration = (
+					local_iteration + max_remaining_decode
+					if max_remaining_decode > 0
+					else None
+				)
 
 			self._cumulative_forward_ms += (time.perf_counter() - forward_start) * 1000
 

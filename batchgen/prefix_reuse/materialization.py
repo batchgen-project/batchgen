@@ -117,10 +117,14 @@ class RollingSingleGroupPrefixMaterialization(SingleGroupPrefixMaterialization):
         if self._closed:
             raise RuntimeError("prefix materialization is already closed")
         layer_idx = int(layer_idx)
-        self._schedule_layer(layer_idx)
         task = self._scheduled_tasks.get(layer_idx)
-        if task is not None:
-            task.wait_for_layer(layer_idx)
+        if task is None:
+            raise RuntimeError(
+                "rolling prefix materialization layer was not scheduled; "
+                f"layer={layer_idx}. The previous prefill offload may not have "
+                "been retired before reusing the physical GPU KV slot."
+            )
+        task.wait_for_layer(layer_idx)
 
     def finish_layer(self, layer_idx: int) -> None:
         if self._closed:
