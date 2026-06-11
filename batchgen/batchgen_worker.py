@@ -234,6 +234,11 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
+# Max per-rank in-decode batch. Bounds the K2.5 MoE padded buffer (mtp = round_up(world_size *
+# this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
+# the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
+_MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
+
 # Optional Nsight Systems capture window for decode-forward profiling.
 # Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
 BATCHGEN_NSYS_DECODE_PROFILE = os.environ.get("BATCHGEN_NSYS_DECODE_PROFILE", "0") == "1"
@@ -2442,6 +2447,22 @@ class BatchGenWorker:
 		)
 		return temps, top_ps, top_ks
 
+	def _decode_batch_all_greedy(self, batch_sequences: list) -> bool:
+		"""True iff every decode-batch sequence is greedy (effective temperature
+		<= 0), resolving params exactly as _build_sampling_tensors. Pure host-side
+		check (no device sync), so an all-greedy batch can skip sample_tokens and
+		its per-token .any() syncs / H2D param builds.
+		"""
+		for seq in batch_sequences:
+			seq_params = getattr(seq, "sampling_params", None)
+			if seq_params is None and self._per_sequence_sampling_params is not None:
+				global_idx = getattr(seq, "global_idx", -1)
+				if 0 <= global_idx < len(self._per_sequence_sampling_params):
+					seq_params = self._per_sequence_sampling_params[global_idx]
+			if ((seq_params or {}).get('temperature', 0.0) or 0.0) > 0:
+				return False
+		return True
+
 	def _select_tokens(self, logits: torch.Tensor, batch_sequences: Optional[list] = None) -> torch.Tensor:
 		"""
 		Select next tokens from logits using greedy or sampling strategy.
@@ -2466,6 +2487,15 @@ class BatchGenWorker:
 			)
 		):
 			active_sequences = batch_sequences or []
+			# All-greedy fast path: if every sequence's effective temperature is
+			# <= 0, argmax directly (fp32, bit-identical to sample_tokens' greedy
+			# branch) instead of entering sample_tokens. This skips its two per-
+			# token .any() device->host syncs (sampling.py:84,88) and the three
+			# per-token H2D sampling-tensor builds — pure pipeline stalls for a
+			# temp-0 batch. Host-side check (no device sync), recomputed each step
+			# so no membership-invalidation hazard.
+			if self._decode_batch_all_greedy(active_sequences):
+				return logits.float().argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -2995,6 +3025,12 @@ class BatchGenWorker:
 		copies. Replaces N per-layer syncs with a single post-forward
 		sync for both caches.
 		"""
+		# Whether this call reached the event.synchronize() below. The caller
+		# enqueues the token-readback copy before calling us and relies on this
+		# flag to know if our single sync already drained that copy (so it can
+		# skip a second sync). Set False up-front so every early-return path
+		# leaves it False.
+		self._kv_offload_synced_this_step = False
 		entries = getattr(self, '_deferred_kv_entries', [])
 		entries_aux = getattr(self, '_deferred_kv_entries_aux', [])
 		if not entries and not entries_aux:
@@ -3032,6 +3068,9 @@ class BatchGenWorker:
 			self._kv_offload_event = torch.cuda.Event()
 		self._kv_offload_event.record(torch.cuda.current_stream(self.torch_device))
 		self._kv_offload_event.synchronize()
+		# Recorded after the caller's token-readback copy (enqueued before this
+		# call), so this one sync covers it too.
+		self._kv_offload_synced_this_step = True
 
 		# Fire all D2H copies
 		if not hasattr(self, '_pending_kv_append_tensors'):
@@ -3487,6 +3526,14 @@ class BatchGenWorker:
 				or os.environ.get("BATCHGEN_GLM5_MOE_GRAPH_COMPARE", "0") == "1"
 			)
 		):
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
+		elif (
+			is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
+			and getattr(self.args, "enable_cuda_graph", False)
+		):
+			# K2.5 whole-model decode graph (cuda-graph adapter). The config flag
+			# defaults off; --enable-cuda-graph flips it on (mirrors GLM-5's
+			# force-enable) so _warmup_cuda_graphs() reaches _setup_cuda_graphs().
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
@@ -6083,6 +6130,7 @@ class BatchGenWorker:
 			candidates=tuple(candidates),
 			total_pages=total_pages,
 			world_size=self.world_size,
+			max_rank_bsz=getattr(self, "_decode_padding_bsz", 0) or 0,
 		)
 
 	def _check_and_handle_completions(
@@ -6962,6 +7010,11 @@ class BatchGenWorker:
 				max_num_seq_estimate = (total_candidates + self.world_size - 1) // self.world_size
 				# Ensure at least some minimum
 				max_num_seq_estimate = max(max_num_seq_estimate, 16)
+				# Cap per-rank decode batch so the MoE buffer's mtp (= round_up(world_size *
+				# this)) stays bounded — a large candidate pool must NOT inflate the padded
+				# buffers (that re-OOMs init). The page-boundary admission also caps in-decode
+				# at this value (decode.py max_rank_bsz), so the buffer never overflows.
+				max_num_seq_estimate = min(max_num_seq_estimate, _MAX_DECODE_RANK_BSZ)
 
 				self._load_decode_model(max_num_seq_estimate, self.comm)
 
@@ -7764,6 +7817,10 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
+		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
+		# never overflows.
+		self._decode_padding_bsz = max_num_seq
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
@@ -9645,15 +9702,22 @@ class BatchGenWorker:
 			return
 
 		capacity = max(1, batch_size)
-		self._decode_cache_seqlens_i32 = torch.empty(
-			(capacity,), dtype=torch.int32, device=self.torch_device
-		)
-		self._decode_position_ids_i64 = torch.empty(
-			(capacity, 1), dtype=torch.int64, device=self.torch_device
-		)
-		self._decode_cache_seqlens_cpu_staging = torch.empty(
-			(capacity,), dtype=torch.int32, pin_memory=True
-		)
+		# Allocate OUTSIDE inference_mode so these persistent, reused buffers are
+		# normal tensors. Otherwise, when this lazily (re)allocates inside the
+		# decode loop's inference_mode, they become "inference tensors" and the
+		# later configure-time bind (_bind_decode_attention_metadata_for_graph_config,
+		# called from generate() outside inference_mode on each new prefill wave)
+		# fails with "Inplace update to inference tensor outside InferenceMode".
+		with torch.inference_mode(False):
+			self._decode_cache_seqlens_i32 = torch.empty(
+				(capacity,), dtype=torch.int32, device=self.torch_device
+			)
+			self._decode_position_ids_i64 = torch.empty(
+				(capacity, 1), dtype=torch.int64, device=self.torch_device
+			)
+			self._decode_cache_seqlens_cpu_staging = torch.empty(
+				(capacity,), dtype=torch.int32, pin_memory=True
+			)
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
 
@@ -10798,11 +10862,58 @@ class BatchGenWorker:
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
+		# K2.5: whole-model graph via the cuda-graph adapter (minimal parallel
+		# path). POIS decision: serialize the shared expert inline to reclaim
+		# the eager-MoE launch overhead. Self-contained; leaves the GLM-5 /
+		# GPT-OSS whole-model paths byte-for-byte untouched. Falls back to the
+		# legacy per-layer K2.5 path below if no adapter is present.
+		if _is_k25 and self._cuda_graph_adapter is not None:
+			from batchgen.models.moonshotai.kimi_k25.cuda_graph_adapter import (
+				SEGMENT_NAME_WHOLE_MODEL as _K25_WM_NAME,
+			)
+			bundle = self._cuda_graph_adapter.build_segments(
+				model=self.model,
+				bucketing=bucketing,
+				gpu_kv_manager=gpu_manager,
+				world_size=self.world_size,
+				rank=self.rank,
+				device=self.torch_device,
+				max_seqlen_cap=max_rope_len,
+			)
+			whole_seg = bundle.whole_model
+			manager.register_segment(_K25_WM_NAME, whole_seg)
+			if self.rank == 0:
+				logging.info(
+					f"CUDA graph capture (K2.5 whole-model): segment={_K25_WM_NAME} "
+					f"× {len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
+				)
+			# NCCL collectives are baked into the graph — all ranks must capture
+			# the same buckets simultaneously.
+			torch.cuda.synchronize(self.torch_device)
+			dist.barrier()
+			manager.warmup_and_capture_all()
+			for _bucket in bucketing.bucket_sizes:
+				_sig = self._cuda_graph_adapter.capture_signature(
+					bucket=_bucket, gpu_kv_manager=gpu_manager, max_seqlen=max_rope_len,
+				)
+				self._cuda_graph_adapter.record_capture(
+					segment_name=_K25_WM_NAME, bucket=_bucket, signature=_sig,
+				)
+			self._cuda_graph_manager = manager
+			self._whole_model_graph = True
+			self._k25_whole_model_graph = True
+			self._whole_model_segment_name = _K25_WM_NAME
+			self._whole_model_bucketing = bucketing
+			self._whole_model_segment = whole_seg
+			if self.rank == 0:
+				stats = manager.get_capture_stats()
+				logging.info(
+					f"CUDA graphs ready (K2.5 whole-model): {stats['total_capture_time_ms']:.0f}ms"
+				)
+			return
+
 		# Whole-model graph is the default for GPT-OSS.
-		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
-		# serializes the shared expert, losing async overlap (~18ms/step regression).
-		# Phase C: K2.5 keeps the per-layer path; GLM-5 always uses whole-model
-		# (the segmented-graph BATCHGEN_SEGMENTED_GRAPH env var is retired).
+		# K2.5 without an adapter falls back to per-layer (segmented) mode.
 		if _is_k25:
 			use_whole_model = False
 		else:
@@ -11592,10 +11703,21 @@ class BatchGenWorker:
 					# Phase B: dual-path gate. When BATCHGEN_DECODE_GRAPH_ADAPTER_DUAL=1
 					# and an adapter is present, route replay through it. Legacy path
 					# (default) preserves today's behavior exactly.
+					# K2.5 always routes whole-model replay through the adapter
+					# (no legacy non-adapter K2.5 whole-model path exists).
+					_k25_whole_active = getattr(self, "_k25_whole_model_graph", False)
 					_adapter_dual_active = (
-						self._cuda_graph_adapter_dual
-						and self._cuda_graph_adapter is not None
-						and getattr(self, "_glm5_whole_model_graph", False)
+						self._cuda_graph_adapter is not None
+						and (
+							_k25_whole_active
+							or (
+								self._cuda_graph_adapter_dual
+								and getattr(self, "_glm5_whole_model_graph", False)
+							)
+						)
+					)
+					_wm_seg_name = getattr(
+						self, "_whole_model_segment_name", "glm5_whole_model"
 					)
 					_adapter_decision = None
 					_adapter_batch_state = None
@@ -11626,19 +11748,62 @@ class BatchGenWorker:
 						replay_inputs = self._cuda_graph_adapter.prepare_replay_inputs(
 							decision=_adapter_decision,
 							batch_state=_adapter_batch_state,
-							segment_name="glm5_whole_model",
+							segment_name=_wm_seg_name,
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
 						graph_out = self._cuda_graph_manager.replay(
-							"glm5_whole_model", _max_bs, **replay_inputs,
+							_wm_seg_name, _max_bs, **replay_inputs,
 						)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
 								time.perf_counter() - _glm5_replay_start
 							) * 1000.0
+						# K2.5 whole-model eager-vs-graph compare via the standard
+						# model-agnostic facility (observability-only; does NOT change
+						# token selection). GLM-5 keeps its own bespoke compare block
+						# below; this path serves any adapter that has no such block.
+						if _k25_whole_active:
+							_dbg = self._cuda_graph_adapter.debug_options(_adapter_batch_state)
+							if _dbg.compare_against_eager:
+								from batchgen.cuda_graph.compare import compare_decode_outputs
+								# graph_out has padded bucket rows; the eager reference
+								# produces local_bsz (=batch_size) rows. Slice to align.
+								# Graph probe keys are `probe_layer_<NNN>_hidden`; the
+								# eager reference uses `hidden_states_layer_<i>` — remap
+								# so the diff aligns by key.
+								_graph_cmp = {}
+								for _k, _v in graph_out.items():
+									_vs = _v[:batch_size]
+									if _k.startswith("probe_layer_") and _k.endswith("_hidden"):
+										_idx = int(_k[len("probe_layer_"):-len("_hidden")])
+										_graph_cmp[f"hidden_states_layer_{_idx}"] = _vs
+									else:
+										_graph_cmp[_k] = _vs
+								_report = compare_decode_outputs(
+									adapter=self._cuda_graph_adapter,
+									decision=_adapter_decision,
+									batch_state=_adapter_batch_state,
+									segment_name=_wm_seg_name,
+									captured_inputs=replay_inputs,
+									graph_outputs=_graph_cmp,
+									probe_layers=_dbg.probe_layers,
+									atol=_dbg.compare_atol,
+									rtol=_dbg.compare_rtol,
+									fail_on_mismatch=_dbg.fail_on_mismatch,
+								)
+								_log = logging.info if _report.passed else logging.error
+								_log(
+									"[K25_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s "
+									"status=%s max_abs=%.6g max_rel=%.6g mismatched=%s "
+									"probes=%s",
+									self.rank, _adapter_decision.bucket, batch_size,
+									"OK" if _report.passed else "MISMATCH",
+									_report.max_abs, _report.max_rel,
+									_report.mismatched_keys, _report.probe_results,
+								)
 					elif getattr(self, "_glm5_whole_model_graph", False):
 						primary_manager = getattr(gpu_manager, "primary", gpu_manager)
 						aux_manager = getattr(
@@ -11881,15 +12046,21 @@ class BatchGenWorker:
 
 			new_tokens = new_tokens_out
 
-			# Flush deferred KV entries — single sync for all layers
-			self._flush_deferred_kv_to_host()
-
-			# P1: Non-blocking GPU→CPU transfer via pinned memory
+			# P1: Non-blocking GPU→CPU token transfer via pinned memory. Enqueue
+			# the copy BEFORE flushing KV so _flush_deferred_kv_to_host's single
+			# event.synchronize() (recorded after this copy on the same stream)
+			# covers it too — collapses the two per-step host syncs into one.
 			bs = new_tokens.shape[0]
 			if bs > _new_tokens_pinned.shape[0]:
 				_new_tokens_pinned = torch.empty(bs, 1, dtype=torch.long, pin_memory=True)
 			_new_tokens_pinned[:bs].copy_(new_tokens[:bs], non_blocking=True)
-			torch.cuda.current_stream(self.torch_device).synchronize()
+
+			# Flush deferred KV entries — its single sync covers all layers plus
+			# the token copy above. Only sync again if it had nothing to flush
+			# (early return without syncing) so the token copy isn't read stale.
+			self._flush_deferred_kv_to_host()
+			if not getattr(self, '_kv_offload_synced_this_step', False):
+				torch.cuda.current_stream(self.torch_device).synchronize()
 			new_tokens_cpu = _new_tokens_pinned[:bs]
 
 			# Update sequences (reuse batch_sequences from forward pass setup)

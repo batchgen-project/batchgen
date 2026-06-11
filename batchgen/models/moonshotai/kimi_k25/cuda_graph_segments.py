@@ -84,7 +84,7 @@ class K25AttnSegment:
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
             "slot_indices": TensorSpec(
-                ("batch_size",), torch.int32, fill_value=0
+                ("batch_size",), torch.int32, fill_value=-1
             ),
         }
 
@@ -109,12 +109,41 @@ class K25AttnSegment:
         variance = h.pow(2).mean(-1, keepdim=True)
         return (weight * (h * torch.rsqrt(variance + eps))).to(x.dtype)
 
+    def compute_shared_decode_ctx(
+        self, cache_seqlens: torch.Tensor, dtype_ref: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Layer-invariant decode quantities, computed once per forward.
+
+        RoPE cos/sin, FlashMLA tile-scheduler metadata, and the position/token
+        ids all derive only from the shared ``cache_seqlens`` (and the shared
+        rotary instance + fixed ``max_seq_len``), so they are bit-identical
+        across all 61 layers. The whole-model graph computes these once and
+        threads them into every ``K25AttnSegment.forward`` (``shared_ctx=``),
+        replacing ~61x redundant metadata/cos-sin/elementwise launches per step.
+        ``dtype_ref`` only supplies dtype/device for cos/sin (rotary reads
+        neither shape nor values when seq_len is passed explicitly).
+        """
+        from flash_mla import get_mla_metadata
+        q_position_ids = (cache_seqlens - 1).clamp(min=0).unsqueeze(1).to(torch.int64)
+        token_indices = q_position_ids.squeeze(-1).to(torch.int32)
+        cos, sin = self.attn_mod.rotary_emb(dtype_ref, seq_len=self.max_seq_len)
+        tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+        return {
+            "q_position_ids": q_position_ids,
+            "token_indices": token_indices,
+            "cos": cos,
+            "sin": sin,
+            "tile_scheduler_metadata": tile_scheduler_metadata,
+            "num_splits": num_splits,
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         cache_seqlens: torch.Tensor,
         page_table: torch.Tensor,
         slot_indices: torch.Tensor,
+        shared_ctx: Dict[str, torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Inlined MLA attention with static page_table for CUDA graph compatibility.
 
@@ -135,8 +164,15 @@ class K25AttnSegment:
         gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
 
         # Position IDs: cache_seqlens = current length AFTER this token is written,
-        # so position = cache_seqlens - 1 (0-indexed).
-        q_position_ids = (cache_seqlens - 1).clamp(min=0).unsqueeze(1).to(torch.int64)
+        # so position = cache_seqlens - 1 (0-indexed). When the whole-model graph
+        # supplies shared_ctx these are computed once per forward (layer-invariant);
+        # otherwise derive here (standalone per-layer-graph path).
+        if shared_ctx is not None:
+            q_position_ids = shared_ctx["q_position_ids"]
+            token_indices = shared_ctx["token_indices"]
+        else:
+            q_position_ids = (cache_seqlens - 1).clamp(min=0).unsqueeze(1).to(torch.int64)
+            token_indices = q_position_ids.squeeze(-1).to(torch.int32)
 
         # === Pre-attn RMSNorm ===
         residual = hidden_states
@@ -157,7 +193,10 @@ class K25AttnSegment:
         q_pe = q_pe.contiguous()
 
         # === RoPE cos/sin (pre-extended to max_seq_len during init) ===
-        cos, sin = attn.rotary_emb(q_pe, seq_len=self.max_seq_len)
+        if shared_ctx is not None:
+            cos, sin = shared_ctx["cos"], shared_ctx["sin"]
+        else:
+            cos, sin = attn.rotary_emb(q_pe, seq_len=self.max_seq_len)
 
         # === Fused KV norm + RoPE on both KV and Q ===
         offload_kv = fused_rmsnorm_rope_with_q(
@@ -178,7 +217,7 @@ class K25AttnSegment:
             k_tokens=k_tensor.view(B, -1),
             page_table=page_table,
             slot_indices=slot_indices,
-            token_indices=q_position_ids.squeeze(-1).to(torch.int32),
+            token_indices=token_indices,
             page_size_tokens=self.page_size_tokens,
         )
 
@@ -198,7 +237,11 @@ class K25AttnSegment:
         # === FlashMLA — use STATIC page_table ===
         # get_mla_metadata is a pure CUDA kernel (flash_fwd_mla_metadata.cu) — graph-safe.
         # flash_mla_with_kvcache internal allocs are handled by the CUDA graph memory pool.
-        tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
+        if shared_ctx is not None:
+            tile_scheduler_metadata = shared_ctx["tile_scheduler_metadata"]
+            num_splits = shared_ctx["num_splits"]
+        else:
+            tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, 128, 1)
         attn_out, _ = flash_mla_with_kvcache(
             query_states, blocked_k,
             page_table,
