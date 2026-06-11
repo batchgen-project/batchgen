@@ -295,6 +295,45 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
 
         return result
 
+    def forward_decode_offloaded(self, hidden_states: torch.Tensor, N: int, K: int) -> torch.Tensor:
+        """Streamed (non-persistent) routed-expert DECODE path.
+
+        N = moe_intermediate_size, K = hidden_size (passed by the caller — the MoE layer
+        has them; the wrapper's model_config does not expose moe_intermediate_size).
+
+        Contract: see batchgen_design/weight_loading/gpu_weight_buffer_copy_contract.md.
+        The copy engine streams EVERY offloaded expert into a slot regardless of token
+        count, so we MUST load_weights (wait for the copy) and free_weights for EVERY
+        expert — including 0-token ones — to advance the queue. Decode keeps Marlin layout:
+        NO Marlin->raw transform (that's prefill-WGMMA only); feed the slot weights straight
+        to the grouped-Marlin E=1 kernel.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        weights = self.load_weights(self.module_key)   # blocks until this expert is copied
+        t = hidden_states.shape[0]
+        if t == 0:
+            # 0-token: the async copy is (or will be) in flight. Wait our stream, then free
+            # immediately so the producer can advance. No transform, no GEMM.
+            torch.cuda.current_stream(device).synchronize()
+            self.free_weights(self.module_key)
+            return hidden_states.new_empty((0, hidden_states.shape[-1]))
+
+        from batchgen.moe.marlin_grouped_moe import single_expert_marlin_decode
+        if hidden_states.dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+        out = single_expert_marlin_decode(
+            hidden_states,
+            weights["gate_proj.weight_packed"], weights["gate_proj.weight_scale"],
+            weights["up_proj.weight_packed"], weights["up_proj.weight_scale"],
+            weights["down_proj.weight_packed"], weights["down_proj.weight_scale"],
+            N, K,
+        )
+        # Fence this expert's matmuls before releasing the slot — the producer recycles it
+        # for the next expert's H2D copy immediately on free.
+        torch.cuda.current_stream(device).synchronize()
+        self.free_weights(self.module_key)
+        return out
+
     def _forward_int4(self, hidden_states: torch.Tensor, weights: dict) -> torch.Tensor:
         """INT4 forward using fused WGMMA kernel (preferred) or dequant+mm fallback."""
         x = hidden_states
