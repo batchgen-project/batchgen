@@ -103,16 +103,20 @@ void BindHostPagedManager(py::module& m, const char* name) {
                  return self.AllocatePages(sequence_id, num_tokens);
              },
              py::arg("sequence_id"), py::arg("num_tokens"))
-       .def("free_sequence", &Manager::FreeSequence,
-           py::arg("sequence_id"))
-       .def("free_sequences", &Manager::FreeSequences,
-           py::arg("sequence_ids"))
+        .def("free_sequence", &Manager::FreeSequence,
+             py::arg("sequence_id"))
+        .def("free_sequences", &Manager::FreeSequences,
+             py::arg("sequence_ids"))
+        .def("release_resident_pages", &Manager::ReleaseResidentPages,
+             py::arg("page_ids"),
+             "Release prefix-cache resident pages returned by coordinator "
+             "eviction.")
         .def("build_page_table", &Manager::BuildPageTable,
              py::arg("sequence_ids"))
         .def("get_stats", &Manager::GetStats)
         .def("memfd_fd", &Manager::memfd_fd)
-       .def("__repr__",
-           [](const Manager& self) { return self.DebugString(); })
+        .def("__repr__",
+             [](const Manager& self) { return self.DebugString(); })
         .def("get_sequence_layer_page_pointers",
              [](Manager& self, std::int64_t sequence_id,
                 std::size_t layer_idx,

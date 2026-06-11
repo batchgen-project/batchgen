@@ -164,6 +164,10 @@ class HostPagedKVManager {
         backend_.ReleaseSequences(sequence_ids);
     }
 
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {
+        backend_.ReleaseResidentPages(page_ids);
+    }
+
     std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
