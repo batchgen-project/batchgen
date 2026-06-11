@@ -315,12 +315,24 @@ class DeepseekV3ParallelStrategyManager:
 		self.model = None
 		torch.cuda.empty_cache()
 
-		# Decode uses the native model.py (3D-strided FP8 blockwise MoE, shared
-		# MoE buffer pool, group gate, MLA decode absorb). Prefill stays on the
-		# legacy modeling_deepseek_v3 path (configure_prefill, unchanged).
-		from .model import DeepseekV3ForCausalLM as DeepseekV3ForCausalLM_Decode
+		# Model selection for decode:
+		#  - EP offloading ON (single-node, streamed experts): use the legacy
+		#    modeling_deepseek_v3 model, which implements the offloading decode
+		#    path (moe_infer_loop_with_offloading). The native model.py only
+		#    implements the all-resident 3D-blockwise path.
+		#  - All experts resident (single-node no-offload / dual-node): use the
+		#    native model.py (3D-strided FP8 blockwise MoE + shared buffer pool).
+		# Prefill always stays on the legacy path (configure_prefill, unchanged).
+		use_offloading_decode = (
+			self.world_size <= 8
+			and getattr(self.engine_config.EP_Config, "enable_offloading", False)
+		)
 		# Always use comm for NCCL collectives
-		self.model = DeepseekV3ForCausalLM_Decode(self.loaded_model_config, comm)
+		if use_offloading_decode:
+			self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
+		else:
+			from .model import DeepseekV3ForCausalLM as DeepseekV3ForCausalLM_Decode
+			self.model = DeepseekV3ForCausalLM_Decode(self.loaded_model_config, comm)
 
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
