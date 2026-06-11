@@ -344,7 +344,11 @@ class K25MoEGraphSegment:
         )
 
         # 4) 3D dispatch scatter into strided expert buffer.
-        bufs.dispatched_x.zero_()
+        # No pre-zero: dispatch_scatter_3d writes exactly expert_counts[e] rows
+        # per expert (starting at e*mtp), and the Marlin S1 GEMM never reads the
+        # padding rows beyond that — each CTA early-exits when m_start >= expert_m
+        # and predicates its A-load by prob_m. (If a future Marlin variant drops
+        # that predicate / loads full 16-row M-tiles, restore this zero_.)
         expert_counts, topk_pos = dispatch_scatter_3d(
             bufs.all_tokens,
             bufs.topk_masked_indices,
@@ -378,7 +382,10 @@ class K25MoEGraphSegment:
         )
 
         # 6) Reduce weighted scatter -> flat global output.
-        bufs.routed_global_output.zero_()
+        # No pre-zero: reduce_weighted_scatter's kernel UNCONDITIONALLY stores
+        # every output row (acc inits to 0; the pos>=0 guard only gates the
+        # accumulate, not the store), and H=7168=28*256 so all columns are
+        # covered. The buffer is fully overwritten regardless of routing.
         routed_global_output = reduce_weighted_scatter(
             bufs.expert_out,
             topk_pos,
@@ -389,18 +396,25 @@ class K25MoEGraphSegment:
             output=bufs.routed_global_output,
         )
 
-        # 7) AllReduce routed outputs across ranks (in-graph NCCL).
+        # 7) ReduceScatter routed outputs across ranks (in-graph NCCL).
+        #    routed_global_output is [world_size*bucket, H] in rank-major order:
+        #    all_gather (step 1) concatenates ranks in order, and
+        #    reduce_weighted_scatter writes by global token row, so rows
+        #    [r*bucket:(r+1)*bucket] are rank r's own tokens. NCCL reduce_scatter
+        #    gives rank r the sum over ranks of chunk r = exactly the value the
+        #    old all_reduce + [rank*bucket:+bucket] slice produced — but ~2x less
+        #    collective traffic (drops the all-gather half of all_reduce) and no
+        #    separate slice copy (it writes straight into local_moe_output).
         import torch.distributed as dist
 
         with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
+            self.comm.reduce_scatter(
+                bufs.local_moe_output,
                 routed_global_output,
                 op=dist.ReduceOp.SUM,
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 8) Local slice + inline shared expert (serialized, per POIS).
-        start = self.rank * bucket_size
-        bufs.local_moe_output.copy_(routed_global_output[start:start + bucket_size])
+        # 8) Inline shared expert (serialized, per POIS).
         bufs.local_moe_output.add_(self.moe.shared_experts(padded))
         return {"moe_output": bufs.local_moe_output}

@@ -103,6 +103,7 @@ class K25DecoderLayerGraphSegment:
         page_table: torch.Tensor,
         slot_indices: torch.Tensor,
         rank_token_counts: Optional[torch.Tensor] = None,
+        shared_ctx: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         # K25AttnSegment does input_ln -> MLA -> post_attn_ln, returning the
         # MoE input (normed), the post-attn residual, and the KV offload tensor.
@@ -111,6 +112,7 @@ class K25DecoderLayerGraphSegment:
             cache_seqlens=cache_seqlens,
             page_table=page_table,
             slot_indices=slot_indices,
+            shared_ctx=shared_ctx,
         )
         normed = attn_out["normed"]
         residual = attn_out["residual"]
