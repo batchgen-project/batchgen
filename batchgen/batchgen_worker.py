@@ -3841,10 +3841,12 @@ class BatchGenWorker:
 		config: GPUPagedKVConfig,
 		sequence_tokens: Sequence[int],
 	) -> tuple[GPUPagedKVConfig, Optional[int]]:
-		"""Return a two-slot layer-mapped config for GQA prefix-hit prefill."""
+		"""Return a two-slot layer-mapped config for prefix-hit prefill.
 
-		if not config.has_v_cache:
-			return config, None
+		The temporary prefix materialization only needs the current attention
+		layer and the next prefetched layer resident on GPU. This applies to
+		GQA/MHA K+V caches and MLA K-only compressed caches alike.
+		"""
 		page_size_tokens = int(config.page_size_tokens)
 		fa_page_size_tokens = self._fa_paged_kv_page_size_tokens(page_size_tokens)
 		num_pages = sum(
