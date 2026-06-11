@@ -552,6 +552,16 @@ class DeepseekV3MoE(nn.Module):
                 self.enable_ep_offloading,
             )
         ):
+            # Size the per-expert 3D stride (mtp) to the actual global batch, NOT
+            # the 4096 default: with 32 experts/rank on a single node the FP8
+            # weights already use ~90 GB, so a 4096-mtp pool (dispatched_x +
+            # expert_out ~3.8 GB) OOMs. Worst case one expert receives every
+            # routed token, so mtp >= global_num_tokens; resize_if_needed grows
+            # it later. Mirrors the Kimi single-node OOM-mtp fix.
+            mtp = max(
+                ((global_num_tokens + _MTP_BLOCK - 1) // _MTP_BLOCK) * _MTP_BLOCK,
+                _MTP_BLOCK,
+            )
             DeepseekV3MoE._buf = DeepseekV3MoEBufferManager(
                 E_local=self.experts_per_rank,
                 max_global_bsz=global_num_tokens,
@@ -560,7 +570,7 @@ class DeepseekV3MoE(nn.Module):
                 topk=self.top_k,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_DEFAULT_MTP,
+                max_tokens_padded=mtp,
             )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
@@ -628,13 +638,21 @@ class DeepseekV3MoE(nn.Module):
                     "persistent before stacking (use mixed decode otherwise)."
                 )
 
+        # The per-expert FP8 weight has TWO live references: wrapper.<attr> and
+        # wrapper.module.<proj>.weight.data (same tensor). Rebind BOTH to the
+        # stacked view so the original frees (refcount 0) before the next copy —
+        # otherwise stacked + originals = 2x (~164 GB) and OOMs. (glm5 pattern.)
+        proj_of = {"fp8_gate": "gate_proj", "fp8_up": "up_proj", "fp8_down": "down_proj"}
+
         def _stack_w(attr: str):
+            proj = proj_of[attr]
             shape = getattr(wrappers[0], attr).shape
             w3d = torch.empty((E, *shape), dtype=getattr(wrappers[0], attr).dtype, device=device)
             for i, w in enumerate(wrappers):
                 w3d[i].copy_(getattr(w, attr))
                 view = w3d[i]
                 setattr(w, attr, view)
+                getattr(w.module, proj).weight.data = view
             return w3d
 
         self.fp8_gate_w3d = _stack_w("fp8_gate")
