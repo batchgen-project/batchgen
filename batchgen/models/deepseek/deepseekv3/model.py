@@ -906,6 +906,17 @@ class DeepseekV3DecoderLayer(nn.Module):
             return None
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
+        # Drained DP rank: 0 local decode tokens (this rank's sequences all
+        # finished while other ranks keep decoding). The fused RMSNorm / MLA
+        # kernels raise "CUDA kernel error" on a 0-row input, so skip all local
+        # compute. MoE layers MUST still run self.mlp so their EP all_gather /
+        # all_reduce stay in lockstep with the other ranks; dense layers have no
+        # collective and return unchanged.
+        if hidden_states.shape[0] == 0:
+            if isinstance(self.mlp, DeepseekV3MoE):
+                hidden_states = self.mlp(hidden_states)
+            return (hidden_states, None, None)
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(hidden_states=hidden_states)
@@ -983,6 +994,10 @@ class DeepseekV3Model(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer_output = layer(hidden_states, layer_idx=layer_idx)
             hidden_states = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+        # Guard the final RMSNorm against a drained DP rank (0-row fused kernel
+        # crashes); see DeepseekV3DecoderLayer.forward.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         return self.norm(hidden_states)
 
 
