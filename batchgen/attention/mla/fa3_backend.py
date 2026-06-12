@@ -1196,12 +1196,16 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	normed_kv = self.kv_a_layernorm(compressed_kv)
 	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
 
-	# Native interleaved RoPE (matches HF / SGLang / vLLM is_neox_style=False
-	# when rope_interleave=true).
-	from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
+	# RoPE: use the permuted-layout `rotary_pos_emb` (NOT interleaved_native).
+	# The decode kernel (fused_rmsnorm_rope_with_q) and every other prefill variant
+	# (and the working Kimi prefill) write the rope dims in the PERMUTED layout;
+	# `rotary_pos_emb` and `_interleaved_native` give the same Q·Kᵀ only if Q and K
+	# use the SAME one. This FP8-prepacked variant was the lone outlier using
+	# interleaved_native, so its prefill-K mismatched the permuted decode-Q -> the
+	# attention dot product was wrong from token 1 (degenerate-greedy garbage).
 	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
+	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
 
 	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
 	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
