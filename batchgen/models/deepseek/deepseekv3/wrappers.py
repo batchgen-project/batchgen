@@ -187,6 +187,30 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
 
         return result
 
+    @torch.inference_mode()
+    def stream_weights_into(self, gate_dst, up_dst, down_dst):
+        """Method-A offload gather: stream this non-persistent expert's FP8
+        weights from the host weight-buffer into the provided 3D-stacked slots,
+        then release the buffer slot.
+
+        Honors the GPU weight-buffer copy contract: load_weights/get_weights
+        blocks until the producer has copied this expert, then copy -> sync the
+        compute stream (so the slot->w3d copy lands before the producer reuses
+        the slot) -> free_weights -> clear. Called for EVERY offloaded expert
+        each decode step, including 0-token ones, so no slot leaks and the
+        producer never stalls. Scales stay resident (weight_dequant_scale), so
+        only the FP8 weights stream.
+        """
+        weights = self.load_weights(self.module_key)
+        gate_dst.copy_(weights["gate_proj.weight"])
+        up_dst.copy_(weights["up_proj.weight"])
+        down_dst.copy_(weights["down_proj.weight"])
+        torch.cuda.current_stream(
+            self.engine_config.Basic_Config.device_torch
+        ).synchronize()
+        self.free_weights(self.module_key)
+        self.clear_weights()
+
 
 class DeepSeekAttnWrapper(AttnWrapperBase):
     """Attention wrapper with FP8 dequantization for DeepSeek-R1/V3.

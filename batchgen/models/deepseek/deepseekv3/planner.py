@@ -49,7 +49,8 @@ class DeepSeekV3Planner(BasePlanner):
         This also matches the dual-node config (16/rank), which the base class already produces.
 
         Only applies when EP offloading is OFF; when offloading is enabled the base-class
-        persistent/host split is respected.
+        _compute_batch_configs already sets attn_mode=3, the persistent/host split, and the
+        routed-expert ring buffer (n_offloaded + 2), which the native Method-A path uses.
         """
         if self.config.EP_Config.enable_offloading:
             return

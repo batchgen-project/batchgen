@@ -330,24 +330,13 @@ class DeepseekV3ParallelStrategyManager:
 				f"{alloc_before:.2f} -> {alloc_after:.2f} GiB allocated"
 			)
 
-		# Model selection for decode:
-		#  - EP offloading ON (single-node, streamed experts): use the legacy
-		#    modeling_deepseek_v3 model, which implements the offloading decode
-		#    path (moe_infer_loop_with_offloading). The native model.py only
-		#    implements the all-resident 3D-blockwise path.
-		#  - All experts resident (single-node no-offload / dual-node): use the
-		#    native model.py (3D-strided FP8 blockwise MoE + shared buffer pool).
+		# Model selection for decode: always the native model.py. It now
+		# implements BOTH the all-resident 3D-blockwise MoE (single-node no-offload
+		# / dual-node) AND the mixed ep-offload path (Method A: persistent grouped
+		# GEMM + streamed-offloaded grouped GEMM via the host weight-buffer ring).
 		# Prefill always stays on the legacy path (configure_prefill, unchanged).
-		use_offloading_decode = (
-			self.world_size <= 8
-			and getattr(self.engine_config.EP_Config, "enable_offloading", False)
-		)
-		# Always use comm for NCCL collectives
-		if use_offloading_decode:
-			self.model = DeepseekV3ForCausalLM(self.loaded_model_config, comm)
-		else:
-			from .model import DeepseekV3ForCausalLM as DeepseekV3ForCausalLM_Decode
-			self.model = DeepseekV3ForCausalLM_Decode(self.loaded_model_config, comm)
+		from .model import DeepseekV3ForCausalLM as DeepseekV3ForCausalLM_Decode
+		self.model = DeepseekV3ForCausalLM_Decode(self.loaded_model_config, comm)
 
 		self.weight_copy_task = {}
 		self.state_dict_name_map = {}
@@ -723,14 +712,12 @@ class DeepseekV3ParallelStrategyManager:
 
 
 	def _init_mode_decoding(self):
-		# Skip grouped GEMM initialization for EP offloading mode
-		# In EP offloading, non-persistent experts don't have fp8_gate/fp8_up/fp8_down registered
-		# and moe_infer_loop_with_offloading() doesn't use these pointer lists anyway
-		if self.enable_ep_offloading:
-			if self.rank == 0:
-				logging.info("EP offloading mode: skipping grouped GEMM init (using loop-based execution)")
-			return
-
+		# Stack persistent experts' FP8 weights into the per-layer 3D buffers for
+		# the grouped GEMM. The native model.py init() handles BOTH the all-resident
+		# case (stacks all E_local) and the mixed ep-offload case (stacks only the
+		# n_persistent resident experts; offloaded ones stream per step into the
+		# shared staging buffer). Offloaded experts have resident scales but no
+		# fp8_gate/up/down — init() skips them.
 		for layer_idx in range(
 			self.loaded_model_config.first_k_dense_replace,
 			self.model_config.num_hidden_layers,

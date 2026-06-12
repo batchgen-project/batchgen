@@ -456,10 +456,12 @@ def _moe_3d_blockwise_supported(
     num_persistent_local_experts: int,
     enable_ep_offloading: bool,
 ) -> bool:
-    """3D blockwise MoE requires every local routed expert resident on GPU."""
+    """3D FP8 blockwise MoE path. Supported for all-resident (every local routed
+    expert on GPU, num_persistent==E) AND for mixed ep-offload (persistent subset
+    resident, offloaded experts streamed per step into a shared buffer)."""
     return (
         int(num_persistent_local_experts) == int(experts_per_rank)
-        and not bool(enable_ep_offloading)
+        or bool(enable_ep_offloading)
     )
 
 
@@ -481,6 +483,12 @@ class DeepseekV3MoE(nn.Module):
 
     _buf: Optional["DeepseekV3MoEBufferManager"] = None
     _rank_token_counts: Optional[torch.Tensor] = None
+    # Shared offloaded-expert weight staging buffers (n_offloaded rows), filled
+    # per layer per step by streaming from the host ring. ONE set for the whole
+    # model, reused across all MoE layers (allocated by the first layer's init).
+    _offload_gate_w3d: Optional[torch.Tensor] = None
+    _offload_up_w3d: Optional[torch.Tensor] = None
+    _offload_down_w3d: Optional[torch.Tensor] = None
     _warned_hot_path = False
     _warned_gemm_3d = False
     _warned_weights_stacked = False
@@ -629,13 +637,17 @@ class DeepseekV3MoE(nn.Module):
         start = self.routed_expert_start_idx
         device = self.device
 
+        n_persistent = self.num_persistent_local_experts
         wrappers = [self.experts[start + i] for i in range(E)]
-        for i, w in enumerate(wrappers):
-            if getattr(w, "fp8_gate", None) is None:
+        # Persistent experts [0:n_persistent] have resident FP8 weights and stack
+        # into the per-layer w3d (memory win = n_persistent rows, NOT E). Offloaded
+        # experts [n_persistent:E] stream per step; only their (tiny) scales are
+        # resident. Require resident weights for the persistent experts only.
+        for i in range(n_persistent):
+            if getattr(wrappers[i], "fp8_gate", None) is None:
                 raise RuntimeError(
-                    f"[DeepseekV3MoE] layer {self.layer_idx} expert {start + i}: "
-                    "FP8 weights not registered; all local experts must be "
-                    "persistent before stacking (use mixed decode otherwise)."
+                    f"[DeepseekV3MoE] layer {self.layer_idx} persistent expert "
+                    f"{start + i}: FP8 weights not registered before stacking."
                 )
 
         # The per-expert FP8 weight has TWO live references: wrapper.<attr> and
@@ -647,8 +659,9 @@ class DeepseekV3MoE(nn.Module):
         def _stack_w(attr: str):
             proj = proj_of[attr]
             shape = getattr(wrappers[0], attr).shape
-            w3d = torch.empty((E, *shape), dtype=getattr(wrappers[0], attr).dtype, device=device)
-            for i, w in enumerate(wrappers):
+            w3d = torch.empty((n_persistent, *shape), dtype=getattr(wrappers[0], attr).dtype, device=device)
+            for i in range(n_persistent):
+                w = wrappers[i]
                 w3d[i].copy_(getattr(w, attr))
                 view = w3d[i]
                 setattr(w, attr, view)
@@ -666,6 +679,24 @@ class DeepseekV3MoE(nn.Module):
             self.fp8_gate_ws3d[i, :, :k_blocks] = w.weight_dequant_scale["gate_proj.weight_scale_inv"]
             self.fp8_up_ws3d[i, :, :k_blocks] = w.weight_dequant_scale["up_proj.weight_scale_inv"]
             self.fp8_down_ws3d[i, :, :n_blocks] = w.weight_dequant_scale["down_proj.weight_scale_inv"]
+
+        # Allocate the shared offloaded-expert weight staging buffer once (first
+        # MoE layer to init under ep-offload). Holds n_offloaded experts' FP8
+        # weights; reused across all layers each decode step (streamed in Pass 2).
+        n_offloaded = E - n_persistent
+        if n_offloaded > 0 and DeepseekV3MoE._offload_gate_w3d is None:
+            DeepseekV3MoE._offload_gate_w3d = torch.empty(
+                (n_offloaded, *self.fp8_gate_w3d.shape[1:]),
+                dtype=self.fp8_gate_w3d.dtype, device=device)
+            DeepseekV3MoE._offload_up_w3d = torch.empty(
+                (n_offloaded, *self.fp8_up_w3d.shape[1:]),
+                dtype=self.fp8_up_w3d.dtype, device=device)
+            DeepseekV3MoE._offload_down_w3d = torch.empty(
+                (n_offloaded, *self.fp8_down_w3d.shape[1:]),
+                dtype=self.fp8_down_w3d.dtype, device=device)
+            logging.info(
+                f"[DeepseekV3MoE] offload staging buffer: {n_offloaded} experts, "
+                f"gate={list(DeepseekV3MoE._offload_gate_w3d.shape)}")
 
         self._fp8_blockwise_ready = True
         if not DeepseekV3MoE._warned_weights_stacked:
@@ -748,8 +779,12 @@ class DeepseekV3MoE(nn.Module):
             buf.topk_pos[:num_global * topk],
         )
 
-        # 4) FP8 blockwise grouped GEMM (in-place on buf.expert_out)
-        self._fp8_blockwise_gemm_3d(buf, expert_counts)
+        # 4) FP8 blockwise grouped GEMM (in-place on buf.expert_out). Mixed
+        #    ep-offload splits into a persistent pass + a streamed-offloaded pass.
+        if self.enable_ep_offloading:
+            self._mixed_expert_gemm(buf, expert_counts)
+        else:
+            self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
         # 5) Weighted scatter reduce
         result_buf = buf.result_buffer[:num_global]
@@ -776,40 +811,108 @@ class DeepseekV3MoE(nn.Module):
 
     @torch.inference_mode()
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
-        """FP8 blockwise grouped GEMM on the 3D strided buffer (mirrors
-        Glm5MoE._fp8_blockwise_gemm_3d). Reads buf.dispatched_x -> buf.expert_out."""
+        """All-resident FP8 blockwise grouped GEMM over all E_local experts
+        (mirrors Glm5MoE._fp8_blockwise_gemm_3d). Reads buf.dispatched_x ->
+        buf.expert_out via the shared _grouped_gemm helper."""
         if not DeepseekV3MoE._warned_gemm_3d:
             logging.warning(
                 f"[DeepseekV3MoE] HOT PATH: _fp8_blockwise_gemm_3d (act_quant_3d={_HAS_FP8_OPS})")
             DeepseekV3MoE._warned_gemm_3d = True
+        self._grouped_gemm(
+            self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d,
+            self.fp8_gate_ws3d, self.fp8_up_ws3d, self.fp8_down_ws3d,
+            buf.dispatched_x, expert_counts,
+            self.experts_per_rank, 0, buf.max_tokens_padded, buf.expert_out,
+        )
 
+    @torch.inference_mode()
+    def _mixed_expert_gemm(self, buf, expert_counts):
+        """Method A (two-pass) mixed ep-offload GEMM. Pass 1: grouped GEMM over
+        the n_persistent resident experts. Pass 2: stream the n_offloaded experts'
+        FP8 weights from the host ring into the shared staging buffer (in task
+        order, EVERY expert incl 0-token per the weight-buffer copy contract),
+        then one grouped GEMM over them. Both write the matching bucket range of
+        buf.expert_out so the downstream reduce/scatter is unchanged."""
+        if not DeepseekV3MoE._warned_gemm_3d:
+            logging.warning("[DeepseekV3MoE] HOT PATH: mixed ep-offload GEMM "
+                            "(persistent grouped + streamed-offloaded grouped)")
+            DeepseekV3MoE._warned_gemm_3d = True
+
+        n_persistent = self.num_persistent_local_experts
         E = self.experts_per_rank
+        mtp = buf.max_tokens_padded
+
+        # Pass 1: persistent experts [0:n_persistent]
+        if n_persistent > 0:
+            self._grouped_gemm(
+                self.fp8_gate_w3d, self.fp8_up_w3d, self.fp8_down_w3d,
+                self.fp8_gate_ws3d[:n_persistent], self.fp8_up_ws3d[:n_persistent],
+                self.fp8_down_ws3d[:n_persistent],
+                buf.dispatched_x, expert_counts,
+                n_persistent, 0, mtp, buf.expert_out,
+            )
+
+        # Pass 2: stream offloaded experts [n_persistent:E] into the staging
+        # buffer (task order = ascending expert idx), then grouped GEMM.
+        n_offloaded = E - n_persistent
+        if n_offloaded > 0:
+            start = self.routed_expert_start_idx
+            for j in range(n_offloaded):
+                wrapper = self.experts[start + n_persistent + j]
+                wrapper.stream_weights_into(
+                    DeepseekV3MoE._offload_gate_w3d[j],
+                    DeepseekV3MoE._offload_up_w3d[j],
+                    DeepseekV3MoE._offload_down_w3d[j],
+                )
+            self._grouped_gemm(
+                DeepseekV3MoE._offload_gate_w3d, DeepseekV3MoE._offload_up_w3d,
+                DeepseekV3MoE._offload_down_w3d,
+                self.fp8_gate_ws3d[n_persistent:E], self.fp8_up_ws3d[n_persistent:E],
+                self.fp8_down_ws3d[n_persistent:E],
+                buf.dispatched_x, expert_counts,
+                n_offloaded, n_persistent, mtp, buf.expert_out,
+            )
+
+    @torch.inference_mode()
+    def _grouped_gemm(self, gate_w, up_w, down_w, gate_s, up_s, down_s,
+                      dispatched_x, expert_counts, n_exp, expert_offset, mtp, out):
+        """Grouped FP8 blockwise GEMM over `n_exp` experts.
+
+        Reads dispatched_x buckets [expert_offset : expert_offset+n_exp] (each
+        mtp-strided), weights gate_w/up_w/down_w[n_exp] + scales gate_s/up_s/down_s
+        [n_exp] (all 0-based over the n_exp experts), writes the same bucket range
+        of `out`. Resident path: expert_offset=0, n_exp=E_local. Mixed (offload)
+        path calls it twice: persistent [0:n_persistent] then offloaded
+        [n_persistent:E_local] with the streamed offloaded weight buffer."""
         K = self.hidden_size
         N = self.moe_intermediate_size
-        mtp = buf.max_tokens_padded
+        E = n_exp
+        lo = expert_offset * mtp
+        hi = (expert_offset + E) * mtp
+        x = dispatched_x[lo:hi]
         cu_seqlens = torch.arange(
-            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
-        seqlens = expert_counts[:E]
+            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=x.device)
+        seqlens = expert_counts[expert_offset:expert_offset + E]
         avg = max(mtp // max(E, 1), 1)
 
         # input activation quant
         if _HAS_FP8_OPS:
-            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+            x_3d = x.view(E, mtp, K)
             x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
             x_quant = x_quant_3d.view(E * mtp, K)
             x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
         else:
             from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
+            x_quant, x_scale = _act_quant(x)
             x_scale_t = x_scale.t().contiguous()
 
         # S1: gate + up + SiLU -> BF16 intermediate
         if _HAS_FP8_OPS:
             s1 = grouped_fp8_blockwise_fused_s1(
                 x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                gate_w.view(torch.float8_e4m3fn),
+                up_w.view(torch.float8_e4m3fn),
+                gate_s, up_s,
                 seqlens, cu_seqlens, avg,
             )
             inter_quant_3d, inter_scale_3d = act_quant_3d(s1.view(E, mtp, N), seqlens)
@@ -819,9 +922,9 @@ class DeepseekV3MoE(nn.Module):
             from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
             intermediate = grouped_fp8_blockwise_s1_silu(
                 x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                gate_w.view(torch.float8_e4m3fn),
+                up_w.view(torch.float8_e4m3fn),
+                gate_s, up_s,
                 seqlens, cu_seqlens, avg,
             )
             inter_quant, inter_scale = _act_quant(intermediate)
@@ -830,11 +933,11 @@ class DeepseekV3MoE(nn.Module):
         # S3: down projection
         result = grouped_fp8_blockwise_s3(
             inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
-            self.fp8_down_w3d.view(torch.float8_e4m3fn),
-            self.fp8_down_ws3d,
+            down_w.view(torch.float8_e4m3fn),
+            down_s,
             seqlens, cu_seqlens, avg,
         )
-        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
+        out[lo:hi].copy_(result[:E * mtp])
 
     def shared_expert_forward(self, identity: torch.Tensor) -> torch.Tensor:
         return self.shared_experts(identity)
