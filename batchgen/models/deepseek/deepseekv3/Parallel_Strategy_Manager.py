@@ -312,8 +312,23 @@ class DeepseekV3ParallelStrategyManager:
 		"""
 		self.loaded_model_config.phase = "decode"
 		self.loaded_model_config._attn_implementation = "eager"
+
+		# Fully free the prefill model BEFORE building the decode model. gc.collect()
+		# is REQUIRED: nn.Module trees hold circular references that empty_cache()
+		# alone cannot reclaim, so without it the prefill model stays resident on GPU
+		# and the ~90 GiB decode load OOMs (mirrors Kimi/GLM-5 PSM phase cleanup).
+		import gc
+		device = self.engine_config.Basic_Config.device_torch
+		alloc_before = torch.cuda.memory_allocated(device) / (1024 ** 3)
 		self.model = None
+		gc.collect()
 		torch.cuda.empty_cache()
+		alloc_after = torch.cuda.memory_allocated(device) / (1024 ** 3)
+		if self.rank == 0:
+			logging.info(
+				f"[HBM] Rank {self.rank} configure_decoding: freed prefill model "
+				f"{alloc_before:.2f} -> {alloc_after:.2f} GiB allocated"
+			)
 
 		# Model selection for decode:
 		#  - EP offloading ON (single-node, streamed experts): use the legacy
@@ -495,11 +510,27 @@ class DeepseekV3ParallelStrategyManager:
 		)
 
 		self.model.eval()
+		# HBM right before model.to(device): experts/attn are already on GPU; the
+		# remaining CPU skeleton params (embed_tokens, lm_head, norms ~3.7 GiB) get
+		# moved here. This is where the OOM surfaced — log it to see the headroom.
+		if self.rank == 0:
+			_dev = self.engine_config.Basic_Config.device_torch
+			_a = torch.cuda.memory_allocated(_dev) / (1024 ** 3)
+			_f, _t = torch.cuda.mem_get_info(_dev)
+			logging.info(
+				f"[HBM] Rank {self.rank} BEFORE model.to(device): allocated={_a:.2f} GiB, "
+				f"free={_f / (1024**3):.2f} GiB / {_t / (1024**3):.2f} GiB"
+			)
 		self.model.to(self.engine_config.Basic_Config.device_torch)
 		# Log final GPU memory (rank 0 only)
 		if self.rank == 0:
-			used_memory = torch.cuda.memory_allocated(self.engine_config.Basic_Config.device_torch)
-			logging.info(f"[MODEL] GPU memory after init: {used_memory / (1024**3):.2f} GB used")
+			_dev = self.engine_config.Basic_Config.device_torch
+			used_memory = torch.cuda.memory_allocated(_dev)
+			_f, _t = torch.cuda.mem_get_info(_dev)
+			logging.info(
+				f"[HBM] Rank {self.rank} AFTER configure_decoding model.to: "
+				f"allocated={used_memory / (1024**3):.2f} GiB, free={_f / (1024**3):.2f} GiB"
+			)
 
 		# Initialize MoE layers for decoding (required for EP offloading mode)
 		# This sets up num_tokens_per_rank and other buffers needed for all-gather/all-reduce
