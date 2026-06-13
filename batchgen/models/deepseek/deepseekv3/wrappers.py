@@ -24,6 +24,8 @@ Provides wrappers for DeepSeek-R1 and DeepSeek-V3 models with FP8 quantization:
 """
 
 import logging
+import os
+import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -187,6 +189,14 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
 
         return result
 
+    # ── offload-overhead audit accumulators (class-level; logged per decode step) ──
+    _audit = bool(int(os.environ.get("BATCHGEN_OFFLOAD_AUDIT", "0")))
+    _audit_t_get = 0.0    # CPU blocked in get_weights (producer keeping up?)
+    _audit_t_copy = 0.0   # slot->staging D2D enqueue (async, ~0)
+    _audit_t_sync = 0.0   # full-stream drain (the removable GPU-CPU sync)
+    _audit_t_free = 0.0   # releaseBuffer + clear (buffer mgmt)
+    _audit_n = 0          # stream_weights_into calls (580 = 1 decode step)
+
     @torch.inference_mode()
     def stream_weights_into(self, gate_dst, up_dst, down_dst):
         """Method-A offload gather: stream this non-persistent expert's FP8
@@ -201,15 +211,49 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
         producer never stalls. Scales stay resident (weight_dequant_scale), so
         only the FP8 weights stream.
         """
+        if not DeepSeekExpertWrapper._audit:
+            weights = self.load_weights(self.module_key)
+            gate_dst.copy_(weights["gate_proj.weight"])
+            up_dst.copy_(weights["up_proj.weight"])
+            down_dst.copy_(weights["down_proj.weight"])
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+            self.clear_weights()
+            return
+
+        # audit path: per-sub-op CPU timing (perf_counter is accurate for the
+        # CPU-blocking ops: get_weights CV-wait and the full-stream drain).
+        cls = DeepSeekExpertWrapper
+        t0 = time.perf_counter()
         weights = self.load_weights(self.module_key)
+        t1 = time.perf_counter()
         gate_dst.copy_(weights["gate_proj.weight"])
         up_dst.copy_(weights["up_proj.weight"])
         down_dst.copy_(weights["down_proj.weight"])
+        t2 = time.perf_counter()
         torch.cuda.current_stream(
             self.engine_config.Basic_Config.device_torch
         ).synchronize()
+        t3 = time.perf_counter()
         self.free_weights(self.module_key)
         self.clear_weights()
+        t4 = time.perf_counter()
+        cls._audit_t_get += t1 - t0
+        cls._audit_t_copy += t2 - t1
+        cls._audit_t_sync += t3 - t2
+        cls._audit_t_free += t4 - t3
+        cls._audit_n += 1
+        if cls._audit_n % 580 == 0 and self.get_rank_safe() == 0:
+            logging.warning(
+                "[OFFLOAD_AUDIT] per-step (580 experts): get=%.0fms copy=%.0fms "
+                "sync=%.0fms free=%.0fms | get is producer-wait, sync is the "
+                "removable full-stream drain",
+                cls._audit_t_get * 1000, cls._audit_t_copy * 1000,
+                cls._audit_t_sync * 1000, cls._audit_t_free * 1000,
+            )
+            cls._audit_t_get = cls._audit_t_copy = cls._audit_t_sync = cls._audit_t_free = 0.0
 
 
 class DeepSeekAttnWrapper(AttnWrapperBase):
