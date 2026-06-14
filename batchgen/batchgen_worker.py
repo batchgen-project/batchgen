@@ -7997,15 +7997,22 @@ class BatchGenWorker:
 			return
 
 		capacity = max(1, batch_size)
-		self._decode_cache_seqlens_i32 = torch.empty(
-			(capacity,), dtype=torch.int32, device=self.torch_device
-		)
-		self._decode_position_ids_i64 = torch.empty(
-			(capacity, 1), dtype=torch.int64, device=self.torch_device
-		)
-		self._decode_cache_seqlens_cpu_staging = torch.empty(
-			(capacity,), dtype=torch.int32, pin_memory=True
-		)
+		# Allocate as NORMAL tensors (not inference tensors). This method is called
+		# lazily from inside the @torch.inference_mode() decode loop, so a plain
+		# torch.empty here would create "inference tensors" that cannot be
+		# inplace-updated from the graph-config metadata path (which runs outside
+		# inference mode -> "Inplace update to inference tensor" RuntimeError at a
+		# non-incremental batch transition). inference_mode(False) makes them normal.
+		with torch.inference_mode(False):
+			self._decode_cache_seqlens_i32 = torch.empty(
+				(capacity,), dtype=torch.int32, device=self.torch_device
+			)
+			self._decode_position_ids_i64 = torch.empty(
+				(capacity, 1), dtype=torch.int64, device=self.torch_device
+			)
+			self._decode_cache_seqlens_cpu_staging = torch.empty(
+				(capacity,), dtype=torch.int32, pin_memory=True
+			)
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
 
