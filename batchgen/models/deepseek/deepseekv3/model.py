@@ -698,6 +698,27 @@ class DeepseekV3MoE(nn.Module):
                 f"[DeepseekV3MoE] offload staging buffer: {n_offloaded} experts, "
                 f"gate={list(DeepseekV3MoE._offload_gate_w3d.shape)}")
 
+        # Free the offloaded experts' GPU-resident module weights. Under Method A
+        # the offloaded experts [n_persistent:E] stream from the host ring into the
+        # shared staging buffer each decode step (stream_weights_into); their
+        # per-expert module.weight copies are never read on the 3D path, so any
+        # resident copy is dead memory competing with the decode KV pool. (Persistent
+        # experts were rebound to w3d above; offloaded ones were never loaded/rebound,
+        # so their construction/skeleton weights linger on GPU.)
+        freed_mb = 0.0
+        for i in range(n_persistent, E):
+            w = wrappers[i]
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                p = getattr(w.module, proj).weight
+                if p.data.is_cuda and p.data.numel() > 0:
+                    freed_mb += p.data.numel() * p.data.element_size() / (1024 ** 2)
+                    p.data = torch.empty(0, dtype=p.data.dtype, device=p.data.device)
+        if freed_mb > 0 and not DeepseekV3MoE._warned_weights_stacked:
+            logging.info(
+                f"[DeepseekV3MoE] freed {freed_mb:.1f} MB offloaded-expert resident "
+                f"weights / layer (~{freed_mb * self.config.num_hidden_layers / 1024:.1f} "
+                f"GiB across all layers) -> reclaimed for KV pool")
+
         self._fp8_blockwise_ready = True
         if not DeepseekV3MoE._warned_weights_stacked:
             logging.info(
