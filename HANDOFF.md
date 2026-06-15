@@ -1,5 +1,40 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟩 SESSION 9 (2026-06-15) — QAT-faithful grouped MoE kernel landed; drift improved, residual #2 remains
+
+### Done (committed fdca8026)
+New `v4_grouped_mxfp4_moe_forward_qat` (batchgen/moe/v4_slot_moe_sm120.py): per-owned-expert
+official `act_quant` + `fp4_gemm` (bit-exact, cos=1.0 rel=0.0 vs per-expert/official reference),
+replacing the bf16-weight-dequant `grouped_mxfp4_gemm_3d` (cos~0.9988). Gated by
+`BATCHGEN_V4_QAT_MOE=1` (default off; fast bf16 path stays default for throughput). Old kernel
+annotated NOT-QAT-FAITHFUL. Tests: `test_grouped_moe_qat_kernel_parity` PASSES (cos>0.9999),
+old-kernel xfail retained. Full suite 4 passed 1 xfailed.
+
+### E2E A/B result (flags: QAT_LINEAR=1 + QAT_MOE=1 + GROUPED_MOE=1 + GLM5_LMHEAD_FP32=1)
+```
+tiny-math  EXACT
+identity   first diff char 106  (unchanged from QAT_LINEAR-only)
+haiku      first diff char 2    (was char 0 -> token-0 NOW FIXED by QAT MoE; "A " matches)
+sys-math   first diff char 121  (was char 51 -> moved much deeper)
+1/4 exact
+```
+=> QAT MoE kernel is a REAL fix (haiku token-0 corrected, sys-math 51->121). But still 1/4 exact:
+the drift has MULTIPLE small contributors. Remaining divergences are now LATE
+(char 106/121) = tiny per-decode-step numeric noise from ANOTHER decode-only path NOT covered by
+QAT linear+MoE.
+
+### Residual #2 — next suspects (decode-only, since prefill/identity char0-105 perfect)
+- Decode ATTENTION: MLA q/kv rope on decode step, fp8 KV dequant of prompt+decode KV, sparse
+  indexer topk selection (int32/int64, tie-breaks), attn_sink.
+- MoE ROUTER (gate): topk_indices/topk_weights — hash-routing layers 0-2 tid2eid int64 vs official
+  int32; topk ordering/normalization. If router picks a different expert at a near-tie, output
+  flips even with bit-exact expert math.
+- Method: BATCHGEN_V4_DIVTRACE=1 on haiku (diverges at char 2 ~ decode step 1) with QAT_MOE on,
+  diff vs official dump_ref_acts.py per-layer h_in/attn_out/h_after_attn/h_after_ffn + router topk
+  ids. First layer/op where cosine<0.9999 OR topk ids differ = residual #2.
+NOTE: QAT_MOE decode is per-expert (slow, ~min for 4-prompt A/B); fine for char-exact validation,
+not throughput.
+
 ## 🟦 SESSION 8 (2026-06-15) — QAT experiment: big drift reduction, residual gap remains
 
 ### Step 1 (parity) — QAT path is BIT-EXACT (confirmed)
