@@ -223,9 +223,20 @@ class BatchScheduler:
             )
             return
 
-        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
-            requests, batch
+        prompts, per_request_max_tokens, sampling_params, per_request_ignore_eos = (
+            self._convert_requests_to_worker_inputs(requests, batch)
         )
+        # ignore_eos is a BatchGen extra_body extension. The worker applies it
+        # batch-level (its completion check uses a single `_ignore_eos`), so we
+        # derive one flag from the batch: True only if every request set it
+        # (homogeneous benchmark batches), else False. Warn on mixed usage.
+        batch_ignore_eos = bool(per_request_ignore_eos) and all(per_request_ignore_eos)
+        if any(per_request_ignore_eos) and not batch_ignore_eos:
+            logger.warning(
+                f"Batch {batch_id}: ignore_eos set on only some requests; applied "
+                f"batch-level, so it is treated as False (per-sequence ignore_eos "
+                f"is not yet supported)."
+            )
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
         default_max = batch.max_decoding_length
         if default_max is None:
@@ -284,6 +295,7 @@ class BatchScheduler:
             await self._process_batch_pool_mode(
                 batch_id, batch, requests, prompts,
                 per_request_max_tokens, sampling_params, incremental_kwargs,
+                per_request_ignore_eos,
             )
             return
 
@@ -294,7 +306,7 @@ class BatchScheduler:
                 prompts,
                 None,  # max_input_len: dynamically determined from prompts
                 max_tokens,
-                False,  # ignore_eos
+                batch_ignore_eos,  # ignore_eos (extra_body, batch-level)
                 None,  # temperature: handled via per-request sampling_params
                 None,  # top_p: handled via per-request sampling_params
                 max_context_length=batch.max_context_length,
@@ -358,18 +370,20 @@ class BatchScheduler:
 
     def _convert_requests_to_worker_inputs(
         self, requests: List[BatchRequestItem], batch=None,
-    ) -> Tuple[List[str], List[int], List[Dict[str, Any]]]:
+    ) -> Tuple[List[str], List[int], List[Dict[str, Any]], List[bool]]:
         """Convert batch requests to worker inputs with per-request sampling params.
 
         Returns:
-            (prompts, per_request_max_tokens, sampling_params) where
+            (prompts, per_request_max_tokens, sampling_params, per_request_ignore_eos) where
             per_request_max_tokens is a per-sequence list of max output token limits,
-            and sampling_params is a list of dicts with keys: temperature, top_p, top_k.
+            sampling_params is a list of dicts with keys: temperature, top_p, top_k, and
+            per_request_ignore_eos is a per-sequence list of the `ignore_eos` extra_body flag.
             Per-request values take priority; batch-level values serve as defaults.
         """
         prompts: List[str] = []
         per_request_max_tokens: List[int] = []
         sampling_params: List[Dict[str, Any]] = []
+        per_request_ignore_eos: List[bool] = []
 
         # Batch-level defaults (fallback when per-request is None)
         batch_temp = batch.temperature if batch else None
@@ -416,6 +430,7 @@ class BatchScheduler:
 
             prompts.append(prompt)
             per_request_max_tokens.append(current_max_tokens)
+            per_request_ignore_eos.append(getattr(body, "ignore_eos", False))
 
             # Extract per-request sampling params with batch-level fallback
             req_temp = getattr(body, 'temperature', None)
@@ -433,7 +448,7 @@ class BatchScheduler:
                 'top_k': effective_top_k,
             })
 
-        return prompts, per_request_max_tokens, sampling_params
+        return prompts, per_request_max_tokens, sampling_params, per_request_ignore_eos
 
     def _inject_reasoning_effort(
         self,
@@ -866,6 +881,7 @@ class BatchScheduler:
         per_request_max_tokens: List[int],
         sampling_params: List[Dict[str, Any]],
         incremental_kwargs: Dict[str, Any],
+        per_request_ignore_eos: Optional[List[bool]] = None,
     ) -> None:
         """Process a batch in pool mode: push to IntakePool for async processing.
 
@@ -895,6 +911,10 @@ class BatchScheduler:
                     "priority": 0,  # TODO: support per-batch priority from API
                     "sampling_params": sampling_params[idx] if sampling_params else {},
                     "batchgen_debug": batch.batchgen_debug or {},
+                    "ignore_eos": (
+                        per_request_ignore_eos[idx]
+                        if per_request_ignore_eos else False
+                    ),
                 },
                 priority=Priority.NORMAL,
             ))
@@ -1043,6 +1063,7 @@ class BatchScheduler:
                     "priority": entry.priority.value,
                     "sampling_params": entry.raw_request.get("sampling_params", {}),
                     "batchgen_debug": entry.raw_request.get("batchgen_debug", {}),
+                    "ignore_eos": entry.raw_request.get("ignore_eos", False),
                 })
 
             admission_msg = {

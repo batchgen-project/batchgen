@@ -417,8 +417,19 @@ def create_app(
         updated = storage.load_batch(batch_id)
         return updated
 
-    @app.post("/v1/inference")
+    @app.post("/v1/inference", deprecated=True)
     async def run_inference(request: Request, body: RawInferenceRequest):
+        """DEPRECATED: direct blocking inference. Use the `/v1/batches` API instead.
+
+        This endpoint bypasses the scheduling pool and is no longer maintained;
+        it is kept only for backward compatibility and may be removed.
+        """
+        if not getattr(app.state, "_v1_inference_deprecation_logged", False):
+            logger.warning(
+                "/v1/inference is DEPRECATED and unmaintained; migrate to the "
+                "/v1/batches API. (extra_body fields like `ignore_eos` are supported there.)"
+            )
+            app.state._v1_inference_deprecation_logged = True
         worker: WorkerManager = request.app.state.worker
         server_args: ServerArgs = request.app.state.server_args
         storage: StorageManager = request.app.state.storage
