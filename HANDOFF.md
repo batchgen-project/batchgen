@@ -1,5 +1,44 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟦 SESSION 10 (2026-06-15) — residual #2 narrowed (2 suspects ruled out)
+
+Hunting residual #2 (decode-only drift after QAT_LINEAR+QAT_MOE+LMHEAD_FP32; haiku diverges
+char 2, identity char 106, sys-math char 121). Oracle-ranked suspects: fp8 KV > SM120 attn >
+indexer > router > rope.
+
+### RULED OUT
+1. **SM120 attention kernel** — Exp1: ran haiku A/B with BATCHGEN_V4_MLA_TORCH=1 (torch ref) vs
+   SM120 triton. BOTH diverge from golden at the SAME point (char 2, both emit "A restless...").
+   => residual is NOT SM120-kernel-specific; it's in SHARED decode state. (torch and SM120 differ
+   slightly downstream — "blue" vs "grey" ~token 3 — so there IS a minor SM120 delta, but it's not
+   the primary residual.)
+2. **RoPE config mismatch** — Exp2: suspected batchgen disabled YaRN for compressed layers. REFUTED.
+   HF config.json has rope_scaling={factor:16, original_max_position_embeddings:65536, type:yarn},
+   compress_rope_theta:160000, rope_theta:10000. `_v4_compress_rope_params` (wrappers.py:480-493)
+   reads these correctly (original_seq_len=65536, factor=16, theta=160000). RoPE params are correct.
+
+### REMAINING SHARED SUSPECTS (decode-only)
+- **fp8 KV cache (Oracle #1).** batchgen V4 decode KV = hardwired 576-byte packed fp8 (nope fp8 +
+  bf16 rope + UE8M0 per-64 scales); torch ref REQUIRES fp8 (v4_mla_torch_ref.py:135-138, cannot
+  switch to bf16). Official stores KV as bf16 with act_quant(kv,64,inplace=True) fake-quant. The
+  pack/unpack (dequantize_nope_from_fp8) is a COMPILED kernel symbol (not pure Python), so no easy
+  Python micro-test. To test: would need a kernel-level pack→readback vs official act_quant on the
+  same bf16 KV block, OR port divtrace into official.
+- **Sparse indexer topk / MoE router** — near-tie discrete flips. Less likely per Oracle (dtype-only
+  int32/int64 is harmless unless ties/masking differ).
+
+### DEFINITIVE NEXT STEP (high-effort): DIVTRACE batchgen vs official
+BATCHGEN_V4_DIVTRACE=1 dumps per-layer h_in/attn_out/h_after_attn/h_after_ffn + router topk +
+moe_internals(L4,5,6) + final logits_topk. The OFFICIAL model has NO divtrace — must port the same
+hooks into assets/inference/model.py (or v4flash_official/inference/) and run torchrun on the same
+prompt, then diff per-layer cosine + router topk ids. First layer where attn_out cosine<0.9999 =>
+KV/rope/indexer; if attn_out matches but h_after_ffn jumps => router/MoE. tools/analyze_divtrace.py
+compares boundary tensors.
+
+### Backend toggle reference (verified)
+BATCHGEN_V4_MLA_SM120_TRITON=1 (default, takes priority) vs BATCHGEN_V4_MLA_TORCH=1 — adapter
+line 139-141. Torch ref is more faithful but slow.
+
 ## 🟩 SESSION 9 (2026-06-15) — QAT-faithful grouped MoE kernel landed; drift improved, residual #2 remains
 
 ### Done (committed fdca8026)
