@@ -89,7 +89,15 @@ _V4_PYNCCL_COMM = os.environ.get("BATCHGEN_V4_PYNCCL_COMM", "1") == "1"
 
 # Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
 _V4_DIVTRACE = os.environ.get("BATCHGEN_V4_DIVTRACE", "0") == "1"
-_V4_DIVTRACE_DUMP_PATH = "/data3/leyangxue/v4-repro-artifacts"
+# Prefill mode: trace the PREFILL forward (q_len > 1) instead of decode tokens,
+# dumping only the last prompt position for comparison with the official
+# reference's prefill activations.
+_V4_DIVTRACE_PREFILL = (
+    os.environ.get("BATCHGEN_V4_DIVTRACE_PREFILL", "0") == "1"
+)
+_V4_DIVTRACE_DUMP_PATH = os.environ.get(
+    "BATCHGEN_V4_DIVTRACE_DUMP_PATH", "/data3/leyangxue/v4-repro-artifacts"
+)
 _V4_DIVTRACE_FFN_ATTRIB_LAYERS = {4, 5, 6}
 _V4_DIVTRACE_MOE_INTERNALS_LAYERS = {4, 5, 6}
 _v4_divtrace_calls: dict[int, int] = {}
@@ -319,6 +327,11 @@ def _v4_divtrace_dump_tensor(
     cache_seqlens: Optional[torch.Tensor],
 ) -> None:
     meta = _v4_divtrace_metadata(cache_seqlens)
+    payload = tensor[:1]
+    if _V4_DIVTRACE_PREFILL and payload.dim() >= 2 and payload.size(1) > 1:
+        # Keep only the last prompt position to match the official
+        # reference dump (last-token activations).
+        payload = payload[:, -1:]
     _v4_divtrace_append(
         {
             "kind": "boundary",
@@ -327,7 +340,7 @@ def _v4_divtrace_dump_tensor(
             "name": name,
             "seq_id": meta["seq_id"],
             "cache_seqlen": meta["cache_seqlen"],
-            "tensor": tensor[:1].detach().to(torch.float32).cpu().clone(),
+            "tensor": payload.detach().to(torch.float32).cpu().clone(),
         }
     )
 
@@ -351,6 +364,8 @@ def _v4_divtrace_is_decode_token(
     past_key_value: Optional[Tuple[torch.Tensor, ...]],
 ) -> bool:
     del past_key_value
+    if _V4_DIVTRACE_PREFILL:
+        return tensor.dim() >= 2 and tensor.size(1) > 1
     return tensor.dim() >= 2 and tensor.size(1) == 1
 
 
@@ -373,6 +388,10 @@ def _v4_divtrace_begin_layer(
 def _v4_divtrace_end_layer(layer_idx: int) -> None:
     _v4_divtrace_active_layers.discard(layer_idx)
     _v4_divtrace_calls[layer_idx] = _v4_divtrace_calls.get(layer_idx, 0) + 1
+    if _V4_DIVTRACE_PREFILL and layer_idx >= 42:
+        # The batchgen prefill path bypasses ForCausalLM.forward (where the
+        # normal flush lives), so flush after the last decoder layer.
+        _v4_divtrace_flush()
 
 
 def _v4_divtrace_should_trace_final(
@@ -705,6 +724,81 @@ def _cfg(config: Any, name: str, default: Any) -> Any:
     return getattr(config, name, default)
 
 
+# QAT-faithful linear (opt-in): quantize activations to fp8 (block 128,
+# ue8m0) and run the official tilelang fp8/fp4 GEMM, exactly like the
+# reference `linear()`. Verified bit-exact vs official in
+# tests/integration/test_v4_linear_numerics_parity.py, but the tilelang
+# kernel-launch storm (256 experts x 43 layers x 3 GEMMs per rank) wedges
+# the multi-process server, so it stays off until batched per-layer.
+_V4_QAT_LINEAR = os.environ.get("BATCHGEN_V4_QAT_LINEAR", "0") == "1"
+
+
+def _v4_official_kernels():
+    from batchgen.models.deepseek.deepseekv4_flash.assets.inference import (
+        kernel,
+    )
+
+    return kernel
+
+
+_v4_qat_linear_logged = {"on": False, "fail": False}
+
+
+def _qat_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    kern = _v4_official_kernels()
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    k = x.shape[-1]
+    if k % 128 != 0:
+        return None
+    # Parameter-server runtime tensors may arrive as raw uint8 views of the
+    # quantized checkpoint bytes; recover the logical dtype from the scale
+    # layout (fp4: scale rows == weight rows; fp8: scale rows == ceil(N/128)).
+    if weight.dtype in (torch.uint8, torch.int8):
+        n = weight.shape[0]
+        if scale.shape[0] == n and fp4_dtype is not None:
+            weight = weight.view(fp4_dtype)
+        elif scale.shape[0] == (n + 127) // 128:
+            weight = weight.view(torch.float8_e4m3fn)
+        else:
+            return None
+    is_fp4 = fp4_dtype is not None and weight.dtype == fp4_dtype
+    is_fp8 = weight.dtype == torch.float8_e4m3fn
+    if not (is_fp4 or is_fp8):
+        return None
+    x2d = x.reshape(-1, k)
+    if x2d.dtype != torch.bfloat16:
+        x2d = x2d.to(torch.bfloat16)
+    xq, xs = kern.act_quant(x2d, 128, "ue8m0", torch.float8_e8m0fnu)
+    wscale = (
+        scale
+        if scale.dtype == torch.float8_e8m0fnu
+        else scale.view(torch.float8_e8m0fnu)
+        if scale.dtype == torch.uint8
+        else scale.to(torch.float32).to(torch.float8_e8m0fnu)
+    )
+    prev_default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        if is_fp4:
+            out = kern.fp4_gemm(xq, xs, weight, wscale, torch.float8_e8m0fnu)
+        else:
+            out = kern.fp8_gemm(xq, xs, weight, wscale, torch.float8_e8m0fnu)
+    finally:
+        torch.set_default_dtype(prev_default_dtype)
+    if not _v4_qat_linear_logged["on"]:
+        _v4_qat_linear_logged["on"] = True
+        print(
+            f"[V4_QAT_LINEAR] active (first GEMM: fp4={is_fp4}, "
+            f"x={tuple(x.shape)}, w={tuple(weight.shape)})",
+            flush=True,
+        )
+    return out.reshape(*x.shape[:-1], out.shape[-1]).to(x.dtype)
+
+
 def _linear_from_weight(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -717,6 +811,41 @@ def _linear_from_weight(
     PyTorch for correctness-oriented bring-up; optimized wrappers/kernels replace
     this path in production.
     """
+
+    if (
+        _V4_QAT_LINEAR
+        and scale is not None
+        and bias is None
+        and x.is_cuda
+        and x.numel() > 0
+    ):
+        try:
+            out = _qat_linear(x, weight, scale)
+        except Exception as exc:
+            out = None
+            if not _v4_qat_linear_logged["fail"]:
+                _v4_qat_linear_logged["fail"] = True
+                print(
+                    f"[V4_QAT_LINEAR] FAILED first call: {type(exc).__name__}: "
+                    f"{exc} (x={tuple(x.shape)},{x.dtype} "
+                    f"w={tuple(weight.shape)},{weight.dtype} "
+                    f"s={tuple(scale.shape)},{scale.dtype})",
+                    flush=True,
+                )
+        if out is not None:
+            return out
+        if (
+            not _v4_qat_linear_logged["fail"]
+            and not _v4_qat_linear_logged["on"]
+        ):
+            _v4_qat_linear_logged["fail"] = True
+            print(
+                f"[V4_QAT_LINEAR] SKIPPED first call (returned None): "
+                f"x={tuple(x.shape)},{x.dtype} "
+                f"w={tuple(weight.shape)},{weight.dtype} "
+                f"s={tuple(scale.shape)},{scale.dtype}",
+                flush=True,
+            )
 
     raw_weight_shape = tuple(weight.shape)
     weight = _dequant_weight(weight, scale, x.dtype)
@@ -966,6 +1095,11 @@ class DeepSeekV4FlashAttention(nn.Module):
         self.compress_ratio = (
             int(ratios[layer_idx]) if layer_idx < len(ratios) else 0
         )
+        self.window_size = int(_cfg(config, "window_size", 128))
+        self.rope_head_dim = int(
+            _cfg(config, "qk_rope_head_dim", _cfg(config, "rope_head_dim", 64))
+        )
+        self._config_ref = config
 
         self.runtime_phase = "prefill"
         self._prefill_full_tensors: Dict[str, torch.Tensor] = {}
@@ -1082,6 +1216,40 @@ class DeepSeekV4FlashAttention(nn.Module):
             self.indexer.compressor.wkv.clear_runtime_tensors()
             self.indexer.compressor.wgate.clear_runtime_tensors()
 
+    def _forward_prefill_sparse(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, None, torch.Tensor]:
+        from batchgen.models.deepseek.deepseekv4_flash.v4_prefill_sparse import (
+            sparse_prefill_attention_sequence,
+        )
+
+        bsz, q_len, _ = hidden_states.shape
+        prepack = bool(getattr(AttnWrapperBase, "prepack_mode", False))
+        cu = getattr(AttnWrapperBase, "prepack_cu_seqlens", None)
+        if prepack and cu is not None and bsz == 1:
+            bounds = cu.tolist()
+            spans = [
+                (int(bounds[i]), int(bounds[i + 1]))
+                for i in range(len(bounds) - 1)
+                if bounds[i + 1] > bounds[i]
+            ]
+        else:
+            spans = [(0, q_len)]
+
+        attn_out = torch.empty_like(hidden_states)
+        kv_out = hidden_states.new_empty(bsz, q_len, self.head_dim)
+        for b in range(bsz):
+            row = hidden_states[b : b + 1]
+            row_spans = spans if bsz == 1 else [(0, q_len)]
+            for start, end in row_spans:
+                seq_x = row[:, start:end]
+                seq_attn, seq_kv = sparse_prefill_attention_sequence(
+                    self, seq_x
+                )
+                attn_out[b : b + 1, start:end] = seq_attn
+                kv_out[b : b + 1, start:end] = seq_kv
+        return attn_out, None, kv_out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1097,6 +1265,12 @@ class DeepSeekV4FlashAttention(nn.Module):
         bsz, q_len, _ = hidden_states.shape
 
         prefill_dp = self.runtime_phase == "prefill" and self.world_size > 1
+        if (
+            self.runtime_phase == "prefill"
+            and q_len > 1
+            and os.environ.get("BATCHGEN_V4_SPARSE_PREFILL", "1") == "1"
+        ):
+            return self._forward_prefill_sparse(hidden_states)
         if prefill_dp:
             n_heads = self.n_heads
             n_groups = self.o_groups
@@ -1367,17 +1541,23 @@ class DeepSeekV4FlashExpertPlaceholder(nn.Module):
             up = torch.clamp(
                 up.float(), min=-self.swiglu_limit, max=self.swiglu_limit
             ).to(up.dtype)
-        try:
-            from batchgen_kernels.moe.silu_mul_quant import (
-                fused_silu_mul_quant_cuda,
-            )
-
-            activated_fp8, _scales = fused_silu_mul_quant_cuda(
-                gate.to(torch.bfloat16), up.to(torch.bfloat16)
-            )
-            activated = activated_fp8.float() * _scales.unsqueeze(-1)
-        except (ImportError, RuntimeError):
+        if _V4_QAT_LINEAR:
+            # Official Expert.forward: silu*up in fp32, cast to bf16, then
+            # w2's linear act-quants ONCE (block 128). The fused silu-quant
+            # kernel would add a second, different fp8 quantization.
             activated = F.silu(gate.float()) * up.float()
+        else:
+            try:
+                from batchgen_kernels.moe.silu_mul_quant import (
+                    fused_silu_mul_quant_cuda,
+                )
+
+                activated_fp8, _scales = fused_silu_mul_quant_cuda(
+                    gate.to(torch.bfloat16), up.to(torch.bfloat16)
+                )
+                activated = activated_fp8.float() * _scales.unsqueeze(-1)
+            except (ImportError, RuntimeError):
+                activated = F.silu(gate.float()) * up.float()
         if weights is not None:
             activated = activated * weights
         return self._linear(
@@ -1433,7 +1613,7 @@ class DeepSeekV4FlashMoE(nn.Module):
             ]
         )
         self.shared_experts = DeepSeekV4FlashExpertPlaceholder(
-            self.hidden_size, self.intermediate_size, 0.0
+            self.hidden_size, self.intermediate_size, self.swiglu_limit
         )
         self.comm = None
         self.rank = 0
@@ -1466,11 +1646,18 @@ class DeepSeekV4FlashMoE(nn.Module):
         # Prepacked prefill and multi-sequence batches use a different/larger
         # all-gather that deadlocks via PyNcclCommunicator, so fall back to
         # torch.distributed there.
+        #
+        # The backend choice MUST be globally uniform across ranks: all ranks
+        # all-gather a tensor padded to the GLOBAL num_tokens_per_rank, so the
+        # gate must use that global value, not this rank's local token count.
+        # Using local _cur_real_tokens caused an uneven decode tail (e.g. per-rank
+        # counts [2,2,2,1]) to mix PyNCCL on the 1-token rank with
+        # torch.distributed on the others -> collective backend mismatch -> hang.
         if AttnWrapperBase is not None and getattr(
             AttnWrapperBase, "prepack_mode", False
         ):
             return False
-        if getattr(self, "_cur_real_tokens", 1) != 1:
+        if int(getattr(self, "num_tokens_per_rank", 1) or 1) != 1:
             return False
         return _V4_PYNCCL_COMM and getattr(self, "comm", None) is not None
 
