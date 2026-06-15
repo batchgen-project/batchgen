@@ -1,5 +1,126 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟧 SESSION 7 (2026-06-15) — full-run crash chain (2 fixed, 1 pending Oracle)
+
+Investigating why the full 12k MMLU SIGSEGV'd at ~105/12032. Found a CHAIN of crashes in the
+watermark-driven on-hold/re-prefill cycle (only triggers on long multi-wave runs; the 100-prompt
+run finished before any watermark fired). All are SEPARATE from the page-accounting fix.
+
+### CRASH 1 (FIXED + E2E verified, committed 12e2e2a4)
+`_put_sequences_on_hold` (worker.py:5752) + `_put_sequences_onhold` (2344) filtered GPU-tracked ids
+via `mgr._sequences`, which DeepSeekV4KVCoordinator lacks (it fans out to 4 sub-pools) ->
+AttributeError when host-KV watermark interrupts decode to evict -> SIGSEGV in GPU_KV_Buffer dtor.
+FIX: added `coordinator.tracked_sequence_ids()` (authoritative via swa._sequences) + routed both
+on-hold paths through it (V4-aware branch). Unit test `test_v4_tracked_sequence_ids_filters_unknown`
+passes (5/5). E2E VERIFIED: 500-prompt run hit "[WATERMARK] putting 20 sequences ON_HOLD" on all 4
+ranks at Decode 2 / iter 256 (the exact prior crash point) with NO AttributeError/SIGSEGV.
+
+### CRASH 2 (FIXED + E2E verified, committed 3db33857)
+Coordinator re-init on watermark re-prefill. configure_prefill deep-frees the coordinator
+(destroyed-but-not-None); the prefill re-init gate only fired on `is None` -> re-prefill ran
+against a destroyed coordinator -> "DeepSeekV4KVCoordinator is not initialized" -> SIGSEGV.
+FIX (Oracle bg_7e97b68c): new `_maybe_reinit_v4_gpu_kv_for_prefill(prefill_uuids)` decides re-init
+COLLECTIVELY — gated on the GLOBAL prefill_uuids (identical across ranks), predicate
+`is None or not is_initialized`, with an all_gather consistency guard that raises rather than
+deadlocks if ranks diverge (because _init_gpu_kv_with_actual_size runs a dist.broadcast +
+early-returns on initialized ranks). Kept destroy-before-configure_prefill (skipping it re-OOMs).
+E2E VERIFIED: 500-prompt run hit `PREFILL TRIGGER` + `Breaking for prefill` + a 2ND prefill config
+(the exact prior crash path) and SURVIVED — 109+ completions, 25min, no "not initialized"/SIGSEGV.
+
+### Commits this session: 12e2e2a4 (CRASH 1), 3db33857 (CRASH 2). Full-run crash chain resolved.
+The watermark on-hold -> re-prefill -> resume-decode cycle now works for V4. Bounded AND
+multi-wave runs survive. Remaining: the QAT char-exact experiment (Session 6 plan) is still
+pending; a full 12k throughput run is slow (~hours) but no longer crashes.
+
+### (superseded) CRASH 2 original diagnosis — coordinator not re-initialized on watermark re-prefill
+After CRASH 1 fixed, the watermark "[DECODE] Breaking for prefill - 99 queued" loops back to PREFILL
+phase. `configure_prefill` ALWAYS deep-frees + `_destroy_gpu_paged_kv_cache()` (worker.py:7849, "Bug
+Fix 7.2": free 20-30GB GPU KV so prefill model loads without OOM). Coordinator is now
+is_initialized=False but NOT None. The prefill re-init gate (worker.py:7237-7246) only fires when
+`gpu_paged_kv_cache_manager is None` -> SKIPPED -> prefill_prepacked -> decoder_layer ->
+coordinator.allocate_pages_for_sequences -> `_ensure_initialized()` raises "DeepSeekV4KVCoordinator
+is not initialized" -> SIGSEGV. Crash traceback: worker.py:9348 decoder_layer ->
+coordinator.py allocate_pages_for_sequences -> _ensure_initialized.
+
+PROPOSED (pending Oracle): change gate from `is None` to `is None or not is_initialized`. OPEN
+RISKS Oracle is checking: (a) `_init_gpu_kv_with_actual_size` issues dist.broadcast(src=0) — the
+re-init condition must evaluate identically across all 4 ranks or the collective desyncs (ties to
+the earlier deadlock fix); (b) re-initing 52GB KV before re-prefill may re-introduce the OOM that
+Bug Fix 7.2 avoids (decode model + 34GB resident experts may still be loaded); (c) configure_prefill
+deep-free releases ALL GPU KV pages INCLUDING in-flight IN_DECODE sequences' KV — does the
+destroy/recreate cycle corrupt in-flight decode state for V4's GPU-resident-only KV? This is a
+deeper architecture question: V4 needs coordinator-KV-before-prefill (resident, no host upload),
+but the generic streaming path assumes prefill/decode models don't coexist and freely
+destroys/recreates KV. The on-hold->re-prefill->resume-decode cycle may need V4-specific handling
+to preserve resident KV of still-in-flight sequences.
+
+### Net: full 12k still blocked by CRASH 2. Bounded runs (<=~100 prompts, no watermark) work fine
+(verified 72% on 100). The watermark fires only when host-KV crosses 70% with queued seqs, i.e.
+sustained multi-wave load.
+
+
+## 🟦 SESSION 6 (2026-06-15) — CHAR-EXACT PLAN (Oracle-validated). Run AFTER 12k MMLU finishes.
+
+### Root cause of multi-token greedy drift (PROVEN)
+Model is QAT-trained: official `linear()` quantizes ACTIVATIONS to fp8 (block-128, ue8m0) before
+every quantized GEMM. batchgen default `_linear_from_weight` dequantizes WEIGHTS to bf16 + F.linear
+=> ~2.6e-2 rel/GEMM, compounds to hidden cos 0.98@L0 -> 0.92@L42 -> greedy argmax flips at token
+2-12. Single token (tiny-math "4") matches; longer generations drift. Proven by
+`tests/integration/test_v4_linear_numerics_parity.py`: `_qat_linear` (model.py:747, env
+BATCHGEN_V4_QAT_LINEAR=1) is cos=1.0 rel=0.0 vs official; default path is not. Oracle confirmed
+this magnitude alone explains the drift (no extra discrete bug needed unless a layer-LOCAL collapse
+persists with QAT on).
+
+### Updated insight: per-expert launch-storm blocker is GONE
+Old note said BATCHGEN_V4_QAT_LINEAR=1 couldn't be enabled (per-expert tilelang launch storm wedged
+the server). But the grouped MXFP4 MoE kernel `v4_grouped_mxfp4_moe_forward_3d_ptrs` (model.py:1789,
+env BATCHGEN_V4_GROUPED_MOE=1) already does `act_quant` once per layer's batch — that's the MMLU
+path. So experts already use QAT-faithful quant; only DENSE/ATTENTION linears + lm_head remain on the
+non-QAT path. All 3 flags verified WIRED:
+- BATCHGEN_V4_QAT_LINEAR -> _qat_linear in _linear_from_weight (model.py:816, graceful fallback)
+- BATCHGEN_V4_GROUPED_MOE -> grouped expert kernel (already on for MMLU)
+- BATCHGEN_GLM5_LMHEAD_FP32 -> force_fp32 lm_head (worker.py:8811/9025/9355; model.py:187/239)
+
+### Oracle-validated experiment plan (cheap -> decisive; DO IN ORDER)
+1. **Grouped-MoE parity in isolation FIRST.** "calls act_quant" is necessary NOT sufficient. For one
+   layer/token-batch, compare official MoE output vs grouped kernel with identical hidden states,
+   router logits/topk ids/weights, expert weights/scales, accumulation dtype. Verify block-128
+   layout, UE8M0 scale rounding, expert packing, routing order, top-k norm, combine order, dist
+   ownership/all-reduce. (Can be a unit script — minimal GPU.)
+2. **One-prompt DIVTRACE with all 3 flags ON**, diff vs official per-layer dump:
+   - batchgen: `BATCHGEN_V4_DIVTRACE=1 BATCHGEN_V4_DIVTRACE_PREFILL=1 BATCHGEN_V4_DIVTRACE_DUMP_PATH=<dir>`
+     + BATCHGEN_V4_GROUPED_MOE=1 BATCHGEN_V4_QAT_LINEAR=1 BATCHGEN_GLM5_LMHEAD_FP32=1
+     -> divtrace_rank{0-3}.pt
+   - official: `v4flash_official/inference/dump_ref_acts.py` (torchrun --nproc-per-node 4, same prompt)
+   - Confirmation = NO progressive cosine decay across layers + router/topk id agreement + prefill
+     final logits top-1 AND top-2 margin agree. (Cosine alone hides logit-order issues — check
+     top-1 id + top-2 margin too.)
+3. **Teacher-forced multi-step**: feed official tokens 16 steps, compare logits/top-1 each step.
+   Separates model-state parity from greedy-trajectory divergence.
+4. **THEN** short greedy A/B vs golden.jsonl (`v4flash_official/results/ab_small/compare_ab.py`).
+
+### TRAPS (Oracle)
+- lm_head: must be PLAIN fp32 projection (BATCHGEN_GLM5_LMHEAD_FP32=1), do NOT route through
+  QAT_LINEAR activation-quant — else double-quantize. (_linear_from_weight QAT gate requires
+  scale!=None and bias is None; lm_head goes through vocab_parallel_lm_head, separate path — verify
+  it's not also QAT'd.)
+- If QAT dense STILL wedges: do NOT group dense GEMMs first. Fix JIT hygiene — pre-warm exact
+  (M,N,K,dtype,block) shapes in EACH worker AFTER cuda init, serialize compile across ranks,
+  persistent JIT cache + file lock, bucket token counts. Group dense only if profiling still shows
+  launch overhead after warmup.
+
+### Diagnostic infra map (file:line)
+- DIVTRACE: model.py:91-100 (flags), dump fns 323-686, flush 348.
+- Attn tensor dump: v4_flashmla_adapter.py:21-27 (BATCHGEN_V4_ATTN_TENSOR_DUMP=<dir>).
+- analyze tool: tools/analyze_divtrace.py ; trace script: tools/v4_divtrace_blackwell.sh.
+- parity tests: tests/integration/test_v4_linear_numerics_parity.py (cos>0.999),
+  test_v4_prefill_sparse_parity.py (cos>0.999) — run IN CONTAINER (bare metal lacks cuda.h).
+- official: v4flash_official/inference/{dump_ref_acts.py,gen_golden.py};
+  results/ab_small/{golden.jsonl,compare_ab.py}; results/debug/compare_{traces,decode_traces,attn_internals}.py.
+
+### Status: 12 commits landed (b done). 12k MMLU running (let it finish, then start step 1 above).
+
+
 ## 🟩 SESSION 5d (2026-06-15) — FIX IMPLEMENTED & VERIFIED: compression-aware page accounting
 
 The 4-pool over-allocation bug (Session 5c) is FIXED. The 100-prompt MMLU run that previously
