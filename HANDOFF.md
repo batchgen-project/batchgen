@@ -1,5 +1,35 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟩 SESSION 12 (2026-06-15) — indexer fixes landed (relu = big win, fp4 = faithful but marginal)
+
+### Indexer relu fix (commit 42fd4626) — MAJOR, verified
+Added per-head `tl.maximum(scores, 0.0)` at all 3 score sites in fused_indexer_score.py to match
+official `index_score.relu_()`. A/B (full QAT config): haiku divergence char 2 -> 71 (near-full
+poem now char-exact), identity 106 -> 122. Parity test predicted ~30% topk-selection change.
+
+### Indexer fp4-quant q+k (commit cba7f54d) — faithful but marginal, KEPT per user
+Official fp4-fake-quants indexer q (model.py:416, after rope+rotate) and rotated K (model.py:369-
+370). Added matching fp4_act_quant: q in wrappers.py `_v4_c4_indexer_inputs`, K in v4_compressor.py
+`_maybe_rotate` (rotate=True == indexer only). A/B: NO material gain on top of relu (identity 122
+same, haiku 71->66, sys-math 121->126 — within near-tie noise; parity test predicted ~10%
+incremental). Kept for reference faithfulness per user decision.
+
+### Char-exact cumulative progress (all verified + committed)
+```
+no QAT:            identity diverges ~char 10
++QAT linear:       identity char 106
++QAT MoE kernel:   haiku token-0 fixed
++indexer relu:     haiku char 2 -> 71, identity -> 122   <- biggest single win
++indexer fp4 q/k:  ~no change (near-tie noise)
+```
+Still 1/4 exact (tiny-math). Remaining residual is now LATE near-tie flips (haiku@~66-71,
+identity@122, sys-math@~121-126) — small per-decode-step noise, source not yet isolated. NOT the
+indexer (relu+fp4 now match official). Candidates left: MoE router near-tie expert selection, or
+residual attention-output precision (the torch-vs-SM120 "blue" vs "grey" ~token-3 delta from
+Session 10 suggests a minor SM120 attention numeric too).
+
+### Ruled out across sessions: SM120-as-primary, rope config, fp8 KV (bit-exact), indexer (now fixed).
+
 ## 🟩 SESSION 11 (2026-06-15) — fp8 KV REFUTED; residual #2 localized to SPARSE INDEXER scoring
 
 ### fp8 KV cache — REFUTED (was Oracle's #1 suspect)
