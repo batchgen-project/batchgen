@@ -46,6 +46,17 @@ kernel has 3 score sites (242, 321, 414) for different cache layouts - all need 
 
 ### Ruled out this session-arc: SM120 kernel, rope config, fp8 KV. Remaining: indexer (above) >> router.
 
+### HYPOTHESIS VALIDATED (synthetic): missing relu changes ~30% of selected KV
+Standalone topk-parity test (random q/k/gates, H=64 D=128 T=2048 topk=512, 8 trials):
+- batchgen-style (bf16 q, NO relu) vs official-style (fp4-q + relu) topk-SET overlap = **70.2%**
+  -> ~30% of attended KV tokens DIFFER. Definitely large enough to flip decode outputs.
+- relu-only (no-relu vs relu, both bf16 q) overlap = **70.7%** -> the missing RELU is the DOMINANT
+  factor; fp4-quant on q is a minor secondary effect.
+=> Fix priority: ADD THE RELU first (per-head index_score.relu() before `* gate`), in all 3 score
+sites of batchgen_kernels/attention/dsa/fused_indexer_score.py (lines ~244, ~321/333, ~414/426).
+fp4-quant-on-q is a smaller follow-up. (Synthetic upper bound; real activations may overlap more,
+but 30% selection delta is clearly the residual-#2 driver.)
+
 ## 🟦 SESSION 10 (2026-06-15) — residual #2 narrowed (2 suspects ruled out)
 
 Hunting residual #2 (decode-only drift after QAT_LINEAR+QAT_MOE+LMHEAD_FP32; haiku diverges
