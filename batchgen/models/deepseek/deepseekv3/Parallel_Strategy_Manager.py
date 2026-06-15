@@ -511,6 +511,15 @@ class DeepseekV3ParallelStrategyManager:
 				f"free={_f / (1024**3):.2f} GiB / {_t / (1024**3):.2f} GiB"
 			)
 		self.model.to(self.engine_config.Basic_Config.device_torch)
+		# CPU embedding (offload path): keep embed_tokens on host to free ~1.7 GiB
+		# GPU for the decode KV pool. The decode forward embeds only ~num_tokens
+		# rows/step and moves them to GPU (a few MB) — see DeepseekV3Model.forward.
+		if self.enable_ep_offloading and hasattr(self.model.model, "embed_tokens"):
+			self.model.model.embed_tokens.to("cpu")
+			torch.cuda.empty_cache()
+			if self.rank == 0:
+				logging.info("[MEM] CPU embedding enabled: embed_tokens moved to host "
+				             "(~1.7 GiB freed for KV pool)")
 		# Log final GPU memory (rank 0 only)
 		if self.rank == 0:
 			_dev = self.engine_config.Basic_Config.device_torch

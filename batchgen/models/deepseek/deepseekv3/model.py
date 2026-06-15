@@ -1099,7 +1099,15 @@ class DeepseekV3Model(nn.Module):
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Must provide either input_ids or inputs_embeds")
-            inputs_embeds = self.embed_tokens(input_ids)
+            # CPU-embedding support: embed_tokens may live on CPU (offload path) to
+            # free ~1.7 GiB GPU for the decode KV pool. Do the lookup on its own
+            # device, then move the small result to the compute device. At decode
+            # this is ~num_tokens x hidden = a few MB/step (negligible).
+            emb_dev = self.embed_tokens.weight.device
+            inputs_embeds = self.embed_tokens(input_ids.to(emb_dev))
+            tgt_dev = self.norm.weight.device
+            if inputs_embeds.device != tgt_dev:
+                inputs_embeds = inputs_embeds.to(tgt_dev, non_blocking=True)
         hidden_states = inputs_embeds
         for layer_idx, layer in enumerate(self.layers):
             layer_output = layer(hidden_states, layer_idx=layer_idx)
