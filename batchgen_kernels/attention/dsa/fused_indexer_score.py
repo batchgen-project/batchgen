@@ -240,6 +240,10 @@ def _fused_score_kernel(
         )
         gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
         scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        # Official indexer applies index_score.relu_() per head BEFORE the
+        # gate-weighted sum (assets/inference/model.py:421). Omitting it changes
+        # ~30% of the topk KV selection and breaks character-exact decode.
+        scores = tl.maximum(scores, 0.0)
         agg += tl.where(
             s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32)
         )
@@ -319,6 +323,10 @@ def _fused_paged_score_kernel(
         )
         gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
         scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        # Official indexer applies index_score.relu_() per head BEFORE the
+        # gate-weighted sum (assets/inference/model.py:421). Omitting it changes
+        # ~30% of the topk KV selection and breaks character-exact decode.
+        scores = tl.maximum(scores, 0.0)
         agg += tl.where(
             s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32)
         )
@@ -412,6 +420,10 @@ def _fused_paged_score_with_slots_kernel(
         )
         gate = tl.load(GATES_ptr + gates_base + h).to(tl.float32)
         scores = tl.sum(k_tile * q_vec[None, :], axis=1)
+        # Official indexer applies index_score.relu_() per head BEFORE the
+        # gate-weighted sum (assets/inference/model.py:421). Omitting it changes
+        # ~30% of the topk KV selection and breaks character-exact decode.
+        scores = tl.maximum(scores, 0.0)
         agg += tl.where(
             s_mask, scores * gate, tl.zeros([BLOCK_S], dtype=tl.float32)
         )
@@ -1249,7 +1261,7 @@ if __name__ == "__main__":
     all_pass &= test_full_pipeline(B=32, max_seqlen=4096, label="medium")
     all_pass &= test_full_pipeline(B=32, max_seqlen=10240, label="long")
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"Overall: {'ALL PASS' if all_pass else 'SOME FAIL'}")
 
     # Benchmark
@@ -1279,7 +1291,7 @@ if __name__ == "__main__":
         cuda_us = (time.perf_counter() - t0) / 200 * 1e6
 
         print(
-            f"  B={B:>2d}: Torch={torch_us:.1f}µs, CUDA={cuda_us:.1f}µs, speedup={torch_us/cuda_us:.2f}×"
+            f"  B={B:>2d}: Torch={torch_us:.1f}µs, CUDA={cuda_us:.1f}µs, speedup={torch_us / cuda_us:.2f}×"
         )
 
     print("\n=== Benchmark: full scoring pipeline ===")
@@ -1344,5 +1356,5 @@ if __name__ == "__main__":
         fused_us = (time.perf_counter() - t0) / 100 * 1e6
 
         print(
-            f"  seqlen={max_seqlen:>5d}: Torch={torch_us:.1f}µs, Fused={fused_us:.1f}µs, speedup={torch_us/fused_us:.2f}×"
+            f"  seqlen={max_seqlen:>5d}: Torch={torch_us:.1f}µs, Fused={fused_us:.1f}µs, speedup={torch_us / fused_us:.2f}×"
         )
