@@ -1,5 +1,83 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟦 SESSION 8 (2026-06-15) — QAT experiment: big drift reduction, residual gap remains
+
+### Step 1 (parity) — QAT path is BIT-EXACT (confirmed)
+`test_v4_linear_numerics_parity.py` IN CONTAINER:
+- WITHOUT flag (default bf16-dequant): fp8 linear cos=0.9996 rel=2.67e-2; fp4 expert cos=0.9987
+  rel=5.1e-2 (FAILS >0.999). This is the drift source.
+- WITH `BATCHGEN_V4_QAT_LINEAR=1`: fp8 linear AND fp4 expert both **cos=1.000000 rel=0.0** vs
+  official. `[V4_QAT_LINEAR] active` logged. So per-op QAT numerics are exact.
+
+### Step 2 (A/B with QAT flags) — divergence DELAYED massively, not eliminated
+Server flags: BATCHGEN_V4_QAT_LINEAR=1 + BATCHGEN_V4_GROUPED_MOE=1 + BATCHGEN_GLM5_LMHEAD_FP32=1
+(+ PYNCCL + MLA_SM120_TRITON, KV=52GB, frac 0.62, pool 64). compare_ab.py vs golden.jsonl:
+```
+[EXACT] tiny-math   (1/1)
+[DIFF]  identity     first char diff at 106  (was ~10 WITHOUT QAT) <-- QAT cut drift ~10x
+[DIFF]  haiku        first char diff at 0    (golden 'A vast...' vs bg "The ocean's...")
+[DIFF]  sys-math     first char diff at 51
+exact match: 1/4
+```
+QAT moved the identity divergence from char ~10 to char 106 (first 105 chars now identical) =>
+the dense-linear QAT gap was a REAL and major contributor. But residual divergence remains; some
+numeric path still differs. haiku diverging at char 0 (different first token) suggests a
+remaining gap that flips even the first decoded token for some prompts.
+
+### Step 3 (NEXT) — localize the RESIDUAL with layer-by-layer DIVTRACE
+QAT is active with no FAILED/SKIPPED, so the residual is NOT the dense linears already covered.
+Candidates for the remaining gap (per Session 6 traps + this result):
+- Attention internals: MLA q/kv rope, sparse indexer topk, attn_sink, fp8 KV quant of prompt KV.
+- MoE router: hash-routing layers 0-2 tid2eid int64 vs official int32; topk gather/order.
+- The GROUPED MoE kernel (v4_grouped_mxfp4_moe_forward_3d_ptrs) vs per-expert: Step-1 parity was
+  on the PLACEHOLDER expert, NOT the grouped kernel — grouped path parity still unproven in-situ.
+- lm_head fp32: verify GLM5_LMHEAD_FP32 actually matched official ParallelHead.float() (argmax
+  tie-breaks).
+Use BATCHGEN_V4_DIVTRACE=1 (+_PREFILL=1) dump vs official inference/dump_ref_acts.py for ONE
+prompt (e.g. haiku, since it diverges at token 0 = easiest to localize). Diff per-layer h_in/
+attn_out/h_after_attn/h_after_ffn cosine + final logits top-1/top-2 margin. First layer where
+cosine drops <0.9999 OR router topk ids differ = the culprit. tools/analyze_divtrace.py +
+v4flash_official/results/debug/compare_{traces,decode_traces,attn_internals}.py.
+
+NOTE perf: QAT path is slower (more tilelang JIT first-call); A/B of 4 prompts took ~8min.
+
+### RESIDUAL DRIFT ROOT CAUSE FOUND (code inspection, Oracle-guided) — grouped MoE decode kernel is NOT QAT-faithful
+The grouped MoE decode kernel `v4_grouped_mxfp4_moe_forward_3d_ptrs` -> `grouped_mxfp4_gemm_3d`
+(batchgen/moe/mxfp4_grouped_gemm.py) DEQUANTIZES the FP4 expert weights to BF16 and runs a BF16
+GEMM against BF16 (NON-quantized) activations: `weight_bf16 = mxfp4_dequantize(...)`;
+`acc += tl.dot(lhs_tile, val_bf16.T)` (mxfp4_grouped_gemm.py:241-246 unfused path, :418-422 triton
+kernel). hidden_3d input is BF16 ([E,M_max,K] BF16, line 903/920). There is NO activation
+quantization (no act_quant to fp8/fp4 of the input).
+
+This is EXACTLY the non-QAT "dequant weights to bf16, F.linear" pattern that BATCHGEN_V4_QAT_LINEAR
+replaced for the DENSE linears — but the grouped DECODE-expert kernel still uses it. So:
+- dense/attention linears: QAT-fixed, bit-exact (QAT_LINEAR=1)
+- prefill experts (per-expert loop, >512 tok): QAT-fixed, bit-exact
+- DECODE experts (grouped kernel, <=512 tok): STILL bf16-dequant-weights => ~5e-2/GEMM error
+  => the residual decode drift (identity char-106, haiku token-0).
+
+Why this matches: grouped kernel is decode-only (<=BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS=512); prefill
+correctness is fine (per-expert), decode MoE has the gap. Confirmed WITHOUT the slow per-expert
+server loop (which is ~5s/token, impractical: 11min produced no result).
+
+### THE FIX (decision pending) — make grouped decode MoE QAT-faithful
+Options:
+  A. Make `grouped_mxfp4_gemm_3d` act-quantize activations (block-128 ue8m0 for w2 input, fp4 for
+     w1/w3 like the official Expert) and do the GEMM in quantized space, matching
+     `_qat_linear`/official Expert exactly. This is a real kernel change (triton mxfp4 grouped
+     gemm currently dequant-to-bf16). HIGH effort.
+  B. For char-exact runs, set BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS=0 (or GROUPED_MOE=0) so decode
+     also uses the bit-exact per-expert loop. CORRECTNESS-exact but ~28x slower decode
+     (4893ms/token) — fine for char-exact VALIDATION, not for throughput.
+  C. Accept the tradeoff: grouped MoE for throughput (72% MMLU, fast) vs per-expert for char-exact
+     (slow). They are different operating points.
+
+Cheapest validation of the diagnosis: run A/B (or even 1 token for haiku) with GROUPED_MOE=0 +
+QAT_LINEAR=1 + LMHEAD_FP32=1 — if char-exact improves (haiku token-0 becomes correct), the grouped
+kernel is confirmed as the residual. (Blocked only by per-expert speed; a unit test of
+grouped_mxfp4_gemm_3d vs act-quant reference is the deterministic alternative.)
+
+
 ## 🟧 SESSION 7 (2026-06-15) — full-run crash chain (2 fixed, 1 pending Oracle)
 
 Investigating why the full 12k MMLU SIGSEGV'd at ~105/12032. Found a CHAIN of crashes in the
