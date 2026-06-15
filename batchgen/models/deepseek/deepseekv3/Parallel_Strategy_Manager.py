@@ -520,6 +520,34 @@ class DeepseekV3ParallelStrategyManager:
 				f"[HBM] Rank {self.rank} AFTER configure_decoding model.to: "
 				f"allocated={used_memory / (1024**3):.2f} GiB, free={_f / (1024**3):.2f} GiB"
 			)
+			# [MEM-AUDIT] Resident weight breakdown by dtype and by top-level module,
+			# to find BF16-pre-dequantized weights that should be FP8 (memory waste).
+			from collections import defaultdict
+			by_dtype = defaultdict(lambda: [0, 0])   # dtype -> [bytes, count]
+			by_mod = defaultdict(lambda: defaultdict(int))  # module -> dtype -> bytes
+
+			def _bucket(name):
+				if ".experts." in name: return "routed_expert"
+				if "shared_expert" in name: return "shared_expert"
+				if ".self_attn." in name or "self_attn" in name: return "attn"
+				if "embed_tokens" in name: return "embed_tokens"
+				if "lm_head" in name: return "lm_head"
+				if ".mlp.gate." in name or name.endswith(".gate.weight"): return "moe_gate"
+				if ".mlp." in name: return "dense_mlp"
+				return "norm/other"
+			for n, p in self.model.named_parameters():
+				b = p.numel() * p.element_size()
+				by_dtype[str(p.dtype)][0] += b
+				by_dtype[str(p.dtype)][1] += 1
+				by_mod[_bucket(n)][str(p.dtype)] += b
+			for n, buf in self.model.named_buffers():
+				b = buf.numel() * buf.element_size()
+				by_dtype[str(buf.dtype) + "(buf)"][0] += b
+			logging.info("[MEM-AUDIT] by dtype: " + ", ".join(
+				f"{d}={v[0]/(1024**3):.2f}GiB({v[1]})" for d, v in sorted(by_dtype.items(), key=lambda x: -x[1][0])))
+			for mod, dd in sorted(by_mod.items(), key=lambda x: -sum(x[1].values())):
+				logging.info(f"[MEM-AUDIT]   {mod:16s} " + ", ".join(
+					f"{d}={b/(1024**3):.2f}GiB" for d, b in sorted(dd.items(), key=lambda x: -x[1])))
 
 		# Initialize MoE layers for decoding (required for EP offloading mode)
 		# This sets up num_tokens_per_rank and other buffers needed for all-gather/all-reduce
