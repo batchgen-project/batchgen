@@ -2354,7 +2354,16 @@ class BatchGenWorker:
 
             manager = self.gpu_paged_kv_cache_manager
             if manager is not None:
-                manager.free_pages_for_sequences(global_ids)
+                # free_pages_for_sequences raises on ids it never allocated
+                # (e.g. host-only prefill completions), so free only tracked ids.
+                if self._is_deepseek_v4_kv_manager(manager):
+                    free_ids = manager.tracked_sequence_ids(global_ids)
+                else:
+                    free_ids = [
+                        gid for gid in global_ids if gid in manager._sequences
+                    ]
+                if free_ids:
+                    manager.free_pages_for_sequences(free_ids)
 
             for uuid in my_uuids:
                 seq = self.global_batch.get_sequence(uuid)
@@ -5747,11 +5756,16 @@ class BatchGenWorker:
                         )  # Use global_idx, not local_idx!
 
             if global_seq_ids:
-                # Filter to only sequences the GPU manager actually tracks
+                # Filter to only sequences the GPU manager actually tracks.
+                # The V4 coordinator has no _sequences map (it fans out to 4
+                # sub-pools); use its membership helper instead.
                 mgr = self.gpu_paged_kv_cache_manager
-                known_ids = [
-                    gid for gid in global_seq_ids if gid in mgr._sequences
-                ]
+                if self._is_deepseek_v4_kv_manager(mgr):
+                    known_ids = mgr.tracked_sequence_ids(global_seq_ids)
+                else:
+                    known_ids = [
+                        gid for gid in global_seq_ids if gid in mgr._sequences
+                    ]
                 if known_ids:
                     mgr.free_pages_for_sequences(known_ids)
                 if len(known_ids) < len(global_seq_ids):

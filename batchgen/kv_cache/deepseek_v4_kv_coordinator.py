@@ -328,6 +328,16 @@ class DeepSeekV4KVCoordinator:
         )
         return len(allocations.get(sequence_id, []))
 
+    def tracked_sequence_ids(self, sequence_ids: Sequence[int]) -> List[int]:
+        # Every sequence is allocated in the swa pool, so its _sequences map is
+        # the authoritative membership set. Callers use this to filter before
+        # free_pages_for_sequences, which raises on unknown ids.
+        return [
+            int(seq_id)
+            for seq_id in sequence_ids
+            if int(seq_id) in self.swa._sequences
+        ]
+
     def free_pages_for_sequences(self, sequence_ids: Sequence[int]) -> None:
         self._ensure_initialized()
         self.swa.free_pages_for_sequences(sequence_ids)

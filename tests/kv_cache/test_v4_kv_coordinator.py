@@ -309,3 +309,16 @@ def test_v4_free_worker_pages_reflects_binding_pool(
     # 16 worker pages (64-token). Other pools cover more raw tokens, so the
     # binding (min) is swa.
     assert coordinator.free_worker_pages(64) == 16
+
+
+def test_v4_tracked_sequence_ids_filters_unknown(
+    coordinator: DeepSeekV4KVCoordinator,
+):
+    coordinator.allocate_pages_for_sequences([7], [256])
+    assert coordinator.tracked_sequence_ids([7, 99]) == [7]
+    assert coordinator.tracked_sequence_ids([99]) == []
+    # Freeing only the tracked id must not raise on the unknown one.
+    coordinator.free_pages_for_sequences(
+        coordinator.tracked_sequence_ids([7, 99])
+    )
+    assert coordinator.tracked_sequence_ids([7]) == []
