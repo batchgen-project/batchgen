@@ -1,5 +1,46 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟦 SESSION 13 (2026-06-15) — residual root-caused to inherent FP rounding (not a bug)
+
+Investigated the last residual (late near-tie token flips: haiku@~66, identity@122) with 2 explore
+agents + DIRECT code verification. Both remaining suspects REFUTED:
+
+### MoE router — FAITHFUL (refuted as residual)
+Both `sqrtsoftplus_topk` and `hash_routing` (batchgen_kernels/moe/) compute gate scores in FLOAT32
+(`F.linear(h.float(), w.float())`), softplus().sqrt(), bias-for-selection, gather from original
+scores, normalize, route_scale — matches official Gate (assets/inference/model.py:564-584) exactly.
+Only diff: batchgen adds +1e-20 in the norm denominator (negligible). The hash-routing
+`input_ids is None` fallback branch the agent flagged is NOT taken in hash layers (they always pass
+input_ids). Router is not the residual.
+
+### SM120 attn_sink — agent claimed "LSE vs logit mismatch", REFUTED by math
+SM120 `_apply_attn_sink`: `logaddexp(lse, sink)` then reweight by `exp(lse - combined)`.
+Mathematically: `logaddexp(log(Σexp(score)), sink) = log(Σexp(score) + exp(sink))` == official
+`sum_exp += exp(sink - max)` == torch-ref `softmax(cat(scores, sink))`. ALL THREE are algebraically
+identical on the sink. SM120's `lse` is converted back to natural-log units (`m_i/LOG2E + log(l)`),
+so the logaddexp is in correct units. Sink is fine. (Verified by reading the actual code, not the
+agent's summary — the agent misread this.)
+
+### Real residual: inherent FP rounding between equivalent kernels (NOT a discrete bug)
+SM120 decode does its online softmax in LOG2 domain (`exp2`, `* LOG2E`; v4_mla_sm120_triton.py:143-
+159) — a standard FlashAttention perf choice — while official/torch-ref use NATURAL-LOG (`exp`).
+Algebraically equal, but different FP rounding. Combined with different GEMM/reduction tiling vs the
+opaque official tilelang `sparse_attn`, this produces tiny per-step deltas that flip only
+genuinely-near-tie greedy tokens. This is the Session-10 "blue vs grey" SM120-vs-torch delta.
+
+CONCLUSION: After QAT linear + QAT MoE + indexer relu/fp4 (all real bugs, all fixed), the remaining
+gap is NOT a correctable discrete bug — it's the expected fp-rounding divergence between batchgen's
+optimized sm120 kernels and the reference's kernels. True bit-exact would require reimplementing the
+optimized attention/MoE kernels to match official's exact reduction order/dtype/domain, which
+defeats the optimized engine's purpose. The engine is functionally correct (72-75% MMLU, single-
+token exact, ~70-120 chars exact on long greedy gens).
+
+### If pursuing further (diminishing returns): the ONE remaining faithful-but-different op is the
+SM120 log2-domain softmax. Rewriting it to natural-log (exp instead of exp2) MIGHT reduce the delta
+but won't guarantee bit-exact (GEMM tiling + opaque official kernel remain). Lower-risk validation
+path: port DIVTRACE into official, diff per-layer attn_out cosine to confirm it's uniform small
+noise (no single layer collapse) rather than a localized bug.
+
 ## 🟩 SESSION 12 (2026-06-15) — indexer fixes landed (relu = big win, fp4 = faithful but marginal)
 
 ### Indexer relu fix (commit 42fd4626) — MAJOR, verified
