@@ -21,6 +21,76 @@ from batchgen.timing import get_decode_timer
 # Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
 _V4_ATTN_PROBE = os.environ.get("BATCHGEN_V4_ATTN_PROBE", "0") == "1"
 _V4_ATTN_PROBE_STEPS = int(os.environ.get("BATCHGEN_V4_ATTN_PROBE_STEPS", "1"))
+# Tensor-level dump for offline diff vs the official reference's sparse_attn
+# inputs (set to a directory path).
+_V4_ATTN_TENSOR_DUMP = os.environ.get("BATCHGEN_V4_ATTN_TENSOR_DUMP", "")
+_V4_ATTN_TENSOR_DUMP_LAYERS = 4
+_v4_attn_tensor_dump_calls: dict[int, int] = {}
+
+
+def _v4_dump_attn_tensors(
+    *,
+    layer_idx: int,
+    q_roped: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_lengths: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    extra_lengths: Optional[torch.Tensor],
+    k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    attn_sink: Optional[torch.Tensor],
+    attn_out: torch.Tensor,
+    coordinator: Any,
+) -> None:
+    if layer_idx >= _V4_ATTN_TENSOR_DUMP_LAYERS:
+        return
+    call_no = _v4_attn_tensor_dump_calls.get(layer_idx, 0)
+    if call_no >= 1:
+        return
+    _v4_attn_tensor_dump_calls[layer_idx] = call_no + 1
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+
+    def _gather_rows(idx, lengths, cache):
+        row = idx[0, 0]
+        n = int(lengths[0].item())
+        valid = row[:n].to(torch.long)
+        flat_bytes = cache.reshape(-1, cache.shape[-1])
+        sel = flat_bytes.index_select(0, valid.clamp_min(0))
+        return valid.cpu(), sel.cpu()
+
+    payload = {
+        "layer_idx": layer_idx,
+        "q_roped": q_roped.float().cpu(),
+        "attn_sink": None if attn_sink is None else attn_sink.float().cpu(),
+        "attn_out": attn_out.float().cpu(),
+        "main_lengths": main_lengths.cpu(),
+    }
+    payload["main_idx"], payload["main_kv_bytes"] = _gather_rows(
+        main_indices, main_lengths, k_cache
+    )
+    payload["main_kv_decoded"] = (
+        coordinator.swa.debug_read_kv(
+            layer_idx=coordinator.get_layer_routing(layer_idx).swa_layer_idx,
+            token_slots=payload["main_idx"].to(k_cache.device),
+        )
+        .float()
+        .cpu()
+    )
+    if extra_indices is not None and extra_k_cache is not None:
+        payload["extra_idx"], payload["extra_kv_bytes"] = _gather_rows(
+            extra_indices, extra_lengths, extra_k_cache
+        )
+    torch.save(
+        payload,
+        os.path.join(
+            _V4_ATTN_TENSOR_DUMP,
+            f"attn_dump_layer{layer_idx}_rank{rank}.pt",
+        ),
+    )
 
 
 def _v4_mla_torch_default() -> bool:
@@ -339,6 +409,11 @@ def _physicalize_positions_with_page_table(
     *,
     device: torch.device,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    # Disabled: the page-table gather fast path produces slot values that crash
+    # FlashMLA sparse decode (cudaErrorMisalignedAddress, splitkv_mla.cuh:779) on
+    # the first decode step it activates. Opt in only for benchmarking.
+    if os.environ.get("BATCHGEN_V4_FAST_PHYS", "0") != "1":
+        return None
     page_table = getattr(pool, "_page_table", None)
     if page_table is None or not _pool_active_order_matches(pool, sequence_ids):
         return None
@@ -1165,6 +1240,20 @@ class DeepSeekV4FlashMLADecodeAdapter:
                 extra_indices_in_kvcache=extra_indices,
                 topk_length=main_lengths,
                 extra_topk_length=extra_lengths,
+            )
+        if _V4_ATTN_TENSOR_DUMP:
+            _v4_dump_attn_tensors(
+                layer_idx=layer_idx,
+                q_roped=q_roped,
+                main_indices=main_indices,
+                main_lengths=main_lengths,
+                extra_indices=extra_indices,
+                extra_lengths=extra_lengths,
+                k_cache=k_cache,
+                extra_k_cache=extra_k_cache,
+                attn_sink=attn_sink,
+                attn_out=attn_out,
+                coordinator=self.coordinator,
             )
         with (
             _dt.timed("attn_inverse_rope", layer_idx) if _dt else nullcontext()
