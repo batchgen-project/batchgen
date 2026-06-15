@@ -78,6 +78,57 @@ def _select_metadata_files(
     return sorted(converted_ckpt_dir.glob(f"model{rank}*.json"))
 
 
+def load_rank_shard_tensors(
+    converted_ckpt_dir: str | Path,
+    rank: int,
+    world_size: Optional[int],
+    tensor_names: Iterable[str],
+):
+    import torch
+
+    converted_ckpt_dir = Path(converted_ckpt_dir)
+    json_files = _select_metadata_files(converted_ckpt_dir, rank, world_size)
+    if not json_files:
+        raise FileNotFoundError(
+            f"No metadata JSON files found in {converted_ckpt_dir} "
+            f"(rank={rank}, world_size={world_size})"
+        )
+
+    wanted = set(tensor_names)
+    result: Dict[str, "torch.Tensor"] = {}
+    for json_path in json_files:
+        with open(json_path) as fh:
+            payload = json.load(fh)
+        shard = payload.get("state_dict", payload)
+        bin_path = json_path.with_suffix(".bin")
+        if not bin_path.is_file():
+            raise FileNotFoundError(f"Shard binary not found: {bin_path}")
+        for name in list(wanted):
+            meta = shard.get(name)
+            if meta is None:
+                continue
+            byte_size = int(meta["byte_size"])
+            offset = int(meta["offset"])
+            with open(bin_path, "rb") as bf:
+                bf.seek(offset)
+                raw = bf.read(byte_size)
+            torch_dtype = resolve_torch_dtype(str(meta["dtype"]))
+            tensor = (
+                torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+                .view(torch_dtype)
+                .reshape(tuple(meta["shape"]))
+            )
+            result[name] = tensor
+            wanted.discard(name)
+
+    if wanted:
+        raise KeyError(
+            f"Tensors {sorted(wanted)} not found in rank {rank} shard "
+            f"under {converted_ckpt_dir}"
+        )
+    return result
+
+
 def build_module_metadata(
     tensor_metadata: MetadataMap,
     state_dict_name_map: Dict[str, Dict[str, str]],
