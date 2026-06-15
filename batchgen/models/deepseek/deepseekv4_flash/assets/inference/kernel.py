@@ -85,7 +85,7 @@ def act_quant_kernel(
                     for i, j in T.Parallel(blk_m, group_size):
                         y_local[i, j] = T.Cast(
                             out_dtype,
-                            T.Cast(compute_dtype, T.Cast(out_dtype, T.clamp(
+                            T.Cast(compute_dtype, T.Cast(FP8, T.clamp(
                                 x_local[i, j] / s_local[i], fp8_min, fp8_max
                             ))) * s_local[i],
                         )

@@ -624,8 +624,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
-        # no swiglu_limit
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim)
+        self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
