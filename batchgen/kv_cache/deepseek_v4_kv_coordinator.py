@@ -206,6 +206,27 @@ class DeepSeekV4KVCoordinator:
             ("indexer", self.indexer),
         ]
 
+    # Raw context tokens map to stored rows per pool at these ratios: swa keeps
+    # raw tokens, c4/indexer keep raw/4 rows, c128 keeps raw/128 rows. The store
+    # paths in v4_prefill_populate.py write arange(compressed.shape[0]) slots, so
+    # page accounting must use these compressed counts, not the raw token count.
+    _POOL_COMPRESS_RATIO: Dict[str, int] = {
+        "swa": 1,
+        "c4": 4,
+        "c128": 128,
+        "indexer": 4,
+    }
+
+    def _pool_logical_tokens(
+        self, pool_name: str, num_tokens: Sequence[int]
+    ) -> List[int]:
+        # ceil (not floor) is a safe never-under bound on stored rows; the max(1)
+        # floor reserves at least one page per pool for a fresh sequence.
+        ratio = self._POOL_COMPRESS_RATIO[pool_name]
+        if ratio == 1:
+            return [int(t) for t in num_tokens]
+        return [max(1, self._ceil_div(int(t), ratio)) for t in num_tokens]
+
     def allocate_pages_for_sequences(
         self,
         sequence_ids: Sequence[int],
@@ -215,14 +236,69 @@ class DeepSeekV4KVCoordinator:
         allocations_by_pool: dict[str, Dict[int, List[int]]] = {}
         try:
             for pool_name, pool in self._pool_order():
+                pool_tokens = self._pool_logical_tokens(pool_name, num_tokens)
                 allocations_by_pool[pool_name] = (
-                    pool.allocate_pages_for_sequences(sequence_ids, num_tokens)
+                    pool.allocate_pages_for_sequences(sequence_ids, pool_tokens)
                 )
         except Exception:
             for pool_name, allocations in allocations_by_pool.items():
                 getattr(self, pool_name)._rollback_allocations(allocations)
             raise
         return allocations_by_pool.get("swa", {})
+
+    def can_allocate_pages_for_sequences(
+        self,
+        sequence_ids: Sequence[int],
+        num_tokens: Sequence[int],
+    ) -> bool:
+        # Per-pool preflight for the scheduler: a summed free-page count hides an
+        # exhausted pool, so admission must verify EVERY pool independently and
+        # fall back to ON_HOLD/skip rather than hit the pool's hard pop() raise.
+        self._ensure_initialized()
+        shortages = self.additional_pages_needed_by_pool(
+            sequence_ids, num_tokens
+        )
+        for pool_name, pool in self._pool_order():
+            if shortages.get(pool_name, 0) > pool.get_stats().num_free_pages:
+                return False
+        return True
+
+    def additional_pages_needed_by_pool(
+        self,
+        sequence_ids: Sequence[int],
+        num_tokens: Sequence[int],
+    ) -> Dict[str, int]:
+        self._ensure_initialized()
+        needed: Dict[str, int] = {}
+        for pool_name, pool in self._pool_order():
+            pool_tokens = self._pool_logical_tokens(pool_name, num_tokens)
+            total_missing = 0
+            for seq_id, token_count in zip(sequence_ids, pool_tokens):
+                required = pool._required_pages(int(token_count))
+                state = pool._sequences.get(int(seq_id))
+                current = 0 if state is None else int(state.pages.numel())
+                total_missing += max(0, required - current)
+            needed[pool_name] = total_missing
+        return needed
+
+    def free_worker_pages(self, page_size_tokens: int = 64) -> int:
+        # Coarse scalar for legacy greedy paths only: the binding (min over pools)
+        # free raw-token headroom, in 64-token worker pages. Real admission must
+        # still go through can_allocate_pages_for_sequences.
+        self._ensure_initialized()
+        if page_size_tokens <= 0:
+            raise ValueError("page_size_tokens must be > 0")
+        free_raw_tokens = None
+        for pool_name, pool in self._pool_order():
+            ratio = self._POOL_COMPRESS_RATIO[pool_name]
+            pool_free_raw = (
+                pool.get_stats().num_free_pages * pool.page_size_tokens * ratio
+            )
+            if free_raw_tokens is None or pool_free_raw < free_raw_tokens:
+                free_raw_tokens = pool_free_raw
+        if free_raw_tokens is None:
+            return 0
+        return free_raw_tokens // page_size_tokens
 
     def rebuild_page_table(
         self, sequence_ids: Sequence[int]

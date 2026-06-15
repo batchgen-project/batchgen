@@ -261,3 +261,51 @@ def test_v4_decode_resident_guard_raises(coordinator: DeepSeekV4KVCoordinator):
         coordinator.copy_kv_to_tensor(1)
     with pytest.raises(RuntimeError, match="GPU-resident only"):
         coordinator.async_offload_layer_kv_to_host(layer_idx=0)
+
+
+def test_v4_compressed_pools_charged_in_compressed_token_space(
+    coordinator: DeepSeekV4KVCoordinator,
+):
+    coordinator.allocate_pages_for_sequences([1], [1024])
+    swa_pages = coordinator.swa.get_sequence_pages(1).numel()
+    c4_pages = coordinator.c4.get_sequence_pages(1).numel()
+    c128_pages = coordinator.c128.get_sequence_pages(1).numel()
+    indexer_pages = coordinator.indexer.get_sequence_pages(1).numel()
+
+    # swa keeps raw tokens: ceil(1024/128)=8. Compressed pools store raw/ratio
+    # rows: c4/indexer ceil(1024/4 / 64)=4, c128 ceil(1024/128 / 2)=4. The old
+    # raw-token bug allocated c128=ceil(1024/2)=512.
+    assert swa_pages == 8
+    assert c4_pages == 4
+    assert indexer_pages == 4
+    assert c128_pages == 4
+
+
+def test_v4_preflight_false_when_one_pool_exhausted(
+    coordinator: DeepSeekV4KVCoordinator,
+):
+    # num_pages=8 per pool. Drain the swa pool with a long raw context while the
+    # other pools still have room, so the SUMMED free count stays positive but
+    # the per-pool preflight must report False.
+    coordinator.allocate_pages_for_sequences([1], [1024])
+    assert coordinator.swa.get_stats().num_free_pages == 0
+    summed_free = coordinator.get_stats().num_free_pages
+    assert summed_free > 0
+    assert coordinator.can_allocate_pages_for_sequences([2], [256]) is False
+
+
+def test_v4_preflight_true_when_all_pools_have_room(
+    coordinator: DeepSeekV4KVCoordinator,
+):
+    assert coordinator.can_allocate_pages_for_sequences([1], [256]) is True
+    coordinator.allocate_pages_for_sequences([1], [256])
+    assert coordinator.can_allocate_pages_for_sequences([2], [256]) is True
+
+
+def test_v4_free_worker_pages_reflects_binding_pool(
+    coordinator: DeepSeekV4KVCoordinator,
+):
+    # Empty coordinator: swa binds at 8 pages * 128 tok = 1024 raw tokens =
+    # 16 worker pages (64-token). Other pools cover more raw tokens, so the
+    # binding (min) is swa.
+    assert coordinator.free_worker_pages(64) == 16
