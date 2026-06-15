@@ -21,6 +21,7 @@ import time
 
 import torch
 
+from ....ckpt_converter.metadata_loader import load_rank_shard_tensors
 from .model import DeepSeekV4FlashForCausalLM
 from .tensor_contract import (
     build_v4_weight_contract,
@@ -53,11 +54,23 @@ class DeepSeekV4FlashParallelStrategyManager:
         self.state_dict_name_map, self.weight_copy_task = (
             build_v4_weight_contract(model_config)
         )
+        self._pristine_routed_expert_task = list(
+            self.weight_copy_task.get("routed_expert", [])
+        )
 
     def configure_prefill(self):
         if self.loaded_model_config is not None:
             self.loaded_model_config.phase = "prefill"
         start = time.perf_counter()
+        # Prefill (world_size=1) owns all 256 experts and streams them through
+        # the rolling buffer pool. A prior configure_decoding() mutates
+        # weight_copy_task to mark owned experts persistent for the grouped
+        # decode path; that mutation must NOT leak into prefill, or prefill
+        # treats those experts as resident and reads unloaded weights. Restore
+        # the pristine (fully-streamed) routed-expert task before configuring.
+        self.weight_copy_task["routed_expert"] = list(
+            self._pristine_routed_expert_task
+        )
         self.model = DeepSeekV4FlashForCausalLM(self.loaded_model_config)
         self._load_model_skeleton()
         self._configure_moe_ranges(prefill=True, comm=None)
@@ -131,9 +144,7 @@ class DeepSeekV4FlashParallelStrategyManager:
             return
         local = {k for _, _, k in self._local_routed_expert_keys()}
         self.weight_copy_task["routed_expert"] = [
-            k
-            for k in self.weight_copy_task.get("routed_expert", [])
-            if k not in local
+            k for k in self._pristine_routed_expert_task if k not in local
         ]
 
     def _load_local_routed_experts(self) -> None:
@@ -160,9 +171,6 @@ class DeepSeekV4FlashParallelStrategyManager:
             logging.info(
                 "[V4 GROUPED] persistent expert resident bytes: %.2f GiB",
                 resident_bytes / 1024**3,
-            )
-            placeholder.set_runtime_tensors(
-                {k: v.to(device) for k, v in tensors.items()}
             )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
@@ -194,6 +202,39 @@ class DeepSeekV4FlashParallelStrategyManager:
                 logging.warning(
                     "DeepSeek-V4 missing skeleton samples: %s", missing[:20]
                 )
+        self._load_vocab_sharded_roots()
+
+    def _load_vocab_sharded_roots(self):
+        if self.world_size <= 1:
+            return
+        vocab_sharded = {
+            "model.embed_tokens.weight": "embed.weight",
+            "lm_head.weight": "head.weight",
+        }
+        converted_ckpt_dir = getattr(
+            self.model_config, "converted_ckpt_dir", None
+        )
+        if converted_ckpt_dir is None:
+            raise RuntimeError(
+                "DeepSeek-V4 vocab-sharded root load requires "
+                "model_config.converted_ckpt_dir to be set"
+            )
+        shard = load_rank_shard_tensors(
+            converted_ckpt_dir,
+            self.global_rank,
+            self.world_size,
+            vocab_sharded.values(),
+        )
+        params = dict(self.model.named_parameters())
+        for model_key, ckpt_key in vocab_sharded.items():
+            param = params[model_key]
+            weight = shard[ckpt_key].to(dtype=param.dtype)
+            param.data = weight
+        if self.rank == 0:
+            logging.info(
+                "DeepSeek-V4 loaded rank-local vocab-sharded roots "
+                "(embed.weight, head.weight) per rank"
+            )
 
     def _configure_moe_ranges(self, prefill: bool, comm) -> None:
         if prefill:
