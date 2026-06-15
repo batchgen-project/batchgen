@@ -1,5 +1,51 @@
 # HANDOFF — batchgen ⇄ DeepSeek-V4-Flash character-exact A/B
 
+## 🟩 SESSION 11 (2026-06-15) — fp8 KV REFUTED; residual #2 localized to SPARSE INDEXER scoring
+
+### fp8 KV cache — REFUTED (was Oracle's #1 suspect)
+Equivalence test (in container): batchgen `quantize_nope_to_fp8`->`dequantize_nope_from_fp8`
+roundtrip vs official `act_quant(kv, 64, "ue8m0", e8m0, inplace=True)` on the same bf16 KV block:
+**cos=1.000000, rel=0.0, max_abs=0.0**. Both lose the identical 2.66e-2 to fp8. batchgen KV quant
+is BIT-EXACT to official. NOT the residual. (block-64, ue8m0, matches.)
+
+### Residual #2 LOCALIZED: sparse indexer (lightning indexer) scoring differs from official
+The indexer decides WHICH KV tokens decode attention sees (topk). batchgen's scoring omits two ops
+the official does, so the topk SET can differ -> different KV attended -> discrete decode output
+flips (matches the late/near-tie divergence pattern).
+
+Official (assets/inference/model.py:411-427):
+```
+apply_rotary_emb(q[...,-rd:]); rotate_activation(q); fp4_act_quant(q, fp4_block_size, True)  # q->fp4
+weights = weights_proj(x) * (softmax_scale * n_heads**-0.5)
+index_score = einsum("bshd,btd->bsht", q, kv)        # kv is bf16
+index_score = (index_score.relu_() * weights).sum(dim=2)   # <-- RELU per-head BEFORE weighted sum
+topk_idxs = index_score.topk(index_topk)[1]
+```
+Batchgen (wrappers.py:522-595 `_v4_c4_indexer_inputs` + batchgen_kernels/attention/dsa/
+fused_indexer_score.py kernel lines 242-245):
+```
+index_q = rope_hadamard_q(wq_b(q_low), ...)          # rope+hadamard, but NO fp4_act_quant on q
+head_gates = weights_proj(hidden) * softmax_scale * n_heads**-0.5   # matches 'weights' OK
+# fused kernel: scores = sum(k_tile * q_vec); agg += scores * gate   # NO RELU
+topk over agg
+```
+TWO discrepancies:
+1. **Missing RELU** on per-head index_score before the gate-weighted sum (kernel line 244 does
+   `scores * gate` with no relu). Official does `index_score.relu_()`. BIGGEST suspect — relu
+   changes aggregate ranking -> different topk set.
+2. **Missing fp4_act_quant on indexer q** (official line 416 quantizes q to fp4 before einsum;
+   batchgen uses bf16 q). Same QAT-gap class as the main-linear fix.
+(Both q and kv: official kv is bf16 per line 419 comment; batchgen index_k is bf16 -> OK.)
+
+### FIX PLAN (next)
+Add relu to the per-head score in fused_indexer_score kernel (and the paged variant ~line 321/414)
+before `* gate`, AND fp4-quant the indexer q to match official. Then verify topk-index parity vs an
+official-faithful reference on the same inputs, then A/B. CAUTION: relu+fp4 must match official
+ordering exactly (relu AFTER einsum, BEFORE weight mult; fp4 quant on q BEFORE einsum). The fused
+kernel has 3 score sites (242, 321, 414) for different cache layouts - all need the relu.
+
+### Ruled out this session-arc: SM120 kernel, rope config, fp8 KV. Remaining: indexer (above) >> router.
+
 ## 🟦 SESSION 10 (2026-06-15) — residual #2 narrowed (2 suspects ruled out)
 
 Hunting residual #2 (decode-only drift after QAT_LINEAR+QAT_MOE+LMHEAD_FP32; haiku diverges
