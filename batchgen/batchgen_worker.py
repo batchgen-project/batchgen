@@ -7208,6 +7208,17 @@ class BatchGenWorker:
                             and torch.distributed.is_initialized()
                         )
 
+                    # DeepSeek-V4 reads prompt KV from the GPU coordinator pools
+                    # only (no host->GPU upload), so the coordinator must be
+                    # initialized BEFORE prefill. configure_prefill deep-frees it
+                    # (Bug Fix 7.2), and on a watermark re-prefill it is destroyed
+                    # but not None, so an `is None` check would wrongly skip
+                    # re-init. _init_gpu_kv_with_actual_size issues a
+                    # dist.broadcast, so the decision MUST be made collectively
+                    # (gated on the global prefill_uuids, not per-rank local
+                    # indices) or the collective stream desyncs.
+                    self._maybe_reinit_v4_gpu_kv_for_prefill(prefill_uuids)
+
                     if (
                         local_prefill_indices
                         or needs_empty_vocab_parallel_lm_head
@@ -7224,27 +7235,6 @@ class BatchGenWorker:
                                 f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
                                 f"free={free_mem / 1e9:.2f}GB alloc={allocated:.2f}GB"
                             )
-                        # DeepSeek-V4 decode reads prompt KV from the GPU
-                        # coordinator pools only (no host->GPU upload path),
-                        # so the coordinator must exist BEFORE prefill for
-                        # _populate_v4_prefill_kv to take the resident path.
-                        # Otherwise prompt KV lands host-only and decode
-                        # attends over zero-filled pages.
-                        # _init_gpu_kv_with_actual_size issues a dist.broadcast,
-                        # so 0-seq ranks (needs_empty_vocab_parallel_lm_head)
-                        # MUST also enter it or the collective stream desyncs
-                        # against the ranks that do have sequences.
-                        if (
-                            local_prefill_indices
-                            or needs_empty_vocab_parallel_lm_head
-                        ) and self.gpu_paged_kv_cache_manager is None:
-                            from batchgen.kv_cache.host_kv_mananger_config import (
-                                is_v4_model,
-                            )
-
-                            if is_v4_model(self.huggingface_ckpt_name):
-                                self._init_gpu_kv_with_actual_size()
-
                         prefill_start = time.perf_counter()
                         with torch.inference_mode():
                             if self.enable_prepack:
@@ -8323,6 +8313,44 @@ class BatchGenWorker:
                 "[GPU-KV] DeepSeek-V4 decode backend installed into %d layers"
                 % len(layer_configs)
             )
+
+    def _maybe_reinit_v4_gpu_kv_for_prefill(self, prefill_uuids) -> None:
+        # Collective re-init of the V4 GPU KV coordinator before prefill.
+        # _init_gpu_kv_with_actual_size contains a dist.broadcast and early-returns
+        # on already-initialized ranks, so a per-rank decision can deadlock. Gate
+        # on the GLOBAL prefill_uuids (identical on all ranks) and all_gather the
+        # local init-need to refuse divergent states rather than silently hang.
+        from batchgen.kv_cache.host_kv_mananger_config import is_v4_model
+
+        if not prefill_uuids or not is_v4_model(self.huggingface_ckpt_name):
+            return
+
+        mgr = self.gpu_paged_kv_cache_manager
+        local_needs_init = int(
+            mgr is None or not getattr(mgr, "is_initialized", False)
+        )
+
+        if torch.distributed.is_initialized():
+            flag = torch.tensor(
+                [local_needs_init],
+                dtype=torch.int32,
+                device=self.torch_device,
+            )
+            gathered = [torch.zeros_like(flag) for _ in range(self.world_size)]
+            dist.all_gather(gathered, flag)
+            flags = [int(x.item()) for x in gathered]
+            if any(f != flags[0] for f in flags):
+                raise RuntimeError(
+                    f"Inconsistent DeepSeek-V4 GPU KV init state across ranks: "
+                    f"{flags}. Refusing _init_gpu_kv_with_actual_size() (it runs "
+                    f"a dist.broadcast and would deadlock)."
+                )
+            needs_init = bool(flags[0])
+        else:
+            needs_init = bool(local_needs_init)
+
+        if needs_init:
+            self._init_gpu_kv_with_actual_size()
 
     def _init_gpu_kv_with_actual_size(self) -> None:
         """
