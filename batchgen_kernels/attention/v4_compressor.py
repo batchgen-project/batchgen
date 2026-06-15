@@ -134,7 +134,18 @@ class DeepSeekV4Compressor(nn.Module):
         )
 
         H = get_hadamard_matrix(x.shape[-1], x.device, torch.float32)
-        return (x.float() @ H).to(x.dtype)
+        rotated = (x.float() @ H).to(x.dtype)
+        # Official compressor fp4-fake-quantizes the rotated indexer K before
+        # caching (assets/inference/model.py:369-370: rotate_activation then
+        # fp4_act_quant(kv, 32, True)). Match it so indexer scores are
+        # QAT-faithful against the fp4-quantized query.
+        from batchgen.models.deepseek.deepseekv4_flash.model import (
+            _v4_official_kernels,
+        )
+
+        q = rotated.to(torch.bfloat16).contiguous()
+        _v4_official_kernels().fp4_act_quant(q, 32, True)
+        return q.to(rotated.dtype)
 
     def _apply_rope(
         self,

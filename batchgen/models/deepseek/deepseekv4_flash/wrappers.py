@@ -558,6 +558,15 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         index_q = rope_hadamard_q(
             index_q, cos_table, sin_table, positions.to(torch.int64), rope_dim
         )
+        # Official indexer fp4-fake-quantizes q after rope+rotate, before scoring
+        # (assets/inference/model.py:416 fp4_act_quant(q, 32, True)). Match it so
+        # the indexer topk selection is QAT-faithful.
+        from batchgen.models.deepseek.deepseekv4_flash.model import (
+            _v4_official_kernels,
+        )
+
+        index_q = index_q.contiguous()
+        _v4_official_kernels().fp4_act_quant(index_q, 32, True)
 
         seq_ids_list = (
             sequence_ids.tolist()
