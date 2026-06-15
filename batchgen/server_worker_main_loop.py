@@ -243,12 +243,18 @@ def _server_worker_main_impl(
     torch.cuda.set_device(args.local_rank)
 
     try:
+        # Host-offload decode of long sequences can stall a rank past the old
+        # hardcoded 3600s and trip the NCCL watchdog on the vocab-parallel
+        # all_gather. Default to 24h; override via BATCHGEN_NCCL_TIMEOUT_SEC.
+        _nccl_timeout_sec = int(
+            os.environ.get("BATCHGEN_NCCL_TIMEOUT_SEC", str(24 * 3600))
+        )
         pg_kwargs = dict(
             backend="nccl",
             init_method="tcp://" + args.dist_init_addr,
             world_size=args.world_size,
             rank=args.global_rank,
-            timeout=timedelta(seconds=3600),
+            timeout=timedelta(seconds=_nccl_timeout_sec),
         )
         # device_id requires torch >= 2.8
         import inspect
