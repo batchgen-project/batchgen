@@ -83,6 +83,10 @@ _V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
 _V4_GROUPED_MOE_MAX_TOKENS = int(
     os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
 )
+# Use the QAT-faithful grouped MoE forward (per-expert act_quant + fp4_gemm,
+# bit-exact vs official) instead of the faster bf16-weight-dequant grouped GEMM.
+# Needed for character-exact output; slower per decode step.
+_V4_QAT_MOE = os.environ.get("BATCHGEN_V4_QAT_MOE", "0") == "1"
 # Use PyNcclCommunicator for EP-decode collectives instead of torch.distributed
 # (default ON; set 0 to fall back to dist.*). See _ep_all_gather.
 _V4_PYNCCL_COMM = os.environ.get("BATCHGEN_V4_PYNCCL_COMM", "1") == "1"
@@ -1785,11 +1789,18 @@ class DeepSeekV4FlashMoE(nn.Module):
             return None
         if not self._stage_owned_expert_weights():
             return None
-        from batchgen.moe.v4_slot_moe_sm120 import (
-            v4_grouped_mxfp4_moe_forward_3d_ptrs,
-        )
+        if _V4_QAT_MOE:
+            from batchgen.moe.v4_slot_moe_sm120 import (
+                v4_grouped_mxfp4_moe_forward_qat,
+            )
 
-        moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
+            moe_forward = v4_grouped_mxfp4_moe_forward_qat
+        else:
+            from batchgen.moe.v4_slot_moe_sm120 import (
+                v4_grouped_mxfp4_moe_forward_3d_ptrs,
+            )
+
+            moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
 
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
         return moe_forward(

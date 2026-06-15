@@ -113,6 +113,13 @@ def v4_grouped_mxfp4_moe_forward_3d_ptrs(
     owned_count: int,
     swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
+    # NOT QAT-FAITHFUL. This path runs grouped_mxfp4_gemm_3d, which dequantizes
+    # the FP4 expert weights to bf16 and matmuls against bf16 (non-quantized)
+    # activations. The official model act-quantizes the activation to fp8
+    # (block-128, ue8m0) before each fp4 GEMM, so this introduces ~5e-2 rel
+    # error per GEMM vs the QAT path (test_grouped_moe_kernel_vs_per_expert_parity
+    # measures cos~0.9988). Kept as the FAST throughput path; for character-exact
+    # output use v4_grouped_mxfp4_moe_forward_qat (BATCHGEN_V4_QAT_MOE=1).
     import torch.nn.functional as F
 
     from batchgen.moe.mxfp4_grouped_gemm import (
@@ -242,4 +249,101 @@ def v4_grouped_mxfp4_moe_forward_3d_ptrs(
         sorted_token_ids.unsqueeze(-1).expand(-1, hidden),
         sorted_output.float() * sorted_weights.float().unsqueeze(-1),
     )
+    return output
+
+
+def _qat_fp4_linear(x, weight, scale, kern):
+    # Bit-exact V4 FP4 linear: act-quant x to fp8 (block-128, ue8m0), then
+    # fp4_gemm against the e8m0-scaled FP4 weight. Mirrors model._qat_linear
+    # exactly so the grouped path matches the per-expert/official numerics.
+    fp4_dtype = torch.float4_e2m1fn_x2
+    if weight.dtype in (torch.uint8, torch.int8):
+        weight = weight.view(fp4_dtype)
+    wscale = (
+        scale
+        if scale.dtype == torch.float8_e8m0fnu
+        else scale.view(torch.float8_e8m0fnu)
+        if scale.dtype == torch.uint8
+        else scale.to(torch.float32).to(torch.float8_e8m0fnu)
+    )
+    x2d = x.reshape(-1, x.shape[-1])
+    if x2d.dtype != torch.bfloat16:
+        x2d = x2d.to(torch.bfloat16)
+    xq, xs = kern.act_quant(x2d, 128, "ue8m0", torch.float8_e8m0fnu)
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        out = kern.fp4_gemm(xq, xs, weight, wscale, torch.float8_e8m0fnu)
+    finally:
+        torch.set_default_dtype(prev)
+    return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+def v4_grouped_mxfp4_moe_forward_qat(
+    token_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    weight_ptrs: dict[str, object],
+    owned_start: int,
+    owned_count: int,
+    swiglu_limit: float = 0.0,
+) -> torch.Tensor:
+    """QAT-faithful grouped MoE: per-owned-expert official act_quant + fp4_gemm.
+
+    Numerically matches the per-expert reference (DeepSeekV4FlashExpertPlaceholder
+    under BATCHGEN_V4_QAT_LINEAR) and the official Expert, unlike
+    v4_grouped_mxfp4_moe_forward_3d_ptrs which dequantizes weights to bf16.
+    Routing/combine semantics are identical to that function. Per-128 K
+    requirement: hidden and intermediate must be divisible by 128.
+    """
+    import torch.nn.functional as F
+
+    from batchgen.models.deepseek.deepseekv4_flash.model import (
+        _v4_official_kernels,
+    )
+
+    kern = _v4_official_kernels()
+    refs = weight_ptrs["expert_refs"]
+    token_states = token_states.contiguous()
+    G, hidden = token_states.shape
+    topk = topk_indices.shape[1]
+
+    output = torch.zeros(
+        G, hidden, dtype=torch.float32, device=token_states.device
+    )
+
+    flat_global = topk_indices.reshape(-1)
+    flat_weights = topk_weights.reshape(-1)
+    token_for_slot = (
+        torch.arange(G, device=token_states.device, dtype=torch.int64)
+        .unsqueeze(1)
+        .expand(G, topk)
+        .reshape(-1)
+    )
+
+    for local_e in range(owned_count):
+        global_e = owned_start + local_e
+        slot_mask = flat_global == global_e
+        if not bool(slot_mask.any()):
+            continue
+        tok_idx = token_for_slot[slot_mask]
+        w = flat_weights[slot_mask]
+        rw = refs[local_e]
+        x = token_states[tok_idx]
+
+        gate = _qat_fp4_linear(x, rw["w1.weight"], rw["w1.scale"], kern).float()
+        up = _qat_fp4_linear(x, rw["w3.weight"], rw["w3.scale"], kern).float()
+        if swiglu_limit and swiglu_limit > 0:
+            gate = torch.clamp(gate, max=swiglu_limit)
+            up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        activated = F.silu(gate) * up
+        activated = activated * w.float().unsqueeze(-1)
+        down = _qat_fp4_linear(
+            activated.to(token_states.dtype),
+            rw["w2.weight"],
+            rw["w2.scale"],
+            kern,
+        )
+        output.index_add_(0, tok_idx, down.float())
+
     return output

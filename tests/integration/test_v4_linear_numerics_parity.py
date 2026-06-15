@@ -265,3 +265,77 @@ def test_grouped_moe_kernel_vs_per_expert_parity():
     rel = _rel(ref, grouped)
     print(f"grouped MoE vs per-expert: cos={cos:.6f} rel={rel:.4e}")
     assert cos > 0.999
+
+
+def _build_grouped_moe_case():
+    from kernel import fp4_act_quant
+
+    from batchgen.models.deepseek.deepseekv4_flash.model import (
+        DeepSeekV4FlashExpertPlaceholder,
+    )
+    from batchgen.moe.v4_slot_moe_sm120 import setup_v4_expert_weight_pointers
+
+    torch.manual_seed(3)
+    torch.set_default_dtype(torch.bfloat16)
+    hidden, inter, n_experts, topk, G = 1024, 512, 8, 2, 16
+    swiglu_limit = 10.0
+    x = torch.randn(G, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+
+    experts, weight_dicts = [], []
+    for _ in range(n_experts):
+        bg = DeepSeekV4FlashExpertPlaceholder(
+            hidden, inter, swiglu_limit
+        ).cuda()
+        rw = {}
+        for name, out_dim, in_dim in (
+            ("w1", inter, hidden),
+            ("w2", hidden, inter),
+            ("w3", inter, hidden),
+        ):
+            w_b = (
+                torch.randn(
+                    out_dim, in_dim, dtype=torch.bfloat16, device="cuda"
+                )
+                * 0.05
+            )
+            q, s = fp4_act_quant(w_b, 32)
+            rw[f"{name}.weight"] = q.view(torch.float4_e2m1fn_x2).contiguous()
+            rw[f"{name}.scale"] = s.contiguous()
+        bg.set_runtime_tensors(rw)
+        experts.append(bg)
+        weight_dicts.append(rw)
+
+    logits = torch.randn(G, n_experts, device="cuda")
+    topk_weights, topk_indices = torch.topk(
+        torch.softmax(logits.float(), dim=-1), topk, dim=-1
+    )
+    topk_indices = topk_indices.to(torch.int64)
+
+    with torch.inference_mode():
+        ref = torch.zeros(G, hidden, dtype=torch.float32, device="cuda")
+        for e in range(n_experts):
+            tok_idx, pos = torch.where(topk_indices == e)
+            if tok_idx.numel() == 0:
+                continue
+            ref[tok_idx] += experts[e](
+                x[tok_idx], topk_weights[tok_idx, pos].unsqueeze(-1)
+            ).float()
+
+    staged = setup_v4_expert_weight_pointers(weight_dicts)
+    return x, topk_weights, topk_indices, staged, n_experts, swiglu_limit, ref
+
+
+def test_grouped_moe_qat_kernel_parity():
+    from batchgen.moe.v4_slot_moe_sm120 import (
+        v4_grouped_mxfp4_moe_forward_qat,
+    )
+
+    x, tw, ti, staged, n_experts, lim, ref = _build_grouped_moe_case()
+    with torch.inference_mode():
+        out = v4_grouped_mxfp4_moe_forward_qat(
+            x, tw, ti, staged, 0, n_experts, lim
+        )
+    cos = _cos(ref, out)
+    rel = _rel(ref, out)
+    print(f"grouped MoE QAT vs per-expert: cos={cos:.6f} rel={rel:.4e}")
+    assert cos > 0.9999
