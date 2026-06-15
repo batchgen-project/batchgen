@@ -313,6 +313,9 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
                     head_gates=head_gates,
                     q_attn=dense_q,
                     current_kv=dense_kv,
+                    rope_cache=self._v4_compressed_rope_cache(
+                        hidden_states.device
+                    ),
                 )
                 score_q, score_kv = index_q, index_k
             elif ratio == 128 and getattr(mod, "compressor", None) is not None:
@@ -628,9 +631,17 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         else:
             seq_lens = attention_mask.to(device).sum(dim=1).tolist()
 
-        rope_cache = self._v4_prefill_rope_cache(device)
+        # Official Attention.__init__: compressed layers (ratio>0) rope their
+        # window KV with compress_rope_theta + YaRN; only ratio==0 layers use
+        # the base theta without YaRN. Using the dense cache for all layers
+        # makes decode read mis-rotated KV on 40/43 layers.
         compress_rope = (
             self._v4_compressed_rope_cache(device) if ratio else None
+        )
+        rope_cache = (
+            compress_rope
+            if compress_rope is not None
+            else self._v4_prefill_rope_cache(device)
         )
         from batchgen.attention.dsa.v4_prefill_populate import (
             populate_v4_prefill_coordinator,
@@ -726,10 +737,24 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         if offload_kv.dtype != target_kv_dtype:
             offload_kv = offload_kv.to(target_kv_dtype)
 
-        if attention_mask is None:
+        prepack = bool(getattr(AttnWrapperBase, "prepack_mode", False))
+        cu_seqlens = None
+        if prepack:
+            seq_lens = list(AttnWrapperBase.prepack_seq_lengths or [])
+            cu = AttnWrapperBase.prepack_cu_seqlens
+            if cu is None:
+                raise RuntimeError(
+                    "prepacked prefill offload requires prepack_cu_seqlens"
+                )
+            cu_seqlens = cu.tolist()
+        elif attention_mask is None:
             attention_mask = AttnWrapperBase.attention_mask
-        if attention_mask is None:
-            seq_lens = [offload_kv.size(1)] * offload_kv.size(0)
+            if attention_mask is None:
+                seq_lens = [offload_kv.size(1)] * offload_kv.size(0)
+            else:
+                seq_lens = (
+                    attention_mask.to(offload_kv.device).sum(dim=1).tolist()
+                )
         else:
             seq_lens = attention_mask.to(offload_kv.device).sum(dim=1).tolist()
 
@@ -741,7 +766,15 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
 
         for seq_idx, seq_len in enumerate(seq_lens):
             seq_len = int(seq_len)
-            seq_kv = offload_kv[seq_idx : seq_idx + 1, :seq_len].unsqueeze(2)
+            if seq_len <= 0:
+                continue
+            if prepack:
+                start = int(cu_seqlens[seq_idx])
+                seq_kv = offload_kv[:, start : start + seq_len].unsqueeze(2)
+            else:
+                seq_kv = offload_kv[seq_idx : seq_idx + 1, :seq_len].unsqueeze(
+                    2
+                )
             task = host_view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=[AttnWrapperBase.cur_batch[seq_idx]],
