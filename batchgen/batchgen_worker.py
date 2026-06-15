@@ -821,6 +821,11 @@ class BatchGenWorker:
         # Track sequences currently with GPU KV allocated
         self._sequences_with_gpu_kv: Set[str] = set()
 
+        # Track global ids with live host KV pages. V4 decode is GPU-resident, so
+        # host KV is released at the prefill->decode transition; without this set a
+        # staggered completion double-releases and crashes the shared backend.
+        self._sequences_with_host_kv: Set[int] = set()
+
         # Request pool: admission queue and response queue for persistent loop
         self._admission_queue = None  # mp.Queue, set via set_admission_queue()
         self._response_queue = None  # mp.Queue, set via set_response_queue()
@@ -2174,11 +2179,13 @@ class BatchGenWorker:
                 f"Rank {self.rank}: _allocate_gpu_kv_two_page_buffer: Allocating GPU KV for {len(alloc_details)} RESUMING sequences. First 5: {alloc_details[:5]}"
             )
 
-        free_pages = manager.get_stats().num_free_pages
-        if total_pages > free_pages:
+        target_tokens_by_global = {
+            global_ids[i]: pages_per_seq[i] for i in range(len(global_ids))
+        }
+        if not self._gpu_kv_can_allocate(manager, target_tokens_by_global):
             logging.error(
-                f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} pages, "
-                f"only {free_pages} free"
+                f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages} "
+                f"worker pages, free={self._gpu_kv_free_worker_pages(manager)}"
             )
             # Don't set gpu_pages_allocated since we're failing
             return False
@@ -2249,10 +2256,9 @@ class BatchGenWorker:
         if manager is None:
             return False
 
-        free_pages = manager.get_stats().num_free_pages
-
         extensions_needed = []
         total_additional = 0
+        target_tokens_by_global: Dict[int, int] = {}
 
         for uuid in uuids:
             if uuid not in self._uuid_to_local_map:
@@ -2262,11 +2268,15 @@ class BatchGenWorker:
             if additional > 0:
                 extensions_needed.append((uuid, additional))
                 total_additional += additional
+                target_tokens_by_global[seq.global_idx] = (
+                    seq.gpu_pages_allocated + additional
+                ) * self.PAGE_SIZE
 
-        if total_additional > free_pages:
+        if not self._gpu_kv_can_allocate(manager, target_tokens_by_global):
             logging.warning(
                 f"Rank {self.rank}: Insufficient GPU pages for extension: "
-                f"need {total_additional}, have {free_pages}"
+                f"need {total_additional} (worker pages), "
+                f"free={self._gpu_kv_free_worker_pages(manager)}"
             )
             return False
 
@@ -2300,7 +2310,7 @@ class BatchGenWorker:
                 List of uuids to put ON_HOLD
         """
         manager = self.gpu_paged_kv_cache_manager
-        current_free = manager.get_stats().num_free_pages if manager else 0
+        current_free = self._gpu_kv_free_worker_pages(manager) if manager else 0
         pages_to_free = required_free_pages - current_free
 
         if pages_to_free <= 0:
@@ -3511,6 +3521,36 @@ class BatchGenWorker:
                 if seq is not None:
                     seq.gpu_pages_allocated = 0
 
+    def _gpu_kv_can_allocate(
+        self, manager, target_tokens_by_global: Dict[int, int]
+    ) -> bool:
+        # V4's 4-pool coordinator needs a per-pool preflight; a summed free-page
+        # count hides an exhausted pool and lets allocation hit a hard raise.
+        # Other managers keep the legacy single-pool scalar comparison.
+        if not target_tokens_by_global:
+            return True
+        if manager is None or not getattr(manager, "is_initialized", False):
+            return False
+        if self._is_deepseek_v4_kv_manager(manager):
+            global_ids = list(target_tokens_by_global.keys())
+            num_tokens = [target_tokens_by_global[g] for g in global_ids]
+            return manager.can_allocate_pages_for_sequences(
+                global_ids, num_tokens
+            )
+        free_pages = manager.get_stats().num_free_pages
+        needed_pages = sum(
+            math.ceil(t / self.PAGE_SIZE)
+            for t in target_tokens_by_global.values()
+        )
+        return needed_pages <= free_pages
+
+    def _gpu_kv_free_worker_pages(self, manager) -> int:
+        if manager is None or not getattr(manager, "is_initialized", False):
+            return 0
+        if self._is_deepseek_v4_kv_manager(manager):
+            return manager.free_worker_pages(self.PAGE_SIZE)
+        return manager.get_stats().num_free_pages
+
     def _destroy_gpu_paged_kv_cache(
         self, *, empty_cuda_cache: bool = False
     ) -> None:
@@ -4268,6 +4308,7 @@ class BatchGenWorker:
                 )
             # Free host KV pages on source (mirror aux for DSA)
             worker_view.release_sequence_pages([global_idx])
+            self._sequences_with_host_kv.discard(global_idx)
             if aux_view is not None:
                 aux_view.release_sequence_pages([global_idx])
             # Also send query_book data (input_ids, decoded_tokens)
@@ -4324,6 +4365,7 @@ class BatchGenWorker:
             worker_view.allocate_pages_for_sequences(
                 [(global_idx, tokens_needed)]
             )
+            self._sequences_with_host_kv.add(global_idx)
             if aux_view is not None:
                 aux_view.register_sequences([global_idx])
                 aux_view.allocate_pages_for_sequences(
@@ -4617,7 +4659,7 @@ class BatchGenWorker:
         manager = self.gpu_paged_kv_cache_manager
         if manager is None:
             return 0
-        return manager.get_stats().num_free_pages
+        return self._gpu_kv_free_worker_pages(manager)
 
     # ============ Main Entry Point ============
 
@@ -5914,7 +5956,7 @@ class BatchGenWorker:
                     seq.gpu_pages_allocated = info["gpu_pages_allocated"]
 
         # ============ Step 3: All-gather free pages per rank (COLLECTIVE #2) ============
-        local_free = manager.get_stats().num_free_pages
+        local_free = self._gpu_kv_free_worker_pages(manager)
         free_tensor = torch.tensor(
             [local_free], dtype=torch.int64, device=self.torch_device
         )
@@ -6456,11 +6498,15 @@ class BatchGenWorker:
 
         # Guard before allocation
         total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
-        free_pages = manager.get_stats().num_free_pages
-        if total_pages_needed > free_pages:
+        target_tokens_by_global = {
+            global_ids[i]: tokens[i] for i in range(len(global_ids))
+        }
+        if not self._gpu_kv_can_allocate(manager, target_tokens_by_global):
             logging.error(
-                f"Rank {self.rank}: Cannot allocate GPU KV - need {total_pages_needed} pages, "
-                f"only {free_pages} free. Skipping load for {len(global_ids)} sequences."
+                f"Rank {self.rank}: Cannot allocate GPU KV - need "
+                f"{total_pages_needed} worker pages, "
+                f"free={self._gpu_kv_free_worker_pages(manager)}. "
+                f"Skipping load for {len(global_ids)} sequences."
             )
             return
 
@@ -7164,6 +7210,27 @@ class BatchGenWorker:
                                 f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
                                 f"free={free_mem / 1e9:.2f}GB alloc={allocated:.2f}GB"
                             )
+                        # DeepSeek-V4 decode reads prompt KV from the GPU
+                        # coordinator pools only (no host->GPU upload path),
+                        # so the coordinator must exist BEFORE prefill for
+                        # _populate_v4_prefill_kv to take the resident path.
+                        # Otherwise prompt KV lands host-only and decode
+                        # attends over zero-filled pages.
+                        # _init_gpu_kv_with_actual_size issues a dist.broadcast,
+                        # so 0-seq ranks (needs_empty_vocab_parallel_lm_head)
+                        # MUST also enter it or the collective stream desyncs
+                        # against the ranks that do have sequences.
+                        if (
+                            local_prefill_indices
+                            or needs_empty_vocab_parallel_lm_head
+                        ) and self.gpu_paged_kv_cache_manager is None:
+                            from batchgen.kv_cache.host_kv_mananger_config import (
+                                is_v4_model,
+                            )
+
+                            if is_v4_model(self.huggingface_ckpt_name):
+                                self._init_gpu_kv_with_actual_size()
+
                         prefill_start = time.perf_counter()
                         with torch.inference_mode():
                             if self.enable_prepack:
@@ -8032,6 +8099,7 @@ class BatchGenWorker:
             self.core_engine.host_paged_kv_worker_view.allocate_pages_for_sequences(
                 list(zip(global_sequence_ids, sequence_tokens))
             )
+            self._sequences_with_host_kv.update(global_sequence_ids)
             # DSA: mirror registration on auxiliary host KV
             aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
             if aux_view is not None:
@@ -8496,7 +8564,7 @@ class BatchGenWorker:
         if manager is None:
             return []
 
-        free_pages = manager.get_stats().num_free_pages
+        free_pages = self._gpu_kv_free_worker_pages(manager)
         max_seqs_per_rank = self.engine_config.Module_Batching_Config.MoE_decoding_micro_batch_size
 
         # Get candidates: PREFILLED and ON_HOLD
@@ -8554,7 +8622,7 @@ class BatchGenWorker:
         # Step 1: All-gather free GPU pages
         manager = self.gpu_paged_kv_cache_manager
         local_free = (
-            manager.get_stats().num_free_pages
+            self._gpu_kv_free_worker_pages(manager)
             if manager and manager.is_initialized
             else 0
         )
@@ -8645,9 +8713,14 @@ class BatchGenWorker:
 
         if my_uuids:
             global_sequence_ids = [
-                self.global_batch.get_sequence(uuid).global_idx
+                gid
                 for uuid in my_uuids
+                if (gid := self.global_batch.get_sequence(uuid).global_idx)
+                in self._sequences_with_host_kv
             ]
+
+            if not global_sequence_ids:
+                return
 
             logging.debug(
                 f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}"
@@ -8660,6 +8733,8 @@ class BatchGenWorker:
             # NOTE: release_sequence_pages already calls unregister_sequences internally,
             # so we don't need to call unregister_sequences separately
             worker_view.release_sequence_pages(global_sequence_ids)
+            for _gid in global_sequence_ids:
+                self._sequences_with_host_kv.discard(_gid)
             # DSA: release auxiliary host KV pages too
             aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
             if aux_view is not None:
@@ -8886,6 +8961,70 @@ class BatchGenWorker:
 
         return new_tokens
 
+    def _needs_vocab_parallel_prefill_participation(self) -> bool:
+        """True when the model's embed/lm_head are vocab-sharded across TP ranks.
+
+        DeepSeek-V4 shards both ``embed_tokens.weight`` and ``lm_head.weight`` by
+        vocab rows across all TP ranks, so ``vocab_parallel_embedding`` and
+        ``vocab_parallel_lm_head`` are COLLECTIVES (all_gather + all_reduce).
+        Every rank must call them the same number of times per prefill, even
+        ranks that were assigned 0 local sequences for this batch — otherwise the
+        collective order diverges and the run deadlocks (rank-with-seqs blocks in
+        all_gather while empty ranks reach the post-prefill dist.barrier()).
+        """
+        if not torch.distributed.is_initialized():
+            return False
+        if "deepseek" not in self.model_config.model_type:
+            return False
+        inner = getattr(self.model, "model", None)
+        lm_head = getattr(self.model, "lm_head", None)
+        model_vocab = getattr(inner, "vocab_size", None)
+        if inner is None or lm_head is None or model_vocab is None:
+            return False
+        embed = getattr(inner, "embed_tokens", None)
+        if embed is None:
+            return False
+        full_vocab = int(model_vocab)
+        embed_sharded = int(embed.weight.shape[0]) < full_vocab
+        lm_head_sharded = int(lm_head.weight.shape[0]) < full_vocab
+        return embed_sharded or lm_head_sharded
+
+    def _run_empty_vocab_parallel_prefill_collectives(self) -> None:
+        """Join the vocab-parallel embedding + lm_head collectives with no tokens.
+
+        Used by ranks that have 0 local sequences in a given prefill micro-batch.
+        Both ``vocab_parallel_embedding`` and ``vocab_parallel_lm_head`` are
+        empty-safe: they all_gather row_counts, pad to max_rows, and slice each
+        rank's output back out, so a [0]-row contribution is correct. This keeps
+        the collective ordering identical across all ranks without doing any
+        per-token compute, KV allocation, or sampling.
+        """
+        from batchgen.models.deepseek.deepseekv4_flash.model import (
+            vocab_parallel_embedding,
+            vocab_parallel_lm_head,
+        )
+
+        inner = self.model.model
+        empty_ids = torch.empty(
+            (0,), dtype=torch.long, device=self.torch_device
+        )
+        vocab_parallel_embedding(
+            inner.embed_tokens,
+            empty_ids,
+            inner.vocab_size,
+        )
+        empty_hidden = torch.empty(
+            (0, int(inner.hidden_size)),
+            dtype=self.model.lm_head.weight.dtype,
+            device=self.torch_device,
+        )
+        vocab_parallel_lm_head(
+            self.model.lm_head,
+            empty_hidden,
+            inner.vocab_size,
+            force_fp32=os.environ.get("BATCHGEN_GLM5_LMHEAD_FP32", "0") == "1",
+        )
+
     def prefill_prepacked(self, batch: list[int]):
         """
         Handle prefill for a batch using prepack optimization.
@@ -8915,6 +9054,24 @@ class BatchGenWorker:
 
         if "deepseek" in self.model_config.model_type:
             self.model.model._use_flash_attention_2 = False
+
+        needs_vocab_parallel_prefill = (
+            self._needs_vocab_parallel_prefill_participation()
+        )
+
+        if not batch:
+            if needs_vocab_parallel_prefill:
+                mb_count_t = torch.tensor(
+                    [0], dtype=torch.int64, device=self.torch_device
+                )
+                dist.all_reduce(mb_count_t, op=dist.ReduceOp.MAX)
+                global_mb_count = int(mb_count_t.item())
+                with torch.inference_mode():
+                    for _ in range(global_mb_count):
+                        self._run_empty_vocab_parallel_prefill_collectives()
+            return torch.empty(
+                (0, 1), dtype=torch.long, device=self.torch_device
+            )
 
         # Collect input_ids and attention_masks as lists for prepacking
         input_ids_list = []
@@ -9035,6 +9192,16 @@ class BatchGenWorker:
         )
         total_tokens_all = sum(seq_lengths_list)
 
+        local_mb_count = len(micro_batches)
+        if needs_vocab_parallel_prefill:
+            mb_count_t = torch.tensor(
+                [local_mb_count], dtype=torch.int64, device=self.torch_device
+            )
+            dist.all_reduce(mb_count_t, op=dist.ReduceOp.MAX)
+            global_mb_count = int(mb_count_t.item())
+        else:
+            global_mb_count = local_mb_count
+
         if self.rank == 0:
             logging.info(
                 f"Prepacked prefill: {len(micro_batches)} micro batches, "
@@ -9045,12 +9212,16 @@ class BatchGenWorker:
         output_tokens = []
 
         with torch.inference_mode():
-            for batch_idx, (seq_start, seq_end) in tqdm(
-                enumerate(micro_batches),
-                total=len(micro_batches),
+            for batch_idx in tqdm(
+                range(global_mb_count),
+                total=global_mb_count,
                 desc="Prepacked Prefill",
                 disable=(self.rank != 0),  # Only show progress on rank 0
             ):
+                if batch_idx >= local_mb_count:
+                    self._run_empty_vocab_parallel_prefill_collectives()
+                    continue
+                seq_start, seq_end = micro_batches[batch_idx]
                 # Feed watchdog during long prefill operations
                 self.feed_watchdog()
 
@@ -9145,6 +9316,18 @@ class BatchGenWorker:
                 # Reshape to 3D: [1, batch_total_tokens, hidden_dim]
                 hidden_states = inputs_embeds.unsqueeze(0)
 
+                # V4 hyper-connections: keep the [1, T, hc_mult, H] stream
+                # state ACROSS layers (official Transformer.forward). Feeding
+                # 3D per layer would expand + mean-collapse the 4 streams at
+                # EVERY layer, destroying stream identity.
+                v4_hc_mult = int(getattr(self.model.model, "hc_mult", 0) or 0)
+                if v4_hc_mult > 1:
+                    hidden_states = (
+                        hidden_states.unsqueeze(2)
+                        .expand(-1, -1, v4_hc_mult, -1)
+                        .contiguous()
+                    )
+
                 for layer_idx, decoder_layer in enumerate(
                     self.model.model.layers
                 ):
@@ -9158,7 +9341,9 @@ class BatchGenWorker:
                     )
                     hidden_states = layer_outputs[0]
 
-                # Final norm
+                # Final norm (V4: hc_head-reduce streams first)
+                if v4_hc_mult > 1:
+                    hidden_states = self.model.model._hc_head(hidden_states)
                 hidden_states = self.model.model.norm(hidden_states)
 
                 # Extract last token hidden states for each sequence
@@ -9819,7 +10004,7 @@ class BatchGenWorker:
         t0 = time.perf_counter()
 
         local_free_pages = (
-            gpu_manager.get_stats().num_free_pages
+            self._gpu_kv_free_worker_pages(gpu_manager)
             if gpu_manager and gpu_manager.is_initialized
             else 0
         )
@@ -10201,6 +10386,8 @@ class BatchGenWorker:
                 if worker_view is not None:
                     worker_view.release_sequence_pages(evicted_global_ids)
                     worker_view.unregister_sequences(evicted_global_ids)
+                    for _gid in evicted_global_ids:
+                        self._sequences_with_host_kv.discard(_gid)
                     # DSA: mirror release + unregister on auxiliary host KV
                     aux_view = getattr(
                         self, "host_paged_kv_worker_view_aux", None
@@ -10424,7 +10611,7 @@ class BatchGenWorker:
 
             if new_load_local:
                 actual_free = (
-                    gpu_manager.get_stats().num_free_pages
+                    self._gpu_kv_free_worker_pages(gpu_manager)
                     if gpu_manager and gpu_manager.is_initialized
                     else 0
                 )
@@ -14429,7 +14616,7 @@ class BatchGenWorker:
             return None, [], [], []
 
         # Step 1: All-gather free GPU pages
-        local_free = gpu_manager.get_stats().num_free_pages
+        local_free = self._gpu_kv_free_worker_pages(gpu_manager)
         free_tensor = torch.tensor(
             [local_free], dtype=torch.int64, device=self.torch_device
         )
@@ -14494,11 +14681,14 @@ class BatchGenWorker:
 
         # FIXED: Guard before allocation
         total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
-        current_free = gpu_manager.get_stats().num_free_pages
-        if total_pages_needed > current_free:
+        target_tokens_by_global = {
+            new_global_ids[i]: tokens[i] for i in range(len(new_global_ids))
+        }
+        if not self._gpu_kv_can_allocate(gpu_manager, target_tokens_by_global):
             logging.warning(
-                f"Rank {self.rank}: Skipping async load - need {total_pages_needed} pages, "
-                f"only {current_free} free"
+                f"Rank {self.rank}: Skipping async load - need "
+                f"{total_pages_needed} worker pages, "
+                f"free={self._gpu_kv_free_worker_pages(gpu_manager)}"
             )
             return None, new_uuids, [], []
 
@@ -14580,7 +14770,7 @@ class BatchGenWorker:
 
         # ============ PHASE 1: Gather global state (COLLECTIVE) ============
         t0 = time.perf_counter()
-        local_free = gpu_manager.get_stats().num_free_pages
+        local_free = self._gpu_kv_free_worker_pages(gpu_manager)
         free_tensor = torch.tensor(
             [local_free], dtype=torch.int64, device=self.torch_device
         )
@@ -14669,8 +14859,17 @@ class BatchGenWorker:
             )
             tokens = self._compute_two_page_buffer_tokens(new_local_indices)
             total_pages_needed = sum(t // self.PAGE_SIZE for t in tokens)
-            current_free = gpu_manager.get_stats().num_free_pages
-            local_can_allocate = 1 if total_pages_needed <= current_free else 0
+            current_free = self._gpu_kv_free_worker_pages(gpu_manager)
+            target_tokens_by_global = {
+                new_global_ids[i]: tokens[i] for i in range(len(new_global_ids))
+            }
+            local_can_allocate = (
+                1
+                if self._gpu_kv_can_allocate(
+                    gpu_manager, target_tokens_by_global
+                )
+                else 0
+            )
         else:
             new_global_ids = []
             tokens = []
@@ -14921,7 +15120,7 @@ class BatchGenWorker:
         # Step 1: All-gather free GPU pages from ALL ranks
         manager = self.gpu_paged_kv_cache_manager
         local_free = (
-            manager.get_stats().num_free_pages
+            self._gpu_kv_free_worker_pages(manager)
             if manager and manager.is_initialized
             else 0
         )
@@ -16252,6 +16451,7 @@ class BatchGenWorker:
 
         # 7. Reset GPU KV tracking
         self._sequences_with_gpu_kv = set()
+        self._sequences_with_host_kv = set()
 
         # 8. Clean up model weights (but NOT core_engine or parallel_manager)
         if hasattr(self, "model") and self.model is not None:
