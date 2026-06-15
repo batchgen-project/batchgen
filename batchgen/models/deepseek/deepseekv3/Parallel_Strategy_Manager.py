@@ -524,11 +524,22 @@ class DeepseekV3ParallelStrategyManager:
 		if self.rank == 0:
 			_dev = self.engine_config.Basic_Config.device_torch
 			used_memory = torch.cuda.memory_allocated(_dev)
+			_reserved = torch.cuda.memory_reserved(_dev)
 			_f, _t = torch.cuda.mem_get_info(_dev)
+			_used = _t - _f
+			_g = 1024 ** 3
 			logging.info(
 				f"[HBM] Rank {self.rank} AFTER configure_decoding model.to: "
-				f"allocated={used_memory / (1024**3):.2f} GiB, free={_f / (1024**3):.2f} GiB"
+				f"allocated={used_memory / _g:.2f} GiB, free={_f / _g:.2f} GiB"
 			)
+			# Split the non-tensor overhead: allocator fragmentation (reserved -
+			# allocated) vs CUDA context + library workspaces (used - reserved =
+			# CUDA ctx + cuBLAS/cuDNN/NCCL/FlashMLA/DeepGEMM). Tells us how much is
+			# reclaimable (e.g. cuBLAS workspace cap; BatchGen uses custom GEMMs).
+			logging.info(
+				f"[MEM-OVERHEAD] allocated={used_memory/_g:.2f} reserved={_reserved/_g:.2f} "
+				f"used(smi)={_used/_g:.2f} GiB | frag(resv-alloc)={(_reserved-used_memory)/_g:.2f} "
+				f"context+libs(used-resv)={(_used-_reserved)/_g:.2f} GiB")
 			# [MEM-AUDIT] Resident weight breakdown by dtype and by top-level module,
 			# to find BF16-pre-dequantized weights that should be FP8 (memory waste).
 			from collections import defaultdict
