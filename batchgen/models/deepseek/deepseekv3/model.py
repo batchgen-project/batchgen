@@ -268,6 +268,13 @@ class DenseMLP(nn.Module):
 
     @torch.inference_mode()
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # FP8 path: when the PSM kept the weights FP8 (weight_dequant_scale set),
+        # run the w8a16 GEMM instead of BF16 nn.Linear. Saves ~1.1 GiB GPU (the
+        # weights stay FP8 instead of being dequantized to BF16 at load) for the
+        # decode KV pool, at the same numerics the experts use.
+        scale = getattr(self, "weight_dequant_scale", None)
+        if scale is not None:
+            return self.deepgemm_forward(hidden_states, scale)
         return self.down_proj(
             self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         )

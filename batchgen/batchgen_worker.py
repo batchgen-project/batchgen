@@ -6209,6 +6209,16 @@ class BatchGenWorker:
 			self.core_engine.start_h2d_worker()
 
 		if self.rank == 0:
+			# Confirm the GPU expert ring-buffer size actually applied (reset_decoding_buffer
+			# resizes the routed_expert pool to num_decoding_module_buffer['routed_expert'])
+			# and the offloaded-expert stream task length, so we can verify the 20-slot config
+			# takes effect at runtime (not just the planner log).
+			_nbuf = self.engine_config.GPU_Buffer_Config.num_decoding_module_buffer.get("routed_expert")
+			_ntask = len(self.weight_copy_task.get("routed_expert", []))
+			logging.info(
+				f"[DECODE] routed_expert ring buffer = {_nbuf} slots; "
+				f"weight_copy_task routed_expert entries = {_ntask} "
+				f"(= n_offloaded x MoE_layers)")
 			logging.info(f"[DECODE] Model loaded for decoding phase")
 
 	def _init_gpu_kv_with_actual_size(self) -> None:

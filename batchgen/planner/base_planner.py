@@ -150,9 +150,13 @@ class BasePlanner(ABC):
         if self.config.EP_Config.enable_offloading and self.config.EP_Config.offloading_ratio > 0:
             # EP offloading: use offloading_ratio to determine persistent vs offloaded experts
             num_local_expert_per_layer = int(expert_per_rank * (1 - self.config.EP_Config.offloading_ratio))
-            # Buffer count = number of offloaded experts + overhead
+            # Buffer count = number of offloaded experts + slack. Use >= 20 ring
+            # slots so the H2D producer can prefetch ~2 layers of offloaded experts
+            # ahead (cross-layer prefetch), keeping the copy stream saturated across
+            # layer boundaries (nsys showed the copy stream idle ~1/8 of each layer
+            # at num_offloaded+2 slots). Each extra slot costs one expert (~42 MB).
             num_offloaded = expert_per_rank - num_local_expert_per_layer
-            num_decoding_module_buffer_routed_expert = num_offloaded + 2
+            num_decoding_module_buffer_routed_expert = max(num_offloaded + 2, 20)
             logging.info(
                 f"EP offloading enabled: {num_local_expert_per_layer} persistent, "
                 f"{num_offloaded} offloaded, {num_decoding_module_buffer_routed_expert} buffers"

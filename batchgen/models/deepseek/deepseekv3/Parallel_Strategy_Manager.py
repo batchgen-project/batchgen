@@ -469,6 +469,7 @@ class DeepseekV3ParallelStrategyManager:
 		torch.cuda.empty_cache()
 		self._extract_dequantize_scale()
 		self._load_model_skeleton()
+		self._load_dense_mlp_fp8()
 		self._load_local_routed_experts()
 		# Load attention and shared expert FP8 weights (required for attn_mode=3 / EP offloading)
 		# These are persistent on GPU, but need explicit loading
@@ -806,6 +807,37 @@ class DeepseekV3ParallelStrategyManager:
 			# attn_module.initialize()
 
 	
+
+	def _load_dense_mlp_fp8(self):
+		"""Keep the first `first_k_dense_replace` layers' dense-MLP weights in FP8.
+
+		_load_model_skeleton dequantized them to BF16 (2.2 GiB). Re-bind the FP8
+		originals (from the skeleton state dict) + store the per-block scales so
+		DenseMLP.forward runs the w8a16 GEMM. Frees ~1.1 GiB GPU for the decode KV
+		pool, at the same numerics the experts/shared-experts use.
+		"""
+		mlp_names = ["gate_proj", "up_proj", "down_proj"]
+		dev = self.engine_config.Basic_Config.device_torch
+		converted = 0
+		for layer_idx in range(self.loaded_model_config.first_k_dense_replace):
+			mlp = self.model.model.layers[layer_idx].mlp
+			scales = {}
+			ok = True
+			for name in mlp_names:
+				wkey = f"model.layers.{layer_idx}.mlp.{name}.weight"
+				skey = wkey + "_scale_inv"
+				if wkey in self.skeleton_state_dict and skey in self.dequant_scale:
+					getattr(mlp, name).weight.data = self.skeleton_state_dict[wkey].to(dev)
+					scales[f"{name}.weight_scale_inv"] = self.dequant_scale[skey].to(dev)
+				else:
+					ok = False
+			if ok and scales:
+				mlp.weight_dequant_scale = scales  # -> DenseMLP.forward uses deepgemm_forward
+				converted += 1
+		torch.cuda.empty_cache()
+		if self.rank == 0:
+			logging.info(f"[MEM] dense-MLP FP8: kept {converted} dense layers in FP8 "
+			             f"(~1.1 GiB freed for KV pool)")
 
 	def _load_shared_expert_module(self):
 		for layer_idx in range(
