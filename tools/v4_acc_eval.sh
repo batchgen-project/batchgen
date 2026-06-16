@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
+# MMLU-Pro accuracy eval for DeepSeek-V4-Flash on a Hopper node (sm90, H20).
+# All paths are env-overridable so the same script runs across hosts/containers.
 set -uo pipefail
 
-REPO=/data3/leyangxue/batchgen
-VENV=/root/moegen/.venv/bin/python
-CKPT=/data2/tairan/models/deepseek-ai/DeepSeek-V4-Flash/v4flash_mp4_fp8/converted_ckpt/converted_ckpt
-ART=/data3/leyangxue/v4-e2e-artifacts
+REPO="${REPO:-/data3/leyangxue/batchgen}"
+VENV="${VENV:-python}"
+CKPT="${CKPT:-/data2/tairan/models/deepseek-ai/DeepSeek-V4-Flash/v4flash_mp4_fp8/converted_ckpt/converted_ckpt}"
+SNAP="${SNAP:-$CKPT}"
+ART="${ART:-/data3/leyangxue/v4-e2e-artifacts}"
 PORT="${PORT:-10920}"
 DIST_PORT="${DIST_PORT:-12420}"
 MAX_DEC="${MAX_DEC:-1024}"
 MAX_PROMPTS="${MAX_PROMPTS:-40}"
 GPU_MEM_FRAC="${GPU_MEM_FRAC:-0.65}"
+DEVICES="${DEVICES:-0,1,2,3}"
 SERVER_LOG="$ART/acc_server.log"
 E2E_LOG="$ART/acc_e2e.log"
 RESULT_JSON="$ART/acc_result.json"
@@ -27,13 +31,13 @@ rm -f "$REPO"/batchgen/storage/files/* "$REPO"/batchgen/storage/files_meta/*.jso
 
 cd "$REPO" || { echo "no repo" > "$DONE"; exit 2; }
 
-nohup env CUDA_VISIBLE_DEVICES=0,1,2,3 HF_HUB_OFFLINE=1 PYTHONPATH="$REPO:$REPO/tools" V4_RESULT_DEBUG=1 \
+nohup env CUDA_VISIBLE_DEVICES="$DEVICES" HF_HUB_OFFLINE=1 PYTHONPATH="$REPO:$REPO/tools" V4_RESULT_DEBUG=1 \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   "$VENV" -m batchgen.launch_http_server \
-  --model deepseek-ai/DeepSeek-V4-Flash --converted-ckpt-dir "$CKPT" --cache-dir "$CKPT" \
+  --model deepseek-ai/DeepSeek-V4-Flash --converted-ckpt-dir "$CKPT" --cache-dir "$SNAP" \
   --kv-dtype fp8 --host-kv-cache-size 100 --gpu-arch hopper --gpu-memory-frac "$GPU_MEM_FRAC" \
   --dist-init-addr "localhost:$DIST_PORT" --world-size 4 --listen-port "$PORT" \
-  --watchdog-timeout 3600 > "$SERVER_LOG" 2>&1 &
+  --watchdog-timeout "${WATCHDOG_TIMEOUT:-3600}" > "$SERVER_LOG" 2>&1 &
 SRV=$!
 
 READY=0

@@ -91,11 +91,17 @@ _build_sm120 = _build_arch == "sm120"
 # ── Architecture flag sets ──
 # On sm120 (Blackwell), the "sm90a" WGMMA extensions are retargeted to sm_120 so the
 # compiler reveals exactly which Hopper-only kernels fail (recompile-only baseline).
-_sm90a_arch_flag = "-arch=sm_120" if _build_sm120 else "-arch=sm_90a"
+# Use explicit -gencode (not bare -arch=sm_90a): bare -arch=sm_90a makes nvcc also emit a
+# plain compute_90 PTX pass, and ptxas rejects wgmma.* on .target sm_90.
+_sm90a_arch_flag = (
+    ["-gencode", "arch=compute_120,code=sm_120"]
+    if _build_sm120
+    else ["-gencode", "arch=compute_90a,code=sm_90a"]
+)
 
 _sm90a_flags = [
     "-std=c++17",
-    _sm90a_arch_flag,
+    *_sm90a_arch_flag,
     "-O3",
     "--ptxas-options=-v",
     "-lineinfo",
@@ -173,7 +179,8 @@ _sm90a_extensions = [
             "nvcc": [
                 "-O3",
                 "-std=c++17",
-                "-arch=sm_90a",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
                 "--use_fast_math",
                 "-lineinfo",
                 "-DUSE_BF16_COMPUTE",
@@ -196,7 +203,8 @@ _sm90a_extensions = [
             "nvcc": [
                 "-O3",
                 "-std=c++17",
-                "-arch=sm_90a",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
                 "-lineinfo",
                 "--expt-relaxed-constexpr",
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
@@ -216,7 +224,8 @@ _sm90a_extensions = [
             "nvcc": [
                 "-O3",
                 "-std=c++17",
-                "-arch=sm_90a",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
                 "-lineinfo",
                 "--threads",
                 _nvcc_threads,
@@ -232,7 +241,8 @@ _sm90a_extensions = [
             "nvcc": [
                 "-O3",
                 "-std=c++17",
-                "-arch=sm_90a",
+                "-gencode",
+                "arch=compute_90a,code=sm_90a",
                 "--use_fast_math",
                 "--threads",
                 _nvcc_threads,
