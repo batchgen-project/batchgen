@@ -611,7 +611,11 @@ class R1AttnSegment:
         k_tensor = offload_kv.view(B, 1, 1, offload_kv.size(-1))
 
         # === KV write — use STATIC page_table + slot_indices (K25 pattern) ===
-        blocked_k, _, _ = gpu_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
+        # Fetch the K-cache tensor WITHOUT requiring the active page table to be
+        # built: at whole-model capture time it is not, and this segment uses the
+        # static page_table input (not the manager's), so the page-table check in
+        # get_layer_kv_with_page_table must be bypassed.
+        blocked_k = gpu_kv_manager.get_layer_k_cache(self.layer_idx)
         run_paged_kv_token_update_fused(
             k_cache=blocked_k,
             k_tokens=k_tensor.view(B, -1),

@@ -1252,6 +1252,20 @@ class GPUPagedKVCacheManager:
 				"call allocate_pages_for_sequences and build_page_table before using this method"
 			)
 
+	def get_layer_k_cache(self, layer_idx: int) -> torch.Tensor:
+		"""Return the layer's K cache tensor at its fixed GPU address WITHOUT
+		requiring the active page table to be built.
+
+		CUDA-graph capture consumers that supply their own static page_table
+		(e.g. the R1 whole-model attention segment) need only the stable
+		``_k_cache`` pointer; the active page table is not built yet at
+		whole-model capture time, so ``get_layer_kv_with_page_table`` would
+		raise. The K cache buffer itself is allocated once the GPU KV pool is
+		initialized.
+		"""
+		self._ensure_initialized()
+		return self._k_cache[self.resolve_physical_layer(layer_idx)]
+
 	def get_page_table_version(self) -> int:
 		"""Return a monotonic version for the active page-table contents."""
 		self._ensure_initialized()
