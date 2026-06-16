@@ -41,3 +41,20 @@ GLM5_BACKEND_NAME_PATTERNS = (
 def is_glm5_backend_model(model_name: str | None) -> bool:
     normalized = (model_name or "").strip().lower()
     return any(pattern in normalized for pattern in GLM5_BACKEND_NAME_PATTERNS)
+
+
+# DeepSeek-R1 shares the DeepseekV3 architecture (plain MLA + FP8 3D-blockwise MoE).
+# Patterns deliberately match R1 and the v3 base but NOT deepseek-v4 (separate backend).
+DEEPSEEK_R1_BACKEND_NAME_PATTERNS = (
+    "deepseek-ai/deepseek-r1",
+    "deepseek-r1",
+    "deepseek_r1",
+    "deepseek-ai/deepseek-v3",
+    "deepseek-v3",
+    "deepseek_v3",
+)
+
+
+def is_deepseek_r1_backend_model(model_name: str | None) -> bool:
+    normalized = (model_name or "").strip().lower()
+    return any(pattern in normalized for pattern in DEEPSEEK_R1_BACKEND_NAME_PATTERNS)

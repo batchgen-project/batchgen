@@ -91,7 +91,10 @@ from batchgen.query_book import (
 	release_local_query_slot,
 )
 from batchgen.utils import config_torch_module_initializer
-from batchgen.config.model_name_utils import is_kimi_k25_backend_model
+from batchgen.config.model_name_utils import (
+	is_deepseek_r1_backend_model,
+	is_kimi_k25_backend_model,
+)
 from batchgen.models.glm.glm5.cuda_graph_policy import (
 	glm5_any_cuda_graph_requested_for_model,
 	glm5_dsa_cuda_graph_requested_for_model,
@@ -577,6 +580,7 @@ class BatchGenWorker:
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
+		self._r1_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_capture_attempted_for_batch = False
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
@@ -8197,6 +8201,7 @@ class BatchGenWorker:
 		if (
 			"gpt-oss-120b" not in model_name_l
 			and not is_kimi_k25_backend_model(model_name)
+			and not is_deepseek_r1_backend_model(model_name)
 			and not glm5_whole_graph_enabled
 		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -8288,6 +8293,32 @@ class BatchGenWorker:
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
+
+	def _r1_whole_model_graph_requested_for_current_batch(self) -> bool:
+		# R1 joins the generic whole-model graph path; activation is gated solely
+		# by --enable-cuda-graph (translated into args.enable_cuda_graph upstream).
+		if getattr(self.args, "disable_cuda_graphs", False):
+			return False
+		return (
+			is_deepseek_r1_backend_model(getattr(self, "model_name", None))
+			and getattr(self.args, "enable_cuda_graph", False)
+		)
+
+	def _r1_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
+		if os.environ.get("BATCHGEN_R1_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("r1_whole_model_graph_compare"))
+
+	def _r1_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
+		if os.environ.get("BATCHGEN_R1_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("r1_whole_model_graph_compare_fail"))
 
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
@@ -8440,6 +8471,7 @@ class BatchGenWorker:
 		self._whole_model_bucketing = None
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
+		self._r1_whole_model_graph = False
 		self._glm5_whole_model_graph_signature = None
 		# Phase B: also drop the adapter's reference to the captured segment so
 		# the next /v1/reload + recapture starts from a clean adapter context.
@@ -8713,6 +8745,9 @@ class BatchGenWorker:
 
 		# Detect K2.5 model for specialized graph segment
 		_is_k25 = is_kimi_k25_backend_model(self.model_name)
+		# Detect R1: plain FP8 MLA + GLM-5-style FP8 3D MoE on the generic
+		# whole-model graph path (own segment classes, NOT the GLM-5 path).
+		_is_r1 = is_deepseek_r1_backend_model(self.model_name)
 
 		max_bucket = self.args.cuda_graph_max_bucket_size
 		num_buckets = self.args.cuda_graph_num_buckets
@@ -9100,7 +9135,7 @@ class BatchGenWorker:
 		# K2.5 uses MLA (not GQA) and has its own segment class, skip per-layer setup
 		has_moe_graph = False
 		moe_pool = None
-		if not _is_k25:
+		if not _is_k25 and not _is_r1:
 			# Pre-warm: initialize sinks and RoPE cache before capture
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				wrapper = decoder_layer.self_attn
@@ -9160,7 +9195,7 @@ class BatchGenWorker:
 						)
 						manager.register_segment(f"layer_{layer_idx}_moe", moe_compute_seg)
 						has_moe_graph = True
-		else:
+		elif _is_k25:
 			# K2.5: Pre-warm RoPE cache (shared instance)
 			rotary_emb = self.model.model._shared_rotary_emb
 			dummy = torch.zeros(1, 1, 1, rotary_emb.dim, device=self.torch_device)
@@ -9169,6 +9204,24 @@ class BatchGenWorker:
 			page_size_tokens = gpu_manager.config.page_size_tokens
 			max_seq_len = self.model.config.max_position_embeddings
 			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+		else:
+			# R1: per-layer MLA RoPE pre-warm (the whole-model segment also warms
+			# it at capture; this primes the cos/sin cache to max position first).
+			page_size_tokens = gpu_manager.config.page_size_tokens
+			max_seq_len = self.model.config.max_position_embeddings
+			max_pages = (max_seq_len + page_size_tokens - 1) // page_size_tokens
+			for decoder_layer in self.model.model.layers:
+				aw = decoder_layer.self_attn
+				m = aw.module if hasattr(aw, "module") else aw
+				try:
+					dummy = torch.zeros(
+						1, 1, m.num_heads, m.qk_rope_head_dim, device=self.torch_device
+					)
+					m.rotary_emb(dummy, seq_len=max_rope_len)
+				except Exception as exc:
+					logging.warning(
+						f"Rank {self.rank}: R1 RoPE pre-warm skipped (signature differs): {exc}"
+					)
 
 		# Set gpu_paged_kv_manager so segments can access it during capture
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
@@ -9201,6 +9254,43 @@ class BatchGenWorker:
 					vocab_size=vocab_size,
 					hidden_size=hidden_size,
 					max_bucket_size=bucketing._max_bucket,
+				)
+			elif _is_r1:
+				# R1: plain FP8 MLA + GLM-5-style FP8 3D MoE — own segment classes.
+				from batchgen.models.deepseek.deepseekv3.cuda_graph_segments import (
+					R1MoEGraphBufferPool, R1WholeModelSegment,
+				)
+				r1_moe = None
+				for _dl in self.model.model.layers:
+					_m = getattr(_dl, "mlp", None)
+					if (_m is not None and getattr(_m, "comm", None) is not None
+							and getattr(_m, "_fp8_blockwise_ready", False)):
+						r1_moe = _m
+						break
+				if r1_moe is None:
+					raise RuntimeError("R1 whole-model graph: no FP8-ready MoE layer with EP communicator")
+				r1_pool = R1MoEGraphBufferPool(
+					world_size=self.world_size,
+					hidden_size=r1_moe.hidden_size,
+					num_experts_per_tok=r1_moe.num_experts_per_tok,
+					num_local_experts=r1_moe.experts_per_rank,
+					intermediate_size=r1_moe.moe_intermediate_size,
+					device=self.torch_device,
+					bucket_sizes=bucketing.bucket_sizes,
+					# Eager decode sizes mtp to the global batch (round_up(world*bsz,128))
+					# and grows via resize_if_needed; the pool derives that same floor
+					# internally. base_mtp=0 keeps the graph pool matched to eager and
+					# avoids the 4096-default OOM the eager-side fix guards against.
+					base_mtp=0,
+				)
+				whole_seg = R1WholeModelSegment(
+					model=self.model, device=self.torch_device,
+					world_size=self.world_size, rank=self.rank,
+					max_pages_per_seq=max_pages, vocab_size=vocab_size, hidden_size=hidden_size,
+					max_bucket_size=bucketing._max_bucket, max_seqlen=max_rope_len,
+					page_size_tokens=page_size_tokens, moe_pool=r1_pool, comm=r1_moe.comm,
+					capture_lm_head=True,
+					compare_probe_layers=None,
 				)
 			else:
 				# GPT-OSS: GQA attention + SharedMoEBufferPool
@@ -9249,6 +9339,8 @@ class BatchGenWorker:
 
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = True
+			if _is_r1:
+				self._r1_whole_model_graph = True
 			self._whole_model_bucketing = bucketing
 			self._whole_model_segment = whole_seg
 			if self.rank == 0:
@@ -10042,6 +10134,41 @@ class BatchGenWorker:
 							_glm5_whole_timing_items["replay_ms"] = (
 								time.perf_counter() - _glm5_replay_start
 							) * 1000.0
+					elif getattr(self, "_r1_whole_model_graph", False):
+						# R1 joins the generic whole-model graph but additionally needs
+						# position_ids and rank_token_counts (FP8 3D MoE DP routing).
+						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
+						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+						if slot_indices_tensor is None:
+							# Rebuild may have cleared it; reconstruct as simple arange
+							slot_indices_tensor = torch.arange(
+								page_table_tensor.shape[0], dtype=torch.int32,
+								device=self.torch_device,
+							)
+						# Page table may have fewer columns than the static buffer
+						# (gpu_table gets rebuilt with varying max_pages_per_sequence).
+						# Pad to match the captured spec width.
+						wm_max_pages = self._whole_model_segment.max_pages_per_seq
+						pt_slice = page_table_tensor[:batch_size]
+						if pt_slice.shape[1] < wm_max_pages:
+							pt_slice = torch.nn.functional.pad(
+								pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+							)
+						elif pt_slice.shape[1] > wm_max_pages:
+							pt_slice = pt_slice[:, :wm_max_pages]
+						position_ids = (
+							AttnWrapperBase.cache_seqlens[:batch_size] - 1
+						).clamp(min=0).unsqueeze(1).to(torch.int64)
+						rank_token_counts = _all_rank_counts
+						graph_out = self._cuda_graph_manager.replay(
+							"whole_model", bucket,
+							input_ids=new_tokens[:batch_size],
+							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+							position_ids=position_ids,
+							page_table=pt_slice,
+							slot_indices=slot_indices_tensor[:batch_size],
+							rank_token_counts=rank_token_counts,
+						)
 					else:
 						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
@@ -11838,6 +11965,7 @@ class BatchGenWorker:
 		self._glm5_moe_graph_failed_buckets = set()
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
+		self._r1_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_capture_attempted_for_batch = False
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
@@ -11970,6 +12098,7 @@ class BatchGenWorker:
 		self._glm5_dsa_graph_page_table_change_after_capture_logged = False
 		self._whole_model_graph = False
 		self._glm5_whole_model_graph = False
+		self._r1_whole_model_graph = False
 		self._glm5_whole_model_graph_failed_buckets = set()
 		self._glm5_whole_model_graph_capture_attempted_for_batch = False
 		self._glm5_whole_model_graph_state_change_after_capture_logged = False
