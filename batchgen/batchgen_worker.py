@@ -8731,6 +8731,79 @@ class BatchGenWorker:
 			"flashmla_num_splits": num_splits,
 		}
 
+	def _make_r1_whole_model_capture_inputs(self, *, bucket, num_heads):
+		"""Build REAL per-bucket capture inputs for the R1 whole-model graph.
+
+		Mirrors ``_make_glm5_whole_model_capture_inputs`` but returns only the
+		keys ``R1WholeModelSegment.get_static_input_specs`` expects and uses REAL
+		page_table/slot_indices from the active GPU allocation (NOT zeros). R1's
+		attention segment writes KV in-graph for every bucket row via
+		``page_table``/``slot_indices``; capturing with fill-value 0 would write
+		the warmup KV into page 0 and corrupt the first real sequence. Active rows
+		(``len(cur_batch)``) point at their real pages; the remaining padding rows
+		replicate row 0 so their warmup KV write lands on an already-owned page
+		instead of page 0. R1 has no aux KV and no flashmla metadata at capture
+		(the segment computes it in-graph), so ``num_heads`` is accepted only to
+		mirror the GLM-5 signature and is unused here.
+		"""
+		from batchgen.models.wrappers.attention import AttnWrapperBase
+
+		bucket = int(bucket)
+		gpu_manager = AttnWrapperBase.gpu_paged_kv_manager
+		page_mgr = gpu_manager._gpu_page_table_manager
+		page_table = page_mgr.gpu_table
+		slot_indices = page_mgr._slot_index_tensor
+		if page_table is None or slot_indices is None:
+			raise RuntimeError(
+				"R1 whole-model graph capture requires an active page table; "
+				"call ensure_cuda_graph_page_table before building capture inputs"
+			)
+		active = int(page_table.shape[0])
+		if active <= 0:
+			raise RuntimeError(
+				"R1 whole-model graph capture requires at least one active decode "
+				"row so warmup does not write KV into page 0"
+			)
+		max_pages = int(self._whole_model_segment.max_pages_per_seq)
+
+		# Pad/trim the active page table columns to the captured spec width.
+		pt = page_table.to(dtype=torch.int32, device=self.torch_device)
+		if pt.shape[1] < max_pages:
+			pt = torch.nn.functional.pad(pt, (0, max_pages - pt.shape[1]), value=0)
+		elif pt.shape[1] > max_pages:
+			pt = pt[:, :max_pages]
+
+		cache_seqlens = AttnWrapperBase.cache_seqlens[:active].to(
+			dtype=torch.int32, device=self.torch_device
+		)
+		position_ids = AttnWrapperBase.position_ids[:active].to(
+			dtype=torch.int64, device=self.torch_device
+		)
+		slot_i32 = slot_indices[:active].to(dtype=torch.int32, device=self.torch_device)
+
+		# Build full-bucket tensors: active rows are real, padding rows replicate
+		# row 0 (a real, already-owned slot) so no row targets page 0.
+		page_table_full = pt[0:1].repeat(bucket, 1)
+		slot_full = slot_i32[0:1].repeat(bucket)
+		cache_seqlens_full = cache_seqlens[0:1].repeat(bucket)
+		position_ids_full = position_ids[0:1].repeat(bucket, 1)
+		fill = min(active, bucket)
+		page_table_full[:fill].copy_(pt[:fill])
+		slot_full[:fill].copy_(slot_i32[:fill])
+		cache_seqlens_full[:fill].copy_(cache_seqlens[:fill])
+		position_ids_full[:fill].copy_(position_ids[:fill])
+
+		return {
+			"input_ids": torch.zeros((bucket, 1), dtype=torch.int64, device=self.torch_device),
+			"cache_seqlens": cache_seqlens_full,
+			"position_ids": position_ids_full,
+			"page_table": page_table_full,
+			"slot_indices": slot_full,
+			"rank_token_counts": torch.zeros(
+				(self.world_size,), dtype=torch.int64, device=self.torch_device
+			),
+		}
+
 	def _setup_cuda_graphs(self, gpu_manager):
 		"""Capture CUDA graphs for decode: full attention block per layer.
 
@@ -9332,15 +9405,25 @@ class BatchGenWorker:
 					f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
 				)
 
+			if _is_r1:
+				# R1 must build the graph-stable page table before capture so the
+				# in-graph KV write targets real pages (not page 0); replay re-runs
+				# ensure to refresh contents.
+				active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+				logging.info(
+					f"Rank {self.rank}: R1 whole-model capture "
+					f"active_sequence_ids={len(active_sequence_ids)}"
+				)
+				gpu_manager.ensure_cuda_graph_page_table(active_sequence_ids)
+				if gpu_manager.get_cuda_graph_page_table_storage() is None:
+					raise RuntimeError(
+						"R1 whole-model CUDA graph requested but GPU page-table storage "
+						"is not initialized"
+					)
+
 			# Sync all ranks — NCCL collectives require simultaneous participation
 			torch.cuda.synchronize(self.torch_device)
 			dist.barrier()
-
-			manager.warmup_and_capture_all()
-
-			# Reset capture mode flags
-			for layer in self.model.model.layers:
-				layer._graph_capture_mode = False
 
 			self._cuda_graph_manager = manager
 			self._whole_model_graph = True
@@ -9348,6 +9431,41 @@ class BatchGenWorker:
 				self._r1_whole_model_graph = True
 			self._whole_model_bucketing = bucketing
 			self._whole_model_segment = whole_seg
+
+			if _is_r1:
+				# Per-bucket capture with REAL inputs (GLM-5-style loop): set real
+				# capture inputs, sync+barrier, capture, drop bucket on OOM.
+				first_attn = self.model.model.layers[0].self_attn
+				_m = first_attn.module if hasattr(first_attn, "module") else first_attn
+				num_heads = int(getattr(_m, "num_heads", 128))
+				for capture_bucket in bucketing.bucket_sizes:
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
+					whole_seg.set_capture_inputs(
+						**self._make_r1_whole_model_capture_inputs(
+							bucket=capture_bucket,
+							num_heads=num_heads,
+						)
+					)
+					try:
+						manager.warmup_and_capture_buckets([capture_bucket])
+					except torch.OutOfMemoryError as exc:
+						manager.drop_bucket(capture_bucket)
+						torch.cuda.empty_cache()
+						logging.error(
+							f"Rank {self.rank}: R1 whole-model CUDA graph capture for "
+							f"bucket BS={capture_bucket} ran out of memory; dropping "
+							f"bucket: {exc}"
+						)
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
+			else:
+				manager.warmup_and_capture_all()
+
+			# Reset capture mode flags
+			for layer in self.model.model.layers:
+				layer._graph_capture_mode = False
+
 			if self.rank == 0:
 				stats = manager.get_capture_stats()
 				logging.info(
@@ -10142,6 +10260,10 @@ class BatchGenWorker:
 					elif getattr(self, "_r1_whole_model_graph", False):
 						# R1 joins the generic whole-model graph but additionally needs
 						# position_ids and rank_token_counts (FP8 3D MoE DP routing).
+						# Refresh the graph-stable page table for the active batch so
+						# the reads below see valid contents (mirrors capture-time ensure).
+						active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+						gpu_manager.ensure_cuda_graph_page_table(active_sequence_ids)
 						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
 						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
 						if slot_indices_tensor is None:

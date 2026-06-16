@@ -822,12 +822,11 @@ class R1WholeModelSegment:
             if spec is not None:
                 target.fill_(spec.fill_value)
 
-        # Fill-value capture (generic K2.5/GPT-OSS warmup flow): when the worker
-        # did not call set_capture_inputs, the static buffers keep their fill
-        # values. R1's plain-MLA KV write uses page_table/slot_indices = 0 (page 0)
-        # during warmup, the same as K2.5's per-layer attn capture.
         if self._capture_inputs is None:
-            return
+            raise RuntimeError(
+                "R1 whole-model graph capture requires runtime inputs so warmup "
+                "does not mutate real KV cache with fill-value positions"
+            )
 
         for name, source in self._capture_inputs.items():
             target = static_inputs[name]
@@ -997,7 +996,7 @@ class R1WholeModelSegment:
         else:
             # Eager reference path (no layer segments): plain decoder layers.
             for layer_idx, layer in enumerate(self.model.model.layers):
-                layer_output = layer(hidden_states, layer_idx=layer_idx)
+                layer_output = layer(hidden_states, position_ids=position_ids, layer_idx=layer_idx)
                 hidden_states = (
                     layer_output[0] if isinstance(layer_output, tuple) else layer_output
                 )
@@ -1029,6 +1028,8 @@ class R1WholeModelSegment:
         old_max_seqlen = AttnWrapperBase.max_seqlen
         old_kv_cb = AttnWrapperBase.kv_append_callback
         try:
+            old_aux_cb = AttnWrapperBase.kv_append_callback_aux
+            AttnWrapperBase.kv_append_callback_aux = None
             AttnWrapperBase.cache_seqlens = cache_seqlens
             AttnWrapperBase.position_ids = position_ids
             AttnWrapperBase.max_seqlen = self.max_seqlen
@@ -1046,6 +1047,7 @@ class R1WholeModelSegment:
             AttnWrapperBase.position_ids = old_position_ids
             AttnWrapperBase.max_seqlen = old_max_seqlen
             AttnWrapperBase.kv_append_callback = old_kv_cb
+            AttnWrapperBase.kv_append_callback_aux = old_aux_cb
 
         return outputs
 
