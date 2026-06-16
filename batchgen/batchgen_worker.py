@@ -2507,6 +2507,11 @@ class BatchGenWorker:
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
+		elif (
+			is_deepseek_r1_backend_model(getattr(self, "model_name", "") or "")
+			and getattr(self.args, "enable_cuda_graph", False)
+		):
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
