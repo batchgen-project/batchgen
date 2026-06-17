@@ -44,14 +44,14 @@
 ## §1. File hygiene — what must not be in a PR
 
 A PR must not **add** any of the following. (Pre-existing instances are tracked in
-[Appendix A](#appendix-a) and removed on their own cleanup PRs; the gate only fails on
-newly-added lines/files.)
+[Appendix A](#appendix-a) and addressed — relocated, not deleted — on their own cleanup PRs;
+the gate only fails on newly-added lines/files.)
 
-1. **Scratch / benchmark / debug scripts in production packages or repo root.**
-   No new files matching `bench_*.py`, `debug_*.py`, `check_*.py`, `scratch_*.py`,
-   `tmp_*.py`, or `*_scratch.py` under any production package or at the repo root.
-   One-off benchmarks and experiments stay out of the shipped package — keep them in your
-   development checkout, not in this PR.
+1. **Throwaway scratch / debug scripts in production packages or repo root.**
+   No new files matching `debug_*.py`, `check_*.py`, `scratch_*.py`, `tmp_*.py`, or
+   `*_scratch.py` under any production package or at the repo root. **Benchmark scripts
+   (`bench_*.py`) are exempt** — they are useful reference and may live alongside the kernels
+   they exercise.
 2. **Tests interleaved in the runtime package.** No new `test_*.py` under the production
    packages. Tests live in the repository's `tests/` tree.
 3. **Server-side env-var debug guards.** Do not add `os.environ.get("BATCHGEN_…")` /
@@ -189,7 +189,7 @@ Run this before marking a PR **Ready for review**. It is reproduced in
 
 - [ ] `git diff --stat origin/main` reviewed; **every** file traces to the task — no unrelated files.
 - [ ] **Change type** declared in the PR template; all changed files are within that type's permitted set (§2.5) — no scaffolding edits in a `model`/`kernel` PR (§2.6).
-- [ ] No `bench_* / debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or root (§1.1).
+- [ ] No `debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or root (§1.1). (`bench_*` is allowed.)
 - [ ] No `test_*.py` added inside the runtime package; tests are under `tests/` (§1.2, §2.1).
 - [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3).
 - [ ] No leftover `print()`, `logging.debug()`, or commented-out code in the changed files (§1.4–§1.5).
@@ -246,7 +246,7 @@ The high-precision subset of §1 and §4 is enforced by the **PR File Hygiene** 
 `.github/workflows/scripts/check-pr-hygiene.sh`). It inspects **only the added lines / new
 files** in the PR relative to the base branch, so it never trips on legacy code.
 
-**Blocking checks** (fail the PR): H1 scratch/bench/debug scripts in a package or root; H2
+**Blocking checks** (fail the PR): H1 throwaway scratch/debug scripts in a package or root (`bench_*` exempt); H2
 `test_*.py` in a package; H6 generated artifacts; H7 loose root `.py`; and a `Co-Authored-By`
 trailer in any commit in the PR range.
 
@@ -325,23 +325,18 @@ Rules that bound every override:
 <a name="appendix-a"></a>
 ## Appendix A — pre-gate cleanup ledger
 
-These pre-existing violations live on `main` today. The §8 gate stays **report-only** until
-every box is ticked. Each line is its own small, single-concern cleanup PR (§3.2).
+These pre-existing items don't yet match the policy. The §8 gate stays **report-only** until
+they're cleared. Each is its own small, single-concern PR — **relocate, never delete** (§3.2).
 
-**Scratch / benchmark scripts in `batchgen/` (§1.1)**
-- [ ] `batchgen/moe/bench_marlin_vs_wgmma.py`
-- [ ] `batchgen/moe/bench_marlin_m16.py`
-- [ ] `batchgen/moe/bench_3stage.py`
-- [ ] `batchgen/moe/bench_fused_s1.py`
-- [ ] `batchgen/moe/bench_grouped_gemm.py`
-- [ ] `batchgen/moe/bench_act_quant.py`
-- [ ] `batchgen/quantization/bench_dequant.py`
-- [ ] `batchgen/moe/debug_transform.py`
+**Benchmark scripts (`bench_*.py`)** — _now permitted in place (§1.1); no action._
 
-**One-off utility at repo root (§1.7)**
-- [ ] `check_ckpt.py`
+**Debug script in `batchgen/` (§1.1)**
+- [ ] `batchgen/moe/debug_transform.py` — relocate to `scripts/` (or delete if obsolete)
 
-**Tests interleaved in the runtime package (§1.2 / §2.1)**
+**Utility at repo root (§1.7)** — _keep it, relocate_
+- [ ] `check_ckpt.py` → `scripts/check_ckpt.py`
+
+**Tests interleaved in the runtime package (§1.2 / §2.1)** — _relocate to `tests/`_
 - [ ] `batchgen/moe/test_marlin_standalone.py`
 - [ ] `batchgen/quantization/test_mxfp4.py`
 - [ ] `batchgen/moe/routing/test_routing.py`

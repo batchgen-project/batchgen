@@ -23,7 +23,7 @@ If it fixes an issue, link it (e.g., `close #123`).
 <!-- Every box must be ticked before "Ready for review". See PR_MERGE_POLICY.md §5. -->
 - [ ] `git diff --stat origin/main` reviewed; every file traces to the task — no unrelated files (§3.1).
 - [ ] Exactly one **Type of Change** ticked above; all changed files are within that type's permitted set (§2.5) — no scaffolding edits in a `model`/`kernel` PR (§2.6).
-- [ ] No `bench_* / debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or repo root (§1.1).
+- [ ] No `debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or repo root (§1.1). (`bench_*` is allowed.)
 - [ ] No `test_*.py` added inside the runtime package; tests are under `tests/` (§1.2, §2.1).
 - [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3).
 - [ ] No leftover `print()`, `logging.debug()`, or commented-out code in the changed files (§1.4–§1.5).
