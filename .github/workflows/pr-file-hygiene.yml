@@ -1,0 +1,51 @@
+name: PR File Hygiene
+
+# Enforces the high-precision subset of PR_MERGE_POLICY.md §1/§4 on the lines a PR
+# ADDS, so it never trips on legacy code. See PR_MERGE_POLICY.md §8 (rollout) and §9
+# (override). The `ci:skip-hygiene` label is the §9 whole-PR override.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so merge-base with the base branch resolves
+
+      - name: Fetch base branch
+        run: git fetch --no-tags origin "${{ github.event.pull_request.base.ref || 'main' }}"
+
+      - name: Resolve enforcement mode
+        id: mode
+        env:
+          # ── ROLLOUT SWITCH ──────────────────────────────────────────────
+          # Keep "0" (report-only) until the PR_MERGE_POLICY.md Appendix A
+          # cleanup ledger is fully ticked, then set to "1" AND add this check
+          # to the main branch-protection required status checks.
+          GATE: "0"
+          HAS_SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'ci:skip-hygiene') }}
+        run: |
+          # §9 override: the ci:skip-hygiene label disables blocking for this PR.
+          if [[ "$GATE" == "1" && "$HAS_SKIP" != "true" ]]; then
+            echo "enforce=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "enforce=0" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$HAS_SKIP" == "true" ]]; then echo "::notice::ci:skip-hygiene label present — §9 override active; record Override-Reason in the PR."; fi
+
+      - name: Run hygiene check
+        env:
+          HYGIENE_ENFORCE: ${{ steps.mode.outputs.enforce }}
+          PR_BODY: ${{ github.event.pull_request.body }}   # §2.4 declared change type
+        run: bash .github/workflows/scripts/check-pr-hygiene.sh "origin/${{ github.event.pull_request.base.ref || 'main' }}"

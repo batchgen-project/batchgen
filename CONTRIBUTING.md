@@ -28,9 +28,15 @@ To help make your contributions as smooth as possible, we've put together this g
   - The description should follow the [Pull Request Template](https://github.com/batchgen-project/batchgen/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
   - Make sure to mention any related issues.
 
-Before your pull request can be merged, it must pass the formatting, linting, and testing checks (see [Development Environment](#development-environment)).
+Before your pull request can be merged, it must pass the formatting, linting, and testing checks (see [Development Environment](#development-environment)) **and satisfy the [PR Merge Policy Contract](PR_MERGE_POLICY.md)**.
 
 ### Merge Policy
+
+> **The binding rules for what a PR's file changes must look like before merge — file
+> hygiene, diff scope, commit rules, the author checklist, the reviewer gate, CI
+> enforcement, and override authority — are in [`PR_MERGE_POLICY.md`](PR_MERGE_POLICY.md).
+> It applies identically to every contributor, agent or human. The summary below is the
+> governance part; the contract is authoritative.**
 
 To keep the `main` branch coherent and reviewed, only the project owner
 presses the **Merge** button on pull requests. Contributors with `Write`
