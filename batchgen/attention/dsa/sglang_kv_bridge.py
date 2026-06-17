@@ -197,7 +197,9 @@ class BatchGenNSAKVAdapter:
         # page_size, 128]; k_fp8 reshaped to the same shape copies byte-for-byte
         # (1 fp8 elem == 1 byte). Matches _set_k_and_s_triton_kernel K store:
         # page*BUF_NUMEL_PER_PAGE + tok*128 + arange(128) (index_buf_accessor.py:427-431).
-        k_section = buf[:, :k_bytes_per_page].view(_FP8_DTYPE)
+        k_section = buf[:, :k_bytes_per_page].view(_FP8_DTYPE).reshape(
+            num_pages, page_size, head_dim
+        )
         k_section.copy_(k_fp8.view(num_pages, page_size, head_dim))
 
         # Scale section: bytes [k_bytes_per_page : buf_numel_per_page]. View as
