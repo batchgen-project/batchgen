@@ -172,12 +172,40 @@ there, and that is the only top-level `batchgen/` edit a new model needs.
 3. **No direct commits to `main`.** Work on a branch named `<handle>/<short-description>`
    (e.g. `tairan/query-book-buffer-pool`); dispatched contributors use the dispatcher-assigned
    `<assignee>/<slug>` branch. Open a PR from that branch.
-4. **Angular commit format.** Header `<type>: <summary>`; types are
-   `build | ci | docs | feat | fix | perf | refactor | test | chore`; a body is mandatory for
-   every type except `docs` and must be ≥ 20 characters. The PR **title** follows the same
-   format.
+4. **Angular commit format.** Header `<type>(<scope>): <summary>`; `<type>` is
+   `build | ci | docs | feat | fix | perf | refactor | test | chore`; `<scope>` (optional) is a
+   subsystem (`moe`, `attention`, `kv_cache`, `scheduler`, `glm5`, …). A body is mandatory for
+   every type except `docs` and must be ≥ 20 characters. The PR **title** follows the same format.
 5. **Sync via git, never file copy.** Do not move files into any checkout of this repo with
    `scp` / `cp` / `rsync`. Use `git push` + `git pull`.
+
+### PR title & message conventions
+
+The title says the **nature** of the change (`<type>`); the **Change Type** checkbox (§2.4) says
+the **subsystem scope** and governs which paths you may touch. They are independent — set both.
+
+| Title part | Rule | Example |
+|------------|------|---------|
+| `type` | `feat` · `fix` · `perf` · `refactor` · `docs` · `test` · `build` · `ci` · `chore` | `perf` |
+| `scope` *(optional)* | subsystem or model | `(moe)` |
+| `summary` | imperative mood, lowercase start, **no trailing period**, ≤ 72 chars | `fuse grouped-gemm act-quant` |
+
+Title don'ts: no PR number in the title, no `WIP:` (use Draft state), no `Co-Authored-By` anywhere.
+
+**Body sections:** **What** (one paragraph) · **Why** (motivation; link `close #123`) · **Type of
+Change** (tick one, §2.4) · **Testing** (unit / MMLU L1–L3 / bench numbers **with commit hash**) ·
+**Checklist** (§5).
+
+**Title `type` ↔ Change Type, by example:**
+
+| Change | Title | Change Type |
+|--------|-------|-------------|
+| New model | `feat: add glm-6 model support` | `model` |
+| Kernel speedup | `perf(moe): fuse grouped-gemm act-quant` | `kernel` |
+| Scheduler bug | `fix(scheduler): fix decode batch admission` | `core` |
+| Narrow bug | `fix: handle empty prompt in tokenizer` | `fix` |
+| CI / build | `ci: add PR file-hygiene check` | `infra` |
+| Docs only | `docs: document GLM-5 FP8 setup` | `docs` |
 
 ---
 
