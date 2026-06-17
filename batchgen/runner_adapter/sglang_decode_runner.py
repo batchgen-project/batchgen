@@ -314,7 +314,11 @@ def build_decode_forward_batch(
     metadata through SGLang's ScheduleBatch path. (a) is the intended M1 route:
     the page table must be reachable from req_to_token_pool[req_pool_indices].
     """
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+        ForwardMode,
+    )
 
     input_ids = new_tokens.view(-1)
     batch_size = int(input_ids.numel())
@@ -346,6 +350,11 @@ def build_decode_forward_batch(
         attn_backend=model_runner.attn_backend,
         # Decode-only: no logprobs, no spec, no LoRA, no DP-padding metadata.
         return_logprob=False,
+        # LM head reads logits_metadata.capture_hidden_mode.need_capture()
+        # (logits_processor.py:550); init_new sets this from the ScheduleBatch
+        # (default NULL). We bypass init_new, so set it explicitly — no hidden
+        # state capture in M1 decode.
+        capture_hidden_mode=CaptureHiddenMode.NULL,
     )
 
     # dp-attention: the model's DP-gather collectives (all_gather across the DP
