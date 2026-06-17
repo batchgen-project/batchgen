@@ -375,9 +375,12 @@ def build_decode_forward_batch(
         gnt = [batch_size] * dp_size
         fb.global_num_tokens_cpu = list(gnt)
         fb.global_num_tokens_for_logprob_cpu = list(gnt)
-        fb.global_num_tokens_gpu = torch.tensor(
-            gnt, dtype=torch.int64, device=input_ids.device
-        )
+        gnt_gpu = torch.tensor(gnt, dtype=torch.int64, device=input_ids.device)
+        fb.global_num_tokens_gpu = gnt_gpu
+        # The LM head's DP-attention hidden-state gather
+        # (logits_processor.compute_dp_attention_metadata:208) does
+        # cumsum(global_num_tokens_for_logprob_gpu); init_new sets it, we don't.
+        fb.global_num_tokens_for_logprob_gpu = gnt_gpu.clone()
         fb.is_extend_in_batch = False  # decode-only: never convert to EXTEND.
         # _pad_inputs_to_size unconditionally does lora_ids.extend(...) (others
         # are None-guarded); default None -> AttributeError. No LoRA in M1.
