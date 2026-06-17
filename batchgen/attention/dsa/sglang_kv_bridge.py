@@ -210,3 +210,33 @@ class BatchGenNSAKVAdapter:
         s_section.copy_(k_scale.view(num_pages, page_size))
 
         return buf
+
+    @property
+    def device(self) -> torch.device:
+        """Device of the indexer KV cache (read by SGLang's index_buf_accessor)."""
+        k_cache, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(0)
+        return k_cache.device
+
+    def get_index_k_scale_buffer(self, layer_id: int, seq_len: int, page_indices):
+        """Per-sequence DECODE read: gather (k_fp8, k_scale) for the first
+        ``seq_len`` tokens of one sequence from its ``page_indices`` (block table).
+
+        SGLang's NSA decode calls THIS per sequence (nsa_indexer.py:521), not the
+        full-buffer ``get_index_k_with_scale_buffer``. Because our packed buffer is
+        byte-identical to SGLang's layout (Slice 0, check iv), we reuse SGLang's own
+        fused Triton gather ``GetKAndS`` on it — guaranteeing the exact decode read
+        semantics.
+
+        Returns:
+            (k_fp8 ``(seq_len, index_head_dim)`` uint8, k_scale ``(seq_len, 4)`` uint8).
+
+        TODO(perf): ``get_index_k_with_scale_buffer`` re-quantizes the whole layer
+        cache on each call; memoize per (layer, decode-step) — fine for M1 correctness
+        but this is the dominant per-step cost (design (4)).
+        """
+        from sglang.srt.layers.attention.nsa import index_buf_accessor
+
+        buf = self.get_index_k_with_scale_buffer(layer_id)
+        return index_buf_accessor.GetKAndS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
