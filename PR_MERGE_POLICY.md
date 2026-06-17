@@ -193,8 +193,11 @@ the **subsystem scope** and governs which paths you may touch. They are independ
 Title don'ts: no PR number in the title, no `WIP:` (use Draft state), no `Co-Authored-By` anywhere.
 
 **Body sections:** **What** (one paragraph) · **Why** (motivation; link `close #123`) · **Type of
-Change** (tick one, §2.4) · **Testing** (unit / MMLU L1–L3 / bench numbers **with commit hash**) ·
-**Checklist** (§5).
+Change** (tick one, §2.4) · **Checklist** (§5). **Test execution is owned by the PR CI**
+(maintainer-triggered GPU / MMLU run via the `ci:run` label) — its accuracy levels, baselines, and
+harness are internal core-team infrastructure. Do **not** paste test commands, accuracy tables, or
+benchmark logs into the PR body; the green CI check is the record. (Author-side unit tests still
+belong under `tests/` — see the §5 checklist.)
 
 **Title `type` ↔ Change Type, by example:**
 
