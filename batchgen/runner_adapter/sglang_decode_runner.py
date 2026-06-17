@@ -370,6 +370,9 @@ def build_decode_forward_batch(
             gnt, dtype=torch.int64, device=input_ids.device
         )
         fb.is_extend_in_batch = False  # decode-only: never convert to EXTEND.
+        # _pad_inputs_to_size unconditionally does lora_ids.extend(...) (others
+        # are None-guarded); default None -> AttributeError. No LoRA in M1.
+        fb.lora_ids = [None] * batch_size
         fb.prepare_mlp_sync_batch(model_runner)
 
     # TODO(verify-on-gpu): the NSA backend pulls the page table from its own
