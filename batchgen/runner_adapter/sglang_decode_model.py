@@ -53,12 +53,19 @@ class SGLangDecodeModel(nn.Module):
     def _ensure_adapter(self):
         if self._adapter_injected:
             return
-        primary = getattr(self._core_engine, "gpu_paged_kv_manager", None)
-        aux = getattr(self._core_engine, "gpu_paged_kv_manager_aux", None)
+        # The worker binds the live decode KV managers onto AttnWrapperBase before
+        # every decode forward (gpu_paged_kv_manager = primary/MLA,
+        # gpu_paged_kv_manager_aux = indexer) — the same source the native GLM-5
+        # decode reads (wrappers.py:817-818). core_engine.gpu_paged_kv_manager is
+        # not populated in this build, so read from AttnWrapperBase.
+        from batchgen.models.wrappers import AttnWrapperBase
+
+        primary = getattr(AttnWrapperBase, "gpu_paged_kv_manager", None)
+        aux = getattr(AttnWrapperBase, "gpu_paged_kv_manager_aux", None)
         if primary is None or aux is None:
             raise RuntimeError(
-                "SGLangDecodeModel: BatchGen GPU KV managers not ready "
-                "(gpu_paged_kv_manager{,_aux} missing on core_engine)."
+                "SGLangDecodeModel: AttnWrapperBase KV managers not bound "
+                "(gpu_paged_kv_manager{,_aux} None at first decode forward)."
             )
         inject_kv_adapter(self._runner, primary, aux)
         self._adapter_injected = True
