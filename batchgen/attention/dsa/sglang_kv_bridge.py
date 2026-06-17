@@ -217,6 +217,59 @@ class BatchGenNSAKVAdapter:
         k_cache, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(0)
         return k_cache.device
 
+    # ------------------------------------------------------------------ #
+    # WRITE PATH. In approach (A) SGLang drives the decode forward, so it
+    # computes AND writes each decode token's KV (BatchGen's native decode
+    # write path is replaced — single writer per phase: BatchGen prefill, then
+    # SGLang decode). These mirror the NSA pool's set_* methods, writing through
+    # the same zero-copy views the read path exposes so writes persist into
+    # BatchGen's paged caches for the next decode step.
+    # ------------------------------------------------------------------ #
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v=None, *args, **kwargs):
+        """Write decode-token primary MLA K into BatchGen's BF16 cache at ``loc``.
+
+        SGLang's ``MLATokenToKVPool.set_kv_buffer`` does ``kv_buffer[loc] = cache_k``.
+        ``get_key_buffer`` is a zero-copy ``[N,1,576]`` view of BatchGen's primary
+        cache, so writing through it persists into BatchGen KV. MLA stores only K;
+        ``cache_v`` is ignored.
+        """
+        kbuf = self.get_key_buffer(layer.layer_id)  # [N, 1, 576] BF16 view.
+        kbuf[loc] = cache_k.reshape(loc.numel(), *kbuf.shape[1:]).to(kbuf.dtype)
+
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, *args, **kwargs):
+        """Write MLA K given separate (nope[512], rope[64]) -> 576 at ``loc``."""
+        kbuf = self.get_key_buffer(layer.layer_id)
+        cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+        kbuf[loc] = cache_k.reshape(loc.numel(), *kbuf.shape[1:]).to(kbuf.dtype)
+
+    def set_index_k_scale_buffer(self, layer_id, loc, index_k, index_k_scale):
+        """Write decode-token indexer K into BatchGen's BF16 aux cache at ``loc``.
+
+        SGLang computes the indexer K as FP8 e4m3 + per-token fp32 scale
+        (nsa_indexer.py:1047, act_quant). BatchGen stores indexer K as BF16, so
+        dequantize (fp8 * scale) -> BF16 and write at the token locations. The
+        read path re-quantizes BF16 -> FP8, so decode tokens round-trip through
+        e4m3 (the lightning indexer is approximate; topk tolerates the step).
+
+        TODO(real-run perf): this round-trip + the read-path re-quant per step is
+        the dominant decode cost (design (4)). The eventual design materializes an
+        adapter-owned FP8 buffer once at decode start and has SGLang read/write it
+        directly; M1 prioritizes correctness.
+        """
+        aux_k, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
+            layer_id
+        )
+        num_pages, page_size, _num_heads, head_dim = aux_k.shape
+        aux_flat = aux_k.reshape(num_pages * page_size, head_dim)
+        index_k_fp8 = (
+            index_k if index_k.dtype == _FP8_DTYPE else index_k.view(_FP8_DTYPE)
+        )
+        deq = (
+            index_k_fp8.to(torch.float32)
+            * index_k_scale.to(torch.float32).reshape(-1, 1)
+        ).to(aux_flat.dtype)
+        aux_flat[loc] = deq.reshape(loc.numel(), head_dim)
+
     def get_index_k_scale_buffer(self, layer_id: int, seq_len: int, page_indices):
         """Per-sequence DECODE read: gather (k_fp8, k_scale) for the first
         ``seq_len`` tokens of one sequence from its ``page_indices`` (block table).
