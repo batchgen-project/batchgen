@@ -55,13 +55,16 @@ the gate only fails on newly-added lines/files.)
 2. **Tests interleaved in the runtime package.** No new `test_*.py` under the production
    packages. Tests live in the repository's `tests/` tree.
 3. **Server-side env-var debug guards.** Do not add `os.environ.get("BATCHGEN_…")` /
-   `os.getenv("BATCHGEN_…")` guards to gate debug or diagnostic behavior in production code.
-   Represent debug behavior as a batch-level `/v1/batches` `batchgen_debug` flag so it can be
-   toggled per job without a server restart. (The only sanctioned env-flag module is
-   `batchgen/timing.py`.)
-4. **Raw `print()` and `logging.debug()` left in production paths** (decode, prefill,
-   tokenize, MoE, attention, scheduler, server loops). If a message is genuinely needed, use a
-   named logger guarded so it fires at most once (see the `warning_once` pattern in §3.4).
+   `os.getenv("BATCHGEN_…")` guards to gate debug or diagnostic behavior in production code;
+   represent debug behavior as a batch-level `/v1/batches` `batchgen_debug` flag (togglable per
+   job, no restart). Any env-guard added while developing **must be removed before the PR is
+   merged**. A genuinely-needed **new environment variable** is a deliberate config change —
+   introduce it in its **own dedicated PR**, never bundled into a feature/fix. (The only
+   sanctioned env-flag module is `batchgen/timing.py`.)
+4. **Raw `print()` left in production paths** (decode, prefill, tokenize, MoE, attention,
+   scheduler, server loops) — use a named logger instead. `logging.getLogger(__name__).debug(...)`
+   is fine; it is a gated logger, not stray output. Remove any `print()` debugging before the PR
+   merges.
 5. **Commented-out / dead code** introduced by the change (e.g. `# print(request)`). Delete it
    instead of commenting it out.
 6. **Generated artifacts.** No `*.log`, profiler traces (`*.nsys-rep`, `*.ncu-rep`,
@@ -192,8 +195,10 @@ the **subsystem scope** and governs which paths you may touch. They are independ
 
 Title don'ts: no PR number in the title, no `WIP:` (use Draft state), no `Co-Authored-By` anywhere.
 
-**Body sections:** **What** (one paragraph) · **Why** (motivation; link `close #123`) · **Type of
-Change** (tick one, §2.4) · **Checklist** (§5). **Test execution is owned by the PR CI**
+**Body sections:** **What** (one paragraph) · **Why** (motivation; link `close #123`) · **Milestone**
+*(optional)* · **Type of Change** (tick one, §2.4) · **File changes** (one row per changed/intended
+file with a Δ and a note, so scope can be audited against §2.5 at the **draft** stage — before the
+diff exists) · **Checklist** (§5). **Test execution is owned by the PR CI**
 (maintainer-triggered GPU / MMLU run via the `ci:run` label) — its accuracy levels, baselines, and
 harness are internal core-team infrastructure. Do **not** paste test commands, accuracy tables, or
 benchmark logs into the PR body; the green CI check is the record. (Author-side unit tests still
@@ -222,8 +227,8 @@ Run this before marking a PR **Ready for review**. It is reproduced in
 - [ ] **Change type** declared in the PR template; all changed files are within that type's permitted set (§2.5) — no scaffolding edits in a `model`/`kernel` PR (§2.6).
 - [ ] No `debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or root (§1.1). (`bench_*` is allowed.)
 - [ ] No `test_*.py` added inside the runtime package; tests are under `tests/` (§1.2, §2.1).
-- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3).
-- [ ] No leftover `print()`, `logging.debug()`, or commented-out code in the changed files (§1.4–§1.5).
+- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3). A genuinely-needed new env var goes in its own PR.
+- [ ] No leftover `print()` or commented-out code in the changed files (§1.4–§1.5). (`logging.debug()` is fine.)
 - [ ] No logs, profiler traces, CSVs, checkpoints, wheels, or compiled artifacts staged; nothing added with `-f` (§1.6).
 - [ ] Touched modules' `MODULE.md` updated if the public API changed (§2.2).
 - [ ] One concern only; diff is surgical (§3).
