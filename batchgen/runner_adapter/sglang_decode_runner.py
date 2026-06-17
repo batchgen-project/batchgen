@@ -348,6 +348,30 @@ def build_decode_forward_batch(
         return_logprob=False,
     )
 
+    # dp-attention: the model's DP-gather collectives (all_gather across the DP
+    # ranks, sized by per-rank token counts) need the DP buffer state set before
+    # forward, or vocab_parallel_embedding -> is_dp_max_padding() trips
+    # AttributeError on _DpGatheredBufferWrapper._dp_max_padding. SGLang's
+    # scheduler does this via maybe_prepare_mlp_sync_batch (scheduler.py:1932);
+    # we bypass the scheduler, so set global_num_tokens + call
+    # ForwardBatch.prepare_mlp_sync_batch (forward_batch_info.py:734) ourselves.
+    if getattr(model_runner.server_args, "enable_dp_attention", False):
+        dp_size = model_runner.server_args.dp_size
+        # SMOKE / uniform decode: every DP rank carries `batch_size` decode
+        # tokens, so all ranks agree on global_num_tokens -> the DP all_gather is
+        # fixed-size and cannot hang.
+        # TODO(real-run): ranks can differ; the BatchGen worker must supply the
+        # DP all-gathered per-rank counts (it is SPMD and knows each rank's batch
+        # via its own scheduler), mirroring scheduler_dp_attn_mixin's gather.
+        gnt = [batch_size] * dp_size
+        fb.global_num_tokens_cpu = list(gnt)
+        fb.global_num_tokens_for_logprob_cpu = list(gnt)
+        fb.global_num_tokens_gpu = torch.tensor(
+            gnt, dtype=torch.int64, device=input_ids.device
+        )
+        fb.is_extend_in_batch = False  # decode-only: never convert to EXTEND.
+        fb.prepare_mlp_sync_batch(model_runner)
+
     # TODO(verify-on-gpu): the NSA backend pulls the page table from its own
     # metadata, which it builds in attn_backend.init_forward_metadata(fb). For
     # the page-gather decode read path (nsa_indexer.py:521
