@@ -126,6 +126,13 @@ def _build_decode_server_args(
         disable_radix_cache=True,
         disable_cuda_graph=True,
         trust_remote_code=True,
+        # Explicit: SGLang's default auto-sizes to ~0.46 which is too low for the
+        # GLM-5-FP8 weights (RuntimeError "increase mem_fraction_static"). The S0
+        # standalone server proved 0.82 fits weights+KV+activations on 2-node dp16.
+        # TODO(verify-on-gpu): for the real parity run, BOTH BatchGen's prefill
+        # model AND SGLang's decode weights are resident — may need to lower this
+        # (or free BatchGen's decode model) to avoid OOM (design R4).
+        mem_fraction_static=0.82,
     )
     # TODO(verify-on-gpu): ServerArgs.__post_init__ rewrites several of these
     # (page_size auto-handling at server_args.py:738, attention-backend
