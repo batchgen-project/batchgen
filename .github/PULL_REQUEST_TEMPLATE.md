@@ -37,8 +37,8 @@ If it fixes an issue, link it (e.g., `close #123`).
 - [ ] **File changes** table lists every changed file and matches the diff (audit-able at draft; kept current).
 - [ ] No `debug_* / check_* / scratch_* / tmp_*` scripts added to a production package or repo root (§1.1). (`bench_*` is allowed.)
 - [ ] No `test_*.py` added inside the runtime package; tests are under `tests/` (§1.2, §2.1).
-- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3).
-- [ ] No leftover `print()`, `logging.debug()`, or commented-out code in the changed files (§1.4–§1.5).
+- [ ] No new `BATCHGEN_*` env-var debug guard; debug behavior is a `batchgen_debug` batch flag (§1.3). A genuinely-needed new env var goes in its own PR.
+- [ ] No leftover `print()` or commented-out code in the changed files (§1.4–§1.5). (`logging.debug()` is fine.)
 - [ ] No logs, profiler traces, CSVs, checkpoints, wheels, or compiled artifacts staged; nothing added with `-f` (§1.6).
 - [ ] Touched modules' `MODULE.md` updated if the public API changed (§2.2).
 - [ ] One concern only; diff is surgical (§3).
