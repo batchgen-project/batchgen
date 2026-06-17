@@ -3,10 +3,9 @@
 #  BatchGen Dependency Installation Script                                      #
 #  Copyright (c) EfficientMoE team 2025                                         #
 #                                                                               #
-#  This script installs the required dependencies for BatchGen on Hopper GPUs:  #
-#  - flash-attention 3 (Hopper optimized)                                       #
-#  - FlashMLA                                                                   #
-#  - DeepGEMM                                                                   #
+#  Supports Hopper (SM90) and Blackwell (SM100/B200) GPUs:                      #
+#  Hopper:    flash-attention 3, FlashMLA, DeepGEMM                             #
+#  Blackwell: flash-attention 4 (CuTeDSL/JIT), FlashMLA (SM100), DeepGEMM      #
 # ---------------------------------------------------------------------------- #
 
 set -e  # Exit on error
@@ -98,11 +97,13 @@ check_prerequisites() {
 check_gpu_arch() {
     print_step "Detecting GPU architecture..."
 
-    GPU_ARCH=$(python -c "
+    GPU_GENERATION=$(python -c "
 import torch
 if torch.cuda.is_available():
     major, minor = torch.cuda.get_device_capability()
-    if major >= 9:
+    if major >= 10:
+        print('blackwell')
+    elif major >= 9:
         print('hopper')
     elif major >= 8:
         print('ampere')
@@ -112,19 +113,25 @@ else:
     print('no_gpu')
 " 2>/dev/null || echo "unknown")
 
-    if [[ "$GPU_ARCH" == "hopper" ]]; then
-        print_success "Hopper GPU detected (SM90+)"
-        return 0
-    elif [[ "$GPU_ARCH" == "ampere" ]]; then
-        print_warning "Ampere GPU detected. Hopper-specific optimizations will be skipped."
-        return 1
-    elif [[ "$GPU_ARCH" == "no_gpu" ]]; then
-        print_warning "No GPU detected. Installing dependencies anyway (for CPU-only builds)."
-        return 0
-    else
-        print_warning "Could not detect GPU architecture. Assuming Hopper."
-        return 0
-    fi
+    case "$GPU_GENERATION" in
+        blackwell)
+            print_success "Blackwell GPU detected (SM100+) — will use FA4 + FlashMLA SM100 + DeepGEMM"
+            ;;
+        hopper)
+            print_success "Hopper GPU detected (SM90)"
+            ;;
+        ampere)
+            print_warning "Ampere GPU detected. Hopper/Blackwell-specific optimizations will be skipped."
+            ;;
+        no_gpu)
+            print_warning "No GPU detected. Installing dependencies anyway (for CPU-only builds)."
+            GPU_GENERATION="hopper"  # default to Hopper path for CI/CPU boxes
+            ;;
+        *)
+            print_warning "Could not detect GPU architecture. Assuming Hopper."
+            GPU_GENERATION="hopper"
+            ;;
+    esac
 }
 
 install_torch() {
@@ -175,6 +182,21 @@ install_flash_attention() {
     FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 
     print_success "flash-attention 3 installed"
+}
+
+install_flash_attention_4() {
+    print_step "Installing flash-attention 4 (Blackwell/CuTeDSL JIT)..."
+
+    if python -c "from flash_attn.cute import flash_attn_func" &>/dev/null 2>&1; then
+        print_success "flash-attention 4 already installed"
+        return 0
+    fi
+
+    pip install flash-attn-4 \
+        "nvidia-cutlass-dsl>=4.4.2" quack-kernels torch-c-dlpack-ext cuda-python \
+        --extra-index-url https://pypi.nvidia.com --no-build-isolation
+
+    print_success "flash-attention 4 installed"
 }
 
 install_flashmla() {
@@ -278,13 +300,14 @@ show_help() {
     echo "  --flashmla        Install FlashMLA only"
     echo "  --deepgemm        Install DeepGEMM only"
     echo "  --batchgen        Install BatchGen only"
-    echo "  --wheel-dir DIR   Use pre-built wheels for flash-attn/FlashMLA/DeepGEMM"
+    echo "  --wheel-dir DIR   Use pre-built wheels for FA3/FA4/FlashMLA/DeepGEMM (auto-detects arch)"
     echo "  --skip-gpu-check  Skip GPU architecture detection"
     echo "  --keep-build      Keep build directory after installation"
     echo "  --help            Show this help message"
     echo ""
     echo "Environment Variables:"
     echo "  BATCHGEN_INSTALL_DIR  Directory for cloning repos (default: /tmp/batchgen_deps)"
+    echo "  WHEEL_DIR             Pre-built wheel directory (same as --wheel-dir)"
     echo "  KEEP_BUILD_DIR        Set to 1 to keep build directory"
     echo ""
     echo "Examples:"
@@ -307,7 +330,7 @@ main() {
     INSTALL_DEEPGEMM=0
     INSTALL_BATCHGEN=0
     SKIP_GPU_CHECK=0
-    WHEEL_DIR=""
+    WHEEL_DIR="${WHEEL_DIR:-}"  # honour env var; overridden by --wheel-dir
 
     if [[ $# -eq 0 ]]; then
         INSTALL_ALL=1
@@ -366,15 +389,17 @@ main() {
     install_torch
 
     # Check GPU architecture
+    GPU_GENERATION="hopper"  # default
     IS_HOPPER=0
+    IS_BLACKWELL=0
     if [[ $SKIP_GPU_CHECK -eq 0 ]]; then
-        if check_gpu_arch; then
-            IS_HOPPER=1
-        fi
+        check_gpu_arch  # sets GPU_GENERATION
     else
-        IS_HOPPER=1
         print_warning "GPU check skipped, assuming Hopper architecture"
+        GPU_GENERATION="hopper"
     fi
+    [[ "$GPU_GENERATION" == "hopper"    ]] && IS_HOPPER=1
+    [[ "$GPU_GENERATION" == "blackwell" ]] && IS_BLACKWELL=1
 
     # Install dependencies based on options
     if [[ $INSTALL_ALL -eq 1 ]]; then
@@ -394,9 +419,26 @@ main() {
                 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
                 print_success "PyTorch reinstalled"
             fi
+        elif [[ $IS_BLACKWELL -eq 1 ]]; then
+            if [[ -n "$WHEEL_DIR" && -d "$WHEEL_DIR" ]]; then
+                print_step "Installing Blackwell dependencies from pre-built wheels: $WHEEL_DIR"
+                for whl in "$WHEEL_DIR"/*.whl; do
+                    [[ -f "$whl" ]] || continue
+                    pip install "$whl" --no-deps \
+                      || { SITE=$(python -c "import site; print(site.getsitepackages()[0])"); unzip -oq "$whl" -d "$SITE/"; }
+                done
+                # FA4 runtime deps (pure-Python, not in wheel cache)
+                pip install "nvidia-cutlass-dsl>=4.4.2" quack-kernels torch-c-dlpack-ext cuda-python \
+                    --extra-index-url https://pypi.nvidia.com -q
+                print_success "Blackwell dependencies installed from wheels"
+            else
+                install_flash_attention_4
+                install_flashmla
+                install_deepgemm
+            fi
         else
-            print_warning "Skipping Hopper-specific dependencies (non-Hopper GPU detected)"
-            print_warning "Use --skip-gpu-check to force installation"
+            print_warning "Skipping GPU-specific dependencies (Ampere or unknown GPU detected)"
+            print_warning "Use --skip-gpu-check to force Hopper installation"
         fi
         install_batchgen_kernels
         install_batchgen
