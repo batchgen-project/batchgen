@@ -101,6 +101,7 @@ def _build_decode_server_args(
     dp_size: int,
     nnodes: int,
     node_rank: int,
+    mem_fraction_static: float,
 ):
     """Map BatchGen's runtime config to a decode-only SGLang ``ServerArgs``.
 
@@ -126,13 +127,13 @@ def _build_decode_server_args(
         disable_radix_cache=True,
         disable_cuda_graph=True,
         trust_remote_code=True,
-        # Explicit: SGLang's default auto-sizes to ~0.46 which is too low for the
-        # GLM-5-FP8 weights (RuntimeError "increase mem_fraction_static"). The S0
-        # standalone server proved 0.82 fits weights+KV+activations on 2-node dp16.
-        # TODO(verify-on-gpu): for the real parity run, BOTH BatchGen's prefill
-        # model AND SGLang's decode weights are resident — may need to lower this
-        # (or free BatchGen's decode model) to avoid OOM (design R4).
-        mem_fraction_static=0.82,
+        # SGLang's default auto-sizes to ~0.46 (too low for GLM-5-FP8 weights ->
+        # RuntimeError "increase mem_fraction_static"). Smoke proved 0.82 fits. The
+        # in-worker path passes a LOWER value (~0.62, just above weights/total) so
+        # SGLang's auto NSA pool is minimal and BatchGen's own paged KV (which the
+        # adapter wraps) gets the remaining HBM — BatchGen is the sole decode model
+        # resident (its native decode model is skipped, design R4).
+        mem_fraction_static=mem_fraction_static,
     )
     # TODO(verify-on-gpu): ServerArgs.__post_init__ rewrites several of these
     # (page_size auto-handling at server_args.py:738, attention-backend
@@ -149,13 +150,14 @@ def build_sglang_decode_runner(
     global_rank: int,
     local_rank: int,
     dist_init_addr: str,
-    primary_kv_mgr,
-    aux_kv_mgr,
+    primary_kv_mgr=None,
+    aux_kv_mgr=None,
     padding_bsz: Optional[int] = None,
     *,
     dp_size: Optional[int] = None,
     nnodes: int = 2,
     node_rank: int = 0,
+    mem_fraction_static: float = 0.82,
 ):
     """Construct a decode-only SGLang ModelRunner wired to BatchGen's KV.
 
@@ -206,6 +208,7 @@ def build_sglang_decode_runner(
         dp_size=dp_size,
         nnodes=nnodes,
         node_rank=node_rank,
+        mem_fraction_static=mem_fraction_static,
     )
 
     model_config = ModelConfig.from_server_args(server_args)
@@ -242,24 +245,38 @@ def build_sglang_decode_runner(
         server_args=server_args,
     )
 
-    # 3) Inject the read-adapter as the KV pool. ForwardBatch.init_new copies
-    #    model_runner.token_to_kv_pool into the batch (forward_batch_info.py:413),
-    #    and NSA reads K via forward_batch.token_to_kv_pool.* — so replacing the
-    #    pool here is sufficient; the auto-created pool is discarded.
+    # 3) Inject the read-adapter as the KV pool (if the KV managers are ready).
+    #    The in-worker path builds the runner BEFORE BatchGen's GPU KV managers
+    #    exist (they size from free HBM after the runner's weights load), so it
+    #    passes primary/aux=None here and calls inject_kv_adapter() later. The
+    #    standalone smoke passes them now. ForwardBatch.init_new / our
+    #    build_decode_forward_batch reads K via forward_batch.token_to_kv_pool.*,
+    #    so replacing the pool is sufficient; the auto-created pool is discarded.
+    if primary_kv_mgr is not None and aux_kv_mgr is not None:
+        inject_kv_adapter(
+            model_runner,
+            primary_kv_mgr,
+            aux_kv_mgr,
+            layer_num=getattr(model_config, "num_hidden_layers", None),
+        )
+
+    return model_runner
+
+
+def inject_kv_adapter(model_runner, primary_kv_mgr, aux_kv_mgr, layer_num=None):
+    """Replace ``model_runner.token_to_kv_pool`` with a BatchGenNSAKVAdapter.
+
+    Called after BatchGen's primary (MLA) + auxiliary (indexer) GPU paged KV
+    managers exist. Idempotent-ish: overwrites whatever pool is currently set.
+    """
     adapter = BatchGenNSAKVAdapter(
         gpu_paged_kv_manager=primary_kv_mgr,
         gpu_paged_kv_manager_aux=aux_kv_mgr,
         page_size=_PAGE_SIZE,
-        layer_num=getattr(model_config, "num_hidden_layers", None),
+        layer_num=layer_num,
     )
     model_runner.token_to_kv_pool = adapter
-    # TODO(verify-on-gpu): does anything downstream read
-    # model_runner.token_to_kv_pool_allocator (vs .token_to_kv_pool) at decode
-    # time? Per SGL_RUNNER_API the allocator is only consulted in
-    # init_memory_pool; if a backend re-derives the pool from the allocator at
-    # forward time, also set model_runner.token_to_kv_pool_allocator to a shim.
-
-    return model_runner
+    return adapter
 
 
 def build_decode_forward_batch(

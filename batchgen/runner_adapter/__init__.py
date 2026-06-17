@@ -15,9 +15,11 @@ from __future__ import annotations
 from batchgen.runner_adapter.sglang_decode_runner import (
     build_decode_forward_batch,
     build_sglang_decode_runner,
+    inject_kv_adapter,
 )
 
 __all__ = [
     "build_sglang_decode_runner",
     "build_decode_forward_batch",
+    "inject_kv_adapter",
 ]
