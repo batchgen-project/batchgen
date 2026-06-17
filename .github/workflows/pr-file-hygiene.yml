@@ -42,7 +42,7 @@ jobs:
           else
             echo "enforce=0" >> "$GITHUB_OUTPUT"
           fi
-          [[ "$HAS_SKIP" == "true" ]] && echo "::notice::ci:skip-hygiene label present — §9 override active; record Override-Reason in the PR."
+          if [[ "$HAS_SKIP" == "true" ]]; then echo "::notice::ci:skip-hygiene label present — §9 override active; record Override-Reason in the PR."; fi
 
       - name: Run hygiene check
         env:
