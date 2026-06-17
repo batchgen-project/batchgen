@@ -67,9 +67,10 @@ for f in ${ADDED[@]+"${ADDED[@]}"}; do
   base="$(basename "$f")"
   in_prod=0; [[ "$f" =~ $PROD_RE || "$f" != */* ]] && in_prod=1
 
-  # H1: scratch / bench / debug / check scripts in a production package or repo root.
-  if [[ $in_prod -eq 1 && "$base" =~ ^(bench_|debug_|check_|scratch_|tmp_).*\.py$ || "$base" =~ _scratch\.py$ && $in_prod -eq 1 ]]; then
-    block "§1.1 scratch/bench/debug script in production tree: $f"
+  # H1: throwaway scratch / debug / check scripts in a production package or repo root.
+  # bench_* is intentionally NOT here — benchmarks may live alongside the kernels (§1.1).
+  if [[ $in_prod -eq 1 && "$base" =~ ^(debug_|check_|scratch_|tmp_).*\.py$ || "$base" =~ _scratch\.py$ && $in_prod -eq 1 ]]; then
+    block "§1.1 throwaway scratch/debug script in production tree: $f"
     continue
   fi
   # H2: test_*.py interleaved in the runtime package (tests belong in tests/).
