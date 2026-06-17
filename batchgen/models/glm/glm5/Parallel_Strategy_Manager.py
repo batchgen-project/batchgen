@@ -161,6 +161,17 @@ class GLM5ParallelStrategyManager:
 
     def configure_decoding(self, padding_bsz=None, comm=None):
         """Configure model for decode: DP + EP."""
+        # Runtime-peel (M1): when BATCHGEN_RUNTIME=sglang, decode runs through a
+        # decode-only SGLang ModelRunner that reads BatchGen's KV via an adapter.
+        # The native BatchGen decode model is NOT built (R4: can't hold both weight
+        # sets). self.model becomes a drop-in SGLangDecodeModel the worker drives
+        # via its generic self.model(...) decode call — no worker changes.
+        self._use_sglang_decode = (
+            os.getenv("BATCHGEN_RUNTIME", "native").lower() == "sglang"
+        )
+        if self._use_sglang_decode:
+            return self._configure_decoding_sglang(padding_bsz=padding_bsz)
+
         self.loaded_model_config.phase = "decode"
         self.loaded_model_config._attn_implementation = "eager"
         self.model = None
@@ -271,7 +282,57 @@ class GLM5ParallelStrategyManager:
 
         return self.model, self.weight_copy_task
 
+    def _configure_decoding_sglang(self, padding_bsz=None):
+        """Runtime-peel decode: build a decode-only SGLang ModelRunner + wrap it.
+
+        Skips the native BatchGen decode model entirely (only SGLang's weights are
+        resident; BatchGen's paged KV — which the adapter wraps — sizes from the
+        remaining HBM in the worker's _init_gpu_kv_with_actual_size). The KV
+        managers do not exist yet here, so the adapter is injected lazily on the
+        first decode forward (SGLangDecodeModel._ensure_adapter).
+        """
+        from batchgen.runner_adapter import build_sglang_decode_runner
+        from batchgen.runner_adapter.sglang_decode_model import SGLangDecodeModel
+
+        self.loaded_model_config.phase = "decode"
+        self.model = None
+        torch.cuda.empty_cache()
+
+        # 8 GPUs/node on H20 -> derive topology from ranks (no worker plumbing).
+        local_world = max(1, torch.cuda.device_count())
+        nnodes = max(1, self.world_size // local_world)
+        node_rank = self.global_rank // local_world
+        # Low mem_fraction so SGLang's auto NSA pool (shadowed by the adapter) is
+        # minimal and BatchGen's own paged KV gets the remaining HBM.
+        mem_frac = float(os.getenv("BATCHGEN_SGLANG_MEM_FRACTION", "0.62"))
+        # dist_init_addr is inert (SGLang adopts BatchGen's already-initialized PG);
+        # overridable for traceability.
+        dist_addr = os.getenv("BATCHGEN_SGLANG_DIST_ADDR", "127.0.0.1:30000")
+
+        runner = build_sglang_decode_runner(
+            loaded_model_config=self.loaded_model_config,
+            world_size=self.world_size,
+            global_rank=self.global_rank,
+            local_rank=self.local_rank,
+            dist_init_addr=dist_addr,
+            dp_size=self.world_size,
+            nnodes=nnodes,
+            node_rank=node_rank,
+            mem_fraction_static=mem_frac,
+        )
+        self.model = SGLangDecodeModel(runner, self.core_engine)
+        self.weight_copy_task = {"attn": [], "routed_expert": [], "shared_expert": []}
+        if self.rank == 0:
+            logging.info(
+                "[DECODE] runtime-peel: SGLang decode runner built "
+                f"(nnodes={nnodes}, node_rank={node_rank}, mem_frac={mem_frac}); "
+                "native BatchGen decode model skipped"
+            )
+        return self.model, self.weight_copy_task
+
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
+        if getattr(self, "_use_sglang_decode", False):
+            return  # SGLang owns MoE; no BatchGen 3D-MoE padding to configure.
         for layer_idx in range(self.FIRST_K_DENSE, self.model_config.num_hidden_layers):
             layer = self.model.model.layers[layer_idx].mlp
             if hasattr(layer, "set_num_tokens_per_rank"):
@@ -286,6 +347,8 @@ class GLM5ParallelStrategyManager:
         active batch has mixed real/padded rows, so the 3D-MoE path can
         mask topk_idx for padded positions before dispatch_scatter_3d.
         """
+        if getattr(self, "_use_sglang_decode", False):
+            return  # SGLang owns MoE; BatchGen 3D-MoE padding mask unused.
         from .model import Glm5MoE
         Glm5MoE._rank_token_counts = counts
 

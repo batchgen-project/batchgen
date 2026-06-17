@@ -1,0 +1,125 @@
+"""M1 runtime-peel — SGLang-backed decode model (PSM-level drop-in).
+
+BatchGen's PSM `configure_decoding` returns `self.model`, and the worker drives
+decode generically:
+
+    outputs = self.model(new_tokens, attention_mask=..., position_ids=..., use_cache=False)
+    next = self._select_tokens(outputs.logits[:, -1, :], ...)
+
+`SGLangDecodeModel` is a drop-in for that `self.model` whose forward routes to a
+decode-only SGLang `ModelRunner` reading BatchGen's KV via `BatchGenNSAKVAdapter`.
+The native decode model is NOT built when the sglang backend is on (R4: can't hold
+both weight sets). The worker is untouched — it just calls `self.model(...)`.
+
+Decode state is read off `AttnWrapperBase` (the worker binds it every step, model-
+agnostically, at `_bind_decode_attention_metadata`) + the GPU paged KV managers:
+  cache_seqlens [B] int32, gpu_paged_kv_manager{,_aux}, position_ids [B,1].
+The page table `gpu_table` ([num_slots, max_pages] physical page indices) is
+batch/slot-ordered after the worker's `rebuild_page_table`, so batch row i == slot i.
+
+Off-by-one (matches BatchGen's convention): cache_seqlens ≡ SGLang seq_lens;
+positions = cache_seqlens-1 (the input token's position); the input token's KV is
+written at the slot for position cache_seqlens-1.
+
+Page-table bridge (load-bearing): SGLang's NSA backend reads the block table as
+`req_to_token_pool.req_to_token[req_pool_indices, :seqlen]` (flat token locs), NOT
+ForwardBatch.page_table. So per step we populate req_to_token[slot, t] =
+gpu_table[slot, t//page]*page + t%page.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import torch
+import torch.nn as nn
+
+from batchgen.runner_adapter.sglang_decode_runner import (
+    build_decode_forward_batch,
+    inject_kv_adapter,
+)
+
+_PAGE = 64
+
+
+class SGLangDecodeModel(nn.Module):
+    """Decode-only GLM-5 model backed by an SGLang ModelRunner."""
+
+    def __init__(self, runner, core_engine):
+        super().__init__()
+        self._runner = runner
+        self._core_engine = core_engine
+        self._adapter_injected = False
+
+    def _ensure_adapter(self):
+        if self._adapter_injected:
+            return
+        primary = getattr(self._core_engine, "gpu_paged_kv_manager", None)
+        aux = getattr(self._core_engine, "gpu_paged_kv_manager_aux", None)
+        if primary is None or aux is None:
+            raise RuntimeError(
+                "SGLangDecodeModel: BatchGen GPU KV managers not ready "
+                "(gpu_paged_kv_manager{,_aux} missing on core_engine)."
+            )
+        inject_kv_adapter(self._runner, primary, aux)
+        self._adapter_injected = True
+
+    def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
+        from batchgen.models.wrappers import AttnWrapperBase
+
+        self._ensure_adapter()
+        input_ids = input_ids.view(-1)
+        dev = input_ids.device
+
+        cache_seqlens = AttnWrapperBase.cache_seqlens.view(-1).to(torch.int32)  # [B]
+        batch_size = int(cache_seqlens.numel())
+        primary = AttnWrapperBase.gpu_paged_kv_manager
+        # gpu_table: [num_slots, max_pages] physical page indices, batch/slot order.
+        _, _, gpu_table = primary.get_layer_kv_with_page_table(0)
+        page_table = gpu_table[:batch_size].to(torch.int32)                    # [B, max_pages]
+        req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=dev)
+
+        # positions = cache_seqlens - 1 (the input token's position).
+        if position_ids is not None:
+            positions = position_ids.view(-1).to(torch.int64)
+        else:
+            positions = cache_seqlens.to(torch.int64) - 1
+
+        # out_cache_loc = write slot for position (ctx-1) = phys_page*64 + offset.
+        pos = cache_seqlens.to(torch.int64) - 1                                # [B]
+        page_col = (pos // _PAGE).view(batch_size, 1)
+        phys = page_table.to(torch.int64).gather(1, page_col).view(batch_size)
+        out_cache_loc = phys * _PAGE + (pos % _PAGE)                           # [B]
+
+        # Page-table bridge: SGLang NSA reads req_to_token[req_pool_indices,:ctx].
+        self._populate_req_to_token(page_table, cache_seqlens)
+
+        fb = build_decode_forward_batch(
+            self._runner,
+            input_ids,
+            positions,
+            cache_seqlens,
+            page_table,
+            req_pool_indices,
+            out_cache_loc,
+        )
+        out = self._runner.forward(fb)
+        logits = out.logits_output.next_token_logits          # [B, vocab]
+        # Worker reads outputs.logits[:, -1, :] -> shape [B, 1, vocab].
+        return SimpleNamespace(logits=logits.unsqueeze(1))
+
+    def _populate_req_to_token(self, page_table, cache_seqlens):
+        """Fill SGLang's req_to_token[row, :ctx] from BatchGen's gpu_table.
+
+        req_to_token[row, t] = page_table[row, t // page] * page + t % page.
+        Row == slot == batch index (req_pool_indices = arange(B)).
+        """
+        r2t = self._runner.req_to_token_pool.req_to_token       # [max_reqs, max_ctx]
+        batch_size = int(page_table.shape[0])
+        for row in range(batch_size):
+            ctx = int(cache_seqlens[row].item())
+            if ctx <= 0:
+                continue
+            t = torch.arange(ctx, device=page_table.device)
+            pages = page_table[row, t // _PAGE].to(torch.int64)
+            locs = pages * _PAGE + (t % _PAGE)
+            r2t[row, :ctx] = locs.to(r2t.dtype)

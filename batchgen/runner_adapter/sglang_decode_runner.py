@@ -189,11 +189,20 @@ def build_sglang_decode_runner(
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-    # TODO(verify-on-gpu): resolve the HF model path off BatchGen's config.
-    model_path = getattr(loaded_model_config, "model_path", None)
-    assert model_path is not None, (
-        "loaded_model_config has no .model_path; wire the GLM-5 HF path that "
-        "configure_decode already resolved (TODO(verify-on-gpu))."
+    # Resolve the HF checkpoint path. BatchGen's loaded_model_config is an HF
+    # PretrainedConfig (AutoConfig.from_pretrained(args.model_name)), so
+    # `_name_or_path` carries the path; `model_path` is set explicitly by callers
+    # that have it. Env override wins (bring-up convenience).
+    import os as _os
+    model_path = (
+        _os.environ.get("BATCHGEN_SGLANG_MODEL_PATH")
+        or getattr(loaded_model_config, "model_path", None)
+        or getattr(loaded_model_config, "_name_or_path", None)
+        or getattr(loaded_model_config, "name_or_path", None)
+    )
+    assert model_path, (
+        "Could not resolve the GLM-5 checkpoint path from loaded_model_config "
+        "(.model_path/._name_or_path) or BATCHGEN_SGLANG_MODEL_PATH."
     )
 
     if dp_size is None:
@@ -383,13 +392,21 @@ def build_decode_forward_batch(
     # ForwardBatch.prepare_mlp_sync_batch (forward_batch_info.py:734) ourselves.
     if getattr(model_runner.server_args, "enable_dp_attention", False):
         dp_size = model_runner.server_args.dp_size
-        # SMOKE / uniform decode: every DP rank carries `batch_size` decode
-        # tokens, so all ranks agree on global_num_tokens -> the DP all_gather is
-        # fixed-size and cannot hang.
-        # TODO(real-run): ranks can differ; the BatchGen worker must supply the
-        # DP all-gathered per-rank counts (it is SPMD and knows each rank's batch
-        # via its own scheduler), mirroring scheduler_dp_attn_mixin's gather.
-        gnt = [batch_size] * dp_size
+        # DP-attention sync group = the dp ranks. With attn_tp_size==1 (M1: dp16,
+        # tp16) each rank is its own DP rank == its world rank, so the per-DP-rank
+        # token counts are an all_gather of the LOCAL batch_size over the world PG.
+        # Real decode batches differ per rank -> we MUST gather (a uniform
+        # [bs]*dp would mismatch the actual dp-gather and corrupt/hang). All ranks
+        # call this in lockstep (SPMD), so the collective is safe.
+        if torch.distributed.is_initialized() and dp_size == model_runner.tp_size:
+            local_t = torch.tensor(
+                [batch_size], device=input_ids.device, dtype=torch.int64
+            )
+            gathered = [torch.empty_like(local_t) for _ in range(dp_size)]
+            torch.distributed.all_gather(gathered, local_t)
+            gnt = [int(t.item()) for t in gathered]
+        else:
+            gnt = [batch_size] * dp_size
         fb.global_num_tokens_cpu = list(gnt)
         fb.global_num_tokens_for_logprob_cpu = list(gnt)
         gnt_gpu = torch.tensor(gnt, dtype=torch.int64, device=input_ids.device)
