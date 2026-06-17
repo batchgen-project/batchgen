@@ -302,9 +302,11 @@ class GLM5ParallelStrategyManager:
         local_world = max(1, torch.cuda.device_count())
         nnodes = max(1, self.world_size // local_world)
         node_rank = self.global_rank // local_world
-        # Low mem_fraction so SGLang's auto NSA pool (shadowed by the adapter) is
-        # minimal and BatchGen's own paged KV gets the remaining HBM.
-        mem_frac = float(os.getenv("BATCHGEN_SGLANG_MEM_FRACTION", "0.62"))
+        # mem_fraction in SGLang's normal range (keeps pool-profiling positive);
+        # the SGLang KV pool is capped tiny in _build_decode_server_args
+        # (max_total_tokens) since the adapter shadows it, so BatchGen's own paged
+        # KV gets the bulk of HBM (sized by --gpu-memory-frac).
+        mem_frac = float(os.getenv("BATCHGEN_SGLANG_MEM_FRACTION", "0.85"))
         # dist_init_addr is inert (SGLang adopts BatchGen's already-initialized PG);
         # overridable for traceability.
         dist_addr = os.getenv("BATCHGEN_SGLANG_DIST_ADDR", "127.0.0.1:30000")

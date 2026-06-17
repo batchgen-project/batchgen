@@ -127,13 +127,23 @@ def _build_decode_server_args(
         disable_radix_cache=True,
         disable_cuda_graph=True,
         trust_remote_code=True,
-        # SGLang's default auto-sizes to ~0.46 (too low for GLM-5-FP8 weights ->
-        # RuntimeError "increase mem_fraction_static"). Smoke proved 0.82 fits. The
-        # in-worker path passes a LOWER value (~0.62, just above weights/total) so
-        # SGLang's auto NSA pool is minimal and BatchGen's own paged KV (which the
-        # adapter wraps) gets the remaining HBM — BatchGen is the sole decode model
-        # resident (its native decode model is skipped, design R4).
+        # mem_fraction stays in SGLang's normal 0.8-0.9 range so the pool-sizing
+        # PROFILE stays positive (a low value like 0.62 makes budget-weights<floor
+        # -> "increase mem_fraction" / tokens<=0). It is NOT used to shrink the
+        # pool.
         mem_fraction_static=mem_fraction_static,
+        # CRITICAL (R4 / double-KV): SGLang would otherwise allocate a FULL NSA KV
+        # pool sized to the mem_fraction budget — but our adapter SHADOWS that pool
+        # (BatchGen owns the real KV), so it is pure waste that competes with
+        # BatchGen's own paged KV for HBM. Cap it to a tiny page-aligned pool; the
+        # real sequences live in BatchGen's cache via the adapter, and BatchGen
+        # supplies out_cache_loc/page table, so SGLang never allocates from this
+        # pool. max_running_requests is set explicitly so SGLang's req_to_token
+        # pool (rows = max_running_requests, cols = context_len) stays large enough
+        # for the decode batch — it would otherwise be derived from the tiny
+        # max_total_tokens.
+        max_total_tokens=16384,
+        max_running_requests=512,
     )
     # TODO(verify-on-gpu): ServerArgs.__post_init__ rewrites several of these
     # (page_size auto-handling at server_args.py:738, attention-backend
