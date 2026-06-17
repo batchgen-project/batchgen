@@ -23,7 +23,6 @@
 - [§8. CI enforcement](#8-ci-enforcement)
 - [§9. Override authority (hotfix bypass)](#9-override-authority)
 - [§10. After merge](#10-after-merge)
-- [Appendix A — pre-gate cleanup ledger](#appendix-a)
 
 ---
 
@@ -43,9 +42,9 @@
 <a name="1-file-hygiene"></a>
 ## §1. File hygiene — what must not be in a PR
 
-A PR must not **add** any of the following. (Pre-existing instances are tracked in
-[Appendix A](#appendix-a) and addressed — relocated, not deleted — on their own cleanup PRs;
-the gate only fails on newly-added lines/files.)
+A PR must not **add** any of the following. (The gate only fails on **newly-added** lines/files,
+so pre-existing instances on `main` don't block PRs; they are cleaned up — relocated, not
+deleted — on their own PRs.)
 
 1. **Throwaway scratch / debug scripts in production packages or repo root.**
    No new files matching `debug_*.py`, `check_*.py`, `scratch_*.py`, `tmp_*.py`, or
@@ -297,16 +296,15 @@ scaffolding layer — is a planned addition to this gate; it is straightforward 
 `check-pr-hygiene.sh` once the type taxonomy in §2.4 is settled. Per current decision, per-layer
 `CODEOWNERS` is **not** used for this boundary.
 
-**Rollout — the gate becomes *required* only after the [Appendix A](#appendix-a) ledger is
-clear.** Until then the workflow runs in **report-only** mode (it posts results but does not
-block), so the existing violations on `main` do not wall off every PR. Flipping it to
-blocking is two steps:
+**Rollout — the gate becomes *required* only after the pre-existing violations on `main` are
+cleared.** Until then the workflow runs in **report-only** mode (it posts results but does not
+block), so existing violations do not wall off every PR. Flipping it to blocking is two steps:
 
 1. Set `HYGIENE_ENFORCE: "1"` in `pr-file-hygiene.yml` (the script exits non-zero on a blocking
    violation only when this is set).
 2. Add **PR File Hygiene** to the `main` branch-protection **required status checks**.
 
-Do **not** perform either step until Appendix A shows zero open items.
+Do **not** perform either step until the cleanup is complete.
 
 **Local pre-check.** Anyone (or any agent) can run the same logic before pushing:
 
@@ -324,7 +322,7 @@ Exceptions are reviewer-approved, not author-asserted.
 <a name="9-override-authority"></a>
 ## §9. Override authority (hotfix bypass)
 
-Sometimes a hotfix must land before the ledger is clear or despite a hygiene failure. Override
+Sometimes a hotfix must land before the cleanup is complete or despite a hygiene failure. Override
 authority is **strictly ranked** and every use is **logged**:
 
 | Layer | Who | Mechanism | When |
@@ -352,39 +350,5 @@ Rules that bound every override:
 ## §10. After merge
 
 1. Delete the PR branch once merged.
-2. If the change closed an Appendix A ledger item (removed a pre-existing violation), tick it
-   off in this file in the same or a follow-up PR.
-3. When the last ledger item is cleared, perform the §8 rollout to make the gate blocking.
-
----
-
-<a name="appendix-a"></a>
-## Appendix A — pre-gate cleanup ledger
-
-These pre-existing items don't yet match the policy. The §8 gate stays **report-only** until
-they're cleared. Each is its own small, single-concern PR — **relocate, never delete** (§3.2).
-
-**Benchmark scripts (`bench_*.py`)** — _now permitted in place (§1.1); no action._
-
-**Debug script in `batchgen/` (§1.1)**
-- [ ] `batchgen/moe/debug_transform.py` — relocate to `scripts/` (or delete if obsolete)
-
-**Utility at repo root (§1.7)** — _keep it, relocate_
-- [ ] `check_ckpt.py` → `scripts/check_ckpt.py`
-
-**Tests interleaved in the runtime package (§1.2 / §2.1)** — _relocate to `tests/`_
-- [ ] `batchgen/moe/test_marlin_standalone.py`
-- [ ] `batchgen/quantization/test_mxfp4.py`
-- [ ] `batchgen/moe/routing/test_routing.py`
-- [ ] `batchgen/attention/gqa/test_sink_correction.py`
-- [ ] `batchgen/models/deepseek/deepseekv4_pro/assets/encoding/test_encoding_dsv4.py`
-- [ ] `batchgen/models/deepseek/deepseekv4_flash/assets/encoding/test_encoding_dsv4.py`
-
-**Server-side env-var debug guards + stray prints (§1.3 / §1.4)** — _advisory; clean as touched_
-- [ ] `batchgen/continuous_batching.py` — `BATCHGEN_CB_LOG` debug guard
-- [ ] `batchgen/batchgen_worker.py` — `BATCHGEN_DEBUG_TOKENIZE` print block
-- [ ] `batchgen/decode.py` — unguarded `print("New tokens: …")`
-- [ ] `batchgen/batchgen_server_dev.py` — commented-out `# print(request)`
-
-> Note: `batchgen/timing.py` env flags (`BATCHGEN_DECODE_TIMING`, …) are **sanctioned** and
-> allowlisted — not part of this ledger.
+2. When the pre-existing violations are all cleared, perform the §8 rollout to make the gate
+   blocking.
