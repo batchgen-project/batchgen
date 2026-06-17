@@ -325,6 +325,10 @@ def build_decode_forward_batch(
 
     seq_lens = cache_seqlens.view(-1)
     seq_lens_sum = int(seq_lens.sum().item())
+    # NSA's init_forward_metadata reads seq_lens_cpu (nsa_backend.py:391/393:
+    # max_seqlen_k = seq_lens_cpu.max()). ForwardBatch.init_new normally
+    # materializes it; we bypass init_new, so build the CPU mirror here.
+    seq_lens_cpu = seq_lens.to("cpu")
 
     fb = ForwardBatch(
         forward_mode=ForwardMode.DECODE,
@@ -332,6 +336,7 @@ def build_decode_forward_batch(
         input_ids=input_ids,
         req_pool_indices=req_pool_indices.view(-1),
         seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens_cpu,
         out_cache_loc=out_cache_loc.view(-1),
         seq_lens_sum=seq_lens_sum,
         positions=positions_1d,
