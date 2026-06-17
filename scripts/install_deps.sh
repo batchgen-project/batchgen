@@ -137,6 +137,11 @@ else:
 install_torch() {
     print_step "Checking PyTorch installation..."
 
+    # Resolve the CUDA channel: honour TORCH_CUDA_CHANNEL env var (set by
+    # provision_machine.sh based on GPU arch), default to cu128 (Hopper).
+    local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
+    local torch_ver="2.9.0+${cuda_channel}"
+
     if python -c "import torch; print(torch.__version__)" &> /dev/null; then
         TORCH_VERSION=$(python -c "import torch; print(torch.__version__)")
         print_success "PyTorch $TORCH_VERSION already installed"
@@ -147,8 +152,8 @@ install_torch() {
             print_warning "PyTorch installed but CUDA not available. Consider reinstalling with CUDA support."
         fi
     else
-        print_step "Installing PyTorch with CUDA 12.8 support..."
-        pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+        print_step "Installing PyTorch ${torch_ver} (cuda_channel=${cuda_channel})..."
+        pip install "torch==${torch_ver}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
         print_success "PyTorch installed"
     fi
 }
@@ -416,7 +421,8 @@ main() {
                 install_deepgemm
                 # Reinstall PyTorch — building deps from source may downgrade torch or triton
                 print_step "Reinstalling PyTorch to ensure correct version after dependency builds..."
-                pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+                local cuda_channel="${TORCH_CUDA_CHANNEL:-cu128}"
+                pip install "torch==2.9.0+${cuda_channel}" --index-url "https://download.pytorch.org/whl/${cuda_channel}"
                 print_success "PyTorch reinstalled"
             fi
         elif [[ $IS_BLACKWELL -eq 1 ]]; then
