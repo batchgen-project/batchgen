@@ -49,6 +49,15 @@ class SGLangDecodeModel(nn.Module):
         self._runner = runner
         self._core_engine = core_engine
         self._adapter_injected = False
+        # The worker reads `next(self.model.parameters()).device` to place sampling
+        # tensors (_build_sampling_tensors). This wrapper owns no real parameters
+        # (they live inside the SGLang runner), so expose a tiny device-anchor on
+        # the decode device (cuda:local_rank — already set by the worker before
+        # configure_decoding) so parameters() is non-empty and reports the right
+        # device.
+        self._device_anchor = nn.Parameter(
+            torch.zeros(1, device="cuda"), requires_grad=False
+        )
 
     def _ensure_adapter(self):
         if self._adapter_injected:
