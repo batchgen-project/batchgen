@@ -290,7 +290,7 @@ class SGLangDecodeModel(nn.Module):
         stats. Returns (capture_dict, handles) to log + remove after forward."""
         import logging as _lg
 
-        cap = {"topk": None, "layers": []}
+        cap = {"topk": None, "layers": [], "attn0_in": None, "attn0_out": None}
         handles = []
         try:
             layers = self._runner.model.model.layers
@@ -308,8 +308,22 @@ class SGLangDecodeModel(nn.Module):
                              float(hs.float().std())))
                 return _h
 
+            def _attn_hook(_m, inp, out):
+                # self_attn.forward(positions, hidden_states, forward_batch) ->
+                # attn contribution. Capture the decode token's attn IN/OUT. The
+                # decode INPUT token is the same (785) for all seqs but each seq's
+                # CONTEXT differs, so OUT must DIFFER across seqs if attention uses
+                # the KV; identical/near-zero OUT => context ignored (peel clears).
+                o = out[0] if isinstance(out, (tuple, list)) else out
+                cap["attn0_out"] = o.detach() if isinstance(o, torch.Tensor) else None
+                hs_in = inp[1] if len(inp) > 1 else (inp[0] if inp else None)
+                cap["attn0_in"] = (hs_in.detach()
+                                   if isinstance(hs_in, torch.Tensor) else None)
+
             handles.append(
                 layers[0].self_attn.indexer.register_forward_hook(_idx_hook))
+            handles.append(
+                layers[0].self_attn.register_forward_hook(_attn_hook))
             n = len(layers)
             for idx in sorted({0, 1, n // 2, n - 2, n - 1}):
                 handles.append(
@@ -345,5 +359,22 @@ class SGLangDecodeModel(nn.Module):
                 )
             _lg.getLogger().warning(
                 "[RTPEEL-SEL] per-layer (idx,absmax,std)=%s", cap["layers"])
+
+            def _fp(t):
+                if not isinstance(t, torch.Tensor) or not t.numel():
+                    return None
+                f = t.float().reshape(-1)
+                return (round(float(f.mean()), 5), round(float(f.std()), 5),
+                        round(float(f.abs().max()), 4),
+                        round(float((f == 0).float().mean()), 3),
+                        [round(x, 4) for x in f[:6].tolist()])
+            # Decode INPUT token is 785 for all seqs (same embed) but CONTEXT
+            # differs per seq. attn0 OUT[:6] identical across seqs => attention
+            # ignores the KV (peel clears it). OUT differs => attention uses
+            # context => corruption is downstream (MoE/dp-gather/lm_head).
+            _lg.getLogger().warning(
+                "[RTPEEL-ATTN0] ctx0=%d layer0 self_attn IN(mean,std,absmax,zf,[:6])=%s "
+                "OUT(mean,std,absmax,zf,[:6])=%s",
+                ctx0, _fp(cap.get("attn0_in")), _fp(cap.get("attn0_out")))
         except Exception as _e:  # noqa: BLE001
             _lg.getLogger().warning("[RTPEEL-SEL] log failed: %r", _e)
