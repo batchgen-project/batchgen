@@ -156,9 +156,13 @@ class BatchGenNSAKVAdapter:
             ``[num_pages, 8448]`` uint8, byte-compatible with SGLang's
             ``index_k_with_scale_buffer[layer]``.
         """
-        from batchgen_kernels.triton.fp8_quantize import (
-            per_token_blocked_quantize_bf16_to_fp8_1d,
-        )
+        # Use SGLang's OWN act_quant so the FP8 K bytes byte-match what SGLang's
+        # indexer expects. CRITICAL: the decode indexer RANKS the FP8 logits
+        # (fast_topk over fp8_paged_mqa_logits), so the scale convention drives
+        # token SELECTION. SGLang uses scale_fmt="ue8m0" (power-of-2 scale, clamp
+        # 1e-4); a plain amax/448 scale (our old per_token_blocked_quantize) yields
+        # a DIFFERENT argsort -> wrong selected tokens -> garbage decode.
+        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         k_cache, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
             layer_id
@@ -175,14 +179,11 @@ class BatchGenNSAKVAdapter:
         device = k_cache.device
         # Flatten to [num_pages * page_size, 128] for per-token quantization.
         k_bf16 = k_cache.reshape(num_pages * page_size, head_dim).contiguous()
-        # FP8 e4m3 [M, 128] + fp32 scale [M, 1] (num_blocks == 128//128 == 1).
-        k_fp8, k_scale = per_token_blocked_quantize_bf16_to_fp8_1d(
-            k_bf16, block_size=self.quant_block_size
-        )
+        # FP8 e4m3 [M, 128] + fp32 scale [M, 1] (block==128 -> 1 scale/token),
+        # ue8m0 (power-of-2) scale to byte-match SGLang's indexer write.
+        k_fp8, k_scale = act_quant(k_bf16, self.quant_block_size, "ue8m0")
+        k_scale = k_scale.view(num_pages * page_size, 1).to(torch.float32)
         assert k_fp8.dtype == _FP8_DTYPE
-        assert k_scale.shape == (num_pages * page_size, 1), (
-            f"expected single fp32 scale per token, got {tuple(k_scale.shape)}"
-        )
 
         # Per-page byte widths (non-HIP page_size=64): 64*128 K bytes + 64*4 scale.
         k_bytes_per_page = page_size * head_dim  # 8192
