@@ -47,6 +47,7 @@ class SGLangDecodeModel(nn.Module):
     _logged_once = False  # one-shot decode KV diagnostic guard (class-level)
     _dbg_steps = 0        # token-flow audit step counter
     _DBG_MAX = 8          # log the first N decode steps
+    _sel_dumped = False   # one-shot indexer-selection + per-layer-stats probe
 
     def __init__(self, runner, core_engine):
         super().__init__()
@@ -181,6 +182,15 @@ class SGLangDecodeModel(nn.Module):
                 import logging as _lg
                 _lg.getLogger().warning("[RTPEEL-KVDBG] dump failed: %r", _e)
 
+        # One-shot selection + per-layer-stats probe. For ctx < index_topk the
+        # indexer MUST select all ctx tokens; a valid set != {0..ctx-1} localizes
+        # the bug to the indexer selection, == {0..ctx-1} points downstream
+        # (MLA gather/compute). Per-layer absmax/std flags any layer that blows up.
+        _probe = None
+        if not SGLangDecodeModel._sel_dumped:
+            SGLangDecodeModel._sel_dumped = True
+            _probe = self._install_probe_hooks()
+
         fb = build_decode_forward_batch(
             self._runner,
             input_ids,
@@ -192,6 +202,9 @@ class SGLangDecodeModel(nn.Module):
         )
         out = self._runner.forward(fb)
         logits = out.logits_output.next_token_logits          # [B, vocab]
+
+        if _probe is not None:
+            self._log_probe(_probe, int(cache_seqlens[0].item()))
 
         # Token-flow audit (POIS: prefill is unchanged BatchGen code, so the first
         # generated token must be correct; find where decode garbage begins). Log
@@ -232,3 +245,66 @@ class SGLangDecodeModel(nn.Module):
             pages = page_table[row, t // _PAGE].to(torch.int64)
             locs = pages * _PAGE + (t % _PAGE)
             r2t[row, :ctx] = locs.to(r2t.dtype)
+
+    def _install_probe_hooks(self):
+        """Hook layer-0 indexer (capture topk_indices) + a few layers' output
+        stats. Returns (capture_dict, handles) to log + remove after forward."""
+        import logging as _lg
+
+        cap = {"topk": None, "layers": []}
+        handles = []
+        try:
+            layers = self._runner.model.model.layers
+
+            def _idx_hook(_m, _i, out):
+                t = out[0] if isinstance(out, (tuple, list)) else out
+                cap["topk"] = t.detach() if isinstance(t, torch.Tensor) else None
+
+            def _mk_layer_hook(idx):
+                def _h(_m, _i, out):
+                    hs = out[0] if isinstance(out, (tuple, list)) else out
+                    if isinstance(hs, torch.Tensor) and hs.numel():
+                        cap["layers"].append(
+                            (idx, float(hs.float().abs().max()),
+                             float(hs.float().std())))
+                return _h
+
+            handles.append(
+                layers[0].self_attn.indexer.register_forward_hook(_idx_hook))
+            n = len(layers)
+            for idx in sorted({0, 1, n // 2, n - 2, n - 1}):
+                handles.append(
+                    layers[idx].register_forward_hook(_mk_layer_hook(idx)))
+        except Exception as _e:  # noqa: BLE001
+            _lg.getLogger().warning("[RTPEEL-SEL] hook setup failed: %r", _e)
+        return cap, handles
+
+    def _log_probe(self, probe, ctx0):
+        import logging as _lg
+
+        cap, handles = probe
+        for h in handles:
+            h.remove()
+        try:
+            tk = cap["topk"]
+            if tk is None:
+                _lg.getLogger().warning("[RTPEEL-SEL] indexer returned no topk")
+            else:
+                row0 = tk[0].reshape(-1)
+                valid = row0[row0 >= 0]
+                vmin = int(valid.min().item()) if valid.numel() else -1
+                vmax = int(valid.max().item()) if valid.numel() else -1
+                uniq = int(torch.unique(valid).numel()) if valid.numel() else 0
+                # For ctx < index_topk, a correct selection = all ctx tokens.
+                expect_all = (valid.numel() == ctx0 and uniq == ctx0
+                              and vmin == 0 and vmax == ctx0 - 1)
+                _lg.getLogger().warning(
+                    "[RTPEEL-SEL] ctx0=%d topk_shape=%s valid_n=%d uniq=%d "
+                    "min=%d max=%d select_all_ctx=%s sample=%s",
+                    ctx0, tuple(tk.shape), int(valid.numel()), uniq, vmin, vmax,
+                    expect_all, valid[:12].tolist(),
+                )
+            _lg.getLogger().warning(
+                "[RTPEEL-SEL] per-layer (idx,absmax,std)=%s", cap["layers"])
+        except Exception as _e:  # noqa: BLE001
+            _lg.getLogger().warning("[RTPEEL-SEL] log failed: %r", _e)
