@@ -113,6 +113,11 @@ def _build_decode_server_args(
         model_path=model_path,
         # --- attention / KV layout: must match BatchGenNSAKVAdapter --------- #
         attention_backend=_ATTENTION_BACKEND,  # "nsa"
+        # Core MLA decode kernel. bf16+SM90(H20) AUTO-defaults to "fa3"; force
+        # "flashmla_kv" to match BatchGen's own decode (flash_mla_with_kvcache,
+        # sparse_decode_mla.py) — same kernel + same MLA-latent/indices contract
+        # as the cache BatchGen writes. (server_args.py NSA_CHOICES / :1156-1179.)
+        nsa_decode_backend="flashmla_kv",
         page_size=_PAGE_SIZE,                   # 64
         kv_cache_dtype=_KV_CACHE_DTYPE,         # "bfloat16" (primary MLA path)
         # --- parallelism: adopt BatchGen's world -------------------------- #
