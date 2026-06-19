@@ -79,6 +79,38 @@ class SGLangDecodeModel(nn.Module):
 
         cache_seqlens = AttnWrapperBase.cache_seqlens.view(-1).to(torch.int32)  # [B]
         batch_size = int(cache_seqlens.numel())
+
+        # --- IDLE dp-attention rank: 0 local decode sequences ----------------- #
+        # With dp16 and fewer prompts than ranks, some ranks have an empty decode
+        # batch. The worker still runs forward on every rank (MoE all-to-all + the
+        # dp-gather collectives need all 16 in lockstep — see batchgen_worker.py
+        # ~9746), but this rank's GPU page table is NOT built (worker `if batch:`
+        # guard ~9724), so primary.get_layer_kv_with_page_table(0) would raise.
+        # Build a TRUE IDLE ForwardBatch (empty tensors): SGLang's
+        # prepare_mlp_sync_batch derives the pad from the cross-rank max and
+        # forward_idle gates attn-metadata init behind batch_size>0, so no KV/page
+        # table is touched. The dp all-gather inside build_decode_forward_batch
+        # still runs (contributing this rank's 0), keeping all ranks in lockstep.
+        if batch_size == 0:
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+            empty_i64 = torch.empty(0, dtype=torch.int64, device=dev)
+            empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+            fb = build_decode_forward_batch(
+                self._runner,
+                empty_i64,  # new_tokens
+                empty_i64,  # positions
+                empty_i32,  # cache_seqlens
+                empty_i32,  # page_table (unused; idle reads no KV)
+                empty_i64,  # req_pool_indices
+                empty_i64,  # out_cache_loc
+                forward_mode=ForwardMode.IDLE,
+            )
+            out = self._runner.forward(fb)
+            logits = out.logits_output.next_token_logits  # [0, vocab]
+            return SimpleNamespace(logits=logits.unsqueeze(1))  # [0, 1, vocab]
+        # ---------------------------------------------------------------------- #
+
         primary = AttnWrapperBase.gpu_paged_kv_manager
         # gpu_table: [num_slots, max_pages] physical page indices, batch/slot order.
         _, _, gpu_table = primary.get_layer_kv_with_page_table(0)

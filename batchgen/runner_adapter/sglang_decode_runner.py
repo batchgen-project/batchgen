@@ -306,6 +306,7 @@ def build_decode_forward_batch(
     page_table: torch.Tensor,
     req_pool_indices: torch.Tensor,
     out_cache_loc: torch.Tensor,
+    forward_mode=None,
 ):
     """Build a DECODE ``ForwardBatch`` directly (bypassing ScheduleBatch).
 
@@ -356,6 +357,12 @@ def build_decode_forward_batch(
         ForwardMode,
     )
 
+    # forward_mode=IDLE is used for dp-attention ranks with 0 local sequences:
+    # they run the model body (so MoE all-to-all + the dp-gather collectives stay
+    # in lockstep) but read no KV/page-table. Default is a normal DECODE step.
+    if forward_mode is None:
+        forward_mode = ForwardMode.DECODE
+
     input_ids = new_tokens.view(-1)
     batch_size = int(input_ids.numel())
 
@@ -371,7 +378,7 @@ def build_decode_forward_batch(
     seq_lens_cpu = seq_lens.to("cpu")
 
     fb = ForwardBatch(
-        forward_mode=ForwardMode.DECODE,
+        forward_mode=forward_mode,
         batch_size=batch_size,
         input_ids=input_ids,
         req_pool_indices=req_pool_indices.view(-1),
