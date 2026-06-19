@@ -45,6 +45,8 @@ class SGLangDecodeModel(nn.Module):
     """Decode-only GLM-5 model backed by an SGLang ModelRunner."""
 
     _logged_once = False  # one-shot decode KV diagnostic guard (class-level)
+    _dbg_steps = 0        # token-flow audit step counter
+    _DBG_MAX = 8          # log the first N decode steps
 
     def __init__(self, runner, core_engine):
         super().__init__()
@@ -190,6 +192,27 @@ class SGLangDecodeModel(nn.Module):
         )
         out = self._runner.forward(fb)
         logits = out.logits_output.next_token_logits          # [B, vocab]
+
+        # Token-flow audit (POIS: prefill is unchanged BatchGen code, so the first
+        # generated token must be correct; find where decode garbage begins). Log
+        # the decode INPUT token + the OUTPUT top-1 for the first few steps.
+        if SGLangDecodeModel._dbg_steps < SGLangDecodeModel._DBG_MAX:
+            SGLangDecodeModel._dbg_steps += 1
+            try:
+                import logging as _lg
+                top1 = logits.argmax(dim=-1)
+                top5 = logits[0].topk(5).indices.tolist() if logits.shape[0] else []
+                _lg.getLogger().warning(
+                    "[RTPEEL-TOK step=%d] in_tokens=%s out_top1=%s out_top5[seq0]=%s "
+                    "logit_absmax=%.4g",
+                    SGLangDecodeModel._dbg_steps, input_ids.tolist()[:8],
+                    top1.tolist()[:8], top5,
+                    float(logits.float().abs().max()) if logits.numel() else -1.0,
+                )
+            except Exception as _e:  # noqa: BLE001
+                import logging as _lg
+                _lg.getLogger().warning("[RTPEEL-TOK] dump failed: %r", _e)
+
         # Worker reads outputs.logits[:, -1, :] -> shape [B, 1, vocab].
         return SimpleNamespace(logits=logits.unsqueeze(1))
 
