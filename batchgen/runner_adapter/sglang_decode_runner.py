@@ -436,6 +436,18 @@ def build_decode_forward_batch(
         # _pad_inputs_to_size unconditionally does lora_ids.extend(...) (others
         # are None-guarded); default None -> AttributeError. No LoRA in M1.
         fb.lora_ids = [None] * batch_size
+        # MoE expert-parallel (moe_ep_size=16 => enable_num_token_non_padded True)
+        # masks topk rows >= num_token_non_padded to expert -1
+        # (topk.py _mask_topk_ids_padded_region). Native ForwardBatch.init_new sets
+        # this (forward_batch_info.py:428); we bypass init_new, so None => NO mask
+        # => the padding rows prepare_mlp_sync_batch adds (to the cross-rank max)
+        # get routed to real experts and reduce-scattered into the shared dp buffer
+        # => every rank's hidden state is contaminated => all sequences collapse to
+        # one token. Set the TRUE local count (0 on IDLE ranks) BEFORE padding.
+        fb.num_token_non_padded = torch.tensor(
+            batch_size, dtype=torch.int32, device=input_ids.device
+        )
+        fb.num_token_non_padded_cpu = batch_size
         fb.prepare_mlp_sync_batch(model_runner)
 
     # TODO(verify-on-gpu): the NSA backend pulls the page table from its own
