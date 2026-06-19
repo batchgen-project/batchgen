@@ -195,6 +195,28 @@ class SGLangDecodeModel(nn.Module):
                     "[RTPEEL-KVFP] ctx0=%d pages=%s fp(logical_tok->sum K[:8])=%s",
                     ctx0, page_table[0, :4].tolist(), fps,
                 )
+                # Per-layer reload completeness: the async per-layer host->GPU
+                # reload may be incomplete for DEEP layers when decode reads them.
+                # I only validated LAYER 0 above. For a shared-prefix token (256)
+                # each layer's K must be NONZERO + sane (the prefix hidden state is
+                # identical across prompts at every layer, so fp@256 must be equal
+                # across the 8 seqs per layer). High zerofrac / fp==0 on a deep
+                # layer => that layer's KV was NOT reloaded to GPU.
+                nlyr = len(self._runner.model.model.layers)
+                lyr = {}
+                for L in sorted({0, 1, nlyr // 4, nlyr // 2,
+                                 3 * nlyr // 4, nlyr - 1}):
+                    try:
+                        kb = self._runner.token_to_kv_pool.get_key_buffer(L)
+                        ks = kb[locs0, 0, :]  # [ctx0, 576]
+                        lyr[L] = (round(float(ks[256, :8].float().sum()), 5),
+                                  round(float((ks == 0).float().mean()), 4))
+                    except Exception as _e2:  # noqa: BLE001
+                        lyr[L] = f"ERR:{_e2!r}"
+                _lg.getLogger().warning(
+                    "[RTPEEL-KVLYR] nlayers=%d per-layer (fp@tok256, zerofrac)=%s",
+                    nlyr, lyr,
+                )
             except Exception as _e:  # noqa: BLE001
                 import logging as _lg
                 _lg.getLogger().warning("[RTPEEL-KVDBG] dump failed: %r", _e)
