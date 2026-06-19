@@ -125,3 +125,42 @@ def test_prefix_reuse_zero_append_finishes_layer_on_retire():
     assert AttnWrapperBase.pending_prefill_offload_layer_idx is None
 
     _reset_pending_state()
+
+
+def test_subclass_prefill_offload_state_retires_through_base_wrapper():
+    class _ModelWrapper(AttnWrapperBase):
+        pass
+
+    _reset_pending_state()
+    host_view = _FakeHostWorkerView()
+    materialization = _FakePrefixMaterialization()
+    wrapper = object.__new__(_ModelWrapper)
+    wrapper.layer_idx = 5
+    wrapper.core_engine = SimpleNamespace(host_paged_kv_worker_view=host_view)
+    AttnWrapperBase.prefill_prefix_materialization = materialization
+
+    key = torch.ones(2, 1, 4)
+    wrapper.offload_prepacked_mla_kv(
+        key,
+        metadata=_metadata(append_len=2),
+        track_tasks=False,
+    )
+
+    assert "pending_prefill_offload_layer_idx" not in _ModelWrapper.__dict__
+    assert AttnWrapperBase.pending_prefill_offload_layer_idx == 5
+    assert len(AttnWrapperBase.pending_prefill_offload_tasks) == 1
+    assert len(AttnWrapperBase.pending_prefill_offload_tensors) >= 2
+
+    retired = AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+        6,
+        device=None,
+    )
+
+    assert retired == 1
+    assert host_view.task.wait_calls == 1
+    assert materialization.finished_layers == [5]
+    assert AttnWrapperBase.pending_prefill_offload_layer_idx is None
+    assert AttnWrapperBase.pending_prefill_offload_tasks == []
+    assert AttnWrapperBase.pending_prefill_offload_tensors == []
+
+    _reset_pending_state()

@@ -98,7 +98,8 @@ class AttnWrapperBase(BaseModuleWrapper):
         cls,
         layer_idx: Optional[int],
     ) -> None:
-        materialization = cls.prefill_prefix_materialization
+        del cls
+        materialization = AttnWrapperBase.prefill_prefix_materialization
         if layer_idx is None or materialization is None:
             return
         materialization.finish_layer(int(layer_idx))
@@ -165,22 +166,23 @@ class AttnWrapperBase(BaseModuleWrapper):
         device: Optional[torch.device] = None,
         reason: str = "",
     ) -> int:
-        pending = cls.pending_prefill_offload_tasks
-        pinned = cls.pending_prefill_offload_tensors
+        del cls
+        pending = AttnWrapperBase.pending_prefill_offload_tasks
+        pinned = AttnWrapperBase.pending_prefill_offload_tensors
         if not pending and not pinned:
-            cls.pending_prefill_offload_layer_idx = None
+            AttnWrapperBase.pending_prefill_offload_layer_idx = None
             return 0
 
         num_tasks = len(pending)
         for task in pending:
             task.wait()
         pending.clear()
-        cls._prefill_offload_sync_device(device)
+        AttnWrapperBase._prefill_offload_sync_device(device)
         pinned.clear()
 
-        layer_idx = cls.pending_prefill_offload_layer_idx
-        cls._finish_pending_prefix_materialization_layer(layer_idx)
-        cls.pending_prefill_offload_layer_idx = None
+        layer_idx = AttnWrapperBase.pending_prefill_offload_layer_idx
+        AttnWrapperBase._finish_pending_prefix_materialization_layer(layer_idx)
+        AttnWrapperBase.pending_prefill_offload_layer_idx = None
         if num_tasks:
             suffix = f" ({reason})" if reason else ""
             logging.debug(
@@ -196,24 +198,27 @@ class AttnWrapperBase(BaseModuleWrapper):
         *,
         device: Optional[torch.device] = None,
     ) -> int:
-        pending_layer = cls.pending_prefill_offload_layer_idx
+        del cls
+        pending_layer = AttnWrapperBase.pending_prefill_offload_layer_idx
         if pending_layer is None or pending_layer == layer_idx:
             return 0
-        return cls.retire_pending_prefill_offloads(
+        return AttnWrapperBase.retire_pending_prefill_offloads(
             device=device,
             reason=f"before layer {layer_idx}",
         )
 
     @classmethod
     def pin_prefill_offload_tensor(cls, tensor: torch.Tensor, layer_idx: int) -> None:
-        cls.pending_prefill_offload_layer_idx = layer_idx
-        cls.pending_prefill_offload_tensors.append(tensor)
+        del cls
+        AttnWrapperBase.pending_prefill_offload_layer_idx = layer_idx
+        AttnWrapperBase.pending_prefill_offload_tensors.append(tensor)
 
     @classmethod
     def track_prefill_offload_task(cls, task: object, layer_idx: int) -> None:
-        cls.pending_prefill_offload_layer_idx = layer_idx
+        del cls
+        AttnWrapperBase.pending_prefill_offload_layer_idx = layer_idx
         if task is not None:
-            cls.pending_prefill_offload_tasks.append(task)
+            AttnWrapperBase.pending_prefill_offload_tasks.append(task)
 
     def prefix_cache_metadata(self):
         """Return validated metadata derived from AttnWrapperBase fields."""
@@ -234,9 +239,9 @@ class AttnWrapperBase(BaseModuleWrapper):
         from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
         metadata = metadata or self.prefix_cache_metadata()
+        materialization = AttnWrapperBase.prefill_prefix_materialization
         prefix_materialization_active = (
-            metadata.prefix_reuse_mode
-            and self.prefill_prefix_materialization is not None
+            metadata.prefix_reuse_mode and materialization is not None
         )
         should_track = track_tasks or prefix_materialization_active
         tracker = self.track_prefill_offload_task if should_track else None
@@ -255,9 +260,9 @@ class AttnWrapperBase(BaseModuleWrapper):
         )
         if (
             prefix_materialization_active
-            and self.pending_prefill_offload_layer_idx != self.layer_idx
+            and AttnWrapperBase.pending_prefill_offload_layer_idx != self.layer_idx
         ):
-            self.prefill_prefix_materialization.finish_layer(self.layer_idx)
+            materialization.finish_layer(self.layer_idx)
 
     def offload_prepacked_mla_kv(
         self,
@@ -270,9 +275,9 @@ class AttnWrapperBase(BaseModuleWrapper):
         from batchgen.kv_cache.prefill_offload import PrefillHostKVOffloader
 
         metadata = metadata or self.prefix_cache_metadata()
+        materialization = AttnWrapperBase.prefill_prefix_materialization
         prefix_materialization_active = (
-            metadata.prefix_reuse_mode
-            and self.prefill_prefix_materialization is not None
+            metadata.prefix_reuse_mode and materialization is not None
         )
         should_track = track_tasks or prefix_materialization_active
         tracker = self.track_prefill_offload_task if should_track else None
@@ -287,9 +292,9 @@ class AttnWrapperBase(BaseModuleWrapper):
         offloader.offload_mla(key=key)
         if (
             prefix_materialization_active
-            and self.pending_prefill_offload_layer_idx != self.layer_idx
+            and AttnWrapperBase.pending_prefill_offload_layer_idx != self.layer_idx
         ):
-            self.prefill_prefix_materialization.finish_layer(self.layer_idx)
+            materialization.finish_layer(self.layer_idx)
 
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
