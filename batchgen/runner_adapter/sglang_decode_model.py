@@ -178,6 +178,23 @@ class SGLangDecodeModel(nn.Module):
                     prefillK[0, :6].float().tolist(),
                     max(ctx0 - 1, 0), prefillK[max(ctx0 - 1, 0), :6].float().tolist(),
                 )
+                # Offload/reload faithfulness probe: per-logical-token K fingerprint
+                # across pages. The 8 MMLU prompts share a long prefix, so EARLY
+                # logical tokens have IDENTICAL fingerprints across seqs and LATE
+                # tokens diverge. A faithful reload => the identical->divergent
+                # boundary is MONOTONIC in logical position (same physical page span
+                # holds the right tokens). A per-page reload scramble => the
+                # identical fingerprints appear at SCATTERED logical positions.
+                # fp = sum(K[:8]); compare these lines across the 8 ranks/seqs.
+                fps = {}
+                for p in [0, 1, 32, 64, 128, 256, 512, ctx0 // 2,
+                          max(ctx0 - 65, 0), max(ctx0 - 2, 0)]:
+                    if p < ctx0:
+                        fps[p] = round(float(prefillK[p, :8].float().sum()), 5)
+                _lg.getLogger().warning(
+                    "[RTPEEL-KVFP] ctx0=%d pages=%s fp(logical_tok->sum K[:8])=%s",
+                    ctx0, page_table[0, :4].tolist(), fps,
+                )
             except Exception as _e:  # noqa: BLE001
                 import logging as _lg
                 _lg.getLogger().warning("[RTPEEL-KVDBG] dump failed: %r", _e)
