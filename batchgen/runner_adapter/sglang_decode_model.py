@@ -44,6 +44,8 @@ _PAGE = 64
 class SGLangDecodeModel(nn.Module):
     """Decode-only GLM-5 model backed by an SGLang ModelRunner."""
 
+    _logged_once = False  # one-shot decode KV diagnostic guard (class-level)
+
     def __init__(self, runner, core_engine):
         super().__init__()
         self._runner = runner
@@ -140,6 +142,42 @@ class SGLangDecodeModel(nn.Module):
 
         # Page-table bridge: SGLang NSA reads req_to_token[req_pool_indices,:ctx].
         self._populate_req_to_token(page_table, cache_seqlens)
+
+        # One-shot decode diagnostic (KV-layout audit): dump metadata + the MLA-K
+        # content the adapter reads at the prefill slots. Zeros there => the prefill
+        # KV is not resident on the GPU pages (load/slot bug); sane values => a
+        # read-flow/semantic issue. Logs once per process.
+        if not SGLangDecodeModel._logged_once:
+            SGLangDecodeModel._logged_once = True
+            try:
+                import logging as _lg
+                kbuf = self._runner.token_to_kv_pool.get_key_buffer(0)  # [N,1,576] BF16 view
+                ctx0 = int(cache_seqlens[0].item())
+                # slots for seq 0's tokens 0..ctx0-1
+                pcol = (torch.arange(ctx0, device=dev) // _PAGE)
+                locs0 = (page_table[0].to(torch.int64)[pcol] * _PAGE
+                         + (torch.arange(ctx0, device=dev) % _PAGE))
+                prefillK = kbuf[locs0, 0, :]              # [ctx0, 576]
+                aux_primary = AttnWrapperBase.gpu_paged_kv_manager
+                slot_seq = getattr(aux_primary._gpu_page_table_manager, "slot_to_seq_id", None)
+                _lg.getLogger().warning(
+                    "[RTPEEL-KVDBG] bsz=%d cache_seqlens=%s positions=%s out_cache_loc=%s "
+                    "req_pool_idx=%s page_table[0,:4]=%s slot_to_seq_id=%s | KBUF shape=%s dtype=%s "
+                    "| prefillK[seq0] mean=%.4g std=%.4g absmax=%.4g zerofrac=%.3f | "
+                    "sample[0,:6]=%s sample[%d,:6]=%s",
+                    batch_size, cache_seqlens.tolist(), positions.view(-1).tolist()[:8],
+                    out_cache_loc.tolist()[:8], req_pool_indices.tolist()[:8],
+                    page_table[0, :4].tolist(), (list(slot_seq)[:8] if slot_seq else None),
+                    tuple(kbuf.shape), kbuf.dtype,
+                    float(prefillK.float().mean()), float(prefillK.float().std()),
+                    float(prefillK.float().abs().max()),
+                    float((prefillK == 0).float().mean()),
+                    prefillK[0, :6].float().tolist(),
+                    max(ctx0 - 1, 0), prefillK[max(ctx0 - 1, 0), :6].float().tolist(),
+                )
+            except Exception as _e:  # noqa: BLE001
+                import logging as _lg
+                _lg.getLogger().warning("[RTPEEL-KVDBG] dump failed: %r", _e)
 
         fb = build_decode_forward_batch(
             self._runner,
