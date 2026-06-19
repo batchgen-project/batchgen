@@ -823,6 +823,7 @@ class BatchGenWorker:
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
 		self._shutdown_requested = False
 		self._max_pool_size = args.max_pool_size  # 0 = legacy mode
+		self._final_response_completed_outputs: Dict[int, str] = {}
 		self.enable_prefix_cache = bool(args.enable_prefix_cache)
 		self.prefix_cache_debug_stats = bool(args.prefix_cache_debug_stats)
 		self.prefix_cache_runtime_config = None
@@ -2403,6 +2404,32 @@ class BatchGenWorker:
 			if rank_outputs:
 				merged.update(rank_outputs)
 		return merged
+
+	def _record_completed_outputs_for_final_response(
+		self,
+		completed_uuids: Sequence[str],
+		gathered_outputs: dict,
+	) -> None:
+		"""Keep owner-rank decoded text for legacy synchronous responses.
+
+		Completed sequences release their local query slots immediately so the
+		final result gather can no longer read their decoded_tokens from
+		query_book. Rank 0 stores the already-gathered text for this batch only.
+		"""
+		if self.rank != 0 or not gathered_outputs:
+			return
+
+		for uuid in completed_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None:
+				continue
+			output = gathered_outputs.get(uuid)
+			if output is None:
+				continue
+			text = output.get("text", "")
+			self._final_response_completed_outputs[seq.global_idx] = (
+				text if isinstance(text, str) else str(text)
+			)
 
 	# ============ End Request Pool Methods ============
 
@@ -5014,6 +5041,7 @@ class BatchGenWorker:
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
+		self._final_response_completed_outputs = {}
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
@@ -5316,6 +5344,10 @@ class BatchGenWorker:
 		)
 		self._submit_completed_to_incremental_writer(completed_list)
 		gathered_outputs = self._gather_completed_outputs(completed_list)
+		self._record_completed_outputs_for_final_response(
+			completed_list,
+			gathered_outputs,
+		)
 
 		if self.enable_prefix_cache:
 			self._wait_pending_kv_append_tasks(sync_distributed_errors=True)
@@ -7240,6 +7272,8 @@ class BatchGenWorker:
 		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
 		# Gathering strings (~KB each) instead reduces memory by ~100x.
 		local_results = []
+		if self.rank == 0:
+			local_results.extend(self._final_response_completed_outputs.items())
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
@@ -13794,6 +13828,7 @@ class BatchGenWorker:
 		
 		# 2. Reset batch completion flag
 		self._batch_completed = False
+		self._final_response_completed_outputs = {}
 		
 		# 3. Destroy GPU KV cache (but keep the manager reference for reuse)
 		self._destroy_gpu_paged_kv_cache(empty_cuda_cache=True)
