@@ -48,6 +48,7 @@ class SGLangDecodeModel(nn.Module):
     _dbg_steps = 0        # token-flow audit step counter
     _DBG_MAX = 8          # log the first N decode steps
     _sel_dumped = False   # one-shot indexer-selection + per-layer-stats probe
+    _step_tap_hooks = False  # persistent step-tap hooks installed (layer 0)
 
     def __init__(self, runner, core_engine):
         super().__init__()
@@ -230,6 +231,13 @@ class SGLangDecodeModel(nn.Module):
             SGLangDecodeModel._sel_dumped = True
             _probe = self._install_probe_hooks()
 
+        # Cross-path step-tap (layer 0): arm + install persistent hooks routing
+        # layer-0 hidden_in/attn_out/hidden_out/indexer_sel through step_tap so the
+        # SGLang path dumps the same named points as native for offline diff.
+        from batchgen.debug import step_tap
+        self._ensure_step_tap_hooks()
+        step_tap.begin()
+
         fb = build_decode_forward_batch(
             self._runner,
             input_ids,
@@ -241,6 +249,9 @@ class SGLangDecodeModel(nn.Module):
         )
         out = self._runner.forward(fb)
         logits = out.logits_output.next_token_logits          # [B, vocab]
+
+        step_tap.tap("logits", logits, layer_id=step_tap.TAP_LAYER)
+        step_tap.flush()
 
         if _probe is not None:
             self._log_probe(_probe, int(cache_seqlens[0].item()))
@@ -267,6 +278,50 @@ class SGLangDecodeModel(nn.Module):
 
         # Worker reads outputs.logits[:, -1, :] -> shape [B, 1, vocab].
         return SimpleNamespace(logits=logits.unsqueeze(1))
+
+    def _ensure_step_tap_hooks(self):
+        """Install persistent layer-0 hooks routing intermediates to step_tap.
+        Names match the native taps in Glm5DecoderLayer.forward (hidden_in,
+        attn_out, hidden_out) plus indexer_sel. step_tap.tap() self-gates, so the
+        hooks are cheap no-ops unless a run is armed via begin()."""
+        if SGLangDecodeModel._step_tap_hooks:
+            return
+        from batchgen.debug import step_tap
+
+        try:
+            l0 = self._runner.model.model.layers[0]
+
+            def _pre(_m, args, kwargs):
+                hs = args[1] if len(args) > 1 else kwargs.get("hidden_states")
+                step_tap.tap("hidden_in", hs)
+
+            def _layer_out(_m, _i, out):
+                # SGLang decoder layer returns (hidden_states, residual) with fused
+                # residual; the residual-stream value = hidden + residual.
+                if (isinstance(out, (tuple, list)) and len(out) >= 2
+                        and isinstance(out[0], torch.Tensor)
+                        and isinstance(out[1], torch.Tensor)):
+                    step_tap.tap("hidden_out", out[0] + out[1])
+                else:
+                    hs = out[0] if isinstance(out, (tuple, list)) else out
+                    step_tap.tap("hidden_out", hs)
+
+            def _attn_out(_m, _i, out):
+                a = out[0] if isinstance(out, (tuple, list)) else out
+                step_tap.tap("attn_out", a)
+
+            def _idx(_m, _i, out):
+                t = out[0] if isinstance(out, (tuple, list)) else out
+                step_tap.tap("indexer_sel", t)
+
+            l0.register_forward_pre_hook(_pre, with_kwargs=True)
+            l0.register_forward_hook(_layer_out)
+            l0.self_attn.register_forward_hook(_attn_out)
+            l0.self_attn.indexer.register_forward_hook(_idx)
+            SGLangDecodeModel._step_tap_hooks = True
+        except Exception as _e:  # noqa: BLE001
+            import logging as _lg
+            _lg.getLogger().warning("[STEP-TAP] sglang hook install failed: %r", _e)
 
     def _populate_req_to_token(self, page_table, cache_seqlens):
         """Fill SGLang's req_to_token[row, :ctx] from BatchGen's gpu_table.

@@ -2245,6 +2245,10 @@ class Glm5DecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # Cross-path step-tap (layer 0 only; no-op unless batchgen_debug.step_tap).
+        from batchgen.debug import step_tap
+        step_tap.tap("hidden_in", hidden_states, layer_id=self.layer_idx)
+
         # Pre-norm attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -2255,6 +2259,7 @@ class Glm5DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
+        step_tap.tap("attn_out", hidden_states, layer_id=self.layer_idx)
 
         # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
@@ -2266,7 +2271,9 @@ class Glm5DecoderLayer(nn.Module):
 
         # MoE/FFN
         hidden_states = self.mlp(hidden_states)
+        step_tap.tap("mlp_out", hidden_states, layer_id=self.layer_idx)
         hidden_states = residual + hidden_states
+        step_tap.tap("hidden_out", hidden_states, layer_id=self.layer_idx)
 
         return hidden_states, attn_weights, present
 
@@ -2352,6 +2359,8 @@ class Glm5ForCausalLM(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
         use_cache: Optional[bool] = None,
     ):
+        from batchgen.debug import step_tap
+        step_tap.begin()
         outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -2362,5 +2371,7 @@ class Glm5ForCausalLM(nn.Module):
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
+        step_tap.tap("logits", logits, layer_id=step_tap.TAP_LAYER)
+        step_tap.flush()
         from types import SimpleNamespace
         return SimpleNamespace(logits=logits)
