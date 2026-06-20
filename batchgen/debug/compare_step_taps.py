@@ -85,6 +85,20 @@ def main():
                 print(f"{name:<12} {ctx:>6} {'jac=':>4}{jac:>5.3f} {'':>9}  "
                       f"|A|={len(sa)} |B|={len(sb)} a-only={len(sa-sb)} b-only={len(sb-sa)}")
                 continue
+            if name.endswith("mlp_in"):
+                # native = [1,H] (this rank's token); sglang = [N_gathered,H]
+                # (dp-gathered buffer). Best-match native's row against sglang rows
+                # => is the token present in the gather, and at which offset?
+                H = ta.shape[-1]
+                a = ta.reshape(-1, H)[0].float()
+                bb = tb.reshape(-1, H).float()
+                csim = torch.nn.functional.cosine_similarity(
+                    a.unsqueeze(0), bb, dim=1)
+                best = int(csim.argmax())
+                print(f"{name:<12} {ctx:>6} {float(csim[best]):>9.5f} "
+                      f"{'':>9}  best_row={best}/{bb.shape[0]} "
+                      f"(gather buffer rows={bb.shape[0]})")
+                continue
             cos, rel, shapes = _cos_relerr(ta, tb)
             flag = "  <<< DIVERGES" if (cos < 0.99 or rel > 0.05) else ""
             print(f"{name:<12} {ctx:>6} {cos:>9.5f} {rel:>9.5f}  "
@@ -96,7 +110,7 @@ def main():
     print(f"{'name':<16} {'mean_cos':>9} {'mean_rel':>9}  n")
     print("-" * 40)
     for name in names:
-        if name.endswith("indexer_sel"):
+        if name.endswith("indexer_sel") or name.endswith("mlp_in"):
             continue
         cs, rs = [], []
         for ctx in ctxs:

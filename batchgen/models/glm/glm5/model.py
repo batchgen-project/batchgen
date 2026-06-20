@@ -2270,6 +2270,7 @@ class Glm5DecoderLayer(nn.Module):
         )
 
         # MoE/FFN
+        step_tap.tap("mlp_in", hidden_states, layer_id=self.layer_idx)
         hidden_states = self.mlp(hidden_states)
         step_tap.tap("mlp_out", hidden_states, layer_id=self.layer_idx)
         hidden_states = residual + hidden_states

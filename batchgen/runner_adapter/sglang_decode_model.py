@@ -316,18 +316,24 @@ class SGLangDecodeModel(nn.Module):
                     o = out[0] if isinstance(out, (tuple, list)) else out
                     step_tap.tap("mlp_out", o, layer_id=L)
 
-                return _pre, _layer_out, _attn_out, _mlp_out
+                def _mlp_pre(_m, args, kwargs):
+                    # MoE input = the dp-gathered buffer (all dp-rank tokens).
+                    x = args[0] if args else kwargs.get("hidden_states")
+                    step_tap.tap("mlp_in", x, layer_id=L)
+
+                return _pre, _layer_out, _attn_out, _mlp_out, _mlp_pre
 
             for L in step_tap.TAP_LAYERS:
                 if L >= n:
                     continue
                 lyr = layers[L]
-                pre, lout, aout, mout = _mk(L)
+                pre, lout, aout, mout, mpre = _mk(L)
                 lyr.register_forward_pre_hook(pre, with_kwargs=True)
                 lyr.register_forward_hook(lout)
                 lyr.self_attn.register_forward_hook(aout)
                 if hasattr(lyr, "mlp"):
                     lyr.mlp.register_forward_hook(mout)
+                    lyr.mlp.register_forward_pre_hook(mpre, with_kwargs=True)
                 if L == 0 and hasattr(lyr.self_attn, "indexer"):
                     lyr.self_attn.indexer.register_forward_hook(
                         lambda _m, _i, o: step_tap.tap(
