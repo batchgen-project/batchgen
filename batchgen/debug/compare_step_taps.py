@@ -20,8 +20,18 @@ import sys
 
 import torch
 
-# Canonical layer-0 substep order (native taps; indexer_sel only on sglang).
+# Canonical substep order within a layer (names are "L{nn}.{substep}").
 ORDER = ["hidden_in", "attn_out", "mlp_out", "hidden_out", "logits", "indexer_sel"]
+
+
+def _sortkey(name):
+    """Sort by (layer, substep-order). Names look like 'L03.attn_out'."""
+    layer, _, sub = name.partition(".")
+    try:
+        ln = int(layer[1:])
+    except ValueError:
+        ln = 99
+    return (ln, ORDER.index(sub) if sub in ORDER else 99)
 
 
 def _load(dir_path, tag):
@@ -53,8 +63,7 @@ def main():
 
     A, B = _load(dir_path, tagA), _load(dir_path, tagB)
     ctxs = sorted({k[0] for k in A} | {k[0] for k in B})
-    names = sorted({k[1] for k in A} | {k[1] for k in B},
-                   key=lambda n: ORDER.index(n) if n in ORDER else 99)
+    names = sorted({k[1] for k in A} | {k[1] for k in B}, key=_sortkey)
     print(f"[compare] {tagA} taps={len(A)}  {tagB} taps={len(B)}  "
           f"ctxs={ctxs}\n")
 
@@ -69,7 +78,7 @@ def main():
                 where = tagA if ta is not None else tagB if tb is not None else "neither"
                 print(f"{name:<12} {ctx:>6} {'—':>9} {'—':>9}  only in {where}")
                 continue
-            if name == "indexer_sel":
+            if name.endswith("indexer_sel"):
                 sa = set(int(x) for x in ta.flatten().tolist() if x >= 0)
                 sb = set(int(x) for x in tb.flatten().tolist() if x >= 0)
                 jac = len(sa & sb) / max(1, len(sa | sb))
@@ -82,9 +91,29 @@ def main():
                   f"{shapes[0]}v{shapes[1]}{flag}")
         print()
 
-    print("Read: hidden_in should match (same input). The FIRST substep that "
-          "DIVERGES localizes the bug (attn_out => attention; hidden_out only => "
-          "MLP/residual; logits only => lm_head/norm).")
+    # Compact divergence curve: mean over ctx per (layer.substep).
+    print("\n=== SUMMARY (mean over ctx) — divergence curve by depth ===")
+    print(f"{'name':<16} {'mean_cos':>9} {'mean_rel':>9}  n")
+    print("-" * 40)
+    for name in names:
+        if name.endswith("indexer_sel"):
+            continue
+        cs, rs = [], []
+        for ctx in ctxs:
+            ta, tb = A.get((ctx, name)), B.get((ctx, name))
+            if ta is None or tb is None:
+                continue
+            cos, rel, _ = _cos_relerr(ta, tb)
+            cs.append(cos)
+            rs.append(rel)
+        if cs:
+            mc = sum(cs) / len(cs)
+            mr = sum(rs) / len(rs)
+            flag = "  <<<" if (mc < 0.99 or mr > 0.05) else ""
+            print(f"{name:<16} {mc:>9.5f} {mr:>9.5f}  {len(cs)}{flag}")
+    print("\nRead the curve: smooth growth => FP8 accumulation; a SPIKE at one "
+          "layer's substep => that step is the bug (attn_out vs mlp_out localizes "
+          "attention vs MoE within the layer).")
 
 
 if __name__ == "__main__":

@@ -289,35 +289,50 @@ class SGLangDecodeModel(nn.Module):
         from batchgen.debug import step_tap
 
         try:
-            l0 = self._runner.model.model.layers[0]
+            layers = self._runner.model.model.layers
+            n = len(layers)
 
-            def _pre(_m, args, kwargs):
-                hs = args[1] if len(args) > 1 else kwargs.get("hidden_states")
-                step_tap.tap("hidden_in", hs)
+            def _mk(L):
+                def _pre(_m, args, kwargs):
+                    hs = args[1] if len(args) > 1 else kwargs.get("hidden_states")
+                    step_tap.tap("hidden_in", hs, layer_id=L)
 
-            def _layer_out(_m, _i, out):
-                # SGLang decoder layer returns (hidden_states, residual) with fused
-                # residual; the residual-stream value = hidden + residual.
-                if (isinstance(out, (tuple, list)) and len(out) >= 2
-                        and isinstance(out[0], torch.Tensor)
-                        and isinstance(out[1], torch.Tensor)):
-                    step_tap.tap("hidden_out", out[0] + out[1])
-                else:
-                    hs = out[0] if isinstance(out, (tuple, list)) else out
-                    step_tap.tap("hidden_out", hs)
+                def _layer_out(_m, _i, out):
+                    # decoder layer returns (hidden_states, residual) fused; the
+                    # residual-stream value = hidden + residual.
+                    if (isinstance(out, (tuple, list)) and len(out) >= 2
+                            and isinstance(out[0], torch.Tensor)
+                            and isinstance(out[1], torch.Tensor)):
+                        step_tap.tap("hidden_out", out[0] + out[1], layer_id=L)
+                    else:
+                        hs = out[0] if isinstance(out, (tuple, list)) else out
+                        step_tap.tap("hidden_out", hs, layer_id=L)
 
-            def _attn_out(_m, _i, out):
-                a = out[0] if isinstance(out, (tuple, list)) else out
-                step_tap.tap("attn_out", a)
+                def _attn_out(_m, _i, out):
+                    a = out[0] if isinstance(out, (tuple, list)) else out
+                    step_tap.tap("attn_out", a, layer_id=L)
 
-            def _idx(_m, _i, out):
-                t = out[0] if isinstance(out, (tuple, list)) else out
-                step_tap.tap("indexer_sel", t)
+                def _mlp_out(_m, _i, out):
+                    o = out[0] if isinstance(out, (tuple, list)) else out
+                    step_tap.tap("mlp_out", o, layer_id=L)
 
-            l0.register_forward_pre_hook(_pre, with_kwargs=True)
-            l0.register_forward_hook(_layer_out)
-            l0.self_attn.register_forward_hook(_attn_out)
-            l0.self_attn.indexer.register_forward_hook(_idx)
+                return _pre, _layer_out, _attn_out, _mlp_out
+
+            for L in step_tap.TAP_LAYERS:
+                if L >= n:
+                    continue
+                lyr = layers[L]
+                pre, lout, aout, mout = _mk(L)
+                lyr.register_forward_pre_hook(pre, with_kwargs=True)
+                lyr.register_forward_hook(lout)
+                lyr.self_attn.register_forward_hook(aout)
+                if hasattr(lyr, "mlp"):
+                    lyr.mlp.register_forward_hook(mout)
+                if L == 0 and hasattr(lyr.self_attn, "indexer"):
+                    lyr.self_attn.indexer.register_forward_hook(
+                        lambda _m, _i, o: step_tap.tap(
+                            "indexer_sel",
+                            o[0] if isinstance(o, (tuple, list)) else o, layer_id=0))
             SGLangDecodeModel._step_tap_hooks = True
         except Exception as _e:  # noqa: BLE001
             import logging as _lg

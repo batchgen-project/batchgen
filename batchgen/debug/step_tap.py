@@ -27,7 +27,11 @@ import os
 
 import torch
 
-TAP_LAYER = 0  # only layer 0 (one-layer scope)
+TAP_LAYER = 0  # back-compat alias (layer 0)
+# Depth sweep: layers 0-2 are dense MLP, 3+ are MoE (first_k_dense_replace=3).
+# Layer 0 matched native within FP8 noise; divergence accumulates -> logits, so
+# sweep depth (incl. the first MoE layer 3) to find where it first spikes.
+TAP_LAYERS = (0, 3, 8, 20, 40, 60, 77)
 
 _active_tag = None      # run tag for the in-flight first forward, else None
 _rank = None
@@ -78,16 +82,17 @@ def active():
 
 
 def tap(name, tensor, layer_id=0, row=0):
-    """Snapshot `tensor` (the decode token's value) under (ctx, name). No-op
-    unless tapping is active and layer_id == TAP_LAYER."""
-    if _active_tag is None or layer_id != TAP_LAYER:
+    """Snapshot `tensor` (the decode token's value) under (ctx, "L{layer}.{name}").
+    No-op unless tapping is active and layer_id is in the sweep set."""
+    if _active_tag is None or layer_id not in TAP_LAYERS:
         return
     if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
         return
     ctx = _ctx_for_row(row)
     if ctx <= 0:  # idle dp rank (0 local seqs) — nothing to compare
         return
-    _store[(ctx, str(name))] = tensor.detach().to(torch.float32).cpu()
+    _store[(ctx, "L%02d.%s" % (int(layer_id), name))] = (
+        tensor.detach().to(torch.float32).cpu())
 
 
 def flush():
