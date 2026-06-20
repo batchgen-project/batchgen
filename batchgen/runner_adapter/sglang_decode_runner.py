@@ -120,6 +120,13 @@ def _build_decode_server_args(
         nsa_decode_backend="flashmla_kv",
         page_size=_PAGE_SIZE,                   # 64
         kv_cache_dtype=_KV_CACHE_DTYPE,         # "bfloat16" (primary MLA path)
+        # SGLang fuses the shared expert into the routed top-k by default
+        # (num_fused_shared_experts=1 -> top_k=9, renormalize over 9). BatchGen's
+        # native MoE keeps the shared expert SEPARATE (routed norm over 8, shared
+        # added with weight 1). That 9-vs-8 norm mismatch rescales the routed MoE
+        # output (step-tap: mlp_out cos ~0.85, router_logits identical) -> garbage.
+        # Disable fusion so SGLang handles the shared expert like native.
+        disable_shared_experts_fusion=True,
         # --- parallelism: adopt BatchGen's world -------------------------- #
         tp_size=world_size,
         dp_size=dp_size,
