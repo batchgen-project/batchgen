@@ -321,19 +321,34 @@ class SGLangDecodeModel(nn.Module):
                     x = args[0] if args else kwargs.get("hidden_states")
                     step_tap.tap("mlp_in", x, layer_id=L)
 
-                return _pre, _layer_out, _attn_out, _mlp_out, _mlp_pre
+                def _gate_out(_m, _i, out):
+                    rl = out[0] if isinstance(out, (tuple, list)) else out
+                    step_tap.tap("router_logits", rl, layer_id=L)
+
+                def _topk_out(_m, _i, out):
+                    ids = getattr(out, "topk_ids", None)
+                    if ids is None and isinstance(out, (tuple, list)):
+                        ids = out[1] if len(out) > 1 else out[0]
+                    step_tap.tap("topk_ids", ids, layer_id=L)
+
+                return (_pre, _layer_out, _attn_out, _mlp_out, _mlp_pre,
+                        _gate_out, _topk_out)
 
             for L in step_tap.TAP_LAYERS:
                 if L >= n:
                     continue
                 lyr = layers[L]
-                pre, lout, aout, mout, mpre = _mk(L)
+                pre, lout, aout, mout, mpre, gout, tout = _mk(L)
                 lyr.register_forward_pre_hook(pre, with_kwargs=True)
                 lyr.register_forward_hook(lout)
                 lyr.self_attn.register_forward_hook(aout)
                 if hasattr(lyr, "mlp"):
                     lyr.mlp.register_forward_hook(mout)
                     lyr.mlp.register_forward_pre_hook(mpre, with_kwargs=True)
+                    if hasattr(lyr.mlp, "gate"):
+                        lyr.mlp.gate.register_forward_hook(gout)
+                    if hasattr(lyr.mlp, "topk"):
+                        lyr.mlp.topk.register_forward_hook(tout)
                 if L == 0 and hasattr(lyr.self_attn, "indexer"):
                     lyr.self_attn.indexer.register_forward_hook(
                         lambda _m, _i, o: step_tap.tap(

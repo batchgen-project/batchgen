@@ -1942,12 +1942,16 @@ class Glm5MoE(nn.Module):
                 x,
                 self.gate.weight,
             )
-        return gate_sigmoid_topk_cuda(
+        from batchgen.debug import step_tap
+        step_tap.tap("router_logits", router_logits, layer_id=self.layer_idx)
+        out = gate_sigmoid_topk_cuda(
             router_logits,
             self.gate.e_score_correction_bias.float(),
             k=self.num_experts_per_tok,
             routed_scaling_factor=self.gate.routed_scaling_factor,
         )
+        step_tap.tap("topk_ids", out[0], layer_id=self.layer_idx)  # (topk_idx, weight)
+        return out
 
     def expert_compute_persistent(self, global_x, topk_idx, topk_weight):
         """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""

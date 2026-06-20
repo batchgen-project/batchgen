@@ -78,14 +78,14 @@ def main():
                 where = tagA if ta is not None else tagB if tb is not None else "neither"
                 print(f"{name:<12} {ctx:>6} {'—':>9} {'—':>9}  only in {where}")
                 continue
-            if name.endswith("indexer_sel"):
+            if name.endswith("indexer_sel") or name.endswith("topk_ids"):
                 sa = set(int(x) for x in ta.flatten().tolist() if x >= 0)
                 sb = set(int(x) for x in tb.flatten().tolist() if x >= 0)
                 jac = len(sa & sb) / max(1, len(sa | sb))
-                print(f"{name:<12} {ctx:>6} {'jac=':>4}{jac:>5.3f} {'':>9}  "
+                print(f"{name:<14} {ctx:>6} {'jac=':>4}{jac:>5.3f} {'':>9}  "
                       f"|A|={len(sa)} |B|={len(sb)} a-only={len(sa-sb)} b-only={len(sb-sa)}")
                 continue
-            if name.endswith("mlp_in"):
+            if name.endswith("mlp_in") or name.endswith("router_logits"):
                 # native = [1,H] (this rank's token); sglang = [N_gathered,H]
                 # (dp-gathered buffer). Best-match native's row against sglang rows
                 # => is the token present in the gather, and at which offset?
@@ -110,7 +110,8 @@ def main():
     print(f"{'name':<16} {'mean_cos':>9} {'mean_rel':>9}  n")
     print("-" * 40)
     for name in names:
-        if name.endswith("indexer_sel") or name.endswith("mlp_in"):
+        if (name.endswith("indexer_sel") or name.endswith("mlp_in")
+                or name.endswith("router_logits") or name.endswith("topk_ids")):
             continue
         cs, rs = [], []
         for ctx in ctxs:
