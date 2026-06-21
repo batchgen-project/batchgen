@@ -97,33 +97,37 @@ class SGLangDecodeModel(nn.Module):
 
         # --- IDLE dp-attention rank: 0 local decode sequences ----------------- #
         # With dp16 and fewer prompts than ranks, some ranks have an empty decode
-        # batch. The worker still runs forward on every rank (MoE all-to-all + the
-        # dp-gather collectives need all 16 in lockstep — see batchgen_worker.py
-        # ~9746), but this rank's GPU page table is NOT built (worker `if batch:`
-        # guard ~9724), so primary.get_layer_kv_with_page_table(0) would raise.
-        # Build a TRUE IDLE ForwardBatch (empty tensors): SGLang's
-        # prepare_mlp_sync_batch derives the pad from the cross-rank max and
-        # forward_idle gates attn-metadata init behind batch_size>0, so no KV/page
-        # table is touched. The dp all-gather inside build_decode_forward_batch
-        # still runs (contributing this rank's 0), keeping all ranks in lockstep.
+        # batch. SGLang's forward_idle REQUIRES dp-attention IDLE batches to be
+        # PADDED to batch_size>0 (model_runner.py:2350 "In DP Attention, IDLE
+        # batches are padded (batch_size > 0) for MLP sync") — a batch_size=0 idle
+        # batch contributes 0 to the dp-attention<->pure-TP-MoE all-gather, which
+        # corrupts the gathered MoE buffer on ALL ranks (mlp_out diverges, decode
+        # garbage). Standalone SGLang never has a truly-idle rank (global_num_tokens
+        # has no zeros). So pad this idle rank with ONE dummy decode token at the
+        # free scratch slot 0 (idle ranks hold no active KV there) so it joins the
+        # MoE collective like every other rank; its output is discarded.
         if batch_size == 0:
             from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-            empty_i64 = torch.empty(0, dtype=torch.int64, device=dev)
-            empty_i32 = torch.empty(0, dtype=torch.int32, device=dev)
+            d_tok = torch.zeros(1, dtype=torch.int64, device=dev)   # dummy token
+            d_pos = torch.zeros(1, dtype=torch.int64, device=dev)   # position 0
+            d_cs = torch.ones(1, dtype=torch.int32, device=dev)     # ctx=1 (itself)
+            d_pt = torch.zeros(1, 1, dtype=torch.int32, device=dev)  # [1 seq, page 0]
+            d_rpi = torch.zeros(1, dtype=torch.int64, device=dev)   # req row 0
+            d_ocl = torch.zeros(1, dtype=torch.int64, device=dev)   # write slot 0
+            # NSA reads req_to_token[req_pool_indices,:ctx]; map the dummy token to
+            # slot 0 so init_forward_metadata builds a valid 1-token page table.
+            self._runner.req_to_token_pool.req_to_token[0, 0] = 0
             fb = build_decode_forward_batch(
-                self._runner,
-                empty_i64,  # new_tokens
-                empty_i64,  # positions
-                empty_i32,  # cache_seqlens
-                empty_i32,  # page_table (unused; idle reads no KV)
-                empty_i64,  # req_pool_indices
-                empty_i64,  # out_cache_loc
+                self._runner, d_tok, d_pos, d_cs, d_pt, d_rpi, d_ocl,
                 forward_mode=ForwardMode.IDLE,
             )
             out = self._runner.forward(fb)
-            logits = out.logits_output.next_token_logits  # [0, vocab]
-            return SimpleNamespace(logits=logits.unsqueeze(1))  # [0, 1, vocab]
+            # Discard the dummy's logits — the worker expects 0 tokens for an idle
+            # rank. Return an empty [0,1,vocab] tensor.
+            nl = out.logits_output.next_token_logits
+            empty = torch.empty(0, nl.shape[-1], dtype=nl.dtype, device=dev)
+            return SimpleNamespace(logits=empty.unsqueeze(1))
         # ---------------------------------------------------------------------- #
 
         primary = AttnWrapperBase.gpu_paged_kv_manager
