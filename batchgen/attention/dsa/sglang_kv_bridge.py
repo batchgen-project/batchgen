@@ -119,7 +119,7 @@ class BatchGenNSAKVAdapter:
         Returns:
             ``[num_pages * page_size, 1, 576]`` BF16 view.
         """
-        k_cache, _, _ = self.gpu_paged_kv_manager.get_layer_kv_with_page_table(layer_id)
+        k_cache = self.gpu_paged_kv_manager.get_layer_kv_buffer(layer_id)
         # k_cache: [num_pages, page_size, num_k_heads(=1), k_head_dim(=576)] BF16.
         assert k_cache.is_contiguous(), (
             "get_key_buffer requires a contiguous primary K cache for a zero-copy "
@@ -164,9 +164,7 @@ class BatchGenNSAKVAdapter:
         # a DIFFERENT argsort -> wrong selected tokens -> garbage decode.
         from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
-        k_cache, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
-            layer_id
-        )
+        k_cache = self.gpu_paged_kv_manager_aux.get_layer_kv_buffer(layer_id)
         # k_cache: [num_pages, page_size, 1, 128] BF16.
         assert k_cache.is_contiguous()
         num_pages, page_size, num_heads, head_dim = k_cache.shape
@@ -215,7 +213,7 @@ class BatchGenNSAKVAdapter:
     @property
     def device(self) -> torch.device:
         """Device of the indexer KV cache (read by SGLang's index_buf_accessor)."""
-        k_cache, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(0)
+        k_cache = self.gpu_paged_kv_manager_aux.get_layer_kv_buffer(0)
         return k_cache.device
 
     # ------------------------------------------------------------------ #
@@ -257,9 +255,7 @@ class BatchGenNSAKVAdapter:
         adapter-owned FP8 buffer once at decode start and has SGLang read/write it
         directly; M1 prioritizes correctness.
         """
-        aux_k, _, _ = self.gpu_paged_kv_manager_aux.get_layer_kv_with_page_table(
-            layer_id
-        )
+        aux_k = self.gpu_paged_kv_manager_aux.get_layer_kv_buffer(layer_id)
         num_pages, page_size, _num_heads, head_dim = aux_k.shape
         aux_flat = aux_k.reshape(num_pages * page_size, head_dim)
         index_k_fp8 = (

@@ -1252,6 +1252,21 @@ class GPUPagedKVCacheManager:
 				"call allocate_pages_for_sequences and build_page_table before using this method"
 			)
 
+	def get_layer_kv_buffer(self, layer_idx: int) -> torch.Tensor:
+		"""Return a layer's raw K cache buffer WITHOUT requiring a built page table.
+
+		The SGLang decode bridge pages via the ForwardBatch's ``req_to_token`` (not
+		this manager's ``gpu_table``), so its read/write paths only need the buffer
+		tensor — every bridge caller of ``get_layer_kv_with_page_table`` discards the
+		returned page table. Idle dp-attention ranks never build a page table (the
+		worker skips empty batches) but must still reach the KV buffer to run the
+		padded-dummy decode that keeps them in the pure-TP-MoE dp-sync collective;
+		this accessor serves that without the page-table precondition.
+		"""
+		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		return self._k_cache[layer_idx]
+
 	def get_page_table_version(self) -> int:
 		"""Return a monotonic version for the active page-table contents."""
 		self._ensure_initialized()
