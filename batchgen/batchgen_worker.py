@@ -11632,6 +11632,9 @@ class BatchGenWorker:
 			return True
 
 	def _unregister_fp8_weights(self):
+		if getattr(self.model, '_batchgen_skip_fp8_unregistration', False):
+			return
+
 		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
 		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
 			return

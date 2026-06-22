@@ -44,6 +44,7 @@ _PAGE = 64
 class SGLangDecodeModel(nn.Module):
     """Decode-only GLM-5 model backed by an SGLang ModelRunner."""
 
+    _batchgen_skip_fp8_unregistration = True
     _logged_once = False  # one-shot decode KV diagnostic guard (class-level)
     _dbg_steps = 0        # token-flow audit step counter
     _DBG_MAX = 8          # log the first N decode steps
