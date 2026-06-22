@@ -35,6 +35,7 @@ Verified signatures (do not drift without re-checking references/sglang):
 
 from __future__ import annotations
 
+import contextlib
 from typing import Optional
 
 import torch
@@ -90,6 +91,22 @@ def _install_pg_adopt_guard() -> None:
     # rebuilt with a wrong world size, replace the is_initialized() branch with
     # an explicit init_world_group(...) call here. Kept minimal until proven.
     parallel_state.init_distributed_environment = _guarded
+
+
+def _register_glm5_config_for_sglang() -> None:
+    """Teach SGLang/HF AutoConfig how to read GLM-5's `glm_moe_dsa` config."""
+    from batchgen.models.glm.glm5.configuration_glm5 import Glm5Config
+    from sglang.srt.utils import hf_transformers_utils as hf_utils
+    from transformers import AutoConfig as TransformersAutoConfig
+
+    registry = getattr(hf_utils, "_CONFIG_REGISTRY", None)
+    if isinstance(registry, dict):
+        registry.setdefault(Glm5Config.model_type, Glm5Config)
+
+    for auto_config in (getattr(hf_utils, "AutoConfig", None), TransformersAutoConfig):
+        if auto_config is not None and hasattr(auto_config, "register"):
+            with contextlib.suppress(ValueError):
+                auto_config.register(Glm5Config.model_type, Glm5Config)
 
 
 def _build_decode_server_args(
@@ -207,6 +224,7 @@ def build_sglang_decode_runner(
     """
     # 1) PG-adopt guard BEFORE any SGLang distributed import path runs.
     _install_pg_adopt_guard()
+    _register_glm5_config_for_sglang()
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_executor.model_runner import ModelRunner
