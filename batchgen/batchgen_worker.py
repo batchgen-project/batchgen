@@ -524,6 +524,7 @@ class BatchGenWorker:
 		# Config is staged by server_worker_main_loop; writer created after tokenizer init
 		self._incremental_writer = None
 		self._incremental_writer_config = None
+		self._completed_result_cache = {}
 
 		# Log page buffer configuration (only on rank 0 to avoid spam)
 		if args.global_rank == 0:
@@ -1497,8 +1498,8 @@ class BatchGenWorker:
 					f"{uuid[:8]} (local_idx={local_idx}, status={seq.status.name})"
 				)
 
-		# Only rank 0 sends to response queue
-		if self.rank != 0 or self._response_queue is None:
+		# Only rank 0 owns the legacy response aggregation.
+		if self.rank != 0:
 			return
 
 		# Use gathered text if provided, otherwise read from local buffer
@@ -1509,6 +1510,9 @@ class BatchGenWorker:
 				text = self.tokenizer.decode(token_ids)
 			except Exception:
 				text = ""
+		self._completed_result_cache[seq.global_idx] = text
+		if self._response_queue is None:
+			return
 		self._response_queue.put({
 			"type": "completion",
 			"request_id": uuid,
@@ -3870,6 +3874,7 @@ class BatchGenWorker:
 		logging.info(
 			f"Rank {self.rank}: Processing global batch of {len(global_prompts)} sequences"
 		)
+		self._completed_result_cache = {}
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
@@ -5839,6 +5844,8 @@ class BatchGenWorker:
 		result_dict = {global_idx: decoded_str for global_idx, decoded_str in all_results}
 
 		if self.rank == 0:
+			if self._completed_result_cache:
+				result_dict.update(self._completed_result_cache)
 			logging.info(f"Detokenization complete: {len(result_dict)} sequences (distributed across {self.world_size} ranks)")
 			self._log_decode_timing()
 
