@@ -430,13 +430,12 @@ def build_decode_forward_batch(
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
 
-    # dp-attention: the model's DP-gather collectives (all_gather across the DP
-    # ranks, sized by per-rank token counts) need the DP buffer state set before
-    # forward, or vocab_parallel_embedding -> is_dp_max_padding() trips
-    # AttributeError on _DpGatheredBufferWrapper._dp_max_padding. SGLang's
-    # scheduler does this via maybe_prepare_mlp_sync_batch (scheduler.py:1932);
-    # we bypass the scheduler, so set global_num_tokens + call
-    # ForwardBatch.prepare_mlp_sync_batch (forward_batch_info.py:734) ourselves.
+    # dp-attention: the model's DP-gather collectives are sized by per-rank
+    # token counts. We bypass SGLang's scheduler, so seed the ForwardBatch with
+    # the same metadata normally produced by maybe_prepare_mlp_sync_batch.
+    # ModelRunner.forward owns the actual prepare_mlp_sync_batch call; calling it
+    # here as well double-pads the batch and makes post_forward_mlp_sync_batch
+    # restore a padded batch size instead of the true local batch size.
     if getattr(model_runner.server_args, "enable_dp_attention", False):
         dp_size = model_runner.server_args.dp_size
         # DP-attention sync group = the dp ranks. With attn_tp_size==1 (M1: dp16,
@@ -478,7 +477,6 @@ def build_decode_forward_batch(
             batch_size, dtype=torch.int32, device=input_ids.device
         )
         fb.num_token_non_padded_cpu = batch_size
-        fb.prepare_mlp_sync_batch(model_runner)
 
     # TODO(verify-on-gpu): the NSA backend pulls the page table from its own
     # metadata, which it builds in attn_backend.init_forward_metadata(fb). For
