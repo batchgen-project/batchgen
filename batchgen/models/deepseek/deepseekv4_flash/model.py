@@ -83,6 +83,19 @@ _V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
 _V4_GROUPED_MOE_MAX_TOKENS = int(
     os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
 )
+
+
+def _v4_grouped_moe_enabled() -> bool:
+    # The grouped path uses MXFP4 WGMMA kernels (cvt.e2m1x2), which ptxas
+    # rejects below sm120. On Hopper/sm90 the per-expert loop fallback
+    # (pure-torch FP4 dequant) is correct, so force grouped off there.
+    if not _V4_GROUPED_MOE:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 12
+
+
 # Use the QAT-faithful grouped MoE forward (per-expert act_quant + fp4_gemm,
 # bit-exact vs official) instead of the faster bf16-weight-dequant grouped GEMM.
 # Needed for character-exact output; slower per decode step.
@@ -1711,7 +1724,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         # Grouped staging clones owned experts resident; only viable in the EP
         # decode phase (world_size>1, 64 owned experts/rank, ~97GB free). Prefill
         # runs world_size=1 owning all 256 experts at a high memory peak -> skip.
-        if _V4_GROUPED_MOE and self.enable_ep_offloading:
+        if _v4_grouped_moe_enabled() and self.enable_ep_offloading:
             grouped = self._run_owned_experts_grouped(
                 token_states, topk_weights, topk_indices
             )
