@@ -18,7 +18,7 @@ from batchgen.attention.v4_backend import DSV4AttnMetadata
 from batchgen.kv_cache.deepseek_v4_kv_coordinator import DeepSeekV4KVCoordinator
 from batchgen.timing import get_decode_timer
 
-# Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
+# Env-gated diagnostic (default OFF).
 _V4_ATTN_PROBE = os.environ.get("BATCHGEN_V4_ATTN_PROBE", "0") == "1"
 _V4_ATTN_PROBE_STEPS = int(os.environ.get("BATCHGEN_V4_ATTN_PROBE_STEPS", "1"))
 # Tensor-level dump for offline diff vs the official reference's sparse_attn
@@ -132,6 +132,9 @@ _SOFTMAX_SCALE = 512**-0.5
 _SWA_WINDOW = 128
 _V4_MLA_VALIDATE_INDICES = (
     os.environ.get("BATCHGEN_V4_MLA_VALIDATE_INDICES", "0") == "1"
+)
+_V4_FAST_PREFIX_INDICES = (
+    os.environ.get("BATCHGEN_V4_FAST_PREFIX_INDICES", "1") == "1"
 )
 
 
@@ -346,7 +349,7 @@ def _resolve_sequence_ids(
     return seqs
 
 
-def _resolve_swa_token_slots(
+def _resolve_swa_token_slots_slow(
     coordinator: DeepSeekV4KVCoordinator,
     sequence_ids: Sequence[int],
     positions: torch.Tensor,
@@ -356,6 +359,44 @@ def _resolve_swa_token_slots(
         for seq_id, position in zip(sequence_ids, positions)
     ]
     return torch.stack(slots).to(dtype=torch.int32, device=positions.device)
+
+
+def _resolve_swa_token_slots_fast(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    positions: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    pool = coordinator.swa
+    page_table = getattr(pool, "_page_table", None)
+    if page_table is None or not _pool_active_order_matches(pool, sequence_ids):
+        return None
+    device = positions.device
+    pos = positions.to(device=device, dtype=torch.long)
+    page_size = int(pool.page_size_tokens)
+    page_table = page_table.to(device=device)
+    page_offsets = torch.div(pos, page_size, rounding_mode="floor")
+    if int(page_offsets.max().item()) >= page_table.shape[1]:
+        return None
+    rows = torch.arange(pos.shape[0], device=device, dtype=torch.long)
+    pages = page_table[rows, page_offsets].to(torch.long)
+    if bool((pages < 0).any().item()):
+        return None
+    slots = pages * page_size + torch.remainder(pos, page_size)
+    return slots.to(dtype=torch.int32, device=device)
+
+
+def _resolve_swa_token_slots(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    if _V4_MLA_SM120_TRITON and _V4_FAST_PREFIX_INDICES:
+        fast = _resolve_swa_token_slots_fast(
+            coordinator, sequence_ids, positions
+        )
+        if fast is not None:
+            return fast
+    return _resolve_swa_token_slots_slow(coordinator, sequence_ids, positions)
 
 
 def _aligned_topk(length: int) -> int:
@@ -451,7 +492,7 @@ def _physicalize_positions_with_page_table(
     return slots.unsqueeze(1).to(dtype=torch.int32), lengths
 
 
-def _build_full_prefix_indices(
+def _build_full_prefix_indices_slow(
     coordinator: DeepSeekV4KVCoordinator,
     sequence_ids: Sequence[int],
     cache_seqlens: torch.Tensor,
@@ -470,13 +511,88 @@ def _build_full_prefix_indices(
     )
 
 
-def _build_swa_window_indices(
+def _physicalize_tail_padded_contiguous(
+    pool: Any,
+    sequence_ids: Sequence[int],
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    padded_topk: int,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Vectorized slot gather for tail-padded contiguous logical positions.
+
+    Each row covers logical positions [start, start+length) with -1 only in the
+    tail (no interior holes), so the compacted slow-path output equals this
+    gather directly. Returns None when the page table is unavailable/stale.
+    """
+    page_table = getattr(pool, "_page_table", None)
+    if page_table is None or not _pool_active_order_matches(pool, sequence_ids):
+        return None
+    batch = starts.shape[0]
+    if padded_topk == 0:
+        return torch.empty(batch, 1, 0, dtype=torch.int32, device=device)
+
+    page_size = int(pool.page_size_tokens)
+    page_table = page_table.to(device=device)
+    offsets = torch.arange(padded_topk, device=device, dtype=torch.long)
+    valid = offsets[None, :] < lengths[:, None]
+    logical = starts[:, None] + offsets[None, :]
+    page_offsets = torch.div(logical, page_size, rounding_mode="floor")
+    token_offsets = torch.remainder(logical, page_size)
+    in_page_table = page_offsets < page_table.shape[1]
+    safe_page_offsets = page_offsets.clamp(max=max(page_table.shape[1] - 1, 0))
+    pages = torch.gather(page_table, 1, safe_page_offsets).to(torch.long)
+    slot_valid = valid & in_page_table & (pages >= 0)
+    slots = pages * page_size + token_offsets
+    slots = torch.where(slot_valid, slots, torch.full_like(slots, -1))
+    return slots.unsqueeze(1).to(dtype=torch.int32)
+
+
+def _build_full_prefix_indices_fast(
     coordinator: DeepSeekV4KVCoordinator,
     sequence_ids: Sequence[int],
     cache_seqlens: torch.Tensor,
-    *,
-    window: int = _SWA_WINDOW,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    device = cache_seqlens.device
+    lengths = cache_seqlens.to(device=device, dtype=torch.int32)
+    seqlens_long = cache_seqlens.to(device=device, dtype=torch.long)
+    padded_topk = (
+        _aligned_topk(int(seqlens_long.max().item()))
+        if seqlens_long.numel()
+        else 0
+    )
+    starts = torch.zeros_like(seqlens_long)
+    indices = _physicalize_tail_padded_contiguous(
+        coordinator.swa,
+        sequence_ids,
+        starts,
+        seqlens_long,
+        padded_topk,
+        device=device,
+    )
+    return indices, lengths
+
+
+def _build_full_prefix_indices(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    cache_seqlens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _V4_MLA_SM120_TRITON and _V4_FAST_PREFIX_INDICES:
+        fast_indices, fast_lengths = _build_full_prefix_indices_fast(
+            coordinator, sequence_ids, cache_seqlens
+        )
+        if fast_indices is not None:
+            return fast_indices, fast_lengths
+    return _build_full_prefix_indices_slow(
+        coordinator, sequence_ids, cache_seqlens
+    )
+
+
+def _swa_window_geometry(
+    cache_seqlens: torch.Tensor, window: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     lengths = torch.minimum(
         cache_seqlens.to(dtype=torch.long),
         torch.full_like(cache_seqlens.to(dtype=torch.long), int(window)),
@@ -485,9 +601,39 @@ def _build_swa_window_indices(
         _aligned_topk(int(lengths.max().item())) if lengths.numel() else 0
     )
     starts = (cache_seqlens.to(dtype=torch.long) - lengths).clamp_min(0)
-    offsets = torch.arange(
-        padded_topk, device=cache_seqlens.device, dtype=torch.long
+    return starts, lengths, padded_topk
+
+
+def _build_swa_window_indices_fast(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    cache_seqlens: torch.Tensor,
+    *,
+    window: int = _SWA_WINDOW,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+    device = cache_seqlens.device
+    starts, lengths, padded_topk = _swa_window_geometry(cache_seqlens, window)
+    indices = _physicalize_tail_padded_contiguous(
+        coordinator.swa,
+        sequence_ids,
+        starts,
+        lengths,
+        padded_topk,
+        device=device,
     )
+    return indices, lengths.to(dtype=torch.int32)
+
+
+def _build_swa_window_indices_slow(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    cache_seqlens: torch.Tensor,
+    *,
+    window: int = _SWA_WINDOW,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = cache_seqlens.device
+    starts, lengths, padded_topk = _swa_window_geometry(cache_seqlens, window)
+    offsets = torch.arange(padded_topk, device=device, dtype=torch.long)
     logical_positions = starts[:, None] + offsets[None, :]
     logical_positions = torch.where(
         offsets[None, :] < lengths[:, None],
@@ -498,19 +644,37 @@ def _build_swa_window_indices(
         coordinator.swa,
         sequence_ids,
         logical_positions,
-        device=cache_seqlens.device,
+        device=device,
     )
     if fast is not None:
         return fast
     fallback_positions = [
-        row[row >= 0].to(dtype=torch.long, device=cache_seqlens.device)
+        row[row >= 0].to(dtype=torch.long, device=device)
         for row in logical_positions
     ]
     return _build_slot_indices_from_positions(
         coordinator.swa,
         sequence_ids,
         fallback_positions,
-        device=cache_seqlens.device,
+        device=device,
+    )
+
+
+def _build_swa_window_indices(
+    coordinator: DeepSeekV4KVCoordinator,
+    sequence_ids: Sequence[int],
+    cache_seqlens: torch.Tensor,
+    *,
+    window: int = _SWA_WINDOW,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _V4_MLA_SM120_TRITON and _V4_FAST_PREFIX_INDICES:
+        fast_indices, fast_lengths = _build_swa_window_indices_fast(
+            coordinator, sequence_ids, cache_seqlens, window=window
+        )
+        if fast_indices is not None:
+            return fast_indices, fast_lengths
+    return _build_swa_window_indices_slow(
+        coordinator, sequence_ids, cache_seqlens, window=window
     )
 
 
@@ -1182,6 +1346,11 @@ class DeepSeekV4FlashMLADecodeAdapter:
         if backend_name == "sm120_triton":
             from batchgen.attention.dsa.v4_mla_sm120_triton import (
                 flash_mla_sparse_decode_sm120,
+                maybe_warmup_sm120_sparse_decode,
+            )
+
+            maybe_warmup_sm120_sparse_decode(
+                num_heads=q.shape[1], head_dim=q.shape[-1], device=q.device
             )
 
             with (
