@@ -228,27 +228,28 @@ class DeepSeekV4SingleKVPool:
             .reshape(num_tokens, -1)
         )
 
-        for tile_idx in range(_MODEL1_NUM_TILES):
-            start = tile_idx * _MODEL1_TILE_SIZE
-            end = start + _MODEL1_TILE_SIZE
-            cur = kv_processed[:, start:end].float()
-            scale = torch.pow(
-                2.0,
-                torch.ceil(
-                    torch.log2(
-                        torch.clamp_min(cur.abs().amax(dim=-1) / 448.0, 1e-4)
-                    )
-                ),
-            )
-            packed[:, TOKEN_DATA_SIZE + tile_idx] = scale.to(
-                torch.float8_e8m0fnu
-            ).view(torch.uint8)
-            packed[:, start:end] = (
-                (cur / scale.unsqueeze(-1))
-                .to(torch.float8_e4m3fn)
-                .view(torch.uint8)
-                .reshape(num_tokens, -1)
-            )
+        tiles = (
+            kv_processed[:, :NOPE_DIM]
+            .float()
+            .reshape(num_tokens, _MODEL1_NUM_TILES, _MODEL1_TILE_SIZE)
+        )
+        scale = torch.pow(
+            2.0,
+            torch.ceil(
+                torch.log2(
+                    torch.clamp_min(tiles.abs().amax(dim=-1) / 448.0, 1e-4)
+                )
+            ),
+        )
+        packed[:, TOKEN_DATA_SIZE : TOKEN_DATA_SIZE + _MODEL1_NUM_TILES] = (
+            scale.to(torch.float8_e8m0fnu).view(torch.uint8)
+        )
+        packed[:, :NOPE_DIM] = (
+            (tiles / scale.unsqueeze(-1))
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .reshape(num_tokens, NOPE_DIM)
+        )
         return packed
 
     def destroy(self, *, empty_cuda_cache: bool = False) -> None:
