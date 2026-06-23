@@ -91,7 +91,7 @@ _V4_QAT_MOE = os.environ.get("BATCHGEN_V4_QAT_MOE", "0") == "1"
 # (default ON; set 0 to fall back to dist.*). See _ep_all_gather.
 _V4_PYNCCL_COMM = os.environ.get("BATCHGEN_V4_PYNCCL_COMM", "1") == "1"
 
-# Env-gated diagnostic (default OFF); see .sisyphus/HANDOFF.md for the probe spec.
+# Env-gated diagnostic (default OFF).
 _V4_DIVTRACE = os.environ.get("BATCHGEN_V4_DIVTRACE", "0") == "1"
 # Prefill mode: trace the PREFILL forward (q_len > 1) instead of decode tokens,
 # dumping only the last prompt position for comparison with the official
