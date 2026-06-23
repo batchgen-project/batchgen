@@ -10,6 +10,12 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"
 )
 
+# MXFP4 cvt.e2m1x2 PTX is rejected by ptxas on sm_90a; sm120+ only.
+requires_mxfp4 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12,
+    reason="MXFP4 requires sm120+ (cvt.e2m1x2 unsupported on sm_90a)",
+)
+
 
 def _make_cos_sin_cache(
     max_pos: int, rope_dim: int = 64, device: str = "cuda"
@@ -150,9 +156,10 @@ def test_weight_folding():
     )
 
 
+@requires_mxfp4
 def test_mxfp4_variant():
-    from batchgen_kernels.triton.v4_fused_indexer_q import fused_indexer_q_mxfp4
     from batchgen_kernels.common.v4_fp4_dequant import dequant_fp4_e2m1
+    from batchgen_kernels.triton.v4_fused_indexer_q import fused_indexer_q_mxfp4
 
     torch.manual_seed(3)
     index_q = torch.randn(32, 64, 128, device="cuda", dtype=torch.bfloat16)
@@ -292,6 +299,34 @@ def test_empty_input():
 
     assert out_fp8.shape == index_q.shape
     assert weights_out.shape == weights.shape
+
+
+def test_dispatch_default_picks_by_capability(monkeypatch):
+    import batchgen_kernels.triton.v4_fused_indexer_q as mod
+
+    calls = {"fp8": 0, "mxfp4": 0}
+    monkeypatch.setattr(
+        mod,
+        "fused_indexer_q_fp8",
+        lambda *a, **k: calls.__setitem__("fp8", calls["fp8"] + 1),
+    )
+    monkeypatch.setattr(
+        mod,
+        "fused_indexer_q_mxfp4",
+        lambda *a, **k: calls.__setitem__("mxfp4", calls["mxfp4"] + 1),
+    )
+    args = (None, None, None, None)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 0))
+    mod.fused_indexer_q(*args)
+    assert (calls["mxfp4"], calls["fp8"]) == (1, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
+    mod.fused_indexer_q(*args)
+    assert (calls["mxfp4"], calls["fp8"]) == (1, 1)
+
+    mod.fused_indexer_q(*args, use_fp4=True)
+    assert (calls["mxfp4"], calls["fp8"]) == (2, 1)
 
 
 @pytest.mark.parametrize("T", [1, 128])

@@ -12,6 +12,12 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"
 )
 
+# MXFP4 cvt.e2m1x2 PTX is rejected by ptxas on sm_90a; sm120+ only.
+requires_mxfp4 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12,
+    reason="MXFP4 requires sm120+ (cvt.e2m1x2 unsupported on sm_90a)",
+)
+
 SPARSE_HEAD_SIZE = 512
 INDEXER_HEAD_SIZE = 128
 ROPE_DIM = 64
@@ -699,6 +705,136 @@ def test_indexer_shape():
     assert weights_out.shape == weights.shape
 
 
+def _make_indexer_fp8_cache(num_blocks: int, block_size: int) -> torch.Tensor:
+    from batchgen_kernels.triton.v4_fused_compress_quant import (
+        INDEXER_FP8_SCALE_DIM,
+        INDEXER_FP8_TOKEN_STRIDE,
+    )
+
+    return torch.zeros(
+        (
+            num_blocks,
+            block_size * INDEXER_FP8_TOKEN_STRIDE
+            + block_size * INDEXER_FP8_SCALE_DIM,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+
+def _decode_indexer_fp8_slot(
+    cache: torch.Tensor, slot: int, block_size: int
+) -> torch.Tensor:
+    from batchgen_kernels.triton.v4_fused_compress_quant import (
+        INDEXER_FP8_SCALE_DIM,
+        INDEXER_FP8_TOKEN_STRIDE,
+    )
+
+    block_idx = slot // block_size
+    pos_in_block = slot % block_size
+    row = cache[block_idx]
+    data_base = pos_in_block * INDEXER_FP8_TOKEN_STRIDE
+    scale_base = (
+        block_size * INDEXER_FP8_TOKEN_STRIDE
+        + pos_in_block * INDEXER_FP8_SCALE_DIM
+    )
+    fp8 = (
+        row[data_base : data_base + INDEXER_FP8_TOKEN_STRIDE]
+        .clone()
+        .view(torch.float8_e4m3fn)
+        .float()
+    )
+    scale = (
+        row[scale_base : scale_base + INDEXER_FP8_SCALE_DIM]
+        .clone()
+        .view(torch.float32)
+    )
+    return fp8 * scale
+
+
+def test_select_indexer_quant(monkeypatch):
+    from batchgen_kernels.triton import v4_fused_compress_quant as mod
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 0))
+    monkeypatch.delenv("BATCHGEN_V4_INDEXER_QUANT", raising=False)
+    assert mod._indexer_quant_use_fp4(None) is True
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
+    assert mod._indexer_quant_use_fp4(None) is False
+
+    monkeypatch.setenv("BATCHGEN_V4_INDEXER_QUANT", "mxfp4")
+    assert mod._indexer_quant_use_fp4(None) is True
+    monkeypatch.setenv("BATCHGEN_V4_INDEXER_QUANT", "fp8")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 0))
+    assert mod._indexer_quant_use_fp4(None) is False
+
+    assert mod._indexer_quant_use_fp4(True) is True
+    assert mod._indexer_quant_use_fp4(False) is False
+
+
+def test_indexer_fp8_compress_matches_eager():
+    from batchgen_kernels.triton.v4_fused_compress_quant import (
+        fused_kv_compress_norm_rope_insert_indexer_fp8_attn,
+    )
+
+    torch.manual_seed(8)
+    T = 8
+    block_size = 4
+    compress_ratio = 2
+    overlap = 1
+    block_table = _make_block_table(T, block_size)
+    state_cache = 0.5 * torch.randn(
+        block_table.shape[1], block_size, INDEXER_HEAD_SIZE * 4, device="cuda"
+    )
+    positions = torch.arange(T, device="cuda", dtype=torch.int64)
+    token_to_req_indices = torch.zeros(T, device="cuda", dtype=torch.int32)
+    slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    kv_slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    weight = torch.randn(INDEXER_HEAD_SIZE, device="cuda", dtype=torch.float32)
+    cache = _make_cos_sin_cache(T + 1)
+    k_cache = _make_indexer_fp8_cache(2, block_size)
+
+    fused_kv_compress_norm_rope_insert_indexer_fp8_attn(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        weight,
+        cache,
+        k_cache,
+        kv_slot_mapping,
+        block_size=block_size,
+        kv_cache_block_size=block_size,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+    )
+
+    for token_idx, position in enumerate(positions.tolist()):
+        if (position + 1) % compress_ratio != 0:
+            continue
+        restored = _decode_indexer_fp8_slot(
+            k_cache, int(kv_slot_mapping[token_idx].item()), block_size
+        )
+        normed = _compress_norm_ref(
+            state_cache,
+            block_table,
+            0,
+            position,
+            weight,
+            head_dim=INDEXER_HEAD_SIZE,
+            block_size=block_size,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            eps=1e-6,
+        )
+        rotated = _rope_ref(
+            normed, (position // compress_ratio) * compress_ratio, cache
+        )
+        torch.testing.assert_close(restored, rotated, atol=0.1, rtol=0.1)
+
+
+@requires_mxfp4
 def test_indexer_mxfp4_roundtrip():
     from batchgen_kernels.triton.v4_fused_compress_quant import (
         fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -761,6 +897,7 @@ def test_indexer_mxfp4_roundtrip():
         torch.testing.assert_close(restored, rotated, atol=0.75, rtol=0.35)
 
 
+@requires_mxfp4
 def test_indexer_mxfp4_block32_scale():
     from batchgen_kernels.triton.v4_fused_compress_quant import (
         fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -811,6 +948,7 @@ def test_indexer_mxfp4_block32_scale():
     assert torch.equal(scale_u8, scale_ref)
 
 
+@requires_mxfp4
 def test_indexer_mxfp4_packed_format():
     from batchgen_kernels.triton.v4_fused_compress_quant import (
         fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
@@ -941,6 +1079,7 @@ def test_benchmark():
     assert mxfp4_ms > 0
 
 
+@requires_mxfp4
 def test_all_three_variants_integration():
     from batchgen_kernels.triton.v4_fused_compress_quant import (
         fused_indexer_q_rope_quant,
@@ -1169,6 +1308,7 @@ def test_bridge_eager_matches_sparse_kernel():
         )
 
 
+@requires_mxfp4
 def test_bridge_eager_matches_indexer_mxfp4_kernel():
     from batchgen_kernels.attention.v4_compressor import DeepSeekV4Compressor
     from batchgen_kernels.triton.v4_fused_compress_quant import (
