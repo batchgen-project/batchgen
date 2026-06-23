@@ -272,7 +272,7 @@ def test_runtime_kernel_compressor_bridges_weights_and_fail_fast():
     comp = wrapper._runtime_kernel_compressor(src, rotate=True)
     assert comp.rotate is True
     assert comp.overlap is True
-    assert torch.equal(comp.wkv.weight.data, tensors["wkv.weight"])
+    assert torch.equal(comp.wkv_weight.data, tensors["wkv.weight"])
     assert torch.equal(comp.ape.data, tensors["ape"])
     comp2 = wrapper._runtime_kernel_compressor(src, rotate=True)
     assert comp2 is comp
@@ -293,6 +293,11 @@ def test_v4_c4_indexer_inputs_reads_pool_and_shapes():
         DeepSeekV4FlashMLADecodeAdapter,
         build_v4_decode_attn_metadata,
     )
+
+    if torch.cuda.get_device_capability()[0] >= 12:
+        pytest.importorskip(
+            "tilelang", reason="sm120 indexer fp4_act_quant needs tilelang"
+        )
 
     cfg = SimpleNamespace(
         hidden_size=512,
@@ -358,7 +363,7 @@ def test_v4_c4_indexer_inputs_reads_pool_and_shapes():
         wrapper.layer_idx = layer_idx
         wrapper.model_config = cfg
         wrapper._v4_backend = backend
-        wrapper.module = SimpleNamespace(indexer=indexer)
+        wrapper.module = SimpleNamespace(indexer=indexer, world_size=1)
 
         q_low = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
         hidden = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
@@ -387,6 +392,11 @@ def test_v4_c4_prefill_populates_indexer_and_c4_pools():
     )
     from batchgen.models.wrappers import AttnWrapperBase
     from batchgen.attention.v4_backend import DSV4LayerConfig
+
+    if torch.cuda.get_device_capability()[0] >= 12:
+        pytest.importorskip(
+            "tilelang", reason="sm120 indexer fp4_act_quant needs tilelang"
+        )
 
     cfg = SimpleNamespace(
         hidden_size=512,
@@ -424,7 +434,9 @@ def test_v4_c4_prefill_populates_indexer_and_c4_pools():
             }
             comp.wkv.set_runtime_tensors(t, "wkv")
             comp.wgate.set_runtime_tensors(t, "wgate")
-        module = SimpleNamespace(compressor=main_comp, indexer=indexer)
+        module = SimpleNamespace(
+            compressor=main_comp, indexer=indexer, world_size=1
+        )
 
         wrapper = object.__new__(DeepSeekV4FlashAttnWrapper)
         wrapper.layer_idx = layer_idx
@@ -513,8 +525,8 @@ def test_v4_c128_decode_emission_stores_compressed_token():
         ).cuda()
         kernel_comp.ape.data = comp.ape.data
         kernel_comp.norm.weight.data = comp.norm.weight.data
-        kernel_comp.wkv.weight.data = comp.wkv.weight
-        kernel_comp.wgate.weight.data = comp.wgate.weight
+        kernel_comp.wkv_weight.data = comp.wkv.weight
+        kernel_comp.wgate_weight.data = comp.wgate.weight
 
         adapter = DeepSeekV4FlashMLADecodeAdapter(manager)
         cos_sin = build_v4_compress_cos_sin_cache(
