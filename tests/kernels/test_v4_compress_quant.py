@@ -1018,3 +1018,222 @@ def test_all_three_variants_integration():
     assert torch.isfinite(folded).all()
     assert sparse_out.sum().item() > 0
     assert mxfp4_out.sum().item() > 0
+
+
+# ---------------------------------------------------------------------------- #
+#  Eager <-> fused-kernel bridge parity                                         #
+#                                                                               #
+#  The runtime decode path runs the EAGER compressor                            #
+#  (DeepSeekV4Compressor.forward_decode in v4_compressor.py), while the fused   #
+#  Triton write kernels (this module) are tested only against their own numpy-  #
+#  style references. These bridge tests drive BOTH from identical projections   #
+#  and assert the emitted compressed-KV row agrees within quant tolerance, so   #
+#  swapping the eager path for the fused kernel is gated by a real equivalence  #
+#  check.                                                                        #
+#                                                                               #
+#  Scope: OVERLAP=0 only. For overlap, the fused kernel uses a cross-chunk      #
+#  window (prefill _overlap_transform semantics: prev-half ++ cur-half), while  #
+#  eager forward_decode_batch pools only the current chunk's staged slots.      #
+#  Those are intentionally different groupings, so an equality assertion would  #
+#  be incorrect; overlap parity is out of scope here.                           #
+# ---------------------------------------------------------------------------- #
+
+
+def _populate_state_cache_from_eager(
+    compressor,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    head_dim: int,
+    block_size: int,
+) -> torch.Tensor:
+    """state_cache row layout: [kv0(H) | kv1(H) | score0(H) | score1(H)]; for
+    OVERLAP=0 only half-0 is populated (kv=wkv, score=wgate+ape[slot])."""
+    num_blocks = block_table.shape[1]
+    state_cache = torch.zeros(
+        num_blocks, block_size, head_dim * 4, device="cuda", dtype=torch.float32
+    )
+    state_width = head_dim * 2
+    ratio = compressor.compress_ratio
+    for token_idx, position in enumerate(positions.tolist()):
+        kv = torch.nn.functional.linear(
+            hidden_states[token_idx].unsqueeze(0), compressor.wkv_weight
+        ).squeeze(0)
+        gate = torch.nn.functional.linear(
+            hidden_states[token_idx].unsqueeze(0), compressor.wgate_weight
+        ).squeeze(0)
+        slot = position % ratio
+        score = gate + compressor.ape[slot]
+        block = int(block_table[0, position // block_size].item())
+        offset = position % block_size
+        state_cache[block, offset, 0:head_dim] = kv
+        state_cache[block, offset, state_width : state_width + head_dim] = score
+    return state_cache
+
+
+def _eager_emit(
+    compressor,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
+) -> dict[int, torch.Tensor]:
+    kv_state = torch.zeros(
+        compressor.compress_ratio,
+        compressor.coeff * head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    score_state = torch.zeros_like(kv_state)
+    emitted: dict[int, torch.Tensor] = {}
+    for token_idx, position in enumerate(positions.tolist()):
+        out, kv_state, score_state = compressor.forward_decode(
+            hidden_states[token_idx : token_idx + 1],
+            kv_state,
+            score_state,
+            positions[token_idx : token_idx + 1],
+            cos_sin_cache,
+        )
+        if out.numel():
+            emitted[token_idx] = out.squeeze(0).float()
+    return emitted
+
+
+def test_bridge_eager_matches_sparse_kernel():
+    from batchgen_kernels.attention.v4_compressor import DeepSeekV4Compressor
+    from batchgen_kernels.triton.v4_fused_compress_quant import (
+        fused_kv_compress_norm_rope_insert_sparse_attn,
+    )
+
+    torch.manual_seed(20)
+    hidden_size = 64
+    head_dim = SPARSE_HEAD_SIZE
+    rope_dim = ROPE_DIM
+    ratio = 2
+    num_chunks = 2
+    T = ratio * num_chunks
+    block_size = 4
+
+    compressor = DeepSeekV4Compressor(
+        hidden_size, head_dim, rope_dim, ratio, 1e-6, overlap=False
+    ).cuda()
+    hidden_states = torch.randn(
+        T, hidden_size, device="cuda", dtype=torch.float32
+    )
+    positions = torch.arange(T, device="cuda", dtype=torch.int64)
+    cos_sin_cache = _make_cos_sin_cache(T + 1, rope_dim)
+    block_table = _make_block_table(T, block_size)
+
+    eager = _eager_emit(
+        compressor, hidden_states, positions, cos_sin_cache, head_dim
+    )
+    assert sorted(eager.keys()) == [1, 3]
+
+    state_cache = _populate_state_cache_from_eager(
+        compressor,
+        hidden_states,
+        positions,
+        block_table,
+        head_dim=head_dim,
+        block_size=block_size,
+    )
+    token_to_req_indices = torch.zeros(T, device="cuda", dtype=torch.int32)
+    slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    kv_slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    k_cache = _make_sparse_cache(2, block_size)
+
+    fused_kv_compress_norm_rope_insert_sparse_attn(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        compressor.norm.weight.contiguous(),
+        cos_sin_cache,
+        k_cache,
+        kv_slot_mapping,
+        block_size=block_size,
+        kv_cache_block_size=block_size,
+        compress_ratio=ratio,
+        overlap=0,
+    )
+
+    fp8_atol, fp8_rtol = 0.1, 0.1
+    for token_idx, eager_vec in eager.items():
+        _, _, _, restored = _decode_sparse_slot(
+            k_cache, int(kv_slot_mapping[token_idx].item()), block_size
+        )
+        torch.testing.assert_close(
+            restored, eager_vec, atol=fp8_atol, rtol=fp8_rtol
+        )
+
+
+def test_bridge_eager_matches_indexer_mxfp4_kernel():
+    from batchgen_kernels.attention.v4_compressor import DeepSeekV4Compressor
+    from batchgen_kernels.triton.v4_fused_compress_quant import (
+        fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
+    )
+
+    torch.manual_seed(21)
+    hidden_size = 64
+    head_dim = INDEXER_HEAD_SIZE
+    rope_dim = ROPE_DIM
+    ratio = 2
+    num_chunks = 2
+    T = ratio * num_chunks
+    block_size = 4
+
+    compressor = DeepSeekV4Compressor(
+        hidden_size, head_dim, rope_dim, ratio, 1e-6, overlap=False
+    ).cuda()
+    mxfp4_amplitude_guard = 0.5
+    hidden_states = mxfp4_amplitude_guard * torch.randn(
+        T, hidden_size, device="cuda", dtype=torch.float32
+    )
+    positions = torch.arange(T, device="cuda", dtype=torch.int64)
+    cos_sin_cache = _make_cos_sin_cache(T + 1, rope_dim)
+    block_table = _make_block_table(T, block_size)
+
+    eager = _eager_emit(
+        compressor, hidden_states, positions, cos_sin_cache, head_dim
+    )
+    assert sorted(eager.keys()) == [1, 3]
+
+    state_cache = _populate_state_cache_from_eager(
+        compressor,
+        hidden_states,
+        positions,
+        block_table,
+        head_dim=head_dim,
+        block_size=block_size,
+    )
+    token_to_req_indices = torch.zeros(T, device="cuda", dtype=torch.int32)
+    slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    kv_slot_mapping = torch.arange(T, device="cuda", dtype=torch.int64)
+    k_cache = _make_mxfp4_cache(2, block_size)
+
+    fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        compressor.norm.weight.contiguous(),
+        cos_sin_cache,
+        k_cache,
+        kv_slot_mapping,
+        block_size=block_size,
+        kv_cache_block_size=block_size,
+        compress_ratio=ratio,
+        overlap=0,
+    )
+
+    mxfp4_atol, mxfp4_rtol = 0.75, 0.35
+    for token_idx, eager_vec in eager.items():
+        _, _, restored = _decode_mxfp4_slot(
+            k_cache, int(kv_slot_mapping[token_idx].item()), block_size
+        )
+        torch.testing.assert_close(
+            restored, eager_vec, atol=mxfp4_atol, rtol=mxfp4_rtol
+        )

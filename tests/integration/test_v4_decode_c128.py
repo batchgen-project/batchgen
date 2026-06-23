@@ -88,12 +88,12 @@ def _canonical_c128_chunks(
         return hidden_states.new_empty(0, compressor.head_dim)
     hidden_states = hidden_states[: num_chunks * ratio].float()
     positions = positions[: num_chunks * ratio]
-    kv = compressor.wkv(hidden_states).view(
+    kv = torch.nn.functional.linear(hidden_states, compressor.wkv_weight).view(
         num_chunks, ratio, compressor.head_dim
     )
-    gate = compressor.wgate(hidden_states).view(
-        num_chunks, ratio, compressor.head_dim
-    )
+    gate = torch.nn.functional.linear(
+        hidden_states, compressor.wgate_weight
+    ).view(num_chunks, ratio, compressor.head_dim)
     scores = gate + compressor.ape.view(ratio, compressor.head_dim).unsqueeze(0)
     weights = torch.softmax(scores, dim=1)
     pooled = (kv * weights).sum(dim=1)

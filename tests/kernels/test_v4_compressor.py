@@ -48,12 +48,12 @@ def _canonical_prefill_reference(
         return hidden_states.new_empty(0, compressor.head_dim)
     hidden_states = hidden_states[:tokens].float()
     positions = positions[:tokens]
-    kv = compressor.wkv(hidden_states).view(
+    kv = torch.nn.functional.linear(hidden_states, compressor.wkv_weight).view(
         num_chunks, ratio * coeff, compressor.head_dim
     )
-    gate = compressor.wgate(hidden_states).view(
-        num_chunks, ratio * coeff, compressor.head_dim
-    )
+    gate = torch.nn.functional.linear(
+        hidden_states, compressor.wgate_weight
+    ).view(num_chunks, ratio * coeff, compressor.head_dim)
     ape = compressor.ape.view(ratio * coeff, compressor.head_dim)
     weights = torch.softmax(gate + ape.unsqueeze(0), dim=1)
     pooled = (kv * weights).sum(dim=1)
@@ -80,8 +80,12 @@ def _canonical_decode_reference(
         hidden_states.float(), positions, strict=False
     ):
         slot = int(position.item()) % compressor.compress_ratio
-        kv = compressor.wkv(hidden_state.unsqueeze(0)).squeeze(0)
-        gate = compressor.wgate(hidden_state.unsqueeze(0)).squeeze(0)
+        kv = torch.nn.functional.linear(
+            hidden_state.unsqueeze(0), compressor.wkv_weight
+        ).squeeze(0)
+        gate = torch.nn.functional.linear(
+            hidden_state.unsqueeze(0), compressor.wgate_weight
+        ).squeeze(0)
         kv_state[slot].copy_(kv)
         score_state[slot].copy_(gate + compressor.ape[slot])
         if slot == compressor.compress_ratio - 1:
@@ -147,9 +151,9 @@ def test_gated_pooling_softmax():
     torch.manual_seed(1)
     compressor = DeepSeekV4Compressor(16, 8, 4, 4, 1e-6).cuda()
     hidden_states = torch.randn(4, 16, device="cuda", dtype=torch.float32)
-    gate = compressor._reshape_projected(compressor.wgate(hidden_states)).view(
-        1, 4, 1, 8
-    )
+    gate = compressor._reshape_projected(
+        torch.nn.functional.linear(hidden_states, compressor.wgate_weight)
+    ).view(1, 4, 1, 8)
     weights = torch.softmax(gate.float().reshape(1, 4, 8), dim=1)
 
     torch.testing.assert_close(
@@ -163,8 +167,8 @@ def test_ape_addition():
 
     compressor = DeepSeekV4Compressor(8, 8, 4, 4, 1e-6).cuda()
     with torch.no_grad():
-        compressor.wkv.weight.zero_()
-        compressor.wgate.weight.zero_()
+        compressor.wkv_weight.zero_()
+        compressor.wgate_weight.zero_()
         compressor.norm.weight.fill_(1.0)
         compressor.ape.copy_(
             torch.tensor(
@@ -193,8 +197,8 @@ def test_norm_after_compress():
 
     compressor = DeepSeekV4Compressor(8, 8, 4, 4, 1e-6).cuda()
     with torch.no_grad():
-        compressor.wkv.weight.copy_(torch.eye(8, device="cuda"))
-        compressor.wgate.weight.zero_()
+        compressor.wkv_weight.copy_(torch.eye(8, device="cuda"))
+        compressor.wgate_weight.zero_()
         compressor.ape.zero_()
         compressor.norm.weight.copy_(
             torch.tensor(
