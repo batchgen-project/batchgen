@@ -63,6 +63,10 @@ This process creates an annotated tag and pushes it to the remote repository. Pu
 ## Contents
 
 - `Dockerfile`: Instructions for building the `batchgen` image.
+- `v4_h20_rebuild_and_launch.sh`: One-stop runbook to rebuild the Hopper/H20
+  image from current source and run a full DeepSeek-V4-Flash launch on 4x H20
+  (`build` / `launch` / `wait` / `smoke` / `mmlu` / `stop`). Encodes the known
+  H20 launch gotchas (512G `--shm-size`, stale-shm cleanup, sm-aware env flags).
 - Other supporting files for the Docker build process.
 
 ## Notes
