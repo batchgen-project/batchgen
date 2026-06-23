@@ -25,18 +25,16 @@ LOG2E = tl.constexpr(1.4426950408889634)
 
 _NOPE_DIM = 448
 _ROPE_DIM = 64
+_HEAD_DIM = _NOPE_DIM + _ROPE_DIM
 _TOKEN_DATA_STRIDE = 576
 _SCALE_STRIDE = 8
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_T": 16}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_T": 16}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_T": 32}, num_warps=8, num_stages=2),
-    ],
-    key=["topk_rounded"],
-)
+_PINNED_BLOCK_T = 32
+_PINNED_NUM_WARPS = 8
+_PINNED_NUM_STAGES = 2
+
+
 @triton.jit
 def _tiled_sparse_decode_kernel(
     Q_ptr,
@@ -178,6 +176,16 @@ def _run_triton_sparse_decode(
     page_size = k_cache.shape[1]
     page_bytes = k_cache.stride(0)
 
+    bytes_per_token = _TOKEN_DATA_STRIDE + _SCALE_STRIDE
+    if page_bytes < page_size * bytes_per_token:
+        raise ValueError(
+            "k_cache must be shaped [num_pages, page_size, ..., "
+            f"{bytes_per_token}] so stride(0) >= page_size*{bytes_per_token}; "
+            f"got page_size(shape[1])={page_size}, stride(0)={page_bytes}. "
+            "A flat [num_pages, page_bytes] cache misreads page_size and "
+            "causes out-of-bounds scale/rope addressing."
+        )
+
     flat_indices = indices.reshape(B, -1).contiguous()
     topk = flat_indices.shape[1]
 
@@ -227,6 +235,9 @@ def _run_triton_sparse_decode(
         NOPE_PAD=512,
         ROPE_DIM=_ROPE_DIM,
         NOPE_DIM_RT=_NOPE_DIM,
+        BLOCK_T=_PINNED_BLOCK_T,
+        num_warps=_PINNED_NUM_WARPS,
+        num_stages=_PINNED_NUM_STAGES,
     )
     return out.unsqueeze(1), lse.unsqueeze(1)
 
@@ -309,3 +320,63 @@ def flash_mla_sparse_decode_sm120(
             out, lse = _apply_attn_sink(out, lse, attn_sink)
 
     return out[..., :head_dim_v]
+
+
+_WARMUP_TOPK_BUCKETS = (64, 128)
+_WARMUP_PAGE_SIZE = 64
+_warmup_done: set[tuple[int, int]] = set()
+
+
+def maybe_warmup_sm120_sparse_decode(
+    *,
+    num_heads: int = 64,
+    head_dim: int = _HEAD_DIM,
+    device: torch.device | str | int = "cuda",
+) -> None:
+    key = (int(num_heads), int(head_dim))
+    if key in _warmup_done:
+        return
+    _warmup_done.add(key)
+    warmup_sm120_sparse_decode(
+        num_heads=num_heads, head_dim=head_dim, device=device
+    )
+
+
+def warmup_sm120_sparse_decode(
+    *,
+    num_heads: int = 64,
+    head_dim: int = _HEAD_DIM,
+    device: torch.device | str | int = "cuda",
+    topk_buckets: tuple[int, ...] = _WARMUP_TOPK_BUCKETS,
+) -> None:
+    """Pre-compile the kernel per topk bucket so the ~377ms first-call JIT and
+    the ~371ms topk 64->128 transition do not land on live decode steps 0/64."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    bytes_per_token = _TOKEN_DATA_STRIDE + _SCALE_STRIDE
+    num_pages = 4
+    k_cache = torch.zeros(
+        num_pages,
+        _WARMUP_PAGE_SIZE,
+        1,
+        bytes_per_token,
+        dtype=torch.uint8,
+        device=device,
+    )
+    softmax_scale = head_dim**-0.5
+    capacity = num_pages * _WARMUP_PAGE_SIZE
+    for topk in topk_buckets:
+        q = torch.zeros(
+            1, 1, num_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        indices = (
+            torch.arange(topk, dtype=torch.int32, device=device) % capacity
+        ).view(1, topk)
+        topk_length = torch.full(
+            (1,), min(topk, capacity), dtype=torch.int32, device=device
+        )
+        _run_triton_sparse_decode(
+            q, k_cache, indices, topk_length, softmax_scale
+        )
+    torch.cuda.synchronize(device)
