@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -330,8 +332,13 @@ def fused_indexer_q(
     softmax_scale: float = 1.0,
     head_scale: float = 1.0,
     rope_dim: int = 64,
-    use_fp4: bool = False,
+    use_fp4: Optional[bool] = None,
 ):
+    if use_fp4 is None:
+        use_fp4 = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 12
+        )
     if use_fp4:
         return fused_indexer_q_mxfp4(
             index_q,

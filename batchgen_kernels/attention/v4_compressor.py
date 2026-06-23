@@ -7,6 +7,31 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+_FP8_E4M3_MAX = 448.0
+
+
+def _supports_mxfp4() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 12
+    )
+
+
+def _fp8_fake_quant_blockwise(q: torch.Tensor, block_size: int) -> None:
+    # sm90 fallback for the indexer's fp4 fake-quant: e4m3 round-trip with the
+    # same block_size grouping. ptxas rejects fp4 cvt.e2m1x2 on sm_90a, so we
+    # approximate the QAT fake-quant in fp8 (in place, like fp4_act_quant).
+    orig_dtype = q.dtype
+    x = q.float()
+    *lead, n = x.shape
+    x = x.reshape(*lead, n // block_size, block_size)
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = amax / _FP8_E4M3_MAX
+    deq = ((x / scale).to(torch.float8_e4m3fn).float() * scale).reshape(
+        *lead, n
+    )
+    q.copy_(deq.to(orig_dtype))
+
 
 class _RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -137,14 +162,17 @@ class DeepSeekV4Compressor(nn.Module):
         rotated = (x.float() @ H).to(x.dtype)
         # Official compressor fp4-fake-quantizes the rotated indexer K before
         # caching (assets/inference/model.py:369-370: rotate_activation then
-        # fp4_act_quant(kv, 32, True)). Match it so indexer scores are
-        # QAT-faithful against the fp4-quantized query.
-        from batchgen.models.deepseek.deepseekv4_flash.model import (
-            _v4_official_kernels,
-        )
-
+        # fp4_act_quant(kv, 32, True)). fp4 cvt.e2m1x2 only compiles on sm120;
+        # on sm90 fall back to an fp8 fake-quant approximation.
         q = rotated.to(torch.bfloat16).contiguous()
-        _v4_official_kernels().fp4_act_quant(q, 32, True)
+        if _supports_mxfp4():
+            from batchgen.models.deepseek.deepseekv4_flash.model import (
+                _v4_official_kernels,
+            )
+
+            _v4_official_kernels().fp4_act_quant(q, 32, True)
+        else:
+            _fp8_fake_quant_blockwise(q, 32)
         return q.to(rotated.dtype)
 
     def _apply_rope(

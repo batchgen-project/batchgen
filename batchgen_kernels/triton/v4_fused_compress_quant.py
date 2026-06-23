@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import os
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -420,6 +423,132 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     tl.store(scale_ptr + tl.arange(0, SCALE_DIM), ue8m0)
 
 
+@triton.jit
+def _fused_kv_compress_norm_rope_insert_indexer_fp8_attn(
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    token_to_req_indices_ptr,
+    positions_ptr,
+    slot_mapping_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_slot_mapping_ptr,
+    kv_cache_block_size,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+    ROPE_HEAD_DIM_: tl.constexpr,
+    FP8_MAX_: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+
+    slot_id = tl.load(slot_mapping_ptr + token_idx)
+    if slot_id < 0:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    pos = start + tokens
+    mask_pos = pos >= 0
+
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
+    block_offsets = pos % block_size
+    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+    block_numbers_i64 = block_numbers.to(tl.int64)
+    row_base = (
+        state_cache_ptr
+        + block_numbers_i64 * state_cache_stride0
+        + block_offsets * state_cache_stride1
+        + head_offset
+    )
+    combined_mask = mask_pos[:, None] & mask[None, :]
+
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
+    score = tl.softmax(score, dim=0)
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
+    compressed_kv = tl.sum(kv * score, axis=0)
+
+    rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
+    variance = tl.sum(compressed_kv * compressed_kv, axis=0) / HEAD_SIZE
+    rrms = tl.rsqrt(variance + rms_norm_eps)
+    normed = compressed_kv * rrms * rms_w
+
+    HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM_ // 2
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM_
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair_local = pair_idx - NOPE_PAIRS
+    is_rope_pair = rope_pair_local >= 0
+    cs_idx = tl.maximum(rope_pair_local, 0)
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cache_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cache_base + cs_idx, mask=is_rope_pair, other=1.0)
+    sin_v = tl.load(
+        cache_base + HALF_ROPE + cs_idx, mask=is_rope_pair, other=0.0
+    )
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    roped = tl.interleave(new_even, new_odd)
+
+    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot_idx < 0:
+        return
+    kv_block_idx = kv_slot_idx // kv_cache_block_size
+    kv_pos_in_block = kv_slot_idx % kv_cache_block_size
+    cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
+    val_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr
+        + kv_cache_block_size * TOKEN_STRIDE
+        + kv_pos_in_block * SCALE_DIM
+    )
+
+    absmax = tl.max(tl.abs(roped), axis=0)
+    scale = tl.maximum(absmax / FP8_MAX_, 1e-4)
+    x_fp8 = tl.clamp(roped / scale, -FP8_MAX_, FP8_MAX_).to(tl.float8e4nv)
+    tl.store(val_ptr + block, x_fp8.to(tl.uint8, bitcast=True), mask=mask)
+
+    scale_f32_ptr = scale_ptr.to(tl.pointer_type(tl.float32))
+    tl.store(scale_f32_ptr, scale)
+
+
 def fused_kv_compress_norm_rope_insert_sparse_attn(
     state_cache: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -634,6 +763,136 @@ def fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     return k_cache
 
 
+def fused_kv_compress_norm_rope_insert_indexer_fp8_attn(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    *,
+    block_size: int,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    overlap: int,
+    rms_norm_eps: float = 1e-6,
+) -> torch.Tensor:
+    assert state_cache.is_cuda and state_cache.ndim == 3
+    assert state_cache.dtype in (torch.bfloat16, torch.float32)
+    assert state_cache.shape[-1] == INDEXER_HEAD_SIZE * 4
+    assert token_to_req_indices.is_cuda and token_to_req_indices.ndim == 1
+    assert (
+        positions.is_cuda
+        and positions.ndim == 1
+        and positions.dtype == torch.int64
+    )
+    assert slot_mapping.is_cuda and slot_mapping.ndim == 1
+    assert block_table.is_cuda and block_table.ndim == 2
+    assert rms_norm_weight.is_cuda and rms_norm_weight.shape == (
+        INDEXER_HEAD_SIZE,
+    )
+    assert cos_sin_cache.is_cuda and cos_sin_cache.shape[-1] == ROPE_HEAD_DIM
+    assert (
+        k_cache.is_cuda and k_cache.dtype == torch.uint8 and k_cache.ndim == 2
+    )
+    assert kv_slot_mapping.is_cuda and kv_slot_mapping.ndim == 1
+    assert state_cache.stride(-1) == 1 and cos_sin_cache.stride(-1) == 1
+
+    num_tokens = positions.numel()
+    if num_tokens == 0:
+        return k_cache
+
+    _fused_kv_compress_norm_rope_insert_indexer_fp8_attn[(num_tokens,)](
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        k_cache,
+        kv_slot_mapping,
+        kv_cache_block_size,
+        HEAD_SIZE=INDEXER_HEAD_SIZE,
+        TRITON_BLOCK_SIZE=INDEXER_HEAD_SIZE,
+        STATE_WIDTH=INDEXER_HEAD_SIZE * 2,
+        COMPRESS_RATIO=compress_ratio,
+        OVERLAP=overlap,
+        ROPE_HEAD_DIM_=ROPE_HEAD_DIM,
+        FP8_MAX_=FP8_MAX,
+        TOKEN_STRIDE=INDEXER_FP8_TOKEN_STRIDE,
+        SCALE_DIM=INDEXER_FP8_SCALE_DIM,
+        KV_BLOCK_STRIDE=k_cache.stride(0),
+        num_warps=1,
+        num_stages=1,
+    )
+    return k_cache
+
+
+def _indexer_quant_use_fp4(use_fp4: Optional[bool]) -> bool:
+    if use_fp4 is not None:
+        return use_fp4
+    env = os.environ.get("BATCHGEN_V4_INDEXER_QUANT", "auto").lower()
+    if env == "mxfp4":
+        return True
+    if env == "fp8":
+        return False
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 12
+    )
+
+
+def fused_kv_compress_norm_rope_insert_indexer(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    *,
+    block_size: int,
+    kv_cache_block_size: int,
+    compress_ratio: int,
+    overlap: int,
+    rms_norm_eps: float = 1e-6,
+    use_fp4: Optional[bool] = None,
+) -> torch.Tensor:
+    impl = (
+        fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
+        if _indexer_quant_use_fp4(use_fp4)
+        else fused_kv_compress_norm_rope_insert_indexer_fp8_attn
+    )
+    return impl(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        slot_mapping,
+        block_table,
+        rms_norm_weight,
+        cos_sin_cache,
+        k_cache,
+        kv_slot_mapping,
+        block_size=block_size,
+        kv_cache_block_size=kv_cache_block_size,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_norm_eps=rms_norm_eps,
+    )
+
+
 __all__ = [
     "FP8_MAX",
     "INDEXER_FP8_SCALE_DIM",
@@ -649,6 +908,8 @@ __all__ = [
     "SPARSE_SCALE_DIM",
     "SPARSE_TOKEN_STRIDE",
     "fused_indexer_q_rope_quant",
+    "fused_kv_compress_norm_rope_insert_indexer",
+    "fused_kv_compress_norm_rope_insert_indexer_fp8_attn",
     "fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn",
     "fused_kv_compress_norm_rope_insert_sparse_attn",
 ]
