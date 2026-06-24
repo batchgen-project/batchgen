@@ -33,6 +33,30 @@ public source — no prebuilt binaries are vendored. Both builds also include `t
 `fast_hadamard_transform` (built from GitHub source), which the V4-Flash sparse-prefill
 path requires.
 
+### Building from inside China (CN mirrors)
+
+The default upstream sources (`download.pytorch.org`, `files.pythonhosted.org`,
+recursive GitHub submodule clones) are slow or flaky from CN. The build is
+parameterized so you can point it at fast mirrors without editing the Dockerfile.
+Defaults are the official sources, so non-CN builds are unaffected.
+
+```bash
+docker buildx build --progress=plain --build-arg GPU_ARCH=hopper \
+  --build-arg TORCH_FIND_LINKS=https://mirrors.aliyun.com/pytorch-wheels/cu129 \
+  --build-arg UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
+  -f docker/Dockerfile -t batchgen:<tag>-hopper .
+```
+
+- `TORCH_FIND_LINKS`: flat wheel mirror for the `torch==2.9.0+cu129` install
+  (uv `--find-links`). Aliyun serves the CUDA wheels at multi-MB/s vs ~127KB/s
+  from `download.pytorch.org`.
+- `UV_DEFAULT_INDEX`: PyPI mirror for all remaining `uv pip install` steps
+  (uv ignores `PIP_INDEX_URL`); without it the `flashinfer-python` install
+  crawls on `files.pythonhosted.org`.
+- GitHub clones (FlashMLA/DeepGEMM + cutlass) are hardened in-Dockerfile with
+  HTTP/1.1 + a retry loop to survive the intermittent HTTP2/TLS framing errors
+  seen from CN; no build arg needed.
+
 You can also directly build and push the image to a container registry by adding the `--push` flag:
 
 ```bash

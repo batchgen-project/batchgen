@@ -37,8 +37,14 @@ RUN uv venv --python ${PYTHON_VERSION} --seed
 
 ENV PATH="/root/moegen/.venv/bin:$PATH"
 
-# Make sure to install ninja to enable fast builds
-RUN uv pip install torch==2.9.0+cu129 --extra-index-url https://download.pytorch.org/whl/cu129 \
+# Make sure to install ninja to enable fast builds.
+# In CN, download.pytorch.org is throttled to ~127KB/s. TORCH_FIND_LINKS points
+# uv at a fast flat wheel mirror (e.g. https://mirrors.aliyun.com/pytorch-wheels/cu129)
+# via --find-links; the official index is kept for sdist/hash resolution of deps.
+ARG TORCH_FIND_LINKS=https://download.pytorch.org/whl/cu129
+RUN uv pip install torch==2.9.0+cu129 \
+    --find-links ${TORCH_FIND_LINKS} \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
     setuptools wheel packaging ninja \
     && uv cache clean
     
@@ -49,6 +55,14 @@ RUN MAX_JOBS=16 git clone --recursive https://github.com/Dao-AILab/flash-attenti
     && cd hopper \
     && MAX_JOBS=16 FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install . --no-build-isolation \
     && uv cache clean
+
+# Harden git clones against the HTTP2-framing-layer flakes seen from CN to
+# GitHub on large recursive clones (FlashMLA/DeepGEMM + cutlass submodules):
+# force HTTP/1.1, grow the post buffer, and tolerate slow idle transfers.
+RUN git config --global http.version HTTP/1.1 \
+    && git config --global http.postBuffer 1048576000 \
+    && git config --global http.lowSpeedLimit 1000 \
+    && git config --global http.lowSpeedTime 600
 
 # Install FlashMLA (built from public upstream source, arch-pinned commit).
 # Hopper (sm90) needs the deferred-scheduling API (zero-arg get_mla_metadata + attn_sink,
@@ -65,11 +79,17 @@ RUN git clone --recursive https://github.com/deepseek-ai/FlashMLA.git \
     && FLASH_MLA_DISABLE_SM100=1 uv pip install -v . --no-build-isolation \
     && uv cache clean
 
-# Install DeepGEMM
-RUN git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git \
-    && cd DeepGEMM \
-    && git checkout v2.1.1.post3 \
-    && git submodule update --init --recursive \
+# Install DeepGEMM. The cutlass submodule is large and flakes from CN; retry the
+# clone+submodule fetch a few times before giving up.
+RUN for i in 1 2 3 4 5; do \
+      rm -rf DeepGEMM \
+      && git clone https://github.com/deepseek-ai/DeepGEMM.git \
+      && cd DeepGEMM \
+      && git checkout v2.1.1.post3 \
+      && git submodule update --init --recursive \
+      && break || { echo "DeepGEMM clone attempt $i failed, retrying in 10s..."; cd /root/moegen; sleep 10; }; \
+    done \
+    && cd /root/moegen/DeepGEMM \
     && bash ./install.sh \
     && uv cache clean
 
@@ -99,12 +119,15 @@ RUN cd /root/moegen/batchgen_kernels \
 # Install BatchGen (filter out torch/nvidia/triton — already installed with CUDA variant in step 6).
 # Re-pin apache-tvm-ffi==0.1.5 LAST: flashinfer-python/requirements pull in 0.1.12, which breaks
 # tilelang import on torch 2.9 ("attribute '__dict__' of 'type' objects is not writable").
+# UV_DEFAULT_INDEX points uv at a fast PyPI mirror (uv ignores PIP_INDEX_URL); inside CN the
+# default files.pythonhosted.org fetch of these deps (esp. flashinfer-python) crawls.
+ARG UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
 RUN grep -vE '^(torch==|triton==|nvidia-)' requirements.txt > /tmp/reqs-filtered.txt \
-    && uv pip install -r /tmp/reqs-filtered.txt \
-    && uv pip install . -v --no-deps \
-    && uv pip install flashinfer-python==0.6.12 \
-    && uv pip install pytest \
-    && uv pip install apache-tvm-ffi==0.1.5 \
+    && uv pip install --default-index ${UV_DEFAULT_INDEX} -r /tmp/reqs-filtered.txt \
+    && uv pip install --default-index ${UV_DEFAULT_INDEX} . -v --no-deps \
+    && uv pip install --default-index ${UV_DEFAULT_INDEX} flashinfer-python==0.6.12 \
+    && uv pip install --default-index ${UV_DEFAULT_INDEX} pytest \
+    && uv pip install --default-index ${UV_DEFAULT_INDEX} apache-tvm-ffi==0.1.5 \
     && python -c 'import tilelang, tilelang.language; print("tilelang reimport OK", tilelang.__version__)' \
     && uv cache clean
 
