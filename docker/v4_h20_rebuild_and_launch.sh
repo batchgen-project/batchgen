@@ -42,6 +42,9 @@ set -uo pipefail
 # ---- config (override via env) --------------------------------------------- #
 REPO_ON_NODE="${REPO_ON_NODE:-/data3/leyangxue/batchgen}"
 IMAGE="${IMAGE:-batchgen:v4flash-hopper-current}"
+# CN-mirror build args (see docker/README.md); defaults are CN-fast.
+TORCH_FIND_LINKS="${TORCH_FIND_LINKS:-https://mirrors.aliyun.com/pytorch-wheels/cu129}"
+UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple}"
 CONTAINER="${CONTAINER:-leyang-v4-fullrun}"
 DEVICES="${DEVICES:-0,1,2,3}"
 WORLD_SIZE="${WORLD_SIZE:-4}"
@@ -77,6 +80,8 @@ cmd_build() {
   cd "$REPO_ON_NODE" || { echo "repo not found at $REPO_ON_NODE"; exit 1; }
   DOCKER_BUILDKIT=1 docker build \
     --build-arg GPU_ARCH=hopper \
+    --build-arg TORCH_FIND_LINKS="$TORCH_FIND_LINKS" \
+    --build-arg UV_DEFAULT_INDEX="$UV_DEFAULT_INDEX" \
     -f docker/Dockerfile \
     -t "$IMAGE" . 2>&1 | tail -40
   echo ">>> Build exit: ${PIPESTATUS[0]}"
