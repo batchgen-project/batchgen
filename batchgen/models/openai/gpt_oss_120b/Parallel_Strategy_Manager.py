@@ -856,6 +856,21 @@ class GptOssParallelStrategyManager:
         gc.collect()
         torch.cuda.empty_cache()
 
+        # BUILD-ONCE: the worker calls configure_decoding on EVERY prefill->decode
+        # phase shift. SGLang's ModelRunner.__init__ runs initialize_model_parallel,
+        # which is GLOBAL and asserts "tensor model parallel group is already
+        # initialized" on a second build -> crash on the 2nd decode phase. So build
+        # the runner once and reuse it across phases (its weights + SGLang parallel
+        # state persist on self._sglang_runner). Re-wrap in a fresh
+        # SGLangGQADecodeModel so the KV adapter re-injects this phase's GPU KV
+        # manager on the next decode forward.
+        if getattr(self, "_sglang_runner", None) is not None:
+            self.model = SGLangGQADecodeModel(self._sglang_runner, self.core_engine)
+            self.weight_copy_task = {"attn": [], "routed_expert": []}
+            if self.rank == 0:
+                logging.info("[DECODE] runtime-peel: reusing cached SGLang GQA runner")
+            return self.model, self.weight_copy_task
+
         # 8 GPUs/node on H20 -> derive topology from ranks (gpt-oss is single-node).
         local_world = max(1, torch.cuda.device_count())
         nnodes = max(1, self.world_size // local_world)
@@ -875,6 +890,7 @@ class GptOssParallelStrategyManager:
             node_rank=node_rank,
             mem_fraction_static=mem_frac,
         )
+        self._sglang_runner = runner  # cache for reuse across phase shifts
         self.model = SGLangGQADecodeModel(runner, self.core_engine)
         self.weight_copy_task = {"attn": [], "routed_expert": []}
         if self.rank == 0:
