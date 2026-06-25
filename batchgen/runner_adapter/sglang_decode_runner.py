@@ -478,6 +478,17 @@ def build_decode_forward_batch(
         )
         fb.num_token_non_padded_cpu = batch_size
 
+        # CUDA-graph eligibility (opt-in, BATCHGEN_SGLANG_CUDA_GRAPH=1). The graph
+        # path in ModelRunner._forward_raw checks fb.can_run_dp_cuda_graph BEFORE the
+        # eager prepare_mlp_sync_batch, so we must set it ourselves (the scheduler
+        # we bypass normally derives it as the MIN over ranks of each rank's
+        # "decode/idle + bs<=bucket" flag — scheduler_dp_attn_mixin.py:126). With the
+        # idle-pad every rank is decode/idle, so it's True iff every gathered per-rank
+        # count fits a captured bucket (SGLang pads bs up to the next bucket <= max_bs).
+        gr = getattr(model_runner, "graph_runner", None)
+        if gr is not None:
+            fb.can_run_dp_cuda_graph = all(int(n) <= int(gr.max_bs) for n in gnt)
+
     # TODO(verify-on-gpu): the NSA backend pulls the page table from its own
     # metadata, which it builds in attn_backend.init_forward_metadata(fb). For
     # the page-gather decode read path (nsa_indexer.py:521

@@ -85,6 +85,40 @@ class SGLangDecodeModel(nn.Module):
             )
         inject_kv_adapter(self._runner, primary, aux)
         self._adapter_injected = True
+        self._maybe_capture_cuda_graph()
+
+    def _maybe_capture_cuda_graph(self):
+        """Deferred SGLang CUDA-graph capture (opt-in BATCHGEN_SGLANG_CUDA_GRAPH=1).
+
+        SGLang captures decode graphs at ModelRunner init, but our BatchGen KV
+        adapter is injected only now (first decode). Capturing here — AFTER
+        inject_kv_adapter + with the live BatchGen KV managers bound — makes the
+        graph bake the ADAPTER's KV buffers, not SGLang's shadow pool. The runner is
+        built with disable_cuda_graph=True (init capture skipped); we flip it and run
+        the capture once. build_decode_forward_batch sets fb.can_run_dp_cuda_graph so
+        subsequent steps replay (ModelRunner._forward_raw graph path) instead of
+        eager per-step ForwardBatch builds.
+        """
+        import os
+        if getattr(self, "_graph_captured", False):
+            return
+        self._graph_captured = True
+        if os.getenv("BATCHGEN_SGLANG_CUDA_GRAPH", "0") != "1":
+            return
+        mr = self._runner
+        mr.server_args.disable_cuda_graph = False
+        if not getattr(mr.server_args, "cuda_graph_bs", None):
+            # dp16, <=128 prompts -> <=8 seqs/rank; capture small per-rank buckets.
+            mr.server_args.cuda_graph_bs = [1, 2, 4, 8]
+        import logging
+        logging.getLogger().warning(
+            "[RTPEEL-CG] deferred CUDA-graph capture START (bs=%s)",
+            mr.server_args.cuda_graph_bs)
+        mr.init_device_graphs()
+        logging.getLogger().warning(
+            "[RTPEEL-CG] deferred capture DONE: graph_runner=%s max_bs=%s",
+            getattr(mr, "graph_runner", None) is not None,
+            getattr(getattr(mr, "graph_runner", None), "max_bs", None))
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, use_cache=False):
         from batchgen.models.wrappers import AttnWrapperBase
