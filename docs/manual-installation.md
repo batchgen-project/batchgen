@@ -46,8 +46,11 @@ Install flash-attention 3 from the Hopper-optimized branch:
 ```bash
 git clone git@github.com:Dao-AILab/flash-attention.git
 cd flash-attention && git checkout v2.8.2
-cd hopper && pip install . --no-build-isolation
+cd hopper && FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 ```
+
+> `FLASH_ATTENTION_FORCE_BUILD=TRUE` is required: against PyTorch 2.9 the build
+> otherwise hangs trying to download a non-existent prebuilt wheel.
 
 See https://github.com/Dao-AILab/flash-attention for more details.
 
@@ -88,12 +91,38 @@ pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu12
 
 ---
 
-## Step 6: Install BatchGen
+## Step 6: Clone BatchGen
 
 ```bash
 git clone git@github.com:batchgen-project/batchgen.git
 cd batchgen
-pip install -e .
+```
+
+---
+
+## Step 7: Build batchgen_kernels (AOT CUDA extensions)
+
+`batchgen_kernels` is a separate package containing the pre-compiled CUDA
+kernels. It must be built before installing BatchGen, otherwise the compiled
+extensions are missing at runtime. On H20, export `TORCH_CUDA_ARCH_LIST=9.0a`
+first; for Blackwell (B200) export `BUILD_ARCH=sm100`.
+
+```bash
+cd batchgen_kernels
+pip install . --no-build-isolation
+cd ..
+```
+
+---
+
+## Step 8: Install BatchGen
+
+Install non-editable. An editable install (`pip install -e .`) leaves the source
+tree on `sys.path`, which shadows the installed package and breaks ray/production
+launches — see [INSTALL.md](INSTALL.md#important-do-not-run-from-the-source-directory).
+
+```bash
+pip install . --no-build-isolation
 ```
 
 ---
@@ -109,6 +138,10 @@ print(f"CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name()}")
 ```
+
+To also confirm the compiled `batchgen_kernels` extensions and the
+flash-attention / FlashMLA / DeepGEMM dependencies, run the fuller verification
+snippet in [INSTALL.md](INSTALL.md#verification).
 
 ---
 
