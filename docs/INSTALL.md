@@ -180,7 +180,7 @@ for ext in [
 ]:
     batchgen_kernels.load_extension(ext)
     print(f'  {ext}: OK')
-import flash_attn_3, flash_mla, deep_gemm
+import flash_attn_interface, flash_mla, deep_gemm
 print('All dependencies verified.')
 "
 ```
