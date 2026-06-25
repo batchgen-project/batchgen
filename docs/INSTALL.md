@@ -27,7 +27,7 @@ conda create -n batchgen python=3.11 -y
 conda activate batchgen
 
 # 2. Clone repo
-git clone --recursive https://github.com/batchgen-project/batchgen.git
+git clone https://github.com/batchgen-project/batchgen.git
 cd batchgen
 
 # 3. Install everything
@@ -39,7 +39,7 @@ This installs (in order):
 2. **flash-attention 3** — built from source, Hopper only (~15-20 min)
 3. **FlashMLA** — built from source (~5-10 min)
 4. **DeepGEMM** — built from source (~5-10 min)
-5. **batchgen_kernels** — AOT-compiled CUDA extensions, 14 kernels (~7 min)
+5. **batchgen_kernels** — AOT-compiled CUDA extensions, 22 kernels (~7 min)
 6. **batchgen** — main package via `pip install .` (~1 min)
 
 Total: ~40-50 min on first install.
@@ -155,31 +155,28 @@ This does not apply to Docker (Option A), where the source is the install target
 | **batchgen_kernels** | Must use `--no-build-isolation` (needs installed PyTorch headers) |
 | **H20 GPUs** | Set `TORCH_CUDA_ARCH_LIST=9.0a` before building kernels |
 | **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s) |
-| **No JIT for compute kernels** | All 14 CUDA extensions are AOT-compiled in `batchgen_kernels` |
+| **No JIT for compute kernels** | All 22 CUDA extensions are AOT-compiled in `batchgen_kernels` |
 
 ## Verification
 
+This discovers and imports every compiled `_C_*` extension shipped in the
+installed `batchgen_kernels` package, so it stays correct as kernels are added:
+
 ```bash
 python -c "
+import glob, os, importlib
 import batchgen_kernels
-for ext in [
-    'batchgen_kernels.moe._C_expert_mxfp4_wgmma',
-    'batchgen_kernels.moe._C_grouped_mxfp4_wgmma',
-    'batchgen_kernels.moe._C_grouped_int4_wgmma',
-    'batchgen_kernels.moe._C_single_expert_int4_wgmma',
-    'batchgen_kernels.moe._C_fused_int4_wgmma_grouped',
-    'batchgen_kernels.attention._C_qkv_wgmma',
-    'batchgen_kernels.moe._C_routing',
-    'batchgen_kernels.moe._C_dispatch_scatter_3d',
-    'batchgen_kernels.attention._C_fused_ops',
-    'batchgen_kernels.moe._C_mxfp4_dequant_cute',
-    'batchgen_kernels.moe._C_mxfp4_dequant',
-    'batchgen_kernels.common._C_rmsnorm',
-    'batchgen_kernels.common._C_cuda_rmsnorm',
-    'batchgen_kernels.common._C_mgn_ops',
-]:
-    batchgen_kernels.load_extension(ext)
+pkg_dir = os.path.dirname(batchgen_kernels.__file__)
+exts = sorted(
+    f'batchgen_kernels.{os.path.basename(os.path.dirname(p))}.'
+    + os.path.basename(p).split('.')[0]
+    for p in glob.glob(os.path.join(pkg_dir, '*', '_C_*.so'))
+)
+assert exts, 'No compiled batchgen_kernels extensions found'
+for ext in exts:
+    importlib.import_module(ext)
     print(f'  {ext}: OK')
+print(f'{len(exts)} batchgen_kernels extensions verified.')
 import flash_attn_interface, flash_mla, deep_gemm
 print('All dependencies verified.')
 "
@@ -192,7 +189,7 @@ PyTorch 2.9.0+cu128
 ├── flash-attention 3  (--no-build-isolation)
 ├── FlashMLA           (--no-build-isolation)
 ├── DeepGEMM           (--no-build-isolation)
-├── batchgen_kernels   (--no-build-isolation, 14 CUDAExtensions)
+├── batchgen_kernels   (--no-build-isolation, 22 CUDAExtensions)
 │   ├── SM90a: WGMMA kernels (MoE, QKV, routing)
 │   └── SM80+: fused ops (RMSNorm, RoPE, dequant, MGN)
 └── batchgen           (pip install .)
@@ -228,8 +225,9 @@ For Blackwell, build with `BUILD_ARCH=sm100` (which leaves SM100 enabled) and a 
 Ensure `TORCH_CUDA_ARCH_LIST` is set correctly (e.g., `9.0a` for H20).
 
 ### CUTLASS headers not found
-The `batchgen_kernels` build requires the CUTLASS submodule. Ensure you cloned with
-`--recursive`, or run `git submodule update --init --recursive`.
+The `batchgen_kernels` build requires CUTLASS headers, which are **vendored** in the
+repository at `batchgen_kernels/3rd/cutlass/` (not a git submodule). If they are
+missing, you likely have a shallow or partial checkout — re-clone the full repository.
 
 ### Git clone fails (network issues)
 If GitHub is unreliable, use Option C (pre-built wheels) which only requires
