@@ -1072,6 +1072,9 @@ class GptOssParallelStrategyManager:
         Args:
             num_tokens_per_rank: The max batch size across all ranks for this page
         """
+        if getattr(self, "_use_sglang_decode", False):
+            return  # SGLang owns MoE; self.model is SGLangGQADecodeModel (no native
+            # .model.layers), and SGLang sizes its own MoE token buffers.
         for layer_idx in range(self.model_config.num_hidden_layers):
             layer = self.model.model.layers[layer_idx].mlp
             if hasattr(layer, "set_num_tokens_per_rank"):
