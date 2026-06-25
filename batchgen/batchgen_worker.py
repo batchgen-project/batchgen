@@ -182,6 +182,12 @@ BATCHGEN_MULTI_BATCH_DIAG = (
     os.environ.get("BATCHGEN_MULTI_BATCH_DIAG", "0") == "1"
 )
 
+# Per-rank decode-deadlock markers (fd 2, immediately flushed to survive a hung
+# pipeline). Enable on multi-GPU H20 with BATCHGEN_DECODE_DEADLOCK_TRACE=1.
+BATCHGEN_DECODE_DEADLOCK_TRACE = (
+    os.environ.get("BATCHGEN_DECODE_DEADLOCK_TRACE", "0") == "1"
+)
+
 # Force synchronous KV offload (disable deferred flush) for debugging
 BATCHGEN_SYNC_KV = os.environ.get("BATCHGEN_SYNC_KV", "0") == "1"
 
@@ -5075,11 +5081,12 @@ class BatchGenWorker:
 
         Returns:
                 (global_completed_uuids, active_decode_uuids) - both sorted by global_idx
-        """
-        if not decode_uuids:
-            return set(), []
 
-        # Build global_idx to uuid mapping for decode candidates
+        Collective-safe: the tensor size and the empty-decision are derived from
+        all_reduce, so a rank with an empty local decode_uuids runs the same
+        collective sequence as the others instead of returning early (an early
+        return here desyncs ranks and hangs multi-GPU decode).
+        """
         idx_to_uuid = {}
         uuid_to_idx = {}
         for uuid in decode_uuids:
@@ -5088,14 +5095,20 @@ class BatchGenWorker:
                 idx_to_uuid[seq.global_idx] = uuid
                 uuid_to_idx[uuid] = seq.global_idx
 
-        if not idx_to_uuid:
+        local_max_idx = max(idx_to_uuid.keys()) if idx_to_uuid else -1
+        max_idx_tensor = torch.tensor(
+            [local_max_idx], dtype=torch.int64, device=self.torch_device
+        )
+        self._ddl_trace(
+            f"sync_completion:before_maxreduce local={len(decode_uuids)}"
+        )
+        dist.all_reduce(max_idx_tensor, op=dist.ReduceOp.MAX)
+        max_idx = int(max_idx_tensor.item())
+
+        if max_idx < 0:
+            self._ddl_trace("sync_completion:empty_global")
             return set(), []
 
-        # Get max global_idx to size the tensor
-        max_idx = max(idx_to_uuid.keys())
-
-        # Create completion tensor: 1 = completed, 0 = not completed
-        # Each rank marks its LOCAL sequences' completion status
         completion_tensor = torch.zeros(
             max_idx + 1, dtype=torch.int32, device=self.torch_device
         )
@@ -5112,7 +5125,9 @@ class BatchGenWorker:
                         completion_tensor[uuid_to_idx[uuid]] = 1
 
         # all_reduce with MAX: if ANY rank marks a sequence complete, result is 1
+        self._ddl_trace("sync_completion:before_status_reduce")
         dist.all_reduce(completion_tensor, op=dist.ReduceOp.MAX)
+        self._ddl_trace("sync_completion:after_status_reduce")
 
         # Decode back to UUIDs
         global_completed = set()
@@ -5141,6 +5156,15 @@ class BatchGenWorker:
 
         return global_completed, active_uuids
 
+    def _ddl_trace(self, tag: str) -> None:
+        if not BATCHGEN_DECODE_DEADLOCK_TRACE:
+            return
+        rank = getattr(self, "global_rank", getattr(self, "rank", "?"))
+        os.write(
+            2,
+            f"[DDL] pid={os.getpid()} rank={rank} {tag}\n".encode(),
+        )
+
     def _sync_decode_uuids_tensor(
         self,
         decode_uuids: List[str],
@@ -5150,35 +5174,49 @@ class BatchGenWorker:
 
         Uses global_idx as the common identifier and all_reduce to find intersection.
         Returns sorted list of UUIDs that ALL ranks agree on.
-        """
-        if not decode_uuids:
-            return []
 
-        # Build global_idx to uuid mapping
+        Collective-safe: every rank executes the same all_reduce sequence even when
+        its local decode_uuids is empty, so an idle rank cannot skip a collective the
+        others run (that mismatch is a multi-GPU decode-hang source).
+        """
         idx_to_uuid = {}
         uuid_to_idx = {}
         for seq in self.global_batch:
             idx_to_uuid[seq.global_idx] = seq.uuid
             uuid_to_idx[seq.uuid] = seq.global_idx
 
-        max_idx = max(idx_to_uuid.keys()) if idx_to_uuid else 0
+        local_max_idx = max(idx_to_uuid.keys()) if idx_to_uuid else -1
+        max_idx_tensor = torch.tensor(
+            [local_max_idx], dtype=torch.int64, device=self.torch_device
+        )
+        self._ddl_trace(
+            f"sync_uuids:before_maxreduce local={len(decode_uuids)}"
+        )
+        dist.all_reduce(max_idx_tensor, op=dist.ReduceOp.MAX)
+        max_idx = int(max_idx_tensor.item())
 
-        # Create presence tensor: 1 = in decode_uuids, 0 = not
+        if max_idx < 0:
+            self._ddl_trace("sync_uuids:empty_global return=[]")
+            return []
+
         presence_tensor = torch.zeros(
             max_idx + 1, dtype=torch.int32, device=self.torch_device
         )
         for uuid in decode_uuids:
-            if uuid in uuid_to_idx:
-                presence_tensor[uuid_to_idx[uuid]] = 1
+            idx = uuid_to_idx.get(uuid)
+            if idx is not None and idx <= max_idx:
+                presence_tensor[idx] = 1
 
-        # all_reduce with MIN: only sequences present on ALL ranks will have value world_size
-        # First broadcast local counts, then sum
+        self._ddl_trace("sync_uuids:before_presence_reduce")
         dist.all_reduce(presence_tensor, op=dist.ReduceOp.MIN)
+        self._ddl_trace("sync_uuids:after_presence_reduce")
 
-        # Extract UUIDs where all ranks agree (value == 1 after MIN means all had 1)
         synced_uuids = []
         for global_idx in sorted(idx_to_uuid.keys()):
-            if presence_tensor[global_idx].item() == 1:
+            if (
+                global_idx <= max_idx
+                and presence_tensor[global_idx].item() == 1
+            ):
                 synced_uuids.append(idx_to_uuid[global_idx])
 
         return synced_uuids
@@ -7445,8 +7483,21 @@ class BatchGenWorker:
                                 f"Likely stale eos_reached from pre-eviction cycle."
                             )
 
-                if not decode_uuids:
+                local_has_decode = torch.tensor(
+                    [1 if decode_uuids else 0],
+                    dtype=torch.int32,
+                    device=self.torch_device,
+                )
+                dist.all_reduce(local_has_decode, op=dist.ReduceOp.MAX)
+                if int(local_has_decode.item()) == 0:
                     break
+                if not decode_uuids:
+                    raise RuntimeError(
+                        f"Rank {self.rank}: decode_uuids desync after global "
+                        "sync; another rank still has decode work but this rank "
+                        "has none. This would deadlock the per-layer MoE "
+                        "collectives."
+                    )
 
                 for uuid in decode_uuids:
                     seq = self.global_batch.get_sequence(uuid)
