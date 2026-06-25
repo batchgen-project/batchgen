@@ -57,6 +57,13 @@ HOST_KV_GB="${HOST_KV_GB:-100}"
 GPU_MEM_FRAC="${GPU_MEM_FRAC:-0.90}"
 DIST_PORT="${DIST_PORT:-12464}"
 
+# Persistent host dir for torch JIT extensions (core_engine + the runtime
+# load()/load_inline kernels). Without this the cache lives at the container's
+# /root/.cache/torch_extensions and is recompiled (~15-20min, 4 extensions) on
+# every fresh container. Mounting a host dir makes the SECOND launch reuse the
+# compiled .so (cache key = source hash), so startup->decode is immediate.
+TORCH_EXT_CACHE="${TORCH_EXT_CACHE:-/data3/leyangxue/torch_ext_cache}"
+
 LOG="/tmp/v4_h20_server.log"
 
 # ---- sm-aware + runtime env flags ------------------------------------------ #
@@ -73,7 +80,11 @@ RUN_ENV=(
   BATCHGEN_V4_INDEXER_QUANT=auto
   BATCHGEN_V4_PYNCCL_COMM=1
   BATCHGEN_V4_SPARSE_PREFILL="${BATCHGEN_V4_SPARSE_PREFILL:-1}"
+  TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions
 )
+# Extra "KEY=VALUE" env entries appended to the server launch (space-separated).
+# Used by v4_h20_validate_decode_fix.sh to inject BATCHGEN_DECODE_DEADLOCK_TRACE=1.
+RUN_ENV_EXTRA="${RUN_ENV_EXTRA:-}"
 
 cmd_build() {
   echo ">>> Building $IMAGE for GPU_ARCH=hopper from $REPO_ON_NODE (~30-60min)"
@@ -90,19 +101,23 @@ cmd_build() {
 
 cmd_launch() {
   echo ">>> Launching $CONTAINER on GPUs $DEVICES (shm=$SHM_SIZE)"
+  echo ">>> JIT extension cache (persistent): $TORCH_EXT_CACHE"
+  mkdir -p "$TORCH_EXT_CACHE"
   docker rm -f "$CONTAINER" 2>/dev/null || true
   docker run -d --name "$CONTAINER" \
     --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="$DEVICES" \
     --shm-size="$SHM_SIZE" \
+    --ulimit memlock=-1 --ulimit stack=67108864 \
     -v "$REPO_ON_NODE":/workspace/repo \
     -v /data2/models:/data2/models:ro \
+    -v "$TORCH_EXT_CACHE":/root/.cache/torch_extensions \
     -w /workspace/repo \
     -e PYTHONPATH=/workspace/repo:/workspace/repo/tools \
     "$IMAGE" sleep infinity
   # clear any stale shm regions from prior crashed launches (critical!)
   docker exec "$CONTAINER" bash -lc 'rm -rf /dev/shm/* 2>/dev/null; df -h /dev/shm | tail -1'
   docker exec -d "$CONTAINER" bash -lc "cd /workspace/repo && \
-    $(printf '%s ' "${RUN_ENV[@]}") \
+    $(printf '%s ' "${RUN_ENV[@]}") $RUN_ENV_EXTRA \
     python -m batchgen.launch_http_server \
       --model deepseek-ai/DeepSeek-V4-Flash \
       --converted-ckpt-dir '$CKPT_DIR' \
@@ -154,6 +169,25 @@ cmd_mmlu() {
       --max_prompts 20 --max_decoding_length 512 --timeout 6000"
 }
 
+# First request triggers the one-time torch JIT compile (4 extensions, ~15-20min)
+# into the persistent cache. Run this ONCE per image build so all later launches
+# (reusing the same $TORCH_EXT_CACHE volume) skip straight to fast decode.
+cmd_warmup() {
+  echo ">>> JIT warmup (first compile populates $TORCH_EXT_CACHE; allow ~25min)"
+  docker exec "$CONTAINER" bash -lc \
+    "curl -s -m 1800 -X POST http://127.0.0.1:$PORT/v1/inference \
+      -H 'Content-Type: application/json' \
+      -d '{\"prompts\":[\"Hello\"],\"max_output_len\":4,\"temperature\":0.0}'"
+  echo
+  cmd_cache_status
+}
+
+cmd_cache_status() {
+  echo ">>> Persistent JIT cache contents ($TORCH_EXT_CACHE):"
+  ls -1 "$TORCH_EXT_CACHE"/*/ 2>/dev/null | grep -vE '/$|^$' | sort -u || true
+  find "$TORCH_EXT_CACHE" -name '*.so' 2>/dev/null | sed "s|$TORCH_EXT_CACHE/||" | head
+}
+
 cmd_stop() {
   echo ">>> Stopping $CONTAINER and freeing GPUs"
   docker exec "$CONTAINER" bash -lc 'pkill -9 -f launch_http_server 2>/dev/null; rm -rf /dev/shm/* 2>/dev/null' || true
@@ -163,13 +197,15 @@ cmd_stop() {
 }
 
 case "${1:-help}" in
-  build)  cmd_build ;;
-  launch) cmd_launch ;;
-  wait)   cmd_wait ;;
-  logs)   cmd_logs ;;
-  smoke)  cmd_smoke ;;
-  mmlu)   cmd_mmlu ;;
-  stop)   cmd_stop ;;
-  full)   cmd_launch && cmd_wait && cmd_smoke ;;
-  *) echo "usage: $0 {build|launch|wait|logs|smoke|mmlu|stop|full}"; exit 1 ;;
+  build)        cmd_build ;;
+  launch)       cmd_launch ;;
+  wait)         cmd_wait ;;
+  logs)         cmd_logs ;;
+  smoke)        cmd_smoke ;;
+  warmup)       cmd_warmup ;;
+  cache-status) cmd_cache_status ;;
+  mmlu)         cmd_mmlu ;;
+  stop)         cmd_stop ;;
+  full)         cmd_launch && cmd_wait && cmd_smoke ;;
+  *) echo "usage: $0 {build|launch|wait|logs|smoke|warmup|cache-status|mmlu|stop|full}"; exit 1 ;;
 esac
