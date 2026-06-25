@@ -107,9 +107,15 @@ class SGLangDecodeModel(nn.Module):
             return
         mr = self._runner
         mr.server_args.disable_cuda_graph = False
-        if not getattr(mr.server_args, "cuda_graph_bs", None):
-            # dp16, <=128 prompts -> <=8 seqs/rank; capture small per-rank buckets.
-            mr.server_args.cuda_graph_bs = [1, 2, 4, 8]
+        # FORCE a small capture set. ServerArgs.__post_init__ pre-populates
+        # cuda_graph_bs with the full default ladder (1..512, ~52 graphs); capturing
+        # all of it OOMs here because BatchGen weights + SGLang's own weight copy +
+        # KV already fill ~92/95 GiB, leaving <10 GiB for graph private pools. The L2
+        # decode regime is dp16 with <=128 prompts -> <=~8 seqs/rank, so a handful of
+        # small per-rank buckets is sufficient. Cap max_bs too in case capture derives
+        # the ladder from it.
+        mr.server_args.cuda_graph_bs = [1, 2, 4, 8, 16]
+        mr.server_args.cuda_graph_max_bs = 16
         import logging
         logging.getLogger().warning(
             "[RTPEEL-CG] deferred CUDA-graph capture START (bs=%s)",
