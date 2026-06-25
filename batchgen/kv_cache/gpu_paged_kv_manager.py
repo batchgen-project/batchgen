@@ -1267,6 +1267,23 @@ class GPUPagedKVCacheManager:
 		layer_idx = self.resolve_physical_layer(layer_idx)
 		return self._k_cache[layer_idx]
 
+	def get_layer_v_buffer(self, layer_idx: int) -> torch.Tensor:
+		"""Return a layer's raw V cache buffer WITHOUT requiring a built page table.
+
+		GQA models (e.g. gpt-oss) store both K and V; the SGLang decode bridge's
+		GQA KV adapter exposes ``_v_cache[layer]`` the same page-table-free way
+		``get_layer_kv_buffer`` exposes ``_k_cache[layer]`` (MLA has no V, so that
+		accessor is K-only). Raises if this manager holds no V cache.
+		"""
+		self._ensure_initialized()
+		if self._v_cache is None:
+			raise RuntimeError(
+				"get_layer_v_buffer: this KV manager has no V cache (_v_cache is None); "
+				"only K-only (MLA) caches lack V"
+			)
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		return self._v_cache[layer_idx]
+
 	def get_page_table_version(self) -> int:
 		"""Return a monotonic version for the active page-table contents."""
 		self._ensure_initialized()

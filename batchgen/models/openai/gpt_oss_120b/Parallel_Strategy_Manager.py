@@ -832,6 +832,59 @@ class GptOssParallelStrategyManager:
             f"GPU experts: {len(self.local_routed_experts)}, Host experts: {len(self.host_routed_experts)}"
         )
 
+    def _configure_decoding_sglang(self, padding_bsz=None) -> Tuple:
+        """Runtime-peel decode: build a decode-only SGLang ModelRunner (GQA) + wrap.
+
+        gpt-oss single-node TP8/EP8 with dp-attention (matching the standalone
+        SGLang launch). The native BatchGen decode model is skipped; BatchGen's
+        paged KV (which the adapter wraps) sizes from the remaining HBM in the
+        worker's GPU-KV init. The KV manager does not exist yet here, so the
+        adapter is injected lazily on the first decode forward
+        (SGLangGQADecodeModel._ensure_adapter).
+        """
+        import os as _os
+
+        from batchgen.runner_adapter.sglang_decode_runner import (
+            build_sglang_decode_runner_gqa,
+        )
+        from batchgen.runner_adapter.sglang_decode_model_gqa import (
+            SGLangGQADecodeModel,
+        )
+
+        self.loaded_model_config.phase = "decode"
+        self.model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # 8 GPUs/node on H20 -> derive topology from ranks (gpt-oss is single-node).
+        local_world = max(1, torch.cuda.device_count())
+        nnodes = max(1, self.world_size // local_world)
+        node_rank = self.global_rank // local_world
+        mem_frac = float(_os.getenv("BATCHGEN_SGLANG_MEM_FRACTION", "0.85"))
+        # dist_init_addr is inert (SGLang adopts BatchGen's already-initialized PG).
+        dist_addr = _os.getenv("BATCHGEN_SGLANG_DIST_ADDR", "127.0.0.1:30000")
+
+        runner = build_sglang_decode_runner_gqa(
+            loaded_model_config=self.loaded_model_config,
+            world_size=self.world_size,
+            global_rank=self.global_rank,
+            local_rank=self.local_rank,
+            dist_init_addr=dist_addr,
+            dp_size=self.world_size,
+            nnodes=nnodes,
+            node_rank=node_rank,
+            mem_fraction_static=mem_frac,
+        )
+        self.model = SGLangGQADecodeModel(runner, self.core_engine)
+        self.weight_copy_task = {"attn": [], "routed_expert": []}
+        if self.rank == 0:
+            logging.info(
+                "[DECODE] runtime-peel: SGLang GQA decode runner built "
+                f"(gpt-oss, nnodes={nnodes}, node_rank={node_rank}, mem_frac={mem_frac}); "
+                "native BatchGen decode model skipped"
+            )
+        return self.model, self.weight_copy_task
+
     def configure_decoding(self, padding_bsz=None, comm=None) -> Tuple:
         """Configure model for decoding phase.
 
@@ -860,6 +913,18 @@ class GptOssParallelStrategyManager:
         log_gpu_memory("configure_decoding: START")
 
         logging.info("Configuring model for decoding phase...")
+
+        # Runtime-peel: when BATCHGEN_RUNTIME=sglang, decode runs through a
+        # decode-only SGLang ModelRunner (GQA path) reading BatchGen's KV via
+        # BatchGenGQAKVAdapter. The native BatchGen decode model is NOT built
+        # (only SGLang's decode weights are resident). self.model becomes a
+        # drop-in SGLangGQADecodeModel the worker drives via self.model(...).
+        import os as _os
+        self._use_sglang_decode = (
+            _os.getenv("BATCHGEN_RUNTIME", "native").lower() == "sglang"
+        )
+        if self._use_sglang_decode:
+            return self._configure_decoding_sglang(padding_bsz=padding_bsz)
 
         # Store comm and padding_bsz for EP communication
         self.comm = comm

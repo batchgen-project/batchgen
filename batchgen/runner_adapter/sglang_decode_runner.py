@@ -328,6 +328,159 @@ def inject_kv_adapter(model_runner, primary_kv_mgr, aux_kv_mgr, layer_num=None):
     return adapter
 
 
+# ====================================================================== #
+# GQA path (gpt-oss-120b). Parallel to the MLA/NSA functions above; the
+# GLM-5 path is untouched. S4 factors the shared body into the template.
+# Differences vs MLA: standard GQA K+V cache (no NSA indexer, no MLA-latent
+# split), no custom HF config to register (gpt_oss is a native SGLang
+# model_type), attention backend left to SGLang's auto-select (fa3 on SM90,
+# which carries gpt-oss's sink + per-layer sliding-window support), and a
+# single (non-dual) BatchGen KV manager.
+# ====================================================================== #
+def _build_decode_server_args_gqa(
+    model_path: str,
+    world_size: int,
+    dp_size: int,
+    nnodes: int,
+    node_rank: int,
+    dist_init_addr: str,
+    mem_fraction_static: float,
+    page_size: int = 64,
+):
+    """Decode-only ``ServerArgs`` for a standard GQA model (gpt-oss-120b).
+
+    Mirrors the standalone S0 launch (``--tp N --dp N --enable-dp-attention``).
+    attention_backend is left None so SGLang auto-selects fa3 on SM90 (the
+    backend that applies gpt-oss's attention sinks + per-layer sliding window);
+    MXFP4 is auto-detected from the checkpoint's quant config. The SGLang KV
+    pool is capped tiny (max_total_tokens) because BatchGenGQAKVAdapter shadows
+    it — BatchGen owns the real K+V.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    server_args = ServerArgs(
+        model_path=model_path,
+        # attention_backend=None -> SGLang auto (fa3 on SM90; sinks + SWA aware).
+        page_size=page_size,
+        kv_cache_dtype="bfloat16",
+        # parallelism: adopt BatchGen's world; dp-attention like S0.
+        tp_size=world_size,
+        dp_size=dp_size,
+        enable_dp_attention=True,
+        nnodes=nnodes,
+        node_rank=node_rank,
+        dist_init_addr=dist_init_addr,
+        # decode-only / S1 simplifications (cuda-graph deferred to S2).
+        skip_tokenizer_init=True,
+        disable_radix_cache=True,
+        disable_cuda_graph=True,
+        trust_remote_code=True,
+        mem_fraction_static=mem_fraction_static,
+        # Shadow pool: BatchGen owns KV via the adapter, so cap SGLang's pool.
+        max_total_tokens=16384,
+        max_running_requests=512,
+    )
+    return server_args
+
+
+def build_sglang_decode_runner_gqa(
+    loaded_model_config,
+    world_size: int,
+    global_rank: int,
+    local_rank: int,
+    dist_init_addr: str,
+    kv_mgr=None,
+    *,
+    dp_size: Optional[int] = None,
+    nnodes: int = 1,
+    node_rank: int = 0,
+    mem_fraction_static: float = 0.85,
+    page_size: int = 64,
+):
+    """Construct a decode-only SGLang ModelRunner for a GQA model (gpt-oss).
+
+    Like ``build_sglang_decode_runner`` but for standard GQA: no GLM-5 HF-config
+    registration, single BatchGen KV manager, GQA ``ServerArgs``. The KV adapter
+    is injected now if ``kv_mgr`` is ready, else lazily on first decode (the
+    in-worker path).
+    """
+    import os as _os
+
+    _install_pg_adopt_guard()
+
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    model_path = (
+        _os.environ.get("BATCHGEN_SGLANG_MODEL_PATH")
+        or getattr(loaded_model_config, "model_path", None)
+        or getattr(loaded_model_config, "_name_or_path", None)
+        or getattr(loaded_model_config, "name_or_path", None)
+    )
+    assert model_path, (
+        "Could not resolve the gpt-oss checkpoint path from loaded_model_config "
+        "(.model_path/._name_or_path) or BATCHGEN_SGLANG_MODEL_PATH."
+    )
+
+    if dp_size is None:
+        dp_size = world_size
+
+    server_args = _build_decode_server_args_gqa(
+        model_path=model_path,
+        world_size=world_size,
+        dp_size=dp_size,
+        nnodes=nnodes,
+        node_rank=node_rank,
+        dist_init_addr=dist_init_addr,
+        mem_fraction_static=mem_fraction_static,
+        page_size=page_size,
+    )
+
+    model_config = ModelConfig.from_server_args(server_args)
+
+    try:
+        nccl_port = int(dist_init_addr.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        nccl_port = 0
+
+    model_runner = ModelRunner(
+        model_config=model_config,
+        mem_fraction_static=server_args.mem_fraction_static or 0.8,
+        gpu_id=local_rank,
+        tp_rank=global_rank,
+        tp_size=world_size,
+        moe_ep_rank=global_rank,
+        moe_ep_size=world_size,
+        pp_rank=0,
+        pp_size=1,
+        nccl_port=nccl_port,
+        server_args=server_args,
+    )
+
+    if kv_mgr is not None:
+        inject_kv_adapter_gqa(
+            model_runner,
+            kv_mgr,
+            page_size=page_size,
+            layer_num=getattr(model_config, "num_hidden_layers", None),
+        )
+
+    return model_runner
+
+
+def inject_kv_adapter_gqa(model_runner, kv_mgr, page_size=64, layer_num=None):
+    """Replace ``model_runner.token_to_kv_pool`` with a BatchGenGQAKVAdapter."""
+    from batchgen.attention.gqa.sglang_kv_bridge import BatchGenGQAKVAdapter
+
+    adapter = BatchGenGQAKVAdapter(
+        gpu_paged_kv_manager=kv_mgr,
+        page_size=page_size,
+        layer_num=layer_num,
+    )
+    model_runner.token_to_kv_pool = adapter
+    return adapter
+
+
 def build_decode_forward_batch(
     model_runner,
     new_tokens: torch.Tensor,
