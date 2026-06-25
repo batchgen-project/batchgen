@@ -39,9 +39,11 @@ satisfies.
 ```bash
 python -m batchgen.batchgen_server \
   --model zai-org/GLM-5.1-FP8 \
-  --enable-thinking \
   ...
 ```
+
+Thinking mode is controlled **per request**, not by a server flag: set
+`enable_thinking` (or its alias `thinking`) in the request body JSON.
 
 Everything downstream (tokenizer, chat template, config, PSM, initializer,
 WP2/WP4/WP5 DSA kernels, dual host KV cache, MMLU-Pro harness) is the
