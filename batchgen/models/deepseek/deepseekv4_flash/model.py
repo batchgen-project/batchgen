@@ -1743,10 +1743,16 @@ class DeepSeekV4FlashMoE(nn.Module):
         counts = torch.bincount(
             topk_indices.reshape(-1), minlength=self.total_experts
         )
-        for expert_idx in range(
-            self.routed_expert_start_idx, self.routed_expert_end_idx
+        # One D2H sync for the whole owned slice instead of a per-expert
+        # counts[e].item() (was ~32 syncs/layer -> ~1.4k/token over 43 layers,
+        # the dominant decode-step cost). tolist() is numerically identical.
+        owned_counts = counts[
+            self.routed_expert_start_idx : self.routed_expert_end_idx
+        ].tolist()
+        for offset, expert_idx in enumerate(
+            range(self.routed_expert_start_idx, self.routed_expert_end_idx)
         ):
-            if counts[expert_idx].item() == 0:
+            if owned_counts[offset] == 0:
                 continue
             token_idx, topk_pos = torch.where(topk_indices == expert_idx)
             expert_out = self.experts[expert_idx](
