@@ -57,6 +57,15 @@ _V4_DECODE_TIMER_CATEGORIES = [
 ]
 init_decode_timer("DeepSeek-V4-Flash", _V4_DECODE_TIMER_CATEGORIES)
 
+_DDL_TRACE = os.environ.get("BATCHGEN_DECODE_DEADLOCK_TRACE", "0") == "1"
+
+
+def _ddl_trace(rank, tag: str) -> None:
+    if not _DDL_TRACE:
+        return
+    os.write(2, f"[DDL] pid={os.getpid()} rank={rank} {tag}\n".encode())
+
+
 _FP4_E2M1_TABLE_VALUES = (
     0.0,
     0.5,
@@ -1943,7 +1952,16 @@ class DeepSeekV4FlashMoE(nn.Module):
                     if _dt
                     else nullcontext()
                 ):
+                    _ddl_trace(
+                        self.rank,
+                        f"moe:before_states_ag L={self.layer_idx} "
+                        f"real={real_tokens} ntpr={ntpr} ws={self.world_size}",
+                    )
                     self._ep_all_gather(global_states, padded)
+                    _ddl_trace(
+                        self.rank,
+                        f"moe:after_states_ag L={self.layer_idx}",
+                    )
 
                 global_ids = None
                 if flat_ids is not None:
@@ -1965,7 +1983,15 @@ class DeepSeekV4FlashMoE(nn.Module):
                         if _dt
                         else nullcontext()
                     ):
+                        _ddl_trace(
+                            self.rank,
+                            f"moe:before_ids_ag L={self.layer_idx}",
+                        )
                         self._ep_all_gather(global_ids, padded_ids)
+                        _ddl_trace(
+                            self.rank,
+                            f"moe:after_ids_ag L={self.layer_idx}",
+                        )
                 elif getattr(self.gate, "is_hash_layer", False):
                     raise RuntimeError(
                         "DeepSeek-V4 hash-routing MoE requires input_ids during EP decode."
@@ -2008,7 +2034,15 @@ class DeepSeekV4FlashMoE(nn.Module):
                 if _dt
                 else nullcontext()
             ):
+                _ddl_trace(
+                    self.rank,
+                    f"moe:before_allreduce L={self.layer_idx}",
+                )
                 self._ep_all_reduce(routed)
+                _ddl_trace(
+                    self.rank,
+                    f"moe:after_allreduce L={self.layer_idx}",
+                )
             if trace_moe:
                 routed_extras["routed_after_allreduce_global"] = (
                     _v4_divtrace_stats(routed)

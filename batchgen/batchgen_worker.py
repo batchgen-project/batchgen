@@ -6841,9 +6841,9 @@ class BatchGenWorker:
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "0":
             # Verify rank consistency
             if dist.is_initialized():
-                assert self.rank == dist.get_rank(), (
-                    f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
-                )
+                assert (
+                    self.rank == dist.get_rank()
+                ), f"Rank mismatch: self.rank={self.rank}, dist.get_rank()={dist.get_rank()}"
 
             # Skip PyNccl initialization for single GPU (no inter-GPU communication needed)
             if self.world_size == 1:
@@ -13194,8 +13194,15 @@ class BatchGenWorker:
         # iterations, but the first forward pass runs immediately. Without this sync,
         # if one rank has more tokens than the initial estimate (ceil(total/world_size)),
         # we get buffer overflow.
+        self._ddl_trace(
+            f"decode_cont:before_entry_moe_sync n_uuids={len(decode_uuids)} "
+            f"n_batch={len(batch)}"
+        )
         max_batch_size = self._sync_decode_moe_rank_counts(
             batch, reason="decode_entry"
+        )
+        self._ddl_trace(
+            f"decode_cont:after_entry_moe_sync max_bs={max_batch_size}"
         )
 
         # OPTIMIZATION: Track if page table was verified since last batch change
@@ -13209,6 +13216,10 @@ class BatchGenWorker:
 
         # Main decode loop — enable decode watchdog for monitoring
         self.enable_decode_watchdog()
+        self._ddl_trace(
+            f"decode_cont:loop_enter n_uuids={len(decode_uuids)} "
+            f"n_batch={len(batch)}"
+        )
         while decode_uuids:
             local_iteration += 1
             self._cumulative_decode_iterations += 1
@@ -13815,8 +13826,15 @@ class BatchGenWorker:
                     gpu_manager=gpu_manager,
                     decode_iter=self._cumulative_decode_iterations,
                 )
+                self._ddl_trace(
+                    f"decode_cont:before_v4_metadata iter={local_iteration} "
+                    f"n_batch={len(batch)}"
+                )
                 self._prepare_deepseek_v4_decode_metadata_for_forward(
                     gpu_manager
+                )
+                self._ddl_trace(
+                    f"decode_cont:after_v4_metadata iter={local_iteration}"
                 )
                 self._prepare_glm5_dsa_graph_flashmla_metadata_for_forward(
                     len(batch),
