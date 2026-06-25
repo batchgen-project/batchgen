@@ -3,9 +3,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from flash_attn import flash_attn_varlen_func
+try:
+	# FA2 (`flash_attn`) differs from FA3 (`flash_attn_interface`); the FA3-only
+	# Hopper install legitimately lacks `flash_attn`. Only the Ampere MLA prefill
+	# path needs FA2, so defer the failure to call time instead of import time.
+	from flash_attn import flash_attn_varlen_func
+except ImportError as _flash_attn_import_error:
+	_FLASH_ATTN_IMPORT_ERROR = _flash_attn_import_error
+
+	def flash_attn_varlen_func(*args, **kwargs):  # type: ignore[misc]
+		raise ImportError(
+			"FlashAttention-2 (the `flash_attn` package) is required for the MLA "
+			"prefill backend on Ampere GPUs but is not installed. Install it with "
+			"`pip install flash-attn --no-build-isolation`, or run on a Hopper GPU "
+			"(which uses the FlashAttention-3 backend instead)."
+		) from _FLASH_ATTN_IMPORT_ERROR
 from .padding import _upad_input, pad_input
 from .rotary_embedding import apply_rotary_pos_emb, rotate_half
+
 
 @torch.inference_mode()
 def mla_prefill_flashattention2(
