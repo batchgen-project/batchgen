@@ -118,6 +118,16 @@ def _setup_nccl_env():
 	if "NCCL_BUFFSIZE" not in os.environ:
 		os.environ["NCCL_BUFFSIZE"] = "16777216"  # 16MB buffer size
 
+	# NCCL_NVLS_ENABLE: disable NVLink-SHARP (NVLS) multicast. NVLS registers a
+	# multicast buffer on first use of each collective size; under CUDA-graph
+	# capture this registration happens INSIDE the captured stream, inflating
+	# capture time (observed ~11s for the K2.5 whole-model graph) and adding
+	# per-replay collective latency for the small TP-MoE AllGather/AllReduce
+	# payloads. Disabling NVLS falls back to ring/tree, which is faster for our
+	# per-layer ~1 MiB collectives and graph-capture-clean. setdefault so it can
+	# be re-enabled explicitly for large-payload runs.
+	os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+
 	# NCCL_ALGO: force deterministic tree algorithm only when
 	# BATCHGEN_DETERMINISTIC is set. Tree has fixed reduction order but
 	# ~1.3-2× slower than ring on intra-node NVLink for the ~1.5 MiB MoE
