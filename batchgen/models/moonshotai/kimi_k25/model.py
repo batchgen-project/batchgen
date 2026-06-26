@@ -47,6 +47,10 @@ from batchgen.layers.rotary_embedding import YarnRotaryEmbedding
 from batchgen.moe.routing import gate_sigmoid_topk_cuda
 from batchgen.batch_invariant_matmul import matmul_persistent as _bi_matmul
 _HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "0") == "1"
+# TP-MoE specialized marlin kernel (MarlinTP: launch_bounds 2 CTA/SM, fused S1 SiLU,
+# STAGES=2 down). Default OFF so the validated grouped_marlin_gemm_m16 path is the
+# steady state; gate the new path entirely behind this flag.
+_USE_TP_MARLIN_V2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
@@ -1339,6 +1343,10 @@ class KimiK25MoE(nn.Module):
         tpg['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
         tpg['s3_C_ptrs'] = tpbuf.expert_out.data_ptr() + idx * (mtp * H * 2)
         tpg['_s3_expert_out_ptr'] = tpbuf.expert_out.data_ptr()
+        # v2 fused-S1 C_ptrs: SiLU(gate)*up written DIRECTLY into intermediate
+        # (inter_pr-wide, mtp-strided) — no separate gateup buffer / silu_mul_split.
+        tpg['s1_fused_C_ptrs'] = tpbuf.intermediate.data_ptr() + idx * (mtp * inter_pr * 2)
+        tpg['_s1_intermediate_ptr'] = tpbuf.intermediate.data_ptr()
         tpg['s1_workspace'] = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
         tpg['s3_workspace'] = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
 
@@ -1457,6 +1465,10 @@ class KimiK25MoE(nn.Module):
             idx = torch.arange(E, dtype=torch.int64, device=device)
             tpg['s3_C_ptrs'] = tpbuf.expert_out.data_ptr() + idx * (mtp * H * 2)
             tpg['_s3_expert_out_ptr'] = tpbuf.expert_out.data_ptr()
+        if _USE_TP_MARLIN_V2 and tpg['_s1_intermediate_ptr'] != tpbuf.intermediate.data_ptr():
+            idx = torch.arange(E, dtype=torch.int64, device=device)
+            tpg['s1_fused_C_ptrs'] = tpbuf.intermediate.data_ptr() + idx * (mtp * inter_pr * 2)
+            tpg['_s1_intermediate_ptr'] = tpbuf.intermediate.data_ptr()
 
         # 5) Dispatch all gathered tokens to ALL 384 experts (expert_start=0).
         expert_counts, topk_pos = dispatch_scatter_3d(
@@ -1477,24 +1489,58 @@ class KimiK25MoE(nn.Module):
         max_m_tiles = max(1, (max_count + 15) // 16)
         mod = self._tpg_mod
 
-        # 6) Stage 1: ONE Marlin GEMM over w13=concat(gate,up) → gate|up [E*mtp, 2*inter_pr]
-        # (prob_n=2*inter_pr=256 at ws16 = one N-tile; reuses the N>=256 kernel), then
-        # silu_mul_split → intermediate [E*mtp, inter_pr]. Works for world_size<=16.
-        mod.grouped_marlin_gemm_m16(
-            tpbuf.dispatched_x, tpg['s1_B_ptrs'], tpg['s1_gateup_C_ptrs'],
-            tpg['s1_scales_ptrs'], tpg['expert_starts'], expert_counts,
-            E, 2 * inter_pr, H, tpg['s1_workspace'],
-            E, tpg['n_tiles_s1'], max_m_tiles)
-        mod.silu_mul_split(
-            self._tpg_gateup, tpbuf.intermediate, expert_counts,
-            E, max_m_tiles * 16, mtp, inter_pr)
-
-        # 7) Stage 3: down GEMM → expert_out [E*mtp, H] (per-rank inter slice)
-        mod.grouped_marlin_gemm_m16(
-            tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
-            tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
-            E, H, inter_pr, tpg['s3_workspace'],
-            E, tpg['n_tiles_s3'], max_m_tiles)
+        # 6+7) Stage 1 (gate|up + SiLU) and Stage 3 (down). Two paths:
+        # v2's fused-S1 epilogue assumes gate|up co-reside in ONE 256-col N-tile
+        # (n_tiles_s1==1, i.e. 2*inter_pr==256 → inter_pr==128 / world_size==16) and
+        # writes an inter_pr-wide (==128, div-by-8) output with no tile_idx offset
+        # (marlin_grouped_gemm.cu:1544 c_gl_wr, :1551 sh_red[c_sh_rd+TN]). At
+        # world_size<16 (inter_pr>128 → n_tiles_s1>1) gate and up split across
+        # N-tiles, so the fused +TN pairing reads the wrong half and tiles collide
+        # on write — silent wrong math. Fall back to the n_tiles-agnostic v1 path
+        # (grouped_marlin_gemm_m16 + silu_mul_split) there.
+        _has_v2 = hasattr(mod, 'grouped_marlin_tp_s1')
+        _v2_single_tile = tpg['n_tiles_s1'] == 1
+        use_v2 = _USE_TP_MARLIN_V2 and _has_v2 and _v2_single_tile
+        if _USE_TP_MARLIN_V2 and not use_v2 and not getattr(KimiK25MoE, '_tp_v2_warned', False):
+            KimiK25MoE._tp_v2_warned = True
+            reason = ("the marlin extension lacks grouped_marlin_tp_s1/s3 (rebuild "
+                      "batchgen_kernels)" if not _has_v2 else
+                      f"n_tiles_s1={tpg['n_tiles_s1']}!=1 (inter_pr={inter_pr}!=128, "
+                      "world_size<16): the fused-S1 epilogue needs gate|up in one "
+                      "256-col N-tile")
+            logging.warning("[TP-MoE batchgen] BATCHGEN_KIMI_TP_MARLIN_V2=1 but "
+                            f"{reason} — falling back to the v1 m16 path.")
+        if use_v2:
+            # v2: MarlinTP (launch_bounds 2 CTA/SM). S1 fuses SiLU into the concat-w13
+            # GEMM epilogue and writes intermediate DIRECTLY (no silu_mul_split, no
+            # gate|up round-trip); S3 uses STAGES=2 for the K=128 single-k-tile down.
+            mod.grouped_marlin_tp_s1(
+                tpbuf.dispatched_x, tpg['s1_B_ptrs'], tpg['s1_fused_C_ptrs'],
+                tpg['s1_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                E, 2 * inter_pr, H, tpg['s1_workspace'],
+                E, tpg['n_tiles_s1'], max_m_tiles, inter_pr)
+            mod.grouped_marlin_tp_s3(
+                tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
+                tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                E, H, inter_pr, tpg['s3_workspace'],
+                E, tpg['n_tiles_s3'], max_m_tiles)
+        else:
+            # v1 (validated): ONE Marlin GEMM over w13=concat(gate,up) → gate|up
+            # [E*mtp, 2*inter_pr] (prob_n=256 at ws16 = one N-tile; reuses the N>=256
+            # kernel), then silu_mul_split → intermediate [E*mtp, inter_pr], then down.
+            mod.grouped_marlin_gemm_m16(
+                tpbuf.dispatched_x, tpg['s1_B_ptrs'], tpg['s1_gateup_C_ptrs'],
+                tpg['s1_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                E, 2 * inter_pr, H, tpg['s1_workspace'],
+                E, tpg['n_tiles_s1'], max_m_tiles)
+            mod.silu_mul_split(
+                self._tpg_gateup, tpbuf.intermediate, expert_counts,
+                E, max_m_tiles * 16, mtp, inter_pr)
+            mod.grouped_marlin_gemm_m16(
+                tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
+                tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                E, H, inter_pr, tpg['s3_workspace'],
+                E, tpg['n_tiles_s3'], max_m_tiles)
 
         # 8) Weighted combine → this rank's partial [num_global, H]
         tp_out = reduce_weighted_scatter(

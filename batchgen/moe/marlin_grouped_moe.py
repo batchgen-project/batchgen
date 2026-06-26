@@ -192,3 +192,62 @@ def marlin_grouped_stage1_unified(
         intermediate_3d, up_buf, expert_counts,
         num_experts, mtp, compact_stride, N,
     )
+
+
+# --------------------------------------------------------------------------- #
+# TP-MoE v2 path (BATCHGEN_KIMI_TP_MARLIN_V2): MarlinTP, __launch_bounds__(256,2).
+# S1 fuses the SiLU into the concat-w13 GEMM epilogue (no silu_mul_split, no
+# gate|up HBM round-trip); S3 uses STAGES=2 for the K=128 single-k-tile down GEMM.
+# Same concat-w13 weight layout as the v1 path, so the parity test still validates.
+# --------------------------------------------------------------------------- #
+def is_tp_marlin_v2_available() -> bool:
+    return hasattr(_module, "grouped_marlin_tp_s1") and hasattr(_module, "grouped_marlin_tp_s3")
+
+
+def marlin_tp_s1_fused(
+    dispatched_x_3d: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    expert_counts: torch.Tensor,
+    expert_starts: torch.Tensor,
+    s1_B_ptrs: torch.Tensor,
+    s1_scales_ptrs: torch.Tensor,
+    prob_n: int,
+    K: int,
+    workspace: torch.Tensor,
+    num_experts: int,
+    n_tiles: int,
+    max_m_tiles: int,
+    out_n: int,
+) -> None:
+    """Fused S1 GEMM: w13=concat(gate,up) @ x -> SiLU(gate)*up, written directly
+    into the intermediate buffer (out_n=inter_pr wide) via C_ptrs. Replaces the
+    grouped_marlin_gemm_m16 + silu_mul_split pair. prob_n = 2*inter_pr (256 at ws16).
+    """
+    _module.grouped_marlin_tp_s1(
+        dispatched_x_3d, s1_B_ptrs, C_ptrs, s1_scales_ptrs,
+        expert_starts, expert_counts,
+        num_experts, prob_n, K, workspace, num_experts, n_tiles, max_m_tiles, out_n,
+    )
+
+
+def marlin_tp_s3(
+    intermediate_3d: torch.Tensor,
+    C_ptrs: torch.Tensor,
+    expert_counts: torch.Tensor,
+    expert_starts: torch.Tensor,
+    s3_B_ptrs: torch.Tensor,
+    s3_scales_ptrs: torch.Tensor,
+    prob_n: int,
+    K: int,
+    workspace: torch.Tensor,
+    num_experts: int,
+    n_tiles: int,
+    max_m_tiles: int,
+) -> None:
+    """Down GEMM (prob_n=H, K=inter_pr=128) with STAGES=2. Standard 16-row writeback
+    into expert_out via C_ptrs."""
+    _module.grouped_marlin_tp_s3(
+        intermediate_3d, s3_B_ptrs, C_ptrs, s3_scales_ptrs,
+        expert_starts, expert_counts,
+        num_experts, prob_n, K, workspace, num_experts, n_tiles, max_m_tiles,
+    )

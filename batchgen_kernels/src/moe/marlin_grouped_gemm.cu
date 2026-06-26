@@ -1237,6 +1237,356 @@ __global__ void MarlinGrouped_M16(
 }
 
 // ============================================================================
+// MarlinTP: TP/Kimi-K2.5/H20-specialized derivative of MarlinGrouped_M16.
+//   * __launch_bounds__(256, 2): caps registers at 128 -> 2 CTAs/SM (25% occ) vs
+//     the 130-reg / 1-CTA (12.5%) base. The inner GEMM math is IDENTICAL
+//     (MBLOCK=16, standard mma_op, ldsm4, 32 FP32 accumulators), so the kernel
+//     stays numerically equivalent — only occupancy, pipeline depth, and the
+//     epilogue change.
+//   * STAGES_T template: S1 uses 4 (deep K=7168, 56 k-tiles); S3 uses 2 — its
+//     K=inter_pr=128 is a single k-tile so the 4-stage cp.async pipeline is dead
+//     weight. STAGES=2 halves sh_b (4096->2048 int4) dropping SMEM 90KB->44KB and
+//     removes the dead fetch/fence/wait per CTA.
+//   * FUSE_SILU template: the S1 concat-w13 GEMM emits gate|up as one 256-col tile
+//     (chunks [0,16)=gate, [16,32)=up). The epilogue reads both halves out of
+//     sh_red, applies SiLU(gate)*up, and writes an out_n(=inter_pr)-wide output —
+//     deleting the separate silu_mul_split kernel and the gate|up HBM round-trip.
+//   * out_n: output row width (S1 fused = inter_pr; S3/non-fused = prob_n).
+// ============================================================================
+
+template <int STAGES_T, bool FUSE_SILU>
+__global__ void __launch_bounds__(256, 2) MarlinTP(
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ B_ptrs,
+    int4* const* __restrict__ C_ptrs,
+    const int4* const* __restrict__ scales_ptrs,
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    int num_experts,
+    int prob_n, int prob_k, int lda,
+    int n_tiles_per_expert,
+    int max_m_tiles,
+    int out_n)
+{
+  // STAGES-derived SMEM sizes (override the file-scope STAGES=4 constants)
+  constexpr int sh_b_size_t = STAGES_T * b_sh_stage;
+  constexpr int sh_s_size_t = STAGES_T * s_sh_stage;
+
+  // CTA M-tiling dispatch (identical to MarlinGrouped_M16)
+  int linear_idx = blockIdx.x;
+  int matrix_idx = linear_idx / (max_m_tiles * n_tiles_per_expert);
+  int remainder = linear_idx % (max_m_tiles * n_tiles_per_expert);
+  int m_tile_idx = remainder / n_tiles_per_expert;
+  int tile_idx = remainder % n_tiles_per_expert;
+  int expert_idx = matrix_idx % num_experts;
+
+  int expert_m = expert_counts[expert_idx];
+  int m_start = m_tile_idx * M16_MBLOCK;
+  if (m_start >= expert_m) return;  // empty CTA: returns before the weight prologue
+
+  int prob_m = min(M16_MBLOCK, expert_m - m_start);
+  int token_start = expert_starts[expert_idx] + m_start;
+
+  const int4* A_ptr = A + token_start * (lda / 8);
+  const int4* B = B_ptrs[matrix_idx];
+  int c_gl_stride_out = out_n / 8;
+  int4* C = C_ptrs[matrix_idx] + m_start * c_gl_stride_out;
+  const int4* scales_ptr = scales_ptrs[matrix_idx];
+
+  int k_tiles = prob_k / 16 / TK;
+
+  // A indices (M16 standard pattern)
+  int a_gl_stride = lda / 8;
+  int a_gl_rd_delta_i = a_gl_stride * (THREADS / a_gl_rd_delta_o);
+  int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+
+  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % 16) + (threadIdx.x % 32) / 16;
+  a_sh_rd += 2 * ((threadIdx.x / 32) / (TN / 4));
+
+  // B indices
+  int b_gl_stride = 16 * prob_n / (PACK * 4);
+  int b_gl_rd_delta_o = b_gl_stride * TK;
+  int b_gl_rd_delta_i = b_gl_stride * (THREADS / b_sh_stride_threads);
+  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads);
+  b_gl_rd += b_sh_stride * tile_idx;
+
+  // Scale indices
+  int s_gl_stride = prob_n / 8;
+  int s_gl_rd = s_sh_stride * tile_idx + threadIdx.x;
+  bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+  int s_sh_rd = 8 * ((threadIdx.x / 32) % (TN / 4)) + (threadIdx.x % 32) / 4;
+
+  // A predicates
+  bool a_sh_wr_pred[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
+
+  auto transform_a = [&](int i) {
+    int row = i / a_gl_rd_delta_o;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+  };
+
+  int a_sh_wr_trans[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
+
+  int a_sh_rd_trans[b_sh_wr_iters][TM];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++)
+    for (int j = 0; j < TM; j++)
+      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
+
+  const int4* B_ptr[b_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++)
+    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+
+  // Shared memory (STAGES_T-sized: S1 -> 90112 B, S3 -> 45056 B)
+  extern __shared__ int4 sh[];
+  int4* sh_b = sh;
+  int4* sh_red = sh;
+  int4* sh_s = sh + (sh_red_size > sh_b_size_t ? sh_red_size : sh_b_size_t);
+  int4* sh_a = sh_s + sh_s_size_t;
+
+  FragA frag_a[2][TM];
+  I4 frag_b_quant[2][1];
+  FragC frag_c[TM][4][2];
+  FragS frag_s[2][4];
+
+#pragma unroll
+  for (int i = 0; i < TM * 4 * 2 * 4; i++)
+    reinterpret_cast<float*>(frag_c)[i] = 0;
+
+  auto fetch_to_shared = [&](int pipe, int k_off, bool pred) {
+    if (pred) {
+      int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < m16_a_sh_wr_iters; i++)
+        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
+                       &A_ptr[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * k_off],
+                       a_sh_wr_pred[i]);
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < b_sh_wr_iters; i++) {
+        cp_async4(&sh_b_stage[b_sh_wr_delta * i + threadIdx.x], B_ptr[i]);
+        B_ptr[i] += b_gl_rd_delta_o;
+      }
+      int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < s_tb_groups; i++) {
+        if (s_sh_wr_pred)
+          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &scales_ptr[s_gl_rd]);
+        s_gl_rd += s_gl_stride;
+      }
+    }
+    cp_async_fence();
+  };
+
+  // ---- Startup: fill pipeline ----
+#pragma unroll
+  for (int i = 0; i < STAGES_T - 1; i++)
+    fetch_to_shared(i, i, i < k_tiles);
+  cp_async_wait<STAGES_T - 2>();
+  __syncthreads();
+
+  auto load_regs = [&](int k, int pipe) {
+    int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+      ldsm4(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+    frag_b_quant[k % 2][0] = *reinterpret_cast<I4*>(
+        &sh_b_stage[b_sh_wr_delta * (k % b_sh_wr_iters) + threadIdx.x]);
+  };
+
+  auto load_scales = [&](int k, int pipe) {
+    int cur_k = k_iter_size * (k % b_sh_wr_iters);
+    int k_blocks = cur_k / 16;
+    int cur_group_id = k_blocks / GROUP_BLOCKS;
+    int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES_T);
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+  };
+
+  auto matmul = [&](int k) {
+    int k2 = k % 2;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      FragB frag_b0, frag_b1;
+      int b_quant_0 = frag_b_quant[k2][0][j];
+      int b_quant_1 = b_quant_0 >> 8;
+      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      scale_op(frag_b0, frag_s[k2][j], 0);
+      scale_op(frag_b1, frag_s[k2][j], 1);
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+        mma_op(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
+        mma_op(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+      }
+    }
+  };
+
+  load_regs(0, 0);
+  load_scales(0, 0);
+  a_gl_rd += a_gl_rd_delta_o * (STAGES_T - 1);
+
+  // ---- Main loop ----
+  int slice_iters = k_tiles;
+  while (slice_iters) {
+#pragma unroll
+    for (int pipe = 0; pipe < STAGES_T;) {
+#pragma unroll
+      for (int k = 0; k < b_sh_wr_iters; k++) {
+        load_regs(k + 1, pipe % STAGES_T);
+        load_scales(k + 1, pipe);
+        if (k == b_sh_wr_iters - 2) {
+          fetch_to_shared((pipe + STAGES_T - 1) % STAGES_T, pipe, slice_iters >= STAGES_T);
+          pipe++;
+          cp_async_wait<STAGES_T - 2>();
+          __syncthreads();
+        }
+        matmul(k);
+      }
+      slice_iters--;
+      if (slice_iters == 0) break;
+    }
+    a_gl_rd += a_gl_rd_delta_o * STAGES_T;
+  }
+  cp_async_wait<0>();
+
+  // ---- Thread-block reduce (step by 1, both [0] and [1] accumulators) ----
+  {
+    constexpr int red_off = THREADS / b_sh_stride_threads / 2;
+    if constexpr (red_off >= 1) {
+      auto red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_sh_stride = b_sh_stride_threads * 4 * 2;
+      constexpr int red_sh_delta = b_sh_stride_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
+                      (threadIdx.x % b_sh_stride_threads);
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (i <= red_idx && red_idx < 2 * i) {
+#pragma unroll
+            for (int j = 0; j < 4 * 2; j++) {
+              int red_sh_wr = red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
+              if (i < red_off) {
+                float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * j + red_sh_rd]);
+                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+#pragma unroll
+                for (int kk = 0; kk < 4; kk++)
+                  reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + j][kk] += c_rd[kk] + c_wr[kk];
+              }
+              sh_red[red_sh_wr] = reinterpret_cast<int4*>(&frag_c)[4 * 2 * m + j];
+            }
+          }
+          __syncthreads();
+        }
+        if (red_idx == 0) {
+#pragma unroll
+          for (int i = 0; i < 4 * 2; i++) {
+            float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+              reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + i][j] += c_rd[j];
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  // ---- Stage frag_c -> sh_red (256 cols), common to both epilogues ----
+  {
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+    c_sh_wr += 32 * (threadIdx.x / 32);
+    if (threadIdx.x / 32 < TN / 4) {
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 8 * j;
+          scalar_t2 r0 = nums2num2(float2num(frag_c[i][j][0][0]), float2num(frag_c[i][j][0][1]));
+          scalar_t2 r1 = nums2num2(float2num(frag_c[i][j][0][2]), float2num(frag_c[i][j][0][3]));
+          scalar_t2 r2 = nums2num2(float2num(frag_c[i][j][1][0]), float2num(frag_c[i][j][1][1]));
+          scalar_t2 r3 = nums2num2(float2num(frag_c[i][j][1][2]), float2num(frag_c[i][j][1][3]));
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 0] = r0;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 0] = r1;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 4] = r2;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 4] = r3;
+        }
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- Epilogue ----
+  if constexpr (FUSE_SILU) {
+    // S1: sh_red holds 256 cols = 32 int4 chunks/row, [0,16)=gate, [16,32)=up.
+    // Each gate-owning thread (col_chunk < 16) reads its gate chunk + the paired
+    // up chunk (+TN), fuses SiLU(gate)*up, and writes out_n(=inter_pr)-wide. This
+    // is exactly what silu_mul_split would read from the gate|up HBM buffer, so it
+    // is byte-equivalent — only the round-trip is removed. Up-owning threads idle.
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_stride = c_gl_stride_out;                        // out_n / 8 = 16
+    int col_chunk = threadIdx.x % (2 * TN);                   // 0..31
+    int row_grp = threadIdx.x / (2 * TN);                     // 0..7
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));   // 128
+    int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));   // 264
+    int c_sh_rd = c_sh_stride * row_grp + col_chunk;
+    int c_gl_wr = c_gl_stride * row_grp + col_chunk;
+    int c_gl_wr_end = c_gl_stride * prob_m;
+    if (col_chunk < TN) {
+#pragma unroll
+      for (int i = 0; i < div_ceil(16 * TM, THREADS / (2 * TN)); i++) {
+        if (c_gl_wr < c_gl_wr_end) {
+          int4 gate_chunk = sh_red[c_sh_rd];
+          int4 up_chunk = sh_red[c_sh_rd + TN];
+          scalar_t* g_ptr = reinterpret_cast<scalar_t*>(&gate_chunk);
+          scalar_t* u_ptr = reinterpret_cast<scalar_t*>(&up_chunk);
+          int4 result;
+          scalar_t* r_ptr = reinterpret_cast<scalar_t*>(&result);
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+            float g = num2float(g_ptr[k]);
+            float u = num2float(u_ptr[k]);
+            r_ptr[k] = float2num(g / (1.0f + __expf(-g)) * u);
+          }
+          C[c_gl_wr] = result;
+          c_gl_wr += c_gl_wr_delta;
+          c_sh_rd += c_sh_rd_delta;
+        }
+      }
+    }
+  } else {
+    // S3 / non-fused: standard 16-row writeback (out_n == prob_n).
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_stride = c_gl_stride_out;
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));
+    constexpr int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));
+    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    c_gl_wr += (2 * TN) * tile_idx;
+    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    int c_gl_wr_end = c_gl_stride * prob_m;
+#pragma unroll
+    for (int i = 0; i < div_ceil(16 * TM, THREADS / (2 * TN)); i++) {
+      if (c_gl_wr < c_gl_wr_end) {
+        C[c_gl_wr] = sh_red[c_sh_rd];
+        c_gl_wr += c_gl_wr_delta;
+        c_sh_rd += c_sh_rd_delta;
+      }
+    }
+  }
+}
+
+// ============================================================================
 // SiLU kernel
 // ============================================================================
 
@@ -1488,6 +1838,67 @@ void silu_mul_split(
 }
 
 // ============================================================================
+// TP-specialized launchers (MarlinTP, __launch_bounds__(256,2) -> 2 CTAs/SM)
+// ============================================================================
+
+// S1: concat-w13 gate|up GEMM (prob_n=2*inter_pr=256, prob_k=H) with STAGES=4 +
+// fused SiLU. Writes SiLU(gate)*up directly into the intermediate buffer
+// (out_n=inter_pr wide), replacing grouped_marlin_gemm_m16 + silu_mul_split.
+void grouped_marlin_tp_s1(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles, int out_n)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    // STAGES=4: max(528,4096) + 512 + 1024 = 5632 int4 = 90112 bytes (== M16 base)
+    constexpr int smem_bytes = 90112;
+    cudaFuncSetAttribute((void*)MarlinTP<4, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * max_m_tiles * num_matrices;
+    MarlinTP<4, true><<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles, max_m_tiles, out_n);
+}
+
+// S3: down GEMM (prob_n=H, prob_k=inter_pr=128 -> 1 k-tile) with STAGES=2 (the
+// 4-stage pipeline is degenerate here) + launch_bounds. Standard 16-row writeback.
+void grouped_marlin_tp_s3(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    // STAGES=2: max(528,2048) + 256 + 512 = 2816 int4 = 45056 bytes (44KB)
+    constexpr int smem_bytes = ((2816 * 16) + 1023) / 1024 * 1024;  // 45056
+    cudaFuncSetAttribute((void*)MarlinTP<2, false>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * max_m_tiles * num_matrices;
+    MarlinTP<2, false><<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles, max_m_tiles, prob_n);  // out_n = prob_n (standard writeback)
+}
+
+// ============================================================================
 // PyBind11 module
 // ============================================================================
 
@@ -1495,6 +1906,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_marlin_gemm", &grouped_marlin_gemm, "Marlin M8 grouped GEMM");
     m.def("grouped_marlin_gemm_m16", &grouped_marlin_gemm_m16, "Marlin M16 grouped GEMM with CTA M-tiling");
     m.def("grouped_marlin_gemm_m16_s1", &grouped_marlin_gemm_m16_s1, "Marlin M16 fused S1 (gate+up+SiLU)");
+    m.def("grouped_marlin_tp_s1", &grouped_marlin_tp_s1, "Marlin TP S1 (concat w13, STAGES=4, fused SiLU, launch_bounds 256,2)");
+    m.def("grouped_marlin_tp_s3", &grouped_marlin_tp_s3, "Marlin TP S3 down (STAGES=2 tiny-K, launch_bounds 256,2)");
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");

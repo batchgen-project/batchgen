@@ -190,6 +190,14 @@ def main():
     if mod is None:
         return 2
 
+    # v2 = MarlinTP (launch_bounds 2 CTA/SM; fused-S1 SiLU; STAGES=2 down).
+    use_v2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
+    if use_v2 and not (hasattr(mod, "grouped_marlin_tp_s1") and hasattr(mod, "grouped_marlin_tp_s3")):
+        print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V2=1 but grouped_marlin_tp_s1/s3 missing "
+              "— rebuild batchgen_kernels.")
+        return 2
+    print(f"Kernel path: {'v2 (MarlinTP: fused-S1 + STAGES2-S3, launch_bounds 2CTA)' if use_v2 else 'v1 (grouped_marlin_gemm_m16 + silu_mul_split)'}")
+
     print(f"TP-MoE Marlin roofline bench  H={H} inter={N_INTER} ws={WORLD_SIZE} "
           f"inter_pr={INTER_PR} E={E} top_k={TOP_K}")
     print(f"Device: {torch.cuda.get_device_name()}  HBM_BW={HBM_BW/1e12:.2f} TB/s  "
@@ -260,24 +268,42 @@ def main():
         eo_row = H * 2
         s1_C = torch.tensor([gateup.data_ptr() + e * mtp * gu_row for e in range(E)],
                             dtype=torch.int64, device=device)
+        # v2 fused-S1 writes SiLU(gate)*up DIRECTLY into intermediate (inter_pr-wide).
+        ie_row = INTER_PR * 2
+        s1f_C = torch.tensor([intermediate.data_ptr() + e * mtp * ie_row for e in range(E)],
+                             dtype=torch.int64, device=device)
         s3_C = torch.tensor([expert_out.data_ptr() + e * mtp * eo_row for e in range(E)],
                             dtype=torch.int64, device=device)
         s1_ws = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
         s3_ws = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
 
-        def bg_s1():
-            mod.grouped_marlin_gemm_m16(
-                dispatched_x, s1_B, s1_C, s1_S, expert_starts, expert_counts,
-                E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
+        if use_v2:
+            def bg_s1():
+                mod.grouped_marlin_tp_s1(
+                    dispatched_x, s1_B, s1f_C, s1_S, expert_starts, expert_counts,
+                    E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
 
-        def bg_s2():
-            mod.silu_mul_split(gateup, intermediate, expert_counts,
-                               E, max_m_tiles * 16, mtp, INTER_PR)
+            def bg_s2():
+                pass  # fused into S1 (no separate silu_mul_split kernel)
 
-        def bg_s3():
-            mod.grouped_marlin_gemm_m16(
-                intermediate, s3_B, s3_C, s3_S, expert_starts, expert_counts,
-                E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+            def bg_s3():
+                mod.grouped_marlin_tp_s3(
+                    intermediate, s3_B, s3_C, s3_S, expert_starts, expert_counts,
+                    E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+        else:
+            def bg_s1():
+                mod.grouped_marlin_gemm_m16(
+                    dispatched_x, s1_B, s1_C, s1_S, expert_starts, expert_counts,
+                    E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
+
+            def bg_s2():
+                mod.silu_mul_split(gateup, intermediate, expert_counts,
+                                   E, max_m_tiles * 16, mtp, INTER_PR)
+
+            def bg_s3():
+                mod.grouped_marlin_gemm_m16(
+                    intermediate, s3_B, s3_C, s3_S, expert_starts, expert_counts,
+                    E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
 
         def bg_all():
             bg_s1(); bg_s2(); bg_s3()

@@ -57,10 +57,16 @@ def main():
     if not hasattr(mod, "silu_mul_split"):
         print("ERROR: rebuild batchgen_kernels (silu_mul_split missing)."); return 2
 
+    use_v2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
+    if use_v2 and not (hasattr(mod, "grouped_marlin_tp_s1") and hasattr(mod, "grouped_marlin_tp_s3")):
+        print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V2=1 but grouped_marlin_tp_s1/s3 missing "
+              "— rebuild batchgen_kernels."); return 2
+
     counts = torch.tensor(COUNTS, dtype=torch.int32, device=dev)
     max_m_tiles = max(1, (int(counts.max().item()) + 15) // 16)
     print(f"BatchGen-marlin TP parity (calc_diff<1e-3 vs BF16 ref)  "
-          f"H={H} inter_pr={INTER_PR} E={E} counts={COUNTS} max_m_tiles={max_m_tiles}")
+          f"H={H} inter_pr={INTER_PR} E={E} counts={COUNTS} max_m_tiles={max_m_tiles}  "
+          f"path={'v2 (MarlinTP fused-S1 + STAGES2-S3)' if use_v2 else 'v1 (m16 + silu_mul_split)'}")
 
     Wg, Wu, Wd = [], [], []
     w13 = torch.empty(E, H // 16, 4 * INTER_PR, dtype=torch.int32, device=dev)
@@ -98,11 +104,20 @@ def main():
     s1_ws = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=dev)
     s3_ws = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=dev)
 
-    mod.grouped_marlin_gemm_m16(dispatched_x, s1_B, s1_C, s1_S, expert_starts, counts,
-                                E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
-    mod.silu_mul_split(gateup, intermediate, counts, E, max_m_tiles * 16, MTP, INTER_PR)
-    mod.grouped_marlin_gemm_m16(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
-                                E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+    if use_v2:
+        # v2: fused S1 writes SiLU(gate)*up DIRECTLY into intermediate (no gateup
+        # round-trip, no silu_mul_split); S3 (down) uses the STAGES=2 kernel.
+        s1f_C = intermediate.data_ptr() + idx * (MTP * INTER_PR * 2)
+        mod.grouped_marlin_tp_s1(dispatched_x, s1_B, s1f_C, s1_S, expert_starts, counts,
+                                 E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
+        mod.grouped_marlin_tp_s3(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                 E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+    else:
+        mod.grouped_marlin_gemm_m16(dispatched_x, s1_B, s1_C, s1_S, expert_starts, counts,
+                                    E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
+        mod.silu_mul_split(gateup, intermediate, counts, E, max_m_tiles * 16, MTP, INTER_PR)
+        mod.grouped_marlin_gemm_m16(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                    E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
     torch.cuda.synchronize()
 
     # BF16 reference (matches kernel precision) over every expert's active rows.

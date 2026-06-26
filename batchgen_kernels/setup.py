@@ -152,7 +152,7 @@ _sm90a_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "-std=c++17", "-arch=sm_90a",
-                     "--use_fast_math", "-lineinfo",
+                     "--use_fast_math", "-lineinfo", "--ptxas-options=-v",
                      "-DUSE_BF16_COMPUTE",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--threads", _nvcc_threads],
