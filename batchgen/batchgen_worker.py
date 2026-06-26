@@ -8280,6 +8280,24 @@ class BatchGenWorker:
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_whole_model_graph_compare_fail"))
 
+	def _k25_whole_model_graph_compare_requested_for_current_batch(self) -> bool:
+		# Batch-level debug flag (batchgen_debug.k25_whole_model_graph_compare) so
+		# graph-vs-eager parity runs without a cold restart.
+		if os.environ.get("BATCHGEN_KIMI_WHOLE_MODEL_GRAPH_COMPARE", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("k25_whole_model_graph_compare"))
+
+	def _k25_whole_model_graph_compare_fail_on_mismatch(self) -> bool:
+		if os.environ.get("BATCHGEN_KIMI_WHOLE_MODEL_GRAPH_COMPARE_FAIL", "0") == "1":
+			return True
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict):
+			return False
+		return self._debug_flag_enabled(debug.get("k25_whole_model_graph_compare_fail"))
+
 	@contextmanager
 	def _glm5_force_segmented_graph_eager(self):
 		old_debug = getattr(AttnWrapperBase, "batchgen_debug", None)
@@ -9165,12 +9183,18 @@ class BatchGenWorker:
 		AttnWrapperBase.gpu_paged_kv_manager = gpu_manager
 
 		# Whole-model graph is the default for GPT-OSS.
-		# K2.5 ALWAYS uses per-layer (segmented) mode because whole-model graph
-		# serializes the shared expert, losing async overlap (~18ms/step regression).
-		# Phase C: K2.5 keeps the per-layer path; GLM-5 always uses whole-model
-		# (the segmented-graph BATCHGEN_SEGMENTED_GRAPH env var is retired).
+		# K2.5: whole-model graph is the default for the TP-MoE path (its collectives
+		# are captured into the single graph, mirroring the live GLM-5 whole-model
+		# graph and SGLang's small-batch whole-forward edge; the page-table-not-built
+		# capture crash is dissolved by binding the K cache via get_layer_kv_buffer
+		# and feeding page_table/slot_indices as static inputs). EP K2.5 has no
+		# marlin/collective graph path and forks the shared-expert side stream, so it
+		# stays per-layer (attn graph) / eager MoE.
 		if _is_k25:
-			use_whole_model = False
+			use_whole_model = any(
+				getattr(getattr(layer, "mlp", None), "_use_tp_moe", False)
+				for layer in self.model.model.layers
+			)
 		else:
 			use_whole_model = True
 
@@ -9183,10 +9207,73 @@ class BatchGenWorker:
 			hidden_size = self.model.config.hidden_size
 
 			if _is_k25:
-				# K2.5 uses MLA attention + 3D strided MoE — different segment class
-				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import K25WholeModelSegment
+				# K2.5 TP-MoE whole-model graph: compose per-layer MLA attn segments
+				# (fixed-address K cache via get_layer_kv_buffer) + per-MoE-layer
+				# capture-safe TP-MoE segments (one shared AllGather pool) into ONE
+				# graph. Layer 0 (dense) runs its MLP inline inside the segment.
+				from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import (
+					K25AttnSegment,
+					K25TpMoEGraphBufferPool,
+					K25TpMoEGraphSegment,
+					K25WholeModelSegment,
+				)
+				from batchgen.models.moonshotai.kimi_k25.model import KimiK25MoE
+
+				attn_segments = [
+					K25AttnSegment(
+						decoder_layer, decoder_layer.self_attn, layer_idx,
+						max_seq_len=max_rope_len,
+						max_pages_per_seq=max_pages,
+						page_size_tokens=page_size_tokens,
+					)
+					for layer_idx, decoder_layer in enumerate(self.model.model.layers)
+				]
+
+				tp_moe_pool = None
+				moe_segments = {}
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe = getattr(decoder_layer, "mlp", None)
+					if (isinstance(moe, KimiK25MoE)
+							and getattr(moe, "_use_tp_moe", False)
+							and getattr(moe, "comm", None) is not None
+							and getattr(moe, "_tp_w13_marlin", None) is not None):
+						if tp_moe_pool is None:
+							tp_moe_pool = K25TpMoEGraphBufferPool(
+								world_size=self.world_size,
+								hidden_size=moe.hidden_size,
+								device=self.torch_device,
+								bucket_sizes=bucket_sizes,
+							)
+						moe_segments[layer_idx] = K25TpMoEGraphSegment(
+							moe, tp_moe_pool, moe.comm,
+							world_size=self.world_size, rank=self.rank,
+							device=self.torch_device,
+						)
+
+				# Fail fast on asymmetric TP-MoE segment count across ranks: TP-MoE is
+				# a rank-invariant env flag, so a mismatch means marlin TP weights
+				# materialized on only some ranks. Without this guard a peer deadlocks
+				# at warmup on an in-graph AllGather no one posts.
+				if self.world_size > 1:
+					_n_seg = torch.tensor(
+						[len(moe_segments)], dtype=torch.int64, device=self.torch_device
+					)
+					_n_min = _n_seg.clone()
+					_n_max = _n_seg.clone()
+					dist.all_reduce(_n_min, op=dist.ReduceOp.MIN)
+					dist.all_reduce(_n_max, op=dist.ReduceOp.MAX)
+					if int(_n_min.item()) != int(_n_max.item()):
+						raise RuntimeError(
+							f"[TP-MoE] asymmetric whole-model MoE segment count across "
+							f"ranks (rank {self.rank} built {len(moe_segments)}; "
+							f"min={int(_n_min.item())} max={int(_n_max.item())}). All "
+							f"ranks must materialize marlin TP weights symmetrically."
+						)
+
 				whole_seg = K25WholeModelSegment(
 					model=self.model,
+					attn_segments=attn_segments,
+					moe_segments=moe_segments,
 					device=self.torch_device,
 					max_pages_per_seq=max_pages,
 					vocab_size=vocab_size,
@@ -10015,6 +10102,12 @@ class BatchGenWorker:
 					)
 					_glm5_whole_timing_items = {}
 					_glm5_skip_graph_kv_offload = False
+					# K2.5 whole-model graph-vs-eager parity (batch-level debug flag;
+					# gated off the GLM-5 path so the two compare modes never collide).
+					_k25_whole_compare = bool(
+						not getattr(self, "_glm5_whole_model_graph", False)
+						and self._k25_whole_model_graph_compare_requested_for_current_batch()
+					)
 					# Whole-model CUDA graph replay.
 					# CRITICAL: Use _max_bs (globally-synced max batch size) for bucket
 					# computation, NOT local len(batch). The graph has NCCL all_reduce
@@ -10108,31 +10201,51 @@ class BatchGenWorker:
 								time.perf_counter() - _glm5_replay_start
 							) * 1000.0
 					else:
+						# Generic whole-model replay (K2.5 TP-MoE / GPT-OSS). An idle
+						# DP-attention rank can reach here with an empty local batch: the
+						# page-table build is gated by `if batch:`, so gpu_table stays None,
+						# yet the rank MUST still replay to post the in-graph TP-MoE
+						# collectives symmetrically (peers deadlock on the first in-graph
+						# AllGather otherwise). Dereferencing gpu_table would crash the rank.
+						# Feed empty page_table / slot_indices; the harness fills the bucket
+						# tail (slot=-1 -> KV writes skipped) so the dummy decode stays
+						# collective-symmetric.
+						wm_max_pages = self._whole_model_segment.max_pages_per_seq
 						page_table_tensor = gpu_manager._gpu_page_table_manager.gpu_table
-						slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
-						if slot_indices_tensor is None:
-							# Rebuild may have cleared it; reconstruct as simple arange
-							slot_indices_tensor = torch.arange(
-								page_table_tensor.shape[0], dtype=torch.int32,
+						if page_table_tensor is None or batch_size == 0:
+							pt_slice = torch.zeros(
+								(batch_size, wm_max_pages), dtype=torch.int32,
 								device=self.torch_device,
 							)
-						# Page table may have fewer columns than the static buffer
-						# (gpu_table gets rebuilt with varying max_pages_per_sequence).
-						# Pad to match the captured spec width.
-						wm_max_pages = self._whole_model_segment.max_pages_per_seq
-						pt_slice = page_table_tensor[:batch_size]
-						if pt_slice.shape[1] < wm_max_pages:
-							pt_slice = torch.nn.functional.pad(
-								pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+							slot_indices_for_replay = torch.zeros(
+								(batch_size,), dtype=torch.int32,
+								device=self.torch_device,
 							)
-						elif pt_slice.shape[1] > wm_max_pages:
-							pt_slice = pt_slice[:, :wm_max_pages]
+						else:
+							slot_indices_tensor = gpu_manager._gpu_page_table_manager._slot_index_tensor
+							if slot_indices_tensor is None:
+								# Rebuild may have cleared it; reconstruct as simple arange
+								slot_indices_tensor = torch.arange(
+									page_table_tensor.shape[0], dtype=torch.int32,
+									device=self.torch_device,
+								)
+							# Page table may have fewer columns than the static buffer
+							# (gpu_table gets rebuilt with varying max_pages_per_sequence).
+							# Pad to match the captured spec width.
+							pt_slice = page_table_tensor[:batch_size]
+							if pt_slice.shape[1] < wm_max_pages:
+								pt_slice = torch.nn.functional.pad(
+									pt_slice, (0, wm_max_pages - pt_slice.shape[1]), value=0
+								)
+							elif pt_slice.shape[1] > wm_max_pages:
+								pt_slice = pt_slice[:, :wm_max_pages]
+							slot_indices_for_replay = slot_indices_tensor[:batch_size]
 						graph_out = self._cuda_graph_manager.replay(
 							"whole_model", bucket,
 							input_ids=new_tokens,
 							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
 							page_table=pt_slice,
-							slot_indices=slot_indices_tensor[:batch_size],
+							slot_indices=slot_indices_for_replay,
 						)
 
 					logits = graph_out["logits"][:batch_size]
@@ -10219,6 +10332,43 @@ class BatchGenWorker:
 						)
 						if not compare["ok"] and self._glm5_whole_model_graph_compare_fail_on_mismatch():
 							raise RuntimeError(f"GLM-5 whole-model CUDA graph compare mismatch: {compare}")
+						_glm5_skip_graph_kv_offload = True
+					elif _k25_whole_compare:
+						# K2.5 graph-vs-eager parity: re-run the fully-eager decode
+						# (no per-layer graph is bound in whole-model mode) and compare
+						# logits. Eager is the token source of truth; skip the graph KV
+						# offload since the eager re-forward already appended KV.
+						from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import (
+							compare_k25_whole_model_graph_logits,
+						)
+						eager_out = self._glm5_decode_model_forward(new_tokens)
+						eager_logits = eager_out.logits[:, -1, :]
+						k25_compare = compare_k25_whole_model_graph_logits(
+							eager_logits=eager_logits,
+							graph_logits=logits,
+							eager_hidden_states=None,
+							graph_hidden_states=graph_hidden_states,
+							atol=float(os.environ.get("BATCHGEN_KIMI_WHOLE_MODEL_GRAPH_COMPARE_ATOL", "1e-2")),
+							rtol=float(os.environ.get("BATCHGEN_KIMI_WHOLE_MODEL_GRAPH_COMPARE_RTOL", "1e-2")),
+						)
+						_log = logging.info if k25_compare["ok"] else logging.error
+						_log(
+							"[KIMI_WHOLE_GRAPH_COMPARE] rank=%s bucket=%s batch=%s status=%s "
+							"max_abs=%.6g mean_abs=%.6g hidden_max_abs=%.6g "
+							"hidden_mean_abs=%.6g argmax_mismatch=%s",
+							self.rank,
+							bucket,
+							batch_size,
+							"OK" if k25_compare["ok"] else "MISMATCH",
+							k25_compare["max_abs"],
+							k25_compare["mean_abs"],
+							k25_compare["hidden_max_abs"],
+							k25_compare["hidden_mean_abs"],
+							k25_compare["argmax_mismatch"],
+						)
+						if not k25_compare["ok"] and self._k25_whole_model_graph_compare_fail_on_mismatch():
+							raise RuntimeError(f"K2.5 whole-model CUDA graph compare mismatch: {k25_compare}")
+						new_tokens_out = self._select_tokens(eager_logits, batch_sequences)
 						_glm5_skip_graph_kv_offload = True
 					else:
 						new_tokens_out = self._select_tokens(logits, batch_sequences)

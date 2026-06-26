@@ -23,7 +23,7 @@ MLA forward is INLINED (not delegated to decoding_attn_mode_3_bf16) because:
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -82,6 +82,16 @@ class K25AttnSegment:
         self.q_absorb = kv_b_proj[:, :self.qk_nope_head_dim, :]   # [64, 128, 512]
         self.out_absorb = kv_b_proj[:, self.qk_nope_head_dim:, :]  # [64, 128, 512]
 
+        # Bind this layer's K cache at a FIXED GPU address for graph capture.
+        # get_layer_kv_buffer returns _k_cache[layer_idx] WITHOUT a built-page-table
+        # precondition (the page-table-free accessor), so capture warmup never raises
+        # "GPU page table is not initialized". The per-step-varying page_table /
+        # slot_indices / cache_seqlens enter as STATIC INPUT buffers instead. This is
+        # the K2.5 analog of GLM-5 baking get_kv_tensors() storage into
+        # Glm5FullDsaAttnSegment (batchgen_worker.py:8842-8843, :8926-8942) rather
+        # than calling get_layer_kv_with_page_table inside the captured forward.
+        self.blocked_k = AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_buffer(layer_idx)
+
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
             "hidden_states": TensorSpec(
@@ -93,8 +103,12 @@ class K25AttnSegment:
             "page_table": TensorSpec(
                 ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
             ),
+            # fill_value=-1: the KV-update kernel skips rows with slot < 0
+            # (batchgen_kernels/triton/kv_cache.py: "skip padding tokens"). A 0
+            # fill would make padded rows write into page_table[slot=0] —
+            # corrupting batch-slot-0's KV every padded replay.
             "slot_indices": TensorSpec(
-                ("batch_size",), torch.int32, fill_value=0
+                ("batch_size",), torch.int32, fill_value=-1
             ),
         }
 
@@ -142,7 +156,6 @@ class K25AttnSegment:
 
         B = hidden_states.shape[0]
         attn = self.attn_mod
-        gpu_kv_manager = AttnWrapperBase.gpu_paged_kv_manager
 
         # Position IDs: cache_seqlens = current length AFTER this token is written,
         # so position = cache_seqlens - 1 (0-indexed).
@@ -179,10 +192,11 @@ class K25AttnSegment:
         # === KV tensor for host offload ===
         k_tensor = offload_kv.view(B, 1, 1, offload_kv.size(-1))
 
-        # === KV write — use STATIC page_table + slot_indices ===
-        # get_layer_kv_with_page_table returns k_cache at fixed GPU address.
-        # We discard its block_table and use our static page_table input instead.
-        blocked_k, _, _ = gpu_kv_manager.get_layer_kv_with_page_table(self.layer_idx)
+        # === KV write — STATIC page_table + slot_indices, FIXED-address K cache ===
+        # blocked_k was bound once at construction via get_layer_kv_buffer (the
+        # page-table-free accessor), so this captured forward never validates the
+        # GPU page table. Per-step page_table / slot_indices are static inputs.
+        blocked_k = self.blocked_k
         run_paged_kv_token_update_fused(
             k_cache=blocked_k,
             k_tokens=k_tensor.view(B, -1),
@@ -449,3 +463,279 @@ class K25TpMoEGraphSegment:
         moe_output.copy_(tp_out[start:start + bucket_size])
         moe_output.add_(moe.shared_experts(padded))
         return {"moe_output": moe_output}
+
+
+# ============================================================================
+# Whole-model graph (BATCHGEN_KIMI_TP_MOE=1 + --enable-cuda-graph)
+# ============================================================================
+
+class K25WholeModelSegment:
+    """Captures the ENTIRE K2.5 TP-MoE decode forward in ONE CUDA graph.
+
+    embed_tokens(input_ids) -> 61 decoder layers (each: MLA attention + in-graph
+    paged KV write -> MoE) -> final RMSNorm -> lm_head -> logits. Layer 0 is the
+    dense SwiGLU MLP (first_k_dense_replace=1); layers 1-60 use the validated
+    capture-safe ``K25TpMoEGraphSegment`` (AllGather -> gate -> SGLang
+    fused_marlin_moe -> AllReduce -> slice + shared expert), so the TP-MoE NCCL
+    collectives record into the single graph (collectives on the capture stream,
+    one shared AllGather pool). One ``graph.replay()`` runs the whole decode step.
+
+    THE PAGE-TABLE FIX (mirrors GLM-5 ``Glm5FullDsaAttnSegment``): each per-layer
+    ``K25AttnSegment`` binds its K-cache buffer at a FIXED GPU address in __init__
+    via ``get_layer_kv_buffer`` (the page-table-free accessor) and reads the
+    per-step page_table / slot_indices / cache_seqlens from STATIC INPUT buffers.
+    The captured forward never calls ``get_layer_kv_with_page_table``, so capture
+    warmup never raises "GPU page table is not initialized". GLM-5 never calls that
+    accessor inside any captured forward either — it bakes ``get_kv_tensors()``
+    storage + the page-table storage into the segment ctor and feeds slot indices
+    as static inputs (batchgen_worker.py:8808-8815, :8842-8843, :8926-8942).
+
+    Single KV stream (MLA) — modeled on the gpt-oss ``WholeModelSegment``, NOT
+    GLM-5's dual-stream DSA path: no aux/indexer KV, no V cache, no per-rank token
+    counts (the per-rank bucket carries the NCCL symmetry). Sampling stays EAGER
+    outside the graph (the graph emits logits; argmax/top-p runs after replay),
+    matching gpt-oss / GLM-5 / SGLang.
+
+    Inputs:  input_ids [B,1] i64, cache_seqlens [B] i32,
+             page_table [B, max_pages] i32, slot_indices [B] i32
+    Outputs: logits [B, vocab] bf16, hidden_states [B, H] bf16
+    """
+
+    def __init__(
+        self,
+        *,
+        model,
+        attn_segments: List[K25AttnSegment],
+        moe_segments: Dict[int, K25TpMoEGraphSegment],
+        device: torch.device,
+        max_pages_per_seq: int,
+        vocab_size: int,
+        hidden_size: int,
+        max_bucket_size: int,
+    ) -> None:
+        self.model = model
+        self.device = device
+        self.max_pages_per_seq = int(max_pages_per_seq)
+        self.vocab_size = int(vocab_size)
+        self.hidden_size = int(hidden_size)
+        self.max_bucket_size = int(max_bucket_size)
+
+        layers = model.model.layers
+        self.num_layers = len(layers)
+        if len(attn_segments) != self.num_layers:
+            raise ValueError(
+                f"K25WholeModelSegment needs one attn segment per layer "
+                f"(got {len(attn_segments)} for {self.num_layers} layers)"
+            )
+        self.attn_segments = list(attn_segments)
+        self.moe_segments = dict(moe_segments)
+        # Non-MoE layers (layer 0 dense, first_k_dense_replace) run their dense MLP
+        # module inline — graph-safe SwiGLU, no collectives. A layer that is NOT a
+        # captured TP-MoE segment MUST be a genuine DenseMLP: if a routed
+        # KimiK25MoE landed here (e.g. its Marlin TP weights failed to materialize)
+        # its eager forward (EP all-to-all / dynamic routing) is NOT graph-safe and
+        # would crash capture / deadlock peers. Assert membership so this surfaces
+        # as a clear startup error instead of a silent capture crash.
+        from batchgen.models.moonshotai.kimi_k25.model import DenseMLP
+        self._dense_mlps = {}
+        for i in range(self.num_layers):
+            if i in self.moe_segments:
+                continue
+            mlp = layers[i].mlp
+            if not isinstance(mlp, DenseMLP):
+                raise RuntimeError(
+                    f"K25WholeModelSegment: layer {i} is neither a captured TP-MoE "
+                    f"segment nor a DenseMLP (got {type(mlp).__name__}). A routed "
+                    f"KimiK25MoE layer cannot run eager inside the captured graph; "
+                    f"ensure its Marlin int4 TP weights materialized on all ranks."
+                )
+            self._dense_mlps[i] = mlp
+        self.kv_dim = int(self.attn_segments[0].kv_dim)  # 576
+
+        # Static KV-offload staging (allocated in setup_static_buffers). The worker
+        # reads _kv_buffers / _kv_key_buffer / num_layers / _no_v_cache after replay
+        # (batchgen_worker.py:10248-10274) — the SAME contract GLM-5 uses, so the
+        # generic whole-model post-replay offload path serves K2.5 unchanged.
+        self._kv_key_buffer: Optional[torch.Tensor] = None
+        self._kv_buffers: Optional[List[dict]] = None
+        self._aux_kv_buffers = None   # MLA single KV stream — no aux/indexer KV
+        self._no_v_cache = True
+
+    # -- Harness hooks ------------------------------------------------------
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        if self._kv_key_buffer is None:
+            # Allocate ONCE at the max bucket; smaller buckets write only their
+            # first `bucket_size` rows. Fixed addresses — the in-graph copy_() into
+            # them is baked into every captured graph.
+            self._kv_key_buffer = torch.zeros(
+                self.num_layers, self.max_bucket_size, 1, 1, self.kv_dim,
+                dtype=torch.bfloat16, device=self.device,
+            )
+            self._kv_buffers = [
+                {"key": self._kv_key_buffer[i], "value": None}
+                for i in range(self.num_layers)
+            ]
+        # Pre-warm the marlin workspace + AllGather pool + enable NCCL on every
+        # TP-MoE sub-segment before capture (idempotent; pool.setup() de-dups).
+        for seg in self.moe_segments.values():
+            seg.setup_static_buffers(bucket_size)
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        for seg in self.moe_segments.values():
+            seg.release_static_buffers(bucket_size)
+        self._kv_key_buffer = None
+        self._kv_buffers = None
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "input_ids": TensorSpec(("batch_size", 1), torch.int64, fill_value=0),
+            "cache_seqlens": TensorSpec(("batch_size",), torch.int32, fill_value=1),
+            "page_table": TensorSpec(
+                ("batch_size", self.max_pages_per_seq), torch.int32, fill_value=0
+            ),
+            # fill_value=-1: KV-update kernel skips rows with slot < 0, so padded
+            # rows [batch_size:bucket] do NOT write into page_table[slot=0] (which
+            # would corrupt the first live sequence's position-0 KV every step).
+            "slot_indices": TensorSpec(("batch_size",), torch.int32, fill_value=-1),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            # fp32 logits: the eager KimiK25ForCausalLM head always returns
+            # .float() (and the batch-invariant _bi_matmul under BI), so the graph
+            # head must too for graph==eager token selection.
+            "logits": TensorSpec(("batch_size", self.vocab_size), torch.float32),
+            "hidden_states": TensorSpec(("batch_size", self.hidden_size), torch.bfloat16),
+        }
+
+    # -- Captured forward ---------------------------------------------------
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        page_table: torch.Tensor,
+        slot_indices: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B = input_ids.shape[0]
+        H = self.hidden_size
+        inner = self.model.model  # KimiK25Model
+
+        hidden_states = inner.embed_tokens(input_ids)  # [B, 1, H]
+
+        for layer_idx in range(self.num_layers):
+            attn_out = self.attn_segments[layer_idx].forward(
+                hidden_states=hidden_states,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                slot_indices=slot_indices,
+            )
+            normed = attn_out["normed"]      # [B, 1, H] — post-attn-normed MoE input
+            residual = attn_out["residual"]  # [B, 1, H]
+
+            # Stage fresh KV for host offload after replay (static-address copy
+            # baked into the graph; worker stages _kv_key_buffer[:, :B] post-replay).
+            if self._kv_key_buffer is not None:
+                self._kv_key_buffer[layer_idx][:B].copy_(attn_out["k_tensor"])
+
+            moe_seg = self.moe_segments.get(layer_idx)
+            if moe_seg is not None:
+                # reshape (not view): guarantees a contiguous [B, H] send buffer for
+                # the in-graph AllGather regardless of `normed`'s layout.
+                moe_out = moe_seg.forward(padded=normed.reshape(B, H))
+                moe_hidden = moe_out["moe_output"].view(B, 1, H)
+            else:
+                moe_hidden = self._dense_mlps[layer_idx](normed)
+
+            hidden_states = residual + moe_hidden
+
+        hidden_states = inner.norm(hidden_states)   # [B, 1, H]
+
+        # Final projection — MIRROR KimiK25ForCausalLM.forward exactly so the graph
+        # head matches the eager parity reference. The eager head always returns
+        # fp32 (.float()), and under batch-invariant mode uses the deterministic
+        # _bi_matmul; a plain bf16 lm_head here would break BI determinism on the
+        # graph path and diverge from eager on near-tie argmax. _bi_matmul is
+        # graph-capturable (the MoE gate already uses it inside this captured graph).
+        from batchgen.models.moonshotai.kimi_k25.model import (
+            _HAS_BATCH_INVARIANT,
+            _bi_matmul,
+        )
+        model = self.model
+        if _HAS_BATCH_INVARIANT:
+            if getattr(model, "_lm_head_weight_t", None) is None:
+                model._lm_head_weight_t = model.lm_head.weight.t().contiguous()
+            logits = _bi_matmul(
+                hidden_states.view(B, H), model._lm_head_weight_t
+            ).float()                                # [B, vocab]
+        else:
+            logits = model.lm_head(hidden_states).float().view(B, self.vocab_size)
+        return {
+            "logits": logits,
+            "hidden_states": hidden_states.squeeze(1),
+        }
+
+
+def compare_k25_whole_model_graph_logits(
+    *,
+    eager_logits: torch.Tensor,
+    graph_logits: torch.Tensor,
+    eager_hidden_states: Optional[torch.Tensor] = None,
+    graph_hidden_states: Optional[torch.Tensor] = None,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+) -> Dict[str, object]:
+    """Graph-vs-eager parity for the K2.5 whole-model decode graph.
+
+    Trimmed clone of ``compare_glm5_whole_model_graph_logits`` (no DSA probe
+    machinery — K2.5 captures no probe layers). Compares logits + argmax and,
+    when both are provided, final hidden states.
+    """
+    if eager_logits.shape != graph_logits.shape:
+        return {
+            "ok": False,
+            "shape_match": False,
+            "eager_shape": tuple(int(d) for d in eager_logits.shape),
+            "graph_shape": tuple(int(d) for d in graph_logits.shape),
+            "max_abs": float("inf"),
+            "mean_abs": float("inf"),
+            "hidden_max_abs": float("inf"),
+            "hidden_mean_abs": float("inf"),
+            "argmax_mismatch": -1,
+        }
+
+    eager_f = eager_logits.detach().to(torch.float32)
+    graph_f = graph_logits.detach().to(torch.float32)
+    diff = (eager_f - graph_f).abs()
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    logits_ok = bool(torch.allclose(eager_f, graph_f, atol=atol, rtol=rtol))
+    argmax_mismatch = int(
+        (torch.argmax(eager_f, dim=-1) != torch.argmax(graph_f, dim=-1)).sum().item()
+    )
+
+    hidden_ok = True
+    hidden_max_abs = 0.0
+    hidden_mean_abs = 0.0
+    if (
+        eager_hidden_states is not None
+        and graph_hidden_states is not None
+        and eager_hidden_states.shape == graph_hidden_states.shape
+    ):
+        eh = eager_hidden_states.detach().to(torch.float32)
+        gh = graph_hidden_states.detach().to(torch.float32)
+        hdiff = (eh - gh).abs()
+        hidden_max_abs = float(hdiff.max().item()) if hdiff.numel() else 0.0
+        hidden_mean_abs = float(hdiff.mean().item()) if hdiff.numel() else 0.0
+        hidden_ok = bool(torch.allclose(eh, gh, atol=atol, rtol=rtol))
+
+    return {
+        "ok": bool(logits_ok and hidden_ok and argmax_mismatch == 0),
+        "shape_match": True,
+        "max_abs": max_abs,
+        "mean_abs": mean_abs,
+        "hidden_max_abs": hidden_max_abs,
+        "hidden_mean_abs": hidden_mean_abs,
+        "argmax_mismatch": argmax_mismatch,
+    }
