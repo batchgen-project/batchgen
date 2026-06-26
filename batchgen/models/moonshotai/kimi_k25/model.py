@@ -73,6 +73,21 @@ def _load_fused_experts_impl():
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
             fused_experts_impl,
         )
+        # The kernel's autotune config helper (try_get_optimal_moe_config ->
+        # fused_moe_triton_config.py) reads ONE flag off SGLang's global
+        # server-args singleton (enable_deterministic_inference). We peel only
+        # the kernel, not SGLang's server, so that singleton is unset and the
+        # first call raises "Global server args is not set yet!". Seed it once
+        # with a defaults-only holder (constructs in ~0s, no model/GPU load).
+        from sglang.srt.server_args import (
+            ServerArgs,
+            get_global_server_args,
+            set_global_server_args_for_scheduler,
+        )
+        try:
+            get_global_server_args()
+        except ValueError:
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         _FUSED_EXPERTS_IMPL = fused_experts_impl
     return _FUSED_EXPERTS_IMPL
 
