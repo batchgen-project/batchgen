@@ -711,6 +711,12 @@ class KimiK25MoE(nn.Module):
         self.device = None
         self.num_tokens_per_rank = None
 
+        # TP-MoE CUDA graph binding (set by enable_tp_moe_cuda_graph at capture time)
+        self._tp_moe_graph_manager = None
+        self._tp_moe_graph_seg_name = None
+        self._tp_moe_graph_segment = None
+        self._tp_moe_graph_bucketing = None
+
         # Persistent vs non-persistent expert tracking (set by PSM)
         # Default: all local experts are persistent (no offloading)
         all_local = list(range(self.routed_expert_start_idx, self.routed_expert_end_idx))
@@ -762,6 +768,21 @@ class KimiK25MoE(nn.Module):
         """MoE forward — routes to decode or prefill path."""
         if self.config.phase == "decode":
             if getattr(self, '_use_tp_moe', False):
+                # Replay the captured TP-MoE graph when available; the validated
+                # eager `_forward_decode_tp` is the fallback (and the only path
+                # when --enable-cuda-graph is off).
+                if self._tp_moe_graph_available(hidden_states):
+                    # Graph replay issues in-graph NCCL collectives (AllGather +
+                    # AllReduce). A per-rank try/except fallback to eager would
+                    # re-issue those collectives on only the failing rank ->
+                    # cross-rank NCCL desync/hang (mismatched collective count or
+                    # sendcount, and a mixed stream domain). The availability
+                    # decision is deterministic and symmetric across ranks (keyed
+                    # on the synchronized num_tokens_per_rank), so every rank takes
+                    # this branch together; any replay failure is a fatal, all-rank
+                    # error and must propagate so the supervisor reaps all ranks
+                    # consistently instead of silently re-running eager on one rank.
+                    return self._forward_decode_tp_graph(hidden_states)
                 return self._forward_decode_tp(hidden_states)
             return self._forward_decode(hidden_states)
         else:
@@ -1269,6 +1290,69 @@ class KimiK25MoE(nn.Module):
         compute_stream.wait_stream(shared_stream)
         out = tp_out[_my_offset:_my_offset + num_tokens] + shared_out
         return out.view(*orig_shape)
+
+    def enable_tp_moe_cuda_graph(self, manager, segment_name: str, segment, bucketing) -> None:
+        """Bind the captured TP-MoE decode graph for this layer (BATCHGEN_KIMI_TP_MOE).
+
+        After this call, decode MoE forward replays the captured graph (AllGather →
+        gate → fused_marlin_moe → AllReduce → slice + shared expert) in one launch,
+        keeping eager `_forward_decode_tp` as the fallback. Bucket selection keys on
+        num_tokens_per_rank (synchronized across ranks) so every rank replays the same
+        global bucket for the in-graph NCCL collectives.
+        """
+        self._tp_moe_graph_manager = manager
+        self._tp_moe_graph_seg_name = segment_name
+        self._tp_moe_graph_segment = segment
+        self._tp_moe_graph_bucketing = bucketing
+        if not getattr(KimiK25MoE, "_tp_graph_logged", False):
+            KimiK25MoE._tp_graph_logged = True
+            logging.info(
+                f"[TP-MoE] decode forward CAPTURED in cuda-graph "
+                f"(rank {self.rank}, world_size {self.world_size})"
+            )
+
+    def _tp_moe_graph_available(self, hidden_states: torch.Tensor) -> bool:
+        """True iff a captured TP-MoE graph exists for this step's per-rank bucket."""
+        if getattr(self, "_tp_moe_graph_manager", None) is None:
+            return False
+        if getattr(self, "_tp_moe_graph_bucketing", None) is None:
+            return False
+        ntp = self.num_tokens_per_rank
+        if ntp is None or ntp <= 0:
+            return False
+        num_tokens = hidden_states.view(-1, hidden_states.shape[-1]).shape[0]
+        if num_tokens > ntp:
+            return False
+        # has_graph keys on num_tokens_per_rank → identical bucket on every rank.
+        return self._tp_moe_graph_manager.has_graph(self._tp_moe_graph_seg_name, ntp)
+
+    @torch.inference_mode()
+    def _forward_decode_tp_graph(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Replay the captured TP-MoE decode graph.
+
+        Numerics are identical to `_forward_decode_tp`: the kernel sequence is reused
+        verbatim inside K25TpMoEGraphSegment.forward. This wrapper only stages inputs
+        and unpads outputs.
+        """
+        orig_shape = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens = hidden_flat.shape[0]
+        ntp = self.num_tokens_per_rank
+        # Pin the bucket to num_tokens_per_rank (same on every rank) so all ranks
+        # replay the SAME global AllGather/AllReduce size. Local num_tokens (≤ ntp)
+        # only controls the unpadded output slice; the replay harness zero-fills the
+        # static `padded` input tail so gathered padding rows are exact zeros.
+        bucket = self._tp_moe_graph_bucketing.get_padded_size(ntp)
+        graph_out = self._tp_moe_graph_manager.replay(
+            self._tp_moe_graph_seg_name, bucket, padded=hidden_flat,
+        )
+        moe_output = graph_out["moe_output"]
+        if num_tokens == 0:
+            # Replay still ran (this rank joined the collectives); no real output.
+            return torch.empty(
+                orig_shape, dtype=hidden_states.dtype, device=hidden_flat.device
+            )
+        return moe_output[:num_tokens].view(*orig_shape)
 
     @torch.inference_mode()
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:

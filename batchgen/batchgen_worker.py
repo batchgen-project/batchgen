@@ -9261,11 +9261,81 @@ class BatchGenWorker:
 					seg_name = f"layer_{layer_idx}_attn"
 					manager.register_segment(seg_name, seg)
 
+				# TP-MoE (BATCHGEN_KIMI_TP_MOE=1): register a per-layer MoE segment so
+				# the whole decode MoE step replays in-graph. EP MoE stays eager (it has
+				# no marlin path and forks the shared-expert side stream). Bucket keys on
+				# num_tokens_per_rank (synchronized) so all ranks capture the same global
+				# AllGather/AllReduce size.
+				from batchgen.models.moonshotai.kimi_k25.model import KimiK25MoE
+				tp_moe_segments = {}  # layer_idx → (moe, segment, seg_name)
+				tp_moe_pool = None
+				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+					moe = getattr(decoder_layer, "mlp", None)
+					if (isinstance(moe, KimiK25MoE)
+							and getattr(moe, "_use_tp_moe", False)
+							and getattr(moe, "comm", None) is not None
+							and getattr(moe, "_tp_w13_marlin", None) is not None):
+						if tp_moe_pool is None:
+							from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import (
+								K25TpMoEGraphBufferPool,
+							)
+							tp_moe_pool = K25TpMoEGraphBufferPool(
+								world_size=self.world_size,
+								hidden_size=moe.hidden_size,
+								device=self.torch_device,
+								bucket_sizes=bucket_sizes,
+							)
+						from batchgen.models.moonshotai.kimi_k25.cuda_graph_segments import (
+							K25TpMoEGraphSegment,
+						)
+						tp_seg = K25TpMoEGraphSegment(
+							moe, tp_moe_pool, moe.comm,
+							world_size=self.world_size, rank=self.rank,
+							device=self.torch_device,
+						)
+						tp_seg_name = f"layer_{layer_idx}_tp_moe"
+						manager.register_segment(tp_seg_name, tp_seg)
+						tp_moe_segments[layer_idx] = (moe, tp_seg, tp_seg_name)
+
 				if self.rank == 0:
+					moe_note = f" + {len(tp_moe_segments)} TP-MoE" if tp_moe_segments else ""
 					logging.info(
-						f"CUDA graph capture (K2.5 MLA): {len(self.model.model.layers)} layers (attn only) × "
+						f"CUDA graph capture (K2.5 MLA): {len(self.model.model.layers)} layers (attn only{moe_note}) × "
 						f"{len(bucketing.bucket_sizes)} buckets {bucketing.bucket_sizes}"
 					)
+
+				# TP-MoE segments issue NCCL collectives — every rank must capture the
+				# same bucket simultaneously. Sync + barrier before capture (the attn-only
+				# segments are local DP and need no barrier, but it is harmless here).
+				# Fail fast on asymmetric registration: TP-MoE on/off is a rank-invariant
+				# (env-derived) flag set on every MoE layer, but if marlin TP weights
+				# materialize on only a subset of ranks, that rank registers fewer
+				# collective-bearing segments and a peer deadlocks at warmup on an
+				# AllGather no one posts. When TP-MoE is intended, every rank reaches this
+				# collective regardless of marlin state, so a count mismatch becomes a
+				# clear error instead of a hang. (No collective is added when TP-MoE is
+				# off — the EP / flag-off capture path is unchanged.)
+				tp_moe_enabled = any(
+					getattr(getattr(layer, "mlp", None), "_use_tp_moe", False)
+					for layer in self.model.model.layers
+				)
+				if self.world_size > 1 and tp_moe_enabled:
+					n_seg_min = torch.tensor(
+						[len(tp_moe_segments)], dtype=torch.int64, device=self.torch_device
+					)
+					n_seg_max = n_seg_min.clone()
+					dist.all_reduce(n_seg_min, op=dist.ReduceOp.MIN)
+					dist.all_reduce(n_seg_max, op=dist.ReduceOp.MAX)
+					if int(n_seg_min.item()) != int(n_seg_max.item()):
+						raise RuntimeError(
+							f"[TP-MoE] asymmetric cuda-graph segment count across ranks "
+							f"(rank {self.rank} registered {len(tp_moe_segments)}; "
+							f"min={int(n_seg_min.item())} max={int(n_seg_max.item())}). "
+							f"All ranks must materialize marlin TP weights symmetrically."
+						)
+				if tp_moe_segments:
+					torch.cuda.synchronize(self.torch_device)
+					dist.barrier()
 
 				manager.warmup_and_capture_all()
 
@@ -9276,6 +9346,10 @@ class BatchGenWorker:
 						attn_name=f"layer_{layer_idx}_attn",
 						max_pages_per_seq=max_pages,
 					)
+
+				# Bind the captured TP-MoE graph on each MoE layer (eager fallback kept).
+				for layer_idx, (moe, tp_seg, tp_seg_name) in tp_moe_segments.items():
+					moe.enable_tp_moe_cuda_graph(manager, tp_seg_name, tp_seg, bucketing)
 			else:
 				# GPT-OSS: per-layer mode (existing behavior)
 				if self.rank == 0:
