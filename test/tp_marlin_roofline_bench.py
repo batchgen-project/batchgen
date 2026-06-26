@@ -181,8 +181,8 @@ def main():
     if not torch.cuda.is_available():
         print("SKIP: CUDA required (Marlin GEMM/transform + sgl_kernel are GPU-only).")
         return 0
-    device = torch.device("cuda")
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(0)
+    device = torch.device("cuda", 0)
 
     mod = load_marlin_or_die()
     if mod is None:
