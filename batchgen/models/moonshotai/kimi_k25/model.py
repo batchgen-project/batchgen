@@ -58,6 +58,25 @@ from batchgen.moe.dispatch_scatter_3d import (
 )
 
 
+_FUSED_EXPERTS_IMPL = None
+
+
+def _load_fused_experts_impl():
+    """Lazily import SGLang's int4 fused_experts kernel (TP-MoE path only).
+
+    Kept lazy so the default EP path never imports SGLang (avoids pulling
+    SGLang config/runtime side-effects into BatchGen when BATCHGEN_KIMI_TP_MOE
+    is unset).
+    """
+    global _FUSED_EXPERTS_IMPL
+    if _FUSED_EXPERTS_IMPL is None:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            fused_experts_impl,
+        )
+        _FUSED_EXPERTS_IMPL = fused_experts_impl
+    return _FUSED_EXPERTS_IMPL
+
+
 @dataclass
 class _CausalLMOutput:
     """Minimal output container with .logits attribute for worker compatibility."""
@@ -716,6 +735,8 @@ class KimiK25MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """MoE forward — routes to decode or prefill path."""
         if self.config.phase == "decode":
+            if getattr(self, '_use_tp_moe', False):
+                return self._forward_decode_tp(hidden_states)
             return self._forward_decode(hidden_states)
         else:
             return self._forward_prefill(hidden_states)
@@ -1110,6 +1131,103 @@ class KimiK25MoE(nn.Module):
             ev[9].record()  # after extract_combine
             timer.defer_moe_times(self._layer_idx, ev, _MOE_OPS)
 
+        return out.view(*orig_shape)
+
+    @torch.inference_mode()
+    def _forward_decode_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """TP-MoE decode (BATCHGEN_KIMI_TP_MOE=1): AllGather → CUDA gate →
+        SGLang int4 fused_experts → AllReduce → slice + shared expert.
+
+        Each rank holds a 1/world_size slice of EVERY expert (TP layout), so the
+        routed FFN is ONE SGLang fused_experts call over all 384 experts, and an
+        AllReduce(SUM) recombines the per-rank intermediate-slice partials into
+        the full MoE output. AllGather, gate, shared-expert overlap, and AllReduce
+        are reused verbatim from the EP path; dispatch + grouped GEMM + reduce are
+        replaced by the single fused_experts call.
+        """
+        fused_experts_impl = _load_fused_experts_impl()
+        buf = self.__class__._buf
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_states
+        num_tokens, H = hidden_states.shape
+        device = self.device or hidden_states.device
+        num_global = self.world_size * self.num_tokens_per_rank
+
+        # 1) AllGather buffers (reuse EP buffer manager's all_tokens/padded)
+        if buf is not None:
+            buf.resize_if_needed(num_global)
+            all_tokens = buf.all_tokens[:num_global]
+            padded = buf.padded
+            padded.zero_()
+        else:
+            all_tokens = torch.zeros(num_global, H, device=device, dtype=torch.bfloat16)
+            padded = torch.zeros(self.num_tokens_per_rank, H, device=device, dtype=hidden_states.dtype)
+
+        if num_tokens > 0:
+            padded[:num_tokens] = hidden_states
+
+        # 1b) Launch shared expert on dedicated stream (overlaps the routed pipeline)
+        compute_stream = torch.cuda.current_stream(device)
+        if not hasattr(self.__class__, '_shared_expert_stream') or self.__class__._shared_expert_stream is None:
+            self.__class__._shared_expert_stream = torch.cuda.Stream(device)
+        shared_stream = self.__class__._shared_expert_stream
+
+        shared_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.shared_experts(identity)
+
+        # 2) AllGather tokens across ranks
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        _my_offset = self.rank * self.num_tokens_per_rank
+
+        # 3) CUDA gate on the full gathered buffer.
+        # topk_idx = GLOBAL expert ids in [0, 384) (TP holds all experts, no remap);
+        # topk_weight already includes routed_scaling_factor (×2.5) — do NOT re-scale.
+        # No padding mask: gathered padded rows are exact zeros, and bias-free INT4
+        # experts map 0 → 0, so padded outputs are zero and are sliced off below.
+        # (Applying topk_idx=-1 would index w13[-1] and crash the SGLang kernel.)
+        topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+
+        # 4) One SGLang int4 fused_experts call over all 384 experts (TP slice).
+        # apply_router_weight_on_input=False → the down GEMM multiplies topk_weight
+        # internally (replaces EP's reduce_weighted_scatter). routed_scaling_factor
+        # left as None (=1.0) since topk_weight already carries the ×2.5 factor.
+        tp_out = fused_experts_impl(
+            all_tokens,
+            self._tp_w13,
+            self._tp_w2,
+            topk_weight.float(),
+            topk_idx.to(torch.int32),
+            b1=None, b2=None,
+            inplace=False,
+            activation="silu",
+            is_gated=True,
+            apply_router_weight_on_input=False,
+            use_int4_w4a16=True,
+            w1_scale=self._tp_w13_scale,
+            w2_scale=self._tp_w2_scale,
+            w1_zp=None, w2_zp=None,
+            block_shape=[0, 32],
+            routed_scaling_factor=None,
+            filter_expert=False,
+        )
+
+        # 5) AllReduce(SUM) → full MoE output for all gathered tokens
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                tp_out, op=dist.ReduceOp.SUM,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        # 6) Sync shared expert stream and combine this rank's slice
+        compute_stream.wait_stream(shared_stream)
+        out = tp_out[_my_offset:_my_offset + num_tokens] + shared_out
         return out.view(*orig_shape)
 
     @torch.inference_mode()

@@ -281,6 +281,11 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config._attn_implementation = "eager"
         self.loaded_model_config.ep_size = self.world_size
 
+        # TP-MoE path (flag-gated). When set, each rank holds a 1/world_size slice
+        # of EVERY expert and the routed FFN runs through SGLang's int4 fused_experts
+        # (matching SGLang's tp/dp layout). Default (unset) = EP path unchanged.
+        self.enable_tp_moe = os.environ.get("BATCHGEN_KIMI_TP_MOE", "0") == "1"
+
         # Log GPU memory before deep free (use GiB = /1024^3, matching PyTorch OOM messages)
         device = self.engine_config.Basic_Config.device_torch
         alloc_before = torch.cuda.memory_allocated(device)
@@ -317,6 +322,7 @@ class KimiK25ParallelStrategyManager:
             moe = self.model.model.layers[layer_idx].mlp
             moe.comm = comm
             moe.device = device
+            moe._use_tp_moe = self.enable_tp_moe
 
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
@@ -449,8 +455,32 @@ class KimiK25ParallelStrategyManager:
         self._load_model_skeleton()
         _log_hbm("_load_model_skeleton")
 
-        self._load_local_routed_experts()
-        _log_hbm("_load_local_routed_experts")
+        # EP loads only this rank's 24 local experts to CPU here; the TP path loads
+        # a 1/world_size slice of ALL 384 experts later (after model.to(device),
+        # since the marlin→raw transform kernel is GPU-only) in _load_tp_moe_experts.
+        if not self.enable_tp_moe:
+            self._load_local_routed_experts()
+            _log_hbm("_load_local_routed_experts")
+        else:
+            # TP-MoE forward uses _tp_w13/_tp_w2 and never reads self.experts, so the
+            # placeholder routed-expert nn.Linear weights (random-init gate/up/down) are
+            # pure waste. Strip them here — mirroring _load_local_routed_experts — BEFORE
+            # model.to(device); otherwise ~24 experts x 60 MoE layers x 88 MB of random
+            # BF16 weights get moved onto the GPU and OOM before _load_tp_moe_experts runs.
+            for layer_idx in range(
+                self.loaded_model_config.first_k_dense_replace,
+                self.model_config.num_hidden_layers,
+            ):
+                for expert in self.model.model.layers[layer_idx].mlp.experts:
+                    if expert is None:
+                        continue
+                    del expert.gate_proj.weight
+                    del expert.up_proj.weight
+                    del expert.down_proj.weight
+                    expert.gate_proj.weight = None
+                    expert.up_proj.weight = None
+                    expert.down_proj.weight = None
+            _log_hbm("strip_placeholder_routed_experts")
 
         self._load_attn_module()
         _log_hbm("_load_attn_module")
@@ -498,24 +528,34 @@ class KimiK25ParallelStrategyManager:
         self.model.to(device)
         _log_hbm("model.to (params only)")
 
-        # Move INT4 weights to GPU using 2 contiguous allocations (not 17,280 individual ones).
-        # This avoids ~20 GiB CUDA allocator fragmentation from small scale tensors.
-        self._move_int4_to_gpu_contiguous()
-        _log_hbm("_move_int4_to_gpu_contiguous")
+        if self.enable_tp_moe:
+            # TP-MoE: each rank holds a 1/world_size slice of EVERY expert, built
+            # from the marlin checkpoint via the GPU marlin→raw transform and
+            # stashed on each MoE layer as _tp_w13/_tp_w2/_tp_w13_scale/_tp_w2_scale.
+            # Skips the EP-only grouped-marlin machinery
+            # (_move_int4_to_gpu_contiguous / _register_marlin_weights /
+            # init_grouped_wgmma) which the fused_experts path replaces.
+            self._load_tp_moe_experts()
+            _log_hbm("_load_tp_moe_experts")
+        else:
+            # Move INT4 weights to GPU using 2 contiguous allocations (not 17,280 individual ones).
+            # This avoids ~20 GiB CUDA allocator fragmentation from small scale tensors.
+            self._move_int4_to_gpu_contiguous()
+            _log_hbm("_move_int4_to_gpu_contiguous")
 
-        # Marlin decode is default for K2.5
-        self._register_marlin_weights()
-        _log_hbm("_register_marlin_weights")
+            # Marlin decode is default for K2.5
+            self._register_marlin_weights()
+            _log_hbm("_register_marlin_weights")
 
-        # Initialize grouped WGMMA for persistent experts (after INT4 weights on GPU)
-        for layer_idx in range(
-            self.loaded_model_config.first_k_dense_replace,
-            self.model_config.num_hidden_layers,
-        ):
-            moe = self.model.model.layers[layer_idx].mlp
-            if hasattr(moe, 'init_grouped_wgmma'):
-                moe.init_grouped_wgmma()
-        _log_hbm("init_grouped_wgmma")
+            # Initialize grouped WGMMA for persistent experts (after INT4 weights on GPU)
+            for layer_idx in range(
+                self.loaded_model_config.first_k_dense_replace,
+                self.model_config.num_hidden_layers,
+            ):
+                moe = self.model.model.layers[layer_idx].mlp
+                if hasattr(moe, 'init_grouped_wgmma'):
+                    moe.init_grouped_wgmma()
+            _log_hbm("init_grouped_wgmma")
 
         # Initialize MoE layers for decoding
         self._init_mode_decoding()
@@ -537,17 +577,18 @@ class KimiK25ParallelStrategyManager:
 
         # Pre-allocate Marlin decode buffers (gate_buf + up_buf) BEFORE KV cache sizing.
         # This ensures the memory planner accounts for them when sizing KV cache.
-        # Marlin decode is default for K2.5
-        mtp = KimiK25MoE._buf.max_tokens_padded
-        for layer_idx in range(
-            self.loaded_model_config.first_k_dense_replace,
-            self.model_config.num_hidden_layers,
-        ):
-            moe = self.model.model.layers[layer_idx].mlp
-            if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
-                moe._init_marlin_buffers(mtp)
-                break  # All layers share the same class-level _buf, init once
-        _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
+        # Marlin decode is default for K2.5 (EP only; TP uses fused_experts workspace).
+        if not self.enable_tp_moe:
+            mtp = KimiK25MoE._buf.max_tokens_padded
+            for layer_idx in range(
+                self.loaded_model_config.first_k_dense_replace,
+                self.model_config.num_hidden_layers,
+            ):
+                moe = self.model.model.layers[layer_idx].mlp
+                if hasattr(moe, '_use_marlin_decode') and moe._use_marlin_decode:
+                    moe._init_marlin_buffers(mtp)
+                    break  # All layers share the same class-level _buf, init once
+            _log_hbm("Marlin decode buffers (gate_buf + up_buf)")
 
         # Initialize All-to-All comms if enabled
         if os.getenv("BATCHGEN_ENABLE_ALL_TO_ALL", "0") == "1":
@@ -908,6 +949,90 @@ class KimiK25ParallelStrategyManager:
 
 
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
+
+    def _load_tp_moe_experts(self):
+        """Load a TP slice of EVERY expert for SGLang int4 fused_experts (TP-MoE).
+
+        Unlike EP (which owns 24 of 384 experts whole), every rank here holds a
+        1/world_size slice of ALL 384 experts per layer. For each expert we fetch
+        the marlin int4 weights from SHM (any rank can read any expert key), run
+        the GPU marlin→raw transform, slice this rank's intermediate portion, and
+        pack into per-layer fused_experts slabs:
+            _tp_w13       [384, 2*inter_pr, H//2]            uint8  (gate|up, gate first)
+            _tp_w2        [384, H,          inter_pr//2]     uint8  (down)
+            _tp_w13_scale [384, 2*inter_pr, H//group_size]   bf16
+            _tp_w2_scale  [384, H,          inter_pr//group] bf16
+        The intermediate slice is on OUTPUT rows for gate/up but on INPUT (packed)
+        columns for down. Weights must already be on GPU (marlin transform kernel
+        is GPU-only); this runs after model.to(device). Streams one expert at a
+        time to keep peak memory bounded.
+        """
+        # Lazy import: keeps the default EP path's import surface unchanged (the
+        # marlin transform pulls the compiled _C_marlin_transform extension).
+        from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+
+        device = self.engine_config.Basic_Config.device_torch
+        H = self.loaded_model_config.hidden_size           # 7168
+        N = self.loaded_model_config.moe_intermediate_size  # 2048
+        E = NUM_TOTAL_EXPERTS                               # 384
+        GROUP_SIZE = 32                                     # INT4 group size (gs=32)
+        r = self.global_rank
+        inter_pr = N // self.world_size                     # 128 for ws=16
+        r0 = r * inter_pr
+        r1 = r0 + inter_pr
+        dcol0 = r * (inter_pr // 8)                         # down packed-col slice start
+        scol0 = r * (inter_pr // GROUP_SIZE)               # down scale-col slice start
+
+        for layer_idx in range(
+            self.loaded_model_config.first_k_dense_replace,
+            self.model_config.num_hidden_layers,
+        ):
+            moe = self.model.model.layers[layer_idx].mlp
+
+            w13 = torch.empty(E, 2 * inter_pr, H // 2, dtype=torch.uint8, device=device)
+            w2 = torch.empty(E, H, inter_pr // 2, dtype=torch.uint8, device=device)
+            w13_scale = torch.empty(E, 2 * inter_pr, H // GROUP_SIZE, dtype=torch.bfloat16, device=device)
+            w2_scale = torch.empty(E, H, inter_pr // GROUP_SIZE, dtype=torch.bfloat16, device=device)
+
+            for e in range(E):
+                t = self.core_engine.get_tensor(f"routed_expert_{layer_idx}_{e}")
+
+                gate_qw = t["gate_proj.weight_packed"].to(device)
+                gate_s = t["gate_proj.weight_scale"].to(device)
+                up_qw = t["up_proj.weight_packed"].to(device)
+                up_s = t["up_proj.weight_scale"].to(device)
+                down_qw = t["down_proj.weight_packed"].to(device)
+                down_s = t["down_proj.weight_scale"].to(device)
+
+                # marlin → raw: gate/up K=H(in) N=N(out); down K=N(in) N=H(out)
+                raw_g, raw_gs = marlin_to_wgmma_fused_gpu(gate_qw, gate_s, H, N)
+                raw_u, raw_us = marlin_to_wgmma_fused_gpu(up_qw, up_s, H, N)
+                raw_d, raw_ds = marlin_to_wgmma_fused_gpu(down_qw, down_s, N, H)
+
+                # gate|up: slice OUTPUT rows [r0:r1], stack gate-first, view uint8.
+                # Slice/cat on int32 first so nibble/byte semantics stay exact; the
+                # int32→uint8 view (little-endian) is the kernel's expected layout.
+                w13_e = torch.cat([raw_g[r0:r1], raw_u[r0:r1]], dim=0).contiguous()
+                w13[e] = w13_e.view(torch.uint8)
+                w13_scale[e] = torch.cat([raw_gs[r0:r1], raw_us[r0:r1]], dim=0)
+
+                # down: slice INPUT(inter) packed columns [dcol0:dcol0+inter_pr//8].
+                d_e = raw_d[:, dcol0:dcol0 + inter_pr // 8].contiguous()
+                w2[e] = d_e.view(torch.uint8)
+                w2_scale[e] = raw_ds[:, scol0:scol0 + inter_pr // GROUP_SIZE]
+
+            moe._tp_w13 = w13
+            moe._tp_w2 = w2
+            moe._tp_w13_scale = w13_scale
+            moe._tp_w2_scale = w2_scale
+            moe._tp_rank = r
+
+        if self.rank == 0:
+            logging.info(
+                f"[MODEL] TP-MoE experts loaded: {E} experts × "
+                f"{self.model_config.num_hidden_layers - self.loaded_model_config.first_k_dense_replace} "
+                f"layers, inter_per_rank={inter_pr} (rank slice {r0}:{r1})"
+            )
 
     def _move_int4_to_gpu_contiguous(self):
         """Move all INT4 expert weights to GPU using 2 contiguous allocations.
