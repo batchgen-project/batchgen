@@ -36,7 +36,9 @@ the cached .so lacks the symbol):
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# append (not insert(0)): keep the freshly-built site-packages batchgen_kernels.so
+# ahead of the workspace SOURCE tree (which has a stale/no compiled .so).
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
