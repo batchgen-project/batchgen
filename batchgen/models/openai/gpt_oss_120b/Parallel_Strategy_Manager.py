@@ -101,6 +101,17 @@ class GptOssParallelStrategyManager:
             torch.cuda.empty_cache()
             log_gpu_memory("configure_prefill: After deleting previous model")
 
+        # BUILD-ONCE bridge: the cached SGLang decode runner (self._sglang_runner)
+        # outlives self.model, so its ~30GB/rank GPU weights would duplicate the
+        # prefill model in HBM. Offload them to host here; _configure_decoding_sglang
+        # reloads them on the next decode phase. (No-op on the first prefill, before
+        # any decode runner exists.)
+        if getattr(self, "_sglang_runner", None) is not None:
+            self._sglang_runner.model.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            log_gpu_memory("configure_prefill: After offloading SGLang decode weights")
+
         # Step 1: Set phase
         self.loaded_model_config.phase = "prefill"
 
@@ -852,20 +863,32 @@ class GptOssParallelStrategyManager:
         )
 
         self.loaded_model_config.phase = "decode"
+
+        # BUILD-ONCE + WEIGHT-OFFLOAD. Rebuilding the SGLang ModelRunner each phase
+        # crashes (initialize_model_parallel is global/non-idempotent) AND reloads
+        # ~30GB weights from disk. Instead build the runner ONCE and keep the object
+        # (+ SGLang's global parallel state) on self._sglang_runner across phase
+        # shifts. The only thing that would duplicate the prefill model in HBM is the
+        # ~30GB GPU weights, so configure_prefill offloads them to host (.to('cpu'));
+        # here we reload them to GPU. Reuse path = reload weights + re-wrap so the KV
+        # adapter re-injects this phase's GPU KV manager on the next decode forward.
+        if getattr(self, "_sglang_runner", None) is not None:
+            self._sglang_runner.model.to("cuda")
+            torch.cuda.synchronize()
+            self.model = SGLangGQADecodeModel(self._sglang_runner, self.core_engine)
+            self.weight_copy_task = {"attn": [], "routed_expert": []}
+            if self.rank == 0:
+                logging.info(
+                    "[DECODE] runtime-peel: reloaded cached SGLang GQA runner "
+                    "weights to GPU (no rebuild)"
+                )
+            return self.model, self.weight_copy_task
+
         self.model = None
         gc.collect()
         torch.cuda.empty_cache()
 
-        # REBUILD each phase (do NOT cache the runner): the SGLang decode weights
-        # (~30GB/rank) must be FREED during the intervening prefill, else they
-        # duplicate the prefill model in HBM -> OOM. The worker frees self.model on
-        # decode->prefill, so a non-cached runner is released; we rebuild here. To
-        # survive the rebuild, build_sglang_decode_runner_gqa installs an
-        # idempotency guard on SGLang's initialize_model_parallel (it asserts the
-        # TP/MoE groups are None and would crash on the 2nd build; the guard reuses
-        # the groups created on the first build). NOTE: this reloads weights from
-        # safetensors each shift (~slow); S3 replaces it with a host-weight feed.
-
+        # First decode phase: build the runner once.
         # 8 GPUs/node on H20 -> derive topology from ranks (gpt-oss is single-node).
         local_world = max(1, torch.cuda.device_count())
         nnodes = max(1, self.world_size // local_world)
@@ -885,6 +908,7 @@ class GptOssParallelStrategyManager:
             node_rank=node_rank,
             mem_fraction_static=mem_frac,
         )
+        self._sglang_runner = runner  # build-once: reused across phase shifts
         self.model = SGLangGQADecodeModel(runner, self.core_engine)
         self.weight_copy_task = {"attn": [], "routed_expert": []}
         if self.rank == 0:
