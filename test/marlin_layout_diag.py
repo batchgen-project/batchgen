@@ -25,9 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 
-# Small but marlin-tile-valid dims (K%16, N%64, group 32).
-H = 256       # "hidden" / contraction K for gate-up
-N_INTER = 128  # "intermediate" / output N
+# Real Kimi dims (override with env for the small sanity case).
+H = int(os.environ.get("DIAG_H", "7168"))        # hidden / contraction K for gate-up
+N_INTER = int(os.environ.get("DIAG_N", "2048"))  # intermediate / output N
 GS = 32
 
 
