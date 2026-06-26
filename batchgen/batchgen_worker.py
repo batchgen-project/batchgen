@@ -2501,6 +2501,13 @@ class BatchGenWorker:
 			)
 		):
 			self.engine_config.Basic_Config.enable_cuda_graphs = True
+		elif (
+			is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
+			and getattr(self.args, "enable_cuda_graph", False)
+		):
+			# K2.5 TP-MoE decode graph: --enable-cuda-graph opts in explicitly
+			# (config default is False). EP/flag-off paths unaffected.
+			self.engine_config.Basic_Config.enable_cuda_graphs = True
 
 		# Set EP offloading config from command-line args
 		self.engine_config.EP_Config.enable_offloading = self.args.enable_ep_with_offloading
