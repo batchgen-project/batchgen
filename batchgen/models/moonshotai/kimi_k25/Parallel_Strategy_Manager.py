@@ -967,6 +967,16 @@ class KimiK25ParallelStrategyManager:
         is GPU-only); this runs after model.to(device). Streams one expert at a
         time to keep peak memory bounded.
         """
+        # Load-once cache: the TP slices are batch-size-independent (expert
+        # weights), so the expensive marlin→raw transform of all 384×60 experts
+        # only needs to run on the FIRST prefill→decode shift. configure_decoding
+        # re-runs each shift; skip the reload once the slices are resident.
+        first_moe = self.loaded_model_config.first_k_dense_replace
+        if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13", None) is not None:
+            if self.rank == 0:
+                logging.info("[MODEL] TP-MoE experts already resident — skipping reload")
+            return
+
         # Lazy import: keeps the default EP path's import surface unchanged (the
         # marlin transform pulls the compiled _C_marlin_transform extension).
         from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu

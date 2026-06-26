@@ -1160,6 +1160,10 @@ class KimiK25MoE(nn.Module):
         are reused verbatim from the EP path; dispatch + grouped GEMM + reduce are
         replaced by the single fused_experts call.
         """
+        if not getattr(KimiK25MoE, "_tp_forward_logged", False):
+            KimiK25MoE._tp_forward_logged = True
+            logging.info(f"[TP-MoE] decode forward ACTIVE (rank {self.rank}, "
+                         f"world_size {self.world_size})")
         fused_experts_impl = _load_fused_experts_impl()
         buf = self.__class__._buf
         orig_shape = hidden_states.shape
@@ -1174,13 +1178,17 @@ class KimiK25MoE(nn.Module):
             buf.resize_if_needed(num_global)
             all_tokens = buf.all_tokens[:num_global]
             padded = buf.padded
-            padded.zero_()
         else:
             all_tokens = torch.zeros(num_global, H, device=device, dtype=torch.bfloat16)
             padded = torch.zeros(self.num_tokens_per_rank, H, device=device, dtype=hidden_states.dtype)
 
         if num_tokens > 0:
             padded[:num_tokens] = hidden_states
+        # fused_experts has no padding mask, so padded rows must be exact zeros.
+        # Zero only the tail (persistent buf carries last step's rows); skipped
+        # entirely when the batch exactly fills the buffer (no padding).
+        if num_tokens < padded.shape[0]:
+            padded[num_tokens:].zero_()
 
         # 1b) Launch shared expert on dedicated stream (overlaps the routed pipeline)
         compute_stream = torch.cuda.current_stream(device)
