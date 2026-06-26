@@ -685,6 +685,7 @@ class KimiK25MoE(nn.Module):
 
     _buf: Optional['KimiK25MoEBufferManager'] = None
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] per-rank token counts for padding masking
+    _tp_buf: Optional['KimiK25MoEBufferManager'] = None  # E=384 buffer for the BatchGen-marlin TP path
 
     def __init__(self, config):
         super().__init__()
@@ -762,6 +763,8 @@ class KimiK25MoE(nn.Module):
         """MoE forward — routes to decode or prefill path."""
         if self.config.phase == "decode":
             if getattr(self, '_use_tp_moe', False):
+                if getattr(self, '_tp_moe_kernel', 'sglang') == 'batchgen':
+                    return self._forward_decode_tp_batchgen(hidden_states)
                 return self._forward_decode_tp(hidden_states)
             return self._forward_decode(hidden_states)
         else:
@@ -1266,6 +1269,239 @@ class KimiK25MoE(nn.Module):
             )
 
         # 6) Sync shared expert stream and combine this rank's slice
+        compute_stream.wait_stream(shared_stream)
+        out = tp_out[_my_offset:_my_offset + num_tokens] + shared_out
+        return out.view(*orig_shape)
+
+    def _init_tp_batchgen_buffers(self, mtp: int):
+        """Build BatchGen-marlin TP grouped-marlin pointer arrays + per-layer state.
+
+        Lazily called from _forward_decode_tp_batchgen on the first decode step
+        (and again if mtp changes). Per-layer weight pointers come from this layer's
+        separate gate/up/down marlin slabs (_tpg_* + _tp_w2_*); the buffer-derived
+        expert_starts / C_ptrs / workspaces are computed against the shared E=384
+        _tp_buf. Mirrors the EP _init_marlin_buffers, with E=num_experts (384),
+        prob_n/prob_k swapped to the per-rank intermediate (inter_pr) layout.
+        """
+        tpbuf = self.__class__._tp_buf
+        E = self.num_experts            # 384 (all experts; TP holds every expert)
+        inter_pr = self._tp_inter_pr    # moe_intermediate // world_size
+        H = self.hidden_size            # 7168
+        GROUP_SIZE = 32                 # INT4 group size (gs=32, K2.5 native)
+        device = self.device
+        idx = torch.arange(E, dtype=torch.int64, device=device)
+
+        # TP16 path: instead of the fused gate+up S1 kernel (which tiles each of
+        # gate/up at N=inter_pr and needs inter_pr>=256 → world_size<=8), run ONE
+        # Marlin GEMM over w13 = concat(gate_marlin, up_marlin) on the marlin column
+        # dim → output width 2*inter_pr, then split with silu_mul_split. At ws=16
+        # 2*inter_pr=256 = exactly one N-tile (n_tiles=1), reusing the proven
+        # N>=256 grouped_marlin_gemm_m16 instead of a 128-wide kernel.
+        # cat(dim=2) of the two [H//16, 2*inter_pr] marlin slabs yields the standard
+        # [H//16, 4*inter_pr] w13 marlin layout (verified byte-identical to SGLang).
+        w13_marlin = torch.cat(
+            [self._tpg_gate_marlin, self._tpg_up_marlin], dim=2).contiguous()      # [E, H//16, 4*inter_pr]
+        w13_scale_marlin = torch.cat(
+            [self._tpg_gate_scale, self._tpg_up_scale], dim=2).contiguous()        # [E, H//GS, 2*inter_pr]
+        self._tpg_w13_marlin = w13_marlin              # keep refs alive
+        self._tpg_w13_scale_marlin = w13_scale_marlin
+
+        n_tiles_s1 = (2 * inter_pr) // 256             # ws<=16 → 2*inter_pr>=256 → >=1
+        assert n_tiles_s1 >= 1, (
+            f"[TP-MoE batchgen] 2*inter_pr={2 * inter_pr} < 256: gate|up GEMM emits "
+            f"zero CTAs. Requires world_size <= 16 (inter_pr >= 128).")
+        n_tiles_s3 = H // 256           # down output H=7168 → 28 tiles
+
+        # Gate|up GEMM output buffer [E*mtp, 2*inter_pr] (consumed by silu_mul_split).
+        gateup = torch.empty(E * mtp, 2 * inter_pr, dtype=torch.bfloat16, device=device)
+        self._tpg_gateup = gateup
+
+        # Per-expert byte strides (int32 = 4B, bf16 = 2B):
+        w13_stride = (H // 16) * (4 * inter_pr) * 4
+        w13scale_stride = (H // GROUP_SIZE) * (2 * inter_pr) * 2
+        down_stride = (inter_pr // 16) * (2 * H) * 4
+        dscale_stride = (inter_pr // GROUP_SIZE) * H * 2
+
+        tpg = {
+            's1_B_ptrs': w13_marlin.data_ptr() + idx * w13_stride,
+            's1_scales_ptrs': w13_scale_marlin.data_ptr() + idx * w13scale_stride,
+            's1_gateup_C_ptrs': gateup.data_ptr() + idx * (mtp * 2 * inter_pr * 2),
+            's3_B_ptrs': self._tp_w2_marlin.data_ptr() + idx * down_stride,
+            's3_scales_ptrs': self._tp_w2_scale_marlin.data_ptr() + idx * dscale_stride,
+            'n_tiles_s1': n_tiles_s1,
+            'n_tiles_s3': n_tiles_s3,
+        }
+
+        # Buffer-derived (shared E=384 _tp_buf; same across all 60 MoE layers).
+        # Stage 1 writes the gate|up GEMM output to the private _tpg_gateup buffer
+        # (s1_gateup_C_ptrs, fixed at init); silu_mul_split then writes tpbuf.intermediate
+        # (flat, no per-expert ptrs). Stage 3 (down) writes tpbuf.expert_out.
+        tpg['expert_starts'] = torch.arange(E, dtype=torch.int32, device=device) * mtp
+        tpg['s3_C_ptrs'] = tpbuf.expert_out.data_ptr() + idx * (mtp * H * 2)
+        tpg['_s3_expert_out_ptr'] = tpbuf.expert_out.data_ptr()
+        tpg['s1_workspace'] = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
+        tpg['s3_workspace'] = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
+
+        from batchgen.moe.marlin_grouped_moe import _load_module
+        self._tpg_mod = _load_module()
+        self._tpg = tpg
+        self._tpg_mtp = mtp
+        if self.rank == 0:
+            logging.info(f"[TP-MoE batchgen] grouped-marlin buffers initialized "
+                         f"(E={E}, inter_pr={inter_pr}, mtp={mtp}, "
+                         f"n_tiles_s1={n_tiles_s1}, n_tiles_s3={n_tiles_s3})")
+
+    @torch.inference_mode()
+    def _forward_decode_tp_batchgen(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """TP-MoE decode via BatchGen's grouped-marlin kernel
+        (BATCHGEN_KIMI_TP_MOE=1 + BATCHGEN_KIMI_TP_MOE_KERNEL=batchgen).
+
+        Same TP envelope as _forward_decode_tp (AllGather, gate, shared-expert
+        overlap, AllReduce(SUM), slice + shared), but the single SGLang
+        fused_marlin_moe call is replaced by the EP-style machinery reconfigured
+        for TP: dispatch all gathered tokens to ALL 384 experts → ONE
+        grouped_marlin_gemm_m16 over w13=concat(gate,up) (N=2*inter_pr) →
+        silu_mul_split → grouped_marlin_gemm_m16 (down,
+        per-rank intermediate slice) → reduce_weighted_scatter (applies topk_weight)
+        → AllReduce(SUM). Weight-then-AllReduce is algebraically identical to
+        SGLang's in-down-GEMM weight × AllReduce (gate is deterministic and equal
+        across ranks). Per-expert marlin bytes are identical to the SGLang slabs,
+        so the routed numerics should match to int4/bf16 precision.
+        """
+        if not getattr(KimiK25MoE, "_tp_bg_forward_logged", False):
+            KimiK25MoE._tp_bg_forward_logged = True
+            logging.info(f"[TP-MoE batchgen] decode forward ACTIVE (rank {self.rank}, "
+                         f"world_size {self.world_size}, inter_pr {self._tp_inter_pr})")
+
+        tpbuf = self.__class__._tp_buf
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        identity = hidden_states
+        num_tokens, H = hidden_states.shape
+        device = self.device or hidden_states.device
+        topk = self.top_k
+        E = self.num_experts
+        inter_pr = self._tp_inter_pr
+        num_global = self.world_size * self.num_tokens_per_rank
+
+        # 1) AllGather buffers. The E=384 _tp_buf is reserved at configure time for
+        # max_global_bsz = world_size * padding_bsz with a small per-expert mtp. Do
+        # NOT call resize_if_needed here: for the 384-expert buffer it would realloc
+        # the 3D dispatched_x/intermediate/expert_out slabs to mtp≈num_global
+        # (~tens of GB → OOM) the moment num_global exceeds mtp. The scheduler caps
+        # decode batches at padding_bsz, so assert we stay within the reserved size.
+        assert num_global <= tpbuf.max_global_bsz, (
+            f"[TP-MoE batchgen] num_global={num_global} exceeds reserved "
+            f"max_global_bsz={tpbuf.max_global_bsz} (num_tokens_per_rank="
+            f"{self.num_tokens_per_rank} > padding_bsz). Increase padding_bsz at "
+            f"configure time; the TP buffer cannot grow safely at runtime.")
+        all_tokens = tpbuf.all_tokens[:num_global]
+        # Send buffer must be EXACTLY num_tokens_per_rank rows: pynccl all_gather
+        # uses input.numel() as the per-rank sendcount, and every consumer below
+        # (gate, padding mask, _my_offset) assumes a num_tokens_per_rank stride.
+        # _tp_buf.padded is frozen at padding_bsz rows (set_num_tokens_per_rank only
+        # resizes the EP _buf), so slice it to the live stride — mirroring the
+        # SGLang-TP path where _buf.padded is kept resized to num_tokens_per_rank.
+        padded = tpbuf.padded[:self.num_tokens_per_rank]
+        padded.zero_()
+        if num_tokens > 0:
+            padded[:num_tokens] = hidden_states
+
+        # 1b) Shared expert on its own stream (overlaps the routed pipeline)
+        compute_stream = torch.cuda.current_stream(device)
+        if not hasattr(self.__class__, '_shared_expert_stream') or self.__class__._shared_expert_stream is None:
+            self.__class__._shared_expert_stream = torch.cuda.Stream(device)
+        shared_stream = self.__class__._shared_expert_stream
+        shared_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.shared_experts(identity)
+
+        # 2) AllGather tokens across ranks
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                all_tokens, padded,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        _my_offset = self.rank * self.num_tokens_per_rank
+
+        # 3) CUDA gate (global expert ids in [0, 384); topk_weight carries ×2.5)
+        topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
+
+        # Mask padding rows to topk_idx=-1 so dispatch_scatter_3d skips them.
+        # Unlike the SGLang TP path (which leaves padded valid and relies on zeros),
+        # BatchGen's dispatch consumes a per-expert slot per token, so padded rows
+        # would inflate expert_counts and risk overflowing the small mtp capacity.
+        rank_counts = self.__class__._rank_token_counts
+        if rank_counts is not None:
+            ntp = self.num_tokens_per_rank
+            positions = torch.arange(num_global, device=device)
+            rank_ids = positions // ntp
+            local_pos = positions % ntp
+            padding_mask = local_pos >= rank_counts[rank_ids]
+            if padding_mask.any():
+                topk_idx[padding_mask] = -1
+                topk_weight[padding_mask] = 0.0
+
+        # 4) Lazy per-layer pointer/buffer init (mtp-dependent)
+        mtp = tpbuf.max_tokens_padded
+        if getattr(self, '_tpg_mtp', -1) != mtp:
+            self._init_tp_batchgen_buffers(mtp)
+        tpg = self._tpg
+
+        # Recompute the down-stage C_ptrs only if expert_out moved (resize). With
+        # max_global_bsz sized to num_global, resize_if_needed is a no-op in steady
+        # state, so this is just defensive (mirrors the EP path). Stage-1 writes the
+        # private _tpg_gateup buffer (fixed at init), so it needs no recompute.
+        if tpg['_s3_expert_out_ptr'] != tpbuf.expert_out.data_ptr():
+            idx = torch.arange(E, dtype=torch.int64, device=device)
+            tpg['s3_C_ptrs'] = tpbuf.expert_out.data_ptr() + idx * (mtp * H * 2)
+            tpg['_s3_expert_out_ptr'] = tpbuf.expert_out.data_ptr()
+
+        # 5) Dispatch all gathered tokens to ALL 384 experts (expert_start=0).
+        expert_counts, topk_pos = dispatch_scatter_3d(
+            all_tokens, topk_idx.to(torch.int32), tpbuf.dispatched_x,
+            0, E, mtp,
+            tpbuf.expert_counts, tpbuf.expert_counters,
+            tpbuf.topk_pos[:num_global * topk],
+        )
+
+        max_possible_m = min(num_global, mtp)
+        max_m_tiles = (max_possible_m + 15) // 16
+        mod = self._tpg_mod
+
+        # 6) Stage 1: ONE Marlin GEMM over w13=concat(gate,up) → gate|up [E*mtp, 2*inter_pr]
+        # (prob_n=2*inter_pr=256 at ws16 = one N-tile; reuses the N>=256 kernel), then
+        # silu_mul_split → intermediate [E*mtp, inter_pr]. Works for world_size<=16.
+        mod.grouped_marlin_gemm_m16(
+            tpbuf.dispatched_x, tpg['s1_B_ptrs'], tpg['s1_gateup_C_ptrs'],
+            tpg['s1_scales_ptrs'], tpg['expert_starts'], expert_counts,
+            E, 2 * inter_pr, H, tpg['s1_workspace'],
+            E, tpg['n_tiles_s1'], max_m_tiles)
+        mod.silu_mul_split(
+            self._tpg_gateup, tpbuf.intermediate, expert_counts, E, mtp, inter_pr)
+
+        # 7) Stage 3: down GEMM → expert_out [E*mtp, H] (per-rank inter slice)
+        mod.grouped_marlin_gemm_m16(
+            tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
+            tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
+            E, H, inter_pr, tpg['s3_workspace'],
+            E, tpg['n_tiles_s3'], max_m_tiles)
+
+        # 8) Weighted combine → this rank's partial [num_global, H]
+        tp_out = reduce_weighted_scatter(
+            tpbuf.expert_out, topk_pos, topk_weight,
+            num_global, H, topk, output=tpbuf.result_buffer[:num_global],
+        )
+
+        # 9) AllReduce(SUM) → full routed output across the intermediate slices
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(
+                tp_out, op=dist.ReduceOp.SUM,
+                stream=torch.cuda.default_stream(device),
+            )
+
+        # 10) Sync shared expert stream and combine this rank's slice
         compute_stream.wait_stream(shared_stream)
         out = tp_out[_my_offset:_my_offset + num_tokens] + shared_out
         return out.view(*orig_shape)

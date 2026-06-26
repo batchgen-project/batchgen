@@ -1310,6 +1310,37 @@ __global__ void silu_mul_dual_stride_kernel(
   gate_inplace[gate_idx] = float2num(g / (1.0f + __expf(-g)) * u);
 }
 
+// SiLU split: input is one contiguous gate|up buffer [E*mtp, 2N] where, per row,
+// cols [0,N) are the gate projection and cols [N,2N) are the up projection (the
+// layout produced by a single Marlin GEMM over w13 = concat(gate_marlin,
+// up_marlin)). Writes out[E*mtp, N] = SiLU(gate) * up, masked by expert_counts.
+// This is the TP-MoE path: at world_size 16 the per-rank gate/up width is
+// inter_pr=128, so 2N=256 (one Marlin N-tile) reuses the proven N>=256 GEMM
+// instead of needing a 128-wide Marlin kernel.
+__global__ void silu_mul_split_kernel(
+    const scalar_t* __restrict__ gate_up,   // [E*mtp, 2N], gate=[:N], up=[N:2N] per row
+    scalar_t* __restrict__ out,             // [E*mtp, N]
+    const int* __restrict__ expert_counts,
+    int num_experts, int mtp, int N)
+{
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_experts * mtp * N;
+  if (tid >= total) return;
+
+  int col = tid % N;
+  int row_global = tid / N;            // row index into [E*mtp]
+  int expert = row_global / mtp;
+  int row_local = row_global % mtp;
+
+  if (expert >= num_experts) return;
+  if (row_local >= expert_counts[expert]) return;
+
+  int gu_base = row_global * (2 * N);
+  float g = num2float(gate_up[gu_base + col]);
+  float u = num2float(gate_up[gu_base + N + col]);
+  out[row_global * N + col] = float2num(g / (1.0f + __expf(-g)) * u);
+}
+
 // ============================================================================
 // Launchers
 // ============================================================================
@@ -1438,6 +1469,20 @@ void silu_mul_dual_stride(
         num_experts, gate_stride, up_stride, N);
 }
 
+void silu_mul_split(
+    torch::Tensor gate_up, torch::Tensor out,
+    torch::Tensor expert_counts,
+    int num_experts, int mtp, int N)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    int total = num_experts * mtp * N;
+    silu_mul_split_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+        reinterpret_cast<const scalar_t*>(gate_up.data_ptr()),
+        reinterpret_cast<scalar_t*>(out.data_ptr()),
+        expert_counts.data_ptr<int>(),
+        num_experts, mtp, N);
+}
+
 // ============================================================================
 // PyBind11 module
 // ============================================================================
@@ -1449,4 +1494,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");
+    m.def("silu_mul_split", &silu_mul_split, "SiLU split of one contiguous gate|up [E*mtp,2N] -> [E*mtp,N]");
 }

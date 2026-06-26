@@ -285,6 +285,14 @@ class KimiK25ParallelStrategyManager:
         # of EVERY expert and the routed FFN runs through SGLang's int4 fused_experts
         # (matching SGLang's tp/dp layout). Default (unset) = EP path unchanged.
         self.enable_tp_moe = os.environ.get("BATCHGEN_KIMI_TP_MOE", "0") == "1"
+        # Backend kernel for the TP-MoE routed FFN. "sglang" (default) keeps the
+        # byte-for-byte SGLang fused_marlin_moe path; "batchgen" routes the routed
+        # FFN through BatchGen's own grouped-marlin dispatch kernel (dispatch ->
+        # grouped_marlin_gemm_m16_s1 -> grouped_marlin_gemm_m16 -> reduce). Load-time
+        # selector: the two paths need different per-expert weight layouts (concat
+        # gate|up vs separate gate/up), so they are mutually exclusive per launch.
+        self.tp_moe_kernel = os.environ.get(
+            "BATCHGEN_KIMI_TP_MOE_KERNEL", "sglang").lower()
 
         # Log GPU memory before deep free (use GiB = /1024^3, matching PyTorch OOM messages)
         device = self.engine_config.Basic_Config.device_torch
@@ -323,6 +331,7 @@ class KimiK25ParallelStrategyManager:
             moe.comm = comm
             moe.device = device
             moe._use_tp_moe = self.enable_tp_moe
+            moe._tp_moe_kernel = self.tp_moe_kernel
 
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
@@ -575,6 +584,38 @@ class KimiK25ParallelStrategyManager:
             device=device,
         )
         _log_hbm("MoEBufferManager")
+
+        # BatchGen-marlin TP path: a SECOND buffer manager sized for ALL 384
+        # experts (E_local=384) with the per-rank intermediate width (N//ws) and a
+        # small per-expert slot capacity (mtp), since the 384-expert dispatch
+        # spreads ~num_global*topk assignments thin. Reserved BEFORE KV sizing so
+        # the memory planner accounts for it (like the EP marlin buffers).
+        if self.enable_tp_moe and self.tp_moe_kernel == "batchgen":
+            inter_pr = self.loaded_model_config.moe_intermediate_size // self.world_size
+            # Gate|up run as ONE Marlin GEMM over w13=concat (output width 2*inter_pr),
+            # so the N-tile floor is 2*inter_pr >= 256 ⟺ inter_pr >= 128 ⟺ world_size <= 16
+            # (production TP16 → inter_pr=128 → 2*inter_pr=256 = one tile). silu_mul_split
+            # splits the [.,2*inter_pr] output back to inter_pr.
+            if 2 * inter_pr < 256:
+                raise RuntimeError(
+                    f"[TP-MoE batchgen] 2*inter_pr={2 * inter_pr} (inter_pr={inter_pr} "
+                    f"= moe_intermediate {self.loaded_model_config.moe_intermediate_size} "
+                    f"// world_size {self.world_size}) < 256. The concat gate|up GEMM emits "
+                    f"zero CTAs below a 256-wide N-tile. Requires world_size <= 16 "
+                    f"(inter_pr >= 128); production TP16 is supported."
+                )
+            tp_mtp = int(os.getenv("BATCHGEN_KIMI_TP_MOE_MTP", "256"))
+            KimiK25MoE._tp_buf = KimiK25MoEBufferManager(
+                E_local=NUM_TOTAL_EXPERTS,
+                max_global_bsz=max_global_bsz,
+                H=self.loaded_model_config.hidden_size,
+                N_inter=inter_pr,
+                topk=self.loaded_model_config.num_experts_per_tok,
+                num_tokens_per_rank=effective_padding_bsz,
+                device=device,
+                max_tokens_padded=tp_mtp,
+            )
+            _log_hbm("TP-MoE batchgen buffer (E=384)")
 
         # Pre-allocate Marlin decode buffers (gate_buf + up_buf) BEFORE KV cache sizing.
         # This ensures the memory planner accounts for them when sizing KV cache.
@@ -973,7 +1014,9 @@ class KimiK25ParallelStrategyManager:
         # only needs to run on the FIRST prefill→decode shift. configure_decoding
         # re-runs each shift; skip the reload once the slices are resident.
         first_moe = self.loaded_model_config.first_k_dense_replace
-        if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13_marlin", None) is not None:
+        is_bg = self.tp_moe_kernel == "batchgen"
+        resident_attr = "_tpg_gate_marlin" if is_bg else "_tp_w13_marlin"
+        if getattr(self.model.model.layers[first_moe].mlp, resident_attr, None) is not None:
             if self.rank == 0:
                 logging.info("[MODEL] TP-MoE experts already resident — skipping reload")
             return
@@ -1003,14 +1046,26 @@ class KimiK25ParallelStrategyManager:
         ):
             moe = self.model.model.layers[layer_idx].mlp
 
-            # Per-layer GPTQ-Marlin slabs for fused_marlin_moe (num_bits=4):
-            #   w13       [E, H//16, 4*inter_pr]          int32 (gate|up concat, output dim)
-            #   w2        [E, inter_pr//16, 2*H]          int32 (down)
-            #   w13_scale [E, H//GROUP_SIZE, 2*inter_pr]  bf16  (marlin-permuted, gs=32)
-            #   w2_scale  [E, inter_pr//GROUP_SIZE, H]    bf16
-            w13 = torch.empty(E, H // 16, 4 * inter_pr, dtype=torch.int32, device=device)
+            # Per-layer GPTQ-Marlin slabs (num_bits=4). SGLang path concats gate|up
+            # into one w13 slab; the BatchGen grouped kernel wants gate/up SEPARATE
+            # (its fused S1 takes gate_B_ptrs/up_B_ptrs as two distinct matrices).
+            # Same marlin bytes either way; total storage identical (gate|up just
+            # stored un-concatenated). Down (w2) is shared verbatim.
+            #   sglang:   w13        [E, H//16, 4*inter_pr]          int32 (gate|up concat)
+            #             w13_scale  [E, H//GROUP_SIZE, 2*inter_pr]  bf16
+            #   batchgen: gate/up    [E, H//16, 2*inter_pr]          int32 (each)
+            #             gate/up_s  [E, H//GROUP_SIZE, inter_pr]    bf16  (each)
+            #   both:     w2         [E, inter_pr//16, 2*H]          int32 (down)
+            #             w2_scale   [E, inter_pr//GROUP_SIZE, H]    bf16
+            if is_bg:
+                gate_marlin = torch.empty(E, H // 16, 2 * inter_pr, dtype=torch.int32, device=device)
+                up_marlin = torch.empty(E, H // 16, 2 * inter_pr, dtype=torch.int32, device=device)
+                gate_scale = torch.empty(E, H // GROUP_SIZE, inter_pr, dtype=torch.bfloat16, device=device)
+                up_scale = torch.empty(E, H // GROUP_SIZE, inter_pr, dtype=torch.bfloat16, device=device)
+            else:
+                w13 = torch.empty(E, H // 16, 4 * inter_pr, dtype=torch.int32, device=device)
+                w13_scale = torch.empty(E, H // GROUP_SIZE, 2 * inter_pr, dtype=torch.bfloat16, device=device)
             w2 = torch.empty(E, inter_pr // 16, 2 * H, dtype=torch.int32, device=device)
-            w13_scale = torch.empty(E, H // GROUP_SIZE, 2 * inter_pr, dtype=torch.bfloat16, device=device)
             w2_scale = torch.empty(E, inter_pr // GROUP_SIZE, H, dtype=torch.bfloat16, device=device)
 
             for e in range(E):
@@ -1037,8 +1092,14 @@ class KimiK25ParallelStrategyManager:
                     raw_g[r0:r1].contiguous(), raw_gs[r0:r1].contiguous(), H, inter_pr)
                 u_mw, u_ms = raw_to_marlin_fused_gpu(
                     raw_u[r0:r1].contiguous(), raw_us[r0:r1].contiguous(), H, inter_pr)
-                w13[e] = torch.cat([g_mw, u_mw], dim=1)
-                w13_scale[e] = torch.cat([g_ms, u_ms], dim=1)
+                if is_bg:
+                    gate_marlin[e] = g_mw
+                    up_marlin[e] = u_mw
+                    gate_scale[e] = g_ms
+                    up_scale[e] = u_ms
+                else:
+                    w13[e] = torch.cat([g_mw, u_mw], dim=1)
+                    w13_scale[e] = torch.cat([g_ms, u_ms], dim=1)
 
                 # down: slice INPUT(inter) packed columns [dcol0:dcol0+inter_pr//8] and
                 # the matching scale columns, then re-marlinize. K=inter_pr (contraction),
@@ -1047,9 +1108,16 @@ class KimiK25ParallelStrategyManager:
                 d_raw_s = raw_ds[:, scol0:scol0 + inter_pr // GROUP_SIZE].contiguous()
                 w2[e], w2_scale[e] = raw_to_marlin_fused_gpu(d_raw, d_raw_s, inter_pr, H)
 
-            moe._tp_w13_marlin = w13
+            if is_bg:
+                moe._tpg_gate_marlin = gate_marlin
+                moe._tpg_up_marlin = up_marlin
+                moe._tpg_gate_scale = gate_scale
+                moe._tpg_up_scale = up_scale
+                moe._tp_inter_pr = inter_pr
+            else:
+                moe._tp_w13_marlin = w13
+                moe._tp_w13_scale_marlin = w13_scale
             moe._tp_w2_marlin = w2
-            moe._tp_w13_scale_marlin = w13_scale
             moe._tp_w2_scale_marlin = w2_scale
             moe._tp_rank = r
 

@@ -58,13 +58,23 @@ __global__ void scatter_tokens_3d_kernel(
 
     if (local_expert < 0 || local_expert >= E_local) return;
 
-    int write_pos;
+    int write_pos = -1;
     if (lane_id == 0) {
         int relative_pos = atomicAdd(&expert_counters[local_expert], 1);
-        write_pos = local_expert * max_tokens_padded + relative_pos;
-        topk_pos[itopk] = write_pos;
+        // Bounds guard: each expert owns only max_tokens_padded slots. On overflow
+        // (load-imbalanced routing exceeding mtp) drop the token instead of writing
+        // past expert e's region into e+1 (cross-expert corruption) or past the
+        // buffer end for the last expert (illegal access). topk_pos stays at the -1
+        // the count kernel set, so reduce_weighted_scatter skips this assignment.
+        if (relative_pos < max_tokens_padded) {
+            write_pos = local_expert * max_tokens_padded + relative_pos;
+            topk_pos[itopk] = write_pos;
+        }
     }
+    // Broadcast first (whole warp shares one itopk, so all lanes participate), then
+    // return together on overflow to keep the warp convergent.
     write_pos = __shfl_sync(0xffffffff, write_pos, 0);
+    if (write_pos < 0) return;
 
     const int vec_size = 8;
     const int vec_count = H / vec_size;
