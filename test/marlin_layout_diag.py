@@ -190,6 +190,29 @@ def main():
         import traceback; traceback.print_exc()
         print(f"  functional test error: {e}")
 
+    # ---- (7) TP-shard loader path: BatchGen marlin->raw->slice->re-marlin vs SGLang control ----
+    banner("(7) TP-shard byte-compare (rank=3): loader path vs SGLang marlin_quantize(sliced)")
+    try:
+        from batchgen.moe.marlin_transform import raw_to_marlin_fused_gpu, marlin_to_wgmma_fused_gpu
+        WS, RK = 16, 3
+        ipr = N_INTER // WS
+        r0, r1 = RK * ipr, (RK + 1) * ipr
+        Wg = (torch.randn(H, N_INTER, device=dev, dtype=torch.float16) * 0.1)  # [K=H, N=inter]
+        rg = quant_one(Wg, qtype, sgl)
+        # BatchGen loader path: full marlin -> raw(wgmma) -> slice OUTPUT rows [r0:r1] -> re-marlin
+        raw_g, raw_gs = marlin_to_wgmma_fused_gpu(rg["bg_mw"], rg["bg_ms"].to(torch.bfloat16), H, N_INTER)
+        bg_shard_w, bg_shard_s = raw_to_marlin_fused_gpu(
+            raw_g[r0:r1].contiguous(), raw_gs[r0:r1].contiguous(), H, ipr)
+        # SGLang control: quantize the sliced smooth weight directly
+        w_ref_s, sgl_shard_w, sgl_shard_s, *_ = sgl["gptq_quantize_weights"](
+            Wg[:, r0:r1].contiguous(), qtype, GS, False, None)
+        wp = sgl["get_weight_perm"](4)
+        sgl_shard_w = sgl["marlin_weights"](sgl_shard_w, H, ipr, 4, wp).to(dev)
+        cmp_t("shard marlin_w", bg_shard_w, sgl_shard_w)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"  (7) error: {e}")
+
     print("\nDONE")
     return 0
 
