@@ -856,20 +856,15 @@ class GptOssParallelStrategyManager:
         gc.collect()
         torch.cuda.empty_cache()
 
-        # BUILD-ONCE: the worker calls configure_decoding on EVERY prefill->decode
-        # phase shift. SGLang's ModelRunner.__init__ runs initialize_model_parallel,
-        # which is GLOBAL and asserts "tensor model parallel group is already
-        # initialized" on a second build -> crash on the 2nd decode phase. So build
-        # the runner once and reuse it across phases (its weights + SGLang parallel
-        # state persist on self._sglang_runner). Re-wrap in a fresh
-        # SGLangGQADecodeModel so the KV adapter re-injects this phase's GPU KV
-        # manager on the next decode forward.
-        if getattr(self, "_sglang_runner", None) is not None:
-            self.model = SGLangGQADecodeModel(self._sglang_runner, self.core_engine)
-            self.weight_copy_task = {"attn": [], "routed_expert": []}
-            if self.rank == 0:
-                logging.info("[DECODE] runtime-peel: reusing cached SGLang GQA runner")
-            return self.model, self.weight_copy_task
+        # REBUILD each phase (do NOT cache the runner): the SGLang decode weights
+        # (~30GB/rank) must be FREED during the intervening prefill, else they
+        # duplicate the prefill model in HBM -> OOM. The worker frees self.model on
+        # decode->prefill, so a non-cached runner is released; we rebuild here. To
+        # survive the rebuild, build_sglang_decode_runner_gqa installs an
+        # idempotency guard on SGLang's initialize_model_parallel (it asserts the
+        # TP/MoE groups are None and would crash on the 2nd build; the guard reuses
+        # the groups created on the first build). NOTE: this reloads weights from
+        # safetensors each shift (~slow); S3 replaces it with a host-weight feed.
 
         # 8 GPUs/node on H20 -> derive topology from ranks (gpt-oss is single-node).
         local_world = max(1, torch.cuda.device_count())
@@ -890,7 +885,6 @@ class GptOssParallelStrategyManager:
             node_rank=node_rank,
             mem_fraction_static=mem_frac,
         )
-        self._sglang_runner = runner  # cache for reuse across phase shifts
         self.model = SGLangGQADecodeModel(runner, self.core_engine)
         self.weight_copy_task = {"attn": [], "routed_expert": []}
         if self.rank == 0:

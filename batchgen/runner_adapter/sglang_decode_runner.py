@@ -93,6 +93,34 @@ def _install_pg_adopt_guard() -> None:
     parallel_state.init_distributed_environment = _guarded
 
 
+def _install_model_parallel_idempotency_guard() -> None:
+    """Make SGLang ``initialize_model_parallel`` idempotent across phase shifts.
+
+    BatchGen's unified worker rebuilds the decode-only ModelRunner on EVERY
+    prefill->decode shift (the decode weights are freed during prefill to avoid
+    duplicating the prefill model in HBM). SGLang's ``initialize_model_parallel``
+    asserts the TP/PP/MoE groups are None and crashes on the 2nd build
+    ("tensor model parallel group is already initialized"). The groups created on
+    the first build are global and reusable, so skip re-init when model-parallel
+    is already initialized — the new ModelRunner adopts the existing groups via
+    ``get_tp_group()`` etc. Idempotent: re-patching is a no-op.
+    """
+    from sglang.srt.distributed import parallel_state
+
+    if getattr(parallel_state.initialize_model_parallel, "_batchgen_mp_guard", False):
+        return
+
+    _orig = parallel_state.initialize_model_parallel
+
+    def _guarded(*args, **kwargs):
+        if parallel_state.model_parallel_is_initialized():
+            return  # groups already exist from the first build; reuse them.
+        return _orig(*args, **kwargs)
+
+    _guarded._batchgen_mp_guard = True
+    parallel_state.initialize_model_parallel = _guarded
+
+
 def _register_glm5_config_for_sglang() -> None:
     """Teach SGLang/HF AutoConfig how to read GLM-5's `glm_moe_dsa` config."""
     from batchgen.models.glm.glm5.configuration_glm5 import Glm5Config
@@ -407,6 +435,7 @@ def build_sglang_decode_runner_gqa(
     import os as _os
 
     _install_pg_adopt_guard()
+    _install_model_parallel_idempotency_guard()
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_executor.model_runner import ModelRunner
