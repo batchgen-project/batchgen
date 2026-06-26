@@ -119,6 +119,11 @@ def _ref_ffn(hidden, topk_ids, topk_weights, get_full, col0=None, col1=None):
 def _routing(device):
     g = torch.Generator(device=device).manual_seed(99)
     hidden = (torch.randn(M, H, device=device, generator=g) * 0.1).to(torch.bfloat16)
+    if os.environ.get("DIAG_DEGENERATE") == "1":
+        # isolate routing/tw: all tokens -> expert 0, weight 1.0
+        topk_ids = torch.zeros(M, TOP_K, dtype=torch.int32, device=device)
+        topk_weights = torch.ones(M, TOP_K, device=device).float()
+        return hidden, topk_ids, topk_weights
     topk_ids = torch.randint(0, E, (M, TOP_K), dtype=torch.int32, device=device, generator=g)
     topk_weights = (torch.rand(M, TOP_K, device=device, generator=g) * 0.5 + 0.25).float()
     return hidden, topk_ids, topk_weights
