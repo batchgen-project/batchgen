@@ -1028,12 +1028,17 @@ class KimiK25ParallelStrategyManager:
                 raw_u, raw_us = marlin_to_wgmma_fused_gpu(up_qw, up_s, H, N)
                 raw_d, raw_ds = marlin_to_wgmma_fused_gpu(down_qw, down_s, N, H)
 
-                # gate|up: slice OUTPUT rows [r0:r1] of each, concat gate-first on the
-                # raw output dim (raw is [N_out, K//8]), then re-marlinize the fused
-                # slab. K=H (contraction), N=2*inter_pr (fused gate|up output).
-                w13_raw = torch.cat([raw_g[r0:r1], raw_u[r0:r1]], dim=0).contiguous()
-                w13_raw_s = torch.cat([raw_gs[r0:r1], raw_us[r0:r1]], dim=0).contiguous()
-                w13[e], w13_scale[e] = raw_to_marlin_fused_gpu(w13_raw, w13_raw_s, H, 2 * inter_pr)
+                # gate|up: slice OUTPUT rows [r0:r1], marlinize gate and up
+                # SEPARATELY, then concat the marlin tensors on the column dim.
+                # marlin(concat) != concat(marlin) — the marlin permutation
+                # interleaves across the output dim, so the kernel wants
+                # concat(marlin(gate), marlin(up)), NOT marlin of the fused raw.
+                g_mw, g_ms = raw_to_marlin_fused_gpu(
+                    raw_g[r0:r1].contiguous(), raw_gs[r0:r1].contiguous(), H, inter_pr)
+                u_mw, u_ms = raw_to_marlin_fused_gpu(
+                    raw_u[r0:r1].contiguous(), raw_us[r0:r1].contiguous(), H, inter_pr)
+                w13[e] = torch.cat([g_mw, u_mw], dim=1)
+                w13_scale[e] = torch.cat([g_ms, u_ms], dim=1)
 
                 # down: slice INPUT(inter) packed columns [dcol0:dcol0+inter_pr//8] and
                 # the matching scale columns, then re-marlinize. K=inter_pr (contraction),

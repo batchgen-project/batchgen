@@ -149,9 +149,11 @@ def test_l1_full(device, fused_marlin_moe, workspace):
     w2_s = torch.empty(E, N_INTER // GROUP_SIZE, H, dtype=torch.bfloat16, device=device)  # [E,64,7168]
     for e in range(E):
         gate_raw, gate_s, up_raw, up_s, down_raw, down_s = experts[e]
-        w13_raw = torch.cat([gate_raw, up_raw], dim=0).contiguous()      # [2*N_INTER, H//8]
-        w13_raw_s = torch.cat([gate_s, up_s], dim=0).contiguous()        # [2*N_INTER, H//32]
-        w13[e], w13_s[e] = raw_to_marlin_fused_gpu(w13_raw, w13_raw_s, H, 2 * N_INTER)
+        # marlinize gate/up SEPARATELY then concat marlin cols (marlin(concat)!=concat(marlin)).
+        g_mw, g_ms = raw_to_marlin_fused_gpu(gate_raw, gate_s, H, N_INTER)
+        u_mw, u_ms = raw_to_marlin_fused_gpu(up_raw, up_s, H, N_INTER)
+        w13[e] = torch.cat([g_mw, u_mw], dim=1)
+        w13_s[e] = torch.cat([g_ms, u_ms], dim=1)
         w2[e], w2_s[e] = raw_to_marlin_fused_gpu(down_raw, down_s, N_INTER, H)
 
     out_k = fused_marlin_moe(
@@ -191,10 +193,11 @@ def test_l2_tp(device, fused_marlin_moe, workspace, shared, rank=3):
         rg, rgs = marlin_to_wgmma_fused_gpu(g_m, g_ms, H, N_INTER)          # [2048,896]/[2048,224]
         ru, rus = marlin_to_wgmma_fused_gpu(u_m, u_ms, H, N_INTER)
         rd, rds = marlin_to_wgmma_fused_gpu(d_m, d_ms, N_INTER, H)          # [7168,256]/[7168,64]
-        # gate|up: slice OUTPUT rows, concat gate-first, re-marlinize.
-        w13_raw = torch.cat([rg[r0:r1], ru[r0:r1]], dim=0).contiguous()     # [256,896]
-        w13_raw_s = torch.cat([rgs[r0:r1], rus[r0:r1]], dim=0).contiguous() # [256,224]
-        w13[e], w13_s[e] = raw_to_marlin_fused_gpu(w13_raw, w13_raw_s, H, 2 * INTER_PR)
+        # gate|up: slice OUTPUT rows, marlinize each separately, concat marlin cols.
+        g_mw, g_ms = raw_to_marlin_fused_gpu(rg[r0:r1].contiguous(), rgs[r0:r1].contiguous(), H, INTER_PR)
+        u_mw, u_ms = raw_to_marlin_fused_gpu(ru[r0:r1].contiguous(), rus[r0:r1].contiguous(), H, INTER_PR)
+        w13[e] = torch.cat([g_mw, u_mw], dim=1)
+        w13_s[e] = torch.cat([g_ms, u_ms], dim=1)
         # down: slice INPUT(inter) packed columns + scale columns, re-marlinize.
         d_raw = rd[:, dcol0:dcol0 + INTER_PR // 8].contiguous()            # [7168,16]
         d_raw_s = rds[:, scol0:scol0 + INTER_PR // GROUP_SIZE].contiguous()  # [7168,4]
