@@ -462,7 +462,7 @@ class KimiK25ParallelStrategyManager:
             self._load_local_routed_experts()
             _log_hbm("_load_local_routed_experts")
         else:
-            # TP-MoE forward uses _tp_w13/_tp_w2 and never reads self.experts, so the
+            # TP-MoE forward uses _tp_w13_marlin/_tp_w2_marlin and never reads self.experts, so the
             # placeholder routed-expert nn.Linear weights (random-init gate/up/down) are
             # pure waste. Strip them here — mirroring _load_local_routed_experts — BEFORE
             # model.to(device); otherwise ~24 experts x 60 MoE layers x 88 MB of random
@@ -531,10 +531,11 @@ class KimiK25ParallelStrategyManager:
         if self.enable_tp_moe:
             # TP-MoE: each rank holds a 1/world_size slice of EVERY expert, built
             # from the marlin checkpoint via the GPU marlin→raw transform and
-            # stashed on each MoE layer as _tp_w13/_tp_w2/_tp_w13_scale/_tp_w2_scale.
+            # stashed on each MoE layer as
+            # _tp_w13_marlin/_tp_w2_marlin/_tp_w13_scale_marlin/_tp_w2_scale_marlin.
             # Skips the EP-only grouped-marlin machinery
             # (_move_int4_to_gpu_contiguous / _register_marlin_weights /
-            # init_grouped_wgmma) which the fused_experts path replaces.
+            # init_grouped_wgmma) which the fused_marlin_moe path replaces.
             self._load_tp_moe_experts()
             _log_hbm("_load_tp_moe_experts")
         else:
@@ -951,17 +952,17 @@ class KimiK25ParallelStrategyManager:
         logging.debug(f"Local routed experts loaded ({len(self.local_routed_experts)} experts)")
 
     def _load_tp_moe_experts(self):
-        """Load a TP slice of EVERY expert for SGLang int4 fused_experts (TP-MoE).
+        """Load a TP slice of EVERY expert for SGLang fused_marlin_moe (TP-MoE).
 
         Unlike EP (which owns 24 of 384 experts whole), every rank here holds a
         1/world_size slice of ALL 384 experts per layer. For each expert we fetch
         the marlin int4 weights from SHM (any rank can read any expert key), run
         the GPU marlin→raw transform, slice this rank's intermediate portion, and
-        pack into per-layer fused_experts slabs:
-            _tp_w13       [384, 2*inter_pr, H//2]            uint8  (gate|up, gate first)
-            _tp_w2        [384, H,          inter_pr//2]     uint8  (down)
-            _tp_w13_scale [384, 2*inter_pr, H//group_size]   bf16
-            _tp_w2_scale  [384, H,          inter_pr//group] bf16
+        re-marlinize the slice into per-layer GPTQ-Marlin slabs for fused_marlin_moe:
+            _tp_w13_marlin       [384, H//16,         4*inter_pr]      int32 (gate|up)
+            _tp_w2_marlin        [384, inter_pr//16,  2*H]             int32 (down)
+            _tp_w13_scale_marlin [384, H//group_size, 2*inter_pr]      bf16
+            _tp_w2_scale_marlin  [384, inter_pr//group_size, H]        bf16
         The intermediate slice is on OUTPUT rows for gate/up but on INPUT (packed)
         columns for down. Weights must already be on GPU (marlin transform kernel
         is GPU-only); this runs after model.to(device). Streams one expert at a
@@ -972,14 +973,17 @@ class KimiK25ParallelStrategyManager:
         # only needs to run on the FIRST prefill→decode shift. configure_decoding
         # re-runs each shift; skip the reload once the slices are resident.
         first_moe = self.loaded_model_config.first_k_dense_replace
-        if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13", None) is not None:
+        if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13_marlin", None) is not None:
             if self.rank == 0:
                 logging.info("[MODEL] TP-MoE experts already resident — skipping reload")
             return
 
         # Lazy import: keeps the default EP path's import surface unchanged (the
         # marlin transform pulls the compiled _C_marlin_transform extension).
-        from batchgen.moe.marlin_transform import marlin_to_wgmma_fused_gpu
+        from batchgen.moe.marlin_transform import (
+            marlin_to_wgmma_fused_gpu,
+            raw_to_marlin_fused_gpu,
+        )
 
         device = self.engine_config.Basic_Config.device_torch
         H = self.loaded_model_config.hidden_size           # 7168
@@ -999,10 +1003,15 @@ class KimiK25ParallelStrategyManager:
         ):
             moe = self.model.model.layers[layer_idx].mlp
 
-            w13 = torch.empty(E, 2 * inter_pr, H // 2, dtype=torch.uint8, device=device)
-            w2 = torch.empty(E, H, inter_pr // 2, dtype=torch.uint8, device=device)
-            w13_scale = torch.empty(E, 2 * inter_pr, H // GROUP_SIZE, dtype=torch.bfloat16, device=device)
-            w2_scale = torch.empty(E, H, inter_pr // GROUP_SIZE, dtype=torch.bfloat16, device=device)
+            # Per-layer GPTQ-Marlin slabs for fused_marlin_moe (num_bits=4):
+            #   w13       [E, H//16, 4*inter_pr]          int32 (gate|up concat, output dim)
+            #   w2        [E, inter_pr//16, 2*H]          int32 (down)
+            #   w13_scale [E, H//GROUP_SIZE, 2*inter_pr]  bf16  (marlin-permuted, gs=32)
+            #   w2_scale  [E, inter_pr//GROUP_SIZE, H]    bf16
+            w13 = torch.empty(E, H // 16, 4 * inter_pr, dtype=torch.int32, device=device)
+            w2 = torch.empty(E, inter_pr // 16, 2 * H, dtype=torch.int32, device=device)
+            w13_scale = torch.empty(E, H // GROUP_SIZE, 2 * inter_pr, dtype=torch.bfloat16, device=device)
+            w2_scale = torch.empty(E, inter_pr // GROUP_SIZE, H, dtype=torch.bfloat16, device=device)
 
             for e in range(E):
                 t = self.core_engine.get_tensor(f"routed_expert_{layer_idx}_{e}")
@@ -1019,27 +1028,29 @@ class KimiK25ParallelStrategyManager:
                 raw_u, raw_us = marlin_to_wgmma_fused_gpu(up_qw, up_s, H, N)
                 raw_d, raw_ds = marlin_to_wgmma_fused_gpu(down_qw, down_s, N, H)
 
-                # gate|up: slice OUTPUT rows [r0:r1], stack gate-first, view uint8.
-                # Slice/cat on int32 first so nibble/byte semantics stay exact; the
-                # int32→uint8 view (little-endian) is the kernel's expected layout.
-                w13_e = torch.cat([raw_g[r0:r1], raw_u[r0:r1]], dim=0).contiguous()
-                w13[e] = w13_e.view(torch.uint8)
-                w13_scale[e] = torch.cat([raw_gs[r0:r1], raw_us[r0:r1]], dim=0)
+                # gate|up: slice OUTPUT rows [r0:r1] of each, concat gate-first on the
+                # raw output dim (raw is [N_out, K//8]), then re-marlinize the fused
+                # slab. K=H (contraction), N=2*inter_pr (fused gate|up output).
+                w13_raw = torch.cat([raw_g[r0:r1], raw_u[r0:r1]], dim=0).contiguous()
+                w13_raw_s = torch.cat([raw_gs[r0:r1], raw_us[r0:r1]], dim=0).contiguous()
+                w13[e], w13_scale[e] = raw_to_marlin_fused_gpu(w13_raw, w13_raw_s, H, 2 * inter_pr)
 
-                # down: slice INPUT(inter) packed columns [dcol0:dcol0+inter_pr//8].
-                d_e = raw_d[:, dcol0:dcol0 + inter_pr // 8].contiguous()
-                w2[e] = d_e.view(torch.uint8)
-                w2_scale[e] = raw_ds[:, scol0:scol0 + inter_pr // GROUP_SIZE]
+                # down: slice INPUT(inter) packed columns [dcol0:dcol0+inter_pr//8] and
+                # the matching scale columns, then re-marlinize. K=inter_pr (contraction),
+                # N=H (down output).
+                d_raw = raw_d[:, dcol0:dcol0 + inter_pr // 8].contiguous()
+                d_raw_s = raw_ds[:, scol0:scol0 + inter_pr // GROUP_SIZE].contiguous()
+                w2[e], w2_scale[e] = raw_to_marlin_fused_gpu(d_raw, d_raw_s, inter_pr, H)
 
-            moe._tp_w13 = w13
-            moe._tp_w2 = w2
-            moe._tp_w13_scale = w13_scale
-            moe._tp_w2_scale = w2_scale
+            moe._tp_w13_marlin = w13
+            moe._tp_w2_marlin = w2
+            moe._tp_w13_scale_marlin = w13_scale
+            moe._tp_w2_scale_marlin = w2_scale
             moe._tp_rank = r
 
         if self.rank == 0:
             logging.info(
-                f"[MODEL] TP-MoE experts loaded: {E} experts × "
+                f"[MODEL] TP-MoE MARLIN experts loaded: {E} experts × "
                 f"{self.model_config.num_hidden_layers - self.loaded_model_config.first_k_dense_replace} "
                 f"layers, inter_per_rank={inter_pr} (rank slice {r0}:{r1})"
             )

@@ -58,27 +58,26 @@ from batchgen.moe.dispatch_scatter_3d import (
 )
 
 
-_FUSED_EXPERTS_IMPL = None
+_FUSED_MARLIN_MOE = None
+_MARLIN_WORKSPACE = None
 
 
-def _load_fused_experts_impl():
-    """Lazily import SGLang's int4 fused_experts kernel (TP-MoE path only).
+def _load_fused_marlin_moe():
+    """Lazily import SGLang's GPTQ-Marlin int4 MoE kernel (TP-MoE path only).
 
     Kept lazy so the default EP path never imports SGLang (avoids pulling
     SGLang config/runtime side-effects into BatchGen when BATCHGEN_KIMI_TP_MOE
     is unset).
     """
-    global _FUSED_EXPERTS_IMPL
-    if _FUSED_EXPERTS_IMPL is None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            fused_experts_impl,
+    global _FUSED_MARLIN_MOE
+    if _FUSED_MARLIN_MOE is None:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
         )
-        # The kernel's autotune config helper (try_get_optimal_moe_config ->
-        # fused_moe_triton_config.py) reads ONE flag off SGLang's global
-        # server-args singleton (enable_deterministic_inference). We peel only
-        # the kernel, not SGLang's server, so that singleton is unset and the
-        # first call raises "Global server args is not set yet!". Seed it once
-        # with a defaults-only holder (constructs in ~0s, no model/GPU load).
+        # fused_marlin_moe -> moe_align_block_size / autotune may read SGLang's
+        # global server-args singleton. We peel only the kernel, not SGLang's
+        # server, so that singleton may be unset; seed it once with a
+        # defaults-only holder (constructs in ~0s, no model/GPU load).
         from sglang.srt.server_args import (
             ServerArgs,
             get_global_server_args,
@@ -88,8 +87,20 @@ def _load_fused_experts_impl():
             get_global_server_args()
         except ValueError:
             set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        _FUSED_EXPERTS_IMPL = fused_experts_impl
-    return _FUSED_EXPERTS_IMPL
+        _FUSED_MARLIN_MOE = fused_marlin_moe
+    return _FUSED_MARLIN_MOE
+
+
+def _get_marlin_workspace(device):
+    """Module-level Marlin MoE workspace (int32, sms*4), allocated once per device.
+
+    Mirrors SGLang's MARLIN_MOE_WORKSPACE (marlin_make_workspace, max_blocks_per_sm=4).
+    """
+    global _MARLIN_WORKSPACE
+    if _MARLIN_WORKSPACE is None or _MARLIN_WORKSPACE.device != device:
+        from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+        _MARLIN_WORKSPACE = marlin_make_workspace(device, max_blocks_per_sm=4)
+    return _MARLIN_WORKSPACE
 
 
 @dataclass
@@ -1151,20 +1162,20 @@ class KimiK25MoE(nn.Module):
     @torch.inference_mode()
     def _forward_decode_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """TP-MoE decode (BATCHGEN_KIMI_TP_MOE=1): AllGather → CUDA gate →
-        SGLang int4 fused_experts → AllReduce → slice + shared expert.
+        SGLang GPTQ-Marlin int4 MoE → AllReduce → slice + shared expert.
 
         Each rank holds a 1/world_size slice of EVERY expert (TP layout), so the
-        routed FFN is ONE SGLang fused_experts call over all 384 experts, and an
+        routed FFN is ONE SGLang fused_marlin_moe call over all 384 experts, and an
         AllReduce(SUM) recombines the per-rank intermediate-slice partials into
         the full MoE output. AllGather, gate, shared-expert overlap, and AllReduce
         are reused verbatim from the EP path; dispatch + grouped GEMM + reduce are
-        replaced by the single fused_experts call.
+        replaced by the single fused_marlin_moe call.
         """
         if not getattr(KimiK25MoE, "_tp_forward_logged", False):
             KimiK25MoE._tp_forward_logged = True
             logging.info(f"[TP-MoE] decode forward ACTIVE (rank {self.rank}, "
                          f"world_size {self.world_size})")
-        fused_experts_impl = _load_fused_experts_impl()
+        fused_marlin_moe = _load_fused_marlin_moe()
         buf = self.__class__._buf
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -1217,28 +1228,34 @@ class KimiK25MoE(nn.Module):
         # (Applying topk_idx=-1 would index w13[-1] and crash the SGLang kernel.)
         topk_idx, topk_weight = self.gate(all_tokens.view(num_global, 1, H))
 
-        # 4) One SGLang int4 fused_experts call over all 384 experts (TP slice).
-        # apply_router_weight_on_input=False → the down GEMM multiplies topk_weight
-        # internally (replaces EP's reduce_weighted_scatter). routed_scaling_factor
-        # left as None (=1.0) since topk_weight already carries the ×2.5 factor.
-        tp_out = fused_experts_impl(
-            all_tokens,
-            self._tp_w13,
-            self._tp_w2,
-            topk_weight.float(),
-            topk_idx.to(torch.int32),
-            b1=None, b2=None,
+        # 4) One SGLang GPTQ-Marlin int4 MoE call over all 384 experts (TP slice).
+        # The down GEMM multiplies topk_weight internally (mul_topk_weights=True),
+        # replacing EP's reduce_weighted_scatter; routed_scaling_factor=None (=1.0)
+        # since topk_weight already carries the ×2.5 factor. Symmetric (no zeros),
+        # no act-order (g_idx/sort_indices None), single TP shard (expert_map None,
+        # is_k_full True). gating_output is unused in compute (only a shape[0]==M
+        # assert) and the CUDA gate returns no router logits, so we pass topk_weight
+        # as the [M, top_k] placeholder.
+        workspace = _get_marlin_workspace(device)
+        tp_out = fused_marlin_moe(
+            hidden_states=all_tokens,
+            w1=self._tp_w13_marlin,
+            w2=self._tp_w2_marlin,
+            w1_scale=self._tp_w13_scale_marlin,
+            w2_scale=self._tp_w2_scale_marlin,
+            gating_output=topk_weight,
+            topk_weights=topk_weight,
+            topk_ids=topk_idx.to(torch.int32),
+            global_num_experts=self.num_experts,
+            expert_map=None,
+            g_idx1=None, g_idx2=None,
+            sort_indices1=None, sort_indices2=None,
+            w1_zeros=None, w2_zeros=None,
+            workspace=workspace,
+            num_bits=4,
+            is_k_full=True,
             inplace=False,
-            activation="silu",
-            is_gated=True,
-            apply_router_weight_on_input=False,
-            use_int4_w4a16=True,
-            w1_scale=self._tp_w13_scale,
-            w2_scale=self._tp_w2_scale,
-            w1_zp=None, w2_zp=None,
-            block_shape=[0, 32],
             routed_scaling_factor=None,
-            filter_expert=False,
         )
 
         # 5) AllReduce(SUM) → full MoE output for all gathered tokens
