@@ -391,6 +391,12 @@ def _build_decode_server_args_gqa(
         # attention_backend=None -> SGLang auto (fa3 on SM90; sinks + SWA aware).
         page_size=page_size,
         kv_cache_dtype="bfloat16",
+        # Keep gpt-oss MoE weights in MXFP4 (~7.8GB/rank). SGLang's gpt-oss default
+        # picks the triton_kernels MoE backend, which DEQUANTIZES MXFP4 -> BF16
+        # (~30GB/rank, server_args.py "use bf16 for mxfp4 triton kernels"). That 4x
+        # blow-up leaves no HBM headroom once BatchGen's paged KV is added (frac 0.9
+        # -> OOM). flashinfer_mxfp4 runs the MoE directly on the packed MXFP4 weights.
+        moe_runner_backend="flashinfer_mxfp4",
         # parallelism: adopt BatchGen's world; dp-attention like S0.
         tp_size=world_size,
         dp_size=dp_size,
