@@ -1317,28 +1317,32 @@ __global__ void silu_mul_dual_stride_kernel(
 // This is the TP-MoE path: at world_size 16 the per-rank gate/up width is
 // inter_pr=128, so 2N=256 (one Marlin N-tile) reuses the proven N>=256 GEMM
 // instead of needing a 128-wide Marlin kernel.
+// `active` = rows/expert actually launched (= max_m_tiles*16, the per-expert token
+// upper bound this step), decoupled from `mtp` (the fixed buffer stride). Launching
+// E*active rows instead of E*mtp avoids ~mtp/active× wasted blocks at decode (mtp=256,
+// active≈16) — the measured 59µs fixed S2 overhead. Buffer rows stay mtp-strided.
 __global__ void silu_mul_split_kernel(
     const scalar_t* __restrict__ gate_up,   // [E*mtp, 2N], gate=[:N], up=[N:2N] per row
     scalar_t* __restrict__ out,             // [E*mtp, N]
     const int* __restrict__ expert_counts,
-    int num_experts, int mtp, int N)
+    int num_experts, int active, int mtp, int N)
 {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = num_experts * mtp * N;
+  int total = num_experts * active * N;
   if (tid >= total) return;
 
   int col = tid % N;
-  int row_global = tid / N;            // row index into [E*mtp]
-  int expert = row_global / mtp;
-  int row_local = row_global % mtp;
+  int rg = tid / N;                    // compact row over [E*active]
+  int expert = rg / active;
+  int row_local = rg % active;
 
-  if (expert >= num_experts) return;
   if (row_local >= expert_counts[expert]) return;
 
-  int gu_base = row_global * (2 * N);
+  int buf_row = expert * mtp + row_local;    // actual mtp-strided buffer row
+  int gu_base = buf_row * (2 * N);
   float g = num2float(gate_up[gu_base + col]);
   float u = num2float(gate_up[gu_base + N + col]);
-  out[row_global * N + col] = float2num(g / (1.0f + __expf(-g)) * u);
+  out[buf_row * N + col] = float2num(g / (1.0f + __expf(-g)) * u);
 }
 
 // ============================================================================
@@ -1472,15 +1476,15 @@ void silu_mul_dual_stride(
 void silu_mul_split(
     torch::Tensor gate_up, torch::Tensor out,
     torch::Tensor expert_counts,
-    int num_experts, int mtp, int N)
+    int num_experts, int active, int mtp, int N)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
-    int total = num_experts * mtp * N;
+    int total = num_experts * active * N;
     silu_mul_split_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
         reinterpret_cast<const scalar_t*>(gate_up.data_ptr()),
         reinterpret_cast<scalar_t*>(out.data_ptr()),
         expert_counts.data_ptr<int>(),
-        num_experts, mtp, N);
+        num_experts, active, mtp, N);
 }
 
 // ============================================================================

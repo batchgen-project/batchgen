@@ -237,18 +237,18 @@ def main():
         counts = torch.bincount(topk_ids.reshape(-1), minlength=E).int()
         routed = int(counts.sum().item())                 # = num_global * TOP_K
         m_per_e = routed / E
-        # Production fixes mtp = tpbuf.max_tokens_padded = BATCHGEN_KIMI_TP_MOE_MTP
-        # (default 256), a CONSTANT buffer stride — NOT counts.max(). max_m_tiles is
-        # then driven by min(num_global, 256), growing 1/4/8/16/16 across the bs sweep
-        # (matches _forward_decode_tp_batchgen, model.py:1447,1469-1470). counts.max()
-        # gave a 16x-too-small grid and deleted the launch overhead doc #3 quantifies.
+        # mtp = tpbuf.max_tokens_padded (BATCHGEN_KIMI_TP_MOE_MTP, default 256) is the
+        # fixed buffer stride. Production now sizes max_m_tiles from the ACTUAL per-expert
+        # max count (expert_counts.max), NOT num_global — mirrors the optimized
+        # _forward_decode_tp_batchgen (model.py). At 384 experts decode M/expert ≪ 16, so
+        # this is ~1-2 (vs the old 1/4/8/16/16), shrinking the down grid ~8-16×.
         mtp = int(os.getenv("BATCHGEN_KIMI_TP_MOE_MTP", "256"))
-        max_m_tiles = (min(num_global, mtp) + 15) // 16
 
         if mtp not in expert_starts_cache:
             expert_starts_cache[mtp] = torch.arange(E, dtype=torch.int32, device=device) * mtp
         expert_starts = expert_starts_cache[mtp]
         expert_counts = counts.clamp(max=mtp)
+        max_m_tiles = max(1, (int(expert_counts.max().item()) + 15) // 16)
 
         # 3D grouped buffers (values are timing-irrelevant; parity is a separate test).
         dispatched_x = (torch.randn(E * mtp, H, dtype=torch.bfloat16, device=device) * 0.1)
@@ -271,7 +271,8 @@ def main():
                 E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
 
         def bg_s2():
-            mod.silu_mul_split(gateup, intermediate, expert_counts, E, mtp, INTER_PR)
+            mod.silu_mul_split(gateup, intermediate, expert_counts,
+                               E, max_m_tiles * 16, mtp, INTER_PR)
 
         def bg_s3():
             mod.grouped_marlin_gemm_m16(

@@ -1466,8 +1466,15 @@ class KimiK25MoE(nn.Module):
             tpbuf.topk_pos[:num_global * topk],
         )
 
-        max_possible_m = min(num_global, mtp)
-        max_m_tiles = (max_possible_m + 15) // 16
+        # Grid size from the ACTUAL per-expert max token count, not num_global.
+        # With 384 experts, decode M/expert = num_global*topk/384 ≪ num_global, so
+        # max_m_tiles from num_global (capped at mtp/16=16) over-provisions the down
+        # grid ~8-16× (172K CTAs @bs32, ~90% early-exit) — the roofline-measured S3
+        # blowup. expert_counts.max() (one device-scalar read) shrinks it to ~1-2.
+        # NOTE: this .item() is a host sync — fine for the eager path; a captured
+        # graph would need a fixed/conservative max_m_tiles instead.
+        max_count = int(expert_counts.max().item())
+        max_m_tiles = max(1, (max_count + 15) // 16)
         mod = self._tpg_mod
 
         # 6) Stage 1: ONE Marlin GEMM over w13=concat(gate,up) → gate|up [E*mtp, 2*inter_pr]
@@ -1479,7 +1486,8 @@ class KimiK25MoE(nn.Module):
             E, 2 * inter_pr, H, tpg['s1_workspace'],
             E, tpg['n_tiles_s1'], max_m_tiles)
         mod.silu_mul_split(
-            self._tpg_gateup, tpbuf.intermediate, expert_counts, E, mtp, inter_pr)
+            self._tpg_gateup, tpbuf.intermediate, expert_counts,
+            E, max_m_tiles * 16, mtp, inter_pr)
 
         # 7) Stage 3: down GEMM → expert_out [E*mtp, H] (per-rank inter slice)
         mod.grouped_marlin_gemm_m16(
