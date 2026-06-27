@@ -196,6 +196,29 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
                          f"(first shape: {list(weights.values())[0].shape})")
             self.__class__._transform_logged = True
 
+    def _release_streamed_weights(self):
+        """Free a streamed (non-persistent) expert slot after its compute is
+        enqueued.
+
+        Prefill: event-based deferred free — record a CUDA event on the compute
+        stream and return the slot with NO host sync (the producer's H2D copy
+        into the recycled slot waits on that event on-device). This is the
+        contract 3(e) sanctioned escape hatch and removes the per-expert host
+        stall (×384×60×micro-batches) that wrecked prefill MFU.
+
+        Decode: keep the per-expert compute-stream sync before free (bit
+        identical to the old path — contract 6 requires (e) until event-based).
+        K2.5 decode does not actually drive this wrapper (it uses the grouped
+        Marlin/WGMMA path), but the branch is kept correct for safety.
+        """
+        if self.phase == "prefill":
+            self.free_weights_deferred(self.module_key)
+        else:
+            torch.cuda.current_stream(
+                self.engine_config.Basic_Config.device_torch
+            ).synchronize()
+            self.free_weights(self.module_key)
+
     def _forward_bf16(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Direct BF16 GEMM path for pre-dequantized weights.
 
@@ -255,6 +278,18 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             f"K2.5 expert forward. Phase: {self.phase}, persistent: {self.persistent}"
         )
 
+        # 0-token expert: skip ALL compute (no Marlin->raw transform, no GEMM).
+        # A streamed (non-persistent) expert was still copied by the producer, so
+        # its slot MUST be drained + freed (contract 3(b)) — skipping the free is
+        # the slot-leak -> producer-stall -> 2 s-timeout bug. Persistent experts
+        # own no slot. The old prefill loop skipped 0-token experts entirely, so
+        # this also keeps the GEMM kernels off any M==0 input.
+        if hidden_states.shape[0] == 0:
+            if not self.persistent:
+                self.load_weights(self.module_key)        # drain the producer's copy
+                self._release_streamed_weights()          # free it (deferred in prefill)
+            return hidden_states.new_zeros((0, hidden_states.shape[-1]))
+
         # Load weights from storage
         if self.persistent:
             weights = self._get_stored_int4_weights()
@@ -279,14 +314,12 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             result = self._forward_int4(hidden_states, weights)
 
         # Non-persistent experts use a shared GPU buffer that gets recycled.
-        # Must sync before free_weights() to prevent the next expert's load_weights()
-        # from overwriting the buffer while this expert's matmuls are still running.
-        # Persistent experts use static module attributes — no buffer recycling, no sync needed.
+        # The slot must not be overwritten by the next expert's H2D copy until
+        # this expert's matmuls finish. Prefill enforces that on the GPU via a
+        # CUDA event (deferred free, no host stall); decode keeps the host sync.
+        # Persistent experts use static module attributes — no recycling, no free.
         if not self.persistent:
-            torch.cuda.current_stream(
-                self.engine_config.Basic_Config.device_torch
-            ).synchronize()
-            self.free_weights(self.module_key)
+            self._release_streamed_weights()
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "

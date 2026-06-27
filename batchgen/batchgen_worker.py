@@ -6204,8 +6204,11 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
-		self.set_phase("decode")
+		# Stop the H2D producer BEFORE set_phase("decode"): set_phase ->
+		# resize_buffer -> reset_slot_events rebuilds the per-slot fence events the
+		# live prefill producer reads lock-free, which otherwise races/UAF here.
 		self.core_engine.stop_h2d_worker()
+		self.set_phase("decode")
 		self.core_engine.clear_kv_copy_queue()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_decoding_buffer()

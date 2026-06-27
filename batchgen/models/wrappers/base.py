@@ -160,6 +160,17 @@ class BaseModuleWrapper(nn.Module):
         self._sync_device_before_release()
         self.core_engine.free_weights_buffer(module_key)
 
+    def free_weights_deferred(self, module_key: str):
+        """Prefill streaming free with NO host sync.
+
+        Records a CUDA event on the current compute stream (C++ side) and
+        returns the slot immediately. The producer's H2D copy into the recycled
+        slot waits on that event on-device, preserving
+        "compute-done-before-overwrite" (contract 3(e)) without stalling the
+        host. Use ONLY on the prefill streaming path; decode keeps free_weights.
+        """
+        self.core_engine.free_weights_buffer_deferred(module_key)
+
     def apply_weights(self, weights_dict: Dict[str, torch.Tensor]):
         """Apply loaded weights to module parameters.
 

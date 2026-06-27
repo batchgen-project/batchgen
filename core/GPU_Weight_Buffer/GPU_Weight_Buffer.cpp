@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <c10/cuda/CUDAStream.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -92,6 +93,40 @@ GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
     this->logger_->info("GPU_Weight_Buffer Instantiated.");
 };
 
+GPU_Weight_Buffer::~GPU_Weight_Buffer() {
+    for (auto& [module_type, events] : this->slot_events_) {
+        for (auto& ev : events) {
+            if (ev != nullptr) {
+                cudaEventDestroy(ev);
+            }
+        }
+    }
+};
+
+void GPU_Weight_Buffer::reset_slot_events(
+    const std::unordered_map<std::string, int64_t>& num_buffers) {
+    // Destroy any pre-existing events (phase-boundary recreate), then create one
+    // per slot. Each is seeded as completed on the default stream so the first
+    // producer reuse of a slot waits on a ready event (no first-use special
+    // case). cudaEvent_t is a handle (~0 memory).
+    for (auto& [module_type, events] : this->slot_events_) {
+        for (auto& ev : events) {
+            if (ev != nullptr) {
+                cudaEventDestroy(ev);
+            }
+        }
+    }
+    this->slot_events_.clear();
+    for (auto& [module_type, num_buffer] : num_buffers) {
+        this->slot_events_[module_type].assign(num_buffer, nullptr);
+        for (int64_t i = 0; i < num_buffer; ++i) {
+            cudaEventCreateWithFlags(&this->slot_events_[module_type][i],
+                                     cudaEventDisableTiming);
+            cudaEventRecord(this->slot_events_[module_type][i], 0);
+        }
+    }
+};
+
 void GPU_Weight_Buffer::Init() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
     auto& num_buffers =
@@ -123,6 +158,8 @@ void GPU_Weight_Buffer::Init() {
             }
         }
     }
+    // One fence event per slot, parallel to buffer_status_.
+    this->reset_slot_events(num_buffers);
 };
 
 void GPU_Weight_Buffer::resize_buffer() {
@@ -157,6 +194,8 @@ void GPU_Weight_Buffer::resize_buffer() {
             this->buffers_["routed_expert"].push_back(new_buffer);
             this->buffer_status_["routed_expert"].push_back(0);
         }
+        // Resize the per-slot fence events to the (grown) decode slot counts.
+        this->reset_slot_events(num_buffers);
     }
 }
 
@@ -183,6 +222,34 @@ void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     this->module_in_buffers_.erase(module_name);
     this->buffer_status_[module_type][buffer_idx] = 0;
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
+                         module_name, module_type, buffer_idx);
+};
+
+void GPU_Weight_Buffer::releaseBufferDeferred(const std::string& module_name) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    // Existence guard: if clear_expert_buffer already window-evicted this name,
+    // do nothing. Never index module_in_buffers_[absent] (that default-inserts
+    // ("",0) and crashes in buffer_status_[""][0] — contract §3(f) SIGSEGV).
+    auto it = this->module_in_buffers_.find(module_name);
+    if (it == this->module_in_buffers_.end()) {
+        return;
+    }
+    auto [module_type, buffer_idx] = it->second;
+    // Record the slot's last GPU read (this expert's transform + GEMM, enqueued
+    // on the calling thread's current compute stream) WITHOUT a host sync. The
+    // producer's reuse of this slot waits on this event on the HtoD stream, so
+    // "compute-done-before-overwrite" (contract §3(e)) is enforced device-side.
+    // The status flips to 0 NOW (slot logically returned); the actual overwrite
+    // is gated on the GPU by the event. acquireEmptyBuffer takes the same mutex_,
+    // so the producer cannot observe status==0 before this event is recorded.
+    cudaEventRecord(
+        this->slot_events_[module_type][buffer_idx],
+        at::cuda::getCurrentCUDAStream(
+            this->engine_config_.basic_config.device)
+            .stream());
+    this->module_in_buffers_.erase(it);
+    this->buffer_status_[module_type][buffer_idx] = 0;
+    this->logger_->debug("Deferred-released buffer: module={}, type={}, idx={}",
                          module_name, module_type, buffer_idx);
 };
 
@@ -602,6 +669,8 @@ void GPU_Weight_Buffer::reset_prefill_buffer() {
             this->buffer_status_[module_type].clear();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
+        // Recreate the per-slot fence events (parallel to buffer_status_).
+        this->reset_slot_events(num_buffers);
 
         // Log the buffer status and size of each buffer (keep original debug level)
         for (auto& [module_type, num_buffer] : num_buffers) {
@@ -854,6 +923,8 @@ void GPU_Weight_Buffer::reset_decoding_buffer() {
             this->buffer_status_[module_type].clear();
             this->buffer_status_[module_type].resize(num_buffer, 0);
         }
+        // Recreate the per-slot fence events (parallel to buffer_status_).
+        this->reset_slot_events(num_buffers);
 
         // Log the buffer status and size of each buffer
         for (auto& [module_type, num_buffer] : num_buffers) {

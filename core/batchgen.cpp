@@ -282,6 +282,12 @@ void BatchGen::free_weights_buffer(const std::string& module_name) {
     this->gpu_weight_buffer_.releaseBuffer(module_name);
 };
 
+void BatchGen::free_weights_buffer_deferred(const std::string& module_name) {
+    /* Prefill streaming free: event-based, no host sync (see
+     * GPU_Weight_Buffer::releaseBufferDeferred). */
+    this->gpu_weight_buffer_.releaseBufferDeferred(module_name);
+};
+
 torch::Tensor BatchGen::attn(py::object torch_module, int64_t layer_idx,
                             torch::Tensor& hidden_states,
                             torch::Tensor& attention_mask,

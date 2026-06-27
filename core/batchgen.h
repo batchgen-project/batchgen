@@ -82,6 +82,7 @@ class BatchGen {
     std::unordered_map<std::string, torch::Tensor> get_weights(
         std::string module_key, std::string& phase);
     void free_weights_buffer(const std::string& module_name);
+    void free_weights_buffer_deferred(const std::string& module_name);
 
     /* Attn */
     torch::Tensor attn(py::object torch_module, int64_t layer_idx,

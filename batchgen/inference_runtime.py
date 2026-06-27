@@ -105,11 +105,16 @@ class InferenceRuntime:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		# Quiesce the H2D producer BEFORE set_phase("decode"): set_phase ->
+		# resize_buffer -> reset_slot_events destroys/recreates the per-slot CUDA
+		# fence events that the still-live prefill producer reads lock-free
+		# (cudaStreamWaitEvent). Stopping first makes all buffer/event mutation
+		# happen with the producer dead (mirrors config_prefill stop-then-reset).
+		self.core_engine.stop_h2d_worker()
 		self.core_engine.set_phase(phase)
 		Attn_Wrapper.phase = phase
 		Expert_Wrapper.phase = phase
 		BaseModuleWrapper.phase = phase
-		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
 		self.core_engine.clear_kv_buffer()
 		self.core_engine.clear_weight_copy_queue()

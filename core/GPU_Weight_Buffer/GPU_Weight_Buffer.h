@@ -46,7 +46,7 @@ using weight_buffers = std::vector<module_weight_tensor_map>;
 class GPU_Weight_Buffer {
    public:
     GPU_Weight_Buffer(EngineConfig& engine_config, ModelConfig& model_config);
-    ~GPU_Weight_Buffer() = default;
+    ~GPU_Weight_Buffer();
 
     /* APIs */
     void Init();
@@ -57,6 +57,19 @@ class GPU_Weight_Buffer {
     acquireEmptyBuffer(const std::string& module_name);
 
     void releaseBuffer(const std::string& module_name);
+
+    // Prefill streaming free: record a CUDA event on the calling thread's
+    // current compute stream and return the slot WITHOUT a host sync. The
+    // producer's H2D copy into the recycled slot waits on this event on-device
+    // (see HtoD_Worker), so "compute-done-before-overwrite" is enforced on the
+    // GPU. Has an existence guard (no-op on an already-evicted name) so it can
+    // never hit the unguarded releaseBuffer SIGSEGV (contract §3(f)).
+    void releaseBufferDeferred(const std::string& module_name);
+
+    // Accessor for the per-slot fence event (read by the producer thread).
+    cudaEvent_t slot_event(const std::string& module_type, int64_t buffer_idx) {
+        return this->slot_events_[module_type][buffer_idx];
+    }
 
     // std::shared_ptr<module_weight_tensor_map> get_weights(
     //     const std::string& module_name);
@@ -76,6 +89,12 @@ class GPU_Weight_Buffer {
     }
 
    private:
+    // (Re)create one fence event per slot, seeded as completed on the default
+    // stream so the first producer reuse sees a ready event. Called from Init /
+    // resize / phase-boundary resets, mirroring buffer_status_.
+    void reset_slot_events(
+        const std::unordered_map<std::string, int64_t>& num_buffers);
+
     EngineConfig& engine_config_;
     ModelConfig& model_config_;
     std::shared_ptr<spdlog::logger> logger_;
@@ -89,6 +108,8 @@ class GPU_Weight_Buffer {
         module_in_buffers_;  // module_name -> (module_type, buffer_idx)
     std::unordered_map<std::string, std::vector<int64_t>>
         buffer_status_;  // 0: empty, 1: in use
+    std::unordered_map<std::string, std::vector<cudaEvent_t>>
+        slot_events_;  // module_type -> [N], one fence event per slot
     std::unordered_map<std::string, std::vector<std::string>>
         weight_copy_tasks_;
 };

@@ -1272,7 +1272,21 @@ class KimiK25MoE(nn.Module):
 
     @torch.inference_mode()
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Prefill: CUDA gate → per-expert wrapper loop (all experts local, no EP)."""
+        """Prefill: CUDA gate -> dispatch precompute -> per-expert streamed loop.
+
+        All experts are local (pure DP, no EP). The dispatch precompute replaces
+        the old per-expert ``mask.any()`` + boolean gather — each a GPU->CPU sync
+        (384x/layer ~= 23k/step) — with ONE bincount + ONE argsort and a SINGLE
+        [num_experts] host readback per layer. The sorted assignment array gives
+        every expert a contiguous index range, so the per-expert gather is a
+        plain strided slice (no ``.nonzero()`` sync).
+
+        Every expert is driven through its wrapper EXACTLY ONCE — including
+        0-token experts — so the slot the producer streamed is always freed
+        (contract 3(b)); the wrapper skips only the GEMM when it gets 0 tokens.
+        The wrapper frees via an event-based deferred free (no per-expert host
+        sync — contract 3(e)), so H2D(e+1..) overlaps compute(e).
+        """
         identity = hidden_states
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -1286,18 +1300,33 @@ class KimiK25MoE(nn.Module):
         token_indices = torch.arange(num_tokens, device=device).repeat_interleave(K)
         topk_positions = torch.arange(K, device=device).repeat(num_tokens)
 
+        # Dispatch precompute: group (token, topk-slot) assignments by expert id
+        # with one sort, then read per-expert counts back to the host ONCE.
+        sort_order = torch.argsort(flat_expert_idx)
+        sorted_token_idx = token_indices[sort_order]
+        sorted_topk_pos = topk_positions[sort_order]
+        counts = torch.bincount(
+            flat_expert_idx, minlength=self.num_experts
+        ).tolist()  # the ONLY host sync in the loop ([num_experts] D2H)
+
         results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
 
+        offset = 0
         for expert_idx, expert in enumerate(self.experts):
+            n = counts[expert_idx]
             if expert is None:
+                offset += n  # keep sorted-segment alignment (no None in pure-DP prefill)
                 continue
-            mask = flat_expert_idx == expert_idx
-            if not mask.any():
-                continue
-            expert_token_idx = token_indices[mask]
-            expert_topk_pos = topk_positions[mask]
+            seg = slice(offset, offset + n)
+            offset += n
+            expert_token_idx = sorted_token_idx[seg]
             tokens_for_expert = hidden_states[expert_token_idx]
+            # Drives load -> (GEMM if n>0) -> deferred free for EVERY expert so
+            # the streamed slot is always reclaimed (0-token included).
             expert_output = expert(tokens_for_expert)
+            if n == 0:
+                continue
+            expert_topk_pos = sorted_topk_pos[seg]
             expert_weights = topk_weight[expert_token_idx, expert_topk_pos]
             weighted_output = expert_output.float() * expert_weights.unsqueeze(-1)
             results.index_add_(0, expert_token_idx, weighted_output)

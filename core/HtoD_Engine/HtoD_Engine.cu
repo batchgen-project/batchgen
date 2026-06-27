@@ -431,6 +431,17 @@ void HtoD_Engine::HtoD_Worker() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
                 auto dst = buffer.get();
+                // Event-ordered reuse: before overwriting this slot, wait on the
+                // fence event the previous occupant recorded on its compute
+                // stream (releaseBufferDeferred). This enforces
+                // "compute-done-before-overwrite" on the GPU with no host stall.
+                // Decode never records a fresh event (it keeps the host-sync
+                // releaseBuffer), so the seed/last event is long complete here
+                // → this is a no-op for decode.
+                CUDA_CHECK(cudaStreamWaitEvent(
+                    this->HtoD_stream,
+                    this->gpu_weight_buffer_.slot_event(module_type, buffer_idx),
+                    0));
                 auto src = this->weights_storage_.get_module_weights_storage(
                     module_name);
                 torch::Tensor tmp_src;

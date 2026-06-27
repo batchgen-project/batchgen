@@ -498,6 +498,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // .def("add_weight_storage", &BatchGen::add_weight_storage)
         .def("get_weights", &BatchGen::get_weights)
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
+        .def("free_weights_buffer_deferred",
+             &BatchGen::free_weights_buffer_deferred)
         .def("attn", &BatchGen::attn)
         .def("submit_to_KV_queue", &BatchGen::submit_to_KV_queue)
         .def("clear_expert_buffer", &BatchGen::clear_expert_buffer)
