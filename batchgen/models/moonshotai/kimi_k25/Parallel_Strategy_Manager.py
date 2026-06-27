@@ -136,9 +136,20 @@ class KimiK25ParallelStrategyManager:
         self._cleanup_decode_gpu_state()
 
         # Step 2: Initialize model
-        # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
+        # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides.
+        # Skip nn.Linear random init (kaiming_uniform): in prefill ep_size=1
+        # materializes 384 experts x 60 layers x 3 nn.Linear/rank, and that init is
+        # 100% dead — real params are overwritten by _load_model_skeleton and the
+        # expert BF16 weights are never read (wrappers stream INT4 from core_engine).
+        # No-op reset_parameters drops ~4.8s with zero correctness risk.
         step_start = time.perf_counter()
-        self.model = KimiK25ForCausalLM(self.loaded_model_config)
+        import torch.nn as _nn
+        _orig_reset = _nn.Linear.reset_parameters
+        _nn.Linear.reset_parameters = lambda self: None
+        try:
+            self.model = KimiK25ForCausalLM(self.loaded_model_config)
+        finally:
+            _nn.Linear.reset_parameters = _orig_reset
         timings['model_init'] = time.perf_counter() - step_start
 
         # Step 3: Initialize data structures
