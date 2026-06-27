@@ -143,13 +143,16 @@ class KimiK25ParallelStrategyManager:
         # expert BF16 weights are never read (wrappers stream INT4 from core_engine).
         # No-op reset_parameters drops ~4.8s with zero correctness risk.
         step_start = time.perf_counter()
-        import torch.nn as _nn
-        _orig_reset = _nn.Linear.reset_parameters
-        _nn.Linear.reset_parameters = lambda self: None
-        try:
-            self.model = KimiK25ForCausalLM(self.loaded_model_config)
-        finally:
-            _nn.Linear.reset_parameters = _orig_reset
+        _prof = self.rank == 0
+        if _prof:
+            import cProfile, pstats, io as _io
+            _pr = cProfile.Profile(); _pr.enable()
+        self.model = KimiK25ForCausalLM(self.loaded_model_config)
+        if _prof:
+            _pr.disable()
+            _s = _io.StringIO()
+            pstats.Stats(_pr, stream=_s).sort_stats("tottime").print_stats(15)
+            logging.info("[PREFILL INIT PROFILE]\n" + _s.getvalue())
         timings['model_init'] = time.perf_counter() - step_start
 
         # Step 3: Initialize data structures
