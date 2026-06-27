@@ -5952,7 +5952,10 @@ class BatchGenWorker:
 			)
 
 		# STEP 1: Configure model for prefill
+		_t_cfgpf = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
+		if self.rank == 0:
+			logging.info(f"[PHASE TIMING] configure_prefill: {time.perf_counter() - _t_cfgpf:.3f}s")
 		self.set_phase("prefill")
 
 		if torch.cuda.is_available():
@@ -6201,9 +6204,12 @@ class BatchGenWorker:
 		self.init_nvshmem()
 
 		# Unified method handles all deployment scenarios
+		_t_cfgdec = time.perf_counter()
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		if self.rank == 0:
+			logging.info(f"[PHASE TIMING] configure_decoding: {time.perf_counter() - _t_cfgdec:.3f}s")
 		# Stop the H2D producer BEFORE set_phase("decode"): set_phase ->
 		# resize_buffer -> reset_slot_events rebuilds the per-slot fence events the
 		# live prefill producer reads lock-free, which otherwise races/UAF here.
