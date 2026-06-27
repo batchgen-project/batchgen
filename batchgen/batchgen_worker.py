@@ -8052,16 +8052,23 @@ class BatchGenWorker:
 		cache_view = self._decode_cache_seqlens_i32[:batch_size]
 		position_view = self._decode_position_ids_i64[:batch_size]
 
-		if can_advance_on_device:
-			cache_view.add_(1)
-			position_view.add_(1)
-		else:
-			staging = self._decode_cache_seqlens_cpu_staging
-			for i, value in enumerate(cache_seqlens_key):
-				staging[i] = value
-			cache_view.copy_(staging[:batch_size], non_blocking=True)
-			position_view[:, 0].copy_(cache_view.to(dtype=torch.int64))
-			position_view.sub_(1)
+		# These persistent metadata buffers are inference tensors (allocated under
+		# inference_mode in _ensure_decode_metadata_capacity). The graph-config bind
+		# path (_bind_decode_attention_metadata_for_graph_config) reaches the slow
+		# branch OUTSIDE inference_mode at batch-composition changes (high concurrency),
+		# where in-place writes to inference tensors raise. Wrap the mutations so they
+		# are legal regardless of the caller's inference-mode state.
+		with torch.inference_mode():
+			if can_advance_on_device:
+				cache_view.add_(1)
+				position_view.add_(1)
+			else:
+				staging = self._decode_cache_seqlens_cpu_staging
+				for i, value in enumerate(cache_seqlens_key):
+					staging[i] = value
+				cache_view.copy_(staging[:batch_size], non_blocking=True)
+				position_view[:, 0].copy_(cache_view.to(dtype=torch.int64))
+				position_view.sub_(1)
 
 		self._decode_metadata_batch_key = batch_key
 		self._decode_metadata_cpu_seqlens = cache_seqlens_key
