@@ -973,9 +973,31 @@ class KimiK25ParallelStrategyManager:
         # only needs to run on the FIRST prefill→decode shift. configure_decoding
         # re-runs each shift; skip the reload once the slices are resident.
         first_moe = self.loaded_model_config.first_k_dense_replace
-        if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13_marlin", None) is not None:
+        n_moe_layers = self.model_config.num_hidden_layers - first_moe
+
+        # Load-once HOST cache (PAGEABLE). The TP slabs are a pure function of
+        # (SHM weights, global_rank, world_size) — constant for the process — so
+        # compute ONCE and H2D-restore each later flip (~1-2s) instead of the ~48s
+        # re-transform of 384x60 experts. self (the PSM) survives the model rebuild
+        # (configure_decoding:314) and every teardown (_cleanup_decode_gpu_state,
+        # worker.deep_free_model_memory :12087-12091) — neither touches
+        # _tp_moe_host_cache — so the cache persists across flips. The old guard
+        # anchored the cache to the model object (rebuilt every flip) -> never hit.
+        # Completeness gate: a partial cache counts as absent -> clean recompute.
+        cache = getattr(self, "_tp_moe_host_cache", None)
+        if cache is not None and len(cache) == n_moe_layers:
+            device = self.engine_config.Basic_Config.device_torch
+            for layer_idx in range(first_moe, self.model_config.num_hidden_layers):
+                w13_h, w2_h, w13s_h, w2s_h = cache[layer_idx]
+                moe = self.model.model.layers[layer_idx].mlp
+                moe._tp_w13_marlin = w13_h.to(device)
+                moe._tp_w2_marlin = w2_h.to(device)
+                moe._tp_w13_scale_marlin = w13s_h.to(device)
+                moe._tp_w2_scale_marlin = w2s_h.to(device)
+                moe._tp_rank = self.global_rank
+            torch.cuda.synchronize(device)
             if self.rank == 0:
-                logging.info("[MODEL] TP-MoE experts already resident — skipping reload")
+                logging.info("[MODEL] TP-MoE slabs restored from host cache (H2D)")
             return
 
         # Lazy import: keeps the default EP path's import surface unchanged (the
@@ -996,6 +1018,8 @@ class KimiK25ParallelStrategyManager:
         r1 = r0 + inter_pr
         dcol0 = r * (inter_pr // 8)                         # down packed-col slice start
         scol0 = r * (inter_pr // GROUP_SIZE)               # down scale-col slice start
+
+        local_cache = {}  # layer_idx -> (w13,w2,w13_scale,w2_scale) host copies; published atomically below
 
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
@@ -1052,6 +1076,18 @@ class KimiK25ParallelStrategyManager:
             moe._tp_w13_scale_marlin = w13_scale
             moe._tp_w2_scale_marlin = w2_scale
             moe._tp_rank = r
+
+            # First-flip only: D2H copy the freshly-computed slabs into a PAGEABLE
+            # host buffer keyed by layer (~0.56 GB/layer, ~34 GB/rank). Pageable
+            # (not pinned) -> zero added page-locked pressure next to the ~768 GB
+            # host-KV pin. Accumulated locally; published atomically after the loop.
+            local_cache[layer_idx] = tuple(
+                t.to("cpu") for t in (w13, w2, w13_scale, w2_scale)
+            )
+
+        # Publish atomically: if any layer raised mid-loop, _tp_moe_host_cache is
+        # never assigned, so the completeness gate above forces a clean recompute.
+        self._tp_moe_host_cache = local_cache
 
         if self.rank == 0:
             logging.info(
