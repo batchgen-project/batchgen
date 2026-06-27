@@ -32,7 +32,9 @@ GROUP_SIZE = 32
 E = 8
 MTP = 64
 COUNTS = [0, 1, 16, 17, 32, 33, 5, 8]      # span the 16-row m-tile boundary
+COUNTS_LE8 = [0, 1, 8, 5, 8, 3, 8, 7]      # all <=8: exercises the V3 S3 M8 (mma_trans) path
 assert len(COUNTS) == E and max(COUNTS) <= MTP
+assert len(COUNTS_LE8) == E and max(COUNTS_LE8) <= 8
 
 
 def calc_diff(x, y):
@@ -58,15 +60,19 @@ def main():
         print("ERROR: rebuild batchgen_kernels (silu_mul_split missing)."); return 2
 
     use_v2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
+    use_v3 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V3", "0") == "1"
     if use_v2 and not (hasattr(mod, "grouped_marlin_tp_s1") and hasattr(mod, "grouped_marlin_tp_s3")):
         print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V2=1 but grouped_marlin_tp_s1/s3 missing "
               "— rebuild batchgen_kernels."); return 2
+    if use_v3 and not (hasattr(mod, "grouped_marlin_tp_s1_v3") and hasattr(mod, "grouped_marlin_tp_s3_v3")):
+        print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V3=1 but grouped_marlin_tp_s1_v3/s3_v3 missing "
+              "— rebuild batchgen_kernels."); return 2
 
-    counts = torch.tensor(COUNTS, dtype=torch.int32, device=dev)
-    max_m_tiles = max(1, (int(counts.max().item()) + 15) // 16)
+    path = ("v3 (MarlinTP_V3: STAGES3-S1 + M8/mma_trans-S3)" if use_v3 else
+            "v2 (MarlinTP fused-S1 + STAGES2-S3)" if use_v2 else
+            "v1 (m16 + silu_mul_split)")
     print(f"BatchGen-marlin TP parity (calc_diff<1e-3 vs BF16 ref)  "
-          f"H={H} inter_pr={INTER_PR} E={E} counts={COUNTS} max_m_tiles={max_m_tiles}  "
-          f"path={'v2 (MarlinTP fused-S1 + STAGES2-S3)' if use_v2 else 'v1 (m16 + silu_mul_split)'}")
+          f"H={H} inter_pr={INTER_PR} E={E}  path={path}")
 
     Wg, Wu, Wd = [], [], []
     w13 = torch.empty(E, H // 16, 4 * INTER_PR, dtype=torch.int32, device=dev)
@@ -104,42 +110,74 @@ def main():
     s1_ws = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=dev)
     s3_ws = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=dev)
 
-    if use_v2:
-        # v2: fused S1 writes SiLU(gate)*up DIRECTLY into intermediate (no gateup
-        # round-trip, no silu_mul_split); S3 (down) uses the STAGES=2 kernel.
-        s1f_C = intermediate.data_ptr() + idx * (MTP * INTER_PR * 2)
-        mod.grouped_marlin_tp_s1(dispatched_x, s1_B, s1f_C, s1_S, expert_starts, counts,
-                                 E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
-        mod.grouped_marlin_tp_s3(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
-                                 E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
-    else:
-        mod.grouped_marlin_gemm_m16(dispatched_x, s1_B, s1_C, s1_S, expert_starts, counts,
-                                    E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
-        mod.silu_mul_split(gateup, intermediate, counts, E, max_m_tiles * 16, MTP, INTER_PR)
-        mod.grouped_marlin_gemm_m16(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
-                                    E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
-    torch.cuda.synchronize()
+    s1f_C = intermediate.data_ptr() + idx * (MTP * INTER_PR * 2)
 
-    # BF16 reference (matches kernel precision) over every expert's active rows.
+    def run_once(counts_list):
+        """Launch S1+S3 for the selected path and validate every expert's rows."""
+        counts = torch.tensor(counts_list, dtype=torch.int32, device=dev)
+        max_count = int(counts.max().item())
+        max_m_tiles = max(1, (max_count + 15) // 16)
+        s3_label = ""
+        if use_v3:
+            # v3 S1 = STAGES3 + 3 CTA/SM fused-SiLU into intermediate (no gateup
+            # round-trip), byte-identical math to v2. v3 S3 = M8 mma_trans when all
+            # counts <= 8, else the v2 STAGES=2 (MBLOCK16) fallback.
+            mod.grouped_marlin_tp_s1_v3(dispatched_x, s1_B, s1f_C, s1_S, expert_starts, counts,
+                                        E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
+            if max_count <= 8:
+                mod.grouped_marlin_tp_s3_v3(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                            E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles, H)
+                s3_label = "S3=M8(mma_trans)"
+            else:
+                mod.grouped_marlin_tp_s3(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                         E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+                s3_label = "S3=v2-fallback(MBLOCK16)"
+        elif use_v2:
+            # v2: fused S1 writes SiLU(gate)*up DIRECTLY into intermediate (no gateup
+            # round-trip, no silu_mul_split); S3 (down) uses the STAGES=2 kernel.
+            mod.grouped_marlin_tp_s1(dispatched_x, s1_B, s1f_C, s1_S, expert_starts, counts,
+                                     E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
+            mod.grouped_marlin_tp_s3(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                     E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+        else:
+            mod.grouped_marlin_gemm_m16(dispatched_x, s1_B, s1_C, s1_S, expert_starts, counts,
+                                        E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles)
+            mod.silu_mul_split(gateup, intermediate, counts, E, max_m_tiles * 16, MTP, INTER_PR)
+            mod.grouped_marlin_gemm_m16(intermediate, s3_B, s3_C, s3_S, expert_starts, counts,
+                                        E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+        torch.cuda.synchronize()
+
+        print(f"counts={counts_list} max_m_tiles={max_m_tiles} {s3_label}")
+        # BF16 reference (matches kernel precision) over every expert's active rows.
+        all_pass = True
+        worst_cd = 0.0
+        for e in range(E):
+            c = counts_list[e]
+            if c == 0:
+                continue
+            a = dispatched_x[e * MTP:e * MTP + c]                  # [c, H] bf16
+            ref = (F.silu(torch.mm(a, Wg[e])) * torch.mm(a, Wu[e]))  # [c, inter_pr] bf16
+            ref = torch.mm(ref, Wd[e])                             # [c, H] bf16
+            out = expert_out[e * MTP:e * MTP + c]
+            cd = calc_diff(out, ref)
+            diff = (out.float() - ref.float()).abs()
+            bf16_tol = 1e-5 + 1.6e-2 * ref.float().abs()
+            bf16_fail = (diff > bf16_tol).float().mean().item() * 100
+            ok = cd < 1e-3
+            all_pass = all_pass and ok
+            worst_cd = max(worst_cd, cd)
+            print(f"  E{e} (count={c:2d}): calc_diff={cd:.2e}  bf16_elem_fail={bf16_fail:5.2f}% "
+                  f"[{'PASS' if ok else 'FAIL'}]")
+        return all_pass, worst_cd
+
+    # v3 runs TWO count vectors so both S3 sub-paths (M8 + >8 fallback) are gated.
+    count_sets = [COUNTS_LE8, COUNTS] if use_v3 else [COUNTS]
     all_pass = True
     worst_cd = 0.0
-    for e in range(E):
-        c = COUNTS[e]
-        if c == 0:
-            continue
-        a = dispatched_x[e * MTP:e * MTP + c]                  # [c, H] bf16
-        ref = (F.silu(torch.mm(a, Wg[e])) * torch.mm(a, Wu[e]))  # [c, inter_pr] bf16
-        ref = torch.mm(ref, Wd[e])                             # [c, H] bf16
-        out = expert_out[e * MTP:e * MTP + c]
-        cd = calc_diff(out, ref)
-        diff = (out.float() - ref.float()).abs()
-        bf16_tol = 1e-5 + 1.6e-2 * ref.float().abs()
-        bf16_fail = (diff > bf16_tol).float().mean().item() * 100
-        ok = cd < 1e-3
-        all_pass = all_pass and ok
-        worst_cd = max(worst_cd, cd)
-        print(f"  E{e} (count={c:2d}): calc_diff={cd:.2e}  bf16_elem_fail={bf16_fail:5.2f}% "
-              f"[{'PASS' if ok else 'FAIL'}]")
+    for cs in count_sets:
+        p, w = run_once(cs)
+        all_pass = all_pass and p
+        worst_cd = max(worst_cd, w)
 
     print(f"\n{'ALL PASS' if all_pass else 'FAILURES PRESENT'}  (worst calc_diff={worst_cd:.2e}, thr 1e-3)")
     return 0 if all_pass else 1

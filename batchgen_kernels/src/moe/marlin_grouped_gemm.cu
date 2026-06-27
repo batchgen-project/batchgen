@@ -1587,6 +1587,640 @@ __global__ void __launch_bounds__(256, 2) MarlinTP(
 }
 
 // ============================================================================
+// V3 barrier-reduced TP-MoE kernels (BATCHGEN_KIMI_TP_MARLIN_V3=1, default OFF).
+//
+// NCU diagnosis (V2): S1 (gate|up, K=7168 -> 56 k-tiles) is BARRIER-bound at
+// 22-31% DRAM with only ~2 CTAs/SM achieved (106 regs, no spill). The per-k-tile
+// cp_async_wait + __syncthreads (56 hard CTA rendezvous) cannot be hidden with so
+// few resident warps. V3 lever L1 = raise occupancy 2 -> 3 CTAs/SM WITHOUT
+// touching the m16n8k16 MMA dequant math (byte-identical to MarlinTP):
+//   * STAGES_T 4 -> 3   : SMEM 90112 -> 67584 B (<= 228/3 = 76 KB) so 3 CTAs fit;
+//                         cp_async_wait<STAGES_T-2> = wait<1> still double-buffers,
+//                         pipeline correctness + math unchanged (only depth).
+//   * MINCTA template -> __launch_bounds__(256, MINCTA): MINCTA=3 forces ptxas to
+//     <=80 reg/thread (the BINDING limit). H20 CC9.0: 65536 regs/SM at 256-reg/warp
+//     (8 reg/thread) granularity -> for 3*256=768 threads the true ceiling is
+//     floor(65536/768/8)*8 = 80, NOT 85; at 85 regs (rounds to 88) 88*256*3=67584 >
+//     65536 seats only 2 CTAs. VERIFY GATE is ptxas -v <=80 (not <=85): if ptxas
+//     reports 81-88 the kernel still builds (launch_bounds clamps it) but spills
+//     ~99->80 (~19 regs) and only 2 CTAs/SM seat = V2-with-STAGES-3 (no barrier win).
+//   * Two math-preserving register cuts to help fit <=80 regs:
+//       - drop the precomputed a_sh_rd_trans[b_sh_wr_iters][TM] array; recompute
+//         it inline in load_regs (transform_a is a few int ops);
+//       - drop the B_ptr[b_sh_wr_iters] pointer array; advance one b_gl_off int
+//         offset in fetch_to_shared (B + b_gl_off + b_gl_rd_delta_i*i).
+// The per-k-tile barrier COUNT is unchanged (still 1 wait + 1 sync); the +50%
+// resident warps (16 -> 24/SM) HIDE the same 56 barriers. S1 = MarlinTP_V3<3,true,3>.
+// ============================================================================
+
+template <int STAGES_T, bool FUSE_SILU, int MINCTA>
+__global__ void __launch_bounds__(256, MINCTA) MarlinTP_V3(
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ B_ptrs,
+    int4* const* __restrict__ C_ptrs,
+    const int4* const* __restrict__ scales_ptrs,
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    int num_experts,
+    int prob_n, int prob_k, int lda,
+    int n_tiles_per_expert,
+    int max_m_tiles,
+    int out_n)
+{
+  // STAGES-derived SMEM sizes (override the file-scope STAGES=4 constants)
+  constexpr int sh_b_size_t = STAGES_T * b_sh_stage;
+  constexpr int sh_s_size_t = STAGES_T * s_sh_stage;
+
+  // CTA M-tiling dispatch (identical to MarlinTP)
+  int linear_idx = blockIdx.x;
+  int matrix_idx = linear_idx / (max_m_tiles * n_tiles_per_expert);
+  int remainder = linear_idx % (max_m_tiles * n_tiles_per_expert);
+  int m_tile_idx = remainder / n_tiles_per_expert;
+  int tile_idx = remainder % n_tiles_per_expert;
+  int expert_idx = matrix_idx % num_experts;
+
+  int expert_m = expert_counts[expert_idx];
+  int m_start = m_tile_idx * M16_MBLOCK;
+  if (m_start >= expert_m) return;
+
+  int prob_m = min(M16_MBLOCK, expert_m - m_start);
+  int token_start = expert_starts[expert_idx] + m_start;
+
+  const int4* A_ptr = A + token_start * (lda / 8);
+  const int4* B = B_ptrs[matrix_idx];
+  int c_gl_stride_out = out_n / 8;
+  int4* C = C_ptrs[matrix_idx] + m_start * c_gl_stride_out;
+  const int4* scales_ptr = scales_ptrs[matrix_idx];
+
+  int k_tiles = prob_k / 16 / TK;
+
+  int a_gl_stride = lda / 8;
+  int a_gl_rd_delta_i = a_gl_stride * (THREADS / a_gl_rd_delta_o);
+  int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+
+  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % 16) + (threadIdx.x % 32) / 16;
+  a_sh_rd += 2 * ((threadIdx.x / 32) / (TN / 4));
+
+  int b_gl_stride = 16 * prob_n / (PACK * 4);
+  int b_gl_rd_delta_o = b_gl_stride * TK;
+  int b_gl_rd_delta_i = b_gl_stride * (THREADS / b_sh_stride_threads);
+  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads);
+  b_gl_rd += b_sh_stride * tile_idx;
+  int b_gl_off = b_gl_rd;   // V3 reg-cut: single running B offset (replaces B_ptr[4])
+
+  int s_gl_stride = prob_n / 8;
+  int s_gl_rd = s_sh_stride * tile_idx + threadIdx.x;
+  bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+  int s_sh_rd = 8 * ((threadIdx.x / 32) % (TN / 4)) + (threadIdx.x % 32) / 4;
+
+  bool a_sh_wr_pred[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
+
+  auto transform_a = [&](int i) {
+    int row = i / a_gl_rd_delta_o;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+  };
+
+  int a_sh_wr_trans[m16_a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < m16_a_sh_wr_iters; i++)
+    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
+  // V3 reg-cut: a_sh_rd_trans[b_sh_wr_iters][TM] NOT precomputed — recompute in load_regs.
+
+  extern __shared__ int4 sh[];
+  int4* sh_b = sh;
+  int4* sh_red = sh;
+  int4* sh_s = sh + (sh_red_size > sh_b_size_t ? sh_red_size : sh_b_size_t);
+  int4* sh_a = sh_s + sh_s_size_t;
+
+  FragA frag_a[2][TM];
+  I4 frag_b_quant[2][1];
+  FragC frag_c[TM][4][2];
+  FragS frag_s[2][4];
+
+#pragma unroll
+  for (int i = 0; i < TM * 4 * 2 * 4; i++)
+    reinterpret_cast<float*>(frag_c)[i] = 0;
+
+  auto fetch_to_shared = [&](int pipe, int k_off, bool pred) {
+    if (pred) {
+      int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < m16_a_sh_wr_iters; i++)
+        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
+                       &A_ptr[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * k_off],
+                       a_sh_wr_pred[i]);
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < b_sh_wr_iters; i++)
+        cp_async4(&sh_b_stage[b_sh_wr_delta * i + threadIdx.x],
+                  B + b_gl_off + b_gl_rd_delta_i * i);
+      b_gl_off += b_gl_rd_delta_o;
+      int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < s_tb_groups; i++) {
+        if (s_sh_wr_pred)
+          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &scales_ptr[s_gl_rd]);
+        s_gl_rd += s_gl_stride;
+      }
+    }
+    cp_async_fence();
+  };
+
+  // ---- Startup: fill pipeline ----
+#pragma unroll
+  for (int i = 0; i < STAGES_T - 1; i++)
+    fetch_to_shared(i, i, i < k_tiles);
+  cp_async_wait<STAGES_T - 2>();
+  __syncthreads();
+
+  auto load_regs = [&](int k, int pipe) {
+    int4* sh_a_stage = sh_a + m16_a_sh_stage * pipe;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+      ldsm4(frag_a[k % 2][i],
+            &sh_a_stage[transform_a(a_sh_rd_delta_o * (k % b_sh_wr_iters)
+                                    + a_sh_rd_delta_i * i + a_sh_rd)]);
+    int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+    frag_b_quant[k % 2][0] = *reinterpret_cast<I4*>(
+        &sh_b_stage[b_sh_wr_delta * (k % b_sh_wr_iters) + threadIdx.x]);
+  };
+
+  auto load_scales = [&](int k, int pipe) {
+    int cur_k = k_iter_size * (k % b_sh_wr_iters);
+    int k_blocks = cur_k / 16;
+    int cur_group_id = k_blocks / GROUP_BLOCKS;
+    int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES_T);
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+  };
+
+  auto matmul = [&](int k) {
+    int k2 = k % 2;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      FragB frag_b0, frag_b1;
+      int b_quant_0 = frag_b_quant[k2][0][j];
+      int b_quant_1 = b_quant_0 >> 8;
+      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      scale_op(frag_b0, frag_s[k2][j], 0);
+      scale_op(frag_b1, frag_s[k2][j], 1);
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+        mma_op(frag_a[k2][i], frag_b0, frag_c[i][j][0]);
+        mma_op(frag_a[k2][i], frag_b1, frag_c[i][j][1]);
+      }
+    }
+  };
+
+  load_regs(0, 0);
+  load_scales(0, 0);
+  a_gl_rd += a_gl_rd_delta_o * (STAGES_T - 1);
+
+  // ---- Main loop ----
+  int slice_iters = k_tiles;
+  while (slice_iters) {
+#pragma unroll
+    for (int pipe = 0; pipe < STAGES_T;) {
+#pragma unroll
+      for (int k = 0; k < b_sh_wr_iters; k++) {
+        load_regs(k + 1, pipe % STAGES_T);
+        load_scales(k + 1, pipe);
+        if (k == b_sh_wr_iters - 2) {
+          fetch_to_shared((pipe + STAGES_T - 1) % STAGES_T, pipe, slice_iters >= STAGES_T);
+          pipe++;
+          cp_async_wait<STAGES_T - 2>();
+          __syncthreads();
+        }
+        matmul(k);
+      }
+      slice_iters--;
+      if (slice_iters == 0) break;
+    }
+    a_gl_rd += a_gl_rd_delta_o * STAGES_T;
+  }
+  cp_async_wait<0>();
+
+  // ---- Thread-block reduce (step by 1, both [0] and [1] accumulators) ----
+  {
+    constexpr int red_off = THREADS / b_sh_stride_threads / 2;
+    if constexpr (red_off >= 1) {
+      auto red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_sh_stride = b_sh_stride_threads * 4 * 2;
+      constexpr int red_sh_delta = b_sh_stride_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
+                      (threadIdx.x % b_sh_stride_threads);
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (i <= red_idx && red_idx < 2 * i) {
+#pragma unroll
+            for (int j = 0; j < 4 * 2; j++) {
+              int red_sh_wr = red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
+              if (i < red_off) {
+                float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * j + red_sh_rd]);
+                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+#pragma unroll
+                for (int kk = 0; kk < 4; kk++)
+                  reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + j][kk] += c_rd[kk] + c_wr[kk];
+              }
+              sh_red[red_sh_wr] = reinterpret_cast<int4*>(&frag_c)[4 * 2 * m + j];
+            }
+          }
+          __syncthreads();
+        }
+        if (red_idx == 0) {
+#pragma unroll
+          for (int i = 0; i < 4 * 2; i++) {
+            float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+              reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + i][j] += c_rd[j];
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  // ---- Stage frag_c -> sh_red (256 cols), common to both epilogues ----
+  {
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_sh_wr = (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+    c_sh_wr += 32 * (threadIdx.x / 32);
+    if (threadIdx.x / 32 < TN / 4) {
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 8 * j;
+          scalar_t2 r0 = nums2num2(float2num(frag_c[i][j][0][0]), float2num(frag_c[i][j][0][1]));
+          scalar_t2 r1 = nums2num2(float2num(frag_c[i][j][0][2]), float2num(frag_c[i][j][0][3]));
+          scalar_t2 r2 = nums2num2(float2num(frag_c[i][j][1][0]), float2num(frag_c[i][j][1][1]));
+          scalar_t2 r3 = nums2num2(float2num(frag_c[i][j][1][2]), float2num(frag_c[i][j][1][3]));
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 0] = r0;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 0] = r1;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 0 + 4] = r2;
+          ((scalar_t2*)sh_red)[wr + (4 * c_sh_stride) * 8 + 4] = r3;
+        }
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- Epilogue (byte-identical to MarlinTP) ----
+  if constexpr (FUSE_SILU) {
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_stride = c_gl_stride_out;
+    int col_chunk = threadIdx.x % (2 * TN);
+    int row_grp = threadIdx.x / (2 * TN);
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));
+    int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));
+    int c_sh_rd = c_sh_stride * row_grp + col_chunk;
+    int c_gl_wr = c_gl_stride * row_grp + col_chunk;
+    int c_gl_wr_end = c_gl_stride * prob_m;
+    if (col_chunk < TN) {
+#pragma unroll
+      for (int i = 0; i < div_ceil(16 * TM, THREADS / (2 * TN)); i++) {
+        if (c_gl_wr < c_gl_wr_end) {
+          int4 gate_chunk = sh_red[c_sh_rd];
+          int4 up_chunk = sh_red[c_sh_rd + TN];
+          scalar_t* g_ptr = reinterpret_cast<scalar_t*>(&gate_chunk);
+          scalar_t* u_ptr = reinterpret_cast<scalar_t*>(&up_chunk);
+          int4 result;
+          scalar_t* r_ptr = reinterpret_cast<scalar_t*>(&result);
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+            float g = num2float(g_ptr[k]);
+            float u = num2float(u_ptr[k]);
+            r_ptr[k] = float2num(g / (1.0f + __expf(-g)) * u);
+          }
+          C[c_gl_wr] = result;
+          c_gl_wr += c_gl_wr_delta;
+          c_sh_rd += c_sh_rd_delta;
+        }
+      }
+    }
+  } else {
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_stride = c_gl_stride_out;
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));
+    constexpr int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));
+    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    c_gl_wr += (2 * TN) * tile_idx;
+    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    int c_gl_wr_end = c_gl_stride * prob_m;
+#pragma unroll
+    for (int i = 0; i < div_ceil(16 * TM, THREADS / (2 * TN)); i++) {
+      if (c_gl_wr < c_gl_wr_end) {
+        C[c_gl_wr] = sh_red[c_sh_rd];
+        c_gl_wr += c_gl_wr_delta;
+        c_sh_rd += c_sh_rd_delta;
+      }
+    }
+  }
+}
+
+// ============================================================================
+// V3 S3 kernel: MBLOCK=8 + mma_trans + ldsm<2> (the dev-validated v12c math,
+// calc_diff=5e-10) templated on STAGES_T + __launch_bounds__(256,MINCTA).
+//
+// S3 (down, N=H, K=inter_pr=128 = 1 k-tile) is memory-LATENCY-bound (DRAM=14%,
+// LONG_SCOREBOARD=1.14): the single exposed B cp.async dominates. The M8
+// mma_trans body uses one mma_trans per j (16 FP32 accumulators vs 32) -> ~80
+// regs -> __launch_bounds__(256,3) forces ptxas to <=80, the BINDING limit: at 768
+// threads the reg ceiling for 3 CTAs is exactly 80, so ~80 sits on the cliff (81
+// regs would drop to 2 CTAs). SMEM @ STAGES=2 = 40 KB would alone allow >=5 CTAs,
+// but REGISTERS cap it at 3 -- verify ptxas -v <=80. Sibling CTAs hide the exposed
+// load. The inner GEMM math is the
+// byte-identical MarlinSimple body; only STAGES depth + launch bound change.
+// VALID only for max per-expert count <= 8 (one CTA covers <=8 rows, no m-tiling);
+// the launcher caller gates on max_count <= 8 and otherwise falls back to V2 S3.
+// ============================================================================
+
+template <int STAGES_T, int MINCTA>
+__global__ void __launch_bounds__(256, MINCTA) MarlinTP_V3_S3(
+    const int4* __restrict__ A,
+    const int4* const* __restrict__ B_ptrs,
+    int4* const* __restrict__ C_ptrs,
+    const int4* const* __restrict__ scales_ptrs,
+    const int* __restrict__ expert_starts,
+    const int* __restrict__ expert_counts,
+    int num_experts,
+    int prob_n, int prob_k, int lda,
+    int n_tiles_per_expert)
+{
+  constexpr int sh_b_size_t = STAGES_T * b_sh_stage;
+  constexpr int sh_s_size_t = STAGES_T * s_sh_stage;
+
+  // Dispatch (MarlinSimple: one CTA = one (expert, N-tile), full K-reduction)
+  int matrix_idx = blockIdx.x / n_tiles_per_expert;
+  int tile_idx = blockIdx.x % n_tiles_per_expert;
+  int expert_idx = matrix_idx % num_experts;
+
+  int prob_m = expert_counts[expert_idx];
+  if (prob_m <= 0) return;
+  int token_start = expert_starts[expert_idx];
+
+  const int4* A_ptr = A + token_start * (lda / 8);
+  const int4* B = B_ptrs[matrix_idx];
+  int4* C = C_ptrs[matrix_idx];
+  const int4* scales_ptr = scales_ptrs[matrix_idx];
+
+  int k_tiles = prob_k / 16 / TK;
+
+  int a_gl_stride = lda / 8;
+  int a_gl_rd_delta_i = a_gl_stride * (THREADS / a_gl_rd_delta_o);
+  int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+
+  int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+  // m_block_size_8: 8-row A shared read pattern
+  int a_sh_rd = a_sh_stride * ((threadIdx.x % 32) % 8) + (threadIdx.x % 32) / 8;
+  a_sh_rd += 2 * ((threadIdx.x / 32) / (TN / 4));
+
+  int b_gl_stride = 16 * prob_n / (PACK * 4);
+  int b_gl_rd_delta_o = b_gl_stride * TK;
+  int b_gl_rd_delta_i = b_gl_stride * (THREADS / b_sh_stride_threads);
+  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads);
+  b_gl_rd += b_sh_stride * tile_idx;
+
+  int s_gl_stride = prob_n / 8;
+  int s_gl_rd = s_sh_stride * tile_idx + threadIdx.x;
+  bool s_sh_wr_pred = threadIdx.x < s_sh_stride;
+  int s_sh_rd = 8 * ((threadIdx.x / 32) % (TN / 4)) + (threadIdx.x % 32) / 4;
+
+  bool a_sh_wr_pred[a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < a_sh_wr_iters; i++)
+    a_sh_wr_pred[i] = a_sh_wr_delta * i + a_sh_wr < a_sh_stride * prob_m;
+
+  auto transform_a = [&](int i) {
+    int row = i / a_gl_rd_delta_o;
+    return a_gl_rd_delta_o * row + (i % a_gl_rd_delta_o) ^ (row % 8);
+  };
+
+  int a_sh_wr_trans[a_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < a_sh_wr_iters; i++)
+    a_sh_wr_trans[i] = transform_a(a_sh_wr_delta * i + a_sh_wr);
+
+  int a_sh_rd_trans[b_sh_wr_iters][TM];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++)
+    for (int j = 0; j < TM; j++)
+      a_sh_rd_trans[i][j] = transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
+
+  const int4* B_ptr[b_sh_wr_iters];
+#pragma unroll
+  for (int i = 0; i < b_sh_wr_iters; i++)
+    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+
+  extern __shared__ int4 sh[];
+  int4* sh_b = sh;
+  int4* sh_red = sh;
+  int4* sh_s = sh + (sh_red_size > sh_b_size_t ? sh_red_size : sh_b_size_t);
+  int4* sh_a = sh_s + sh_s_size_t;
+
+  FragA frag_a[2][TM];
+  I4 frag_b_quant[2][1];
+  FragC frag_c[TM][4][2];
+  FragS frag_s[2][4];
+
+#pragma unroll
+  for (int i = 0; i < TM * 4 * 2 * 4; i++)
+    reinterpret_cast<float*>(frag_c)[i] = 0;
+
+  auto fetch_to_shared = [&](int pipe, int k_off, bool pred) {
+    if (pred) {
+      int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < a_sh_wr_iters; i++)
+        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]],
+                       &A_ptr[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * k_off],
+                       a_sh_wr_pred[i]);
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < b_sh_wr_iters; i++) {
+        cp_async4(&sh_b_stage[b_sh_wr_delta * i + threadIdx.x], B_ptr[i]);
+        B_ptr[i] += b_gl_rd_delta_o;
+      }
+      int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#pragma unroll
+      for (int i = 0; i < s_tb_groups; i++) {
+        if (s_sh_wr_pred)
+          cp_async4(&sh_s_stage[i * s_sh_stride + threadIdx.x], &scales_ptr[s_gl_rd]);
+        s_gl_rd += s_gl_stride;
+      }
+    }
+    cp_async_fence();
+  };
+
+#pragma unroll
+  for (int i = 0; i < STAGES_T - 1; i++)
+    fetch_to_shared(i, i, i < k_tiles);
+  cp_async_wait<STAGES_T - 2>();
+  __syncthreads();
+
+  auto load_regs = [&](int k, int pipe) {
+    int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+      ldsm2(frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+    int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+    frag_b_quant[k % 2][0] = *reinterpret_cast<I4*>(
+        &sh_b_stage[b_sh_wr_delta * (k % b_sh_wr_iters) + threadIdx.x]);
+  };
+
+  auto load_scales = [&](int k, int pipe) {
+    int cur_k = k_iter_size * (k % b_sh_wr_iters);
+    int k_blocks = cur_k / 16;
+    int cur_group_id = k_blocks / GROUP_BLOCKS;
+    int4* sh_s_stage = sh_s + s_sh_stage * (pipe % STAGES_T);
+    reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+        sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+  };
+
+  auto matmul = [&](int k) {
+    int k2 = k % 2;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      FragB frag_b0, frag_b1;
+      int b_quant_0 = frag_b_quant[k2][0][j];
+      int b_quant_1 = b_quant_0 >> 8;
+      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      scale_op(frag_b0, frag_s[k2][j], 0);
+      scale_op(frag_b1, frag_s[k2][j], 1);
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+        // m_block_size_8: single mma_trans combines both b0 and b1
+        mma_trans_op(frag_a[k2][i], frag_b0, frag_b1, frag_c[i][j][0]);
+      }
+    }
+  };
+
+  load_regs(0, 0);
+  load_scales(0, 0);
+  a_gl_rd += a_gl_rd_delta_o * (STAGES_T - 1);
+
+  int slice_iters = k_tiles;
+  while (slice_iters) {
+#pragma unroll
+    for (int pipe = 0; pipe < STAGES_T;) {
+#pragma unroll
+      for (int k = 0; k < b_sh_wr_iters; k++) {
+        load_regs(k + 1, pipe % STAGES_T);
+        load_scales(k + 1, pipe);
+        if (k == b_sh_wr_iters - 2) {
+          fetch_to_shared((pipe + STAGES_T - 1) % STAGES_T, pipe, slice_iters >= STAGES_T);
+          pipe++;
+          cp_async_wait<STAGES_T - 2>();
+          __syncthreads();
+        }
+        matmul(k);
+      }
+      slice_iters--;
+      if (slice_iters == 0) break;
+    }
+    a_gl_rd += a_gl_rd_delta_o * STAGES_T;
+  }
+  cp_async_wait<0>();
+
+  // ---- Thread-block reduce (m_block_size_8: step by 2) ----
+  {
+    constexpr int red_off = THREADS / b_sh_stride_threads / 2;  // 1
+    if constexpr (red_off >= 1) {
+      auto red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_sh_stride = b_sh_stride_threads * 4 * 2;
+      constexpr int red_sh_delta = b_sh_stride_threads;
+      int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
+                      (threadIdx.x % b_sh_stride_threads);
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (i <= red_idx && red_idx < 2 * i) {
+#pragma unroll
+            for (int j = 0; j < 4 * 2; j += 2) {  // m_block_size_8: step by 2
+              int red_sh_wr = red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
+              if (i < red_off) {
+                float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * j + red_sh_rd]);
+                float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+#pragma unroll
+                for (int kk = 0; kk < 4; kk++)
+                  reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + j][kk] += c_rd[kk] + c_wr[kk];
+              }
+              sh_red[red_sh_wr] = reinterpret_cast<int4*>(&frag_c)[4 * 2 * m + j];
+            }
+          }
+          __syncthreads();
+        }
+        if (red_idx == 0) {
+#pragma unroll
+          for (int i = 0; i < 4 * 2; i += 2) {  // m_block_size_8: step by 2
+            float* c_rd = reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+              reinterpret_cast<FragC*>(frag_c)[4 * 2 * m + i][j] += c_rd[j];
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  // ---- Write result (m_block_size_8 layout) ----
+  {
+    int c_gl_stride = prob_n / 8;
+    constexpr int c_sh_stride = 2 * TN + 1;
+    int c_gl_wr_delta = c_gl_stride * (THREADS / (2 * TN));
+    constexpr int c_sh_rd_delta = c_sh_stride * (THREADS / (2 * TN));
+
+    int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    c_gl_wr += (2 * TN) * tile_idx;
+    int c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) + (threadIdx.x % 32) / 4;
+    c_sh_wr += 64 * (threadIdx.x / 32);
+    int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * TN)) + (threadIdx.x % (2 * TN));
+    int c_gl_wr_end = c_gl_stride * prob_m;
+
+    auto write_m8 = [&](int idx, float c0, float c1) {
+      scalar_t2 res = nums2num2(float2num(c0), float2num(c1));
+      ((scalar_t*)sh_red)[idx] = res.x;
+      ((scalar_t*)sh_red)[idx + 8 * c_sh_stride] = res.y;
+    };
+
+    if (threadIdx.x / 32 < TN / 4) {
+#pragma unroll
+      for (int i = 0; i < TM; i++) {
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          int wr = c_sh_wr + 16 * j;
+          write_m8(wr, frag_c[i][j][0][0], frag_c[i][j][0][1]);
+          write_m8(wr + 8, frag_c[i][j][0][2], frag_c[i][j][0][3]);
+        }
+        c_sh_wr += 16 * (4 * c_sh_stride);
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < div_ceil(8 * TM, THREADS / (2 * TN)); i++) {
+      if (c_gl_wr < c_gl_wr_end) {
+        C[c_gl_wr] = sh_red[c_sh_rd];
+        c_gl_wr += c_gl_wr_delta;
+        c_sh_rd += c_sh_rd_delta;
+      }
+    }
+  }
+}
+
+// ============================================================================
 // SiLU kernel
 // ============================================================================
 
@@ -1899,6 +2533,71 @@ void grouped_marlin_tp_s3(
 }
 
 // ============================================================================
+// V3 TP-specialized launchers (barrier-reduced: STAGES=3 / M8 mma_trans + 3 CTA/SM)
+// ============================================================================
+
+// S1 V3: concat-w13 gate|up GEMM (prob_n=2*inter_pr=256, prob_k=H) with STAGES=3
+// + fused SiLU + __launch_bounds__(256,3). Math byte-identical to grouped_marlin_tp_s1;
+// only pipeline depth, occupancy bound, and the two register cuts differ. SMEM:
+// max(528,3072) + 384 + 768 = 4224 int4 = 67584 B (<= 228/3=76 KB -> 3 CTAs/SM).
+void grouped_marlin_tp_s1_v3(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles, int out_n)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem_bytes = 67584;
+    cudaFuncSetAttribute((void*)MarlinTP_V3<3, true, 3>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * max_m_tiles * num_matrices;
+    MarlinTP_V3<3, true, 3><<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles, max_m_tiles, out_n);
+}
+
+// S3 V3: down GEMM (prob_n=H, prob_k=inter_pr=128 -> 1 k-tile) via the M8
+// mma_trans path (16 accumulators) + STAGES=2 + __launch_bounds__(256,3). Grid has
+// no m-tiling (one CTA per (expert, n-tile) covers <=8 rows); the CALLER must gate
+// on max per-expert count <= 8 (else use grouped_marlin_tp_s3 / V2). max_m_tiles +
+// out_n are accepted for call-site uniformity with s1_v3 but unused. SMEM:
+// max(528,2048) + 256 + 256 = 2560 int4 = 40960 B.
+void grouped_marlin_tp_s3_v3(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles, int out_n)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int smem_bytes = 40960;
+    cudaFuncSetAttribute((void*)MarlinTP_V3_S3<2, 3>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * num_matrices;
+    MarlinTP_V3_S3<2, 3><<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles);
+    (void)workspace; (void)max_m_tiles; (void)out_n;
+}
+
+// ============================================================================
 // PyBind11 module
 // ============================================================================
 
@@ -1908,6 +2607,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_marlin_gemm_m16_s1", &grouped_marlin_gemm_m16_s1, "Marlin M16 fused S1 (gate+up+SiLU)");
     m.def("grouped_marlin_tp_s1", &grouped_marlin_tp_s1, "Marlin TP S1 (concat w13, STAGES=4, fused SiLU, launch_bounds 256,2)");
     m.def("grouped_marlin_tp_s3", &grouped_marlin_tp_s3, "Marlin TP S3 down (STAGES=2 tiny-K, launch_bounds 256,2)");
+    m.def("grouped_marlin_tp_s1_v3", &grouped_marlin_tp_s1_v3, "Marlin TP S1 V3 (STAGES=3, reg-cut, fused SiLU, 3 CTA/SM)");
+    m.def("grouped_marlin_tp_s3_v3", &grouped_marlin_tp_s3_v3, "Marlin TP S3 V3 (M8 mma_trans, STAGES=2, 3 CTA/SM; caller gates max count<=8)");
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");

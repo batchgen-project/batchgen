@@ -51,6 +51,11 @@ _HAS_BATCH_INVARIANT = os.environ.get("BATCHGEN_BATCH_INVARIANT", "0") == "1"
 # STAGES=2 down). Default OFF so the validated grouped_marlin_gemm_m16 path is the
 # steady state; gate the new path entirely behind this flag.
 _USE_TP_MARLIN_V2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
+# V3 barrier-reduced MarlinTP (STAGES=3 + 3 CTA/SM S1; M8 mma_trans + 3 CTA/SM S3).
+# Math byte-identical to V2; only occupancy/pipeline-depth differ. Default OFF; takes
+# precedence over V2 when both are set. Same single-256-col-N-tile (world_size==16)
+# requirement as V2's fused-S1 epilogue.
+_USE_TP_MARLIN_V3 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V3", "0") == "1"
 from batchgen.moe.fused_int4_wgmma_grouped import (
     _load_int4_grouped_module,
     create_tma_descriptor,
@@ -767,7 +772,14 @@ class KimiK25MoE(nn.Module):
         """MoE forward — routes to decode or prefill path."""
         if self.config.phase == "decode":
             if getattr(self, '_use_tp_moe', False):
-                if getattr(self, '_tp_moe_kernel', 'sglang') == 'batchgen':
+                # Zero-overhead hybrid dispatch: ONE host-int compare on num_global
+                # (world_size * num_tokens_per_rank — both host ints the path already
+                # needs; no .item(), no kernel, no warp divergence). The threshold is
+                # stamped at configure time and ENCODES the mode: sglang=2^30 (always
+                # SGL), batchgen=1 (always BatchGen), hybrid=BATCHGEN_KIMI_TP_MOE_HYBRID_BSZ
+                # (SGL below the crossover num_global, BatchGen-marlin at/above it).
+                num_global = self.world_size * self.num_tokens_per_rank
+                if num_global >= getattr(self, '_tp_moe_hybrid_bsz', 1 << 30):
                     return self._forward_decode_tp_batchgen(hidden_states)
                 return self._forward_decode_tp(hidden_states)
             return self._forward_decode(hidden_states)
@@ -1301,14 +1313,17 @@ class KimiK25MoE(nn.Module):
         # dim → output width 2*inter_pr, then split with silu_mul_split. At ws=16
         # 2*inter_pr=256 = exactly one N-tile (n_tiles=1), reusing the proven
         # N>=256 grouped_marlin_gemm_m16 instead of a 128-wide kernel.
-        # cat(dim=2) of the two [H//16, 2*inter_pr] marlin slabs yields the standard
-        # [H//16, 4*inter_pr] w13 marlin layout (verified byte-identical to SGLang).
-        w13_marlin = torch.cat(
-            [self._tpg_gate_marlin, self._tpg_up_marlin], dim=2).contiguous()      # [E, H//16, 4*inter_pr]
-        w13_scale_marlin = torch.cat(
-            [self._tpg_gate_scale, self._tpg_up_scale], dim=2).contiguous()        # [E, H//GS, 2*inter_pr]
-        self._tpg_w13_marlin = w13_marlin              # keep refs alive
-        self._tpg_w13_scale_marlin = w13_scale_marlin
+        # ZERO-OVERHEAD HYBRID: share ONE w13 slab with the SGLang path. _tp_w13_marlin
+        # IS the [E, H//16, 4*inter_pr] gate|up concat (cat(marlin(gate),marlin(up)),
+        # which is exactly what the prior _tpg_gate/up concat produced — byte-identical),
+        # so the S1 B-pointers below index it with NO copy. This drops the separate
+        # gate/up pair + the runtime concat (~672 MiB int4 + ~176 MiB scales / MoE layer
+        # = tens of GiB over the 60-layer stack), so enabling hybrid costs zero extra
+        # resident weight (= the SGLang footprint). Down (S3) is already shared
+        # (_tp_w2_marlin). The per-expert strides below (w13_stride / w13scale_stride)
+        # are exactly _tp_w13_marlin's per-expert byte strides.
+        w13_marlin = self._tp_w13_marlin                # [E, H//16, 4*inter_pr] (shared)
+        w13_scale_marlin = self._tp_w13_scale_marlin    # [E, H//GS, 2*inter_pr] (shared)
 
         n_tiles_s1 = (2 * inter_pr) // 256             # ws<=16 → 2*inter_pr>=256 → >=1
         assert n_tiles_s1 >= 1, (
@@ -1465,7 +1480,8 @@ class KimiK25MoE(nn.Module):
             idx = torch.arange(E, dtype=torch.int64, device=device)
             tpg['s3_C_ptrs'] = tpbuf.expert_out.data_ptr() + idx * (mtp * H * 2)
             tpg['_s3_expert_out_ptr'] = tpbuf.expert_out.data_ptr()
-        if _USE_TP_MARLIN_V2 and tpg['_s1_intermediate_ptr'] != tpbuf.intermediate.data_ptr():
+        if (_USE_TP_MARLIN_V2 or _USE_TP_MARLIN_V3) and \
+                tpg['_s1_intermediate_ptr'] != tpbuf.intermediate.data_ptr():
             idx = torch.arange(E, dtype=torch.int64, device=device)
             tpg['s1_fused_C_ptrs'] = tpbuf.intermediate.data_ptr() + idx * (mtp * inter_pr * 2)
             tpg['_s1_intermediate_ptr'] = tpbuf.intermediate.data_ptr()
@@ -1499,9 +1515,20 @@ class KimiK25MoE(nn.Module):
         # on write — silent wrong math. Fall back to the n_tiles-agnostic v1 path
         # (grouped_marlin_gemm_m16 + silu_mul_split) there.
         _has_v2 = hasattr(mod, 'grouped_marlin_tp_s1')
+        _has_v3 = hasattr(mod, 'grouped_marlin_tp_s1_v3')
         _v2_single_tile = tpg['n_tiles_s1'] == 1
-        use_v2 = _USE_TP_MARLIN_V2 and _has_v2 and _v2_single_tile
-        if _USE_TP_MARLIN_V2 and not use_v2 and not getattr(KimiK25MoE, '_tp_v2_warned', False):
+        # V3 takes precedence over V2 (same single-256-N-tile requirement).
+        use_v3 = _USE_TP_MARLIN_V3 and _has_v3 and _v2_single_tile
+        use_v2 = _USE_TP_MARLIN_V2 and _has_v2 and _v2_single_tile and not use_v3
+        if _USE_TP_MARLIN_V3 and not use_v3 and not getattr(KimiK25MoE, '_tp_v3_warned', False):
+            KimiK25MoE._tp_v3_warned = True
+            reason = ("the marlin extension lacks grouped_marlin_tp_s1_v3 (rebuild "
+                      "batchgen_kernels)" if not _has_v3 else
+                      f"n_tiles_s1={tpg['n_tiles_s1']}!=1 (world_size<16): the fused-S1 "
+                      "epilogue needs gate|up in one 256-col N-tile")
+            logging.warning("[TP-MoE batchgen] BATCHGEN_KIMI_TP_MARLIN_V3=1 but "
+                            f"{reason} — falling back to v2/v1.")
+        if _USE_TP_MARLIN_V2 and not use_v2 and not use_v3 and not getattr(KimiK25MoE, '_tp_v2_warned', False):
             KimiK25MoE._tp_v2_warned = True
             reason = ("the marlin extension lacks grouped_marlin_tp_s1/s3 (rebuild "
                       "batchgen_kernels)" if not _has_v2 else
@@ -1510,7 +1537,29 @@ class KimiK25MoE(nn.Module):
                       "256-col N-tile")
             logging.warning("[TP-MoE batchgen] BATCHGEN_KIMI_TP_MARLIN_V2=1 but "
                             f"{reason} — falling back to the v1 m16 path.")
-        if use_v2:
+        if use_v3:
+            # v3: barrier-reduced MarlinTP. S1 = STAGES=3 + 3 CTA/SM (same fused-SiLU
+            # epilogue, writes intermediate DIRECTLY, math byte-identical to v2). S3 =
+            # M8 mma_trans + 3 CTA/SM when every expert has <=8 rows (decode bs<=~24);
+            # else fall back to the v2 STAGES=2 S3 (MBLOCK16) which handles >8 rows.
+            mod.grouped_marlin_tp_s1_v3(
+                tpbuf.dispatched_x, tpg['s1_B_ptrs'], tpg['s1_fused_C_ptrs'],
+                tpg['s1_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                E, 2 * inter_pr, H, tpg['s1_workspace'],
+                E, tpg['n_tiles_s1'], max_m_tiles, inter_pr)
+            if max_count <= 8:
+                mod.grouped_marlin_tp_s3_v3(
+                    tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
+                    tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                    E, H, inter_pr, tpg['s3_workspace'],
+                    E, tpg['n_tiles_s3'], max_m_tiles, H)
+            else:
+                mod.grouped_marlin_tp_s3(
+                    tpbuf.intermediate, tpg['s3_B_ptrs'], tpg['s3_C_ptrs'],
+                    tpg['s3_scales_ptrs'], tpg['expert_starts'], expert_counts,
+                    E, H, inter_pr, tpg['s3_workspace'],
+                    E, tpg['n_tiles_s3'], max_m_tiles)
+        elif use_v2:
             # v2: MarlinTP (launch_bounds 2 CTA/SM). S1 fuses SiLU into the concat-w13
             # GEMM epilogue and writes intermediate DIRECTLY (no silu_mul_split, no
             # gate|up round-trip); S3 uses STAGES=2 for the K=128 single-k-tile down.
