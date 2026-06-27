@@ -135,6 +135,26 @@ class KimiK25ParallelStrategyManager:
         # Step 1.5: Free decode-phase GPU allocations before creating prefill model
         self._cleanup_decode_gpu_state()
 
+        # Load-once prefill model cache: the configured prefill model (skeleton +
+        # attn/expert wrappers) is a pure function of the static config + SHM weights
+        # and is NOT mutated during decode (decode uses a separate model object), so a
+        # cached copy is reusable. This skips the ~4.8s of ~92k dead nn.Module
+        # constructions (ep_size=1 -> 384 expert modules x 60 layers, each paying
+        # archer_param_init) + ~2.6s expert re-wrapping every flip. The cache lives on
+        # the PSM (survives _cleanup_decode_gpu_state's `del self.model`); it holds
+        # ~6.5GB on GPU during decode (fits: decode 63GB + 6.5 < 0.95*96GB).
+        cached = getattr(self, "_prefill_model_cache", None)
+        if cached is not None and getattr(self, "_prefill_weight_copy_task_cache", None) is not None:
+            self.model = cached
+            self.weight_copy_task = self._prefill_weight_copy_task_cache
+            self.state_dict_name_map = self._prefill_name_map_cache
+            if self.rank == 0:
+                logging.info(
+                    f"[PREFILL] Reused cached prefill model — skipped rebuild+config "
+                    f"({time.perf_counter() - start_time:.2f}s)"
+                )
+            return self.model, self.weight_copy_task
+
         # Step 2: Initialize model
         # K2.5 reuses KimiK25ForCausalLM with K2.5 config overrides
         step_start = time.perf_counter()
@@ -248,6 +268,12 @@ class KimiK25ParallelStrategyManager:
                 f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
                 f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
             )
+
+        # Publish the configured prefill model for reuse on later flips (skips the
+        # rebuild+config above). Pure function of static config + SHM weights.
+        self._prefill_model_cache = self.model
+        self._prefill_weight_copy_task_cache = self.weight_copy_task
+        self._prefill_name_map_cache = self.state_dict_name_map
 
         return self.model, self.weight_copy_task
 
