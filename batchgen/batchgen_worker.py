@@ -5718,8 +5718,21 @@ class BatchGenWorker:
 					model_name=getattr(self, "model_name", None),
 					enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
 				)
+				# Kimi-K2.5 whole-model graph: capture on the FIRST decode regardless of
+				# queued prefill. The generic policy only warms up when the prefill queue
+				# is drained (has_queueing=False = the "last decode phase"), which under
+				# continuous batching (large pool, always-queued admission) never fires —
+				# so decode runs eager for the whole run. The whole-model graph captures
+				# FIXED buckets via dummy inputs (page-table as static buffers), so queued
+				# prefill is irrelevant to capture correctness (same as the GLM-5 path).
+				kimi_whole_graph_requested = (
+					getattr(self.args, "enable_cuda_graph", False)
+					and is_kimi_k25_backend_model(getattr(self, "model_name", "") or "")
+				)
 				if generic_cuda_graph_warmup_needed or (
 					glm5_whole_graph_requested and self._cuda_graph_manager is None
+				) or (
+					kimi_whole_graph_requested and self._cuda_graph_manager is None
 				) or self._glm5_whole_model_graph_current_bucket_missing():
 					if has_queueing:
 						logging.info(
