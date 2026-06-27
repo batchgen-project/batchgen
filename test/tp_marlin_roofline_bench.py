@@ -191,7 +191,10 @@ def main():
         return 2
 
     # v2 = MarlinTP (launch_bounds 2 CTA/SM; fused-S1 SiLU; STAGES=2 down).
+    use_v3 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V3", "0") == "1"
     use_v2 = os.environ.get("BATCHGEN_KIMI_TP_MARLIN_V2", "0") == "1"
+    if use_v3 and not (hasattr(mod, "grouped_marlin_tp_s1_v3") and hasattr(mod, "grouped_marlin_tp_s3_v3")):
+        print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V3=1 but grouped_marlin_tp_s1_v3/s3_v3 missing — rebuild."); return 2
     if use_v2 and not (hasattr(mod, "grouped_marlin_tp_s1") and hasattr(mod, "grouped_marlin_tp_s3")):
         print("ERROR: BATCHGEN_KIMI_TP_MARLIN_V2=1 but grouped_marlin_tp_s1/s3 missing "
               "— rebuild batchgen_kernels.")
@@ -277,7 +280,27 @@ def main():
         s1_ws = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=device)
         s3_ws = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=device)
 
-        if use_v2:
+        _maxc = int(expert_counts.max().item())
+        if use_v3:
+            def bg_s1():
+                mod.grouped_marlin_tp_s1_v3(
+                    dispatched_x, s1_B, s1f_C, s1_S, expert_starts, expert_counts,
+                    E, 2 * INTER_PR, H, s1_ws, E, n_tiles_s1, max_m_tiles, INTER_PR)
+
+            def bg_s2():
+                pass  # fused into S1
+
+            def bg_s3():
+                # v3 S3 (M8 mma_trans) only when all per-expert counts <= 8; else v2 fallback.
+                if _maxc <= 8:
+                    mod.grouped_marlin_tp_s3_v3(
+                        intermediate, s3_B, s3_C, s3_S, expert_starts, expert_counts,
+                        E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles, H)
+                else:
+                    mod.grouped_marlin_tp_s3(
+                        intermediate, s3_B, s3_C, s3_S, expert_starts, expert_counts,
+                        E, H, INTER_PR, s3_ws, E, n_tiles_s3, max_m_tiles)
+        elif use_v2:
             def bg_s1():
                 mod.grouped_marlin_tp_s1(
                     dispatched_x, s1_B, s1f_C, s1_S, expert_starts, expert_counts,
