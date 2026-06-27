@@ -47,6 +47,7 @@ def main():
     dev = torch.device("cuda", 0)
     mod = _load_module()
     from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import moe_align_block_size
+    from sgl_kernel import shuffle_rows, moe_sum_reduce
 
     w13 = torch.empty(E, H // 16, 4 * INTER_PR, dtype=torch.int32, device=dev)
     w13_s = torch.empty(E, H // GROUP_SIZE, 2 * INTER_PR, dtype=torch.bfloat16, device=dev)
@@ -91,20 +92,27 @@ def main():
         starts[1:] = torch.cumsum(padded, 0)[:-1].to(torch.int32)
         Mtopk = numG * TOPK
         valid = sorted_ids < Mtopk
-        flat = sorted_ids.clamp(0, Mtopk - 1)
-        token_idx = (flat // TOPK).to(torch.int64)
-        max_m_tiles = max(1, (int(counts.max().item()) + 15) // 16)
+        is_valid = sorted_ids < Mtopk
+        token_idx = torch.where(is_valid, sorted_ids, torch.zeros_like(sorted_ids)).to(torch.int32) // TOPK
+        max_m_tiles = max(1, (int(counts.max().item()) + 15) // 16)   # OUTSIDE timing (graph: static)
         s1_ws = torch.zeros(E * (n_tiles_s1 + 17), dtype=torch.int32, device=dev)
         s3_ws = torch.zeros(E * (n_tiles_s3 + 17), dtype=torch.int32, device=dev)
         inter = torch.empty(num_post, INTER_PR, dtype=torch.bfloat16, device=dev)
         out_c = torch.empty(num_post, H, dtype=torch.bfloat16, device=dev)
         inter_C = inter.data_ptr() + starts.to(torch.int64) * (INTER_PR * 2)
         s3_C = out_c.data_ptr() + starts.to(torch.int64) * (H * 2)
-        w_row = topk_w.reshape(-1).index_select(0, flat).float() * valid.float()
+        # inv_map (combine permutation) precomputed OUTSIDE timing — graph-static
+        g_idx = torch.where(is_valid, sorted_ids.to(torch.int64),
+                            torch.full_like(sorted_ids, Mtopk, dtype=torch.int64))
+        inv = torch.empty(Mtopk + 1, dtype=torch.int32, device=dev)
+        inv.scatter_(0, g_idx, torch.arange(num_post, dtype=torch.int32, device=dev))
+        inv_map = inv[:Mtopk]
+        tw = topk_w.view(numG, TOPK, 1).to(torch.bfloat16)
+        out_buf = torch.empty(numG, H, dtype=torch.bfloat16, device=dev)
 
         t_align = _t(lambda: moe_align_block_size(topk_idx, _BLOCK, E))
-        t_gather = _t(lambda: hidden.index_select(0, token_idx) * valid.unsqueeze(1))
-        A = hidden.index_select(0, token_idx) * valid.unsqueeze(1)
+        t_gather = _t(lambda: shuffle_rows(hidden, token_idx, (num_post, H)))
+        A = shuffle_rows(hidden, token_idx, (num_post, H))
 
         def gemm():
             mod.grouped_marlin_tp_s1_v3(A, s1_B, inter_C, s1_S, starts, counts,
@@ -114,9 +122,9 @@ def main():
         t_gemm = _t(gemm)
 
         def scatter():
-            out = torch.zeros(numG, H, dtype=torch.float32, device=dev)
-            out.index_add_(0, token_idx, out_c.float() * w_row.unsqueeze(1))
-            return out.bfloat16()
+            out_tok = (shuffle_rows(out_c, inv_map, (Mtopk, H)).view(numG, TOPK, H) * tw)
+            moe_sum_reduce(out_tok, out_buf, 1.0)
+            return out_buf
         t_scatter = _t(scatter)
 
         tot = t_align + t_gather + t_gemm + t_scatter
