@@ -9,6 +9,7 @@ Tests correctness and performance of the buffer pool design:
 - Performance: buffer pool vs per-sequence allocation
 """
 
+import sys
 import time
 import torch
 import pytest
@@ -458,6 +459,85 @@ class TestPerformance:
 
         migrate_ms = (time.perf_counter() - t0) * 1000
         print(f"\n  Migration 10 seqs: {migrate_ms:.1f}ms ({migrate_ms/10:.2f}ms/seq)")
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="RSS-based host-mem measurement is faithful only on Linux (the H20 deploy target): "
+           "macOS compresses/lazily-accounts anon pages so RSS undercounts and is run-to-run "
+           "noisy. Run on the H20 nodes to validate the footprint.")
+class TestHostMemoryFootprint:
+    """The pool-mode decoded_tokens_buffer (batchgen_worker.py:282, torch.full) is committed
+    EAGERLY (every page written at construction) and was sized to the model's full context
+    (model_context_length=262144) even though it only ever holds GENERATED tokens. At
+    num_sequences=12288 that is ~24 GiB/rank = ~180 GB/node of host anon that never gets used,
+    which left no room for the Kimi TP-MoE host slab cache (285 GB/node) and OOM-killed the node
+    at host-KV 768. The fix caps the width at batchgen_worker._DECODED_TOKENS_BUFFER_MAX (32768).
+    These CPU-only tests (no CUDA) reproduce the eager commit and quantify the saving.
+
+    NOTE: the cap literal below must match batchgen_worker._DECODED_TOKENS_BUFFER_MAX (cannot be
+    imported here — batchgen_worker JIT-loads a CUDA op at import).
+    """
+
+    _PROD_NUM_SEQ = 12288          # max_pool_size in pool mode
+    _PROD_RANKS_PER_NODE = 8
+    _FULL_CTX = 262144             # model_context_length (the old, wasteful decoded width)
+    _DECODED_CAP = 32768           # mirrors batchgen_worker._DECODED_TOKENS_BUFFER_MAX
+
+    @staticmethod
+    def _rss_bytes():
+        import os
+        import psutil
+        return psutil.Process(os.getpid()).memory_info().rss
+
+    def _commit_decoded_buffer(self, num_seq, width):
+        """RSS delta of materializing a decoded_tokens_buffer of (num_seq, width) int64.
+
+        The production buffer is torch.full(pad) at worker.py:282; here we fill with
+        INCOMPRESSIBLE random data instead. On the H20/Linux deploy nodes torch.full commits
+        every page regardless of value (the dmesg anon-rss proved it), but macOS compresses
+        low-entropy anon pages (all-zero AND all-constant), which would mask the footprint on
+        the dev box. Random int64 defeats the compressor so the committed size (num_seq*width*8)
+        shows up in RSS on both platforms. The fill value never changes the committed size.
+        """
+        import gc
+        gc.collect()
+        before = self._rss_bytes()
+        buf = torch.randint(0, 2**62, (num_seq, width), dtype=torch.int64)  # incompressible
+        after = self._rss_bytes()
+        delta = after - before
+        del buf
+        gc.collect()
+        return delta
+
+    def test_decoded_buffer_is_eagerly_committed(self):
+        """torch.full writes every page, so RSS grows by ~the full tensor size at construction —
+        independent of how many of the 12288 slots are ever admitted. This is the waste."""
+        num_seq = 1024  # scaled down so 1024*262144*8 = 2.0 GiB fits a dev box
+        delta = self._commit_decoded_buffer(num_seq, self._FULL_CTX)
+        nominal = num_seq * self._FULL_CTX * 8
+        print(f"\n  decoded[{num_seq},{self._FULL_CTX}] committed {delta/2**30:.2f} GiB "
+              f"(nominal {nominal/2**30:.2f} GiB)")
+        assert delta >= 0.85 * nominal, (
+            f"decoded buffer not eagerly committed: {delta/2**30:.2f} GiB vs {nominal/2**30:.2f} GiB")
+
+    def test_cap_frees_expected_bytes(self):
+        """Capping the decoded width 262144 -> 32768 cuts the committed footprint by
+        1 - 32768/262144 = 87.5%, and extrapolates to >150 GB/node freed at production scale."""
+        num_seq = 1024
+        full = self._commit_decoded_buffer(num_seq, self._FULL_CTX)
+        capped = self._commit_decoded_buffer(num_seq, self._DECODED_CAP)
+        ratio = self._DECODED_CAP / self._FULL_CTX
+        assert capped <= (ratio + 0.1) * full, (
+            f"capped buffer too large: {capped/2**30:.2f} GiB vs expected ~{ratio*full/2**30:.2f} GiB")
+
+        saved_per_rank = (full - capped) * (self._PROD_NUM_SEQ / num_seq)
+        saved_per_node = saved_per_rank * self._PROD_RANKS_PER_NODE
+        print(f"\n  cap {self._FULL_CTX}->{self._DECODED_CAP}: saves {saved_per_rank/2**30:.1f} GiB/rank "
+              f"= {saved_per_node/2**30:.0f} GiB/node at {self._PROD_NUM_SEQ} seqs x "
+              f"{self._PROD_RANKS_PER_NODE} ranks")
+        assert saved_per_node > 150 * 2**30, (
+            f"saving {saved_per_node/2**30:.0f} GiB/node is below the 150 GB/node needed to fit (c)")
 
 
 if __name__ == "__main__":
