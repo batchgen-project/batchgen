@@ -269,15 +269,17 @@ class _DualKVLoadPointers:
 	aux_page_counts: torch.Tensor
 
 
-# Pool-mode QueryBookBufferPool.decoded_tokens_buffer holds only GENERATED tokens
-# (never the prompt or full context), but was sized to the model's full context window
-# (model_context_length=262144). torch.full commits every page at server start, so that
-# is ~21 GiB/rank = ~180 GB/node of host anon permanently wasted — which leaves no room
-# for the Kimi TP-MoE host slab cache (285 GB/node) and OOM-kills the node at host-KV 768.
-# Cap the buffer at a generous max output length; per-request max_tokens is clamped to it
-# at admission so no sequence writes past its row. 32768 covers all BatchGen workloads
-# (longbench out=2048, MMLU out=10240) with margin.
-_DECODED_TOKENS_BUFFER_MAX = 32768
+# Pool-mode QueryBookBufferPool sizes BOTH its buffers to the model's full context window
+# (model_context_length=262144) for all max_pool_size=12288 slots: input_ids_buffer (holds
+# prompt+generated tokens) via torch.zeros and decoded_tokens_buffer (holds ONLY generated
+# tokens) via torch.full. Both commit every page at server start (~24 GiB/rank each = ~48
+# GiB/rank = ~384 GB/node), but no BatchGen workload comes near a 262144-token sequence — so
+# most of it is host anon permanently wasted, which leaves no room for the Kimi TP-MoE host
+# slab cache (285 GB/node) and OOM-kills the node at host-KV 768. Cap both buffers' length;
+# admission clamps each sequence's max_tokens and total length to it so nothing writes past
+# its row. 32768 covers all BatchGen workloads (longbench in=8192/out=2048 total 10240, MMLU
+# total ~12288) with >=2.5x margin. Caps both per-request output AND total sequence length.
+_QUERY_BOOK_BUFFER_MAX_LEN = 32768
 
 
 class QueryBookBufferPool:
@@ -1221,7 +1223,7 @@ class BatchGenWorker:
 			global_idx = start_idx + i
 			max_dec = entry.get("max_tokens", self.max_decoding_length)
 			# Clamp to the decoded_tokens buffer width: that buffer holds only generated
-			# tokens and is capped (see _DECODED_TOKENS_BUFFER_MAX), so a request asking for
+			# tokens and is capped (see _QUERY_BOOK_BUFFER_MAX_LEN), so a request asking for
 			# more output would write past its row into the next slot.
 			if self._buffer_pool is not None:
 				max_dec = min(max_dec, self._buffer_pool.max_decoding_length)
@@ -1372,6 +1374,7 @@ class BatchGenWorker:
 			seq_extended_size = min(
 				actual_prompt_len + seq.max_decode_length,
 				self.model_context_length,
+				_QUERY_BOOK_BUFFER_MAX_LEN,  # the input_ids buffer row is capped at this width
 			)
 
 			slot = self._buffer_pool.allocate_slot()
@@ -5104,12 +5107,14 @@ class BatchGenWorker:
 		# Pre-allocate buffer pool for max_pool_size.
 		# Use model_context_length for decoded_tokens buffer (not max_decoding_length)
 		# because per-request max_completion_tokens can be up to the full context window.
+		# Cap BOTH buffers' width (see _QUERY_BOOK_BUFFER_MAX_LEN) instead of sizing to the full
+		# 262144 context — torch.zeros/torch.full commit every page at startup (~48 GiB/rank),
+		# almost all of it wasted, which OOM-killed the node alongside the TP-MoE host cache.
+		_qbuf_len = min(self.model_context_length, _QUERY_BOOK_BUFFER_MAX_LEN)
 		self._buffer_pool = QueryBookBufferPool(
 			num_sequences=self._max_pool_size,
-			model_context_length=self.model_context_length,
-			# decoded_tokens holds only generated tokens — cap it (see _DECODED_TOKENS_BUFFER_MAX)
-			# instead of sizing to the full 262144 context, which committed ~180 GB/node of waste.
-			max_decoding_length=min(self.model_context_length, _DECODED_TOKENS_BUFFER_MAX),
+			model_context_length=_qbuf_len,
+			max_decoding_length=_qbuf_len,
 			pad_token_id=self.pad_token_id,
 		)
 		logging.info(

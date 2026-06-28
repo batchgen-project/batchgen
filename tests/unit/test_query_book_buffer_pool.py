@@ -472,17 +472,19 @@ class TestHostMemoryFootprint:
     (model_context_length=262144) even though it only ever holds GENERATED tokens. At
     num_sequences=12288 that is ~24 GiB/rank = ~180 GB/node of host anon that never gets used,
     which left no room for the Kimi TP-MoE host slab cache (285 GB/node) and OOM-killed the node
-    at host-KV 768. The fix caps the width at batchgen_worker._DECODED_TOKENS_BUFFER_MAX (32768).
-    These CPU-only tests (no CUDA) reproduce the eager commit and quantify the saving.
+    at host-KV 768. The fix caps the width at batchgen_worker._QUERY_BOOK_BUFFER_MAX_LEN (32768)
+    for BOTH the input_ids and decoded_tokens buffers (each ~24 GiB/rank), so the real node
+    saving is ~2x the per-buffer number below. These CPU-only tests (no CUDA) reproduce the
+    eager commit of one buffer and quantify the per-buffer saving.
 
-    NOTE: the cap literal below must match batchgen_worker._DECODED_TOKENS_BUFFER_MAX (cannot be
+    NOTE: the cap literal below must match batchgen_worker._QUERY_BOOK_BUFFER_MAX_LEN (cannot be
     imported here — batchgen_worker JIT-loads a CUDA op at import).
     """
 
     _PROD_NUM_SEQ = 12288          # max_pool_size in pool mode
     _PROD_RANKS_PER_NODE = 8
-    _FULL_CTX = 262144             # model_context_length (the old, wasteful decoded width)
-    _DECODED_CAP = 32768           # mirrors batchgen_worker._DECODED_TOKENS_BUFFER_MAX
+    _FULL_CTX = 262144             # model_context_length (the old, wasteful buffer width)
+    _DECODED_CAP = 32768           # mirrors batchgen_worker._QUERY_BOOK_BUFFER_MAX_LEN
 
     @staticmethod
     def _rss_bytes():
