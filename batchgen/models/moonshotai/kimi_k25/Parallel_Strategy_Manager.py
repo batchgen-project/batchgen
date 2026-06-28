@@ -994,14 +994,37 @@ class KimiK25ParallelStrategyManager:
         is GPU-only); this runs after model.to(device). Streams one expert at a
         time to keep peak memory bounded.
         """
-        # Load-once cache: the TP slices are batch-size-independent (expert
-        # weights), so the expensive marlin→raw transform of all 384×60 experts
-        # only needs to run on the FIRST prefill→decode shift. configure_decoding
-        # re-runs each shift; skip the reload once the slices are resident.
+        # Host-slab cache: the TP marlin slices are batch-size-independent expert
+        # weights, but the decode model's GPU state is EVACUATED on every flip-to-prefill
+        # (prefill needs the HBM for its own model + O(L^2) attention activations), so the
+        # ~46s marlin re-transform of 384 experts × 60 layers would otherwise re-run on
+        # EVERY decode re-entry. Two-tier skip:
+        #   (1) slabs still resident on GPU (spurious re-entry within a decode phase) -> no-op.
+        #   (2) slabs cached on HOST (survive `del self.model` in _cleanup_decode_gpu_state)
+        #       -> cheap H2D restore (~2-4s) instead of the full re-transform.
         first_moe = self.loaded_model_config.first_k_dense_replace
+        n_moe_layers = self.model_config.num_hidden_layers - first_moe
+        device = self.engine_config.Basic_Config.device_torch
         if getattr(self.model.model.layers[first_moe].mlp, "_tp_w13_marlin", None) is not None:
             if self.rank == 0:
                 logging.info("[MODEL] TP-MoE experts already resident — skipping reload")
+            return
+        host_cache = getattr(self, "_tp_moe_host_cache", None)
+        if host_cache is not None and len(host_cache) == n_moe_layers:
+            for layer_idx in range(first_moe, self.model_config.num_hidden_layers):
+                w13_h, w2_h, w13s_h, w2s_h = host_cache[layer_idx]
+                moe = self.model.model.layers[layer_idx].mlp
+                moe._tp_w13_marlin = w13_h.to(device, non_blocking=True)
+                moe._tp_w2_marlin = w2_h.to(device, non_blocking=True)
+                moe._tp_w13_scale_marlin = w13s_h.to(device, non_blocking=True)
+                moe._tp_w2_scale_marlin = w2s_h.to(device, non_blocking=True)
+                moe._tp_rank = self.global_rank
+            torch.cuda.synchronize(device)
+            if self.rank == 0:
+                logging.info(
+                    f"[MODEL] TP-MoE MARLIN slabs restored from host cache "
+                    f"({n_moe_layers} layers, H2D)"
+                )
             return
 
         # Lazy import: keeps the default EP path's import surface unchanged (the
@@ -1022,6 +1045,23 @@ class KimiK25ParallelStrategyManager:
         r1 = r0 + inter_pr
         dcol0 = r * (inter_pr // 8)                         # down packed-col slice start
         scol0 = r * (inter_pr // GROUP_SIZE)               # down scale-col slice start
+
+        # No-transient host cache: pre-allocate the per-layer host buffers ONCE, then
+        # copy each layer's slabs in-place (D2H) as they are built (below). This holds
+        # the host footprint at its steady ~34GB/rank — the earlier `local_cache[layer]=
+        # tuple(t.to("cpu") ...)` accumulation spiked the host past RAM and got OOM-killed.
+        host_cache = {
+            layer_idx: (
+                torch.empty(E, H // 16, 4 * inter_pr, dtype=torch.int32, device="cpu"),
+                torch.empty(E, inter_pr // 16, 2 * H, dtype=torch.int32, device="cpu"),
+                torch.empty(E, H // GROUP_SIZE, 2 * inter_pr, dtype=torch.bfloat16, device="cpu"),
+                torch.empty(E, inter_pr // GROUP_SIZE, H, dtype=torch.bfloat16, device="cpu"),
+            )
+            for layer_idx in range(
+                self.loaded_model_config.first_k_dense_replace,
+                self.model_config.num_hidden_layers,
+            )
+        }
 
         for layer_idx in range(
             self.loaded_model_config.first_k_dense_replace,
@@ -1079,11 +1119,23 @@ class KimiK25ParallelStrategyManager:
             moe._tp_w2_scale_marlin = w2_scale
             moe._tp_rank = r
 
+            # Mirror this layer's slabs into the pre-allocated host cache (in-place D2H);
+            # one layer's worth of pinned bounce buffer is the only transient.
+            h13, h2, h13s, h2s = host_cache[layer_idx]
+            h13.copy_(w13)
+            h2.copy_(w2)
+            h13s.copy_(w13_scale)
+            h2s.copy_(w2_scale)
+
+        # Publish atomically only after the full transform — a partial cache would fail
+        # the completeness check on the next flip and trigger a full re-transform.
+        self._tp_moe_host_cache = host_cache
+
         if self.rank == 0:
             logging.info(
                 f"[MODEL] TP-MoE MARLIN experts loaded: {E} experts × "
                 f"{self.model_config.num_hidden_layers - self.loaded_model_config.first_k_dense_replace} "
-                f"layers, inter_per_rank={inter_pr} (rank slice {r0}:{r1})"
+                f"layers, inter_per_rank={inter_pr} (rank slice {r0}:{r1}); host cache populated"
             )
 
     def _move_int4_to_gpu_contiguous(self):
