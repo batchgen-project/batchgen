@@ -277,9 +277,13 @@ class _DualKVLoadPointers:
 # most of it is host anon permanently wasted, which leaves no room for the Kimi TP-MoE host
 # slab cache (285 GB/node) and OOM-kills the node at host-KV 768. Cap both buffers' length;
 # admission clamps each sequence's max_tokens and total length to it so nothing writes past
-# its row. 32768 covers all BatchGen workloads (longbench in=8192/out=2048 total 10240, MMLU
-# total ~12288) with >=2.5x margin. Caps both per-request output AND total sequence length.
-_QUERY_BOOK_BUFFER_MAX_LEN = 32768
+# its row. 81920 covers all BatchGen workloads incl. 64k-prefill/1k-decode (total 65042) and
+# 8k/2k, 2k/8k (total ~10240), with margin for 64k input + up to ~16k output. The pool then
+# costs ~128 GB/node (81920/262144 x 384) — still leaves ~287 GB headroom alongside the 285 GB
+# (c) host cache + 1487 GB shmem (kv768+wt719) on the 2266 GB node. (Was 32768, which fit only
+# <=32k total and crashed at admission for a 64k prompt: input_ids row was 32768 wide but the
+# prompt was 64018 tokens — RuntimeError "expanded size (32768) must match (64018)".)
+_QUERY_BOOK_BUFFER_MAX_LEN = 81920
 
 
 class QueryBookBufferPool:
