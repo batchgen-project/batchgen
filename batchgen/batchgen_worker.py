@@ -1193,9 +1193,16 @@ class BatchGenWorker:
 		self._shutdown_requested = status[1].item() == 1
 
 		if has_new:
+			_t_bc0 = time.perf_counter()
 			container = [msg_data]
 			dist.broadcast_object_list(container, src=0)
 			msg_data = container[0]
+			if self.rank == 0:
+				_n_ent = len(msg_data.get("entries", [])) if isinstance(msg_data, dict) else 0
+				logging.info(
+					f"[ADMIT_TIMING] broadcast_object_list of {_n_ent}-entry admit msg "
+					f"took {time.perf_counter() - _t_bc0:.2f}s"
+				)
 			self._admit_sequences_from_message(msg_data)
 
 		return has_new
@@ -1293,6 +1300,9 @@ class BatchGenWorker:
 		all_texts = [seq.text for seq in sequences]
 		num_new = len(all_texts)
 
+		# [ADMIT_TIMING] localize the admission cost (rank 0 only): encode vs all_gather vs fill.
+		_t_admit0 = time.perf_counter()
+
 		# Phase 1: Parallel tokenization across ranks (same as _tokenize_global_batch)
 		my_indices = list(range(self.rank, num_new, self.world_size))
 		my_texts = [all_texts[i] for i in my_indices]
@@ -1321,6 +1331,8 @@ class BatchGenWorker:
 		else:
 			my_tokenized = []
 
+		_t_encode = time.perf_counter()
+
 		# Phase 1.5: Gather across ranks
 		all_tokenized_lists = [None] * self.world_size
 		dist.all_gather_object(all_tokenized_lists, my_tokenized)
@@ -1331,6 +1343,7 @@ class BatchGenWorker:
 				for item in rank_results:
 					tokenized_by_idx[item["idx"]] = item
 		del all_tokenized_lists
+		_t_gather = time.perf_counter()
 
 		# Phase 2.5: Reject sequences exceeding context length
 		rejected_uuids = []
@@ -1396,6 +1409,19 @@ class BatchGenWorker:
 			seq.original_prompt_length = actual_prompt_len
 			seq.current_context_length = actual_prompt_len
 			seq.kv_token_budget = seq_extended_size
+
+		# [ADMIT_TIMING] breakdown (rank 0): which phase dominates for long-context admission.
+		if self.rank == 0:
+			_t_fill = time.perf_counter()
+			_my_tok = sum(len(item.get("input_ids", ())) for item in tokenized_by_idx.values()
+			              if item is not None)
+			logging.info(
+				f"[ADMIT_TIMING] {num_new} seqs ({_my_tok} tok): "
+				f"encode(rank-shard)={_t_encode - _t_admit0:.2f}s "
+				f"all_gather_object={_t_gather - _t_encode:.2f}s "
+				f"buffer_fill={_t_fill - _t_gather:.2f}s "
+				f"total={_t_fill - _t_admit0:.2f}s"
+			)
 
 	def _assign_admitted_sequences_to_ranks(self, uuids: List[str]) -> None:
 		"""Assign newly admitted sequences to ranks.
