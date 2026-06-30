@@ -215,6 +215,59 @@ class TikTokenTokenizer(PreTrainedTokenizer):
 
         return t
 
+    def encode_batch(self,
+                     texts: List[str],
+                     allow_special_tokens: bool = True) -> List[List[int]]:
+        """Batch-encode many texts in parallel — bit-identical to per-text ``encode``.
+
+        ``encode`` runs the per-substring ``self.model.encode`` calls in a SERIAL Python
+        loop (one CPU core). For long prompts (e.g. 64k tokens) this is the admission
+        bottleneck. Here we apply the SAME pre-split to every text, then issue ONE
+        ``self.model.encode_batch`` call over all substrings — tiktoken fans these out
+        across CPU cores via its internal thread pool with the GIL released, so the Rust
+        BPE encode (the expensive part) runs truly in parallel. ``encode_batch([s,...])``
+        equals ``[encode(s),...]`` per tiktoken, and we concatenate per text exactly as the
+        serial path does, so the token ids are identical.
+        """
+        TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+        MAX_NO_WHITESPACES_CHARS = 25_000
+
+        # 1) Same pre-split as encode(); record each text's [start, end) span of substrings.
+        flat_substrs: List[str] = []
+        group_bounds: List[Tuple[int, int]] = []
+        for text in texts:
+            assert type(text) is str
+            start = len(flat_substrs)
+            for piece in self.pre_tokenizer_process(text):
+                for i in range(0, len(piece), TIKTOKEN_MAX_ENCODE_CHARS):
+                    flat_substrs.extend(
+                        self._split_whitespaces_or_nonwhitespaces(
+                            piece[i:i + TIKTOKEN_MAX_ENCODE_CHARS],
+                            MAX_NO_WHITESPACES_CHARS))
+            group_bounds.append((start, len(flat_substrs)))
+
+        # 2) One parallel Rust batch encode of ALL substrings across ALL texts.
+        # num_threads targets full-node utilisation without oversubscribing the co-located
+        # ranks (each GPU rank is a separate process that also tokenizes); cores / ranks-per-node.
+        if flat_substrs:
+            n_threads = max(1, (os.cpu_count() or 8) //
+                            int(os.environ.get("BATCHGEN_TOKENIZE_RANKS_PER_NODE", "8")))
+            special_kw = ({"allowed_special": "all"} if allow_special_tokens
+                          else {"disallowed_special": ()})
+            encoded_substrs = self.model.encode_batch(
+                flat_substrs, num_threads=n_threads, **special_kw)
+        else:
+            encoded_substrs = []
+
+        # 3) Concatenate each text's substrings back — identical to encode()'s t.extend loop.
+        out: List[List[int]] = []
+        for start, end in group_bounds:
+            ids: List[int] = []
+            for j in range(start, end):
+                ids.extend(encoded_substrs[j])
+            out.append(ids)
+        return out
+
     def decode(self, token_ids: Union[int, List[int]], **kwargs) -> str:
         """
         Decodes a list of token IDs into a string.

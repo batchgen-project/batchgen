@@ -188,8 +188,11 @@ class KimiK25Tokenizer(BaseTokenizer):
         if isinstance(texts, str):
             texts = [texts]
 
-        # Encode all texts
-        encoded = [self.encode(text) for text in texts]
+        # Encode all texts in ONE parallel tiktoken batch (all CPU cores, GIL released),
+        # bit-identical to [self.encode(t) for t in texts]. The serial per-text loop was the
+        # admission bottleneck for long (e.g. 64k) prompts. add_special_tokens defaults True
+        # in self.encode, i.e. allow_special_tokens=True — match that here.
+        encoded = self._tokenizer.encode_batch(texts, allow_special_tokens=True)
 
         # Pad if requested
         if padding:
