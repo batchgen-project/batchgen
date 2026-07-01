@@ -5846,9 +5846,12 @@ class BatchGenWorker:
 					self.decoding_continuous(new_tokens, decode_uuids, local_decode_indices)
 				decoding_time += time.perf_counter() - decode_start
 
-				# D. Cleanup
-				self._unregister_fp8_weights()
-				self.deep_free_model_memory()
+				# D. Barrier only — the decode model + cuda-graph stay RESIDENT across
+				# decode-group boundaries. Teardown happens ONLY on a genuine flip to
+				# prefill (in the needs_prefill branch below), so a batch that exceeds
+				# GPU-KV and decodes in successive waves (e.g. 100×64k → ~50-seq waves)
+				# does NOT pay a redundant deep_free + configure_decoding (~100s) between
+				# waves. _load_decode_model skips reload while the model is resident.
 				dist.barrier()
 
 				# Poll for new admissions after each decode interval.
@@ -5869,6 +5872,11 @@ class BatchGenWorker:
 				)
 				needs_prefill = has_pending and self._check_host_kv_watermark_trigger()
 				if needs_prefill:
+					# Genuine flip to prefill: free the decode model + cuda-graph so prefill
+					# has the HBM for its own model + O(L^2) attention activations. fp8
+					# unregister FIRST (it iterates model.layers), then deep_free.
+					self._unregister_fp8_weights()
+					self.deep_free_model_memory()
 					if self.rank == 0:
 						num_queued = len(self.global_batch.get_sequences_by_status(SequenceStatus.QUEUEING))
 						num_evicted = len(self.global_batch.get_sequences_by_status(SequenceStatus.EVICTED)) if self.enable_host_kv_eviction else 0
@@ -6311,6 +6319,14 @@ class BatchGenWorker:
 			max_num_seq: Maximum number of sequences per rank for buffer allocation.
 			comm: NCCL communicator for distributed MoE forward.
 		"""
+		# Fast path: on a decode→decode wave boundary the model + cuda-graph are still
+		# resident (no flip to prefill happened, so the D-barrier block left them intact).
+		# Skip the teardown + full configure_decoding (~100s) and keep decoding.
+		if self.model is not None and self._cuda_graph_manager is not None:
+			if self.rank == 0:
+				logging.info("[DECODE] Model + cuda-graph resident — skipping reload/reconfigure")
+			self.set_phase("decode")
+			return
 		self.deep_free_model_memory()
 		self.init_nvshmem()
 
