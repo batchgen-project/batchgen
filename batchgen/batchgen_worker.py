@@ -1397,7 +1397,12 @@ class BatchGenWorker:
 			slot = self._buffer_pool.allocate_slot()
 			try:
 				input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-				input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+				# torch.tensor(<python list>) boxes each int one-by-one — ~53ms for a 64k
+				# prompt, the #1 admission cost ([ADMIT_TIMING] buffer_fill). np.asarray does
+				# one bulk C conversion; from_numpy shares its buffer (no copy), then the view
+				# assignment is a single memcpy into the preallocated row. ~10x faster.
+				input_ids_view[0, :actual_prompt_len] = torch.from_numpy(
+					np.asarray(input_ids_list, dtype=np.int64))
 				seq.input_ids = input_ids_view
 				seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 			except Exception:
