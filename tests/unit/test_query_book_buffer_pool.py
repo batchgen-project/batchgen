@@ -544,5 +544,44 @@ class TestHostMemoryFootprint:
             f"saving {saved_per_node/2**30:.0f} GiB/node (one buffer) is below the 120 GB/node floor")
 
 
+class TestBufferFillNumpyEquivalence:
+    """The admission buffer_fill copies the tokenized prompt into a preallocated pool row.
+    torch.tensor(<python list>) boxes each int one-by-one (~53ms per 64k prompt — the #1
+    admission cost); torch.from_numpy(np.asarray(list, int64)) is one bulk C convert + memcpy.
+    These pin that the numpy path is bit-identical (same dtype, same values, no write past the
+    prompt, slot-reuse clears) and strictly faster.
+    """
+
+    def test_numpy_path_bit_identical(self):
+        import numpy as np
+        N = 64000
+        ids = list(range(N))                                  # tokenizer-style python int list
+        old = torch.tensor(ids, dtype=torch.long)             # legacy path
+        new = torch.from_numpy(np.asarray(ids, dtype=np.int64))  # fix path
+        assert old.dtype == new.dtype == torch.long           # np.int64 == torch.long, no cast
+        assert torch.equal(old, new)                          # bit-identical
+
+    def test_fill_into_pool_row_no_overrun(self):
+        import numpy as np
+        N = 4096
+        ids = list(range(1, N + 1))                           # nonzero so overrun is visible
+        pool = QueryBookBufferPool(num_sequences=4, model_context_length=8192,
+                                   max_decoding_length=128)
+        slot = pool.allocate_slot()
+        view = pool.get_input_ids_view(slot, N + 100)         # seq_extended_size
+        view[0, :N] = torch.from_numpy(np.asarray(ids, dtype=np.int64))
+        assert view[0, :N].tolist() == ids                    # prompt copied exactly
+        assert int(torch.count_nonzero(view[0, N:])) == 0     # nothing written past the prompt
+
+    def test_numpy_path_faster(self):
+        import time
+        import numpy as np
+        ids = list(range(64000))
+        t0 = time.perf_counter(); torch.tensor(ids, dtype=torch.long); t_torch = time.perf_counter() - t0
+        t0 = time.perf_counter(); torch.from_numpy(np.asarray(ids, dtype=np.int64)); t_np = time.perf_counter() - t0
+        print(f"\n  torch.tensor={t_torch*1e3:.2f}ms  from_numpy={t_np*1e3:.2f}ms  speedup={t_torch/max(t_np,1e-9):.1f}x")
+        assert t_np < t_torch                                 # strictly faster (typically ~10x)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

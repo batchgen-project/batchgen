@@ -4455,7 +4455,11 @@ class BatchGenWorker:
 			seq._buffer_slot = slot
 
 			input_ids_view = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
-			input_ids_view[0, :actual_prompt_len] = torch.tensor(input_ids_list, dtype=torch.long)
+			# Bulk numpy conversion (see the admission-path sibling): torch.tensor(<python
+			# list>) boxes each int one-by-one; from_numpy(np.asarray) is a single C convert
+			# + memcpy into the same preallocated row. Cold-start path (init), same dtype.
+			input_ids_view[0, :actual_prompt_len] = torch.from_numpy(
+				np.asarray(input_ids_list, dtype=np.int64))
 			seq.input_ids = input_ids_view
 			seq.decoded_tokens = self._buffer_pool.get_decoded_tokens_view(slot)
 
