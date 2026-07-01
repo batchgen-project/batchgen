@@ -7003,16 +7003,10 @@ class BatchGenWorker:
 
 		output_tokens = []
 		num_micro_batches = len(micro_batches)
-		# Per-micro-batch timing via CUDA events (rank 0), logged AFTER the loop so there is
-		# no per-step torch.cuda.synchronize (which drained the device every micro-batch and
-		# blocked CPU run-ahead).
-		_mb_events = []
 
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
-				if self.rank == 0:
-					_mb_ev_start = torch.cuda.Event(enable_timing=True)
-					_mb_ev_start.record()
+				_mb_t0 = time.perf_counter()
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
 
@@ -7127,26 +7121,19 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
-				# Record this micro-batch's stop event; the log is deferred to after the loop
-				# so there is NO per-micro-batch device sync (that drained the GPU every step).
+				# Structured per-micro-batch timing, logged LIVE. GPU work is async, so sync
+				# before timing for the true wall-time of this micro-batch. A 64k prefill wave
+				# has only a few huge micro-batches, so the per-step sync is negligible and the
+				# live progress is worth it.
 				if self.rank == 0:
-					_mb_ev_stop = torch.cuda.Event(enable_timing=True)
-					_mb_ev_stop.record()
-					_mb_events.append(
-						(batch_idx, _mb_ev_start, _mb_ev_stop, sum(batch_seq_lengths), batch_num_seqs)
+					torch.cuda.synchronize(self.torch_device)
+					_mb_dt = time.perf_counter() - _mb_t0
+					_mb_tokens = sum(batch_seq_lengths)
+					logging.info(
+						f"[PREFILL] micro-batch {batch_idx + 1}/{num_micro_batches}: "
+						f"{batch_num_seqs} seqs, {_mb_tokens:,} tokens, {_mb_dt:.2f}s "
+						f"({_mb_tokens / _mb_dt:,.0f} tok/s)"
 					)
-
-		# Emit per-micro-batch timing now — one device sync resolves all CUDA events, instead
-		# of a blocking synchronize per micro-batch.
-		if self.rank == 0 and _mb_events:
-			torch.cuda.synchronize(self.torch_device)
-			for _bi, _s, _e, _tok, _ns in _mb_events:
-				_dt = _s.elapsed_time(_e) / 1000.0
-				logging.info(
-					f"[PREFILL] micro-batch {_bi + 1}/{num_micro_batches}: "
-					f"{_ns} seqs, {_tok:,} tokens, {_dt:.2f}s "
-					f"({_tok / _dt if _dt > 0 else 0:,.0f} tok/s)"
-				)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
