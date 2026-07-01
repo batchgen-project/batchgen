@@ -6987,6 +6987,13 @@ class BatchGenWorker:
 		)
 		total_tokens_all = sum(seq_lengths_list)
 
+		# Prefix sum of sequence lengths (built ONCE) so each micro-batch's flat-token range
+		# is O(1). The per-sequence `sum(seq_lengths_list[:idx])` below was O(N^2) across the
+		# loop, holding the GIL and delaying kernel dispatch.
+		seq_token_prefix = [0] * (len(seq_lengths_list) + 1)
+		for _i, _l in enumerate(seq_lengths_list):
+			seq_token_prefix[_i + 1] = seq_token_prefix[_i] + _l
+
 		if self.rank == 0:
 			logging.info(
 				f"Prepacked prefill: {len(micro_batches)} micro batches, "
@@ -6996,10 +7003,16 @@ class BatchGenWorker:
 
 		output_tokens = []
 		num_micro_batches = len(micro_batches)
+		# Per-micro-batch timing via CUDA events (rank 0), logged AFTER the loop so there is
+		# no per-step torch.cuda.synchronize (which drained the device every micro-batch and
+		# blocked CPU run-ahead).
+		_mb_events = []
 
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
-				_mb_t0 = time.perf_counter()
+				if self.rank == 0:
+					_mb_ev_start = torch.cuda.Event(enable_timing=True)
+					_mb_ev_start.record()
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
 
@@ -7007,22 +7020,13 @@ class BatchGenWorker:
 				batch_seq_lengths = seq_lengths_list[seq_start:seq_end]
 				batch_num_seqs = seq_end - seq_start
 
-				# Extract tokens for this micro-batch
-				batch_input_ids = []
-				batch_position_ids = []
-				token_offset = sum(seq_lengths_list[:seq_start])  # Offset into flat tensors
-
-				for seq_idx in range(seq_start, seq_end):
-					seq_len = seq_lengths_list[seq_idx]
-					# Calculate where this sequence's tokens are in the flat tensor
-					seq_token_start = sum(seq_lengths_list[:seq_idx])
-					seq_token_end = seq_token_start + seq_len
-
-					batch_input_ids.append(packed_input_ids_flat[seq_token_start:seq_token_end])
-					batch_position_ids.append(packed_position_ids_flat[seq_token_start:seq_token_end])
-
-				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
-				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
+				# A micro-batch is a CONTIGUOUS token range of the packed flat tensors
+				# (sequences are packed in order), so slice once — no per-seq sum()
+				# (O(N^2)) and no torch.cat.
+				tok_start = seq_token_prefix[seq_start]
+				tok_end = seq_token_prefix[seq_end]
+				batch_input_ids_flat = packed_input_ids_flat[tok_start:tok_end]
+				batch_position_ids_flat = packed_position_ids_flat[tok_start:tok_end]
 
 				batch_local_indices = batch[seq_start:seq_end]
 				local_to_global_seq_id_map = {}
@@ -7123,18 +7127,26 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
-				# Structured per-micro-batch timing (replaces the tqdm bar, which did not
-				# match the [BatchGenWorker-N] logging style). GPU work is async, so sync
-				# before timing to get the true wall-time of this micro-batch's prefill.
+				# Record this micro-batch's stop event; the log is deferred to after the loop
+				# so there is NO per-micro-batch device sync (that drained the GPU every step).
 				if self.rank == 0:
-					torch.cuda.synchronize(self.torch_device)
-					_mb_dt = time.perf_counter() - _mb_t0
-					_mb_tokens = sum(batch_seq_lengths)
-					logging.info(
-						f"[PREFILL] micro-batch {batch_idx + 1}/{num_micro_batches}: "
-						f"{batch_num_seqs} seqs, {_mb_tokens:,} tokens, {_mb_dt:.2f}s "
-						f"({_mb_tokens / _mb_dt:,.0f} tok/s)"
+					_mb_ev_stop = torch.cuda.Event(enable_timing=True)
+					_mb_ev_stop.record()
+					_mb_events.append(
+						(batch_idx, _mb_ev_start, _mb_ev_stop, sum(batch_seq_lengths), batch_num_seqs)
 					)
+
+		# Emit per-micro-batch timing now — one device sync resolves all CUDA events, instead
+		# of a blocking synchronize per micro-batch.
+		if self.rank == 0 and _mb_events:
+			torch.cuda.synchronize(self.torch_device)
+			for _bi, _s, _e, _tok, _ns in _mb_events:
+				_dt = _s.elapsed_time(_e) / 1000.0
+				logging.info(
+					f"[PREFILL] micro-batch {_bi + 1}/{num_micro_batches}: "
+					f"{_ns} seqs, {_tok:,} tokens, {_dt:.2f}s "
+					f"({_tok / _dt if _dt > 0 else 0:,.0f} tok/s)"
+				)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False

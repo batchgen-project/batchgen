@@ -1372,12 +1372,19 @@ class KimiK25MoE(nn.Module):
 
         results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
 
+        # Per-expert token counts computed ONCE (a single D2H) so the loop skips empty experts
+        # from a CPU list — instead of a per-expert `mask.any()` GPU->CPU sync (was 384 syncs
+        # per layer × 60 layers = ~23k per prefill forward, serializing the whole loop).
+        expert_counts_cpu = torch.bincount(
+            flat_expert_idx, minlength=len(self.experts)
+        ).tolist()
+
         for expert_idx, expert in enumerate(self.experts):
             if expert is None:
                 continue
-            mask = flat_expert_idx == expert_idx
-            if not mask.any():
+            if expert_counts_cpu[expert_idx] == 0:
                 continue
+            mask = flat_expert_idx == expert_idx
             expert_token_idx = token_indices[mask]
             expert_topk_pos = topk_positions[mask]
             tokens_for_expert = hidden_states[expert_token_idx]
