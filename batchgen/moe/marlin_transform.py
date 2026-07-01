@@ -43,6 +43,50 @@ def _get_inverse_scale_perm() -> list:
     return inv_scale_perm
 
 
+# The Marlin↔raw permutations are FIXED constants (num_bits=4, gs=32). Recomputing them
+# on CPU and H2D-copying every transform call is ~77% of the per-call cost (measured: the
+# fused kernel is ~58us/proj but the full wrapper is ~248us/proj — the gap is these small
+# perm tensors being rebuilt + copied per call, under the serialized per-expert loop). Cache
+# them once per device.
+_WEIGHT_PERM_CACHE = {}      # device -> forward weight perm (int32)
+_INV_WEIGHT_PERM_CACHE = {}  # device -> inverse weight perm (int32)
+_SCALE_PERM_CACHE = {}       # device -> forward scale perm (long)
+_INV_SCALE_PERM_CACHE = {}   # device -> inverse scale perm (long)
+
+
+def _cached_weight_perm(device) -> torch.Tensor:
+    t = _WEIGHT_PERM_CACHE.get(device)
+    if t is None:
+        t = get_weight_perm(4).to(device=device, dtype=torch.int32)
+        _WEIGHT_PERM_CACHE[device] = t
+    return t
+
+
+def _cached_inv_weight_perm(device) -> torch.Tensor:
+    t = _INV_WEIGHT_PERM_CACHE.get(device)
+    if t is None:
+        t = _get_inverse_weight_perm(4).to(device=device, dtype=torch.int32)
+        _INV_WEIGHT_PERM_CACHE[device] = t
+    return t
+
+
+def _cached_scale_perm(device) -> torch.Tensor:
+    t = _SCALE_PERM_CACHE.get(device)
+    if t is None:
+        scale_perm, _ = _get_scale_perms()
+        t = torch.tensor(scale_perm, device=device, dtype=torch.long)
+        _SCALE_PERM_CACHE[device] = t
+    return t
+
+
+def _cached_inv_scale_perm(device) -> torch.Tensor:
+    t = _INV_SCALE_PERM_CACHE.get(device)
+    if t is None:
+        t = torch.tensor(_get_inverse_scale_perm(), device=device, dtype=torch.long)
+        _INV_SCALE_PERM_CACHE[device] = t
+    return t
+
+
 def marlin_to_wgmma_cpu(
     marlin_qw: torch.Tensor,
     marlin_s: torch.Tensor,
@@ -123,18 +167,18 @@ def raw_to_marlin_fused_gpu(
     mod = _load_transform_module()
 
     # Weight transform: raw → Marlin
-    # perm maps marlin_pos → raw_pos (forward perm from _marlin_permute_weights)
-    perm = get_weight_perm(4).to(device=device, dtype=torch.int32)
+    # perm maps marlin_pos → raw_pos (forward perm from _marlin_permute_weights).
+    # Cached per device: fixed constant, no per-call CPU rebuild + H2D.
+    perm = _cached_weight_perm(device)
     marlin_qw = torch.empty(K // 16, N * 2, dtype=torch.int32, device=device)
     mod.raw_to_marlin_transform(raw_packed, marlin_qw, perm, K, N)
 
     # Scale transform: raw [N, K//32] → Marlin permuted [K//32, N]
     # Work in native dtype (no fp16 cast — bf16 values may overflow fp16 range)
-    scale_perm, _ = _get_scale_perms()
-    scale_perm_t = torch.tensor(scale_perm, device=device, dtype=torch.long)
+    scale_perm_t = _cached_scale_perm(device)
     K_groups = K // INT4_GROUP_SIZE
     s_transposed = raw_scales.t().contiguous()  # [K//32, N]
-    marlin_s = s_transposed.reshape(-1, len(scale_perm))[:, scale_perm_t]
+    marlin_s = s_transposed.reshape(-1, scale_perm_t.numel())[:, scale_perm_t]
     marlin_s = marlin_s.reshape(-1, N).contiguous()
 
     return marlin_qw, marlin_s
@@ -154,15 +198,15 @@ def marlin_to_wgmma_fused_gpu(
     device = marlin_qw.device
     mod = _load_transform_module()
 
-    # Weight transform — need INVERSE perm (maps raw position → marlin position)
-    inv_perm = _get_inverse_weight_perm(4).to(device=device, dtype=torch.int32)
+    # Weight transform — need INVERSE perm (maps raw position → marlin position).
+    # Cached per device: the perm is a fixed constant, so no per-call CPU rebuild + H2D.
+    inv_perm = _cached_inv_weight_perm(device)
     raw_packed = torch.empty(N, K // 8, dtype=torch.int32, device=device)
     mod.marlin_to_wgmma_transform(marlin_qw, raw_packed, inv_perm, K, N)
 
     # Scale transform: inverse permute + transpose. Work in native dtype (no fp16 cast).
-    inv_scale_perm = _get_inverse_scale_perm()
-    inv_scale_perm_t = torch.tensor(inv_scale_perm, device=device, dtype=torch.long)
-    s_inv = marlin_s.reshape(-1, len(inv_scale_perm))
+    inv_scale_perm_t = _cached_inv_scale_perm(device)
+    s_inv = marlin_s.reshape(-1, inv_scale_perm_t.numel())
     s_inv = s_inv[:, inv_scale_perm_t]
     raw_scales = s_inv.reshape(-1, N).t().contiguous()
 
