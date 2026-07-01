@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from flash_attn_interface import flash_attn_varlen_func 
 from .padding import _upad_input, pad_input
 from .rotary_embedding import mla_rotary_pos_emb, rotary_pos_emb, apply_rotary_pos_emb
+from .fused_rmsnorm_rope import fused_rmsnorm_rope_with_q
 import deep_gemm
 # from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
@@ -1067,23 +1068,32 @@ def mla_prefill_flashattention3_prepacked(
 		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
 	)
 
-	# Project KV
-	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-	compressed_kv, k_pe = torch.split(
-		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-	)
-	normed_kv = self.kv_a_layernorm(compressed_kv)
-	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
-
-	# Apply rotary embeddings
+	# Project KV (raw). The fused Triton kernel does kv_a_layernorm + RoPE(k_pe) + RoPE(q_pe) in
+	# ONE launch — exactly what the decode path uses (flashmla_backend fused_rmsnorm_rope_with_q) —
+	# replacing the separate kv_a_layernorm + two eager rotary_pos_emb + offload cat (each of which
+	# gathered cos/sin, did a transpose/reshape copy and BF16<->FP32 casts, x61 layers). The kernel's
+	# rope math is IDENTICAL to rotary_pos_emb (interleaved read, split-half store) and it RMSNorms
+	# the kv-lora slice with the same weight, so numerics and the k_pe KV-cache layout are unchanged.
+	# It treats packed prefill as bsz=total_tokens, q_len=1 (per-token norm+rope) and ropes q_pe
+	# IN-PLACE; offload_kv = [normed_kv | roped_k_pe].
+	compressed_kv = self.kv_a_proj_with_mqa(hidden_states).view(
+		total_tokens, 1, self.kv_lora_rank + self.qk_rope_head_dim)
 	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	# For prepacked, position_ids is 1D [total_tokens]
-	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-
-	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
-	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
-	del compressed_kv, k_pe_flat
+	q_pe = q_pe.contiguous().view(total_tokens, self.num_heads, 1, self.qk_rope_head_dim)
+	offload_kv = fused_rmsnorm_rope_with_q(
+		compressed_kv,
+		q_pe,
+		cos,
+		sin,
+		position_ids.view(total_tokens, 1),
+		self.kv_a_layernorm.weight,
+		self.kv_lora_rank,
+		self.qk_rope_head_dim,
+	).view(total_tokens, self.kv_lora_rank + self.qk_rope_head_dim)
+	normed_kv = offload_kv[:, :self.kv_lora_rank]
+	k_pe = offload_kv[:, self.kv_lora_rank:].view(total_tokens, 1, self.qk_rope_head_dim)
+	q_pe = q_pe.view(total_tokens, self.num_heads, self.qk_rope_head_dim)
+	del compressed_kv
 
 	# Expand KV
 	kv = self.kv_b_proj(normed_kv)

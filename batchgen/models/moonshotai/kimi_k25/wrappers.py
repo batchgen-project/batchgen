@@ -444,12 +444,15 @@ class KimiK25AttnWrapper(AttnWrapperBase):
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
         cu_seqlens = self.prepack_cu_seqlens
+        # One D2H copy of the whole boundary vector, instead of 2*num_sequences .item()
+        # GPU->CPU syncs per layer (this offload runs once per attention layer).
+        cu_seqlens_list = cu_seqlens.tolist()
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
 
         for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
+            start_idx = cu_seqlens_list[seq_idx]
+            end_idx = cu_seqlens_list[seq_idx + 1]
             seq_len = end_idx - start_idx
 
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
