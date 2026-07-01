@@ -13,7 +13,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Set
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
 
@@ -63,7 +62,6 @@ def _check_repeating_pattern(token_ids: torch.Tensor, decoded_length: int,
 		if is_repeat:
 			return True
 	return False
-from tqdm import trange
 import gc
 import numpy as np
 from datetime import timedelta
@@ -6788,8 +6786,9 @@ class BatchGenWorker:
 
 		cur_batch_start = 0
 		output_tokens = []
-		
-		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
+
+		# Plain loop (was a tqdm bar that did not match the [BatchGenWorker-N] log style).
+		for micro_batch_idx in range(num_prefill_micro_batches):
 			# Feed watchdog during long prefill operations
 			self.feed_watchdog()
 
@@ -6980,14 +6979,11 @@ class BatchGenWorker:
 			)
 
 		output_tokens = []
+		num_micro_batches = len(micro_batches)
 
 		with torch.inference_mode():
-			for batch_idx, (seq_start, seq_end) in tqdm(
-				enumerate(micro_batches),
-				total=len(micro_batches),
-				desc="Prepacked Prefill",
-				disable=(self.rank != 0)  # Only show progress on rank 0
-			):
+			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
+				_mb_t0 = time.perf_counter()
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
 
@@ -7110,6 +7106,19 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
+
+				# Structured per-micro-batch timing (replaces the tqdm bar, which did not
+				# match the [BatchGenWorker-N] logging style). GPU work is async, so sync
+				# before timing to get the true wall-time of this micro-batch's prefill.
+				if self.rank == 0:
+					torch.cuda.synchronize(self.torch_device)
+					_mb_dt = time.perf_counter() - _mb_t0
+					_mb_tokens = sum(batch_seq_lengths)
+					logging.info(
+						f"[PREFILL] micro-batch {batch_idx + 1}/{num_micro_batches}: "
+						f"{batch_num_seqs} seqs, {_mb_tokens:,} tokens, {_mb_dt:.2f}s "
+						f"({_mb_tokens / _mb_dt:,.0f} tok/s)"
+					)
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
