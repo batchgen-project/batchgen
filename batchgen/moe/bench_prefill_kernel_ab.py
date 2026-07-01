@@ -28,6 +28,13 @@ E = 128           # experts in the bench (grid occupancy; per-expert tput is E-i
 GROUP_SIZE = 32
 M_VALUES = [256, 512, 1024, 1365, 2048]   # tokens per expert; 1365 = 64k operating point
 ITERS = 30
+# SGL fused_marlin_moe (moe_wna16_marlin) needs SGLang's own gptq_marlin_repack layout;
+# BatchGen's get_weight_perm repack passes all shape/dtype asserts but the kernel still
+# reads OOB at full N=2048 (soft: wrong values / async illegal access). The "which marlin"
+# answer is unaffected (SGL-marlin is the same m16n8k16 class as BG-marlin, decode-validated,
+# predicted <= BG-marlin for large M < WGMMA). Left off; flip to build the SGL arm on
+# SGLang's repack later.
+RUN_SGL = False
 
 
 def _dequant(packed_i32, scales, rows, cols):
@@ -218,7 +225,7 @@ def main():
 
         # ---- SGL fused_marlin_moe ----
         sg_us = sg_diff = float('nan')
-        if have_sgl:
+        if have_sgl and RUN_SGL:
             try:
                 topk_ids = (torch.arange(M, device=dev) // Me).view(M, 1).to(torch.int32)
                 topk_w = torch.ones(M, 1, dtype=torch.bfloat16, device=dev)
@@ -245,7 +252,6 @@ def main():
               f"{bm_us:6.0f} {tf(bm_us):6.1f} {bm_diff:6.4f} | "
               f"{sg_us:6.0f} {tf(sg_us):6.1f} {sg_diff:6.4f} | {best:>10}")
         del A, ref
-        torch.cuda.empty_cache()
 
     print("\nTFLOP/s = 2·E·M_e·(2·H·N + N·H) / t   (E={E}); 64k-prefill op point ~1365 tok/expert."
           .format(E=E))
