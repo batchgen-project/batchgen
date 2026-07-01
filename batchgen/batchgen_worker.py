@@ -1443,15 +1443,29 @@ class BatchGenWorker:
 		use_l2 = _os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
 
 		if use_l2:
-			# Per-rank load = sum of (prompt_length ** 2) over already-assigned seqs.
-			rank_load = [0.0] * self.world_size
+			# Multi-term per-seq prefill cost (was pure L^2). Kimi prefill is embarrassingly-
+			# parallel DP — no cross-rank collective in the forward, only a trailing barrier —
+			# so prefill wall = max_rank(T_rank) and ANY cost-model error shows up 1:1 as
+			# barrier idle. Sum(L^2) alone models ONLY block-diagonal varlen attention; it is
+			# blind to the LINEAR MoE/token term (Kimi prefill MoE is a local per-expert loop,
+			# O(tokens)) and the per-seq fixed cost. Two ranks with equal Sum(L^2) but different
+			# Sum(L)/num_seqs then finish at different times (a rank of many short seqs vs few
+			# long ones). cost(L) = L^2 + BETA*L + GAMMA; BETA/GAMMA are fit from a profiling run
+			# (regress per-rank prefill time on Sum(L^2), Sum(L), num_seqs). BETA=GAMMA=0 recovers
+			# the legacy pure-L^2 behavior.
+			BETA = float(_os.environ.get("BATCHGEN_L2_BETA", "16000"))
+			GAMMA = float(_os.environ.get("BATCHGEN_L2_GAMMA", "1e8"))
+			def _seq_cost(L):
+				L = float(L)
+				return L * L + BETA * L + GAMMA
+
+			rank_cost = [0.0] * self.world_size
 			for seq in self.global_batch:
 				if seq.uuid in uuids or seq.assigned_rank is None:
 					continue
-				L = getattr(seq, "prompt_length", 0) or 0
-				rank_load[seq.assigned_rank] += float(L) * float(L)
+				rank_cost[seq.assigned_rank] += _seq_cost(getattr(seq, "prompt_length", 0) or 0)
 
-			# Resolve uuids → seqs and sort by length DESC (FFD).
+			# Resolve uuids → seqs and sort by length DESC (LPT / FFD: costliest first).
 			pending = []
 			for uuid in uuids:
 				seq = self.global_batch.get_sequence(uuid)
@@ -1461,17 +1475,30 @@ class BatchGenWorker:
 				pending.append((L, uuid))
 			pending.sort(key=lambda t: -t[0])
 
-			for L, uuid in pending:
-				min_rank = min(range(self.world_size), key=lambda r: rank_load[r])
-				self.global_batch.assign_rank(uuid, min_rank)
-				rank_load[min_rank] += float(L) * float(L)
+			npn = NUM_GPUS_PER_NODE if NUM_GPUS_PER_NODE > 0 else self.world_size
+			def _node_load(node_idx):
+				b = node_idx * npn
+				return sum(rank_cost[b:b + npn])
 
-			if self.rank == 0 and rank_load:
-				lo = min(rank_load); hi = max(rank_load)
+			for L, uuid in pending:
+				# min projected makespan; ties -> rank whose NODE is lighter, then lowest rank.
+				# The node-aware tie-break spreads the FFD remainder ACROSS nodes instead of
+				# piling it on the low-index ranks (all node0) — the legacy lowest-index tie
+				# gave node0 the surplus every wave.
+				min_rank = min(
+					range(self.world_size),
+					key=lambda r: (rank_cost[r], _node_load(r // npn), r),
+				)
+				self.global_batch.assign_rank(uuid, min_rank)
+				rank_cost[min_rank] += _seq_cost(L)
+
+			if self.rank == 0 and rank_cost:
+				lo = min(rank_cost); hi = max(rank_cost)
 				ratio = (hi / lo) if lo > 0 else float("inf")
+				n_loads = [_node_load(nd) for nd in range(max(1, self.world_size // npn))]
 				logging.info(
-					f"[L2_BALANCE] per-rank sum(L^2): min={lo:.3e} max={hi:.3e} "
-					f"ratio={ratio:.2f} ranks={[f'{x:.2e}' for x in rank_load]}"
+					f"[LB_BALANCE] per-rank true-cost: min={lo:.3e} max={hi:.3e} "
+					f"ratio={ratio:.2f} per-node={[f'{x:.2e}' for x in n_loads]}"
 				)
 			return
 
