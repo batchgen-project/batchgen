@@ -21,13 +21,12 @@ import torch
 
 from batchgen.moe.bench_marlin_vs_wgmma import create_k25_int4_weights_raw
 from batchgen.moe.marlin_weight_prep import repack_int4_to_marlin_gs32
-from batchgen.moe.marlin_transform import raw_to_marlin_fused_gpu
 
 H = 7168          # hidden
 N = 2048          # expert intermediate
 E = 128           # experts in the bench (grid occupancy; per-expert tput is E-independent)
 GROUP_SIZE = 32
-M_VALUES = [256, 512, 1024, 2048, 4096]   # tokens per expert; ~1365 = 64k operating point
+M_VALUES = [256, 512, 1024, 1365, 2048]   # tokens per expert; 1365 = 64k operating point
 ITERS = 30
 
 
@@ -114,14 +113,14 @@ def main():
         up_w.append(_dequant(upi32, us, N, H))     # [N, H]
         down_w.append(_dequant(dpi32, ds, H, N))   # [H, N]
 
-        # SGL slabs (no TP slice; inter_pr = N): concat(marlin(gate), marlin(up)).
-        gmw2, gms2 = raw_to_marlin_fused_gpu(gpi32, gs, H, N)
-        umw2, ums2 = raw_to_marlin_fused_gpu(upi32, us, H, N)
-        dmw2, dms2 = raw_to_marlin_fused_gpu(dpi32, ds, N, H)
-        w13[e] = torch.cat([gmw2, umw2], dim=1)
-        w13s[e] = torch.cat([gms2, ums2], dim=1)
-        w2[e] = dmw2
-        w2s[e] = dms2
+        # SGL slabs from the SAME standard-marlin repack (Python nibble order, consistent
+        # with the synthetic raw; the C++ raw->marlin assumes the C++ raw byte layout and
+        # mismatches here). fused_marlin_moe wants w1 [E, K//16, 2N] — repack gives [K, N//8]
+        # = identical bytes reshaped.
+        w13[e] = torch.cat([gmw.reshape(H // 16, 2 * N), umw.reshape(H // 16, 2 * N)], dim=1)
+        w13s[e] = torch.cat([gms, ums], dim=1)
+        w2[e] = dmw.reshape(N // 16, 2 * H)
+        w2s[e] = dms
     print("done\n")
 
     # Pointer arrays (WGMMA + marlin) — built once, weights are static.
@@ -245,6 +244,8 @@ def main():
         print(f"{Me:6d} | {wg_us:6.0f} {tf(wg_us):6.1f} {wg_diff:6.4f} | "
               f"{bm_us:6.0f} {tf(bm_us):6.1f} {bm_diff:6.4f} | "
               f"{sg_us:6.0f} {tf(sg_us):6.1f} {sg_diff:6.4f} | {best:>10}")
+        del A, ref
+        torch.cuda.empty_cache()
 
     print("\nTFLOP/s = 2·E·M_e·(2·H·N + N·H) / t   (E={E}); 64k-prefill op point ~1365 tok/expert."
           .format(E=E))
