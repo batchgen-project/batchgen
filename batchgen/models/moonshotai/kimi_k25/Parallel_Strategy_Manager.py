@@ -1030,7 +1030,6 @@ class KimiK25ParallelStrategyManager:
         # Lazy import: keeps the default EP path's import surface unchanged (the
         # marlin transform pulls the compiled _C_marlin_transform extension).
         from batchgen.moe.marlin_transform import (
-            marlin_to_wgmma_fused_gpu,
             raw_to_marlin_fused_gpu,
         )
 
@@ -1089,10 +1088,12 @@ class KimiK25ParallelStrategyManager:
                 down_qw = t["down_proj.weight_packed"].to(device)
                 down_s = t["down_proj.weight_scale"].to(device)
 
-                # marlin → raw: gate/up K=H(in) N=N(out); down K=N(in) N=H(out)
-                raw_g, raw_gs = marlin_to_wgmma_fused_gpu(gate_qw, gate_s, H, N)
-                raw_u, raw_us = marlin_to_wgmma_fused_gpu(up_qw, up_s, H, N)
-                raw_d, raw_ds = marlin_to_wgmma_fused_gpu(down_qw, down_s, N, H)
+                # Store is RAW (WGMMA layout): get_tensor already returns [N,K//8] raw INT4 +
+                # [N,K//32] bf16 scales — exactly what marlin_to_wgmma_fused_gpu used to output.
+                # No leading marlin→raw transform; the slice + re-marlinize below is unchanged.
+                raw_g, raw_gs = gate_qw, gate_s
+                raw_u, raw_us = up_qw, up_s
+                raw_d, raw_ds = down_qw, down_s
 
                 # gate|up: slice OUTPUT rows [r0:r1], marlinize gate and up
                 # SEPARATELY, then concat the marlin tensors on the column dim.

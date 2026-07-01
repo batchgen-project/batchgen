@@ -142,11 +142,17 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_packed": self.module.int4_down_packed,
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
-        # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA prefill
-        self._transform_marlin_to_raw(weights)
+        # Weights are stored RAW (WGMMA layout) at checkpoint conversion — no per-forward
+        # transform. Only the legacy marlin store needs the on-the-fly Marlin→raw transform.
+        if self.stored_layout != "raw":
+            self._transform_marlin_to_raw(weights)
         return weights
 
     _transform_logged = False
+    _wgmma_fallback_logged = False
+    # "raw": checkpoint stored in WGMMA raw layout (kimi_parameter_server raw=True) → prefill
+    # consumes it directly, no per-forward Marlin→raw. Set "marlin" to re-enable the legacy path.
+    stored_layout = "raw"
 
     def _transform_marlin_to_raw(self, weights: dict):
         """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
@@ -260,8 +266,9 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
-            # Marlin decode is default for K2.5 — transform Marlin→raw INT4 on-the-fly for WGMMA
-            self._transform_marlin_to_raw(weights)
+            # Raw store (default) → weights already in WGMMA layout, no transform.
+            if self.stored_layout != "raw":
+                self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
         if hidden_states.dtype != torch.bfloat16:
@@ -310,8 +317,15 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
                 weights["up_proj.weight_packed"], weights["up_proj.weight_scale"],
                 weights["down_proj.weight_packed"], weights["down_proj.weight_scale"],
             )
-        except Exception:
-            pass
+        except Exception as ex:
+            # Bring-up guard: a wrong-layout raw store would make WGMMA fail and silently
+            # fall back to dequant+mm (correct but slow + masks the bug). Log once, loudly.
+            if not self.__class__._wgmma_fallback_logged:
+                self.__class__._wgmma_fallback_logged = True
+                logging.warning(
+                    f"[Kimi INT4] single_expert_int4_forward failed, falling back to dequant+mm "
+                    f"(check stored_layout=='raw' matches the checkpoint): {ex}"
+                )
 
         # Fallback: dequant → BF16 matmul
         gate_weight = self.dequant_fn(

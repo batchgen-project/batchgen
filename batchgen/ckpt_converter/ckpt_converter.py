@@ -117,7 +117,50 @@ class ckpt_converter:
 			logging.info(f"[ckpt_converter] Marlin GPU repack: {count} projections replaced in-place")
 		return ckpt
 
-	def convert(self, ckpt_path, output_dir, marlin=False):
+	def _store_raw_int4(self, ckpt):
+		"""Store INT4 expert weights in RAW (WGMMA) layout IN-PLACE — native reinterpret only.
+
+		The HF compressed-tensors on-disk packing, reinterpreted uint8[N,K//2] -> int32[N,K//8],
+		IS ALREADY the WGMMA raw format (== marlin_to_wgmma_fused_gpu output). So unlike
+		_apply_marlin_repack this does NO GPU pass: it only does the uint8->int32 view and keeps
+		the native bf16 scales [N,K//32]. The convert-time raw->marlin and the per-forward
+		marlin->raw are exact inverses; storing raw makes both vanish. Same tensor names, same bytes.
+		"""
+		import re
+
+		packed_pattern = re.compile(
+			r'(.+\.mlp\.experts\.\d+\.(gate|up|down)_proj)\.weight_packed$')
+
+		count = 0
+		for name in list(ckpt.keys()):
+			m = packed_pattern.match(name)
+			if not m:
+				continue
+			prefix = m.group(1)
+			scale_name = f"{prefix}.weight_scale"
+			if scale_name not in ckpt:
+				continue
+
+			packed = ckpt[name]       # [N, K//2] uint8 or [N, K//8] int32
+			scale = ckpt[scale_name]  # [N, K//32] bf16
+
+			if packed.dtype == torch.uint8:
+				N_dim = scale.shape[0]
+				K_dim = scale.shape[1] * 32
+				packed = packed.view(N_dim, K_dim // 8, 4).contiguous().view(torch.int32).squeeze(-1)
+
+			if packed.dtype != torch.int32:
+				continue
+
+			ckpt[name] = packed.contiguous()                          # raw int32 [N, K//8]
+			ckpt[scale_name] = scale.to(torch.bfloat16).contiguous()  # bf16 [N, K//32]
+			count += 1
+
+		if count > 0:
+			logging.info(f"[ckpt_converter] Raw INT4 store: {count} projections kept native (no marlin repack)")
+		return ckpt
+
+	def convert(self, ckpt_path, output_dir, marlin=False, raw=False):
 		# Check if the file dir exists
 		if not os.path.exists(ckpt_path):
 			raise FileNotFoundError(f"Checkpoint file path {ckpt_path} does not exist.")
@@ -138,8 +181,11 @@ class ckpt_converter:
 		else:
 			ckpt = torch.load(ckpt_path, weights_only=True)
 
-		# Optional: repack INT4 expert weights to Marlin tile layout
-		if marlin:
+		# Optional: repack INT4 expert weights to Marlin tile layout, OR store raw (WGMMA)
+		# layout. raw takes precedence; the two are mutually exclusive layouts.
+		if raw:
+			ckpt = self._store_raw_int4(ckpt)
+		elif marlin:
 			ckpt = self._apply_marlin_repack(ckpt)
 
 		out_file_name = os.path.join(output_dir, os.path.basename(ckpt_path).replace(".safetensors", ".bin")).replace(".pt", ".bin")
@@ -262,7 +308,7 @@ class ckpt_converter:
 
 		return True, None
 
-	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False):
+	def convert_model_directory(self, input_dir, output_dir=None, force=False, marlin=False, raw=False):
 		"""
 		Convert all checkpoint files in a directory to BatchGen format.
 
@@ -329,10 +375,10 @@ class ckpt_converter:
 
 		for file_path in file_iterator:
 			logging.debug(f"Converting {file_path} to {output_dir}")
-			self.convert(file_path, output_dir, marlin=marlin)
+			self.convert(file_path, output_dir, marlin=marlin, raw=raw)
 
 		logging.info(f"Conversion complete. Output directory: {output_dir}"
-		             f"{' (with Marlin repack)' if marlin else ''}")
+		             f"{' (raw INT4 store)' if raw else (' (with Marlin repack)' if marlin else '')}")
 		return output_dir
 
 	

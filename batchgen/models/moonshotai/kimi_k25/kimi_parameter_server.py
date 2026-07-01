@@ -164,8 +164,14 @@ class KimiK25_Parameter_Server:
         # K2.5 uses HuggingFace safetensors format — no custom conversion needed
         if self.converted_ckpt_dir is None:
             converter = ckpt_converter()
+            # Store RAW (WGMMA) layout: prefill consumes raw directly (no per-forward
+            # marlin->raw transform), and decode re-marlinizes the raw slab once at configure.
+            # Distinct output dir so a stale marlin `converted_ckpt` is never silently reused
+            # (validate_converted_directory checks file counts, not layout).
             self.converted_ckpt_dir = converter.convert_model_directory(
-                self.cache_dir, marlin=True)  # Marlin layout is default for K2.5 decode
+                self.cache_dir,
+                output_dir=os.path.join(self.cache_dir, "converted_ckpt_raw"),
+                raw=True)
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
 
