@@ -79,6 +79,7 @@ from batchgen.batch_order import (
 	batch_matches_expected_uuid_order,
 	build_prefill_sequence_spans,
 	local_indices_to_uuid_order,
+	prefill_sequence_spans_to_cu_seqlens,
 	prefill_sequence_spans_to_global_seq_ids,
 )
 from batchgen.query_book import (
@@ -6996,11 +6997,6 @@ class BatchGenWorker:
 		seq_token_prefix = [0] * (len(seq_lengths_list) + 1)
 		for _i, _l in enumerate(seq_lengths_list):
 			seq_token_prefix[_i + 1] = seq_token_prefix[_i] + _l
-		full_cu_seqlens = torch.tensor(
-			seq_token_prefix,
-			dtype=torch.int32,
-			device=self.torch_device,
-		)
 
 		if self.rank == 0:
 			logging.info(
@@ -7008,6 +7004,12 @@ class BatchGenWorker:
 				f"{total_tokens_all:,} total tokens, max {MAX_TOKENS_PER_MICRO_BATCH:,} tokens/batch"
 				+ (f", l2_cap={l2_cap:,}" if l2_cap > 0 else "")
 			)
+			for plan_idx, (plan_seq_start, plan_seq_end) in enumerate(micro_batches):
+				plan_tokens = seq_token_prefix[plan_seq_end] - seq_token_prefix[plan_seq_start]
+				logging.info(
+					f"[PREFILL] micro-batch plan {plan_idx + 1}/{len(micro_batches)}: "
+					f"{plan_seq_end - plan_seq_start} seqs, {plan_tokens:,} tokens"
+				)
 
 		output_tokens = []
 		num_micro_batches = len(micro_batches)
@@ -7055,9 +7057,10 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
-				batch_cu_seqlens = (
-					full_cu_seqlens[seq_start:seq_end + 1]
-					- full_cu_seqlens[seq_start]
+				batch_cu_seqlens = torch.tensor(
+					prefill_sequence_spans_to_cu_seqlens(batch_spans),
+					dtype=torch.int32,
+					device=self.torch_device,
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
 

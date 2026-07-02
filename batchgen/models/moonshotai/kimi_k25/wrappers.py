@@ -449,23 +449,25 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        seq_lengths = self.prepack_seq_lengths
-        if seq_lengths is None:
+        cu_seqlens = self.prepack_cu_seqlens
+        if cu_seqlens is None:
             raise RuntimeError(
-                f"Kimi prepacked KV offload missing sequence lengths for layer {self.layer_idx}"
+                f"Kimi prepacked KV offload missing cu_seqlens for layer {self.layer_idx}"
             )
+        # Keep host KV offload aligned with the exact boundaries consumed by varlen attention.
+        cu_seqlens_list = cu_seqlens.tolist()
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
-        if num_sequences != len(seq_lengths):
+        if num_sequences != len(cu_seqlens_list) - 1:
             raise RuntimeError(
                 f"Kimi prepacked KV offload sequence count mismatch: "
-                f"num_sequences={num_sequences}, len(seq_lengths)={len(seq_lengths)}"
+                f"num_sequences={num_sequences}, len(cu_seqlens)={len(cu_seqlens_list)}"
             )
 
-        start_idx = 0
         for seq_idx in range(num_sequences):
-            seq_len = seq_lengths[seq_idx]
-            end_idx = start_idx + seq_len
+            start_idx = cu_seqlens_list[seq_idx]
+            end_idx = cu_seqlens_list[seq_idx + 1]
+            seq_len = end_idx - start_idx
 
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
@@ -478,7 +480,6 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
-            start_idx = end_idx
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using BF16 MLA attention.
