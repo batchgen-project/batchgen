@@ -251,6 +251,12 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
         Returns:
             Output [num_tokens, hidden_size]
         """
+        if hidden_states.numel() == 0:
+            if not self.persistent:
+                self.load_weights(self.module_key)
+                self.free_weights(self.module_key)
+            return hidden_states.new_empty(hidden_states.shape)
+
         # Fast path: pre-loaded/dequantized BF16 weights (persistent mode or shared experts)
         if getattr(self, 'use_bf16_weights', False):
             return self._forward_bf16(hidden_states)
@@ -443,17 +449,23 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        cu_seqlens = self.prepack_cu_seqlens
-        # One D2H copy of the whole boundary vector, instead of 2*num_sequences .item()
-        # GPU->CPU syncs per layer (this offload runs once per attention layer).
-        cu_seqlens_list = cu_seqlens.tolist()
+        seq_lengths = self.prepack_seq_lengths
+        if seq_lengths is None:
+            raise RuntimeError(
+                f"Kimi prepacked KV offload missing sequence lengths for layer {self.layer_idx}"
+            )
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
+        if num_sequences != len(seq_lengths):
+            raise RuntimeError(
+                f"Kimi prepacked KV offload sequence count mismatch: "
+                f"num_sequences={num_sequences}, len(seq_lengths)={len(seq_lengths)}"
+            )
 
+        start_idx = 0
         for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens_list[seq_idx]
-            end_idx = cu_seqlens_list[seq_idx + 1]
-            seq_len = end_idx - start_idx
+            seq_len = seq_lengths[seq_idx]
+            end_idx = start_idx + seq_len
 
             seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
             seq_global_id = [global_sequence_ids[seq_idx]]
@@ -466,6 +478,7 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            start_idx = end_idx
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using BF16 MLA attention.

@@ -1372,17 +1372,35 @@ class KimiK25MoE(nn.Module):
 
         results = torch.zeros(num_tokens, hidden_size, device=device, dtype=torch.float32)
 
-        # Per-expert token counts computed ONCE (a single D2H) so the loop skips empty experts
-        # from a CPU list — instead of a per-expert `mask.any()` GPU->CPU sync (was 384 syncs
-        # per layer × 60 layers = ~23k per prefill forward, serializing the whole loop).
-        expert_counts_cpu = torch.bincount(
-            flat_expert_idx, minlength=len(self.experts)
-        ).tolist()
+        dense_loop_mode = os.environ.get(
+            "BATCHGEN_KIMI_PREFILL_DENSE_EXPERT_LOOP", "auto"
+        ).lower()
+        if dense_loop_mode == "auto":
+            min_assignments_per_expert = int(os.environ.get(
+                "BATCHGEN_KIMI_PREFILL_DENSE_EXPERT_MIN_ASSIGNMENTS_PER_EXPERT",
+                "16",
+            ))
+            use_dense_expert_loop = (
+                num_tokens * K >= len(self.experts) * min_assignments_per_expert
+            )
+        else:
+            use_dense_expert_loop = dense_loop_mode in ("1", "true", "yes", "on")
+
+        expert_counts_cpu = None
+        if not use_dense_expert_loop:
+            # One D2H count read is still cheaper than invoking offloaded empty experts
+            # on short prompts. Long prompts use the dense loop above to avoid this sync.
+            expert_counts_cpu = torch.bincount(
+                flat_expert_idx, minlength=len(self.experts)
+            ).tolist()
 
         for expert_idx, expert in enumerate(self.experts):
             if expert is None:
                 continue
-            if expert_counts_cpu[expert_idx] == 0:
+            if (
+                expert_counts_cpu is not None
+                and expert_counts_cpu[expert_idx] == 0
+            ):
                 continue
             mask = flat_expert_idx == expert_idx
             expert_token_idx = token_indices[mask]

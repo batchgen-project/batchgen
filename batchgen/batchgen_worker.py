@@ -79,7 +79,6 @@ from batchgen.batch_order import (
 	batch_matches_expected_uuid_order,
 	build_prefill_sequence_spans,
 	local_indices_to_uuid_order,
-	prefill_sequence_spans_to_cu_seqlens,
 	prefill_sequence_spans_to_global_seq_ids,
 )
 from batchgen.query_book import (
@@ -5588,7 +5587,10 @@ class BatchGenWorker:
 
 					# B. Execute Prefill
 					if local_prefill_indices:
-						if torch.cuda.is_available():
+						if (
+							torch.cuda.is_available()
+							and os.environ.get("BATCHGEN_PREFILL_HBM_LOG", "0") == "1"
+						):
 							free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)
 							allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
 							logging.info(
@@ -6980,6 +6982,7 @@ class BatchGenWorker:
 		# on one micro-batch when a single very long sequence is present.
 		import os as _os_mb
 		_USE_L2_MB = _os_mb.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+		_LIVE_MB_TIMING = _os_mb.environ.get("BATCHGEN_PREFILL_LIVE_TIMING", "0") == "1"
 		micro_batches, l2_cap = build_prefill_micro_batches(
 			seq_lengths_list,
 			MAX_TOKENS_PER_MICRO_BATCH,
@@ -6993,6 +6996,11 @@ class BatchGenWorker:
 		seq_token_prefix = [0] * (len(seq_lengths_list) + 1)
 		for _i, _l in enumerate(seq_lengths_list):
 			seq_token_prefix[_i + 1] = seq_token_prefix[_i] + _l
+		full_cu_seqlens = torch.tensor(
+			seq_token_prefix,
+			dtype=torch.int32,
+			device=self.torch_device,
+		)
 
 		if self.rank == 0:
 			logging.info(
@@ -7006,7 +7014,11 @@ class BatchGenWorker:
 
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in enumerate(micro_batches):
-				_mb_t0 = time.perf_counter()
+				_mb_t0 = (
+					time.perf_counter()
+					if self.rank == 0 and _LIVE_MB_TIMING
+					else 0.0
+				)
 				# Feed watchdog during long prefill operations
 				self.feed_watchdog()
 
@@ -7043,10 +7055,9 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
-				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
-					dtype=torch.int32,
-					device=self.torch_device,
+				batch_cu_seqlens = (
+					full_cu_seqlens[seq_start:seq_end + 1]
+					- full_cu_seqlens[seq_start]
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
 
@@ -7121,11 +7132,8 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
-				# Structured per-micro-batch timing, logged LIVE. GPU work is async, so sync
-				# before timing for the true wall-time of this micro-batch. A 64k prefill wave
-				# has only a few huge micro-batches, so the per-step sync is negligible and the
-				# live progress is worth it.
-				if self.rank == 0:
+				# Optional live timing syncs the device; keep it off for throughput runs.
+				if self.rank == 0 and _LIVE_MB_TIMING:
 					torch.cuda.synchronize(self.torch_device)
 					_mb_dt = time.perf_counter() - _mb_t0
 					_mb_tokens = sum(batch_seq_lengths)
