@@ -10,6 +10,12 @@
 
 set -e  # Exit on error
 
+# Resolve the repo layout ONCE, before anything can `cd` away: BASH_SOURCE[0] is
+# relative when invoked as ./scripts/install_deps.sh, and the dependency
+# installers cd into $INSTALL_DIR, which used to break the late lookups.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -254,9 +260,6 @@ install_deepgemm() {
 install_batchgen_kernels() {
     print_step "Installing batchgen_kernels (AOT-compiled CUDA kernel extensions)..."
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
-
     if [[ -f "$BATCHGEN_DIR/batchgen_kernels/setup.py" ]]; then
         cd "$BATCHGEN_DIR/batchgen_kernels"
         pip install . --no-build-isolation
@@ -270,9 +273,6 @@ install_batchgen() {
     print_step "Installing BatchGen..."
 
     # Find BatchGen directory (script is in scripts/, BatchGen is parent)
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    BATCHGEN_DIR="$(dirname "$SCRIPT_DIR")"
-
     if [[ -f "$BATCHGEN_DIR/setup.py" ]]; then
         cd "$BATCHGEN_DIR"
         pip install .
