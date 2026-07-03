@@ -233,7 +233,7 @@ _sm90a_extensions = [
             "cxx": ["-O3"],
             "nvcc": ["-O3", "-std=c++17",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # ── AOT MLA attention kernels (SM90a, BF16-only) ──
@@ -299,7 +299,7 @@ _sm80_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # MXFP4 dequant with shared memory LUT
@@ -309,7 +309,7 @@ _sm80_extensions = [
         extra_compile_args={
             "cxx": ["-O3"],
             "nvcc": ["-O3", "--use_fast_math", "-lineinfo",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # RMSNorm (multi-dtype: BF16/FP16/FP32) — common
@@ -323,7 +323,7 @@ _sm80_extensions = [
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # CUDA RMSNorm + Add+RMSNorm (from cuda_rmsnorm.py)
@@ -337,7 +337,7 @@ _sm80_extensions = [
                      "-U__CUDA_NO_HALF_CONVERSIONS__",
                      "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                      "--expt-relaxed-constexpr",
-                     "--threads", _nvcc_threads],
+                     "--threads", _nvcc_threads] + _sm80_gencode,
         },
     ),
     # MGN (MoE General Native) ops — token dispatch, fused gate, bincount, rmsnorm
