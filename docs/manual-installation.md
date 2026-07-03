@@ -44,13 +44,14 @@ pip install flash-attn --no-build-isolation
 Install flash-attention 3 from the Hopper-optimized branch:
 
 ```bash
-git clone git@github.com:Dao-AILab/flash-attention.git
+git clone https://github.com/Dao-AILab/flash-attention.git
 cd flash-attention && git checkout v2.8.2
 cd hopper && FLASH_ATTENTION_FORCE_BUILD=TRUE pip install . --no-build-isolation
 ```
 
-> `FLASH_ATTENTION_FORCE_BUILD=TRUE` is required: against PyTorch 2.9 the build
-> otherwise hangs trying to download a non-existent prebuilt wheel.
+> `FLASH_ATTENTION_FORCE_BUILD=TRUE` skips the prebuilt-wheel download attempt:
+> no wheel exists for PyTorch 2.9, and depending on network conditions the
+> download can hang or time out before falling back to a source build.
 
 See https://github.com/Dao-AILab/flash-attention for more details.
 
@@ -61,8 +62,13 @@ See https://github.com/Dao-AILab/flash-attention for more details.
 FlashMLA provides optimized Multi-head Latent Attention for DeepSeek models on Hopper GPUs.
 
 ```bash
-pip install git+https://github.com/deepseek-ai/FlashMLA.git --no-build-isolation
+FLASH_MLA_DISABLE_SM100=1 pip install "git+https://github.com/deepseek-ai/FlashMLA.git@1408756a88e52a25196b759eaf8db89d2b51b5a1" --no-build-isolation
 ```
+
+> Pin the commit and set `FLASH_MLA_DISABLE_SM100=1` (same as
+> `scripts/install_deps.sh`): FlashMLA HEAD enables SM100 (Blackwell) kernels
+> that require nvcc >= 12.9, so the unpinned command fails on a CUDA 12.8
+> toolchain. For Blackwell builds use nvcc 12.9+ and drop the env var.
 
 See https://github.com/deepseek-ai/FlashMLA for more details.
 
@@ -73,9 +79,13 @@ See https://github.com/deepseek-ai/FlashMLA for more details.
 DeepGEMM provides optimized FP8 GEMM kernels for Hopper GPUs.
 
 ```bash
-git clone --recursive git@github.com:deepseek-ai/DeepGEMM.git
-cd DeepGEMM && pip install . --no-build-isolation
+git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git
+cd DeepGEMM && git checkout v2.1.1.post3 && git submodule update --init --recursive
+pip install . --no-build-isolation
 ```
+
+> Check out `v2.1.1.post3` (the version `scripts/install_deps.sh` pins):
+> DeepGEMM HEAD is not guaranteed to build against this stack.
 
 See https://github.com/deepseek-ai/DeepGEMM for more details.
 
@@ -94,7 +104,7 @@ pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu12
 ## Step 6: Clone BatchGen
 
 ```bash
-git clone git@github.com:batchgen-project/batchgen.git
+git clone https://github.com/batchgen-project/batchgen.git
 cd batchgen
 ```
 
