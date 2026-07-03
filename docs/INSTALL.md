@@ -5,6 +5,10 @@
 - **CUDA**: 12.8+ toolkit installed (Blackwell/B200 requires **12.9+**, see below)
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
+- **GitHub access**: the repository is currently **private** — anonymous
+  `git clone` and raw release-asset URLs fail (404). Authenticate first
+  (e.g. `gh auth login`), clone via `gh repo clone batchgen-project/batchgen`,
+  and fetch release wheels with `gh release download` (see Option C).
 
 All three options below have been validated end-to-end on a fresh 2-node (16×H20) cluster
 with Kimi-K2.5. Pick whichever fits your workflow. For Blackwell (B200), see the
@@ -48,6 +52,17 @@ Total: ~40-50 min on first install.
 
 Pre-built wheels for Hopper GPUs (CUDA 12.8, PyTorch 2.9, Python 3.11) are
 available on the [GitHub Releases](https://github.com/batchgen-project/batchgen/releases) page.
+The wheel set below is pinned to `v1.0.10.post2` — the most recent release that
+ships the full dependency wheel set (later releases only ship the batchgen
+wheels). While the repository is private, plain `pip install <URL>` returns
+404; download the wheels with an authenticated client first:
+
+```bash
+gh release download v1.0.10.post2 -R batchgen-project/batchgen -p '*.whl' -D ./wheels
+pip install ./wheels/*.whl
+```
+
+Or, with direct URLs once the repository is public:
 
 ```bash
 # 1. Create conda env + install PyTorch
@@ -55,7 +70,7 @@ conda create -n batchgen python=3.11 -y
 conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
-# 2. Install all wheels from the latest release
+# 2. Install all wheels from the pinned release
 RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post2"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
