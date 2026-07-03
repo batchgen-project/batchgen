@@ -223,9 +223,9 @@ Get current status of a batch job. Use this endpoint to poll for completion.
 
 ### POST /v1/batches/{batch_id}/cancel
 
-Cancel a running batch. The batch transitions to `cancelling`, then `cancelled` once the worker stops processing.
+Cancel a batch in `validating` or `in_progress` state (other states return an error). The batch is marked `cancelled` immediately; `cancelling_at` and `cancelled_at` are set to the same timestamp. A cancelled batch that has not started yet is skipped by the scheduler; sequences already executing are not interrupted.
 
-**Response:** `BatchObject` with `status: "cancelling"`
+**Response:** `BatchObject` with `status: "cancelled"`
 
 ---
 
@@ -234,7 +234,7 @@ Cancel a running batch. The batch transitions to `cancelling`, then `cancelled` 
 ```
 validating → in_progress → completed
                          → failed
-                         → cancelling → cancelled
+                         → cancelled
 ```
 
 | Status | Description |
@@ -243,7 +243,7 @@ validating → in_progress → completed
 | `in_progress` | Sequences are being processed |
 | `completed` | All sequences finished. `output_file_id` is set. |
 | `failed` | Processing failed. `error` field has details. |
-| `cancelling` | Cancel requested, waiting for worker to stop |
+| `cancelling` | Reserved. Defined in the API schema but currently never emitted — cancel sets `cancelled` directly. |
 | `cancelled` | Batch was cancelled. `cancelled_at` is set. |
 
 **Timestamps:** `started_at`, `completed_at`, `cancelled_at`, `cancelling_at` are set as the batch transitions through states.
