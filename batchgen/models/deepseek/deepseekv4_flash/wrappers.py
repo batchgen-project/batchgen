@@ -454,9 +454,14 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         )
         return comp
 
-    def _v4_prefill_rope_cache(self, device):
+    def _v4_prefill_rope_cache(self, device, min_len: int = 0):
+        need = max(
+            int(getattr(self.model_config, "max_position_embeddings", 8192) or 8192),
+            int(getattr(self.model_config, "original_seq_len", 65536) or 65536),
+            int(min_len),
+        )
         cache = AttnWrapperBase.__dict__.get("_v4_prefill_rope_cache_cpu")
-        if cache is None:
+        if cache is None or int(cache.size(0)) < need:
             from batchgen.attention.dsa.v4_flashmla_adapter import (
                 build_v4_rope_cache,
             )
@@ -465,11 +470,8 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
                 getattr(self.model_config, "qk_rope_head_dim", 64)
             )
             theta = float(getattr(self.model_config, "rope_theta", 10000.0))
-            max_pos = int(
-                getattr(self.model_config, "max_position_embeddings", 8192)
-            )
             cache = build_v4_rope_cache(
-                max_pos=max_pos,
+                max_pos=need,
                 theta=theta,
                 rope_head_dim=rope_head_dim,
                 device="cpu",
@@ -481,7 +483,10 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         cfg = self.model_config
         scaling = getattr(cfg, "rope_scaling", None) or {}
         return dict(
-            max_pos=int(getattr(cfg, "max_position_embeddings", 8192)),
+            max_pos=max(
+                int(getattr(cfg, "max_position_embeddings", 8192) or 8192),
+                int(getattr(cfg, "original_seq_len", 65536) or 65536),
+            ),
             theta=float(getattr(cfg, "compress_rope_theta", 160000.0)),
             rope_head_dim=int(getattr(cfg, "qk_rope_head_dim", 64)),
             original_seq_len=int(
@@ -506,17 +511,20 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         cos_table, sin_table = tables
         return cos_table.to(device), sin_table.to(device)
 
-    def _v4_compressed_rope_cache(self, device):
+    def _v4_compressed_rope_cache(self, device, min_len: int = 0):
+        params = self._v4_compress_rope_params()
+        need = max(int(params["max_pos"]), int(min_len))
+        params["max_pos"] = need
         cache = AttnWrapperBase.__dict__.get("_v4_compress_cos_sin_cache_cpu")
-        if cache is None:
+        built = AttnWrapperBase.__dict__.get("_v4_compress_cos_sin_cache_len", 0)
+        if cache is None or int(built) < need:
             from batchgen.attention.dsa.v4_flashmla_adapter import (
                 build_v4_compress_cos_sin_cache,
             )
 
-            cache = build_v4_compress_cos_sin_cache(
-                device="cpu", **self._v4_compress_rope_params()
-            )
+            cache = build_v4_compress_cos_sin_cache(device="cpu", **params)
             AttnWrapperBase._v4_compress_cos_sin_cache_cpu = cache
+            AttnWrapperBase._v4_compress_cos_sin_cache_len = need
         return cache.to(device)
 
     def _v4_c4_indexer_inputs(self, q_low, hidden_states):
@@ -644,13 +652,14 @@ class DeepSeekV4FlashAttnWrapper(AttnWrapperBase):
         # window KV with compress_rope_theta + YaRN; only ratio==0 layers use
         # the base theta without YaRN. Using the dense cache for all layers
         # makes decode read mis-rotated KV on 40/43 layers.
+        max_len = int(max(seq_lens)) if seq_lens else 0
         compress_rope = (
-            self._v4_compressed_rope_cache(device) if ratio else None
+            self._v4_compressed_rope_cache(device, max_len) if ratio else None
         )
         rope_cache = (
             compress_rope
             if compress_rope is not None
-            else self._v4_prefill_rope_cache(device)
+            else self._v4_prefill_rope_cache(device, max_len)
         )
         from batchgen.attention.dsa.v4_prefill_populate import (
             populate_v4_prefill_coordinator,
