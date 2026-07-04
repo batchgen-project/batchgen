@@ -19,11 +19,12 @@ Environment variables:
 
 import os
 import shutil
+
+import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 _this_dir = os.path.dirname(os.path.abspath(__file__))
-import torch
 
 
 # ── Version (single source of truth: _version.py) ──
@@ -402,6 +403,23 @@ _sm80_extensions = [
                 "--threads",
                 _nvcc_threads,
             ],
+        },
+    ),
+    # Native sm120 mega MoE forward kernel (route metadata is prepared separately)
+    CUDAExtension(
+        name="batchgen_kernels.moe._C_mega_moe_sm120",
+        sources=["src/moe/mega_moe_sm120.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "--use_fast_math",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                _nvcc_threads,
+            ]
+            + _sm80_gencode,
         },
     ),
     # RMSNorm (multi-dtype: BF16/FP16/FP32) — common

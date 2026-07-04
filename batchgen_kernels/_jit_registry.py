@@ -177,6 +177,18 @@ def get_registry():
                 "4",
             ],
         },
+        "batchgen_kernels.moe._C_mega_moe_sm120": {
+            "sources": ["src/moe/mega_moe_sm120.cu"],
+            "nvcc_flags": [
+                "-O3",
+                "-std=c++17",
+                "--use_fast_math",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads",
+                "4",
+            ]
+            + _SM80_GENCODE,
+        },
         "batchgen_kernels.common._C_rmsnorm": {
             "sources": ["src/common/rmsnorm.cu"],
             "nvcc_flags": [
