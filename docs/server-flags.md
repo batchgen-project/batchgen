@@ -79,7 +79,7 @@ python -m batchgen.launch_http_server \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host-kv-cache-size` | Auto | Host KV cache size in GB. Critical for throughput. |
-| `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`) |
+| `--kv-dtype` | `bfloat16` | Data type for KV cache (`bfloat16`, `float16`, `float8_e4m3fn`). Values are not validated at parse time — typos are accepted silently. |
 
 **Auto-detection formula** (when `--host-kv-cache-size` is not specified):
 ```
@@ -155,7 +155,7 @@ Controls how BatchGen schedules sequences on GPU.
 |------|---------|-------------|
 | `--initial-gpu-page-buffer` | `32` | Pages to reserve when first loading sequence to GPU. Each page = 64 tokens. |
 | `--extension-gpu-page-buffer` | `4` | Pages to add at page boundaries during decode |
-| `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages) |
+| `--decision-frequency-pages` | `2` | How often to make scheduling decisions (in pages). Must be <= `--extension-gpu-page-buffer`, otherwise the server fails at startup with a `ValueError`. |
 | `--host-kv-watermark` | `70` | Percentage threshold for prioritizing prefill over decode |
 | `--enable-decode-preemption` | `true` | Allow interrupting decode to prefill new sequences (always on) |
 
@@ -252,7 +252,8 @@ CUDA graphs capture the GPU kernel launch sequence and replay it with minimal CP
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. |
+| `--enable-cuda-graph` | `false` | Explicitly enable CUDA graph capture for decode (alias: `--enable-cuda-graphs`). Mutually exclusive with `--disable-cuda-graphs`. |
+| `--disable-cuda-graphs` | `false` | Disable CUDA graph capture for decode. Use if encountering compatibility issues. Mutually exclusive with `--enable-cuda-graph`. |
 | `--cuda-graph-max-bucket-size` | `128` | Maximum batch size per rank for CUDA graph capture. Batches exceeding this fall back to eager execution. |
 | `--cuda-graph-num-buckets` | `16` | Number of CUDA graph bucket sizes. More buckets = longer startup capture time but less padding waste. |
 
@@ -328,10 +329,23 @@ The watchdog monitors worker processes and reports health via the `/health` endp
 | `--decode-step-timeout` | Disabled | Max seconds for a single decode iteration. Recommended: 300 for production. |
 | `--startup-timeout` | Disabled | Max seconds from process launch to server ready. Recommended: 1800 for large models. |
 | `--no-watchdog` | - | Disable watchdog (default behavior, kept for compatibility) |
+| `--watchdog-heartbeat-interval` | None | Idle heartbeat interval in seconds when watchdog is enabled |
+| `--watchdog-test-stuck-time` | `0.0` | Deliberately sleep during watchdog feed (testing only) |
 
 **When to enable watchdog:**
 - For production deployments: use `--watchdog-timeout 600 --decode-step-timeout 300 --startup-timeout 1800`
 - Increase timeouts for very long sequences or slow hardware
+
+---
+
+## Additional Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pre-dequantize-weights` | `false` | Pre-dequantize MoE routed expert MXFP4 weights to BF16 at load time (higher HBM usage, lower compute overhead). Other weights are unaffected. |
+| `--max-pool-size` | `10240` | Max QueryBook pool capacity for persistent request scheduling. |
+| `--max-intake-capacity` | `1000000` | Max total requests in the intake pool. Prevents OOM under high load. |
+| `--detokenization-include-special-tokens` | `false` | Include special tokens in detokenized output (default: off, special tokens stripped). |
 
 ---
 
