@@ -907,9 +907,9 @@ class BatchScheduler:
                 f"Batch with {len(entries)} requests rejected. Retry later."
             )
             logger.warning(f"[POOL] Batch {batch_id} rejected: {error_msg}")
-            self.storage.update_batch(batch_id, status="failed", error={
-                "code": "capacity_exceeded", "message": error_msg,
-            })
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=f"capacity_exceeded: {error_msg}"
+            )
             return
         # Store max_tokens for init message
         if not hasattr(self, '_pool_max_output_len'):
@@ -974,9 +974,9 @@ class BatchScheduler:
 
         if batch_failed:
             error_msg = getattr(tracker, 'error', 'timeout') if tracker else 'timeout'
-            self.storage.update_batch(batch_id, status="failed", error={
-                "code": "batch_failed", "message": str(error_msg)
-            })
+            self.storage.update_batch_status(
+                batch_id, BatchStatus.FAILED, error=f"batch_failed: {error_msg}"
+            )
             return
 
         self._finalize_batch_output(batch_id, requests, prompts)

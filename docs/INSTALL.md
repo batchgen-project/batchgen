@@ -5,6 +5,9 @@
 - **CUDA**: 12.8+ toolkit installed (Blackwell/B200 requires **12.9+**, see below)
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
+- **libnuma**: `libnuma-dev` headers (`numa.h`) — required by the core-engine
+  JIT at first server launch (`sudo apt-get install -y libnuma-dev`). The
+  Docker image (Option A) already includes it.
 - **GitHub access**: the repository is currently **private** — anonymous
   `git clone` and raw release-asset URLs fail (404). Authenticate first
   (e.g. `gh auth login`), clone via `gh repo clone batchgen-project/batchgen`,
@@ -52,13 +55,13 @@ Total: ~40-50 min on first install.
 
 Pre-built wheels for Hopper GPUs (CUDA 12.8, PyTorch 2.9, Python 3.11) are
 available on the [GitHub Releases](https://github.com/batchgen-project/batchgen/releases) page.
-The wheel set below is pinned to `v1.0.10.post2` — the most recent release that
-ships the full dependency wheel set (later releases only ship the batchgen
-wheels). While the repository is private, plain `pip install <URL>` returns
-404; download the wheels with an authenticated client first:
+The wheel set below is pinned to `v1.0.10.post5`, which ships the full
+dependency wheel set. While the repository is private, plain
+`pip install <URL>` returns 404; download the wheels with an authenticated
+client first:
 
 ```bash
-gh release download v1.0.10.post2 -R batchgen-project/batchgen -p '*.whl' -D ./wheels
+gh release download v1.0.10.post5 -R batchgen-project/batchgen -p '*.whl' -D ./wheels
 pip install ./wheels/*.whl
 ```
 
@@ -71,13 +74,13 @@ conda activate batchgen
 pip install torch==2.9.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 
 # 2. Install all wheels from the pinned release
-RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post2"
+RELEASE_URL="https://github.com/batchgen-project/batchgen/releases/download/v1.0.10.post5"
 pip install \
   "${RELEASE_URL}/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl" \
   "${RELEASE_URL}/flash_mla-1.0.0+1408756-cp311-cp311-linux_x86_64.whl" \
   "${RELEASE_URL}/deep_gemm-2.1.1+c9f8b34-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen_kernels-0.3.2+sm90a-cp311-cp311-linux_x86_64.whl" \
-  "${RELEASE_URL}/batchgen-1.0.10.post2-py3-none-any.whl"
+  "${RELEASE_URL}/batchgen_kernels-0.3.3+sm90a-cp311-cp311-linux_x86_64.whl" \
+  "${RELEASE_URL}/batchgen-1.0.10.post5-py3-none-any.whl"
 ```
 
 No source compilation needed — pip auto-installs all remaining Python dependencies
@@ -169,7 +172,7 @@ This does not apply to Docker (Option A), where the source is the install target
 | **Do not run from source dir** | Source tree shadows installed packages (see above) |
 | **batchgen_kernels** | Must use `--no-build-isolation` (needs installed PyTorch headers) |
 | **H20 GPUs** | Set `TORCH_CUDA_ARCH_LIST=9.0a` before building kernels |
-| **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s) |
+| **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s; needs `libnuma-dev`) |
 | **No JIT for compute kernels** | All 23 CUDA extensions are AOT-compiled in `batchgen_kernels` |
 
 ## Verification

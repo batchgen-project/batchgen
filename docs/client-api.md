@@ -251,7 +251,7 @@ BatchGen provides test scripts that demonstrate how to use the client API. These
 ### Example: MMLU Pro Batch Test
 
 ```bash
-python test/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
+python tests/e2e/r1_mmlu_pro_test/r1_mmlu_pro_batch_test.py \
     --hugging_face_checkpoint /path/to/DeepSeek-R1 \
     --max_decoding_length 10240 \
     --server_host localhost \

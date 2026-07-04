@@ -14,6 +14,8 @@ For quick installation, use the automated script instead:
 - Python 3.11+
 - CUDA 12.8+ toolkit
 - Git
+- libnuma headers (`sudo apt-get install -y libnuma-dev`) — required by the
+  core-engine JIT at first server launch
 
 Create and activate a virtual environment:
 ```bash

@@ -83,6 +83,24 @@ check_prerequisites() {
     fi
     print_success "git found"
 
+    # Check libnuma headers (numa.h) — the core engine JIT-compiles
+    # batchgen/core/Parameter_Server/posix_shm.cpp at first server launch and
+    # includes <numa.h>. Missing headers => first `launch_http_server` dies with
+    # "fatal error: numa.h: No such file or directory". Fail early with a hint.
+    if command -v cc &> /dev/null; then
+        numa_ok=$(echo '#include <numa.h>' | cc -fsyntax-only -x c - &> /dev/null && echo yes || echo no)
+    elif [[ -f /usr/include/numa.h ]]; then
+        numa_ok=yes
+    else
+        numa_ok=no
+    fi
+    if [[ "$numa_ok" != "yes" ]]; then
+        print_error "libnuma headers (numa.h) not found — required by the core-engine JIT at first launch."
+        print_error "Install them first:  sudo apt-get install -y libnuma-dev"
+        exit 1
+    fi
+    print_success "libnuma headers found"
+
     # Check CUDA
     if ! command -v nvcc &> /dev/null; then
         print_warning "nvcc not found. CUDA may not be properly configured."
