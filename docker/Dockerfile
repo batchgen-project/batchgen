@@ -1,6 +1,7 @@
 ARG CUDA_VERSION=12.9.1
 ARG PYTHON_VERSION=3.11.13
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG PYTHON_VERSION
 # Build target arch for FlashMLA + batchgen_kernels:
