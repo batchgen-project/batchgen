@@ -13,17 +13,26 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_grouped_moe_gated_off_below_sm120(monkeypatch):
-    monkeypatch.setattr(v4_model, "_V4_GROUPED_MOE", True)
+def test_owned_experts_dispatches_grouped_path(monkeypatch):
+    hidden, inter, num_experts = 64, 128, 4
+    moe = _minimal_moe(num_experts, hidden, inter)
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
-    assert v4_model._v4_grouped_moe_enabled() is False
+    expected = torch.randn(8, hidden, device="cuda", dtype=torch.float32)
+    grouped_mock = MagicMock(return_value=expected)
+    monkeypatch.setattr(moe, "_run_owned_experts_grouped", grouped_mock)
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 0))
-    assert v4_model._v4_grouped_moe_enabled() is True
+    token_states = torch.randn(8, hidden, device="cuda") / 8
+    topk_weights = torch.rand(8, 2, device="cuda")
+    topk_indices = torch.randint(
+        0, num_experts, (8, 2), device="cuda", dtype=torch.int64
+    )
 
-    monkeypatch.setattr(v4_model, "_V4_GROUPED_MOE", False)
-    assert v4_model._v4_grouped_moe_enabled() is False
+    out = moe._run_owned_experts(token_states, topk_weights, topk_indices)
+
+    grouped_mock.assert_called_once_with(
+        token_states, topk_weights, topk_indices
+    )
+    assert out is expected
 
 
 def _minimal_moe(num_experts=4, hidden=64, inter=128):
@@ -66,17 +75,10 @@ def _stage_fp4_experts(moe, hidden, inter):
         )
 
 
-def test_owned_experts_uses_loop_when_gated(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
-    monkeypatch.setattr(v4_model, "_V4_GROUPED_MOE", True)
-
+def test_owned_experts_grouped_path_returns_finite_output():
     hidden, inter, num_experts = 64, 128, 4
     moe = _minimal_moe(num_experts, hidden, inter)
-    moe.enable_ep_offloading = True
     _stage_fp4_experts(moe, hidden, inter)
-
-    grouped_mock = MagicMock(return_value=None)
-    monkeypatch.setattr(moe, "_run_owned_experts_grouped", grouped_mock)
 
     tokens = 8
     token_states = torch.randn(tokens, hidden, device="cuda") / 8
@@ -87,15 +89,11 @@ def test_owned_experts_uses_loop_when_gated(monkeypatch):
 
     out = moe._run_owned_experts(token_states, topk_weights, topk_indices)
 
-    grouped_mock.assert_not_called()
     assert out.shape == (tokens, hidden)
     assert torch.isfinite(out.float()).all()
 
 
-def test_grouped_moe_runs_on_sm120(monkeypatch):
-    if torch.cuda.get_device_capability()[0] < 12:
-        pytest.skip("grouped MXFP4 path requires sm120")
-
+def test_grouped_moe_runs_on_current_cuda_arch():
     hidden, inter, num_experts = 64, 128, 4
     moe = _minimal_moe(num_experts, hidden, inter)
     _stage_fp4_experts(moe, hidden, inter)
@@ -110,7 +108,5 @@ def test_grouped_moe_runs_on_sm120(monkeypatch):
     out = moe._run_owned_experts_grouped(
         token_states, topk_weights, topk_indices
     )
-    if out is None:
-        pytest.skip("grouped staging unavailable for this minimal config")
     assert out.shape == (tokens, hidden)
     assert torch.isfinite(out.float()).all()
