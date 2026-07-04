@@ -3,7 +3,7 @@
 import argparse
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -174,6 +174,13 @@ class ServerArgs:
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
+    # Snapshot environment-only worker knobs that must be reproduced in spawned
+    # subprocesses instead of relying on ambient inheritance.
+    v4_resident_experts: bool = field(
+        default_factory=lambda: _env_bool_default(
+            "BATCHGEN_V4_RESIDENT_EXPERTS", False
+        )
+    )
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -642,6 +649,9 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         startup_timeout=parsed.startup_timeout,
         max_pool_size=parsed.max_pool_size,
         max_intake_capacity=parsed.max_intake_capacity,
+        v4_resident_experts=_env_bool_default(
+            "BATCHGEN_V4_RESIDENT_EXPERTS", False
+        ),
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

@@ -121,8 +121,14 @@ class DeepSeekV4FlashParallelStrategyManager:
         for layer in self.model.model.layers:
             layer.mlp.init_num_tokens(max_rank_bsz)
 
-    def _grouped_moe_enabled(self) -> bool:
-        return os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
+    def _resident_experts_enabled(self) -> bool:
+        # Keep owned routed experts GPU-resident during decode (no per-forward
+        # host-streaming load/free). Residency avoids the streaming path's
+        # per-expert cudaStreamSynchronize in free_weights, which desyncs ranks
+        # (each owns different experts -> different timing) and hangs the
+        # per-layer EP collective (7R+1futex). This remains an orthogonal
+        # residency knob; grouped-kernel selection is no longer env-gated.
+        return os.environ.get("BATCHGEN_V4_RESIDENT_EXPERTS", "0") == "1"
 
     def _local_routed_expert_keys(self):
         keys = []
@@ -136,11 +142,12 @@ class DeepSeekV4FlashParallelStrategyManager:
         return keys
 
     def _mark_local_experts_persistent(self) -> None:
-        # Grouped MoE needs owned experts resident (not streamed through the
-        # rolling buffer pool), mirroring GLM5/DeepSeek-V3. Remove them from the
+        # Make owned routed experts resident (not streamed through the rolling
+        # buffer pool), mirroring GLM5/DeepSeek-V3. Remove them from the
         # weight-copy (streaming) task so _config_expert_module marks them
-        # persistent. Gated: default path keeps all experts streamed.
-        if not self._grouped_moe_enabled():
+        # persistent. Required for EP-decode collective correctness, not just the
+        # grouped kernel -- see _resident_experts_enabled.
+        if not self._resident_experts_enabled():
             return
         local = {k for _, _, k in self._local_routed_expert_keys()}
         self.weight_copy_task["routed_expert"] = [
@@ -150,26 +157,68 @@ class DeepSeekV4FlashParallelStrategyManager:
     def _load_local_routed_experts(self) -> None:
         # Load persistent owned-expert weights resident from the host parameter
         # store via core_engine.get_tensor (stable, not the recyclable get_weights
-        # buffer pool), mirroring GLM5._load_local_routed_experts.
-        if not self._grouped_moe_enabled():
+        # buffer pool), mirroring GLM5._load_local_routed_experts. Must run
+        # whenever experts are marked persistent (see _resident_experts_enabled),
+        # otherwise the persistent experts have no weights loaded.
+        if not self._resident_experts_enabled():
             return
         device = self.engine_config.Basic_Config.device_torch
         resident_bytes = 0
+        current_layer_idx = None
+        staged_layer_count = 0
+
+        if self.rank == 0:
+            logging.info(
+                "[V4 GROUPED] resident expert mode active: pre-staging owned expert bundles during configure_decoding "
+                "(single-copy, release_runtime_tensors=True)"
+            )
+
+        def _stage_loaded_layer(layer_idx: int | None) -> None:
+            nonlocal staged_layer_count
+            if layer_idx is None:
+                return
+            mlp = self.model.model.layers[layer_idx].mlp
+            owned_count = (
+                mlp.routed_expert_end_idx - mlp.routed_expert_start_idx
+            )
+            if owned_count <= 0:
+                return
+            # Resident decode owns stable expert tensors for the lifetime of the
+            # model, so prebuild the grouped bundle now and immediately release
+            # the original per-expert FP4 runtime tensors. That leaves exactly
+            # one resident copy: the swizzled grouped bundle consumed by the
+            # kernel on every forward.
+            if not mlp._stage_owned_expert_weights(
+                release_runtime_tensors=True
+            ):
+                raise RuntimeError(
+                    "DeepSeek-V4 resident grouped MoE could not stage owned expert weights at load time"
+                )
+            staged_layer_count += 1
+
         for layer_idx, expert_idx, key in self._local_routed_expert_keys():
+            if current_layer_idx is not None and layer_idx != current_layer_idx:
+                _stage_loaded_layer(current_layer_idx)
             tensors = self.core_engine.get_tensor(key)
             moved = {k: v.to(device) for k, v in tensors.items()}
-            for v in moved.values():
-                if v.is_cuda:
-                    resident_bytes += v.numel() * v.element_size()
+            resident_bytes += sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in moved.values()
+                if tensor.is_cuda
+            )
             placeholder = (
                 self.model.model.layers[layer_idx]
                 .mlp.experts[expert_idx]
                 .module
             )
             placeholder.set_runtime_tensors(moved)
+            current_layer_idx = layer_idx
+            del tensors, moved
+        _stage_loaded_layer(current_layer_idx)
         if self.rank == 0:
             logging.info(
-                "[V4 GROUPED] persistent expert resident bytes: %.2f GiB",
+                "[V4 GROUPED] configure_decoding staged %d resident layers; persistent expert resident bytes: %.2f GiB",
+                staged_layer_count,
                 resident_bytes / 1024**3,
             )
 

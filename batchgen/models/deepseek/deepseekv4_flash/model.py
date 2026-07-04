@@ -85,30 +85,17 @@ _FP4_E2M1_TABLE_VALUES = (
     -6.0,
 )
 
-# Env-gated grouped-MoE for sm120 decode (default OFF). When enabled,
-# _run_owned_experts uses the 3D grouped MXFP4 GEMM path instead of the
-# per-expert loop, and owned experts are made resident (see PSM persistence).
-_V4_GROUPED_MOE = os.environ.get("BATCHGEN_V4_GROUPED_MOE", "0") == "1"
-_V4_GROUPED_MOE_MAX_TOKENS = int(
-    os.environ.get("BATCHGEN_V4_GROUPED_MOE_MAX_TOKENS", "512")
-)
+_V4_LAYER_BARRIER = os.environ.get("BATCHGEN_V4_LAYER_BARRIER", "1") == "1"
 
 
-def _v4_grouped_moe_enabled() -> bool:
-    # The grouped path uses MXFP4 WGMMA kernels (cvt.e2m1x2), which ptxas
-    # rejects below sm120. On Hopper/sm90 the per-expert loop fallback
-    # (pure-torch FP4 dequant) is correct, so force grouped off there.
-    if not _V4_GROUPED_MOE:
-        return False
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] >= 12
+def _v4_layer_barrier_enabled() -> bool:
+    # On by default: required for streamed (offloaded) experts to bound the
+    # per-layer host drift that deadlocks the EP collective. Fully-resident
+    # experts cannot drift, so set BATCHGEN_V4_LAYER_BARRIER=0 to drop the
+    # 43-barriers/token cost when BATCHGEN_V4_RESIDENT_EXPERTS=1.
+    return _V4_LAYER_BARRIER
 
 
-# Use the QAT-faithful grouped MoE forward (per-expert act_quant + fp4_gemm,
-# bit-exact vs official) instead of the faster bf16-weight-dequant grouped GEMM.
-# Needed for character-exact output; slower per decode step.
-_V4_QAT_MOE = os.environ.get("BATCHGEN_V4_QAT_MOE", "0") == "1"
 # Use PyNcclCommunicator for EP-decode collectives instead of torch.distributed
 # (default ON; set 0 to fall back to dist.*). See _ep_all_gather.
 _V4_PYNCCL_COMM = os.environ.get("BATCHGEN_V4_PYNCCL_COMM", "1") == "1"
@@ -1604,6 +1591,7 @@ class DeepSeekV4FlashMoE(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.runtime_phase = str(_cfg(config, "phase", "prefill"))
         self.hidden_size = int(
             _cfg(config, "hidden_size", _cfg(config, "dim", 4096))
         )
@@ -1730,37 +1718,51 @@ class DeepSeekV4FlashMoE(nn.Module):
         topk_weights: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        # Grouped staging clones owned experts resident; only viable in the EP
-        # decode phase (world_size>1, 64 owned experts/rank, ~97GB free). Prefill
-        # runs world_size=1 owning all 256 experts at a high memory peak -> skip.
-        if _v4_grouped_moe_enabled() and self.enable_ep_offloading:
-            grouped = self._run_owned_experts_grouped(
+        if self._should_stream_prefill_owned_experts():
+            return self._run_owned_experts_prefill_eager(
                 token_states, topk_weights, topk_indices
             )
-            if grouped is not None:
-                return grouped
-        routed = torch.zeros_like(token_states, dtype=torch.float32)
-        counts = torch.bincount(
-            topk_indices.reshape(-1), minlength=self.total_experts
+        return self._run_owned_experts_grouped(
+            token_states, topk_weights, topk_indices
         )
-        # One D2H sync for the whole owned slice instead of a per-expert
-        # counts[e].item() (was ~32 syncs/layer -> ~1.4k/token over 43 layers,
-        # the dominant decode-step cost). tolist() is numerically identical.
-        owned_counts = counts[
-            self.routed_expert_start_idx : self.routed_expert_end_idx
-        ].tolist()
-        for offset, expert_idx in enumerate(
-            range(self.routed_expert_start_idx, self.routed_expert_end_idx)
+
+    def _should_stream_prefill_owned_experts(self) -> bool:
+        # Real first-request prefill runs with world_size=1, so rank0 owns all 256
+        # experts for every MoE layer. A full grouped bundle for those 256 experts
+        # is ~4x the decode shard (~3.19 GiB/layer vs ~0.80 GiB/layer) and does
+        # not fit on rank0/GPU0 once the rest of the model is resident. Decode
+        # stays on the grouped path; only the all-owned prefill path falls back to
+        # streamed eager expert execution.
+        return (
+            self.runtime_phase == "prefill"
+            and self.world_size == 1
+            and self.routed_expert_start_idx == 0
+            and self.routed_expert_end_idx == self.total_experts
+        )
+
+    def _run_owned_experts_prefill_eager(
+        self,
+        token_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens, hidden = token_states.shape
+        out = torch.zeros(
+            (num_tokens, hidden),
+            dtype=torch.float32,
+            device=token_states.device,
+        )
+        for expert_idx in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
         ):
-            if owned_counts[offset] == 0:
+            token_ids, topk_pos = torch.where(topk_indices == expert_idx)
+            if token_ids.numel() == 0:
                 continue
-            token_idx, topk_pos = torch.where(topk_indices == expert_idx)
-            expert_out = self.experts[expert_idx](
-                token_states[token_idx],
-                topk_weights[token_idx, topk_pos].unsqueeze(-1),
-            )
-            routed[token_idx] += expert_out.float()
-        return routed
+            local_hidden = token_states.index_select(0, token_ids)
+            local_weights = topk_weights[token_ids, topk_pos].unsqueeze(-1)
+            expert_out = self.experts[expert_idx](local_hidden, local_weights)
+            out.index_add_(0, token_ids, expert_out.float())
+        return out
 
     def _expert_weight_dict(self, expert_idx: int):
         wrapper = self.experts[expert_idx]
@@ -1774,34 +1776,122 @@ class DeepSeekV4FlashMoE(nn.Module):
             return None
         return load(key)
 
-    def _stage_owned_expert_weights(self) -> bool:
-        # Build small pointer arrays to this layer's already-resident owned
-        # experts. Experts are persistent/resident (loaded via get_tensor), so
-        # their data_ptr() values are stable; keeping pointers avoids the
-        # per-layer torch.stack copies that duplicate tens of GB at ws=2.
+    def _owned_expert_module(self, expert_idx: int) -> nn.Module:
+        wrapper = self.experts[expert_idx]
+        return getattr(wrapper, "module", wrapper)
+
+    def _owned_expert_runtime_bytes(self) -> int:
+        resident_bytes = 0
+        for expert_idx in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
+        ):
+            module = self._owned_expert_module(expert_idx)
+            runtime_weights = getattr(module, "runtime_weights", None)
+            if runtime_weights is None:
+                continue
+            for tensor in runtime_weights.values():
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                    resident_bytes += tensor.numel() * tensor.element_size()
+        return resident_bytes
+
+    def _grouped_staged_bundle_bytes(self) -> int:
+        staged = self._grouped_staged
+        if staged is None:
+            return 0
+        seen: set[tuple[torch.device, int, int]] = set()
+        resident_bytes = 0
+
+        def _visit(value) -> None:
+            nonlocal resident_bytes
+            if isinstance(value, torch.Tensor):
+                if not value.is_cuda:
+                    return
+                storage = value.untyped_storage()
+                key = (value.device, storage.data_ptr(), storage.nbytes())
+                if key in seen:
+                    return
+                seen.add(key)
+                resident_bytes += storage.nbytes()
+                return
+            if isinstance(value, dict):
+                for child in value.values():
+                    _visit(child)
+                return
+            if isinstance(value, (list, tuple)):
+                for child in value:
+                    _visit(child)
+
+        _visit(staged)
+        return resident_bytes
+
+    def _release_owned_expert_runtime_tensors(self) -> int:
+        released_bytes = 0
+        for expert_idx in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
+        ):
+            module = self._owned_expert_module(expert_idx)
+            runtime_weights = getattr(module, "runtime_weights", None)
+            if runtime_weights is None:
+                continue
+            for tensor in runtime_weights.values():
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                    released_bytes += tensor.numel() * tensor.element_size()
+            clear_runtime_tensors = getattr(module, "clear_runtime_tensors", None)
+            if clear_runtime_tensors is not None:
+                clear_runtime_tensors()
+        return released_bytes
+
+    def _collect_owned_expert_weight_dicts(
+        self,
+    ) -> Optional[list[dict[str, torch.Tensor]]]:
+        dicts: list[dict[str, torch.Tensor]] = []
+        for expert_idx in range(
+            self.routed_expert_start_idx, self.routed_expert_end_idx
+        ):
+            runtime_weights = self._expert_weight_dict(expert_idx)
+            if (
+                runtime_weights is None
+                or "w1.weight" not in runtime_weights
+            ):
+                return None
+            dicts.append(runtime_weights)
+        return dicts
+
+    def _stage_owned_expert_weights(
+        self, *, release_runtime_tensors: bool = False
+    ) -> bool:
+        # Canonicalize this layer's owned expert weights into the grouped MoE
+        # bundle once, then reuse that bundle across forwards. Resident decode
+        # now prebuilds this during model load; streaming decode keeps the lazy
+        # first-forward path because its source expert buffers are recyclable.
         if self._grouped_staged is not None:
+            if release_runtime_tensors:
+                self._release_owned_expert_runtime_tensors()
             return True
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
         if owned_count <= 0:
             return False
 
-        dicts = []
-        for e in range(
-            self.routed_expert_start_idx, self.routed_expert_end_idx
-        ):
-            rw = self._expert_weight_dict(e)
-            if rw is None or "w1.weight" not in rw:
-                return False
-            dicts.append(rw)
+        dicts = self._collect_owned_expert_weight_dicts()
+        if dicts is None:
+            return False
 
         try:
             from batchgen.moe.v4_slot_moe_sm120 import (
                 setup_v4_expert_weight_pointers,
             )
 
-            self._grouped_staged = setup_v4_expert_weight_pointers(dicts)
+            self._grouped_staged = setup_v4_expert_weight_pointers(
+                dicts,
+                global_expert_count=self.total_experts,
+            )
         except (KeyError, ValueError):
             return False
+        finally:
+            dicts = None
+
+        if release_runtime_tensors:
+            self._release_owned_expert_runtime_tensors()
         return True
 
     def _run_owned_experts_grouped(
@@ -1809,29 +1899,17 @@ class DeepSeekV4FlashMoE(nn.Module):
         token_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_indices: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        # The slot kernel allocates [tokens*topk, 2*I] / [tokens*topk, hidden]
-        # buffers, which only fit the small-token decode regime. Prefill packs
-        # thousands of tokens, so fall back to the loop there.
-        if token_states.shape[0] > _V4_GROUPED_MOE_MAX_TOKENS:
-            return None
+    ) -> torch.Tensor:
         if not self._stage_owned_expert_weights():
-            return None
-        if _V4_QAT_MOE:
-            from batchgen.moe.v4_slot_moe_sm120 import (
-                v4_grouped_mxfp4_moe_forward_qat,
+            raise RuntimeError(
+                "DeepSeek-V4 ragged grouped MoE could not stage owned expert weights"
             )
-
-            moe_forward = v4_grouped_mxfp4_moe_forward_qat
-        else:
-            from batchgen.moe.v4_slot_moe_sm120 import (
-                v4_grouped_mxfp4_moe_forward_3d_ptrs,
-            )
-
-            moe_forward = v4_grouped_mxfp4_moe_forward_3d_ptrs
+        from batchgen.moe.v4_slot_moe_sm120 import (
+            v4_grouped_mxfp4_moe_forward_3d_ptrs,
+        )
 
         owned_count = self.routed_expert_end_idx - self.routed_expert_start_idx
-        return moe_forward(
+        return v4_grouped_mxfp4_moe_forward_3d_ptrs(
             token_states,
             topk_weights,
             topk_indices,
@@ -1941,6 +2019,24 @@ class DeepSeekV4FlashMoE(nn.Module):
                     f"DeepSeek-V4 MoE buffer overflow: real_tokens={real_tokens} > "
                     f"num_tokens_per_rank={ntpr}"
                 )
+
+            # Per-layer host rendezvous (bounds inter-rank layer drift to <=1).
+            # Streamed (offloaded) experts make each rank do a data-dependent
+            # number of load/cudaStreamSynchronize/free ops per layer (the loop
+            # skips zero-token experts), so ranks drift apart across layers and
+            # the per-layer EP collective deadlocks (7R+1futex) instead of
+            # re-aligning. A 1-element all_reduce whose .item() forces a host D2H
+            # wait makes every rank block here until all arrive, regardless of
+            # routed tokens. Skipped when experts are fully resident (no drift).
+            if _v4_layer_barrier_enabled():
+                _bar = flat_states.new_ones((), dtype=torch.int32)
+                dist.all_reduce(_bar, op=dist.ReduceOp.SUM)
+                if int(_bar.item()) != self.world_size:
+                    raise RuntimeError(
+                        f"DeepSeek-V4 MoE layer barrier desync at layer "
+                        f"{self.layer_idx}: saw {int(_bar.item())} of "
+                        f"{self.world_size} ranks."
+                    )
 
             padded = flat_states.new_zeros((ntpr, self.hidden_size))
             if real_tokens > 0:

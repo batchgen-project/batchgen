@@ -700,6 +700,7 @@ class WorkerManager:
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
+            v4_resident_experts=self.args.v4_resident_experts,
         )
         from batchgen.server_worker_main_loop import server_worker_main
 

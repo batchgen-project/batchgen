@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from batchgen.batchgen_worker import BatchGenWorker, BatchGenWorkerArgs
+from batchgen.server.worker_env import apply_worker_env_overrides
 from batchgen.server.process_utils import install_worker_signal_handlers
 from batchgen.server.watchdog import Watchdog
 
@@ -233,6 +234,7 @@ def _server_worker_main_impl(
 
     # Reconfigure logging with actual global rank for clearer log output
     _setup_worker_logging(rank_idx, args.global_rank)
+    apply_worker_env_overrides(args)
 
     # 2. Initialize Process Group
     logging.info(

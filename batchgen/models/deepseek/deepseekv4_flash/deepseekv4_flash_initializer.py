@@ -195,6 +195,27 @@ class DeepSeekV4FlashInitializer:
         reserved_length = self.engine_config.KV_Storage_Config.reserved_length
         world_size = max(1, int(self.world_size))
         experts_per_rank = self.model_config.num_local_experts // world_size
+        offloading_ratio = float(self.engine_config.EP_Config.offloading_ratio)
+        offloading_enabled = (
+            self.engine_config.EP_Config.enable_offloading and offloading_ratio > 0.0
+        )
+        if offloading_enabled:
+            num_local_expert_per_layer = int(experts_per_rank * (1.0 - offloading_ratio))
+            num_local_expert_per_layer = max(
+                0, min(experts_per_rank, num_local_expert_per_layer)
+            )
+            decode_routed_expert_buffers = (
+                experts_per_rank - num_local_expert_per_layer + 2
+            )
+            logging.info(
+                "DeepSeek-V4-Flash EP offloading enabled: %s persistent, %s offloaded, %s decode buffers",
+                num_local_expert_per_layer,
+                experts_per_rank - num_local_expert_per_layer,
+                decode_routed_expert_buffers,
+            )
+        else:
+            num_local_expert_per_layer = experts_per_rank
+            decode_routed_expert_buffers = max(experts_per_rank, 1)
 
         self.engine_config.Module_Batching_Config.attn_prefill_micro_batch_size = 8
         self.engine_config.Module_Batching_Config.MoE_prefill_micro_batch_size = 8
@@ -205,7 +226,7 @@ class DeepSeekV4FlashInitializer:
 
         prefill_buf = {"routed_expert": experts_per_rank, "shared_expert": 1}
         decode_buf = {
-            "routed_expert": max(experts_per_rank, 1),
+            "routed_expert": decode_routed_expert_buffers,
             "shared_expert": 1,
         }
         for mt in self.module_metadata:
@@ -225,9 +246,7 @@ class DeepSeekV4FlashInitializer:
             * reserved_length
         )
         self.engine_config.EP_Config.enable = True
-        self.engine_config.EP_Config.num_local_expert_per_layer = (
-            experts_per_rank
-        )
+        self.engine_config.EP_Config.num_local_expert_per_layer = num_local_expert_per_layer
 
     def Init(self, weights_storage):
         try:
