@@ -72,13 +72,20 @@ LOG="/tmp/v4_h20_server.log"
 #  INDEXER_QUANT=auto : my A3 dispatch -> FP8 indexer quant on sm90.
 #  SPARSE_PREFILL : keep =1 once tilelang works (rebuild fixes it); =0 forces the
 #                   tilelang-free dense prefill fallback if you must skip it.
+#  PYNCCL_COMM=0 (default): the PyNCCL per-layer EP all-gather/all-reduce path
+#    deadlocks markers-off at MP8 (7 ranks GPU-spin + 1 on a host futex) due to
+#    per-rank backend/collective-order divergence; a stray os.write in the debug
+#    tracer masks it via CPU/GIL yield (a Heisenbug, NOT a fix). torch.distributed
+#    is the one-backend, timing-independent path. Override to 1 only after the
+#    PyNCCL wrapper gets real stream/work ordering + a globally-uniform
+#    _use_pynccl() gate. See docker/V4_DECODE_DEADLOCK_FINDINGS.md.
 RUN_ENV=(
   CUDA_VISIBLE_DEVICES="$DEVICES"
   HF_HUB_OFFLINE=1
   PYTHONPATH=/workspace/repo:/workspace/repo/tools
   BATCHGEN_V4_GROUPED_MOE=0
   BATCHGEN_V4_INDEXER_QUANT=auto
-  BATCHGEN_V4_PYNCCL_COMM=1
+  BATCHGEN_V4_PYNCCL_COMM="${BATCHGEN_V4_PYNCCL_COMM:-0}"
   BATCHGEN_V4_SPARSE_PREFILL="${BATCHGEN_V4_SPARSE_PREFILL:-1}"
   TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions
 )
