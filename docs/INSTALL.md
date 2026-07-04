@@ -39,7 +39,7 @@ This installs (in order):
 2. **flash-attention 3** — built from source, Hopper only (~15-20 min)
 3. **FlashMLA** — built from source (~5-10 min)
 4. **DeepGEMM** — built from source (~5-10 min)
-5. **batchgen_kernels** — AOT-compiled CUDA extensions, 22 kernels (~7 min)
+5. **batchgen_kernels** — AOT-compiled CUDA extensions, 23 kernels (~7 min)
 6. **batchgen** — main package via `pip install .` (~1 min)
 
 Total: ~40-50 min on first install.
@@ -155,7 +155,7 @@ This does not apply to Docker (Option A), where the source is the install target
 | **batchgen_kernels** | Must use `--no-build-isolation` (needs installed PyTorch headers) |
 | **H20 GPUs** | Set `TORCH_CUDA_ARCH_LIST=9.0a` before building kernels |
 | **Core engine** | JIT-compiled at first server launch via ninja (automatic, ~5s) |
-| **No JIT for compute kernels** | All 22 CUDA extensions are AOT-compiled in `batchgen_kernels` |
+| **No JIT for compute kernels** | All 23 CUDA extensions are AOT-compiled in `batchgen_kernels` |
 
 ## Verification
 
@@ -189,7 +189,7 @@ PyTorch 2.9.0+cu128
 ├── flash-attention 3  (--no-build-isolation)
 ├── FlashMLA           (--no-build-isolation)
 ├── DeepGEMM           (--no-build-isolation)
-├── batchgen_kernels   (--no-build-isolation, 22 CUDAExtensions)
+├── batchgen_kernels   (--no-build-isolation, 23 CUDAExtensions)
 │   ├── SM90a: WGMMA kernels (MoE, QKV, routing)
 │   └── SM80+: fused ops (RMSNorm, RoPE, dequant, MGN)
 └── batchgen           (pip install .)
