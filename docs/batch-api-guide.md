@@ -339,7 +339,7 @@ Returns `{"status": "healthy"}` (200) or `{"status": "unhealthy", "reason": "...
 
 ## Limitations
 
-- **No batch cancellation.** Once a batch is submitted, it runs to completion. If a batch was submitted incorrectly, either wait for it to complete (results can be ignored) or restart the server.
+- **Coarse batch cancellation.** `POST /v1/batches/{batch_id}/cancel` cancels a `validating` or `in_progress` batch: a batch that has not started is skipped by the scheduler, but sequences already executing are not interrupted mid-flight.
 - **No streaming.** Results are available only after each sequence finishes (via incremental output) or when the entire batch completes.
 - **Single model.** The server loads one model at startup. All batches use that model; the `model` field in request bodies is for validation only.
 
