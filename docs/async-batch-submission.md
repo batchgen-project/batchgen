@@ -66,12 +66,10 @@ while active:
     still_active = []
     for bid, submitted_at in active:
         b = client.get_batch(bid)
-        if b["status"] in ("completed", "failed", "cancelled", "expired"):
+        if b["status"] in ("completed", "failed", "cancelled"):
             elapsed = time.time() - submitted_at
-            counts  = b.get("request_counts", {})
             print(
                 f"{bid}: {b['status']} | "
-                f"{counts.get('completed', 0)}/{counts.get('total', 0)} ok, "
                 f"{elapsed:.0f}s | output_file_id={b.get('output_file_id')}"
             )
         else:
@@ -93,7 +91,7 @@ def poll_all(client, active):
     still_active = []
     for bid, submitted_at in active:
         b = client.get_batch(bid)
-        if b["status"] not in ("completed", "failed", "cancelled", "expired"):
+        if b["status"] not in ("completed", "failed", "cancelled"):
             still_active.append((bid, submitted_at))
     return still_active
 
