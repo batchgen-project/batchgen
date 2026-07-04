@@ -24,6 +24,7 @@ never uses hardcoded values.
 
 from abc import ABC, abstractmethod
 import logging
+import os
 
 from batchgen.config.config import EngineConfig
 
@@ -66,10 +67,46 @@ class BasePlanner(ABC):
         # Compute batch sizes and buffer configs
         self._compute_batch_configs()
 
-        # Model-specific adjustments
         self._adjust_config_for_model()
 
+        # Applied last so env overrides win over planned values (unset = unchanged).
+        self._apply_module_batching_env_overrides()
+
         return self.config
+
+    def _apply_module_batching_env_overrides(self):
+        mb = self.config.Module_Batching_Config
+        overrides = {
+            "BATCHGEN_ATTN_PREFILL_MB": "attn_prefill_micro_batch_size",
+            "BATCHGEN_MOE_PREFILL_MB": "MoE_prefill_micro_batch_size",
+            "BATCHGEN_EXPERT_PREFILL_CAP": "expert_prefill_batch_size_upper_bound",
+            "BATCHGEN_PREFILL_TOKEN_CAP": "prefill_micro_batch_token_cap",
+            "BATCHGEN_ATTN_DECODE_MB": "attn_decoding_micro_batch_size",
+            "BATCHGEN_MOE_DECODE_MB": "MoE_decoding_micro_batch_size",
+            "BATCHGEN_EXPERT_DECODE_CAP": "expert_decoding_batch_size_upper_bound",
+        }
+        for env_name, attr in overrides.items():
+            raw = os.environ.get(env_name)
+            if raw is None or raw == "":
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                logging.warning(
+                    "[planner] ignoring %s=%r (not an int)", env_name, raw
+                )
+                continue
+            if value <= 0:
+                logging.warning(
+                    "[planner] ignoring %s=%d (must be > 0)", env_name, value
+                )
+                continue
+            old = getattr(mb, attr, None)
+            setattr(mb, attr, value)
+            logging.info(
+                "[planner] Module_Batching_Config override: %s %s -> %d (via %s)",
+                attr, old, value, env_name,
+            )
 
     def _set_default_configs(self):
         """Set common default configs. Subclasses can override."""
