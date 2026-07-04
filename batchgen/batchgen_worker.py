@@ -527,6 +527,7 @@ class BatchGenWorkerArgs:
     max_pool_size: int = (
         10240  # Default enables pool mode. 0 = legacy batch-FIFO.
     )
+    v4_resident_experts: bool = False
 
 
 class BatchGenWorker:
@@ -5749,6 +5750,10 @@ class BatchGenWorker:
                 prefill_batch.append(uuid)
                 node_pages_used[seq_node] += req_pages
 
+        prefill_batch = self._truncate_prefill_to_gpu_kv_capacity(
+            prefill_batch
+        )
+
         if self.rank == 0:
             n_evicted = sum(
                 1
@@ -5763,6 +5768,79 @@ class BatchGenWorker:
             )
 
         return prefill_batch
+
+    def _truncate_prefill_to_gpu_kv_capacity(
+        self, prefill_batch: List[str]
+    ) -> List[str]:
+        """Backpressure prefill admission against GPU-KV page capacity.
+
+        Host-KV-based selection can admit more sequences than the GPU KV
+        pools can hold; allocation then raises mid-forward and the excess
+        sequences are silently dropped from the response. Truncate the
+        admitted list to the longest prefix every rank can allocate
+        (MIN-all-reduced so the SPMD batch stays identical across ranks);
+        the remainder stays queued for the next prefill wave.
+        """
+        if not prefill_batch:
+            return prefill_batch
+        manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+        if manager is None or not getattr(manager, "is_initialized", False):
+            # Reset destroys the coordinator between request batches, so at
+            # admission time it may not exist yet. The reinit is collective
+            # but SPMD-safe here: prefill_batch is rank-identical and the
+            # later reinit call in the prefill phase no-ops once initialized.
+            self._maybe_reinit_v4_gpu_kv_for_prefill(prefill_batch)
+            manager = getattr(self, "gpu_paged_kv_cache_manager", None)
+        manager = getattr(manager, "primary", None) or manager
+        if (
+            manager is None
+            or not getattr(manager, "is_initialized", False)
+            or not self._is_deepseek_v4_kv_manager(manager)
+        ):
+            if self.rank == 0:
+                logging.info(
+                    "[PREFILL] GPU-KV preflight skipped: manager="
+                    f"{type(manager).__name__} initialized="
+                    f"{getattr(manager, 'is_initialized', None)}"
+                )
+            return prefill_batch
+
+        from batchgen.sequence import INITIAL_GPU_PAGE_BUFFER
+
+        def _prefill_tokens(seq) -> int:
+            return (
+                math.ceil((seq.prompt_length + 1) / seq.PAGE_SIZE)
+                + INITIAL_GPU_PAGE_BUFFER
+            ) * seq.PAGE_SIZE
+
+        return self._truncate_batch_to_gpu_kv_fit(
+            prefill_batch, manager, _prefill_tokens, "PREFILL"
+        )
+
+    def _truncate_batch_to_gpu_kv_fit(
+        self, batch: List[str], manager, tokens_fn, phase: str
+    ) -> List[str]:
+        fit = 0
+        cumulative: Dict[int, int] = {}
+        for uuid in batch:
+            seq = self.global_batch.get_sequence(uuid)
+            cumulative[int(seq.global_idx)] = int(tokens_fn(seq))
+            if not self._gpu_kv_can_allocate(manager, dict(cumulative)):
+                break
+            fit += 1
+        if self.world_size > 1 and dist.is_initialized():
+            fit_t = torch.tensor([fit], dtype=torch.int64, device="cuda")
+            dist.all_reduce(fit_t, op=dist.ReduceOp.MIN)
+            fit = int(fit_t.item())
+        if fit < len(batch):
+            if self.rank == 0:
+                logging.warning(
+                    f"[{phase}] GPU-KV backpressure: admitting "
+                    f"{fit}/{len(batch)} sequences this wave; "
+                    f"the rest stay queued"
+                )
+            batch = batch[:fit]
+        return batch
 
     def _put_sequences_on_hold(self, uuids: List[str]) -> None:
         """Move IN_DECODE sequences to ON_HOLD, freeing GPU KV but keeping host KV."""
@@ -5880,6 +5958,25 @@ class BatchGenWorker:
             if rank_pages_used[assigned_rank] + req_pages <= capacity_per_rank:
                 decode_batch.append(uuid)
                 rank_pages_used[assigned_rank] += req_pages
+
+        v4_manager = (
+            getattr(self.gpu_paged_kv_cache_manager, "primary", None)
+            or self.gpu_paged_kv_cache_manager
+        )
+        if decode_batch and self._is_deepseek_v4_kv_manager(v4_manager):
+
+            def _decode_tokens(seq) -> int:
+                # Decode loads the FULL context KV from host; the per-seq
+                # two-page-buffer estimate above only covers the working
+                # set, so V4 needs a coordinator preflight to avoid
+                # over-admission (excess stays PREFILLED/ON_HOLD).
+                return int(seq.current_context_length) + 2 * int(
+                    seq.PAGE_SIZE
+                )
+
+            decode_batch = self._truncate_batch_to_gpu_kv_fit(
+                decode_batch, v4_manager, _decode_tokens, "DECODE"
+            )
 
         if self.rank == 0:
             logging.info(
@@ -8697,6 +8794,22 @@ class BatchGenWorker:
             decode_batch.append(uuid)
             rank_counts[assigned_rank] += 1
             total_pages_needed += pages
+
+        v4_manager = getattr(manager, "primary", None) or manager
+        if decode_batch and self._is_deepseek_v4_kv_manager(v4_manager):
+
+            def _decode_tokens(seq) -> int:
+                # The two-page-buffer load pulls the FULL context KV from
+                # host; the per-seq page estimate above only covers the
+                # decode working set, so V4 needs a real coordinator
+                # preflight to avoid over-admission.
+                return int(seq.current_context_length) + 2 * int(
+                    seq.PAGE_SIZE
+                )
+
+            decode_batch = self._truncate_batch_to_gpu_kv_fit(
+                decode_batch, v4_manager, _decode_tokens, "DECODE"
+            )
 
         if self.rank == 0:
             logging.info(
@@ -16482,6 +16595,18 @@ class BatchGenWorker:
 
         # Synchronize all ranks before cleanup
         dist.barrier()
+        if getattr(self, "_pending_kv_append_tasks", None) or getattr(
+            self, "_pending_kv_append_tensors", None
+        ):
+            try:
+                self._wait_pending_kv_append_tasks(defer_errors=True)
+            except Exception as exc:
+                logging.warning(
+                    f"Rank {self.rank}: dropping pending KV-append tasks "
+                    f"on reset: {exc}"
+                )
+            self._pending_kv_append_tasks = []
+            self._pending_kv_append_tensors = []
         self._ignore_eos = False
         # Reset logging flags for new batch (to log sampling mode once per batch)
         self._logged_greedy = False
