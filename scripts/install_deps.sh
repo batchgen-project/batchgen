@@ -167,8 +167,8 @@ install_torch() {
 install_flash_attention() {
     print_step "Installing flash-attention 3 (Hopper)..."
 
-    # Check if already installed
-    if python -c "import flash_attn_hopper" &> /dev/null 2>&1; then
+    # Check if already installed (hopper build exposes the `flash_attn_interface` module)
+    if python -c "import flash_attn_interface" &> /dev/null 2>&1; then
         print_success "flash-attention 3 already installed"
         return 0
     fi
