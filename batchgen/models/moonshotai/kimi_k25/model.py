@@ -1365,10 +1365,9 @@ class KimiK25MoE(nn.Module):
     _prefill_wgmma_mod = None
     _prefill_ptrs_pinned = None    # [6, 384] int64 pinned staging (data_ptr rows)
     _prefill_ptrs_dev = None       # [6, 384] int64 device pointer arrays
-    _prefill_overflow_dev = None   # [1] int32 device sticky overflow flag
-    _prefill_overflow_host = None  # [1] int32 pinned mirror (async D2H, read sync-free)
     _prefill_ring_pending = None   # (event, [384 keys], core_engine) of the previous layer
     _prefill_grouped_logged = False
+    _prefill_skew_logged = False
 
     @torch.inference_mode()
     def _forward_prefill_grouped(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1404,8 +1403,6 @@ class KimiK25MoE(nn.Module):
             cls._prefill_wgmma_mod = _load_int4_grouped_module()
             cls._prefill_ptrs_pinned = torch.empty(6, E, dtype=torch.int64, pin_memory=True)
             cls._prefill_ptrs_dev = torch.empty(6, E, dtype=torch.int64, device=device)
-            cls._prefill_overflow_dev = torch.zeros(1, dtype=torch.int32, device=device)
-            cls._prefill_overflow_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
         buf = cls._prefill_buf
         mod = cls._prefill_wgmma_mod
         mtp = buf.max_tokens_padded
@@ -1418,18 +1415,11 @@ class KimiK25MoE(nn.Module):
 
         # ---- ring: release the PREVIOUS layer's 384 experts ----
         # One event sync bounds CPU run-ahead to a layer; freeing L-1's slots lets the
-        # in-order cyclic H2D worker fill layer L+1 while this layer computes. The pinned
-        # overflow mirror was copied before that event, so reading it here is sync-free.
+        # in-order cyclic H2D worker fill layer L+1 while this layer computes. Overflow is
+        # handled synchronously per chunk (skew check below), so no flag check here.
         if cls._prefill_ring_pending is not None:
             ev, prev_keys, engine = cls._prefill_ring_pending
             ev.synchronize()
-            if int(cls._prefill_overflow_host[0]) != 0:
-                raise RuntimeError(
-                    "[GROUPED-PREFILL] expert overflow: an expert exceeded its "
-                    f"mtp={mtp} stride window (>2x mean load in a {Tc}-token chunk). "
-                    "Rerun with BATCHGEN_KIMI_PREFILL_GROUPED=0 or a larger "
-                    "BATCHGEN_KIMI_PREFILL_GROUPED_CHUNK."
-                )
             for k in prev_keys:
                 engine.free_weights_buffer(k)
             cls._prefill_ring_pending = None
@@ -1440,8 +1430,10 @@ class KimiK25MoE(nn.Module):
         # (in the pending block above) bypasses the wrapper's per-call device sync.
         stage = cls._prefill_ptrs_pinned
         keys = []
+        weights_list = []  # acquired GPU views, reused by the per-chunk skew fallback
         for e_idx, expert in enumerate(self.experts):
             w = expert.load_weights(expert.module_key)
+            weights_list.append(w)
             stage[0, e_idx] = w["gate_proj.weight_packed"].data_ptr()
             stage[1, e_idx] = w["gate_proj.weight_scale"].data_ptr()
             stage[2, e_idx] = w["up_proj.weight_packed"].data_ptr()
@@ -1459,6 +1451,7 @@ class KimiK25MoE(nn.Module):
 
         out = torch.empty(num_tokens, H, dtype=torch.bfloat16, device=device)
         max_m_tiles = mtp // _BLOCK_M
+        n_grouped = n_fallback = 0
         for c0 in range(0, num_tokens, Tc):
             c1 = min(c0 + Tc, num_tokens)
             n = c1 - c0
@@ -1468,32 +1461,73 @@ class KimiK25MoE(nn.Module):
                 0, E, mtp,
                 buf.expert_counts, buf.expert_counters,
                 buf.topk_pos[:n * K],
-                cls._prefill_overflow_dev,
             )
-            # S6 companion: never walk tiles past an (overflowed) expert's stride window.
-            buf.expert_counts.clamp_(max=mtp)
-            mod.grouped_int4_moe_stage1_inplace(
-                buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
-                buf.expert_counts,
-                ptrs[0], ptrs[1], ptrs[2], ptrs[3],
-                buf.empty_bias, buf.empty_bias,
-                N_inter, H // 2, H // 32, max_m_tiles, mtp,
-            )
-            mod.grouped_int4_moe_stage2_inplace(
-                buf.intermediate, buf.expert_out, buf.tma_intermediate,
-                buf.expert_counts,
-                ptrs[4], ptrs[5],
-                buf.empty_bias,
-                H, N_inter // 2, N_inter // 32, max_m_tiles, mtp,
-            )
-            reduce_weighted_scatter(
-                buf.expert_out, buf.topk_pos[:n * K], topk_weight[c0:c1],
-                n, H, K, output=out[c0:c1],
-            )
+            # Per-chunk skew check: the count kernel writes TRUE per-expert counts (unclamped).
+            # One [384] int32 D2H per chunk (~122/microbatch — vs the ~46k per-expert syncs the
+            # grouped path removes) decides grouped-vs-fallback. Real data routes skewed
+            # (RULER niah filler concentrates experts far beyond the 2x-mean mtp window), and
+            # the strided layout cannot hold an expert past mtp rows.
+            counts_cpu = buf.expert_counts.tolist()
+            max_count = max(counts_cpu)
+            if max_count <= mtp:
+                n_grouped += 1
+                mod.grouped_int4_moe_stage1_inplace(
+                    buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
+                    buf.expert_counts,
+                    ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+                    buf.empty_bias, buf.empty_bias,
+                    N_inter, H // 2, H // 32, max_m_tiles, mtp,
+                )
+                mod.grouped_int4_moe_stage2_inplace(
+                    buf.intermediate, buf.expert_out, buf.tma_intermediate,
+                    buf.expert_counts,
+                    ptrs[4], ptrs[5],
+                    buf.empty_bias,
+                    H, N_inter // 2, N_inter // 32, max_m_tiles, mtp,
+                )
+                reduce_weighted_scatter(
+                    buf.expert_out, buf.topk_pos[:n * K], topk_weight[c0:c1],
+                    n, H, K, output=out[c0:c1],
+                )
+            else:
+                # Skewed chunk: a hot expert exceeds its mtp stride window — the dispatch
+                # buffer is lossy for it (S6 skipped the overflow slots). Recompute this
+                # chunk with a per-expert loop over the ALREADY-ACQUIRED ring weights
+                # (no extra load/free, no ring interference; the pending event below is
+                # recorded after these kernels, so release still waits for them).
+                # Follow-up (zero-sync endgame): compact-offsets grouped kernel — per-expert
+                # base offsets instead of e*mtp strides removes this overflow class entirely.
+                n_fallback += 1
+                if not cls._prefill_skew_logged:
+                    cls._prefill_skew_logged = True
+                    logging.warning(
+                        f"[GROUPED-PREFILL] skewed chunk: max expert load {max_count} > "
+                        f"mtp={mtp} (chunk={n} tok) — per-expert fallback for such chunks"
+                    )
+                flat = topk_idx[c0:c1].reshape(-1)
+                tok_rel = torch.arange(n, device=device).repeat_interleave(K)
+                pos_k = torch.arange(K, device=device).repeat(n)
+                x_chunk = x[c0:c1]
+                w_chunk = topk_weight[c0:c1]
+                res32 = torch.zeros(n, H, dtype=torch.float32, device=device)
+                for e_idx in range(E):
+                    if counts_cpu[e_idx] == 0:
+                        continue
+                    mask = flat == e_idx
+                    t_idx = tok_rel[mask]
+                    p_idx = pos_k[mask]
+                    w = weights_list[e_idx]
+                    ye = single_expert_int4_forward(
+                        x_chunk[t_idx],
+                        w["gate_proj.weight_packed"], w["gate_proj.weight_scale"],
+                        w["up_proj.weight_packed"], w["up_proj.weight_scale"],
+                        w["down_proj.weight_packed"], w["down_proj.weight_scale"],
+                    )
+                    wgt = w_chunk[t_idx, p_idx]
+                    res32.index_add_(0, t_idx, ye.float() * wgt.unsqueeze(-1))
+                out[c0:c1] = res32.to(torch.bfloat16)
 
-        # ---- publish pending release: async overflow mirror + zero + event ----
-        cls._prefill_overflow_host.copy_(cls._prefill_overflow_dev, non_blocking=True)
-        cls._prefill_overflow_dev.zero_()
+        # ---- publish pending release ----
         ev = torch.cuda.Event()
         ev.record()
         cls._prefill_ring_pending = (ev, keys, self.experts[0].core_engine)
@@ -1502,7 +1536,7 @@ class KimiK25MoE(nn.Module):
             cls._prefill_grouped_logged = True
             logging.info(
                 f"[GROUPED-PREFILL] active: chunk={Tc} mtp={mtp} E={E} "
-                f"({(num_tokens + Tc - 1) // Tc} chunks this microbatch)"
+                f"(this layer: {n_grouped} grouped / {n_fallback} fallback chunks)"
             )
 
         out = out + self.shared_experts(identity.view(-1, H))
