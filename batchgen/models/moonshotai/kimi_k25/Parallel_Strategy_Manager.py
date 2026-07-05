@@ -312,6 +312,15 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config._attn_implementation = "eager"
         self.loaded_model_config.ep_size = self.world_size
 
+        # Grouped prefill: drop the class-level activation buffers (~10GB GPU: dispatched/
+        # intermediate/expert_out + ptr arrays) for the decode phase — decode needs the HBM
+        # for its own model + cuda-graph; they are lazily recreated on the next prefill.
+        # (The 768-buffer weight RING is freed separately by reset_decoding_buffer.)
+        KimiK25MoE._prefill_buf = None
+        KimiK25MoE._prefill_ptrs_dev = None
+        KimiK25MoE._prefill_expert_offsets = None
+        KimiK25MoE._prefill_ring_pending = None
+
         # TP-MoE path (flag-gated). When set, each rank holds a 1/world_size slice
         # of EVERY expert and the routed FFN runs through SGLang's int4 fused_experts
         # (matching SGLang's tp/dp layout). Default (unset) = EP path unchanged.
