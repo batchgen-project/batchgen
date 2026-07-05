@@ -4120,15 +4120,30 @@ class BatchGenWorker:
 		"""
 		if not decode_uuids:
 			return
-		
-		# Step 1: Each rank reports state for sequences it owns
-		# CRITICAL FIX: Also compute and send prompt_length so receivers can validate ctx_len
-		local_state = {}
+
+		# Tensorized sync: ONE fixed-shape int64 all_reduce(MAX) replaces the pickle
+		# dist.all_gather_object of per-uuid dicts (serialize/deserialize + variable-size
+		# gather blocking all ranks). Rows are keyed by global_idx and sized over the FULL
+		# global_batch — NOT the passed decode_uuids — so the collective shape matches
+		# even when per-rank uuid views diverge (the very condition this sync repairs).
+		# Column 0 = valid flag (1 iff some rank owns the row); all metadata fields are
+		# non-negative ints, so MAX over a zero background reproduces the owner's values.
+		all_seqs = {
+			seq.global_idx: (uuid, seq)
+			for uuid, seq in self.global_batch.sequences.items()
+			if seq is not None
+		}
+		num_rows = max(all_seqs.keys()) + 1 if all_seqs else 0
+		if num_rows == 0:
+			return
+		NUM_FIELDS = 12
+		state = torch.zeros(num_rows, 1 + NUM_FIELDS, dtype=torch.int64, device=self.torch_device)
+
+		# Owner side: repair/validate then publish (same semantics as the dict path).
 		for uuid in decode_uuids:
 			if uuid in self._uuid_to_local_map:
 				seq = self.global_batch.get_sequence(uuid)
-				# CRITICAL: Ensure current_context_length is consistent before sending
-				# The invariant is: current_context_length = prompt_length + decoded_length
+				# CRITICAL: current_context_length = prompt_length + decoded_length invariant
 				expected_ctx = seq.original_prompt_length + seq.decoded_length
 				if seq.current_context_length != expected_ctx:
 					logging.warning(
@@ -4139,78 +4154,64 @@ class BatchGenWorker:
 						f"old={seq.current_context_length}, new={expected_ctx}")
 					seq.current_context_length = expected_ctx
 				seq.validate_metadata(f"rank {self.rank} _sync_sequence_metadata/send")
+				g = seq.global_idx
+				state[g, 0] = 1
+				state[g, 1] = seq.decoded_length
+				state[g, 2] = seq.current_context_length
+				state[g, 3] = seq.gpu_pages_allocated
+				state[g, 4] = 1 if seq.eos_reached else 0
+				state[g, 5] = 1 if getattr(seq, '_rep_detected', False) else 0
+				state[g, 6] = seq.prompt_length
+				state[g, 7] = seq.reentry_decoded_baseline or 0
+				state[g, 8] = seq.max_decode_length or 0
+				state[g, 9] = seq.original_max_decode_length or 0
+				state[g, 10] = seq.host_pages_allocated or 0
+				state[g, 11] = seq.host_token_capacity or 0
+				# total_decoded_before_eviction: needed so non-owning ranks sort
+				# eviction candidates consistently in _prepare_prefill_batch.
+				state[g, 12] = seq.total_decoded_before_eviction or 0
 
-				local_state[uuid] = {
-					'decoded_length': seq.decoded_length,
-					'current_context_length': seq.current_context_length,
-					'gpu_pages_allocated': seq.gpu_pages_allocated,
-					'eos_reached': seq.eos_reached,
-					'rep_detected': getattr(seq, '_rep_detected', False),
-					'prompt_length': seq.prompt_length,  # Include for validation
-					'reentry_decoded_baseline': seq.reentry_decoded_baseline,
-					'max_decode_length': seq.max_decode_length,
-					'original_max_decode_length': seq.original_max_decode_length,
-					'host_pages_allocated': seq.host_pages_allocated,
-					'host_token_capacity': seq.host_token_capacity,
-					# total_decoded_before_eviction: needed so non-owning ranks
-					# sort eviction candidates consistently in _prepare_prefill_batch.
-					'total_decoded_before_eviction': seq.total_decoded_before_eviction,
-				}
-		
-		# Step 2: All-gather state from all ranks
-		all_states = [None] * self.world_size
-		dist.all_gather_object(all_states, local_state)
-		
-		# Step 3: Merge and update local SequenceEntry objects
-		for rank_state in all_states:
-			if rank_state:
-				for uuid, state in rank_state.items():
-					if uuid not in self._uuid_to_local_map:
-						# This sequence belongs to another rank - update our local copy
-						seq = self.global_batch.get_sequence(uuid)
-						if seq is not None:
-							seq.decoded_length = state['decoded_length']
-							seq.current_context_length = state['current_context_length']
-							seq.gpu_pages_allocated = state['gpu_pages_allocated']
-							seq.eos_reached = state['eos_reached']
-							if state.get('rep_detected', False):
-								seq._rep_detected = True
-							# Sync prompt_length too. For EVICTED sequences the
-							# owner rewrites prompt_length at eviction time to
-							# the reconstructed re-entry length; non-owners must
-							# pick that up or prefill selection under-counts.
-							if 'prompt_length' in state:
-								seq.prompt_length = state['prompt_length']
-							if 'reentry_decoded_baseline' in state:
-								seq.reentry_decoded_baseline = state['reentry_decoded_baseline']
-							if 'max_decode_length' in state:
-								seq.max_decode_length = state['max_decode_length']
-							if 'original_max_decode_length' in state:
-								seq.original_max_decode_length = state['original_max_decode_length']
-							# Sync host KV fields for consistent migration planning
-							if 'host_pages_allocated' in state:
-								seq.host_pages_allocated = state['host_pages_allocated']
-							if 'host_token_capacity' in state:
-								seq.host_token_capacity = state['host_token_capacity']
-							# Eviction-related fields
-							if 'total_decoded_before_eviction' in state:
-								seq.total_decoded_before_eviction = state['total_decoded_before_eviction']
-							
-							# VALIDATION: Ensure received ctx_len is consistent
-							expected_ctx = seq.original_prompt_length + seq.decoded_length
-							if seq.current_context_length != expected_ctx:
-								logging.error(
-									f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
-									f"received={seq.current_context_length}, expected={expected_ctx} "
-									f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
-								)
-								seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
-									f"sync_recv old={seq.current_context_length}, new={expected_ctx}")
-								seq.current_context_length = expected_ctx
-							seq.validate_metadata(
-								f"rank {self.rank} _sync_sequence_metadata/recv",
-								require_owner_tensors=False,
-							)
+		dist.all_reduce(state, op=dist.ReduceOp.MAX)
+		state_cpu = state.cpu()
+
+		# Receiver side: apply owner values to sequences this rank does NOT own.
+		for g, (uuid, seq) in all_seqs.items():
+			if state_cpu[g, 0].item() != 1 or uuid in self._uuid_to_local_map:
+				continue
+			row = state_cpu[g]
+			seq.decoded_length = int(row[1])
+			seq.current_context_length = int(row[2])
+			seq.gpu_pages_allocated = int(row[3])
+			seq.eos_reached = bool(row[4])
+			if bool(row[5]):
+				seq._rep_detected = True
+			# prompt_length: for EVICTED sequences the owner rewrites it at eviction
+			# time to the reconstructed re-entry length; non-owners must pick that up
+			# or prefill selection under-counts.
+			seq.prompt_length = int(row[6])
+			seq.reentry_decoded_baseline = int(row[7])
+			seq.max_decode_length = int(row[8])
+			seq.original_max_decode_length = int(row[9])
+			# Host KV fields for consistent migration planning
+			seq.host_pages_allocated = int(row[10])
+			seq.host_token_capacity = int(row[11])
+			seq.total_decoded_before_eviction = int(row[12])
+
+			# VALIDATION: Ensure received ctx_len is consistent
+			expected_ctx = seq.original_prompt_length + seq.decoded_length
+			if seq.current_context_length != expected_ctx:
+				logging.error(
+					f"Rank {self.rank}: [SYNC-VALIDATE] Received inconsistent ctx_len for {uuid[:8]}: "
+					f"received={seq.current_context_length}, expected={expected_ctx} "
+					f"(prompt={seq.prompt_length}, decoded={seq.decoded_length})"
+				)
+				seq.log_event(SeqEvent.CTX_REPAIR, self.rank,
+					f"sync_recv old={seq.current_context_length}, new={expected_ctx}")
+				seq.current_context_length = expected_ctx
+			seq.validate_metadata(
+				f"rank {self.rank} _sync_sequence_metadata/recv",
+				require_owner_tensors=False,
+			)
 
 	# Thin delegations to `batchgen.worker.sync.SyncCoordinator`. The worker
 	# owns the canonical state; `_make_sync_context` snapshots it into a
