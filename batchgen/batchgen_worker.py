@@ -146,9 +146,7 @@ from batchgen.kv_cache.dual_kv_cache_coordinator import DualKVCacheCoordinator
 from batchgen.kv_cache.dual_host_kv_coordinator import DualAsyncKVTask, DualHostKVCoordinator
 from batchgen.sequence import SequenceBatch, SequenceEntry, SequenceStatus, INITIAL_GPU_PAGE_BUFFER, EXTENSION_GPU_PAGE_BUFFER, DECISION_FREQUENCY_PAGES, configure_page_buffers
 from batchgen.prefill.prepack import (
-	prepack_sequences,
 	unpack_last_token_logits,
-	get_prepack_stats,
 	PrepackMetadata,
 	build_prefill_micro_batches,
 )
@@ -6887,7 +6885,6 @@ class BatchGenWorker:
 
 		# Collect input_ids and attention_masks as lists for prepacking
 		input_ids_list = []
-		attention_mask_list = []
 		seq_lengths = []
 
 		for query_idx in batch:
@@ -6921,62 +6918,56 @@ class BatchGenWorker:
 			)
 			input_ids = encoded[:, :L]
 			seq_lengths.append(L)
-
-			# Per-seq mask marks the L valid positions for the prepacker.
-			# Causal attention is enforced by FA varlen + cu_seqlens.
-			attention_mask = torch.zeros_like(input_ids, dtype=torch.int64)
-			attention_mask[0, :L] = 1
-
 			input_ids_list.append(input_ids)
-			attention_mask_list.append(attention_mask)
 
-		# Prepack sequences
-		# Row capacity is set by planner in config (None = no limit, use max sequence length)
-		row_capacity = self.engine_config.Module_Batching_Config.prepack_row_capacity
-		prepack_meta = prepack_sequences(
-			input_ids_list,
-			attention_mask_list,
-			row_capacity=row_capacity,
-			device=self.torch_device,
+		# Assemble the packed flat tensors DIRECTLY via a pinned staging buffer.
+		# The old path built per-seq [1, 64k+] CPU masks, ran prepack_sequences (four
+		# oversized [rows, >=64k] GPU tensors filled with O(num_seqs) BLOCKING pageable
+		# H2D copies + per-seq GPU aranges + a per-seq .item()), then RE-extracted +
+		# re-cat'd the very same flat tensors. Only the flat tensors + cu_seqlens ever
+		# escape this function, so: one CPU memcpy pass into a pinned stage, ONE async
+		# H2D, and 3 GPU kernels for positions. The 8 GB/rank pageable pool itself is
+		# NOT pinned (host budget: 285 GB expert cache + shmem).
+		num_sequences = len(seq_lengths)
+		seq_lengths_list = seq_lengths
+		total_tokens = sum(seq_lengths_list)
+
+		stage = getattr(self, "_prefill_ids_stage", None)
+		if stage is None or stage.numel() < total_tokens:
+			cap = 1 << max(total_tokens - 1, 1).bit_length()  # geometric growth
+			stage = torch.empty(cap, dtype=torch.int64, pin_memory=True)
+			self._prefill_ids_stage = stage
+			self._prefill_ids_stage_evt = torch.cuda.Event()
+		else:
+			# Reuse guard: the previous wave's async H2D out of this pinned buffer
+			# must have completed before we overwrite it.
+			self._prefill_ids_stage_evt.synchronize()
+
+		offset = 0
+		for ids, L in zip(input_ids_list, seq_lengths_list):
+			stage[offset:offset + L].copy_(ids[0, :L])  # pageable-CPU -> pinned memcpy
+			offset += L
+		packed_input_ids_flat = stage[:total_tokens].to(self.torch_device, non_blocking=True)
+		self._prefill_ids_stage_evt.record()
+
+		# Position ids [0..L) per sequence, computed on-GPU (3 kernels, no per-seq work).
+		lens_gpu = torch.tensor(seq_lengths_list, dtype=torch.int64, device=self.torch_device)
+		starts_gpu = torch.cumsum(lens_gpu, dim=0) - lens_gpu
+		packed_position_ids_flat = (
+			torch.arange(total_tokens, dtype=torch.int64, device=self.torch_device)
+			- torch.repeat_interleave(starts_gpu, lens_gpu)
 		)
 
-		# Log prepack statistics
 		if self.rank == 0:
-			stats = get_prepack_stats(prepack_meta)
 			logging.info(
-				f"Prepack stats: {stats['num_sequences']} seqs -> {stats['num_packed_rows']} rows, "
-				f"padding saved: {stats['padding_saved']} tokens, "
-				f"efficiency: {stats['packing_efficiency']:.2%}"
+				f"Prepacked prefill assembly: {num_sequences} seqs, {total_tokens:,} tokens "
+				f"(pinned stage, single async H2D)"
 			)
-
-		# Create flattened tensors for prepacked forward
-		# Flatten packed_input_ids to [total_tokens]
-		total_tokens = sum(prepack_meta.original_seq_lengths)
-
-		# Extract only valid tokens (non-padding) in order
-		packed_input_ids_flat = []
-		packed_position_ids_flat = []
-
-		for seq_idx in range(prepack_meta.num_original_sequences):
-			row_idx, start_pos = prepack_meta.pack_assignment[seq_idx]
-			seq_len = prepack_meta.original_seq_lengths[seq_idx]
-
-			# Extract tokens for this sequence
-			seq_input_ids = prepack_meta.packed_input_ids[row_idx, start_pos:start_pos + seq_len]
-			packed_input_ids_flat.append(seq_input_ids)
-
-			# Position IDs are 0, 1, 2, ... for each sequence
-			packed_position_ids_flat.append(torch.arange(seq_len, device=self.torch_device))
-
-		packed_input_ids_flat = torch.cat(packed_input_ids_flat, dim=0)  # [total_tokens]
-		packed_position_ids_flat = torch.cat(packed_position_ids_flat, dim=0)  # [total_tokens]
 
 		# Split sequences into micro-batches based on TOKEN count (not sequence count)
 		# This prevents OOM when sequences have varying lengths
 		# Token cap is set by planner in config, worker reads from config (no hardcoded values)
 		MAX_TOKENS_PER_MICRO_BATCH = self.engine_config.Module_Batching_Config.prefill_micro_batch_token_cap
-		num_sequences = prepack_meta.num_original_sequences
-		seq_lengths_list = prepack_meta.original_seq_lengths
 
 		# Create micro-batches bounded by token count, optionally also by sum(L^2)
 		# so the per-microbatch attention work (which is O(L^2)) doesn't pile up
