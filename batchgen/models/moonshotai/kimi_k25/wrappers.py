@@ -412,6 +412,13 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         Returns:
             Tuple of (attn_output, attn_weights, kv_cache)
         """
+        # Retire the PREVIOUS layer's pinned offload tensors + futures (mirrors GLM-5):
+        # bounds the pinned-tensor balloon to one layer instead of accumulating all 61
+        # layers' offload_kv until the end-of-prefill retire.
+        AttnWrapperBase.retire_pending_prefill_offloads_before_layer(
+            self.layer_idx,
+            device=hidden_states.device,
+        )
         if self.prepack_mode:
             # Prepacked mode: varlen flash attention
             hidden_states_2d = hidden_states.squeeze(0)
@@ -467,6 +474,23 @@ class KimiK25AttnWrapper(AttnWrapperBase):
                 f"num_sequences={num_sequences}, len(cu_seqlens)={len(cu_seqlens_list)}"
             )
 
+        # Async-offload contract (mirrors the GLM-5 offload): the C++ d2h runs on its OWN
+        # CPU thread with NO CUDA-stream ordering against compute, so (a) drain the compute
+        # stream via an event so the FA3 kernel that wrote offload_kv has fully retired
+        # before the lambda reads it, and (b) PIN offload_kv (and each per-seq view) in the
+        # class-level list + TRACK the returned future, so the caching allocator cannot
+        # re-hand these pages while the d2h is in flight and the worker's
+        # retire_pending_prefill_offloads waits on every future before flip-to-decode.
+        # The old per-layer cu_seqlens.tolist() masked all of this by accident (its blocking
+        # D2H drained the stream); removing it without this contract caused in-flight d2h
+        # reads of freed memory -> cudaErrorIllegalAddress poisoning the context at the
+        # first decode step on 64k runs (all 16 ranks, uniform).
+        from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
+        _AWB.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
+        evt = torch.cuda.Event()
+        evt.record(torch.cuda.current_stream())
+        evt.synchronize()
+
         for seq_idx in range(num_sequences):
             start_idx = cu_seqlens_list[seq_idx]
             end_idx = cu_seqlens_list[seq_idx + 1]
@@ -476,13 +500,15 @@ class KimiK25AttnWrapper(AttnWrapperBase):
             seq_global_id = [global_sequence_ids[seq_idx]]
 
             # MLA: K contains compressed KV + k_pe, no separate V
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+            task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=seq_global_id,
                 k_tensor=seq_kv,
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
+            _AWB.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
+            _AWB.track_prefill_offload_task(task, self.layer_idx)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using BF16 MLA attention.
