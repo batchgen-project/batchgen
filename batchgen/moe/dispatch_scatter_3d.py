@@ -60,6 +60,7 @@ def dispatch_scatter_3d(
     expert_counts: torch.Tensor,
     expert_counters: torch.Tensor,
     topk_pos: torch.Tensor,
+    overflow_flag: torch.Tensor = None,
 ):
     """Route tokens from flat [G, H] into 3D strided [E*mtp, H] buffer.
 
@@ -73,16 +74,26 @@ def dispatch_scatter_3d(
         expert_counts: Pre-allocated [E_local] int32 (zeroed internally)
         expert_counters: Pre-allocated [E_local] int32 (zeroed internally)
         topk_pos: Pre-allocated [G*K] int32 (set to strided positions)
+        overflow_flag: Optional [1] int32; set to 1 (sticky) if any expert's
+            token count exceeds max_tokens_padded. Overflowing slots get
+            topk_pos=-1 (skipped by the reduce) instead of corrupting the
+            next expert's rows.
 
     Returns:
         (expert_counts, topk_pos) — expert_counts[e] = tokens routed to expert e,
-        topk_pos[i] = absolute row index in act_buffer (or -1 if non-local)
+        topk_pos[i] = absolute row index in act_buffer (or -1 if non-local/overflow)
     """
     mod = _load_dispatch_reduce_module()
+    if overflow_flag is None:
+        return mod.dispatch_scatter_3d(
+            x, topk_indices, act_buffer,
+            expert_start, num_local_experts, max_tokens_padded,
+            expert_counts, expert_counters, topk_pos,
+        )
     return mod.dispatch_scatter_3d(
         x, topk_indices, act_buffer,
         expert_start, num_local_experts, max_tokens_padded,
-        expert_counts, expert_counters, topk_pos,
+        expert_counts, expert_counters, topk_pos, overflow_flag,
     )
 
 

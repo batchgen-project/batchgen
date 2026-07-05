@@ -43,7 +43,8 @@ __global__ void scatter_tokens_3d_kernel(
     int32_t* __restrict__ topk_pos,
     int NK, int H, int K,
     int expert_start, int E_local,
-    int max_tokens_padded
+    int max_tokens_padded,
+    int32_t* __restrict__ overflow_flag
 ) {
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp_id = global_tid / WARP_SIZE;
@@ -61,10 +62,21 @@ __global__ void scatter_tokens_3d_kernel(
     int write_pos;
     if (lane_id == 0) {
         int relative_pos = atomicAdd(&expert_counters[local_expert], 1);
-        write_pos = local_expert * max_tokens_padded + relative_pos;
-        topk_pos[itopk] = write_pos;
+        if (relative_pos >= max_tokens_padded) {
+            // Overflow: a hot expert exceeded its mtp stride window. Writing would
+            // corrupt the NEXT expert's rows (OOB for expert E_local-1). Mark the
+            // slot skipped (-1; the weighted reduce already treats -1 as zero
+            // contribution) and raise the sticky flag for the host-side redo policy.
+            write_pos = -1;
+            topk_pos[itopk] = -1;
+            if (overflow_flag != nullptr) *overflow_flag = 1;
+        } else {
+            write_pos = local_expert * max_tokens_padded + relative_pos;
+            topk_pos[itopk] = write_pos;
+        }
     }
     write_pos = __shfl_sync(0xffffffff, write_pos, 0);
+    if (write_pos < 0) return;  // whole warp skips the vector write on overflow
 
     const int vec_size = 8;
     const int vec_count = H / vec_size;
@@ -92,7 +104,8 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
     int64_t max_tokens_padded,
     torch::Tensor expert_counts,
     torch::Tensor expert_counters,
-    torch::Tensor topk_pos
+    torch::Tensor topk_pos,
+    torch::Tensor overflow_flag
 ) {
     const int N = topk_indices.size(0);
     const int K = topk_indices.size(1);
@@ -121,13 +134,16 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
         int total_threads = NK * WARP_SIZE;
         int threads_per_block = 256;
         int blocks = (total_threads + threads_per_block - 1) / threads_per_block;
+        int32_t* overflow_ptr = (overflow_flag.defined() && overflow_flag.numel() > 0)
+            ? overflow_flag.data_ptr<int32_t>() : nullptr;
         scatter_tokens_3d_kernel<<<blocks, threads_per_block, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
             flat_indices.data_ptr<int32_t>(),
             expert_counters.data_ptr<int32_t>(),
             reinterpret_cast<__nv_bfloat16*>(act_buffer.data_ptr()),
             topk_pos.data_ptr<int32_t>(),
-            NK, H, K, expert_start, E_local, max_tokens_padded);
+            NK, H, K, expert_start, E_local, max_tokens_padded,
+            overflow_ptr);
     }
 
     return {expert_counts, topk_pos};
@@ -203,7 +219,15 @@ torch::Tensor reduce_weighted_scatter(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dispatch_scatter_3d", &dispatch_scatter_3d,
-          "3D dispatch scatter for strided MoE buffer layout");
+          "3D dispatch scatter for strided MoE buffer layout",
+          py::arg("x"), py::arg("topk_indices"), py::arg("act_buffer"),
+          py::arg("expert_start"), py::arg("num_local_experts"),
+          py::arg("max_tokens_padded"), py::arg("expert_counts"),
+          py::arg("expert_counters"), py::arg("topk_pos"),
+          // Optional [1] int32 sticky overflow flag; empty/undefined = no flag
+          // (decode call sites unchanged — overflow silently skips as before,
+          // now WITHOUT corrupting the next expert's rows).
+          py::arg("overflow_flag") = torch::Tensor());
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter,
           "Weighted reduce scatter from 3D to flat layout");
 }
