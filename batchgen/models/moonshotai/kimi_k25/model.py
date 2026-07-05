@@ -114,6 +114,12 @@ class _CausalLMOutput:
 # ============================================================================
 
 _K25_TIMING_ENABLED = os.environ.get("BATCHGEN_K25_TIMING", "0") == "1"
+
+# Grouped prefill MoE: ONE dispatch -> grouped WGMMA stage1/stage2 -> reduce per token-chunk,
+# with all 384 experts of a layer resident (2-layer weight ring, planner couples the 768-buffer
+# count to this flag — 8 buffers + grouped path DEADLOCKS). Default off for bring-up.
+_PREFILL_GROUPED = os.environ.get("BATCHGEN_KIMI_PREFILL_GROUPED", "0") == "1"
+_PREFILL_GROUPED_CHUNK = int(os.environ.get("BATCHGEN_KIMI_PREFILL_GROUPED_CHUNK", "32768"))
 _K25_TIMING_LOG_INTERVAL = int(os.environ.get("BATCHGEN_K25_TIMING_INTERVAL", "10"))
 _K25_TIMING_SYNC_EVERY = int(os.environ.get("BATCHGEN_K25_TIMING_SYNC_EVERY", "50"))
 
@@ -1354,9 +1360,159 @@ class KimiK25MoE(nn.Module):
             )
         return moe_output[:num_tokens].view(*orig_shape)
 
+    # ---- Grouped prefill MoE state (class-level, shared across all 60 MoE layers) ----
+    _prefill_buf = None            # KimiK25MoEBufferManager (E=384, mtp from chunk size)
+    _prefill_wgmma_mod = None
+    _prefill_ptrs_pinned = None    # [6, 384] int64 pinned staging (data_ptr rows)
+    _prefill_ptrs_dev = None       # [6, 384] int64 device pointer arrays
+    _prefill_overflow_dev = None   # [1] int32 device sticky overflow flag
+    _prefill_overflow_host = None  # [1] int32 pinned mirror (async D2H, read sync-free)
+    _prefill_ring_pending = None   # (event, [384 keys], core_engine) of the previous layer
+    _prefill_grouped_logged = False
+
+    @torch.inference_mode()
+    def _forward_prefill_grouped(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Prefill MoE as ONE grouped WGMMA pipeline per token-chunk (no per-expert loop).
+
+        Replaces ~384 sequential single-expert WGMMA pairs + their per-expert buffer-recycle
+        device syncs with: dispatch_scatter_3d -> grouped stage1/stage2 (per-expert pointer
+        arrays over the streamed weight ring) -> weighted reduce. All 384 experts of the
+        layer are resident; the planner's 768-buffer (2-layer) ring lets the background H2D
+        worker fill layer L+1 while layer L computes. ONE CUDA-event sync per layer (the
+        previous layer's release) instead of ~768 device-wide synchronizes.
+        """
+        cls = KimiK25MoE
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        x = hidden_states.view(-1, hidden_states.shape[-1])
+        num_tokens, H = x.shape
+        device = x.device
+        K = self.top_k
+        E = len(self.experts)
+        N_inter = self.moe_intermediate_size
+
+        # ---- lazy shared buffers (once per process) ----
+        if cls._prefill_buf is None:
+            Tc = _PREFILL_GROUPED_CHUNK
+            avg = (Tc * K + E - 1) // E
+            mtp = ((2 * avg + _BLOCK_M - 1) // _BLOCK_M) * _BLOCK_M
+            cls._prefill_buf = KimiK25MoEBufferManager(
+                E_local=E, max_global_bsz=Tc, H=H, N_inter=N_inter,
+                topk=K, num_tokens_per_rank=Tc, device=device,
+                max_tokens_padded=mtp,
+            )
+            cls._prefill_wgmma_mod = _load_int4_grouped_module()
+            cls._prefill_ptrs_pinned = torch.empty(6, E, dtype=torch.int64, pin_memory=True)
+            cls._prefill_ptrs_dev = torch.empty(6, E, dtype=torch.int64, device=device)
+            cls._prefill_overflow_dev = torch.zeros(1, dtype=torch.int32, device=device)
+            cls._prefill_overflow_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+        buf = cls._prefill_buf
+        mod = cls._prefill_wgmma_mod
+        mtp = buf.max_tokens_padded
+        Tc = buf.max_global_bsz
+        if buf.tma_dispatched is None or mod is None:
+            raise RuntimeError(
+                "[GROUPED-PREFILL] WGMMA module/TMA descriptors unavailable — "
+                "run with BATCHGEN_KIMI_PREFILL_GROUPED=0"
+            )
+
+        # ---- ring: release the PREVIOUS layer's 384 experts ----
+        # One event sync bounds CPU run-ahead to a layer; freeing L-1's slots lets the
+        # in-order cyclic H2D worker fill layer L+1 while this layer computes. The pinned
+        # overflow mirror was copied before that event, so reading it here is sync-free.
+        if cls._prefill_ring_pending is not None:
+            ev, prev_keys, engine = cls._prefill_ring_pending
+            ev.synchronize()
+            if int(cls._prefill_overflow_host[0]) != 0:
+                raise RuntimeError(
+                    "[GROUPED-PREFILL] expert overflow: an expert exceeded its "
+                    f"mtp={mtp} stride window (>2x mean load in a {Tc}-token chunk). "
+                    "Rerun with BATCHGEN_KIMI_PREFILL_GROUPED=0 or a larger "
+                    "BATCHGEN_KIMI_PREFILL_GROUPED_CHUNK."
+                )
+            for k in prev_keys:
+                engine.free_weights_buffer(k)
+            cls._prefill_ring_pending = None
+
+        # ---- acquire THIS layer's 384 experts IN QUEUE ORDER + build pointer arrays ----
+        # Every expert (incl. empty ones) is acquired and later freed as a block,
+        # preserving the cyclic weight-copy queue contract. Direct core_engine release
+        # (in the pending block above) bypasses the wrapper's per-call device sync.
+        stage = cls._prefill_ptrs_pinned
+        keys = []
+        for e_idx, expert in enumerate(self.experts):
+            w = expert.load_weights(expert.module_key)
+            stage[0, e_idx] = w["gate_proj.weight_packed"].data_ptr()
+            stage[1, e_idx] = w["gate_proj.weight_scale"].data_ptr()
+            stage[2, e_idx] = w["up_proj.weight_packed"].data_ptr()
+            stage[3, e_idx] = w["up_proj.weight_scale"].data_ptr()
+            stage[4, e_idx] = w["down_proj.weight_packed"].data_ptr()
+            stage[5, e_idx] = w["down_proj.weight_scale"].data_ptr()
+            keys.append(expert.module_key)
+        cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
+        ptrs = cls._prefill_ptrs_dev
+
+        # ---- gate once, then compute per Tc-chunk ----
+        topk_idx, topk_weight = self.gate(identity)
+        topk_idx = topk_idx.view(-1, K)
+        topk_weight = topk_weight.view(-1, K)
+
+        out = torch.empty(num_tokens, H, dtype=torch.bfloat16, device=device)
+        max_m_tiles = mtp // _BLOCK_M
+        for c0 in range(0, num_tokens, Tc):
+            c1 = min(c0 + Tc, num_tokens)
+            n = c1 - c0
+            dispatch_scatter_3d(
+                x[c0:c1], topk_idx[c0:c1].to(torch.int32),
+                buf.dispatched_x,
+                0, E, mtp,
+                buf.expert_counts, buf.expert_counters,
+                buf.topk_pos[:n * K],
+                cls._prefill_overflow_dev,
+            )
+            # S6 companion: never walk tiles past an (overflowed) expert's stride window.
+            buf.expert_counts.clamp_(max=mtp)
+            mod.grouped_int4_moe_stage1_inplace(
+                buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
+                buf.expert_counts,
+                ptrs[0], ptrs[1], ptrs[2], ptrs[3],
+                buf.empty_bias, buf.empty_bias,
+                N_inter, H // 2, H // 32, max_m_tiles, mtp,
+            )
+            mod.grouped_int4_moe_stage2_inplace(
+                buf.intermediate, buf.expert_out, buf.tma_intermediate,
+                buf.expert_counts,
+                ptrs[4], ptrs[5],
+                buf.empty_bias,
+                H, N_inter // 2, N_inter // 32, max_m_tiles, mtp,
+            )
+            reduce_weighted_scatter(
+                buf.expert_out, buf.topk_pos[:n * K], topk_weight[c0:c1],
+                n, H, K, output=out[c0:c1],
+            )
+
+        # ---- publish pending release: async overflow mirror + zero + event ----
+        cls._prefill_overflow_host.copy_(cls._prefill_overflow_dev, non_blocking=True)
+        cls._prefill_overflow_dev.zero_()
+        ev = torch.cuda.Event()
+        ev.record()
+        cls._prefill_ring_pending = (ev, keys, self.experts[0].core_engine)
+
+        if not cls._prefill_grouped_logged:
+            cls._prefill_grouped_logged = True
+            logging.info(
+                f"[GROUPED-PREFILL] active: chunk={Tc} mtp={mtp} E={E} "
+                f"({(num_tokens + Tc - 1) // Tc} chunks this microbatch)"
+            )
+
+        out = out + self.shared_experts(identity.view(-1, H))
+        return out.view(*orig_shape)
+
     @torch.inference_mode()
     def _forward_prefill(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill: CUDA gate → per-expert wrapper loop (all experts local, no EP)."""
+        if _PREFILL_GROUPED and getattr(self.experts[0], "stored_layout", "raw") == "raw":
+            return self._forward_prefill_grouped(hidden_states)
         identity = hidden_states
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])

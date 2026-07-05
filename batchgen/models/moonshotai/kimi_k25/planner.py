@@ -18,6 +18,8 @@
 
 """Kimi K2.5 specific planner for BatchGen configuration."""
 
+import os
+
 from batchgen.planner.base_planner import BasePlanner
 
 
@@ -66,6 +68,16 @@ class KimiK25Planner(BasePlanner):
 
         # K2.5 context window: max_position_embeddings=262144 (YaRN: 4096 * factor=64)
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
+
+        # Grouped prefill MoE (BATCHGEN_KIMI_PREFILL_GROUPED=1): the grouped path holds
+        # TWO full layers of expert weights concurrently (compute layer + prefetch layer)
+        # in the streamed weight-buffer ring — 2 x 384 = 768 buffers (~18.6 GiB INT4,
+        # freed on flip-to-decode by reset_decoding_buffer). The flag MUST couple the
+        # buffer count with the model-side path: 8 buffers + grouped path DEADLOCKS
+        # (the grouped path acquires 384 slots concurrently); 768 buffers + the old
+        # per-expert loop is merely wasteful.
+        if os.environ.get("BATCHGEN_KIMI_PREFILL_GROUPED", "0") == "1":
+            self.config.GPU_Buffer_Config.num_prefill_module_buffer["routed_expert"] = 768
 
     def get_module_shapes(self) -> dict:
         """Return Kimi K2.5 specific tensor shapes."""

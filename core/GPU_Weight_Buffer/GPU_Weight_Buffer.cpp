@@ -192,9 +192,12 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
 {
     this->logger_->debug("Get weights: {}", module_name);
     
-    // Start timer for timeout tracking
+    // Start timer for timeout tracking. 30s (was 2s): the grouped prefill MoE path
+    // legitimately holds 384 in-flight acquisitions per layer while 8 ranks/node each
+    // stream ~9.5 GB/layer — a cold ring can exceed 2s without being stuck. This is a
+    // deadline on a blocking wait (error path unchanged), not a sleep.
     auto start_time = std::chrono::steady_clock::now();
-    constexpr auto timeout_duration = std::chrono::seconds(2);
+    constexpr auto timeout_duration = std::chrono::seconds(30);
     
     try {
         while (true) {

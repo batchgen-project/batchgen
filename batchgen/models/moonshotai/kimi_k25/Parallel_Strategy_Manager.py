@@ -132,6 +132,11 @@ class KimiK25ParallelStrategyManager:
         self.loaded_model_config.phase = "prefill"
         self.loaded_model_config.ep_size = 1  # Pure DP: all 384 experts on each rank
 
+        # Grouped prefill MoE: any pending ring release from the PREVIOUS prefill phase
+        # is stale — the flip-to-decode reset destroyed the weight ring, so those slots
+        # no longer exist. Clear so the first grouped layer doesn't free unheld keys.
+        KimiK25MoE._prefill_ring_pending = None
+
         # Step 1.5: Free decode-phase GPU allocations before creating prefill model
         self._cleanup_decode_gpu_state()
 
