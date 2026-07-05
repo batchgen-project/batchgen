@@ -7057,16 +7057,21 @@ class BatchGenWorker:
 					self._local_to_uuid_map,
 					local_to_global_seq_id_map,
 				)
+				batch_cu_seqlens_cpu = prefill_sequence_spans_to_cu_seqlens(batch_spans)
 				batch_cu_seqlens = torch.tensor(
-					prefill_sequence_spans_to_cu_seqlens(batch_spans),
+					batch_cu_seqlens_cpu,
 					dtype=torch.int32,
 					device=self.torch_device,
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
 
-				# Set up Attn_Wrapper for this micro-batch
+				# Set up Attn_Wrapper for this micro-batch. prepack_cu_seqlens_cpu is the SAME
+				# python list the GPU tensor is built from (above) — bound so the per-layer KV
+				# offload can read boundaries without a blocking .tolist() D2H sync per layer,
+				# while preserving the invariant that boundaries == what varlen attention consumed.
 				Attn_Wrapper.prepack_mode = True
 				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
+				Attn_Wrapper.prepack_cu_seqlens_cpu = batch_cu_seqlens_cpu
 				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
 				Attn_Wrapper.prepack_num_sequences = batch_num_seqs
 				Attn_Wrapper.prepack_seq_lengths = batch_seq_lengths
@@ -7078,6 +7083,7 @@ class BatchGenWorker:
 				# which does NOT offload KV to host, causing decode to read garbage.
 				AttnWrapperBase.prepack_mode = True
 				AttnWrapperBase.prepack_cu_seqlens = batch_cu_seqlens
+				AttnWrapperBase.prepack_cu_seqlens_cpu = batch_cu_seqlens_cpu
 				AttnWrapperBase.prepack_max_seqlen = batch_max_seqlen
 				AttnWrapperBase.prepack_num_sequences = batch_num_seqs
 				AttnWrapperBase.prepack_seq_lengths = batch_seq_lengths
@@ -7149,6 +7155,7 @@ class BatchGenWorker:
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
 		Attn_Wrapper.prepack_cu_seqlens = None
+		Attn_Wrapper.prepack_cu_seqlens_cpu = None
 		Attn_Wrapper.prepack_max_seqlen = None
 		Attn_Wrapper.prepack_num_sequences = None
 		Attn_Wrapper.prepack_seq_lengths = None
@@ -7156,6 +7163,7 @@ class BatchGenWorker:
 		# Also reset AttnWrapperBase for models using new wrapper system (GPT-OSS)
 		AttnWrapperBase.prepack_mode = False
 		AttnWrapperBase.prepack_cu_seqlens = None
+		AttnWrapperBase.prepack_cu_seqlens_cpu = None
 		AttnWrapperBase.prepack_max_seqlen = None
 		AttnWrapperBase.prepack_num_sequences = None
 		AttnWrapperBase.prepack_seq_lengths = None

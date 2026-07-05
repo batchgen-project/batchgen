@@ -449,13 +449,16 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        cu_seqlens = self.prepack_cu_seqlens
-        if cu_seqlens is None:
+        # Boundaries come from the bound CPU list that the GPU cu_seqlens tensor was BUILT
+        # from (batchgen_worker binds both from the same python list), so alignment with the
+        # exact boundaries varlen attention consumed holds by construction — WITHOUT the
+        # blocking per-layer .tolist() D2H sync this used to do (61 syncs per microbatch,
+        # each stalling the expert H2D stream).
+        cu_seqlens_list = self.prepack_cu_seqlens_cpu
+        if cu_seqlens_list is None:
             raise RuntimeError(
                 f"Kimi prepacked KV offload missing cu_seqlens for layer {self.layer_idx}"
             )
-        # Keep host KV offload aligned with the exact boundaries consumed by varlen attention.
-        cu_seqlens_list = cu_seqlens.tolist()
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
         if num_sequences != len(cu_seqlens_list) - 1:

@@ -743,8 +743,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
 
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
+        # Boundaries from the bound CPU source list (same list the GPU tensor was built
+        # from) — no D2H read at all; fall back to tolist only if unbound.
+        cu = self.prepack_cu_seqlens_cpu if self.prepack_cu_seqlens_cpu is not None else cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
             start_idx = cu[seq_idx]
             end_idx = cu[seq_idx + 1]
@@ -779,8 +780,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         evt.record(torch.cuda.current_stream())
         evt.synchronize()
 
-        # Single D2H sync for all seq boundaries instead of 2N per-seq .item() calls.
-        cu = cu_seqlens.tolist()
+        # Boundaries from the bound CPU source list — no D2H read; fallback if unbound.
+        cu = self.prepack_cu_seqlens_cpu if self.prepack_cu_seqlens_cpu is not None else cu_seqlens.tolist()
         for seq_idx in range(num_sequences):
             start_idx = cu[seq_idx]
             end_idx = cu[seq_idx + 1]

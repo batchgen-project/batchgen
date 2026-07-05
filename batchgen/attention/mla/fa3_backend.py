@@ -1113,9 +1113,10 @@ def mla_prefill_flashattention3_prepacked(
 	key_states[:, :, self.qk_nope_head_dim:] = k_pe
 	del q_nope, q_pe, k_nope, k_pe, kv, normed_kv
 
-	query_states = query_states.contiguous()
-	key_states = key_states.contiguous()
-	value_states = value_states.contiguous()
+	# No .contiguous() needed: query/key are new_empty-assembled (already contiguous, the call
+	# was a no-op) and FA3 hopper accepts a strided value as long as stride(-1)==1 (the split
+	# view qualifies; FA3 only copies internally when the last dim is strided) — dropping the
+	# explicit value copy saves one [T, H, 128] BF16 materialization per layer.
 
 	# Flash attention with varlen - input is already packed, no unpadding needed
 	attn_output = flash_attn_varlen_func(
@@ -1135,7 +1136,8 @@ def mla_prefill_flashattention3_prepacked(
 	if isinstance(attn_output, tuple):
 		attn_output = attn_output[0]
 
-	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim).contiguous()
+	# FA3 output is contiguous — the view succeeds without a copy.
+	attn_output = attn_output.view(total_tokens, self.num_heads * self.v_head_dim)
 	attn_output = self.o_proj(attn_output)
 
 	return attn_output, offload_kv

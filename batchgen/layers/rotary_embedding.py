@@ -70,7 +70,12 @@ class YarnRotaryEmbedding(nn.Module):
         self.mscale_all_dim = mscale_all_dim
 
         self._compute_inv_freq(device)
-        self._set_cos_sin_cache(max_position_embeddings, device, torch.get_default_dtype())
+        # Cache in BF16 (not default FP32): every runtime consumer is BF16, so the old FP32
+        # cache forced a [seq_len, dim] .to(bf16) COPY x2 (cos+sin) on EVERY forward call
+        # (~122 casts / 64k prefill microbatch across 61 layers). The trig math above stays
+        # FP32; this is the same single RTNE cast the per-call .to() applied — stored values
+        # are bit-identical to what consumers already received.
+        self._set_cos_sin_cache(max_position_embeddings, device, torch.bfloat16)
 
     def _compute_inv_freq(self, device: torch.device):
         """Compute inverse frequencies with YaRN NTK-by-parts interpolation."""
@@ -140,11 +145,16 @@ class YarnRotaryEmbedding(nn.Module):
         if seq_len is None:
             seq_len = x.size(-2)
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len, x.device, x.dtype)
-        return (
-            self.cos_cached[:seq_len].to(x.dtype),
-            self.sin_cached[:seq_len].to(x.dtype),
-        )
+            # Rebuild in the CACHE's dtype (not x.dtype) so an FP32 warmup/dummy caller can
+            # never flip the BF16 cache back to FP32 (or reallocate it post-cuda-graph-capture).
+            self._set_cos_sin_cache(seq_len, x.device, self.cos_cached.dtype)
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        if cos.dtype != x.dtype:
+            # Fallback for non-BF16 test/eager callers; never taken in the BF16 runtime.
+            cos = cos.to(x.dtype)
+            sin = sin.to(x.dtype)
+        return cos, sin
 
 
 def apply_rotary_pos_emb(

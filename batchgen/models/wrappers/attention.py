@@ -207,6 +207,9 @@ class AttnWrapperBase(BaseModuleWrapper):
     # Prepack mode state
     prepack_mode: ClassVar[bool] = False
     prepack_cu_seqlens: ClassVar[Optional[torch.Tensor]] = None
+    # Same boundaries as prepack_cu_seqlens, as the SOURCE python list — per-layer KV offload
+    # reads this instead of .tolist() (a blocking D2H sync per layer).
+    prepack_cu_seqlens_cpu: ClassVar[Optional[List[int]]] = None
     prepack_max_seqlen: ClassVar[Optional[int]] = None
     prepack_num_sequences: ClassVar[Optional[int]] = None
     prepack_seq_lengths: ClassVar[Optional[List[int]]] = None

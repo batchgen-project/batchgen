@@ -305,6 +305,7 @@ class Attn_Wrapper(torch.nn.Module):
 	# Prepack mode for efficient prefill batching
 	prepack_mode = False
 	prepack_cu_seqlens = None  # [num_sequences + 1] cumulative sequence lengths
+	prepack_cu_seqlens_cpu = None  # same boundaries as the SOURCE python list (no D2H to read)
 	prepack_max_seqlen = None  # Maximum sequence length
 	prepack_num_sequences = None  # Number of sequences
 	prepack_seq_lengths = None  # List of individual sequence lengths
