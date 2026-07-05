@@ -61,6 +61,7 @@ def dispatch_scatter_3d(
     expert_counters: torch.Tensor,
     topk_pos: torch.Tensor,
     overflow_flag: torch.Tensor = None,
+    expert_offsets: torch.Tensor = None,
 ):
     """Route tokens from flat [G, H] into 3D strided [E*mtp, H] buffer.
 
@@ -84,16 +85,12 @@ def dispatch_scatter_3d(
         topk_pos[i] = absolute row index in act_buffer (or -1 if non-local/overflow)
     """
     mod = _load_dispatch_reduce_module()
-    if overflow_flag is None:
-        return mod.dispatch_scatter_3d(
-            x, topk_indices, act_buffer,
-            expert_start, num_local_experts, max_tokens_padded,
-            expert_counts, expert_counters, topk_pos,
-        )
     return mod.dispatch_scatter_3d(
         x, topk_indices, act_buffer,
         expert_start, num_local_experts, max_tokens_padded,
-        expert_counts, expert_counters, topk_pos, overflow_flag,
+        expert_counts, expert_counters, topk_pos,
+        overflow_flag=overflow_flag,
+        expert_offsets=expert_offsets,
     )
 
 

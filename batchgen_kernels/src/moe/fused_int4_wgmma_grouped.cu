@@ -294,6 +294,7 @@ grouped_int4_moe_stage1_kernel(
     const int64_t* __restrict__ gate_bias_ptrs,
     const int64_t* __restrict__ up_bias_ptrs,
     const int32_t* __restrict__ tokens_per_expert,
+    const int32_t* __restrict__ expert_offsets,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
     int max_tokens_padded, int N, int K, int num_experts,
@@ -317,8 +318,13 @@ grouped_int4_moe_stage1_kernel(
     const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
     if (m_tile >= num_m_tiles) return;
 
-    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
-    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
+    // Compact-offsets mode (skew-proof): expert windows start at BLOCK_M-aligned
+    // prefix-sum bases instead of fixed e*mtp strides — buffer rows track actual
+    // routing, so ANY skew fits. nullptr = legacy strided layout (decode unchanged).
+    const int expert_base = expert_offsets
+        ? expert_offsets[expert_idx] : expert_idx * max_tokens_padded;
+    const int m_start = expert_base + m_tile * BLOCK_M;
+    const int expert_end = expert_base + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
     const uint8_t* gate_weight = reinterpret_cast<const uint8_t*>(gate_ptrs[expert_idx]);
@@ -535,6 +541,7 @@ grouped_int4_moe_stage2_kernel(
     const int64_t* __restrict__ down_scale_ptrs,
     const int64_t* __restrict__ down_bias_ptrs,
     const int32_t* __restrict__ tokens_per_expert,
+    const int32_t* __restrict__ expert_offsets,
     __nv_bfloat16* __restrict__ C,
     int64_t stride_c_m,
     int max_tokens_padded, int N, int K, int num_experts,
@@ -558,8 +565,11 @@ grouped_int4_moe_stage2_kernel(
     const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
     if (m_tile >= num_m_tiles) return;
 
-    const int m_start = expert_idx * max_tokens_padded + m_tile * BLOCK_M;
-    const int expert_end = expert_idx * max_tokens_padded + expert_tokens;
+    // Compact-offsets mode: see stage1. nullptr = legacy strided (decode unchanged).
+    const int expert_base = expert_offsets
+        ? expert_offsets[expert_idx] : expert_idx * max_tokens_padded;
+    const int m_start = expert_base + m_tile * BLOCK_M;
+    const int expert_end = expert_base + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
     const uint8_t* down_weight = reinterpret_cast<const uint8_t*>(down_ptrs[expert_idx]);
@@ -785,6 +795,7 @@ torch::Tensor grouped_int4_moe_stage1(
         has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
         has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
         tokens_per_expert.data_ptr<int32_t>(),
+        nullptr,  // expert_offsets: legacy strided layout
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         max_tokens_padded, N, K, num_experts,
@@ -842,6 +853,7 @@ torch::Tensor grouped_int4_moe_stage2(
         down_scale_ptrs.data_ptr<int64_t>(),
         has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
         tokens_per_expert.data_ptr<int32_t>(),
+        nullptr,  // expert_offsets: legacy strided layout
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         max_tokens_padded, N, K, num_experts,
@@ -890,7 +902,8 @@ void grouped_int4_moe_stage1_inplace(
     int64_t stride_weight_n,
     int64_t stride_scale_n,
     int max_m_tiles,
-    int max_tokens_padded
+    int max_tokens_padded,
+    c10::optional<torch::Tensor> expert_offsets
 ) {
     TORCH_CHECK(A.is_cuda() && A.dtype() == torch::kBFloat16);
     TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
@@ -926,6 +939,8 @@ void grouped_int4_moe_stage1_inplace(
         has_gate_bias ? gate_bias_ptrs.data_ptr<int64_t>() : nullptr,
         has_up_bias ? up_bias_ptrs.data_ptr<int64_t>() : nullptr,
         tokens_per_expert.data_ptr<int32_t>(),
+        (expert_offsets.has_value() && expert_offsets->defined() && expert_offsets->numel() > 0)
+            ? expert_offsets->data_ptr<int32_t>() : nullptr,
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         max_tokens_padded, N, K, num_experts,
@@ -948,7 +963,8 @@ void grouped_int4_moe_stage2_inplace(
     int64_t stride_weight_n,
     int64_t stride_scale_n,
     int max_m_tiles,
-    int max_tokens_padded
+    int max_tokens_padded,
+    c10::optional<torch::Tensor> expert_offsets
 ) {
     TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kBFloat16);
     TORCH_CHECK(C.is_cuda() && C.dtype() == torch::kBFloat16);
@@ -980,6 +996,8 @@ void grouped_int4_moe_stage2_inplace(
         down_scale_ptrs.data_ptr<int64_t>(),
         has_down_bias ? down_bias_ptrs.data_ptr<int64_t>() : nullptr,
         tokens_per_expert.data_ptr<int32_t>(),
+        (expert_offsets.has_value() && expert_offsets->defined() && expert_offsets->numel() > 0)
+            ? expert_offsets->data_ptr<int32_t>() : nullptr,
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         C.stride(0),
         max_tokens_padded, N, K, num_experts,
@@ -995,7 +1013,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("create_tma_desc_bf16", &create_tma_desc_bf16,
           "Create TMA descriptor for a 2D BF16 tensor");
     m.def("grouped_int4_moe_stage1_inplace", &grouped_int4_moe_stage1_inplace,
-          "Grouped INT4 Stage 1 inplace with 3D strided layout");
+          "Grouped INT4 Stage 1 inplace (strided; or compact via expert_offsets)",
+          py::arg("A"), py::arg("C"), py::arg("tma_desc_bytes"),
+          py::arg("tokens_per_expert"), py::arg("gate_ptrs"), py::arg("gate_scale_ptrs"),
+          py::arg("up_ptrs"), py::arg("up_scale_ptrs"),
+          py::arg("gate_bias_ptrs"), py::arg("up_bias_ptrs"),
+          py::arg("N"), py::arg("stride_weight_n"), py::arg("stride_scale_n"),
+          py::arg("max_m_tiles"), py::arg("max_tokens_padded"),
+          // Optional [E] int32 BLOCK_M-aligned prefix-sum bases (compact, skew-proof
+          // layout); None/omitted = legacy strided e*mtp windows.
+          py::arg("expert_offsets") = py::none());
     m.def("grouped_int4_moe_stage2_inplace", &grouped_int4_moe_stage2_inplace,
-          "Grouped INT4 Stage 2 inplace with 3D strided layout");
+          "Grouped INT4 Stage 2 inplace (strided; or compact via expert_offsets)",
+          py::arg("input"), py::arg("C"), py::arg("tma_desc_bytes"),
+          py::arg("tokens_per_expert"), py::arg("down_ptrs"), py::arg("down_scale_ptrs"),
+          py::arg("down_bias_ptrs"),
+          py::arg("K"), py::arg("stride_weight_n"), py::arg("stride_scale_n"),
+          py::arg("max_m_tiles"), py::arg("max_tokens_padded"),
+          py::arg("expert_offsets") = py::none());
 }

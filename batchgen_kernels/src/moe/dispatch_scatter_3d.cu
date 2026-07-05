@@ -35,6 +35,24 @@ __global__ void count_tokens_3d_kernel(
         expert_counts[i] = s_counts[i];
 }
 
+// Compact-offsets support: BLOCK_M(=64)-aligned exclusive prefix sum of per-expert
+// counts. Expert e's window = [offsets[e], offsets[e] + round_up(counts[e], 64)) —
+// sized to actual routing, so ANY skew fits with <=63 pad rows per expert. E is tiny
+// (384): a single serial thread is negligible and keeps this graph-capturable.
+__global__ void compute_aligned_offsets_kernel(
+    const int32_t* __restrict__ expert_counts,
+    int32_t* __restrict__ expert_offsets,
+    int E_local, int align
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < E_local; e++) {
+            expert_offsets[e] = acc;
+            acc += ((expert_counts[e] + align - 1) / align) * align;
+        }
+    }
+}
+
 __global__ void scatter_tokens_3d_kernel(
     const __nv_bfloat16* __restrict__ x,
     const int32_t* __restrict__ topk_indices,
@@ -44,7 +62,8 @@ __global__ void scatter_tokens_3d_kernel(
     int NK, int H, int K,
     int expert_start, int E_local,
     int max_tokens_padded,
-    int32_t* __restrict__ overflow_flag
+    int32_t* __restrict__ overflow_flag,
+    const int32_t* __restrict__ expert_offsets
 ) {
     const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp_id = global_tid / WARP_SIZE;
@@ -62,9 +81,13 @@ __global__ void scatter_tokens_3d_kernel(
     int write_pos;
     if (lane_id == 0) {
         int relative_pos = atomicAdd(&expert_counters[local_expert], 1);
-        if (relative_pos >= max_tokens_padded) {
-            // Overflow: a hot expert exceeded its mtp stride window. Writing would
-            // corrupt the NEXT expert's rows (OOB for expert E_local-1). Mark the
+        if (expert_offsets != nullptr) {
+            // Compact layout: window sized to round_up(count) — overflow impossible.
+            write_pos = expert_offsets[local_expert] + relative_pos;
+            topk_pos[itopk] = write_pos;
+        } else if (relative_pos >= max_tokens_padded) {
+            // Strided overflow: a hot expert exceeded its mtp stride window. Writing
+            // would corrupt the NEXT expert's rows (OOB for expert E_local-1). Mark the
             // slot skipped (-1; the weighted reduce already treats -1 as zero
             // contribution) and raise the sticky flag for the host-side redo policy.
             write_pos = -1;
@@ -105,7 +128,8 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
     torch::Tensor expert_counts,
     torch::Tensor expert_counters,
     torch::Tensor topk_pos,
-    c10::optional<torch::Tensor> overflow_flag
+    c10::optional<torch::Tensor> overflow_flag,
+    c10::optional<torch::Tensor> expert_offsets
 ) {
     const int N = topk_indices.size(0);
     const int K = topk_indices.size(1);
@@ -130,6 +154,15 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
             NK, expert_start, E_local);
     }
 
+    // Compact-offsets mode: BLOCK_M(64)-aligned prefix sum of the just-computed counts,
+    // entirely on-GPU (no host sync); the scatter then writes at offsets[e]+slot.
+    int32_t* offsets_ptr = nullptr;
+    if (expert_offsets.has_value() && expert_offsets->defined() && expert_offsets->numel() > 0) {
+        offsets_ptr = expert_offsets->data_ptr<int32_t>();
+        compute_aligned_offsets_kernel<<<1, 1, 0, stream>>>(
+            expert_counts.data_ptr<int32_t>(), offsets_ptr, E_local, 64);
+    }
+
     {
         int total_threads = NK * WARP_SIZE;
         int threads_per_block = 256;
@@ -144,7 +177,7 @@ std::vector<torch::Tensor> dispatch_scatter_3d(
             reinterpret_cast<__nv_bfloat16*>(act_buffer.data_ptr()),
             topk_pos.data_ptr<int32_t>(),
             NK, H, K, expert_start, E_local, max_tokens_padded,
-            overflow_ptr);
+            overflow_ptr, offsets_ptr);
     }
 
     return {expert_counts, topk_pos};
@@ -228,7 +261,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           // Optional [1] int32 sticky overflow flag; None/omitted = no flag
           // (decode call sites unchanged — overflow silently skips as before,
           // now WITHOUT corrupting the next expert's rows).
-          py::arg("overflow_flag") = py::none());
+          py::arg("overflow_flag") = py::none(),
+          // Optional [E] int32 output: filled with 64-aligned prefix-sum bases and
+          // used as the COMPACT write layout (skew-proof); None = strided e*mtp.
+          py::arg("expert_offsets") = py::none());
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter,
           "Weighted reduce scatter from 3D to flat layout");
 }
