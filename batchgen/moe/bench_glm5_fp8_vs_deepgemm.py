@@ -51,7 +51,8 @@ TOPK_RATIO = E_TOTAL // TOPK   # 32:  M_e = B_global / 32  ->  B_global = 32 * M
 H20_FP8_PEAK_TFLOPS = 296.0
 
 M_VALUES = [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
-            128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 384, 448, 512]
+            128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 384, 448, 512,
+            640, 768, 1024, 1536, 2048]
 ITERS = 30
 
 # The two GLM-5 MoE GEMM shapes:  (name, K=contraction, N=output_width)
