@@ -17,7 +17,7 @@
 #define WGMMA_K 16
 #define TILES_K (BLOCK_K / WGMMA_K)          // 4
 #define WGMMA_NUM_ACCUM 32                    // 64*64/128
-#define NUM_STAGES 4
+#define NUM_STAGES 2
 #define TILE_ELEMS (BLOCK_M * BLOCK_K)        // 4096
 #define TILE_BYTES (TILE_ELEMS * 2)           // 8192 bytes (BF16)
 #define TOTAL_THREADS 256                     // 2 WG
