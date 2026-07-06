@@ -1369,6 +1369,52 @@ class KimiK25MoE(nn.Module):
     _prefill_expert_offsets = None  # [E] int32 compact window bases (filled by dispatch)
     _prefill_grouped_logged = False
 
+    def _prefill_prepare_weights(self) -> None:
+        """Release layer L-1's ring slots + acquire THIS layer's 384 experts + stage ptrs.
+
+        Called at DECODER-LAYER entry (before attention launches): the GPU still has the
+        previous layer's MoE queued there, so this CPU-side glue (~25-60ms: 384 frees +
+        384 blocking acquires + 2304 pinned data_ptr writes) overlaps GPU work instead of
+        running on the drained stream right before the gate. The release event is from two
+        drains ago at that point — effectively retired, so the synchronize is free.
+        Freeing L-1's slots is also what lets the in-order cyclic H2D worker start filling
+        layer L+1 while layer L computes (the 2-layer ring overlap).
+        """
+        cls = KimiK25MoE
+        if getattr(self, "_prefill_prepared_keys", None) is not None:
+            return  # already prepared for this layer
+        if self.config.phase == "decode":
+            return
+        if getattr(self.experts[0], "stored_layout", "raw") != "raw":
+            return  # legacy marlin store -> the per-expert path handles its own weights
+        if cls._prefill_buf is None:
+            # Buffers not initialized yet (first grouped forward creates them) — defer to
+            # the inline fallback in _forward_prefill_grouped.
+            return
+        if cls._prefill_ring_pending is not None:
+            ev, prev_keys, engine = cls._prefill_ring_pending
+            ev.synchronize()
+            for k in prev_keys:
+                engine.free_weights_buffer(k)
+            cls._prefill_ring_pending = None
+
+        # Acquire IN QUEUE ORDER; every expert (incl. empty ones) is acquired and later
+        # freed as a block, preserving the cyclic weight-copy queue contract. Direct
+        # core_engine release above bypasses the wrapper's per-call device sync.
+        stage = cls._prefill_ptrs_pinned
+        keys = []
+        for e_idx, expert in enumerate(self.experts):
+            w = expert.load_weights(expert.module_key)
+            stage[0, e_idx] = w["gate_proj.weight_packed"].data_ptr()
+            stage[1, e_idx] = w["gate_proj.weight_scale"].data_ptr()
+            stage[2, e_idx] = w["up_proj.weight_packed"].data_ptr()
+            stage[3, e_idx] = w["up_proj.weight_scale"].data_ptr()
+            stage[4, e_idx] = w["down_proj.weight_packed"].data_ptr()
+            stage[5, e_idx] = w["down_proj.weight_scale"].data_ptr()
+            keys.append(expert.module_key)
+        cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
+        self._prefill_prepared_keys = keys
+
     @torch.inference_mode()
     def _forward_prefill_grouped(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Prefill MoE as ONE grouped WGMMA pipeline per token-chunk (no per-expert loop).
@@ -1407,7 +1453,8 @@ class KimiK25MoE(nn.Module):
             cls._prefill_wgmma_mod = _load_int4_grouped_module()
             cls._prefill_ptrs_pinned = torch.empty(6, E, dtype=torch.int64, pin_memory=True)
             cls._prefill_ptrs_dev = torch.empty(6, E, dtype=torch.int64, device=device)
-            cls._prefill_expert_offsets = torch.zeros(E, dtype=torch.int32, device=device)
+            # [E+1]: compact window bases + total-rows sentinel (flat-grid binary search).
+            cls._prefill_expert_offsets = torch.zeros(E + 1, dtype=torch.int32, device=device)
         buf = cls._prefill_buf
         mod = cls._prefill_wgmma_mod
         mtp = buf.max_tokens_padded
@@ -1418,33 +1465,15 @@ class KimiK25MoE(nn.Module):
                 "run with BATCHGEN_KIMI_PREFILL_GROUPED=0"
             )
 
-        # ---- ring: release the PREVIOUS layer's 384 experts ----
-        # One event sync bounds CPU run-ahead to a layer; freeing L-1's slots lets the
-        # in-order cyclic H2D worker fill layer L+1 while this layer computes. Overflow is
-        # handled synchronously per chunk (skew check below), so no flag check here.
-        if cls._prefill_ring_pending is not None:
-            ev, prev_keys, engine = cls._prefill_ring_pending
-            ev.synchronize()
-            for k in prev_keys:
-                engine.free_weights_buffer(k)
-            cls._prefill_ring_pending = None
-
-        # ---- acquire THIS layer's 384 experts IN QUEUE ORDER + build pointer arrays ----
-        # Every expert (incl. empty ones) is acquired and later freed as a block,
-        # preserving the cyclic weight-copy queue contract. Direct core_engine release
-        # (in the pending block above) bypasses the wrapper's per-call device sync.
-        stage = cls._prefill_ptrs_pinned
-        keys = []
-        for e_idx, expert in enumerate(self.experts):
-            w = expert.load_weights(expert.module_key)
-            stage[0, e_idx] = w["gate_proj.weight_packed"].data_ptr()
-            stage[1, e_idx] = w["gate_proj.weight_scale"].data_ptr()
-            stage[2, e_idx] = w["up_proj.weight_packed"].data_ptr()
-            stage[3, e_idx] = w["up_proj.weight_scale"].data_ptr()
-            stage[4, e_idx] = w["down_proj.weight_packed"].data_ptr()
-            stage[5, e_idx] = w["down_proj.weight_scale"].data_ptr()
-            keys.append(expert.module_key)
-        cls._prefill_ptrs_dev.copy_(stage, non_blocking=True)
+        # ---- weights: consume the layer-entry prepare (or do it inline as fallback) ----
+        # _prefill_prepare_weights normally ran at DECODER-LAYER entry, where the GPU still
+        # has layer L-1's MoE queued — hiding the 384-acquire glue that would otherwise
+        # execute on a drained (idle) stream right before the gate.
+        keys = getattr(self, "_prefill_prepared_keys", None)
+        if keys is None:
+            self._prefill_prepare_weights()
+            keys = self._prefill_prepared_keys
+        self._prefill_prepared_keys = None
         ptrs = cls._prefill_ptrs_dev
 
         # ---- gate once, then compute per Tc-chunk ----
@@ -1453,13 +1482,12 @@ class KimiK25MoE(nn.Module):
         topk_weight = topk_weight.view(-1, K)
 
         out = torch.empty(num_tokens, H, dtype=torch.bfloat16, device=device)
-        max_load = 0
         for c0 in range(0, num_tokens, Tc):
             c1 = min(c0 + Tc, num_tokens)
             n = c1 - c0
             # COMPACT dispatch: writes tokens at 64-aligned prefix-sum windows sized to
-            # the actual routing (offsets computed on-GPU inside the call — no host sync,
-            # no overflow class at any skew).
+            # the actual routing (offsets [E+1] computed on-GPU inside the call — no host
+            # sync, no overflow class at any skew).
             dispatch_scatter_3d(
                 x[c0:c1], topk_idx[c0:c1].to(torch.int32),
                 buf.dispatched_x,
@@ -1468,18 +1496,15 @@ class KimiK25MoE(nn.Module):
                 buf.topk_pos[:n * K],
                 expert_offsets=cls._prefill_expert_offsets,
             )
-            # One [384] int32 D2H per chunk (~122/microbatch) sizes the kernel grid to the
-            # HOTTEST expert exactly (max_m_tiles) instead of a worst-case bound.
-            counts_cpu = buf.expert_counts.tolist()
-            max_count = max(counts_cpu)
-            max_load = max(max_load, max_count)
-            max_m_tiles = (max_count + _BLOCK_M - 1) // _BLOCK_M
+            # FLAT-grid stages: the kernel enumerates the buffer's global tiles and each
+            # block binary-searches the offsets for its expert — no host-side counts
+            # (zero D2H per chunk), constant scheduling cost at any skew.
             mod.grouped_int4_moe_stage1_inplace(
                 buf.dispatched_x, buf.intermediate, buf.tma_dispatched,
                 buf.expert_counts,
                 ptrs[0], ptrs[1], ptrs[2], ptrs[3],
                 buf.empty_bias, buf.empty_bias,
-                N_inter, H // 2, H // 32, max_m_tiles, mtp,
+                N_inter, H // 2, H // 32, 1, mtp,
                 expert_offsets=cls._prefill_expert_offsets,
             )
             mod.grouped_int4_moe_stage2_inplace(
@@ -1487,7 +1512,7 @@ class KimiK25MoE(nn.Module):
                 buf.expert_counts,
                 ptrs[4], ptrs[5],
                 buf.empty_bias,
-                H, N_inter // 2, N_inter // 32, max_m_tiles, mtp,
+                H, N_inter // 2, N_inter // 32, 1, mtp,
                 expert_offsets=cls._prefill_expert_offsets,
             )
             reduce_weighted_scatter(
@@ -1503,8 +1528,8 @@ class KimiK25MoE(nn.Module):
         if not cls._prefill_grouped_logged:
             cls._prefill_grouped_logged = True
             logging.info(
-                f"[GROUPED-PREFILL] active (compact layout): chunk={Tc} buf_rows={E * mtp} "
-                f"E={E} max_expert_load={max_load}"
+                f"[GROUPED-PREFILL] active (compact flat-grid): chunk={Tc} "
+                f"buf_rows={E * mtp} E={E} chunks={(num_tokens + Tc - 1) // Tc}"
             )
 
         out = out + self.shared_experts(identity.view(-1, H))
@@ -1637,6 +1662,14 @@ class KimiK25DecoderLayer(nn.Module):
         layer_idx = kwargs.get("layer_idx", self.layer_idx)
         batch_size = hidden_states.shape[0]
         fused_add_norm = self._get_fused_add_rmsnorm_fn()
+
+        # Grouped prefill: prepare this layer's MoE weights (release L-1's ring slots +
+        # acquire L's 384 experts) at LAYER ENTRY — the GPU still has L-1's MoE queued
+        # here, so the acquire glue overlaps compute instead of an idle stream, and the
+        # H2D worker starts filling L+1 a whole attention earlier. All correctness guards
+        # (phase, raw layout, buffers initialized) live inside the prepare method.
+        if _PREFILL_GROUPED and isinstance(self.mlp, KimiK25MoE):
+            self.mlp._prefill_prepare_weights()
 
         if timer is not None:
             ev = timer.make_events(len(_LAYER_OPS))

@@ -50,6 +50,9 @@ __global__ void compute_aligned_offsets_kernel(
             expert_offsets[e] = acc;
             acc += ((expert_counts[e] + align - 1) / align) * align;
         }
+        // Sentinel: total used rows — lets flat-grid GEMM blocks (and binary search)
+        // bound the last expert's window. expert_offsets must be sized [E_local + 1].
+        expert_offsets[E_local] = acc;
     }
 }
 

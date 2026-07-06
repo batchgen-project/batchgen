@@ -306,24 +306,38 @@ grouped_int4_moe_stage1_kernel(
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int expert_idx = blockIdx.x;
+    int expert_idx, expert_base, m_start;
     const int n_tile = blockIdx.y;
-    const int m_tile = blockIdx.z;
     const int n_start = n_tile * BLOCK_N;
-
     if (n_start >= N) return;
 
+    if (expert_offsets) {
+        // FLAT compact grid (skew-proof, no early-exit storm): grid.x enumerates GLOBAL
+        // buffer tiles; each block binary-searches the monotone [E+1] offsets to find its
+        // expert. Grid size = buffer_rows/BLOCK_M regardless of routing, so scheduling
+        // cost is constant and no per-expert tile count (host D2H) is needed.
+        m_start = blockIdx.x * BLOCK_M;
+        if (m_start >= expert_offsets[num_experts]) return;  // beyond used rows
+        int lo = 0, hi = num_experts - 1;
+        while (lo < hi) {  // largest e with offsets[e] <= m_start (~9 steps for E=384)
+            int mid = (lo + hi + 1) >> 1;
+            if (expert_offsets[mid] <= m_start) lo = mid; else hi = mid - 1;
+        }
+        expert_idx = lo;
+        expert_base = expert_offsets[expert_idx];
+        if (m_start - expert_base >= tokens_per_expert[expert_idx]) return;  // pad tile
+    } else {
+        // Legacy strided layout (decode path unchanged): grid = (E, n_tiles, m_tiles).
+        expert_idx = blockIdx.x;
+        const int m_tile = blockIdx.z;
+        const int expert_tokens_ = tokens_per_expert[expert_idx];
+        const int num_m_tiles = (expert_tokens_ + BLOCK_M - 1) / BLOCK_M;
+        if (m_tile >= num_m_tiles) return;
+        expert_base = expert_idx * max_tokens_padded;
+        m_start = expert_base + m_tile * BLOCK_M;
+    }
+
     const int expert_tokens = tokens_per_expert[expert_idx];
-
-    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
-    if (m_tile >= num_m_tiles) return;
-
-    // Compact-offsets mode (skew-proof): expert windows start at BLOCK_M-aligned
-    // prefix-sum bases instead of fixed e*mtp strides — buffer rows track actual
-    // routing, so ANY skew fits. nullptr = legacy strided layout (decode unchanged).
-    const int expert_base = expert_offsets
-        ? expert_offsets[expert_idx] : expert_idx * max_tokens_padded;
-    const int m_start = expert_base + m_tile * BLOCK_M;
     const int expert_end = expert_base + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
@@ -553,22 +567,35 @@ grouped_int4_moe_stage2_kernel(
     const int wg_id = tid / 128;
     const int wg_tid = tid % 128;
 
-    const int expert_idx = blockIdx.x;
+    int expert_idx, expert_base, m_start;
     const int k_tile = blockIdx.y;
-    const int m_tile = blockIdx.z;
     const int k_start = k_tile * BLOCK_N;
-
     if (k_start >= K) return;
 
+    if (expert_offsets) {
+        // FLAT compact grid: see stage1.
+        m_start = blockIdx.x * BLOCK_M;
+        if (m_start >= expert_offsets[num_experts]) return;
+        int lo = 0, hi = num_experts - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >> 1;
+            if (expert_offsets[mid] <= m_start) lo = mid; else hi = mid - 1;
+        }
+        expert_idx = lo;
+        expert_base = expert_offsets[expert_idx];
+        if (m_start - expert_base >= tokens_per_expert[expert_idx]) return;
+    } else {
+        // Legacy strided layout (decode unchanged).
+        expert_idx = blockIdx.x;
+        const int m_tile = blockIdx.z;
+        const int expert_tokens_ = tokens_per_expert[expert_idx];
+        const int num_m_tiles = (expert_tokens_ + BLOCK_M - 1) / BLOCK_M;
+        if (m_tile >= num_m_tiles) return;
+        expert_base = expert_idx * max_tokens_padded;
+        m_start = expert_base + m_tile * BLOCK_M;
+    }
+
     const int expert_tokens = tokens_per_expert[expert_idx];
-
-    const int num_m_tiles = (expert_tokens + BLOCK_M - 1) / BLOCK_M;
-    if (m_tile >= num_m_tiles) return;
-
-    // Compact-offsets mode: see stage1. nullptr = legacy strided (decode unchanged).
-    const int expert_base = expert_offsets
-        ? expert_offsets[expert_idx] : expert_idx * max_tokens_padded;
-    const int m_start = expert_base + m_tile * BLOCK_M;
     const int expert_end = expert_base + expert_tokens;
     const int m_size = min(BLOCK_M, expert_end - m_start);
 
@@ -917,7 +944,13 @@ void grouped_int4_moe_stage1_inplace(
     std::memcpy(&desc_a, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
 
     const int num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_experts, num_n_tiles, max_m_tiles);
+    const bool flat = expert_offsets.has_value() && expert_offsets->defined()
+                      && expert_offsets->numel() > 0;
+    // FLAT compact grid: enumerate the buffer's global tiles (constant size, no host
+    // tile counts, no per-expert early-exit storm); legacy strided keeps (E, n, m_tiles).
+    dim3 grid = flat
+        ? dim3((C.size(0) + BLOCK_M - 1) / BLOCK_M, num_n_tiles, 1)
+        : dim3(num_experts, num_n_tiles, max_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
@@ -978,7 +1011,11 @@ void grouped_int4_moe_stage2_inplace(
     std::memcpy(&desc_input, tma_desc_bytes.data_ptr(), sizeof(CUtensorMap));
 
     const int num_k_tiles = (K + BLOCK_N - 1) / BLOCK_N;
-    dim3 grid(num_experts, num_k_tiles, max_m_tiles);
+    const bool flat = expert_offsets.has_value() && expert_offsets->defined()
+                      && expert_offsets->numel() > 0;
+    dim3 grid = flat
+        ? dim3((C.size(0) + BLOCK_M - 1) / BLOCK_M, num_k_tiles, 1)
+        : dim3(num_experts, num_k_tiles, max_m_tiles);
     dim3 block(TOTAL_THREADS);
 
     constexpr int smem_bytes = 2 * NUM_STAGES * TILE_BYTES +
