@@ -84,6 +84,14 @@ def main():
     except Exception:
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 
+    # SGLang's fused_moe reads global server args (autotune/config); init a dummy one.
+    from sglang.srt.server_args import (
+        ServerArgs, get_global_server_args, set_global_server_args_for_scheduler)
+    try:
+        get_global_server_args()
+    except Exception:
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
     print("Building INT4 weights + bf16 golden ...", flush=True)
     w1_u8_l, w1_s_l, w1_bf_l = [], [], []   # gate|up: [2N, H]
     w2_u8_l, w2_s_l, w2_bf_l = [], [], []   # down:    [H,  N]
