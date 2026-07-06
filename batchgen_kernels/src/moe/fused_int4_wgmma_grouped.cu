@@ -244,15 +244,19 @@ __device__ __forceinline__ void load_decode_rhs_int4_swizzled(
     __nv_bfloat16 scale_val = scale_base[n_global * stride_scale_n + (k_start + k_local_start) / 32];
     __nv_bfloat162 scale2 = __bfloat162bfloat162(scale_val);
 
-    // Decode: extract nibbles, offset decode (nibble - 8), cast to BF16, apply scale
+    // Decode: magic-number INT4->BF16. Bitwise-identical to (nibble-8) via I2F, but skips
+    // the 2x I2F + 2x F32->BF16 CVT conversion-pipe chain that bottlenecks the producer.
+    // (0x4300 | v) reinterpreted as bf16 = 128+v exactly for v in [0,15] (low mantissa bits);
+    // subtract 136.0 (0x4308) -> v-8, exact in bf16. Scale applied below (unchanged).
+    const __nv_bfloat16 c136 = __ushort_as_bfloat16((unsigned short)0x4308);   // 136.0
+    const __nv_bfloat162 bias136 = __halves2bfloat162(c136, c136);
     __nv_bfloat162 raw[16];
     #pragma unroll
     for (int i = 0; i < 16; i++) {
-        int lo_int = (bytes[i] & 0x0F) - 8;
-        int hi_int = ((bytes[i] >> 4) & 0x0F) - 8;
-        __nv_bfloat16 lo = __float2bfloat16(static_cast<float>(lo_int));
-        __nv_bfloat16 hi = __float2bfloat16(static_cast<float>(hi_int));
-        raw[i] = __halves2bfloat162(lo, hi);
+        unsigned b = bytes[i];
+        __nv_bfloat16 lo = __ushort_as_bfloat16((unsigned short)(0x4300u |  (b & 0x0Fu)));
+        __nv_bfloat16 hi = __ushort_as_bfloat16((unsigned short)(0x4300u | ((b >> 4) & 0x0Fu)));
+        raw[i] = __hsub2(__halves2bfloat162(lo, hi), bias136);
     }
 
     // Apply scale
