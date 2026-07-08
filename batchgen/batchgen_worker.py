@@ -6887,6 +6887,7 @@ class BatchGenWorker:
 		Args:
 			batch: list of local indices
 		"""
+		_prefill_wall_t0 = time.perf_counter()
 		# Bind AttnWrapperBase.host_paged_kv_worker_view_aux BEFORE the decoder
 		# loop. Without this binding, GLM-5's prefill indexer-K offload at
 		# wrappers.py:_offload_prepacked_indexer_kv silently early-returns
@@ -7181,6 +7182,17 @@ class BatchGenWorker:
 
 		# Log timing summary for GPT-OSS if timing was enabled
 		self._log_prefill_timing()
+
+		# Unconditional prepacked-prefill wall time (POIS 2026-07-08: the config/sync bracket
+		# lines exist but the forward wall itself was never logged).
+		_prefill_wall = time.perf_counter() - _prefill_wall_t0
+		_pf_tokens = sum(seq_lengths_list)
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] prepacked prefill COMPLETE: {_pf_tokens:,} tokens, "
+				f"{len(batch)} seqs, {len(micro_batches)} micro-batches (this rank) in "
+				f"{_prefill_wall:.1f}s ({_pf_tokens / max(_prefill_wall, 1e-6):,.0f} tok/s/rank)"
+			)
 
 		new_tokens = torch.cat(output_tokens, dim=0)
 		if new_tokens.shape[0] != len(batch):
