@@ -56,10 +56,6 @@ class DecodeBatchRequest:
     candidates: Tuple[DecodeCandidate, ...]
     total_pages: int
     world_size: int
-    # Per-rank in-decode sequence cap (= the MoE buffer's num_tokens_per_rank = mtp/world_size).
-    # Bounds the global decode batch to <= mtp so the pre-reserved padded MoE buffers never
-    # overflow (no runtime resize -> no OOM). 0 = unlimited (legacy / non-K2.5).
-    max_rank_bsz: int = 0
 
 
 class DecodeScheduler:
@@ -81,19 +77,11 @@ class DecodeScheduler:
         candidates = sorted(req.candidates, key=lambda c: c.global_idx)
 
         rank_pages_used = [0] * req.world_size
-        rank_seq_count = [0] * req.world_size
-        cap = req.max_rank_bsz  # <= 0 means unlimited
         decode_batch: List[str] = []
 
         for c in candidates:
-            r = c.assigned_rank
-            # Cap per-rank in-decode count so the global batch stays <= mtp (MoE buffer
-            # capacity) — prevents overflow of the pre-reserved padded buffers.
-            if cap > 0 and rank_seq_count[r] >= cap:
-                continue
-            if rank_pages_used[r] + c.req_pages <= capacity_per_rank:
+            if rank_pages_used[c.assigned_rank] + c.req_pages <= capacity_per_rank:
                 decode_batch.append(c.uuid)
-                rank_pages_used[r] += c.req_pages
-                rank_seq_count[r] += 1
+                rank_pages_used[c.assigned_rank] += c.req_pages
 
         return decode_batch
