@@ -1055,10 +1055,21 @@ class KimiK25MoE(nn.Module):
 
         # 3) 3D dispatch scatter into strided buffer
         if buf is not None:
+            # buf is sized for buf.E_local persistent experts (== experts_per_rank only
+            # when EP offloading is off). Passing experts_per_rank with offloading on
+            # made the kernel's bounds guard too wide -> OOB counter atomics + token-row
+            # writes past dispatched_x (single-node IMA, bug_log 2026-07-09). EP decode
+            # has NO offloaded-expert execution path, so offloading + EP decode is
+            # unsupported: fail loudly instead of silently dropping routed expert mass.
+            if buf.E_local != self.experts_per_rank:
+                raise RuntimeError(
+                    f"EP decode requires all local experts persistent: buf.E_local="
+                    f"{buf.E_local} != experts_per_rank={self.experts_per_rank} "
+                    f"(EP offloading enabled? unsupported in EP decode)")
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
                 buf.dispatched_x,
-                self.routed_expert_start_idx, self.experts_per_rank,
+                self.routed_expert_start_idx, buf.E_local,
                 buf.max_tokens_padded,
                 buf.expert_counts, buf.expert_counters,
                 buf.topk_pos[:total_real * topk],
