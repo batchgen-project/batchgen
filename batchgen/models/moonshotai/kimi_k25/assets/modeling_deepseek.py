@@ -884,14 +884,14 @@ class MoEGate(nn.Module):
 		scores = torch.sigmoid(logits)
 
 		# Custom kernel handles MoE routing (DeepSeek-V3: n_group=8, topk_group=4)
+		# mgn.py wrapper derives n_routed_experts from the scores tensor; do not pass it.
 		topk_idx, topk_weight = moe_fused_gate(
 			scores,
 			self.e_score_correction_bias,
 			self.n_group,
 			self.topk_group,
-			self.n_routed_experts,
 			self.top_k,
-			self.routed_scaling_factor
+			routed_scaling_factor=self.routed_scaling_factor,
 		)
 
 		return topk_idx, topk_weight
