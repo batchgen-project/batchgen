@@ -284,7 +284,11 @@ class _DualKVLoadPointers:
 # (c) host cache + 1487 GB shmem (kv768+wt719) on the 2266 GB node. (Was 32768, which fit only
 # <=32k total and crashed at admission for a 64k prompt: input_ids row was 32768 wide but the
 # prompt was 64018 tokens — RuntimeError "expanded size (32768) must match (64018)".)
-_QUERY_BOOK_BUFFER_MAX_LEN = 81920
+# Env-tunable: single-node 255k-prefill workloads need 262144-wide rows; pair a larger width
+# with a small --max-pool-size so the pool stays tiny (e.g. 64 rows x 262144 x 8 B ~= 134
+# MB/rank input_ids + same again for decoded_tokens — vs 128 GB/node at the 12288 default).
+_QUERY_BOOK_BUFFER_MAX_LEN = int(
+	os.environ.get("BATCHGEN_QUERY_BOOK_BUFFER_MAX_LEN", "81920"))
 
 
 class QueryBookBufferPool:
