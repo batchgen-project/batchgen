@@ -167,7 +167,9 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
     _wgmma_fallback_logged = False
     # "raw": checkpoint stored in WGMMA raw layout (kimi_parameter_server raw=True) → prefill
     # consumes it directly, no per-forward Marlin→raw. Set "marlin" to re-enable the legacy path.
-    stored_layout = "raw"
+    # NOTE: the streamed-expert feed can reshape Marlin bytes to raw metadata dims, making
+    # shape detection blind — BATCHGEN_KIMI_STORED_LAYOUT=marlin forces the transform.
+    stored_layout = os.environ.get("BATCHGEN_KIMI_STORED_LAYOUT", "raw")
 
     def _transform_marlin_to_raw(self, weights: dict):
         """Transform Marlin-layout weights to raw INT4 on-the-fly for WGMMA prefill.
