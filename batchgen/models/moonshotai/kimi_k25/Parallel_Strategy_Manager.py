@@ -1044,6 +1044,7 @@ class KimiK25ParallelStrategyManager:
         # Lazy import: keeps the default EP path's import surface unchanged (the
         # marlin transform pulls the compiled _C_marlin_transform extension).
         from batchgen.moe.marlin_transform import (
+            marlin_to_wgmma_fused_gpu,
             raw_to_marlin_fused_gpu,
         )
 
@@ -1052,6 +1053,9 @@ class KimiK25ParallelStrategyManager:
         N = self.loaded_model_config.moe_intermediate_size  # 2048
         E = NUM_TOTAL_EXPERTS                               # 384
         GROUP_SIZE = 32                                     # INT4 group size (gs=32)
+        # Same override convention as wrappers.py stored_layout (96eda416): forces the
+        # Marlin→raw un-permute when metadata dims hide the layout from shape detection.
+        stored_marlin = os.environ.get("BATCHGEN_KIMI_STORED_LAYOUT", "raw") == "marlin"
         r = self.global_rank
         inter_pr = N // self.world_size                     # 128 for ws=16
         r0 = r * inter_pr
@@ -1102,12 +1106,45 @@ class KimiK25ParallelStrategyManager:
                 down_qw = t["down_proj.weight_packed"].to(device)
                 down_s = t["down_proj.weight_scale"].to(device)
 
-                # Store is RAW (WGMMA layout): get_tensor already returns [N,K//8] raw INT4 +
-                # [N,K//32] bf16 scales — exactly what marlin_to_wgmma_fused_gpu used to output.
-                # No leading marlin→raw transform; the slice + re-marlinize below is unchanged.
-                raw_g, raw_gs = gate_qw, gate_s
-                raw_u, raw_us = up_qw, up_s
-                raw_d, raw_ds = down_qw, down_s
+                # Layout must be DETECTED, not assumed (same rule as wrappers.py
+                # get_weights and _register_marlin_weights): production converted ckpts
+                # store MARLIN bytes (kimi_parameter_server converts with marlin=True).
+                # Marlin gate/up packed is [K//16, N*2] (rows < cols); raw is [N, K//8]
+                # (rows > cols) — unambiguous. The slice on the intermediate dim below
+                # needs RAW layout, so un-permute first, then slice + re-marlinize.
+                # view() normalizes metadata-reshaped Marlin bytes to Marlin dims
+                # (identical numel); it is a no-op when shapes are already Marlin.
+                is_marlin = gate_qw.shape[0] < gate_qw.shape[1] or stored_marlin
+                if is_marlin:
+                    raw_g, raw_gs = marlin_to_wgmma_fused_gpu(
+                        gate_qw.view(H // 16, N * 2),
+                        gate_s.view(H // GROUP_SIZE, N), H, N)
+                    raw_u, raw_us = marlin_to_wgmma_fused_gpu(
+                        up_qw.view(H // 16, N * 2),
+                        up_s.view(H // GROUP_SIZE, N), H, N)
+                    # down: contraction K = N (moe inter), output dim = H
+                    raw_d, raw_ds = marlin_to_wgmma_fused_gpu(
+                        down_qw.view(N // 16, H * 2),
+                        down_s.view(N // GROUP_SIZE, H), N, H)
+                else:
+                    raw_g, raw_gs = gate_qw, gate_s
+                    raw_u, raw_us = up_qw, up_s
+                    raw_d, raw_ds = down_qw, down_s
+
+                # Loud layout guard: a wrong-layout store slips through Python shape
+                # checks only via the scales (the packed-int32 kernel has none) and
+                # historically surfaced as EMPTY re-marlinized scales on ranks >= 1.
+                # Fail here, per expert, never silently.
+                if raw_gs.shape != (N, H // GROUP_SIZE) or raw_ds.shape != (H, N // GROUP_SIZE):
+                    raise RuntimeError(
+                        f"TP-MoE layer {layer_idx} expert {e}: un-permuted scale shapes "
+                        f"gate={tuple(raw_gs.shape)} down={tuple(raw_ds.shape)} do not match "
+                        f"raw WGMMA dims gate=({N}, {H // GROUP_SIZE}) down=({H}, {N // GROUP_SIZE}). "
+                        f"Stored layout mishandled (is_marlin={is_marlin}, "
+                        f"BATCHGEN_KIMI_STORED_LAYOUT="
+                        f"{os.environ.get('BATCHGEN_KIMI_STORED_LAYOUT', 'raw')}); "
+                        f"slicing would yield empty/garbage marlin scales."
+                    )
 
                 # gate|up: slice OUTPUT rows [r0:r1], marlinize gate and up
                 # SEPARATELY, then concat the marlin tensors on the column dim.
