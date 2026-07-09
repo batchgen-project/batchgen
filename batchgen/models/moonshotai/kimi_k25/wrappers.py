@@ -142,9 +142,24 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             "down_proj.weight_packed": self.module.int4_down_packed,
             "down_proj.weight_scale": self.module.int4_down_scale,
         }
-        # Weights are stored RAW (WGMMA layout) at checkpoint conversion — no per-forward
-        # transform. Only the legacy marlin store needs the on-the-fly Marlin→raw transform.
-        if self.stored_layout != "raw":
+        # Layout must be DETECTED, not assumed: the production converted_ckpt dirs are
+        # Marlin-layout (decode loads them directly), and consuming Marlin nibbles as raw
+        # WGMMA silently produces garbage prefill MoE output (root cause of the 2-node
+        # degenerate-decode bug, bug_log 2026-07-09). Marlin gate/up is [K//16, N*2]
+        # (shape[0] < shape[1]) — unambiguous vs raw [N, K//8]. The stored_layout attr
+        # remains as an override for marlin data reshaped to raw metadata dims.
+        gate = weights["gate_proj.weight_packed"]
+        is_marlin_shape = (
+            isinstance(gate, torch.Tensor) and gate.dim() == 2
+            and gate.shape[0] < gate.shape[1]
+        )
+        if is_marlin_shape or self.stored_layout == "marlin":
+            if not KimiK25ExpertWrapper._transform_logged:
+                logging.info(
+                    "[PREFILL] Marlin-layout expert store detected (gate %s) — "
+                    "enabling per-forward Marlin→raw transform for WGMMA",
+                    tuple(gate.shape) if isinstance(gate, torch.Tensor) else "?")
+                KimiK25ExpertWrapper._transform_logged = True
             self._transform_marlin_to_raw(weights)
         return weights
 
@@ -272,8 +287,15 @@ class KimiK25ExpertWrapper(ExpertWrapperBase):
             weights = self._get_stored_int4_weights()
         else:
             weights = self.load_weights(self.module_key)
-            # Raw store (default) → weights already in WGMMA layout, no transform.
-            if self.stored_layout != "raw":
+            # Detect layout per-expert (see _get_stored_int4_weights): Marlin gate/up is
+            # [K//16, N*2] (shape[0] < shape[1]); consuming it as raw WGMMA silently
+            # corrupts prefill MoE output. stored_layout=="marlin" stays as override.
+            _gate = weights.get("gate_proj.weight_packed")
+            _is_marlin = (
+                isinstance(_gate, torch.Tensor) and _gate.dim() == 2
+                and _gate.shape[0] < _gate.shape[1]
+            )
+            if _is_marlin or self.stored_layout == "marlin":
                 self._transform_marlin_to_raw(weights)
 
         # Ensure BF16 activations
