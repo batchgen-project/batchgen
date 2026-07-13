@@ -795,6 +795,7 @@ from .fused_rmsnorm_rope import (
 	fused_rmsnorm_rope_cache_update_with_q,
 	fused_rmsnorm_rope_cache_update_with_q_return_new_kv,
 	fused_rmsnorm_rope_with_q,
+	fused_rmsnorm_rope_with_q_native,
 )
 from batchgen.kv_cache.gpu_paged_kv_manager import GPUPagedKVCacheManager
 from batchgen.gemm.w8a8_deepgemm import w8a8_deepgemm
@@ -1296,7 +1297,11 @@ def mla_decoding_flashmla_attn_mode_3_bf16_with_pagekv(
 		raise ValueError(
 			f"q_position_ids (max={max_pos_id}) exceed RoPE cache size ({cos_seq_len})"
 		)
-	offload_kv = fused_rmsnorm_rope_with_q(
+	# Native-interleaved variant: R1 prefill (fa3_backend) rotates q_pe/k_pe with
+	# rotary_pos_emb_interleaved_native, so decode must rotate/store in the same
+	# layout — the legacy split-half kernel permutes the 64 rope dims relative to
+	# every prefill-written key (B-R1 decode collapse).
+	offload_kv = fused_rmsnorm_rope_with_q_native(
 		new_compressed_kv,
 		q_pe,
 		cos,
