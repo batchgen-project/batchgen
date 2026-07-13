@@ -139,22 +139,6 @@ class DeepseekV3ParallelStrategyManager:
 		# Step 1: Set phase
 		self.loaded_model_config.phase = "prefill"
 
-		# Reuse the configured prefill skeleton on decode->prefill flips (port of the Kimi
-		# PSM cache; root cause pattern: DeepseekV3ForCausalLM() pays 61x257 dead nn.Linear
-		# random inits every flip). Pure function of static config + SHM weights; survives
-		# the decode-side `del self.model`.
-		cached = getattr(self, "_prefill_model_cache", None)
-		if cached is not None and getattr(self, "_prefill_weight_copy_task_cache", None) is not None:
-			self.model = cached
-			self.weight_copy_task = self._prefill_weight_copy_task_cache
-			self.state_dict_name_map = self._prefill_name_map_cache
-			if self.rank == 0:
-				logging.info(
-					f"[PREFILL] Reused cached prefill model — skipped rebuild+config "
-					f"({time.perf_counter() - start_time:.2f}s)"
-				)
-			return self.model, self.weight_copy_task
-
 		# Step 2: Initialize model
 		step_start = time.perf_counter()
 		self.model = DeepseekV3ForCausalLM(self.loaded_model_config)
@@ -272,12 +256,6 @@ class DeepseekV3ParallelStrategyManager:
 				f"(init={timings['model_init']:.1f}s, skeleton={timings['skeleton']:.1f}s, "
 				f"expert={timings['expert']:.1f}s, to_device={timings['to_device']:.1f}s)"
 			)
-
-		# Publish the configured prefill model for reuse on later flips (skips the
-		# rebuild+config above). Pure function of static config + SHM weights.
-		self._prefill_model_cache = self.model
-		self._prefill_weight_copy_task_cache = self.weight_copy_task
-		self._prefill_name_map_cache = self.state_dict_name_map
 
 		return self.model, self.weight_copy_task
 	

@@ -172,29 +172,13 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
         # Micro-batch forward
         result = self.micro_batch_forward(hidden_states, "expert")
 
-        # Cleanup for non-persistent experts. ONE explicit sync (expert GEMMs retired),
-        # then the overridden sync-free free/clear below — the base versions each re-sync,
-        # which cost 3 host-blocking syncs per streamed expert (~45K per micro-batch at
-        # 58 layers x 257 experts), serializing launch-ahead against the H2D stream.
+        # Cleanup for non-persistent experts
         if not self.persistent:
             torch.cuda.current_stream(
                 self.engine_config.Basic_Config.device_torch
             ).synchronize()
             self.free_weights(self.module_key)
             self.clear_weights()
-
-    def free_weights(self, module_key: str):
-        """Sync-free release: every deepseekv3 call site syncs explicitly first."""
-        self.core_engine.free_weights_buffer(module_key)
-
-    def clear_weights(self):
-        """Sync-free param clear (caller already drained the stream)."""
-        applied = getattr(self, "_applied_param_keys", None)
-        for name, param in self.module.named_parameters():
-            if applied is not None and name not in applied:
-                continue
-            param.data = torch.empty(0, device=param.data.device)
-        self._applied_param_keys = None
 
         logging.debug(
             f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
@@ -235,19 +219,6 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
-
-    def free_weights(self, module_key: str):
-        """Sync-free release: the base attention forward's release block syncs first."""
-        self.core_engine.free_weights_buffer(module_key)
-
-    def clear_weights(self):
-        """Sync-free param clear (caller already drained the stream)."""
-        applied = getattr(self, "_applied_param_keys", None)
-        for name, param in self.module.named_parameters():
-            if applied is not None and name not in applied:
-                continue
-            param.data = torch.empty(0, device=param.data.device)
-        self._applied_param_keys = None
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights for MLA architecture."""
@@ -293,14 +264,6 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
             Tuple of (attn_output, attn_weights, kv_cache) to match decoder_layer's
             expected unpacking.
         """
-        # Retire the PREVIOUS layer's pinned offload tensors + futures (mirrors Kimi/GLM-5):
-        # bounds the pinned-tensor balloon to one layer instead of accumulating all 61
-        # layers' offload_kv until the end-of-prefill retire.
-        from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-        _AWB.retire_pending_prefill_offloads_before_layer(
-            self.layer_idx,
-            device=hidden_states.device,
-        )
         if self.prepack_mode:
             # Prepack mode: hidden_states is [1, total_tokens, hidden_dim]
             # Prepacked attention expects [total_tokens, hidden_dim]
@@ -348,56 +311,31 @@ class DeepSeekAttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        # Boundaries come from the bound CPU list the GPU cu_seqlens tensor was BUILT from
-        # (batchgen_worker binds both from the same python list), replacing the blocking
-        # per-sequence .item() D2H syncs (2 x seqs x 61 layers per micro-batch).
-        cu_seqlens_list = self.prepack_cu_seqlens_cpu
-        if cu_seqlens_list is None:
-            raise RuntimeError(
-                f"DeepSeek prepacked KV offload missing cu_seqlens for layer {self.layer_idx}"
-            )
+        cu_seqlens = self.prepack_cu_seqlens
         num_sequences = self.prepack_num_sequences
         global_sequence_ids = self.cur_batch
-        if num_sequences != len(cu_seqlens_list) - 1:
-            raise RuntimeError(
-                f"DeepSeek prepacked KV offload sequence count mismatch: "
-                f"num_sequences={num_sequences}, len(cu_seqlens)={len(cu_seqlens_list)}"
-            )
-
-        # Async-offload contract (port of the Kimi/GLM-5 fix): the C++ d2h runs on its OWN
-        # CPU thread with NO CUDA-stream ordering against compute, so (a) drain the compute
-        # stream via an event so the kernel that wrote offload_kv has fully retired before
-        # the d2h reads it, and (b) PIN offload_kv and each per-seq view + TRACK the future,
-        # so the caching allocator cannot re-hand these pages while the d2h is in flight.
-        # The old per-sequence .item() masked this by accident (its blocking D2H drained the
-        # stream); without the contract, in-flight d2h reads of freed memory produce
-        # cudaErrorIllegalAddress or silently corrupted host KV (decode-side gibberish).
-        from batchgen.models.wrappers.attention import AttnWrapperBase as _AWB
-        _AWB.pin_prefill_offload_tensor(offload_kv, self.layer_idx)
-        evt = torch.cuda.Event()
-        evt.record(torch.cuda.current_stream())
-        evt.synchronize()
 
         for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens_list[seq_idx]
-            end_idx = cu_seqlens_list[seq_idx + 1]
+            start_idx = cu_seqlens[seq_idx].item()
+            end_idx = cu_seqlens[seq_idx + 1].item()
             seq_len = end_idx - start_idx
 
-            # Extract KV for this sequence; reshape to [1, seq_len, 1, kv_dim] for KV cache API
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
+            # Extract KV for this sequence
+            seq_kv = offload_kv[start_idx:end_idx]  # [seq_len, kv_dim]
+
+            # Reshape to [1, seq_len, 1, kv_dim] for KV cache API
+            seq_kv = seq_kv.unsqueeze(0).unsqueeze(2)
 
             seq_global_id = [global_sequence_ids[seq_idx]]
 
             # MLA has no V (K contains compressed KV + k_pe)
-            task = self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
+            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
                 layer_idx=self.layer_idx,
                 sequence_ids=seq_global_id,
                 k_tensor=seq_kv,
                 v_tensor=None,
                 sequence_lengths=[seq_len],
             )
-            _AWB.pin_prefill_offload_tensor(seq_kv, self.layer_idx)
-            _AWB.track_prefill_offload_task(task, self.layer_idx)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using FlashMLA backend.
