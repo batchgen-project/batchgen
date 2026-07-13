@@ -793,6 +793,15 @@ class MoEGate(nn.Module):
 
 	def forward(self, hidden_states):
 		# log self.weight and self.e_score_correction_bias shape and dtype
+		if not hasattr(self, "_gate_diag_prefill"):
+			self._gate_diag_prefill = True
+			logger.info(
+				f"[GATE_DIAG prefill] rows={hidden_states.numel() // hidden_states.shape[-1]} "
+				f"wsum={self.weight.float().abs().sum().item():.3f} "
+				f"bsum={self.e_score_correction_bias.float().abs().sum().item():.5f} "
+				f"bdtype={self.e_score_correction_bias.dtype} "
+				f"hsum={hidden_states.float().abs().sum().item():.3f}"
+			)
 		bsz, seq_len, h = hidden_states.shape
 		### compute gating score
 		hidden_states = hidden_states.view(-1, h)
@@ -969,11 +978,23 @@ class MoEGate(nn.Module):
 		# 	logger.warning_once(f"MoE Gate e_score_correction_bias shape: {self.e_score_correction_bias.shape}, dtype: {self.e_score_correction_bias.dtype}")
 	
 		# self.input_buf.copy_(hidden_states)
-		return compiled_moe_gate_forward(
+		out = compiled_moe_gate_forward(
 			hidden_states, self.weight, self.e_score_correction_bias,
-			self.n_group, self.topk_group, self.n_routed_experts, 
+			self.n_group, self.topk_group, self.n_routed_experts,
 			self.top_k, self.routed_scaling_factor
 		)
+		if not hasattr(self, "_gate_diag_decode"):
+			self._gate_diag_decode = True
+			topk_idx, topk_weight = out
+			logger.info(
+				f"[GATE_DIAG decode] rows={hidden_states.numel() // hidden_states.shape[-1]} "
+				f"wsum={self.weight.float().abs().sum().item():.3f} "
+				f"bsum={self.e_score_correction_bias.float().abs().sum().item():.5f} "
+				f"bdtype={self.e_score_correction_bias.dtype} "
+				f"hsum={hidden_states.float().abs().sum().item():.3f} "
+				f"topk_uniq={topk_idx.unique().numel()} wmean={topk_weight.float().mean().item():.5f}"
+			)
+		return out
 
 import triton
 import triton.language as tl
