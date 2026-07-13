@@ -183,13 +183,6 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
             self.free_weights(self.module_key)
             self.clear_weights()
 
-        logging.debug(
-            f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
-            f"Finish forward pass. Phase: {self.phase}"
-        )
-
-        return result
-
     def free_weights(self, module_key: str):
         """Sync-free release: every deepseekv3 call site syncs explicitly first."""
         self.core_engine.free_weights_buffer(module_key)
@@ -202,6 +195,13 @@ class DeepSeekExpertWrapper(ExpertWrapperBase):
                 continue
             param.data = torch.empty(0, device=param.data.device)
         self._applied_param_keys = None
+
+        logging.debug(
+            f"[Rank {rank} Layer {self.layer_idx} Expert {self.expert_idx}] "
+            f"Finish forward pass. Phase: {self.phase}"
+        )
+
+        return result
 
 
 class DeepSeekAttnWrapper(AttnWrapperBase):
