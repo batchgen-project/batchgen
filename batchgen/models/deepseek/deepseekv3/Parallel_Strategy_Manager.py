@@ -949,6 +949,8 @@ class DeepseekV3ParallelStrategyManager:
 		logging.debug(f"Local routed experts loaded")
 
 	def _load_model_skeleton(self):
+		missing = []
+		loaded = 0
 		for key, param in self.model.named_parameters():
 			if key in self.skeleton_state_dict:
 				dequant_key = key + "_scale_inv"
@@ -959,6 +961,16 @@ class DeepseekV3ParallelStrategyManager:
 					)
 				else:
 					param.data = self.skeleton_state_dict[key]
+				loaded += 1
+			else:
+				missing.append(key)
+		if self.rank == 0:
+			logging.info(
+				f"[SKEL_DIAG] phase={getattr(self.loaded_model_config, 'phase', '?')} "
+				f"loaded={loaded} missing={len(missing)}"
+			)
+			for name in missing[:40]:
+				logging.info(f"[SKEL_DIAG]   MISSING: {name}")
 
 		model_skeletion_byte_size = (
 			sum(p.numel() * p.element_size() for p in self.model.parameters())
