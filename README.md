@@ -37,8 +37,6 @@ BatchGen introduces the sequence coroutine compute model, which treats each sequ
 - Test-time scaling (e.g., chain-of-thought, self-consistency)
 - RL rollouts and post-training workflows
 
-## Performance
-
 ## Roadmap
 
 - 🚧 Kimi-K2.5 (1T) support and H20 performance results.
