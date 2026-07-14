@@ -60,8 +60,7 @@ BatchGen is the only system in this comparison that serves the 255K workload on 
 ## Roadmap
 
 - ✅ Kimi-K2.5 (1T) support and H20 performance results.
-- 🚧 Improve the stability and robustness of model partitioning across heterogeneous and multi-node deployments.
-- 🚧 Strengthen sequence and KV-cache migration under long-running, high-concurrency workloads.
+- 🚧 Stabilize and harden the partitioning and migration primitives for release.
 - 🚧 Develop more adaptive scheduling policies for better resource utilization and workload balance.
 - 🚧 Expand reliable, OpenAI-compatible tool-calling support across supported models.
 - 🚧 Continue improving performance, observability, deployment ergonomics, and model coverage.
