@@ -39,27 +39,9 @@ BatchGen introduces the sequence coroutine compute model, which treats each sequ
 
 ## Performance
 
-### Kimi-K2.5 (1T)
-
-Batch completion time (BCT) in seconds for 16 input requests on H20 GPUs. Lower is better. SGLang uses its default settings, while SGLang-Opt is tuned for higher throughput. Speedup is measured for BatchGen over SGLang-Opt.
-
-| Deployment | Workload | SGLang | SGLang-Opt | BatchGen | Speedup |
-|:-----------|:---------|-------:|-----------:|---------:|--------:|
-| 1×8 H20 | 64K-1 | 233.1 | 233.1 | **160.2** | **1.46×** |
-| 1×8 H20 | 128K-1 | 637.5 | 605.6 | **455.9** | **1.33×** |
-| 1×8 H20 | 255K-1 | OOM | OOM | **1497.8** | — |
-| 2×8 H20 | 64K-1 | 106.2 | 106.2 | **86.7** | **1.22×** |
-| 2×8 H20 | 128K-1 | 528.8 | 304.8 | **234.3** | **1.30×** |
-| 2×8 H20 | 255K-1 | 1912.6 | 1202.9 | **748.4** | **1.61×** |
-| 2×8 H20 | 64K-1K | 213.5 | 182.9 | **146.8** | **1.25×** |
-| 2×8 H20 | 128K-1K | 559.3 | 456.0 | **303.6** | **1.50×** |
-| 2×8 H20 | 255K-1K | 1829.5 | 1268.6 | **838.5** | **1.51×** |
-
-BatchGen is the only system in this comparison that serves the 255K workload on a single node.
-
 ## Roadmap
 
-- ✅ Kimi-K2.5 (1T) support and H20 performance results.
+- 🚧 Kimi-K2.5 (1T) support and H20 performance results.
 - 🚧 Stabilize and release the partition and migration primitives.
 - 🚧 Develop more adaptive scheduling policies for better resource utilization and workload balance.
 - 🚧 Support OpenAI-compatible tool-calling.
