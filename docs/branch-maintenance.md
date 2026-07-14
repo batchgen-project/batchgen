@@ -20,7 +20,34 @@ This document audits every branch (local and remote) and classifies it by how it
 - **Safe to delete now:** all **Linear-merged** + **Squash-merged** branches (their work is already in `main`).
 - **Keep:** all **Unmerged** branches — they contain unique work not in `main`.
 - **Dead/stale flag:** **12** unmerged branches are >180 days old (abandoned), **25** are 90–180 days old. These need an **owner decision**, never auto-deletion.
-- This PR **does not delete anything** — it documents the plan for owner review (per the owner-only merge policy below).
+- **Status:** the delete plan below has since been **executed** (owner-run CLI) — see the [Execution Log](#execution-log). All merged branches (linear + squash) were removed; only unmerged branches and two protected `release/*` branches remain. The table above is the **audit-time snapshot**, retained as the record.
+
+---
+
+## Execution Log
+
+> **2026-07-14** — the delete plan in this document was executed via CLI (owner-run). Each branch was **re-verified fresh** against `origin/main` immediately before deletion (linear = `merge-base --is-ancestor`; squash = synthetic-commit + `git cherry` patch-id); every deleted SHA was recorded for recovery.
+
+**Deleted — 116 total (104 remote + 12 local):**
+
+| Tier | Deleted | Notes |
+|------|--------:|-------|
+| Linear-merged (remote) | 7 | ancestors of `main`; trivially recoverable from `main` history |
+| Squash-merged `ahead==1` (remote) | 51 | high-confidence single-commit squashes |
+| Squash-merged (local) | 12 | local counterparts of the above |
+| Squash-merged `ahead>1` (remote) | 44 | multi-commit; each patch-id-re-verified before deletion |
+| Trivial dead (remote) | 2 | `tairan/decoding_opt` (0 net diff), `tairan/CB` (1-line README) |
+
+A further ~12 already-merged branches had been deleted upstream between the snapshot and execution.
+
+**Held (deliberately not deleted):**
+
+- `release/v1.0.10.post3-glm5-stability`, `release/v1.0.10-glm5-cudagraph-clean` — merged, but match the protected `release/*` pattern.
+- `docs/glm51-enable-thinking-fix` (local) — checked out in a separate worktree, so `-D` was refused; its remote counterpart was deleted.
+
+**Recovery:** deleted tips are restorable with `git push origin <sha>:refs/heads/<name>` (SHAs saved in the operator's recovery manifests; server reflog retains them ~90 days).
+
+**State after execution** (vs `origin/main` `d171a154`): **100 remote branches remain — 2 merged (both protected `release/*`) and 98 unmerged** (24 with open PRs). Unmerged/no-PR by age: **10 dead** (≥180d), **25 stale** (90–179d), **39 active** (<90d). No unmerged, dead, or stale branch was deleted.
 
 ---
 
