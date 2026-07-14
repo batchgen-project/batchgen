@@ -1,0 +1,60 @@
+name: Stale Branches
+
+# Scheduled audit of remote branches vs the default branch, helping enforce
+# PR_MERGE_POLICY.md §4 ("Delete the PR branch once merged"). Scheduled runs are
+# ALWAYS report-only (results in the job summary). Deletion is opt-in via a manual
+# workflow_dispatch (mode=delete-merged + confirm=DELETE) and only ever removes
+# branches provably merged into the default branch (linear, or single-commit
+# squash). Unmerged, dead, stale, protected (main/release/hotfix), and open-PR
+# branches are never deleted. See docs/branch-maintenance.md for the method.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      stale_days:
+        description: "Unmerged branches idle >= this many days are 'stale'"
+        required: false
+        default: "90"
+      dead_days:
+        description: "Unmerged branches idle >= this many days are 'dead'"
+        required: false
+        default: "180"
+      mode:
+        description: "report = summary only; delete-merged = also delete merged branches"
+        required: false
+        default: "report"
+        type: choice
+        options: [report, delete-merged]
+      confirm:
+        description: "Type DELETE to authorize deletion (delete-merged only)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write      # required only for the opt-in delete-merged path
+  pull-requests: read  # to exclude branches that have an open PR
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for merge-base / cherry classification
+
+      - name: Scan, report, and (optionally) delete merged branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          STALE_DAYS: ${{ github.event.inputs.stale_days || '90' }}
+          DEAD_DAYS: ${{ github.event.inputs.dead_days || '180' }}
+          MODE: ${{ github.event.inputs.mode || 'report' }}
+          CONFIRM: ${{ github.event.inputs.confirm || '' }}
+        run: bash .github/workflows/scripts/scan-stale-branches.sh
