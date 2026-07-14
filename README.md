@@ -57,6 +57,18 @@ Batch completion time (BCT) in seconds for 16 input requests on H20 GPUs. Lower 
 
 BatchGen is the only system in this comparison that serves the 255K workload on a single node.
 
+## Roadmap
+
+### Partitioning and Migration
+
+- Improve the stability and robustness of model partitioning across heterogeneous and multi-node deployments.
+- Strengthen sequence and KV-cache migration under long-running, high-concurrency workloads.
+
+### Ongoing Work
+
+- Develop more adaptive scheduling policies for better resource utilization and workload balance.
+- Expand reliable, OpenAI-compatible tool-calling support across supported models.
+- Continue improving performance, observability, deployment ergonomics, and model coverage.
 
 ## Getting Started
 
