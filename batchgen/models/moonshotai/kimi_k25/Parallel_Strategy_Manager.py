@@ -28,7 +28,12 @@ Key differences from DeepSeek-V3 PSM:
 - Loads INT4 packed/scale tensors for persistent experts
 """
 
-from .model import KimiK25ForCausalLM, KimiK25MoE, KimiK25MoEBufferManager
+from .model import (
+    KimiK25ForCausalLM,
+    KimiK25MoE,
+    KimiK25MoEBufferManager,
+    round_moe_buffer_tokens,
+)
 from .wrappers import KimiK25ExpertWrapper, KimiK25AttnWrapper
 import logging
 import types
@@ -524,6 +529,7 @@ class KimiK25ParallelStrategyManager:
 
         # Allocate shared MoE buffer manager (one instance for all 60 MoE layers)
         max_global_bsz = self.world_size * effective_padding_bsz
+        max_tokens_padded = round_moe_buffer_tokens(max_global_bsz)
         KimiK25MoE._buf = KimiK25MoEBufferManager(
             E_local=NUM_LOCAL_EXPERT_PER_LAYER,
             max_global_bsz=max_global_bsz,
@@ -532,6 +538,7 @@ class KimiK25ParallelStrategyManager:
             topk=self.loaded_model_config.num_experts_per_tok,
             num_tokens_per_rank=effective_padding_bsz,
             device=device,
+            max_tokens_padded=max_tokens_padded,
         )
         _log_hbm("MoEBufferManager")
 

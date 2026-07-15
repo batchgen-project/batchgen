@@ -76,6 +76,12 @@ class SequenceEntry:
         # Dynamic host KV reservation tracking
         'host_token_capacity',   # Current host KV capacity in tokens (grows by chunk)
         'host_pages_allocated',  # Current host page count
+        'prefix_shared_tokens',  # Effective tokens reused by this prefill
+        'prefix_committed_tokens',  # Tokens already owned by prefix cache metadata
+        'prefix_prompt_token_ids',  # Cached prompt token ids for prefix commit
+        'prefix_prompt_cache_data_ptr',  # input_ids pointer for cached tokens
+        'prefix_prompt_cache_length',  # prompt length for cached tokens
+        'prefix_prompt_cache_version',  # input_ids tensor version for cache
         # Eviction support
         'evicted_token_ids',     # Saved (prompt + decoded) tokens for recompute after eviction
         'original_prompt_length',  # Original prompt length before eviction (for tracking)
@@ -152,6 +158,12 @@ class SequenceEntry:
         # Dynamic host KV reservation: starts at 0, set by worker at prefill time
         self.host_token_capacity: int = 0
         self.host_pages_allocated: int = 0
+        self.prefix_shared_tokens: int = 0
+        self.prefix_committed_tokens: int = 0
+        self.prefix_prompt_token_ids: Optional[List[int]] = None
+        self.prefix_prompt_cache_data_ptr: int = 0
+        self.prefix_prompt_cache_length: int = 0
+        self.prefix_prompt_cache_version: int = -1
 
         # Eviction support
         self.evicted_token_ids: Optional[torch.Tensor] = None
@@ -542,6 +554,24 @@ class SequenceEntry:
 
     def remaining_decode_tokens(self) -> int:
         return self.max_decode_length - self.decoded_length
+
+    def clamp_reentry_decoded_length(self, decoded_length: int) -> int:
+        """Clamp reconstructed decoded progress using this request's limit."""
+        return min(max(0, int(decoded_length)), int(self.original_max_decode_length))
+
+    def compute_reentry_decoded_length(self, reconstructed_prompt_length: int) -> int:
+        """Return cumulative decoded progress after host-KV eviction re-entry.
+
+        Pool-mode workers can process batches with different request-level
+        max_tokens. Re-entry accounting must therefore use the sequence's own
+        original_max_decode_length, not the worker's current batch default.
+        """
+        prompt_delta = max(
+            0,
+            int(reconstructed_prompt_length) - int(self.original_prompt_length),
+        )
+        cumulative_decoded = max(prompt_delta, int(self.total_decoded_before_eviction))
+        return self.clamp_reentry_decoded_length(cumulative_decoded)
 
     def should_check_completion(self) -> bool:
         """Check if we're at a page boundary (every PAGE_SIZE tokens in decoding)."""

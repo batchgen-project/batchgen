@@ -1,0 +1,170 @@
+"""BatchGenWorker-facing helpers for publishing Host KV pages."""
+
+from __future__ import annotations
+
+from typing import Mapping
+
+from batchgen.prefix_reuse.commit import (
+    aligned_prefix_tokens,
+    build_committable_prefix_token_ids,
+    build_prefix_commit_request,
+    collect_required_group_pages_for_commit,
+)
+from batchgen.prefix_reuse.config import PrefixCacheRuntimeConfig
+from batchgen.sequence import SequenceEntry
+
+
+def sequence_token_ids_for_prefix_commit(
+    seq: SequenceEntry,
+    *,
+    include_new_decode_tokens: bool,
+    max_tokens: int,
+) -> list[int]:
+    """Return token ids matching the logical Host KV prefix for a sequence."""
+
+    prompt_token_count = int(seq.prompt_length)
+    prompt_tensor = seq.input_ids.reshape(-1)
+    prompt_data_ptr = int(prompt_tensor.data_ptr())
+    prompt_version = int(prompt_tensor._version)
+    if (
+        seq.prefix_prompt_token_ids is not None
+        and int(seq.prefix_prompt_cache_data_ptr) == prompt_data_ptr
+        and int(seq.prefix_prompt_cache_length) == prompt_token_count
+        and int(seq.prefix_prompt_cache_version) == prompt_version
+    ):
+        prompt_token_ids = seq.prefix_prompt_token_ids
+    else:
+        prompt_token_ids = [
+            int(token_id)
+            for token_id in prompt_tensor[:prompt_token_count].tolist()
+        ]
+        seq.prefix_prompt_token_ids = prompt_token_ids
+        seq.prefix_prompt_cache_data_ptr = prompt_data_ptr
+        seq.prefix_prompt_cache_length = prompt_token_count
+        seq.prefix_prompt_cache_version = prompt_version
+
+    decoded_token_ids: list[int] = []
+    decoded_start = 0
+    if include_new_decode_tokens:
+        decoded_start = int(seq.reentry_decoded_baseline)
+        decoded_length = int(seq.decoded_length)
+        decoded_tensor = seq.decoded_tokens
+        if decoded_tensor is not None and decoded_length > 0:
+            decoded_token_ids = [
+                int(token_id)
+                for token_id in decoded_tensor.reshape(-1)[
+                    :decoded_length
+                ].tolist()
+            ]
+
+    return build_committable_prefix_token_ids(
+        prompt_token_ids=prompt_token_ids,
+        decoded_token_ids=decoded_token_ids,
+        decoded_start=decoded_start,
+        max_tokens=max_tokens,
+    )
+
+
+def build_sequence_prefix_commit_request(
+    *,
+    core_engine_module: object,
+    runtime_config: PrefixCacheRuntimeConfig,
+    worker_views_by_group: Mapping[int, object],
+    seq: SequenceEntry,
+    include_new_decode_tokens: bool,
+) -> tuple[object, int] | None:
+    """Build a prefix-cache commit request for one worker-owned sequence."""
+
+    decoded_start = int(seq.reentry_decoded_baseline)
+    decoded_length = int(seq.decoded_length)
+    new_decode_tokens = (
+        max(0, decoded_length - decoded_start)
+        if include_new_decode_tokens
+        else 0
+    )
+    total_tokens = int(seq.prompt_length) + new_decode_tokens
+    commit_tokens = aligned_prefix_tokens(
+        total_tokens,
+        int(runtime_config.publish_boundary_tokens),
+    )
+    if commit_tokens <= 0:
+        return None
+
+    already_committed_tokens = max(
+        int(seq.prefix_shared_tokens),
+        int(seq.prefix_committed_tokens),
+    )
+    if commit_tokens <= already_committed_tokens:
+        return None
+
+    token_ids = sequence_token_ids_for_prefix_commit(
+        seq,
+        include_new_decode_tokens=include_new_decode_tokens,
+        max_tokens=commit_tokens,
+    )
+    if len(token_ids) < commit_tokens:
+        raise RuntimeError(
+            "prefix cache commit has fewer token ids than committed tokens: "
+            f"got {len(token_ids)}, expected {commit_tokens}"
+        )
+
+    pages_by_group = collect_required_group_pages_for_commit(
+        worker_views_by_group=worker_views_by_group,
+        sequence_id=int(seq.global_idx),
+        commit_tokens=commit_tokens,
+        group_specs=runtime_config.group_specs,
+    )
+    request = build_prefix_commit_request(
+        core_engine_module=core_engine_module,
+        namespace_digest=runtime_config.namespace_digest,
+        token_ids=token_ids,
+        publish_boundary_tokens=int(runtime_config.publish_boundary_tokens),
+        pages_by_group=pages_by_group,
+        raw_page_tokens_by_group={
+            int(spec.group_id): int(spec.raw_page_tokens)
+            for spec in runtime_config.group_specs
+        },
+    )
+    if request is None:
+        return None
+    return request, commit_tokens
+
+
+def retain_newly_committed_prefix_pages(
+    *,
+    runtime_config: PrefixCacheRuntimeConfig,
+    worker_views_by_group: Mapping[int, object],
+    sequence_id: int,
+    previous_committed_tokens: int,
+    commit_tokens: int,
+    page_ids_by_group: Mapping[int, list[int]] | None = None,
+) -> int:
+    """Move newly published sequence-owned pages into resident ownership."""
+
+    previous = max(0, int(previous_committed_tokens))
+    target = int(commit_tokens)
+    if target <= previous:
+        return previous
+
+    for spec in runtime_config.group_specs:
+        if not spec.required_for_reuse:
+            continue
+        raw_page_tokens = int(spec.raw_page_tokens)
+        previous_pages = previous // raw_page_tokens
+        target_pages = target // raw_page_tokens
+        new_pages = target_pages - previous_pages
+        if new_pages <= 0:
+            continue
+        worker_view = worker_views_by_group[int(spec.group_id)]
+        if page_ids_by_group is None:
+            logical_pages = worker_view.build_page_table([int(sequence_id)])[0]
+            retained_pages = logical_pages[previous_pages:target_pages]
+        else:
+            retained_pages = page_ids_by_group[int(spec.group_id)][
+                previous_pages:target_pages
+            ]
+        worker_view.retain_sequence_pages(
+            int(sequence_id),
+            [int(page_id) for page_id in retained_pages],
+        )
+    return target

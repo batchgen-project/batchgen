@@ -137,6 +137,10 @@ class ServerArgs:
     # IntakePool capacity: max total requests that can be queued.
     # Prevents OOM under high-load. Default 1M. Set 0 for unlimited.
     max_intake_capacity: int = 1_000_000
+    # Host-side prefix cache. Internal sizing and namespace settings are derived
+    # from model and Host KV config.
+    enable_prefix_cache: bool = False
+    prefix_cache_debug_stats: bool = False
 
     def __post_init__(self):
         if self.storage_path is None:
@@ -280,6 +284,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1_000_000,
         help="Max total requests in the intake pool. Prevents OOM under high load. "
              "Default: 1000000. Set to 0 for unlimited (not recommended).",
+    )
+    parser.add_argument(
+        "--enable-prefix-cache",
+        action="store_true",
+        default=False,
+        help="Enable Host-side prefix cache reuse. Internal cache sizing is derived from Host KV settings.",
+    )
+    parser.add_argument(
+        "--prefix-cache-debug-stats",
+        action="store_true",
+        default=False,
+        help="Emit additional Host prefix cache lookup/commit statistics.",
     )
     parser.add_argument(
         "--enable-prepack",
@@ -592,6 +608,8 @@ def prepare_server_args(argv: Optional[list[str]] = None) -> ServerArgs:
         startup_timeout=parsed.startup_timeout,
         max_pool_size=parsed.max_pool_size,
         max_intake_capacity=parsed.max_intake_capacity,
+        enable_prefix_cache=parsed.enable_prefix_cache,
+        prefix_cache_debug_stats=parsed.prefix_cache_debug_stats,
     )
     server_args.resolve_paths()
     validate_server_args(server_args)

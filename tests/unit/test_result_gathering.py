@@ -8,6 +8,7 @@ Run with: python tests/test_result_gathering.py
 
 import sys
 import torch
+import pytest
 from dataclasses import dataclass
 from typing import List, Set, Optional
 
@@ -199,6 +200,45 @@ def test_old_vs_new_equivalence():
     print("  PASS: test_old_vs_new_equivalence")
 
 
+def test_completed_outputs_cached_for_final_response():
+    """Completed sequences remain available after local query slots are released."""
+    try:
+        from batchgen.batchgen_worker import BatchGenWorker
+    except ImportError as exc:
+        pytest.skip(f"BatchGenWorker import requires runtime extensions: {exc}")
+
+    @dataclass
+    class Sequence:
+        global_idx: int
+
+    class Batch:
+        def __init__(self):
+            self._sequences = {
+                "seq_a": Sequence(global_idx=3),
+                "seq_b": Sequence(global_idx=1),
+            }
+
+        def get_sequence(self, uuid: str):
+            return self._sequences.get(uuid)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.global_batch = Batch()
+    worker._final_response_completed_outputs = {}
+
+    worker._record_completed_outputs_for_final_response(
+        ["seq_a", "seq_b", "missing"],
+        {
+            "seq_a": {"text": "alpha"},
+            "seq_b": {"text": "beta"},
+            "missing": {"text": "ignored"},
+        },
+    )
+
+    assert worker._final_response_completed_outputs == {3: "alpha", 1: "beta"}
+    print("  PASS: test_completed_outputs_cached_for_final_response")
+
+
 if __name__ == "__main__":
     print("Running result gathering tests...\n")
 
@@ -214,6 +254,7 @@ if __name__ == "__main__":
         test_gather_sorting,
         test_empty_rank,
         test_old_vs_new_equivalence,
+        test_completed_outputs_cached_for_final_response,
     ]
 
     passed = 0

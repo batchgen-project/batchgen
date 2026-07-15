@@ -149,8 +149,22 @@ class BatchGenServer:
 		indexer, splitting the budget proportionally between primary and aux.
 		"""
 		from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+		from batchgen.kv_cache.glm5_kv_coordinator import GLM5HostKVCoordinator
 
-		# DSA models: split budget into primary + auxiliary
+		# GLM-5 uses a model-specific group coordinator so prefix cache can
+		# manage primary/indexer pages independently.
+		glm5 = GLM5HostKVCoordinator.create_managers(
+			model_name=self.args.model,
+			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+		)
+		if glm5 is not None:
+			primary_mgr, indexer_mgr = glm5
+			logging.info(
+				"Allocated GLM-5 host KV cache: primary + indexer"
+			)
+			return primary_mgr, indexer_mgr
+
+		# Other DSA models keep the existing dual coordinator path.
 		dual = DualHostKVCoordinator.create_managers(
 			model_name=self.args.model,
 			host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
@@ -238,6 +252,8 @@ class BatchGenServer:
 			adaptive_chunk_max=getattr(self.args, 'adaptive_chunk_max', 65536),
 			adaptive_chunk_ema_alpha=getattr(self.args, 'adaptive_chunk_ema_alpha', 0.1),
 			adaptive_chunk_multiplier=getattr(self.args, 'adaptive_chunk_multiplier', 1.5),
+			enable_prefix_cache=getattr(self.args, 'enable_prefix_cache', False),
+			prefix_cache_debug_stats=getattr(self.args, 'prefix_cache_debug_stats', False),
 
 			# Place holder
 			local_rank=-1,
@@ -257,6 +273,33 @@ class BatchGenServer:
 			daemon=True
 		)
 
+	def _initialize_prefix_cache_owner(self):
+		self.prefix_cache_runtime_config = None
+		self.prefix_cache_coordinator_owner = None
+		if not getattr(self.args, "enable_prefix_cache", False):
+			return
+		if self.args.host_kv_cache_size is None:
+			raise RuntimeError(
+				"--enable-prefix-cache requires --host-kv-cache-size"
+			)
+		from batchgen.prefix_reuse.config import (
+			build_prefix_cache_runtime_config,
+			create_host_prefix_cache_coordinator,
+		)
+
+		runtime_config = build_prefix_cache_runtime_config(
+			model_name=self.args.model,
+			kv_dtype=self.args.kv_dtype,
+			host_kv_cache_size_bytes=int(self.args.host_kv_cache_size * (1024**3)),
+			debug_stats=getattr(self.args, "prefix_cache_debug_stats", False),
+		)
+		self.prefix_cache_runtime_config = runtime_config
+		self.prefix_cache_coordinator_owner = create_host_prefix_cache_coordinator(
+			core_engine_module=bg_lib,
+			runtime_config=runtime_config,
+			create_region=True,
+		)
+
 	def start(self):
 		"""Start the TCP Server loop"""
 		try:
@@ -269,6 +312,7 @@ class BatchGenServer:
 			# 1. Allocate KV & Load Model & Spawn Workers
 			self.allocate_host_kv_cache(self.args.host_kv_cache_size)
 			self.load_model_resources()
+			self._initialize_prefix_cache_owner()
 			self.spawn_workers()
 			
 			# 2. Start TCP Listener
@@ -664,6 +708,8 @@ def parse_args():
 	parser.add_argument("--nnodes", type=int, default=1)
 	parser.add_argument("--node-rank", type=int, default=0)
 	parser.add_argument("--world-size", type=int, default=1)
+	parser.add_argument("--enable-prefix-cache", action="store_true", default=False)
+	parser.add_argument("--prefix-cache-debug-stats", action="store_true", default=False)
 	parser.add_argument(
 		"--allow-model-download",
 		action="store_true",

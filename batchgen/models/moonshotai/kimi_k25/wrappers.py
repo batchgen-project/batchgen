@@ -37,6 +37,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from batchgen.models.wrappers.prefix_mla_model_adapters import (
+    build_kimi_prefix_backend_context,
+)
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
 
 
@@ -434,16 +437,26 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         if self.prepack_mode:
             # Prepacked mode: varlen flash attention
             hidden_states_2d = hidden_states.squeeze(0)
+            metadata = self.prefix_cache_metadata()
+            position_ids = self.position_ids.to(hidden_states_2d.device)
+            prefix_context = None
+            if metadata.prefix_reuse_mode:
+                prefix_context = build_kimi_prefix_backend_context(
+                    wrapper=self,
+                    metadata=metadata,
+                )
 
             attn_output, offload_kv = self.module.prefill_attn_bf16_prepacked(
                 hidden_states_2d,
-                self.position_ids.to(hidden_states_2d.device),
-                self.prepack_cu_seqlens.to(hidden_states_2d.device),
-                self.prepack_max_seqlen,
-                self.prepack_num_sequences,
+                position_ids,
+                metadata.cu_seqlens.to(hidden_states_2d.device),
+                metadata.max_seqlen,
+                metadata.num_sequences,
+                prefix_context=prefix_context,
             )
-
             # Offload KV cache per-sequence to host
+            if offload_kv is None:
+                raise RuntimeError("Kimi prepacked prefill returned no KV")
             self._offload_prepacked_kv(offload_kv)
 
             attn_output = attn_output.unsqueeze(0)
@@ -468,26 +481,7 @@ class KimiK25AttnWrapper(AttnWrapperBase):
         Args:
             offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim]
         """
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
-        global_sequence_ids = self.cur_batch
-
-        for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
-
-            seq_kv = offload_kv[start_idx:end_idx].unsqueeze(0).unsqueeze(2)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-
-            # MLA: K contains compressed KV + k_pe, no separate V
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_kv,
-                v_tensor=None,
-                sequence_lengths=[seq_len],
-            )
+        self.offload_prepacked_mla_kv(offload_kv)
 
     def _forward_decode(self, hidden_states: torch.Tensor, **kwargs) -> Tuple:
         """Decode forward using BF16 MLA attention.

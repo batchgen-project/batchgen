@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from batchgen.prefix_reuse.config import (
+    PrefixKVGroupSemantic,
+    PrefixKVGroupSpec,
+    build_prefix_cache_namespace_digest,
+    build_prefix_cache_runtime_config,
+    build_prefix_cache_runtime_config_from_specs,
+    create_host_prefix_cache_coordinator,
+    derive_prefix_cache_shm_name,
+)
+from batchgen.server.server_args import _build_parser
+
+
+def test_prefix_cache_runtime_config_derives_boundaries_and_capacities():
+    config = build_prefix_cache_runtime_config_from_specs(
+        model_name="test/model",
+        kv_dtype="bfloat16",
+        host_kv_pages_per_required_group=128,
+        group_specs=[
+            PrefixKVGroupSpec(
+                group_id=0,
+                semantic=PrefixKVGroupSemantic.MLA_COMPRESSED_KV,
+                required_for_reuse=True,
+                raw_page_tokens=64,
+            ),
+            PrefixKVGroupSpec(
+                group_id=1,
+                semantic=PrefixKVGroupSemantic.SWA_KV,
+                required_for_reuse=True,
+                raw_page_tokens=128,
+            ),
+        ],
+    )
+
+    assert config.hash_block_tokens == 64
+    assert config.publish_boundary_tokens == 128
+    assert config.max_nodes >= 1024
+    assert config.max_group_entries == config.max_nodes * 2
+    assert config.max_page_handles >= config.max_group_entries
+    assert config.max_attachments >= 1024
+
+
+def test_prefix_cache_runtime_config_uses_multi_rate_kv_groups():
+    config = build_prefix_cache_runtime_config(
+        model_name="deepseek-v4-flash",
+        kv_dtype="bfloat16",
+        host_kv_cache_size_bytes=1 << 30,
+    )
+
+    assert config.hash_block_tokens == 64
+    assert config.publish_boundary_tokens == 256
+    assert [
+        (
+            spec.group_id,
+            spec.semantic,
+            spec.raw_page_tokens,
+            spec.compression_ratio,
+        )
+        for spec in config.group_specs
+    ] == [
+        (0, PrefixKVGroupSemantic.SWA_KV, 64, 1),
+        (1, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 4),
+        (2, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 128),
+        (3, PrefixKVGroupSemantic.COMPRESSED_RATIO_KV, 256, 4),
+    ]
+
+
+def test_prefix_cache_namespace_digest_is_stable_and_group_sensitive():
+    group = PrefixKVGroupSpec(
+        group_id=0,
+        semantic=PrefixKVGroupSemantic.FULL_KV,
+        required_for_reuse=True,
+        raw_page_tokens=64,
+    )
+    same = build_prefix_cache_namespace_digest(
+        model_name="OpenAI/GPT-OSS-120B",
+        kv_dtype="bfloat16",
+        group_specs=[group],
+    )
+    reordered_case = build_prefix_cache_namespace_digest(
+        model_name="openai/gpt-oss-120b",
+        kv_dtype="BFLOAT16",
+        group_specs=[group],
+    )
+    changed = build_prefix_cache_namespace_digest(
+        model_name="openai/gpt-oss-120b",
+        kv_dtype="bfloat16",
+        group_specs=[
+            PrefixKVGroupSpec(
+                group_id=0,
+                semantic=PrefixKVGroupSemantic.FULL_KV,
+                required_for_reuse=True,
+                raw_page_tokens=128,
+            )
+        ],
+    )
+
+    assert same == reordered_case
+    assert same != changed
+    assert len(same) == 4
+
+
+def test_prefix_cache_core_config_conversion_uses_bound_classes():
+    class _CoreGroupSpec(SimpleNamespace):
+        pass
+
+    class _CoreConfig(SimpleNamespace):
+        pass
+
+    class _Core:
+        HostKVGroupSpec = _CoreGroupSpec
+        HostPrefixCacheConfig = _CoreConfig
+        HostKVGroupSemantic = SimpleNamespace(
+            FULL_KV="full",
+            MLA_COMPRESSED_KV="mla",
+            SWA_KV="swa",
+            COMPRESSED_RATIO_KV="compressed",
+        )
+
+    config = build_prefix_cache_runtime_config_from_specs(
+        model_name="test/model",
+        kv_dtype="bfloat16",
+        host_kv_pages_per_required_group=8,
+        group_specs=[
+            PrefixKVGroupSpec(
+                group_id=3,
+                semantic=PrefixKVGroupSemantic.COMPRESSED_RATIO_KV,
+                required_for_reuse=False,
+                raw_page_tokens=256,
+                compression_ratio=4,
+            ),
+            PrefixKVGroupSpec(
+                group_id=0,
+                semantic=PrefixKVGroupSemantic.FULL_KV,
+                required_for_reuse=True,
+                raw_page_tokens=64,
+            ),
+        ],
+    )
+
+    core_config = config.to_core_config(_Core)
+
+    assert core_config.shm_name == config.shm_name
+    assert core_config.hash_block_tokens == 64
+    assert len(core_config.group_specs) == 2
+    assert core_config.group_specs[0].group_id == 3
+    assert core_config.group_specs[0].semantic == "compressed"
+    assert core_config.group_specs[0].compression_ratio == 4
+
+
+def test_create_host_prefix_cache_coordinator_initializes_requested_region():
+    class _CoreGroupSpec(SimpleNamespace):
+        pass
+
+    class _CoreConfig(SimpleNamespace):
+        pass
+
+    class _Coordinator:
+        instances = []
+
+        def __init__(self, config):
+            self.config = config
+            self.initialize_calls = []
+            self.instances.append(self)
+
+        def initialize(self, create_region):
+            self.initialize_calls.append(bool(create_region))
+
+    class _Core:
+        HostKVGroupSpec = _CoreGroupSpec
+        HostPrefixCacheConfig = _CoreConfig
+        HostPrefixCacheCoordinator = _Coordinator
+        HostKVGroupSemantic = SimpleNamespace(
+            FULL_KV="full",
+            MLA_COMPRESSED_KV="mla",
+            SWA_KV="swa",
+            COMPRESSED_RATIO_KV="compressed",
+        )
+
+    runtime_config = build_prefix_cache_runtime_config_from_specs(
+        model_name="test/model",
+        kv_dtype="bfloat16",
+        host_kv_pages_per_required_group=8,
+        group_specs=[
+            PrefixKVGroupSpec(
+                group_id=0,
+                semantic=PrefixKVGroupSemantic.FULL_KV,
+                required_for_reuse=True,
+                raw_page_tokens=64,
+            )
+        ],
+    )
+
+    coordinator = create_host_prefix_cache_coordinator(
+        core_engine_module=_Core,
+        runtime_config=runtime_config,
+        create_region=True,
+    )
+
+    assert coordinator.initialize_calls == [True]
+    assert coordinator.config.shm_name == runtime_config.shm_name
+
+
+def test_prefix_cache_runtime_config_rejects_no_required_group():
+    with pytest.raises(ValueError, match="required KV group"):
+        build_prefix_cache_runtime_config_from_specs(
+            model_name="test/model",
+            kv_dtype="bfloat16",
+            host_kv_pages_per_required_group=8,
+            group_specs=[
+                PrefixKVGroupSpec(
+                    group_id=0,
+                    semantic=PrefixKVGroupSemantic.FULL_KV,
+                    required_for_reuse=False,
+                    raw_page_tokens=64,
+                )
+            ],
+        )
+
+
+def test_prefix_cache_shm_name_is_sanitized_and_node_agnostic():
+    shm_name = derive_prefix_cache_shm_name("Org/Model-Name")
+
+    assert shm_name.startswith("batchgen_prefix_cache_org_model_name_")
+    assert "_node" not in shm_name
+
+
+def test_server_parser_exposes_only_prefix_cache_user_flags():
+    parsed = _build_parser().parse_args(
+        [
+            "--model",
+            "openai/gpt-oss-120b",
+            "--enable-prefix-cache",
+            "--prefix-cache-debug-stats",
+        ]
+    )
+
+    assert parsed.enable_prefix_cache is True
+    assert parsed.prefix_cache_debug_stats is True
+    assert not hasattr(parsed, "prefix_cache_size_gb")
+    assert not hasattr(parsed, "prefix_cache_hash_block_tokens")

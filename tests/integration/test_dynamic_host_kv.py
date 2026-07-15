@@ -531,15 +531,12 @@ class TestFullLifecycle:
         new_prompt_len = len(evicted_ids)
         prev_decoded = seq.total_decoded_before_eviction
 
-        # Rebuild input_ids (2D) and attention_mask
+        # Rebuild input_ids (2D)
         seq_extended_size = seq.kv_token_budget
         input_ids_extended = torch.zeros((1, seq_extended_size), dtype=torch.long)
-        attention_mask_extended = torch.zeros((1, seq_extended_size), dtype=torch.int64)
         input_ids_extended[0, :new_prompt_len] = evicted_ids
-        attention_mask_extended[0, :new_prompt_len] = 1
 
         seq.input_ids = input_ids_extended
-        seq.attention_mask = attention_mask_extended
         seq.prompt_length = new_prompt_len
         seq.current_context_length = new_prompt_len
 
@@ -550,19 +547,22 @@ class TestFullLifecycle:
         n_old = min(len(old_decoded), max_decoding_length)
         seq.decoded_tokens[0, :n_old] = old_decoded[:n_old]
         seq.decoded_length = n_old
+        seq.reentry_decoded_baseline = n_old
 
-        remaining_decode = seq.original_max_decode_length - prev_decoded
-        seq.max_decode_length = remaining_decode
+        assert prev_decoded == n_old
+        seq.max_decode_length = seq.original_max_decode_length
         # kv_token_budget stays unchanged
         seq.evicted_token_ids = None
         batch.update_status("s1", SequenceStatus.IN_PREFILL)
 
         assert seq.prompt_length == 5512
-        assert seq.max_decode_length == 32768 - 5000
+        assert seq.max_decode_length == 32768
         assert seq.decoded_length == 5000  # Pre-filled with old tokens
+        assert seq.reentry_decoded_baseline == 5000
         assert seq.kv_token_budget == 512 + 32768  # Unchanged
         assert seq.original_prompt_length == 512  # Original preserved
         assert seq.status == SequenceStatus.IN_PREFILL
+        seq.validate_metadata("test_eviction_reentry_lifecycle")
 
         # Verify pre-filled tokens match original decoded tokens
         assert torch.equal(seq.decoded_tokens[0, :n_old], decoded[:n_old])
@@ -599,6 +599,26 @@ class TestFullLifecycle:
         assert seq.decoded_tokens[0, 200].item() == 99999
         # Old tokens still intact
         assert torch.equal(seq.decoded_tokens[0, :200], old_decoded)
+
+    def test_reentry_uses_sequence_decode_limit_not_stale_worker_limit(self):
+        """Re-entry accounting must not clamp to a previous pool batch max_tokens."""
+        seq = make_seq(
+            uuid="s1",
+            prompt_length=1000,
+            max_decode_length=512,
+            decoded_length=128,
+            status=SequenceStatus.EVICTED,
+        )
+        seq.original_prompt_length = 1000
+        seq.original_max_decode_length = 512
+        seq.total_decoded_before_eviction = 128
+        reconstructed_prompt_len = seq.original_prompt_length + seq.total_decoded_before_eviction
+
+        stale_worker_max_decoding_length = 1
+
+        assert min(seq.total_decoded_before_eviction, stale_worker_max_decoding_length) == 1
+        assert seq.compute_reentry_decoded_length(reconstructed_prompt_len) == 128
+        assert seq.clamp_reentry_decoded_length(128) == 128
 
     def test_adaptive_chunk_reduces_waste(self):
         """Demonstrate that adaptive sizing reduces over-reservation."""

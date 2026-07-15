@@ -144,6 +144,9 @@ class DualHostKVCoordinator:
 		self.primary = primary
 		self.auxiliary = auxiliary
 
+	def views_by_group(self) -> dict[int, Any]:
+		return {0: self.primary, 1: self.auxiliary}
+
 	@classmethod
 	def from_budget(
 		cls,

@@ -1,0 +1,57 @@
+"""Common GQA prefix-cache extend-prefill helpers for attention wrappers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+
+@dataclass(frozen=True)
+class GqaExtendSpec:
+    """Static GQA dimensions and optional attention modifiers."""
+
+    num_kv_heads: int
+    head_dim: int
+    sinks: Optional[torch.Tensor] = None
+    softmax_scale: Optional[float] = None
+    sliding_window: Optional[int] = None
+
+
+def run_prefix_gqa_prefill_attention(
+    *,
+    wrapper: object,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    metadata: object,
+    spec: GqaExtendSpec,
+) -> torch.Tensor:
+    """Run GQA prefill attention with optional cached prefix K/V."""
+    from batchgen.attention.forward_metadata_context import (
+        get_current_forward_batch_metadata,
+    )
+    from batchgen.attention.prefix_aware_backend import (
+        GqaPrefixAwareAttentionBackend,
+    )
+
+    forward_metadata = get_current_forward_batch_metadata()
+    kv_cache_metadata = (
+        None if forward_metadata is None else forward_metadata.kv_cache
+    )
+    backend = GqaPrefixAwareAttentionBackend(
+        layer_idx=int(wrapper.layer_idx),
+        num_kv_heads=spec.num_kv_heads,
+        head_dim=spec.head_dim,
+        sinks=spec.sinks,
+        softmax_scale=spec.softmax_scale,
+        sliding_window=spec.sliding_window,
+    )
+    return backend.forward_prefill(
+        query=query,
+        key=key,
+        value=value,
+        metadata=metadata,
+        kv_cache_metadata=kv_cache_metadata,
+    )

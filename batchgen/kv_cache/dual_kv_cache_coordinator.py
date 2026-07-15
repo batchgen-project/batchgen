@@ -52,6 +52,9 @@ class DualKVCacheCoordinator:
 				f"aux={auxiliary.config.page_size_tokens}"
 			)
 
+	def managers_by_group(self) -> dict[int, GPUPagedKVCacheManager]:
+		return {0: self.primary, 1: self.auxiliary}
+
 	# -- Lifecycle --
 
 	def initialize(self) -> None:

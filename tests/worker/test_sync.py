@@ -143,6 +143,22 @@ def test_completion_status_one_eos(coordinator, ctx):
     assert ctx.global_batch.get_sequence("bravo").status == SequenceStatus.COMPLETED
 
 
+def test_completion_status_one_length_completed(coordinator, ctx):
+    """Length-complete sequences must not wait for a decode boundary."""
+    seq = ctx.global_batch.get_sequence("bravo")
+    seq.decoded_length = seq.max_decode_length
+    seq.eos_reached = False
+
+    completed, active = coordinator.sync_completion_status_tensor(
+        ctx, ["alpha", "bravo", "charlie"]
+    )
+
+    assert completed == {"bravo"}
+    assert active == ["alpha", "charlie"]
+    assert ctx.global_batch.get_sequence("bravo").status == SequenceStatus.COMPLETED
+    assert ctx.global_batch.get_sequence("bravo").eos_reached is True
+
+
 def test_completion_status_idempotent_mutation(coordinator, ctx):
     """Running twice in succession yields the same result; status guard prevents double-transition."""
     ctx.global_batch.get_sequence("bravo").eos_reached = True

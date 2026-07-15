@@ -114,6 +114,27 @@ class CUDAGraphPageTableState:
 
 
 @dataclass(frozen=True)
+class GPUPagedKVSuffixAppendPlan:
+	"""Destination metadata for multi-token suffix writes into GPU paged KV."""
+
+	sequence_ids: List[int]
+	prefix_values: Tuple[int, ...]
+	suffix_values: Tuple[int, ...]
+	slot_values: Tuple[int, ...]
+	total_suffix_tokens: int
+	prefix_lens: torch.Tensor
+	suffix_lens: torch.Tensor
+	cache_seqlens: torch.Tensor
+	token_starts: torch.Tensor
+	slot_indices: torch.Tensor
+	page_table: torch.Tensor
+
+	@property
+	def batch_size(self) -> int:
+		return len(self.sequence_ids)
+
+
+@dataclass(frozen=True)
 class GPUPagedKVConfig:
 	num_layers: int
 	num_pages: int
@@ -759,6 +780,8 @@ class GPUPagedKVCacheManager:
 				"GPUPagedKVCacheManager.destroy called while uninitialized; "
 				"no-op (state was already reset by a prior destroy call)"
 			)
+			if empty_cuda_cache:
+				self._release_cached_cuda_memory()
 			return
 
 		self._reset_runtime_state()
@@ -889,6 +912,170 @@ class GPUPagedKVCacheManager:
 		if allocations:
 			self._clear_active_page_pointer_tables()
 		return allocations
+
+	def prepare_prefill_suffix_append(
+		self,
+		*,
+		sequence_ids: Sequence[int],
+		prefix_lens: Sequence[int] | torch.Tensor,
+		suffix_lens: Sequence[int] | torch.Tensor,
+		rebuild_page_table: bool = True,
+	) -> GPUPagedKVSuffixAppendPlan:
+		"""Prepare page-table metadata for multi-token prefill suffix writes.
+
+		The returned plan maps each suffix segment to destination token positions
+		``[prefix_len, prefix_len + suffix_len)`` for the matching sequence.
+		Sequences with reused prefixes must already have full-context GPU pages
+		allocated by the caller; miss sequences without an allocation are
+		allocated normally.
+		"""
+
+		self._ensure_initialized()
+		sequence_ids = [int(seq_id) for seq_id in sequence_ids]
+		prefix_values = self._normalize_cpu_int_vector(
+			prefix_lens,
+			expected_len=len(sequence_ids),
+			name="prefix_lens",
+			allow_zero=True,
+		)
+		suffix_values = self._normalize_cpu_int_vector(
+			suffix_lens,
+			expected_len=len(sequence_ids),
+			name="suffix_lens",
+			allow_zero=True,
+		)
+		if not sequence_ids:
+			raise ValueError("prepare_prefill_suffix_append: sequence_ids must be non-empty")
+
+		full_lengths = [
+			int(prefix_len) + int(suffix_len)
+			for prefix_len, suffix_len in zip(prefix_values, suffix_values)
+		]
+		for seq_id, prefix_len, suffix_len, full_len in zip(
+			sequence_ids,
+			prefix_values,
+			suffix_values,
+			full_lengths,
+		):
+			if full_len <= 0:
+				raise ValueError(
+					"prepare_prefill_suffix_append: full sequence length must be "
+					f"positive for seq {seq_id}, got prefix={prefix_len}, suffix={suffix_len}"
+				)
+			state = self._sequences.get(seq_id)
+			if state is None:
+				if prefix_len > 0:
+					raise KeyError(
+						"prepare_prefill_suffix_append: prefix-reused sequence "
+						f"{seq_id} is not allocated on GPU"
+					)
+				self.allocate_pages(seq_id, full_len)
+				continue
+			required_pages = int(self._geometry.required_pages(full_len))
+			missing_pages = max(0, required_pages - int(state.pages.numel()))
+			if missing_pages > 0:
+				self.grow_sequence_pages(seq_id, missing_pages)
+
+		if rebuild_page_table:
+			page_table = self.rebuild_page_table(sequence_ids)
+		else:
+			page_table = self._gpu_page_table_manager.gpu_table
+			if page_table is None:
+				raise RuntimeError(
+					"prepare_prefill_suffix_append: GPU page table is not initialized"
+				)
+
+		slot_indices = []
+		for seq_id in sequence_ids:
+			slot = self._gpu_page_table_manager.seq_id_to_slot.get(seq_id)
+			if slot is None:
+				raise RuntimeError(
+					"prepare_prefill_suffix_append: missing page-table slot for "
+					f"sequence {seq_id}"
+				)
+			slot_indices.append(int(slot))
+
+		return GPUPagedKVSuffixAppendPlan(
+			sequence_ids=sequence_ids,
+			prefix_values=tuple(prefix_values),
+			suffix_values=tuple(suffix_values),
+			slot_values=tuple(slot_indices),
+			total_suffix_tokens=sum(suffix_values),
+			prefix_lens=torch.tensor(prefix_values, dtype=torch.int32, device=self.device),
+			suffix_lens=torch.tensor(suffix_values, dtype=torch.int32, device=self.device),
+			cache_seqlens=torch.tensor(full_lengths, dtype=torch.int32, device=self.device),
+			token_starts=torch.tensor(prefix_values, dtype=torch.int32, device=self.device),
+			slot_indices=torch.tensor(slot_indices, dtype=torch.int32, device=self.device),
+			page_table=page_table,
+		)
+
+	def append_layer_prefill_suffix_tokens(
+		self,
+		*,
+		k_tensor: torch.Tensor,
+		v_tensor: Optional[torch.Tensor],
+		append_plan: GPUPagedKVSuffixAppendPlan,
+		layer_idx: int,
+	) -> None:
+		"""Write flattened multi-token suffix K/V into GPU paged KV."""
+
+		op_name = "append_layer_prefill_suffix_tokens"
+		self._ensure_initialized()
+		layer_idx = self.resolve_physical_layer(layer_idx)
+		self._geometry.ensure_layer_bounds(layer_idx, op_name)
+		k_tensor = self._prepare_flat_suffix_tensor(
+			k_tensor,
+			expected_heads=self.config.num_k_heads,
+			expected_dim=self.config.k_head_dim,
+			expected_tokens=append_plan.total_suffix_tokens,
+			name="k_tensor",
+			op_name=op_name,
+		)
+		if v_tensor is not None:
+			if not self.config.has_v_cache:
+				raise ValueError(f"{op_name}: V tensor provided but V cache disabled")
+			v_tensor = self._prepare_flat_suffix_tensor(
+				v_tensor,
+				expected_heads=int(self.config.num_v_heads),
+				expected_dim=int(self.config.v_head_dim),
+				expected_tokens=append_plan.total_suffix_tokens,
+				name="v_tensor",
+				op_name=op_name,
+			)
+		elif self.config.has_v_cache:
+			logging.debug("%s: V cache enabled but v_tensor is None", op_name)
+
+		k_layer = self._k_cache[layer_idx]
+		v_layer = self._v_cache[layer_idx] if self._v_cache is not None else None
+		source_offset = 0
+		for seq_id, prefix_len, suffix_len, slot_idx in zip(
+			append_plan.sequence_ids,
+			append_plan.prefix_values,
+			append_plan.suffix_values,
+			append_plan.slot_values,
+		):
+			end_offset = source_offset + int(suffix_len)
+			if suffix_len > 0:
+				self._write_token_range_to_cache_by_page_table(
+					cache_layer=k_layer,
+					page_table=append_plan.page_table,
+					slot_index=int(slot_idx),
+					sequence_id=seq_id,
+					token_start=int(prefix_len),
+					values=k_tensor[source_offset:end_offset],
+					context=op_name,
+				)
+				if v_layer is not None and v_tensor is not None:
+					self._write_token_range_to_cache_by_page_table(
+						cache_layer=v_layer,
+						page_table=append_plan.page_table,
+						slot_index=int(slot_idx),
+						sequence_id=seq_id,
+						token_start=int(prefix_len),
+						values=v_tensor[source_offset:end_offset],
+						context=op_name,
+					)
+			source_offset = end_offset
 
 	def clear_page_table(self) -> None:
 		"""Clear the GPU page table to empty state (0 sequences).
@@ -1432,6 +1619,116 @@ class GPUPagedKVCacheManager:
 			raise KeyError(f"Sequence {sequence_id} not registered on GPU")
 		return state
 
+	def _normalize_cpu_int_vector(
+		self,
+		values: Sequence[int] | torch.Tensor,
+		*,
+		expected_len: int,
+		name: str,
+		allow_zero: bool,
+	) -> List[int]:
+		tensor = torch.as_tensor(values, dtype=torch.long, device="cpu")
+		if tensor.dim() != 1:
+			raise ValueError(
+				f"{name} must be 1-D, got shape={tuple(tensor.shape)}"
+			)
+		if tensor.numel() != expected_len:
+			raise ValueError(
+				f"{name} length must match sequence_ids: "
+				f"{tensor.numel()} != {expected_len}"
+			)
+		limit_ok = tensor >= 0 if allow_zero else tensor > 0
+		if not bool(torch.all(limit_ok).item()):
+			requirement = "non-negative" if allow_zero else "positive"
+			raise ValueError(f"{name} values must be {requirement}")
+		return [int(value) for value in tensor.tolist()]
+
+	def _prepare_flat_suffix_tensor(
+		self,
+		tensor: torch.Tensor,
+		*,
+		expected_heads: int,
+		expected_dim: int,
+		expected_tokens: int,
+		name: str,
+		op_name: str,
+	) -> torch.Tensor:
+		if not isinstance(tensor, torch.Tensor):
+			raise TypeError(f"{op_name}: {name} must be a torch.Tensor")
+		if tensor.dim() == 2 and expected_heads == 1:
+			tensor = tensor.unsqueeze(1)
+		if tensor.dim() != 3:
+			raise ValueError(
+				f"{op_name}: {name} must have shape [tokens, heads, dim], "
+				f"got {tuple(tensor.shape)}"
+			)
+		if tensor.device != self.device:
+			raise ValueError(f"{op_name}: {name} must be on device {self.device}")
+		if int(tensor.shape[0]) != int(expected_tokens):
+			raise ValueError(
+				f"{op_name}: {name} token count mismatch: "
+				f"{tensor.shape[0]} != {expected_tokens}"
+			)
+		if int(tensor.shape[1]) != int(expected_heads) or int(tensor.shape[2]) != int(expected_dim):
+			raise ValueError(
+				f"{op_name}: {name} head shape mismatch, got "
+				f"{tuple(tensor.shape[1:])}, expected "
+				f"({int(expected_heads)}, {int(expected_dim)})"
+			)
+		return tensor.contiguous()
+
+	def _write_token_range_to_cache_by_page_table(
+		self,
+		*,
+		cache_layer: torch.Tensor,
+		page_table: torch.Tensor,
+		slot_index: int,
+		sequence_id: int,
+		token_start: int,
+		values: torch.Tensor,
+		context: str,
+	) -> None:
+		if values.numel() == 0:
+			return
+		if page_table is None:
+			raise RuntimeError(f"{context}: append plan has no page_table")
+		if page_table.ndim != 2:
+			raise ValueError(
+				f"{context}: page_table must be 2-D, got {tuple(page_table.shape)}"
+			)
+		if slot_index < 0 or slot_index >= page_table.shape[0]:
+			raise ValueError(
+				f"{context}: slot index {slot_index} is outside page_table rows "
+				f"{page_table.shape[0]}"
+			)
+		if token_start < 0:
+			raise ValueError(f"{context}: token_start must be non-negative")
+		page_size = self.config.page_size_tokens
+		remaining = int(values.shape[0])
+		source_offset = 0
+		token_index = int(token_start)
+		while remaining > 0:
+			page_slot = token_index // page_size
+			if page_slot >= page_table.shape[1]:
+				raise RuntimeError(
+					f"{context}: sequence {sequence_id} token range exceeds "
+					f"page_table width {page_table.shape[1]}"
+				)
+			gpu_page = int(page_table[slot_index, page_slot].item())
+			if gpu_page < 0:
+				raise RuntimeError(
+					f"{context}: sequence {sequence_id} slot {slot_index} "
+					f"has no GPU page for logical page {page_slot}"
+				)
+			page_offset = token_index % page_size
+			take = min(remaining, page_size - page_offset)
+			cache_layer[gpu_page, page_offset : page_offset + take].copy_(
+				values[source_offset : source_offset + take]
+			)
+			remaining -= take
+			source_offset += take
+			token_index += take
+
 	def _validate_token_inputs(
 		self,
 		k_tensor: torch.Tensor,
@@ -1866,6 +2163,43 @@ class GPUPagedKVCacheManager:
 			)
 
 		return k_tensor, v_tensor
+
+	def get_page_pointer_matrix(
+		self,
+		gpu_pages: Sequence[int] | torch.Tensor,
+	) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+		"""Return layer-major device pointer matrices for explicit GPU pages.
+
+		The returned tensors are CPU ``int64`` matrices shaped
+		``[num_layers, num_pages]``. They are suitable for C++ page-level H2D
+		copy APIs that take explicit destination pages instead of active
+		sequence layouts.
+		"""
+
+		self._ensure_initialized()
+		pages = torch.as_tensor(gpu_pages, dtype=torch.long, device="cpu")
+		if pages.dim() != 1:
+			raise ValueError(
+				"get_page_pointer_matrix: gpu_pages must be 1-D, "
+				f"got shape={tuple(pages.shape)}"
+			)
+		if pages.numel() == 0:
+			empty = self._k_page_ptr_table.new_empty(
+				(self.config.num_layers, 0)
+			)
+			return empty, None if self._v_page_ptr_table is None else empty.clone()
+		if torch.any(pages < 0) or torch.any(pages >= self.config.num_pages):
+			raise ValueError(
+				"get_page_pointer_matrix: gpu_pages contains out-of-range page IDs"
+			)
+
+		k_ptrs = self._select_active_page_columns(self._k_page_ptr_table, pages)
+		v_ptrs = None
+		if self.config.has_v_cache:
+			v_ptrs = self._select_active_page_columns(
+				self._v_page_ptr_table, pages
+			)
+		return k_ptrs.contiguous(), None if v_ptrs is None else v_ptrs.contiguous()
 
 	# In gpu_paged_kv_manager.py
 	def extend_pages_for_sequence(self, sequence_id: int, new_total_tokens: int) -> int:

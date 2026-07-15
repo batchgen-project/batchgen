@@ -37,9 +37,9 @@ Usage:
     )
 """
 
+from .attention import AttnWrapperBase
 from .base import BaseModuleWrapper
 from .expert import ExpertWrapperBase
-from .attention import AttnWrapperBase
 
 __all__ = [
     "BaseModuleWrapper",

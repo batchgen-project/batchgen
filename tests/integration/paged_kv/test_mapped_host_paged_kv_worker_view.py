@@ -72,6 +72,14 @@ def _make_mapped_mla_config(bg, shm_name: str):
     return cfg
 
 
+def _make_mapped_default_config(bg, shm_name: str):
+    cfg = _make_mapped_mla_config(bg, shm_name)
+    cfg.num_v_heads = NUM_K_HEADS
+    cfg.v_head_dim = K_HEAD_DIM
+    cfg.v_element_size_bytes = K_ELEMENT_SIZE_BYTES
+    return cfg
+
+
 def _k_page_bytes() -> int:
     return PAGE_TOKENS * NUM_K_HEADS * K_HEAD_DIM * K_ELEMENT_SIZE_BYTES
 
@@ -211,6 +219,37 @@ def test_mapped_mla_view_routes_logical_layers_after_cpu_write(bg):
                         _expected_token(expected_value),
                     )
 
+        range_sequence_id = 404
+        range_logical_layer = 4
+        all_k_ptrs, all_v_ptrs = view.get_sequence_layer_page_pointers(
+            range_sequence_id, range_logical_layer, None
+        )
+        range_k_ptrs, range_v_ptrs = (
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, 1, 2
+            )
+        )
+        assert all_v_ptrs is None
+        assert range_v_ptrs is None
+        assert range_k_ptrs == all_k_ptrs[1:3]
+
+        empty_k_ptrs, empty_v_ptrs = (
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, len(all_k_ptrs), 0
+            )
+        )
+        assert empty_k_ptrs == []
+        assert empty_v_ptrs is None
+
+        with pytest.raises(IndexError):
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, 0, 1, 1
+            )
+        with pytest.raises(IndexError):
+            view.get_sequence_layer_page_range_pointers(
+                range_sequence_id, range_logical_layer, len(all_k_ptrs), 1
+            )
+
         with pytest.raises(IndexError):
             view.resolve_physical_layer(len(LOGICAL_TO_PHYSICAL))
 
@@ -312,6 +351,143 @@ def test_mapped_mla_view_routes_prefill_and_batched_decode_writes(bg):
         stats_after_free = view.get_stats()
         assert stats_after_free.num_used_pages == 0
         assert stats_after_free.num_active_sequences == 0
+        view.shutdown()
+        view = None
+    finally:
+        _close_view(view, sequence_ids)
+        _shm_unlink(shm_name)
+
+
+def test_mapped_mla_view_offloads_prefill_range_to_raw_offset(bg):
+    shm_name = _random_shm_name()
+    cfg = _make_mapped_mla_config(bg, shm_name)
+    view = None
+    sequence_ids = [501, 502]
+    raw_starts = [PAGE_TOKENS + 3, PAGE_TOKENS * 2 - 2]
+    token_counts = [5, 7]
+    capacity_tokens = PAGE_TOKENS * 4
+
+    try:
+        torch.cuda.set_device(0)
+        view = bg.MappedMLAHostPagedKVWorkerView(cfg)
+        view.initialize(0, True)
+        view.register_sequences(sequence_ids)
+        allocations = view.allocate_pages_for_sequences(
+            [(sequence_id, capacity_tokens) for sequence_id in sequence_ids]
+        )
+        assert all(len(pages) == 4 for pages in allocations)
+
+        device = torch.device("cuda:0")
+        max_token_count = max(token_counts)
+        prefill = torch.zeros(
+            (
+                len(sequence_ids),
+                max_token_count,
+                NUM_K_HEADS,
+                K_HEAD_DIM,
+            ),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        for batch_idx, count in enumerate(token_counts):
+            prefill[batch_idx, :count].fill_(float(80 + batch_idx))
+
+        # logical layer 5 routes to physical layer 1.
+        task = view.async_offload_layer_kv_range_to_host(
+            5,
+            sequence_ids,
+            prefill,
+            None,
+            raw_starts,
+            token_counts,
+        )
+        task.wait()
+
+        for batch_idx, sequence_id in enumerate(sequence_ids):
+            k_cpu, v_cpu = view.read_sequence_kv_to_cpu(sequence_id)
+            assert v_cpu.numel() == 0
+            value = float(80 + batch_idx)
+            for token_idx in range(
+                raw_starts[batch_idx],
+                raw_starts[batch_idx] + token_counts[batch_idx],
+            ):
+                page_ordinal = token_idx // PAGE_TOKENS
+                page_offset = token_idx % PAGE_TOKENS
+                actual = k_cpu[1, page_ordinal, page_offset].flatten()
+                assert torch.equal(actual, _expected_token(value))
+
+            before_start = raw_starts[batch_idx] - 1
+            actual_before = k_cpu[
+                1,
+                before_start // PAGE_TOKENS,
+                before_start % PAGE_TOKENS,
+            ].flatten()
+            assert torch.equal(actual_before, torch.zeros_like(actual_before))
+
+        view.release_sequence_pages(sequence_ids)
+        view.shutdown()
+        view = None
+    finally:
+        _close_view(view, sequence_ids)
+        _shm_unlink(shm_name)
+
+
+def test_mapped_default_view_offloads_prefill_range_to_raw_offset(bg):
+    shm_name = _random_shm_name()
+    cfg = _make_mapped_default_config(bg, shm_name)
+    view = None
+    sequence_ids = [601]
+    raw_start = PAGE_TOKENS - 2
+    token_count = 4
+    capacity_tokens = PAGE_TOKENS * 2
+
+    try:
+        torch.cuda.set_device(0)
+        view = bg.MappedDefaultHostPagedKVWorkerView(cfg)
+        view.initialize(0, True)
+        assert view.has_v_cache is True
+        view.register_sequences(sequence_ids)
+        allocations = view.allocate_pages_for_sequences(
+            [(sequence_ids[0], capacity_tokens)]
+        )
+        assert len(allocations[0]) == 2
+
+        device = torch.device("cuda:0")
+        k_prefill = torch.full(
+            (1, token_count, NUM_K_HEADS, K_HEAD_DIM),
+            91.0,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        v_prefill = torch.full(
+            (1, token_count, NUM_K_HEADS, K_HEAD_DIM),
+            101.0,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+        # logical layer 1 routes to physical layer 3.
+        task = view.async_offload_layer_kv_range_to_host(
+            1,
+            sequence_ids,
+            k_prefill,
+            v_prefill,
+            [raw_start],
+            [token_count],
+        )
+        task.wait()
+
+        k_cpu, v_cpu = view.read_sequence_kv_to_cpu(sequence_ids[0])
+        assert v_cpu.numel() != 0
+        for token_idx in range(raw_start, raw_start + token_count):
+            page_ordinal = token_idx // PAGE_TOKENS
+            page_offset = token_idx % PAGE_TOKENS
+            actual_k = k_cpu[3, page_ordinal, page_offset].flatten()
+            actual_v = v_cpu[3, page_ordinal, page_offset].flatten()
+            assert torch.equal(actual_k, _expected_token(91.0))
+            assert torch.equal(actual_v, _expected_token(101.0))
+
+        view.release_sequence_pages(sequence_ids)
         view.shutdown()
         view = None
     finally:

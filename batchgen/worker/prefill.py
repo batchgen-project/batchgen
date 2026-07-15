@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,8 @@ class PrefillCandidate:
     prompt_length: int
     kv_token_budget: int
     page_size: int
+    estimated_shared_prefix_tokens: int = 0
+    estimated_shared_prefix_page_ids: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,10 +65,49 @@ class PrefillSelectionRequest:
     num_nodes: int
     gpus_per_node: int
     initial_gpu_page_buffer: int
+    charge_shared_prefix_pages: bool = False
+
+
+@dataclass(frozen=True)
+class PrefillWaveGateRequest:
+    """Inputs for deciding whether to start a selected prefill wave.
+
+    Prefix-cache hits can make the selected wave's real append work much
+    smaller than the prompt-length-based admission estimate. When active decode
+    work already exists, running a tiny extra prefill wave pays the full
+    decode->prefill transition cost for little compute. The gate only applies
+    to that case; first waves and non-prefix-cache runs keep the legacy path.
+    """
+
+    selected_count: int
+    prefix_cache_enabled: bool
+    has_active_work: bool
+    world_size: int
+    min_sequences: Optional[int] = None
 
 
 class PrefillScheduler:
     """Prefill admission decision — pure, deterministic across ranks."""
+
+    @staticmethod
+    def min_prefix_cache_wave_sequences(world_size: int) -> int:
+        """Minimum selected sequence count for prefill while decode is active."""
+        return max(128, max(1, int(world_size)) * 16)
+
+    @staticmethod
+    def should_run_prefill_wave(req: PrefillWaveGateRequest) -> bool:
+        """Return whether the selected wave should be launched immediately."""
+        if req.selected_count <= 0:
+            return False
+        if not req.prefix_cache_enabled or not req.has_active_work:
+            return True
+
+        min_sequences = (
+            req.min_sequences
+            if req.min_sequences is not None
+            else PrefillScheduler.min_prefix_cache_wave_sequences(req.world_size)
+        )
+        return req.selected_count >= int(min_sequences)
 
     @staticmethod
     def select_prefill_batch(req: PrefillSelectionRequest) -> List[str]:
@@ -81,8 +122,10 @@ class PrefillScheduler:
         ``max(prompt_length + chunk_size, gpu_initial_tokens)`` capped at
         ``kv_token_budget``, rounded up to whole pages — where
         ``gpu_initial_tokens`` covers ``prompt_length + 1`` plus the GPU
-        page buffer. No safety margin: selection and allocation use the
-        same formula by design.
+        page buffer. With prefix-cache estimates, page-aligned shared prefix
+        pages are charged as already resident and only the private append
+        capacity is admitted. No safety margin: selection and allocation use
+        the same formula by design.
 
         Pure: reads only the candidate snapshots + per-node free pages.
         The NCCL gather and the ``global_batch`` enumeration stay on the
@@ -99,6 +142,7 @@ class PrefillScheduler:
 
         per_node_effective_free = list(req.per_node_host_free)
         node_pages_used = [0] * req.num_nodes
+        protected_shared_pages = [set() for _ in range(req.num_nodes)]
         prefill_batch: List[str] = []
 
         for c in all_candidates:
@@ -111,10 +155,29 @@ class PrefillScheduler:
             gpu_initial_tokens = gpu_initial_pages * c.page_size
             initial_capacity = max(c.prompt_length + req.chunk_size, gpu_initial_tokens)
             initial_capacity = min(initial_capacity, c.kv_token_budget)
-            req_pages = math.ceil(initial_capacity / c.page_size)
+            shared_tokens = max(0, int(c.estimated_shared_prefix_tokens))
+            shared_tokens = min(shared_tokens, int(c.prompt_length))
+            shared_page_tokens = (shared_tokens // c.page_size) * c.page_size
+            append_tokens = max(0, int(c.prompt_length) - shared_tokens)
+            private_capacity = max(
+                initial_capacity - shared_page_tokens,
+                append_tokens,
+            )
+            req_pages = math.ceil(private_capacity / c.page_size)
+            if req.charge_shared_prefix_pages:
+                shared_pages = protected_shared_pages[seq_node]
+                req_pages += sum(
+                    1
+                    for page_key in c.estimated_shared_prefix_page_ids
+                    if page_key not in shared_pages
+                )
 
             if node_pages_used[seq_node] + req_pages <= per_node_effective_free[seq_node]:
                 prefill_batch.append(c.uuid)
                 node_pages_used[seq_node] += req_pages
+                if req.charge_shared_prefix_pages:
+                    protected_shared_pages[seq_node].update(
+                        c.estimated_shared_prefix_page_ids
+                    )
 
         return prefill_batch

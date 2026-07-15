@@ -248,10 +248,17 @@ class BatchError(BaseModel):
     message: str
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
 
 
 class ToolCallFunction(BaseModel):

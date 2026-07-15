@@ -89,6 +89,55 @@ class QuietAccessLogMiddleware(BaseHTTPMiddleware):
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
+def _count_active_batches(scheduler: BatchScheduler) -> int:
+    spool = scheduler._scheduling_pool
+    active_batches = 0
+    with spool._lock:
+        for tracker in spool._batch_trackers.values():
+            if not tracker.is_complete and not tracker.is_failed:
+                active_batches += 1
+    return active_batches
+
+
+def _ensure_no_active_batches(scheduler: BatchScheduler, action: str) -> None:
+    active_batches = _count_active_batches(scheduler)
+    if active_batches:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot {action} prefix cache while batches are active: "
+                f"active_batches={active_batches}"
+            ),
+        )
+
+
+def _token_id_batches_from_payload(payload: object) -> list[list[int]]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+    token_ids = payload.get("token_ids")
+    if not isinstance(token_ids, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Expected token_ids to be a list of token-id lists",
+        )
+
+    batches: list[list[int]] = []
+    for index, row in enumerate(token_ids):
+        if not isinstance(row, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Expected token_ids[{index}] to be a list",
+            )
+        try:
+            batches.append([int(token_id) for token_id in row])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"token_ids[{index}] contains a non-integer token id",
+            ) from exc
+    return batches
+
+
 def create_app(
     server_args: ServerArgs,
     worker_exit_state: Optional[WorkerExitState] = None,
@@ -168,11 +217,7 @@ def create_app(
         scheduler: BatchScheduler = request.app.state.scheduler
         spool = scheduler._scheduling_pool
         ipool = scheduler._intake_pool
-        active_batches = 0
-        with spool._lock:
-            for t in spool._batch_trackers.values():
-                if not t.is_complete and not t.is_failed:
-                    active_batches += 1
+        active_batches = _count_active_batches(scheduler)
         return {
             "intake_pool_size": ipool.size(),
             "intake_pool_capacity": ipool.max_capacity,
@@ -182,6 +227,70 @@ def create_app(
             "active_batches": active_batches,
             "pool_mode": scheduler._pool_mode,
         }
+
+    @app.post("/v1/prefix-cache/clear")
+    @app.post("/v1/prefix_cache/clear", include_in_schema=False)
+    async def clear_prefix_cache(request: Request):
+        scheduler: BatchScheduler = request.app.state.scheduler
+        _ensure_no_active_batches(scheduler, "clear")
+
+        worker: WorkerManager = request.app.state.worker
+        try:
+            return await asyncio.to_thread(worker.clear_prefix_cache)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.exception("Failed to clear prefix cache")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/v1/prefix-cache/pin")
+    @app.post("/v1/prefix_cache/pin", include_in_schema=False)
+    async def pin_prefix_cache(request: Request):
+        scheduler: BatchScheduler = request.app.state.scheduler
+        _ensure_no_active_batches(scheduler, "pin")
+        payload = await request.json()
+        token_id_batches = _token_id_batches_from_payload(payload)
+        replace_existing = bool(payload.get("replace_existing", False))
+
+        worker: WorkerManager = request.app.state.worker
+        try:
+            return await asyncio.to_thread(
+                worker.pin_prefix_cache,
+                token_id_batches,
+                replace_existing=replace_existing,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.exception("Failed to pin prefix cache")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/v1/prefix-cache/unpin")
+    @app.post("/v1/prefix_cache/unpin", include_in_schema=False)
+    async def unpin_prefix_cache(request: Request):
+        scheduler: BatchScheduler = request.app.state.scheduler
+        _ensure_no_active_batches(scheduler, "unpin")
+
+        worker: WorkerManager = request.app.state.worker
+        try:
+            return await asyncio.to_thread(worker.unpin_prefix_cache)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.exception("Failed to unpin prefix cache")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.get("/v1/prefix-cache/pins")
+    @app.get("/v1/prefix_cache/pins", include_in_schema=False)
+    async def prefix_cache_pins(request: Request):
+        worker: WorkerManager = request.app.state.worker
+        try:
+            return await asyncio.to_thread(worker.prefix_cache_pin_status)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.exception("Failed to inspect prefix cache pins")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     # ==================== File Endpoints ====================
 

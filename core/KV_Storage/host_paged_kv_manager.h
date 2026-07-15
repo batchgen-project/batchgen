@@ -164,6 +164,10 @@ class HostPagedKVManager {
         backend_.ReleaseSequences(sequence_ids);
     }
 
+    void ReleaseResidentPages(const std::vector<std::int32_t>& page_ids) {
+        backend_.ReleaseResidentPages(page_ids);
+    }
+
     std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
     GetSequenceLayerPagePointers(
         std::int64_t sequence_id, std::size_t layer_idx,
@@ -195,6 +199,37 @@ class HostPagedKVManager {
                 v_ptrs->emplace_back(v_ptr);
                 // LogPageBytes("V", layer_idx, sequence_id, page, v_ptr,
                 //              geometry_.template VTokenBytes<true>());
+            }
+        }
+        return {std::move(k_ptrs), std::move(v_ptrs)};
+    }
+
+    std::pair<std::vector<void*>, std::optional<std::vector<void*>>>
+    GetSequenceLayerPageRangePointers(std::int64_t sequence_id,
+                                      std::size_t layer_idx,
+                                      std::size_t start_page,
+                                      std::size_t page_count) const {
+        geometry_.EnsureLayerBounds(
+            layer_idx,
+            "HostPagedKVManager::GetSequenceLayerPageRangePointers");
+        auto page_indices =
+            backend_.SequencePageRange(sequence_id, start_page, page_count);
+        std::vector<void*> k_ptrs;
+        k_ptrs.reserve(page_indices.size());
+        std::optional<std::vector<void*>> v_ptrs;
+        if constexpr (Layout::kHasVCache) {
+            v_ptrs.emplace();
+            v_ptrs->reserve(page_indices.size());
+        }
+        std::byte* base = const_cast<std::byte*>(backend_.DataBase());
+        for (std::int32_t page : page_indices) {
+            void* k_ptr =
+                static_cast<void*>(layout_.KPageAddress(base, layer_idx, page));
+            k_ptrs.emplace_back(k_ptr);
+            if constexpr (Layout::kHasVCache) {
+                void* v_ptr = static_cast<void*>(
+                    layout_.VPageAddress(base, layer_idx, page));
+                v_ptrs->emplace_back(v_ptr);
             }
         }
         return {std::move(k_ptrs), std::move(v_ptrs)};

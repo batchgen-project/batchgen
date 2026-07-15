@@ -33,6 +33,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from batchgen.models.wrappers import ExpertWrapperBase, AttnWrapperBase
+from batchgen.models.wrappers.prefix_gqa_extend import (
+    GqaExtendSpec,
+    run_prefix_gqa_prefill_attention,
+)
 from batchgen.quantization.fp8e4m3 import deepseek_v3_dequantization
 from .model import rotate_half
 
@@ -422,7 +426,6 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
     def _forward_prefill(self, hidden_states, **kwargs):
         """Prefill forward: FP8 Q/K/V projection + QK norm + partial RoPE + FA varlen."""
-        from batchgen.attention.gqa import gqa_prefill_fa
         from batchgen.attention.fused_kernels import cuda_rmsnorm
 
         fp8_q, q_scale, fp8_k, k_scale, fp8_v, v_scale, fp8_o, o_scale = self._get_attn_weights()
@@ -435,9 +438,14 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             hidden_states_2d = hidden_states
 
         total_tokens = hidden_states_2d.shape[0]
-        cu_seqlens = self.prepack_cu_seqlens.to(hidden_states_2d.device)
-        max_seqlen = self.prepack_max_seqlen
+        metadata = self.prefix_cache_metadata()
+        max_seqlen = metadata.max_seqlen
         position_ids = self.position_ids.to(hidden_states_2d.device)
+        full_seq_lengths = metadata.full_seq_lengths
+        if metadata.prefix_reuse_mode and full_seq_lengths:
+            rotary_seq_len = max(max(int(length) for length in full_seq_lengths), int(max_seqlen))
+        else:
+            rotary_seq_len = int(max_seqlen)
 
         # Q/K/V projection — packed FP8 GEMM (2.94× faster) or fallback
         if _HAS_PACKED_QKV and hasattr(self, 'packed_qkv_w') and self.packed_qkv_w is not None:
@@ -464,7 +472,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
         value = value.view(total_tokens, num_kv_heads, head_dim)
 
         # Partial RoPE (rotate first rotary_dim=64 dims, passthrough rest)
-        cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+        cos, sin = self.module.rotary_emb(value, seq_len=rotary_seq_len)
         cos = cos[position_ids]  # [total_tokens, rotary_dim]
         sin = sin[position_ids]
 
@@ -486,15 +494,16 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
             k_pass,
         ], dim=-1)
 
-        # FlashAttention varlen GQA
-        attn_output, lse = gqa_prefill_fa(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+        attn_output = run_prefix_gqa_prefill_attention(
+            wrapper=self,
+            query=query,
+            key=key,
+            value=value,
+            metadata=metadata,
+            spec=GqaExtendSpec(
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+            ),
         )
 
         # Output projection via FP8 GEMM
@@ -516,26 +525,7 @@ class MiniMaxM25AttnWrapper(AttnWrapperBase):
 
     def _offload_prepacked_kv_gqa(self, k_cache, v_cache):
         """Offload GQA KV cache per-sequence to host memory."""
-        cu_seqlens = self.prepack_cu_seqlens
-        num_sequences = self.prepack_num_sequences
-        global_sequence_ids = self.cur_batch
-
-        for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
-
-            seq_k = k_cache[start_idx:end_idx].unsqueeze(0)
-            seq_v = v_cache[start_idx:end_idx].unsqueeze(0)
-            seq_global_id = [global_sequence_ids[seq_idx]]
-
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_k,
-                v_tensor=seq_v,
-                sequence_lengths=[seq_len],
-            )
+        self.offload_prepacked_gqa_kv(k_cache, v_cache)
 
     def _forward_decode(self, hidden_states, **kwargs):
         """Decode forward: FP8 Q/K/V + QK norm + partial RoPE + paged KV attention.

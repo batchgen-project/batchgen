@@ -844,10 +844,11 @@ class GptOssMoEDecode(nn.Module):
         # Phase 1: Grouped kernel for persistent experts
         num_persistent = len(self.persistent_expert_indices)
         if num_persistent > 0:
-            output = self._grouped_forward(
+            self._grouped_forward(
                 hidden_flat, topk_indices, topk_weights,
                 expert_start=self.expert_start,
                 num_local_experts=num_persistent,
+                output=output,
             )
 
         # Phase 2: Single-expert kernel for non-persistent experts
@@ -902,21 +903,23 @@ class GptOssMoEDecode(nn.Module):
         global_results = self.global_results_buffer
         global_results.zero_()
         num_global_tokens = all_tokens.shape[0]
+        global_results_view = global_results[:num_global_tokens]
 
         # Phase 1: Grouped kernel for persistent experts
         num_persistent = len(self.persistent_expert_indices)
         if num_persistent > 0:
-            global_results[:num_global_tokens] = self._grouped_forward(
+            self._grouped_forward(
                 all_tokens, topk_indices, topk_weights,
                 expert_start=self.expert_start,
                 num_local_experts=num_persistent,
+                output=global_results_view,
             )
 
         # Phase 2: Single-expert kernel for non-persistent experts
         if self.non_persistent_expert_indices:
             self._single_expert_forward(
                 all_tokens, topk_indices, topk_weights,
-                global_results[:num_global_tokens],
+                global_results_view,
             )
 
         # 4) AllReduce
@@ -938,6 +941,7 @@ class GptOssMoEDecode(nn.Module):
         topk_weights: torch.Tensor,
         expert_start: int,
         num_local_experts: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Grouped kernel for persistent experts."""
         if self.weight_format == "mxfp4":
@@ -959,6 +963,7 @@ class GptOssMoEDecode(nn.Module):
                 gate_bias_ptrs=self.gate_bias_ptrs,
                 up_bias_ptrs=self.up_bias_ptrs,
                 down_bias_ptrs=self.down_bias_ptrs,
+                output=output,
             )
         elif self.weight_format == "bf16":
             # Placeholder: grouped BF16 kernel to be ported from
@@ -1110,6 +1115,23 @@ class GptOssMoEPrefill(nn.Module):
             self._buffer_shape = shape
         return self._bf16_buffer
 
+    @staticmethod
+    def _debug_sync_mlp(label: str, tensor: torch.Tensor) -> None:
+        if os.environ.get("BATCHGEN_GPT_OSS_MLP_DEBUG_SYNC", "0") != "1":
+            return
+        logging.getLogger(__name__).info(
+            "[GPT_OSS_MLP_DEBUG] before_sync label=%s shape=%s dtype=%s device=%s",
+            label,
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+        )
+        torch.cuda.synchronize(tensor.device)
+        logging.getLogger(__name__).info(
+            "[GPT_OSS_MLP_DEBUG] after_sync label=%s",
+            label,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward pass: grouped WGMMA for persistent experts, per-expert loop for the rest."""
         import os
@@ -1121,8 +1143,17 @@ class GptOssMoEPrefill(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)  # [total_tokens, hidden_size]
 
+        disable_fused_gate = (
+            os.environ.get("BATCHGEN_GPT_OSS_PREFILL_DISABLE_FUSED_GATE", "0")
+            == "1"
+        )
+
         # Compute routing: fused gate (WGMMA GEMM + bias + TopK + Softmax) or fallback
-        if self._fused_gate_ctx is None and _HAS_CUDA_ROUTING:
+        if (
+            not disable_fused_gate
+            and self._fused_gate_ctx is None
+            and _HAS_CUDA_ROUTING
+        ):
             w = self.router.weight  # [E, K_dim] BF16
             if w.dtype == torch.bfloat16:
                 from batchgen.moe.routing import FusedGateContext
@@ -1130,22 +1161,26 @@ class GptOssMoEPrefill(nn.Module):
                 _bias_bf16 = _bias.to(torch.bfloat16) if _bias is not None else None
                 self._fused_gate_ctx = FusedGateContext(w, _bias_bf16, topk=self.num_experts_per_tok)
 
-        if self._fused_gate_ctx is not None:
+        if self._fused_gate_ctx is not None and not disable_fused_gate:
             topk_indices, topk_weights = self._fused_gate_ctx.forward(hidden_flat)
+            self._debug_sync_mlp("routing_fused_gate", hidden_flat)
         elif _HAS_CUDA_ROUTING:
             router_logits = self.router(hidden_flat)  # [total_tokens, num_experts]
             topk_indices, topk_weights = gate_topk_softmax_cuda(
                 router_logits, k=self.num_experts_per_tok
             )
+            self._debug_sync_mlp("routing_cuda_topk", hidden_flat)
         else:
             router_logits = self.router(hidden_flat)
             topk_weights, topk_indices = torch.topk(
                 router_logits, k=self.num_experts_per_tok, dim=-1
             )
             topk_weights = F.softmax(topk_weights, dim=-1)
+            self._debug_sync_mlp("routing_torch_topk", hidden_flat)
 
         # Initialize output
         output = torch.zeros_like(hidden_flat)
+        self._debug_sync_mlp("zeros_like_output", output)
 
         # Phase 1: Grouped WGMMA for persistent experts
         num_persistent = len(self.persistent_expert_indices)
@@ -1163,6 +1198,7 @@ class GptOssMoEPrefill(nn.Module):
                 up_bias_ptrs=self.up_bias_ptrs,
                 down_bias_ptrs=self.down_bias_ptrs,
             )
+            self._debug_sync_mlp("grouped_moe", output)
             # If all experts are persistent, we're done
             if not self.non_persistent_expert_indices:
                 return output.view(batch_size, seq_len, hidden_dim)

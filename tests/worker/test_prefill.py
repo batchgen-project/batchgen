@@ -19,6 +19,7 @@ from batchgen.worker.prefill import (
     PrefillCandidate,
     PrefillScheduler,
     PrefillSelectionRequest,
+    PrefillWaveGateRequest,
 )
 
 _PAGE = 64
@@ -39,7 +40,38 @@ def _cand(uuid, *, rank=0, evicted=False, gidx=0, decoded=0, prompt=100, budget=
     )
 
 
-def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
+def _prefix_cand(
+    uuid,
+    *,
+    rank=0,
+    gidx=0,
+    prompt=4096,
+    cached=0,
+    page_ids=(),
+    budget=100000,
+):
+    return PrefillCandidate(
+        uuid=uuid,
+        assigned_rank=rank,
+        is_evicted=False,
+        global_idx=gidx,
+        total_decoded_before_eviction=0,
+        prompt_length=prompt,
+        kv_token_budget=budget,
+        page_size=_PAGE,
+        estimated_shared_prefix_tokens=cached,
+        estimated_shared_prefix_page_ids=tuple(page_ids),
+    )
+
+
+def _req(
+    candidates,
+    per_node_free,
+    *,
+    chunk=128,
+    gpus_per_node=_GPN,
+    charge_shared_prefix_pages=False,
+):
     return PrefillSelectionRequest(
         candidates=tuple(candidates),
         per_node_host_free=tuple(per_node_free),
@@ -47,6 +79,7 @@ def _req(candidates, per_node_free, *, chunk=128, gpus_per_node=_GPN):
         num_nodes=len(per_node_free),
         gpus_per_node=gpus_per_node,
         initial_gpu_page_buffer=_BUF,
+        charge_shared_prefix_pages=charge_shared_prefix_pages,
     )
 
 
@@ -150,6 +183,56 @@ def test_no_eviction_candidates_pure_queueing_order():
     assert plan == ["q2", "q1", "q0"]  # uuids q2(gidx0), q1(gidx1), q0(gidx2)
 
 
+def test_prefix_estimate_reduces_admission_pages():
+    # Without prefix estimate, prompt 4096 needs 97 pages:
+    # max(prompt + chunk = 4224, gpu_tokens = (65 + 32) * 64).
+    # With a 3072-token page-aligned hit, the private charge drops to
+    # ceil((6208 - 3072) / 64) = 49 pages, so two candidates fit in 98 pages.
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072)
+    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [98]))
+    assert plan == ["c0", "c1"]
+    plan = PrefillScheduler.select_prefill_batch(_req([c0, c1], [97]))
+    assert plan == ["c0"]
+
+
+def test_non_page_aligned_prefix_estimate_is_conservative():
+    # A full-hit compute path may normalize to prompt_length - 1. Admission
+    # must only credit fully page-aligned shared pages.
+    c = _prefix_cand("c", prompt=4096, cached=4095)
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [33]))
+    assert plan == []
+    plan = PrefillScheduler.select_prefill_batch(_req([c], [34]))
+    assert plan == ["c"]
+
+
+def test_prefix_admission_charges_unique_shared_pages_when_requested():
+    shared_pages = tuple((0, page_id) for page_id in range(48))
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072, page_ids=shared_pages)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072, page_ids=shared_pages)
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [145], charge_shared_prefix_pages=True)
+    )
+    assert plan == ["c0"]
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [146], charge_shared_prefix_pages=True)
+    )
+    assert plan == ["c0", "c1"]
+
+
+def test_prefix_admission_does_not_charge_shared_pages_against_free_capacity():
+    shared_pages = tuple((0, page_id) for page_id in range(48))
+    c0 = _prefix_cand("c0", gidx=0, prompt=4096, cached=3072, page_ids=shared_pages)
+    c1 = _prefix_cand("c1", gidx=1, prompt=4096, cached=3072, page_ids=shared_pages)
+
+    plan = PrefillScheduler.select_prefill_batch(
+        _req([c0, c1], [98], charge_shared_prefix_pages=False)
+    )
+    assert plan == ["c0", "c1"]
+
+
 def test_request_and_candidate_are_frozen():
     req = _req([_cand("a")], [34])
     with pytest.raises((AttributeError, Exception)):
@@ -157,3 +240,48 @@ def test_request_and_candidate_are_frozen():
     c = _cand("a")
     with pytest.raises((AttributeError, Exception)):
         c.uuid = "b"  # type: ignore[misc]
+
+
+def test_prefix_cache_wave_gate_allows_first_wave():
+    req = PrefillWaveGateRequest(
+        selected_count=1,
+        prefix_cache_enabled=True,
+        has_active_work=False,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_defers_small_wave_with_active_work():
+    req = PrefillWaveGateRequest(
+        selected_count=35,
+        prefix_cache_enabled=True,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert not PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_allows_large_wave_with_active_work():
+    req = PrefillWaveGateRequest(
+        selected_count=128,
+        prefix_cache_enabled=True,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_does_not_change_non_prefix_cache_path():
+    req = PrefillWaveGateRequest(
+        selected_count=1,
+        prefix_cache_enabled=False,
+        has_active_work=True,
+        world_size=8,
+    )
+    assert PrefillScheduler.should_run_prefill_wave(req)
+
+
+def test_prefix_cache_wave_gate_uses_world_size_threshold():
+    assert PrefillScheduler.min_prefix_cache_wave_sequences(world_size=1) == 128
+    assert PrefillScheduler.min_prefix_cache_wave_sequences(world_size=32) == 512

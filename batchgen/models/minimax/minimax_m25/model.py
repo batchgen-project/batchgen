@@ -663,15 +663,45 @@ class MiniMaxM25MoEBufferManager:
         )
 
     def resize_if_needed(self, global_bsz: int):
-        """Resize communication/routing buffers if global_bsz exceeds capacity."""
-        if global_bsz <= self.max_global_bsz:
+        """Resize buffers for the current global decode batch.
+
+        ``dispatch_scatter_3d`` writes up to one row per original token into a
+        single local expert slot. In the worst case all tokens route to the same
+        local expert, so the per-expert stride must cover ``global_bsz``.
+        """
+        grew_comm = global_bsz > self.max_global_bsz
+        grew_mtp = global_bsz > self.max_tokens_padded
+        if not grew_comm and not grew_mtp:
             return
-        logging.info(f"[MoEBufferManager] Resizing: {self.max_global_bsz} -> {global_bsz}")
-        self.max_global_bsz = global_bsz
-        NK = global_bsz * self.topk
-        self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
-        self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
-        self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
+
+        if grew_comm:
+            logging.info(
+                f"[MoEBufferManager] Resizing comm buffers: {self.max_global_bsz} -> {global_bsz}"
+            )
+            self.max_global_bsz = global_bsz
+            NK = global_bsz * self.topk
+            self.all_tokens = torch.zeros(
+                global_bsz, self.H, dtype=torch.bfloat16, device=self.device,
+            )
+            self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
+            self.result_buffer = torch.empty(
+                global_bsz, self.H, dtype=torch.bfloat16, device=self.device,
+            )
+
+        if grew_mtp:
+            new_mtp = ((global_bsz + _DEFAULT_MTP - 1) // _DEFAULT_MTP) * _DEFAULT_MTP
+            logging.info(
+                f"[MoEBufferManager] Resizing 3D buffers: "
+                f"mtp {self.max_tokens_padded} -> {new_mtp}"
+            )
+            self.max_tokens_padded = new_mtp
+            buf_rows = self.E_local * new_mtp
+            self.dispatched_x = torch.zeros(
+                buf_rows, self.H, dtype=torch.bfloat16, device=self.device,
+            )
+            self.expert_out = torch.zeros(
+                buf_rows, self.H, dtype=torch.bfloat16, device=self.device,
+            )
 
     def _total_bytes(self):
         total = 0

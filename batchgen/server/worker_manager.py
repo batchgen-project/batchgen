@@ -22,8 +22,15 @@ from batchgen.config.model_name_utils import is_kimi_k25_backend_model
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
 from batchgen.models.engine_loader import core_engine as bg_lib
 from batchgen.parameter_server_client import ParameterServerClient
+from batchgen.prefix_reuse.admin import (
+    clear_host_prefix_cache,
+    host_kv_views_by_prefix_group,
+    pin_host_prefix_cache,
+    unpin_host_prefix_cache,
+)
 from batchgen.server.gpu_arch import detect_gpu_arch  # noqa: F401  (re-export)
 from batchgen.server.process_utils import (
+    cleanup_shm_files,
     cleanup_resources,
     get_hugepage_size,
     get_model_byte_size,
@@ -121,6 +128,7 @@ class WorkerManager:
         self._stopping = False
         self._monitor_interval_s = 1.0
         self._ready_event = self._mp_ctx.Event()
+        self._prefix_cache_pin_handles: list[int] = []
 
         # Register cleanup for skeleton state dict temp file
         atexit.register(self._cleanup_skeleton_state_dict_file)
@@ -193,6 +201,7 @@ class WorkerManager:
         _diag("<<< _load_model_resources")
         logger.info("[startup] Model resources loaded in %.2fs",
                     _time.monotonic() - model_start)
+        self._initialize_prefix_cache_owner()
 
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
@@ -279,6 +288,9 @@ class WorkerManager:
             clean_hugepages=self._hugepages_enabled,
             kill_workers=False,  # Already handled above
         )
+        prefix_config = getattr(self, "prefix_cache_runtime_config", None)
+        if prefix_config is not None:
+            cleanup_shm_files(prefix_config.shm_name)
 
         self.started = False
         logger.info("WorkerManager stopped")
@@ -298,6 +310,99 @@ class WorkerManager:
 
     def get_worker_exit_state(self) -> WorkerExitState:
         return self._worker_exit_state
+
+    def clear_prefix_cache(self) -> dict[str, Any]:
+        """Clear unprotected Host prefix-cache entries and release Host pages."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+        host_kv_manager = self.host_kv_manager
+        if host_kv_manager is None:
+            raise RuntimeError("Host KV manager is not initialized")
+
+        host_kv_views = host_kv_views_by_prefix_group(
+            primary_host_kv=host_kv_manager,
+            auxiliary_host_kv=self.host_kv_aux_manager,
+        )
+        with self._lock:
+            unpin_result = self._unpin_prefix_cache_locked(coordinator)
+            clear_result = clear_host_prefix_cache(
+                coordinator=coordinator,
+                host_kv_views_by_group=host_kv_views,
+            )
+            clear_result["unpin"] = unpin_result
+            return clear_result
+
+    def pin_prefix_cache(
+        self,
+        token_id_batches: list[list[int]],
+        *,
+        replace_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Pin cache entries matching token-id batches against eviction."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+        runtime_config = self.prefix_cache_runtime_config
+        if runtime_config is None:
+            raise RuntimeError("Prefix cache runtime config is not initialized")
+
+        with self._lock:
+            unpin_result = None
+            if replace_existing:
+                unpin_result = self._unpin_prefix_cache_locked(coordinator)
+            pin_result = pin_host_prefix_cache(
+                coordinator=coordinator,
+                namespace_digest=runtime_config.namespace_digest,
+                token_id_batches=token_id_batches,
+            )
+            handles = [
+                int(handle)
+                for handle in pin_result.pop("attachment_handles")
+            ]
+            self._prefix_cache_pin_handles.extend(handles)
+            pin_result["total_pinned"] = len(self._prefix_cache_pin_handles)
+            if unpin_result is not None:
+                pin_result["unpin"] = unpin_result
+            return pin_result
+
+    def unpin_prefix_cache(self) -> dict[str, Any]:
+        """Release all server-owned prefix-cache pins."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        coordinator = self.prefix_cache_coordinator_owner
+        if coordinator is None:
+            raise RuntimeError("Prefix cache coordinator is not initialized")
+
+        with self._lock:
+            return self._unpin_prefix_cache_locked(coordinator)
+
+    def _unpin_prefix_cache_locked(self, coordinator: Any) -> dict[str, Any]:
+        handles = list(self._prefix_cache_pin_handles)
+        result = unpin_host_prefix_cache(
+            coordinator=coordinator,
+            attachment_handles=handles,
+        )
+        self._prefix_cache_pin_handles.clear()
+        return result
+
+    def prefix_cache_pin_status(self) -> dict[str, Any]:
+        """Return server-owned prefix-cache pin state."""
+
+        if not self.args.enable_prefix_cache:
+            raise RuntimeError("Prefix cache is not enabled")
+        with self._lock:
+            return {
+                "status": "success",
+                "pinned": len(self._prefix_cache_pin_handles),
+            }
 
     def infer(
         self,
@@ -612,6 +717,8 @@ class WorkerManager:
             adaptive_chunk_multiplier=self.args.adaptive_chunk_multiplier,
             fast_init=self.args.fast_init,
             max_pool_size=self.args.max_pool_size,
+            enable_prefix_cache=self.args.enable_prefix_cache,
+            prefix_cache_debug_stats=self.args.prefix_cache_debug_stats,
             kv_memfd_pid=self._get_kv_memfd_pid(),
             kv_memfd_fd=self._get_kv_memfd_fd(),
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
@@ -630,6 +737,46 @@ class WorkerManager:
             nprocs=local_world_size,  # Use world_size-derived count, not device_count
             join=False,
             daemon=True,
+        )
+
+    def _initialize_prefix_cache_owner(self) -> None:
+        self.prefix_cache_runtime_config = None
+        self.prefix_cache_coordinator_owner = None
+        if not self.args.enable_prefix_cache:
+            return
+        if getattr(self, "host_kv_manager", None) is None:
+            raise RuntimeError(
+                "--enable-prefix-cache requires Host KV cache allocation"
+            )
+
+        from batchgen.prefix_reuse.config import (
+            build_prefix_cache_runtime_config,
+            create_host_prefix_cache_coordinator,
+        )
+
+        host_budget_gb = self.args_dict.get("host_kv_cache_size_per_rank")
+        if host_budget_gb is None:
+            raise RuntimeError(
+                "Prefix cache requires resolved Host KV cache budget"
+            )
+        runtime_config = build_prefix_cache_runtime_config(
+            model_name=self.args.model,
+            kv_dtype=self.args.kv_dtype,
+            host_kv_cache_size_bytes=int(host_budget_gb * (1024**3)),
+            debug_stats=self.args.prefix_cache_debug_stats,
+        )
+        self.prefix_cache_runtime_config = runtime_config
+        self.prefix_cache_coordinator_owner = create_host_prefix_cache_coordinator(
+            core_engine_module=bg_lib,
+            runtime_config=runtime_config,
+            create_region=True,
+        )
+        logger.info(
+            "Host prefix cache initialized: shm=%s groups=%d hash_block=%d publish_boundary=%d",
+            runtime_config.shm_name,
+            len(runtime_config.group_specs),
+            runtime_config.hash_block_tokens,
+            runtime_config.publish_boundary_tokens,
         )
 
     def _get_kv_memfd_pid(self) -> int:
@@ -993,8 +1140,21 @@ class WorkerManager:
         enable_memfd: bool = False,
     ) -> Any:
         from batchgen.kv_cache.dual_host_kv_coordinator import DualHostKVCoordinator
+        from batchgen.kv_cache.glm5_kv_coordinator import GLM5HostKVCoordinator
 
-        # DSA models: split budget into primary + auxiliary
+        # GLM-5 uses model-specific logical KV groups so prefix cache can
+        # manage primary/indexer pages independently.
+        glm5 = GLM5HostKVCoordinator.create_managers(
+            model_name=model_name,
+            host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),
+            enable_memfd=enable_memfd,
+        )
+        if glm5 is not None:
+            primary_mgr, indexer_mgr = glm5
+            logger.info("Allocated GLM-5 host KV cache: primary + indexer")
+            return primary_mgr, indexer_mgr
+
+        # Other DSA models keep the existing dual coordinator path.
         dual = DualHostKVCoordinator.create_managers(
             model_name=model_name,
             host_kv_cache_size=int(host_kv_cache_size_gb * (1024**3)),

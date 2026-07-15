@@ -11,7 +11,9 @@ from .rotary_embedding import mla_rotary_pos_emb, rotary_pos_emb, apply_rotary_p
 import deep_gemm
 # from deep_gemm import get_col_major_tma_aligned_tensor
 import logging
-from typing import Tuple
+import os
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 import torch.distributed as dist
 from ...moe.fused_dequant_gemm import fused_fp8_bf16_gemm
 
@@ -658,6 +660,167 @@ def w8a16_gemm_dequant(
 	return out
 
 
+@dataclass(frozen=True)
+class MlaPrepackProjection:
+	"""Q and compressed-KV tensors shared by MLA prefill variants."""
+
+	q_nope: torch.Tensor
+	q_pe: torch.Tensor
+	normed_kv: Optional[torch.Tensor] = None
+	k_pe: Optional[torch.Tensor] = None
+	offload_kv: Optional[torch.Tensor] = None
+
+
+def select_w8a16_gemm() -> Callable[
+	[torch.Tensor, torch.Tensor, torch.Tensor],
+	torch.Tensor,
+]:
+	"""Return the default W8A16 GEMM implementation used by MLA prefill."""
+	use_dequant_path = os.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
+	return w8a16_gemm_dequant if use_dequant_path else w8a16_gemm
+
+
+def _apply_prepacked_mla_rope(
+	self,
+	q_pe: torch.Tensor,
+	k_pe: Optional[torch.Tensor],
+	position_ids: torch.Tensor,
+	rotary_seq_len: int,
+	*,
+	interleaved: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+	if interleaved:
+		from batchgen.attention.mla.rotary_embedding import (
+			rotary_pos_emb_interleaved_native,
+		)
+		rope_fn = rotary_pos_emb_interleaved_native
+	else:
+		rope_fn = rotary_pos_emb
+	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=rotary_seq_len)
+	q_pe = rope_fn(
+		q_pe.unsqueeze(0),
+		cos,
+		sin,
+		position_ids.unsqueeze(0),
+		2,
+	).squeeze(0)
+	if k_pe is None:
+		return q_pe, None
+	k_pe = rope_fn(
+		k_pe.unsqueeze(0),
+		cos,
+		sin,
+		position_ids.unsqueeze(0),
+		2,
+	).squeeze(0)
+	return q_pe, k_pe
+
+
+def project_bf16_mla_q_and_compressed_kv_prepacked(
+	self,
+	hidden_states: torch.Tensor,
+	position_ids: torch.Tensor,
+	rotary_seq_len: int,
+) -> MlaPrepackProjection:
+	"""Project prepacked MLA Q and compressed KV using BF16 module linears."""
+	total_tokens = hidden_states.shape[0]
+	query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+
+	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+
+	q_pe, k_pe = _apply_prepacked_mla_rope(
+		self,
+		q_pe,
+		k_pe,
+		position_ids,
+		rotary_seq_len,
+		interleaved=False,
+	)
+	if k_pe is None:
+		raise RuntimeError("BF16 MLA prepack projection failed to build k_pe")
+	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
+	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+	del compressed_kv, k_pe_flat
+	return MlaPrepackProjection(
+		q_nope=q_nope,
+		q_pe=q_pe,
+		normed_kv=normed_kv,
+		k_pe=k_pe,
+		offload_kv=offload_kv,
+	)
+
+
+def project_w8a16_mla_q_and_compressed_kv_prepacked(
+	self,
+	hidden_states: torch.Tensor,
+	position_ids: torch.Tensor,
+	rotary_seq_len: int,
+	weight_scale: dict,
+	gemm: Optional[
+		Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+	] = None,
+) -> MlaPrepackProjection:
+	"""Project prepacked MLA Q and compressed KV using the default W8A16 path."""
+	gemm = select_w8a16_gemm() if gemm is None else gemm
+	total_tokens = hidden_states.shape[0]
+	query_states = gemm(
+		self.q_a_proj.weight.data,
+		weight_scale["q_a_proj.weight_scale_inv"],
+		hidden_states,
+	)
+	query_states = self.q_a_layernorm(query_states)
+	query_states = gemm(
+		self.q_b_proj.weight.data,
+		weight_scale["q_b_proj.weight_scale_inv"],
+		query_states,
+	)
+	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
+	q_nope, q_pe = torch.split(
+		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	)
+
+	compressed_kv = gemm(
+		self.kv_a_proj_with_mqa.weight.data,
+		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
+		hidden_states,
+	)
+	compressed_kv, k_pe = torch.split(
+		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+	)
+	normed_kv = self.kv_a_layernorm(compressed_kv)
+	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
+
+	q_pe, k_pe = _apply_prepacked_mla_rope(
+		self,
+		q_pe,
+		k_pe,
+		position_ids,
+		rotary_seq_len,
+		interleaved=True,
+	)
+	if k_pe is None:
+		raise RuntimeError("W8A16 MLA prepack projection failed to build k_pe")
+	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
+	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
+	del compressed_kv, k_pe_flat
+	return MlaPrepackProjection(
+		q_nope=q_nope,
+		q_pe=q_pe,
+		normed_kv=normed_kv,
+		k_pe=k_pe,
+		offload_kv=offload_kv,
+	)
+
+
 @torch.inference_mode()
 def mla_prefill_flashattention3_w8a16_deepgemm(
 	self,
@@ -1038,6 +1201,7 @@ def mla_prefill_flashattention3_prepacked(
 	cu_seqlens: torch.Tensor,
 	max_seqlen: int,
 	num_sequences: int,
+	prefix_context=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
 	MLA prefill on Hopper device for PREPACKED sequences.
@@ -1059,31 +1223,27 @@ def mla_prefill_flashattention3_prepacked(
 		offload_kv: [total_tokens, kv_lora_rank + qk_rope_head_dim] for KV cache
 	"""
 	total_tokens = hidden_states.shape[0]
+	rotary_seq_len = max_seqlen
+	if prefix_context is not None:
+		rotary_seq_len = prefix_context.rotary_seq_len(position_ids, max_seqlen)
 
-	# Project Q
-	query_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
-	q_nope, q_pe = torch.split(
-		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+	projection = project_bf16_mla_q_and_compressed_kv_prepacked(
+		self,
+		hidden_states,
+		position_ids,
+		rotary_seq_len,
 	)
-
-	# Project KV
-	compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-	compressed_kv, k_pe = torch.split(
-		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-	)
-	normed_kv = self.kv_a_layernorm(compressed_kv)
-	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
-
-	# Apply rotary embeddings
-	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	# For prepacked, position_ids is 1D [total_tokens]
-	q_pe = rotary_pos_emb(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-
-	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
-	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
-	del compressed_kv, k_pe_flat
+	q_nope = projection.q_nope
+	q_pe = projection.q_pe
+	normed_kv = projection.normed_kv
+	k_pe = projection.k_pe
+	offload_kv = projection.offload_kv
+	if normed_kv is None or k_pe is None or offload_kv is None:
+		raise RuntimeError("BF16 MLA prepack projection returned incomplete KV")
+	if prefix_context is not None:
+		if not prefix_context.prefix_reuse_mode:
+			raise RuntimeError("MLA prefix context has no enabled reuse mode")
+		return prefix_context.run_suffix_prefill(projection)
 
 	# Expand KV
 	kv = self.kv_b_proj(normed_kv)
@@ -1140,6 +1300,7 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	max_seqlen: int,
 	num_sequences: int,
 	weight_scale: dict,
+	prefix_context=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 	"""
 	MLA prefill with W8A16 quantization for PREPACKED sequences.
@@ -1162,50 +1323,29 @@ def mla_prefill_flashattention3_w8a16_deepgemm_prepacked(
 	# Default: FP8 act_quant + DeepGEMM fp8_gemm_nt (matches SGLang/DeepGEMM
 	# blockwise FP8 semantics and the decode path's w8a8_deepgemm). Opt into
 	# the dequant-to-BF16 path via BATCHGEN_W8A16_DEQUANT=1.
-	import os as _os_gemm
-	_w8a16_dequant_path = _os_gemm.environ.get("BATCHGEN_W8A16_DEQUANT", "0") == "1"
-	_gemm = w8a16_gemm_dequant if _w8a16_dequant_path else w8a16_gemm
-
-	# Project Q
-	query_states = _gemm(
-		self.q_a_proj.weight.data,
-		weight_scale["q_a_proj.weight_scale_inv"],
-		hidden_states
+	_gemm = select_w8a16_gemm()
+	rotary_seq_len = max_seqlen
+	if prefix_context is not None:
+		rotary_seq_len = prefix_context.rotary_seq_len(position_ids, max_seqlen)
+	projection = project_w8a16_mla_q_and_compressed_kv_prepacked(
+		self,
+		hidden_states,
+		position_ids,
+		rotary_seq_len,
+		weight_scale,
+		gemm=_gemm,
 	)
-	query_states = self.q_a_layernorm(query_states)
-	query_states = _gemm(
-		self.q_b_proj.weight.data,
-		weight_scale["q_b_proj.weight_scale_inv"],
-		query_states
-	)
-
-	query_states = query_states.view(total_tokens, self.num_heads, self.q_head_dim)
-	q_nope, q_pe = torch.split(
-		query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-	)
-
-	# Project KV
-	compressed_kv = _gemm(
-		self.kv_a_proj_with_mqa.weight.data,
-		weight_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-		hidden_states
-	)
-	compressed_kv, k_pe = torch.split(
-		compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-	)
-	normed_kv = self.kv_a_layernorm(compressed_kv)
-	k_pe = k_pe.view(total_tokens, 1, self.qk_rope_head_dim)
-
-	# Native interleaved RoPE (matches HF / SGLang / vLLM is_neox_style=False
-	# when rope_interleave=true).
-	from batchgen.attention.mla.rotary_embedding import rotary_pos_emb_interleaved_native
-	cos, sin = self.rotary_emb(q_pe.unsqueeze(0), seq_len=max_seqlen)
-	q_pe = rotary_pos_emb_interleaved_native(q_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-	k_pe = rotary_pos_emb_interleaved_native(k_pe.unsqueeze(0), cos, sin, position_ids.unsqueeze(0), 2).squeeze(0)
-
-	k_pe_flat = k_pe.view(total_tokens, self.qk_rope_head_dim)
-	offload_kv = torch.cat([normed_kv, k_pe_flat], dim=-1)
-	del compressed_kv, k_pe_flat
+	q_nope = projection.q_nope
+	q_pe = projection.q_pe
+	normed_kv = projection.normed_kv
+	k_pe = projection.k_pe
+	offload_kv = projection.offload_kv
+	if normed_kv is None or k_pe is None or offload_kv is None:
+		raise RuntimeError("W8A16 MLA prepack projection returned incomplete KV")
+	if prefix_context is not None:
+		if not prefix_context.prefix_reuse_mode:
+			raise RuntimeError("MLA prefix context has no enabled reuse mode")
+		return prefix_context.run_suffix_prefill(projection)
 
 	# Expand KV
 	kv = _gemm(

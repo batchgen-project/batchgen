@@ -33,7 +33,7 @@ import logging
 import math
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1677,7 +1677,9 @@ class GptOssAttnWrapper(AttnWrapperBase):
             Tuple of (output, None, None) - KV cache offloaded to host
         """
         # Import here to avoid circular imports
-        from batchgen.attention.gqa import gqa_prefill_fa
+        from batchgen.attention.prefix_aware_backend import (
+            GqaPrefixAwareAttentionBackend,
+        )
 
         # Handle both 2D and 3D input
         if hidden_states.dim() == 3:
@@ -1691,10 +1693,18 @@ class GptOssAttnWrapper(AttnWrapperBase):
         total_tokens = hidden_states_2d.shape[0]
 
         # Get prepack metadata from class variables
-        cu_seqlens = AttnWrapperBase.prepack_cu_seqlens
-        max_seqlen = AttnWrapperBase.prepack_max_seqlen
-        num_sequences = AttnWrapperBase.prepack_num_sequences
-        seq_lengths = AttnWrapperBase.prepack_seq_lengths
+        metadata = self.prefix_cache_metadata()
+        cu_seqlens = metadata.cu_seqlens
+        max_seqlen = metadata.max_seqlen
+        num_sequences = metadata.num_sequences
+        seq_lengths = metadata.seq_lengths
+        prefix_reuse_mode = metadata.prefix_reuse_mode
+        global_sequence_ids = metadata.global_sequence_ids
+        full_seq_lengths = metadata.full_seq_lengths
+        if prefix_reuse_mode and full_seq_lengths:
+            rotary_seq_len = max(max(int(length) for length in full_seq_lengths), int(max_seqlen))
+        else:
+            rotary_seq_len = int(max_seqlen)
 
         # DEBUG: Check input hidden_states before projection
         if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1":
@@ -1766,8 +1776,8 @@ class GptOssAttnWrapper(AttnWrapperBase):
         # hidden_states_2d: [total_tokens, hidden_size]
         if self._use_wgmma and position_ids is not None:
             from batchgen.attention.fused_kernels import cuda_qkv_wgmma
-            cos_table = self.module.rotary_emb.cos_cached[:max_seqlen].to(hidden_states_2d.dtype)
-            sin_table = self.module.rotary_emb.sin_cached[:max_seqlen].to(hidden_states_2d.dtype)
+            cos_table = self.module.rotary_emb.cos_cached[:rotary_seq_len].to(hidden_states_2d.dtype)
+            sin_table = self.module.rotary_emb.sin_cached[:rotary_seq_len].to(hidden_states_2d.dtype)
             rope_cos = cos_table[position_ids]  # [total_tokens, head_dim]
             rope_sin = sin_table[position_ids]
             query, key, value = cuda_qkv_wgmma(
@@ -1787,7 +1797,7 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
             # Apply RoPE per sequence using position_ids
             if position_ids is not None:
-                cos, sin = self.module.rotary_emb(value, seq_len=max_seqlen)
+                cos, sin = self.module.rotary_emb(value, seq_len=rotary_seq_len)
                 cos = cos[position_ids]  # [total_tokens, head_dim]
                 sin = sin[position_ids]  # [total_tokens, head_dim]
 
@@ -1808,19 +1818,40 @@ class GptOssAttnWrapper(AttnWrapperBase):
                     k2 * cos_half + k1 * sin_half
                 ], dim=-1)
 
-        # Use gqa_prefill_fa for varlen attention with sink correction
-        # q, k, v: [total_tokens, num_heads, head_dim]
-        attn_output, lse = gqa_prefill_fa(
-            q=query,
-            k=key,
-            v=value,
-            cu_seqlens_q=cu_seqlens.to(hidden_states_2d.device),
-            cu_seqlens_k=cu_seqlens.to(hidden_states_2d.device),
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+        backend = GqaPrefixAwareAttentionBackend(
+            layer_idx=self.layer_idx,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
             sinks=self.sinks,
             softmax_scale=self.scale,
             sliding_window=self.sliding_window,
+        )
+        from batchgen.attention.forward_metadata_context import (
+            get_current_forward_batch_metadata,
+        )
+
+        forward_metadata = get_current_forward_batch_metadata()
+        kv_cache_metadata = (
+            None if forward_metadata is None else forward_metadata.kv_cache
+        )
+        if (
+            kv_cache_metadata is None
+            and AttnWrapperBase.prefill_prefix_materialization is not None
+        ):
+            from types import SimpleNamespace
+
+            kv_cache_metadata = SimpleNamespace(
+                prefill_prefix_materialization=(
+                    AttnWrapperBase.prefill_prefix_materialization
+                )
+            )
+        # q, k, v: [total_tokens, num_heads, head_dim]
+        attn_output = backend.forward_prefill(
+            query=query,
+            key=key,
+            value=value,
+            metadata=metadata,
+            kv_cache_metadata=kv_cache_metadata,
         )
 
         # attn_output: [total_tokens, num_heads, head_dim]
@@ -1829,9 +1860,6 @@ class GptOssAttnWrapper(AttnWrapperBase):
 
         # Output projection
         attn_output = self.module.o_proj(attn_output)  # [total_tokens, hidden_size]
-
-        # Offload KV cache per sequence to host
-        global_sequence_ids = AttnWrapperBase.cur_batch
 
         torch.cuda.current_stream().synchronize()  # Make sure KV is ready
 
@@ -1865,35 +1893,28 @@ class GptOssAttnWrapper(AttnWrapperBase):
                 else:
                     print(f"[PREFILL L0] OK: seq0 and seq1 have DIFFERENT K at position 0")
 
-        # For GQA, we store both K and V (unlike MLA which only stores K)
-        # Split by cu_seqlens and offload each sequence
-        for seq_idx in range(num_sequences):
-            start_idx = cu_seqlens[seq_idx].item()
-            end_idx = cu_seqlens[seq_idx + 1].item()
-            seq_len = end_idx - start_idx
+        def _debug_offload_sequence(seq_idx, sequence_id, seq_len, seq_key, seq_value):
+            del seq_value
+            if (
+                self.layer_idx == 0
+                and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1"
+                and seq_idx < 3
+            ):
+                # [1, seq_len, heads, dim] -> position 0, head 0.
+                k_sample = seq_key[0, 0, 0, :4].cpu().tolist()
+                print(
+                    f"[PREFILL L0 OFFLOAD] seq{seq_idx}: "
+                    f"global_id={sequence_id}, seq_len={seq_len}, "
+                    f"K[0,0,:4]={k_sample}"
+                )
 
-            # Extract KV for this sequence
-            seq_key = key[start_idx:end_idx]    # [seq_len, num_kv_heads, head_dim]
-            seq_value = value[start_idx:end_idx]  # [seq_len, num_kv_heads, head_dim]
-
-            # Reshape to [1, seq_len, num_kv_heads, head_dim] for KV cache API
-            seq_key = seq_key.unsqueeze(0)
-            seq_value = seq_value.unsqueeze(0)
-
-            seq_global_id = [global_sequence_ids[seq_idx]]
-
-            # DEBUG: Print what's being offloaded per sequence
-            if self.layer_idx == 0 and os.environ.get("BATCHGEN_DEBUG_PREFILL_KV", "0") == "1" and seq_idx < 3:
-                k_sample = seq_key[0, 0, 0, :4].cpu().tolist()  # [1, seq_len, heads, dim] -> position 0, head 0
-                print(f"[PREFILL L0 OFFLOAD] seq{seq_idx}: global_id={seq_global_id[0]}, seq_len={seq_len}, K[0,0,:4]={k_sample}")
-
-            self.core_engine.host_paged_kv_worker_view.async_offload_layer_kv_to_host(
-                layer_idx=self.layer_idx,
-                sequence_ids=seq_global_id,
-                k_tensor=seq_key,
-                v_tensor=seq_value,
-                sequence_lengths=[seq_len],
-            )
+        self.offload_prepacked_gqa_kv(
+            key,
+            value,
+            metadata=metadata,
+            track_tasks=(metadata.full_seq_lengths is not None),
+            sequence_callback=_debug_offload_sequence,
+        )
 
         logging.debug(
             f"[Layer {self.layer_idx}] GPT-OSS prepacked prefill complete. "
