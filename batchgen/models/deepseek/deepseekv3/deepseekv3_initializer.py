@@ -250,6 +250,13 @@ class DeepseekV3Initializer:
         model_config.compressed_kv_dim = 576
         return model_config
 
+    def get_runtime_behavior_adapter(self):
+        """Per-model runtime behaviors (M2). See batchgen/contracts/runtime_adapter.py."""
+        from batchgen.models.deepseek.deepseekv3.runtime_adapter import (
+            DeepseekV3RuntimeAdapter,
+        )
+        return DeepseekV3RuntimeAdapter(self.model_config)
+
     def Init(self, weights_storage):
         try:
             torch.cuda.set_device(self.local_rank)
