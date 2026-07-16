@@ -40,9 +40,15 @@ Reference for the JSONL input file format used by BatchGen's `/v1/batches` API. 
 | `max_tokens` | int | No | Maximum output tokens to generate per request (legacy alias for `max_completion_tokens`) |
 | `temperature` | float | No | Sampling temperature (see [Sampling Parameters](#sampling-parameters)) |
 | `top_p` | float | No | Nucleus sampling threshold (see [Sampling Parameters](#sampling-parameters)) |
-| `top_k` | int | No | Top-k filtering threshold (see [Sampling Parameters](#sampling-parameters)) |
+| `top_k` | int | No | Top-k filtering threshold (vendor extension — not an OpenAI field; see [Sampling Parameters](#sampling-parameters)) |
+| `ignore_eos` | bool | No | Ignore EOS and decode to the max output length (vendor extension; falls back to the batch-level `ignore_eos`) |
 
 *One of `messages` or `prompt` is required depending on the endpoint.
+
+> **Vendor extensions (`extra_body`).** Some body fields above are not part of the OpenAI API
+> (`top_k`, `ignore_eos`, `enable_thinking`/`thinking`, `preserve_thinking`, `reasoning_effort`).
+> With the OpenAI SDK, pass them via `extra_body={...}`; in Batch JSONL, put them directly in `body`.
+> See the full list in `batchgen_design/server/openai_extended_kwargs.md`.
 
 ---
 
