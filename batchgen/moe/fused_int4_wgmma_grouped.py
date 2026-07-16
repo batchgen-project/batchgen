@@ -62,6 +62,18 @@ def _check_wgmma_support() -> bool:
     return True
 
 
+_arch = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ('sm90a' / 'sm100')."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels
+        _arch = batchgen_kernels.get_device_arch()
+    return _arch
+
+
 def _load_int4_grouped_module():
     """Load the pre-compiled grouped INT4 WGMMA CUDA module (Stage 1 + Stage 2)."""
     global _int4_grouped_module
@@ -96,6 +108,13 @@ def is_int4_grouped_wgmma_available() -> bool:
         logging.info("WGMMA INT4 grouped kernels disabled by BATCHGEN_DISABLE_WGMMA_INT4_GROUPED")
         _int4_grouped_wgmma_available = False
         return False
+
+    # SM100 (Blackwell): grouped INT4 is served by the model-level Triton path
+    # (int4_grouped_moe_forward). Report available without loading the
+    # Hopper-only _C extension.
+    if _get_arch() == "sm100":
+        _int4_grouped_wgmma_available = True
+        return True
 
     mod = _load_int4_grouped_module()
     _int4_grouped_wgmma_available = mod is not None

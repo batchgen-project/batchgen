@@ -54,6 +54,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bucket_size"),
           py::arg("world_size"));
 
+#ifdef BATCHGEN_HAS_FUSED_GATE
     m.def("create_fused_gate_context", &create_fused_gate_context,
           "Create cached fused gate context (SM90a WGMMA)",
           py::arg("router_weight"),
@@ -77,6 +78,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_indices"),
           py::arg("topk_weights"),
           py::arg("num_valid_tokens") = -1);
+#endif  // BATCHGEN_HAS_FUSED_GATE
 
     m.def("reduce_weighted_scatter", &reduce_weighted_scatter_cuda,
           "Reduce: weighted scatter-add (CUDA)",

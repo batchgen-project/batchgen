@@ -39,6 +39,16 @@ import torch
 _wgmma_available = None
 _module_bf16_moe = None
 _module_mxfp4_moe = None
+_arch = None
+
+
+def _get_arch() -> str:
+    """Cached device arch ('sm90a' / 'sm100')."""
+    global _arch
+    if _arch is None:
+        import batchgen_kernels
+        _arch = batchgen_kernels.get_device_arch()
+    return _arch
 
 
 
@@ -96,6 +106,13 @@ def is_wgmma_available() -> bool:
         _wgmma_available = False
         return False
 
+    # SM100 (Blackwell): the WGMMA .cu is not built. The fused MXFP4 expert
+    # path is provided by the pure-Triton kernel (fused_mxfp4_mlp_forward),
+    # which JIT-compiles for sm100. Do NOT attempt to load the _C extension.
+    if _get_arch() == "sm100":
+        _wgmma_available = True
+        return True
+
     # Try to load the module
     mod = _load_mxfp4_module()
     _wgmma_available = mod is not None
@@ -144,6 +161,26 @@ def fused_mxfp4_expert_forward(
     Raises:
         RuntimeError: If WGMMA kernels are not available
     """
+    # SM100 (Blackwell): use the pure-Triton fused MXFP4 MLP (no WGMMA .cu).
+    if _get_arch() == "sm100":
+        from batchgen.triton_kernels.fused_mxfp4_gemm import fused_mxfp4_mlp_forward
+        x = hidden_states
+        original_shape = None
+        if x.dim() == 3:
+            original_shape = x.shape
+            x = x.view(-1, x.shape[-1])
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+        out = fused_mxfp4_mlp_forward(
+            x.contiguous(),
+            gate_packed, gate_scales, gate_bias,
+            up_packed, up_scales, up_bias,
+            down_packed, down_scales, down_bias,
+        )
+        if original_shape is not None:
+            out = out.view(original_shape[0], original_shape[1], -1)
+        return out
+
     mod = _load_mxfp4_module()
     if mod is None:
         raise RuntimeError(
