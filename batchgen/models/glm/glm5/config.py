@@ -489,3 +489,94 @@ class GLM52Config(GLM5Config):
         return cls(**kwargs)
 
 
+# ---------------------------------------------------------------------------- #
+#  DSA indexer top-k reuse schedule                                            #
+# ---------------------------------------------------------------------------- #
+# GLM-5.2 does not run the DSA indexer on every layer. Only "full" layers carry
+# indexer weights and recompute the sparse top-k token selection; "shared"
+# layers reuse the most recent preceding full layer's top-k indices. GLM-5 (base
+# GLM5Config) has no such schedule — every layer is a full layer (uniform
+# recompute), so the helpers below are no-ops for it and GLM-5 behavior is
+# unchanged.
+#
+# Ported from SGLang's ``dsa_layer_skips_topk`` (sglang/srt/configs/model_config.py):
+# the freq/offset formula is authoritative; the per-layer ``indexer_types`` list
+# shipped in the GLM-5.2 checkpoint is used only as a startup cross-check oracle.
+
+
+def dsa_layer_skips_topk(config, layer_id: int) -> bool:
+    """Whether ``layer_id`` reuses the previous full layer's DSA top-k indices.
+
+    Value-based (works on ANY config object — the rich :class:`GLM52Config` or
+    the ``configuration_glm5.Glm5Config`` PretrainedConfig used to build the
+    model graph): the decision keys off the presence of a positive
+    ``index_topk_freq``. GLM-5 / GLM-5.1 configs have no such field (or it is
+    ``None`` / 1), so every layer is a full layer (uniform recompute) and this
+    returns ``False`` — GLM-5 behavior unchanged.
+
+    Authoritative formula (matches SGLang ``dsa_layer_skips_topk``):
+      - if ``index_topk_pattern`` is set: ``pattern[layer_id] == "S"``
+      - else with ``freq = index_topk_freq`` (>=1) and optional
+        ``offset = index_skip_topk_offset``:
+          ``max(layer_id - offset + 1, 0) % freq != 0``   (offset present)
+          ``max(layer_id - 1, 0) % freq != 0``            (offset absent)
+    """
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", None)
+    if freq is None:
+        freq = 1
+    if freq <= 0:
+        raise ValueError(f"index_topk_freq must be positive, got {freq}")
+    if freq == 1:
+        # Uniform recompute (GLM-5): no layer is ever skipped.
+        return False
+
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        if offset <= 0:
+            raise ValueError(
+                "index_skip_topk_offset must be positive; offset <= 0 marks "
+                "layer 0 as skip_topk with no prior topk to reuse"
+            )
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
+def assert_indexer_schedule_consistent(config) -> None:
+    """Fail loud if the freq/offset schedule disagrees with ``indexer_types``.
+
+    GLM-5.2 checkpoints ship a per-layer ``indexer_types`` list ("full" /
+    "shared"). It must agree layer-for-layer with :func:`dsa_layer_skips_topk`
+    (shared == skips top-k). This is a startup guard so a future checkpoint whose
+    list diverges from the formula fails immediately instead of silently
+    mis-scheduling. No-op when ``indexer_types`` is absent/``None`` (e.g. GLM-5).
+    """
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        return
+    num_layers = config.num_hidden_layers
+    if len(indexer_types) != num_layers:
+        raise ValueError(
+            f"indexer_types has {len(indexer_types)} entries but "
+            f"num_hidden_layers={num_layers} "
+            f"(model_type={getattr(config, 'model_type', '?')!r})"
+        )
+    mismatched = [
+        layer_id
+        for layer_id in range(num_layers)
+        if dsa_layer_skips_topk(config, layer_id) != (indexer_types[layer_id] == "shared")
+    ]
+    if mismatched:
+        raise ValueError(
+            "DSA indexer schedule mismatch: dsa_layer_skips_topk disagrees with "
+            f"indexer_types at layers {mismatched} "
+            f"(index_topk_freq={getattr(config, 'index_topk_freq', None)}, "
+            f"index_skip_topk_offset={getattr(config, 'index_skip_topk_offset', None)})"
+        )
+
+
+
