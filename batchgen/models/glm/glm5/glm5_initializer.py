@@ -23,7 +23,7 @@ import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.batchgen_model_config import BatchGenModelConfig
-from .configuration_glm5 import Glm5Config
+from .config import assert_indexer_schedule_consistent
 from .set_basic_config import set_basic_config
 from .planner import GLM5Planner
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
@@ -37,14 +37,23 @@ except ImportError:
 
 class GLM5Initializer:
     def __init__(self, input_arguments):
-        self.loaded_model_config = Glm5Config()
-        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
-        self.loaded_model_config.architectures = ["GlmMoeDsaForCausalLM"]
-
         self.model_name = input_arguments.huggingface_ckpt_name
         # Local checkpoint dir holding config.json (pre-downloaded model files).
         # None for a bare HF id -> resolver falls back to rich defaults.
         self.checkpoint_path = input_arguments.get("cache_dir", None)
+
+        # Single source of truth: the resolved internal config (GLM5Config /
+        # GLM52Config, checkpoint-backed). This IS the config used to build the
+        # model graph (loaded_model_config) — GLM-5 no longer uses an HF
+        # transformers.PretrainedConfig, matching kimi and every other model.
+        self.loaded_model_config = BatchGenModelConfig.resolve(
+            self.model_name, self.checkpoint_path
+        )
+        self.loaded_model_config._name_or_path = self.model_name
+        self.loaded_model_config.architectures = ["GlmMoeDsaForCausalLM"]
+        # Fail loud at build if the DSA indexer schedule (freq/offset) disagrees
+        # with the checkpoint's per-layer indexer_types (no-op for GLM-5).
+        assert_indexer_schedule_consistent(self.loaded_model_config)
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -178,7 +187,7 @@ class GLM5Initializer:
           _default_engine_config, glm5_parameter_server). Set them as attributes
           so Init does not crash with AttributeError.
         """
-        rich = BatchGenModelConfig.resolve(self.model_name, self.checkpoint_path)
+        rich = self.loaded_model_config
 
         model_config = ModelConfig()
         model_config.model_type = rich.model_type
