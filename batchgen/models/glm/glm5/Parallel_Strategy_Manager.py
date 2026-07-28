@@ -688,8 +688,9 @@ class GLM5ParallelStrategyManager:
             # After wrapping, self_attn is GLM5AttnWrapper; original Glm5MLA is at .module
             inner = attn.module if hasattr(attn, 'module') else attn
             # When use_dense_mla is set, Glm5MLA skips indexer construction;
-            # skip the scale attach too (no destination).
-            if hasattr(inner, "indexer"):
+            # skip the scale attach too (no destination). GLM-5.2 "shared" layers
+            # carry no indexer weights either (indexer is None) — skip them.
+            if getattr(inner, "indexer", None) is not None:
                 indexer = inner.indexer
                 for proj, attr in [("wk", "wk_scale"), ("wq_b", "wq_b_scale")]:
                     key = f"model.layers.{layer_idx}.self_attn.indexer.{proj}.weight_scale_inv"

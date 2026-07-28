@@ -8163,6 +8163,9 @@ class BatchGenWorker:
 		else:
 			GLM5AttnWrapper._dsa_short_count = 0 if cache_view.numel() == 0 else None
 
+		# GLM-5.2 DSA indexer reuse: clear prev top-k once per decode step (before layer 0)
+		# so shared layers never reuse a stale value carried over from the previous step.
+		GLM5AttnWrapper._dsa_prev_topk_indices = None
 		gpu_manager = self._get_cuda_graph_gpu_manager()
 		if gpu_manager is not None and cur_batch:
 			manager = getattr(gpu_manager, "primary", gpu_manager)
@@ -9810,6 +9813,12 @@ class BatchGenWorker:
 						)
 					else:
 						GLM5AttnWrapper._dsa_short_count = None
+
+						# GLM-5.2 DSA indexer reuse: clear prev top-k once per decode
+						# step (before layer 0) so shared layers never reuse a stale
+						# value from the previous step. (Second decode path; the
+						# graph-config path resets it separately.)
+						GLM5AttnWrapper._dsa_prev_topk_indices = None
 
 					if new_tokens.shape[0] != len(batch):
 						new_tokens = self._rebuild_input_tokens(batch)
