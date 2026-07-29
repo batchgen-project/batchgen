@@ -5,6 +5,10 @@
 - **CUDA**: 12.8+ toolkit installed (Blackwell/B200 requires **12.9+**, see below)
 - **Python**: 3.11+
 - **OS**: Ubuntu 22.04 (tested)
+- **System packages**: the NUMA dev headers (`numactl-devel` on RHEL/TencentOS,
+  `libnuma-dev` on Debian/Ubuntu) — required for the `core_engine` JIT build
+  (`#include <numa.h>`). `install_deps.sh` installs these automatically; without them
+  the first server launch fails with `numa.h: No such file or directory`.
 - **GitHub access**: the repository is currently **private** — anonymous
   `git clone` and raw release-asset URLs fail (404). Authenticate first
   (e.g. `gh auth login`), clone via `gh repo clone batchgen-project/batchgen`,
@@ -212,6 +216,16 @@ PyTorch 2.9.0+cu128
 ```
 
 ## Troubleshooting
+
+> See [`docs/troubleshooting.md`](troubleshooting.md) for the full list of commonly-met
+> problems (build, runtime, and model bring-up).
+
+### core_engine JIT build fails: `numa.h: No such file or directory`
+`core_engine` is JIT-compiled by ninja at first launch and needs the NUMA dev headers.
+Install them (`sudo dnf install -y numactl-devel` on RHEL/TencentOS, or
+`sudo apt-get install -y libnuma-dev` on Debian/Ubuntu). `install_deps.sh` now does this
+automatically. The runtime `numactl`/`numactl-libs` packages are **not** enough — the
+`-devel`/`-dev` package ships `numa.h`.
 
 ### flash-attention build hangs or fails with torch 2.9.0
 flash-attention's `setup.py` tries to download a pre-built wheel matching your

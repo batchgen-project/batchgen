@@ -2006,11 +2006,19 @@ class BatchGenWorker:
 			local_indices = self._get_local_indices_for_uuids(my_uuids)
 			global_ids = self._local_indices_to_global_seq_ids(local_indices)
 			
-			manager = self.gpu_paged_kv_cache_manager
-			if manager is not None:
-				manager.free_pages_for_sequences(global_ids)
-			
-			for uuid in my_uuids:
+		manager = self.gpu_paged_kv_cache_manager
+		if manager is not None:
+			manager.free_pages_for_sequences(global_ids)
+
+		# Kimi-Linear: release KDA state slots alongside GPU KV pages.
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+			if KimiLinearKDAWrapper.slot_manager is not None:
+				KimiLinearKDAWrapper.free_sequences(global_ids)
+		except ImportError:
+			pass
+
+		for uuid in my_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				self._sequences_with_gpu_kv.discard(uuid)
@@ -3025,6 +3033,15 @@ class BatchGenWorker:
 		logging.debug(
 			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 		)
+
+		# Kimi-Linear: release KDA state slots alongside GPU KV pages (no-op for
+		# other models — slot_manager is None).
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+			if KimiLinearKDAWrapper.slot_manager is not None:
+				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
+		except ImportError:
+			pass
 
 		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
 		for local_idx in local_sequence_ids:
@@ -5998,6 +6015,10 @@ class BatchGenWorker:
 			)
 
 		# STEP 1: Configure model for prefill
+		# Hand the NCCL communicator to managers that need it during prefill
+		# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
+		if hasattr(self.parallel_manager, "set_comm"):
+			self.parallel_manager.set_comm(self.comm)
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
 
@@ -6974,7 +6995,10 @@ class BatchGenWorker:
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
 
-				# Set up Attn_Wrapper for this micro-batch
+				# Set up Attn_Wrapper for this micro-batch.
+				# These class attrs are the per-step worker->model contract read
+				# by attention wrappers; see semantics in
+				#   batchgen-context/architecture/PSM_WORKER_CONTRACT.md (§2)
 				Attn_Wrapper.prepack_mode = True
 				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
 				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
@@ -11814,6 +11838,15 @@ class BatchGenWorker:
 	def _unregister_fp8_weights(self):
 		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
 		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
+			return
+
+		# Models whose MoE layers don't expose DeepSeek-style `.mlp` (e.g.
+		# Kimi-Linear uses `.block_sparse_moe` with BF16 experts) have no FP8
+		# weights to unregister.
+		_fkd = self.loaded_model_config.first_k_dense_replace
+		if _fkd < len(self.model.model.layers) and not hasattr(
+			self.model.model.layers[_fkd], 'mlp'
+		):
 			return
 
 		for layer_idx in range(len(self.model.model.layers)):
