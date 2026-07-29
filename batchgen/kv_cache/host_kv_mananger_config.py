@@ -208,6 +208,13 @@ for canonical, aliases in {
 		"zai-org/glm-5.1",
 		"glm-5.1-fp8",
 		"glm-5.1",
+		# GLM-5.2: same 78-layer MLA graph (compressed_kv_dim=576); the indexer
+		# reuse schedule (21 full / 57 shared) only affects compute, not the
+		# host KV cache layout.
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
+		"glm-5.2-fp8",
+		"glm-5.2",
 	),
 }.items():
 	for alias in aliases:
@@ -231,6 +238,12 @@ for canonical, aliases in {
 		"zai-org/glm-5.1",
 		"glm-5.1-fp8",
 		"glm-5.1",
+		# GLM-5.2: same indexer dims; shared layers reuse top-k, no aux cache
+		# needed but the profile is used for sizing so it's safe to over-allocate.
+		"zai-org/glm-5.2-fp8",
+		"zai-org/glm-5.2",
+		"glm-5.2-fp8",
+		"glm-5.2",
 	),
 }.items():
 	for alias in aliases:
