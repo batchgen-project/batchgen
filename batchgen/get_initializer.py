@@ -21,6 +21,9 @@ def get_initializer(model_name:str):
 	if "minimax" in model_lower or "minimax-m2.5" in model_lower:
 		from batchgen.models.minimax.minimax_m25.minimax_m25_initializer import MiniMaxM25Initializer
 		return MiniMaxM25Initializer
+	elif "kimi-linear" in model_lower or "kimi-k3" in model_lower:
+		from batchgen.models.moonshotai.kimi_linear.kimi_initializer import KimiLinearInitializer
+		return KimiLinearInitializer
 	elif _is_kimi_k25_backend_model(model_name):
 		from batchgen.models.moonshotai.kimi_k25.kimi_initializer import KimiK25Initializer
 		return KimiK25Initializer
