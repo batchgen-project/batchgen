@@ -7,11 +7,15 @@
 
 """Kimi-Linear Parallel Strategy Manager (PSM).
 
-BF16-only, EP-everywhere design (simpler than K2.5):
+BF16-only design (simpler than K2.5):
   - One model build serves both phases; wrappers route prefill/decode.
-  - MoE: 256 BF16 experts sharded by rank (EP). Attention is DP-replicated, so
-    each rank computes its local expert shard and a single comm.all_reduce(SUM)
-    combines all experts (no host streaming, no INT4/marlin, no all-gather).
+  - MoE prefill: pure DP — all 256 BF16 experts host-offloaded and streamed
+    per rank by the copy engine (no collectives, no INT4/marlin).
+  - MoE decode (decode_moe_mode="resident_ep", M4 P0.3): each rank holds its
+    EP-8 shard resident (32 experts x 26 MoE layers, stacked BF16, ~11.8 GB)
+    and runs all_gather -> fused_moe_bf16 -> comm.all_reduce(SUM) per layer
+    (batchgen.moe.fused_moe_bf16_resident seam). "streamed" falls back to
+    the prefill-style streaming path.
   - Attention: NoPE-MLA layers use paged KV + FlashMLA decode; KDA layers
     use pooled conv/recurrent state (KimiLinearKDAWrapper pools).
 
@@ -94,15 +98,16 @@ class KimiLinearParallelStrategyManager:
             engine_config.GPU_Buffer_Config, "kda_state_slots", 256
         ))
         self._comm = None
+        self._resident_ep_built = False
 
     # ------------------------------------------------------------------ #
     #  Phase configuration                                                #
     # ------------------------------------------------------------------ #
 
     def set_comm(self, comm):
-        """Receive the BatchGen NCCL communicator from the worker. Kept for the
-        worker handshake; the pure-DP streamed MoE does not use collectives, so
-        this is currently just stored (reserved for a future EP decode path)."""
+        """Receive the BatchGen NCCL communicator from the worker. Consumed by
+        the resident-EP decode MoE (all_gather + all_reduce per MoE layer);
+        the streamed prefill path uses no collectives."""
         self._comm = comm
 
     def _build_weight_copy_task(self):
@@ -136,7 +141,15 @@ class KimiLinearParallelStrategyManager:
         return self.model, self.weight_copy_task
 
     def configure_decoding(self, padding_bsz=None, comm=None):
-        """Switch to decode phase (model already built; pure DP, streamed)."""
+        """Switch to decode phase (model already built).
+
+        decode_moe_mode="resident_ep" (default, set by the planner):
+        materialize the stacked EP shard once and return an EMPTY
+        routed_expert copy task — the worker then never starts the decode
+        H2D streamer (batchgen_worker._load_decode_model gates on a
+        non-empty routed_expert list). "streamed": legacy pure-DP streaming,
+        identical to prefill.
+        """
         self.loaded_model_config.phase = "decode"
         if comm is not None:
             self._comm = comm
@@ -145,7 +158,63 @@ class KimiLinearParallelStrategyManager:
         AttnWrapperBase.phase = "decode"
         KimiLinearExpertWrapper.phase = "decode"
         self.weight_copy_task = self._build_weight_copy_task()
+        if self._decode_moe_mode() == "resident_ep":
+            self._init_resident_ep_decode()
+            # Resident shards serve every routed expert: decode streams
+            # nothing, so the copy engine gets no decode expert tasks.
+            self.weight_copy_task["routed_expert"] = []
         return self.model, self.weight_copy_task
+
+    def _decode_moe_mode(self):
+        """Planner-set decode MoE execution mode (config-driven, no env vars):
+        "resident_ep" (M4 P0.3 default) or "streamed" (fallback)."""
+        return getattr(self.engine_config.EP_Config, "decode_moe_mode",
+                       "resident_ep")
+
+    def _init_resident_ep_decode(self):
+        """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
+        attach a ResidentEPMoELayer to every MoE block.
+
+        Source is the host copy-engine weight storage (core_engine.get_tensor,
+        the exact tensors the streamed path consumes) — after this one-time
+        H2D there is no per-step expert traffic in decode. HBM arithmetic for
+        the ~11.8 GB/rank shards lives at the allocation site
+        (batchgen.moe.fused_moe_bf16_resident.build_layer_shard).
+        """
+        if self._resident_ep_built:
+            return
+        from batchgen.moe.fused_moe_bf16_resident import (
+            build_resident_ep_layers,
+        )
+
+        assert self._comm is not None, (
+            "resident-EP decode needs the NCCL communicator (worker passes "
+            "it via configure_decoding(comm=...) or set_comm)"
+        )
+        cfg = self.loaded_model_config
+        build_resident_ep_layers(
+            self.model.model.layers,
+            self.core_engine.get_tensor,
+            self._comm,
+            self.world_size,
+            self.global_rank,
+            self.local_expert_start,
+            self.experts_per_rank,
+            cfg.moe_intermediate_size,
+            self.engine_config.Basic_Config.device_torch,
+        )
+        self._resident_ep_built = True
+
+    def set_num_tokens_per_rank(self, num_tokens_per_rank):
+        """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step
+        MAX decode rows across ranks. Defines the padded all_gather /
+        all_reduce layout of the resident-EP decode MoE — every rank
+        (including empty ones) sizes the global buffer from this scalar."""
+        if not self._resident_ep_built:
+            return
+        from batchgen.moe.fused_moe_bf16_resident import ResidentEPMoELayer
+
+        ResidentEPMoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
 
     # ------------------------------------------------------------------ #
     #  Model build                                                        #

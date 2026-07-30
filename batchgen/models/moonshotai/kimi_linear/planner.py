@@ -54,17 +54,36 @@ class KimiLinearPlanner(BasePlanner):
         # Override all three results here — this method runs last, so the
         # values stick:
         # (a) Decode expert staging buffers: normalize to the prefill ring (8).
-        #     The memory-based split left 7-9 buffers.
+        #     The memory-based split left 7-9 buffers. Kept non-zero under
+        #     resident-EP decode (which streams nothing — the worker only
+        #     starts the decode H2D streamer when the PSM returns a non-empty
+        #     routed_expert task): 8 slots ~ 113 MB keep the
+        #     decode_moe_mode="streamed" fallback launchable without
+        #     re-planning.
         self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 8
-        # (b) Zero persistent experts: the PSM streams all 256 experts/rank
-        #     (persistent=False), so no routed-expert weights are resident.
-        #     The memory-based split claimed 25-27 "persistent" experts.
+        # (b) Zero persistent experts FOR THE ENGINE: this field is consumed
+        #     Python-side only (base_planner sizing, other models' PSMs; the
+        #     C++ engine reads model_config.num_local_experts in
+        #     core/utils.cpp:357, never EP_Config) — it does NOT size the
+        #     resident-EP decode shards, which the Kimi PSM keeps fully
+        #     Python-side. 0 states the engine-facing contract: all streamed
+        #     (prefill streams all 256 experts/rank, persistent=False).
         self.config.EP_Config.num_local_expert_per_layer = 0
         # (c) Decode admission cap — consumed by the worker as the per-rank
         #     max decode sequences (batchgen_worker rank_counts checks); the
         #     base leaves it None -> TypeError on first decode admission.
         #     16/rank x 8 ranks = single-wave admission of a 128-seq batch.
+        #     Also bounds the resident-EP decode collective layout
+        #     (num_tokens_per_rank <= 16 -> <= 128-row global buffer).
         self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = 16
+
+        # M4 P0.3 — decode MoE execution mode, read by the PSM at
+        # configure_decoding (config-driven, no env vars):
+        #   "resident_ep": stacked EP-8 BF16 shards resident on GPU
+        #                  (~11.8 GB/rank) + fused_moe_bf16 + all_reduce;
+        #   "streamed":    legacy per-expert host streaming (fallback; it
+        #                  re-streams every expert each step and is H2D-bound).
+        self.config.EP_Config.decode_moe_mode = "resident_ep"
 
         # KDA conv/recurrent state-pool slots (peak concurrent sequences the
         # PSM pools can hold). Config-driven (M1-C).
