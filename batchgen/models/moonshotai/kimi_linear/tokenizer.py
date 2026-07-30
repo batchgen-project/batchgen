@@ -89,7 +89,13 @@ class KimiLinearTokenizer(BaseTokenizer):
             TikTokenTokenizer,
         )
 
-        assets_dir = Path(model_path) if model_path is not None else _K25_ASSETS_DIR
+        # Default to kimi_linear's OWN vendored assets (checkpoint's
+        # chat_template.jinja + tokenizer_config.json). The k25 assets are
+        # only a fallback for tiktoken.model (byte-identical vocab) — the k25
+        # CHAT TEMPLATE is materially different (media tokens, tool sections,
+        # think handling) and must never be used for kimi_linear.
+        _own_assets = Path(__file__).parent / "assets"
+        assets_dir = Path(model_path) if model_path is not None else _own_assets
 
         # tiktoken.model is byte-identical across families; fall back to the
         # bundled copy if a passed model dir happens not to ship it.
