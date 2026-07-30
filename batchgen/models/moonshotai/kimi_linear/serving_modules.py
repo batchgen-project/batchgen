@@ -314,13 +314,16 @@ def _kda_project(self, hidden_states_2d):
     q = self.q_proj(hidden_states_2d)
     k = self.k_proj(hidden_states_2d)
     v = self.v_proj(hidden_states_2d)
-    f = self.f_b_proj(F.silu(self.f_a_proj(hidden_states_2d)))
+    # No activation between the low-rank stacks (matches model.py:605 and
+    # fla's nn.Sequential(Linear, Linear) reference; silu here drifted the
+    # gate by up to 6.6e-2 vs the validated oracle — P-6(c) finding).
+    f = self.f_b_proj(self.f_a_proj(hidden_states_2d))
     f = f.view(-1, num_heads, head_dim)
     beta = self.b_proj(hidden_states_2d)
     if self.use_full_rank_gate:
         z = self.g_proj(hidden_states_2d).view(-1, num_heads, head_dim)
     else:
-        z = self.g_b_proj(F.silu(self.g_a_proj(hidden_states_2d)))
+        z = self.g_b_proj(self.g_a_proj(hidden_states_2d))
         z = z.view(-1, num_heads, head_dim)
     return q, k, v, f, beta, z
 
