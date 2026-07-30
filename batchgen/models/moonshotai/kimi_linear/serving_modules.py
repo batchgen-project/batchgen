@@ -18,8 +18,11 @@ Contents:
       decode:  causal_conv1d_update (CUDA, pooled) + fla
                fused_recurrent_kda_fwd (pooled, ssm_state_indices,
                inplace_final_state)
-  - EP MoE forward: all-gather tokens -> local experts via fused_moe_bf16
-    (masked routing) -> all-reduce partial sums.
+  - MoE forward: PREFILL streams all 256 experts per rank (pure DP, no
+    collectives). DECODE (decode_moe_mode="resident_ep", M4 P0.3) uses the
+    resident EP-8 shard: all-gather tokens -> local experts via
+    fused_moe_bf16 (masked routing) -> all-reduce partial sums
+    (batchgen.moe.fused_moe_bf16_resident seam).
 
 KDA state pools are class-level on KimiLinearKDAWrapperState (see wrappers.py);
 this module only implements the math.
@@ -29,6 +32,8 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from .wrappers import KimiLinearExpertWrapper
 
 # ============================================================================
 #  NoPE-MLA
@@ -500,8 +505,36 @@ def _grouped_moe_bf16(x, w13, w2, weights, ids):
     return out
 
 
+def moe_forward_resident_ep_decode(self, hidden_states, resident):
+    """KimiSparseMoeBlock DECODE forward — resident EP-8 + fused BF16 MoE.
+
+    The routed-expert math (pad -> all_gather -> router on global tokens ->
+    fused_moe_bf16 on the local shard -> all_reduce -> local slice) lives in
+    the ResidentEPMoELayer seam; this function only adds the DP-local shared
+    expert. Empty ranks (0 rows) MUST still reach resident.forward — the
+    collectives run on every rank, every decode step (worker :9746 no-skip
+    invariant); only the returned local slice is empty.
+    """
+    identity = hidden_states
+    orig_shape = hidden_states.shape
+    x = hidden_states.reshape(-1, self.hidden_dim)
+
+    routed = resident.forward(x, self.gate)
+
+    out = routed.reshape(orig_shape)
+    if getattr(self, "shared_experts", None) is not None:
+        out = out + self.shared_experts(identity)
+    return out
+
+
 def moe_forward_serving(self, hidden_states):
-    """KimiSparseMoeBlock serving forward — pure DP with streamed experts.
+    """KimiSparseMoeBlock serving forward.
+
+    DECODE with a materialized resident shard (decode_moe_mode="resident_ep",
+    injected by the PSM at configure_decoding) dispatches to
+    moe_forward_resident_ep_decode — no streaming, one all_gather +
+    all_reduce per layer. Everything below serves PREFILL (and the
+    decode_moe_mode="streamed" fallback): pure DP with streamed experts.
 
     Each rank independently processes its own tokens; the routed experts are
     host-offloaded and streamed to GPU per layer by the copy engine. The MoE
@@ -514,6 +547,10 @@ def moe_forward_serving(self, hidden_states):
         self.gate      — router; returns (topk_idx, topk_weight[, ...])
         self.shared_experts — resident BF16 shared expert (or None)
     """
+    resident = getattr(self, "_resident_ep_moe", None)
+    if resident is not None and KimiLinearExpertWrapper.phase == "decode":
+        return moe_forward_resident_ep_decode(self, hidden_states, resident)
+
     identity = hidden_states
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)
