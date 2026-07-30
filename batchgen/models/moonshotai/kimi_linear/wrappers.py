@@ -55,6 +55,9 @@ class KDASlotManager:
         self.device = device
         self.seq_to_slot: Dict[int, int] = {}
         self.free_slots: List[int] = list(range(num_slots))
+        # KDALayerState instances registered by init_state_pools; fresh
+        # allocs zero the slot across every layer pool (see alloc).
+        self.layer_states: List["KDALayerState"] = []
 
     def alloc(self, seq_id: int) -> int:
         if seq_id in self.seq_to_slot:
@@ -66,6 +69,17 @@ class KDASlotManager:
             )
         slot = self.free_slots.pop()
         self.seq_to_slot[seq_id] = slot
+        # Zero the (possibly recycled) slot in ALL layer pools. The manager
+        # is shared across layers, so layers > first see contains()==True
+        # (has_initial_state=True) for a sequence the first KDA layer just
+        # allocated — with zeroed pools that quirk is harmless (zero state
+        # == no state), and a recycled slot cannot leak the previous
+        # sequence's conv/recurrent state.
+        for st in self.layer_states:
+            st.conv_q[slot].zero_()
+            st.conv_k[slot].zero_()
+            st.conv_v[slot].zero_()
+            st.recurrent_pool[slot].zero_()
         return slot
 
     def lookup(self, seq_id: int) -> int:
@@ -147,6 +161,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
             cls.layer_pools[i] = KDALayerState(
                 cls.slot_manager, conv_q, conv_k, conv_v, recurrent
             )
+            cls.slot_manager.layer_states.append(cls.layer_pools[i])
 
     @classmethod
     def free_sequences(cls, seq_ids) -> None:
@@ -185,6 +200,13 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         return out.unsqueeze(0)
 
     def _forward_decode(self, hidden_states, **kwargs):
+        # Empty DP rank (bsz==0): skip — 0-row conv1d_update /
+        # fused_recurrent grids are undefined. Streamed-expert lockstep is
+        # preserved: the MoE drive (moe_forward_serving) runs in the decoder
+        # layer's FFN after attention and still load+frees every expert via
+        # a 0-row forward.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         state = KimiLinearKDAWrapper.layer_pools[self.layer_idx]
         state.set_decode_batch(list(AttnWrapperBase.cur_batch or []))
         return self.module.kda_decode_serving(hidden_states, state)
@@ -259,6 +281,7 @@ class KimiLinearAttnWrapper(AttnWrapperBase):
             None,
         )
 
-        if AttnWrapperBase.kv_append_callback is not None:
+        if (AttnWrapperBase.kv_append_callback is not None
+                and k_tensor.shape[0] > 0):
             AttnWrapperBase.kv_append_callback(self.layer_idx, k_tensor, None)
         return attn_output

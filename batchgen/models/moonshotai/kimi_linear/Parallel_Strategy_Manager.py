@@ -339,8 +339,11 @@ class KimiLinearParallelStrategyManager:
                     if expert is None:
                         continue
                     # Clear meta/params -> empty GPU tensors (streamed later).
-                    for _, p in list(expert.named_parameters()):
-                        p.data = torch.empty(0, device=device)
+                    # (`p.data =` cannot materialize meta params — swap the
+                    # Parameter object via _replace_param instead.)
+                    for name, _ in list(expert.named_parameters()):
+                        _replace_param(expert, name,
+                                       torch.empty(0, device=device))
                     moe.experts[e_idx] = KimiLinearExpertWrapper(
                         expert, layer_idx, e_idx, self.core_engine,
                         self.engine_config, self.model_config,
@@ -363,6 +366,11 @@ class KimiLinearParallelStrategyManager:
         orig_forward = model.forward
 
         def forward_with_logits(self, *args, **kwargs):
+            # The worker passes attention_mask=None; it would ride **kwargs
+            # into the decoder-layer call and collide with the model's own
+            # explicit attention_mask= argument (TypeError: multiple values).
+            # Drop it here to keep model.py parity-clean.
+            kwargs.pop("attention_mask", None)
             logits = orig_forward(*args, **kwargs)
             return types.SimpleNamespace(logits=logits)
 
