@@ -1484,6 +1484,9 @@ class BatchGenWorker:
 		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
 			if seq._buffer_slot >= 0:
 				self._buffer_pool.free_slot(seq._buffer_slot)
+				# Guard against double-free / stale reuse: a re-entered report
+				# for this seq must not free a slot now owned by another seq.
+				seq._buffer_slot = -1
 
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
@@ -5660,6 +5663,11 @@ class BatchGenWorker:
 
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
+					# Refresh rank-0's sequence replicas first: _report_completion
+					# reads prompt_length/decoded_length from the local entry,
+					# which is stale here for sequences owned by other ranks
+					# (only the completion BIT was all-reduced above).
+					self._sync_sequence_metadata(list(global_completed))
 					self._submit_completed_to_incremental_writer(list(global_completed))
 					# Gather decoded tokens from owning ranks before reporting
 					# (each rank only writes decoded tokens for its own sequences)
