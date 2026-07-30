@@ -117,7 +117,9 @@ def mla_prefill_nope_prepacked(
         attn_output: (total_tokens, hidden)
         offload_kv: (total_tokens, kv_lora_rank + qk_rope_head_dim)
     """
-    from flash_attn import flash_attn_varlen_func
+    # FA3 (flash_attn_interface); FA2 `flash_attn` is not installed on the
+    # H20 node. Same kwargs; the tuple return is normalized below.
+    from flash_attn_interface import flash_attn_varlen_func
 
     total_tokens = hidden_states_2d.shape[0]
 

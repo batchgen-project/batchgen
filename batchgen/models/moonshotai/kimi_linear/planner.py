@@ -46,6 +46,11 @@ class KimiLinearPlanner(BasePlanner):
         # BF16 KV (no kv quantization).
         self.config.Basic_Config.kv_dtype = "bf16"
 
+        # KDA conv/recurrent state-pool slots (peak concurrent sequences the
+        # PSM pools can hold). Config-driven — replaces the retired
+        # BATCHGEN_KDA_STATE_SLOTS env var (M1-C).
+        self.config.GPU_Buffer_Config.kda_state_slots = 256
+
     def get_module_shapes(self) -> dict:
         """Return Kimi-Linear specific tensor shapes."""
         return {
