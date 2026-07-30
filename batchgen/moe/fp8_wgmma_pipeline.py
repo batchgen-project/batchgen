@@ -1448,7 +1448,7 @@ def _build_wgmma_module():
             "create_tma_descriptors_v8c", "grouped_fp8_moe_gemm_v8c",
         ],
         extra_cuda_cflags=[
-            "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
+            "-O3", "-gencode=arch=compute_90a,code=sm_90a", "--ptxas-options=-v", "-lineinfo",
             "-DNUM_STAGES=4",
         ],
         verbose=True,
@@ -1472,7 +1472,7 @@ def _build_fast_module():
         cuda_sources=[FAST_CUDA_SOURCE],
         functions=["act_quant_3d", "fused_silu_quant_3d"],
         extra_cuda_cflags=[
-            "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
+            "-O3", "-gencode=arch=compute_90a,code=sm_90a", "--ptxas-options=-v", "-lineinfo",
         ],
         verbose=True,
     )
@@ -1495,7 +1495,7 @@ def _build_dispatch_reduce_module():
         cuda_sources=[DISPATCH_REDUCE_CUDA_SOURCE],
         functions=["dispatch_scatter_3d", "reduce_weighted_scatter"],
         extra_cuda_cflags=[
-            "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
+            "-O3", "-gencode=arch=compute_90a,code=sm_90a", "--ptxas-options=-v", "-lineinfo",
         ],
         verbose=True,
     )
