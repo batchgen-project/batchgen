@@ -33,12 +33,15 @@ checkpoint dir) may be passed via `model_path` to load `tiktoken.model` /
 """
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import torch
 from tokenizers import AddedToken
+
+logger = logging.getLogger(__name__)
 
 from batchgen.config.base_tokenizer import BaseTokenizer
 from batchgen.config.tokenizer_registry import register_tokenizer
@@ -99,14 +102,21 @@ class KimiLinearTokenizer(BaseTokenizer):
 
         # tiktoken.model is byte-identical across families; fall back to the
         # bundled copy if a passed model dir happens not to ship it.
+        # (No-silent-fallback policy: equivalent substitute, but still warn.)
         vocab_path = assets_dir / "tiktoken.model"
         if not vocab_path.exists():
+            logger.warning(
+                "kimi_linear tokenizer: %s has no tiktoken.model; using the "
+                "kimi_k25 bundled copy (byte-identical vocab)", assets_dir)
             vocab_path = _K25_ASSETS_DIR / "tiktoken.model"
 
         # tokenizer_config.json drives added_tokens_decoder (special tokens).
+        # Fail fast if missing — special-token drift is silent corruption.
         config_path = assets_dir / "tokenizer_config.json"
         if not config_path.exists():
-            config_path = _K25_ASSETS_DIR / "tokenizer_config.json"
+            raise FileNotFoundError(
+                f"kimi_linear tokenizer_config.json not found in {assets_dir}; "
+                "refusing to substitute another model's special-token config")
         with open(config_path) as f:
             config = json.load(f)
 
@@ -125,12 +135,14 @@ class KimiLinearTokenizer(BaseTokenizer):
             added_tokens_decoder=added_tokens_decoder,
         )
 
-        # Load chat template from the model dir if present, else the bundled one.
+        # Chat template: NEVER substitute another model's template — that was
+        # the silent-wrong-template bug (bug_log.md 2026-07-31). Fail fast.
         jinja_file = assets_dir / "chat_template.jinja"
         if not jinja_file.exists():
-            jinja_file = _K25_ASSETS_DIR / "chat_template.jinja"
-        if jinja_file.exists():
-            self._tokenizer.chat_template = jinja_file.read_text()
+            raise FileNotFoundError(
+                f"kimi_linear chat_template.jinja not found in {assets_dir}; "
+                "refusing to fall back to another model's chat template")
+        self._tokenizer.chat_template = jinja_file.read_text()
 
         # Special token IDs.
         self.bos_token_id = KIMI_LINEAR_BOS_TOKEN_ID
