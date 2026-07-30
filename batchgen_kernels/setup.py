@@ -405,13 +405,14 @@ setup(
         "batchgen_kernels.attention.dsa.indexer": "attention/dsa/indexer",
         "batchgen_kernels.moe": "moe",
         "batchgen_kernels.common": "common",
+        "batchgen_kernels.conv1d": "conv1d",
         "batchgen_kernels.triton": "triton",
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
               "batchgen_kernels.attention.dsa",
               "batchgen_kernels.attention.dsa.indexer",
               "batchgen_kernels.moe", "batchgen_kernels.common",
-              "batchgen_kernels.triton"],
+              "batchgen_kernels.conv1d", "batchgen_kernels.triton"],
     package_data={
         "batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"],
         "batchgen_kernels.attention.dsa.indexer": [
