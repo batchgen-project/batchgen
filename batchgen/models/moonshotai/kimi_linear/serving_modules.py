@@ -520,8 +520,15 @@ def moe_forward_serving(self, hidden_states):
     num_tokens = x.shape[0]
     device = x.device
 
-    gate_out = self.gate(identity)
-    topk_idx, topk_weight = gate_out[0], gate_out[1]
+    if num_tokens == 0:
+        # Empty DP rank: KimiMoEGate dies on scores.view(0, -1). Build empty
+        # routing instead so the drive loop below still load+frees every
+        # expert in lockstep with the non-empty ranks (first-smoke finding).
+        topk_idx = x.new_empty((0, self.gate.top_k), dtype=torch.long)
+        topk_weight = x.new_empty((0, self.gate.top_k))
+    else:
+        gate_out = self.gate(identity)
+        topk_idx, topk_weight = gate_out[0], gate_out[1]
     K = topk_idx.shape[-1]
 
     flat_expert_idx = topk_idx.reshape(-1)
