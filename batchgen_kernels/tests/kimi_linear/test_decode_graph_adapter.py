@@ -520,22 +520,32 @@ def main():
     # cache is regrown mid-run with the OLD tensor deliberately kept alive, so
     # a graph that failed to drop would replay against still-valid but stale
     # memory — wrong logits, no crash, exactly the production failure.
+    # SHRINK, not grow: production drifts downward (30888 -> 30845 observed),
+    # and freeing then re-allocating smaller is what makes the caching
+    # allocator hand back the SAME address. That pointer-reused/shape-changed
+    # combination is the ONLY one that reproduces the real bug — a grown
+    # tensor lands at a new address, which even a pointer-only signature
+    # catches, so growing here would make this test pass without the fix.
     pool_restore(mgr, kda_snap)
     kv.restore(kv_snap)
-    old_k = kv._k                                   # keep alive on purpose
-    grown = torch.zeros(
-        (NUM_LAYERS, NUM_PAGES + 3, PAGE_SIZE, 1, old_k.shape[-1]),
-        dtype=old_k.dtype, device=old_k.device,
+    old_ptr = kv._k.data_ptr()
+    old_off1 = kv._k[1].data_ptr() - old_ptr
+    keep = kv._k[:, : NUM_PAGES - 3].cpu().clone()
+    kv._k = None                                  # drop the only GPU reference
+    shrunk = torch.zeros(
+        (NUM_LAYERS, NUM_PAGES - 3, PAGE_SIZE, 1, keep.shape[-1]),
+        dtype=keep.dtype, device=torch.device(DEVICE),
     )
-    grown[:, :NUM_PAGES].copy_(old_k)               # same KV contents, new geometry
-    kv._k = grown
-    report("test setup: per-layer K slice actually relocated",
-           (grown[1].data_ptr() - grown.data_ptr())
-           != (old_k[1].data_ptr() - old_k.data_ptr()),
-           f"layer-1 offset {old_k[1].data_ptr() - old_k.data_ptr()} -> "
-           f"{grown[1].data_ptr() - grown.data_ptr()}")
+    shrunk.copy_(keep)
+    kv._k = shrunk
+    reused = shrunk.data_ptr() == old_ptr
+    new_off1 = shrunk[1].data_ptr() - shrunk.data_ptr()
+    report("test setup: per-layer K slice relocated by the geometry change",
+           new_off1 != old_off1,
+           f"layer-1 offset {old_off1} -> {new_off1}; "
+           f"base ptr {'REUSED (true failure mode)' if reused else 'moved'}")
     report("adapter sees the new geometry in its signature",
-           tuple(grown.shape) in adapter._signature(kv))
+           tuple(shrunk.shape) in adapter._signature(kv))
 
     geo_snap = kv.snapshot()
     geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts)
@@ -548,9 +558,14 @@ def main():
     geo_eager = run_schedule(model, kv, "eager", live, token_plan, base_contexts)
     worst_geo = max((g - e).abs().max().item()
                     for g, e in zip(geo_graph, geo_eager))
+    reuse_note = (
+        "base ptr REUSED — exercised the true failure mode" if reused else
+        "base ptr moved, so this check is weaker than intended; the "
+        "signature checks below still cover the pointer-reused case"
+    )
     report("logits still match eager after a K-cache geometry change",
            worst_geo <= OUT_TOL,
-           f"worst max|Δ|={worst_geo:.2e} (tol {OUT_TOL:.0e})")
+           f"worst max|Δ|={worst_geo:.2e} (tol {OUT_TOL:.0e}); {reuse_note}")
 
     # -- regression: K-cache geometry must be part of the capture signature ---
     # The MLA spans bake `_k_cache[layer]`, whose base address is
