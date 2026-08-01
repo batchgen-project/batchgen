@@ -4821,7 +4821,7 @@ class BatchGenWorker:
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={dl}"
 							)
 
@@ -10506,7 +10506,7 @@ class BatchGenWorker:
 							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
 								seq._lifespan_log, "REPETITION")
 							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
+								f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
 								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
 							)
 					else:
@@ -10520,7 +10520,7 @@ class BatchGenWorker:
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 
