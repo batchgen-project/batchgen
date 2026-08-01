@@ -18,6 +18,10 @@ BF16-only design (simpler than K2.5):
     the prefill-style streaming path.
   - Attention: NoPE-MLA layers use paged KV + FlashMLA decode; KDA layers
     use pooled conv/recurrent state (KimiLinearKDAWrapper pools).
+  - Decode CUDA graphs (decode_graph_mode="graph"|"compare", M5.2 Phase A):
+    per-layer attention spans captured/replayed by KimiLinearDecodeGraph
+    (cuda_graph_segments.py); the MoE stays eager between replays because its
+    collectives cannot be captured. "eager" (default) installs nothing.
 
 PSM <-> worker contract (methods, AttnWrapperBase class attrs the worker writes
 each step, injected module attributes, comm handoff, weight-storage sharing,
@@ -99,6 +103,7 @@ class KimiLinearParallelStrategyManager:
         ))
         self._comm = None
         self._resident_ep_built = False
+        self._decode_graph = None
 
     # ------------------------------------------------------------------ #
     #  Phase configuration                                                #
@@ -163,6 +168,7 @@ class KimiLinearParallelStrategyManager:
             # Resident shards serve every routed expert: decode streams
             # nothing, so the copy engine gets no decode expert tasks.
             self.weight_copy_task["routed_expert"] = []
+        self._init_decode_graph()
         return self.model, self.weight_copy_task
 
     def _decode_moe_mode(self):
@@ -170,6 +176,40 @@ class KimiLinearParallelStrategyManager:
         "resident_ep" (M4 P0.3 default) or "streamed" (fallback)."""
         return getattr(self.engine_config.EP_Config, "decode_moe_mode",
                        "resident_ep")
+
+    def _decode_graph_mode(self):
+        """Planner-set decode CUDA-graph mode (config-driven, no env vars):
+        "eager" (default until M5.5), "graph" or "compare"."""
+        return getattr(self.engine_config.Basic_Config, "decode_graph_mode",
+                       "eager")
+
+    def _init_decode_graph(self):
+        """Install the Phase-A decode CUDA-graph adapter (M5.2), if asked for.
+
+        Per-layer attention spans are captured lazily (first use of a bucket)
+        and replayed with the MoE running eagerly between them — its resident-EP
+        forward does all_gather/all_reduce, which must not be captured in
+        Phase A. See cuda_graph_segments.py for the capture-structure rationale.
+        """
+        mode = self._decode_graph_mode()
+        if mode not in ("graph", "compare"):
+            return
+        if self._decode_graph is not None:
+            self._decode_graph.set_mode(mode)
+            return
+        from .cuda_graph_segments import KimiLinearDecodeGraph
+
+        basic = self.engine_config.Basic_Config
+        self._decode_graph = KimiLinearDecodeGraph(
+            self.model,
+            self.loaded_model_config,
+            device=basic.device_torch,
+            buckets=getattr(basic, "decode_graph_buckets", None),
+            mode=mode,
+            compare_every=getattr(basic, "decode_graph_compare_every", None),
+            rank=self.rank,
+        )
+        self._decode_graph.install()
 
     def _init_resident_ep_decode(self):
         """Materialize the stacked EP-8 BF16 shards ONCE (idempotent) and
