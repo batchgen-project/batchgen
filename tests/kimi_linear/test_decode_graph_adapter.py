@@ -71,7 +71,9 @@ MOE_INTER = 64
 
 SLOTS = 16                        # KDA state slots (1 reserved as scratch)
 PAGE_SIZE = 64                    # FlashMLA page size
-NUM_PAGES = 16
+NUM_PAGES = 24                    # > MAX_KV_SLOTS*MAX_PAGES_PER_SEQ, so the
+                                  # geometry-change test can shrink the cache
+                                  # while every assigned page stays in range
 MAX_PAGES_PER_SEQ = 2
 MAX_KV_SLOTS = 8
 
@@ -533,10 +535,18 @@ def main():
     kv.restore(kv_snap)
     old_ptr = kv._k.data_ptr()
     old_off1 = kv._k[1].data_ptr() - old_ptr
-    keep = kv._k[:, : NUM_PAGES - 3].cpu().clone()
+    # Shrink only down to the pages actually assigned, so every live page
+    # index stays addressable in the new cache.
+    used_pages = max(max(p) for p in kv._seq_pages.values()) + 1
+    new_pages = used_pages + 2
+    assert new_pages < NUM_PAGES, (
+        f"geometry test needs headroom: NUM_PAGES={NUM_PAGES} must exceed "
+        f"used_pages+2={new_pages}"
+    )
+    keep = kv._k[:, :new_pages].cpu().clone()
     kv._k = None                                  # drop the only GPU reference
     shrunk = torch.zeros(
-        (NUM_LAYERS, NUM_PAGES - 3, PAGE_SIZE, 1, keep.shape[-1]),
+        (NUM_LAYERS, new_pages, PAGE_SIZE, 1, keep.shape[-1]),
         dtype=keep.dtype, device=torch.device(DEVICE),
     )
     shrunk.copy_(keep)
