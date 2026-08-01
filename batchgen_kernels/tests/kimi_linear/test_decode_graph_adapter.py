@@ -512,6 +512,46 @@ def main():
            f"worst span max|Δ|={worst_span:.2e} (tol {COMPARE_TOL:.0e}) "
            f"per-layer={ {k: f'{v:.2e}' for k, v in sorted(deltas.items())} }")
 
+    # -- regression: a K-cache geometry change must drop + re-capture --------
+    # End-to-end companion to the signature checks below. The old gate never
+    # reached this condition: it only ever ran inside a single batch job, so
+    # the KV manager never changed shape under a live graph and the bug sailed
+    # through 162/162 spans at 0.000e+00 while halving MMLU accuracy. Here the
+    # cache is regrown mid-run with the OLD tensor deliberately kept alive, so
+    # a graph that failed to drop would replay against still-valid but stale
+    # memory — wrong logits, no crash, exactly the production failure.
+    pool_restore(mgr, kda_snap)
+    kv.restore(kv_snap)
+    old_k = kv._k                                   # keep alive on purpose
+    grown = torch.zeros(
+        (NUM_LAYERS, NUM_PAGES + 3, PAGE_SIZE, 1, old_k.shape[-1]),
+        dtype=old_k.dtype, device=old_k.device,
+    )
+    grown[:, :NUM_PAGES].copy_(old_k)               # same KV contents, new geometry
+    kv._k = grown
+    report("test setup: per-layer K slice actually relocated",
+           (grown[1].data_ptr() - grown.data_ptr())
+           != (old_k[1].data_ptr() - old_k.data_ptr()),
+           f"layer-1 offset {old_k[1].data_ptr() - old_k.data_ptr()} -> "
+           f"{grown[1].data_ptr() - grown.data_ptr()}")
+    report("adapter sees the new geometry in its signature",
+           tuple(grown.shape) in adapter._signature(kv))
+
+    geo_snap = kv.snapshot()
+    geo_graph = run_schedule(model, kv, "graph", live, token_plan, base_contexts)
+    report("graphs were re-captured after the geometry change",
+           len(adapter._captured) > 0,
+           f"captured={sorted(adapter._captured)}")
+
+    pool_restore(mgr, kda_snap)
+    kv.restore(geo_snap)
+    geo_eager = run_schedule(model, kv, "eager", live, token_plan, base_contexts)
+    worst_geo = max((g - e).abs().max().item()
+                    for g, e in zip(geo_graph, geo_eager))
+    report("logits still match eager after a K-cache geometry change",
+           worst_geo <= OUT_TOL,
+           f"worst max|Δ|={worst_geo:.2e} (tol {OUT_TOL:.0e})")
+
     # -- regression: K-cache geometry must be part of the capture signature ---
     # The MLA spans bake `_k_cache[layer]`, whose base address is
     # `data_ptr + layer * num_pages * page_stride`. The worker re-creates the
