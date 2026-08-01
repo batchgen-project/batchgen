@@ -38,7 +38,7 @@ from batchgen.models.moonshotai.kimi_linear.wrappers import (
 )
 from batchgen_kernels.conv1d import causal_conv1d_update
 
-DEVICE = "cuda"
+DEVICE = "cuda:0"
 DTYPE = torch.bfloat16
 
 # Small synthetic geometry (contract test, not a numerics test)

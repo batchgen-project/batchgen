@@ -51,7 +51,7 @@ from batchgen.models.moonshotai.kimi_linear.wrappers import (
     KimiLinearKDAWrapper,
 )
 
-DEVICE = "cuda"
+DEVICE = "cuda:0"
 DTYPE = torch.bfloat16
 
 # Synthetic single-layer geometry (head_dim matches the real model's 128)
