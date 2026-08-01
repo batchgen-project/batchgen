@@ -24,8 +24,9 @@ Contents:
     fused_moe_bf16 (masked routing) -> all-reduce partial sums
     (batchgen.moe.fused_moe_bf16_resident seam).
 
-KDA state pools are class-level on KimiLinearKDAWrapperState (see wrappers.py);
-this module only implements the math.
+KDA state pools are owned by the KDAStateGPUManager (M5.1 unification); the
+KDALayerState objects consumed here hold fixed-address VIEWS of the manager's
+tensors (see wrappers.py). This module only implements the math.
 """
 
 from typing import Optional, Tuple
