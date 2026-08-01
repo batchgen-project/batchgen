@@ -21,7 +21,9 @@ BF16-only design (simpler than K2.5):
   - Decode CUDA graphs (decode_graph_mode="graph"|"compare", M5.2 Phase A):
     per-layer attention spans captured/replayed by KimiLinearDecodeGraph
     (cuda_graph_segments.py); the MoE stays eager between replays because its
-    collectives cannot be captured. "eager" (default) installs nothing.
+    collectives cannot be captured. "eager" (default) installs the adapter but
+    replays nothing, so batchgen_debug can switch modes on a live server;
+    "off" installs nothing at all.
 
 PSM <-> worker contract (methods, AttnWrapperBase class attrs the worker writes
 each step, injected module attributes, comm handoff, weight-storage sharing,
@@ -192,8 +194,15 @@ class KimiLinearParallelStrategyManager:
         Phase A. See cuda_graph_segments.py for the capture-structure rationale.
         """
         mode = self._decode_graph_mode()
-        if mode not in ("graph", "compare"):
+        if mode == "off":
             return
+        # Install for "eager" too: the adapter then replays nothing (pure
+        # pass-through to the wrapper path) but is present, so a batch-level
+        # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
+        # on a live server — the project's debug-flag policy (cf.
+        # glm5_moe_mode), instead of a cold restart per experiment. Buckets
+        # capture lazily, so eager mode costs no capture time or memory.
+        # "off" is the rollback escape that installs nothing at all.
         if self._decode_graph is not None:
             self._decode_graph.set_mode(mode)
             return
