@@ -512,6 +512,37 @@ def main():
            f"worst span max|Δ|={worst_span:.2e} (tol {COMPARE_TOL:.0e}) "
            f"per-layer={ {k: f'{v:.2e}' for k, v in sorted(deltas.items())} }")
 
+    # -- regression: K-cache geometry must be part of the capture signature ---
+    # The MLA spans bake `_k_cache[layer]`, whose base address is
+    # `data_ptr + layer * num_pages * page_stride`. The worker re-creates the
+    # KV manager per batch job and sizes it from that rank's free HBM, so
+    # num_pages varies between jobs. A re-init that reuses the same base
+    # address with a different page count leaves data_ptr unchanged while every
+    # slice above layer 0 moves -- graphs are then never dropped and replay
+    # against relocated slices. That silently corrupted MLA output (KDA stayed
+    # bitwise clean) and halved MMLU accuracy before it was caught. Task #12.
+    sig = adapter._signature(kv)
+    report("capture signature carries the K-cache shape",
+           tuple(kv._k.shape) in sig,
+           f"shape={tuple(kv._k.shape)} sig={sig}")
+    report("capture signature carries the K-cache stride",
+           tuple(kv._k.stride()) in sig,
+           f"stride={tuple(kv._k.stride())} sig={sig}")
+
+    # Proves the above is not a vacuous check: the per-layer slice really does
+    # move when only num_pages changes, so a pointer-only signature is blind.
+    kv_dim = kv._k.shape[-1]
+    k_small = torch.zeros((NUM_LAYERS, NUM_PAGES, PAGE_SIZE, 1, kv_dim),
+                          dtype=DTYPE, device=torch.device(DEVICE))
+    k_big = torch.zeros((NUM_LAYERS, NUM_PAGES + 1, PAGE_SIZE, 1, kv_dim),
+                        dtype=DTYPE, device=torch.device(DEVICE))
+    off_small = k_small[1].data_ptr() - k_small.data_ptr()
+    off_big = k_big[1].data_ptr() - k_big.data_ptr()
+    report("per-layer K slice offset depends on num_pages",
+           off_small != off_big,
+           f"layer-1 offset {off_small} (num_pages={NUM_PAGES}) vs "
+           f"{off_big} (num_pages={NUM_PAGES + 1})")
+
     adapter.release()
     report("release() restored the eager forwards",
            not adapter._installed and not adapter._captured)
