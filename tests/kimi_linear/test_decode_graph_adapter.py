@@ -459,14 +459,32 @@ def main():
     report(f"all {len(BSZ_SCHEDULE)} steps within logits tol",
            worst <= OUT_TOL, f"worst max|Δ|={worst:.2e}")
 
+    # State lives per slot. The graph path pads to the bucket and parks the
+    # padded rows on the scratch slot, which the (unpadded) eager path never
+    # touches — so the scratch row legitimately differs and is NOT part of the
+    # correctness claim. Compare the LIVE slots, and report the per-slot
+    # breakdown so a real divergence can never hide behind that exclusion.
+    live_slots = sorted({s for s in expected_slots[:last_bsz]}
+                        | {mgr.get_sequence_state_item(sid) for sid in live})
     for name, got, ref in (
         ("conv_q", graph_pools[0], eager_pools[0]),
         ("conv_k", graph_pools[1], eager_pools[1]),
         ("conv_v", graph_pools[2], eager_pools[2]),
         ("recurrent", graph_pools[3], eager_pools[3]),
     ):
-        check(f"KDA {name} state evolution over {len(BSZ_SCHEDULE)} steps",
-              got, ref, STATE_TOL)
+        per_slot = {
+            s: (got[:, s].float() - ref[:, s].float()).abs().max().item()
+            for s in range(got.shape[1])
+        }
+        offenders = {s: d for s, d in per_slot.items()
+                     if d > STATE_TOL and s != scratch}
+        report(f"KDA {name}: only the scratch slot may differ",
+               not offenders,
+               f"scratch={scratch} d_scratch={per_slot[scratch]:.2e} "
+               f"live_slots={live_slots} offenders={offenders}")
+        check(f"KDA {name} state evolution over {len(BSZ_SCHEDULE)} steps "
+              f"(live slots)",
+              got[:, live_slots], ref[:, live_slots], STATE_TOL)
     check("paged K cache after full schedule", graph_kv, eager_kv, OUT_TOL)
 
     # ---- pass 3: compare mode --------------------------------------------
