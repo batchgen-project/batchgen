@@ -86,8 +86,24 @@ class KimiLinearPlanner(BasePlanner):
         self.config.EP_Config.decode_moe_mode = "resident_ep"
 
         # KDA conv/recurrent state-pool slots (peak concurrent sequences the
-        # PSM pools can hold). Config-driven (M1-C).
+        # PSM pools can hold). Config-driven (M1-C). One slot is reserved by
+        # the Phase-A decode graph as the padding/warmup scratch slot.
         self.config.GPU_Buffer_Config.kda_state_slots = 256
+
+        # M5.2 Phase-A CUDA-graph decode (per-layer attention spans; MoE stays
+        # eager because its resident-EP forward runs NCCL collectives). Read by
+        # the PSM at configure_decoding — config-driven, no env vars.
+        #   "eager":   no graphs (default until the M5.5 gates pass);
+        #   "graph":   replay the captured spans;
+        #   "compare": replay AND run the eager span, logging max|delta|.
+        # A batch can override per request with
+        # batchgen_debug.kimi_decode_graph_mode.
+        self.config.Basic_Config.decode_graph_mode = "eager"
+        # Per-rank decode buckets; the top bucket must cover
+        # MoE_decoding_micro_batch_size (16 rows/rank above).
+        self.config.Basic_Config.decode_graph_buckets = [1, 2, 4, 8, 16]
+        # Steps between graph-vs-eager comparisons in "compare" mode.
+        self.config.Basic_Config.decode_graph_compare_every = 64
 
     def get_module_shapes(self) -> dict:
         """Return Kimi-Linear specific tensor shapes."""
