@@ -206,8 +206,11 @@ def _mla_decode_graph_safe(
     offload_kv = torch.cat([normed_kv, k_pe], dim=-1)
     k_tensor = offload_kv.view(bsz, 1, 1, offload_kv.size(-1))
 
-    # k_cache is the manager's per-layer view: a fixed address for the life of
-    # the manager (the block table beside it is NOT, hence the static one).
+    # k_cache is the manager's per-layer view. Its address is fixed only for
+    # the life of ONE KV manager instance: the slice base is
+    # `data_ptr + layer * num_pages * page_stride`, so a re-init with a
+    # different num_pages moves it even when data_ptr is reused. That is why
+    # `_signature` must carry the cache shape/stride, not just the pointer.
     blocked_k, _, _ = (
         AttnWrapperBase.gpu_paged_kv_manager.get_layer_kv_with_page_table(
             layer_idx=layer_idx
@@ -767,13 +770,27 @@ class KimiLinearDecodeGraph:
 
     def _signature(self, kv_manager) -> tuple:
         """Everything material to the addresses baked into the graphs: the
-        graph-stable page table and the K cache the spans write/read."""
+        graph-stable page table and the K cache the spans write/read.
+
+        The MLA spans bake `_k_cache[physical_layer]` — a per-layer SLICE whose
+        base address is `data_ptr + p * num_pages * page_stride`, a function of
+        the FULL cache shape and not just its base pointer. The worker
+        re-creates the KV manager per batch job and sizes it from that rank's
+        free HBM, so num_pages varies between jobs. A re-init that reuses the
+        same base address with a different page count leaves data_ptr unchanged
+        while every slice above physical layer 0 moves — by an amount
+        proportional to p, which is why the corruption grew with layer depth.
+        Shape/stride MUST be in the signature or the graphs are never dropped
+        and replay against relocated K-cache slices.
+        """
         storage = kv_manager.get_cuda_graph_page_table_storage()
         k_cache, _ = kv_manager.get_kv_tensors()
         return (
             storage.data_ptr(),
             tuple(storage.shape),
             k_cache.data_ptr(),
+            tuple(k_cache.shape),
+            tuple(k_cache.stride()),
             int(kv_manager.config.page_size_tokens),
         )
 
