@@ -54,6 +54,22 @@ class KimiLinearInitializer:
                     input_arguments.huggingface_ckpt_name
                 )
 
+        # Kimi-K3 must reach KimiLinearConfig.from_json — it flattens
+        # `text_config` and stamps model_type="kimi_k3". If it did not, the
+        # name-pattern registry shortcut (model_registry.py:232-238) has handed
+        # us KimiLinearConfig() with its 48B DEFAULTS, which builds a model that
+        # loads, runs, and is wrong.
+        self.is_k3 = self.batchgen_config.model_type == "kimi_k3"
+        if "kimi-k3" in input_arguments.huggingface_ckpt_name.lower() \
+                and not self.is_k3:
+            raise RuntimeError(
+                "Kimi-K3 identifier "
+                f"{input_arguments.huggingface_ckpt_name!r} resolved to a "
+                f"config with model_type={self.batchgen_config.model_type!r}. "
+                f"Pass --cache-dir pointing at the checkpoint directory so its "
+                "config.json is read; there is no K3 default config."
+            )
+
         # Model instantiation config (same class; structure from config.json).
         self.loaded_model_config = self.batchgen_config
         self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
@@ -129,19 +145,19 @@ class KimiLinearInitializer:
         )
 
         cfg = self.batchgen_config
-        hidden_size = cfg.hidden_size                    # 2304
-        moe_intermediate = cfg.moe_intermediate_size     # 1024
-        kv_lora_rank = cfg.kv_lora_rank                  # 512
-        qk_rope_head_dim = cfg.qk_rope_head_dim          # 64
-        num_heads = cfg.num_attention_heads              # 32
-        qk_nope_head_dim = cfg.qk_nope_head_dim          # 128
-        v_head_dim = cfg.v_head_dim                      # 128
-        compressed_kv_dim = kv_lora_rank + qk_rope_head_dim  # 576
+        hidden_size = cfg.hidden_size                    # 48B 2304 / K3 7168
+        moe_intermediate = cfg.moe_intermediate_size     # 48B 1024 / K3 3072
+        kv_lora_rank = cfg.kv_lora_rank                  # 512 (both)
+        qk_rope_head_dim = cfg.qk_rope_head_dim          # 64  (both)
+        num_heads = cfg.num_attention_heads              # 48B 32   / K3 96
+        qk_nope_head_dim = cfg.qk_nope_head_dim          # 128 (both)
+        v_head_dim = cfg.v_head_dim                      # 128 (both)
+        compressed_kv_dim = kv_lora_rank + qk_rope_head_dim  # 576 (both)
 
         lac = getattr(cfg, "linear_attn_config", None) or {}
-        kda_num_heads = lac.get("num_heads", 32)
-        kda_head_dim = lac.get("head_dim", 128)
-        kda_proj = kda_num_heads * kda_head_dim          # 4096
+        kda_num_heads = lac.get("num_heads", 32)         # 48B 32   / K3 96
+        kda_head_dim = lac.get("head_dim", 128)          # 128 (both)
+        kda_proj = kda_num_heads * kda_head_dim          # 48B 4096 / K3 12288
         conv_w = lac.get("short_conv_kernel_size", 4)
 
         # ---- KV cache (MLA latent KV per token; KDA layers never append) ----
@@ -176,66 +192,93 @@ class KimiLinearInitializer:
         )
 
         # ---- Module shapes ----
-        q_head_dim = qk_nope_head_dim + qk_rope_head_dim  # 192
-        self.engine_config.GPU_Buffer_Config.module_shapes = {
-            # NoPE-MLA (q_lora_rank=None → direct q_proj)
-            "attn": {
-                "q_proj.weight": [num_heads * q_head_dim, hidden_size],
-                "kv_a_proj_with_mqa.weight": [compressed_kv_dim, hidden_size],
-                "kv_a_layernorm.weight": [kv_lora_rank],
-                "kv_b_proj.weight": [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank],
-                "o_proj.weight": [hidden_size, num_heads * v_head_dim],
-            },
-            # KDA attention
-            "kda_attn": {
-                "q_proj.weight": [kda_proj, hidden_size],
-                "k_proj.weight": [kda_proj, hidden_size],
-                "v_proj.weight": [kda_proj, hidden_size],
-                "q_conv1d.weight": [kda_proj, 1, conv_w],
-                "k_conv1d.weight": [kda_proj, 1, conv_w],
-                "v_conv1d.weight": [kda_proj, 1, conv_w],
-                "A_log": [kda_num_heads],
-                "f_a_proj.weight": [kda_head_dim, hidden_size],
-                "f_b_proj.weight": [kda_proj, kda_head_dim],
-                "dt_bias": [kda_proj],
-                "b_proj.weight": [kda_num_heads, hidden_size],
-                "g_a_proj.weight": [kda_head_dim, hidden_size],
-                "g_b_proj.weight": [kda_proj, kda_head_dim],
-                "o_norm.weight": [kda_head_dim],
-                "o_proj.weight": [hidden_size, kda_proj],
-            },
-            # BF16 routed experts (w1/w3: gate/up, w2: down)
-            "routed_expert": {
-                "w1.weight": [moe_intermediate, hidden_size],
-                "w2.weight": [hidden_size, moe_intermediate],
-                "w3.weight": [moe_intermediate, hidden_size],
-            },
-            # BF16 shared expert
-            "shared_expert": {
-                "gate_proj.weight": [moe_intermediate, hidden_size],
-                "up_proj.weight": [moe_intermediate, hidden_size],
-                "down_proj.weight": [hidden_size, moe_intermediate],
-            },
-        }
+        if self.is_k3:
+            # K3 shapes live next to the K3 name map so the two cannot drift.
+            # reconcile_k3_checkpoint proves sum(shape x dtype) equals the
+            # checkpoint's per-tensor shapes and dtypes exactly (verified: 0
+            # delta and 0 tensor mismatches against the released
+            # 1,560,860,324,864 B checkpoint, all 497,220 tensors).
+            # if/else, not an early return: an early return would silently skip
+            # anything appended to this method later on the K3 path only.
+            from .k3.tensor_map import k3_module_shapes, validate_k3_config
 
-        self.engine_config.GPU_Buffer_Config.weight_dtypes = {
-            "attn": torch.bfloat16,
-            "kda_attn": torch.bfloat16,
-            "routed_expert": torch.bfloat16,
-            "shared_expert": torch.bfloat16,
-        }
+            validate_k3_config(cfg)
+            (
+                self.engine_config.GPU_Buffer_Config.module_shapes,
+                self.engine_config.GPU_Buffer_Config.weight_dtypes,
+                self.engine_config.GPU_Buffer_Config.tensor_dtypes,
+            ) = k3_module_shapes(cfg)
+        else:
+            q_head_dim = qk_nope_head_dim + qk_rope_head_dim  # 192
+            self.engine_config.GPU_Buffer_Config.module_shapes = {
+                # NoPE-MLA (q_lora_rank=None → direct q_proj)
+                "attn": {
+                    "q_proj.weight": [num_heads * q_head_dim, hidden_size],
+                    "kv_a_proj_with_mqa.weight": [compressed_kv_dim, hidden_size],
+                    "kv_a_layernorm.weight": [kv_lora_rank],
+                    "kv_b_proj.weight": [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank],
+                    "o_proj.weight": [hidden_size, num_heads * v_head_dim],
+                },
+                # KDA attention
+                "kda_attn": {
+                    "q_proj.weight": [kda_proj, hidden_size],
+                    "k_proj.weight": [kda_proj, hidden_size],
+                    "v_proj.weight": [kda_proj, hidden_size],
+                    "q_conv1d.weight": [kda_proj, 1, conv_w],
+                    "k_conv1d.weight": [kda_proj, 1, conv_w],
+                    "v_conv1d.weight": [kda_proj, 1, conv_w],
+                    "A_log": [kda_num_heads],
+                    "f_a_proj.weight": [kda_head_dim, hidden_size],
+                    "f_b_proj.weight": [kda_proj, kda_head_dim],
+                    "dt_bias": [kda_proj],
+                    "b_proj.weight": [kda_num_heads, hidden_size],
+                    "g_a_proj.weight": [kda_head_dim, hidden_size],
+                    "g_b_proj.weight": [kda_proj, kda_head_dim],
+                    "o_norm.weight": [kda_head_dim],
+                    "o_proj.weight": [hidden_size, kda_proj],
+                },
+                # BF16 routed experts (w1/w3: gate/up, w2: down)
+                "routed_expert": {
+                    "w1.weight": [moe_intermediate, hidden_size],
+                    "w2.weight": [hidden_size, moe_intermediate],
+                    "w3.weight": [moe_intermediate, hidden_size],
+                },
+                # BF16 shared expert
+                "shared_expert": {
+                    "gate_proj.weight": [moe_intermediate, hidden_size],
+                    "up_proj.weight": [moe_intermediate, hidden_size],
+                    "down_proj.weight": [hidden_size, moe_intermediate],
+                },
+            }
 
-        # Per-tensor dtype overrides: KDA gate params are fp32 in the ckpt.
-        self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
-            "attn": {
-                "kv_a_layernorm.weight": torch.bfloat16,
-            },
-            "kda_attn": {
-                "A_log": torch.float32,
-                "dt_bias": torch.float32,
-                "o_norm.weight": torch.float32,
-            },
-        }
+            self.engine_config.GPU_Buffer_Config.weight_dtypes = {
+                "attn": torch.bfloat16,
+                "kda_attn": torch.bfloat16,
+                "routed_expert": torch.bfloat16,
+                "shared_expert": torch.bfloat16,
+            }
+
+            # Per-tensor dtype overrides.
+            # A_log and dt_bias are F32 in the 48B checkpoint; o_norm.weight is
+            # NOT — it ships BF16[128] (256 B), verified from the 48B shard
+            # headers. Declaring it float32 sized the GPU slot at 512 B, which
+            # is a live 256 B under-copy the moment `kda_attn` becomes a
+            # streamed ring: blocking_copy_ writes the host byte size with no
+            # bound check (HtoD_Engine.cu:232-238), leaving the slot's second
+            # half at its zeros init and reinterpreting two BF16 values as one
+            # F32. Inert today only because no `kda_attn` ring is ever allocated
+            # (num_prefill_module_buffer has no such key, base_planner.py:90-94)
+            # and the resident path reads the checkpoint dtype from the host
+            # side instead.
+            self.engine_config.GPU_Buffer_Config.tensor_dtypes = {
+                "attn": {
+                    "kv_a_layernorm.weight": torch.bfloat16,
+                },
+                "kda_attn": {
+                    "A_log": torch.float32,
+                    "dt_bias": torch.float32,
+                },
+            }
 
     def _parse_model_config(self) -> ModelConfig:
         cfg = self.batchgen_config
