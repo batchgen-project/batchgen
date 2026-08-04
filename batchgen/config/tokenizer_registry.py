@@ -42,6 +42,7 @@ Usage:
 """
 
 from typing import Dict, Type, Optional, TYPE_CHECKING
+import importlib
 import logging
 
 from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
@@ -87,8 +88,15 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
     "Kimi-Linear": "kimi_linear",
     "kimi-linear": "kimi_linear",
-    "Kimi-K3": "kimi_linear",
-    "kimi-k3": "kimi_linear",
+    # Kimi-K3 shares the Kimi-Linear ARCHITECTURE but NOT its tokenizer. The two
+    # ship different added_tokens_decoder tables over a byte-identical BPE merge
+    # file (163586 is "<|end_of_msg|>" in K3, "<|im_end|>" in the 48B) and K3 has
+    # no Jinja chat template at all -- its XTML format is Python. Cross-loading
+    # renders a 12-token K3 fragment as 32 marker-free tokens, silently
+    # (bug_log.md 2026-07-31). Neither string is a substring of the other, so
+    # ordering against "Kimi-Linear" does not matter.
+    "Kimi-K3": "kimi_k3",
+    "kimi-k3": "kimi_k3",
 }
 
 for model_id in KIMI_K25_BACKEND_MODEL_IDS:
@@ -142,6 +150,18 @@ def load_tokenizer(model_identifier: str) -> "BaseTokenizer":
                 logger.info(f"Using registered tokenizer for type={tokenizer_type}")
                 # Tokenizer loads from its own package directory (no path argument)
                 return TOKENIZER_REGISTRY[tokenizer_type]()
+            # Falling through to a later, less specific pattern means serving
+            # this model with a DIFFERENT model's tokenizer. That is intended
+            # and documented for GLM-5.2 (identical vocab, see above); anywhere
+            # else it is the bug_log.md 2026-07-31 failure mode. Never silent.
+            logger.warning(
+                "Model %r matched pattern %r -> tokenizer type %r, which is not "
+                "registered. Falling through to a less specific pattern; the "
+                "tokenizer that ends up serving this model is NOT the one its "
+                "name selected. This is correct only when the two share a vocab "
+                "AND a chat template -- verify before relying on it.",
+                model_identifier, pattern, tokenizer_type,
+            )
 
     raise ValueError(
         f"No tokenizer registered for model: {model_identifier}. "
@@ -162,56 +182,31 @@ def get_registered_tokenizers() -> Dict[str, Type["BaseTokenizer"]]:
 # Import model-specific tokenizers to register them
 # These imports trigger the @register_tokenizer decorators
 def _import_tokenizers():
-    """Import all model-specific tokenizer modules to register them."""
-    try:
-        from batchgen.models.deepseek.deepseekv4_flash import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
+    """Import all model-specific tokenizer modules to register them.
 
-    try:
-        from batchgen.models.deepseek.deepseekv3 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.deepseek.deepseekv2 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.openai.gpt_oss_120b import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.mixtral import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.moonshotai.kimi_k25 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.moonshotai.kimi_linear import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.minimax.minimax_m25 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
-
-    try:
-        from batchgen.models.glm.glm5 import tokenizer as _  # noqa: F401
-    except ImportError:
-        pass
+    A model package that cannot be imported (optional extra not installed, a
+    typo in a module, an asset missing from the wheel) is tolerated -- but it is
+    logged. Swallowing it silently turns a broken tokenizer into the misleading
+    "No tokenizer registered for model" further down.
+    """
+    for module_path in (
+        "batchgen.models.deepseek.deepseekv4_flash.tokenizer",
+        "batchgen.models.deepseek.deepseekv3.tokenizer",
+        "batchgen.models.deepseek.deepseekv2.tokenizer",
+        "batchgen.models.openai.gpt_oss_120b.tokenizer",
+        "batchgen.models.mixtral.tokenizer",
+        "batchgen.models.moonshotai.kimi_k25.tokenizer",
+        "batchgen.models.moonshotai.kimi_linear.tokenizer",
+        "batchgen.models.moonshotai.kimi_k3.tokenizer",
+        "batchgen.models.glm.glm5.tokenizer",
+        "batchgen.models.minimax.minimax_m25.tokenizer",
+    ):
+        try:
+            importlib.import_module(module_path)
+        except ImportError as exc:
+            logger.warning(
+                "Tokenizer module %s could not be imported (%s); any model "
+                "routed to it will fail to load a tokenizer.", module_path, exc)
 
 
 # Auto-import on module load
