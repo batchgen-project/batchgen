@@ -439,16 +439,42 @@ void HtoD_Engine::HtoD_Worker() {
                 for (auto& [tensor_name, host_tensor_storage] : src) {
                     src_ptr = host_tensor_storage.data_ptr;
                     src_byte_size = host_tensor_storage.byte_size;
-                    if (dst[tensor_name].defined() &&
-                        dst[tensor_name].has_storage()) {
-                        this->blocking_copy_(dst[tensor_name].data_ptr(),
-                                            src_ptr, src_byte_size);
-                    } else {
+                    // find(), not operator[]: dst is an unordered_map and
+                    // operator[] DEFAULT-INSERTS an undefined torch::Tensor on
+                    // every miss, permanently growing a buffer map that is
+                    // reused across ring slots.
+                    auto slot = dst.find(tensor_name);
+                    if (slot == dst.end() || !slot->second.defined() ||
+                        !slot->second.has_storage()) {
+                        // The host map carries a tensor module_shapes declares
+                        // no slot for. Continuing drops it silently and the
+                        // consumer reads whatever the slot last held.
                         this->logger_->error(
-                            "Tensor {} doesn't have valid storage",
+                            "Module {}: host tensor {} has no GPU slot -- "
+                            "module_shapes declares no such key",
+                            module_name, tensor_name);
+                        throw std::runtime_error(
+                            "HtoD: host tensor has no GPU slot: " +
                             tensor_name);
-                        std::runtime_error("Tensor doesn't have valid storage");
                     }
+                    int64_t dst_byte_size = slot->second.nbytes();
+                    if (src_byte_size != dst_byte_size) {
+                        // blocking_copy_ writes src_byte_size bytes with no
+                        // bound check: a short slot is overrun into its
+                        // neighbour, a long one keeps a stale tail. Both are
+                        // silent and both produce wrong weights.
+                        this->logger_->error(
+                            "Module {}: tensor {} size mismatch -- host {} B, "
+                            "GPU slot {} B (module_shapes/dtype disagrees with "
+                            "the checkpoint)",
+                            module_name, tensor_name, src_byte_size,
+                            dst_byte_size);
+                        throw std::runtime_error(
+                            "HtoD: host/GPU byte size mismatch for " +
+                            tensor_name);
+                    }
+                    this->blocking_copy_(slot->second.data_ptr(), src_ptr,
+                                         src_byte_size);
                 }
                 this->logger_->debug("Copied module: {} to buffer: {}",
                                     module_name, buffer_idx);
