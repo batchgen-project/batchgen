@@ -1,7 +1,29 @@
-"""Fused MXFP4 dequantization and grouped GEMM for MoE layers.
+"""MXFP4 utilities + DEAD Triton grouped-GEMM kernels (gpt-oss lineage).
 
-This module implements fused dequantization of MXFP4 weights during matrix
-multiplication, avoiding the memory overhead of materializing full BF16 weights.
+============================================================================
+!! WARNING — THE GROUPED TRITON KERNELS IN THIS MODULE ARE DEAD CODE !!
+
+The grouped MXFP4 GEMM surface here (fused_mxfp4_grouped_gemm,
+grouped_mxfp4_gemm_3d[_tunable], grouped_mxfp4_moe_forward[_3d,_cuda_routing])
+has ZERO production callers, was NEVER gated by a numerics test, and carries
+12 confirmed defects — including an unconditional scale-group-aliasing bug
+that produces finite, plausible, WRONG numbers on the first K3-shaped call.
+See batchgen_design/model_support/kimi_k3/KERNEL_WORKUNIT.md.
+
+Per the 2026-08-04 POIS decision (task #34): Kimi-K3 MXFP4 MoE numerics run
+on the PRODUCTION-PROVEN Marlin machinery instead —
+  - repack:  batchgen/moe/marlin_weight_prep.py::repack_mxfp4_to_marlin_gs32
+  - kernels: batchgen_kernels/src/moe/marlin_grouped_gemm.cu
+             (grouped_marlin_gemm_m16_mxfp4, ..._m16_s1_mxfp4_situ)
+  - wrappers: batchgen/moe/marlin_grouped_moe.py (hard-fail contracts)
+Do NOT wire K3 (or any new model) through the grouped kernels below; they
+raise NotImplementedError to keep this path loudly closed (this repo has been
+bitten by dead-but-inviting kernels before).
+
+Still LIVE (gpt-oss-120b + int4_grouped_gemm) and NOT covered by the warning:
+  moe_token_dispatch, reshape_to_3d_expert_layout, gather_from_3d_expert_layout,
+  setup_expert_weight_pointers, fused_mxfp4_single_gemm, mxfp4_linear.
+============================================================================
 
 MXFP4 Format:
 - 32 FP4 values packed in 16 bytes (2 values per uint8)
@@ -32,6 +54,22 @@ except ImportError:
 # MXFP4 configuration
 MXFP4_BLOCK_SIZE = 32  # FP4 values per scale
 MXFP4_PACKED_BLOCK_SIZE = 16  # Bytes per scale (32 values / 2 per byte)
+
+
+def _refuse_dead_triton_grouped(entry: str):
+    """Hard tombstone for the never-validated Triton grouped MXFP4 kernels.
+
+    See the module docstring: 12 confirmed defects, zero callers, no gate ever
+    existed. The supported MXFP4 grouped path is the Marlin machinery
+    (batchgen/moe/marlin_grouped_moe.py + marlin_grouped_gemm.cu).
+    """
+    raise NotImplementedError(
+        f"{entry} is dead, unvalidated code (12 confirmed defects incl. "
+        f"unconditional scale-group aliasing — see "
+        f"batchgen_design/model_support/kimi_k3/KERNEL_WORKUNIT.md). "
+        f"Use the Marlin MXFP4 path: batchgen.moe.marlin_grouped_moe "
+        f"(grouped_marlin_gemm_m16_s1_mxfp4_situ / grouped_marlin_gemm_m16_mxfp4) "
+        f"with batchgen.moe.marlin_weight_prep.repack_mxfp4_to_marlin_gs32.")
 
 
 @triton.jit
@@ -390,6 +428,7 @@ def fused_mxfp4_grouped_gemm(
     Returns:
         Output tensor [M, N] in BF16
     """
+    _refuse_dead_triton_grouped("fused_mxfp4_grouped_gemm")
     assert lhs.dtype == torch.bfloat16, "lhs must be BF16"
     assert all(r.dtype == torch.uint8 for r in rhs_packed_list), "packed weights must be uint8"
     assert all(s.dtype == torch.uint8 for s in rhs_scales_list), "scales must be uint8"
@@ -758,6 +797,7 @@ def grouped_mxfp4_gemm_3d(
     Returns:
         output_3d: [E, M_max, N] in BF16
     """
+    _refuse_dead_triton_grouped("grouped_mxfp4_gemm_3d")
     num_experts = hidden_3d.shape[0]
     M_max = hidden_3d.shape[1]
     K = hidden_3d.shape[2]
@@ -827,6 +867,7 @@ def grouped_mxfp4_gemm_3d_tunable(
     Returns:
         output_3d: [E, M_max, N] in BF16
     """
+    _refuse_dead_triton_grouped("grouped_mxfp4_gemm_3d_tunable")
     num_experts = hidden_3d.shape[0]
     M_max = hidden_3d.shape[1]
     K = hidden_3d.shape[2]
@@ -912,6 +953,7 @@ def grouped_mxfp4_moe_forward_3d(
     Returns:
         Output [batch*seq, hidden] in BF16
     """
+    _refuse_dead_triton_grouped("grouped_mxfp4_moe_forward_3d")
     num_tokens, hidden_size = hidden_states.shape
     device = hidden_states.device
 
@@ -1024,6 +1066,7 @@ def grouped_mxfp4_moe_forward_cuda_routing(
         num_local_experts: Number of local experts
         Other args: Same as grouped_mxfp4_moe_forward_3d
     """
+    _refuse_dead_triton_grouped("grouped_mxfp4_moe_forward_cuda_routing")
     from batchgen.moe.routing import dispatch_count_gather_cuda, reduce_weighted_scatter_cuda
 
     num_tokens, hidden_size = hidden_states.shape
@@ -1144,6 +1187,7 @@ def grouped_mxfp4_moe_forward(
     num_tokens, hidden = hidden_states.shape
     num_experts = len(gate_weights)
     num_experts_per_tok = topk_indices.shape[1]
+    _refuse_dead_triton_grouped("grouped_mxfp4_moe_forward")
     device = hidden_states.device
     intermediate_size = gate_weights[0].shape[0]  # N dimension
 
