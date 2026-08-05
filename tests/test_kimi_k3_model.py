@@ -329,7 +329,14 @@ def test_kda_module_hard_fails():
         mod(hidden, cache_params=object())
     with pytest.raises(NotImplementedError, match="M4"):
         mod(hidden, attention_mask=torch.ones(1, 4))
-    with pytest.raises(NotImplementedError, match="M4"):
+    # cu_seqlens is now SUPPORTED (packed prefill), so the assertion moves to
+    # the two things that stay contract errors: a packed descriptor on a
+    # non-packed batch, and the reference backend, which has no varlen path
+    # and would silently run one recurrence across every boundary.
+    batched = H.seeded_input("kda:hf:b2", 2, 4, cfg.hidden_size)
+    with pytest.raises(ValueError, match="PACKED"):
+        mod(batched, cu_seqlens=torch.tensor([0, 4]))
+    with pytest.raises(NotImplementedError, match="no packed/varlen path"):
         mod(hidden, cu_seqlens=torch.tensor([0, 4]))
     with pytest.raises(ValueError, match="kda_backend"):
         ours.model.KimiK3KDAAttention(cfg, layer_idx=0, kda_backend="banana")

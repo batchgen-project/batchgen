@@ -706,7 +706,8 @@ def _patched_layer_forward(ns, *, boundary_reset=True, mix_feeds_accumulator=Fal
                            snapshot_post_mix=False):
     lean = ns.model._apply_attn_res_lean
 
-    def forward(self, hidden_states, attention_mask, block_residual):
+    def forward(self, hidden_states, attention_mask, block_residual,
+                cu_seqlens=None):
         batch_size, seq_len, hidden_size = hidden_states.shape
         prefix_sum = hidden_states
         if block_residual.shape[1] > 0:
@@ -723,7 +724,7 @@ def _patched_layer_forward(ns, *, boundary_reset=True, mix_feeds_accumulator=Fal
             if boundary_reset:
                 prefix_sum = None
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._run_attn(hidden_states, attention_mask)
+        hidden_states = self._run_attn(hidden_states, attention_mask, cu_seqlens)
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states
         else:
@@ -1026,7 +1027,7 @@ def _m(ns):
 def _m(ns):
     orig = ns.model.KimiK3KDAAttention.__init__
 
-    def patched(self, config, layer_idx, kda_backend="fla_chunk"):
+    def patched(self, config, layer_idx, kda_backend="fla_triton"):
         orig(self, config, layer_idx, kda_backend=kda_backend)
         self.gate_lower_bound = None
     ns.model.KimiK3KDAAttention.__init__ = patched
@@ -1041,6 +1042,9 @@ def _m(ns):
 
 @_mutation("kda_conv_no_silu", "test_kda_module_fp32")
 def _m(ns):
+    # Patches _conv_dense, not forward: it is the single seam both the dense
+    # and the per-segment packed path go through, so the mutation stays live
+    # whichever layout the caller uses.
     def patched(self, x):
         seq_len = x.shape[1]
         y = F.conv1d(
@@ -1048,7 +1052,7 @@ def _m(ns):
             groups=self.hidden_size, padding=self.kernel_size - 1,
         )[..., :seq_len]
         return y.transpose(1, 2).to(x.dtype)
-    ns.model.CausalConv1dSilu.forward = patched
+    ns.model.CausalConv1dSilu._conv_dense = patched
 
 
 @_mutation("kda_conv_noncausal", "test_kda_module_fp32")
@@ -1060,7 +1064,7 @@ def _m(ns):
             groups=self.hidden_size, padding=self.kernel_size - 1,
         )[..., 1:seq_len + 1]                      # looks one step ahead
         return F.silu(y).transpose(1, 2).to(x.dtype)
-    ns.model.CausalConv1dSilu.forward = patched
+    ns.model.CausalConv1dSilu._conv_dense = patched
 
 
 @_mutation("dt_bias_transposed", "test_kda_module_fp32")
@@ -1089,7 +1093,7 @@ def _m(ns):
 def _m(ns):
     orig = ns.model.KimiK3DecoderLayer.__init__
 
-    def patched(self, config, layer_idx, kda_backend="fla_chunk"):
+    def patched(self, config, layer_idx, kda_backend="fla_triton"):
         import copy
         cfg = copy.copy(config)
         cfg.first_k_dense_replace = 0
