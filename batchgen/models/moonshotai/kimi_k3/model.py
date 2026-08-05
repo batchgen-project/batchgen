@@ -31,9 +31,17 @@ therefore un-importable on CPU dev machines and in file-path-loaded tests.
 The pure-torch components below are ports of the same oracle the kimi_linear
 module ports; provenance comments mark each.
 
+Layout: BOTH the dense ``(B, T, H)`` batch and the PACKED
+``(1, total_tokens, H)`` + ``cu_seqlens`` layout production prefill actually
+uses.  ``cu_seqlens=None`` selects the dense path bit-for-bit unchanged; a
+non-None ``cu_seqlens`` makes the MLA mask block-diagonal causal, segments the
+KDA convs, and hands ``cu_seqlens`` to ``chunk_kda``.  All three are load-
+bearing — see :func:`_build_block_causal_mask` and
+:meth:`CausalConv1dSilu.forward` for the measured corruption each prevents.
+
 Hard-fail policy (POIS decision 1): decode-shaped calls, vision tokens,
-padding masks, varlen, training, position_ids — every unsupported input
-raises, naming the milestone that will implement it.  No silent fallbacks.
+padding masks, training, position_ids — every unsupported input raises,
+naming the milestone that will implement it.  No silent fallbacks.
 
 Dtype policy (ACTIVATION_FLOW §5.4 / checkpoint facts): ``A_log``,
 ``dt_bias``, ``{q,k,v}_conv1d.weight``, ``o_norm.weight`` and
@@ -81,8 +89,17 @@ M3_DECODE_MSG = (
     "cache state."
 )
 M4_VARLEN_MSG = (
-    "Kimi-K3 M2 supports only a dense equal-length batch (attention_mask=None, "
-    "cu_seqlens=None). Packed/varlen prefill arrives in M4."
+    "Kimi-K3 does not consume a padding mask (attention_mask=None). The M4 "
+    "packed path takes a (1, total_tokens, H) batch with cu_seqlens instead — "
+    "unpad at admission and pass cu_seqlens, never a 2D padding mask."
+)
+#: Mirrors kimi_linear/model.py:576-579 verbatim in intent: the KDA path has no
+#: representation for pad tokens, so a 2D mask is a contract error, not a
+#: missing feature.
+KDA_PACKED_MASK_MSG = (
+    "KimiK3KDAAttention expects a packed layout; pass cu_seqlens, not a 2D "
+    "mask. (M4: unpad to (1, total_tokens, H) at admission — the KDA "
+    "recurrence and its convs cannot skip pad positions.)"
 )
 VISION_MSG = (
     "Kimi-K3 vision (MoonViT tower / mm_projector) is not implemented "
@@ -525,7 +542,7 @@ class CausalConv1dSilu(nn.Module):
         self.weight = nn.Parameter(
             torch.empty(hidden_size, 1, kernel_size, dtype=torch.float32))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _conv_dense(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, D) -> (B, T, D)
         seq_len = x.shape[1]
         y = F.conv1d(
@@ -536,6 +553,32 @@ class CausalConv1dSilu(nn.Module):
             padding=self.kernel_size - 1,
         )[..., :seq_len]
         return F.silu(y).transpose(1, 2).to(x.dtype)
+
+    def forward(self, x: torch.Tensor,
+                cu_seqlens: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """``cu_seqlens is None`` -> the dense path, byte-for-byte as before.
+
+        Otherwise ``x`` is the packed ``(1, total_tokens, D)`` layout and the
+        conv is applied PER SEGMENT.  A single dense conv over the packed axis
+        leaks across every boundary: the left zero-pad is replaced by the tail
+        of the previous sequence, so exactly the first ``W-1`` tokens of every
+        non-first sequence are wrong (measured on H20, syn25, W=4: the first 3
+        tokens of each of sequences 2 and 3 differ by max abs 1.598e-1 while
+        every other token is bit-exact).
+        """
+        if cu_seqlens is None:
+            return self._conv_dense(x)
+        if x.shape[0] != 1:
+            raise ValueError(
+                "CausalConv1dSilu with cu_seqlens requires the packed layout "
+                "(1, total_tokens, D); got batch {}".format(x.shape[0]))
+        # .tolist() syncs; this is the eager reference path, and the segment
+        # loop needs host-side bounds anyway.
+        bounds = cu_seqlens.tolist()
+        out = torch.empty_like(x)
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            out[:, start:end] = self._conv_dense(x[:, start:end])
+        return out
 
 
 #: The kwarg that makes the fla chunk kernel apply ``sigmoid(beta)`` itself.
@@ -551,7 +594,7 @@ def _import_chunk_kda():
     except ImportError as exc:
         raise ImportError(
             "fla-core (>= 0.5.0) is required for the KDA prefill kernel "
-            "(kda_backend='fla_chunk'). CPU parity tests must construct the "
+            "(kda_backend='fla_triton'). CPU parity tests must construct the "
             "model with kda_backend='reference' explicitly — there is no "
             "automatic fallback."
         ) from exc
@@ -582,15 +625,23 @@ class KimiK3KDAAttention(nn.Module):
     g_a_proj/g_b_proj).
 
     ``kda_backend``:
-      * ``"fla_chunk"`` (default) — fla's triton ``chunk_kda`` with the
+      * ``"fla_triton"`` (default) — fla's triton ``chunk_kda`` with the
         byte-identical flag set of the oracle call (ML:609-627).  The oracle
         was written against fla >= 0.5 semantics, where
         ``use_beta_sigmoid_in_kernel=True`` makes the kernel apply
         ``sigmoid(beta)``; ``_import_chunk_kda`` refuses any fla that does not
         name that parameter, because older ones consume beta RAW without
         complaining.
+
+        The selector is deliberately NOT named after fla's function: "chunk"
+        in ``chunk_kda`` refers to the chunkwise-PARALLEL algorithm (64-token
+        internal chunks over the whole sequence), NOT to chunked prefill.  In
+        a codebase whose headline feature is UNCHUNKED prefill, a backend
+        called ``fla_chunk`` reads as "the chunked-prefill backend" and is a
+        standing invitation to a wrong conclusion.
       * ``"reference"`` — the vendored pure-torch composition in
-        ``kda_reference.py``.  Parity/testing only; never auto-selected.
+        ``kda_reference.py``.  Parity/testing only; never auto-selected, and
+        it has NO packed/varlen path (see ``_run_kda_core``).
     """
 
     #: l2-normalize q/k inside the kernel (oracle flag, ML:619).  Class-level
@@ -598,11 +649,11 @@ class KimiK3KDAAttention(nn.Module):
     use_qk_l2norm = True
 
     def __init__(self, config: KimiK3Config, layer_idx: int,
-                 kda_backend: str = "fla_chunk"):
+                 kda_backend: str = "fla_triton"):
         super().__init__()
-        if kda_backend not in ("fla_chunk", "reference"):
+        if kda_backend not in ("fla_triton", "reference"):
             raise ValueError(
-                "kda_backend must be 'fla_chunk' or 'reference', got {!r}".format(kda_backend))
+                "kda_backend must be 'fla_triton' or 'reference', got {!r}".format(kda_backend))
         if not config.kda_use_full_rank_gate:
             raise NotImplementedError(
                 "KimiK3KDAAttention implements only the full-rank gate (the K3 "
@@ -661,8 +712,9 @@ class KimiK3KDAAttention(nn.Module):
         inside the kernel / reference."""
         return self.b_proj(hidden_states).float()
 
-    def _run_kda_core(self, q, k, v, g_raw, beta_raw):
-        if self.kda_backend == "fla_chunk":
+    def _run_kda_core(self, q, k, v, g_raw, beta_raw,
+                      cu_seqlens: Optional[torch.Tensor] = None):
+        if self.kda_backend == "fla_triton":
             chunk_kda = _import_chunk_kda()
             o, _ = chunk_kda(
                 q=q, k=k, v=v, g=g_raw, beta=beta_raw,
@@ -676,9 +728,16 @@ class KimiK3KDAAttention(nn.Module):
                 safe_gate=self.gate_lower_bound is not None,
                 lower_bound=self.gate_lower_bound,
                 transpose_state_layout=True,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens,
             )
             return o
+        if cu_seqlens is not None:
+            raise NotImplementedError(
+                "kda_backend='reference' has no packed/varlen path: the "
+                "vendored torch composition runs ONE recurrence over the whole "
+                "T axis and would silently carry delta-rule state across every "
+                "sequence boundary. Use kda_backend='fla_triton' for packed "
+                "prefill, or run the reference per segment in the caller.")
         from .kda_reference import kda_reference_prefill  # noqa: PLC0415
         return kda_reference_prefill(
             q, k, v, g_raw, beta_raw,
@@ -697,15 +756,24 @@ class KimiK3KDAAttention(nn.Module):
     ) -> torch.Tensor:
         if cache_params is not None:
             raise NotImplementedError(M3_DECODE_MSG)
-        if attention_mask is not None or cu_seqlens is not None:
-            raise NotImplementedError(M4_VARLEN_MSG)
+        if attention_mask is not None:
+            raise NotImplementedError(KDA_PACKED_MASK_MSG)
 
         batch_size, seq_len, _ = hidden_states.shape
+        if cu_seqlens is not None and batch_size != 1:
+            raise ValueError(
+                "cu_seqlens describes a PACKED (1, total_tokens, H) batch; got "
+                "batch {}. Pack the sequences before calling, or drop "
+                "cu_seqlens for a dense equal-length batch.".format(batch_size))
         h, k_dim = self.num_heads, self.head_dim
 
-        q = self.q_conv1d(self.q_proj(hidden_states))
-        k = self.k_conv1d(self.k_proj(hidden_states))
-        v = self.v_conv1d(self.v_proj(hidden_states))
+        # cu_seqlens is load-bearing in BOTH places: the convs leak the
+        # previous sequence's tail into the first W-1 tokens of the next, and
+        # chunk_kda without it runs one recurrence across every boundary.
+        # Fixing only one of the two still gives wrong numbers (measured).
+        q = self.q_conv1d(self.q_proj(hidden_states), cu_seqlens=cu_seqlens)
+        k = self.k_conv1d(self.k_proj(hidden_states), cu_seqlens=cu_seqlens)
+        v = self.v_conv1d(self.v_proj(hidden_states), cu_seqlens=cu_seqlens)
 
         g_raw = self.f_b_proj(self.f_a_proj(hidden_states))
         g_raw = g_raw.view(batch_size, seq_len, h, k_dim)
@@ -715,7 +783,7 @@ class KimiK3KDAAttention(nn.Module):
         k = k.view(batch_size, seq_len, h, k_dim)
         v = v.view(batch_size, seq_len, h, k_dim)
 
-        o = self._run_kda_core(q, k, v, g_raw, beta_raw)
+        o = self._run_kda_core(q, k, v, g_raw, beta_raw, cu_seqlens=cu_seqlens)
 
         g_out = self.g_proj(hidden_states).view(batch_size, seq_len, h, k_dim)
         o = self.o_norm(o, g_out)
@@ -790,7 +858,7 @@ class KimiK3DecoderLayer(nn.Module):
     to block_residual and the accumulator resets (assignment, not add)."""
 
     def __init__(self, config: KimiK3Config, layer_idx: int,
-                 kda_backend: str = "fla_chunk"):
+                 kda_backend: str = "fla_triton"):
         super().__init__()
         if config.attn_res_block_size is None:
             raise ValueError(
@@ -818,11 +886,16 @@ class KimiK3DecoderLayer(nn.Module):
         self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
         self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
-    def _run_attn(self, hidden_states, attention_mask):
-        # Both mixer kinds take the same call. KDA ignores the causal mask
-        # (its recurrence is causal by construction) and the model already
-        # passes None for KDA layers (ML:1194-1195), so there is nothing to
-        # branch on here.
+    def _run_attn(self, hidden_states, attention_mask, cu_seqlens=None):
+        # The two mixer kinds consume the packed layout through DIFFERENT
+        # channels: KDA needs cu_seqlens (its recurrence and convs are
+        # sequential in T and would run straight through a boundary), MLA
+        # needs the mask (which the model builds block-diagonal causal when
+        # packed). The model still passes attention_mask=None for KDA layers
+        # (ML:1194-1195); forwarding it keeps the 2D-mask hard-fail live.
+        if self.is_linear_attn:
+            return self.self_attn(hidden_states, attention_mask=attention_mask,
+                                  cu_seqlens=cu_seqlens)
         return self.self_attn(hidden_states, attention_mask=attention_mask)
 
     def _run_ffn(self, hidden_states):
@@ -835,6 +908,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         block_residual: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
         prefix_sum = hidden_states                                     # ML:985
@@ -854,7 +928,8 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None                                          # ML:998
 
         hidden_states = self.input_layernorm(hidden_states)            # ML:1000
-        hidden_states = self._run_attn(hidden_states, attention_mask)  # ML:1003
+        hidden_states = self._run_attn(                                # ML:1003
+            hidden_states, attention_mask, cu_seqlens)
 
         if prefix_sum is not None:                                     # ML:1023-1026
             prefix_sum = prefix_sum + hidden_states
@@ -886,8 +961,37 @@ def _build_causal_mask(seq_len: int, device, dtype) -> torch.Tensor:
     return mask.triu(1)
 
 
+def _build_block_causal_mask(cu_seqlens: torch.Tensor, seq_len: int, device,
+                             dtype) -> torch.Tensor:
+    """Additive bias for the eager MLA path on a PACKED (1, total_tokens, H)
+    batch: -inf above the diagonal AND across every sequence boundary.
+
+    The plain triangular mask is not merely imprecise here, it is catastrophic:
+    with it, sequence 2 attends to all of sequence 1.  Measured on H20 (syn25,
+    seqlens [37, 53, 128], bf16): relative error 1.08 on sequence 1 and 0.95 on
+    sequence 2 — i.e. the output is unrelated to the truth.  With this mask the
+    packed MLA module is BIT-EXACT to the per-sequence oracle.
+
+    ``right=True`` is load-bearing.  With the EXCLUSIVE segment ends
+    ``cu_seqlens[1:]`` as boundaries, ``bucketize(i, ends, right=True)`` returns
+    the ``j`` with ``ends[j-1] <= i < ends[j]`` — exactly the segment id of
+    token ``i``.  ``right=False`` returns the ``j`` with ``ends[j-1] < i <=
+    ends[j]`` instead, so each sequence's FIRST token (``i == ends[j-1]``)
+    counts its own segment's start-boundary and lands in the PREVIOUS segment;
+    that off-by-one was tried and left the fp32 whole-model relative error at
+    7.4e-2 — small enough to look like drift, which is exactly why it is
+    called out here.
+    """
+    idx = torch.arange(seq_len, device=device, dtype=torch.long)
+    seg = torch.bucketize(idx, cu_seqlens[1:].to(device=device, dtype=torch.long),
+                          right=True)
+    allowed = (idx.unsqueeze(1) >= idx.unsqueeze(0)) & (seg.unsqueeze(1) == seg.unsqueeze(0))
+    mask = torch.zeros((1, 1, seq_len, seq_len), device=device, dtype=dtype)
+    return mask.masked_fill(~allowed, float("-inf"))
+
+
 class KimiK3Model(nn.Module):
-    def __init__(self, config: KimiK3Config, kda_backend: str = "fla_chunk"):
+    def __init__(self, config: KimiK3Config, kda_backend: str = "fla_triton"):
         super().__init__()
         config.validate()   # defensive; parse_k3_config already ran this
         self.config = config
@@ -947,6 +1051,7 @@ class KimiK3Model(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self._guard_prefill_only(past_key_values, attention_mask, position_ids)
         if (input_ids is None) == (inputs_embeds is None):
@@ -960,21 +1065,25 @@ class KimiK3Model(nn.Module):
 
         causal_mask = None
         if seq_len > 1:
-            causal_mask = _build_causal_mask(
-                seq_len, hidden_states.device, hidden_states.dtype)
+            if cu_seqlens is None:
+                causal_mask = _build_causal_mask(
+                    seq_len, hidden_states.device, hidden_states.dtype)
+            else:
+                causal_mask = _build_block_causal_mask(
+                    cu_seqlens, seq_len, hidden_states.device, hidden_states.dtype)
 
         block_residual = self._initial_block_residual(hidden_states)
 
         for decoder_layer in self.layers:
             layer_mask = None if decoder_layer.is_linear_attn else causal_mask
             hidden_states, block_residual = decoder_layer(
-                hidden_states, layer_mask, block_residual)
+                hidden_states, layer_mask, block_residual, cu_seqlens)
 
         return self._finalize(hidden_states, block_residual)
 
 
 class KimiK3ForCausalLM(nn.Module):
-    def __init__(self, config: KimiK3Config, kda_backend: str = "fla_chunk"):
+    def __init__(self, config: KimiK3Config, kda_backend: str = "fla_triton"):
         super().__init__()
         self.config = config
         self.model = KimiK3Model(config, kda_backend=kda_backend)
@@ -988,6 +1097,7 @@ class KimiK3ForCausalLM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values=None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
@@ -995,6 +1105,7 @@ class KimiK3ForCausalLM(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            cu_seqlens=cu_seqlens,
         )
         # BF16 head, no fp32 cast (ML:1298-1301).
         return self.lm_head(hidden_states)

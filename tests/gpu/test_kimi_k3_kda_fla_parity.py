@@ -20,7 +20,7 @@ backs BOTH stacks there, so the kernel interior cancels):
        Acceptance for kernel-vs-reference is fla's OWN err_ratio bar
        (RMS-relative < 0.005), not the per-element bf16 gate: see
        kimi_k3_harness.assert_kernel_err_ratio for the measured rationale.
-  B    our KimiK3KDAAttention (kda_backend='fla_chunk') vs the vendored oracle
+  B    our KimiK3KDAAttention (kda_backend='fla_triton') vs the vendored oracle
        KimiDeltaAttention running the REAL fla — synthetic and REAL dims; plus
        micro-parity of our pure-torch conv / gated-norm vs fla's
        ShortConvolution / FusedRMSNormGated.
@@ -29,6 +29,18 @@ backs BOTH stacks there, so the kernel interior cancels):
        memory bound at T=16384, nb=8, H=7168.
   E    full K3-SYN-25 model, GPU bf16: ours (fla backend) vs the oracle
        (real fla, MLA forced to eager).
+  F    PACKED (varlen) prefill — the layout production actually uses:
+       (1, total_tokens, H) + cu_seqlens, against the oracle, which has no
+       packed path of its own.  KDA and MLA sub-modules at UNEQUAL lengths
+       [37, 53, 128] vs the oracle per sequence: BIT-EXACT.  Whole model at
+       EQUAL lengths (3x37, 2x53) vs the oracle's dense (N, T) batch:
+       BIT-EXACT in bf16 and fp32 — equal lengths keep every GEMM's M
+       dimension identical, so the comparison isolates packing.  Every one of
+       those carries a MANDATORY control (cu_seqlens=None, or the plain
+       triangular mask) that must FAIL.  Unequal lengths at full depth are
+       pinned separately: parity there is precluded by the amplification chain
+       of test_E_kernel_seam_amplification, measured and explained in
+       test_F_varlen_full_depth_limit.
 
 Launch (from the repo root ON instance-1; see run_kimi_k3_kda_instance1.sh):
     K3_GPU_STAGE=1 CUDA_VISIBLE_DEVICES=0 python -m pytest \
@@ -257,7 +269,7 @@ def _build_kda_pair_gpu(cfg_dict, tag):
     cfg = H.build_our_config(cfg_dict)
     ocfg = configuration.KimiLinearConfig(**cfg_dict["text_config"])
     ocfg._attn_implementation = "eager"
-    our_mod = ours.model.KimiK3KDAAttention(cfg, layer_idx=0, kda_backend="fla_chunk")
+    our_mod = ours.model.KimiK3KDAAttention(cfg, layer_idx=0, kda_backend="fla_triton")
     oracle_mod = modeling.KimiDeltaAttention(ocfg, layer_idx=0)
     ours_sd, oracle_sd = H.make_state_dicts(
         H.named_shapes_of(our_mod), cfg.kda_num_heads, prefix="gpuB:{}:".format(tag))
@@ -467,8 +479,13 @@ def _share_fla_kernels(model, ours):
                                   activation="silu").to(mod.weight.device)
             sc.weight = mod.weight                     # SHARE, never copy
             mod._fla = sc
-            mod.forward = (lambda x, _m=mod: _m._fla(
-                x=x, cache=None, output_final_state=False, cu_seqlens=None)[0])
+            # cu_seqlens must be FORWARDED, not hardcoded None: the packed
+            # tests below call the conv with a real cu_seqlens, and a swallowed
+            # one silently reintroduces the cross-sequence leak (first W-1
+            # tokens of every non-first sequence) that Part F exists to detect.
+            mod.forward = (lambda x, cu_seqlens=None, _m=mod: _m._fla(
+                x=x, cache=None, output_final_state=False,
+                cu_seqlens=cu_seqlens)[0])
             swapped[0] += 1
         elif isinstance(mod, m.KimiGatedRMSNormSigmoid):
             fn = FusedRMSNormGated(mod.weight.shape[0], eps=mod.variance_epsilon,
@@ -550,12 +567,14 @@ def test_E_kernel_seam_amplification():
 
 
 
-def test_E_full_model_gpu():
+def _build_full_model_pair_gpu(dtype=torch.bfloat16):
+    """(ours, oracle, cfg) at K3-SYN-25, identical seeded weights, fla kernels
+    SHARED into our stack (see _share_fla_kernels)."""
     ours = H.load_our_modules()
     configuration, modeling = _load_oracle_gpu()
     cfg_dict = H.syn25_config_dict()
     cfg = H.build_our_config(cfg_dict)
-    our_model = ours.model.KimiK3ForCausalLM(cfg, kda_backend="fla_chunk")
+    our_model = ours.model.KimiK3ForCausalLM(cfg, kda_backend="fla_triton")
     ocfg = configuration.KimiLinearConfig(**cfg_dict["text_config"])
     ocfg._attn_implementation = "eager"
     ocfg.use_cache = False
@@ -578,12 +597,17 @@ def test_E_full_model_gpu():
         H.named_shapes_of(our_model), cfg.kda_num_heads)
     our_model.load_state_dict(ours_sd, strict=True)
     oracle_model.load_state_dict(oracle_sd, strict=True)
-    ours.model.cast_model_to_inference_dtype(our_model, torch.bfloat16)
-    H.cast_selective(oracle_model, torch.bfloat16)
+    if dtype != torch.float32:
+        ours.model.cast_model_to_inference_dtype(our_model, dtype)
+        H.cast_selective(oracle_model, dtype)
     our_model = our_model.to(DEV).eval()
     oracle_model = oracle_model.to(DEV).eval()
-
     _share_fla_kernels(our_model, ours)
+    return our_model, oracle_model, cfg
+
+
+def test_E_full_model_gpu():
+    our_model, oracle_model, cfg = _build_full_model_pair_gpu(torch.bfloat16)
 
     ids = H.seeded_token_ids("gpuE", 2, 512, cfg.vocab_size,
                              cfg.media_placeholder_token_id).to(DEV)
@@ -601,3 +625,276 @@ def test_E_full_model_gpu():
             (ours_logits.float() - ref_logits.float()).pow(2).mean().sqrt().item()
             / (ref_logits.float().pow(2).mean().sqrt().item() + 1e-8),
             (ours_logits.argmax(-1) == ref_logits.argmax(-1)).float().mean().item()))
+
+
+
+
+# --------------------------------------------------------------------------- #
+#  F — PACKED (varlen) prefill: (1, total_tokens, H) + cu_seqlens               #
+# --------------------------------------------------------------------------- #
+#: Deliberately unequal, and none of them a multiple of chunk_kda's internal
+#: 64 except the last: 37 is a segment SHORTER than one kernel chunk, 53 puts a
+#: boundary inside a chunk, 128 is chunk-aligned.  Every number quoted in this
+#: section was measured at these seqlens on H20, 2026-08-06.
+PACKED_SEQLENS = (37, 53, 128)
+
+
+def _cu_seqlens(seqlens=PACKED_SEQLENS):
+    cu = [0]
+    for n in seqlens:
+        cu.append(cu[-1] + n)
+    return torch.tensor(cu, dtype=torch.int32, device=DEV), cu[-1]
+
+
+def _segments(cu):
+    bounds = cu.tolist()
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def _err_ratio(a, r):
+    a, r = a.float(), r.float()
+    return (a - r).pow(2).mean().sqrt().item() / (r.pow(2).mean().sqrt().item() + 1e-8)
+
+
+def test_F_kda_module_packed_varlen():
+    """Our KDA module on a PACKED batch vs the oracle run PER SEQUENCE.
+
+    The oracle has no packed layout — its reference is N independent
+    (B=1, T=T_i) forwards concatenated along the token axis.  Bit-exactness is
+    the right bar here (measured 0.000e+00): every op in the KDA module is
+    either token-parallel — the projections, whose GEMM splits along M and so
+    keeps each row's K-reduction order — or explicitly segmented (the convs and
+    chunk_kda, both via cu_seqlens).
+
+    Both packing hazards on this path are live in this comparison: a dense conv
+    over the packed axis puts max abs 1.598e-1 into the first W-1 = 3 tokens of
+    every non-first sequence, and chunk_kda without cu_seqlens carries the
+    delta-rule state straight through the boundaries.
+    """
+    ours_mods = H.load_our_modules()
+    our_mod, oracle_mod, cfg = _build_kda_pair_gpu(H.syn25_config_dict(), "packed")
+    _share_fla_kernels(our_mod, ours_mods)
+    cu, total = _cu_seqlens()
+    hidden = H.seeded_input("gpuF:h:kda", 1, total, cfg.hidden_size,
+                            dtype=torch.bfloat16).to(DEV)
+    with torch.no_grad():
+        packed = our_mod(hidden, cu_seqlens=cu)
+        ref = torch.cat(
+            [oracle_mod(hidden_states=hidden[:, s:e], attention_mask=None)
+             for s, e in _segments(cu)], dim=1)
+    assert packed.shape == ref.shape
+    assert torch.equal(packed, ref), (
+        "packed KDA module is not bit-identical to the per-sequence oracle; "
+        "max_abs={:.3e}, and over the first 3 tokens of sequence 2 alone "
+        "max_abs={:.3e} (if that second number carries the first, the CONV "
+        "boundary is the leak, not the recurrence)".format(
+            (packed.float() - ref.float()).abs().max().item(),
+            (packed[:, 37:40].float() - ref[:, 37:40].float()).abs().max().item()))
+
+
+def _build_mla_pair_gpu(cfg_dict, tag, layer_idx=3):
+    ours = H.load_our_modules()
+    configuration, modeling = _load_oracle_gpu()
+    cfg = H.build_our_config(cfg_dict)
+    ocfg = configuration.KimiLinearConfig(**cfg_dict["text_config"])
+    ocfg._attn_implementation = "eager"
+    our_mod = ours.model.KimiK3MLAAttention(cfg, layer_idx=layer_idx)
+    oracle_mod = modeling.KimiMLAAttention(ocfg, layer_idx=layer_idx)
+    ours_sd, oracle_sd = H.make_state_dicts(
+        H.named_shapes_of(our_mod), cfg.kda_num_heads, prefix="gpuF:{}:".format(tag))
+    our_mod.load_state_dict(ours_sd, strict=True)
+    oracle_mod.load_state_dict(oracle_sd, strict=True)
+    ours.model.cast_model_to_inference_dtype(our_mod, torch.bfloat16)
+    H.cast_selective(oracle_mod, torch.bfloat16)
+    return our_mod.to(DEV).eval(), oracle_mod.to(DEV).eval(), cfg
+
+
+def test_F_mla_module_packed_block_mask():
+    """The MLA half of the packing contract: our block-diagonal causal mask on
+    a packed batch vs the oracle run per sequence with its own plain causal
+    mask.  Bit-exact (measured 0.000e+00 in bf16).
+
+    The control in the same test is the whole point.  Feed the SAME packed
+    batch through the SAME module with the plain triangular mask this model
+    used before packing existed, and sequence 2 attends to all of sequence 1:
+    err_ratio 7.74e-1 — the output is unrelated to the truth, not merely
+    imprecise.  So this is not a tolerance question, and a future "simplify the
+    mask" refactor cannot pass by accident.
+    """
+    ours = H.load_our_modules()
+    our_mod, oracle_mod, cfg = _build_mla_pair_gpu(H.syn25_config_dict(), "mla")
+    cu, total = _cu_seqlens()
+    hidden = H.seeded_input("gpuF:h:mla", 1, total, cfg.hidden_size,
+                            dtype=torch.bfloat16).to(DEV)
+    block_mask = ours.model._build_block_causal_mask(cu, total, DEV, torch.bfloat16)
+    with torch.no_grad():
+        packed = our_mod(hidden, attention_mask=block_mask)
+        ref = torch.cat(
+            [oracle_mod(hidden_states=hidden[:, s:e],
+                        attention_mask=ours.model._build_causal_mask(
+                            e - s, DEV, torch.bfloat16))
+             for s, e in _segments(cu)], dim=1)
+        plain = our_mod(hidden, attention_mask=ours.model._build_causal_mask(
+            total, DEV, torch.bfloat16))
+    assert torch.equal(packed, ref), (
+        "packed MLA with the block-diagonal mask is not bit-identical to the "
+        "per-sequence oracle; max_abs={:.3e}".format(
+            (packed.float() - ref.float()).abs().max().item()))
+    control = _err_ratio(plain, ref)
+    print("\n[F] MLA plain-triangular-mask control: err_ratio={:.3e} "
+          "(cross-sequence attention)".format(control))
+    assert control > 1e-1, (
+        "the plain triangular mask no longer corrupts the packed batch "
+        "(err_ratio {:.3e}). Either the mask stopped being applied at all or "
+        "the sequences stopped interacting — re-derive before trusting the "
+        "block-mask claim.".format(control))
+
+
+@pytest.mark.parametrize("dtype,n_seq,seq_len", [
+    (torch.bfloat16, 3, 37),
+    (torch.float32, 3, 37),
+    (torch.bfloat16, 2, 53),
+    (torch.float32, 2, 53),
+])
+def test_F_full_model_packed_equal_lengths(dtype, n_seq, seq_len):
+    """THE whole-model packed gate: N EQUAL-length sequences packed into
+    (1, N*T, H) + cu_seqlens vs the oracle's dense (N, T) batch.  BIT-EXACT,
+    measured 0.000e+00 in both bf16 and fp32.
+
+    Equal lengths are chosen for a specific, load-bearing reason, not for
+    convenience.  Packing changes the M dimension of every nn.Linear in the
+    stack, and cuBLAS picks its kernel and split from the problem shape; with
+    UNEQUAL lengths the packed run (M = 218) and the per-sequence reference
+    runs (M = 37 / 53 / 128) therefore differ by ~3e-7 in the very first
+    projection even when the packing is perfect, and this model amplifies that
+    seed without bound (see test_F_varlen_full_depth_limit).  With equal lengths
+    the dense batch flattens to M = N*T = the packed total, every GEMM shape is
+    IDENTICAL, and the comparison isolates exactly what is under test: the
+    block-diagonal mask, the segmented convs, and cu_seqlens into chunk_kda.
+
+    T is deliberately NOT a multiple of chunk_kda's internal 64 (37, 53), so
+    the sequence boundaries land inside kernel chunks.
+
+    The control — the same packed token stream with cu_seqlens=None — lands at
+    err_ratio ~1.0 (measured 1.13 at 3x37, 0.98 at 2x53). There is no
+    tolerance question here at all: correct is bitwise, broken is O(1).
+    """
+    our_model, oracle_model, cfg = _build_full_model_pair_gpu(dtype)
+    ids = H.seeded_token_ids("gpuF:eq:{}x{}".format(n_seq, seq_len), n_seq,
+                             seq_len, cfg.vocab_size,
+                             cfg.media_placeholder_token_id).to(DEV)
+    packed_ids = ids.reshape(1, n_seq * seq_len)
+    cu = torch.tensor([seq_len * i for i in range(n_seq + 1)],
+                      dtype=torch.int32, device=DEV)
+    with torch.no_grad():
+        packed = our_model(input_ids=packed_ids, cu_seqlens=cu)
+        ref = oracle_model(input_ids=ids, use_cache=False).logits.reshape(
+            1, n_seq * seq_len, -1)
+        no_cu = our_model(input_ids=packed_ids)
+    assert packed.shape == ref.shape
+    assert torch.equal(packed, ref), (
+        "packed {}x{} [{}] is not bit-identical to the oracle's dense batch: "
+        "err_ratio={:.3e}, max_abs={:.3e}".format(
+            n_seq, seq_len, dtype, _err_ratio(packed, ref),
+            (packed.float() - ref.float()).abs().max().item()))
+
+    # MANDATORY discriminating control: without it the assertion above could be
+    # passing for a reason unrelated to packing.
+    control = _err_ratio(no_cu, ref)
+    print("\n[F] control cu_seqlens=None {}x{} [{}]: err_ratio={:.3e}".format(
+        n_seq, seq_len, dtype, control))
+    assert not torch.equal(no_cu, ref), (
+        "the SAME packed token stream WITHOUT cu_seqlens produced the same "
+        "logits — cu_seqlens is inert and this test proves nothing")
+    assert control > 1e-1, (
+        "cu_seqlens=None on a packed batch only costs err_ratio {:.3e}; the "
+        "hazards it is supposed to prevent (cross-sequence attention, conv "
+        "leak, unsegmented recurrence) are no longer reproducing, so this "
+        "gate has stopped discriminating".format(control))
+
+
+def test_F_varlen_full_depth_limit():
+    """UNEQUAL lengths at full depth: pins WHY logit-level parity is
+    unattainable there, so nobody "fixes" a future failure by loosening a gate
+    — and asserts the part that IS attainable.
+
+    Measured 2026-08-06, H20, seqlens (37, 53, 128), against the oracle run per
+    sequence:  packed err_ratio 1.62e-1 (bf16) / 4.29e-1 (fp32), while the
+    cu_seqlens=None control sits at 1.25.  Those are not packing bugs; the
+    chain was traced end to end:
+
+      1. The packed run's GEMMs have M = 218, the reference runs' M = 37/53/128.
+         A bare nn.Linear(448 -> 2112) already differs by err_ratio 4.2e-7
+         between the two shapes in fp32 (measured directly). Nothing can remove
+         this: it is the definition of packing.
+      2. `chunk_kda` has the perturbation FLOOR that
+         test_E_kernel_seam_amplification pins: 3e-7 in, 5e-5 out at the KDA
+         module output (measured here, ~170x).
+      3. The top-16-of-64 sigmoid router turns that into a discrete event. In
+         bf16 the packed and per-sequence runs are BIT-IDENTICAL through
+         decoder layers 0 and 1 (layer-1 router: 0 of 218 tokens select a
+         different expert set) and first diverge at layer 2, at 1.36e-4 — a
+         flipped expert, not drift. From there it runs away over 25 layers.
+
+    Removing amplifier 3 (a config with top-k == num_experts, i.e. a
+    continuous router) still leaves err_ratio 5.0e-3 bf16 / 5.0e-3 fp32,
+    because amplifier 2 alone compounds across 25 layers. So the ceiling is
+    structural, not a tolerance choice.
+
+    What IS asserted: decoder layer 0 — KDA + dense MLP, the layer that
+    carries BOTH the conv and the recurrence hazard and no router at all —
+    must be bit-identical packed vs per-sequence; and the packed logits must be
+    far closer to the reference than the cu_seqlens=None control.
+    The whole-model bitwise gate lives in
+    test_F_full_model_packed_equal_lengths, where the GEMM shapes match.
+    """
+    our_model, oracle_model, cfg = _build_full_model_pair_gpu(torch.bfloat16)
+    cu, total = _cu_seqlens()
+    segs = _segments(cu)
+    ids = H.seeded_token_ids("gpuF:ids", 1, total, cfg.vocab_size,
+                             cfg.media_placeholder_token_id).to(DEV)
+
+    layer0 = our_model.model.layers[0]
+    assert layer0.is_linear_attn and hasattr(layer0, "mlp"), (
+        "layer 0 is expected to be KDA + dense MLP (no router); the config "
+        "changed and this test's premise with it")
+
+    captured = []
+    handle = layer0.register_forward_hook(
+        lambda m, a, out: captured.append(out[0].detach()))
+    with torch.no_grad():
+        packed = our_model(input_ids=ids, cu_seqlens=cu)
+        packed_l0 = captured.pop()
+        per_seq_l0 = []
+        for s, e in segs:
+            our_model(input_ids=ids[:, s:e])
+            per_seq_l0.append(captured.pop())
+        no_cu = our_model(input_ids=ids)
+        captured.pop()
+        ref = torch.cat([oracle_model(input_ids=ids[:, s:e], use_cache=False).logits
+                         for s, e in segs], dim=1)
+    handle.remove()
+
+    l0_ref = torch.cat(per_seq_l0, dim=1)
+    assert torch.equal(packed_l0, l0_ref), (
+        "decoder layer 0 (KDA + dense MLP) is not bit-identical packed vs "
+        "per-sequence at unequal lengths: err_ratio={:.3e}, max_abs={:.3e}. "
+        "This layer has no router, so a difference here is the conv or the "
+        "recurrence leaking across a boundary — a real packing bug.".format(
+            _err_ratio(packed_l0, l0_ref),
+            (packed_l0.float() - l0_ref.float()).abs().max().item()))
+
+    err_packed = _err_ratio(packed, ref)
+    err_control = _err_ratio(no_cu, ref)
+    print("\n[F] unequal lengths at full depth: packed err_ratio={:.3e}, "
+          "cu_seqlens=None control={:.3e} ({:.1f}x)".format(
+              err_packed, err_control, err_control / max(err_packed, 1e-12)))
+    assert err_control > 4.0 * err_packed, (
+        "packing no longer separates from the cu_seqlens=None control "
+        "(packed {:.3e} vs control {:.3e}) — either cu_seqlens stopped being "
+        "honoured or the control stopped being wrong".format(
+            err_packed, err_control))
+    assert err_packed < 0.5, (
+        "packed err_ratio {:.3e} is at the level of the BROKEN control "
+        "(measured 1.25): the amplification story above cannot account for "
+        "this and a genuine packing bug should be suspected".format(err_packed))
