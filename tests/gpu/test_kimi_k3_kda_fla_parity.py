@@ -269,25 +269,45 @@ def _build_kda_pair_gpu(cfg_dict, tag):
 
 
 def test_B_kda_module_synthetic_dims():
+    """Our KDA module's COMPOSITION vs the oracle's, on shared kernels.
+
+    Like test_E, this comparison would otherwise straddle two equally-correct
+    implementations of conv and gated-norm; chunk_kda's ~1e-5 perturbation
+    floor turns that 1e-7 seam into a fail_frac of 3.3e-3 (measured before
+    sharing). The kernels themselves are gated by test_B_conv_micro_parity /
+    test_B_gated_norm_micro_parity; what is under test HERE is our wiring —
+    projection order, the A_log slice, dt_bias layout, beta at the call site,
+    the o_norm gate source. Sharing makes it bit-exact, which is a strictly
+    stronger assertion than the gate it replaces.
+    """
+    ours_mods = H.load_our_modules()
     our_mod, oracle_mod, cfg = _build_kda_pair_gpu(H.syn25_config_dict(), "syn")
+    _share_fla_kernels(our_mod, ours_mods)
     hidden = H.seeded_input("gpuB:h:syn", 2, 333, cfg.hidden_size,
                             dtype=torch.bfloat16).to(DEV)
     with torch.no_grad():
         ours = our_mod(hidden)
         ref = oracle_mod(hidden_states=hidden, attention_mask=None)
-    H.assert_bf16_gate(ours, ref, "KDA module GPU synthetic dims")
+    assert torch.equal(ours, ref), (
+        "KDA module GPU synthetic dims: not bit-identical on shared kernels; "
+        "max_abs={:.3e}".format((ours.float() - ref.float()).abs().max().item()))
 
 
 def test_B_kda_module_real_dims():
     """One layer at the TRUE K3 geometry: hidden 7168, 96 heads x 128, ~890 MB
-    of bf16 weights per stack."""
+    of bf16 weights per stack. Shared kernels, same reasoning as above."""
+    ours_mods = H.load_our_modules()
     our_mod, oracle_mod, cfg = _build_kda_pair_gpu(H.real_config_dict(), "real")
+    _share_fla_kernels(our_mod, ours_mods)
     hidden = H.seeded_input("gpuB:h:real", 1, 512, cfg.hidden_size,
                             dtype=torch.bfloat16).to(DEV)
     with torch.no_grad():
         ours = our_mod(hidden)
         ref = oracle_mod(hidden_states=hidden, attention_mask=None)
-    H.assert_bf16_gate(ours, ref, "KDA module GPU real dims (96x128)")
+    assert torch.equal(ours, ref), (
+        "KDA module GPU real dims (96x128): not bit-identical on shared "
+        "kernels; max_abs={:.3e}".format(
+            (ours.float() - ref.float()).abs().max().item()))
 
 
 def test_B_conv_micro_parity():
@@ -505,20 +525,28 @@ def test_E_kernel_seam_amplification():
         "re-measure before changing anything.".format(rel_in, gain))
 
     # 2. the router's discontinuity: how close tokens sit to the top-k edge
-    ours_mod = H.load_our_modules().model
     cfg = H.build_our_config(H.syn25_config_dict())
+    top = int(cfg.num_experts_per_token)
     torch.manual_seed(0)
-    scores = torch.rand(1024, cfg.n_routed_experts, device=DEV)
-    top = cfg.num_experts_per_tok
+    scores = torch.rand(1024, int(cfg.num_experts), device=DEV)
     srt = scores.sort(dim=-1, descending=True).values
     boundary_gap = (srt[:, top - 1] - srt[:, top]).abs()
     near = (boundary_gap < 1e-4).sum().item()
-    print("[seam] router top-{} boundary: {} / 1024 tokens within 1e-4 "
-          "(min gap {:.2e})".format(top, near, boundary_gap.min().item()))
-    assert near > 0, (
-        "no token sits within 1e-4 of the top-k boundary; the router-flip half "
-        "of the amplification story no longer reproduces — re-derive it")
-    assert ours_mod is not None
+    print("[seam] router top-{} of {}: {} / 1024 tokens within 1e-4 of the "
+          "rank-{}/{} boundary (min gap {:.2e})".format(
+              top, int(cfg.num_experts), near, top, top + 1,
+              boundary_gap.min().item()))
+    # A ~1e-5 perturbation (amplifier 1's output floor) flips any token whose
+    # boundary gap is below it, and one flip was enough to carry layer 1's
+    # entire MoE divergence. Requiring only that the min gap is under 1e-4
+    # keeps this robust: the claim is that the boundary is APPROACHED, not
+    # that a fixed count sits there.
+    assert boundary_gap.min().item() < 1e-4, (
+        "closest token sits {:.2e} from the top-k boundary — far above the "
+        "~1e-5 perturbation floor, so the router-flip half of the "
+        "amplification story no longer reproduces; re-derive it before "
+        "trusting any whole-model parity claim".format(
+            boundary_gap.min().item()))
 
 
 
