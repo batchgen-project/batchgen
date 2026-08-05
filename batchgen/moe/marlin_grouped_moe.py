@@ -277,10 +277,19 @@ def _require_mxfp4_kernels():
     """L1: the marlin MXFP4 entries must exist — K3 refuses to run otherwise."""
     missing = [k for k in _MXFP4_KERNEL_ENTRIES if not hasattr(_module, k)]
     if missing:
+        # Name the .so actually loaded. A stale copy installed in
+        # site-packages shadows the repo's in-tree build whenever the repo
+        # root is not on sys.path (e.g. `python path/to/script.py`, whose
+        # sys.path[0] is the SCRIPT's directory) — in which case the fix is
+        # the import path, not a rebuild.
+        loaded = getattr(_module, "__file__", "<unknown>")
         raise RuntimeError(
             f"Marlin MXFP4 kernel entries missing from "
             f"batchgen_kernels.moe._C_marlin_grouped_gemm: {missing}. "
-            f"K3 refuses to run (stale batchgen_kernels build — rebuild). "
+            f"The extension actually loaded is {loaded} — if that path is "
+            f"not inside this repo, a stale installed copy is shadowing the "
+            f"in-tree build; fix sys.path/PYTHONPATH rather than rebuilding. "
+            f"K3 refuses to run. "
             f"The designated parity-debug opt-in is batchgen_debug."
             f"k3_moe_reference; its model-side wiring is a named follow-up "
             f"of task #34 — if it is not wired yet there is NO alternative "
