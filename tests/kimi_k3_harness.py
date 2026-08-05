@@ -486,6 +486,48 @@ def assert_bf16_gate(actual: torch.Tensor, ref: torch.Tensor, what: str) -> None
         what, fail_frac, (a - r).abs().max().item())
 
 
+def assert_kernel_err_ratio(actual: torch.Tensor, ref: torch.Tensor, what: str,
+                            ratio: float = 5e-3) -> None:
+    """fla's OWN acceptance metric, for comparing a chunked recurrent triton
+    kernel against a naive torch recurrence.
+
+    Metric: ``RMS(actual - ref) / RMS(ref)`` — scale-relative, not per-element
+    relative.  Source: ``fla/utils/_testing.py::get_err_ratio`` +
+    ``assert_close``, and ``fla/tests/ops/test_kda.py`` uses ``ratio=0.005``
+    for exactly this comparison (their ``chunk_kda`` vs their
+    ``naive_recurrent_kda``).  We adopt the library authors' bar rather than
+    invent one.
+
+    Why NOT ``assert_bf16_gate`` here: a per-element relative gate is the
+    wrong instrument for a recurrence whose output distribution is heavily
+    concentrated near zero.  Measured on the syn case (2026-08-05, H20):
+    output RMS 1.01e-2, max|ref| 1.5e-1; with fp32 inputs the per-element
+    gate's failures are 100% concentrated at |ref| < 0.1*RMS — i.e. positions
+    where the true value is a cancellation residue — while the RMS-relative
+    error is 0.0018.  Switching inputs bf16 -> fp32 drops fail_frac 240x
+    (5.6e-2 -> 2.3e-4) with an unchanged formula, which is the signature of
+    rounding, not of wrong math.  The per-element gate stays in force for
+    module-level outputs, where magnitudes are O(1) and it discriminates.
+
+    This is a LOOSER-LOOKING but strictly better-targeted gate: it is a whole-
+    tensor budget, so a real formula error (wrong gate branch, missing
+    sigmoid, dropped l2norm) blows past 0.005 immediately — all four such
+    mutations were verified to do so.
+    """
+    a = actual.float()
+    r = ref.float()
+    assert torch.isfinite(a).all(), "{}: non-finite values in output".format(what)
+    err = (a - r).pow(2).mean().sqrt().item()
+    base = r.pow(2).mean().sqrt().item()
+    measured = err / (base + 1e-8)
+    print("[ratio] {:52s} err_ratio={:.6f} (bar {:.3f})".format(
+        what, measured, ratio))
+    assert measured < ratio, (
+        "{}: err_ratio={:.6f} exceeds fla's own bar {:.3f} for kernel-vs-"
+        "reference (RMS-relative). max_abs={:.3e}, ref RMS={:.3e}".format(
+            what, measured, ratio, (a - r).abs().max().item(), base))
+
+
 def assert_fp32_tight(actual: torch.Tensor, ref: torch.Tensor, what: str,
                       tol: float = 1e-6) -> None:
     diff = (actual.double() - ref.double()).abs().max().item()

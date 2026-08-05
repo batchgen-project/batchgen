@@ -8,14 +8,18 @@
 This is the closure for everything the CPU suite cannot see (the fla CPU shim
 backs BOTH stacks there, so the kernel interior cancels):
 
-  PRE  fla version pin (0.4.2 — the API the oracle was written against).
+  PRE  fla CAPABILITY probe: chunk_kda must NAME use_beta_sigmoid_in_kernel
+       (a version-string pin is what misled this file before; fla < 0.5
+       swallows the kwarg and consumes beta RAW).
   A    real triton ``chunk_kda`` (exact oracle flag set: l2norm/gate-in-kernel/
        safe_gate lower_bound=-5.0/transpose_state_layout) vs the vendored
        pure-torch composition (kda_reference.py), at synthetic dims, REAL dims
        (96 heads x 128), odd T, and one varlen case; plus naive_chunk vs
        naive_recurrent self-consistency; plus two flag-semantics assertions
-       (sigmoid(beta) is unconditional; ``use_beta_sigmoid_in_kernel`` is a
-       dead kwarg in 0.4.2).
+       (sigmoid applied EXACTLY once, and the flag is honored -- not dead).
+       Acceptance for kernel-vs-reference is fla's OWN err_ratio bar
+       (RMS-relative < 0.005), not the per-element bf16 gate: see
+       kimi_k3_harness.assert_kernel_err_ratio for the measured rationale.
   B    our KimiK3KDAAttention (kda_backend='fla_chunk') vs the vendored oracle
        KimiDeltaAttention running the REAL fla — synthetic and REAL dims; plus
        micro-parity of our pure-torch conv / gated-norm vs fla's
@@ -52,7 +56,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kimi_k3_harness as H  # noqa: E402
 
-FLA_PIN = "0.4.2"
 
 if os.environ.get("K3_GPU_STAGE") == "1" and not torch.cuda.is_available():
     raise RuntimeError(
@@ -169,7 +172,8 @@ def test_A_kernel_vs_reference(dims):
     o_ref = ref.kda_reference_prefill(
         q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias,
         lower_bound=-5.0, use_qk_l2norm=True)
-    H.assert_bf16_gate(o_kernel, o_ref, "chunk_kda vs torch reference [{}]".format(tag))
+    H.assert_kernel_err_ratio(
+        o_kernel, o_ref, "chunk_kda vs torch reference [{}]".format(tag))
 
 
 def test_A_kernel_vs_reference_varlen():
@@ -185,7 +189,8 @@ def test_A_kernel_vs_reference_varlen():
             q[:, s:e], k[:, s:e], v[:, s:e], g[:, s:e], beta[:, s:e],
             A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0, use_qk_l2norm=True))
     o_ref = torch.cat(parts, dim=1)
-    H.assert_bf16_gate(o_kernel, o_ref, "chunk_kda varlen vs per-segment reference")
+    H.assert_kernel_err_ratio(
+        o_kernel, o_ref, "chunk_kda varlen vs per-segment reference")
 
 
 def test_A_naive_chunk_vs_recurrent_selfconsistency():

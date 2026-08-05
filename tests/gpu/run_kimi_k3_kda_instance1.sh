@@ -11,8 +11,11 @@
 #      cd <REMOTE_CHECKOUT>/BatchGen-k3-kimi-linear && \
 #      bash tests/gpu/run_kimi_k3_kda_instance1.sh'                            #
 #                                                                              #
-#  Requires: fla-core 0.4.2 (pinned — the test hard-fails on drift),           #
-#  transformers >= 4.56, einops.  GPU 0 only.                                  #
+#  Requires: fla-core >= 0.5.0 — the test probes chunk_kda's SIGNATURE for     #
+#  use_beta_sigmoid_in_kernel and hard-fails without it (older fla swallows    #
+#  the kwarg and consumes beta RAW).  transformers >= 4.56, einops.  GPU 0.    #
+#  Set PYTHONPATH=<repo>:<fla-src> — a stale batchgen_kernels in site-packages #
+#  shadows the in-tree build when the repo root is not on sys.path.            #
 #  ALWAYS report the log path printed below back to POIS.                      #
 # ---------------------------------------------------------------------------- #
 set -euo pipefail
