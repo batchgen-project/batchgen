@@ -380,11 +380,46 @@ def test_D_lean_mixer_gpu():
     torch.cuda.synchronize()
     transient = torch.cuda.max_memory_allocated() - base
     assert out.shape == (T, hidden)
-    limit = 1 << 30
+
+    # The bound is DERIVED, not a round number. The old `1 << 30` was
+    # arbitrary and the true peak (1138 MiB) sat 8% over it, which says
+    # nothing about correctness. Peak = output + N live fp32 chunk working
+    # sets; measured N = 3.63 at chunk 1024 (2026-08-05, H20), and the
+    # measured peak scales linearly with chunk_size (1138 / 665 / 446 MiB at
+    # 1024 / 512 / 256), confirming the model. Allow N = 4.
+    out_bytes = out.numel() * out.element_size()
+    chunk_set = 1024 * (nb + 1) * hidden * 4
+    limit = out_bytes + 4 * chunk_set
     assert transient <= limit, (
-        "lean mixer transient GPU memory {} B exceeds the 1 GiB bound "
-        "(the reference form would need ~{} B for the fp32 cat alone)".format(
-            transient, T * (nb + 1) * hidden * 4))
+        "lean mixer transient {} B exceeds the derived bound {} B = output "
+        "({}) + 4 fp32 chunk sets ({} each); the reference form would need "
+        "~{} B for the fp32 cat alone".format(
+            transient, limit, out_bytes, chunk_set, T * (nb + 1) * hidden * 4))
+
+    # The property that actually matters is that the (T, nb+1, H) tensor is
+    # never built, i.e. the NON-OUTPUT transient does not grow with T. A
+    # magnitude bound cannot distinguish "chunked" from "materialized but
+    # small T"; this can. Reverting to the reference form makes the
+    # non-output transient scale with T and trips this immediately.
+    prefix2 = torch.cat([prefix, prefix], dim=0)
+    block2 = torch.cat([block, block], dim=0)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    base2 = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        out2 = ours.model._apply_attn_res_lean(prefix2, block2, proj, norm,
+                                               chunk_size=1024)
+    torch.cuda.synchronize()
+    transient2 = torch.cuda.max_memory_allocated() - base2
+    scratch = transient - out_bytes
+    scratch2 = transient2 - out2.numel() * out2.element_size()
+    print("\n[D] non-output transient: T={} -> {:.1f} MiB, T={} -> {:.1f} MiB"
+          .format(T, scratch / 1048576, 2 * T, scratch2 / 1048576))
+    assert scratch2 <= 1.15 * scratch, (
+        "non-output transient grew with T ({} B at T={} vs {} B at T={}): the "
+        "mixer is materializing something proportional to sequence length"
+        .format(scratch2, 2 * T, scratch, T))
 
 
 # --------------------------------------------------------------------------- #
