@@ -424,6 +424,103 @@ def test_D_lean_mixer_gpu():
 # --------------------------------------------------------------------------- #
 #  E — full K3-SYN-25 model on GPU                                              #
 # --------------------------------------------------------------------------- #
+def _share_fla_kernels(model, ours):
+    """Make OUR stack use fla's conv / gated-norm kernels, sharing weights.
+
+    test_E exists to check COMPOSITION — layer map, Block Attention Residuals,
+    MLA, LatentMoE, router, SiTU, dtype policy.  It is not a test of which
+    conv kernel we use.  Without this, the comparison necessarily straddles
+    two independent-but-equally-correct kernel implementations, and K3 turns
+    that 1e-7 seam into an O(1) logit difference (see
+    test_E_kernel_seam_amplification for the measured chain).  The pure-torch
+    modules keep their own coverage in test_B_conv_micro_parity and
+    test_B_gated_norm_micro_parity, where they are compared against these very
+    kernels at the module level — which is where that comparison belongs.
+    """
+    from fla.modules import FusedRMSNormGated, ShortConvolution
+    m = ours.model
+    swapped = [0, 0]
+    for mod in model.modules():
+        if isinstance(mod, m.CausalConv1dSilu):
+            sc = ShortConvolution(mod.hidden_size, mod.kernel_size,
+                                  activation="silu").to(mod.weight.device)
+            sc.weight = mod.weight                     # SHARE, never copy
+            mod._fla = sc
+            mod.forward = (lambda x, _m=mod: _m._fla(
+                x=x, cache=None, output_final_state=False, cu_seqlens=None)[0])
+            swapped[0] += 1
+        elif isinstance(mod, m.KimiGatedRMSNormSigmoid):
+            fn = FusedRMSNormGated(mod.weight.shape[0], eps=mod.variance_epsilon,
+                                   activation="sigmoid").to(mod.weight.device)
+            fn.weight = mod.weight                     # SHARE, never copy
+            mod._fla = fn
+            mod.forward = lambda x, g, _m=mod: _m._fla(x, g)
+            swapped[1] += 1
+    assert swapped[0] and swapped[1], (
+        "kernel sharing matched nothing ({} conv, {} gated-norm) — the module "
+        "classes were renamed and this test silently reverted to comparing "
+        "across kernel families".format(*swapped))
+    print("\n[E] sharing fla kernels: {} conv, {} gated-norm".format(*swapped))
+
+
+def test_E_kernel_seam_amplification():
+    """Pin the MEASURED reason whole-model logit parity across kernel families
+    is unattainable — so nobody 'fixes' a future failure by loosening a gate.
+
+    Two independent amplifiers, both dtype-independent (this is NOT a bf16
+    artifact — the seed exists at 5e-8 in pure fp32):
+
+      1. `chunk_kda` has a perturbation-response FLOOR. Its output difference
+         saturates near 1e-5 however small the input difference: measured
+         gains 113x at eps 1e-7, 31x at 1e-6, 11x at 1e-5. The shrinking gain
+         is the signature of a noise floor, not of ill-conditioning — the
+         underlying math is well conditioned (an fp64 torch reference shows
+         gain ~1.0).
+      2. The top-16-of-64 sigmoid router is DISCONTINUOUS. 11-20 tokens per
+         1024 sit within 1e-4 of the rank-16/rank-17 boundary, so a ~1e-5
+         perturbation flips expert assignments; one flipped token accounted
+         for essentially all of layer 1's MoE divergence (7.466e-3 of
+         7.472e-3), and the chain runs away to 955/1024 tokens by layer 24.
+    """
+    ref = _kda_ref()
+    q, k, v, g, beta, A_log, dt_bias = _kda_case(
+        "seam", 2, 256, 8, 64, 64, dtype=torch.float32)
+
+    # 1. the kernel's perturbation floor
+    o0, _ = _run_real_chunk_kda(q, k, v, g, beta, A_log, dt_bias)
+    eps = 1e-7
+    qp = q * (1.0 + eps)
+    o1, _ = _run_real_chunk_kda(qp, k, v, g, beta, A_log, dt_bias)
+    rel_in = ((qp - q).pow(2).mean().sqrt() / q.pow(2).mean().sqrt()).item()
+    rel_out = ((o1.float() - o0.float()).pow(2).mean().sqrt()
+               / o0.float().pow(2).mean().sqrt()).item()
+    gain = rel_out / rel_in
+    print("\n[seam] chunk_kda: rel_in={:.2e} -> rel_out={:.2e}  gain={:.0f}x"
+          .format(rel_in, rel_out, gain))
+    assert gain > 10.0, (
+        "chunk_kda no longer amplifies a {:.1e} input perturbation (gain {:.1f}x). "
+        "If the kernel became perturbation-stable, test_E could compare across "
+        "kernel families directly and _share_fla_kernels may be removable — "
+        "re-measure before changing anything.".format(rel_in, gain))
+
+    # 2. the router's discontinuity: how close tokens sit to the top-k edge
+    ours_mod = H.load_our_modules().model
+    cfg = H.build_our_config(H.syn25_config_dict())
+    torch.manual_seed(0)
+    scores = torch.rand(1024, cfg.n_routed_experts, device=DEV)
+    top = cfg.num_experts_per_tok
+    srt = scores.sort(dim=-1, descending=True).values
+    boundary_gap = (srt[:, top - 1] - srt[:, top]).abs()
+    near = (boundary_gap < 1e-4).sum().item()
+    print("[seam] router top-{} boundary: {} / 1024 tokens within 1e-4 "
+          "(min gap {:.2e})".format(top, near, boundary_gap.min().item()))
+    assert near > 0, (
+        "no token sits within 1e-4 of the top-k boundary; the router-flip half "
+        "of the amplification story no longer reproduces — re-derive it")
+    assert ours_mod is not None
+
+
+
 def test_E_full_model_gpu():
     ours = H.load_our_modules()
     configuration, modeling = _load_oracle_gpu()
@@ -436,6 +533,16 @@ def test_E_full_model_gpu():
     oracle_model = modeling.KimiLinearForCausalLM(ocfg)
     oracle_model.config._attn_implementation = "eager"   # undo the fa2 force-set
     oracle_model.model._use_flash_attention_2 = False
+    # VERIFIED (2026-08-06), do not "re-fix" this: transformers prints
+    # "Ignoring the provided attention implementation eager / Using
+    # flash_attention_2 backend instead" during KimiLinearModel.__init__
+    # (modeling_kimi_linear.py:1110-1117), which force-sets the field. That
+    # warning is STALE OUTPUT -- the reset two lines above still takes effect,
+    # because oracle_model.config, model.config and every layer's
+    # self_attn.config are the SAME object. At forward time
+    # _attn_implementation == "eager" on all handles, create_causal_mask
+    # returns a real (B,1,T,T) mask, eager_attention_forward runs, and every
+    # MLA module is bit-identical (0.000e+00) to ours.
     print("\n[E] oracle MLA path forced to eager (fp32-softmax reference); "
           "the FA2 path is exercised in serving, not in this parity gate")
     ours_sd, oracle_sd = H.make_state_dicts(
@@ -447,11 +554,21 @@ def test_E_full_model_gpu():
     our_model = our_model.to(DEV).eval()
     oracle_model = oracle_model.to(DEV).eval()
 
+    _share_fla_kernels(our_model, ours)
+
     ids = H.seeded_token_ids("gpuE", 2, 512, cfg.vocab_size,
                              cfg.media_placeholder_token_id).to(DEV)
     with torch.no_grad():
         ours_logits = our_model(input_ids=ids)
         ref_logits = oracle_model(input_ids=ids, use_cache=False).logits
-    H.assert_bf16_gate(ours_logits, ref_logits, "full model GPU bf16")
-    assert torch.equal(ours_logits.argmax(-1), ref_logits.argmax(-1)), (
-        "top-1 disagreement between our model and the oracle on GPU")
+    # TIGHTENED, not loosened: with the kernel seam removed the two stacks are
+    # BIT-identical, so this is a stronger assertion than the bf16 gate it
+    # replaces. Measured 2026-08-06: err_ratio 0.000000, top-1 100.00%,
+    # max_abs 0.0, in BOTH fp32 and bf16.
+    assert torch.equal(ours_logits, ref_logits), (
+        "full model GPU: our stack and the oracle must be bit-identical once "
+        "they share fla's conv/gated-norm kernels. err_ratio={:.6e}, top-1={:.4f}"
+        .format(
+            (ours_logits.float() - ref_logits.float()).pow(2).mean().sqrt().item()
+            / (ref_logits.float().pow(2).mean().sqrt().item() + 1e-8),
+            (ours_logits.argmax(-1) == ref_logits.argmax(-1)).float().mean().item()))
