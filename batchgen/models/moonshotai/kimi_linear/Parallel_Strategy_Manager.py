@@ -41,6 +41,7 @@ import torch
 from batchgen.models.wrappers import AttnWrapperBase
 
 from .config import require_num_routed_experts
+from .k3.tensor_map import k3_skeleton_key
 from .serving_modules import (
     kda_decode_serving,
     kda_prefill_serving,
@@ -93,6 +94,12 @@ class KimiLinearParallelStrategyManager:
         self.model = None
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
+
+        # K3 vs 48B. The ONLY thing this decides in the PSM is the skeleton key
+        # translation (`_skeleton_ckpt_key`); it is the same discriminator the
+        # rest of the family uses (kimi_initializer.is_k3,
+        # kimi_parameter_server._detect_kimi_family).
+        self._is_k3 = getattr(loaded_model_config, "model_type", None) == "kimi_k3"
 
         # `model_config` is a ModelConfig, which has NO `n_routed_experts`
         # field at all — the old `getattr(..., 256) or 256` here therefore
@@ -380,6 +387,31 @@ class KimiLinearParallelStrategyManager:
                 f"KDA slots {self._kda_pool_slots})"
             )
 
+    def _skeleton_ckpt_key(self, model_param_name):
+        """`model.named_parameters()` name -> the key the parameter server used.
+
+        The C++ parameter server keys `skeleton_state_dict_` by the CHECKPOINT
+        name (Parameter_Server.cpp:357-397), and every K3 text tensor carries a
+        `language_model.` prefix that `model.named_parameters()` does not
+        (k3/tensor_map.py: K3_CKPT_PREFIX). The 48B checkpoint has no prefix, so
+        this is the identity there and that path is unchanged.
+
+        Translated in this direction, and in this one place — the single
+        skeleton lookup below — deliberately:
+
+          * model-name -> ckpt-name is a total function (prepend a constant).
+            The reverse is not: K3's `skeleton_state_dict_` ALSO holds the 168
+            unprefixed `vision_tower.` / `mm_projector.` tensors (they are in
+            neither the name map nor the skeleton declaration, so the C++ side
+            promotes them), and a strip-on-ingest pass would have to guess which
+            keys are text before it could rewrite them.
+          * one lookup per parameter, never two. A "try prefixed, else bare"
+            probe would trade a genuinely missing tensor for a silent wrong-name
+            hit somewhere in the 1026-name space, which is exactly the class of
+            bug the reconciler exists to prevent.
+        """
+        return k3_skeleton_key(model_param_name) if self._is_k3 else model_param_name
+
     def _load_model_skeleton(self):
         """Load non-module weights from the checkpoint state dict."""
         device = self.engine_config.Basic_Config.device_torch
@@ -393,17 +425,23 @@ class KimiLinearParallelStrategyManager:
         for key, param in self.model.named_parameters():
             if any(f in key for f in skip_fragments):
                 continue
-            if key in self.skeleton_state_dict:
+            ckpt_key = self._skeleton_ckpt_key(key)
+            if ckpt_key in self.skeleton_state_dict:
                 # Materialize on GPU from the shared shm tensor (native dtype).
                 _replace_param(self.model, key,
-                               self.skeleton_state_dict[key].to(device))
+                               self.skeleton_state_dict[ckpt_key].to(device))
                 n_loaded += 1
             elif param.is_meta:
-                missing.append(key)
+                missing.append((key, ckpt_key))
         if missing:
+            prefix = "language_model." if self._is_k3 else "(none)"
             raise RuntimeError(
                 f"Kimi-Linear skeleton: {len(missing)} params not found in "
-                f"weight storage (still on meta): {missing[:8]}"
+                f"weight storage (still on meta). Each was looked up under its "
+                f"CHECKPOINT key (prefix {prefix}); there is no bare-name "
+                f"fallback, because a second probe would trade a missing tensor "
+                f"for a silently wrong one. First failures as "
+                f"(param, checkpoint key): {missing[:8]}"
             )
         if self.rank == 0:
             logging.info(f"Skeleton: {n_loaded} tensors loaded from shared storage")
