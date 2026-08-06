@@ -7102,6 +7102,17 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
+				# The FIRST generated token, straight out of prefill. Logged
+				# because a max_tokens=1 request currently still enters decode
+				# (PREFILL_PLAN C4) and returns decode's error instead of this,
+				# so for a prefill-only model the token is computed and then
+				# thrown away with no way to see it. Rank 0 only; ids only
+				# (the worker has no tokenizer -- decode them client-side).
+				if self.rank == 0:
+					logging.info(
+						"[PREFILL] first sampled token ids: %s",
+						batch_new_tokens.reshape(-1).tolist()[:16])
+
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
 		Attn_Wrapper.prepack_cu_seqlens = None
