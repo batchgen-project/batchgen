@@ -18,8 +18,10 @@ Contents:
       decode:  causal_conv1d_update (CUDA, pooled) + fla
                fused_recurrent_kda_fwd (pooled, ssm_state_indices,
                inplace_final_state)
-  - MoE forward: PREFILL streams all 256 experts per rank (pure DP, no
-    collectives). DECODE (decode_moe_mode="resident_ep", M4 P0.3) uses the
+  - MoE forward: PREFILL streams every expert per rank (pure DP, no
+    collectives), in the hidden space on the 48B and in the 3584 LATENT space
+    on K3 (routed_expert_down_proj / norm / up_proj — LatentMoE).
+    DECODE (decode_moe_mode="resident_ep", M4 P0.3) uses the
     resident EP-8 shard: all-gather tokens -> local experts via
     fused_moe_bf16 (masked routing) -> all-reduce partial sums
     (batchgen.moe.fused_moe_bf16_resident seam).
@@ -506,6 +508,39 @@ def _grouped_moe_bf16(x, w13, w2, weights, ids):
     return out
 
 
+def _require_k3_latent_moe(self):
+    """A ``kimi_k3`` config MUST reach the LatentMoE path — or die here.
+
+    ``KimiSparseMoeBlock.use_latent_moe`` is derived from
+    ``config.routed_expert_hidden_size``, which K3 declares under
+    ``text_config`` (3584). A K3 config that arrives without it — a
+    ``ModelConfig``, a truncated dict, anything that never went through
+    ``KimiLinearConfig.from_hf_dict`` — builds hidden-space experts and runs
+    the 7168 hidden straight into 3584-wide latent weights. That is the same
+    class of silent-default bug as the 896 -> 256 expert undercount
+    (config.require_num_routed_experts), so it fails loudly instead.
+    """
+    cfg = getattr(self, "config", None)
+    if getattr(cfg, "model_type", None) != "kimi_k3":
+        return                      # 48B (and every other model): no LatentMoE
+    if not getattr(self, "use_latent_moe", False):
+        raise RuntimeError(
+            "Kimi-K3 MoE reached the hidden-space (non-latent) branch: "
+            "config.routed_expert_hidden_size is None. K3's routed experts "
+            "live in a LATENT space (w1/w3: 3584->3072, w2: 3072->3584) fed "
+            "by routed_expert_down_proj (7168->3584); running them on the "
+            "7168 hidden is wrong math. Load the real config.json so "
+            "text_config.routed_expert_hidden_size=3584 is parsed."
+        )
+    if not getattr(self, "latent_moe_use_norm", False):
+        raise RuntimeError(
+            "Kimi-K3 MoE has latent_moe_use_norm=False, but the checkpoint "
+            "ships block_sparse_moe.routed_expert_norm on every MoE layer "
+            "(k3/tensor_map.py:326-330). Skipping that norm silently changes "
+            "the routed_expert_up_proj input scale."
+        )
+
+
 def moe_forward_resident_ep_decode(self, hidden_states, resident):
     """KimiSparseMoeBlock DECODE forward — resident EP-8 + fused BF16 MoE.
 
@@ -515,7 +550,20 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
     expert. Empty ranks (0 rows) MUST still reach resident.forward — the
     collectives run on every rank, every decode step (worker :9746 no-skip
     invariant); only the returned local slice is empty.
+
+    HIDDEN-SPACE ONLY: the resident shard stacks w1/w2/w3 and routes in the
+    hidden space, so a LatentMoE config has no representation here.
     """
+    if getattr(self, "use_latent_moe", False):
+        raise NotImplementedError(
+            "resident-EP decode does not implement LatentMoE: the stacked "
+            "shard (batchgen.moe.fused_moe_bf16_resident) routes and runs the "
+            "experts in the hidden space, with no routed_expert_down_proj / "
+            "routed_expert_norm / routed_expert_up_proj seam. Run K3 decode "
+            "with decode_moe_mode='streamed' (moe_forward_serving's streamed "
+            "path implements the latent form) until the resident shard grows "
+            "one."
+        )
     identity = hidden_states
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)
@@ -543,11 +591,31 @@ def moe_forward_serving(self, hidden_states):
     order) so the producer never stalls: experts with no routed tokens still
     run a load+free (via a 0-row forward). No cross-rank collectives.
 
+    LatentMoE (K3, ``config.routed_expert_hidden_size``): the routed experts
+    do NOT live in the hidden space. Op order, from the eager reference
+    (kimi_k3/model.py::KimiSparseMoeBlock, bit-exact to the HF oracle):
+
+        router(identity)                    # PRE-down 7168 hidden, fp32
+        x = routed_expert_down_proj(x)      # 7168 -> 3584, ONCE per token,
+                                            #   BEFORE dispatch
+        y = sum_k w_k * expert_k(x)         # experts in the 3584 latent,
+                                            #   combine in FP32
+        y = routed_expert_norm(y)           # ONCE, post-combine, pre-up
+        y = routed_expert_up_proj(y)        # 3584 -> 7168
+        out = y + shared_experts(identity)  # shared expert in HIDDEN space
+
+    Applying the down-proj per (token, expert) instead of per token, or the
+    norm per expert instead of once, is a different function — the reference
+    is the only authority on the seam.
+
     Requires (set by the PSM):
         self.experts   — ModuleList of KimiLinearExpertWrapper (streamed)
         self.gate      — router; returns (topk_idx, topk_weight[, ...])
         self.shared_experts — resident BF16 shared expert (or None)
+        LatentMoE only: self.routed_expert_{down_proj,norm,up_proj}
     """
+    _require_k3_latent_moe(self)
+
     resident = getattr(self, "_resident_ep_moe", None)
     if resident is not None and KimiLinearExpertWrapper.phase == "decode":
         return moe_forward_resident_ep_decode(self, hidden_states, resident)
@@ -557,7 +625,9 @@ def moe_forward_serving(self, hidden_states):
     x = hidden_states.reshape(-1, self.hidden_dim)
     num_tokens = x.shape[0]
     device = x.device
+    use_latent = bool(getattr(self, "use_latent_moe", False))
 
+    # Routing reads the PRE-down-proj hidden (`identity`), never the latent.
     if num_tokens == 0:
         # Empty DP rank: KimiMoEGate dies on scores.view(0, -1). Build empty
         # routing instead so the drive loop below still load+frees every
@@ -569,11 +639,16 @@ def moe_forward_serving(self, hidden_states):
         topk_idx, topk_weight = gate_out[0], gate_out[1]
     K = topk_idx.shape[-1]
 
+    if use_latent:
+        # ONCE per token, before dispatch — a token routed to 16 experts is
+        # projected once, not 16 times.
+        x = self.routed_expert_down_proj(x)
+    expert_dim = x.shape[-1]
+
     flat_expert_idx = topk_idx.reshape(-1)
     token_indices = torch.arange(num_tokens, device=device).repeat_interleave(K)
-    topk_positions = torch.arange(K, device=device).repeat(num_tokens)
 
-    results = torch.zeros(num_tokens, self.hidden_dim, device=device,
+    results = torch.zeros(num_tokens, expert_dim, device=device,
                           dtype=torch.float32)
 
     for expert_idx, expert in enumerate(self.experts):
@@ -591,7 +666,15 @@ def moe_forward_serving(self, hidden_states):
         results.index_add_(0, expert_token_idx,
                            expert_output.float() * w.float())
 
-    out = results.to(x.dtype).reshape(orig_shape)
+    # FP32 combine -> model dtype, exactly where the reference downcasts
+    # (kimi_k3/model.py::_moe_combine's trailing `.type(new_x.dtype)`).
+    y = results.to(identity.dtype)
+    if use_latent:
+        if self.latent_moe_use_norm:
+            y = self.routed_expert_norm(y)
+        y = self.routed_expert_up_proj(y)
+
+    out = y.reshape(orig_shape)
     if getattr(self, "shared_experts", None) is not None:
         out = out + self.shared_experts(identity)
     return out
