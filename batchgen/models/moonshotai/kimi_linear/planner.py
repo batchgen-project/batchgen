@@ -30,15 +30,24 @@ class KimiLinearPlanner(BasePlanner):
     DEFAULT_MEM_FRAC = 0.85
     NUM_EXPERTS = 256
 
-    def __init__(self, is_k3: bool = False):
+    def __init__(self, is_k3: bool = False, stream_all_modules: bool = None):
         """``is_k3`` selects the K3 (2.8T, 93L/896E) branch of the plan.
 
         Passed by ``KimiLinearInitializer`` from its own ``is_k3`` (which is
         derived from the checkpoint's ``config.json``, not from the model
         name). Default False keeps the validated 48B plan byte-identical.
+
+        ``stream_all_modules`` defaults to ``is_k3``: OFF for the 48B, ON for
+        K3, which cannot fit attn/kda/shared resident. Passing it True with
+        ``is_k3=False`` is the PREFILL_PLAN M3 rehearsal — force the 48B to
+        stream all four rings and check its logits are unchanged, on a model
+        whose right answer is already known.
         """
         super().__init__()
         self.is_k3 = is_k3
+        self.stream_all_modules = (
+            is_k3 if stream_all_modules is None else bool(stream_all_modules)
+        )
         if is_k3:
             # `_compute_batch_configs` runs before `_adjust_config_for_model`
             # and asserts NUM_EXPERTS // world_size > 0; K3 has 896, not 256.
@@ -122,12 +131,14 @@ class KimiLinearPlanner(BasePlanner):
         self.config.Basic_Config.decode_graph_compare_every = 64
 
         # M-PR-6 — stream attn / kda_attn / shared_expert as well as the
-        # routed experts. Read by the PSM at configure_prefill. OFF here so the
-        # validated 48B path keeps every weight resident, bit-for-bit.
-        self.config.Basic_Config.stream_all_modules = False
+        # routed experts. Read by the PSM at configure_prefill. OFF for the
+        # 48B so its validated path keeps every weight resident, bit-for-bit.
+        self.config.Basic_Config.stream_all_modules = self.stream_all_modules
 
         if self.is_k3:
             self._adjust_config_for_k3()
+        if self.stream_all_modules:
+            self._configure_streamed_rings()
 
     def _adjust_config_for_k3(self):
         """K3 (93 layers, 896 experts, MXFP4) overrides. Runs last.
@@ -145,8 +156,23 @@ class KimiLinearPlanner(BasePlanner):
         expert ring, activations or the CUDA context. Streaming all four module
         types is what makes 8xH20 possible at all.
         """
-        self.config.Basic_Config.stream_all_modules = True
+        # KDA conv/recurrent state pools. Per slot at K3 dims:
+        #   recurrent 69 x 96 x 128 x 128 x 4 B = 434,110,464 B (414.0 MiB)
+        #   conv      3 x 69 x 12288 x 3 x 2 B  =  15,261,696 B ( 14.6 MiB)
+        #                                       = 449,372,160 B (428.6 MiB)/slot
+        # The 48B's 256 slots would be 107.14 GiB — larger than the whole GPU.
+        # 4 slots = 1,797,488,640 B = 1.674 GiB. This is a hard cap on
+        # CONCURRENT SEQUENCES (one slot each, one reserved by the decode
+        # graph's padding/warmup slot); raise it deliberately, at 428.6 MiB
+        # apiece, when the workload needs more than a handful in flight.
+        self.config.GPU_Buffer_Config.kda_state_slots = 4
 
+    def _configure_streamed_rings(self):
+        """Ring depths for the four streamed module types.
+
+        Sizes below are K3's (k3_module_shapes); the 48B's modules are ~13x
+        smaller, so these depths are cheaper still on the M3 rehearsal.
+        """
         # Ring depths. Cost = depth x per-instance module size:
         #   attn           442.88 MiB x 2 =   885.8 MiB
         #   kda_attn       846.67 MiB x 2 =  1653.3 MiB
@@ -175,17 +201,6 @@ class KimiLinearPlanner(BasePlanner):
             "shared_expert": 2,
             "routed_expert": 64,
         }
-
-        # KDA conv/recurrent state pools. Per slot at K3 dims:
-        #   recurrent 69 x 96 x 128 x 128 x 4 B = 434,110,464 B (414.0 MiB)
-        #   conv      3 x 69 x 12288 x 3 x 2 B  =  15,261,696 B ( 14.6 MiB)
-        #                                       = 449,372,160 B (428.6 MiB)/slot
-        # The 48B's 256 slots would be 107.14 GiB — larger than the whole GPU.
-        # 4 slots = 1,797,488,640 B = 1.674 GiB. This is a hard cap on
-        # CONCURRENT SEQUENCES (one slot each, one reserved by the decode
-        # graph's padding/warmup slot); raise it deliberately, at 428.6 MiB
-        # apiece, when the workload needs more than a handful in flight.
-        self.config.GPU_Buffer_Config.kda_state_slots = 4
 
     def get_module_shapes(self) -> dict:
         """Return Kimi-Linear specific tensor shapes."""
