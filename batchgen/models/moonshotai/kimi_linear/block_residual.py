@@ -74,19 +74,37 @@ def apply_attn_res(prefix_sum: torch.Tensor,
                    chunk_size: int = 1024) -> torch.Tensor:
     """Memory-lean Block-Attention-Residual depth mixer.
 
-    Port of ``kimi_k3/model.py::_apply_attn_res_lean`` (M2), which is gated
-    bit-identical to the unchunked reference at max_abs < 1e-6 in fp32
-    (tests/test_kimi_k3_model.py::test_attn_res_lean_equiv).
+    Port of ``kimi_k3/model.py::_apply_attn_res_lean`` (M2), gated against the
+    unchunked reference at max_abs < 1e-6 in fp32
+    (tests/test_kimi_k3_model.py::test_attn_res_lean_equiv).  That is a
+    tolerance, NOT bit equality — see the note on the reference for the
+    ragged-final-chunk measurement.
 
     Per token: 1 query over ``nb+1`` keys, fp32 throughout;
     ``scores[:, j] = (v_j * rsqrt(mean(v_j^2) + eps)) . w`` with
     ``w = norm.weight * proj.weight``; the value matmul uses the UNNORMALIZED
     fp32 ``v``.  Every op is token-parallel — which is also why packing needs
     no per-sequence awareness here — so the mixer runs in token CHUNKS with the
-    verbatim reference op order inside each chunk.  Nothing of shape
-    ``(T, nb+1, hidden)`` is ever materialized in fp32: the transient is
-    ``O(chunk_size * (nb+1) * hidden)``, independent of T.  That matters in
-    serving, where one packed prefill micro-batch is the whole T.
+    verbatim reference op order inside each chunk.
+
+    MEMORY, MEASURED (H20, real K3 scale H=7168, nb=8, bf16 in/out, chunk 1024,
+    under ``torch.inference_mode``; peak EXTRA device allocation over the call):
+
+        T =  1024   770 MiB        T =  8192    994 MiB
+        T =  2048   910 MiB        T = 32768   1330 MiB
+
+    Nothing of shape ``(T, nb+1, hidden)`` is materialized in fp32, and that is
+    the win: the fp32 part is ``O(chunk_size * (nb+1) * hidden)`` per live
+    tensor.  But do NOT read that as "one 252 MiB buffer, independent of T" —
+    several fp32 chunk tensors are live at once (``v``, ``v.pow(2)``, ``k``,
+    ``k*w``, plus the bf16 ``cat``), giving a ~0.75 GiB floor, and ``out`` is
+    ``torch.empty_like(prefix_sum)``, i.e. ``O(T * hidden)`` on top.
+
+    ``torch.inference_mode`` is load-bearing, not incidental: with grad enabled
+    the same call reaches 16.8 GiB at T=32768, because ``proj.weight`` is a leaf
+    Parameter and autograd pins every chunk's ``v``/``k``.  The worker's
+    prepack-prefill loop is inside ``with torch.inference_mode()``
+    (batchgen_worker.py:6939) — any new caller must be too.
 
     Args:
         prefix_sum: ``(num_tokens, hidden)``.

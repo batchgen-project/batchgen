@@ -674,11 +674,17 @@ class KimiKDAAttention(nn.Module):
 # ============================================================================
 #  Attention-residual helper (K3 only)
 # ============================================================================
-# One mixer for both paths. The chunked (memory-lean) form is bit-identical to
-# the unchunked reference — every op is token-parallel, so chunking along
-# tokens changes no reduction — but its fp32 transient is O(chunk * (nb+1) * H)
-# instead of O(T * (nb+1) * H), which is what makes a packed serving prefill
-# (T = the whole micro-batch) affordable. See block_residual.apply_attn_res.
+# One mixer for both paths. The chunked (memory-lean) form agrees with the
+# unchunked reference to < 1e-6 max_abs, NOT bitwise: every op is token-parallel
+# so no reduction crosses a chunk, but a ragged final chunk (T not a multiple of
+# chunk_size) is a differently-shaped tensor and ATen/cuBLAS pick a different
+# batched-GEMM/reduction strategy for it. MEASURED on H20, H=512, fp32:
+# torch.equal True at T in {13,1024,2048,8192}, False at T in {1025,4097} with
+# max_abs 2.4e-7 (nb=3) / 2.6e-6 (nb=9). The gate is the 1e-6 tolerance in
+# tests/test_kimi_k3_model.py::test_attn_res_lean_equiv, not bit equality.
+# What the chunking buys is the fp32 transient: O(chunk * (nb+1) * H) instead of
+# O(T * (nb+1) * H), which is what makes a packed serving prefill (T = the whole
+# micro-batch) affordable. See block_residual.apply_attn_res.
 _apply_attn_res = _block_residual_apply_attn_res
 
 

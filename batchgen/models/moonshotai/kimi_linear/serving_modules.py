@@ -513,12 +513,22 @@ def _require_k3_latent_moe(self):
 
     ``KimiSparseMoeBlock.use_latent_moe`` is derived from
     ``config.routed_expert_hidden_size``, which K3 declares under
-    ``text_config`` (3584). A K3 config that arrives without it — a
-    ``ModelConfig``, a truncated dict, anything that never went through
-    ``KimiLinearConfig.from_hf_dict`` — builds hidden-space experts and runs
-    the 7168 hidden straight into 3584-wide latent weights. That is the same
-    class of silent-default bug as the 896 -> 256 expert undercount
-    (config.require_num_routed_experts), so it fails loudly instead.
+    ``text_config`` (3584). A config that says ``model_type == 'kimi_k3'`` but
+    arrives WITHOUT that key — a truncated dict, a hand-built config, a
+    ``routed_expert_hidden_size`` that got filtered out by
+    ``from_hf_dict``'s unknown-key filter — builds hidden-space experts and
+    runs the 7168 hidden straight into 3584-wide latent weights. Same class of
+    silent-default bug as the 896 -> 256 expert undercount
+    (``config.require_num_routed_experts``), so it fails loudly instead.
+
+    SCOPE, precisely: the only trigger is ``model_type == 'kimi_k3'``. A config
+    that never went through ``KimiLinearConfig.from_hf_dict`` at all is NOT
+    caught here — ``from_hf_dict`` is what stamps ``'kimi_k3'`` (config.py
+    :169-170); without it the field holds the dataclass default
+    ``'kimi_linear'`` and this guard returns silently. That case is covered
+    elsewhere, loudly: ``Parallel_Strategy_Manager._is_k3`` keys off the same
+    attribute, so a K3 with a stripped ``model_type`` fails the skeleton lookup
+    first with all 1026 skeleton params missing.
     """
     cfg = getattr(self, "config", None)
     if getattr(cfg, "model_type", None) != "kimi_k3":
@@ -604,9 +614,21 @@ def moe_forward_serving(self, hidden_states):
         y = routed_expert_up_proj(y)        # 3584 -> 7168
         out = y + shared_experts(identity)  # shared expert in HIDDEN space
 
-    Applying the down-proj per (token, expert) instead of per token, or the
-    norm per expert instead of once, is a different function — the reference
-    is the only authority on the seam.
+    Two ways to get the seam wrong, and they are NOT the same kind of wrong —
+    stated separately because conflating them mis-sold the evidence once
+    already:
+
+      * norm per expert instead of once post-combine, or after up_proj instead
+        of before: a DIFFERENT FUNCTION. MEASURED err_ratio 1.486e-01 and
+        8.180e-01 against the eager reference. Numeric parity catches these.
+      * down-proj per (token, expert) instead of once per token: the SAME
+        function, 16x wasted FLOPs. ``routed_expert_down_proj`` is a bias-free
+        ``nn.Linear``, so applying it to a duplicated row is idempotent —
+        MEASURED err_ratio 0.000e+00 (bf16) / 2.259e-07 (fp32) with the
+        duplication in place. Numeric parity CANNOT see this; it is pinned
+        instead by the call-count hook test
+        (``tests/gpu/test_kimi_linear_latent_moe_serving.py``, which asserts
+        one down-proj call with T rows, not T*top_k).
 
     Requires (set by the PSM):
         self.experts   — ModuleList of KimiLinearExpertWrapper (streamed)

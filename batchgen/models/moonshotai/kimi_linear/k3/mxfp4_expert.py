@@ -40,21 +40,43 @@ green 9/9 GPU parity ladder (``tests/moe/gpu_parity_mxfp4_marlin.py``).  This
 also matches the 2026-08-04 decision ledger recorded in
 ``marlin_grouped_moe.py:253-261``.
 
-THE ONE COST, STATED PLAINLY
-----------------------------
+THE ONE COST, WITH THE NUMBER ATTACHED
+--------------------------------------
 The marlin kernels read weights in marlin TILE order; the engine streams them
 in CHECKPOINT order, because ``kimi_parameter_server.py:242-243`` converts with
 ``marlin=False`` (and ``ckpt_converter._apply_marlin_repack`` explicitly
 REFUSES uint8/E8M0 scales — it is a uniform-INT4 path).  So this module repacks
-per forward, on device.  That is a pure static rearrangement of bytes that does
-not depend on the activations, so it does not belong here: the end state is the
-converter emitting marlin layout (byte-identical in size — ``[K//16, N*2]``
-int32 == ``[N, K//2]`` uint8, ``[K//32, N]`` uint8 == ``[N, K//32]`` uint8), at
-which point ``_marlin_from_slot`` collapses to two ``.view()``s.  NAMED
-FOLLOW-UP; it is a converter change (``batchgen/ckpt_converter/``), which is
-outside a model PR's allowlist.
+per forward, on device, and that is EXPENSIVE.  MEASURED on H20, one expert at
+the real K3 shapes:
+
+    repack total        1068.1 us   (packed branch 641.4 + scale branch 426.6)
+    forward, t=1        1350.0 us with repack vs  240.8 us pre-repacked (5.61x)
+    forward, t=512      1688.8 us with repack vs  635.1 us pre-repacked (2.66x)
+
+The cost is FLAT in token count — it is per expert, not per token.  INFERRED
+from that: at prefill occupancy (>=4096 tokens x top-16 makes essentially all
+896 experts non-empty) it is ~0.96 s of pure repack per MoE layer, ~88 s per
+forward across the 92 MoE layers.  This is a blocker for a real 8K prefill, not
+a rounding error, and it is NOT fixable inside this file.
+
+The end state is the converter emitting marlin order.  Two variants, and they
+are not interchangeable — ``marlin_grouped_moe.py:358`` hard-fails a non-bf16
+scale:
+
+  * converter emits marlin-order **uint8** E8M0 scales: per-expert byte count
+    unchanged, but ``mxfp4_scale_e8m0_to_bf16`` still runs every forward
+    (MEASURED 227.3 us/expert).  Only the 641 us packed branch collapses to a
+    ``.view()``.
+  * converter emits **bf16** scales: both branches become ``.view()``s, but
+    per-expert bytes go 17,547,264 -> 18,579,456 (+5.88%), i.e. +85.1 GB across
+    82,432 experts against the 2.147 TB host ceiling in ``mxfp4_layout.py``
+    :26-30.
+
+Either way it is a ``batchgen/ckpt_converter/`` change plus a ~2.4 h
+re-conversion, outside a model PR's allowlist.  NAMED FOLLOW-UP, sized.
 """
 
+import logging
 from typing import Dict, Tuple
 
 import torch
@@ -85,17 +107,52 @@ _MARLIN_TILE = 16
 def is_mxfp4_quantized(config) -> bool:
     """True iff ``config`` declares the MXFP4 routed-expert format we implement.
 
-    False ONLY for a config with no quantization declaration at all — the
-    Kimi-Linear-48B, whose routed experts really are BF16.  Every OTHER
-    declaration raises out of :func:`validate_quantization_config` instead of
-    quietly selecting the BF16 expert module, which would then find no
+    False ONLY for a config with no quantization declaration at all.  Every
+    OTHER declaration raises out of :func:`validate_quantization_config` instead
+    of quietly selecting the BF16 expert module, which would then find no
     ``.weight`` in the checkpoint and compute on empty tensors.
+
+    On the "no declaration" branch a ``kimi_k3`` config is a fallback and is
+    WARNED about, per the project's no-silent-fallback rule — but it is not
+    refused here, for two measured reasons:
+
+      * the real load path ALREADY refuses it, three times over:
+        ``k3/tensor_map.py::validate_k3_config`` collects
+        ``validate_quantization_config(cfg.quantization_config)`` (tensor_map
+        :361) and is called by ``kimi_initializer`` :205, by
+        ``build_k3_state_dict_name_map`` :392 and by ``load_k3_config`` :685.
+        No real K3 serving build can reach this function with a ``None``;
+      * an UNQUANTIZED K3 is a supported, tested shape.  The M2 eager ground
+        truth (``kimi_k3/model.py``) builds BF16 experts for exactly these
+        configs, and the synthetic K3-SYN-25 / K3-SKEW-10 harness configs
+        (``tests/kimi_k3_harness.py``) declare ``model_type='kimi_k3'`` with no
+        ``quantization_config`` on purpose, so that the serving MoE can be
+        compared against it.  Raising here would delete that comparison.
     """
     quantization_config = getattr(config, "quantization_config", None)
-    if quantization_config is None:
-        return False
-    validate_quantization_config(quantization_config)
-    return True
+    if quantization_config is not None:
+        validate_quantization_config(quantization_config)
+        return True
+
+    if str(getattr(config, "quantization", "none")).lower() == "mxfp4":
+        raise K3QuantContractError(
+            "config.quantization == 'mxfp4' but quantization_config is None. "
+            "The label and the block must agree; the packed layout (group "
+            "size, dtypes, ignore list) is read from the block, so there is "
+            "nothing to build MXFP4 experts from."
+        )
+
+    if getattr(config, "model_type", None) == "kimi_k3":
+        logging.warning(
+            "Kimi-K3 config carries NO quantization_config: building BF16 "
+            "routed experts (KimiBlockSparseMLP, w{1,2,3}.weight). The RELEASED "
+            "checkpoint ships no .weight for any routed expert — only "
+            "w{1,2,3}.weight_{packed,scale} — so against real weights this "
+            "expert computes on empty(0). Legitimate only for a synthetic "
+            "unquantized K3 (tests/kimi_k3_harness.py). A real load cannot "
+            "reach here: validate_k3_config raises first."
+        )
+    return False
 
 
 # --------------------------------------------------------------------------- #

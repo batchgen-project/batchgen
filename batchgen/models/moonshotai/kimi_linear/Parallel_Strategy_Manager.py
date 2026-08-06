@@ -46,7 +46,6 @@ from .block_residual import (
     make_output_block_residual_pre_hook,
 )
 from .config import require_num_routed_experts
-from .k3.tensor_map import k3_skeleton_key
 from .serving_modules import (
     kda_decode_serving,
     kda_prefill_serving,
@@ -270,20 +269,24 @@ class KimiLinearParallelStrategyManager:
             # the adapter's patched layer forward returns a 1-tuple
             # (cuda_graph_segments.py::_make_layer_forward) and its captured
             # span runs the classic residual body, so a replayed layer neither
-            # produces nor consumes block_residual. Installing it would leave a
-            # live batchgen_debug.kimi_decode_graph_mode flip one step away from
-            # silently running K3 decode without its depth residuals. Do not
-            # install it at all, and refuse outright if a graph mode was asked
-            # for — a flag that quietly does nothing is the failure mode this
-            # avoids.
+            # produces nor consumes block_residual.
+            #
+            # The failure is LOUD, not silent — MEASURED: model.py:880 unpacks
+            # two values from every layer under use_attn_residuals, so a
+            # replayed 1-tuple dies on the first decode step with
+            # `ValueError: not enough values to unpack (expected 2, got 1)`.
+            # The guard is still worth it: that error names neither CUDA graphs
+            # nor block residuals, and it lands 93 layers into a live server
+            # instead of at configure time. Refuse here, by name.
             if mode != "eager":
                 raise NotImplementedError(
                     f"decode_graph_mode={mode!r} is not implemented for a "
                     "Block-Attention-Residual model (attn_res_block_size="
                     f"{self.loaded_model_config.attn_res_block_size}): the "
                     "captured per-layer span carries no block_residual, so a "
-                    "replayed layer would drop K3's depth residuals. Run "
-                    "decode_graph_mode='eager'."
+                    "replayed layer returns a 1-tuple and model.py:880 dies on "
+                    "`not enough values to unpack (expected 2, got 1)` at the "
+                    "first decode step. Run decode_graph_mode='eager'."
                 )
             if self.rank == 0:
                 logging.info(
@@ -447,8 +450,17 @@ class KimiLinearParallelStrategyManager:
             probe would trade a genuinely missing tensor for a silent wrong-name
             hit somewhere in the 1026-name space, which is exactly the class of
             bug the reconciler exists to prevent.
+
+        Imported INSIDE the K3 branch, like every other `.k3` use in this
+        package: `k3/__init__.py` states that nothing is exported eagerly, and a
+        module-level import would drag `k3.tensor_map` -> `k3.mxfp4_layout` ->
+        `weight_reconciler` into every 48B run that merely imports the PSM.
         """
-        return k3_skeleton_key(model_param_name) if self._is_k3 else model_param_name
+        if not self._is_k3:
+            return model_param_name
+        from .k3.tensor_map import k3_skeleton_key
+
+        return k3_skeleton_key(model_param_name)
 
     def _load_model_skeleton(self):
         """Load non-module weights from the checkpoint state dict."""
@@ -472,7 +484,15 @@ class KimiLinearParallelStrategyManager:
             elif param.is_meta:
                 missing.append((key, ckpt_key))
         if missing:
-            prefix = "language_model." if self._is_k3 else "(none)"
+            # Read the prefix from the constant the lookup actually used —
+            # a duplicated literal here would keep printing "language_model."
+            # after K3_CKPT_PREFIX changed, i.e. the diagnostic would misname
+            # the very key it failed to find (adversarial-review W1).
+            prefix = "(none)"
+            if self._is_k3:
+                from .k3.tensor_map import K3_CKPT_PREFIX
+
+                prefix = K3_CKPT_PREFIX
             raise RuntimeError(
                 f"Kimi-Linear skeleton: {len(missing)} params not found in "
                 f"weight storage (still on meta). Each was looked up under its "

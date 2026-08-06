@@ -817,10 +817,18 @@ def _apply_attn_res_lean(prefix_sum: torch.Tensor,
     single-rank prefill upper bound.
 
     Chunking along tokens changes no reduction (variance, score-dot, softmax
-    and the value matmul are all per-token), so the result is BIT-IDENTICAL to
-    the reference; the further algebraic fold ``(v @ w) * rsqrt(var)`` was
-    measured at max_abs 1.07e-6 > the 1e-6 gate at (T,nb,H)=(4096,8,1024) and
-    is deliberately NOT used.  Equivalence is gated at max_abs_diff < 1e-6 in
+    and the value matmul are all per-token), so the result agrees with the
+    reference to well inside the 1e-6 gate — but NOT bitwise.  MEASURED on H20
+    (H=512, fp32, chunk 1024): ``torch.equal`` is True at T in
+    {13, 1024, 2048, 8192} and False at T in {1025, 4097}, max_abs 2.4e-7
+    (nb=3) / 2.6e-6 (nb=9).  A ragged final chunk is a differently-shaped
+    tensor, and ATen/cuBLAS pick a different batched-GEMM strategy for it; the
+    op ORDER is unchanged, the kernel selection is not.  Do not restate this as
+    bit-identity — a whole-stack claim was once built on that and it does not
+    hold for T not a multiple of chunk_size, which is the normal packed-prefill
+    case.  The further algebraic fold ``(v @ w) * rsqrt(var)`` was measured at
+    max_abs 1.07e-6 > the 1e-6 gate at (T,nb,H)=(4096,8,1024) and is
+    deliberately NOT used.  Equivalence is gated at max_abs_diff < 1e-6 in
     fp32 (tests/test_kimi_k3_model.py::test_attn_res_lean_equiv) and the
     no-materialization property at test_attn_res_lean_no_materialization.
 
