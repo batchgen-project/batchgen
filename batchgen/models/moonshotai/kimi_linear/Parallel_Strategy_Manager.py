@@ -560,6 +560,10 @@ class KimiLinearParallelStrategyManager:
         """
         device = self.engine_config.Basic_Config.device_torch
         cfg = self.loaded_model_config
+        # MXFP4 (K3) experts declare the checkpoint's packed/scale names and
+        # need the validating wrapper; BF16 (48B) experts keep the plain one.
+        from .k3.mxfp4_expert import K3MXFP4Expert, KimiK3MXFP4ExpertWrapper
+
         for layer_idx in range(cfg.num_hidden_layers):
             layer = self.model.model.layers[layer_idx]
             if not hasattr(layer, "block_sparse_moe"):
@@ -576,7 +580,12 @@ class KimiLinearParallelStrategyManager:
                     for name, _ in list(expert.named_parameters()):
                         _replace_param(expert, name,
                                        torch.empty(0, device=device))
-                    moe.experts[e_idx] = KimiLinearExpertWrapper(
+                    wrapper_cls = (
+                        KimiK3MXFP4ExpertWrapper
+                        if isinstance(expert, K3MXFP4Expert)
+                        else KimiLinearExpertWrapper
+                    )
+                    moe.experts[e_idx] = wrapper_cls(
                         expert, layer_idx, e_idx, self.core_engine,
                         self.engine_config, self.model_config,
                         persistent=False,

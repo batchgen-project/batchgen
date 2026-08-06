@@ -252,15 +252,31 @@ class KimiSparseMoeBlock(nn.Module):
         self.ep_size = 1
         self.experts_per_rank = config.n_routed_experts
         self.ep_rank = 0
-        self.experts = nn.ModuleList(
-            [
-                KimiBlockSparseMLP(
+        # K3 ships routed experts MXFP4-packed and NO `.weight` for any of
+        # them, so a BF16 KimiBlockSparseMLP here is not "unquantized" — it is
+        # silently empty (k3/mxfp4_expert.py banner). Evaluated once, not per
+        # expert: is_mxfp4_quantized() runs the full contract validation.
+        from .k3.mxfp4_expert import is_mxfp4_quantized
+
+        if is_mxfp4_quantized(config):
+            from .k3.mxfp4_expert import K3MXFP4Expert
+
+            def _build_expert():
+                return K3MXFP4Expert(
                     config,
                     hidden_size=self.moe_hidden_size,
                     intermediate_size=config.moe_intermediate_size,
                 )
-                for _ in range(config.n_routed_experts)
-            ]
+        else:
+            def _build_expert():
+                return KimiBlockSparseMLP(
+                    config,
+                    hidden_size=self.moe_hidden_size,
+                    intermediate_size=config.moe_intermediate_size,
+                )
+
+        self.experts = nn.ModuleList(
+            [_build_expert() for _ in range(config.n_routed_experts)]
         )
         self.gate = KimiMoEGate(config)
 
