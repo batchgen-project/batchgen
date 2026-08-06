@@ -40,6 +40,11 @@ import torch
 
 from batchgen.models.wrappers import AttnWrapperBase
 
+from .block_residual import (
+    BlockResidualCarrier,
+    decoder_layer_forward_block_residual,
+    make_output_block_residual_pre_hook,
+)
 from .config import require_num_routed_experts
 from .k3.tensor_map import k3_skeleton_key
 from .serving_modules import (
@@ -188,6 +193,10 @@ class KimiLinearParallelStrategyManager:
             self._build_model()
         AttnWrapperBase.phase = "prefill"
         KimiLinearExpertWrapper.phase = "prefill"
+        # block_residual never outlives one decoder pass; drop anything a
+        # previous (possibly aborted) pass left parked so the first prefill of
+        # this phase starts from the seeded-at-layer-0 state.
+        BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
         return self.model, self.weight_copy_task
 
@@ -223,6 +232,7 @@ class KimiLinearParallelStrategyManager:
             self._build_model()
         AttnWrapperBase.phase = "decode"
         KimiLinearExpertWrapper.phase = "decode"
+        BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
         if self._decode_moe_mode() == "resident_ep":
             self._init_resident_ep_decode()
@@ -360,6 +370,7 @@ class KimiLinearParallelStrategyManager:
         self._config_attn_modules()
         self._config_kda_modules()
         self._config_expert_modules()   # wrap routed experts as streamed
+        self._config_block_residual()   # K3 Block Attention Residuals
         self._config_lm_head_hook()
         self._wrap_logits_output()
 
@@ -602,6 +613,46 @@ class KimiLinearParallelStrategyManager:
                     persistent=False,
                 )
             moe.forward = types.MethodType(moe_forward_serving, moe)
+
+    def _config_block_residual(self):
+        """Wire K3's Block Attention Residuals into the serving path.
+
+        No-op unless ``attn_res_block_size`` is set: the 48B keeps the classic
+        pre-norm residual body and its ``(hidden_states,)`` 1-tuple return.
+
+        For K3 two things are installed, because the two phases reach the
+        decoder stack through different callers:
+
+          * every decoder layer's ``forward`` -> ``decoder_layer_forward_
+            block_residual``. DECODE arrives via ``KimiLinearModel.forward``,
+            which threads ``block_residual`` explicitly, and is passed straight
+            through. PREFILL arrives from the worker's prepack loop, which
+            drives the layers itself, passes no ``block_residual`` and keeps
+            only ``layer_outputs[0]``; that caller gets the carrier.
+          * a pre-hook on ``model.norm`` applying the OUTPUT depth mix before
+            the final norm (mixer-then-norm). The worker calls ``norm``
+            directly, so this is the only seam where the output stage can run;
+            it no-ops for the explicit path, which has already mixed.
+
+        Both are pure wiring — the layer body itself is ``model.py``'s
+        ``_forward_attn_residual`` in either case.
+        """
+        cfg = self.loaded_model_config
+        if getattr(cfg, "attn_res_block_size", None) is None:
+            return
+        BlockResidualCarrier.configure(cfg.num_hidden_layers)
+        for layer in self.model.model.layers:
+            layer.forward = types.MethodType(
+                decoder_layer_forward_block_residual, layer
+            )
+        self.model.model.norm.register_forward_pre_hook(
+            make_output_block_residual_pre_hook(self.model.model)
+        )
+        if self.rank == 0:
+            logging.info(
+                f"Block Attention Residuals wired: {cfg.num_hidden_layers} "
+                f"layers, block size {cfg.attn_res_block_size}"
+            )
 
     def _lm_head_forward_pre_hook(self, module, input):
         return input[0][:, -1, :].unsqueeze(1)
