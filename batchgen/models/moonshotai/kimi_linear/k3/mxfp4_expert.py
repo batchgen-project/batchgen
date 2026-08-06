@@ -142,8 +142,9 @@ def repack_mxfp4_to_marlin_device(
     exists only because the CPU one round-trips through ``.cpu().numpy()``,
     which would sync and stall the copy engine on every streamed expert.
 
-    ``tests/models/moonshotai/test_k3_mxfp4_expert.py`` asserts bit-identity
-    against the CPU function; nothing here may drift from it independently.
+    ``tests/gpu/verify_k3_mxfp4_expert.py --gpu`` asserts bit-identity against
+    the CPU function at both K3 shapes; nothing here may drift from it
+    independently.
 
     Args:
         weight_packed: [N, K//2] uint8, low nibble = even K index.
