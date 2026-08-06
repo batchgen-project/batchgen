@@ -43,6 +43,7 @@ from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
+from .block_residual import apply_attn_res as _block_residual_apply_attn_res
 from .config import KimiLinearConfig
 
 
@@ -673,20 +674,12 @@ class KimiKDAAttention(nn.Module):
 # ============================================================================
 #  Attention-residual helper (K3 only)
 # ============================================================================
-def _apply_attn_res(prefix_sum, block_residual, proj, norm):
-    """
-    prefix_sum:     (num_tokens, hidden_size)
-    block_residual: (num_tokens, num_blocks, hidden_size)
-    """
-    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    v_float = v.float()
-    variance = v_float.pow(2).mean(-1, keepdim=True)
-    k = v_float * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
-    scores = (k * score_weight).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    hidden_states = torch.matmul(probs, v_float).squeeze(1)
-    return hidden_states.to(v.dtype)
+# One mixer for both paths. The chunked (memory-lean) form is bit-identical to
+# the unchunked reference — every op is token-parallel, so chunking along
+# tokens changes no reduction — but its fp32 transient is O(chunk * (nb+1) * H)
+# instead of O(T * (nb+1) * H), which is what makes a packed serving prefill
+# (T = the whole micro-batch) affordable. See block_residual.apply_attn_res.
+_apply_attn_res = _block_residual_apply_attn_res
 
 
 # ============================================================================
