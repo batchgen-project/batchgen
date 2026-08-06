@@ -20,12 +20,19 @@ STAGED — not part of the CPU workflow. Two independent checks:
                          twin inherits that validation rather than asserting
                          its own correctness;
                       2. the wrapper's end-to-end expert output vs an
-                         oracle-dequant + fp32 matmul + eager SiTU reference,
-                         under the project gate from
-                         tests/moe/gpu_parity_mxfp4_marlin.py
-                         (tol = 1e-5 + 1.6e-2*|ref|, PASS iff finite and
-                         fail_frac < 1e-4 and max_rel < 1.6e-2 on |ref| >
-                         0.1*rms);
+                         oracle-dequant reference built at the KERNEL's
+                         precision (bf16 tensor-core GEMMs, bf16 intermediate,
+                         fp32 SiTU interior) — kernel-validation.md: "BF16 GEMM
+                         ground-truth must also use BF16 tensor core matmul,
+                         NOT FP32". The all-fp32 reference is REPORTED as a
+                         control, never asserted: it misses the true bf16
+                         answer by more than the kernel does, so it measures
+                         itself, not the kernel. Gate: RMS-relative err_ratio
+                         < 5e-3 (kimi_k3_harness.assert_kernel_err_ratio —
+                         the right instrument for a K=3072 reduction output),
+                         with the per-element fail_frac and its concentration
+                         reported alongside, and two mutation arms proving the
+                         bar discriminates;
                       3. the hard-fail negatives: a dropped tensor, a wrong
                          dtype and a wrong shape must each RAISE.
 
@@ -55,21 +62,32 @@ def report(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}  {detail}")
 
 
-def gate(out, ref, name):
-    """Project numerical gate (verbatim from tests/moe/gpu_parity_mxfp4_marlin.py)."""
+def measure(out, ref, name):
+    """Report BOTH project gates for one comparison; return (err_ratio, fail_frac).
+
+    ``err_ratio``  RMS(out-ref)/RMS(ref) — ``kimi_k3_harness.assert_kernel_err_ratio``,
+                   bar 5e-3 (fla's own bar for kernel-vs-reference).
+    ``fail_frac``  per-element, ``kimi_k3_harness.assert_bf16_gate``, bar 1e-4.
+    ``conc``       share of the per-element failures landing at |ref| < 0.1*RMS,
+                   the cancellation-residue positions the harness names as the
+                   rounding signature that makes the per-element gate the wrong
+                   instrument for a reduction output.
+    """
     out = out.float()
     ref = ref.float()
     finite = bool(torch.isfinite(out).all())
     err = (out - ref).abs()
-    tol = 1e-5 + 1.6e-2 * ref.abs()
-    fail_frac = float((err > tol).float().mean())
+    bad = err > (1e-5 + 1.6e-2 * ref.abs())
+    fail_frac = float(bad.float().mean())
     rms = float(ref.pow(2).mean().sqrt())
-    mask = ref.abs() > 0.1 * rms
-    max_rel = float((err[mask] / ref.abs()[mask]).max()) if mask.any() else 0.0
-    passed = finite and fail_frac < 1e-4 and max_rel < 1.6e-2
-    print(f"    {name}: {'gate-PASS' if passed else 'gate-FAIL'} "
-          f"fail_frac={fail_frac:.3e} max_rel={max_rel:.3e} finite={finite}")
-    return passed
+    err_ratio = float((out - ref).pow(2).mean().sqrt()) / rms
+    n_bad = float(bad.float().sum())
+    conc = (float(bad[ref.abs() < 0.1 * rms].float().sum()) / n_bad
+            if n_bad else 1.0)
+    print(f"    {name}: err_ratio={err_ratio:.2e} (bar 5e-3)  "
+          f"fail_frac={fail_frac:.2e} (bar 1e-4)  "
+          f"fails at |ref|<0.1rms={100 * conc:.0f}%  finite={finite}")
+    return err_ratio, fail_frac, finite
 
 
 def k3_config(num_layers=None, num_experts=None):
@@ -226,6 +244,31 @@ def build_wrapped_expert(dev, weights_cpu):
     return wrapper, engine, served
 
 
+def reference_expert(x, dequant_w, swap_gate_up=False, use_silu=False):
+    """Reference expert forward at the KERNEL's precision.
+
+    ``kernel-validation.md``: "BF16 GEMM ground-truth must also use BF16 tensor
+    core matmul, NOT FP32."  Both GEMMs therefore run in bf16 (fp32 accumulate,
+    bf16 result) and the intermediate is rounded to bf16 exactly as the fused S1
+    kernel writes it; only the SiTU interior is fp32, which is what the kernel
+    does too.  An all-fp32 reference is NOT a valid ground truth here and the
+    ``--gpu`` run reports it as a control: it misses the true bf16 answer by
+    more than the kernel does.
+
+    ``dequant_w`` values are bf16 and EXACT — an E2M1 magnitude has at most 3
+    significant bits and an E8M0 scale is a power of two, so the oracle dequant
+    loses nothing in bf16.
+    """
+    gate_w, up_w = ("w1", "w3") if not swap_gate_up else ("w3", "w1")
+    gate_x = (x @ dequant_w[gate_w].t()).float()
+    up_x = (x @ dequant_w[up_w].t()).float()
+    if use_silu:
+        intermediate = gate_x * torch.sigmoid(gate_x) * up_x
+    else:
+        intermediate = situ_ref_fp32(gate_x, up_x)
+    return (intermediate.to(torch.bfloat16) @ dequant_w["w2"].t()).float()
+
+
 def check_numerics(dev, num_tokens=64):
     from batchgen.moe.mxfp4_oracle_vector import mxfp4_dequantize_oracle
 
@@ -242,22 +285,46 @@ def check_numerics(dev, num_tokens=64):
         weights_cpu[f"{name}.weight_scale"] = scale
 
     wrapper, engine, _ = build_wrapped_expert(dev, weights_cpu)
-    x = (torch.randn(num_tokens, K3_LATENT, device=dev) * 0.5).to(torch.bfloat16)
+    dequant_w = {n: mxfp4_dequantize_oracle(p, s).to(dev)
+                 for n, (p, s) in raw.items()}
 
-    out = wrapper(x)
+    for t in (1, 16, num_tokens, 512):
+        engine.freed.clear()
+        x = (torch.randn(t, K3_LATENT, device=dev) * 0.5).to(torch.bfloat16)
+        out = wrapper(x)
+        ref = reference_expert(x, dequant_w)
+        print(f"  t={t} out={tuple(out.shape)} {out.dtype} "
+              f"ref rms={float(ref.pow(2).mean().sqrt()):.4f}")
+        err_ratio, fail_frac, finite = measure(out, ref, "kernel vs bf16 ref")
+        report(f"expert output vs oracle-dequant reference (t={t})",
+               finite and err_ratio < 5e-3,
+               f"err_ratio={err_ratio:.2e} fail_frac={fail_frac:.2e}")
 
-    # Reference: exact oracle dequant -> fp32 matmul -> eager SiTU -> fp32 down.
-    ref_w = {n: mxfp4_dequantize_oracle(p, s).to(dev).float()
-             for n, (p, s) in raw.items()}
+    # Control: the all-fp32 reference the project rule forbids. Reported, never
+    # asserted — it exists to show that its disagreement with the TRUE bf16
+    # answer is larger than the kernel's, i.e. the instrument, not the kernel.
     xf = x.float()
-    gate_x = xf @ ref_w["w1"].t()
-    up_x = xf @ ref_w["w3"].t()
-    ref = situ_ref_fp32(gate_x, up_x) @ ref_w["w2"].t()
+    fp32_w = {n: w.float() for n, w in dequant_w.items()}
+    ref_fp32 = (situ_ref_fp32(xf @ fp32_w["w1"].t(), xf @ fp32_w["w3"].t())
+                @ fp32_w["w2"].t())
+    print("  control — the FORBIDDEN all-fp32 reference:")
+    measure(ref, ref_fp32, "bf16 ref vs fp32 ref  ")
+    measure(out, ref_fp32, "kernel  vs fp32 ref  ")
 
-    print(f"    tokens={num_tokens} out={tuple(out.shape)} {out.dtype} "
-          f"ref rms={float(ref.pow(2).mean().sqrt()):.4f}")
-    report(f"expert output vs oracle-dequant reference (t={num_tokens})",
-           gate(out, ref, "expert"))
+    # The err_ratio bar must have TEETH: a wrong-but-plausible expert has to
+    # blow past it, or it is not a gate.
+    caught = 0
+    mutations = {
+        "gate/up (w1/w3) swapped": dict(swap_gate_up=True),
+        "SiLU instead of SiTU": dict(use_silu=True),
+    }
+    for tag, kwargs in mutations.items():
+        bad_ratio, _, _ = measure(out, reference_expert(x, dequant_w, **kwargs),
+                                  f"mutation: {tag}")
+        caught += bad_ratio > 5e-3
+    report("err_ratio gate discriminates (mutations blow past 5e-3)",
+           caught == len(mutations), f"{caught}/{len(mutations)}")
+
     report("weight buffer released exactly once per forward",
            engine.freed == ["routed_expert_4_0"], f"freed={engine.freed}")
 
