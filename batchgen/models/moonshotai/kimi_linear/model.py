@@ -903,15 +903,30 @@ class KimiLinearModel(nn.Module):
                 )[0]
 
         if self.use_attn_residuals:
-            hidden_states = _apply_attn_res(
-                hidden_states.view(-1, self.config.hidden_size),
-                block_residual,
-                self.output_attn_res_proj,
-                self.output_attn_res_norm,
+            hidden_states = self._apply_output_attn_res(
+                hidden_states.view(-1, self.config.hidden_size), block_residual
             ).view(batch_size, seq_len, self.config.hidden_size)
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def _apply_output_attn_res(self, flat_hidden: torch.Tensor,
+                               block_residual: torch.Tensor) -> torch.Tensor:
+        """Final depth-mix over the block residuals, on a FLAT (N, hidden) view.
+
+        Exists as a method so the serving prefill loop
+        (``batchgen_worker.py``) can perform the same mix without importing
+        this module's internals — the worker stays model-agnostic and there is
+        exactly one implementation of the mix, so the two paths cannot drift.
+        Callers apply ``self.norm`` AFTER this: mix-then-norm is the reference
+        order and swapping it changes every output.
+        """
+        return _apply_attn_res(
+            flat_hidden,
+            block_residual,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+        )
 
 
 class KimiLinearForCausalLM(nn.Module):
