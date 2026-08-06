@@ -265,6 +265,33 @@ class KimiLinearParallelStrategyManager:
         mode = self._decode_graph_mode()
         if mode == "off":
             return
+        if getattr(self.loaded_model_config, "attn_res_block_size", None) is not None:
+            # Block Attention Residuals and the Phase-A adapter cannot coexist:
+            # the adapter's patched layer forward returns a 1-tuple
+            # (cuda_graph_segments.py::_make_layer_forward) and its captured
+            # span runs the classic residual body, so a replayed layer neither
+            # produces nor consumes block_residual. Installing it would leave a
+            # live batchgen_debug.kimi_decode_graph_mode flip one step away from
+            # silently running K3 decode without its depth residuals. Do not
+            # install it at all, and refuse outright if a graph mode was asked
+            # for — a flag that quietly does nothing is the failure mode this
+            # avoids.
+            if mode != "eager":
+                raise NotImplementedError(
+                    f"decode_graph_mode={mode!r} is not implemented for a "
+                    "Block-Attention-Residual model (attn_res_block_size="
+                    f"{self.loaded_model_config.attn_res_block_size}): the "
+                    "captured per-layer span carries no block_residual, so a "
+                    "replayed layer would drop K3's depth residuals. Run "
+                    "decode_graph_mode='eager'."
+                )
+            if self.rank == 0:
+                logging.info(
+                    "Decode CUDA-graph adapter NOT installed: Block Attention "
+                    "Residuals have no captured-span representation. "
+                    "batchgen_debug.kimi_decode_graph_mode is inert for K3."
+                )
+            return
         # Install for "eager" too: the adapter then replays nothing (pure
         # pass-through to the wrapper path) but is present, so a batch-level
         # batchgen_debug.kimi_decode_graph_mode can switch graph/compare/eager
