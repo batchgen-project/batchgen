@@ -336,6 +336,17 @@ def _kda_project(self, hidden_states_2d):
     return q, k, v, f, beta, z
 
 
+def _conv_weights(conv, dtype):
+    """Return (weight, bias) for a ShortConvolution cast to the activation dtype.
+
+    Kimi-K3 ships q/k/v_conv1d.weight as fp32 while the projections are bf16;
+    the causal_conv1d CUDA kernel requires weight dtype == input dtype. `.to()`
+    is a no-op when they already match (e.g. Kimi-Linear 48B).
+    """
+    bias = getattr(conv, "bias", None)
+    return conv.weight.to(dtype), (None if bias is None else bias.to(dtype))
+
+
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
                         has_initial_state, kda_state):
     """KDA prefill for PREPACKED (varlen) sequences.
@@ -361,18 +372,21 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     q, k, v, f, beta, z = _kda_project(self, hidden_states_2d)
 
     # conv (silu) with final-state write into the pools at slot_ids
+    qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_fwd(
-        q, self.q_conv1d.weight, bias=getattr(self.q_conv1d, "bias", None),
+        q, qw, bias=qb,
         conv_states=kda_state.conv_q, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
     )
+    kw, kb = _conv_weights(self.k_conv1d, k.dtype)
     k = causal_conv1d_fwd(
-        k, self.k_conv1d.weight, bias=getattr(self.k_conv1d, "bias", None),
+        k, kw, bias=kb,
         conv_states=kda_state.conv_k, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
     )
+    vw, vb = _conv_weights(self.v_conv1d, v.dtype)
     v = causal_conv1d_fwd(
-        v, self.v_conv1d.weight, bias=getattr(self.v_conv1d, "bias", None),
+        v, vw, bias=vb,
         conv_states=kda_state.conv_v, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
     )
@@ -425,19 +439,19 @@ def kda_decode_serving(self, hidden_states, kda_state):
 
     slot_ids = kda_state.cur_decode_slots  # (bsz,) int32
 
+    qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_update(
-        q, kda_state.conv_q, self.q_conv1d.weight,
-        bias=getattr(self.q_conv1d, "bias", None),
+        q, kda_state.conv_q, qw, bias=qb,
         conv_state_indices=slot_ids,
     )
+    kw, kb = _conv_weights(self.k_conv1d, k.dtype)
     k = causal_conv1d_update(
-        k, kda_state.conv_k, self.k_conv1d.weight,
-        bias=getattr(self.k_conv1d, "bias", None),
+        k, kda_state.conv_k, kw, bias=kb,
         conv_state_indices=slot_ids,
     )
+    vw, vb = _conv_weights(self.v_conv1d, v.dtype)
     v = causal_conv1d_update(
-        v, kda_state.conv_v, self.v_conv1d.weight,
-        bias=getattr(self.v_conv1d, "bias", None),
+        v, kda_state.conv_v, vw, bias=vb,
         conv_state_indices=slot_ids,
     )
 
