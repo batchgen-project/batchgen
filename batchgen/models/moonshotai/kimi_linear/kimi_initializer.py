@@ -22,7 +22,7 @@ import torch
 from batchgen.config.config import EngineConfig, ModelConfig
 from batchgen.config.model_registry import load_config
 
-from .config import KimiLinearConfig
+from .config import KimiLinearConfig, require_num_routed_experts
 from .planner import KimiLinearPlanner
 
 try:
@@ -90,7 +90,7 @@ class KimiLinearInitializer:
         self.engine_config = EngineConfig()
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        self.planner = KimiLinearPlanner()
+        self.planner = KimiLinearPlanner(is_k3=self.is_k3)
         self.engine_config = self.planner.generate_config(self.engine_config)
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")
@@ -286,7 +286,7 @@ class KimiLinearInitializer:
         model_config = ModelConfig()
         model_config.model_type = cfg.model_type
         model_config.num_hidden_layers = cfg.num_hidden_layers
-        model_config.num_local_experts = getattr(cfg, "n_routed_experts", 256) or 256
+        model_config.num_local_experts = require_num_routed_experts(cfg)
         model_config.num_attention_heads = cfg.num_attention_heads
         model_config.num_key_value_heads = cfg.num_key_value_heads
         model_config.head_dim = getattr(cfg, "head_dim", 128)

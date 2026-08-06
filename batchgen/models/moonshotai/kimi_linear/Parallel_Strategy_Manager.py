@@ -40,6 +40,7 @@ import torch
 
 from batchgen.models.wrappers import AttnWrapperBase
 
+from .config import require_num_routed_experts
 from .serving_modules import (
     kda_decode_serving,
     kda_prefill_serving,
@@ -93,7 +94,11 @@ class KimiLinearParallelStrategyManager:
         self.weight_copy_task = {}
         self.state_dict_name_map = {}
 
-        self.num_experts = int(getattr(model_config, "n_routed_experts", 256) or 256)
+        # `model_config` is a ModelConfig, which has NO `n_routed_experts`
+        # field at all — the old `getattr(..., 256) or 256` here therefore
+        # evaluated to 256 unconditionally, for every model. Harmless on the
+        # 48B (which really has 256) and a silent 3.5x undercount on K3's 896.
+        self.num_experts = require_num_routed_experts(loaded_model_config)
         assert self.num_experts % world_size == 0, (
             f"num_experts {self.num_experts} not divisible by world_size {world_size}"
         )
@@ -102,6 +107,11 @@ class KimiLinearParallelStrategyManager:
 
         self._kda_pool_slots = int(getattr(
             engine_config.GPU_Buffer_Config, "kda_state_slots", 256
+        ))
+        # M-PR-6: stream attn / kda_attn / shared_expert too (planner-set,
+        # default False so the validated 48B path stays fully resident).
+        self._stream_all_modules = bool(getattr(
+            engine_config.Basic_Config, "stream_all_modules", False
         ))
         self._comm = None
         self._resident_ep_built = False
@@ -119,17 +129,44 @@ class KimiLinearParallelStrategyManager:
 
     def _build_weight_copy_task(self):
         """Modules the copy engine must stream (host-offloaded), in layer-major
-        ascending order. Only routed experts are streamed; attn/kda/shared are
-        resident (empty lists). The MoE forward MUST consume routed experts in
-        this exact order per layer so the producer never stalls."""
+        ascending order.
+
+        Each module TYPE has its own ring, so what matters is that the list for
+        a type is in the order the consumer will request it — the producer
+        drains its list front to front and the consumer blocks on the head. An
+        out-of-order request finds no matching slot and dies on
+        ``get_weights``' 2 s ``std::runtime_error``
+        (GPU_Weight_Buffer.cpp:196-233); it does not hang and it does not
+        return the wrong module.
+
+        Consumer order, per forward pass:
+          * one ``attn_{L}`` or ``kda_attn_{L}`` per layer, L ascending, at the
+            top of the decoder layer;
+          * one ``shared_expert_{L}`` per MoE layer, L ascending;
+          * all ``routed_expert_{L}_{E}``, E ascending within L, L ascending —
+            ``moe_forward_serving`` drives EVERY expert including 0-token ones
+            precisely to keep this true.
+
+        With ``stream_all_modules`` off (the 48B default) the first three lists
+        stay empty: those modules are resident and never touch the ring.
+        """
         cfg = self.loaded_model_config
         task = {"attn": [], "kda_attn": [], "shared_expert": [],
                 "routed_expert": []}
         for layer_idx in range(cfg.num_hidden_layers):
             layer = self.model.model.layers[layer_idx]
+            if self._stream_all_modules:
+                if cfg.is_kda_layer(layer_idx):
+                    task["kda_attn"].append(f"kda_attn_{layer_idx}")
+                else:
+                    task["attn"].append(f"attn_{layer_idx}")
             moe = getattr(layer, "block_sparse_moe", None)
             if moe is None or moe.experts is None:
                 continue
+            if self._stream_all_modules and getattr(
+                moe, "shared_experts", None
+            ) is not None:
+                task["shared_expert"].append(f"shared_expert_{layer_idx}")
             for e_idx in range(len(moe.experts)):
                 task["routed_expert"].append(
                     f"routed_expert_{layer_idx}_{e_idx}"
@@ -157,6 +194,21 @@ class KimiLinearParallelStrategyManager:
         non-empty routed_expert list). "streamed": legacy pure-DP streaming,
         identical to prefill.
         """
+        if self._stream_all_modules:
+            # Decode under stream_all_modules is NOT wired: the worker starts
+            # the decode H2D streamer only when the routed_expert task is
+            # non-empty (_load_decode_model), and decode_moe_mode="resident_ep"
+            # empties it below — so nothing would ever refill the attn /
+            # kda_attn / shared_expert rings and every persistent=False
+            # wrapper would die on get_weights' 2 s throw. Fail here, loudly,
+            # instead of at that timeout 93 layers deep.
+            raise NotImplementedError(
+                "stream_all_modules is a PREFILL-only path (M-PR-6). Decode "
+                "needs a decode-phase H2D streamer for attn/kda_attn/"
+                "shared_expert, which does not exist. Run prefill-only "
+                "(max_tokens=1 still enters decode today — see PREFILL_PLAN "
+                "C4) or turn the flag off."
+            )
         self.loaded_model_config.phase = "decode"
         if comm is not None:
             self._comm = comm
@@ -290,8 +342,9 @@ class KimiLinearParallelStrategyManager:
         #    from the shared shm storage (zero-copy across ranks).
         self._load_model_skeleton()
 
-        # 2. RESIDENT module weights from the core engine (attn/kda/shared are
-        #    small; routed experts are host-offloaded & streamed, see step 3).
+        # 2. attn/kda/shared module weights. Resident by default (they are
+        #    small on the 48B); under stream_all_modules these are emptied
+        #    instead and streamed from the ring like the routed experts.
         self._load_attn_modules()
         self._load_kda_modules()
         self._load_shared_expert_modules()
@@ -355,6 +408,17 @@ class KimiLinearParallelStrategyManager:
         if self.rank == 0:
             logging.info(f"Skeleton: {n_loaded} tensors loaded from shared storage")
 
+    def _clear_streamed_params(self, module):
+        """Empty a module's params so meta is cleared and `model.to(device)` is
+        safe; the copy engine fills them from the ring per forward.
+
+        Same contract as `_config_expert_modules` — `p.data =` cannot
+        materialize a meta parameter, so the Parameter object is swapped.
+        """
+        device = self.engine_config.Basic_Config.device_torch
+        for name, _ in list(module.named_parameters()):
+            _replace_param(module, name, torch.empty(0, device=device))
+
     def _load_attn_modules(self):
         device = self.engine_config.Basic_Config.device_torch
         cfg = self.loaded_model_config
@@ -362,6 +426,9 @@ class KimiLinearParallelStrategyManager:
             if cfg.is_kda_layer(layer_idx):
                 continue
             attn = self.model.model.layers[layer_idx].self_attn
+            if self._stream_all_modules:
+                self._clear_streamed_params(attn)
+                continue
             tensors = self.core_engine.get_tensor(f"attn_{layer_idx}")
             for name, p in list(attn.named_parameters()):
                 if name in tensors:
@@ -376,6 +443,9 @@ class KimiLinearParallelStrategyManager:
             if not cfg.is_kda_layer(layer_idx):
                 continue
             kda = self.model.model.layers[layer_idx].self_attn
+            if self._stream_all_modules:
+                self._clear_streamed_params(kda)
+                continue
             tensors = self.core_engine.get_tensor(f"kda_attn_{layer_idx}")
             for name, p in list(kda.named_parameters()):
                 if name in tensors:
@@ -392,6 +462,12 @@ class KimiLinearParallelStrategyManager:
                 continue
             shared = layer.block_sparse_moe.shared_experts
             if shared is None:
+                continue
+            if self._stream_all_modules:
+                # Wrapped as a streamed expert in _config_expert_modules;
+                # ExpertWrapperBase turns expert_idx=-1 into the module key
+                # "shared_expert_{L}" the parameter server already serves.
+                self._clear_streamed_params(shared)
                 continue
             tensors = self.core_engine.get_tensor(f"shared_expert_{layer_idx}")
             for name, p in list(shared.named_parameters()):
@@ -419,7 +495,7 @@ class KimiLinearParallelStrategyManager:
             )
             self.model.model.layers[layer_idx].self_attn = KimiLinearAttnWrapper(
                 attn, layer_idx, self.core_engine, self.engine_config,
-                self.model_config, persistent=True,
+                self.model_config, persistent=not self._stream_all_modules,
             )
 
     def _config_kda_modules(self):
@@ -432,7 +508,7 @@ class KimiLinearParallelStrategyManager:
             kda.kda_decode_serving = types.MethodType(kda_decode_serving, kda)
             self.model.model.layers[layer_idx].self_attn = KimiLinearKDAWrapper(
                 kda, layer_idx, self.core_engine, self.engine_config,
-                self.model_config, persistent=True,
+                self.model_config, persistent=not self._stream_all_modules,
             )
 
     def _config_expert_modules(self):
@@ -467,6 +543,17 @@ class KimiLinearParallelStrategyManager:
                         self.engine_config, self.model_config,
                         persistent=False,
                     )
+            shared = getattr(moe, "shared_experts", None)
+            if self._stream_all_modules and shared is not None:
+                # expert_idx=-1 -> module_key "shared_expert_{L}"
+                # (ExpertWrapperBase._build_module_key), which is exactly the
+                # key the parameter server registers for this module. Params
+                # were emptied in _load_shared_expert_modules.
+                moe.shared_experts = KimiLinearExpertWrapper(
+                    shared, layer_idx, -1, self.core_engine,
+                    self.engine_config, self.model_config,
+                    persistent=False,
+                )
             moe.forward = types.MethodType(moe_forward_serving, moe)
 
     def _lm_head_forward_pre_hook(self, module, input):

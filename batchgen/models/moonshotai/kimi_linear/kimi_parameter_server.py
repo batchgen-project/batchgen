@@ -51,6 +51,8 @@ from tqdm import trange
 from batchgen.config.model_registry import load_config
 from batchgen.ckpt_converter.ckpt_converter import ckpt_converter
 
+from .config import require_num_routed_experts
+
 try:
     from batchgen.core_engine import Parameter_Server
 except ImportError:
@@ -183,7 +185,7 @@ class KimiLinear_Parameter_Server:
                 "model_type='kimi_k3'; the 48B defaults were loaded instead."
             )
         self.num_layers = self.model_config.num_hidden_layers  # 27
-        self.num_experts = getattr(self.model_config, "n_routed_experts", 256) or 256
+        self.num_experts = require_num_routed_experts(self.model_config)
         self.first_k_dense_replace = self.model_config.first_k_dense_replace  # 1
 
         free_memory, total_memory = torch.cuda.mem_get_info()
