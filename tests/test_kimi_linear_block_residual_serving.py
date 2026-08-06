@@ -308,7 +308,31 @@ def test_output_hook_rejects_a_truncated_stack():
 
 
 # --------------------------------------------------------------------------- #
-#  T5 — the 48B (no attn residuals) is untouched                               #
+#  T5 — the decode CUDA-graph adapter cannot represent block_residual          #
+# --------------------------------------------------------------------------- #
+def test_decode_graph_mode_refused_for_attn_res():
+    """``cuda_graph_segments._make_layer_forward`` returns a 1-tuple and its
+    captured span runs the classic residual body, so a replayed K3 layer would
+    drop the depth residuals. The PSM must refuse the mode outright rather than
+    install an adapter one debug flag away from silently wrong decode."""
+    _, kl, cfg = _build_pair(torch.float32)
+    stub = types.SimpleNamespace(
+        loaded_model_config=cfg,
+        model=types.SimpleNamespace(model=kl),
+        rank=1,
+        _decode_graph=None,
+        _decode_graph_mode=lambda: "graph",
+    )
+    with pytest.raises(NotImplementedError, match="block_residual"):
+        PSM._init_decode_graph(stub)
+
+    stub._decode_graph_mode = lambda: "eager"
+    PSM._init_decode_graph(stub)          # inert, and installs nothing
+    assert stub._decode_graph is None
+
+
+# --------------------------------------------------------------------------- #
+#  T6 — the 48B (no attn residuals) is untouched                               #
 # --------------------------------------------------------------------------- #
 def test_no_wiring_without_attn_res_block_size():
     _, kl, cfg = _build_pair(torch.float32)
