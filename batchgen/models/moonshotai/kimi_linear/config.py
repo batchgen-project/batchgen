@@ -38,6 +38,37 @@ _HF_ALIASES = {
 }
 
 
+def require_num_routed_experts(cfg) -> int:
+    """Routed-expert count for a Kimi-Linear / Kimi-K3 config, or raise.
+
+    K3's ``config.json`` declares the count as ``num_experts`` (896) and ships
+    **no** ``n_routed_experts`` key; :data:`_HF_ALIASES` bridges the two, but
+    only for a config that actually went through :meth:`from_hf_dict`.
+
+    This replaces ``getattr(cfg, "n_routed_experts", 256) or 256``, which
+    returns **256 for an 896-expert model** whenever the attribute is absent —
+    and on :class:`batchgen.config.config.ModelConfig` it is *always* absent,
+    since that class has no such field. Nothing raised: the EP shard layout,
+    the routing pool and the expert copy task were all sized for the wrong
+    model, and only the 48B's coincidental 256 hid it.
+
+    Accepts either config class (``KimiLinearConfig`` has both fields,
+    ``ModelConfig`` only ``num_local_experts``). There is no default.
+    """
+    for attr in ("n_routed_experts", "num_local_experts"):
+        value = getattr(cfg, attr, None)
+        if value:
+            return int(value)
+    raise RuntimeError(
+        "Cannot determine the routed-expert count from a "
+        f"{type(cfg).__name__}: neither 'n_routed_experts' nor "
+        "'num_local_experts' is set. K3 declares it as 'num_experts' in "
+        "config.json (aliased by KimiLinearConfig.from_hf_dict) — pass "
+        "--cache-dir so that file is read. There is no default and there "
+        "must not be one."
+    )
+
+
 @register_config("kimi_linear")
 @register_config("kimi_k3")
 @dataclass
