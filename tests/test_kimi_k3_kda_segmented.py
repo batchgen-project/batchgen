@@ -95,6 +95,16 @@ SM = _load_serving_modules()
 torch.set_num_threads(1)
 
 BT = SM._KDA_CHUNK_SIZE
+
+# The chunk size fla ACTUALLY uses, written out rather than read from the
+# module under test. `_KDA_CHUNK_SIZE` is the whole exactness argument — every
+# cut has to land on fla's own chunk grid — so a test that derives its
+# expectation from that same constant cannot detect the constant being wrong.
+# MEASURED at the source: fla 0.5.2 `fla/ops/kda/chunk.py`
+#   chunk_size = kwargs.pop("chunk_size", 64)
+# and `kda_prefill_serving` never passes `chunk_size`.
+FLA_CHUNK_SIZE = 64
+
 H, D = 2, 8
 
 
@@ -237,9 +247,12 @@ def test_plan_tiles_the_range_and_respects_sequences(cu, seg):
         # every cut is a sequence boundary or a chunk boundary of its sequence
         if b != total:
             j = max(i for i in range(len(cu)) if cu[i] <= b)
-            assert b == cu[j] or (b - cu[j]) % BT == 0, (
+            # FLA_CHUNK_SIZE, not BT: the assertion must hold against fla's
+            # real grid even if _KDA_CHUNK_SIZE is mis-set.
+            assert b == cu[j] or (b - cu[j]) % FLA_CHUNK_SIZE == 0, (
                 "cut {} is {} tokens into sequence {} — not a multiple of the "
-                "chunk_kda chunk size {}".format(b, b - cu[j], j, BT))
+                "chunk_kda chunk size {}".format(
+                    b, b - cu[j], j, FLA_CHUNK_SIZE))
         # the rebased cu_seqlens must be exactly the clamped intersections
         assert bounds == [min(max(c, a), b) - a for c in cu[lo:hi + 1]]
         assert bounds[0] == 0 and bounds[-1] == b - a
@@ -266,13 +279,54 @@ def test_plan_rejects_a_misaligned_segment_size():
         SM._kda_segment_plan([0, 512], 0)
 
 
-@pytest.mark.parametrize("cu", [[0, 0, 512], [0, 512, 512]])
+@pytest.mark.parametrize("cu", [
+    [0, 0, 512],            # leading
+    [0, 512, 512],          # trailing
+    [0, 64, 64, 128],       # INTERIOR — invisible to any coverage check that
+    [0, 128, 128, 128, 256],  # only inspects the first and last segment
+    [0, 300, 200],          # non-monotonic outright
+])
 def test_plan_refuses_to_drop_a_zero_length_sequence(cu):
     """A dropped sequence would silently leave its pool state stale. The conv1d
     kernel cannot handle a zero-length sequence either, so this is a hard
-    failure rather than a special case."""
-    with pytest.raises(ValueError, match="zero-length"):
+    failure rather than a special case.
+
+    The interior cases are the ones that matter: the segments on either side of
+    a zero-length sequence still tile the token axis perfectly and still start
+    at sequence 0 and end at the last sequence, so only a check on the INPUT
+    catches them."""
+    with pytest.raises(ValueError, match="strictly increasing"):
         SM._kda_segment_plan(cu, 128)
+
+
+def test_chunk_size_constant_matches_flas_own():
+    """``_KDA_CHUNK_SIZE`` is load-bearing for exactness, not a tuning knob.
+
+    Every other test in this file constructs its expectations from it, so none
+    of them can see it being wrong — MEASURED: setting it to 32 leaves all 46
+    of them green while producing cuts that land mid-chunk in the real kernel.
+    This is the one assertion that pins it, against a literal.
+    """
+    assert SM._KDA_CHUNK_SIZE == FLA_CHUNK_SIZE, (
+        "_KDA_CHUNK_SIZE={} but fla chunks at {}: segment cuts would land "
+        "inside a chunk, re-cutting the gate cumsum and the WY transform, and "
+        "the sweep would no longer be bit-exact"
+        .format(SM._KDA_CHUNK_SIZE, FLA_CHUNK_SIZE))
+    assert SM.KDA_PREFILL_SEGMENT_TOKENS % FLA_CHUNK_SIZE == 0
+
+    try:                                    # exact when fla is installed
+        import inspect
+
+        from fla.ops.kda import chunk as fla_chunk
+        src = inspect.getsource(fla_chunk)
+        assert 'chunk_size = kwargs.pop("chunk_size", {})'.format(
+            FLA_CHUNK_SIZE) in src or \
+            "chunk_size = kwargs.pop('chunk_size', {})".format(
+                FLA_CHUNK_SIZE) in src, (
+            "fla's chunk_kda default chunk size is no longer {}"
+            .format(FLA_CHUNK_SIZE))
+    except ImportError:
+        pass                                # CPU dev box: the literal stands
 
 
 @pytest.mark.parametrize("seed", range(20))
