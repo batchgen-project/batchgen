@@ -195,6 +195,12 @@ class KimiMLP(nn.Module):
                 # the body produces, never a guess off `x`.
                 out = y.new_empty((num_tokens, y.shape[-1]))
             out[start:end] = y
+            # `y` is rebound only on the NEXT iteration's assignment, i.e. after
+            # `self._ffn(...)` for that tile has already peaked. Without this
+            # `del`, one whole (tile, hidden) output tile is co-live with the
+            # peak — MEASURED at +T*H*2 bytes = +0.109 GiB at K3 scale, which is
+            # small but is carried into the prefill budget and is free to drop.
+            del y
         return out.view(*x.shape[:-1], out.shape[-1])
 
 
@@ -972,6 +978,13 @@ class KimiLinearModel(nn.Module):
             hidden_states = self._apply_output_attn_res(
                 hidden_states.view(-1, self.config.hidden_size), block_residual
             ).view(batch_size, seq_len, self.config.hidden_size)
+            # The pass is over. `block_residual` is a view of class-state
+            # scratch, so unlike the local it replaced it does not die with
+            # this frame — drop both, or the (S, 8, H) buffer stays pinned
+            # (14.00 GiB at S=131,072). The carried path does the same through
+            # BlockResidualCarrier.take().
+            block_residual = None
+            BlockResidualBuffer.reset()
 
         hidden_states = self.norm(hidden_states)
         return hidden_states

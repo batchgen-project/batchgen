@@ -32,6 +32,16 @@ have it unconditionally — MEASURED here, on arm64 with 6 threads:
     a GEMV). This is why ``forward`` splits into EVEN tiles and never emits a
     degenerate tail — ``test_tiles_are_even``.
 
+THE fp32 ARM OF THE SWEEP IS LOAD-BEARING, and not as a secondary dtype: it is
+the only arm that has the resolution to see a degenerate tile. MEASURED — with
+``forward`` mutated back to `fixed width + ragged remainder`, the suite goes
+red on exactly four cases, all fp32 (``[65-dtype0-situ]``, ``[65-dtype0-silu]``,
+``[257-dtype0-situ]``, ``[257-dtype0-silu]``, i.e. num_tokens = k*TILE+1); every
+bf16 case at the same token counts stays green, because bf16's 8-bit mantissa
+rounds the GEMV/GEMM difference away. Production is bf16. Do not "simplify" the
+sweep down to the production dtype — that deletes the only detector for the
+trap the even split exists to avoid.
+
 So the ``torch.equal`` sweeps run single-threaded, where the CPU backend IS
 element-count invariant and any failure is therefore the tiling's fault: index
 arithmetic, a dropped or duplicated row, the ragged final tile, output dtype or
@@ -53,6 +63,7 @@ import importlib.util
 import math
 import sys
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -269,6 +280,42 @@ def test_tiles_are_even(M):
         assert max(sizes) - min(sizes) <= 1
 
 
+def test_previous_tile_is_freed_before_the_next(M, monkeypatch):
+    """No tile's output is co-live with the next tile's peak.
+
+    Tiling bounds the FFN island only if the loop actually holds ONE tile at a
+    time. Python rebinds ``y`` on the next iteration's assignment — i.e. AFTER
+    ``self._ffn(...)`` for that tile has already peaked — so without the
+    explicit ``del`` the previous ``(tile, hidden)`` output sits underneath
+    every peak (+0.109 GiB at K3 scale). Weakrefs, not byte counting: this
+    asserts the liveness directly and is backend-independent.
+    """
+    monkeypatch.setattr(M, "_FFN_TOKEN_TILE", TILE)
+    mlp = _mlp(M, "situ", torch.bfloat16)
+    num_tokens = 4 * TILE + 1
+    x = torch.randn(num_tokens, HIDDEN,
+                    generator=torch.Generator().manual_seed(13)).bfloat16()
+
+    real_ffn = mlp._ffn
+    refs, alive_at_entry = [], []
+
+    def spy(t):
+        alive_at_entry.append(sum(r() is not None for r in refs))
+        y = real_ffn(t)
+        refs.append(weakref.ref(y))
+        return y
+
+    mlp._ffn = spy
+    with torch.inference_mode():
+        got = mlp(x)
+
+    assert len(refs) == math.ceil(num_tokens / TILE) == 5
+    assert alive_at_entry == [0] * len(refs), (
+        "a previous tile's output was still alive when the next tile started: "
+        "{} — the `del y` in KimiMLP.forward was removed".format(alive_at_entry))
+    assert torch.equal(got, real_ffn(x))
+
+
 def test_backend_invariance_notes():
     """The two backend measurements the module docstring rests on. Printed,
     never asserted: they are properties of this torch build, and the tiling is
@@ -304,14 +351,21 @@ def test_backend_invariance_notes():
 #  T3 — the GPU answer (skips off-GPU; run it on the node)                     #
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("num_tokens", [8192 + 1, 2 * 8192 + 517, 3 * 8192])
-def test_chunked_equals_unchunked_cuda(M, num_tokens):
-    """Real K3 widths (hidden 7168, the 2-wide shared expert's 6144
-    intermediate), production dtype, production tile. This is the assertion the
-    CPU cannot make: that CUDA's elementwise kernels and these GEMM shapes are
-    both invariant to how many rows arrive at once. Peak extra allocation is
-    24 * 8192 * 6144 = 1.13 GiB."""
-    mlp = _mlp(M, "situ", torch.bfloat16, hidden=7168, inter=6144,
+@pytest.mark.parametrize("inter,num_tokens", [
+    # MoE shared expert (2 x moe_intermediate_size 3072)
+    (6144, 8192 + 1), (6144, 2 * 8192 + 517), (6144, 3 * 8192),
+    # LAYER 0's DENSE MLP — the width fix 1 actually exists for, and a
+    # different cuBLAS regime (N = 2*33792 = 67,584). 6144 passing does not
+    # imply 33792 passes; both must be run. Unchunked reference transient is
+    # 24 * num_tokens * inter = 6.6 GiB and 13.8 GiB for these two cases.
+    (33792, 8192 + 1), (33792, 2 * 8192 + 517),
+])
+def test_chunked_equals_unchunked_cuda(M, inter, num_tokens):
+    """Real K3 widths (hidden 7168), production dtype, production tile. This is
+    the assertion the CPU cannot make: that CUDA's elementwise kernels and these
+    GEMM shapes are both invariant to how many rows arrive at once. num_tokens
+    = 8192+1 is the degenerate-tail trap the even split exists to avoid."""
+    mlp = _mlp(M, "situ", torch.bfloat16, hidden=7168, inter=inter,
                device="cuda")
     x = torch.randn(1, num_tokens, 7168, device="cuda",
                     generator=torch.Generator(device="cuda").manual_seed(5)
@@ -322,5 +376,6 @@ def test_chunked_equals_unchunked_cuda(M, num_tokens):
         got = mlp(x)
 
     assert torch.equal(got, ref), (
-        "CUDA: chunked FFN differs from the unchunked body at num_tokens={} "
-        "max|delta|={}".format(num_tokens, (got.float() - ref.float()).abs().max()))
+        "CUDA: chunked FFN differs from the unchunked body at inter={} "
+        "num_tokens={} max|delta|={}".format(
+            inter, num_tokens, (got.float() - ref.float()).abs().max()))

@@ -134,12 +134,47 @@ def main():
     check("no-op .contiguous() preserves values exactly",
           torch.equal(qa.contiguous(), qb.contiguous()))
 
+    # --- what the SEGMENTED KDA sweep sees (kimi_linear fix 5) ---
+    # This is where the saving is actually collected once chunk_kda runs in
+    # token segments: fla copies whatever slice it is handed, so the win is
+    # per-SEGMENT, not per-sequence. 1.125 GiB/layer at K3's T=16,384, not the
+    # 9.00 GiB the unsegmented sweep would have saved.
+    seg = slice(8, 40)
+    seg_a, seg_b = qa[:, seg], qb[:, seg]
+    check("SEGMENT slice of the OLD path is non-contiguous (fla copies it)",
+          not seg_a.is_contiguous())
+    check("SEGMENT slice of the NEW path IS contiguous (fla copies nothing)",
+          seg_b.is_contiguous() and seg_b.contiguous() is seg_b)
+    check("segment values identical across the two paths",
+          torch.equal(seg_a.contiguous(), seg_b))
+
+    # --- the contiguity precondition, and that it fires BEFORE the kernel ---
+    # The kernel mutates conv_states in place, so a late assert would leave the
+    # pool half-updated. x here is a last-dim slice of a fused qkv buffer.
+    x_bad = torch.randn(total, 2 * DIM, generator=g).to(DTYPE)[:, :DIM]
+    pool_c = torch.zeros(4, DIM, W - 1, dtype=DTYPE)
+    pool_c0 = pool_c.clone()
+    raised = False
+    try:
+        _run(x_bad, weight, bias, cu, slots, pool_c, overwrite_x=True)
+    except AssertionError:
+        raised = True
+    check("overwrite_x REFUSES non-contiguous x", raised)
+    check("...and refuses before the kernel touches conv_states",
+          torch.equal(pool_c, pool_c0))
+
     print()
     if fails:
         print(f"{len(fails)} FAILED: {fails}")
         return 1
     print("all checks passed")
     return 0
+
+
+def test_conv1d_layout_cpu():
+    """pytest entry point, so the check actually gates in a suite run as well
+    as under ``python -m``."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

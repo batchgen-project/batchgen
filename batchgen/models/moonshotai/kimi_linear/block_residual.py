@@ -196,7 +196,20 @@ class BlockResidualBuffer:
 
     @classmethod
     def reset(cls) -> None:
-        """Drop the buffer (phase switches, error recovery, tests)."""
+        """Drop the buffer.
+
+        MUST run at the end of every pass, not only on phase switches.  The
+        buffer is class state, so unlike the plain local it replaced it does
+        NOT die when the prefill frame returns: at S=131,072 / H=7168 / bf16 it
+        would otherwise keep 14.00 GiB pinned across ``configure_decoding()``
+        and the resident-EP build that follows it, until the first decode step
+        reseeded it.  That is a regression the ``cat`` form could not have —
+        which is why :meth:`BlockResidualCarrier.reset` calls this, and why
+        ``take()`` (end of a carried pass) and ``KimiLinearModel.forward`` (end
+        of an explicitly-threaded pass) both go through it.  The narrowed view
+        the consumer is holding keeps the storage alive for exactly as long as
+        the output depth mix needs it, and no longer.
+        """
         cls._buf = None
         cls._view = None
 
@@ -298,9 +311,17 @@ class BlockResidualCarrier:
 
     @classmethod
     def reset(cls) -> None:
-        """Drop any parked scratch (phase switches, error recovery)."""
+        """Drop any parked scratch — the view AND the buffer behind it.
+
+        "The pass is over" is one fact, so it has one switch.  Freeing only the
+        carrier's view would leave :class:`BlockResidualBuffer` holding the
+        whole ``(S, 8, H)`` allocation (14.00 GiB at S=131,072) as class state
+        long after the prefill frame returned; see
+        :meth:`BlockResidualBuffer.reset`.
+        """
         cls._block_residual = None
         cls._last_layer = None
+        BlockResidualBuffer.reset()
 
     @classmethod
     def peek(cls) -> Optional[torch.Tensor]:
@@ -324,10 +345,9 @@ class BlockResidualCarrier:
                     "attn_res_block_size) was never called; the block_residual "
                     "buffer cannot be sized.")
             batch, seq_len, hidden = hidden_states.shape
-            # Drop last pass's view BEFORE seeding, so the old buffer is not
-            # still live while the new one is allocated.
-            cls._block_residual = None
-            cls._last_layer = None
+            # Drop last pass's view AND buffer BEFORE seeding, so the old
+            # allocation is not still live while the new one is made.
+            cls.reset()
             cls._block_residual = BlockResidualBuffer.seed(
                 batch * seq_len, hidden, cls.num_columns,
                 dtype=hidden_states.dtype, device=hidden_states.device)

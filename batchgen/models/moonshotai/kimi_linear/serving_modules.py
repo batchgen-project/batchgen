@@ -388,6 +388,19 @@ def _kda_segment_plan(cu_list, segment_tokens):
             "segment_tokens ({}) must be a positive multiple of the chunk_kda "
             "chunk size ({})".format(segment_tokens, _KDA_CHUNK_SIZE)
         )
+    # Reject zero-length sequences ANYWHERE, not just at the ends. A segment is
+    # identified by its token range, so a sequence with no tokens is invisible
+    # to the sweep and its state slot would silently never be written. Checking
+    # the input is the only check that catches an INTERIOR one; the coverage
+    # assertion below cannot, because the segments around it still tile the
+    # token axis perfectly.
+    if len(cu_list) < 2 or cu_list[0] != 0 or any(
+            b <= a for a, b in zip(cu_list, cu_list[1:])):
+        raise ValueError(
+            "cu_seqlens must start at 0 and be strictly increasing; got {}. A "
+            "zero-length sequence would be dropped from the segmented sweep "
+            "(and the conv1d kernel cannot handle one either)".format(cu_list)
+        )
     total = cu_list[-1]
     plan = []
     start, cut_seq, lo = 0, 0, 0
@@ -412,14 +425,19 @@ def _kda_segment_plan(cu_list, segment_tokens):
         bounds = [min(max(c, start), end) - start for c in cu_list[lo:hi + 2]]
         plan.append((start, end, lo, hi + 1, bounds))
         start = end
-    if plan[0][2] != 0 or plan[-1][3] != len(cu_list) - 1:
-        # Only reachable with leading/trailing zero-length sequences, which the
-        # conv1d kernel cannot handle either. Fail rather than silently drop a
-        # sequence's state update.
+    # Every sequence must be visited by at least one segment, or its recurrent
+    # state slot is never written. This guards the planner loop itself (the
+    # precondition above guards its input) — a sequence dropped here would
+    # produce a plausible-looking output and a stale state.
+    covered = set()
+    for _, _, lo, hi, _ in plan:
+        covered.update(range(lo, hi))
+    if covered != set(range(len(cu_list) - 1)):
         raise ValueError(
-            "segment plan covers sequences {}..{} of {} — cu_seqlens {} has "
-            "zero-length sequences".format(
-                plan[0][2], plan[-1][3], len(cu_list) - 1, cu_list)
+            "segment plan misses sequences {} of {}; cu_seqlens={} "
+            "segment_tokens={}".format(
+                sorted(set(range(len(cu_list) - 1)) - covered),
+                len(cu_list) - 1, cu_list, segment_tokens)
         )
     return plan
 
@@ -515,7 +533,14 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     # overwrite_x=True: the conv result is transposed back into the projection's
     # own (total, dim) buffer, which is dead after the call. q/k/v stay
     # token-major CONTIGUOUS, so fla's @input_guard .contiguous() is a no-op
-    # instead of a third full copy of each — 9.00 GiB/layer at S=131k.
+    # instead of allocating a copy of each.
+    #
+    # SIZE OF THAT SAVING, with the segmented sweep below in place: fla copies
+    # whatever slice it is handed, and it is handed one SEGMENT, so the win is
+    # 3 x (segment_tokens, 12288) bf16 = 1.125 GiB/layer at T=16,384 — not the
+    # 3 x (S, 12288) = 9.00 GiB/layer that PREFILL_MEMORY_AUDIT.md fix 2 quotes
+    # for the unsegmented sweep it was measured against. Still worth having:
+    # nothing else makes the segment slices contiguous, and it is free.
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_fwd(
         q, qw, bias=qb,

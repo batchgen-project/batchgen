@@ -47,6 +47,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,6 +143,10 @@ except Exception as exc:  # pragma: no cover - environment problem, not a failur
 
 BlockResidualBuffer = KL.BlockResidualBuffer
 num_block_residual_columns = KL.num_block_residual_columns
+# The carrier lives next to the buffer; reach it through whichever alias the
+# import dance above resolved to.
+BlockResidualCarrier = sys.modules[
+    BlockResidualBuffer.__module__].BlockResidualCarrier
 
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +401,68 @@ def test_append_beyond_the_buffer_hard_fails():
     with pytest.raises(RuntimeError, match="overflow"):
         BlockResidualBuffer.append(block_residual, column)
     BlockResidualBuffer.reset()
+
+
+# --------------------------------------------------------------------------- #
+#  T5 — the buffer is class state, so its RELEASE has to be wired              #
+# --------------------------------------------------------------------------- #
+#  The tensor this change replaced was a plain local in the worker's prefill
+#  frame: it died when the frame returned. The buffer does not. Nothing here is
+#  about numerics — it is about 14.00 GiB (S=131,072 / H=7168 / bf16) staying
+#  pinned across configure_decoding() and the resident-EP build if the release
+#  is ever unwired. Weakrefs, because "was it freed" is the actual question.
+def test_buffer_reset_releases_the_allocation():
+    BlockResidualBuffer.reset()
+    view = BlockResidualBuffer.seed(4, 3, 8, dtype=torch.float32,
+                                    device=torch.device("cpu"))
+    buf_ref = weakref.ref(BlockResidualBuffer._buf)
+    del view
+    assert buf_ref() is not None, "class state should still hold the buffer"
+    BlockResidualBuffer.reset()
+    assert buf_ref() is None, "BlockResidualBuffer.reset() did not free the buffer"
+
+
+def test_carrier_reset_releases_the_buffer():
+    """``BlockResidualCarrier.reset()`` is what the PSM calls on every phase
+    switch (configure_prefill / configure_decoding) and after an aborted pass.
+    Dropping only the carrier's view would leave the whole buffer alive."""
+    BlockResidualCarrier.configure(_LAYERS, _BLOCK)
+    block_residual = BlockResidualCarrier.borrow(0, torch.zeros(1, 5, 3))
+    buf_ref = weakref.ref(BlockResidualBuffer._buf)
+    BlockResidualCarrier.stash(0, block_residual)
+    del block_residual
+    assert buf_ref() is not None
+    BlockResidualCarrier.reset()
+    assert buf_ref() is None, (
+        "BlockResidualCarrier.reset() freed its view but left the "
+        "(num_tokens, num_columns, hidden) buffer pinned as class state")
+
+
+def test_take_releases_the_buffer_with_the_output_mix():
+    """The production carried path: the norm pre-hook calls ``take()``, mixes,
+    and returns. After ``take()`` no class state may reference the buffer — the
+    consumer's own view is the ONLY thing keeping it alive, so it dies with the
+    hook's frame instead of outliving the whole prefill."""
+    BlockResidualCarrier.configure(2, 1)          # boundaries at layers 0 and 1
+    hidden_states = torch.zeros(1, 5, 3)
+    column = torch.randn(5, 3)
+
+    block_residual = BlockResidualCarrier.borrow(0, hidden_states)
+    block_residual = BlockResidualBuffer.append(block_residual, column)
+    BlockResidualCarrier.stash(0, block_residual)
+    block_residual = BlockResidualCarrier.borrow(1, hidden_states)
+    block_residual = BlockResidualBuffer.append(block_residual, column)
+    BlockResidualCarrier.stash(1, block_residual)
+    del block_residual
+
+    buf_ref = weakref.ref(BlockResidualBuffer._buf)
+    taken = BlockResidualCarrier.take()
+    assert taken.shape == (5, 2, 3)
+    assert BlockResidualBuffer._buf is None and BlockResidualBuffer._view is None
+    assert buf_ref() is not None, "the consumer's view must still pin the bytes"
+    del taken
+    assert buf_ref() is None, (
+        "the buffer outlived the pass: take() left it referenced by class state")
 
 
 def test_consumer_cat_erases_the_stride_difference():
