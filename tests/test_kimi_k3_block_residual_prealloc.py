@@ -465,6 +465,57 @@ def test_take_releases_the_buffer_with_the_output_mix():
         "the buffer outlived the pass: take() left it referenced by class state")
 
 
+def test_carried_drive_releases_the_buffer_end_to_end():
+    """The production PREFILL path, end to end, on CPU.
+
+    ``tests/test_kimi_linear_block_residual_serving.py`` covers this wiring
+    against the M2 ground truth but cannot run without a GPU (its import chain
+    JIT-builds a CUDA op), so the release property is pinned here instead:
+    drive the real ``decoder_layer_forward_block_residual`` over all 93 layers
+    the way the worker's prepack loop does — no ``block_residual`` argument,
+    only ``layer_outputs[0]`` kept — then fire the real ``model.norm`` pre-hook
+    and check nothing is left holding the buffer.
+    """
+    layers, out_model, final_norm, x = _build_stack(torch.float32)
+    BR = sys.modules[BlockResidualBuffer.__module__]
+    # The stub layer supplies _run_attn/_run_ffn and the norms; the body itself
+    # is the real one, exactly as the PSM installs it.
+    for layer in layers:
+        layer._forward_attn_residual = types.MethodType(
+            KL.KimiDecoderLayer._forward_attn_residual, layer)
+
+    BlockResidualCarrier.configure(_LAYERS, _BLOCK)
+    hidden_states = x
+    for layer in layers:
+        hidden_states = BR.decoder_layer_forward_block_residual(
+            layer, hidden_states)[0]
+
+    buf_ref = weakref.ref(BlockResidualBuffer._buf)
+    assert BlockResidualCarrier.peek() is not None
+
+    pre_hook = BR.make_output_block_residual_pre_hook(out_model)
+    mixed = pre_hook(final_norm, (hidden_states,))[0]
+
+    assert mixed.shape == hidden_states.shape
+    assert BlockResidualCarrier.peek() is None
+    assert BlockResidualBuffer._buf is None
+    assert buf_ref() is None, (
+        "the (num_tokens, 8, hidden) buffer survived the prefill pass — at "
+        "S=131,072 that is 14.00 GiB pinned across configure_decoding()")
+
+    # And a second pass still reproduces the first: releasing is not a leak of
+    # state into the next forward.
+    BlockResidualCarrier.configure(_LAYERS, _BLOCK)
+    hidden_states = x
+    for layer in layers:
+        hidden_states = BR.decoder_layer_forward_block_residual(
+            layer, hidden_states)[0]
+    again = BR.make_output_block_residual_pre_hook(out_model)(
+        final_norm, (hidden_states,))[0]
+    assert torch.equal(mixed, again)
+    BlockResidualCarrier.reset()
+
+
 def test_consumer_cat_erases_the_stride_difference():
     """The one device-dependent risk, pinned as a device-INDEPENDENT invariant.
 
