@@ -7085,6 +7085,14 @@ class BatchGenWorker:
 				# allocator-history trace, so it still localises the peak layer
 				# if the trace ring buffer wraps.
 				_memprof_layers = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
+				# The allocator-history ring buffer only holds the LAST max_entries
+				# events, and one K3 prefill emits ~2e7 of them (896-expert
+				# moe_infer loop x 92 layers), so a whole-forward trace only ever
+				# retains the tail. The HBM peak is set in the FIRST layer, so
+				# BATCHGEN_MEM_PROFILE_STOP_LAYER=N dumps and stops recording right
+				# after layer N: a short, wrap-free trace of the window that
+				# actually contains the peak.
+				_memprof_stop_layer = int(os.environ.get("BATCHGEN_MEM_PROFILE_STOP_LAYER", "-1"))
 
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					if use_attn_res:
@@ -7116,6 +7124,17 @@ class BatchGenWorker:
 							f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
 							f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
 						)
+						if layer_idx == _memprof_stop_layer:
+							_p = os.path.join(
+								os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
+								f"memprof_rank{self.rank}_thru_layer{layer_idx}_{int(time.time())}.pickle",
+							)
+							torch.cuda.memory._dump_snapshot(_p)
+							torch.cuda.memory._record_memory_history(enabled=None)
+							logging.info(
+								f"[MEMPROF] Rank {self.rank}: stop-layer snapshot -> {_p} "
+								f"(peak_alloc so far={torch.cuda.max_memory_allocated()/2**30:.3f}GiB)"
+							)
 
 				# Output depth-mix, then norm -- that ORDER is load-bearing
 				# (kimi_linear/model.py:904-913).
