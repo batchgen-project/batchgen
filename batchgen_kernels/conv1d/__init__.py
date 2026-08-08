@@ -21,6 +21,7 @@ Usage (BatchGen token-major serving layout):
         query_start_loc=cu_seqlens,  # (batch+1,) int32
         cache_indices=slot_ids,      # (batch,) int32
         has_initial_state=has_init,  # (batch,) bool or None
+        overwrite_x=True,            # y IS x, token-major contiguous; saves a copy
     )
 
     # decode: x (batch, dim) -> y (batch, dim); conv_state pool updated in place
@@ -60,13 +61,15 @@ def causal_conv1d_fwd(
     has_initial_state: torch.Tensor | None = None,
     silu_activation: bool = True,
     pad_slot_id: int = -1,
+    overwrite_x: bool = False,
 ) -> torch.Tensor:
     """Causal conv1d prefill.
 
     Args:
         x: (total_tokens, dim) token-major packed varlen input (requires
             query_start_loc), or (batch, dim, seqlen) channel-major batched
-            input. A staging copy is made; x is not modified.
+            input. A staging copy is made; x is not modified unless
+            overwrite_x is set.
         weight: (dim, W) or (dim, 1, W).
         bias: optional (dim,).
         conv_states: optional (num_slots, dim, W-1) pool; final state of each
@@ -77,11 +80,24 @@ def causal_conv1d_fwd(
             used as the conv initial state (chunked-prefill continuation).
         silu_activation: apply SiLU (default True).
         pad_slot_id: slot id treated as padding (skipped).
+        overwrite_x: varlen path only. Transpose the result back into x's own
+            storage and return x, so the caller gets a token-major CONTIGUOUS
+            tensor. x is DESTROYED (it holds the output). Requires contiguous
+            2-D x. Off by default; existing callers keep the strided view.
 
     Returns:
-        Output in the same logical layout as x: (total_tokens, dim) view over
-        the channel-major staging buffer for varlen input, or
+        Output in the same logical layout as x: (total_tokens, dim) for varlen
+        input — a strided view over the channel-major staging buffer by
+        default, or contiguous x itself with overwrite_x=True — or
         (batch, dim, seqlen) for batched input.
+
+    Memory note (varlen): the staging buffer is a full (total, dim) copy. With
+    overwrite_x=False the returned view keeps it alive, and any consumer that
+    needs a contiguous token-major tensor (e.g. fla's @input_guard) allocates a
+    THIRD full copy. overwrite_x=True does that transpose-back into the buffer
+    the caller already owns, so exactly one (total, dim) tensor survives the
+    call and the downstream .contiguous() is a no-op. Same two transposing
+    copies either way — no extra bandwidth.
     """
     ext = _get_ext()
     weight = _prep_weight(weight)
@@ -90,6 +106,8 @@ def causal_conv1d_fwd(
     if query_start_loc is not None:
         # token-major (total, dim) -> channel-major (dim, total) staging copy
         assert x.dim() == 2, "varlen x must be (total_tokens, dim)"
+        # checked before the kernel runs — it mutates conv_states in place
+        assert not overwrite_x or x.is_contiguous(), "overwrite_x requires contiguous x"
         x_cm = x.t().contiguous()
         ext.causal_conv1d_fwd(
             x_cm, weight, bias, conv_states,
@@ -98,7 +116,14 @@ def causal_conv1d_fwd(
             has_initial_state,
             silu_activation, pad_slot_id,
         )
+        if overwrite_x:
+            # Transpose back into x's storage: pure bf16->bf16 element copy, so
+            # the values are bit-identical to x_cm.t() (and to the .contiguous()
+            # the consumer would otherwise have made). x_cm dies at return.
+            x.copy_(x_cm.t())
+            return x
         return x_cm.t()  # (total, dim) strided view; downstream handles strides
+    assert not overwrite_x, "overwrite_x is varlen-only (the batched path is already in place)"
     assert x.dim() == 3, "batched x must be (batch, dim, seqlen)"
     x_c = x if x.stride(-1) == 1 else x.contiguous()
     ext.causal_conv1d_fwd(
