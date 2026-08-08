@@ -7066,6 +7066,14 @@ class BatchGenWorker:
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
+				# unsqueeze is a VIEW, so `hidden_states` already keeps the
+				# embedding storage alive for exactly as long as layer 0 needs
+				# it. Keeping `inputs_embeds` bound as well pins that storage
+				# for the WHOLE stack instead -- 1.75 GiB dead across layers
+				# 1-92 at S=131,072 / H=7168 / bf16
+				# (batchgen_design/model_support/kimi_k3/
+				#  PREFILL_MEMORY_AUDIT.md section 7, fix 4).
+				del inputs_embeds
 
 				# Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
 				# classic residual body, so the per-layer state has to be carried
@@ -7076,9 +7084,14 @@ class BatchGenWorker:
 				use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
 				block_residual = None
 				if use_attn_res:
-					block_residual = hidden_states.new_zeros(
-						hidden_states.shape[0] * hidden_states.shape[1], 0,
-						hidden_states.shape[2])
+					# Zero-column view of a buffer preallocated for ALL the
+					# stack's block boundaries, so the per-boundary `cat` never
+					# holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
+					# GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
+					# `block_residual = None` above is load-bearing: it drops
+					# the previous micro-batch's view before the next buffer is
+					# allocated.
+					block_residual = self.model.model._new_block_residual(hidden_states)
 
 				# DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
 				# bookkeeping is CPU-side, no sync) and independent of the
