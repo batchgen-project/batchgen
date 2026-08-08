@@ -5549,12 +5549,55 @@ class BatchGenWorker:
 								f"[HBM] Rank {self.rank} BEFORE prefill ({len(local_prefill_indices)} seqs): "
 								f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 							)
+						# DEBUG instrumentation (env-gated, off by default):
+						# per-allocation attribution of the prefill HBM peak.
+						# BATCHGEN_MEM_PROFILE=1 turns on torch's allocator history
+						# recorder around the prefill forward and dumps a snapshot
+						# (also on OOM, via the finally) to BATCHGEN_MEM_PROFILE_DIR.
+						_memprof = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
+						if _memprof:
+							_memprof_base = torch.cuda.memory_allocated()
+							# context="alloc"/stacks="python": frames on allocation
+							# events only. K3 prefill does ~1e6 allocations (the
+							# 896-expert moe_infer loop), so recording free-event
+							# and C++ stacks too would double cost for no signal.
+							torch.cuda.memory._record_memory_history(
+								context="alloc",
+								stacks=os.environ.get("BATCHGEN_MEM_PROFILE_STACKS", "python"),
+								max_entries=int(os.environ.get("BATCHGEN_MEM_PROFILE_ENTRIES", "3000000")),
+							)
+							torch.cuda.reset_peak_memory_stats()
+							logging.info(
+								f"[MEMPROF] Rank {self.rank}: recording ON, "
+								f"baseline_alloc={_memprof_base/2**30:.3f}GiB"
+							)
 						prefill_start = time.perf_counter()
-						with torch.inference_mode():
-							if self.enable_prepack:
-								self.prefill_prepacked(local_prefill_indices)
-							else:
-								self.prefill(local_prefill_indices)
+						try:
+							with torch.inference_mode():
+								if self.enable_prepack:
+									self.prefill_prepacked(local_prefill_indices)
+								else:
+									self.prefill(local_prefill_indices)
+						finally:
+							if _memprof:
+								logging.info(
+									f"[MEMPROF] Rank {self.rank}: "
+									f"peak_alloc={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
+									f"cur_alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
+									f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
+									f"peak_reserved={torch.cuda.max_memory_reserved()/2**30:.3f}GiB "
+									f"baseline_alloc={_memprof_base/2**30:.3f}GiB"
+								)
+								_memprof_path = os.path.join(
+									os.environ.get("BATCHGEN_MEM_PROFILE_DIR", "/tmp"),
+									f"memprof_rank{self.rank}_{int(time.time())}.pickle",
+								)
+								try:
+									torch.cuda.memory._dump_snapshot(_memprof_path)
+									logging.info(f"[MEMPROF] Rank {self.rank}: snapshot -> {_memprof_path}")
+								except Exception as _memprof_err:
+									logging.error(f"[MEMPROF] Rank {self.rank}: dump failed: {_memprof_err}")
+								torch.cuda.memory._record_memory_history(enabled=None)
 						prefill_time += time.perf_counter() - prefill_start
 
 						# CRITICAL: Wait for all async KV offloads to complete before decode.
@@ -7037,6 +7080,12 @@ class BatchGenWorker:
 						hidden_states.shape[0] * hidden_states.shape[1], 0,
 						hidden_states.shape[2])
 
+				# DEBUG (env-gated): per-layer HBM watermarks. Cheap (allocator
+				# bookkeeping is CPU-side, no sync) and independent of the
+				# allocator-history trace, so it still localises the peak layer
+				# if the trace ring buffer wraps.
+				_memprof_layers = os.environ.get("BATCHGEN_MEM_PROFILE", "0") == "1"
+
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 					if use_attn_res:
 						hidden_states, block_residual = decoder_layer(
@@ -7058,6 +7107,15 @@ class BatchGenWorker:
 							use_cache=False,
 						)
 						hidden_states = layer_outputs[0]
+					if _memprof_layers:
+						logging.info(
+							f"[MEMPROF-L] rank={self.rank} layer={layer_idx} "
+							f"attn={type(getattr(decoder_layer, 'self_attn', decoder_layer)).__name__} "
+							f"alloc={torch.cuda.memory_allocated()/2**30:.3f}GiB "
+							f"cum_peak={torch.cuda.max_memory_allocated()/2**30:.3f}GiB "
+							f"reserved={torch.cuda.memory_reserved()/2**30:.3f}GiB "
+							f"bres={tuple(block_residual.shape) if block_residual is not None else None}"
+						)
 
 				# Output depth-mix, then norm -- that ORDER is load-bearing
 				# (kimi_linear/model.py:904-913).
