@@ -687,7 +687,8 @@ class KimiLinearParallelStrategyManager:
         cfg = self.loaded_model_config
         if getattr(cfg, "attn_res_block_size", None) is None:
             return
-        BlockResidualCarrier.configure(cfg.num_hidden_layers)
+        BlockResidualCarrier.configure(cfg.num_hidden_layers,
+                                       cfg.attn_res_block_size)
         for layer in self.model.model.layers:
             layer.forward = types.MethodType(
                 decoder_layer_forward_block_residual, layer

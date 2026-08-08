@@ -133,6 +133,134 @@ def apply_attn_res(prefix_sum: torch.Tensor,
 
 
 # ============================================================================
+#  Preallocated block_residual scratch
+# ============================================================================
+
+
+def num_block_residual_columns(num_hidden_layers: int,
+                               attn_res_block_size: int) -> int:
+    """How many block boundaries one whole-stack pass crosses.
+
+    A boundary is a layer with ``layer_idx % attn_res_block_size == 0``, so over
+    ``range(num_hidden_layers)`` there are ``ceil(L / block_size)`` of them:
+    K3's 93 layers at block size 12 give **8** (layers 0, 12, 24, ..., 84), and
+    the SYN-25 test config's 25 layers at block size 3 give 9 (0, 3, ..., 24).
+    """
+    num_hidden_layers = int(num_hidden_layers)
+    attn_res_block_size = int(attn_res_block_size)
+    return -(-num_hidden_layers // attn_res_block_size)
+
+
+class BlockResidualBuffer:
+    """One preallocated ``(num_tokens, num_columns, hidden)`` scratch tensor.
+
+    WHY.  The boundary append used to be
+    ``torch.cat([block_residual, snapshot], dim=1)``, which allocates the
+    ``(S, nb+1, H)`` result while the ``(S, nb, H)`` input is still live.  At
+    S=131,072 / H=7168 / bf16 the last boundary (layer 84) therefore held
+    12.25 + 14.00 GiB simultaneously, and seven earlier boundaries each churned
+    a full reallocation — ``PREFILL_MEMORY_AUDIT.md`` §4/§7 fix 3.  Writing
+    column ``nb`` of a buffer that already exists removes the transient and the
+    seven intermediate allocations both.
+
+    WHAT IS THREADED IS STILL A PLAIN TENSOR, and still exactly the tensor the
+    ``cat`` produced.  :meth:`append` hands back the NARROWED view
+    ``buf[:, :nb+1]`` — never the whole buffer.  That is the trap in this
+    optimisation and the reason the narrowing is not optional: every consumer
+    reads ``block_residual.shape[1]`` as "boundaries seen so far" (the
+    ``shape[1] > 0`` gate in ``KimiDecoderLayer._forward_attn_residual``, the
+    ``block_residual[start:end]`` read in :func:`apply_attn_res`, the worker's
+    ``bres=`` memory log), and a caller handed the full ``(S, 8, H)`` buffer
+    would mix eight all-zero keys into layer 0's depth-attention and silently
+    compute a different model.
+
+    BIT-EXACTNESS.  The in-place path is a same-dtype ``copy_`` of exactly the
+    bytes ``cat`` would have copied into exactly the same logical column, so the
+    view's *values* are identical.  Consumers immediately re-``cat`` a token
+    slice of it into a fresh contiguous fp32 tensor, so the differing strides
+    never reach a reduction: ``apply_attn_res``'s ``v`` is byte-identical and
+    identically laid out either way.  Nothing is reassociated and no op order
+    changes.  Gated by ``torch.equal`` over a full 93-layer / 8-boundary drive
+    in ``tests/test_kimi_k3_block_residual_prealloc.py``.
+
+    Process-wide class state, like :class:`BlockResidualCarrier`: one decoder
+    stack is driven at a time and this scratch never outlives one pass.
+    :meth:`append` writes in place ONLY when handed back the exact view it last
+    produced; a caller-built ``block_residual`` (a test, or any caller that did
+    not go through :meth:`seed`) falls through to the original ``torch.cat`` and
+    is unaffected.  Everything that *is* on the buffer path is hard-checked.
+    """
+
+    _buf: Optional[torch.Tensor] = None
+    _view: Optional[torch.Tensor] = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """Drop the buffer (phase switches, error recovery, tests)."""
+        cls._buf = None
+        cls._view = None
+
+    @classmethod
+    def seed(cls, num_tokens: int, hidden: int, num_columns: int, *,
+             dtype: torch.dtype, device) -> torch.Tensor:
+        """Allocate this pass's buffer; return its ZERO-column view.
+
+        ``torch.zeros``, not ``torch.empty``, and a fresh allocation every pass:
+        ``block_residual`` is intra-forward scratch that must be re-zeroed each
+        forward (M2 pins this as ``test_forward_twice_identical``), and in a
+        server the untouched columns of a recycled buffer would otherwise hold
+        another request's activations.  The memset is ~14 GiB once per prefill
+        micro-batch against a multi-second prefill.
+
+        :meth:`reset` runs FIRST so our reference to the previous pass's buffer
+        is gone before the next one is allocated — otherwise the two are briefly
+        co-live, which is the very doubling this class exists to remove.
+        """
+        cls.reset()
+        buf = torch.zeros(int(num_tokens), int(num_columns), int(hidden),
+                          dtype=dtype, device=device)
+        cls._buf = buf
+        cls._view = buf[:, :0]
+        return cls._view
+
+    @classmethod
+    def append(cls, block_residual: torch.Tensor,
+               column: torch.Tensor) -> torch.Tensor:
+        """Append ``column`` ``(num_tokens, hidden)`` as the next boundary.
+
+        Equivalent, value for value, to
+        ``torch.cat([block_residual, column.unsqueeze(1)], dim=1)``.
+        """
+        if cls._view is None or block_residual is not cls._view:
+            # Not our buffer: a caller that built its own block_residual and
+            # never went through seed(). Same result, no preallocation win.
+            return torch.cat([block_residual, column.unsqueeze(1)], dim=1)
+
+        buf = cls._buf
+        num_blocks = block_residual.shape[1]
+        if num_blocks >= buf.shape[1]:
+            raise RuntimeError(
+                "block_residual overflow: boundary {} of a buffer sized for {} "
+                "boundaries. num_block_residual_columns() disagrees with the "
+                "layer stack actually being driven — the depth-attention would "
+                "silently drop this block.".format(num_blocks + 1, buf.shape[1]))
+        if column.shape != (buf.shape[0], buf.shape[2]):
+            raise RuntimeError(
+                "block_residual column shape {} does not fit the buffer's "
+                "(num_tokens, hidden) = {}.".format(
+                    tuple(column.shape), (buf.shape[0], buf.shape[2])))
+        if column.dtype != buf.dtype:
+            raise RuntimeError(
+                "block_residual column dtype {} != buffer dtype {}; the cat "
+                "this replaces would have refused too.".format(
+                    column.dtype, buf.dtype))
+
+        buf[:, num_blocks].copy_(column)
+        cls._view = buf[:, :num_blocks + 1]
+        return cls._view
+
+
+# ============================================================================
 #  Between-layer carry for callers that drive the decoder stack directly
 # ============================================================================
 
@@ -153,12 +281,19 @@ class BlockResidualCarrier:
     #: layer of the stack.
     num_layers: Optional[int] = None
 
+    #: Number of block boundaries one pass crosses = the preallocated
+    #: block_residual buffer's column count; set by the PSM alongside
+    #: ``num_layers``.
+    num_columns: Optional[int] = None
+
     _block_residual: Optional[torch.Tensor] = None
     _last_layer: Optional[int] = None
 
     @classmethod
-    def configure(cls, num_layers: int) -> None:
+    def configure(cls, num_layers: int, attn_res_block_size: int) -> None:
         cls.num_layers = int(num_layers)
+        cls.num_columns = num_block_residual_columns(
+            num_layers, attn_res_block_size)
         cls.reset()
 
     @classmethod
@@ -178,13 +313,24 @@ class BlockResidualCarrier:
 
         Layer 0 RE-ZEROES it — ``block_residual`` is per-forward scratch, and
         carrying it across forwards is exactly the mutation the M2 suite pins
-        (``test_forward_twice_identical``).
+        (``test_forward_twice_identical``).  It also allocates the whole pass's
+        :class:`BlockResidualBuffer` and returns its zero-column view, so the
+        boundary appends never reallocate.
         """
         if layer_idx == 0:
+            if cls.num_columns is None:
+                raise RuntimeError(
+                    "BlockResidualCarrier.configure(num_layers, "
+                    "attn_res_block_size) was never called; the block_residual "
+                    "buffer cannot be sized.")
             batch, seq_len, hidden = hidden_states.shape
-            cls._block_residual = hidden_states.new_zeros(
-                batch * seq_len, 0, hidden)
+            # Drop last pass's view BEFORE seeding, so the old buffer is not
+            # still live while the new one is allocated.
+            cls._block_residual = None
             cls._last_layer = None
+            cls._block_residual = BlockResidualBuffer.seed(
+                batch * seq_len, hidden, cls.num_columns,
+                dtype=hidden_states.dtype, device=hidden_states.device)
             return cls._block_residual
         if cls._last_layer != layer_idx - 1 or cls._block_residual is None:
             raise RuntimeError(
@@ -214,8 +360,9 @@ class BlockResidualCarrier:
             return None
         if cls.num_layers is None:
             raise RuntimeError(
-                "BlockResidualCarrier.configure(num_layers) was never called; "
-                "the output depth mix cannot verify the stack ran to the end.")
+                "BlockResidualCarrier.configure(num_layers, "
+                "attn_res_block_size) was never called; the output depth mix "
+                "cannot verify the stack ran to the end.")
         if cls._last_layer != cls.num_layers - 1:
             raise RuntimeError(
                 "Block-residual carrier is stale: the output depth mix was "
