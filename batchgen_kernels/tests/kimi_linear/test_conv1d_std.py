@@ -19,6 +19,8 @@ Cases (bias=None, SiLU on — the Kimi-Linear KDA configuration):
   2. chunked-prefill continuation (has_initial_state) vs single-shot oracle
   3. 8-step causal_conv1d_update decode chain over the pooled state,
      continuing case-1's sequences (prefill -> decode state carry)
+  4. overwrite_x=True (varlen) — token-major contiguous output that is
+     BIT-IDENTICAL to the default strided-view path (layout only, no numerics)
 Inputs: realistic magnitudes (randn * 0.1).
 
 Run (GPU): python batchgen_kernels/tests/kimi_linear/test_conv1d_std.py
@@ -184,6 +186,28 @@ def main():
         check_std_bf16(f"decode step{step} y (batch of {n_seqs})", y_t, y_ref_t)
         tails = window[:, :, 1:].to(DTYPE)  # roll the state windows
     check_std_bf16("decode final pooled states", pool[slots.long()], tails)
+
+    # ── case 4: overwrite_x — layout only, bit-exact ─────────────────────────
+    # Case-1 inputs run both ways. The flag must change strides, nothing else.
+    x_cat = torch.cat(xs, dim=0)
+    pool_a = torch.zeros(8, DIM, W - 1, dtype=DTYPE, device=DEVICE)
+    pool_b = torch.zeros(8, DIM, W - 1, dtype=DTYPE, device=DEVICE)
+    y_view = causal_conv1d_fwd(
+        x_cat.clone(), weight, bias=None,
+        conv_states=pool_a, query_start_loc=cu, cache_indices=slots,
+        has_initial_state=None,
+    )
+    y_own = causal_conv1d_fwd(
+        x_cat.clone(), weight, bias=None,
+        conv_states=pool_b, query_start_loc=cu, cache_indices=slots,
+        has_initial_state=None, overwrite_x=True,
+    )
+    report("overwrite_x output is token-major contiguous",
+           y_own.is_contiguous(), f"strides={tuple(y_own.stride())}")
+    report("overwrite_x output BIT-IDENTICAL to the strided-view path",
+           torch.equal(y_own, y_view))
+    report("overwrite_x pooled final states bit-identical",
+           torch.equal(pool_a, pool_b))
 
     print("\n" + ("ALL CHECKS PASSED" if PASS else "SOME CHECKS FAILED"))
     sys.exit(0 if PASS else 1)

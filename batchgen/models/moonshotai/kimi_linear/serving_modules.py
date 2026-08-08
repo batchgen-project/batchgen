@@ -371,24 +371,31 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
 
     q, k, v, f, beta, z = _kda_project(self, hidden_states_2d)
 
-    # conv (silu) with final-state write into the pools at slot_ids
+    # conv (silu) with final-state write into the pools at slot_ids.
+    # overwrite_x=True: the conv result is transposed back into the projection's
+    # own (total, dim) buffer, which is dead after the call. q/k/v stay
+    # token-major CONTIGUOUS, so fla's @input_guard .contiguous() is a no-op
+    # instead of a third full copy of each — 9.00 GiB/layer at S=131k.
     qw, qb = _conv_weights(self.q_conv1d, q.dtype)
     q = causal_conv1d_fwd(
         q, qw, bias=qb,
         conv_states=kda_state.conv_q, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
+        overwrite_x=True,
     )
     kw, kb = _conv_weights(self.k_conv1d, k.dtype)
     k = causal_conv1d_fwd(
         k, kw, bias=kb,
         conv_states=kda_state.conv_k, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
+        overwrite_x=True,
     )
     vw, vb = _conv_weights(self.v_conv1d, v.dtype)
     v = causal_conv1d_fwd(
         v, vw, bias=vb,
         conv_states=kda_state.conv_v, query_start_loc=cu_seqlens,
         cache_indices=slot_ids, has_initial_state=has_initial_state,
+        overwrite_x=True,
     )
 
     q = rearrange(q, "l (h d) -> 1 l h d", h=num_heads)
