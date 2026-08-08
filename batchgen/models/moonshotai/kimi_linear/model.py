@@ -43,6 +43,7 @@ from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
 
+from .block_residual import BlockResidualBuffer, num_block_residual_columns
 from .block_residual import apply_attn_res as _block_residual_apply_attn_res
 from .config import KimiLinearConfig
 
@@ -853,8 +854,15 @@ class KimiDecoderLayer(nn.Module):
             ).view(batch_size, seq_len, hidden_size)
 
         if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual = torch.cat(
-                [block_residual, prefix_sum.view(-1, hidden_size).unsqueeze(1)], dim=1
+            # Boundary: snapshot the PRE-mix prefix_sum, then RESET (assignment,
+            # not add). Value-for-value the old
+            #   torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
+            # but written into a column of the pass's preallocated buffer, so
+            # the (S,nb,H) and (S,nb+1,H) tensors are never co-live — 12.25 GiB
+            # of transient at the last K3 boundary. What comes back is the
+            # NARROWED (S,nb+1,H) view, so shape[1] still counts boundaries.
+            block_residual = BlockResidualBuffer.append(
+                block_residual, prefix_sum.view(-1, hidden_size)
             )
             prefix_sum = None
 
@@ -936,7 +944,7 @@ class KimiLinearModel(nn.Module):
 
         block_residual = None
         if self.use_attn_residuals:
-            block_residual = hidden_states.new_zeros(batch_size * seq_len, 0, hidden_states.shape[2])
+            block_residual = self._new_block_residual(hidden_states)
 
         for decoder_layer in self.layers:
             layer_mask = None if decoder_layer.is_linear_attn else causal_mask
@@ -967,6 +975,29 @@ class KimiLinearModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def _new_block_residual(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Seed one pass's ``block_residual`` scratch — a ZERO-column view of a
+        preallocated ``(num_tokens, num_boundaries, hidden)`` buffer.
+
+        Same contract as the ``new_zeros(num_tokens, 0, hidden)`` it replaces:
+        intra-forward scratch, re-zeroed every forward, ``shape[1]`` counts the
+        boundaries seen so far. What it adds is that the eight boundary appends
+        no longer reallocate — see :class:`BlockResidualBuffer`.
+
+        A method (like ``_apply_output_attn_res``) so the serving prefill loop
+        in ``batchgen_worker.py`` can seed the buffer the same way without
+        importing this module or knowing K3's boundary arithmetic.
+        """
+        hidden = self.config.hidden_size
+        return BlockResidualBuffer.seed(
+            hidden_states.numel() // hidden,
+            hidden,
+            num_block_residual_columns(self.config.num_hidden_layers,
+                                       self.config.attn_res_block_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
     def _apply_output_attn_res(self, flat_hidden: torch.Tensor,
                                block_residual: torch.Tensor) -> torch.Tensor:
