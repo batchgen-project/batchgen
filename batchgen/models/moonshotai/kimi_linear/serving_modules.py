@@ -347,8 +347,132 @@ def _conv_weights(conv, dtype):
     return conv.weight.to(dtype), (None if bias is None else bias.to(dtype))
 
 
+# fla's chunk_kda internal chunk size (its `chunk_size` kwarg default). Every
+# segment cut must be a multiple of this measured from the start of the
+# sequence it falls in, so that a segment's per-sequence chunk grid is exactly
+# the restriction of the unsegmented grid. See _kda_segment_plan.
+_KDA_CHUNK_SIZE = 64
+
+# Token budget for one KDA prefill segment. chunk_kda's own scratch is 12
+# (T, num_heads * head_dim) bf16-equivalents live at once (w/u/kg, q_l2/k_l2,
+# Aqk+Akk, v_new, its output, plus the fp32 gate cumsum and h at 2 each); on K3
+# (96 x 128 = 12288) that is 294,912 B per token — 36.0 GiB at S=131,072
+# against 4.5 GiB at 16,384. Must be a multiple of _KDA_CHUNK_SIZE.
+KDA_PREFILL_SEGMENT_TOKENS = 16384
+
+
+def _kda_segment_plan(cu_list, segment_tokens):
+    """Plan a segmented sweep over a packed (varlen) token range.
+
+    Args:
+        cu_list: cu_seqlens as a Python list of ints, ``cu_list[-1] == total``.
+        segment_tokens: target segment size; must be a multiple of
+            ``_KDA_CHUNK_SIZE``.
+
+    Returns:
+        List of ``(start, end, seq_lo, seq_hi, bounds)``: ``[start, end)`` is
+        the packed token range of the segment, sequences ``seq_lo:seq_hi``
+        overlap it, and ``bounds`` is the segment-relative cu_seqlens for those
+        sequences (``bounds[0] == 0``, ``bounds[-1] == end - start``).
+
+    Every cut is either a sequence boundary or ``k * _KDA_CHUNK_SIZE`` tokens
+    from the start of the sequence it falls in.  That is what makes the sweep
+    EXACT: each sequence's chunk grid inside a segment is the restriction of
+    the grid the unsegmented call would have used, so chunk-local work
+    (gate cumsum, WY transform, intra-chunk attention) is unchanged and only
+    the inter-chunk recurrent state crosses the boundary — in fp32, through the
+    state pool.
+    """
+    if segment_tokens <= 0 or segment_tokens % _KDA_CHUNK_SIZE:
+        raise ValueError(
+            "segment_tokens ({}) must be a positive multiple of the chunk_kda "
+            "chunk size ({})".format(segment_tokens, _KDA_CHUNK_SIZE)
+        )
+    total = cu_list[-1]
+    plan = []
+    start, cut_seq, lo = 0, 0, 0
+    while start < total:
+        end = start + segment_tokens
+        if end >= total:
+            end = total
+        else:
+            # Snap the cut back to a chunk boundary of the sequence it lands
+            # in. `start` is itself such a boundary and segment_tokens is a
+            # multiple of _KDA_CHUNK_SIZE, so end > start always holds.
+            while cu_list[cut_seq + 1] <= end:
+                cut_seq += 1
+            seq_start = cu_list[cut_seq]
+            n_chunks = (end - seq_start) // _KDA_CHUNK_SIZE
+            end = seq_start + n_chunks * _KDA_CHUNK_SIZE
+        while cu_list[lo + 1] <= start:
+            lo += 1
+        hi = lo
+        while cu_list[hi + 1] < end:
+            hi += 1
+        bounds = [min(max(c, start), end) - start for c in cu_list[lo:hi + 2]]
+        plan.append((start, end, lo, hi + 1, bounds))
+        start = end
+    if plan[0][2] != 0 or plan[-1][3] != len(cu_list) - 1:
+        # Only reachable with leading/trailing zero-length sequences, which the
+        # conv1d kernel cannot handle either. Fail rather than silently drop a
+        # sequence's state update.
+        raise ValueError(
+            "segment plan covers sequences {}..{} of {} — cu_seqlens {} has "
+            "zero-length sequences".format(
+                plan[0][2], plan[-1][3], len(cu_list) - 1, cu_list)
+        )
+    return plan
+
+
+def _kda_chunk_segments(chunk_kda_fn, q, k, v, f, beta, cu_seqlens, slot_ids,
+                        recurrent_pool, kernel_kwargs, segment_tokens):
+    """Run chunk_kda over a packed range, in token segments, and write the
+    per-sequence final recurrent states back into ``recurrent_pool``.
+
+    ``chunk_kda_fn`` is passed in rather than imported so the segment driver
+    can be exercised against a CPU reference kernel
+    (tests/test_kimi_k3_kda_segmented.py) — fla is CUDA-only.
+
+    Segmenting is a memory optimisation only.  Per segment, chunk_kda is fed
+    the same q/k/v/g/beta rows, cut on the same chunk grid, and the recurrent
+    state is handed over in fp32 (the pool's dtype, and the dtype chunk_kda
+    both requires for ``initial_state`` and produces for ``final_state``), so
+    the arithmetic is identical to the unsegmented call.
+    """
+    slots = slot_ids.long()
+    total = q.shape[1]
+    if segment_tokens is None or total <= segment_tokens:
+        o, recurrent_out = chunk_kda_fn(
+            q=q, k=k, v=v, g=f, beta=beta,
+            initial_state=recurrent_pool.index_select(0, slots),
+            cu_seqlens=cu_seqlens.to(torch.long),
+            **kernel_kwargs,
+        )
+        recurrent_pool.index_copy_(0, slots, recurrent_out)
+        return o
+
+    o = torch.empty(q.shape[0], total, v.shape[2], v.shape[3],
+                    dtype=v.dtype, device=v.device)
+    for start, end, lo, hi, bounds in _kda_segment_plan(
+            cu_seqlens.tolist(), segment_tokens):
+        seg_slots = slots[lo:hi]
+        o_seg, recurrent_out = chunk_kda_fn(
+            q=q[:, start:end], k=k[:, start:end], v=v[:, start:end],
+            g=f[:, start:end], beta=beta[:, start:end],
+            initial_state=recurrent_pool.index_select(0, seg_slots),
+            cu_seqlens=torch.tensor(bounds, dtype=torch.long, device=q.device),
+            **kernel_kwargs,
+        )
+        # The sequence that straddles `end` gets a PARTIAL state here; the
+        # segment that continues it reads that state back and overwrites it.
+        recurrent_pool.index_copy_(0, seg_slots, recurrent_out)
+        o[:, start:end] = o_seg
+    return o
+
+
 def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
-                        has_initial_state, kda_state):
+                        has_initial_state, kda_state,
+                        segment_tokens=KDA_PREFILL_SEGMENT_TOKENS):
     """KDA prefill for PREPACKED (varlen) sequences.
 
     Args:
@@ -357,9 +481,25 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
         slot_ids: (num_sequences,) int32 KDA state-pool slot per sequence.
         has_initial_state: (num_sequences,) bool or None.
         kda_state: KDALayerState (conv/recurrent pools; mutated in place).
+        segment_tokens: token budget for one chunk_kda call; None or a value
+            >= total_tokens reproduces the single-call path exactly.
 
     Returns:
         (total_tokens, hidden) attention output.
+
+    The projections, the convs and the output norm/projection run over the
+    WHOLE packed range; only chunk_kda is segmented.  That split is deliberate:
+      - Re-running an nn.Linear at a smaller M changes the cuBLAS kernel choice
+        and therefore the result by ~3e-7, which this model amplifies without
+        bound (see tests/gpu/test_kimi_k3_kda_fla_parity.py, test_F docstrings).
+        So no GEMM shape may change.
+      - overwrite_x makes the conv write back into the projection's own buffer,
+        so segmenting the conv would save nothing (its input IS its output)
+        while it would have to carry the causal width-1 = 3 token context
+        across every cut. Not worth the known trap for zero bytes.
+      - chunk_kda's own scratch is 12x the token stream against the 6x that has
+        to stay resident, so segmenting it alone takes a KDA layer from
+        51.0 GiB to 18.0 + 4.5 GiB at S=131,072 / T=16,384.
     """
     from einops import rearrange
     from fla.ops.kda import chunk_kda
@@ -404,19 +544,19 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
     f = f.unsqueeze(0)        # (1, total, H, K)
     beta = beta.unsqueeze(0)  # (1, total, H)
 
-    recurrent_in = kda_state.recurrent_pool.index_select(0, slot_ids.long())
-    o, recurrent_out = chunk_kda(
-        q=q, k=k, v=v, g=f, beta=beta,
-        A_log=self.A_log, dt_bias=self.dt_bias,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
-        lower_bound=self.gate_lower_bound,
-        initial_state=recurrent_in,
-        output_final_state=True,
-        cu_seqlens=cu_seqlens.to(torch.long),
+    o = _kda_chunk_segments(
+        chunk_kda, q, k, v, f, beta, cu_seqlens, slot_ids,
+        kda_state.recurrent_pool,
+        dict(
+            A_log=self.A_log, dt_bias=self.dt_bias,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            lower_bound=self.gate_lower_bound,
+            output_final_state=True,
+        ),
+        segment_tokens,
     )
-    kda_state.recurrent_pool.index_copy_(0, slot_ids.long(), recurrent_out)
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(total, num_heads * head_dim))
