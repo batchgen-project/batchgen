@@ -116,6 +116,27 @@ class KimiRMSNorm(nn.Module):
 # ============================================================================
 #  Dense MLP / expert MLP
 # ============================================================================
+# Token-tile width for KimiMLP's chunked body.
+#
+# The FFN is elementwise in the token axis but very wide in the feature axis:
+# at its peak SituAndMul holds FIVE full (tokens, intermediate) fp32 tensors at
+# once — `gate`, `up`, `beta*tanh(gate/beta)`, `sigmoid(gate)` and their
+# product — while KimiMLP's bf16 `[gate, up]` cat is still bound by the caller
+# frame. That is 5*4 + 2*2 = 24 bytes per (token, intermediate) element.
+# Unchunked at S=131,072 (batchgen_design/model_support/kimi_k3/
+# PREFILL_MEMORY_AUDIT.md section 4):
+#
+#   layer 0 dense MLP, intermediate 33,792 : 24*S*I = 98.998 GiB
+#   MoE shared expert, intermediate  6,144 : 24*S*I = 18.000 GiB
+#
+# Tiled, the same term is 24*TILE*I and no longer scales with S: 6.19 GiB and
+# 1.13 GiB respectively at TILE=8192. 8192 rows is far past the knee of these
+# GEMMs (K=7168 with N=2*intermediate already saturates the GPU on the N axis
+# alone), so the tiling costs no throughput; doubling it would only double the
+# term that is being removed.
+_FFN_TOKEN_TILE = 8192
+
+
 class KimiMLP(nn.Module):
     """Dense SwiGLU/SiTU MLP (gate_proj / up_proj / down_proj naming)."""
 
@@ -132,11 +153,48 @@ class KimiMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = build_activation(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _ffn(self, x: torch.Tensor) -> torch.Tensor:
+        """The FFN body, verbatim. Applied to the whole input or to one token
+        tile — same ops, same order, either way."""
         if self.config.hidden_act == "situ":
             gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
             return self.down_proj(self.act_fn(gate_up))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Token-tiled FFN — BIT-EXACT against the unchunked body.
+
+        Every output row depends only on its own input row (the projections are
+        bias-free row-wise GEMMs, everything between them is elementwise), and
+        `_ffn` is the untouched body, so no sum is reassociated and no op order
+        changes. Only the peak allocation changes.
+
+        Tiles are EVEN, not `fixed width + ragged remainder`: a remainder of a
+        handful of rows is a degenerate GEMM shape, and a degenerate M can move
+        the BLAS onto a different (GEMV-like) reduction order. MEASURED on CPU
+        fp32: a 1-row `F.linear` does NOT reproduce the corresponding row of the
+        full GEMM, while every tile >= 7 rows does. Even tiles keep every tile
+        at `_FFN_TOKEN_TILE / 2` rows or wider, so no such shape is ever
+        emitted. Pinned by tests/test_kimi_linear_ffn_chunk.py.
+        """
+        num_tokens = x.numel() // x.shape[-1]
+        if num_tokens <= _FFN_TOKEN_TILE:
+            # Decode and short prefill: the pre-chunking call, unchanged.
+            return self._ffn(x)
+
+        flat = x.reshape(num_tokens, x.shape[-1])
+        n_tiles = math.ceil(num_tokens / _FFN_TOKEN_TILE)
+        out = None
+        for i in range(n_tiles):
+            start = (i * num_tokens) // n_tiles
+            end = ((i + 1) * num_tokens) // n_tiles
+            y = self._ffn(flat[start:end])
+            if out is None:
+                # Allocated from the first tile so the output dtype is the one
+                # the body produces, never a guess off `x`.
+                out = y.new_empty((num_tokens, y.shape[-1]))
+            out[start:end] = y
+        return out.view(*x.shape[:-1], out.shape[-1])
 
 
 class KimiBlockSparseMLP(nn.Module):
