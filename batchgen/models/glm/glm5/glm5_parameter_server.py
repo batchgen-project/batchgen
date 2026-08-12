@@ -38,11 +38,9 @@ _diag("safetensors done")
 from tqdm import tqdm, trange
 _diag("tqdm done")
 
-from .configuration_glm5 import Glm5Config
-_diag("configuration_glm5 done")
 from .model import Glm5ForCausalLM
 _diag("model (Glm5ForCausalLM) done")
-from batchgen.config.model_registry import load_config
+from batchgen.config.batchgen_model_config import BatchGenModelConfig
 _diag("model_registry done")
 
 try:
@@ -64,8 +62,11 @@ class GLM5_Parameter_Server:
         self.state_dict_name_map = {}
         self.enable_hugetlbfs = enable_hugetlbfs
         self.enable_memfd = enable_memfd
-        self.model_config = load_config(huggingface_ckpt_name)
-        self.hf_config = Glm5Config()
+        # Single resolved internal config (checkpoint-backed GLM5Config/GLM52Config).
+        # Used both for metadata reads and to build the model graph — GLM-5 no
+        # longer uses an HF transformers.PretrainedConfig.
+        self.model_config = BatchGenModelConfig.resolve(huggingface_ckpt_name, cache_dir)
+        self.hf_config = self.model_config
         self.hf_config._name_or_path = huggingface_ckpt_name
 
         free_memory, total_memory = torch.cuda.mem_get_info()

@@ -29,7 +29,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .decode_utils import clamp_token_indices_to_seqlens
-from .configuration_glm5 import Glm5Config
+# GLM-5 uses BatchGen's internal config (a plain BaseModelConfig dataclass), not
+# an HF transformers.PretrainedConfig — matching every other model (kimi, etc.).
+# Imported under the historical name `Glm5Config` so the __init__ type hints below
+# need no churn; only attribute reads are used, so any config object works.
+from .config import GLM5Config as Glm5Config, dsa_layer_skips_topk
 
 
 # ============================================================================

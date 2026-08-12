@@ -117,6 +117,11 @@ class GLM5Config(BaseModelConfig):
     max_position_embeddings: int = 202752
     rope_theta: float = 1000000.0
     rope_scaling: Optional[Dict[str, Any]] = None  # No YaRN
+    # GLM checkpoints nest rope params under `rope_parameters`; the model graph
+    # reads both the raw block and `rope_type` (surfaced for parity with the
+    # former HF PretrainedConfig; defaults keep GLM-5 behavior unchanged).
+    rope_parameters: Optional[Dict[str, Any]] = None
+    rope_type: str = "default"
 
     # ==================== Normalization & Activation ====================
     rms_norm_eps: float = 1e-5
@@ -246,6 +251,13 @@ class GLM5Config(BaseModelConfig):
         rope_theta = GLM5Config._rope_theta_from_hf(hf)
         if rope_theta is not None:
             kwargs["rope_theta"] = rope_theta
+        # Carry the raw rope_parameters block and rope_type for the model graph
+        # (parity with the former HF PretrainedConfig, which surfaced both).
+        rope_params = hf.get("rope_parameters")
+        if isinstance(rope_params, dict):
+            kwargs["rope_parameters"] = rope_params
+            if rope_params.get("rope_type") is not None:
+                kwargs["rope_type"] = rope_params["rope_type"]
 
         # Normalization & activation
         put("rms_norm_eps", "rms_norm_eps")
@@ -508,11 +520,10 @@ def dsa_layer_skips_topk(config, layer_id: int) -> bool:
     """Whether ``layer_id`` reuses the previous full layer's DSA top-k indices.
 
     Value-based (works on ANY config object — the rich :class:`GLM52Config` or
-    the ``configuration_glm5.Glm5Config`` PretrainedConfig used to build the
-    model graph): the decision keys off the presence of a positive
-    ``index_topk_freq``. GLM-5 / GLM-5.1 configs have no such field (or it is
-    ``None`` / 1), so every layer is a full layer (uniform recompute) and this
-    returns ``False`` — GLM-5 behavior unchanged.
+    the base :class:`GLM5Config` used to build the model graph): the decision
+    keys off the presence of a positive ``index_topk_freq``. GLM-5 / GLM-5.1
+    configs have no such field (or it is ``None`` / 1), so every layer is a full
+    layer (uniform recompute) and this returns ``False`` — GLM-5 unchanged.
 
     Authoritative formula (matches SGLang ``dsa_layer_skips_topk``):
       - if ``index_topk_pattern`` is set: ``pattern[layer_id] == "S"``
