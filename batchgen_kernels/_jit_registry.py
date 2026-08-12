@@ -126,6 +126,14 @@ def get_registry():
                 "--threads", "4",
             ] + _SM80_GENCODE,
         },
+        "batchgen_kernels.conv1d._C_causal_conv1d": {
+            "sources": ["src/conv1d/causal_conv1d.cu"],
+            "nvcc_flags": [
+                "-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--threads", "4",
+            ] + _SM80_GENCODE,
+        },
         "batchgen_kernels.moe._C_mxfp4_dequant_cute": {
             "sources": ["src/moe/mxfp4_dequant_cute.cu"],
             "nvcc_flags": [
