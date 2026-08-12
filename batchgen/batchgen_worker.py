@@ -869,6 +869,10 @@ class BatchGenWorker:
 		# Request pool: admission queue and response queue for persistent loop
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
+		# global_idx -> decoded text for sequences completed during PREFILL
+		# (C4). Captured before _report_completion pops the local maps; the
+		# legacy end-of-generate() gather merges it. Legacy mode only.
+		self._prefill_completed_results: Dict[int, str] = {}
 		self._shutdown_requested = False
 		self._max_pool_size = args.max_pool_size  # 0 = legacy mode
 
@@ -4100,6 +4104,7 @@ class BatchGenWorker:
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
+		self._prefill_completed_results = {}
 		for idx, text in enumerate(global_prompts):
 			max_dec = self.max_decoding_length
 			if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
@@ -5290,6 +5295,28 @@ class BatchGenWorker:
 				self._sequences_with_gpu_kv.discard(uuid)
 
 		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+
+		# Legacy /v1/inference gathers results at the END of generate() by
+		# iterating _local_to_uuid_map. _report_completion below pops that map
+		# (release_local_query_slot also drops the query_book entry), so a
+		# C4-completed sequence would be invisible to that gather and the
+		# request would return "Results unexpectedly empty after inference".
+		# Capture the text while the slot still exists.
+		# Gated on the absence of a response queue: pool/batch mode is fed by
+		# _report_completion and _submit_completed_to_incremental_writer, so it
+		# must NOT also accumulate here -- that store is never drained in a
+		# persistent server and would grow without bound.
+		if self._response_queue is None:
+			for uuid in completed_uuids:
+				local_idx = self._uuid_to_local_map.get(uuid)
+				seq = self.global_batch.get_sequence(uuid)
+				if local_idx is None or seq is None or local_idx not in self.query_book:
+					continue
+				_decoded = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
+				self._prefill_completed_results[seq.global_idx] = (
+					self._decode_tokens_to_string(_decoded)
+				)
+
 		# Runs LAST: _report_completion pops the local-index map and frees the
 		# buffer-pool slot.
 		for uuid in completed_uuids:
@@ -6335,6 +6362,9 @@ class BatchGenWorker:
 		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
 		# Gathering strings (~KB each) instead reduces memory by ~100x.
 		local_results = []
+		# Sequences completed during prefill (C4) were reported and popped from
+		# the local maps back then; their text was captured at that point.
+		local_results.extend(self._prefill_completed_results.items())
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
