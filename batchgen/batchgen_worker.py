@@ -5308,15 +5308,21 @@ class BatchGenWorker:
 		# must NOT also accumulate here -- that store is never drained in a
 		# persistent server and would grow without bound.
 		if self._response_queue is None:
+			# getattr, not a plain attribute read: hot reload rebinds methods on a
+			# LIVE worker and never re-runs __init__, so an attribute introduced in
+			# __init__ is absent on a reloaded process. _validate_reload
+			# (server_worker_main_loop.py:68) warns about exactly this and does not
+			# fix it -- "These will cause AttributeError if accessed."
+			store = getattr(self, '_prefill_completed_results', None)
+			if store is None:
+				store = self._prefill_completed_results = {}
 			for uuid in completed_uuids:
 				local_idx = self._uuid_to_local_map.get(uuid)
 				seq = self.global_batch.get_sequence(uuid)
 				if local_idx is None or seq is None or local_idx not in self.query_book:
 					continue
 				_decoded = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
-				self._prefill_completed_results[seq.global_idx] = (
-					self._decode_tokens_to_string(_decoded)
-				)
+				store[seq.global_idx] = self._decode_tokens_to_string(_decoded)
 
 		# Runs LAST: _report_completion pops the local-index map and frees the
 		# buffer-pool slot.
@@ -6365,7 +6371,7 @@ class BatchGenWorker:
 		local_results = []
 		# Sequences completed during prefill (C4) were reported and popped from
 		# the local maps back then; their text was captured at that point.
-		local_results.extend(self._prefill_completed_results.items())
+		local_results.extend(getattr(self, '_prefill_completed_results', {}).items())
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
