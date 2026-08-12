@@ -90,6 +90,22 @@ class ckpt_converter:
 			packed = ckpt[name]       # [N, K//8] int32 or uint8
 			scale = ckpt[scale_name]  # [N, K//32] bf16
 
+			# Refuse MXFP4. This path is uniform-INT4-only: it reinterprets the
+			# uint8 buffer as packed uint4b8 below, and converts the SCALE
+			# TENSOR VALUE to bfloat16 — an E8M0 exponent byte of 121 would
+			# become 121.0 instead of 2**(121-127) = 0.015625. Both corruptions
+			# are silent. Scoped to tensors this function would actually touch:
+			# an unscoped check would reject every MXFP4 checkpoint the repack
+			# never matches, and `batchgen/tools/convert_checkpoint.py:144`
+			# passes marlin=True BY DEFAULT.
+			if scale.dtype == torch.uint8:
+				raise ValueError(
+					f"{scale_name}: uint8 (E8M0) scale on a tensor the Marlin "
+					"repack matches. Marlin handles uniform INT4 with BF16 "
+					"scales only; MXFP4 needs an E2M1 nibble decode and E8M0 "
+					"scale handling. Re-run with --no-marlin."
+				)
+
 			# Convert uint8 → int32 if needed
 			if packed.dtype == torch.uint8:
 				N_dim = scale.shape[0]

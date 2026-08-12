@@ -94,6 +94,10 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "GLM-5.1": "glm_moe_dsa",
     "GLM-5-FP8": "glm_moe_dsa",
     "GLM-5": "glm_moe_dsa",
+    # Kimi-Linear (testbed) + Kimi-K3 family (hybrid KDA + NoPE-MLA MoE)
+    "Kimi-Linear-48B-A3B": "kimi_linear",
+    "Kimi-Linear": "kimi_linear",
+    "Kimi-K3": "kimi_k3",
 }
 
 for model_id in KIMI_K25_BACKEND_MODEL_IDS:
@@ -217,16 +221,24 @@ def load_config(model_identifier: str) -> "BaseModelConfig":
 
     config = None
 
-    # Step 1: Try to detect model type from identifier patterns
-    detected_type = _detect_model_type_from_identifier(model_identifier)
-    if detected_type and detected_type in CONFIG_REGISTRY:
-        logger.info(f"Using built-in config for model_type={detected_type}")
-        config = CONFIG_REGISTRY[detected_type]()
-        config._name_or_path = model_identifier
-        return config
+    # A local checkout's config.json is authoritative — prefer it over the
+    # name-pattern shortcut (Step 1), which returns curated *defaults* and would
+    # silently drop data-driven fields (e.g. kimi_linear's `linear_attn_config`)
+    # for a local dir whose name happens to match a pattern.
+    _local_config_json = Path(model_identifier) / "config.json"
+    _is_local_dir = _local_config_json.exists()
+
+    # Step 1: Try to detect model type from identifier patterns (HF model IDs).
+    if not _is_local_dir:
+        detected_type = _detect_model_type_from_identifier(model_identifier)
+        if detected_type and detected_type in CONFIG_REGISTRY:
+            logger.info(f"Using built-in config for model_type={detected_type}")
+            config = CONFIG_REGISTRY[detected_type]()
+            config._name_or_path = model_identifier
+            return config
 
     # Step 2: Check if it's a local directory with config.json
-    config_path = Path(model_identifier) / "config.json"
+    config_path = _local_config_json
     if config_path.exists():
         with open(config_path, 'r') as f:
             data = json.load(f)
@@ -310,6 +322,11 @@ def _import_model_configs():
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import config as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.moonshotai.kimi_linear import config as _  # noqa: F401
     except ImportError:
         pass
 
