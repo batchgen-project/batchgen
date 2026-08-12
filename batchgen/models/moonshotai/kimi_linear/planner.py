@@ -43,8 +43,28 @@ class KimiLinearPlanner(BasePlanner):
         # context window.
         self.config.Module_Batching_Config.prefill_micro_batch_token_cap = 262_144
 
-        # BF16 KV (no kv quantization).
-        self.config.Basic_Config.kv_dtype = "bf16"
+        # BF16 KV (no kv quantization). Canonical spelling is "bfloat16":
+        # base_planner's kv_element_size check and the engine dtype map
+        # (core/utils.cpp) both match on "bfloat16", never "bf16".
+        self.config.Basic_Config.kv_dtype = "bfloat16"
+
+        # F6: _compute_batch_configs() ran before this method with the base
+        # default attn_mode=1 (our attn_mode=3 above lands after buffer
+        # sizing), so its expert-residency math is wrong for this model.
+        # Override all three results here — this method runs last, so the
+        # values stick:
+        # (a) Decode expert staging buffers: normalize to the prefill ring (8).
+        #     The memory-based split left 7-9 buffers.
+        self.config.GPU_Buffer_Config.num_decoding_module_buffer["routed_expert"] = 8
+        # (b) Zero persistent experts: the PSM streams all 256 experts/rank
+        #     (persistent=False), so no routed-expert weights are resident.
+        #     The memory-based split claimed 25-27 "persistent" experts.
+        self.config.EP_Config.num_local_expert_per_layer = 0
+        # (c) Decode admission cap — consumed by the worker as the per-rank
+        #     max decode sequences (batchgen_worker rank_counts checks); the
+        #     base leaves it None -> TypeError on first decode admission.
+        #     16/rank x 8 ranks = single-wave admission of a 128-seq batch.
+        self.config.Module_Batching_Config.MoE_decoding_micro_batch_size = 16
 
         # KDA conv/recurrent state-pool slots (peak concurrent sequences the
         # PSM pools can hold). Config-driven (M1-C).
