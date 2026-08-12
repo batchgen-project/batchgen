@@ -413,6 +413,10 @@ class GLM5AttnWrapper(AttnWrapperBase):
     # Set once per decode step by the worker so per-layer _forward_decode_dsa
     # branches on it without doing a D2H .sum().item() 78 times per step.
     _dsa_short_count: ClassVar[Optional[int]] = None
+    # DSA top-k index REUSE (GLM-5.2): carried top-k indices from the most recent
+    # FULL layer, reused by subsequent shared layers. Reset per decode step by the
+    # worker. For GLM-5 (all layers full) this is never read by a shared branch.
+    _dsa_prev_topk_indices: ClassVar[Optional[torch.Tensor]] = None
     # Whole-model CUDA graph can pad local rows to a global NCCL bucket. These
     # graph-owned overrides let GLM-5 DSA use explicit slot sentinels for padded
     # rows instead of deriving slot count from cur_batch.
@@ -547,7 +551,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
         AND after _setup_fp8_scales has attached indexer.wk_scale / wq_b_scale.
         """
         attn = self.module
-        if not hasattr(attn, "indexer"):
+        if not hasattr(attn, "indexer") or attn.indexer is None:
             return
         indexer = attn.indexer
 
@@ -700,15 +704,20 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 raise RuntimeError(
                     "GLM-5 DSA prefill requires indexer KV; refusing primary-only host offload"
                 )
-            indexer_kv = self.module.indexer.compute_indexer_kv(
-                hidden_states_2d.unsqueeze(0),
-                positions=self.position_ids.to(hidden_states_2d.device),
-            )
-            if indexer_kv is None:
-                raise RuntimeError(
-                    "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
+            # Shared layers (GLM-5.2) have indexer is None: they reuse a full
+            # layer's top-k at decode and never read an aux indexer cache, so
+            # skip the indexer-K compute + offload entirely. GLM-5 layers always
+            # have a real indexer so this block always runs there.
+            if self.module.indexer is not None:
+                indexer_kv = self.module.indexer.compute_indexer_kv(
+                    hidden_states_2d.unsqueeze(0),
+                    positions=self.position_ids.to(hidden_states_2d.device),
                 )
-            self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
+                if indexer_kv is None:
+                    raise RuntimeError(
+                        "GLM-5 DSA prefill indexer returned no KV; refusing primary-only host offload"
+                    )
+                self._offload_prepacked_indexer_kv(indexer_kv.squeeze(0))
 
             self._offload_prepacked_kv(offload_kv)
             attn_output = attn_output.unsqueeze(0)
