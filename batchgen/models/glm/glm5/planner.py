@@ -7,6 +7,8 @@
 
 import logging
 
+import torch
+
 from batchgen.planner.base_planner import BasePlanner
 
 
@@ -71,7 +73,11 @@ class GLM5Planner(BasePlanner):
             attn_decoding_micro_batch_size * self.max_context_length
         )
 
-        available_gpu_mem = 96 * self.DEFAULT_MEM_FRAC
+        # Query the actual device instead of assuming the H20's 96 GB: on
+        # 141 GB parts the hardcoded value made attn_mode=3 refuse single-node
+        # world_size=8 (32 experts/rank) even though it fits with margin.
+        gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        available_gpu_mem = gpu_total_gb * self.DEFAULT_MEM_FRAC
         model_skeleton_size = 6
         cuda_page_table_default_size = 5
         nccl_default_buffer_usage = 2.5
