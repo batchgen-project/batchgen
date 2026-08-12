@@ -402,53 +402,64 @@ def build_glm5_dsa_flashmla_inputs(
             AttnWrapperBase.kv_append_callback(li, k_tensor, None)
 
     indexer_k_tensor = None
-    with (dt.timed("indexer_k", li) if dt else nullcontext()):
-        if wrapper._indexer_cuda_weights is not None:
-            from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
-                cuda_wk_proj_gemm_only,
-            )
+    if wrapper.module.indexer is not None:
+        with (dt.timed("indexer_k", li) if dt else nullcontext()):
+            if wrapper._indexer_cuda_weights is not None:
+                from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
+                    cuda_wk_proj_gemm_only,
+                )
 
-            k_raw = cuda_wk_proj_gemm_only(
-                hidden_flat,
-                wrapper._indexer_cuda_weights,
-                wrapper._indexer_cuda_module,
+                k_raw = cuda_wk_proj_gemm_only(
+                    hidden_flat,
+                    wrapper._indexer_cuda_weights,
+                    wrapper._indexer_cuda_module,
+                )
+                k_normed = indexer.k_norm(k_raw)
+                indexer_kv = indexer._fused_rope_hadamard_or_fallback(
+                    k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
+                ).unsqueeze(2)
+            else:
+                raise RuntimeError(
+                    f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP2 "
+                    "fused indexer KV projection; PyTorch fallback is disabled"
+                )
+            indexer_k_tensor = indexer_kv
+            seq_lengths_i32_aux = (
+                seq_lengths_i32
+                if aux_device == manager_device
+                else new_token_pos.to(dtype=torch.int32, device=aux_device)
             )
-            k_normed = indexer.k_norm(k_raw)
-            indexer_kv = indexer._fused_rope_hadamard_or_fallback(
-                k_normed.unsqueeze(1), new_token_pos, max_seqlen=max_seqlen,
-            ).unsqueeze(2)
-        else:
-            raise RuntimeError(
-                f"[layer {wrapper.layer_idx}] GLM-5 DSA selector requires WP2 "
-                "fused indexer KV projection; PyTorch fallback is disabled"
+            gpu_paged_kv_manager_aux.update_layer_decode_new_token(
+                k_tensor=indexer_k_tensor,
+                v_tensor=None,
+                sequence_lengths=seq_lengths_i32_aux,
+                layer_idx=li,
+                slot_indices=aux_slot_indices,
             )
-        indexer_k_tensor = indexer_kv
-        seq_lengths_i32_aux = (
-            seq_lengths_i32
-            if aux_device == manager_device
-            else new_token_pos.to(dtype=torch.int32, device=aux_device)
-        )
-        gpu_paged_kv_manager_aux.update_layer_decode_new_token(
-            k_tensor=indexer_k_tensor,
-            v_tensor=None,
-            sequence_lengths=seq_lengths_i32_aux,
-            layer_idx=li,
-            slot_indices=aux_slot_indices,
-        )
-        if AttnWrapperBase.kv_append_callback_aux is not None:
-            AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
+            if AttnWrapperBase.kv_append_callback_aux is not None:
+                AttnWrapperBase.kv_append_callback_aux(li, indexer_k_tensor, None)
 
     with (dt.timed("indexer_score", li) if dt else nullcontext()):
-        top_k_indices, branch_label, row_modes = _select_glm5_dsa_indices(
-            wrapper,
-            hidden_states,
-            q_a_normed,
-            cache_seqlens,
-            max_seqlen,
-            new_token_pos,
-            gpu_paged_kv_manager_aux,
-            aux_slot_indices,
-        )
+        if wrapper.module.skip_topk:
+            top_k_indices = type(wrapper)._dsa_prev_topk_indices
+            assert top_k_indices is not None, "shared DSA layer has no carried top-k; layer 0 must be full"
+            index_topk = top_k_indices.shape[-1]
+            row_modes = (cache_seqlens > index_topk).to(torch.int32)
+            branch_label = "reuse-shared"
+        else:
+            top_k_indices, branch_label, row_modes = _select_glm5_dsa_indices(
+                wrapper,
+                hidden_states,
+                q_a_normed,
+                cache_seqlens,
+                max_seqlen,
+                new_token_pos,
+                gpu_paged_kv_manager_aux,
+                aux_slot_indices,
+            )
+            index_topk = wrapper.module.indexer.index_topk
+            if wrapper.module.next_skip_topk:
+                type(wrapper)._dsa_prev_topk_indices = top_k_indices
 
     with (dt.timed("sparse_gather", li) if dt else nullcontext()):
         mla_blocked_k, _, mla_block_table = gpu_paged_kv_manager.get_layer_kv_with_page_table(li)
@@ -476,7 +487,7 @@ def build_glm5_dsa_flashmla_inputs(
                 mla_block_table,
                 cache_seqlens,
                 top_k_indices,
-                index_topk=wrapper.module.indexer.index_topk,
+                index_topk=index_topk,
                 page_size=mla_page_size,
                 return_indices=verify_indices or return_selected_indices,
                 primary_slot_indices=primary_selector_slots,
