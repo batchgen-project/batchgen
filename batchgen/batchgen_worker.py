@@ -2006,19 +2006,11 @@ class BatchGenWorker:
 			local_indices = self._get_local_indices_for_uuids(my_uuids)
 			global_ids = self._local_indices_to_global_seq_ids(local_indices)
 			
-		manager = self.gpu_paged_kv_cache_manager
-		if manager is not None:
-			manager.free_pages_for_sequences(global_ids)
-
-		# Kimi-Linear: release KDA state slots alongside GPU KV pages.
-		try:
-			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
-			if KimiLinearKDAWrapper.slot_manager is not None:
-				KimiLinearKDAWrapper.free_sequences(global_ids)
-		except ImportError:
-			pass
-
-		for uuid in my_uuids:
+			manager = self.gpu_paged_kv_cache_manager
+			if manager is not None:
+				manager.free_pages_for_sequences(global_ids)
+			
+			for uuid in my_uuids:
 				seq = self.global_batch.get_sequence(uuid)
 				seq.gpu_pages_allocated = 0
 				self._sequences_with_gpu_kv.discard(uuid)
@@ -9566,6 +9558,10 @@ class BatchGenWorker:
 		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 
+		# Heartbeat state for the rate-limited [DECODE] progress line below
+		_hb_last_time = time.perf_counter()
+		_hb_tokens = 0
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -9575,6 +9571,20 @@ class BatchGenWorker:
 			# Feed watchdogs to prevent timeout during long decoding
 			self.feed_watchdog()
 			self.feed_decode_watchdog()
+
+			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
+			# monitor sees liveness during long decode phases
+			_hb_tokens += len(decode_uuids)
+			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
+				_hb_elapsed = time.perf_counter() - _hb_last_time
+				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+				logging.info(
+					f"[DECODE] step={self._cumulative_decode_iterations} "
+					f"active={len(decode_uuids)} finished={_hb_finished} "
+					f"tok/s={_hb_tokens / _hb_elapsed:.2f}"
+				)
+				_hb_last_time = time.perf_counter()
+				_hb_tokens = 0
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
