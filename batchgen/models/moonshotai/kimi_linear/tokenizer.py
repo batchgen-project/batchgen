@@ -16,20 +16,28 @@
 #  limitations under the license.                                               #
 # ---------------------------------------------------------------------------- #
 
-"""Kimi-Linear / Kimi-K3 Tokenizer for BatchGen.
+"""Kimi-Linear-48B Tokenizer for BatchGen.
 
-The Kimi-Linear-48B testbed and Kimi-K3 use exactly the same tiktoken 'kimi'
-tokenizer family as Kimi K2.5 (vocab 163840, bos=163584, eos=163586,
-pad=163839). The `tiktoken.model` merge file is byte-identical to the one
-bundled with kimi_k25, so this module reuses the verified
-`TikTokenTokenizer` implementation from
-`batchgen.models.moonshotai.kimi_k25.assets` and simply re-registers a thin
-`BaseTokenizer` wrapper for the "kimi_linear" and "kimi_k3" tokenizer types.
+The Kimi-Linear-48B testbed uses the same tiktoken 'kimi' merge file as Kimi
+K2.5 (vocab 163840, bos=163584, eos=163586, pad=163839) — `tiktoken.model` is
+byte-identical — so this module reuses the verified `TikTokenTokenizer`
+implementation from `batchgen.models.moonshotai.kimi_k25.assets` and registers a
+thin `BaseTokenizer` wrapper for the "kimi_linear" tokenizer type.
 
-By default the wrapper loads its vocab/config from the bundled kimi_k25 assets
-directory (identical files). A concrete model directory (e.g. the testbed
-checkpoint dir) may be passed via `model_path` to load `tiktoken.model` /
-`tokenizer_config.json` / `chat_template.jinja` from there instead.
+NOT Kimi-K3. A matching merge-file md5 does not imply matching special tokens.
+K3 names the same reserved ids differently — 163586 `<|end_of_msg|>` vs
+`<|im_end|>`, 163587 `<|open|>` vs `<|im_user|>`, 163588 `<|close|>` vs
+`<|im_assistant|>`, plus `<|sep|>` at 163589 which the 48B does not have at all
+— and K3 has no Jinja chat template (its XTML format is implemented in Python).
+Cross-loading renders a 12-token K3 prompt fragment as 32 marker-free BPE
+tokens, silently. K3 is served by `KimiK3Tokenizer`
+(`batchgen/models/moonshotai/kimi_k3/tokenizer.py`, tokenizer type "kimi_k3").
+
+By default the wrapper loads its vocab/config from this package's own assets
+directory. A concrete model directory may be passed via `model_path`; note that
+`load_tokenizer()` never does (`config/tokenizer_registry.py:144` constructs
+with no arguments), so in production that parameter is always None — the branch
+that silently substituted kimi_k25's chat template in bug_log.md 2026-07-31.
 """
 
 import json
@@ -62,17 +70,21 @@ KIMI_LINEAR_VOCAB_SIZE = 163840
 
 
 @register_tokenizer("kimi_linear")
-@register_tokenizer("kimi_k3")
 class KimiLinearTokenizer(BaseTokenizer):
-    """Kimi-Linear / Kimi-K3 tokenizer using TikToken.
+    """Kimi-Linear-48B tokenizer using TikToken.
 
     Wraps the verified ``TikTokenTokenizer`` shipped with kimi_k25 (the
     tiktoken merge file is byte-identical across the two families) and exposes
     the BatchGen ``BaseTokenizer`` interface.
 
+    Does NOT serve Kimi-K3 — see the module docstring. K3's special tokens
+    differ at ids 163586-163591; use ``KimiK3Tokenizer``.
+
     Attributes:
         bos_token_id: 163584 ("[BOS]")
-        eos_token_id: 163586 ("<|im_end|>")
+        eos_token_id: 163586 ("<|im_end|>" in the 48B's config; the SAME id is
+            "<|end_of_msg|>" in Kimi-K3's, which is why the two must not share
+            a tokenizer class)
         pad_token_id: 163839 ("[PAD]")
         vocab_size: 163840
     """
