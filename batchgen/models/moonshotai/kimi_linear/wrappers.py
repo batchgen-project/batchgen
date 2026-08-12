@@ -11,10 +11,17 @@
 - KimiLinearKDAWrapper: KDA linear attention with per-layer conv/recurrent
   state pools and a shared sequence->slot manager.
 
-KDA state lifecycle:
-  - prefill: slots allocated for new sequences (prepare_prefill), final
-    conv/recurrent states written into the pools.
-  - decode: slots looked up from cur_batch, state updated in place.
+KDA state lifecycle (M5.1 unified):
+  - storage + slot accounting are owned by ONE KDAStateGPUManager
+    (fixed-address recurrent/conv pools + persistent decode slot-index
+    buffer — the CUDA-graph-ready canonical home). The per-layer
+    KDALayerState pools handed to serving_modules are VIEWS of the
+    manager's tensors; the KDASlotManager facade delegates to it.
+  - prefill: slots allocated for new sequences (prepare_prefill); the
+    manager zeroes a fresh slot across every layer's conv+recurrent pool
+    (F4 fix), then final conv/recurrent states are written into the pools.
+  - decode: slots staged in place through the manager's persistent slot
+    buffer (prepare_decode_step), state updated in place.
   - completion/eviction: worker calls KimiLinearKDAWrapper.free_sequences(ids)
     (hook registered next to GPU KV release).
 """
@@ -48,50 +55,38 @@ class KimiLinearExpertWrapper(ExpertWrapperBase):
 
 
 class KDASlotManager:
-    """Shared sequence(global id) -> slot allocator for all KDA layers."""
+    """Shared sequence(global id) -> slot facade for all KDA layers.
 
-    def __init__(self, num_slots: int, device):
-        self.num_slots = num_slots
-        self.device = device
-        self.seq_to_slot: Dict[int, int] = {}
-        self.free_slots: List[int] = list(range(num_slots))
-        # KDALayerState instances registered by init_state_pools; fresh
-        # allocs zero the slot across every layer pool (see alloc).
-        self.layer_states: List["KDALayerState"] = []
+    M5.1: slot accounting is owned by the authoritative KDAStateGPUManager
+    (free list, seq->slot map, and the F4 zero-on-alloc that clears a fresh
+    slot across every layer's conv+recurrent pool — the wrapper pools are
+    views of the manager's tensors, so one zeroing covers all layers). This
+    facade only adapts the wrapper-facing alloc/lookup/free/contains API
+    and holds no state of its own.
+    """
+
+    def __init__(self, state_manager):
+        self.state_manager = state_manager
+
+    @property
+    def num_slots(self) -> int:
+        return self.state_manager.config.num_state_items
+
+    @property
+    def device(self):
+        return self.state_manager.device
 
     def alloc(self, seq_id: int) -> int:
-        if seq_id in self.seq_to_slot:
-            return self.seq_to_slot[seq_id]
-        if not self.free_slots:
-            raise RuntimeError(
-                f"KDA state pool exhausted ({self.num_slots} slots); "
-                "increase pool size or implement eviction"
-            )
-        slot = self.free_slots.pop()
-        self.seq_to_slot[seq_id] = slot
-        # Zero the (possibly recycled) slot in ALL layer pools. The manager
-        # is shared across layers, so layers > first see contains()==True
-        # (has_initial_state=True) for a sequence the first KDA layer just
-        # allocated — with zeroed pools that quirk is harmless (zero state
-        # == no state), and a recycled slot cannot leak the previous
-        # sequence's conv/recurrent state.
-        for st in self.layer_states:
-            st.conv_q[slot].zero_()
-            st.conv_k[slot].zero_()
-            st.conv_v[slot].zero_()
-            st.recurrent_pool[slot].zero_()
-        return slot
+        return self.state_manager.allocate_state_item(int(seq_id))
 
     def lookup(self, seq_id: int) -> int:
-        return self.seq_to_slot[seq_id]
+        return self.state_manager.get_sequence_state_item(int(seq_id))
 
     def free(self, seq_id: int) -> None:
-        slot = self.seq_to_slot.pop(seq_id, None)
-        if slot is not None:
-            self.free_slots.append(slot)
+        self.state_manager.release_sequence_states([int(seq_id)])
 
     def contains(self, seq_id: int) -> bool:
-        return seq_id in self.seq_to_slot
+        return self.state_manager.has_sequence_state_item(int(seq_id))
 
 
 class KDALayerState:
@@ -122,11 +117,12 @@ class KDALayerState:
         return torch.tensor(slots, dtype=torch.int32, device=device)
 
     def set_decode_batch(self, seq_ids: List[int]) -> None:
-        device = self.conv_q.device
         self.cur_batch_ids = seq_ids
-        self.cur_decode_slots = torch.tensor(
-            [self.slot_manager.lookup(s) for s in seq_ids],
-            dtype=torch.int32, device=device,
+        # Staged through the manager's persistent int32 slot buffer: fixed
+        # address (CUDA-graph static input), refreshed in place each step;
+        # no per-layer tensor allocation.
+        self.cur_decode_slots = (
+            self.slot_manager.state_manager.prepare_decode_step(seq_ids)
         )
 
 
@@ -134,6 +130,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
     """Wrapper for KimiKDAAttention (linear attention, no KV cache)."""
 
     # Shared across all KDA layer instances (set by the PSM).
+    state_manager = None  # KDAStateGPUManager: pools + slot accounting
     slot_manager: Optional[KDASlotManager] = None
     layer_pools: Dict[int, KDALayerState] = {}
 
@@ -146,22 +143,44 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
     @classmethod
     def init_state_pools(cls, kda_layer_indices, num_slots, num_heads, head_dim,
                          conv_width, proj_size, device, dtype):
-        """Allocate conv/recurrent pools for every KDA layer (called by PSM)."""
-        cls.slot_manager = KDASlotManager(num_slots, device)
+        """Build the unified KDA state pools for every KDA layer (PSM call).
+
+        M5.1: a single KDAStateGPUManager owns the storage — recurrent pool
+        (L, slots, H, K, K) fp32, conv pools (L, slots, proj, W-1) and the
+        persistent decode slot buffer — each allocated once with a fixed
+        address (CUDA-graph capture requirement). Every KDALayerState
+        receives VIEWS of the manager's tensors; slot alloc/free/zeroing is
+        delegated to the manager through the KDASlotManager facade.
+        """
+        from batchgen.kv_cache.kda_state_gpu_manager import (
+            KDAStateGPUConfig,
+            KDAStateGPUManager,
+        )
+
+        cls.state_manager = KDAStateGPUManager(
+            config=KDAStateGPUConfig(
+                num_kda_layers=len(kda_layer_indices),
+                num_state_items=num_slots,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                conv_dim=proj_size,
+                conv_width=conv_width,
+                conv_dtype=dtype,
+                cuda_graph_max_slots=num_slots,
+            ),
+            device=device,
+        )
+        cls.state_manager.initialize()
+        cls.slot_manager = KDASlotManager(cls.state_manager)
         cls.layer_pools = {}
-        for i in kda_layer_indices:
-            conv_q = torch.zeros(num_slots, proj_size, conv_width - 1,
-                                 dtype=dtype, device=device)
-            conv_k = torch.zeros(num_slots, proj_size, conv_width - 1,
-                                 dtype=dtype, device=device)
-            conv_v = torch.zeros(num_slots, proj_size, conv_width - 1,
-                                 dtype=dtype, device=device)
-            recurrent = torch.zeros(num_slots, num_heads, head_dim, head_dim,
-                                    dtype=torch.float32, device=device)
+        for physical, i in enumerate(kda_layer_indices):
+            conv_q, conv_k, conv_v = (
+                cls.state_manager.get_layer_conv_views(physical)
+            )
+            recurrent = cls.state_manager.get_layer_recurrent_view(physical)
             cls.layer_pools[i] = KDALayerState(
                 cls.slot_manager, conv_q, conv_k, conv_v, recurrent
             )
-            cls.slot_manager.layer_states.append(cls.layer_pools[i])
 
     @classmethod
     def free_sequences(cls, seq_ids) -> None:
@@ -173,6 +192,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
 
     @classmethod
     def reset(cls) -> None:
+        cls.state_manager = None
         cls.slot_manager = None
         cls.layer_pools = {}
 
