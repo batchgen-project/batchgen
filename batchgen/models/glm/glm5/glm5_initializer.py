@@ -22,7 +22,8 @@ import os
 import torch
 
 from batchgen.config.config import EngineConfig, ModelConfig
-from .configuration_glm5 import Glm5Config
+from batchgen.config.batchgen_model_config import BatchGenModelConfig
+from .config import assert_indexer_schedule_consistent
 from .set_basic_config import set_basic_config
 from .planner import GLM5Planner
 from batchgen.kv_cache.host_kv_mananger_config import build_host_kv_config
@@ -36,9 +37,23 @@ except ImportError:
 
 class GLM5Initializer:
     def __init__(self, input_arguments):
-        self.loaded_model_config = Glm5Config()
-        self.loaded_model_config._name_or_path = input_arguments.huggingface_ckpt_name
+        self.model_name = input_arguments.huggingface_ckpt_name
+        # Local checkpoint dir holding config.json (pre-downloaded model files).
+        # None for a bare HF id -> resolver falls back to rich defaults.
+        self.checkpoint_path = input_arguments.get("cache_dir", None)
+
+        # Single source of truth: the resolved internal config (GLM5Config /
+        # GLM52Config, checkpoint-backed). This IS the config used to build the
+        # model graph (loaded_model_config) — GLM-5 no longer uses an HF
+        # transformers.PretrainedConfig, matching kimi and every other model.
+        self.loaded_model_config = BatchGenModelConfig.resolve(
+            self.model_name, self.checkpoint_path
+        )
+        self.loaded_model_config._name_or_path = self.model_name
         self.loaded_model_config.architectures = ["GlmMoeDsaForCausalLM"]
+        # Fail loud at build if the DSA indexer schedule (freq/offset) disagrees
+        # with the checkpoint's per-layer indexer_types (no-op for GLM-5).
+        assert_indexer_schedule_consistent(self.loaded_model_config)
 
         self.host_kv_cache_size = input_arguments.host_kv_cache_size
         self.host_kv_cache_byte_size = input_arguments.host_kv_cache_size * (1024**3)
@@ -156,15 +171,35 @@ class GLM5Initializer:
         }
 
     def _parse_model_config(self):
+        """Resolve the rich, checkpoint-backed config via the single decoupled
+        resolver, then PROJECT it into the minimal engine ModelConfig.
+
+        The rich config (GLM5Config / GLM52Config) is the single source of
+        truth; the engine's minimal ModelConfig is duck-typed on the C++ side
+        (core/utils.cpp parse_model_config reads model_type, num_hidden_layers,
+        num_local_experts, num_attention_heads, num_key_value_heads, head_dim).
+
+        Traps honored here:
+        * head_dim <- rich.qk_head_dim (256), NOT rich.head_dim (64). The C++
+          attention geometry expects the MLA qk head dim.
+        * compressed_kv_dim and first_k_dense_replace are NOT declared fields of
+          the minimal ModelConfig but ARE read downstream (this file @
+          _default_engine_config, glm5_parameter_server). Set them as attributes
+          so Init does not crash with AttributeError.
+        """
+        rich = self.loaded_model_config
+
         model_config = ModelConfig()
-        model_config.model_type = "glm_moe_dsa"
-        model_config.num_hidden_layers = 78
-        model_config.num_local_experts = 256
-        model_config.num_attention_heads = 64
-        model_config.num_key_value_heads = 64
-        model_config.head_dim = 256  # qk_nope + qk_rope = 192 + 64
-        model_config.compressed_kv_dim = 576  # kv_lora_rank + qk_rope_head_dim
-        model_config.first_k_dense_replace = 3
+        model_config.model_type = rich.model_type
+        model_config.num_hidden_layers = rich.num_hidden_layers
+        model_config.num_local_experts = rich.num_local_experts
+        model_config.num_attention_heads = rich.num_attention_heads
+        model_config.num_key_value_heads = rich.num_key_value_heads
+        # TRAP: engine head_dim is the MLA qk head dim (256), not rich.head_dim (64).
+        model_config.head_dim = rich.qk_head_dim
+        # Not declared on ModelConfig but read downstream — set as attributes.
+        model_config.compressed_kv_dim = rich.compressed_kv_dim  # kv_lora_rank + qk_rope_head_dim
+        model_config.first_k_dense_replace = rich.first_k_dense_replace
         return model_config
 
     def Init(self, weights_storage):

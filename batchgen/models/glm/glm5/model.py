@@ -29,7 +29,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .decode_utils import clamp_token_indices_to_seqlens
-from .configuration_glm5 import Glm5Config
+# GLM-5 uses BatchGen's internal config (a plain BaseModelConfig dataclass), not
+# an HF transformers.PretrainedConfig — matching every other model (kimi, etc.).
+# Imported under the historical name `Glm5Config` so the __init__ type hints below
+# need no churn; only attribute reads are used, so any config object works.
+from .config import GLM5Config as Glm5Config, dsa_layer_skips_topk
 
 
 # ============================================================================
@@ -754,11 +758,17 @@ class Glm5MLA(nn.Module):
         # Softmax scale
         self.softmax_scale = self.q_head_dim ** -0.5
 
-        # DSA indexer — structurally absent when config.use_dense_mla is True.
-        # Downstream decode dispatch uses hasattr(self.module, 'indexer') as
-        # the signal to route to the dense-MLA (DeepSeek-V3 / Kimi style) path.
+        # DSA indexer — structurally absent when config.use_dense_mla is True
+        # (the `indexer` attribute is then NOT set, so hasattr(...) routes to the
+        # dense-MLA path — unchanged for DeepSeek-V3 / Kimi style configs).
+        # For DSA configs the attribute always exists, but GLM-5.2 "shared" layers
+        # carry no indexer weights: they reuse the previous full layer's top-k
+        # indices, so self.indexer is None on those layers (GLM-5: never a shared
+        # layer, so indexer is built on every layer — bit-identical).
+        self.skip_topk = dsa_layer_skips_topk(config, layer_idx)
+        self.next_skip_topk = dsa_layer_skips_topk(config, layer_idx + 1)
         if not getattr(config, "use_dense_mla", False):
-            self.indexer = Glm5Indexer(config, layer_idx)
+            self.indexer = None if self.skip_topk else Glm5Indexer(config, layer_idx)
 
         # Absorbed projections for decode (set by initialize())
         self.q_absorb = None
@@ -2298,7 +2308,9 @@ class Glm5Model(nn.Module):
         # Assign shared RoPE to attention and indexer
         for layer in self.layers:
             layer.self_attn.rotary_emb = self._shared_rotary_emb
-            if hasattr(layer.self_attn, 'indexer'):
+            # DSA layers have an `indexer` attribute; GLM-5.2 shared layers set it
+            # to None (no indexer weights), so guard the deref.
+            if getattr(layer.self_attn, 'indexer', None) is not None:
                 layer.self_attn.indexer.rotary_emb = self._shared_rotary_emb
 
         self.norm = Glm5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
