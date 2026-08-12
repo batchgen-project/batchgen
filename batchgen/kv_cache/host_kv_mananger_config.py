@@ -145,6 +145,17 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# Kimi-Linear: MLA latent KV (compressed_kv_dim=576, 27 engine layers; only
+# the 7 MLA layers ever append — KDA layers hold no KV).
+_KIMI_LINEAR_MLA_PROFILE = _HostKVModelProfile(
+	num_layers=27,
+	num_k_heads=1,
+	k_head_dim=576,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+)
+
 _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"deepseek_mla": _DEEPSEEK_MLA_PROFILE,
 	"deepseek_v4_flash": _DEEPSEEK_V4_FLASH_PROFILE,
@@ -154,6 +165,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 	"glm5_mla": _GLM5_MLA_PROFILE,
 	"glm5_indexer": _GLM5_INDEXER_PROFILE,
+	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
 }
 
 _PROFILE_ALIASES: Dict[str, str] = {}
@@ -196,6 +208,15 @@ for canonical, aliases in {
 		"minimaxai/minimax-m2.5",
 		"minimax-m2.5",
 		"minimax",
+	),
+	"kimi_linear_mla": (
+		"moonshotai/kimi-linear-48b-a3b-instruct",
+		"moonshotai/kimi-linear",
+		"kimi-linear",
+		"kimi_linear",
+		"moonshotai/kimi-k3",
+		"kimi-k3",
+		"kimi_k3",
 	),
 	"glm5_mla": (
 		"zai-org/glm-5-fp8",

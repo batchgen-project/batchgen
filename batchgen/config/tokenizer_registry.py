@@ -85,6 +85,10 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     "GLM-5": "glm_moe_dsa",
     "MiniMax-M2.5": "minimax_m25",
     "MiniMaxAI/MiniMax-M2.5": "minimax_m25",
+    "Kimi-Linear": "kimi_linear",
+    "kimi-linear": "kimi_linear",
+    "Kimi-K3": "kimi_linear",
+    "kimi-k3": "kimi_linear",
 }
 
 for model_id in KIMI_K25_BACKEND_MODEL_IDS:
@@ -186,6 +190,11 @@ def _import_tokenizers():
 
     try:
         from batchgen.models.moonshotai.kimi_k25 import tokenizer as _  # noqa: F401
+    except ImportError:
+        pass
+
+    try:
+        from batchgen.models.moonshotai.kimi_linear import tokenizer as _  # noqa: F401
     except ImportError:
         pass
 
