@@ -43,6 +43,7 @@ from pathlib import Path
 import json
 import logging
 import os
+import re
 
 from .model_name_utils import KIMI_K25_BACKEND_MODEL_IDS
 
@@ -83,7 +84,12 @@ MODEL_NAME_PATTERNS: Dict[str, str] = {
     "gpt-oss": "gpt_oss",
     # GLM-5 / GLM-5.1 share an architecturally-identical glm_moe_dsa graph
     # (754B MoE + DSA, 78 layers, identical config.json apart from transformers_version).
-    # More-specific patterns first so `GLM-5.1-FP8` doesn't get swallowed by `GLM-5`.
+    # GLM-5.2 shares the model graph but gets its OWN config identity
+    # (glm_moe_dsa_5_2) — longer context, nested rope, extra DSA indexer knobs.
+    # More-specific patterns first so `GLM-5.2-FP8` doesn't get swallowed by
+    # `GLM-5` (and `GLM-5.1-FP8` not by `GLM-5`).
+    "GLM-5.2-FP8": "glm_moe_dsa_5_2",
+    "GLM-5.2": "glm_moe_dsa_5_2",
     "GLM-5.1-FP8": "glm_moe_dsa",
     "GLM-5.1": "glm_moe_dsa",
     "GLM-5-FP8": "glm_moe_dsa",
@@ -116,6 +122,55 @@ def register_config(model_type: str):
     return decorator
 
 
+def _warn_if_unlisted_glm5_variant(model_identifier: str, matched_pattern: str) -> None:
+    """Loudly warn when a GLM-5.x identifier resolved via the broad ``GLM-5``
+    catch-all rather than an explicitly-listed variant.
+
+    ``"GLM-5"`` is a substring of every future minor (``GLM-5.3``, ``GLM-5.9``)
+    and of superstrings like ``GLM-50``. Without this guard such an identifier
+    silently binds to the GLM-5 base config (glm_moe_dsa) — and if its real
+    config.json diverges the engine would be built with wrong dims and no
+    diagnostic. We only warn when the matched pattern is the broad ``GLM-5`` /
+    ``GLM-5-FP8`` AND the identifier carries a minor/patch token that is not one
+    of the explicitly-listed GLM-5.x patterns.
+    """
+    if matched_pattern not in ("GLM-5", "GLM-5-FP8"):
+        return
+
+    # Version tokens that are explicitly listed (and therefore trusted).
+    listed_versions = set()
+    for pat in MODEL_NAME_PATTERNS:
+        m = re.search(r"GLM-5(?:\.(\d+))?", pat)
+        if m and pat.startswith("GLM-5"):
+            listed_versions.add(m.group(1))  # None for bare "GLM-5", "1", "2", ...
+
+    # Extract the GLM-5 version token from the identifier: an optional trailing
+    # integer glued to the 5 (GLM-50) or a dotted minor (GLM-5.3).
+    m = re.search(r"GLM-5(\d*)(?:\.(\d+))?", model_identifier)
+    if m is None:
+        return
+    glued, minor = m.group(1), m.group(2)
+    # GLM-50 / GLM-51 ... — a superstring of "GLM-5", never a real GLM-5 minor.
+    if glued:
+        logger.warning(
+            "Model identifier %r matched the broad 'GLM-5' pattern as a "
+            "superstring (GLM-5%s...). This is almost certainly NOT GLM-5; it "
+            "is being resolved to the GLM-5 base config (glm_moe_dsa). Add an "
+            "explicit pattern if this is a real variant.",
+            model_identifier, glued,
+        )
+        return
+    if minor not in listed_versions:
+        logger.warning(
+            "Model identifier %r is an unlisted GLM-5.%s variant; it matched the "
+            "broad 'GLM-5' pattern and is being resolved to the GLM-5 base config "
+            "(glm_moe_dsa). If its config.json diverges from GLM-5 the engine will "
+            "be built with wrong dims. Add an explicit 'GLM-5.%s' pattern to "
+            "MODEL_NAME_PATTERNS.",
+            model_identifier, minor, minor,
+        )
+
+
 def _detect_model_type_from_identifier(model_identifier: str) -> Optional[str]:
     """Detect model type from HuggingFace model identifier.
 
@@ -130,6 +185,9 @@ def _detect_model_type_from_identifier(model_identifier: str) -> Optional[str]:
     for pattern, model_type in MODEL_NAME_PATTERNS.items():
         if pattern in model_identifier:
             logger.debug(f"Detected model_type={model_type} from identifier={model_identifier}")
+            # Loud guard: an unlisted GLM-5.x that fell through to the broad
+            # 'GLM-5' catch-all must not silently bind to the base config.
+            _warn_if_unlisted_glm5_variant(model_identifier, pattern)
             return model_type
     return None
 

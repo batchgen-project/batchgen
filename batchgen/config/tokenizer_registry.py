@@ -71,8 +71,14 @@ TOKENIZER_NAME_PATTERNS: Dict[str, str] = {
     # EOS/pad), but GLM-5.1 ships a richer chat template (tool_to_json macro,
     # thinking_indices tracking, tool_reference responses). We route them to
     # separate tokenizer types so each loads its own Jinja template.
-    # More-specific patterns first so `GLM-5.1-FP8` doesn't get swallowed by
-    # `GLM-5`.
+    # GLM-5.2 reserves its own tokenizer identity (glm_moe_dsa_5_2) here; it
+    # shares the GLM-5 vocab, so until a dedicated GLM52Tokenizer class is
+    # registered, load_tokenizer() gracefully falls through this (unregistered)
+    # type to the shared "glm_moe_dsa" tokenizer via the `GLM-5` pattern below.
+    # More-specific patterns first so `GLM-5.2-FP8` / `GLM-5.1-FP8` don't get
+    # swallowed by `GLM-5`.
+    "GLM-5.2-FP8": "glm_moe_dsa_5_2",
+    "GLM-5.2": "glm_moe_dsa_5_2",
     "GLM-5.1-FP8": "glm_moe_dsa_5_1",
     "GLM-5.1": "glm_moe_dsa_5_1",
     "GLM-5-FP8": "glm_moe_dsa",
