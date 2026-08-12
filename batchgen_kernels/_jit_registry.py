@@ -9,7 +9,7 @@ setup.py, add a corresponding entry here for JIT dev mode support.
 
 # Common flag sets (mirror setup.py)
 _SM90A_FLAGS = [
-    "-std=c++17", "-arch=sm_90a", "-O3",
+    "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a", "-O3",
     "--ptxas-options=-v", "-lineinfo", "--threads", "4",
 ]
 
@@ -49,7 +49,7 @@ def get_registry():
         "batchgen_kernels.moe._C_marlin_grouped_gemm": {
             "sources": ["src/moe/marlin_grouped_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
                 "--use_fast_math", "-lineinfo",
                 "-DUSE_BF16_COMPUTE",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
@@ -59,7 +59,7 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_gemm": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_gemm.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
                 "-lineinfo", "--expt-relaxed-constexpr",
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
                 "-DNDEBUG", "-Xptxas=-v",
@@ -70,14 +70,14 @@ def get_registry():
         "batchgen_kernels.moe._C_fp8_blockwise_ops": {
             "sources": ["src/moe/fp8_blockwise/fp8_blockwise_ops.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
                 "-lineinfo", "--threads", "4",
             ],
         },
         "batchgen_kernels.moe._C_marlin_transform": {
             "sources": ["src/moe/marlin_transform_kernel.cu"],
             "nvcc_flags": [
-                "-O3", "-std=c++17", "-arch=sm_90a",
+                "-O3", "-std=c++17", "-gencode", "arch=compute_90a,code=sm_90a",
                 "--use_fast_math", "--threads", "4",
             ],
         },

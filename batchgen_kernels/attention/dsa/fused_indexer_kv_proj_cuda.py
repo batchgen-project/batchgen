@@ -948,7 +948,7 @@ def build_module(num_stages=4):
             "indexer_kv_proj_gemm_only_valid_m_out",
         ],
         extra_cuda_cflags=[
-            "-O3", "-arch=sm_90a", "--ptxas-options=-v", "-lineinfo",
+            "-O3", "-gencode", "arch=compute_90a,code=sm_90a", "--ptxas-options=-v", "-lineinfo",
             f"-DNUM_STAGES={num_stages}",
         ],
         verbose=True,
