@@ -22,6 +22,9 @@ def get_parallel_strategy_manager(model_name:str):
 	if "minimax" in model_lower or "minimax-m2.5" in model_lower:
 		from batchgen.models.minimax.minimax_m25.Parallel_Strategy_Manager import MiniMaxM25ParallelStrategyManager
 		return MiniMaxM25ParallelStrategyManager
+	elif "kimi-linear" in model_lower or "kimi-k3" in model_lower:
+		from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import KimiLinearParallelStrategyManager
+		return KimiLinearParallelStrategyManager
 	elif _is_kimi_k25_backend_model(model_name):
 		from batchgen.models.moonshotai.kimi_k25.Parallel_Strategy_Manager import KimiK25ParallelStrategyManager
 		return KimiK25ParallelStrategyManager
