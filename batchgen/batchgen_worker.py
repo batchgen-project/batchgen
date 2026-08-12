@@ -17,6 +17,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
+from batchgen.deprecation import LegacyInferenceDeprecated
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
@@ -1294,6 +1295,17 @@ class BatchGenWorker:
 				elif isinstance(msg, dict) and msg.get("type") == "admit":
 					msg_data = msg
 					has_new = True
+				elif isinstance(msg, dict) and "prompts" in msg:
+					# A legacy /v1/inference payload (worker_manager.infer builds
+					# exactly this shape). It matches no branch above, so it used
+					# to be dropped right here while the caller sat on
+					# response_queue.get() and took the next batch's completion.
+					# The HTTP route now returns 410, so reaching this line means
+					# some other producer is putting legacy payloads on the queue:
+					# fail loudly rather than park. Deliberately NOT a catch-all
+					# for unknown messages -- {"command": "reload"} also lands
+					# here and must keep its current handling.
+					raise LegacyInferenceDeprecated()
 			except queue_mod.Empty:
 				pass
 
@@ -5851,6 +5863,12 @@ class BatchGenWorker:
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
 							self._handle_hot_reload(msg)
+						elif isinstance(msg, dict) and "prompts" in msg:
+							# Legacy /v1/inference payload -- see the matching
+							# guard in _poll_admissions. The `else` below would
+							# swallow it and the caller would then steal the next
+							# completion off the shared response queue.
+							raise LegacyInferenceDeprecated()
 						else:
 							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
