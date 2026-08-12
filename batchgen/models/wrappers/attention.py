@@ -36,22 +36,54 @@ from .base import BaseModuleWrapper
 class AttnWrapperBase(BaseModuleWrapper):
     """Base wrapper for attention modules.
 
+    The class-level attributes below form the **per-step contract** between the
+    worker and the model: the worker (batchgen_worker.py) writes them right
+    before calling model.forward, and the wrapper reads them inside
+    _forward_prefill / _forward_decode. They are GLOBAL MUTABLE STATE, valid
+    only for the current micro-batch/step. Full semantics + which worker line
+    writes each field are documented in:
+        batchgen-context/architecture/PSM_WORKER_CONTRACT.md  (§2)
+
     Handles:
     - Class-level batch state (cur_batch, attention_mask, position_ids)
     - Module key generation for weight loading
     - Weight dequantization hooks
     - Prefill and decode phase routing
 
-    Class Attributes:
-        phase: Current execution phase ("prefill" or "decode")
-        attn_mode: Attention computation mode
-        cur_batch: Current batch sequence IDs
-        attention_mask: Attention mask tensor
-        position_ids: Position IDs tensor
-        kv_quantization_factor: KV cache quantization factors
-        kv_append_callback: Callback for KV cache append
-        async_kv_load_active: Flag for async KV load
-        async_kv_load_task: Async KV load task object
+    Class Attributes (grouped by when they are valid):
+      Always (routing):
+        phase           -- "prefill" | "decode"; selects the forward branch.
+        cur_batch       -- list[int] global_seq_ids in this step's order; used
+                           to index paged KV pages / model state pools.
+        position_ids    -- token positions (flat in prepack; (bsz,1) in decode).
+      Prefill, standard padded path:
+        attention_mask  -- (bsz, seq_len) 1/0 padding mask. NOTE: the model's
+                           _run_attn passes None for linear/KDA layers; those
+                           read lengths here or from prepack_cu_seqlens.
+      Prefill, prepack (varlen) path [default, --enable-prepack]:
+        prepack_mode        -- bool; gate model code on this.
+        prepack_cu_seqlens  -- (num_seq+1,) int32 cumulative token offsets.
+        prepack_max_seqlen  -- int; longest sequence.
+        prepack_num_sequences -- int.
+        prepack_seq_lengths -- list[int] per-sequence lengths.
+        host_paged_kv_worker_view (on core_engine) -- target for
+                           async_offload_layer_kv_to_host(...) KV offload.
+        pending_prefill_offload_tasks/_tensors -- async-offload bookkeeping
+                           (worker waits on these; do not clear from model code).
+      Decode path:
+        attention_mask  -- None (unused in decode).
+        cache_seqlens   -- (bsz,) int32 current context length per sequence.
+        max_seqlen      -- int max context length in batch.
+        gpu_paged_kv_manager (+ _aux) -- paged-KV read/write.
+        kv_append_callback  (+ _aux)  -- fn(layer_idx, k, v) to append new KV.
+      KV / misc:
+        attn_mode, scale, past_key_states, past_value_states,
+        kv_quantization_factor, batchgen_debug,
+        async_kv_load_active / async_kv_load_task.
+
+    Distributed: model MoE-EP collectives must use the worker's
+    PyNcclCommunicator (bound onto modules by the PSM), NOT torch.distributed
+    (deadlocks vs the engine's C++ NCCL). See PSM_WORKER_CONTRACT.md §3.
 
     Subclasses should implement:
     - dequantize_weights(): Model-specific weight dequantization

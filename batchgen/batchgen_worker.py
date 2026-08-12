@@ -1,6 +1,7 @@
 import concurrent.futures
 import copy
 import functools
+import json
 import psutil
 import logging
 import math
@@ -16,6 +17,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from batchgen.config.model_registry import load_config
 from batchgen.config.tokenizer_registry import load_tokenizer
+from batchgen.deprecation import LegacyInferenceDeprecated
 
 # Use new wrapper system - Attn_Wrapper/Expert_Wrapper are aliases for backward compatibility
 from batchgen.models.wrappers import BaseModuleWrapper, AttnWrapperBase, ExpertWrapperBase
@@ -274,23 +276,124 @@ class _DualKVLoadPointers:
 	aux_page_counts: torch.Tensor
 
 
+class QueryBookPoolCapacityError(RuntimeError):
+	"""A QueryBook pool request exceeded the rows/width actually allocated."""
+
+
+def allocate_node_shared_int64(
+	name: str,
+	rows: int,
+	width: int,
+	is_creator: bool,
+	barrier,
+) -> Tuple[torch.Tensor, object]:
+	"""Map ONE int64 ``[rows, width]`` CPU tensor per node into every worker.
+
+	The tokenized global batch is identical on every rank (``_tokenize_global_batch``
+	all-gathers the results to all of them), so each worker used to hold its own
+	private copy of the same input-ids table — ``world_size`` duplicates of the
+	same bytes, which is what OOM-killed the node.
+
+	``is_creator`` must be true on exactly one rank per node. The creator makes
+	the segment (POSIX guarantees it is zero-filled, matching the ``torch.zeros``
+	it replaces), everyone waits on ``barrier``, then the rest attach. ``barrier``
+	is ``dist.barrier`` in the worker and an ``mp.Barrier`` in tests.
+
+	Returns ``(tensor, shm)``. The caller MUST keep ``shm`` alive for as long as
+	the tensor is reachable: the tensor points straight into the mapping.
+
+	Two operational notes: the segment lands in /dev/shm, so the container's
+	shm budget has to cover it; and CPython < 3.13 registers a segment with the
+	resource_tracker on attach as well as on create, so every non-creator rank
+	prints one "leaked shared_memory objects" warning at shutdown. That warning
+	is cosmetic — unlink only drops the name, never a live mapping.
+	"""
+	from multiprocessing import shared_memory
+
+	nbytes = rows * width * 8
+	if is_creator:
+		try:
+			# A crashed predecessor can leave the name behind; reusing its
+			# (possibly smaller) segment would silently truncate.
+			shared_memory.SharedMemory(name=name).unlink()
+		except FileNotFoundError:
+			pass
+		shm = shared_memory.SharedMemory(name=name, create=True, size=nbytes)
+	barrier()
+	if not is_creator:
+		shm = shared_memory.SharedMemory(name=name)
+	if shm.size < nbytes:
+		raise QueryBookPoolCapacityError(
+			f"shared input_ids segment '{name}' is {shm.size} bytes, "
+			f"need {nbytes} ({rows} rows x {width} tokens x 8B)"
+		)
+	buf = torch.frombuffer(shm.buf, dtype=torch.int64, count=rows * width).view(rows, width)
+	# Nobody may unlink/close until every rank has mapped it.
+	barrier()
+	return buf, shm
+
+
 class QueryBookBufferPool:
 	"""Pre-allocated contiguous buffers for query book tensors.
 
 	Eliminates per-sequence tensor allocation in Phase 3 of _tokenize_global_batch().
 	With 16 ranks each creating 12K tensors, allocator contention causes ~19 min init.
 	This replaces 24K allocations per rank with 2 large allocations + views.
+
+	``input_ids_buffer`` may be passed in as a node-shared tensor (see
+	``allocate_node_shared_int64``) — its contents are identical on every rank,
+	so one copy per node is enough. ``decoded_tokens_buffer`` stays PRIVATE: only
+	the owning rank writes a sequence's decoded tokens, so the ranks' copies
+	legitimately differ.
+
+	``input_ids_width`` is the widest ``seq_extended_size`` the pool can serve.
+	It is sized from the batch that is actually being admitted, NOT from the
+	model context length: at K3's 1,048,576-token context a 10240-slot pool
+	would be 80 GiB of zeros per worker.
 	"""
 
-	def __init__(self, num_sequences: int, model_context_length: int, max_decoding_length: int, pad_token_id: int = 0):
-		self.input_ids_buffer = torch.zeros((num_sequences, model_context_length), dtype=torch.long)
+	def __init__(
+		self,
+		num_sequences: int,
+		input_ids_width: int,
+		max_decoding_length: int,
+		pad_token_id: int = 0,
+		input_ids_buffer: Optional[torch.Tensor] = None,
+		input_ids_shm: object = None,
+	):
+		if input_ids_buffer is None:
+			input_ids_buffer = torch.zeros((num_sequences, input_ids_width), dtype=torch.long)
+		elif tuple(input_ids_buffer.shape) != (num_sequences, input_ids_width):
+			raise QueryBookPoolCapacityError(
+				f"shared input_ids buffer has shape {tuple(input_ids_buffer.shape)}, "
+				f"pool needs ({num_sequences}, {input_ids_width})"
+			)
+		self.input_ids_buffer = input_ids_buffer
+		self.input_ids_shm = input_ids_shm
 		self.decoded_tokens_buffer = torch.full((num_sequences, max_decoding_length), pad_token_id, dtype=torch.int64)
 		self.pad_token_id = pad_token_id
 		self.num_sequences = num_sequences
-		self.model_context_length = model_context_length
+		self.input_ids_width = input_ids_width
 		self.max_decoding_length = max_decoding_length
 		self._free_slots: set = set()
 		self._next_slot: int = 0
+
+	def adopt(self, old: "QueryBookBufferPool") -> None:
+		"""Carry contents and slot bookkeeping over from a superseded pool."""
+		rows = min(self.num_sequences, old.num_sequences)
+		cols = min(self.input_ids_width, old.input_ids_width)
+		self.input_ids_buffer[:rows, :cols] = old.input_ids_buffer[:rows, :cols]
+		dec = min(self.max_decoding_length, old.max_decoding_length)
+		self.decoded_tokens_buffer[:rows, :dec] = old.decoded_tokens_buffer[:rows, :dec]
+		self._free_slots = set(old._free_slots)
+		self._next_slot = old._next_slot
+
+	def reset(self) -> None:
+		"""Return the pool to its just-allocated state (legacy per-batch reuse)."""
+		self._free_slots = set()
+		self._next_slot = 0
+		self.input_ids_buffer.zero_()
+		self.decoded_tokens_buffer.fill_(self.pad_token_id)
 
 	def allocate_slot(self) -> int:
 		if self._free_slots:
@@ -301,7 +404,10 @@ class QueryBookBufferPool:
 			return slot
 		slot = self._next_slot
 		if slot >= self.num_sequences:
-			raise RuntimeError(f"QueryBookBufferPool exhausted: {self.num_sequences} slots used")
+			raise QueryBookPoolCapacityError(
+				f"QueryBookBufferPool exhausted: {self.num_sequences} slots used "
+				f"(raise --max-pool-size)"
+			)
 		self._next_slot += 1
 		return slot
 
@@ -309,6 +415,13 @@ class QueryBookBufferPool:
 		self._free_slots.add(slot)
 
 	def get_input_ids_view(self, slot: int, seq_extended_size: int) -> torch.Tensor:
+		if seq_extended_size > self.input_ids_width:
+			# Slicing would silently hand back a SHORT view and truncate the
+			# prompt. The pool must be grown instead (_ensure_buffer_pool).
+			raise QueryBookPoolCapacityError(
+				f"input_ids view of {seq_extended_size} tokens requested from a pool "
+				f"allocated {self.input_ids_width} tokens wide (slot={slot})"
+			)
 		return self.input_ids_buffer[slot:slot+1, :seq_extended_size]
 
 	def get_decoded_tokens_view(self, slot: int) -> torch.Tensor:
@@ -758,8 +871,23 @@ class BatchGenWorker:
 		# Request pool: admission queue and response queue for persistent loop
 		self._admission_queue = None  # mp.Queue, set via set_admission_queue()
 		self._response_queue = None   # mp.Queue, set via set_response_queue()
+		# global_idx -> decoded text for sequences completed during PREFILL
+		# (C4). Captured before _report_completion pops the local maps; the
+		# legacy end-of-generate() gather merges it. Legacy mode only.
+		self._prefill_completed_results: Dict[int, str] = {}
 		self._shutdown_requested = False
 		self._max_pool_size = args.max_pool_size  # 0 = legacy mode
+
+		# QueryBook buffer pool. Allocated lazily by _ensure_buffer_pool() once
+		# the first batch's tokenized lengths are known — its input_ids buffer
+		# is ONE shared-memory segment per node, so it cannot be sized from
+		# static config.
+		self._buffer_pool: Optional[QueryBookBufferPool] = None
+		self._buffer_pool_generation = 0
+		self._shared_buffer_tag: Optional[str] = None
+		# Superseded pools stay mapped for the process lifetime (see
+		# _retire_buffer_pool).
+		self._retired_buffer_pools: List[QueryBookBufferPool] = []
 
 		logging.info(f"Rank {self.rank}: BatchGenWorker __init__ completed.")
 
@@ -1167,6 +1295,17 @@ class BatchGenWorker:
 				elif isinstance(msg, dict) and msg.get("type") == "admit":
 					msg_data = msg
 					has_new = True
+				elif isinstance(msg, dict) and "prompts" in msg:
+					# A legacy /v1/inference payload (worker_manager.infer builds
+					# exactly this shape). It matches no branch above, so it used
+					# to be dropped right here while the caller sat on
+					# response_queue.get() and took the next batch's completion.
+					# The HTTP route now returns 410, so reaching this line means
+					# some other producer is putting legacy payloads on the queue:
+					# fail loudly rather than park. Deliberately NOT a catch-all
+					# for unknown messages -- {"command": "reload"} also lands
+					# here and must keep its current handling.
+					raise LegacyInferenceDeprecated()
 			except queue_mod.Empty:
 				pass
 
@@ -1261,7 +1400,9 @@ class BatchGenWorker:
 
 		Reuses the same parallel tokenization + buffer pool fill pattern as
 		_tokenize_global_batch Phase 1 + Phase 3. Key differences:
-		- Uses existing buffer pool (not creating a new one)
+		- Allocates the buffer pool on the first admission and grows it when a
+		  later admission is wider (the pool cannot be pre-sized: its widths
+		  come from the requests, not from static config)
 		- Only processes the new sequences, not the full global_batch
 
 		Optimization: uses padding=False to avoid creating a large padded 2D
@@ -1343,6 +1484,35 @@ class BatchGenWorker:
 					"text": "",
 				})
 			self.global_batch.remove_sequence(uuid)
+
+		# Phase 2.75: size the pool for what this admission actually needs.
+		# COLLECTIVE — every rank runs it with the same numbers: the admission
+		# message was broadcast and the tokenized lengths were all-gathered above.
+		required_input_width = 0
+		required_decode_width = 0
+		for i, seq in enumerate(sequences):
+			if seq.uuid in rejected_uuids:
+				continue
+			prompt_len = tokenized_by_idx[i]["length"]
+			required_input_width = max(
+				required_input_width,
+				min(prompt_len + seq.max_decode_length, self.model_context_length),
+			)
+			required_decode_width = max(
+				required_decode_width,
+				min(seq.max_decode_length, self.model_context_length),
+			)
+		if required_input_width > 0:
+			# Rows keep their --max-pool-size meaning: the pool is NOT widened to
+			# fit an over-subscribed batch, allocate_slot() still hard-fails.
+			self._ensure_buffer_pool(
+				required_rows=(
+					self._max_pool_size if self._max_pool_size > 0 else len(sequences)
+				),
+				required_input_width=required_input_width,
+				required_decode_width=required_decode_width,
+				reason=f"admission of {len(sequences)} sequences",
+			)
 
 		# Phase 3: Assign buffer pool slots and fill token data
 		# Same pattern as _tokenize_global_batch Phase 3 — allocate slot from
@@ -1484,6 +1654,9 @@ class BatchGenWorker:
 		if hasattr(self, '_buffer_pool') and self._buffer_pool is not None:
 			if seq._buffer_slot >= 0:
 				self._buffer_pool.free_slot(seq._buffer_slot)
+				# Guard against double-free / stale reuse: a re-entered report
+				# for this seq must not free a slot now owned by another seq.
+				seq._buffer_slot = -1
 
 		# Free local index mapping.
 		# DIAGNOSTIC: log the pop on the owning rank so we can correlate
@@ -3026,6 +3199,15 @@ class BatchGenWorker:
 			f"Rank {self.rank} Released GPU KV pages for global_idx: {global_sequence_ids}"
 		)
 
+		# Kimi-Linear: release KDA state slots alongside GPU KV pages (no-op for
+		# other models — slot_manager is None).
+		try:
+			from batchgen.models.moonshotai.kimi_linear.wrappers import KimiLinearKDAWrapper
+			if KimiLinearKDAWrapper.slot_manager is not None:
+				KimiLinearKDAWrapper.free_sequences(global_sequence_ids)
+		except ImportError:
+			pass
+
 		# FIX Bug 2: Remove from tracking set and reset gpu_pages_allocated
 		for local_idx in local_sequence_ids:
 			uuid = self._local_to_uuid_map.get(local_idx)
@@ -3578,11 +3760,16 @@ class BatchGenWorker:
 				# are already contiguous (.contiguous() returns same tensor, not a copy)
 				dist.send(tensor=qb.encoded["input_ids"].clone(), dst=to_rank, group=gloo_group)
 				dist.send(tensor=qb.decoded_tokens.clone(), dst=to_rank, group=gloo_group)
-				# Free buffer slot after send completes
-				seq_for_slot = self.global_batch.get_sequence(uuid)
-				if hasattr(seq_for_slot, '_buffer_slot') and seq_for_slot._buffer_slot >= 0:
-					self._buffer_pool.free_slot(seq_for_slot._buffer_slot)
-					seq_for_slot._buffer_slot = -1
+				# The buffer slot is NOT freed here. slot -> row is GLOBAL
+				# state: every rank allocates the same slot for the same
+				# sequence at tokenization and frees it in _report_completion,
+				# and the destination below reuses this very slot index.
+				# Freeing it only on the source made this rank's pool disagree
+				# with every other rank's -- it could hand row S to a new
+				# admission while everyone else still reads S as this sequence,
+				# and it left _buffer_slot = -1, so an eviction re-entry wrote
+				# into row -1 (the LAST row). Now that input_ids is one
+				# node-shared segment that divergence is data corruption.
 				if BATCHGEN_CB_DEBUG:
 					logging.debug(f"MIGRATION: Rank {self.rank}: Sent query_book for {uuid[:8]}...")
 			else:
@@ -3811,9 +3998,19 @@ class BatchGenWorker:
 						f"reusing existing_slot={existing_slot}, budget={budget}"
 					)
 					if existing_slot < 0:
-						logging.info(f"Rank {self.rank}: Migration receive {uuid[:8]} has no buffer slot (expected for cross-rank migration), allocating new")
-						existing_slot = self._buffer_pool.allocate_slot()
-						seq._buffer_slot = existing_slot
+						# Was: allocate a fresh slot here. That is a rank-LOCAL
+						# allocation of a globally-agreed index, so this rank would
+						# then write the sequence into a row every other rank reads
+						# as somebody else's -- silent corruption of the shared
+						# input_ids segment. The slot is allocated on every rank at
+						# tokenization and released on every rank in
+						# _report_completion, so reaching here means that invariant
+						# is already broken.
+						raise QueryBookPoolCapacityError(
+							f"Rank {self.rank}: migration receive of {uuid[:8]} found no "
+							f"buffer slot (_buffer_slot={existing_slot}); slot assignment "
+							f"has diverged from the other ranks"
+						)
 					self._buffer_pool.input_ids_buffer[existing_slot, :budget] = pending['input_ids'][0, :budget]
 					self._buffer_pool.decoded_tokens_buffer[existing_slot, :] = pending['decoded_tokens'][0, :]
 					input_ids_view = self._buffer_pool.get_input_ids_view(existing_slot, budget)
@@ -3920,6 +4117,7 @@ class BatchGenWorker:
 
 		# Step 1: Initialize global batch
 		self.global_batch = SequenceBatch()
+		self._prefill_completed_results = {}
 		for idx, text in enumerate(global_prompts):
 			max_dec = self.max_decoding_length
 			if per_sequence_max_tokens is not None and idx < len(per_sequence_max_tokens):
@@ -4202,6 +4400,128 @@ class BatchGenWorker:
 			self._make_sync_context(), decode_uuids
 		)
 
+	# ============ QueryBook Buffer Pool ============
+
+	def _node_shared_tag(self) -> str:
+		"""Run-unique tag shared by every rank, for shared-memory segment names."""
+		if self._shared_buffer_tag is None:
+			tag = [os.urandom(6).hex() if self.rank == 0 else None]
+			dist.broadcast_object_list(tag, src=0)
+			self._shared_buffer_tag = tag[0]
+		return self._shared_buffer_tag
+
+	def _ensure_buffer_pool(
+		self,
+		required_rows: int,
+		required_input_width: int,
+		required_decode_width: int,
+		reason: str,
+	) -> None:
+		"""Allocate — or grow — the QueryBook buffer pool.
+
+		COLLECTIVE: every rank must call this with identical arguments. They do,
+		because both call sites derive the requirement from the tokenized batch,
+		which is all-gathered to every rank before this runs.
+
+		``input_ids_buffer`` is ONE shared-memory segment per node. Sizing is by
+		actual need: ``required_input_width`` is the widest ``seq_extended_size``
+		(prompt + that request's decode budget) the batch will ask for, capped at
+		the model context length — never the context length itself, and never the
+		``--max-pool-size`` flag, which keeps its row-count meaning only.
+
+		A later admission that needs more never silently truncates: it grows the
+		pool with a WARNING naming both sizes, copies the live rows over and
+		rebinds every view. ``get_input_ids_view`` hard-fails
+		(``QueryBookPoolCapacityError``) if a request ever slips past this.
+		"""
+		old = self._buffer_pool
+		if old is not None and (
+			required_rows <= old.num_sequences
+			and required_input_width <= old.input_ids_width
+			and required_decode_width <= old.max_decoding_length
+		):
+			return
+
+		rows = max(required_rows, old.num_sequences if old is not None else 0)
+		in_w = max(required_input_width, old.input_ids_width if old is not None else 0)
+		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
+
+		self._buffer_pool_generation += 1
+		node_id = self.rank // NUM_GPUS_PER_NODE
+		name = (
+			f"batchgen_input_ids_{self._node_shared_tag()}"
+			f"_n{node_id}_g{self._buffer_pool_generation}"
+		)
+		is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
+		shared_input_ids, shm = allocate_node_shared_int64(
+			name, rows, in_w, is_creator, dist.barrier
+		)
+		new_pool = QueryBookBufferPool(
+			num_sequences=rows,
+			input_ids_width=in_w,
+			max_decoding_length=dec_w,
+			pad_token_id=self.pad_token_id,
+			input_ids_buffer=shared_input_ids,
+			input_ids_shm=shm,
+		)
+		shared_gib = rows * in_w * 8 / 2**30
+		private_gib = rows * dec_w * 8 / 2**30
+		if old is None:
+			logging.info(
+				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
+				f"input_ids_width={in_w}, decoded_width={dec_w} -> input_ids "
+				f"{shared_gib:.3f} GiB SHARED per node ('{name}'), decoded_tokens "
+				f"{private_gib:.3f} GiB per rank"
+			)
+		else:
+			logging.warning(
+				f"Rank {self.rank}: QueryBook pool GROWN ({reason}): rows "
+				f"{old.num_sequences}->{rows}, input_ids_width "
+				f"{old.input_ids_width}->{in_w}, decoded_width "
+				f"{old.max_decoding_length}->{dec_w}; new input_ids segment "
+				f"{shared_gib:.3f} GiB SHARED per node ('{name}')"
+			)
+			new_pool.adopt(old)
+		self._buffer_pool = new_pool
+		if old is not None:
+			self._rebind_buffer_pool_views()
+			self._retire_buffer_pool(old, is_creator)
+
+	def _retire_buffer_pool(self, old: QueryBookBufferPool, is_creator: bool) -> None:
+		"""Drop a superseded pool's NAME but keep its mapping alive.
+
+		Views handed out before the grow may still be referenced somewhere this
+		rebind does not reach; unmapping under them would segfault. Unlinking on
+		the node's creator keeps /dev/shm from accumulating one entry per grow —
+		POSIX frees the pages once the last mapping goes, i.e. at process exit.
+		"""
+		self._retired_buffer_pools.append(old)
+		if is_creator and old.input_ids_shm is not None:
+			try:
+				old.input_ids_shm.unlink()
+			except FileNotFoundError:
+				pass
+
+	def _rebind_buffer_pool_views(self) -> None:
+		"""Repoint every live sequence and query-book entry at the current pool."""
+		pool = self._buffer_pool
+		rebound = 0
+		for seq in self.global_batch:
+			slot = getattr(seq, '_buffer_slot', -1)
+			if slot < 0:
+				continue
+			input_ids_view = pool.get_input_ids_view(slot, seq.kv_token_budget)
+			decoded_view = pool.get_decoded_tokens_view(slot)
+			seq.input_ids = input_ids_view
+			seq.decoded_tokens = decoded_view
+			local_idx = self._uuid_to_local_map.get(seq.uuid)
+			if local_idx is not None and self.query_book and local_idx in self.query_book:
+				entry = self.query_book[local_idx]
+				entry.encoded["input_ids"] = input_ids_view
+				entry.decoded_tokens = decoded_view
+			rebound += 1
+		logging.warning(f"Rank {self.rank}: rebound {rebound} sequences onto the grown QueryBook pool")
+
 	# ============ Tokenization and Assignment ============
 
 	def _tokenize_global_batch(self) -> None:
@@ -4372,17 +4692,30 @@ class BatchGenWorker:
 
 		# Use max_pool_size for pre-allocation if in pool mode (allows future admissions)
 		pool_capacity = max(num_seqs, self._max_pool_size) if self._max_pool_size > 0 else num_seqs
-		self._buffer_pool = QueryBookBufferPool(
-			num_sequences=pool_capacity,
-			model_context_length=self.model_context_length,
-			max_decoding_length=self.max_decoding_length,
-			pad_token_id=self.pad_token_id,
+		# Width by actual need: the widest seq_extended_size the loop below will
+		# ask get_input_ids_view() for. Sizing it at model_context_length instead
+		# costs 8 bytes x pool_capacity x context — 80 GiB per worker at K3's 1M
+		# context — for a buffer whose rows are only ever read up to their own
+		# prompt length.
+		required_width = min(
+			max_prompt_length + self.max_decoding_length,
+			self.model_context_length,
 		)
+		self._ensure_buffer_pool(
+			required_rows=pool_capacity,
+			required_input_width=required_width,
+			required_decode_width=self.max_decoding_length,
+			reason="legacy batch tokenization",
+		)
+		# Legacy mode tokenizes a whole new global batch per call, so the slot
+		# bookkeeping (and buffer contents) must start clean even when the
+		# existing allocation is reused.
+		self._buffer_pool.reset()
 		t_alloc = time.perf_counter() - phase3_start
 		logging.info(
-			f"Rank {self.rank}: Phase 3 buffer pool allocated in {t_alloc:.2f}s "
-			f"(input_ids: [{num_seqs}, {self.model_context_length}], "
-			f"decoded_tokens: [{num_seqs}, {self.max_decoding_length}])"
+			f"Rank {self.rank}: Phase 3 buffer pool ready in {t_alloc:.2f}s "
+			f"(input_ids: [{pool_capacity}, {self._buffer_pool.input_ids_width}] shared per node, "
+			f"decoded_tokens: [{pool_capacity}, {self._buffer_pool.max_decoding_length}] per rank)"
 		)
 
 		for seq_i, seq in enumerate(self.global_batch):
@@ -4809,7 +5142,7 @@ class BatchGenWorker:
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={dl}"
 							)
 
@@ -4889,8 +5222,129 @@ class BatchGenWorker:
 					for global_idx, tokens, finish_reason in rank_tokens:
 						writer.submit(global_idx, tokens, finish_reason=finish_reason)
 
+	def _finish_prefill_completed_sequences(self, prefill_uuids: List[str]) -> List[str]:
+		"""Complete the sequences whose budget is satisfied by the prefill token.
+
+		Prefill already samples the first token and appends it through the
+		normal decode write path (``query_book[..].decoded_tokens`` at
+		``seq.decoded_length``, then ``decoded_length += 1``; see the writeback
+		loop at the end of ``prefill``/``prefill_prepacked``). For a
+		``max_tokens=1`` request that token IS the whole completion, so the
+		sequence is finished before decode starts. Previously every prefilled
+		sequence was handed to the decode phase unconditionally, which
+		 - loaded the decode model and configured decoding for nothing, and
+		 - on a prefill-only model (Kimi-K3 ``stream_all_modules``, M-PR-6)
+		   replaced the answer with decode's ``NotImplementedError`` text.
+
+		Only the length budget is checked here: that is exactly the first test
+		decode's own boundary check makes (``CompletionHandler`` /
+		``_check_and_handle_completions``: ``decoded_length >=
+		max_decode_length``), and it is also the test that wins in
+		``get_finish_reason``, so these sequences report the same
+		length-capped ``finish_reason`` they report today. Sequences that
+		stop for any other reason (EOS, context limit) are left PREFILLED and
+		reach decode exactly as before — ``max_tokens > 1`` behaviour is
+		unchanged.
+
+		Rank alignment: ``decoded_length`` is advanced only on the owning
+		rank, so the set is derived AFTER ``_sync_sequence_metadata``
+		replicates it to every rank. Every rank then computes the identical
+		set from identical batch-global state — required both for the
+		collectives below and because the resulting PREFILLED -> COMPLETED
+		transition is what makes the decode ``while`` loop's
+		``has_prefilled()`` false. A rank-divergent set would deadlock the
+		next collective.
+
+		Returns the list of completed uuids (identical on every rank).
+		"""
+		if not prefill_uuids:
+			return []
+
+		# Replicate owner-side decoded_length / current_context_length to all
+		# ranks. Also required by _report_completion, which reads those fields
+		# on rank 0 for sequences owned elsewhere.
+		self._sync_sequence_metadata(prefill_uuids)
+
+		completed_uuids = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.status != SequenceStatus.PREFILLED:
+				continue
+			if seq.decoded_length >= seq.max_decode_length:
+				completed_uuids.append(uuid)
+
+		if not completed_uuids:
+			return []
+
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] {len(completed_uuids)}/{len(prefill_uuids)} sequences "
+				f"completed at prefill (decode budget satisfied by the first "
+				f"sampled token); they skip the decode phase"
+			)
+
+		# Same order as the decode-phase completion handling in generate():
+		# writer -> gather text -> release KV -> scalar cleanup -> status ->
+		# report. _submit_completed_to_incremental_writer and
+		# _gather_completed_tokens are collectives; every rank calls them with
+		# the identical uuid list.
+		self._submit_completed_to_incremental_writer(completed_uuids)
+		gathered_texts = self._gather_completed_tokens(completed_uuids)
+
+		my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+		if my_completed:
+			# prefill_prepacked writes KV straight to host, so most of these
+			# never registered with the GPU paged manager.
+			gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+			if gpu_allocated:
+				self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+			self._release_host_kv_pages_for_batch(my_completed)
+		for uuid in completed_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.gpu_pages_allocated = 0
+				seq.host_pages_allocated = 0
+				seq.host_token_capacity = 0
+				self._sequences_with_gpu_kv.discard(uuid)
+
+		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+
+		# Legacy /v1/inference gathers results at the END of generate() by
+		# iterating _local_to_uuid_map. _report_completion below pops that map
+		# (release_local_query_slot also drops the query_book entry), so a
+		# C4-completed sequence would be invisible to that gather and the
+		# request would return "Results unexpectedly empty after inference".
+		# Capture the text while the slot still exists.
+		# Gated on the absence of a response queue: pool/batch mode is fed by
+		# _report_completion and _submit_completed_to_incremental_writer, so it
+		# must NOT also accumulate here -- that store is never drained in a
+		# persistent server and would grow without bound.
+		if self._response_queue is None:
+			# getattr, not a plain attribute read: hot reload rebinds methods on a
+			# LIVE worker and never re-runs __init__, so an attribute introduced in
+			# __init__ is absent on a reloaded process. _validate_reload
+			# (server_worker_main_loop.py:68) warns about exactly this and does not
+			# fix it -- "These will cause AttributeError if accessed."
+			store = getattr(self, '_prefill_completed_results', None)
+			if store is None:
+				store = self._prefill_completed_results = {}
+			for uuid in completed_uuids:
+				local_idx = self._uuid_to_local_map.get(uuid)
+				seq = self.global_batch.get_sequence(uuid)
+				if local_idx is None or seq is None or local_idx not in self.query_book:
+					continue
+				_decoded = self.query_book[local_idx].decoded_tokens[:, :seq.decoded_length]
+				store[seq.global_idx] = self._decode_tokens_to_string(_decoded)
+
+		# Runs LAST: _report_completion pops the local-index map and frees the
+		# buffer-pool slot.
+		for uuid in completed_uuids:
+			self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+
+		return completed_uuids
+
 	def _try_load_new_sequences(
-		self, 
+		self,
 		current_decode_uuids: List[str],
 		current_local_indices: List[int]
 	) -> Tuple[List[str], List[int]]:
@@ -5114,19 +5568,17 @@ class BatchGenWorker:
 		# Initialize empty global batch (Init may have created one via _reset)
 		self.global_batch = SequenceBatch()
 
-		# Pre-allocate buffer pool for max_pool_size.
-		# Use model_context_length for decoded_tokens buffer (not max_decoding_length)
-		# because per-request max_completion_tokens can be up to the full context window.
-		self._buffer_pool = QueryBookBufferPool(
-			num_sequences=self._max_pool_size,
-			model_context_length=self.model_context_length,
-			max_decoding_length=self.model_context_length,
-			pad_token_id=self.pad_token_id,
-		)
+		# The buffer pool is NOT pre-allocated here. Both of its widths depend on
+		# the requests: input_ids needs prompt + that request's decode budget,
+		# decoded_tokens needs that request's max_completion_tokens — and neither
+		# is known until the first admission is tokenized. Sizing them at
+		# model_context_length "just in case" is what allocated 2 x 80 GiB per
+		# worker at K3's 1,048,576-token context. _tokenize_admitted_sequences
+		# allocates on first admission and grows if a later one needs more.
+		self._buffer_pool = None
 		logging.info(
-			f"Rank {self.rank}: Buffer pool pre-allocated for {self._max_pool_size} sequences "
-			f"(context_length={self.model_context_length}, "
-			f"max_decoding={self.model_context_length})"
+			f"Rank {self.rank}: Buffer pool deferred to first admission "
+			f"(rows={self._max_pool_size}, widths sized per batch)"
 		)
 
 		# Initialize index maps
@@ -5411,6 +5863,12 @@ class BatchGenWorker:
 							container = [msg]
 							dist.broadcast_object_list(container, src=0)
 							self._handle_hot_reload(msg)
+						elif isinstance(msg, dict) and "prompts" in msg:
+							# Legacy /v1/inference payload -- see the matching
+							# guard in _poll_admissions. The `else` below would
+							# swallow it and the caller would then steal the next
+							# completion off the shared response queue.
+							raise LegacyInferenceDeprecated()
 						else:
 							status = torch.tensor([0, 0, 0], dtype=torch.int32, device=self.torch_device)
 							dist.broadcast(status, src=0)
@@ -5571,6 +6029,14 @@ class BatchGenWorker:
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
 					dist.barrier()
 
+					# C4: a request whose whole budget is the prefill-sampled
+					# token is DONE here. Completing it now (instead of sending
+					# it into decode to be completed on the first boundary
+					# check) keeps the decode phase — and its decode-model load
+					# — off the critical path for max_tokens=1, and is the only
+					# way a prefill-only model can answer at all.
+					self._finish_prefill_completed_sequences(prefill_uuids)
+
 				# After prefill completes, poll for newly arrived sequences.
 				# If more QUEUEING sequences exist and host KV has capacity,
 				# loop back to prefill instead of entering decode.
@@ -5651,6 +6117,11 @@ class BatchGenWorker:
 
 				# Incremental write: submit sequences completed between decode rounds
 				if global_completed:
+					# Refresh rank-0's sequence replicas first: _report_completion
+					# reads prompt_length/decoded_length from the local entry,
+					# which is stale here for sequences owned by other ranks
+					# (only the completion BIT was all-reduced above).
+					self._sync_sequence_metadata(list(global_completed))
 					self._submit_completed_to_incremental_writer(list(global_completed))
 					# Gather decoded tokens from owning ranks before reporting
 					# (each rank only writes decoded tokens for its own sequences)
@@ -5873,6 +6344,9 @@ class BatchGenWorker:
 		# With 12K sequences × 1MB tensors = 12GB, all_gather_object OOMs.
 		# Gathering strings (~KB each) instead reduces memory by ~100x.
 		local_results = []
+		# Sequences completed during prefill (C4) were reported and popped from
+		# the local maps back then; their text was captured at that point.
+		local_results.extend(getattr(self, '_prefill_completed_results', {}).items())
 		for local_idx, uuid in self._local_to_uuid_map.items():
 			seq = self.global_batch.get_sequence(uuid)
 			if seq is None:
@@ -5998,6 +6472,10 @@ class BatchGenWorker:
 			)
 
 		# STEP 1: Configure model for prefill
+		# Hand the NCCL communicator to managers that need it during prefill
+		# (e.g. Kimi-Linear MoE EP all-reduce); harmless no-op for others.
+		if hasattr(self.parallel_manager, "set_comm"):
+			self.parallel_manager.set_comm(self.comm)
 		self.model, self.weight_copy_task = self.parallel_manager.configure_prefill()
 		self.set_phase("prefill")
 
@@ -6106,6 +6584,14 @@ class BatchGenWorker:
 			# Rebuild input_ids with new prompt — reuse buffer pool slot
 			seq_extended_size = seq.kv_token_budget
 			slot = seq._buffer_slot
+			if slot < 0:
+				# A negative index silently rewrites the LAST row of the pool,
+				# which is another sequence's prompt (and, now that input_ids is
+				# node-shared, every rank's copy of it).
+				raise QueryBookPoolCapacityError(
+					f"Rank {self.rank}: re-entry of {uuid[:8]} has no buffer slot "
+					f"(_buffer_slot={slot}); slot assignment has diverged"
+				)
 			self._buffer_pool.input_ids_buffer[slot, :] = 0
 			self._buffer_pool.input_ids_buffer[slot, :new_prompt_len] = evicted_ids
 			seq.input_ids = self._buffer_pool.get_input_ids_view(slot, seq_extended_size)
@@ -6915,6 +7401,9 @@ class BatchGenWorker:
 
 		output_tokens = []
 
+		# Pure forward wall time: started here so configure_prefill (already
+		# reported separately as `Config completed`) is NEVER folded in.
+		_prefill_forward_t0 = time.perf_counter()
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in tqdm(
 				enumerate(micro_batches),
@@ -6974,7 +7463,10 @@ class BatchGenWorker:
 				)
 				batch_max_seqlen = max(batch_seq_lengths)
 
-				# Set up Attn_Wrapper for this micro-batch
+				# Set up Attn_Wrapper for this micro-batch.
+				# These class attrs are the per-step worker->model contract read
+				# by attention wrappers; see semantics in
+				#   batchgen-context/architecture/PSM_WORKER_CONTRACT.md (§2)
 				Attn_Wrapper.prepack_mode = True
 				Attn_Wrapper.prepack_cu_seqlens = batch_cu_seqlens
 				Attn_Wrapper.prepack_max_seqlen = batch_max_seqlen
@@ -6999,17 +7491,63 @@ class BatchGenWorker:
 
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
+				# unsqueeze is a VIEW, so `hidden_states` already keeps the
+				# embedding storage alive for exactly as long as layer 0 needs
+				# it. Keeping `inputs_embeds` bound as well pins that storage
+				# for the WHOLE stack instead -- 1.75 GiB dead across layers
+				# 1-92 at S=131,072 / H=7168 / bf16
+				# (batchgen_design/model_support/kimi_k3/
+				#  PREFILL_MEMORY_AUDIT.md section 7, fix 4).
+				del inputs_embeds
+
+				# Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
+				# classic residual body, so the per-layer state has to be carried
+				# here. Without it every layer sees a zero-width residual and the
+				# model runs happily while computing something that is not K3 --
+				# wrong text, no error. Mirrors KimiLinearModel.forward
+				# (kimi_linear/model.py:880-910), which is the eager reference.
+				use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
+				block_residual = None
+				if use_attn_res:
+					# Zero-column view of a buffer preallocated for ALL the
+					# stack's block boundaries, so the per-boundary `cat` never
+					# holds the (S,nb,H) and (S,nb+1,H) tensors at once (12.25
+					# GiB at K3's last boundary; PREFILL_MEMORY_AUDIT.md fix 3).
+					# `block_residual = None` above is load-bearing: it drops
+					# the previous micro-batch's view before the next buffer is
+					# allocated.
+					block_residual = self.model.model._new_block_residual(hidden_states)
 
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					layer_outputs = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
-					)
-					hidden_states = layer_outputs[0]
+					if use_attn_res:
+						hidden_states, block_residual = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+							block_residual=block_residual,
+						)
+					else:
+						layer_outputs = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)
+						hidden_states = layer_outputs[0]
+
+				# Output depth-mix, then norm -- that ORDER is load-bearing
+				# (kimi_linear/model.py:904-913).
+				if use_attn_res:
+					hidden_dim = hidden_states.shape[2]
+					batch_sz, seq_sz = hidden_states.shape[:2]
+					hidden_states = self.model.model._apply_output_attn_res(
+						hidden_states.view(-1, hidden_dim), block_residual
+					).view(batch_sz, seq_sz, hidden_dim)
 
 				# Final norm
 				hidden_states = self.model.model.norm(hidden_states)
@@ -7044,6 +7582,52 @@ class BatchGenWorker:
 						f"got {batch_new_tokens.shape[0]} rows for {batch_num_seqs} sequences"
 					)
 				output_tokens.append(batch_new_tokens)
+
+				# The FIRST generated token, straight out of prefill. A
+				# max_tokens=1 request is now completed right after prefill
+				# (PREFILL_PLAN C4, _finish_prefill_completed_sequences) and
+				# the token reaches the client through the normal response
+				# path, so this log is a cross-check of that path rather than
+				# the only way to see the token. Rank 0 only; ids only (the
+				# worker has no tokenizer -- decode them client-side).
+				if self.rank == 0:
+					logging.info(
+						"[PREFILL] first sampled token ids: %s",
+						batch_new_tokens.reshape(-1).tolist()[:16])
+
+		_prefill_forward_s = time.perf_counter() - _prefill_forward_t0
+
+		# Structured prefill record, one JSON line per rank that actually ran a
+		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
+		# report tool prefers this over scraping the tqdm bar, which is
+		# presentation, not an API.
+		#
+		# Deliberately NOT gated on rank 0, departing from the proposal's
+		# "rank 0 only". prefill_prepacked runs only under
+		# `if local_prefill_indices:`, and the tqdm bar above is
+		# disable=(self.rank != 0) -- so when rank 0 owns none of the batch
+		# there is neither a bar nor a rank-0 line anywhere in the log, and the
+		# run reports `Prefill: 0.0s` with nothing to scrape. That is exactly
+		# what the 131,069-token run produced when rank 2 owned the sequence.
+		# Every participating rank emits its own tagged line; the wall time for
+		# the batch is the MAX of `prefill_s` over the emitting ranks.
+		logging.info("[METRICS] %s", json.dumps({
+			"phase": "prefill",
+			"prefill_s": _prefill_forward_s,
+			"sequences": num_sequences,
+			"tokens_total": total_tokens_all,
+			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
+			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,
+			"micro_batches": len(micro_batches),
+			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
+			"world_size": self.world_size,
+			"rank": self.rank,
+			# Guarded: the proposal's unguarded output_tokens[0] is an IndexError
+			# on a rank that ran zero micro-batches.
+			"first_sampled_token_ids": (
+				output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
+			),
+		}, separators=(",", ":")))
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
@@ -9542,6 +10126,10 @@ class BatchGenWorker:
 		# P0: Pre-allocate pinned memory buffer for non-blocking GPU→CPU token transfer
 		_new_tokens_pinned = torch.empty(max(max_batch_size, 1), 1, dtype=torch.long, pin_memory=True)
 
+		# Heartbeat state for the rate-limited [DECODE] progress line below
+		_hb_last_time = time.perf_counter()
+		_hb_tokens = 0
+
 		# Main decode loop — enable decode watchdog for monitoring
 		self.enable_decode_watchdog()
 		while decode_uuids:
@@ -9551,6 +10139,20 @@ class BatchGenWorker:
 			# Feed watchdogs to prevent timeout during long decoding
 			self.feed_watchdog()
 			self.feed_decode_watchdog()
+
+			# Rate-limited decode heartbeat (rank 0, ~every 30 s) so the log
+			# monitor sees liveness during long decode phases
+			_hb_tokens += len(decode_uuids)
+			if self.rank == 0 and time.perf_counter() - _hb_last_time >= 30.0:
+				_hb_elapsed = time.perf_counter() - _hb_last_time
+				_hb_finished = len(self.global_batch.get_sequences_by_status(SequenceStatus.COMPLETED))
+				logging.info(
+					f"[DECODE] step={self._cumulative_decode_iterations} "
+					f"active={len(decode_uuids)} finished={_hb_finished} "
+					f"tok/s={_hb_tokens / _hb_elapsed:.2f}"
+				)
+				_hb_last_time = time.perf_counter()
+				_hb_tokens = 0
 
 			# Page boundary check - use DECISION_INTERVAL (configurable via BATCHGEN_DECISION_FREQUENCY_PAGES)
 			if local_iteration - last_boundary >= self.DECISION_INTERVAL:
@@ -10465,7 +11067,7 @@ class BatchGenWorker:
 							lifespan.dump_lifespan(seq.uuid, seq.global_idx,
 								seq._lifespan_log, "REPETITION")
 							logging.warning(
-								f"Rank {self.rank}: REPETITION {seq.uuid[:8]} gid={seq.global_idx} "
+								f"Rank {self.rank}: REPETITION {seq.uuid} gid={seq.global_idx} "
 								f"token={token_id} x{seq._rep_count} at decoded_len={seq.decoded_length}"
 							)
 					else:
@@ -10479,7 +11081,7 @@ class BatchGenWorker:
 							seq._rep_detected = True
 							seq.eos_reached = True
 							logging.warning(
-								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid[:8]} "
+								f"Rank {self.rank}: REPETITION (ngram) {seq.uuid} "
 								f"gid={seq.global_idx} at decoded_len={_dl}"
 							)
 
@@ -11815,6 +12417,15 @@ class BatchGenWorker:
 	def _unregister_fp8_weights(self):
 		# Skip FP8 unregistration for models that don't use FP8 (e.g., GPT-OSS uses MXFP4)
 		if not hasattr(self.loaded_model_config, 'first_k_dense_replace'):
+			return
+
+		# Models whose MoE layers don't expose DeepSeek-style `.mlp` (e.g.
+		# Kimi-Linear uses `.block_sparse_moe` with BF16 experts) have no FP8
+		# weights to unregister.
+		_fkd = self.loaded_model_config.first_k_dense_replace
+		if _fkd < len(self.model.model.layers) and not hasattr(
+			self.model.model.layers[_fkd], 'mlp'
+		):
 			return
 
 		for layer_idx in range(len(self.model.model.layers)):

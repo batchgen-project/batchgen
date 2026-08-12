@@ -223,9 +223,29 @@ class BatchScheduler:
             )
             return
 
-        prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
-            requests, batch
-        )
+        try:
+            prompts, per_request_max_tokens, sampling_params = self._convert_requests_to_worker_inputs(
+                requests, batch
+            )
+        except Exception as exc:
+            # Prompt construction can reject a request: an unknown chat role, a
+            # conversation the tokenizer cannot render faithfully, a malformed
+            # tool call. Without this the exception propagates to _run's bare
+            # `except Exception: logger.exception(...)`, which never sets a
+            # terminal status -- and the batch was already marked IN_PROGRESS
+            # above, so every request in it is lost and the client polls
+            # forever.
+            #
+            # NOTE this still fails the whole batch on one bad request.
+            # Per-request rejection at admission is the proper fix and is left
+            # as a follow-up; this only makes the failure visible and terminal.
+            logger.exception("Batch %s: prompt construction failed", batch_id)
+            self.storage.update_batch_status(
+                batch_id,
+                BatchStatus.FAILED,
+                error=f"Prompt construction failed: {type(exc).__name__}: {exc}",
+            )
+            return
         # Apply batch-level max_decoding_length as fallback for requests without explicit value
         default_max = batch.max_decoding_length
         if default_max is None:
@@ -403,9 +423,18 @@ class BatchScheduler:
                     template_kwargs["tools"] = body.tools
                 if body.preserve_thinking is not None:
                     template_kwargs["preserve_thinking"] = body.preserve_thinking
-                prompt = self._format_chat_messages(
-                    messages, body.model, **template_kwargs
-                )
+                try:
+                    prompt = self._format_chat_messages(
+                        messages, body.model, **template_kwargs
+                    )
+                except Exception as exc:
+                    # Attach the custom_id. The caller fails the batch; without
+                    # the id there is no way to tell which of N requests did it.
+                    custom_id = request.custom_id or "<no custom_id>"
+                    raise ValueError(
+                        f"request {custom_id!r}: the chat template rejected "
+                        f"this conversation: {type(exc).__name__}: {exc}"
+                    ) from exc
                 # Priority: max_completion_tokens > max_tokens > None
                 current_max_tokens = body.max_completion_tokens if body.max_completion_tokens is not None else body.max_tokens
             elif isinstance(body, CompletionRequest):

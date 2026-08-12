@@ -276,6 +276,17 @@ _sm90a_extensions = [
 _sm80_extensions = [
     # ── SM80+ universal kernels ──
 
+    # Causal conv1d (KDA / mamba): varlen prefill + pooled-state decode update
+    CUDAExtension(
+        name="batchgen_kernels.conv1d._C_causal_conv1d",
+        sources=["src/conv1d/causal_conv1d.cu"],
+        extra_compile_args={
+            "cxx": ["-O3"],
+            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr",
+                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                     "--threads", _nvcc_threads] + _sm80_gencode,
+        },
+    ),
     # Attention fused ops (RMSNorm, RoPE, QKV split)
     CUDAExtension(
         name="batchgen_kernels.attention._C_fused_ops",
@@ -394,13 +405,14 @@ setup(
         "batchgen_kernels.attention.dsa.indexer": "attention/dsa/indexer",
         "batchgen_kernels.moe": "moe",
         "batchgen_kernels.common": "common",
+        "batchgen_kernels.conv1d": "conv1d",
         "batchgen_kernels.triton": "triton",
     },
     packages=["batchgen_kernels", "batchgen_kernels.attention",
               "batchgen_kernels.attention.dsa",
               "batchgen_kernels.attention.dsa.indexer",
               "batchgen_kernels.moe", "batchgen_kernels.common",
-              "batchgen_kernels.triton"],
+              "batchgen_kernels.conv1d", "batchgen_kernels.triton"],
     package_data={
         "batchgen_kernels.attention": ["_C_gqa_mha_decode_bf16*.so"],
         "batchgen_kernels.attention.dsa.indexer": [

@@ -22,6 +22,7 @@ Coverage:
 """
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -32,7 +33,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _REPO_ROOT / "batchgen" / "config"
 _GLM5_CONFIG = _REPO_ROOT / "batchgen" / "models" / "glm" / "glm5" / "config.py"
 
-_GLM52_CKPT = "/taijifs_zw35/share_304153846/hunyuan/tairanxu/models/GLM-5.2-FP8"
+# Point GLM52_CKPT_DIR at a local GLM-5.2-FP8 checkout to exercise the
+# real-config resolution tests; unset, they skip (as they do in CI).
+_GLM52_CKPT = os.environ.get("GLM52_CKPT_DIR", "")
 
 # Old _parse_model_config hardcoded values — the regression baseline.
 _LEGACY_GLM5 = {

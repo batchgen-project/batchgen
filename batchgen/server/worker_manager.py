@@ -803,6 +803,18 @@ class WorkerManager:
                 self.args.enable_hugetlbfs,
                 enable_memfd=self.args.fast_init,
             )
+        elif "kimi-linear" in self.args.model.lower() or "kimi-k3" in self.args.model.lower():
+            from batchgen.models.moonshotai.kimi_linear.kimi_parameter_server import (
+                KimiLinear_Parameter_Server,
+            )
+
+            parameter_server = KimiLinear_Parameter_Server(
+                self.args.model,
+                self.args.cache_dir,
+                converted_ckpt_dir,
+                self.args.enable_hugetlbfs,
+                enable_memfd=self.args.fast_init,
+            )
         elif is_kimi_k25_backend_model(self.args.model):
             from batchgen.models.moonshotai.kimi_k25.kimi_parameter_server import (
                 KimiK25_Parameter_Server,
