@@ -118,6 +118,97 @@ __device__ inline void dequant_u4b8(int q, scalar_t2* frag_b) {
 #endif
 }
 
+// ----------------------------------------------------------------------------
+// MXFP4 (E2M1) dequant — Kimi-K3.
+//
+// E2M1 nibble is SIGN-MAGNITUDE: bit3 = sign, bits2:0 = eem index into
+// {0, 0.5, 1, 1.5, 2, 3, 4, 6}. The additive magic-number trick used by
+// dequant_u4b8 (0x4300 bias / sub 0x4308) is intrinsically uint4-zero-point-8
+// and CANNOT be parameterized to produce sign-magnitude E2M1 — this is a full
+// replacement of the decode, with the identical register contract
+// (int q in; frag_b[0] = lanes from nibbles at bits[3:0]/[19:16],
+//  frag_b[1] = lanes from bits[7:4]/[23:20]; caller does q >> 8 for the rest).
+//
+// Recipe (branch-free): plant eem at bf16 bits [8:6] (low 2 exponent bits +
+// mantissa MSB), sign at bit 15, then rebias with one mul by 2^126:
+//   eem=0        -> bits 0x0000 -> 0.0                (x 2^126 = 0)
+//   eem=1        -> bits 0x0040 = 2^-127 (subnormal)  (x 2^126 = 0.5)
+//   eem=2e+m,e>0 -> (1+m/2) * 2^(e-127)               (x 2^126 = {1,1.5,2,3,4,6})
+// Exact for all 8 magnitudes. NOTE the eem=1 path transits a bf16 SUBNORMAL
+// input to mul.rn.bf16x2 (no .ftz variant exists for bf16x2 on sm_90) — the
+// GPU parity suite is deliberately +-0.5-heavy to pin this; the fallback if a
+// device flushes it is a 2x PRMT byte-LUT (hi {00,3F,3F,3F,40,40,40,40},
+// lo {00,00,80,C0,00,40,80,C0}) + sign OR.
+//
+// Scales are handled OUTSIDE this function: E8M0 uint8 bytes are expanded to
+// exact bf16 powers of two at repack/fill time (marlin_weight_prep.
+// mxfp4_scale_e8m0_to_bf16), so scale_op and the whole scale SMEM pipeline are
+// reused byte-for-byte. Residual: scale byte 0x01 (2^-126) times a +-0.5 code
+// makes the scale_op PRODUCT itself a bf16 subnormal — unreachable for K3
+// (observed scale floor is 112, and repack hard-fails only 0x00/0xFF), but
+// revisit this if the legal scale window is ever widened toward the bottom.
+// ----------------------------------------------------------------------------
+__device__ inline void dequant_e2m1(int q, scalar_t2* frag_b) {
+#if defined(USE_BF16_COMPUTE)
+  static constexpr uint32_t EEM = 0x00070007;      // magnitude bits per lane
+  static constexpr uint32_t SGN = 0x00080008;      // sign bit per lane
+  static constexpr uint32_t REBIAS = 0x7E807E80;   // bf16x2 {2^126, 2^126}
+  uint32_t uq = (uint32_t)q;
+  uint32_t lo = ((uq & EEM) << 6) | ((uq & SGN) << 12);
+  uint32_t uq_hi = uq >> 4;
+  uint32_t hi = ((uq_hi & EEM) << 6) | ((uq_hi & SGN) << 12);
+  uint32_t res_lo, res_hi;
+  asm("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(res_lo) : "r"(lo), "r"(REBIAS));
+  asm("mul.rn.bf16x2 %0, %1, %2;\n" : "=r"(res_hi) : "r"(hi), "r"(REBIAS));
+  reinterpret_cast<uint32_t*>(frag_b)[0] = res_lo;
+  reinterpret_cast<uint32_t*>(frag_b)[1] = res_hi;
+#else
+  // Both build registrations (setup.py + _jit_registry.py) define
+  // USE_BF16_COMPUTE; an FP16 build of the MXFP4 path was never validated and
+  // must fail loudly rather than ship an untested decode.
+#error "Marlin MXFP4 (E2M1) dequant requires USE_BF16_COMPUTE"
+#endif
+}
+
+// ----------------------------------------------------------------------------
+// Compile-time functors: weight codec + fused-epilogue activation.
+// The U4B8/SILU instantiations must stay semantically identical to the
+// pre-template K2.5 production kernels (if-constexpr resolves at compile time;
+// verify with -Xptxas -v / SASS diff on the GPU stage).
+// ----------------------------------------------------------------------------
+enum class WCodec { U4B8, E2M1 };
+enum class Act { SILU, SITU };
+
+template <WCodec CODEC>
+__device__ inline void dequant_w4(int q, scalar_t2* frag_b) {
+  if constexpr (CODEC == WCodec::E2M1) {
+    dequant_e2m1(q, frag_b);
+  } else {
+    dequant_u4b8(q, frag_b);
+  }
+}
+
+// Fused S1 epilogue: combine gate-branch value g (pass 1 / w1) with
+// linear-branch value u (pass 2 / w3). fp32 scalar, per output element.
+template <Act ACT>
+__device__ inline float act_gate_mul(float g, float u) {
+  if constexpr (ACT == Act::SITU) {
+    // Kimi-K3 SiTU (modeling_kimi_linear.py:75-82; config beta=4.0,
+    // linear_beta=25.0). fp32 interior, tanh-soft-clamped both branches:
+    //   situ_a = 4 * tanh(g/4) * sigmoid(g)      in (-0.2698, 4)
+    //   u_c    = 25 * tanh(u/25)                 in (-25, 25)
+    // NOTE branch order is SILENT if swapped — pinned by the GPU mutation
+    // test. Under --use_fast_math tanhf/__expf lower to SFU approximations
+    // (~2^-11 rel err), inside the 1.6e-2 parity gate; de-fast-math this
+    // epilogue only if parity fails.
+    float situ_a = 4.0f * tanhf(0.25f * g) * (1.0f / (1.0f + __expf(-g)));
+    float u_c = 25.0f * tanhf(0.04f * u);
+    return situ_a * u_c;
+  } else {
+    return g / (1.0f + __expf(-g)) * u;
+  }
+}
+
 // mma_trans: swaps A and B operand positions for m_block_size_8
 // B fragments go into the 4-register A operand slot (interleaved b0, b1)
 // A fragment goes into the 2-register B operand slot (ldsm<2>)
@@ -542,9 +633,13 @@ static constexpr int m16_sh_a_size = STAGES * m16_a_sh_stage;           // 1024
 static constexpr int sh_gate_size = sh_red_size;  // 528 int4 — stores gate BF16 result
 
 // ============================================================================
-// Fused S1 kernel: gate+up+SiLU in single kernel, no temp buffer
+// Fused S1 kernel: gate+up+activation in single kernel, no temp buffer.
+// Templated on weight codec (U4B8 = K2.5 INT4, E2M1 = K3 MXFP4) and epilogue
+// activation (SILU = K2.5, SITU = K3). <U4B8, SILU> is the production K2.5
+// instantiation and must stay bit-identical to the pre-template kernel.
 // ============================================================================
 
+template <WCodec CODEC, Act ACT>
 __global__ void MarlinGrouped_M16_S1(
     const int4* __restrict__ A,
     const int4* const* __restrict__ gate_B_ptrs,     // [E] gate weight ptrs
@@ -696,8 +791,8 @@ __global__ void MarlinGrouped_M16_S1(
       FragB frag_b0, frag_b1;
       int b_quant_0 = frag_b_quant[k2][0][j];
       int b_quant_1 = b_quant_0 >> 8;
-      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
-      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      dequant_w4<CODEC>(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_w4<CODEC>(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
       scale_op(frag_b0, frag_s[k2][j], 0);
       scale_op(frag_b1, frag_s[k2][j], 1);
 #pragma unroll
@@ -890,7 +985,8 @@ __global__ void MarlinGrouped_M16_S1(
   }
 
   // ================================================================
-  // FUSED WRITE-BACK: SiLU(gate) * up → output C
+  // FUSED WRITE-BACK: act(gate, up) → output C
+  // (SILU: SiLU(gate) * up — K2.5; SITU: Kimi-K3, see act_gate_mul)
   // ================================================================
   {
     int c_gl_stride = prob_n / 8;
@@ -918,7 +1014,7 @@ __global__ void MarlinGrouped_M16_S1(
         for (int k = 0; k < 8; k++) {
           float g = num2float(g_ptr[k]);
           float u = num2float(u_ptr[k]);
-          r_ptr[k] = float2num(g / (1.0f + __expf(-g)) * u);
+          r_ptr[k] = float2num(act_gate_mul<ACT>(g, u));
         }
         C[c_gl_wr] = result;
         c_gl_wr += c_gl_wr_delta;
@@ -930,8 +1026,10 @@ __global__ void MarlinGrouped_M16_S1(
 
 // ============================================================================
 // M16 kernel (for S2 and standalone use)
+// Templated on weight codec; <U4B8> is the production K2.5 instantiation.
 // ============================================================================
 
+template <WCodec CODEC>
 __global__ void MarlinGrouped_M16(
     const int4* __restrict__ A,
     const int4* const* __restrict__ B_ptrs,
@@ -1105,8 +1203,8 @@ __global__ void MarlinGrouped_M16(
       FragB frag_b0, frag_b1;
       int b_quant_0 = frag_b_quant[k2][0][j];
       int b_quant_1 = b_quant_0 >> 8;
-      dequant_u4b8(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
-      dequant_u4b8(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
+      dequant_w4<CODEC>(b_quant_0, reinterpret_cast<scalar_t2*>(&frag_b0));
+      dequant_w4<CODEC>(b_quant_1, reinterpret_cast<scalar_t2*>(&frag_b1));
       scale_op(frag_b0, frag_s[k2][j], 0);
       scale_op(frag_b1, frag_s[k2][j], 1);
 #pragma unroll
@@ -1367,6 +1465,37 @@ void silu_mul_scatter(
         num_experts, compact_stride, output_stride, N);
 }
 
+template <WCodec CODEC, Act ACT>
+static void launch_m16_s1(
+    torch::Tensor& A,
+    torch::Tensor& gate_B_ptrs, torch::Tensor& up_B_ptrs,
+    torch::Tensor& C_ptrs,
+    torch::Tensor& gate_scales_ptrs, torch::Tensor& up_scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    int n_tiles, int max_m_tiles)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // SMEM: M16 base (90112) + gate result (528 * 16 = 8448) = 98560 bytes
+    constexpr int smem_bytes = 98560;
+    cudaFuncSetAttribute((void*)MarlinGrouped_M16_S1<CODEC, ACT>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+    int total_ctas = n_tiles * max_m_tiles * num_experts;
+    MarlinGrouped_M16_S1<CODEC, ACT><<<total_ctas, 256, smem_bytes, stream>>>(
+        reinterpret_cast<const int4*>(A.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
+        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
+        expert_starts.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        num_experts, prob_n, prob_k, prob_k,
+        n_tiles, max_m_tiles);
+}
+
 void grouped_marlin_gemm_m16_s1(
     torch::Tensor A,
     torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
@@ -1376,21 +1505,102 @@ void grouped_marlin_gemm_m16_s1(
     int num_experts, int prob_n, int prob_k,
     torch::Tensor workspace, int n_tiles, int max_m_tiles)
 {
+    launch_m16_s1<WCodec::U4B8, Act::SILU>(
+        A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts, num_experts, prob_n, prob_k,
+        n_tiles, max_m_tiles);
+}
+
+// ----------------------------------------------------------------------------
+// K3 MXFP4 entry-point hard-fail checks. The established integration pattern
+// (K2.5: kimi_k25/model.py calls the pybind symbols directly) bypasses the
+// python wrappers entirely, so the C++ entries must hard-fail on malformed
+// metadata themselves: distinct symbols stop codec mixups, these TORCH_CHECKs
+// stop everything else that is visible host-side. INT4 entries are left
+// byte-identical to production on purpose.
+// ----------------------------------------------------------------------------
+static void check_mxfp4_ptr_array(const torch::Tensor& t, const char* name,
+                                  int64_t len) {
+    TORCH_CHECK(t.scalar_type() == at::kLong && t.is_cuda() && t.numel() == len,
+        "mxfp4 launch: ", name, " must be int64 CUDA [", len, "], got ",
+        t.scalar_type(), " numel=", t.numel());
+}
+
+static void check_mxfp4_counts(const torch::Tensor& t, const char* name,
+                               int64_t len) {
+    TORCH_CHECK(t.scalar_type() == at::kInt && t.is_cuda() && t.numel() == len,
+        "mxfp4 launch: ", name, " must be int32 CUDA [", len, "], got ",
+        t.scalar_type(), " numel=", t.numel());
+}
+
+static void check_mxfp4_common(const torch::Tensor& A,
+                               const torch::Tensor& expert_starts,
+                               const torch::Tensor& expert_counts,
+                               int num_experts, int prob_n, int prob_k,
+                               int n_tiles, int max_m_tiles) {
+    TORCH_CHECK(A.scalar_type() == at::kBFloat16 && A.is_cuda()
+                && A.is_contiguous() && A.size(-1) == prob_k,
+        "mxfp4 launch: A must be contiguous bf16 CUDA [*, ", prob_k,
+        "], got ", A.scalar_type(), " last dim ", A.size(-1));
+    TORCH_CHECK(prob_n % 256 == 0 && prob_k % 128 == 0,
+        "mxfp4 launch: prob_n%256==0 and prob_k%128==0 required, got prob_n=",
+        prob_n, " prob_k=", prob_k);
+    TORCH_CHECK(n_tiles == prob_n / 256,
+        "mxfp4 launch: n_tiles=", n_tiles, " != prob_n/256=", prob_n / 256);
+    TORCH_CHECK(num_experts >= 1 && max_m_tiles >= 1,
+        "mxfp4 launch: num_experts=", num_experts, " max_m_tiles=",
+        max_m_tiles, " must both be >= 1");
+    check_mxfp4_counts(expert_starts, "expert_starts", num_experts);
+    check_mxfp4_counts(expert_counts, "expert_counts", num_experts);
+}
+
+// K3 MXFP4 fused S1: E2M1 weight decode + SiTU epilogue. Separate entry point
+// on purpose — pointer arrays are opaque to the kernel, so distinct pybind
+// symbols are the enforceable seam preventing INT4 entries from silently
+// consuming E2M1 codes ((q-8)*s on E2M1 codes is finite plausible garbage).
+void grouped_marlin_gemm_m16_s1_mxfp4_situ(
+    torch::Tensor A,
+    torch::Tensor gate_B_ptrs, torch::Tensor up_B_ptrs,
+    torch::Tensor C_ptrs,
+    torch::Tensor gate_scales_ptrs, torch::Tensor up_scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int n_tiles, int max_m_tiles)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    check_mxfp4_ptr_array(gate_B_ptrs, "gate_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_B_ptrs, "up_B_ptrs", num_experts);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_experts);
+    check_mxfp4_ptr_array(gate_scales_ptrs, "gate_scales_ptrs", num_experts);
+    check_mxfp4_ptr_array(up_scales_ptrs, "up_scales_ptrs", num_experts);
+    launch_m16_s1<WCodec::E2M1, Act::SITU>(
+        A, gate_B_ptrs, up_B_ptrs, C_ptrs, gate_scales_ptrs, up_scales_ptrs,
+        expert_starts, expert_counts, num_experts, prob_n, prob_k,
+        n_tiles, max_m_tiles);
+}
+
+template <WCodec CODEC>
+static void launch_m16(
+    torch::Tensor& A, torch::Tensor& B_ptrs, torch::Tensor& C_ptrs,
+    torch::Tensor& scales_ptrs,
+    torch::Tensor& expert_starts, torch::Tensor& expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    int num_matrices, int n_tiles, int max_m_tiles)
+{
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // SMEM: M16 base (90112) + gate result (528 * 16 = 8448) = 98560 bytes
-    constexpr int smem_bytes = 98560;
-    cudaFuncSetAttribute((void*)MarlinGrouped_M16_S1,
+    // SMEM: max(528, 4096) + 512 + 1024 = 5632 int4 = 90112 bytes
+    constexpr int smem_bytes = 90112;
+    cudaFuncSetAttribute((void*)MarlinGrouped_M16<CODEC>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
-    int total_ctas = n_tiles * max_m_tiles * num_experts;
-    MarlinGrouped_M16_S1<<<total_ctas, 256, smem_bytes, stream>>>(
+    int total_ctas = n_tiles * max_m_tiles * num_matrices;
+    MarlinGrouped_M16<CODEC><<<total_ctas, 256, smem_bytes, stream>>>(
         reinterpret_cast<const int4*>(A.data_ptr()),
-        reinterpret_cast<const int4* const*>(gate_B_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(up_B_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
         reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(gate_scales_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(up_scales_ptrs.data_ptr()),
+        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
         expert_starts.data_ptr<int>(),
         expert_counts.data_ptr<int>(),
         num_experts, prob_n, prob_k, prob_k,
@@ -1405,23 +1615,31 @@ void grouped_marlin_gemm_m16(
     torch::Tensor workspace, int num_matrices, int n_tiles,
     int max_m_tiles)
 {
-    auto stream = at::cuda::getCurrentCUDAStream();
+    launch_m16<WCodec::U4B8>(
+        A, B_ptrs, C_ptrs, scales_ptrs, expert_starts, expert_counts,
+        num_experts, prob_n, prob_k, num_matrices, n_tiles, max_m_tiles);
+}
 
-    // SMEM: max(528, 4096) + 512 + 1024 = 5632 int4 = 90112 bytes
-    constexpr int smem_bytes = 90112;
-    cudaFuncSetAttribute((void*)MarlinGrouped_M16,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-
-    int total_ctas = n_tiles * max_m_tiles * num_matrices;
-    MarlinGrouped_M16<<<total_ctas, 256, smem_bytes, stream>>>(
-        reinterpret_cast<const int4*>(A.data_ptr()),
-        reinterpret_cast<const int4* const*>(B_ptrs.data_ptr()),
-        reinterpret_cast<int4* const*>(C_ptrs.data_ptr()),
-        reinterpret_cast<const int4* const*>(scales_ptrs.data_ptr()),
-        expert_starts.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        num_experts, prob_n, prob_k, prob_k,
-        n_tiles, max_m_tiles);
+// K3 MXFP4 M16 (S3 down projection / standalone): E2M1 weight decode.
+void grouped_marlin_gemm_m16_mxfp4(
+    torch::Tensor A, torch::Tensor B_ptrs, torch::Tensor C_ptrs,
+    torch::Tensor scales_ptrs,
+    torch::Tensor expert_starts, torch::Tensor expert_counts,
+    int num_experts, int prob_n, int prob_k,
+    torch::Tensor workspace, int num_matrices, int n_tiles,
+    int max_m_tiles)
+{
+    check_mxfp4_common(A, expert_starts, expert_counts,
+                       num_experts, prob_n, prob_k, n_tiles, max_m_tiles);
+    TORCH_CHECK(num_matrices >= num_experts,
+        "mxfp4 launch: num_matrices=", num_matrices, " < num_experts=",
+        num_experts);
+    check_mxfp4_ptr_array(B_ptrs, "B_ptrs", num_matrices);
+    check_mxfp4_ptr_array(C_ptrs, "C_ptrs", num_matrices);
+    check_mxfp4_ptr_array(scales_ptrs, "scales_ptrs", num_matrices);
+    launch_m16<WCodec::E2M1>(
+        A, B_ptrs, C_ptrs, scales_ptrs, expert_starts, expert_counts,
+        num_experts, prob_n, prob_k, num_matrices, n_tiles, max_m_tiles);
 }
 
 void silu_mul_dual_stride(
@@ -1446,6 +1664,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_marlin_gemm", &grouped_marlin_gemm, "Marlin M8 grouped GEMM");
     m.def("grouped_marlin_gemm_m16", &grouped_marlin_gemm_m16, "Marlin M16 grouped GEMM with CTA M-tiling");
     m.def("grouped_marlin_gemm_m16_s1", &grouped_marlin_gemm_m16_s1, "Marlin M16 fused S1 (gate+up+SiLU)");
+    m.def("grouped_marlin_gemm_m16_mxfp4", &grouped_marlin_gemm_m16_mxfp4,
+          "Marlin M16 grouped GEMM, MXFP4 (E2M1) weights — Kimi-K3");
+    m.def("grouped_marlin_gemm_m16_s1_mxfp4_situ", &grouped_marlin_gemm_m16_s1_mxfp4_situ,
+          "Marlin M16 fused S1, MXFP4 (E2M1) weights + SiTU epilogue — Kimi-K3");
     m.def("silu_mul", &silu_mul, "Element-wise SiLU(gate) * up");
     m.def("silu_mul_scatter", &silu_mul_scatter, "SiLU with expert_counts scatter");
     m.def("silu_mul_dual_stride", &silu_mul_dual_stride, "SiLU with dual-stride layout");
