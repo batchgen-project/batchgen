@@ -6,6 +6,8 @@ import logging
 import argparse
 from typing import List, Optional, Dict, Any
 
+from batchgen.deprecation import LegacyInferenceDeprecated
+
 try:
     import requests
     _REQUESTS_AVAILABLE = True
@@ -208,47 +210,18 @@ class BatchGenHttpClient:
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
     ) -> List[str]:
-        """Submit inference request and get decoded string results.
+        """DEPRECATED and disabled. Use submit_batch() instead.
 
-        Args:
-            prompts: List of prompt strings
-            max_input_len: Maximum input sequence length. If None, determined
-                          dynamically from the longest prompt in the batch.
-            max_output_len: Maximum output/decoding length
-            ignore_eos: If True, ignore EOS tokens and decode to max_output_len
-            temperature: Sampling temperature (None = greedy decoding)
-            top_p: Nucleus sampling threshold (None = disabled)
-
-        Returns:
-            List of decoded output strings
+        The method is kept, rather than deleted, so a caller gets the
+        explanation above instead of an AttributeError telling it only that
+        something is gone. It raises without any network call: the server
+        answers /v1/inference with 410 anyway, and failing here keeps the
+        deprecated request off the wire entirely.
 
         Raises:
-            RuntimeError: If inference fails or returns unexpected format
+            LegacyInferenceDeprecated: always.
         """
-        payload: Dict[str, Any] = {
-            "prompts": prompts,
-            "max_input_len": max_input_len,
-            "max_output_len": max_output_len,
-            "ignore_eos": ignore_eos,
-        }
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if top_p is not None:
-            payload["top_p"] = top_p
-
-        response = self.post_json("/v1/inference", payload)
-
-        if response.get("status") != "success":
-            raise RuntimeError(f"Inference failed: {response}")
-
-        results = response.get("results")
-        if not results:
-            raise RuntimeError("Server returned empty results.")
-
-        if not isinstance(results, list):
-            raise RuntimeError(f"Unexpected result format: {type(results)}")
-
-        return results
+        raise LegacyInferenceDeprecated()
 
     # ==================== Batch API Methods ====================
 
