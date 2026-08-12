@@ -4901,8 +4901,101 @@ class BatchGenWorker:
 					for global_idx, tokens, finish_reason in rank_tokens:
 						writer.submit(global_idx, tokens, finish_reason=finish_reason)
 
+	def _finish_prefill_completed_sequences(self, prefill_uuids: List[str]) -> List[str]:
+		"""Complete the sequences whose budget is satisfied by the prefill token.
+
+		Prefill already samples the first token and appends it through the
+		normal decode write path (``query_book[..].decoded_tokens`` at
+		``seq.decoded_length``, then ``decoded_length += 1``; see the writeback
+		loop at the end of ``prefill``/``prefill_prepacked``). For a
+		``max_tokens=1`` request that token IS the whole completion, so the
+		sequence is finished before decode starts. Previously every prefilled
+		sequence was handed to the decode phase unconditionally, which
+		 - loaded the decode model and configured decoding for nothing, and
+		 - on a prefill-only model (Kimi-K3 ``stream_all_modules``, M-PR-6)
+		   replaced the answer with decode's ``NotImplementedError`` text.
+
+		Only the length budget is checked here: that is exactly the first test
+		decode's own boundary check makes (``CompletionHandler`` /
+		``_check_and_handle_completions``: ``decoded_length >=
+		max_decode_length``), and it is also the test that wins in
+		``get_finish_reason``, so these sequences report the same
+		length-capped ``finish_reason`` they report today. Sequences that
+		stop for any other reason (EOS, context limit) are left PREFILLED and
+		reach decode exactly as before — ``max_tokens > 1`` behaviour is
+		unchanged.
+
+		Rank alignment: ``decoded_length`` is advanced only on the owning
+		rank, so the set is derived AFTER ``_sync_sequence_metadata``
+		replicates it to every rank. Every rank then computes the identical
+		set from identical batch-global state — required both for the
+		collectives below and because the resulting PREFILLED -> COMPLETED
+		transition is what makes the decode ``while`` loop's
+		``has_prefilled()`` false. A rank-divergent set would deadlock the
+		next collective.
+
+		Returns the list of completed uuids (identical on every rank).
+		"""
+		if not prefill_uuids:
+			return []
+
+		# Replicate owner-side decoded_length / current_context_length to all
+		# ranks. Also required by _report_completion, which reads those fields
+		# on rank 0 for sequences owned elsewhere.
+		self._sync_sequence_metadata(prefill_uuids)
+
+		completed_uuids = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is None or seq.status != SequenceStatus.PREFILLED:
+				continue
+			if seq.decoded_length >= seq.max_decode_length:
+				completed_uuids.append(uuid)
+
+		if not completed_uuids:
+			return []
+
+		if self.rank == 0:
+			logging.info(
+				f"[PREFILL] {len(completed_uuids)}/{len(prefill_uuids)} sequences "
+				f"completed at prefill (decode budget satisfied by the first "
+				f"sampled token); they skip the decode phase"
+			)
+
+		# Same order as the decode-phase completion handling in generate():
+		# writer -> gather text -> release KV -> scalar cleanup -> status ->
+		# report. _submit_completed_to_incremental_writer and
+		# _gather_completed_tokens are collectives; every rank calls them with
+		# the identical uuid list.
+		self._submit_completed_to_incremental_writer(completed_uuids)
+		gathered_texts = self._gather_completed_tokens(completed_uuids)
+
+		my_completed = [u for u in completed_uuids if u in self._uuid_to_local_map]
+		if my_completed:
+			# prefill_prepacked writes KV straight to host, so most of these
+			# never registered with the GPU paged manager.
+			gpu_allocated = [u for u in my_completed if u in self._sequences_with_gpu_kv]
+			if gpu_allocated:
+				self._release_gpu_kv_pages(self._get_local_indices_for_uuids(gpu_allocated))
+			self._release_host_kv_pages_for_batch(my_completed)
+		for uuid in completed_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				seq.gpu_pages_allocated = 0
+				seq.host_pages_allocated = 0
+				seq.host_token_capacity = 0
+				self._sequences_with_gpu_kv.discard(uuid)
+
+		self._update_batch_status(completed_uuids, SequenceStatus.COMPLETED)
+		# Runs LAST: _report_completion pops the local-index map and frees the
+		# buffer-pool slot.
+		for uuid in completed_uuids:
+			self._report_completion(uuid, gathered_text=gathered_texts.get(uuid))
+
+		return completed_uuids
+
 	def _try_load_new_sequences(
-		self, 
+		self,
 		current_decode_uuids: List[str],
 		current_local_indices: List[int]
 	) -> Tuple[List[str], List[int]]:
@@ -5582,6 +5675,14 @@ class BatchGenWorker:
 							f"decoded_len={seq.decoded_length}")
 					self._update_batch_status(prefill_uuids, SequenceStatus.PREFILLED)
 					dist.barrier()
+
+					# C4: a request whose whole budget is the prefill-sampled
+					# token is DONE here. Completing it now (instead of sending
+					# it into decode to be completed on the first boundary
+					# check) keeps the decode phase — and its decode-model load
+					# — off the critical path for max_tokens=1, and is the only
+					# way a prefill-only model can answer at all.
+					self._finish_prefill_completed_sequences(prefill_uuids)
 
 				# After prefill completes, poll for newly arrived sequences.
 				# If more QUEUEING sequences exist and host KV has capacity,
@@ -7115,12 +7216,13 @@ class BatchGenWorker:
 					)
 				output_tokens.append(batch_new_tokens)
 
-				# The FIRST generated token, straight out of prefill. Logged
-				# because a max_tokens=1 request currently still enters decode
-				# (PREFILL_PLAN C4) and returns decode's error instead of this,
-				# so for a prefill-only model the token is computed and then
-				# thrown away with no way to see it. Rank 0 only; ids only
-				# (the worker has no tokenizer -- decode them client-side).
+				# The FIRST generated token, straight out of prefill. A
+				# max_tokens=1 request is now completed right after prefill
+				# (PREFILL_PLAN C4, _finish_prefill_completed_sequences) and
+				# the token reaches the client through the normal response
+				# path, so this log is a cross-check of that path rather than
+				# the only way to see the token. Rank 0 only; ids only (the
+				# worker has no tokenizer -- decode them client-side).
 				if self.rank == 0:
 					logging.info(
 						"[PREFILL] first sampled token ids: %s",
