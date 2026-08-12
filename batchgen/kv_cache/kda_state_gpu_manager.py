@@ -22,6 +22,10 @@ class KDAStateGPUConfig:
     Unlike the rolling compressor there is no ring: the fla kernel updates
     each sequence's recurrent + short-conv state *in place*, so a sequence
     owns exactly one slot per state item for its whole lifetime.
+
+    ``conv_width`` is the conv KERNEL width W; the conv pools store the last
+    W-1 raw inputs per slot — the ``causal_conv1d.cu`` state contract
+    (per-layer view shape ``(num_state_items, conv_dim, W-1)``).
     """
 
     num_kda_layers: int
@@ -29,7 +33,7 @@ class KDAStateGPUConfig:
     num_heads: int  # HV (number of value heads)
     head_dim: int = 128
     conv_dim: Optional[int] = None  # num_heads * head_dim; derived if None
-    conv_width: int = 4
+    conv_width: int = 4  # kernel width W; pools store W-1 entries per slot
     recurrent_dtype: torch.dtype = torch.float32
     conv_dtype: torch.dtype = torch.bfloat16
     cuda_graph_max_slots: Optional[int] = None
@@ -55,7 +59,15 @@ class KDAStateGPUManager:
     Each active sequence owns one fixed-size state item (one slot) per KDA
     layer. The fla kernel mutates ``recurrent_state`` and the three short
     causal-conv states in place, so this manager only handles slot
-    allocation, view export, free-list bookkeeping, and zero-on-recycle.
+    allocation, view export, free-list bookkeeping, and zero-on-alloc.
+
+    M5.1: this manager is the canonical, CUDA-graph-ready home of the KDA
+    state — the recurrent pool, the three conv pools and the persistent
+    decode slot-index buffer are each allocated ONCE with a fixed address.
+    ``KimiLinearKDAWrapper``'s per-layer pools are views of these tensors
+    and its slot facade delegates all alloc/free/zeroing here. Per-layer
+    conv views are ``(num_state_items, conv_dim, conv_width-1)`` — the
+    ``causal_conv1d.cu`` layout (matching the wrapper).
     """
 
     manager_name = "KDAStateGPUManager"
@@ -76,8 +88,10 @@ class KDAStateGPUManager:
             raise ValueError("num_heads must be > 0")
         if self.config.head_dim <= 0:
             raise ValueError("head_dim must be > 0")
-        if self.config.conv_width <= 0:
-            raise ValueError("conv_width must be > 0")
+        if self.config.conv_width < 2:
+            raise ValueError(
+                "conv_width must be >= 2 (pools store W-1 entries per slot)"
+            )
         if self.config.resolved_conv_dim() <= 0:
             raise ValueError("conv_dim must be > 0")
         self._logical_to_physical_layer = _normalize_gpu_layer_mapping(
@@ -107,11 +121,16 @@ class KDAStateGPUManager:
             dtype=cfg.recurrent_dtype,
             device=self.device,
         )
+        # causal_conv1d.cu contract: a slot holds the last W-1 raw inputs,
+        # so per-layer views are contiguous (num_state_items, conv_dim, W-1)
+        # 3-D tensors satisfying the kernel's dim()==3 && size(2)==W-1 check.
+        # The 4-D allocation keeps ONE fixed base address per q/k/v pool
+        # (CUDA-graph capture requirement).
         conv_shape = (
             cfg.num_kda_layers,
             cfg.num_state_items,
             conv_dim,
-            cfg.conv_width,
+            cfg.conv_width - 1,
         )
         self._conv_q = torch.zeros(
             conv_shape, dtype=cfg.conv_dtype, device=self.device
@@ -160,7 +179,7 @@ class KDAStateGPUManager:
             self._free_state_items.push(reclaimed)
 
     def reset_state_items(self, state_item_ids: Sequence[int]) -> None:
-        """Zero recurrent + conv state for recycled slots."""
+        """Zero recurrent + conv (+ aux, if present) state for the slots."""
         self._ensure_initialized()
         slots = [int(s) for s in state_item_ids]
         if not slots:
@@ -174,6 +193,11 @@ class KDAStateGPUManager:
         self._conv_q.index_fill_(1, idx, 0)
         self._conv_k.index_fill_(1, idx, 0)
         self._conv_v.index_fill_(1, idx, 0)
+        # Per-slot auxiliary rows (block_reps on branches that carry them)
+        # are zeroed too so the F4 zero-on-alloc covers every pool.
+        block_reps = getattr(self, "_block_reps", None)
+        if block_reps is not None:
+            block_reps.index_fill_(0, idx, 0)
 
     # ------------------------------------------------------------------
     # view export
@@ -187,7 +211,7 @@ class KDAStateGPUManager:
     def get_layer_conv_views(
         self, logical_layer: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Conv-state views (q, k, v), each [num_state_items, conv_dim, width]."""
+        """Conv views (q, k, v), each [num_state_items, conv_dim, width-1]."""
         self._ensure_initialized()
         physical = self.resolve_physical_layer(logical_layer)
         return (
@@ -236,6 +260,10 @@ class KDAStateGPUManager:
     def get_sequence_state_item(self, sequence_id: int) -> int:
         self._ensure_initialized()
         return self._get_sequence_state_item(int(sequence_id))
+
+    def has_sequence_state_item(self, sequence_id: int) -> bool:
+        self._ensure_initialized()
+        return int(sequence_id) in self._sequence_state_items
 
     def get_stats(self) -> KDAStateGPUStats:
         self._ensure_initialized()
@@ -299,6 +327,13 @@ class KDAStateGPUManager:
             raise RuntimeError("Insufficient free KDA state items")
         state_item = self._free_state_items.pop(1)
         state_item_id = int(state_item[0].item())
+        # F4 fix: zero the (possibly recycled) slot across every layer's
+        # conv + recurrent pool on FRESH alloc — a recycled slot must not
+        # leak the previous sequence's state, and layers > 0 seeing
+        # has_initial_state=True for a just-allocated sequence stays
+        # harmless (zero state == no state). Idempotent re-allocs return
+        # above and never re-zero live state.
+        self.reset_state_items([state_item_id])
         self._sequence_state_items[sequence_id] = state_item_id
         return state_item_id
 
