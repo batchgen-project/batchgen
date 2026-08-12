@@ -7024,16 +7024,49 @@ class BatchGenWorker:
 				# Reshape to 3D: [1, batch_total_tokens, hidden_dim]
 				hidden_states = inputs_embeds.unsqueeze(0)
 
+				# Block Attention Residuals (Kimi-K3): the depth-mix REPLACES the
+				# classic residual body, so the per-layer state has to be carried
+				# here. Without it every layer sees a zero-width residual and the
+				# model runs happily while computing something that is not K3 --
+				# wrong text, no error. Mirrors KimiLinearModel.forward
+				# (kimi_linear/model.py:880-910), which is the eager reference.
+				use_attn_res = getattr(self.model.model, "use_attn_residuals", False)
+				block_residual = None
+				if use_attn_res:
+					block_residual = hidden_states.new_zeros(
+						hidden_states.shape[0] * hidden_states.shape[1], 0,
+						hidden_states.shape[2])
+
 				for layer_idx, decoder_layer in enumerate(self.model.model.layers):
-					layer_outputs = decoder_layer(
-						hidden_states,
-						attention_mask=None,
-						position_ids=None,
-						past_key_value=None,
-						output_attentions=False,
-						use_cache=False,
-					)
-					hidden_states = layer_outputs[0]
+					if use_attn_res:
+						hidden_states, block_residual = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+							block_residual=block_residual,
+						)
+					else:
+						layer_outputs = decoder_layer(
+							hidden_states,
+							attention_mask=None,
+							position_ids=None,
+							past_key_value=None,
+							output_attentions=False,
+							use_cache=False,
+						)
+						hidden_states = layer_outputs[0]
+
+				# Output depth-mix, then norm -- that ORDER is load-bearing
+				# (kimi_linear/model.py:904-913).
+				if use_attn_res:
+					hidden_dim = hidden_states.shape[2]
+					batch_sz, seq_sz = hidden_states.shape[:2]
+					hidden_states = self.model.model._apply_output_attn_res(
+						hidden_states.view(-1, hidden_dim), block_residual
+					).view(batch_sz, seq_sz, hidden_dim)
 
 				# Final norm
 				hidden_states = self.model.model.norm(hidden_states)
