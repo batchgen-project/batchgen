@@ -1,6 +1,7 @@
 import concurrent.futures
 import copy
 import functools
+import json
 import psutil
 import logging
 import math
@@ -7419,6 +7420,9 @@ class BatchGenWorker:
 
 		output_tokens = []
 
+		# Pure forward wall time: started here so configure_prefill (already
+		# reported separately as `Config completed`) is NEVER folded in.
+		_prefill_forward_t0 = time.perf_counter()
 		with torch.inference_mode():
 			for batch_idx, (seq_start, seq_end) in tqdm(
 				enumerate(micro_batches),
@@ -7643,6 +7647,40 @@ class BatchGenWorker:
 					logging.info(
 						"[PREFILL] first sampled token ids: %s",
 						batch_new_tokens.reshape(-1).tolist()[:16])
+
+		_prefill_forward_s = time.perf_counter() - _prefill_forward_t0
+
+		# Structured prefill record, one JSON line per rank that actually ran a
+		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
+		# report tool prefers this over scraping the tqdm bar, which is
+		# presentation, not an API.
+		#
+		# Deliberately NOT gated on rank 0, departing from the proposal's
+		# "rank 0 only". prefill_prepacked runs only under
+		# `if local_prefill_indices:`, and the tqdm bar above is
+		# disable=(self.rank != 0) -- so when rank 0 owns none of the batch
+		# there is neither a bar nor a rank-0 line anywhere in the log, and the
+		# run reports `Prefill: 0.0s` with nothing to scrape. That is exactly
+		# what the 131,069-token run produced when rank 2 owned the sequence.
+		# Every participating rank emits its own tagged line; the wall time for
+		# the batch is the MAX of `prefill_s` over the emitting ranks.
+		logging.info("[METRICS] %s", json.dumps({
+			"phase": "prefill",
+			"prefill_s": _prefill_forward_s,
+			"sequences": num_sequences,
+			"tokens_total": total_tokens_all,
+			"seq_len_min": min(seq_lengths_list) if seq_lengths_list else 0,
+			"seq_len_max": max(seq_lengths_list) if seq_lengths_list else 0,
+			"micro_batches": len(micro_batches),
+			"max_tokens_per_micro_batch": MAX_TOKENS_PER_MICRO_BATCH,
+			"world_size": self.world_size,
+			"rank": self.rank,
+			# Guarded: the proposal's unguarded output_tokens[0] is an IndexError
+			# on a rank that ran zero micro-batches.
+			"first_sampled_token_ids": (
+				output_tokens[0].reshape(-1).tolist()[:16] if output_tokens else []
+			),
+		}, separators=(",", ":")))
 
 		# Reset prepack mode
 		Attn_Wrapper.prepack_mode = False
