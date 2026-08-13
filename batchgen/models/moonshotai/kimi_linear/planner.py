@@ -30,7 +30,8 @@ class KimiLinearPlanner(BasePlanner):
     DEFAULT_MEM_FRAC = 0.85
     NUM_EXPERTS = 256
 
-    def __init__(self, is_k3: bool = False, stream_all_modules: bool = None):
+    def __init__(self, is_k3: bool = False, stream_all_modules: bool = None,
+                 attention_group_size: int = 1):
         """``is_k3`` selects the K3 (2.8T, 93L/896E) branch of the plan.
 
         Passed by ``KimiLinearInitializer`` from its own ``is_k3`` (which is
@@ -42,12 +43,20 @@ class KimiLinearPlanner(BasePlanner):
         ``is_k3=False`` is the PREFILL_PLAN M3 rehearsal — force the 48B to
         stream all four rings and check its logits are unchanged, on a model
         whose right answer is already known.
+
+        ``attention_group_size`` (G, default 1) is the head-parallel TP degree
+        for KDA (M2a). G=1 is the validated single-shard path, byte-identical
+        to before. G>1 slices the ``kda_num_heads`` projections across G ranks
+        (attn_tp sub-group), each rank owning ``kda_num_heads // G`` heads and
+        summing the o_proj partials with an all_reduce; the PSM derives the
+        sub-group layout from this value.
         """
         super().__init__()
         self.is_k3 = is_k3
         self.stream_all_modules = (
             is_k3 if stream_all_modules is None else bool(stream_all_modules)
         )
+        self.attention_group_size = int(attention_group_size)
         if is_k3:
             # `_compute_batch_configs` runs before `_adjust_config_for_model`
             # and asserts NUM_EXPERTS // world_size > 0; K3 has 896, not 256.
@@ -134,6 +143,12 @@ class KimiLinearPlanner(BasePlanner):
         # routed experts. Read by the PSM at configure_prefill. OFF for the
         # 48B so its validated path keeps every weight resident, bit-for-bit.
         self.config.Basic_Config.stream_all_modules = self.stream_all_modules
+
+        # M2a — head-parallel TP degree for KDA (G). Read by the PSM
+        # (__init__) to derive the attn_tp sub-group layout. 1 = single-shard
+        # (unchanged); >1 shards kda_num_heads across G ranks with an o_proj
+        # all_reduce.
+        self.config.Basic_Config.attention_group_size = self.attention_group_size
 
         if self.is_k3:
             self._adjust_config_for_k3()

@@ -585,6 +585,12 @@ def kda_prefill_serving(self, hidden_states_2d, cu_seqlens, slot_ids,
 
     o = self.o_norm(o.reshape(total, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(total, num_heads * head_dim))
+    # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so the
+    # partial sums across the attn_tp sub-group must be reduced. Only when G>1.
+    if getattr(self, "attn_tp_size", 1) > 1:
+        import torch.distributed as dist
+
+        dist.all_reduce(o, group=self.attn_tp_group)
     return o
 
 
@@ -652,6 +658,12 @@ def kda_decode_serving(self, hidden_states, kda_state):
 
     o = self.o_norm(o.reshape(bsz, num_heads, head_dim), z)
     o = self.o_proj(o.reshape(bsz, num_heads * head_dim))
+    # M2a head-parallel KDA: o_proj is row-parallel over the head shard, so the
+    # partial sums across the attn_tp sub-group must be reduced. Only when G>1.
+    if getattr(self, "attn_tp_size", 1) > 1:
+        import torch.distributed as dist
+
+        dist.all_reduce(o, group=self.attn_tp_group)
     return o.unsqueeze(1)
 
 

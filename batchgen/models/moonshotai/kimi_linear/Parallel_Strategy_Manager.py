@@ -124,6 +124,40 @@ class KimiLinearParallelStrategyManager:
         self._stream_all_modules = bool(getattr(
             engine_config.Basic_Config, "stream_all_modules", False
         ))
+
+        # M2a: head-parallel TP for KDA. G=1 is the validated single-shard
+        # path (every derived value collapses to "all heads on this rank", so
+        # every KDA seam below is byte-identical to before). G>1 slices
+        # kda_num_heads across G contiguous ranks (one attn_tp sub-group per
+        # block of G ranks); this rank owns heads [rank%G * Hl : +Hl].
+        G = int(getattr(engine_config.Basic_Config, "attention_group_size", 1))
+        kda_num_heads = int(loaded_model_config.kda_num_heads)
+        assert kda_num_heads % G == 0, (
+            f"kda_num_heads {kda_num_heads} not divisible by "
+            f"attention_group_size {G}"
+        )
+        assert world_size % G == 0, (
+            f"world_size {world_size} not divisible by "
+            f"attention_group_size {G}"
+        )
+        self._attn_tp_size = G
+        self._attn_tp_rank = global_rank % G
+        self._attn_tp_group_id = global_rank // G
+        self._attn_tp_hl = kda_num_heads // G
+        self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
+        self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        if self._stream_all_modules and self._attn_tp_size > 1:
+            # Streamed KDA feeds full-96-head tensors from the copy-engine
+            # ring, which _load_kda_modules never sees, so the head slice
+            # below cannot run — the DP x TP token-flow + streamed-shard seam
+            # is M2b (core), out of M2a scope. Fail by name here rather than
+            # crash on a shape mismatch 93 layers into decode.
+            raise NotImplementedError(
+                "attention_group_size>1 with stream_all_modules is not wired "
+                "(M2a shards the RESIDENT KDA load path; streamed-KDA head "
+                "sharding is M2b). Run head-parallel KDA with "
+                "stream_all_modules off."
+            )
         self._comm = None
         self._resident_ep_built = False
         self._decode_graph = None
@@ -396,6 +430,11 @@ class KimiLinearParallelStrategyManager:
         self._load_kda_modules()
         self._load_shared_expert_modules()
 
+        # 2b. head-parallel KDA sub-group (M2a). Collective across ALL ranks;
+        #     no-op when attention_group_size==1. Built before _config_kda_
+        #     modules stamps it onto the KDA modules.
+        self._build_attn_tp_group()
+
         # 3. serving method injection + wrappers
         self._config_attn_modules()
         self._config_kda_modules()
@@ -408,13 +447,15 @@ class KimiLinearParallelStrategyManager:
         kda_indices = [
             i for i in range(cfg.num_hidden_layers) if cfg.is_kda_layer(i)
         ]
+        # M2a: the pools hold this rank's LOCAL heads (Hl == kda_num_heads for
+        # G==1). The conv/recurrent kernels only ever see the local shard.
         KimiLinearKDAWrapper.init_state_pools(
             kda_indices,
             num_slots=self._kda_pool_slots,
-            num_heads=cfg.kda_num_heads,
+            num_heads=self._attn_tp_hl,
             head_dim=cfg.kda_head_dim,
             conv_width=cfg.kda_conv_size,
-            proj_size=cfg.kda_num_heads * cfg.kda_head_dim,
+            proj_size=self._attn_tp_hl * cfg.kda_head_dim,
             device=device,
             dtype=torch.bfloat16,
         )
@@ -532,6 +573,55 @@ class KimiLinearParallelStrategyManager:
                 elif self.rank == 0:
                     logging.warning(f"attn_{layer_idx}: missing tensor {name}")
 
+    def _build_attn_tp_group(self):
+        """Build the head-parallel (KDA TP) NCCL sub-groups (M2a).
+
+        COLLECTIVE: every rank creates every group, in the same order, and
+        keeps the one it belongs to as ``self._attn_tp_group``. No-op for
+        G==1. The global PyNccl communicator (``self._comm``, EP-32) is
+        untouched; this is a separate torch NCCL group, exactly like the
+        worker's own ``dist.new_group`` usage.
+        """
+        if self._attn_tp_size <= 1:
+            return
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "attention_group_size>1 needs torch.distributed initialized "
+                "(head-parallel KDA builds NCCL sub-groups at configure time)."
+            )
+        G = self._attn_tp_size
+        for g in range(self.world_size // G):
+            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
+            if g == self._attn_tp_group_id:
+                self._attn_tp_group = grp
+
+    def _head_shard_kda_tensor(self, name, tensor):
+        """Slice a KDA weight/param to this rank's head shard (M2a, G>1).
+
+        head block = [rank%G * Hl : +Hl]; projection block = that * head_dim.
+          * f_a_proj / g_a_proj / o_norm : REPLICATE (per-head over head_dim
+            or a shared low-rank latent) -> no slice.
+          * o_proj                       : COLS (dim1) -> row-parallel, summed
+            by the all_reduce in serving_modules.
+          * A_log / b_proj               : per-HEAD rows [lo:hi].
+          * everything else (q/k/v_proj, {q,k,v}_conv1d weight+bias, f_b_proj,
+            g_proj, g_b_proj, dt_bias): per-(head*head_dim) rows [rlo:rhi].
+        """
+        hd = self._attn_tp_head_dim
+        lo = self._attn_tp_rank * self._attn_tp_hl
+        hi = lo + self._attn_tp_hl
+        rlo, rhi = lo * hd, hi * hd
+        base = name.split(".")[0]
+        if base in ("f_a_proj", "g_a_proj", "o_norm"):
+            return tensor
+        if base == "o_proj":
+            return tensor[:, rlo:rhi]
+        if base in ("A_log", "b_proj"):
+            return tensor[lo:hi]
+        return tensor[rlo:rhi]
+
     def _load_kda_modules(self):
         device = self.engine_config.Basic_Config.device_torch
         cfg = self.loaded_model_config
@@ -545,9 +635,16 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"kda_attn_{layer_idx}")
             for name, p in list(kda.named_parameters()):
                 if name in tensors:
-                    _replace_param(kda, name, tensors[name].to(device=device))
+                    t = tensors[name]
+                    if self._attn_tp_size > 1:
+                        t = self._head_shard_kda_tensor(name, t).contiguous()
+                    _replace_param(kda, name, t.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"kda_attn_{layer_idx}: missing tensor {name}")
+            if self._attn_tp_size > 1:
+                # After sharding, this module owns Hl heads: the serving math
+                # (reshapes, conv/recurrent grids) reads num_heads/num_k_heads.
+                kda.num_heads = kda.num_k_heads = self._attn_tp_hl
 
     def _load_shared_expert_modules(self):
         device = self.engine_config.Basic_Config.device_torch
@@ -602,6 +699,12 @@ class KimiLinearParallelStrategyManager:
             kda = self.model.model.layers[layer_idx].self_attn
             kda.kda_prefill_serving = types.MethodType(kda_prefill_serving, kda)
             kda.kda_decode_serving = types.MethodType(kda_decode_serving, kda)
+            # M2a: stamp the head-parallel context the serving methods read
+            # (attn_tp_size==1 -> the o_proj all_reduce is skipped, unchanged).
+            kda.attn_tp_size = self._attn_tp_size
+            kda.attn_tp_rank = self._attn_tp_rank
+            kda.attn_tp_group = self._attn_tp_group
+            kda.Hl = self._attn_tp_hl
             self.model.model.layers[layer_idx].self_attn = KimiLinearKDAWrapper(
                 kda, layer_idx, self.core_engine, self.engine_config,
                 self.model_config, persistent=not self._stream_all_modules,
