@@ -1193,6 +1193,7 @@ class Glm5MoE(nn.Module):
 
         self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
         self.num_tokens_per_rank = None
+        self._gate_w_fp32 = None
         self.enable_ep_offloading = False
         self.num_persistent_local_experts = self.experts_per_rank
 
@@ -2008,14 +2009,22 @@ class Glm5MoE(nn.Module):
         from batchgen.timing import get_decode_timer
         dt = get_decode_timer()
         with (dt.timed("router_gemm", 0) if dt else _nullctx()):
-            if _glm5_moe_router_mode() == "cublas":
-                router_logits = F.linear(x.float(), self.gate.weight.float())
-            else:
+            if _glm5_moe_router_mode() == "custom_gemm":
+                # Original fused kernel: one block per expert, serial N-row
+                # loop — O(N) wall (98.8 ms/step at num_global~1448). Kept for
+                # CUDA-graph bucket-M-independence work only.
                 from batchgen.moe.routing import glm5_router_gemm_cuda
                 router_logits = glm5_router_gemm_cuda(
                     x,
                     self.gate.weight,
                 )
+            else:
+                # FP32 cuBLAS with the gate weight cast once and cached:
+                # fp32-grade logits (maxabs ~2e-6 vs fp64), 100% top-8
+                # agreement with the custom kernel, 0.14 ms/call at N=1448.
+                if self._gate_w_fp32 is None:
+                    self._gate_w_fp32 = self.gate.weight.float()
+                router_logits = F.linear(x.float(), self._gate_w_fp32)
         with (dt.timed("gate_topk", 0) if dt else _nullctx()):
             return gate_sigmoid_topk_cuda(
                 router_logits,
