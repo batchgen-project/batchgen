@@ -1166,6 +1166,7 @@ class Glm5MoE(nn.Module):
 
     # K2.5 3D-MoE path (minimax parity).
     _3d_buf: Optional[Glm5MoE3DBuffers] = None
+    _shared_expert_stream = None  # side stream: shared expert overlaps MoE collectives (P1)
     _warned_k25_path = False
     _warned_gemm_3d = False
     _warned_partial_3d_disabled = False
@@ -1802,6 +1803,19 @@ class Glm5MoE(nn.Module):
                 "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
             Glm5MoE._warned_k25_path = True
 
+        # Shared expert on a side stream so it overlaps the whole MoE
+        # pipeline including both collectives — mirrors KimiK25MoE
+        # (kimi_k25/model.py:938-940); GLM previously serialized it after
+        # the combine (perf plan glm52-h200-perf-optimization P1).
+        compute_stream = torch.cuda.current_stream(self.device)
+        shared_stream = Glm5MoE._shared_expert_stream
+        if shared_stream is None:
+            shared_stream = torch.cuda.Stream(device=self.device)
+            Glm5MoE._shared_expert_stream = shared_stream
+        shared_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(shared_stream):
+            shared_out = self.shared_expert_forward(identity) if num_tokens > 0 else None
+
         # 1) AllGather
         all_tokens = buf.all_tokens[:num_global]
         # Slice the send buffer to exactly ntp rows: ncclAllGather sends
@@ -1876,19 +1890,26 @@ class Glm5MoE(nn.Module):
             output=result_buf,
         )
 
-        # 6) AllReduce across EP ranks
+        # 6) ReduceScatter across EP ranks. global_results is rank-major
+        # ([r*ntp, (r+1)*ntp) holds rank r's tokens), which is exactly
+        # ReduceScatter's output contract — the previous AllReduce + own-slice
+        # materialized the full summed matrix on every rank and moved 2x the
+        # necessary wire bytes (perf plan glm52-h200-perf-optimization P1).
+        # `padded` is free here (its all_gather role for this layer is done)
+        # and is reused as the [ntp, H] receive buffer.
+        rs_out = buf.padded[:ntp]
         with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
+            self.comm.reduce_scatter(
+                rs_out, global_results,
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        # 7) Slice local + add shared expert
+        # 7) Local slice + add side-stream shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * ntp
-        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
-        out = out + self.shared_expert_forward(identity)
+        out = rs_out[:num_tokens].to(hidden_states.dtype)
+        compute_stream.wait_stream(shared_stream)
+        out = out + shared_out
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
