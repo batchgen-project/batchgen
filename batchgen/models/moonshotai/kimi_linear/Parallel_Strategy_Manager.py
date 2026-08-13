@@ -391,12 +391,43 @@ class KimiLinearParallelStrategyManager:
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step
         MAX decode rows across ranks. Defines the padded all_gather /
         all_reduce layout of the resident-EP decode MoE — every rank
-        (including empty ones) sizes the global buffer from this scalar."""
+        (including empty ones) sizes the global buffer from this scalar.
+
+        M2b: under TP-G decode the worker passes the POST-scatter share
+        ceil(B_grp/G) (each rank owns 1/G of the group's rows after
+        moe_forward_resident_ep_decode's scatter), so this scalar stays the
+        per-rank distinct-row count the DP-32 resident layer expects."""
         if not self._resident_ep_built:
             return
         from batchgen.moe.fused_moe_bf16_resident import ResidentEPMoELayer
 
         ResidentEPMoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
+
+    @property
+    def attn_tp_size(self):
+        """G — the head-parallel (TP-KDA) sub-group size. 1 == pure DP-32. The
+        worker reads this (getattr, default 1) to size the decode MoE padding
+        and to gate the decode DP-group assignment / KDA reshard (M2b)."""
+        return self._attn_tp_size
+
+    @staticmethod
+    def scatter_rows(x, group_size, group_rank):
+        """Intra-group decode-MoE row scatter (M2b). Pure local slice — the
+        group's rows are replicated across its G ranks, so no collective is
+        needed. See moe_tp_reshard for the contract."""
+        from .moe_tp_reshard import scatter_rows
+
+        return scatter_rows(x, group_size, group_rank)
+
+    @staticmethod
+    def all_gather_rows(routed_local, num_rows, group_size, group_rank, group):
+        """Intra-group decode-MoE row gather (M2b): reassemble the full group
+        batch on every rank from each rank's routed slice over attn_tp_group."""
+        from .moe_tp_reshard import all_gather_rows
+
+        return all_gather_rows(
+            routed_local, num_rows, group_size, group_rank, group
+        )
 
     # ------------------------------------------------------------------ #
     #  Model build                                                        #
@@ -762,6 +793,13 @@ class KimiLinearParallelStrategyManager:
                     self.engine_config, self.model_config,
                     persistent=False,
                 )
+            # M2b: stamp the head-parallel (TP) context the resident-EP decode
+            # forward reads for the intra-group token scatter/gather. G==1 leaves
+            # attn_tp_size==1, so moe_forward_resident_ep_decode skips it and the
+            # validated pure-DP path is byte-identical.
+            moe.attn_tp_size = self._attn_tp_size
+            moe.attn_tp_rank = self._attn_tp_rank
+            moe.attn_tp_group = self._attn_tp_group
             moe.forward = types.MethodType(moe_forward_serving, moe)
 
     def _config_block_residual(self):

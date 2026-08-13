@@ -776,7 +776,24 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)
 
-    routed = resident.forward(x, self.gate)
+    # M2b: under DP-(world/G) x TP-G decode the G ranks of a group hold the SAME
+    # rows (replicated attention), but ResidentEPMoELayer is a DP-32 contract.
+    # Scatter the group's rows into G distinct slices (DP-32 restored), route
+    # each slice through the UNCHANGED resident forward, then gather back to the
+    # full group batch (attention downstream needs all rows on every rank). An
+    # empty rank (B_grp<G) still runs resident.forward + the gather (lockstep).
+    G = int(getattr(self, "attn_tp_size", 1))
+    if G > 1:
+        from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+        B_grp = x.shape[0]
+        x_local = scatter_rows(x, G, self.attn_tp_rank)
+        routed_local = resident.forward(x_local, self.gate)
+        routed = all_gather_rows(
+            routed_local, B_grp, G, self.attn_tp_rank, self.attn_tp_group
+        )
+    else:
+        routed = resident.forward(x, self.gate)
 
     out = routed.reshape(orig_shape)
     if getattr(self, "shared_experts", None) is not None:
