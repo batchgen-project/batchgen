@@ -5,14 +5,17 @@
 #  licensed under the apache license, version 2.0 (the "license");              #
 # ---------------------------------------------------------------------------- #
 
-"""Decode-side DP-group assignment for DP-(world/G) x TP-G decode (Kimi-Linear
-M2b, CORE).
+"""Serve-group assignment for DP-(world/G) x TP-G resident serving (Kimi-Linear,
+Option 1, CORE).
 
-Prefill stays streamed pure-DP-32 (a sequence lives on ONE ``assigned_rank``).
-Decode splits the world into ``num_dp = world_size // G`` groups of G ranks; the
-G ranks of a group hold the SAME sequences (replicated attention state) so the
-TP-KDA head shards line up. ``seq.decode_dp_group`` (0..num_dp-1) names the group
-that owns a sequence in decode; every rank keys decode membership on
+Option 1 (unified resident TP): the world splits into ``num_dp = world_size // G``
+serve-groups of G ranks, and a sequence binds to ALL G ranks of its group at
+PREFILL and stays there for decode. The G ranks of a group hold the SAME
+sequences (replicated attention, head-sharded KDA state) so both phases run in
+TP-G lockstep and the o_proj all_reduce couples matching tokens — there is NO
+prefill->decode reshard (superseding the earlier M2b "streamed pure-DP prefill
+then reshard to the decode group" model). ``seq.decode_dp_group`` (0..num_dp-1)
+names the group; every rank keys membership on
 
     seq.decode_dp_group == global_rank // G
 

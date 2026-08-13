@@ -146,6 +146,30 @@ def test_rank_in_decode_group_mapping():
     assert rank_in_decode_group(None, 0, G) is False   # unassigned owns nothing
 
 
+def test_option1_single_group_all_ranks_own_all():
+    """Option 1 parity-gate config: world=8, G=8 -> num_dp=1 (one serve-group).
+
+    The moved binding (admission/prefill, not the decode transition) uses
+    rank_in_decode_group as the per-rank ownership predicate. With a single
+    group EVERY rank owns EVERY sequence, so all 8 ranks bind + prefill + decode
+    the same sequences in TP-8 lockstep. This is exactly the invariant the G=8
+    parity gate exercises.
+    """
+    world, G = 8, 8
+    num_dp = num_decode_dp_groups(world, G)
+    assert num_dp == 1
+    lengths = [((i * 17 + 3) % 200) + 1 for i in range(4)]  # the 4 gate prompts
+    groups = assign_decode_dp_groups(lengths, num_dp)
+    assert groups == [0, 0, 0, 0]                # only group 0 exists
+    # Every rank resolves the FULL set (replicated), none is empty.
+    for r in range(world):
+        owned = {i for i, g in enumerate(groups)
+                 if rank_in_decode_group(g, r, G)}
+        assert owned == set(range(len(lengths)))
+    # MoE post-scatter share: 4 rows over 8 ranks -> ceil = 1.
+    assert moe_ntp_from_group_max(len(lengths), G) == 1
+
+
 # --------------------------------------------------------------------------- #
 #  Piece 2: MoE ntp = ceil(max_B_grp / G)                                      #
 # --------------------------------------------------------------------------- #

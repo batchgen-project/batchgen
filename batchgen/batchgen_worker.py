@@ -1385,6 +1385,15 @@ class BatchGenWorker:
 		# Step 3: Assign ranks (round-robin, continuing from existing)
 		self._assign_admitted_sequences_to_ranks(new_uuids)
 
+		# Step 3b (Option 1, CORE): assign the serve-group at ADMISSION. Under
+		# unified resident TP (G>1) a sequence binds to ALL G ranks of its
+		# decode_dp_group from PREFILL onward (head-sharded KDA state + o_proj
+		# all_reduce need the group replicated at prefill, not reshuffled at the
+		# decode transition). No-op for G==1 (the validated pure-DP path never
+		# carries a group id). _config_prefill_for_batch re-runs this idempotently
+		# so evicted re-entries (whose group was cleared) re-group before binding.
+		self._assign_decode_dp_groups(new_uuids)
+
 		# Step 4: Build local query book entries for new sequences
 		self._build_local_query_book_for_admitted(new_uuids)
 
@@ -1611,16 +1620,35 @@ class BatchGenWorker:
 		pm = getattr(self, "parallel_manager", None)
 		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
 
-	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
-		"""Stamp ``seq.decode_dp_group`` at the prefill->decode transition (M2b).
+	def _owns_local_sequence(self, seq) -> bool:
+		"""Which ranks bind a sequence into the LOCAL maps (query_book +
+		_uuid_to_local_map) and drive it through prefill/decode.
 
-		ADDITIVE — ``assigned_rank`` (prefill DP-32) is untouched. For G==1 the
-		decode group equals the rank and nothing keys on this field, so we skip
-		entirely: the validated pure-DP path never carries a group id. For G>1
-		the G ranks of a group must own the SAME sequences, so the assignment is
-		over ``num_dp = world_size // G`` groups, L^2-balanced against the
-		sequences already in decode (mirrors ``_assign_admitted_sequences_to_
-		ranks``). Deterministic across ranks: identical inputs -> identical map.
+		Pure DP (G==1, the validated path): the single ``assigned_rank`` owns it.
+		Option 1 unified resident TP (G>1): ALL G ranks of the sequence's
+		``decode_dp_group`` hold it — the group runs prefill+decode in TP-G
+		lockstep on identical sequences (replicated attention, head-sharded KDA
+		state), so the o_proj all_reduce couples matching tokens and no
+		prefill->decode reshard is ever needed. Requires ``decode_dp_group`` to
+		be stamped (done at admission / prefill config before binding)."""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return seq.assigned_rank == self.rank
+		from batchgen.decode_dp_group import rank_in_decode_group
+		return rank_in_decode_group(seq.decode_dp_group, self.rank, G)
+
+	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
+		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
+		BEFORE the group-predicate binding — not at the decode transition).
+
+		ADDITIVE — ``assigned_rank`` is untouched. For G==1 the group equals the
+		rank and nothing keys on this field, so we skip entirely: the validated
+		pure-DP path never carries a group id. For G>1 the G ranks of a group own
+		the SAME sequences from prefill onward, so the assignment is over
+		``num_dp = world_size // G`` groups, L^2-balanced against the sequences
+		already grouped (mirrors ``_assign_admitted_sequences_to_ranks``).
+		Idempotent (skips already-grouped seqs) and deterministic across ranks:
+		identical inputs -> identical map.
 		"""
 		G = self._decode_attn_tp_size()
 		if G <= 1 or not uuids:
@@ -1675,10 +1703,15 @@ class BatchGenWorker:
 		return local_idx
 
 	def _build_local_query_book_for_admitted(self, uuids: List[str]) -> None:
-		"""Build local query book entries for newly admitted sequences on this rank."""
+		"""Build local query book entries for newly admitted sequences on this rank.
+
+		Option 1: under G>1 every rank of a sequence's serve-group binds it (see
+		``_owns_local_sequence``), so the group holds the sequence replicated from
+		admission. G==1 keeps the single-owner (assigned_rank) binding unchanged.
+		"""
 		for uuid in uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq is None or seq.assigned_rank != self.rank:
+			if seq is None or not self._owns_local_sequence(seq):
 				continue
 			self._bind_local_sequence_to_query_book(uuid)
 
@@ -3225,36 +3258,12 @@ class BatchGenWorker:
 			self.rank, len(global_sequence_ids), load_duration,
 		)
 
-		# M2b: prefill->decode KDA state reshard (head-shard 96 -> 96/G per rank
-		# + rank->group move). MLA compressed latent is REPLICATED (this same
-		# per-node shared-host load already fans 1->G with no cross-rank move);
-		# the KDA recurrent/conv state must be head-sliced and moved. No-op for
-		# the validated G==1 pure-DP path.
-		self._reshard_kda_state_to_decode_group(global_sequence_ids)
-
-	def _reshard_kda_state_to_decode_group(
-		self, global_sequence_ids: List[int]
-	) -> None:
-		"""Head-shard + rank->group move of KDA state at the decode transition.
-
-		The reshard LOGIC (head_shard_recurrent/conv, gather_*, the move plan) is
-		implemented and unit-tested in ``batchgen.kv_cache.kda_state_reshard``;
-		the pure slice is bit-exact per head (P0.6). Executing it over the LIVE
-		KDAStateGPUManager pools + KVMigrationHelper's Gloo transport is the M2b
-		multi-GPU server-integration gate (the NEXT gate), not this pass. G==1
-		(pure DP, prefill rank == decode rank) needs no reshard and returns here.
-		"""
-		G = self._decode_attn_tp_size()
-		if G <= 1:
-			return
-		raise NotImplementedError(
-			"prefill->decode KDA head-shard reshard (attn_tp_size>1) is not "
-			"wired to the live Gloo transport — that is the M2b multi-GPU "
-			"server-integration gate. The reshard arithmetic is implemented and "
-			"unit-tested (batchgen.kv_cache.kda_state_reshard); hook it onto the "
-			"KDAStateGPUManager recurrent/conv pools over KVMigrationHelper's "
-			"Gloo group at 8-GPU bring-up. Run attn_tp_size==1 until then."
-		)
+		# Option 1 (unified resident TP): NO prefill->decode KDA reshard. Under
+		# G>1 the sequence's serve-group ran prefill in TP-G lockstep, so each of
+		# its G ranks already holds its own head-shard of the KDA recurrent/conv
+		# state in the GPU state pool (slot keyed by global seq id, persists
+		# prefill->decode). This host->GPU load handles only the MLA paged KV,
+		# which is REPLICATED across the group — nothing to reshard.
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
 		"""Return GPU KV pages associated with the provided local sequence ids."""
@@ -6757,12 +6766,22 @@ class BatchGenWorker:
 				f"remaining_decode={seq.max_decode_length}, kv_budget={seq.kv_token_budget}"
 			)
 
-		# STEP 4: Allocate host KV pages for sequences (only THIS RANK's sequences)
-		# Check by assigned_rank, NOT by _uuid_to_local_map (which may not have new sequences yet)
+		# STEP 3.5 (Option 1, CORE): (re)assign the serve-group before binding.
+		# Idempotent for fresh admits (already grouped at admission); RE-groups
+		# evicted re-entries (whose decode_dp_group was cleared on eviction) so
+		# the group predicate below binds them on all G ranks. No-op for G==1.
+		self._assign_decode_dp_groups(prefill_uuids)
+
+		# STEP 4: Allocate host KV pages for sequences this rank serves.
+		# Ownership: G==1 -> the single assigned_rank; G>1 (Option 1) -> ALL G
+		# ranks of the sequence's serve-group, so the group holds the sequence's
+		# replicated MLA KV and head-sharded KDA state from prefill onward.
+		# Check by _owns_local_sequence, NOT _uuid_to_local_map (which may not
+		# have new sequences yet).
 		my_prefill_uuids = []
 		for uuid in prefill_uuids:
 			seq = self.global_batch.get_sequence(uuid)
-			if seq.assigned_rank == self.rank:
+			if self._owns_local_sequence(seq):
 				my_prefill_uuids.append(uuid)
 				# Add to local maps if not already present (for new sequences)
 				if uuid not in self._uuid_to_local_map:
