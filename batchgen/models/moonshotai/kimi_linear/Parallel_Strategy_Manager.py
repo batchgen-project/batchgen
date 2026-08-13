@@ -636,7 +636,12 @@ class KimiLinearParallelStrategyManager:
             or a shared low-rank latent) -> no slice.
           * o_proj                       : COLS (dim1) -> row-parallel, summed
             by the all_reduce in serving_modules.
-          * A_log / b_proj               : per-HEAD rows [lo:hi].
+          * A_log                         : per-HEAD, sliced on the FLATTENED
+            head axis (the 48B checkpoint ships it as (1, 1, H, 1) -- heads on
+            axis 2, NOT axis 0 -- so a dim-0 slice empties every rank but rank 0
+            into a null-pointer tensor that the fla gate kernel dereferences;
+            G=8 prefill IMA, bug_log 2026-08-14).
+          * b_proj                        : per-HEAD rows [lo:hi] ((H, hidden)).
           * everything else (q/k/v_proj, {q,k,v}_conv1d weight+bias, f_b_proj,
             g_proj, g_b_proj, dt_bias): per-(head*head_dim) rows [rlo:rhi].
         """
@@ -649,7 +654,20 @@ class KimiLinearParallelStrategyManager:
             return tensor
         if base == "o_proj":
             return tensor[:, rlo:rhi]
-        if base in ("A_log", "b_proj"):
+        if base == "A_log":
+            # The fla gate kernel reads A_log FLAT as A_log[i_h] (one log-decay
+            # scalar per head). Its stored shape is (1, 1, H, 1) on the 48B
+            # checkpoint, so slice the flattened head axis -- a dim-0 slice
+            # (tensor[lo:hi]) hits the size-1 leading axis and returns 0 rows.
+            a = tensor.reshape(-1)
+            n = self._attn_tp_hl * self._attn_tp_size
+            if a.numel() != n:
+                raise ValueError(
+                    f"A_log has {a.numel()} elements (shape {tuple(tensor.shape)}); "
+                    f"expected kda_num_heads={n} for a per-head shard"
+                )
+            return a[lo:hi]
+        if base == "b_proj":
             return tensor[lo:hi]
         return tensor[rlo:rhi]
 
