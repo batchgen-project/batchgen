@@ -60,6 +60,24 @@ def rank_in_decode_group(
     return int(decode_dp_group) == global_rank // group_size
 
 
+def host_kv_owner_rank(decode_dp_group: int, group_size: int) -> int:
+    """Canonical rank that owns the per-node SHARED host-KV entry for a group.
+
+    The host paged KV cache is ONE shared-memory region per node
+    (shm ``batchgen_host_kv_cache``) keyed by ``global_idx``, so a sequence's
+    register / allocate / grow / release against it must happen EXACTLY once. Under
+    Option 1 (G>1) all G ranks of a group replicate the sequence, so if every rank
+    touched the shared region the first releaser would tombstone the entry and the
+    rest would raise ``IndexError: Sequence ID ... not found during release``
+    (and register/allocate would over-reserve G x pages). The group LEADER
+    ``g*G`` is the single canonical owner. G==1 is handled by the caller (the
+    ``assigned_rank`` owner) and never calls this.
+    """
+    if group_size <= 0:
+        raise ValueError(f"group_size must be > 0, got {group_size}")
+    return int(decode_dp_group) * group_size
+
+
 def assign_decode_dp_groups(
     lengths: Sequence[int],
     num_dp: int,

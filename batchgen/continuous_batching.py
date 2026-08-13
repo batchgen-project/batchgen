@@ -99,21 +99,47 @@ def _format_ranked_reports(reports: Dict[str, List[int]], limit: int = 8) -> str
     return ", ".join(f"{uuid}:{ranks}" for uuid, ranks in items)
 
 
+def _reported_by_exact_group(ranks: List[int], group: Any, group_size: int) -> bool:
+    """True iff ``ranks`` is EXACTLY the G contiguous ranks of decode group ``group``.
+
+    Option 1 (G>1): a replicated sequence in group g must be reported by every rank
+    in ``[g*G, (g+1)*G)`` and no other -- neither a missing group member nor a
+    stray cross-group report is tolerated.
+    """
+    if not isinstance(group, int):
+        return False
+    expected = set(range(group * group_size, (group + 1) * group_size))
+    return set(ranks) == expected
+
+
 def validate_boundary_payload_alignment(
     decode_uuids: List[str],
     all_payloads: List[Optional[Dict[str, Any]]],
+    group_size: int = 1,
 ) -> None:
     """Fail fast when boundary all-gather ownership metadata is inconsistent.
 
-    Every UUID in the active decode list must be reported exactly once in
-    ``seq_state`` by its assigned rank. Load candidates must be reported exactly
-    once and must not overlap active decode UUIDs. Violations mean scheduler
-    state is already corrupt enough that silently completing or dropping rows
-    would hide data loss and can lead to long-tail stalls.
+    ``group_size`` (G) is the decode attention TP size:
+
+    * G==1 (validated pure-DP path): every UUID in the active decode list must be
+      reported EXACTLY ONCE in ``seq_state`` by its ``assigned_rank``. Load
+      candidates likewise once, and must not overlap active decode UUIDs.
+    * G>1 (Option 1 unified resident TP): a sequence is replicated onto ALL G
+      ranks of its ``decode_dp_group`` g, so it must be reported by EXACTLY the G
+      contiguous ranks ``[g*G, (g+1)*G)`` (``set(ranks) == set(range(g*G,(g+1)*G))``)
+      and ownership is GROUP MEMBERSHIP (``rank // G == g``), not
+      ``assigned_rank == rank``.
+
+    Violations mean scheduler state is already corrupt enough that silently
+    completing or dropping rows would hide data loss and can lead to long-tail
+    stalls.
     """
+    G = int(group_size)
     errors: List[str] = []
     active_reports: Dict[str, List[int]] = {}
     candidate_reports: Dict[str, List[int]] = {}
+    active_group: Dict[str, Any] = {}       # uuid -> decode_dp_group (G>1)
+    candidate_group: Dict[str, Any] = {}
     active_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_wrong_owner: List[Tuple[str, int, Any]] = []
     candidate_bad_status: List[Tuple[str, int, Any]] = []
@@ -128,27 +154,42 @@ def validate_boundary_payload_alignment(
 
         for uuid, state in seq_state.items():
             active_reports.setdefault(uuid, []).append(rank_idx)
-            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-            if assigned_rank is not None:
-                try:
-                    assigned_rank_int = int(assigned_rank)
-                except (TypeError, ValueError):
-                    active_wrong_owner.append((uuid, rank_idx, assigned_rank))
-                else:
-                    if assigned_rank_int != rank_idx:
+            if G > 1:
+                group = state.get("decode_dp_group") if isinstance(state, dict) else None
+                if group is not None:
+                    active_group[uuid] = group
+                # Owner check is group membership: rank // G == decode_dp_group.
+                if not isinstance(group, int) or rank_idx // G != group:
+                    active_wrong_owner.append((uuid, rank_idx, group))
+            else:
+                assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+                if assigned_rank is not None:
+                    try:
+                        assigned_rank_int = int(assigned_rank)
+                    except (TypeError, ValueError):
                         active_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                    else:
+                        if assigned_rank_int != rank_idx:
+                            active_wrong_owner.append((uuid, rank_idx, assigned_rank))
 
         for uuid, state in candidate_state.items():
             candidate_reports.setdefault(uuid, []).append(rank_idx)
-            assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
-            if assigned_rank is not None:
-                try:
-                    assigned_rank_int = int(assigned_rank)
-                except (TypeError, ValueError):
-                    candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
-                else:
-                    if assigned_rank_int != rank_idx:
+            if G > 1:
+                group = state.get("decode_dp_group") if isinstance(state, dict) else None
+                if group is not None:
+                    candidate_group[uuid] = group
+                if not isinstance(group, int) or rank_idx // G != group:
+                    candidate_wrong_owner.append((uuid, rank_idx, group))
+            else:
+                assigned_rank = state.get("assigned_rank") if isinstance(state, dict) else None
+                if assigned_rank is not None:
+                    try:
+                        assigned_rank_int = int(assigned_rank)
+                    except (TypeError, ValueError):
                         candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
+                    else:
+                        if assigned_rank_int != rank_idx:
+                            candidate_wrong_owner.append((uuid, rank_idx, assigned_rank))
             status = state.get("status") if isinstance(state, dict) else None
             if status not in (None, "PREFILLED", "ON_HOLD"):
                 candidate_bad_status.append((uuid, rank_idx, status))
@@ -160,23 +201,44 @@ def validate_boundary_payload_alignment(
             f"count={len(missing_active)} first={missing_active[:8]}"
         )
 
-    duplicate_active = {
-        uuid: ranks for uuid, ranks in active_reports.items() if len(ranks) != 1
-    }
-    if duplicate_active:
-        errors.append(
-            "active UUIDs reported by multiple ranks: "
-            f"{_format_ranked_reports(duplicate_active)}"
-        )
+    if G > 1:
+        # Each active UUID must be reported by EXACTLY its group's G contiguous ranks.
+        bad_active_card = {
+            uuid: ranks for uuid, ranks in active_reports.items()
+            if not _reported_by_exact_group(ranks, active_group.get(uuid), G)
+        }
+        if bad_active_card:
+            errors.append(
+                "active UUIDs not reported by exactly their decode group's G ranks: "
+                f"{_format_ranked_reports(bad_active_card)}"
+            )
+        bad_candidate_card = {
+            uuid: ranks for uuid, ranks in candidate_reports.items()
+            if not _reported_by_exact_group(ranks, candidate_group.get(uuid), G)
+        }
+        if bad_candidate_card:
+            errors.append(
+                "load candidates not reported by exactly their decode group's G ranks: "
+                f"{_format_ranked_reports(bad_candidate_card)}"
+            )
+    else:
+        duplicate_active = {
+            uuid: ranks for uuid, ranks in active_reports.items() if len(ranks) != 1
+        }
+        if duplicate_active:
+            errors.append(
+                "active UUIDs reported by multiple ranks: "
+                f"{_format_ranked_reports(duplicate_active)}"
+            )
 
-    duplicate_candidates = {
-        uuid: ranks for uuid, ranks in candidate_reports.items() if len(ranks) != 1
-    }
-    if duplicate_candidates:
-        errors.append(
-            "load candidates reported by multiple ranks: "
-            f"{_format_ranked_reports(duplicate_candidates)}"
-        )
+        duplicate_candidates = {
+            uuid: ranks for uuid, ranks in candidate_reports.items() if len(ranks) != 1
+        }
+        if duplicate_candidates:
+            errors.append(
+                "load candidates reported by multiple ranks: "
+                f"{_format_ranked_reports(duplicate_candidates)}"
+            )
 
     active_candidate_overlap = [
         uuid for uuid in decode_uuids if uuid in candidate_reports
@@ -188,19 +250,21 @@ def validate_boundary_payload_alignment(
         )
 
     if active_wrong_owner:
+        _key = "group" if G > 1 else "assigned_rank"
         errors.append(
             "active UUID owner/rank mismatch: "
             + ", ".join(
-                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                f"{uuid}(reported_rank={rank}, {_key}={assigned})"
                 for uuid, rank, assigned in active_wrong_owner[:8]
             )
         )
 
     if candidate_wrong_owner:
+        _key = "group" if G > 1 else "assigned_rank"
         errors.append(
             "candidate UUID owner/rank mismatch: "
             + ", ".join(
-                f"{uuid}(reported_rank={rank}, assigned_rank={assigned})"
+                f"{uuid}(reported_rank={rank}, {_key}={assigned})"
                 for uuid, rank, assigned in candidate_wrong_owner[:8]
             )
         )

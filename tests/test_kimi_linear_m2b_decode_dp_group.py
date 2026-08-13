@@ -26,6 +26,7 @@ import pytest
 
 from batchgen.decode_dp_group import (
     assign_decode_dp_groups,
+    host_kv_owner_rank,
     moe_ntp_from_group_max,
     num_decode_dp_groups,
     rank_in_decode_group,
@@ -168,6 +169,37 @@ def test_option1_single_group_all_ranks_own_all():
         assert owned == set(range(len(lengths)))
     # MoE post-scatter share: 4 rows over 8 ranks -> ceil = 1.
     assert moe_ntp_from_group_max(len(lengths), G) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  Piece 1b: host-KV owner = group leader (per-node SHARED region)            #
+# --------------------------------------------------------------------------- #
+
+def test_host_kv_owner_is_group_leader():
+    """The single rank allowed to touch the shared host-KV region is g*G, and it
+    is a member of the group (so it already holds the sequence's replica)."""
+    G = 8
+    for g in range(4):                       # world=32, num_dp=4
+        leader = host_kv_owner_rank(g, G)
+        assert leader == g * G
+        # leader is inside the group's contiguous rank band
+        assert rank_in_decode_group(g, leader, G)
+        # exactly one rank per group is the owner: no OTHER group rank matches
+        owners = [r for r in range(g * G, (g + 1) * G)
+                  if r == host_kv_owner_rank(g, G)]
+        assert owners == [leader]
+
+
+def test_host_kv_owner_single_group_gate_config():
+    """G=8 parity-gate: world=8, one group -> leader is rank 0, the other 7 ranks
+    replicate the seq but MUST NOT release the shared entry (that is the
+    double-free IndexError this gate reproduces)."""
+    world, G = 8, 8
+    assert host_kv_owner_rank(0, G) == 0
+    non_leaders = [r for r in range(world) if r != host_kv_owner_rank(0, G)]
+    assert non_leaders == [1, 2, 3, 4, 5, 6, 7]   # all skip the shared region
+    with pytest.raises(ValueError):
+        host_kv_owner_rank(0, 0)
 
 
 # --------------------------------------------------------------------------- #

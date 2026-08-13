@@ -1637,6 +1637,28 @@ class BatchGenWorker:
 		from batchgen.decode_dp_group import rank_in_decode_group
 		return rank_in_decode_group(seq.decode_dp_group, self.rank, G)
 
+	def _owns_host_kv(self, seq) -> bool:
+		"""Which SINGLE rank drives the per-node SHARED host-KV region for a seq.
+
+		The host paged KV cache is ONE shm region per node
+		(``batchgen_host_kv_cache``) keyed by ``global_idx``, so register /
+		allocate / grow / release must fire EXACTLY once per sequence. This is
+		NARROWER than ``_owns_local_sequence``: G>1 replicates a seq onto all G
+		ranks of its group (they each hold GPU KV + head-sharded KDA state), but
+		only the group LEADER ``decode_dp_group*G`` may touch the shared host
+		region — otherwise the G ranks double-register (G x host reservation) and
+		double-release (2nd releaser hits ``IndexError: Sequence ID ... not found
+		during release``). G==1 is the validated single-owner path: the
+		``assigned_rank`` owner, identical to ``uuid in _uuid_to_local_map``."""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return seq.assigned_rank == self.rank
+		from batchgen.decode_dp_group import host_kv_owner_rank
+		return (
+			seq.decode_dp_group is not None
+			and host_kv_owner_rank(seq.decode_dp_group, G) == self.rank
+		)
+
 	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
 		"""Stamp ``seq.decode_dp_group`` (Option 1: at admission / prefill config,
 		BEFORE the group-predicate binding — not at the decode transition).
@@ -7240,18 +7262,30 @@ class BatchGenWorker:
 			return
 		
 		my_uuids = [uuid for uuid in uuids if uuid in self._uuid_to_local_map]
-		
-		if my_uuids:
+
+		# Host KV is ONE per-node SHARED shm region (batchgen_host_kv_cache) keyed
+		# by global_idx. Under Option 1 (G>1) all G ranks of a group hold the uuid
+		# in _uuid_to_local_map, so releasing on every rank double-frees the single
+		# shared entry -- the first releaser tombstones it and the rest raise
+		# "Sequence ID ... not found during release". Release the shared entry on
+		# EXACTLY the group leader (_owns_host_kv). G==1: host_release_uuids ==
+		# my_uuids, so the validated single-owner path is byte-identical.
+		host_release_uuids = [
+			uuid for uuid in my_uuids
+			if self._owns_host_kv(self.global_batch.get_sequence(uuid))
+		]
+
+		if host_release_uuids:
 			global_sequence_ids = [
 				self.global_batch.get_sequence(uuid).global_idx
-				for uuid in my_uuids
+				for uuid in host_release_uuids
 			]
 
 			logging.debug(f"Rank {self.rank}: Releasing host KV pages for global_idx: {global_sequence_ids}")
-			
+
 			# NOTE: GPU KV pages should already be released by caller
 			# Do NOT call _release_gpu_kv_pages here to avoid double-free
-			
+
 			# Release host KV pages
 			# NOTE: release_sequence_pages already calls unregister_sequences internally,
 			# so we don't need to call unregister_sequences separately
@@ -7261,7 +7295,10 @@ class BatchGenWorker:
 			if aux_view is not None:
 				aux_view.release_sequence_pages(global_sequence_ids)
 
-			# Rebuild GPU page table with remaining active sequences
+		# GPU page table is PER-RANK (GPU KV is replicated across the group's G
+		# ranks under Option 1), so EVERY rank that held these sequences rebuilds
+		# its own remaining page table -- keyed on my_uuids, not the leader subset.
+		if my_uuids:
 			manager = self.gpu_paged_kv_cache_manager
 			if manager is not None and manager.is_initialized:
 				remaining_in_decode = self.global_batch.get_sequences_by_status(SequenceStatus.IN_DECODE)
@@ -7270,7 +7307,7 @@ class BatchGenWorker:
 					if uuid in self._uuid_to_local_map and uuid not in my_uuids:
 						seq = self.global_batch.get_sequence(uuid)
 						remaining_global_ids.append(seq.global_idx)
-				
+
 				if remaining_global_ids:
 					remaining_global_ids.sort()
 					manager.rebuild_page_table(remaining_global_ids)
@@ -8054,6 +8091,10 @@ class BatchGenWorker:
 					'completed': is_completed,
 					'additional_pages_needed': seq.get_additional_gpu_pages_needed(),
 					'assigned_rank': seq.assigned_rank,  # Include for consistency
+					# Option 1 (G>1): the serve-group id. The boundary validator keys
+					# group ownership on this (a uuid is reported by exactly its G
+					# contiguous ranks [g*G,(g+1)*G)), not on a single assigned_rank.
+					'decode_dp_group': seq.decode_dp_group,
 					# Host KV growth fields
 					'needs_host_growth': seq.needs_host_kv_growth(chunk_size),
 					'host_growth_pages': seq.get_host_growth_pages(chunk_size),
@@ -8098,6 +8139,7 @@ class BatchGenWorker:
 			local_candidate_state[uuid] = {
 				'pages_needed': seq.get_gpu_pages_for_two_page_buffer(),
 				'assigned_rank': seq.assigned_rank,
+				'decode_dp_group': seq.decode_dp_group,  # Option 1 group-ownership key
 				'status': seq.status.name,  # Include status for debugging
 				'decoded_length': seq.decoded_length,  # For prioritized loading
 			}
@@ -8111,7 +8153,9 @@ class BatchGenWorker:
 		
 		all_payloads = [None] * self.world_size
 		dist.all_gather_object(all_payloads, local_payload)
-		validate_boundary_payload_alignment(decode_uuids, all_payloads)
+		validate_boundary_payload_alignment(
+			decode_uuids, all_payloads, group_size=self._decode_attn_tp_size()
+		)
 		
 		timing.gather_ms = (time.perf_counter() - t0) * 1000
 		
@@ -8121,13 +8165,23 @@ class BatchGenWorker:
 		# Extract per-rank free pages
 		per_rank_free = [p['free_pages'] for p in all_payloads]
 
-		# Merge sequence state - each uuid appears exactly once (owned by one rank)
+		# Merge sequence state. G==1: each uuid appears exactly once (single owner).
+		# G>1 (Option 1): the uuid is reported by all G ranks of its group, so pin a
+		# CANONICAL owning_rank = decode_dp_group*G (the group leader) instead of
+		# last-writer-wins (which would arbitrarily land on the highest group rank).
+		_G_merge = self._decode_attn_tp_size()
 		global_seq_state = {}
 		for rank_idx, payload in enumerate(all_payloads):
 			if payload and payload['seq_state']:
 				for uuid, state in payload['seq_state'].items():
 					global_seq_state[uuid] = state
-					global_seq_state[uuid]['owning_rank'] = rank_idx
+					if _G_merge > 1:
+						_g = state.get('decode_dp_group')
+						global_seq_state[uuid]['owning_rank'] = (
+							_g * _G_merge if _g is not None else rank_idx
+						)
+					else:
+						global_seq_state[uuid]['owning_rank'] = rank_idx
 
 		# Merge candidate state
 		global_candidate_info = {}
