@@ -4460,13 +4460,13 @@ class BatchGenWorker:
 		# allocation, which is the configuration validated correct.
 		# COLLECTIVE-SAFE: rows/in_w are identical on every rank (derived from
 		# the all-gathered batch), so all ranks take the same branch.
+		is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
 		if rows * in_w * 8 >= NODE_SHARED_INPUT_IDS_MIN_BYTES:
 			node_id = self.rank // NUM_GPUS_PER_NODE
 			name = (
 				f"batchgen_input_ids_{self._node_shared_tag()}"
 				f"_n{node_id}_g{self._buffer_pool_generation}"
 			)
-			is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
 			shared_input_ids, shm = allocate_node_shared_int64(
 				name, rows, in_w, is_creator, dist.barrier
 			)
