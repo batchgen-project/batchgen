@@ -41,7 +41,10 @@ class Glm5DecoderLayerGraphSegment:
         self.max_seqlen = int(getattr(dsa_segment, "max_seqlen"))
         self.index_topk = int(getattr(dsa_segment, "index_topk"))
         self.primary_kv_dim = int(dsa_segment.primary_blocked_k.shape[3])
-        self.aux_kv_dim = int(dsa_segment.aux_blocked_k.shape[3])
+        # Reuse-topk segments (GLM-5.2 skip layers) have no aux/indexer KV;
+        # aux_kv_dim=0 marks the layer as producing no indexer_k_tensor.
+        _aux_blocked_k = getattr(dsa_segment, "aux_blocked_k", None)
+        self.aux_kv_dim = int(_aux_blocked_k.shape[3]) if _aux_blocked_k is not None else 0
         self.capture_local_bsz: Optional[int] = None
         self.capture_rank_token_counts: Optional[torch.Tensor] = None
         self.set_capture_context(
@@ -104,7 +107,7 @@ class Glm5DecoderLayerGraphSegment:
         }
 
     def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
-        return {
+        specs = {
             "hidden_states": TensorSpec(
                 ("batch_size", 1, self.hidden_size),
                 torch.bfloat16,
@@ -113,11 +116,13 @@ class Glm5DecoderLayerGraphSegment:
                 ("batch_size", 1, 1, self.primary_kv_dim),
                 torch.bfloat16,
             ),
-            "indexer_k_tensor": TensorSpec(
+        }
+        if self.aux_kv_dim > 0:
+            specs["indexer_k_tensor"] = TensorSpec(
                 ("batch_size", 1, 1, self.aux_kv_dim),
                 torch.bfloat16,
-            ),
-        }
+            )
+        return specs
 
     def setup_static_buffers(self, bucket_size: int) -> None:
         self.dsa_segment.setup_static_buffers(bucket_size)
@@ -196,8 +201,10 @@ class Glm5DecoderLayerGraphSegment:
             )["moe_output"]
             mlp_output = moe_output.view(batch_size, 1, self.hidden_size)
 
-        return {
+        out = {
             "hidden_states": residual + mlp_output,
             "primary_k_tensor": dsa_out["primary_k_tensor"],
-            "indexer_k_tensor": dsa_out["indexer_k_tensor"],
         }
+        if "indexer_k_tensor" in dsa_out:
+            out["indexer_k_tensor"] = dsa_out["indexer_k_tensor"]
+        return out

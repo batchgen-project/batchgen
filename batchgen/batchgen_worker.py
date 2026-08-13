@@ -9563,37 +9563,73 @@ class BatchGenWorker:
 					base_mtp=_GLM5_3D_MTP,
 				)
 			shared_dsa_buffers = {}
+			shared_reuse_buffers = {}
+			last_full_segment = None
+			last_cos_table = None
+			last_sin_table = None
+			last_index_topk = None
 			layer_segments = []
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				wrapper = decoder_layer.self_attn
 				indexer = wrapper.module.indexer
 				primary_blocked_k = primary_k_cache[layer_idx]
-				aux_blocked_k = aux_k_cache[layer_idx]
-				dummy = torch.empty(
-					1,
-					1,
-					indexer.rope_head_dim,
-					device=primary_blocked_k.device,
-					dtype=torch.bfloat16,
-				)
-				cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
-				dsa_segment = Glm5FullDsaAttnSegment(
-					wrapper=wrapper,
-					primary_blocked_k=primary_blocked_k,
-					aux_blocked_k=aux_blocked_k,
-					primary_page_table=primary_page_table,
-					aux_page_table=aux_page_table,
-					wq_b_weights=wrapper._fused_wqb_weights,
-					absorb_weights=wrapper._fp8_absorb_weights,
-					cuda_module=wrapper._indexer_cuda_module,
-					cos_table=cos_table,
-					sin_table=sin_table,
-					max_seqlen=graph_max_seqlen,
-					index_topk=indexer.index_topk,
-					page_size=primary_page_size,
-					aux_page_size=aux_page_size,
-					shared_buffers=shared_dsa_buffers,
-				)
+				if indexer is None:
+					# GLM-5.2 skip_topk layer: no indexer module. Reuse the
+					# most recent full layer's top-k (eager semantics,
+					# glm5_decode_selector.py:443-461) via the reuse segment.
+					# Rope tables are layer-invariant; borrow the producer's.
+					if last_full_segment is None:
+						raise RuntimeError(
+							"GLM-5 whole-model graph: first layer has no DSA "
+							"indexer; layer 0 must be a full indexer layer"
+						)
+					from batchgen.models.glm.glm5.reuse_topk_segment import (
+						Glm5ReuseTopkAttnSegment,
+					)
+					dsa_segment = Glm5ReuseTopkAttnSegment(
+						wrapper=wrapper,
+						primary_blocked_k=primary_blocked_k,
+						primary_page_table=primary_page_table,
+						absorb_weights=wrapper._fp8_absorb_weights,
+						cos_table=last_cos_table,
+						sin_table=last_sin_table,
+						max_seqlen=graph_max_seqlen,
+						index_topk=last_index_topk,
+						page_size=primary_page_size,
+						topk_source=last_full_segment,
+						shared_buffers=shared_reuse_buffers,
+					)
+				else:
+					aux_blocked_k = aux_k_cache[layer_idx]
+					dummy = torch.empty(
+						1,
+						1,
+						indexer.rope_head_dim,
+						device=primary_blocked_k.device,
+						dtype=torch.bfloat16,
+					)
+					cos_table, sin_table = indexer.rotary_emb(dummy, seq_len=graph_max_seqlen)
+					dsa_segment = Glm5FullDsaAttnSegment(
+						wrapper=wrapper,
+						primary_blocked_k=primary_blocked_k,
+						aux_blocked_k=aux_blocked_k,
+						primary_page_table=primary_page_table,
+						aux_page_table=aux_page_table,
+						wq_b_weights=wrapper._fused_wqb_weights,
+						absorb_weights=wrapper._fp8_absorb_weights,
+						cuda_module=wrapper._indexer_cuda_module,
+						cos_table=cos_table,
+						sin_table=sin_table,
+						max_seqlen=graph_max_seqlen,
+						index_topk=indexer.index_topk,
+						page_size=primary_page_size,
+						aux_page_size=aux_page_size,
+						shared_buffers=shared_dsa_buffers,
+					)
+					last_full_segment = dsa_segment
+					last_cos_table = cos_table
+					last_sin_table = sin_table
+					last_index_topk = indexer.index_topk
 				moe_segment = None
 				moe = getattr(decoder_layer, "mlp", None)
 				if isinstance(moe, Glm5MoE):

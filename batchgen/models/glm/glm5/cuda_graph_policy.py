@@ -17,7 +17,7 @@ import os
 from collections.abc import Mapping
 
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
-GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32]
+GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]
 
 
 def _is_glm_model(model_name: str | None) -> bool:
@@ -35,10 +35,14 @@ def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
             "glm_5_fp8",
             "glm-5.1-fp8",
             "glm_5.1_fp8",
+            "glm-5.2-fp8",
+            "glm_5.2_fp8",
             "glm5-fp8",
             "glm5_fp8",
             "glm51-fp8",
             "glm51_fp8",
+            "glm52-fp8",
+            "glm52_fp8",
         )
     )
 

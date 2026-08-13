@@ -358,7 +358,11 @@ class Glm5WholeModelSegment:
                 )
                 hidden_states = graph_out["hidden_states"]
                 self._copy_primary_kv(layer_idx, graph_out["primary_k_tensor"], None)
-                self._copy_aux_kv(layer_idx, graph_out["indexer_k_tensor"], None)
+                # GLM-5.2 skip layers have no indexer KV (reuse-topk segments
+                # return no indexer_k_tensor).
+                _indexer_k = graph_out.get("indexer_k_tensor")
+                if _indexer_k is not None:
+                    self._copy_aux_kv(layer_idx, _indexer_k, None)
                 if layer_idx in self._compare_probe_layer_set:
                     outputs[self._probe_output_name(layer_idx)] = hidden_states[:, -1, :]
         else:
