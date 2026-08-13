@@ -11189,6 +11189,12 @@ class BatchGenWorker:
 			from batchgen.timing import get_decode_timer
 			_dt = get_decode_timer()
 			if _dt and _dt.enabled:
+				# step_done() resolves this step's CUDA event pairs (one event
+				# sync). Without it every event keeps elapsed_ms=-1 and both
+				# the CSV and log_summary silently emit nothing — the GLM-5
+				# path never called it (kimi/minimax do; coverage audit
+				# wf_9441685c). Must precede log_summary/reset.
+				_dt.step_done()
 				_dt.log_summary()
 				_dt.reset()
 

@@ -186,6 +186,28 @@ class TimingStats:
     # -- Recording API -----------------------------------------------------
 
     @contextmanager
+    def host_timed(self, segment_name: str):
+        """Context manager: wall-clock a HOST-side segment (perf_counter).
+
+        Rows land in the same records/CSV as GPU events, distinguished by
+        the ``host:`` op-name prefix and layer_idx=-1, so the per-step
+        budget-closure analysis (step_wall == GPU critical path + serial
+        host + unattributed) reads one stream. Zero cost when disabled.
+        """
+        if not self.enabled:
+            yield
+            return
+        import time as _time
+        _t0 = _time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record(
+                f"host:{segment_name}", -1,
+                (_time.perf_counter() - _t0) * 1000.0,
+            )
+
+    @contextmanager
     def timed(self, op_name: str, layer_idx: int = 0):
         """Context manager: queue a pair of CUDA events around the block.
 
