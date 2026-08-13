@@ -1080,7 +1080,7 @@ class Glm5MoE3DBuffers:
             f"total={total_bytes / (1024**3):.2f} GiB"
         )
 
-    def resize_if_needed(self, global_bsz: int):
+    def resize_if_needed(self, global_bsz: int, num_tokens_per_rank: int = None):
         """Resize comm/routing buffers and — if per-expert worst case would exceed
         the 3D stride — regrow the per-expert 3D buffers.
 
@@ -1092,9 +1092,24 @@ class Glm5MoE3DBuffers:
         """
         grew_comm = global_bsz > self.max_global_bsz
         grew_mtp = global_bsz > self.max_tokens_padded
+        # `padded` (per-rank all-gather send buffer) is sized at creation-time
+        # num_tokens_per_rank; the class-level buffer outlives the batch job, so
+        # a later job with more per-rank tokens overruns it (bug_log 2026-08-13:
+        # `padded[:16]` on a 2-row buffer after an n32 -> n128 job sequence).
+        grew_padded = (
+            num_tokens_per_rank is not None
+            and num_tokens_per_rank > self.padded.shape[0]
+        )
 
-        if not grew_comm and not grew_mtp:
+        if not grew_comm and not grew_mtp and not grew_padded:
             return
+
+        if grew_padded:
+            logging.info(
+                f"[Glm5MoE3DBuffers] Resizing padded send buffer: "
+                f"{self.padded.shape[0]} -> {num_tokens_per_rank}")
+            self.padded = torch.zeros(
+                num_tokens_per_rank, self.H, dtype=torch.bfloat16, device=self.device)
 
         if grew_comm:
             logging.info(
@@ -1780,7 +1795,7 @@ class Glm5MoE(nn.Module):
         num_global = ntp * self.world_size
         topk = self.num_experts_per_tok
         buf = Glm5MoE._3d_buf
-        buf.resize_if_needed(num_global)
+        buf.resize_if_needed(num_global, num_tokens_per_rank=ntp)
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
             logging.warning(
@@ -1789,7 +1804,10 @@ class Glm5MoE(nn.Module):
 
         # 1) AllGather
         all_tokens = buf.all_tokens[:num_global]
-        padded = buf.padded
+        # Slice the send buffer to exactly ntp rows: ncclAllGather sends
+        # input.numel(), so an oversized `padded` (left by a bigger previous
+        # batch job) would rank-stride the gather wider than consumers read.
+        padded = buf.padded[:ntp]
         padded.zero_()
         if num_tokens > 0:
             padded[:num_tokens] = hidden_states

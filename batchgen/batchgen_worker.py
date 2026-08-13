@@ -240,6 +240,9 @@ ENABLE_DECODE_PREEMPTION = os.environ.get('BATCHGEN_ENABLE_DECODE_PREEMPTION', '
 # gpu_kv_cache = GPU_mem * gpu_memory_frac - model_instance_size
 _GPU_KV_CACHE_SIZE_OVERRIDE = os.environ.get("BATCHGEN_GPU_KV_CACHE_SIZE_GB")
 NUM_GPUS_PER_NODE = int(os.environ.get('NUM_GPUS_PER_NODE', '8'))
+# Input-ids tables at or above this size use one node-shared shm segment
+# (see _ensure_buffer_pool); smaller tables stay private per rank.
+NODE_SHARED_INPUT_IDS_MIN_BYTES = 1 << 30
 
 
 # Note: Generic Scheduler removed - config is now created by model-specific Planner in initializer
@@ -4447,15 +4450,28 @@ class BatchGenWorker:
 		dec_w = max(required_decode_width, old.max_decoding_length if old is not None else 0)
 
 		self._buffer_pool_generation += 1
-		node_id = self.rank // NUM_GPUS_PER_NODE
-		name = (
-			f"batchgen_input_ids_{self._node_shared_tag()}"
-			f"_n{node_id}_g{self._buffer_pool_generation}"
-		)
-		is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
-		shared_input_ids, shm = allocate_node_shared_int64(
-			name, rows, in_w, is_creator, dist.barrier
-		)
+		# Node-shared input-ids dedup exists for huge tables (K3's 1M-token
+		# context OOM'd the node with per-rank copies). Below the threshold the
+		# dedup saves almost nothing, and sharing turns every slot zero/rewrite
+		# during admission into a cross-rank mutation on rows another
+		# (non-lockstep) rank may still be reading — observed as cross-sequence
+		# token corruption on GLM-5.2 multi-batch lifetimes (17.97% MMLU,
+		# bug_log 2026-08-13). Small tables keep the pre-sharing private
+		# allocation, which is the configuration validated correct.
+		# COLLECTIVE-SAFE: rows/in_w are identical on every rank (derived from
+		# the all-gathered batch), so all ranks take the same branch.
+		if rows * in_w * 8 >= NODE_SHARED_INPUT_IDS_MIN_BYTES:
+			node_id = self.rank // NUM_GPUS_PER_NODE
+			name = (
+				f"batchgen_input_ids_{self._node_shared_tag()}"
+				f"_n{node_id}_g{self._buffer_pool_generation}"
+			)
+			is_creator = (self.rank % NUM_GPUS_PER_NODE) == 0
+			shared_input_ids, shm = allocate_node_shared_int64(
+				name, rows, in_w, is_creator, dist.barrier
+			)
+		else:
+			shared_input_ids, shm = None, None
 		new_pool = QueryBookBufferPool(
 			num_sequences=rows,
 			input_ids_width=in_w,
@@ -4464,13 +4480,14 @@ class BatchGenWorker:
 			input_ids_buffer=shared_input_ids,
 			input_ids_shm=shm,
 		)
-		shared_gib = rows * in_w * 8 / 2**30
+		input_gib = rows * in_w * 8 / 2**30
 		private_gib = rows * dec_w * 8 / 2**30
+		mode = f"SHARED per node ('{name}')" if shm is not None else "PRIVATE per rank"
 		if old is None:
 			logging.info(
 				f"Rank {self.rank}: QueryBook pool allocated ({reason}): rows={rows}, "
 				f"input_ids_width={in_w}, decoded_width={dec_w} -> input_ids "
-				f"{shared_gib:.3f} GiB SHARED per node ('{name}'), decoded_tokens "
+				f"{input_gib:.3f} GiB {mode}, decoded_tokens "
 				f"{private_gib:.3f} GiB per rank"
 			)
 		else:
@@ -4479,7 +4496,7 @@ class BatchGenWorker:
 				f"{old.num_sequences}->{rows}, input_ids_width "
 				f"{old.input_ids_width}->{in_w}, decoded_width "
 				f"{old.max_decoding_length}->{dec_w}; new input_ids segment "
-				f"{shared_gib:.3f} GiB SHARED per node ('{name}')"
+				f"{input_gib:.3f} GiB {mode}"
 			)
 			new_pool.adopt(old)
 		self._buffer_pool = new_pool
