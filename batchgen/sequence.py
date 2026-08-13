@@ -69,6 +69,11 @@ class SequenceEntry:
         'status', 'decoded_length', 'current_context_length',
         'input_ids', 'decoded_tokens',
         'kv_token_budget', 'assigned_rank', 'text', 'eos_reached',
+        # Decode-side DP-group (M2b): 0..num_dp-1, the group of G ranks that
+        # owns this sequence in DP-(world/G) x TP-G decode. None until the
+        # prefill->decode transition assigns it; unused (stays None) for the
+        # pure-DP G==1 path, which keeps keying decode on assigned_rank.
+        'decode_dp_group',
         # Two-page buffer tracking
         'gpu_pages_allocated',
         # Track whether this sequence has had its initial GPU reservation
@@ -138,6 +143,7 @@ class SequenceEntry:
         self.decoded_tokens: Optional[torch.Tensor] = None
         self.kv_token_budget: int = prompt_length + max_decode_length
         self.assigned_rank: Optional[int] = None
+        self.decode_dp_group: Optional[int] = None
         self.text = text
         self.eos_reached: bool = False
         

@@ -1606,6 +1606,53 @@ class BatchGenWorker:
 			self.global_batch.assign_rank(uuid, min_rank)
 			rank_counts[min_rank] += 1
 
+	def _decode_attn_tp_size(self) -> int:
+		"""G (attn_tp_size) for decode; 1 (pure-DP) unless the PSM head-shards."""
+		pm = getattr(self, "parallel_manager", None)
+		return int(getattr(pm, "attn_tp_size", 1)) if pm is not None else 1
+
+	def _assign_decode_dp_groups(self, uuids: List[str]) -> None:
+		"""Stamp ``seq.decode_dp_group`` at the prefill->decode transition (M2b).
+
+		ADDITIVE — ``assigned_rank`` (prefill DP-32) is untouched. For G==1 the
+		decode group equals the rank and nothing keys on this field, so we skip
+		entirely: the validated pure-DP path never carries a group id. For G>1
+		the G ranks of a group must own the SAME sequences, so the assignment is
+		over ``num_dp = world_size // G`` groups, L^2-balanced against the
+		sequences already in decode (mirrors ``_assign_admitted_sequences_to_
+		ranks``). Deterministic across ranks: identical inputs -> identical map.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1 or not uuids:
+			return
+		from batchgen.decode_dp_group import (
+			assign_decode_dp_groups,
+			num_decode_dp_groups,
+		)
+		num_dp = num_decode_dp_groups(self.world_size, G)
+		prior = [0.0] * num_dp
+		to_assign = set(uuids)
+		for seq in self.global_batch:
+			if seq.uuid in to_assign or seq.decode_dp_group is None:
+				continue
+			L = getattr(seq, "prompt_length", 0) or 0
+			prior[seq.decode_dp_group] += float(L) * float(L)
+		lengths, seqs = [], []
+		for uuid in uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			# Idempotent: only FIRST entry (PREFILLED->IN_DECODE). A re-entry
+			# (ON_HOLD->IN_DECODE) keeps its group — its head-sharded KDA state
+			# already lives on that group's ranks, so re-grouping would strand it.
+			if seq is None or seq.decode_dp_group is not None:
+				continue
+			lengths.append(getattr(seq, "prompt_length", 0) or 0)
+			seqs.append(seq)
+		if not seqs:
+			return
+		groups = assign_decode_dp_groups(lengths, num_dp, prior_load=prior)
+		for seq, g in zip(seqs, groups):
+			seq.decode_dp_group = g
+
 	def _bind_local_sequence_to_query_book(
 		self,
 		uuid: str,
@@ -3176,6 +3223,37 @@ class BatchGenWorker:
 		logging.debug(
 			"Rank %s Loaded host KV for %d sequences into GPU cache in %.3fs",
 			self.rank, len(global_sequence_ids), load_duration,
+		)
+
+		# M2b: prefill->decode KDA state reshard (head-shard 96 -> 96/G per rank
+		# + rank->group move). MLA compressed latent is REPLICATED (this same
+		# per-node shared-host load already fans 1->G with no cross-rank move);
+		# the KDA recurrent/conv state must be head-sliced and moved. No-op for
+		# the validated G==1 pure-DP path.
+		self._reshard_kda_state_to_decode_group(global_sequence_ids)
+
+	def _reshard_kda_state_to_decode_group(
+		self, global_sequence_ids: List[int]
+	) -> None:
+		"""Head-shard + rank->group move of KDA state at the decode transition.
+
+		The reshard LOGIC (head_shard_recurrent/conv, gather_*, the move plan) is
+		implemented and unit-tested in ``batchgen.kv_cache.kda_state_reshard``;
+		the pure slice is bit-exact per head (P0.6). Executing it over the LIVE
+		KDAStateGPUManager pools + KVMigrationHelper's Gloo transport is the M2b
+		multi-GPU server-integration gate (the NEXT gate), not this pass. G==1
+		(pure DP, prefill rank == decode rank) needs no reshard and returns here.
+		"""
+		G = self._decode_attn_tp_size()
+		if G <= 1:
+			return
+		raise NotImplementedError(
+			"prefill->decode KDA head-shard reshard (attn_tp_size>1) is not "
+			"wired to the live Gloo transport — that is the M2b multi-GPU "
+			"server-integration gate. The reshard arithmetic is implemented and "
+			"unit-tested (batchgen.kv_cache.kda_state_reshard); hook it onto the "
+			"KDAStateGPUManager recurrent/conv pools over KVMigrationHelper's "
+			"Gloo group at 8-GPU bring-up. Run attn_tp_size==1 until then."
 		)
 
 	def _release_gpu_kv_pages(self, local_sequence_ids: List[int]) -> None:
@@ -5376,6 +5454,9 @@ class BatchGenWorker:
 		# Get local indices for sequences belonging to THIS rank
 		new_local_indices = self._get_local_indices_for_uuids(new_uuids)
 		
+		# M2b: assign the decode DP-group before the transition (no-op for G==1).
+		self._assign_decode_dp_groups(new_uuids)
+
 		if new_local_indices:
 			# Allocate and load (without final rebuild)
 			self._allocate_and_load_gpu_kv_for_new_sequences(new_local_indices)
@@ -6232,6 +6313,9 @@ class BatchGenWorker:
 				if decode_uuids:
 					self._sync_sequence_metadata(decode_uuids)
 
+				# M2b: stamp the decode DP-group before local-index resolution so
+				# the G ranks of a group resolve the SAME sequences (no-op, G==1).
+				self._assign_decode_dp_groups(decode_uuids)
 				local_decode_indices = self._get_local_indices_for_uuids(decode_uuids)
 				global_decode_sequences = self._debug_sequences_for_decode_uuids(decode_uuids)
 				AttnWrapperBase.batchgen_debug = self._active_batchgen_debug_for_sequences(
@@ -8861,8 +8945,17 @@ class BatchGenWorker:
 		self._current_decode_rank_token_counts = all_rank_counts
 
 		if max_batch_size > 0 and hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
+			# M2b: under DP-(world/G) x TP-G decode the 32-way max above is the
+			# per-GROUP batch B_grp (the G ranks of a group hold identical
+			# sequences). Decode scatters those rows across the group's G ranks
+			# before the DP-32 resident MoE, so the padded all_gather/all_reduce
+			# layout is sized by the POST-scatter share ceil(B_grp/G), not B_grp.
+			# G==1 -> ceil(max/1)==max, byte-identical to the pure-DP path.
+			from batchgen.decode_dp_group import moe_ntp_from_group_max
+			_G = getattr(self.parallel_manager, "attn_tp_size", 1)
+			moe_ntp = moe_ntp_from_group_max(max_batch_size, _G)
 			if hasattr(self.parallel_manager, 'set_num_tokens_per_rank'):
-				self.parallel_manager.set_num_tokens_per_rank(max_batch_size)
+				self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
 			if hasattr(self.parallel_manager, 'set_rank_token_counts'):
 				self.parallel_manager.set_rank_token_counts(all_rank_counts)
 
