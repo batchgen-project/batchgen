@@ -10189,6 +10189,11 @@ class BatchGenWorker:
 
 				# Batch may have changed - need to verify page table
 				_page_table_verified_this_batch = False
+				# Batch (or its slot map) may have changed: drop the hoisted
+				# per-step DSA slot-index overrides so the next step rebuilds
+				# them once (P0b — perf plan glm52-h200-perf-optimization).
+				GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+				GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
 
 				# Post-boundary: verify page table matches batch and fix if needed
 				if batch and gpu_manager and gpu_manager.is_initialized and gpu_manager._gpu_page_table_manager:
@@ -10482,7 +10487,39 @@ class BatchGenWorker:
 									seq.log_event(SeqEvent.PAGE_REBUILD, self.rank,
 										f"batch_size={len(batch)}")
 						_page_table_verified_this_batch = True
-				
+
+					# P0b (perf plan glm52-h200-perf-optimization): build the DSA
+					# page-slot index tensors ONCE per batch-epoch and publish them
+					# via the existing selector override hook. Without this, every
+					# one of the 78 layers rebuilt them from Python lists twice per
+					# step (156 pageable-H2D copies + stream syncs per step). The
+					# overrides are cleared wherever the batch/slot map can change
+					# (boundary, decode end), mirroring _page_table_verified_this_batch.
+					if GLM5AttnWrapper.glm5_decode_primary_slot_indices is None:
+						_aux_manager = getattr(self.core_engine, "gpu_paged_kv_manager_aux", None)
+						if (
+							gpu_manager is not None
+							and getattr(gpu_manager, "_gpu_page_table_manager", None) is not None
+							and _aux_manager is not None
+							and getattr(_aux_manager, "_gpu_page_table_manager", None) is not None
+						):
+							from batchgen.models.glm.glm5.decode_utils import (
+								build_batch_slot_indices as _build_slots,
+							)
+							_gb = Attn_Wrapper.cur_batch
+							GLM5AttnWrapper.glm5_decode_primary_slot_indices = _build_slots(
+								_gb,
+								gpu_manager._gpu_page_table_manager.seq_id_to_slot,
+								len(_gb),
+								gpu_manager.device,
+							)
+							GLM5AttnWrapper.glm5_decode_aux_slot_indices = _build_slots(
+								_gb,
+								_aux_manager._gpu_page_table_manager.seq_id_to_slot,
+								len(_gb),
+								_aux_manager.device,
+							)
+
 				# NOTE: Do NOT skip forward pass even with empty batch!
 				# MoE models have all-to-all collective operations that ALL ranks must participate in.
 				# Skipping would cause deadlock as other ranks wait for this rank.
