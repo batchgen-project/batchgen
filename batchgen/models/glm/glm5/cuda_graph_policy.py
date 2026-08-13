@@ -17,7 +17,7 @@ import os
 from collections.abc import Mapping
 
 GLM5_WHOLE_MODEL_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE"
-GLM5_POWER_OF_TWO_BUCKETS_32 = [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]
+GLM5_POWER_OF_TWO_BUCKETS_32 = [64, 192, 256]
 
 
 def _is_glm_model(model_name: str | None) -> bool:
