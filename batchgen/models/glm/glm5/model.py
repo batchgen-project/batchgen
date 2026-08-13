@@ -1845,7 +1845,16 @@ class Glm5MoE(nn.Module):
             )
 
         # 3) 3D dispatch
-        buf.dispatched_x.zero_()
+        # Zero only the rows a GEMM tile can read this step, not the whole
+        # [E*mtp, H] buffer: mtp is pinned at 4096 for capacity, but one expert
+        # can receive at most num_global tokens, and the grouped GEMM / 3D
+        # act-quant read at most ceil(count/128)*128 rows per expert. Full
+        # zero_() was 1.61 GB x 75 MoE layers = 121 GB/step of B-independent
+        # memset (perf plan glm52-h200-perf-optimization, Phase 1 item #1).
+        zero_rows = min(buf.max_tokens_padded, num_global + 128)
+        buf.dispatched_x.view(
+            self.experts_per_rank, buf.max_tokens_padded, hidden_size
+        )[:, :zero_rows].zero_()
         expert_counts, topk_pos = dispatch_scatter_3d(
             all_tokens, topk_idx.to(torch.int32),
             buf.dispatched_x,
@@ -1940,14 +1949,19 @@ class Glm5MoE(nn.Module):
             inter_quant, inter_scale = _act_quant(intermediate)
             inter_scale_t = inter_scale.t().contiguous()
 
-        # S3: down projection
-        result = grouped_fp8_blockwise_s3(
+        # S3: down projection — write straight into the shared expert_out
+        # buffer (kernel supports output=). The former fresh-tensor + full
+        # [E*mtp, H] copy_ moved 2 x 1.61 GB x 75 layers = 242 GB/step
+        # (perf plan glm52-h200-perf-optimization, Phase 1 item #1). Stale rows
+        # beyond each expert's count are never read: reduce_weighted_scatter
+        # only visits this step's topk_pos slots.
+        grouped_fp8_blockwise_s3(
             inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
             self.fp8_down_w3d.view(torch.float8_e4m3fn),
             self.fp8_down_ws3d,
             seqlens, cu_seqlens, avg,
+            output=buf.expert_out[:E * mtp],
         )
-        buf.expert_out[:E * mtp].copy_(result[:E * mtp])
 
     # ── Gate + Expert Compute ──
 
