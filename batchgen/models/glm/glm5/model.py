@@ -2318,8 +2318,11 @@ class Glm5DecoderLayer(nn.Module):
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
 
+        # self_attn is the GLM5AttnWrapper; the config (with .phase) lives on
+        # the wrapped module.
+        _attn_cfg = getattr(getattr(self.self_attn, 'module', self.self_attn), 'config', None)
         dt = (get_decode_timer()
-              if getattr(self.self_attn.config, 'phase', 'decode') == 'decode'
+              if getattr(_attn_cfg, 'phase', 'decode') == 'decode'
               else None)
         li = self.layer_idx
 
