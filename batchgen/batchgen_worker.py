@@ -8377,6 +8377,13 @@ class BatchGenWorker:
 				seq.host_pages_allocated = 0
 				seq.host_token_capacity = 0
 				self._sequences_with_gpu_kv.discard(uuid)
+				# M2b (d): eviction destroys the head-sharded KDA state on the
+				# group's ranks, so drop the decode DP-group. A re-prefilled
+				# sequence must re-group fresh — otherwise _assign_decode_dp_groups
+				# treats the stale non-None group id as a preserved re-entry and
+				# skips it, stranding the sequence with no live state. No-op for
+				# G==1 (the field is always None on the validated pure-DP path).
+				seq.decode_dp_group = None
 				self.global_batch.update_status(uuid, SequenceStatus.EVICTED)
 
 			evicted_set = set(host_evicted_uuids)

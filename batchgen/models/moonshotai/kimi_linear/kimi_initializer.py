@@ -89,7 +89,18 @@ class KimiLinearInitializer:
         self.engine_config = EngineConfig()
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        self.planner = KimiLinearPlanner(is_k3=self.is_k3)
+        # M2b: decode head-parallel TP degree G (attention_group_size). The
+        # planner threads it into Basic_Config, which the PSM reads to build the
+        # attn_tp sub-group. There is no server CLI/config seam for it yet, so
+        # it is a launch-time env knob (model-scoped); default 1 keeps the
+        # validated pure-DP-32 path byte-identical. world_size must be a
+        # multiple of G (asserted downstream in the PSM).
+        G = int(os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1"))
+        self.planner = KimiLinearPlanner(
+            is_k3=self.is_k3, attention_group_size=G
+        )
+        if self.global_rank == 0:
+            logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
         self.engine_config = self.planner.generate_config(self.engine_config)
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")
