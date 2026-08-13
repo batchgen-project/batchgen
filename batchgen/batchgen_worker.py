@@ -9506,11 +9506,19 @@ class BatchGenWorker:
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
 				wrapper = decoder_layer.self_attn
 				indexer = getattr(wrapper.module, "indexer", None)
-				if indexer is None:
-					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires DSA indexer")
+				if indexer is None and layer_idx == 0:
+					# Reuse-topk segments need a producing full layer first.
+					raise RuntimeError(
+						"Layer 0: GLM-5 whole-model graph requires a DSA "
+						"indexer on the first layer")
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					wrapper.initialize_decode_absorb()
-				if getattr(wrapper, "_fused_wqb_weights", None) is None or getattr(wrapper, "_indexer_cuda_module", None) is None:
+				if indexer is not None and (
+					getattr(wrapper, "_fused_wqb_weights", None) is None
+					or getattr(wrapper, "_indexer_cuda_module", None) is None
+				):
+					# Indexer-only kernels; GLM-5.2 skip layers have none and
+					# get Glm5ReuseTopkAttnSegment instead.
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
