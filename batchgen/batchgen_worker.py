@@ -9522,9 +9522,9 @@ class BatchGenWorker:
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
-				if getattr(wrapper, "_fused_wqb_weights", None) is None:
+				if indexer is not None and getattr(wrapper, "_fused_wqb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused WQB weights")
-				if getattr(wrapper, "_indexer_cuda_module", None) is None:
+				if indexer is not None and getattr(wrapper, "_indexer_cuda_module", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused indexer CUDA module")
 			moe_not_ready = []
 			for layer_idx, decoder_layer in enumerate(self.model.model.layers):
