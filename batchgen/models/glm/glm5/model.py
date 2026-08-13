@@ -2003,21 +2003,26 @@ class Glm5MoE(nn.Module):
         a fixed per-row accumulation order so valid rows do not drift when CUDA
         graph buckets include rank padding.
         """
+        from contextlib import nullcontext as _nullctx
         from batchgen.moe.routing import gate_sigmoid_topk_cuda
-        if _glm5_moe_router_mode() == "cublas":
-            router_logits = F.linear(x.float(), self.gate.weight.float())
-        else:
-            from batchgen.moe.routing import glm5_router_gemm_cuda
-            router_logits = glm5_router_gemm_cuda(
-                x,
-                self.gate.weight,
+        from batchgen.timing import get_decode_timer
+        dt = get_decode_timer()
+        with (dt.timed("router_gemm", 0) if dt else _nullctx()):
+            if _glm5_moe_router_mode() == "cublas":
+                router_logits = F.linear(x.float(), self.gate.weight.float())
+            else:
+                from batchgen.moe.routing import glm5_router_gemm_cuda
+                router_logits = glm5_router_gemm_cuda(
+                    x,
+                    self.gate.weight,
+                )
+        with (dt.timed("gate_topk", 0) if dt else _nullctx()):
+            return gate_sigmoid_topk_cuda(
+                router_logits,
+                self.gate.e_score_correction_bias.float(),
+                k=self.num_experts_per_tok,
+                routed_scaling_factor=self.gate.routed_scaling_factor,
             )
-        return gate_sigmoid_topk_cuda(
-            router_logits,
-            self.gate.e_score_correction_bias.float(),
-            k=self.num_experts_per_tok,
-            routed_scaling_factor=self.gate.routed_scaling_factor,
-        )
 
     def expert_compute_persistent(self, global_x, topk_idx, topk_weight):
         """All-persistent expert compute. Zero CPU-GPU sync on WGMMA path."""
