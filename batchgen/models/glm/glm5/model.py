@@ -1780,6 +1780,12 @@ class Glm5MoE(nn.Module):
         addition at the end (minimax has no shared expert).
         """
         import torch.distributed as dist
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = get_decode_timer()
+        li = self.layer_idx
+
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         identity = hidden_states
@@ -1807,18 +1813,21 @@ class Glm5MoE(nn.Module):
         # Slice the send buffer to exactly ntp rows: ncclAllGather sends
         # input.numel(), so an oversized `padded` (left by a bigger previous
         # batch job) would rank-stride the gather wider than consumers read.
-        padded = buf.padded[:ntp]
-        padded.zero_()
-        if num_tokens > 0:
-            padded[:num_tokens] = hidden_states
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(
-                all_tokens, padded,
-                stream=torch.cuda.current_stream(self.device),
-            )
+        with (dt.timed("moe_pad_copy", li) if dt else _nullctx()):
+            padded = buf.padded[:ntp]
+            padded.zero_()
+            if num_tokens > 0:
+                padded[:num_tokens] = hidden_states
+        with (dt.timed("allgather", li) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_gather(
+                    all_tokens, padded,
+                    stream=torch.cuda.current_stream(self.device),
+                )
 
         # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
-        topk_idx, topk_weight = self._gate_decode(all_tokens)
+        with (dt.timed("routing", li) if dt else _nullctx()):
+            topk_idx, topk_weight = self._gate_decode(all_tokens)
 
         # Mask padding tokens so they don't inflate expert_counts nor pollute
         # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
@@ -1827,22 +1836,23 @@ class Glm5MoE(nn.Module):
         # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
         rank_counts = Glm5MoE._rank_token_counts
         if rank_counts is not None:
-            positions = torch.arange(num_global, device=self.device)
-            rank_ids = positions // ntp
-            local_pos = positions % ntp
-            max_valid = rank_counts[rank_ids]
-            padding_mask = local_pos >= max_valid
-            padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
-            topk_idx = torch.where(
-                padding_mask_2d,
-                torch.full_like(topk_idx, -1),
-                topk_idx,
-            )
-            topk_weight = torch.where(
-                padding_mask_2d,
-                torch.zeros_like(topk_weight),
-                topk_weight,
-            )
+            with (dt.timed("routing_pad_mask", li) if dt else _nullctx()):
+                positions = torch.arange(num_global, device=self.device)
+                rank_ids = positions // ntp
+                local_pos = positions % ntp
+                max_valid = rank_counts[rank_ids]
+                padding_mask = local_pos >= max_valid
+                padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
+                topk_idx = torch.where(
+                    padding_mask_2d,
+                    torch.full_like(topk_idx, -1),
+                    topk_idx,
+                )
+                topk_weight = torch.where(
+                    padding_mask_2d,
+                    torch.zeros_like(topk_weight),
+                    topk_weight,
+                )
 
         # 3) 3D dispatch
         # Zero only the rows a GEMM tile can read this step, not the whole
@@ -1851,44 +1861,50 @@ class Glm5MoE(nn.Module):
         # act-quant read at most ceil(count/128)*128 rows per expert. Full
         # zero_() was 1.61 GB x 75 MoE layers = 121 GB/step of B-independent
         # memset (perf plan glm52-h200-perf-optimization, Phase 1 item #1).
-        zero_rows = min(buf.max_tokens_padded, num_global + 128)
-        buf.dispatched_x.view(
-            self.experts_per_rank, buf.max_tokens_padded, hidden_size
-        )[:, :zero_rows].zero_()
-        expert_counts, topk_pos = dispatch_scatter_3d(
-            all_tokens, topk_idx.to(torch.int32),
-            buf.dispatched_x,
-            self.routed_expert_start_idx, self.experts_per_rank,
-            buf.max_tokens_padded,
-            buf.expert_counts, buf.expert_counters,
-            buf.topk_pos[:num_global * topk],
-        )
+        with (dt.timed("dispatch_memset", li) if dt else _nullctx()):
+            zero_rows = min(buf.max_tokens_padded, num_global + 128)
+            buf.dispatched_x.view(
+                self.experts_per_rank, buf.max_tokens_padded, hidden_size
+            )[:, :zero_rows].zero_()
+        with (dt.timed("dispatch", li) if dt else _nullctx()):
+            expert_counts, topk_pos = dispatch_scatter_3d(
+                all_tokens, topk_idx.to(torch.int32),
+                buf.dispatched_x,
+                self.routed_expert_start_idx, self.experts_per_rank,
+                buf.max_tokens_padded,
+                buf.expert_counts, buf.expert_counters,
+                buf.topk_pos[:num_global * topk],
+            )
 
         # 4) FP8 blockwise GEMM on 3D buffer
         self._fp8_blockwise_gemm_3d(buf, expert_counts)
 
         # 5) Weighted scatter reduce
         result_buf = buf.result_buffer[:num_global]
-        result_buf.zero_()
-        global_results = reduce_weighted_scatter(
-            buf.expert_out, topk_pos, topk_weight,
-            num_global, hidden_size, topk,
-            output=result_buf,
-        )
+        with (dt.timed("scatter_memset", li) if dt else _nullctx()):
+            result_buf.zero_()
+        with (dt.timed("scatter_reduce", li) if dt else _nullctx()):
+            global_results = reduce_weighted_scatter(
+                buf.expert_out, topk_pos, topk_weight,
+                num_global, hidden_size, topk,
+                output=result_buf,
+            )
 
         # 6) AllReduce across EP ranks
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                global_results, op=dist.ReduceOp.SUM,
-                stream=torch.cuda.current_stream(self.device),
-            )
+        with (dt.timed("allreduce", li) if dt else _nullctx()):
+            with self.comm.change_state(enable=True):
+                self.comm.all_reduce(
+                    global_results, op=dist.ReduceOp.SUM,
+                    stream=torch.cuda.current_stream(self.device),
+                )
 
         # 7) Slice local + add shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
         start = self.rank * ntp
         out = global_results[start:start + num_tokens].to(hidden_states.dtype)
-        out = out + self.shared_expert_forward(identity)
+        with (dt.timed("shared_expert", li) if dt else _nullctx()):
+            out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
@@ -1897,6 +1913,12 @@ class Glm5MoE(nn.Module):
         Mirrors MiniMaxM25MoE._fp8_blockwise_gemm_3d (model.py:1106-1177).
         Reads buf.dispatched_x, writes buf.expert_out.
         """
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = get_decode_timer()
+        li = self.layer_idx
+
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
             logging.warning(
                 f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
@@ -1913,41 +1935,46 @@ class Glm5MoE(nn.Module):
         avg = max(mtp // max(E, 1), 1)
 
         # Stage input quant (3D if CUDA ops available, else Triton fallback)
-        if _GLM5_HAS_FP8_OPS:
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
-            x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
-            x_quant = x_quant_3d.view(E * mtp, K)
-            x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
-        else:
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
-            x_scale_t = x_scale.t().contiguous()
+        with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
+            if _GLM5_HAS_FP8_OPS:
+                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+                x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
+                x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
+                x_quant = x_quant_3d.view(E * mtp, K)
+                x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
+            else:
+                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
+                x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
+                x_scale_t = x_scale.t().contiguous()
 
         # S1: gate + up + SiLU (fused if possible) → BF16 intermediate
         if _GLM5_HAS_FP8_OPS:
-            s1_result = grouped_fp8_blockwise_fused_s1(
-                x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                seqlens, cu_seqlens, avg,
-            )
-            inter_quant_3d, inter_scale_3d = act_quant_3d(
-                s1_result.view(E, mtp, N), seqlens)
-            inter_quant = inter_quant_3d.view(E * mtp, N)
-            inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
+            with (dt.timed("grouped_gemm_s1", li) if dt else _nullctx()):
+                s1_result = grouped_fp8_blockwise_fused_s1(
+                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                    seqlens, cu_seqlens, avg,
+                )
+            with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
+                inter_quant_3d, inter_scale_3d = act_quant_3d(
+                    s1_result.view(E, mtp, N), seqlens)
+                inter_quant = inter_quant_3d.view(E * mtp, N)
+                inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
         else:
-            intermediate = grouped_fp8_blockwise_s1_silu(
-                x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                seqlens, cu_seqlens, avg,
-            )
+            with (dt.timed("grouped_gemm_s1", li) if dt else _nullctx()):
+                intermediate = grouped_fp8_blockwise_s1_silu(
+                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
+                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                    seqlens, cu_seqlens, avg,
+                )
             from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            inter_quant, inter_scale = _act_quant(intermediate)
-            inter_scale_t = inter_scale.t().contiguous()
+            with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
+                inter_quant, inter_scale = _act_quant(intermediate)
+                inter_scale_t = inter_scale.t().contiguous()
 
         # S3: down projection — write straight into the shared expert_out
         # buffer (kernel supports output=). The former fresh-tensor + full
@@ -1955,13 +1982,14 @@ class Glm5MoE(nn.Module):
         # (perf plan glm52-h200-perf-optimization, Phase 1 item #1). Stale rows
         # beyond each expert's count are never read: reduce_weighted_scatter
         # only visits this step's topk_pos slots.
-        grouped_fp8_blockwise_s3(
-            inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
-            self.fp8_down_w3d.view(torch.float8_e4m3fn),
-            self.fp8_down_ws3d,
-            seqlens, cu_seqlens, avg,
-            output=buf.expert_out[:E * mtp],
-        )
+        with (dt.timed("grouped_gemm_s3", li) if dt else _nullctx()):
+            grouped_fp8_blockwise_s3(
+                inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+                self.fp8_down_w3d.view(torch.float8_e4m3fn),
+                self.fp8_down_ws3d,
+                seqlens, cu_seqlens, avg,
+                output=buf.expert_out[:E * mtp],
+            )
 
     # ── Gate + Expert Compute ──
 
@@ -2287,9 +2315,18 @@ class Glm5DecoderLayer(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = (get_decode_timer()
+              if getattr(self.self_attn.config, 'phase', 'decode') == 'decode'
+              else None)
+        li = self.layer_idx
+
         # Pre-norm attention
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        with (dt.timed("input_norm", li) if dt else _nullctx()):
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states, attn_weights, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -2300,15 +2337,19 @@ class Glm5DecoderLayer(nn.Module):
 
         # Fused residual add + RMSNorm (saves one HBM pass of [B, 6144])
         from batchgen.attention.fused_kernels import cuda_add_rmsnorm
-        hidden_states, residual = cuda_add_rmsnorm(
-            residual, hidden_states,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
-        )
+        with (dt.timed("add_rmsnorm", li) if dt else _nullctx()):
+            hidden_states, residual = cuda_add_rmsnorm(
+                residual, hidden_states,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
 
         # MoE/FFN
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        with (dt.timed("dense_mlp", li)
+              if dt and isinstance(self.mlp, Glm5MLP) else _nullctx()):
+            hidden_states = self.mlp(hidden_states)
+        with (dt.timed("residual_add", li) if dt else _nullctx()):
+            hidden_states = residual + hidden_states
 
         return hidden_states, attn_weights, present
 
@@ -2356,8 +2397,15 @@ class Glm5Model(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
         use_cache: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, ...]:
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = (get_decode_timer()
+              if getattr(self.config, 'phase', 'decode') == 'decode' else None)
+
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            with (dt.timed("embed", 0) if dt else _nullctx()):
+                inputs_embeds = self.embed_tokens(input_ids)
 
         hidden_states = inputs_embeds
 
@@ -2366,7 +2414,8 @@ class Glm5Model(nn.Module):
             hidden_states, _, _ = layer(
                 hidden_states, attention_mask, position_ids, past_kv, use_cache,
             )
-        hidden_states = self.norm(hidden_states)
+        with (dt.timed("final_norm", 0) if dt else _nullctx()):
+            hidden_states = self.norm(hidden_states)
         return (hidden_states,)
 
 
@@ -2405,6 +2454,12 @@ class Glm5ForCausalLM(nn.Module):
             use_cache=use_cache,
         )
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        from contextlib import nullcontext as _nullctx
+        from batchgen.timing import get_decode_timer
+
+        dt = (get_decode_timer()
+              if getattr(self.config, 'phase', 'decode') == 'decode' else None)
+        with (dt.timed("lm_head", 0) if dt else _nullctx()):
+            logits = self.lm_head(hidden_states)
         from types import SimpleNamespace
         return SimpleNamespace(logits=logits)

@@ -345,33 +345,34 @@ def build_glm5_dsa_flashmla_inputs(
     manager_device = gpu_paged_kv_manager.device
     seq_lengths_i32 = new_token_pos.to(dtype=torch.int32, device=manager_device)
     aux_device = gpu_paged_kv_manager_aux.device
-    primary_slot_indices = _slot_indices_override(
-        "glm5_decode_primary_slot_indices",
-        bsz,
-        manager_device,
-    )
-    aux_slot_indices = _slot_indices_override(
-        "glm5_decode_aux_slot_indices",
-        bsz,
-        aux_device,
-    )
-    slot_override_active = primary_slot_indices is not None
-    if primary_slot_indices is None or aux_slot_indices is None:
-        current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
-        if primary_slot_indices is None:
-            primary_slot_indices = build_batch_slot_indices(
-                current_batch,
-                gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
-                bsz,
-                manager_device,
-            )
-        if aux_slot_indices is None:
-            aux_slot_indices = build_batch_slot_indices(
-                current_batch,
-                gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
-                bsz,
-                aux_device,
-            )
+    with (dt.timed("dsa_slot_meta", li) if dt else nullcontext()):
+        primary_slot_indices = _slot_indices_override(
+            "glm5_decode_primary_slot_indices",
+            bsz,
+            manager_device,
+        )
+        aux_slot_indices = _slot_indices_override(
+            "glm5_decode_aux_slot_indices",
+            bsz,
+            aux_device,
+        )
+        slot_override_active = primary_slot_indices is not None
+        if primary_slot_indices is None or aux_slot_indices is None:
+            current_batch = list(AttnWrapperBase.cur_batch) if AttnWrapperBase.cur_batch else []
+            if primary_slot_indices is None:
+                primary_slot_indices = build_batch_slot_indices(
+                    current_batch,
+                    gpu_paged_kv_manager._gpu_page_table_manager.seq_id_to_slot,
+                    bsz,
+                    manager_device,
+                )
+            if aux_slot_indices is None:
+                aux_slot_indices = build_batch_slot_indices(
+                    current_batch,
+                    gpu_paged_kv_manager_aux._gpu_page_table_manager.seq_id_to_slot,
+                    bsz,
+                    aux_device,
+                )
 
     verify_indices = os.environ.get("BATCHGEN_GLM5_VERIFY_INDICES", "0") == "1"
     if verify_indices and wrapper.layer_idx <= 4:
@@ -497,15 +498,16 @@ def build_glm5_dsa_flashmla_inputs(
     with (dt.timed("q_absorb", li) if dt else nullcontext()):
         query_states = _build_query_states(wrapper, q_nope, q_pe, selected_mla_kv)
 
-    flashmla = prepare_sparse_flash_mla_decode_inputs(
-        query_states,
-        selected_mla_kv,
-        selected_lengths,
-        attn.num_heads,
-        attn.softmax_scale,
-        head_dim_v=attn.kv_lora_rank,
-        page_size=mla_page_size,
-    )
+    with (dt.timed("flashmla_prep", li) if dt else nullcontext()):
+        flashmla = prepare_sparse_flash_mla_decode_inputs(
+            query_states,
+            selected_mla_kv,
+            selected_lengths,
+            attn.num_heads,
+            attn.softmax_scale,
+            head_dim_v=attn.kv_lora_rank,
+            page_size=mla_page_size,
+        )
 
     return Glm5DsaFlashMlaInputs(
         flashmla=flashmla,
