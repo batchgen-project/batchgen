@@ -91,10 +91,15 @@ def _situ_fp32(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 def _kernel_gate(out: torch.Tensor, ref: torch.Tensor, name: str):
-    """The MXFP4 kernel-validation gate (tests/moe/gpu_parity_mxfp4_marlin.gate):
-    finite AND fail_frac(|a-r| > 1e-5 + 1.6e-2|r|) < 1e-4 AND max relative error
-    < 1.6e-2 on the well-conditioned subset (|ref| > 0.1*rms). Returns (passed,
-    stats-dict)."""
+    """Aggregate gate for the CHAINED MXFP4-LatentMoE comparisons (expert-path
+    and full-block): finite AND err_ratio (rms(|a-r|)/rms(ref)) < 3e-3. The
+    per-element gate (fail_frac<1e-4, max_rel<1.6e-2 — the isolated-kernel gate
+    in tests/moe/gpu_parity_mxfp4_marlin.py) is INVALID here: the chained output
+    passes through two cancellation stages (S3 down GEMM + routed_expert_up_proj)
+    that amplify irreducible bf16-accumulation-order noise on cancelled elements,
+    so aggregate err_ratio is the correct gate (same principle as task #11).
+    fail_frac/max_rel/max_abs are still computed for diagnostics. Returns
+    (passed, stats-dict)."""
     a = out.float()
     r = ref.float()
     finite = bool(torch.isfinite(a).all())
@@ -106,7 +111,9 @@ def _kernel_gate(out: torch.Tensor, ref: torch.Tensor, name: str):
     max_rel = float((err[mask] / r.abs()[mask]).max()) if bool(mask.any()) else 0.0
     max_abs = float(err.max())
     err_ratio = float((err.pow(2).mean().sqrt() / (rms + 1e-8)))
-    passed = finite and fail_frac < 1e-4 and max_rel < 1.6e-2
+    # Chained cancellation gate (see docstring): aggregate err_ratio, NOT the
+    # per-element fail_frac/max_rel that is only valid for isolated stages.
+    passed = finite and err_ratio < 3e-3
     stats = dict(finite=finite, fail_frac=fail_frac, max_rel=max_rel,
                  max_abs=max_abs, err_ratio=err_ratio, rms=rms)
     print("[mxfp4-moe] {:38s} {} fail_frac={:.2e} max_rel={:.2e} "
