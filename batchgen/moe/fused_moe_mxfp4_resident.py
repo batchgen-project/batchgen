@@ -1,0 +1,362 @@
+# ---------------------------------------------------------------------------- #
+#  BatchGen                                                                      #
+#  copyright (c) EfficientMoE team 2025                                          #
+#                                                                               #
+#  licensed under the apache license, version 2.0 (the "license");              #
+# ---------------------------------------------------------------------------- #
+
+"""Resident-EP decode MoE seam for Kimi-K3 MXFP4 LatentMoE (M3.1a, decision A13).
+
+DECODE-ONLY companion to the STREAMED MXFP4-LatentMoE path
+(``kimi_linear/serving_modules.py::moe_forward_serving``). Each rank repacks the
+MXFP4 weights of its EP shard into marlin tile order ONCE at load — the packed
+E2M1 nibbles + E8M0 scales the streamed path repacks EVERY forward
+(``k3/mxfp4_expert.py::K3MXFP4Projection.marlin`` -> ``repack_mxfp4_to_marlin_device``,
+MEASURED ~1068 us/expert) — and then computes every decode step from HBM with no
+per-step repack and (M3.1b) no per-step H2D.
+
+Latent dataflow, EXACTLY the streamed oracle's op order (the resident layer
+reproduces the expert PATH; the caller adds the DP-local shared expert):
+
+    router(hidden)                         # topk on the PRE-down 7168 hidden
+    x = routed_expert_down_proj(hidden)    # 7168 -> 3584, ONCE per token
+    dispatch x(latent) -> [E*mtp, latent]  # dispatch_scatter_3d (any top_k)
+    grouped S1 (w1 gate + w3 up + SiTU)    # marlin MXFP4, resident shard
+    grouped S3 (w2 down)                    # marlin MXFP4, resident shard
+    y = sum_k weight_k * expert_out_k       # FP32 accumulate -> bf16 (see below)
+    y = routed_expert_norm(y)               # ONCE, post-combine, pre-up
+    y = routed_expert_up_proj(y)            # 3584 -> 7168
+
+Because the grouped S1/S3 kernel entries are the SAME ones the streamed
+single-expert path drives at E=1, and both sides repack with the identical
+``repack_mxfp4_to_marlin_device``, the resident marlin weights are bit-identical
+to the streamed path's per-forward repack — so resident == streamed to within
+combine-order noise, and resident gates against the M3.0 fp32-dequant oracle at
+the same err_ratio the streamed path already clears.
+
+THE FP32 COMBINE (A13's flagged risk — read this before touching it)
+--------------------------------------------------------------------
+The spec named ``dispatch_scatter_3d.reduce_weighted_scatter`` for the fp32
+combine, but that kernel is ``template<int K>`` with cases ONLY for K in
+{2, 4, 8} (``dispatch_scatter_3d.cu`` switch; ``default`` is
+``TORCH_CHECK(false, "Unsupported K=", K)``). K3's ``num_experts_per_token`` is
+16, so the named kernel HARD-FAILS on K3 — its only production caller (K2.5)
+runs top_k=8. The combine here is therefore done with the STREAMED ORACLE'S OWN
+arithmetic: the per-token top-k contributions are summed in FP32 and cast to
+bf16 exactly where ``moe_forward_serving`` downcasts (``results`` fp32 ->
+``.to(identity.dtype)``). This is not a different combine — it is bit-for-bit
+the reference reduction — so it cannot introduce combine error; it merely does
+not use the fused kernel. Enabling the fused kernel on K3 requires a
+``case 16:`` in ``dispatch_scatter_3d.cu`` + a kernel rebuild (a kernel-PR
+change, and relevant mainly to the CUDA-graph decode path where a data-indexed
+``index_add`` is less capture-friendly than the fused scatter). NAMED FOLLOW-UP
+for M3.1b; flagged to the planning loop.
+
+SINGLE-RANK ONLY (M3.1a). ``world_size == 1``: the EP all_gather / all_reduce
+are identity and are marked as such in ``forward`` so world>=2 drops in at
+M3.1b. A world>=2 call HARD-FAILS rather than silently running a single-shard
+result.
+"""
+
+import logging
+import time
+
+import torch
+
+from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d
+from batchgen.moe.marlin_grouped_moe import (
+    marlin_grouped_m16_mxfp4,
+    marlin_grouped_stage1_fused_mxfp4_situ,
+)
+
+
+class MXFP4LayerShard:
+    """One MoE layer's local expert shard, repacked into marlin tile order once.
+
+    Holds the resident (marlin_qw int32, marlin_s bf16) tensors for w1/w3/w2 of
+    every local expert (kept alive so their ``data_ptr()`` stays valid) plus the
+    six per-expert int64 pointer arrays the grouped marlin kernels consume.
+    """
+
+    def __init__(self, num_local, N, K_latent, device):
+        self.num_local = int(num_local)
+        self.N = int(N)                  # moe_intermediate_size
+        self.K_latent = int(K_latent)    # routed_expert_hidden_size (latent)
+        self.device = device
+        # resident weight tensors, indexed [local_expert] -> dict(proj -> (qw, s))
+        self._tensors = []
+        # pointer arrays, filled by build_layer_shard
+        self.gate_B_ptrs = None
+        self.gate_scales_ptrs = None
+        self.up_B_ptrs = None
+        self.up_scales_ptrs = None
+        self.down_B_ptrs = None
+        self.down_scales_ptrs = None
+
+    def nbytes(self):
+        total = 0
+        for t in self._tensors:
+            for qw, s in t.values():
+                total += qw.numel() * qw.element_size()
+                total += s.numel() * s.element_size()
+        return total
+
+
+def _repack_projection(packed, scale, device):
+    """Repack one MXFP4 projection ([n_out, k_in//pack] uint8 + [n_out, k_in//gs]
+    uint8 E8M0) into (marlin_qw int32, marlin_s bf16). Shapes are inferred from
+    ``packed`` so the same helper serves w1/w3 (n_out=N, k_in=K) and w2
+    (n_out=K, k_in=N)."""
+    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+        repack_mxfp4_to_marlin_device,
+    )
+    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
+        MXFP4_PACK_FACTOR,
+    )
+
+    n_out = int(packed.shape[0])
+    k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
+    return repack_mxfp4_to_marlin_device(
+        packed.to(device), scale.to(device), k_in, n_out
+    )
+
+
+def build_layer_shard(expert_sources, device):
+    """Repack one layer's local experts into a resident marlin shard, ONCE.
+
+    Args:
+        expert_sources: list over local experts; each item is a dict
+            ``{"w1": (packed, scale), "w3": (packed, scale),
+               "w2": (packed, scale)}`` where ``packed`` is [n_out, k_in//2]
+            uint8 (low nibble = even k index) and ``scale`` is [n_out, k_in//32]
+            uint8 E8M0 — exactly what ``K3MXFP4Projection`` holds and what
+            ``core_engine.get_tensor`` serves (``w{1,3,2}.weight_{packed,scale}``).
+        device: CUDA device for the resident tensors.
+
+    Returns:
+        MXFP4LayerShard with the six int64 pointer arrays populated.
+    """
+    num_local = len(expert_sources)
+    if num_local == 0:
+        raise ValueError("build_layer_shard: no local experts")
+    # Infer N (=w1.n_out) and K_latent (=w1.k_in) from expert 0's gate projection.
+    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
+        MXFP4_PACK_FACTOR,
+    )
+    w1_packed0 = expert_sources[0]["w1"][0]
+    N = int(w1_packed0.shape[0])
+    K_latent = int(w1_packed0.shape[1]) * MXFP4_PACK_FACTOR
+
+    shard = MXFP4LayerShard(num_local, N, K_latent, device)
+    gate_B, gate_s, up_B, up_s, down_B, down_s = ([] for _ in range(6))
+    for src in expert_sources:
+        w1_qw, w1_s = _repack_projection(src["w1"][0], src["w1"][1], device)  # gate
+        w3_qw, w3_s = _repack_projection(src["w3"][0], src["w3"][1], device)  # up
+        w2_qw, w2_s = _repack_projection(src["w2"][0], src["w2"][1], device)  # down
+        shard._tensors.append(
+            {"w1": (w1_qw, w1_s), "w3": (w3_qw, w3_s), "w2": (w2_qw, w2_s)}
+        )
+        gate_B.append(w1_qw.data_ptr()); gate_s.append(w1_s.data_ptr())
+        up_B.append(w3_qw.data_ptr()); up_s.append(w3_s.data_ptr())
+        down_B.append(w2_qw.data_ptr()); down_s.append(w2_s.data_ptr())
+
+    def _ptrs(vals):
+        return torch.tensor(vals, dtype=torch.int64, device=device)
+
+    shard.gate_B_ptrs = _ptrs(gate_B)
+    shard.gate_scales_ptrs = _ptrs(gate_s)
+    shard.up_B_ptrs = _ptrs(up_B)
+    shard.up_scales_ptrs = _ptrs(up_s)
+    shard.down_B_ptrs = _ptrs(down_B)
+    shard.down_scales_ptrs = _ptrs(down_s)
+    return shard
+
+
+class ResidentEPMXFP4MoELayer:
+    """Per-layer resident-EP decode MoE forward for K3 MXFP4 LatentMoE.
+
+    Holds the layer's repacked marlin shard and references to the block's own
+    (BF16, resident) latent seam modules ``routed_expert_down_proj`` /
+    ``routed_expert_norm`` / ``routed_expert_up_proj``; the router is passed into
+    ``forward`` (K2.5 pattern). ``forward`` returns the routed expert PATH; the
+    caller adds the shared expert (mirrors the BF16
+    ``moe_forward_resident_ep_decode`` seam).
+    """
+
+    # Per-step padded rows per rank; set by the worker for the M3.1b EP layout.
+    # Unused at world=1 (all_gather / all_reduce are identity).
+    num_tokens_per_rank = None
+
+    def __init__(self, layer_idx, shard, down_proj, norm, up_proj,
+                 comm=None, world_size=1, rank=0, expert_start=0):
+        self.layer_idx = layer_idx
+        self.shard = shard
+        self.down_proj = down_proj
+        self.norm = norm                 # may be None (latent_moe_use_norm False)
+        self.up_proj = up_proj
+        self.comm = comm
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self.expert_start = int(expert_start)
+
+    @classmethod
+    def set_num_tokens_per_rank(cls, num_tokens_per_rank):
+        cls.num_tokens_per_rank = int(num_tokens_per_rank)
+
+    def _combine_fp32(self, expert_out, topk_pos, topk_weight, T, H, K):
+        """Weighted top-k combine in FP32, cast to bf16 — the streamed oracle's
+        exact reduction (``results`` fp32 -> ``.to(identity.dtype)``). Substitutes
+        for ``reduce_weighted_scatter``, which is K in {2,4,8} only (K3 is 16).
+
+        ``topk_pos`` [T*K] int32: absolute row of this (token, k) assignment in
+        the strided expert_out buffer, or -1 (non-local / padding — 0 at world=1).
+        """
+        pos = topk_pos.view(T, K).long()
+        valid = (pos >= 0)
+        rows = pos.clamp(min=0).reshape(-1)
+        gathered = expert_out.index_select(0, rows).float().view(T, K, H)
+        w = topk_weight.reshape(T, K).float().unsqueeze(-1)
+        contrib = gathered * w * valid.unsqueeze(-1).to(torch.float32)
+        return contrib.sum(dim=1).to(torch.bfloat16)
+
+    def forward(self, x, gate):
+        """Resident-EP decode MoE over this rank's decode rows.
+
+        Args:
+            x: (T, H) hidden decode rows (bf16).
+            gate: router module; called on the (T, 1, H) hidden, returns
+                (topk_idx, topk_weight[, ...]).
+
+        Returns:
+            (T, H) routed expert-path output (down->experts->combine->norm->up),
+            WITHOUT the shared expert (added by the caller).
+        """
+        if self.world_size != 1:
+            raise NotImplementedError(
+                "ResidentEPMXFP4MoELayer is single-rank (M3.1a): world_size="
+                f"{self.world_size}. The EP all_gather(hidden) / "
+                "all_reduce(latent) seams are marked in this forward but not "
+                "implemented — that is M3.1b."
+            )
+        T, H = x.shape
+        device = x.device
+        if T == 0:
+            return x.new_zeros((0, H))
+
+        shard = self.shard
+        E, N, K_latent = shard.num_local, shard.N, shard.K_latent
+
+        # --- router on the PRE-down hidden (M3.1b: on the all_gathered hidden) ---
+        gate_out = gate(x.view(T, 1, H))
+        topk_idx, topk_weight = gate_out[0], gate_out[1]
+        K = topk_idx.shape[-1]
+
+        # --- down-proj once per token: hidden -> latent (M3.1b: on the global) ---
+        x_latent = self.down_proj(x).contiguous()          # [T, K_latent] bf16
+
+        # --- dispatch latent rows into the strided [E*mtp, K_latent] buffer ---
+        mtp = max(((T + 15) // 16) * 16, 16)               # per-expert count <= T
+        dispatched = torch.zeros(E * mtp, K_latent, dtype=torch.bfloat16,
+                                 device=device)
+        expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
+        expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
+        topk_pos = torch.full((T * K,), -1, dtype=torch.int32, device=device)
+        expert_counts, topk_pos = dispatch_scatter_3d(
+            x_latent, topk_idx.to(torch.int32), dispatched,
+            self.expert_start, E, mtp, expert_counts, expert_counters, topk_pos,
+        )
+        expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
+        max_m_tiles = (min(T, mtp) + 15) // 16
+
+        # --- grouped S1: gate(w1) + up(w3) + SiTU -> intermediate [E*mtp, N] ---
+        intermediate = torch.empty(E * mtp, N, dtype=torch.bfloat16,
+                                   device=device)
+        row_N = N * intermediate.element_size()
+        s1_C_ptrs = torch.tensor(
+            [intermediate.data_ptr() + e * mtp * row_N for e in range(E)],
+            dtype=torch.int64, device=device)
+        s1_ws = torch.zeros(E * (N // 256 + 17), dtype=torch.int32, device=device)
+        marlin_grouped_stage1_fused_mxfp4_situ(
+            dispatched, intermediate, expert_counts, expert_starts,
+            shard.gate_B_ptrs, shard.gate_scales_ptrs,
+            shard.up_B_ptrs, shard.up_scales_ptrs, s1_C_ptrs,
+            N, K_latent, s1_ws, max_m_tiles, mtp, E, T,
+        )
+
+        # --- grouped S3: down(w2) -> expert_out [E*mtp, K_latent] ---
+        expert_out = torch.empty(E * mtp, K_latent, dtype=torch.bfloat16,
+                                 device=device)
+        row_K = K_latent * expert_out.element_size()
+        s3_C_ptrs = torch.tensor(
+            [expert_out.data_ptr() + e * mtp * row_K for e in range(E)],
+            dtype=torch.int64, device=device)
+        s3_ws = torch.zeros(E * (K_latent // 256 + 17), dtype=torch.int32,
+                            device=device)
+        marlin_grouped_m16_mxfp4(
+            intermediate, shard.down_B_ptrs, s3_C_ptrs, shard.down_scales_ptrs,
+            expert_starts, expert_counts, E, K_latent, N, s3_ws, E,
+            K_latent // 256, max_m_tiles,
+        )
+
+        # --- FP32 weighted combine (oracle-identical; see _combine_fp32) ---
+        y = self._combine_fp32(expert_out, topk_pos, topk_weight, T, K_latent, K)
+
+        # --- M3.1b EP: all_reduce(y) over ranks (SUM) here; identity at world=1 ---
+
+        # --- post-combine norm + up-proj: latent -> hidden ---
+        if self.norm is not None:
+            y = self.norm(y)
+        y = self.up_proj(y)                                # [T, H] bf16
+        # --- M3.1b EP: extract this rank's local slice here; identity at world=1 ---
+        return y
+
+
+def build_resident_ep_mxfp4_layers(model_layers, get_tensor, comm, world_size,
+                                   rank, expert_start, num_local, device):
+    """Materialize MXFP4 marlin shards for every MoE layer and attach a
+    ``ResidentEPMXFP4MoELayer`` to each ``block_sparse_moe`` as
+    ``_resident_ep_moe`` (consumed by ``moe_forward_serving``'s decode dispatch).
+
+    Source is ``core_engine.get_tensor`` (the host copy-engine store), keys
+    ``routed_expert_{layer}_{expert}`` -> ``w{1,3,2}.weight_{packed,scale}``
+    (``k3/mxfp4_layout.routed_expert_tensor_names``). Returns total resident
+    bytes.
+
+    NOTE (M3.1a): the pytest gate builds the layer directly from the block's
+    experts at world=1; this server-side build path is NOT exercised by that
+    gate and is verified by the main loop's server run.
+    """
+    start_t = time.perf_counter()
+    total_bytes = 0
+    num_layers = 0
+    for layer_idx, layer in enumerate(model_layers):
+        moe = getattr(layer, "block_sparse_moe", None)
+        if moe is None or moe.experts is None:
+            continue
+        expert_sources = []
+        for i in range(num_local):
+            t = get_tensor(f"routed_expert_{layer_idx}_{expert_start + i}")
+            expert_sources.append({
+                "w1": (t["w1.weight_packed"], t["w1.weight_scale"]),
+                "w3": (t["w3.weight_packed"], t["w3.weight_scale"]),
+                "w2": (t["w2.weight_packed"], t["w2.weight_scale"]),
+            })
+        shard = build_layer_shard(expert_sources, device)
+        moe._resident_ep_moe = ResidentEPMXFP4MoELayer(
+            layer_idx, shard,
+            moe.routed_expert_down_proj,
+            moe.routed_expert_norm if getattr(moe, "latent_moe_use_norm", False)
+            else None,
+            moe.routed_expert_up_proj,
+            comm=comm, world_size=world_size, rank=rank,
+            expert_start=expert_start,
+        )
+        total_bytes += shard.nbytes()
+        num_layers += 1
+    logging.info(
+        f"Rank {rank}: resident EP MXFP4 marlin shards materialized — "
+        f"{num_layers} MoE layers x {num_local} experts, "
+        f"{total_bytes / (1024**3):.2f} GiB "
+        f"({time.perf_counter() - start_t:.1f}s, one-time repack)"
+    )
+    return total_bytes
