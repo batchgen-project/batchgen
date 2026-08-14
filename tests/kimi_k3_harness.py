@@ -332,6 +332,122 @@ def real_config_dict() -> dict:
         return json.load(f)
 
 
+# --------------------------------------------------------------------------- #
+#  Synthetic MXFP4-LatentMoE configs (M3.0 / decision A13)                     #
+# --------------------------------------------------------------------------- #
+#  The BF16 syn25/skew10 configs above exercise the LatentMoE seam but build
+#  BF16 experts.  The MXFP4 twins below add a `quantization_config` so that
+#  ``k3/mxfp4_expert.is_mxfp4_quantized(cfg)`` returns True and
+#  ``KimiSparseMoeBlock`` builds ``K3MXFP4Expert`` (packed w{1,3,2}) instead —
+#  the STREAMED serving path that M3.1's resident layer will gate against.
+#
+#  DIM CONSTRAINT (the M3.0 blocker, stated in code): the fused marlin MXFP4
+#  decode (``marlin_grouped_moe.single_expert_marlin_mxfp4_decode`` ->
+#  ``_check_m16_shapes(N, K)`` AND ``_check_m16_shapes(K, N)`` on BOTH the S1
+#  gate/up GEMM and the S3 down GEMM) requires prob_n % 256 == 0 AND
+#  prob_k % 128 == 0.  Applied to both orientations this forces BOTH the MoE
+#  latent (``routed_expert_hidden_size`` = K) AND ``moe_intermediate_size``
+#  (= N) to be multiples of 256.  syn25's 224/192 and skew10's 192/112 CANNOT
+#  be used verbatim.  The twins below pick the nearest valid shrunk dims and
+#  keep the two configs' distinguishing properties (syn: latent == hidden/2, the
+#  real K3 ratio; skew: latent != hidden/2, moe_intermediate != latent,
+#  rms_norm_eps != 1e-5, shared width 3x).  Everything else is inherited.
+
+#: The released K3 ``quantization_config['ignore']`` set, verbatim.  MUST equal
+#: ``kimi_linear/k3/mxfp4_layout.K3_EXPECTED_QUANT_IGNORE`` — asserted in the GPU
+#: test, which owns the batchgen import.
+K3_MXFP4_QUANT_IGNORE = [
+    "re:.*self_attn.*",
+    "re:.*shared_experts.*",
+    r"re:.*mlp\.(gate|up|gate_up|down)_proj.*",
+    "re:.*lm_head.*",
+    "re:.*vision_tower.*",
+    "re:.*mm_projector.*",
+]
+
+
+def mxfp4_quantization_config() -> dict:
+    """A minimal MXFP4 block that passes ``validate_quantization_config``.
+
+    Every field below is pinned by ``k3/mxfp4_layout.validate_quantization_config``
+    (compressed-tensors / mxfp4-pack-quantized, group_size 32, num_bits 4,
+    float/symmetric/group, uint8 E8M0 scales, weight-only W4A16, status
+    'compressed', the exact ignore set).  Structurally identical to the real K3
+    checkpoint's declaration.
+    """
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "mxfp4-pack-quantized",
+        "quantization_status": "compressed",
+        "ignore": list(K3_MXFP4_QUANT_IGNORE),
+        "config_groups": {
+            "group_0": {
+                "format": "mxfp4-pack-quantized",
+                "input_activations": None,
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "symmetric": True,
+                    "strategy": "group",
+                    "group_size": 32,
+                    "scale_dtype": "torch.uint8",
+                    "dynamic": False,
+                },
+            }
+        },
+    }
+
+
+def syn25_mxfp4_config_dict() -> dict:
+    """MXFP4 twin of K3-SYN-25.  latent == hidden/2 (the real K3 ratio) with
+    both marlin dims 256-multiples: hidden 512, latent 256, moe_intermediate
+    256."""
+    cfg = syn25_config_dict()
+    text = cfg["text_config"]
+    text["hidden_size"] = 512
+    text["routed_expert_hidden_size"] = 256      # latent K, == hidden/2
+    text["moe_intermediate_size"] = 256          # N, 256-multiple
+    text["quantization_config"] = mxfp4_quantization_config()
+    return cfg
+
+
+def skew10_mxfp4_config_dict() -> dict:
+    """MXFP4 twin of K3-SKEW-10.  Every dim pair decoupled: hidden 768, latent
+    256 (!= hidden/2 = 384), moe_intermediate 512 (!= latent), rms_norm_eps
+    2e-5, shared width 3x — both marlin dims still 256-multiples."""
+    cfg = skew10_config_dict()
+    text = cfg["text_config"]
+    text["hidden_size"] = 768
+    text["routed_expert_hidden_size"] = 256      # latent K, != hidden/2 (384)
+    text["moe_intermediate_size"] = 512          # N, != latent, 256-multiple
+    text["quantization_config"] = mxfp4_quantization_config()
+    return cfg
+
+
+def rand_mxfp4_packed(n_out: int, k_in: int, seed: int,
+                      scale_lo: int = 112, scale_hi: int = 122):
+    """Synthetic MXFP4 checkpoint weight for ONE projection, in the exact
+    ``(weight_packed, weight_scale)`` layout ``K3MXFP4Projection`` declares.
+
+    Torch-only transcription of
+    ``tests/moe/gpu_parity_mxfp4_marlin.py::rand_expert`` (no kernel import, so
+    the harness stays importable on a CPU box).  Scale bytes in [112, 122]
+    mirror the observed K3 range and stay clear of the forbidden 0x00/0xFF that
+    ``mxfp4_scale_e8m0_to_bf16`` hard-fails.
+
+    Returns:
+        (packed [n_out, k_in // 2] uint8, scale [n_out, k_in // 32] uint8)
+    """
+    if k_in % 32 != 0:
+        raise ValueError(f"k_in={k_in} must be a multiple of 32 (MXFP4 group).")
+    g = torch.Generator().manual_seed(int(seed))
+    packed = torch.randint(0, 256, (n_out, k_in // 2), generator=g,
+                           dtype=torch.int16).to(torch.uint8)
+    scale = torch.randint(scale_lo, scale_hi + 1, (n_out, k_in // 32),
+                          generator=g, dtype=torch.int16).to(torch.uint8)
+    return packed, scale
+
+
 def build_our_config(cfg_dict: dict):
     ours = load_our_modules()
     return ours.config.parse_k3_config(cfg_dict)
