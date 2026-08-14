@@ -20,7 +20,13 @@ import logging
 
 import torch
 
-import batchgen_kernels.moe._C_marlin_grouped_gemm as _module
+from batchgen_kernels import load_extension as _load_extension
+
+try:
+    _module = _load_extension("batchgen_kernels.moe._C_marlin_grouped_gemm")
+except Exception as _e:  # kernel unavailable (AOT-only env without a build)
+    logging.warning("Marlin grouped GEMM kernel unavailable: %s", _e)
+    _module = None
 
 _warned_m8 = False
 _warned_m16 = False
