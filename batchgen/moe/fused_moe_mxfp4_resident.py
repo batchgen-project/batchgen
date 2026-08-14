@@ -52,16 +52,21 @@ change, and relevant mainly to the CUDA-graph decode path where a data-indexed
 ``index_add`` is less capture-friendly than the fused scatter). NAMED FOLLOW-UP
 for M3.1b; flagged to the planning loop.
 
-SINGLE-RANK ONLY (M3.1a). ``world_size == 1``: the EP all_gather / all_reduce
-are identity and are marked as such in ``forward`` so world>=2 drops in at
-M3.1b. A world>=2 call HARD-FAILS rather than silently running a single-shard
-result.
+WORLD>=2 EP (M3.1b, decisions A13/A16). ``world_size == 1`` keeps the M3.1a
+path bit-for-bit (no collectives). ``world_size >= 2`` routes ``forward`` to
+``_forward_ep``: router + down-proj on the LOCAL padded hidden (DP-replicated),
+all_gather the 3584-d LATENT (NOT the 7168 hidden — halves comm, A13) plus the
+per-token routing, run this rank's expert shard on the global tokens, fp32
+combine, all_reduce(SUM) the combined LATENT across ranks, slice this rank's
+rows, then routed_expert_norm + routed_expert_up_proj. See ``_forward_ep`` for
+the ntp layout contract.
 """
 
 import logging
 import time
 
 import torch
+from torch.distributed import ReduceOp
 
 from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d
 from batchgen.moe.marlin_grouped_moe import (
@@ -204,12 +209,18 @@ class ResidentEPMXFP4MoELayer:
         cls.num_tokens_per_rank = int(num_tokens_per_rank)
 
     def _combine_fp32(self, expert_out, topk_pos, topk_weight, T, H, K):
-        """Weighted top-k combine in FP32, cast to bf16 — the streamed oracle's
-        exact reduction (``results`` fp32 -> ``.to(identity.dtype)``). Substitutes
-        for ``reduce_weighted_scatter``, which is K in {2,4,8} only (K3 is 16).
+        """Weighted top-k combine in FP32 — the streamed oracle's exact reduction
+        (``results`` fp32; the caller casts to bf16 exactly where
+        ``moe_forward_serving`` downcasts). Substitutes for
+        ``reduce_weighted_scatter``, which is K in {2,4,8} only (K3 is 16).
+
+        Returns FP32 (not bf16) so the EP path can ``all_reduce`` the per-rank
+        partial sums BEFORE the single bf16 downcast — summing disjoint expert
+        subsets in fp32 then adding across ranks equals the world=1 fp32 sum to
+        bf16-ULP. The world=1 caller downcasts immediately (M3.1a bit-identical).
 
         ``topk_pos`` [T*K] int32: absolute row of this (token, k) assignment in
-        the strided expert_out buffer, or -1 (non-local / padding — 0 at world=1).
+        the strided expert_out buffer, or -1 (non-local / padding).
         """
         pos = topk_pos.view(T, K).long()
         valid = (pos >= 0)
@@ -217,56 +228,38 @@ class ResidentEPMXFP4MoELayer:
         gathered = expert_out.index_select(0, rows).float().view(T, K, H)
         w = topk_weight.reshape(T, K).float().unsqueeze(-1)
         contrib = gathered * w * valid.unsqueeze(-1).to(torch.float32)
-        return contrib.sum(dim=1).to(torch.bfloat16)
+        return contrib.sum(dim=1)
 
-    def forward(self, x, gate):
-        """Resident-EP decode MoE over this rank's decode rows.
+    def _expert_path(self, x_latent, topk_idx_i32, num_rows):
+        """Dispatch ``num_rows`` latent rows into this rank's local expert shard
+        and run grouped marlin S1(gate+up+SiTU) -> S3(down); returns
+        (expert_out [E*mtp, K_latent] bf16, topk_pos [num_rows*K] int32).
 
-        Args:
-            x: (T, H) hidden decode rows (bf16).
-            gate: router module; called on the (T, 1, H) hidden, returns
-                (topk_idx, topk_weight[, ...]).
-
-        Returns:
-            (T, H) routed expert-path output (down->experts->combine->norm->up),
-            WITHOUT the shared expert (added by the caller).
+        The SAME kernel entries and strided buffer layout the M3.1a world=1 path
+        used — factored so the EP path (``num_rows`` = world*ntp global tokens)
+        drives bit-identical arithmetic. ``dispatch_scatter_3d`` masks non-owned
+        experts to topk_pos = -1 via ``self.expert_start`` (world=1: start 0, all
+        experts local; EP: this rank's shard only).
         """
-        if self.world_size != 1:
-            raise NotImplementedError(
-                "ResidentEPMXFP4MoELayer is single-rank (M3.1a): world_size="
-                f"{self.world_size}. The EP all_gather(hidden) / "
-                "all_reduce(latent) seams are marked in this forward but not "
-                "implemented — that is M3.1b."
-            )
-        T, H = x.shape
-        device = x.device
-        if T == 0:
-            return x.new_zeros((0, H))
-
+        device = x_latent.device
         shard = self.shard
         E, N, K_latent = shard.num_local, shard.N, shard.K_latent
-
-        # --- router on the PRE-down hidden (M3.1b: on the all_gathered hidden) ---
-        gate_out = gate(x.view(T, 1, H))
-        topk_idx, topk_weight = gate_out[0], gate_out[1]
-        K = topk_idx.shape[-1]
-
-        # --- down-proj once per token: hidden -> latent (M3.1b: on the global) ---
-        x_latent = self.down_proj(x).contiguous()          # [T, K_latent] bf16
+        K = topk_idx_i32.shape[-1]
 
         # --- dispatch latent rows into the strided [E*mtp, K_latent] buffer ---
-        mtp = max(((T + 15) // 16) * 16, 16)               # per-expert count <= T
+        mtp = max(((num_rows + 15) // 16) * 16, 16)        # per-expert cnt <= num_rows
         dispatched = torch.zeros(E * mtp, K_latent, dtype=torch.bfloat16,
                                  device=device)
         expert_counts = torch.zeros(E, dtype=torch.int32, device=device)
         expert_counters = torch.zeros(E, dtype=torch.int32, device=device)
-        topk_pos = torch.full((T * K,), -1, dtype=torch.int32, device=device)
+        topk_pos = torch.full((num_rows * K,), -1, dtype=torch.int32,
+                              device=device)
         expert_counts, topk_pos = dispatch_scatter_3d(
-            x_latent, topk_idx.to(torch.int32), dispatched,
+            x_latent, topk_idx_i32, dispatched,
             self.expert_start, E, mtp, expert_counts, expert_counters, topk_pos,
         )
         expert_starts = torch.arange(E, dtype=torch.int32, device=device) * mtp
-        max_m_tiles = (min(T, mtp) + 15) // 16
+        max_m_tiles = (min(num_rows, mtp) + 15) // 16
 
         # --- grouped S1: gate(w1) + up(w3) + SiTU -> intermediate [E*mtp, N] ---
         intermediate = torch.empty(E * mtp, N, dtype=torch.bfloat16,
@@ -280,7 +273,7 @@ class ResidentEPMXFP4MoELayer:
             dispatched, intermediate, expert_counts, expert_starts,
             shard.gate_B_ptrs, shard.gate_scales_ptrs,
             shard.up_B_ptrs, shard.up_scales_ptrs, s1_C_ptrs,
-            N, K_latent, s1_ws, max_m_tiles, mtp, E, T,
+            N, K_latent, s1_ws, max_m_tiles, mtp, E, num_rows,
         )
 
         # --- grouped S3: down(w2) -> expert_out [E*mtp, K_latent] ---
@@ -297,17 +290,120 @@ class ResidentEPMXFP4MoELayer:
             expert_starts, expert_counts, E, K_latent, N, s3_ws, E,
             K_latent // 256, max_m_tiles,
         )
+        return expert_out, topk_pos
 
-        # --- FP32 weighted combine (oracle-identical; see _combine_fp32) ---
-        y = self._combine_fp32(expert_out, topk_pos, topk_weight, T, K_latent, K)
+    def forward(self, x, gate):
+        """Resident-EP decode MoE over this rank's decode rows.
 
-        # --- M3.1b EP: all_reduce(y) over ranks (SUM) here; identity at world=1 ---
+        Args:
+            x: (T, H) hidden decode rows (bf16).
+            gate: router module; called on the (T, 1, H) hidden, returns
+                (topk_idx, topk_weight[, ...]).
+
+        Returns:
+            (T, H) routed expert-path output (down->experts->combine->norm->up),
+            WITHOUT the shared expert (added by the caller).
+        """
+        if self.world_size != 1:
+            return self._forward_ep(x, gate)
+        T, H = x.shape
+        if T == 0:
+            return x.new_zeros((0, H))
+        K_latent = self.shard.K_latent
+
+        # --- router on the PRE-down hidden ---
+        gate_out = gate(x.view(T, 1, H))
+        topk_idx, topk_weight = gate_out[0], gate_out[1]
+        K = topk_idx.shape[-1]
+
+        # --- down-proj once per token: hidden -> latent ---
+        x_latent = self.down_proj(x).contiguous()          # [T, K_latent] bf16
+
+        # --- local shard (all experts at world=1) -> expert_out, topk_pos ---
+        expert_out, topk_pos = self._expert_path(
+            x_latent, topk_idx.to(torch.int32), T)
+
+        # --- FP32 weighted combine (oracle-identical), then bf16 downcast ---
+        y = self._combine_fp32(
+            expert_out, topk_pos, topk_weight, T, K_latent, K).to(torch.bfloat16)
 
         # --- post-combine norm + up-proj: latent -> hidden ---
         if self.norm is not None:
             y = self.norm(y)
         y = self.up_proj(y)                                # [T, H] bf16
-        # --- M3.1b EP: extract this rank's local slice here; identity at world=1 ---
+        return y
+
+    def _forward_ep(self, x, gate):
+        """world>=2 EP path (M3.1b, decisions A13/A16). Mirrors the BF16 resident
+        collective structure (``fused_moe_bf16_resident``) but for the LATENT
+        dataflow: gather the 3584-d LATENT (NOT the 7168 hidden — halves comm),
+        route + shard-experts on the global tokens, reduce the combined LATENT,
+        then slice this rank's rows and run norm + up-proj.
+
+            router + down_proj on LOCAL padded hidden (DP-replicated, pre-gather)
+            -> all_gather(latent) + all_gather(routing) over EP ranks
+            -> this rank's expert shard on the global tokens (non-owned -> 0)
+            -> fp32 combine -> all_reduce(SUM) over ranks -> local slice
+            -> bf16 -> routed_expert_norm -> routed_expert_up_proj
+
+        The per-rank layout scalar ntp (max decode rows over ranks) is delivered
+        by the worker's rank-count sync via ``set_num_tokens_per_rank`` before
+        the forward; every rank sizes the global buffer from ntp alone, so no
+        extra communication is needed. Empty ranks (T == 0) still run every
+        collective and the shard kernels in lockstep — their resident experts
+        serve the OTHER ranks' tokens, and a bias-free expert MLP maps padded
+        zero rows to exactly zero, so padding contributes nothing to the reduced
+        sum and the padded slice is discarded on the local slice.
+
+        Routing note: the router is DP-replicated, so running it on this rank's
+        LOCAL hidden and all_gathering the per-token (topk_idx, topk_weight) is
+        bit-identical to running it on the gathered global hidden — but gathers
+        K int32 + K weights per token instead of the 7168-d hidden.
+        """
+        ntp = ResidentEPMXFP4MoELayer.num_tokens_per_rank
+        T, H = x.shape
+        assert ntp is not None and ntp > 0, (
+            "resident-EP MXFP4 decode requires the worker rank-count sync "
+            "(set_num_tokens_per_rank) before the MoE forward")
+        assert T <= ntp, f"local decode rows {T} exceed synced ntp {ntp}"
+        world = self.world_size
+        num_global = world * ntp
+        K_latent = self.shard.K_latent
+
+        # --- router + down-proj on LOCAL (padded) hidden; DP-replicated ---
+        padded = x.new_zeros((ntp, H))
+        if T > 0:
+            padded[:T].copy_(x)
+        gate_out = gate(padded.view(ntp, 1, H))
+        topk_idx = gate_out[0].reshape(ntp, -1).to(torch.int32)    # [ntp, K]
+        topk_weight = gate_out[1].reshape(ntp, -1)                 # [ntp, K]
+        K = topk_idx.shape[-1]
+        x_latent = self.down_proj(padded).contiguous()            # [ntp, K_latent]
+
+        # --- all_gather the LATENT + routing across EP ranks (NOT the hidden) ---
+        all_latent = x_latent.new_empty((num_global, K_latent))
+        all_idx = topk_idx.new_empty((num_global, K))
+        all_weight = topk_weight.new_empty((num_global, K))
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(all_latent, x_latent)
+            self.comm.all_gather(all_idx, topk_idx)
+            self.comm.all_gather(all_weight, topk_weight)
+
+        # --- this rank's expert shard on the global tokens (non-owned -> -1) ---
+        expert_out, topk_pos = self._expert_path(all_latent, all_idx, num_global)
+
+        # --- fp32 combine, then SUM the combined LATENT across ranks ---
+        y = self._combine_fp32(expert_out, topk_pos, all_weight,
+                               num_global, K_latent, K)            # fp32
+        with self.comm.change_state(enable=True):
+            self.comm.all_reduce(y, op=ReduceOp.SUM)
+
+        # --- local slice -> bf16 -> post-combine norm + up-proj: latent->hidden ---
+        start = self.rank * ntp
+        y = y[start:start + T].to(torch.bfloat16)
+        if self.norm is not None:
+            y = self.norm(y)
+        y = self.up_proj(y)                                        # [T, H] bf16
         return y
 
 
