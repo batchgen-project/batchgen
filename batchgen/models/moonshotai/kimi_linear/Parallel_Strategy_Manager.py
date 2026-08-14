@@ -421,9 +421,18 @@ class KimiLinearParallelStrategyManager:
         per-rank distinct-row count the DP-32 resident layer expects."""
         if not self._resident_ep_built:
             return
+        # Drive BOTH resident classes' per-rank layout scalar. Only one is
+        # ever materialized per model (BF16 stacked hidden shard vs MXFP4
+        # latent shard), but num_tokens_per_rank is a class attribute so
+        # setting the unused one is a harmless no-op — and the MXFP4 EP
+        # forward (_forward_ep) asserts it before the collectives.
         from batchgen.moe.fused_moe_bf16_resident import ResidentEPMoELayer
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
 
         ResidentEPMoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
+        ResidentEPMXFP4MoELayer.set_num_tokens_per_rank(num_tokens_per_rank)
 
     @property
     def attn_tp_size(self):

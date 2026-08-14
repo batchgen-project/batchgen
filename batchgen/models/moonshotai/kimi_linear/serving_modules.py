@@ -782,17 +782,27 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
                 "build ResidentEPMXFP4MoELayer via the PSM is_mxfp4_quantized "
                 "branch."
             )
-        G = int(getattr(self, "attn_tp_size", 1))
-        if G > 1:
-            raise NotImplementedError(
-                "MXFP4 LatentMoE resident decode is single-rank (M3.1a): "
-                f"attn_tp_size={G}. The TP-G row reshard (scatter/gather) and "
-                "the EP all_gather/all_reduce collectives are M3.1b."
-            )
+        # M3.1b (A13/A16): the EP all_gather/all_reduce now live INSIDE
+        # resident.forward. Under TP-G decode the G ranks of a group hold the
+        # SAME rows (replicated attention) but the resident layer is a DP
+        # contract, so — exactly like the BF16 branch below — scatter the
+        # group's rows into G distinct DP slices, route each through the
+        # UNCHANGED latent forward, then gather back to the full group batch.
         identity = hidden_states
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, self.hidden_dim)
-        routed = resident.forward(x, self.gate)
+        G = int(getattr(self, "attn_tp_size", 1))
+        if G > 1:
+            from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+            B_grp = x.shape[0]
+            x_local = scatter_rows(x, G, self.attn_tp_rank)
+            routed_local = resident.forward(x_local, self.gate)
+            routed = all_gather_rows(
+                routed_local, B_grp, G, self.attn_tp_rank, self.attn_tp_group
+            )
+        else:
+            routed = resident.forward(x, self.gate)
         out = routed.reshape(orig_shape)
         if getattr(self, "shared_experts", None) is not None:
             out = out + self.shared_experts(identity)
