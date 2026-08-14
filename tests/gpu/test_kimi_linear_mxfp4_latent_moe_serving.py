@@ -390,6 +390,78 @@ def test_latent_projections_run_once_per_token(cfg_name):
 
 
 # --------------------------------------------------------------------------- #
+#  4. RESIDENT (M3.1a) == the SAME fp32 dequant oracle; resident ≈ streamed    #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cfg_name", sorted(CONFIGS))
+def test_resident_matches_fp32_dequant(cfg_name):
+    """M3.1a (decision A13): the resident MXFP4-LatentMoE decode layer
+    (``batchgen.moe.fused_moe_mxfp4_resident.ResidentEPMXFP4MoELayer``, world=1)
+    reproduces the streamed oracle's latent expert path and gates against the
+    SAME ``_dequant_fp32_reference`` at err_ratio < 3e-3 on syn25 + skew10.
+
+    The resident layer repacks the block's MXFP4 experts ONCE into a marlin
+    shard and drives the grouped MXFP4 S1(SiTU)+S3 kernels — the SAME kernel
+    entries the streamed single-expert path uses at E=1 — with an fp32 top-k
+    combine bit-identical to ``moe_forward_serving``'s (reduce_weighted_scatter
+    is K in {2,4,8} only; K3 top_k=16). So resident ≈ streamed is the tightest
+    cross-check (kernel + repack identity), and resident ≈ reference clears the
+    same gate the streamed path already does."""
+    from batchgen.moe.fused_moe_mxfp4_resident import (
+        ResidentEPMXFP4MoELayer,
+        build_layer_shard,
+    )
+
+    block, cfg, _cfg_dict = _build_mxfp4_serving_block(cfg_name)
+    tokens = 64
+    x = H.seeded_input(
+        "mxfp4_latent_moe:{}".format(cfg_name), 1, tokens, cfg.hidden_size,
+        dtype=torch.bfloat16,
+    ).to(DEV)
+
+    # World=1: every expert is local. Repack from the block's own experts.
+    shard = build_layer_shard(
+        [{"w1": (e.w1.weight_packed.data, e.w1.weight_scale.data),
+          "w3": (e.w3.weight_packed.data, e.w3.weight_scale.data),
+          "w2": (e.w2.weight_packed.data, e.w2.weight_scale.data)}
+         for e in block.experts],
+        device=DEV,
+    )
+    layer = ResidentEPMXFP4MoELayer(
+        layer_idx=0, shard=shard,
+        down_proj=block.routed_expert_down_proj,
+        norm=block.routed_expert_norm if block.latent_moe_use_norm else None,
+        up_proj=block.routed_expert_up_proj,
+        world_size=1, rank=0, expert_start=0,
+    )
+
+    with torch.no_grad():
+        x2d = x.reshape(-1, cfg.hidden_size)
+        resident_expert_path = layer.forward(x2d, block.gate).reshape(
+            1, tokens, cfg.hidden_size)                       # routed path only
+        resident_full = resident_expert_path + block.shared_experts(x)
+        streamed = block(x)                                   # streamed oracle
+        reference, ref_expert_path, _idx, _w = _dequant_fp32_reference(block, x)
+
+    assert resident_full.shape == reference.shape == (1, tokens, cfg.hidden_size)
+    assert torch.isfinite(resident_full).all(), "resident output non-finite"
+
+    ok_path, stats_path = _kernel_gate(
+        resident_expert_path, ref_expert_path,
+        "{} resident expert-path".format(cfg_name))
+    ok_full, stats_full = _kernel_gate(
+        resident_full, reference, "{} resident full-block".format(cfg_name))
+    ok_rs, stats_rs = _kernel_gate(
+        resident_full, streamed, "{} resident-vs-streamed".format(cfg_name))
+
+    assert ok_path, "{} resident expert path failed the kernel gate: {}".format(
+        cfg_name, stats_path)
+    assert ok_full, "{} resident full-block failed the kernel gate: {}".format(
+        cfg_name, stats_full)
+    assert ok_rs, "{} resident-vs-streamed exceeded the 3e-3 gate: {}".format(
+        cfg_name, stats_rs)
+
+
+# --------------------------------------------------------------------------- #
 #  Artifact capture (deliverable 3)                                            #
 # --------------------------------------------------------------------------- #
 def _save_artifact(cfg_name, cfg_dict, block, x, streamed, streamed_expert_path,
