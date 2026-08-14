@@ -763,15 +763,41 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
     hidden space, so a LatentMoE config has no representation here.
     """
     if getattr(self, "use_latent_moe", False):
-        raise NotImplementedError(
-            "resident-EP decode does not implement LatentMoE: the stacked "
-            "shard (batchgen.moe.fused_moe_bf16_resident) routes and runs the "
-            "experts in the hidden space, with no routed_expert_down_proj / "
-            "routed_expert_norm / routed_expert_up_proj seam. Run K3 decode "
-            "with decode_moe_mode='streamed' (moe_forward_serving's streamed "
-            "path implements the latent form) until the resident shard grows "
-            "one."
-        )
+        # M3.1a (A13): MXFP4 LatentMoE resident decode. The resident layer runs
+        # the full latent expert path (routed_expert_down_proj once/token ->
+        # grouped MXFP4 S1(SiTU)+S3 on the resident shard -> fp32 top-k combine
+        # -> routed_expert_norm -> routed_expert_up_proj); THIS seam only adds
+        # the DP-local shared expert, exactly like the BF16 branch below. A
+        # latent config MUST have built ResidentEPMXFP4MoELayer (PSM
+        # is_mxfp4_quantized branch); the BF16 stacked shard has no latent seam
+        # and is refused here rather than silently run in the wrong space.
+        from batchgen.moe.fused_moe_mxfp4_resident import ResidentEPMXFP4MoELayer
+
+        if not isinstance(resident, ResidentEPMXFP4MoELayer):
+            raise RuntimeError(
+                "LatentMoE decode reached moe_forward_resident_ep_decode with a "
+                f"non-MXFP4 resident ({type(resident).__name__}): the BF16 "
+                "stacked shard (fused_moe_bf16_resident) has no "
+                "routed_expert_down/norm/up latent seam. A K3 latent config must "
+                "build ResidentEPMXFP4MoELayer via the PSM is_mxfp4_quantized "
+                "branch."
+            )
+        G = int(getattr(self, "attn_tp_size", 1))
+        if G > 1:
+            raise NotImplementedError(
+                "MXFP4 LatentMoE resident decode is single-rank (M3.1a): "
+                f"attn_tp_size={G}. The TP-G row reshard (scatter/gather) and "
+                "the EP all_gather/all_reduce collectives are M3.1b."
+            )
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_dim)
+        routed = resident.forward(x, self.gate)
+        out = routed.reshape(orig_shape)
+        if getattr(self, "shared_experts", None) is not None:
+            out = out + self.shared_experts(identity)
+        return out
+
     identity = hidden_states
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)

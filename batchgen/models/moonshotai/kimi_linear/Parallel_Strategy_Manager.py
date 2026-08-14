@@ -365,26 +365,48 @@ class KimiLinearParallelStrategyManager:
         """
         if self._resident_ep_built:
             return
-        from batchgen.moe.fused_moe_bf16_resident import (
-            build_resident_ep_layers,
-        )
-
         assert self._comm is not None, (
             "resident-EP decode needs the NCCL communicator (worker passes "
             "it via configure_decoding(comm=...) or set_comm)"
         )
         cfg = self.loaded_model_config
-        build_resident_ep_layers(
-            self.model.model.layers,
-            self.core_engine.get_tensor,
-            self._comm,
-            self.world_size,
-            self.global_rank,
-            self.local_expert_start,
-            self.experts_per_rank,
-            cfg.moe_intermediate_size,
-            self.engine_config.Basic_Config.device_torch,
-        )
+        device = self.engine_config.Basic_Config.device_torch
+        from .k3.mxfp4_expert import is_mxfp4_quantized
+
+        if is_mxfp4_quantized(cfg):
+            # K3 MXFP4 LatentMoE (M3.1a): repack-once marlin shards + a resident
+            # layer that runs the latent dataflow (down/norm/up seam). The BF16
+            # stacked shard cannot represent it (hidden-space, no latent seam).
+            from batchgen.moe.fused_moe_mxfp4_resident import (
+                build_resident_ep_mxfp4_layers,
+            )
+
+            build_resident_ep_mxfp4_layers(
+                self.model.model.layers,
+                self.core_engine.get_tensor,
+                self._comm,
+                self.world_size,
+                self.global_rank,
+                self.local_expert_start,
+                self.experts_per_rank,
+                device,
+            )
+        else:
+            from batchgen.moe.fused_moe_bf16_resident import (
+                build_resident_ep_layers,
+            )
+
+            build_resident_ep_layers(
+                self.model.model.layers,
+                self.core_engine.get_tensor,
+                self._comm,
+                self.world_size,
+                self.global_rank,
+                self.local_expert_start,
+                self.experts_per_rank,
+                cfg.moe_intermediate_size,
+                device,
+            )
         self._resident_ep_built = True
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
