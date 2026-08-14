@@ -250,12 +250,20 @@ def _dequant_fp32_reference(block, x_3d: torch.Tensor):
                                      expert.w3.weight_scale, torch.float32)  # [N, latent]
         w2 = mxfp4_dequantize_oracle(expert.w2.weight_packed,
                                      expert.w2.weight_scale, torch.float32)  # [latent, N]
-        gate_out = xr @ w1.t()                        # [t_e, N]
-        up_out = xr @ w3.t()                          # [t_e, N]
-        situ = _situ_fp32(gate_out, up_out)           # [t_e, N]
-        down = situ @ w2.t()                          # [t_e, latent]
+        # Model the marlin S1->S3 kernel's bf16 intermediates exactly
+        # (single_expert_marlin_mxfp4_decode): S1 rounds each gate/up GEMM
+        # pass to bf16 in SMEM BEFORE the fused SiTU, writes the SiTU result
+        # to a bf16 `intermediate`, and S3 writes a bf16 `expert_out`. An
+        # all-fp32 reference is NOT the kernel's arithmetic: it keeps ~1%
+        # (bf16-ULP) intermediate precision the kernel discards, which the
+        # down GEMM's cancellation then amplifies past tol (M3.0 A14: this
+        # missing truncation, not a repack/SiTU/kernel bug, is the 17%).
+        gate_out = (xr @ w1.t()).to(torch.bfloat16)   # [t_e, N] bf16 pass
+        up_out = (xr @ w3.t()).to(torch.bfloat16)     # [t_e, N] bf16 pass
+        situ = _situ_fp32(gate_out, up_out).to(torch.bfloat16)  # bf16 S1
+        down = (situ.float() @ w2.t()).to(torch.bfloat16)       # bf16 S3
         w = topk_weight.reshape(-1)[sel].unsqueeze(-1).float()
-        results.index_add_(0, rows, down * w)
+        results.index_add_(0, rows, down.float() * w)
 
     y = results.to(x.dtype)                           # bf16, exactly where the
     if block.latent_moe_use_norm:                     # streamed path downcasts
