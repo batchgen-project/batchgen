@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _DEV_MODE = os.environ.get("BATCHGEN_KERNELS_DEV", "0") == "1"
 
 
-def load_extension(module_name: str):
+def load_extension(module_name: str, allow_dev_jit: bool = True):
     """Import a pre-compiled CUDA extension by module name.
 
     Extensions are compiled at pip install time via CUDAExtension with
@@ -29,11 +29,16 @@ def load_extension(module_name: str):
 
     With BATCHGEN_KERNELS_DEV=1, falls back to JIT compilation from source
     if the AOT module import fails.
+
+    Pass ``allow_dev_jit=False`` to force AOT-only import even in dev mode, for
+    kernels whose DEV-JIT is known-doomed and would spawn a wasted compile on
+    every worker (e.g. the wgmma MoE kernels — their ``-arch=sm_90a`` shorthand
+    also emits a compute_90 PTX fallback image that ptxas rejects for wgmma).
     """
     try:
         return importlib.import_module(module_name)
     except ImportError:
-        if not _DEV_MODE:
+        if not _DEV_MODE or not allow_dev_jit:
             raise
 
     logger.warning(f"[DEV] AOT import failed for {module_name}, attempting JIT...")
