@@ -1830,7 +1830,11 @@ class BatchGenWorker:
 			# temp-0 batch. Host-side check (no device sync), recomputed each step
 			# so no membership-invalidation hazard.
 			if self._decode_batch_all_greedy(active_sequences):
-				return logits.float().argmax(dim=-1, keepdim=True)
+				# argmax directly on the lm_head dtype: fp32-upcast preserves
+				# bf16 ordering exactly, and the .float() copy was a fresh
+				# [bs, vocab] fp32 alloc per step (76 MiB at bs=128) — the
+				# allocation that OOM'd the 0.93 graphs boots (boot25/26).
+				return logits.argmax(dim=-1, keepdim=True)
 			temps, top_ps, top_ks = self._build_sampling_tensors(active_sequences)
 			if not getattr(self, '_logged_sampling', False) and self.rank == 0:
 				logging.info(f"Using PER-SEQUENCE sampling for {logits.shape[0]} sequences")
@@ -6793,7 +6797,13 @@ class BatchGenWorker:
 		used_mem_gb = total_mem_gb - free_mem_gb
 
 		# Formula: gpu_kv_cache = total * frac - used
-		new_gpu_kv_cache_size = total_mem_gb * self.gpu_memory_frac - used_mem_gb
+		# With CUDA graphs enabled, capture happens AFTER this sizing and its
+		# private pools + static bucket buffers (~1.2 GiB measured, boot25) plus
+		# eager runtime transients must fit in what the pool leaves free.
+		graph_reserve_gb = 2.0 if getattr(self.args, 'enable_cuda_graph', False) else 0.0
+		new_gpu_kv_cache_size = (
+			total_mem_gb * self.gpu_memory_frac - used_mem_gb - graph_reserve_gb
+		)
 		if new_gpu_kv_cache_size > 0:
 			self.gpu_kv_cache_size_gb = new_gpu_kv_cache_size
 		else:
@@ -9706,7 +9716,9 @@ class BatchGenWorker:
 			self._whole_model_segment = whole_seg
 			self._glm5_whole_model_graph_capture_attempted_for_batch = True
 			try:
-				for capture_bucket in capture_buckets:
+				# Largest-first: the big bucket primes the shared graph pool and
+				# smaller buckets reuse its blocks instead of growing the pool.
+				for capture_bucket in sorted(capture_buckets, reverse=True):
 					torch.cuda.synchronize(self.torch_device)
 					dist.barrier()
 					whole_seg.set_capture_inputs(
