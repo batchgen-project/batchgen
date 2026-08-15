@@ -2211,6 +2211,30 @@ class BatchGenWorker:
 				remaining_global = self._local_indices_to_global_seq_ids(remaining_local)
 				manager.rebuild_page_table(remaining_global)
 
+	def _aux_layers_with_slots(self):
+		"""Logical layer ids that have a slot in the aux (indexer) KV pools.
+
+		None = no layer mapping (every engine layer has an aux slot). GLM-5.2
+		maps only its 21 indexer layers; skip layers' index-K is never read,
+		so decode appends for them are dropped at the queueing choke points —
+		the mapped host view hard-fails on unmapped layers by design.
+		"""
+		cached = getattr(self, "_aux_layers_with_slots_cache", False)
+		if cached is not False:
+			return cached
+		coord = getattr(self, "gpu_paged_kv_cache_manager", None)
+		aux_mgr = getattr(coord, "auxiliary", None)
+		if aux_mgr is None:
+			return None  # aux not initialized yet; do not cache
+		aux_map = getattr(aux_mgr.config, "logical_to_physical_layer", None)
+		result = None
+		if aux_map is not None:
+			result = frozenset(
+				l for l, p in enumerate(aux_map) if p is not None and int(p) >= 0
+			)
+		self._aux_layers_with_slots_cache = result
+		return result
+
 	def _flush_deferred_kv_to_host(self) -> None:
 		"""Flush all deferred KV host offload entries accumulated during forward.
 
@@ -2567,6 +2591,9 @@ class BatchGenWorker:
 		"""
 		aux_view = getattr(self, "host_paged_kv_worker_view_aux", None)
 		if aux_view is None or not batch:
+			return
+		valid_layers = self._aux_layers_with_slots()
+		if valid_layers is not None and layer_idx not in valid_layers:
 			return
 
 		sequence_ids = []
@@ -10690,6 +10717,9 @@ class BatchGenWorker:
 							self._append_decode_kv_to_host_aux_async(layer_idx, current_batch, k_tensor, v_tensor)
 					else:
 						def kv_append_callback_aux(layer_idx: int, k_tensor: torch.Tensor, v_tensor: torch.Tensor = None):
+							valid_layers = self._aux_layers_with_slots()
+							if valid_layers is not None and layer_idx not in valid_layers:
+								return
 							self._deferred_kv_entries_aux.append((layer_idx, k_tensor, v_tensor))
 					AttnWrapperBase.kv_append_callback_aux = kv_append_callback_aux
 				else:
