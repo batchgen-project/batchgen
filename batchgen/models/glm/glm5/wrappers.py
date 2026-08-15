@@ -445,13 +445,15 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
-        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step)
+        # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step).
+        # These are BF16 WEIGHT copies, not workspaces. They are quantizer
+        # INPUT only: once _fp8_absorb_weights is built they are freed by
+        # initialize_decode_absorb, so decode must never read them.
         self._cached_q_absorb = None
         self._cached_out_absorb = None
-        # SGLang-aligned BF16 BMM absorb weights (set by
-        # initialize_decode_absorb). w_kc: [H, 192, 512] BF16 with
-        # SGLang's stride trick; w_vc: [H, 512, 256] BF16 non-contig view.
-        self.w_kc = None
+        # SGLang-aligned BF16 BMM absorb weight, built by
+        # initialize_decode_absorb ONLY when FP8 absorb is unavailable.
+        # w_vc: [H, 512, 256] BF16 non-contig view for the bmm fallback.
         self.w_vc = None
         # WP5: FP8 absorb weights (pre-quantized once at init)
         self._fp8_absorb_weights = None
@@ -508,23 +510,6 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self._cached_q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim, :].contiguous()
         self._cached_out_absorb = kv_b_proj[:, attn.qk_nope_head_dim:, :].contiguous()
 
-        # SGLang-aligned absorb weights for BF16 BMM (matches
-        # deepseek_weight_loader.py:572-578 layout exactly).
-        #
-        #   self.w_kc — [H, qk_nope=192, kv_lora=512], BF16
-        #     `.transpose(1,2).contiguous().transpose(1,2)` is SGLang's stride
-        #     trick: physical memory laid out as [H, 512, 192] contiguous,
-        #     strides swapped on dim 1/2. Math-identical to [H, 192, 512] but
-        #     makes bmm/bmm_fp8 hit the same cuBLAS kernel SGLang triggers.
-        #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
-        #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
-        self.w_kc = self._cached_q_absorb.transpose(1, 2).contiguous().transpose(1, 2)
-        # Mirror SGLang exactly: .contiguous() first, then .transpose — the
-        # final tensor is a non-contiguous view with physical [H, 256, 512]
-        # and logical [H, 512, 256]. Adding a trailing .contiguous() would
-        # re-lay it out and change which cuBLAS kernel bmm dispatches to.
-        self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
-
         # WP5: Pre-quantize absorb weights for FP8 WGMMA kernel
         if _HAS_FP8_ABSORB:
             try:
@@ -540,6 +525,28 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     f"[layer {self.layer_idx}] FP8 absorb init failed: {e}"
                 )
                 self._fp8_absorb_weights = None
+
+        if self._fp8_absorb_weights is not None:
+            # The FP8 kernel owns both absorb GEMMs on every live decode path
+            # (glm5_decode_selector._build_query_states hard-fails without it),
+            # so the BF16 originals were quantizer input only. Free them here —
+            # BEFORE _init_gpu_kv_with_actual_size sizes the KV pool — instead
+            # of holding [H,192,512] + [H,256,512] BF16 per layer for nothing.
+            # H*448*512*2 B/layer freed; the BF16 bmm fallback (w_vc) is not
+            # built at all on this path.
+            self._cached_q_absorb = None
+            self._cached_out_absorb = None
+            self.w_vc = None
+        else:
+            # No FP8 absorb kernel: keep the SGLang-aligned BF16 BMM weight
+            # (matches deepseek_weight_loader.py:572-578 layout exactly).
+            #   self.w_vc — [H, kv_lora=512, v_head=256], BF16
+            #     transposed so `bmm(attn_out_T, w_vc)` produces [H, B, 256].
+            # Mirror SGLang exactly: .contiguous() first, then .transpose — the
+            # final tensor is a non-contiguous view with physical [H, 256, 512]
+            # and logical [H, 512, 256]. Adding a trailing .contiguous() would
+            # re-lay it out and change which cuBLAS kernel bmm dispatches to.
+            self.w_vc = self._cached_out_absorb.contiguous().transpose(1, 2)
 
         # WP2/WP4 init moved to initialize_fused_kernels() — must run after set_device
 
@@ -1578,15 +1585,27 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
         # --- Step 6: out_absorb → o_proj ---
         with (dt.timed("o_proj", li) if dt else _nullctx()):
-            # WP5: FP8 out_absorb kernel or SGLang-aligned BF16 BMM fallback
+            # WP5: FP8 out_absorb kernel, or the SGLang-aligned BF16 BMM when
+            # no FP8 absorb kernel was built for this layer.
             if self._fp8_absorb_weights is not None:
                 attn_heads = fp8_out_absorb(attn_out, self._fp8_absorb_weights)
-            else:
+            elif self.w_vc is not None:
                 # SGLang forward_mla.py:548 — bmm(attn_output.T, w_vc).
                 attn_out_3d = attn_out.squeeze(1)  # [B, H, 512]
                 attn_heads = torch.bmm(
                     attn_out_3d.transpose(0, 1), self.w_vc,
                 ).transpose(0, 1).unsqueeze(1)  # [B, 1, H, v_head_dim]
+            else:
+                # No silent fallback: w_vc is only None when the FP8 weights
+                # existed at init (and freed it) but are gone now — i.e. state
+                # was torn down mid-flight, not a supported configuration.
+                raise RuntimeError(
+                    f"[layer {self.layer_idx}] GLM-5 out_absorb has neither FP8 "
+                    "absorb weights nor the BF16 w_vc fallback: the BF16 copies "
+                    "were freed by initialize_decode_absorb once FP8 absorb was "
+                    "built, so _fp8_absorb_weights must not be cleared "
+                    "afterwards. Re-run initialize_decode_absorb()."
+                )
             attn_output = attn_heads.reshape(bsz, attn.num_heads * attn.v_head_dim)
             attn_output_fp8, attn_output_scale = act_quant(attn_output)
             attn_output = w8a8_deepgemm(

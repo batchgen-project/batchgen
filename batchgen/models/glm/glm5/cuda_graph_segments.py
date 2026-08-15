@@ -17,7 +17,8 @@ preconditions should fast-fail before replay rather than silently falling back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, fields as dataclass_fields
 from typing import Dict, Optional
 
 import torch
@@ -39,6 +40,8 @@ from batchgen_kernels.attention.dsa.fp8_absorb import (
     fp8_q_absorb_out,
 )
 from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (
+    _BLOCK_K as _FP8_SCRATCH_BLOCK_K,
+    _BLOCK_M as _FP8_SCRATCH_BLOCK_M,
     cuda_wk_proj_gemm_only_out,
     make_fp8_activation_scratch,
 )
@@ -119,6 +122,129 @@ class _Glm5FullDsaSegmentOutputs:
     primary_k_tensor: torch.Tensor
     indexer_k_tensor: torch.Tensor
     attn_output: torch.Tensor
+
+
+# ---------------------------------------------------------------------------
+# Per-bucket buffer VIEWS (allocate once at the largest bucket)
+#
+# Capture runs largest-first (batchgen_worker.py: `sorted(capture_buckets,
+# reverse=True)`), so the first setup_static_buffers call carries the biggest
+# bucket. Every later bucket takes leading-dim slices of that one allocation
+# instead of a full fresh set. Slices share storage with the base tensor and
+# capture happens AFTER setup, so the pointers a graph bakes at capture time
+# are the base pointers — replaying bucket N writes into the base storage,
+# which is exactly what its own views alias. Buckets are replayed one at a
+# time, so cross-bucket aliasing of scratch is not a hazard (it is the same
+# reuse the buffers already get across the 21 layers sharing this dict).
+#
+# Every field below has dim 0 == bucket size, and every initializer used for
+# them is slice-invariant: torch.empty (uninitialized), torch.arange
+# (arange(n)[:m] == arange(m)), torch.ones / torch.zeros / torch.full /
+# Tensor.fill_ (constant). No field needs re-initialization after slicing.
+_FULL_DSA_BUCKET_DIM_FIELDS = (
+    "valid_mask",
+    "aux_valid_mask",
+    "row_indices",
+    "valid_rows_bf16",
+    "valid_rows_ones",
+    "valid_rows_zeros",
+    "safe_slot_zeros",
+    "skip_slot_neg_ones",
+    "safe_seqlen_zeros",
+    "kv_primary_slot_indices",
+    "kv_aux_slot_indices",
+    "safe_primary_slot_indices",
+    "safe_aux_slot_indices",
+    "safe_cache_seqlens",
+    "q_a",
+    "q_flat",
+    "q_nope",
+    "q_rope_4d",
+    "new_compressed_kv",
+    "indexer_k_raw",
+    "q_flat_indexer",
+    "q_index",
+    "head_gates",
+    "positions_expanded",
+    "agg_scores",
+    "top_k_indices",
+    "selected_mla_kv",
+    "selected_lengths",
+    "row_modes",
+    "absorbed_q",
+    "query_states",
+    "attn_heads",
+)
+
+# Fields that must be rebuilt per bucket rather than sliced:
+#   * the two FP8 activation scratch triples — dim 0 is max(bucket, _BLOCK_M),
+#     and the TMA descriptor bakes BOTH the base pointer and the global row
+#     count, so the descriptor is re-encoded over the sliced view;
+#   * prepared_flashmla — the tile-scheduler metadata and the synthetic
+#     block table are sized by batch.
+_FULL_DSA_REBUILT_FIELDS = (
+    "indexer_k_x_fp8",
+    "indexer_k_x_scale",
+    "indexer_k_tma_desc",
+    "q_x_fp8",
+    "q_x_scale",
+    "q_tma_desc",
+    "prepared_flashmla",
+)
+
+
+def _assert_dsa_buffer_field_coverage(covered, where: str) -> None:
+    """Fail loudly if the buffer dataclass grew a field the view path ignores."""
+    expected = {f.name for f in dataclass_fields(_Glm5FullDsaSegmentBuffers)}
+    covered = set(covered)
+    missing = sorted(expected - covered)
+    unknown = sorted(covered - expected)
+    if missing or unknown:
+        raise RuntimeError(
+            f"{where}: _Glm5FullDsaSegmentBuffers field coverage is stale — "
+            f"missing={missing} unknown={unknown}. Add each new field to the "
+            "sliced set or to the rebuilt/placeholder set."
+        )
+
+
+_assert_dsa_buffer_field_coverage(
+    _FULL_DSA_BUCKET_DIM_FIELDS + _FULL_DSA_REBUILT_FIELDS,
+    "cuda_graph_segments",
+)
+
+
+def _slice_fp8_activation_scratch(
+    base_x_fp8: torch.Tensor,
+    base_x_scale: torch.Tensor,
+    batch_size: int,
+    module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-bucket view of a scratch pair made by ``make_fp8_activation_scratch``.
+
+    Mirrors that helper exactly — same row padding, same TMA box dims — but the
+    storage comes from the largest bucket's scratch instead of a fresh
+    allocation. The dim-0 slice starts at offset 0, so the view keeps the base
+    ``data_ptr``; only the descriptor's global row count narrows to this
+    bucket's padded batch (which is what ``_validate_projection_out_buffers``
+    checks the tensor against).
+    """
+    padded_batch = max(batch_size, _FP8_SCRATCH_BLOCK_M)
+    if padded_batch > base_x_fp8.shape[0] or batch_size > base_x_scale.shape[0]:
+        raise ValueError(
+            f"FP8 activation scratch base too small: need "
+            f"({padded_batch}, {batch_size}), have "
+            f"({base_x_fp8.shape[0]}, {base_x_scale.shape[0]})"
+        )
+    x_fp8 = base_x_fp8[:padded_batch]
+    x_scale = base_x_scale[:batch_size]
+    a_tma_desc = module.create_tma_desc(
+        x_fp8,
+        padded_batch,
+        x_fp8.shape[1],
+        _FP8_SCRATCH_BLOCK_M,
+        _FP8_SCRATCH_BLOCK_K,
+    )
+    return x_fp8, x_scale, a_tma_desc
 
 
 class Glm5DsaAttnSegment:
@@ -673,10 +799,89 @@ class Glm5FullDsaAttnSegment:
             ),
         }
 
+    def _base_buffers_for(self, bucket_size: int):
+        """Largest already-allocated bucket that can back ``bucket_size`` views.
+
+        The base is read from ``self._buffers`` rather than an instance
+        attribute on purpose: the 21 indexer layers SHARE one buffers dict
+        (the worker's ``shared_dsa_buffers``), so whichever segment instance
+        allocated a bucket first owns the storage for all of them.
+        """
+        if not self._buffers:
+            return None
+        base_bucket = max(self._buffers)
+        if base_bucket < bucket_size:
+            return None
+        return self._buffers[base_bucket]
+
     def setup_static_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._buffers:
             self._setup_static_output_buffers(bucket_size)
             return
+        base = self._base_buffers_for(bucket_size)
+        if base is None:
+            if self._buffers:
+                logging.warning(
+                    "GLM-5 DSA segment: bucket %d is larger than every "
+                    "allocated bucket %s — capture is not running "
+                    "largest-first, allocating a second full buffer set",
+                    bucket_size,
+                    sorted(self._buffers),
+                )
+            # Base allocation. Graph capture happens AFTER this call, so every
+            # pointer a graph bakes belongs to this storage (or to a view of
+            # it), and this set stays alive as long as any bucket's views do.
+            self._buffers[bucket_size] = self._allocate_static_buffers(bucket_size)
+        else:
+            self._buffers[bucket_size] = self._view_static_buffers(base, bucket_size)
+        self._setup_static_output_buffers(bucket_size)
+
+    def _view_static_buffers(
+        self,
+        base: _Glm5FullDsaSegmentBuffers,
+        bucket_size: int,
+    ) -> _Glm5FullDsaSegmentBuffers:
+        """Build a bucket's buffer set as leading-dim slices of ``base``."""
+        attn = self.attn
+        buffers = {
+            name: getattr(base, name)[:bucket_size]
+            for name in _FULL_DSA_BUCKET_DIM_FIELDS
+        }
+        (
+            buffers["indexer_k_x_fp8"],
+            buffers["indexer_k_x_scale"],
+            buffers["indexer_k_tma_desc"],
+        ) = _slice_fp8_activation_scratch(
+            base.indexer_k_x_fp8,
+            base.indexer_k_x_scale,
+            bucket_size,
+            self.cuda_module,
+        )
+        (
+            buffers["q_x_fp8"],
+            buffers["q_x_scale"],
+            buffers["q_tma_desc"],
+        ) = _slice_fp8_activation_scratch(
+            base.q_x_fp8,
+            base.q_x_scale,
+            bucket_size,
+            self.cuda_module,
+        )
+        # Recomputed on the SLICED views: blocked_k is a reshape of
+        # selected_mla_kv (same storage) and cache_seqlens is selected_lengths
+        # itself, so the prepared object stays wired to this bucket's views.
+        buffers["prepared_flashmla"] = prepare_sparse_flash_mla_decode_inputs(
+            buffers["query_states"],
+            buffers["selected_mla_kv"],
+            buffers["selected_lengths"],
+            attn.num_heads,
+            float(attn.softmax_scale),
+            head_dim_v=attn.kv_lora_rank,
+            page_size=self.page_size,
+        )
+        return _Glm5FullDsaSegmentBuffers(**buffers)
+
+    def _allocate_static_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
         device = self.primary_blocked_k.device
         attn = self.attn
         indexer = attn.indexer
@@ -723,7 +928,7 @@ class Glm5FullDsaAttnSegment:
             head_dim_v=attn.kv_lora_rank,
             page_size=self.page_size,
         )
-        self._buffers[bucket_size] = _Glm5FullDsaSegmentBuffers(
+        return _Glm5FullDsaSegmentBuffers(
             valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             aux_valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             row_indices=torch.arange(bucket_size, dtype=torch.int32, device=device),
@@ -806,7 +1011,6 @@ class Glm5FullDsaAttnSegment:
             ),
             prepared_flashmla=prepared_flashmla,
         )
-        self._setup_static_output_buffers(bucket_size)
 
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._outputs:

@@ -35,6 +35,7 @@ from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
+    _assert_dsa_buffer_field_coverage,
     prepare_sparse_flash_mla_decode_inputs,
     run_prepared_sparse_flash_mla_decode,
     select_mla_kv_for_flashmla_bf16_out,
@@ -44,6 +45,73 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     run_paged_kv_token_update_fused,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
+)
+
+
+# Per-bucket buffer VIEWS, skip-layer flavour. Same contract as the full
+# segment (allocate once at the largest bucket, slice for the rest — see
+# cuda_graph_segments._FULL_DSA_BUCKET_DIM_FIELDS), but this dict holds the
+# skip layers' own placeholder-carrying sets, so the split differs.
+#
+# dim 0 == bucket size; every initializer here is slice-invariant
+# (torch.empty / arange / ones / zeros / full / fill_).
+_REUSE_BUCKET_DIM_FIELDS = (
+    "valid_mask",
+    "aux_valid_mask",
+    "row_indices",
+    "valid_rows_bf16",
+    "valid_rows_ones",
+    "valid_rows_zeros",
+    "safe_slot_zeros",
+    "skip_slot_neg_ones",
+    "safe_seqlen_zeros",
+    "kv_primary_slot_indices",
+    "kv_aux_slot_indices",
+    "safe_primary_slot_indices",
+    "safe_aux_slot_indices",
+    "safe_cache_seqlens",
+    "q_a",
+    "q_flat",
+    "q_nope",
+    "q_rope_4d",
+    "new_compressed_kv",
+    "selected_mla_kv",
+    "selected_lengths",
+    "row_modes",
+    "absorbed_q",
+    "query_states",
+    "attn_heads",
+)
+
+# Indexer-only fields: 1-element placeholders, never read on this path. They
+# are NOT bucket-shaped, so a view bucket reuses the base's placeholder tensor
+# objects unchanged instead of slicing them.
+_REUSE_PLACEHOLDER_FIELDS = (
+    "indexer_k_raw",
+    "indexer_k_x_fp8",
+    "indexer_k_x_scale",
+    "indexer_k_tma_desc",
+    "q_x_fp8",
+    "q_x_scale",
+    "q_tma_desc",
+    "q_flat_indexer",
+    "q_index",
+    "head_gates",
+    "positions_expanded",
+    "agg_scores",
+)
+
+# Rebuilt per bucket: top_k_indices is borrowed from the producing full
+# segment's buffer set FOR THIS BUCKET (never sliced from our own base), and
+# prepared_flashmla is batch-size dependent.
+_REUSE_REBUILT_FIELDS = (
+    "top_k_indices",
+    "prepared_flashmla",
+)
+
+_assert_dsa_buffer_field_coverage(
+    _REUSE_BUCKET_DIM_FIELDS + _REUSE_PLACEHOLDER_FIELDS + _REUSE_REBUILT_FIELDS,
+    "reuse_topk_segment",
 )
 
 
@@ -135,14 +203,11 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             ),
         )
 
-    def setup_static_buffers(self, bucket_size: int) -> None:
-        if bucket_size in self._buffers:
-            self._setup_static_output_buffers(bucket_size)
-            return
-        device = self.primary_blocked_k.device
-        attn = self.attn
-        kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
-
+    # setup_static_buffers itself is INHERITED from Glm5FullDsaAttnSegment: the
+    # dispatcher only touches self._buffers, the two hooks below, and
+    # _setup_static_output_buffers (all overridden here or deref-safe), so the
+    # allocate-once-at-the-largest-bucket policy stays in one place.
+    def _topk_source_buffers(self, bucket_size: int):
         source_buffers = self.topk_source._buffers.get(bucket_size)
         if source_buffers is None:
             # Producer captures before consumers (layer order); if we get here
@@ -152,6 +217,41 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 f"bucket {bucket_size}; producing indexer-layer segment must "
                 "be set up first"
             )
+        return source_buffers
+
+    def _view_static_buffers(
+        self,
+        base: _Glm5FullDsaSegmentBuffers,
+        bucket_size: int,
+    ) -> _Glm5FullDsaSegmentBuffers:
+        attn = self.attn
+        buffers = {
+            name: getattr(base, name)[:bucket_size]
+            for name in _REUSE_BUCKET_DIM_FIELDS
+        }
+        buffers.update(
+            {name: getattr(base, name) for name in _REUSE_PLACEHOLDER_FIELDS}
+        )
+        # THE handoff, per bucket: the producing full segment's static top-k
+        # buffer for THIS bucket (itself a view of the producer's base).
+        buffers["top_k_indices"] = self._topk_source_buffers(bucket_size).top_k_indices
+        buffers["prepared_flashmla"] = prepare_sparse_flash_mla_decode_inputs(
+            buffers["query_states"],
+            buffers["selected_mla_kv"],
+            buffers["selected_lengths"],
+            attn.num_heads,
+            float(attn.softmax_scale),
+            head_dim_v=attn.kv_lora_rank,
+            page_size=self.page_size,
+        )
+        return _Glm5FullDsaSegmentBuffers(**buffers)
+
+    def _allocate_static_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
+        device = self.primary_blocked_k.device
+        attn = self.attn
+        kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+
+        source_buffers = self._topk_source_buffers(bucket_size)
 
         selected_mla_kv = torch.empty(
             bucket_size, self.index_topk, 1, kv_dim,
@@ -174,7 +274,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         )
         one_i32 = torch.ones(1, dtype=torch.int32, device=device)
         one_bf16 = torch.ones(1, dtype=torch.bfloat16, device=device)
-        self._buffers[bucket_size] = _Glm5FullDsaSegmentBuffers(
+        return _Glm5FullDsaSegmentBuffers(
             valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             aux_valid_mask=torch.empty(bucket_size, dtype=torch.bool, device=device),
             row_indices=torch.arange(bucket_size, dtype=torch.int32, device=device),
@@ -235,7 +335,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             ),
             prepared_flashmla=prepared_flashmla,
         )
-        self._setup_static_output_buffers(bucket_size)
 
     def forward(
         self,
