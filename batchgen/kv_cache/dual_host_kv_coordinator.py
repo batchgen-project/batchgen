@@ -91,6 +91,8 @@ def _build_host_config_from_profile(profile, shm_name: str, num_pages: int) -> A
 		profile.sequence_table_capacity or config.num_pages
 	)
 	config.alignment_bytes = profile.alignment_bytes
+	if getattr(profile, "logical_to_physical_layer", None) is not None:
+		config.logical_to_physical_layer = list(profile.logical_to_physical_layer)
 	return config
 
 
@@ -189,8 +191,13 @@ class DualHostKVCoordinator:
 			aux_config.memfd_fd = aux_memfd_fd
 
 		primary_view = core_engine_module.MLAHostPagedKVWorkerView(primary_config)
+		aux_view_cls = (
+			core_engine_module.MappedMLAHostPagedKVWorkerView
+			if getattr(aux_config, "logical_to_physical_layer", None)
+			else core_engine_module.MLAHostPagedKVWorkerView
+		)
 		try:
-			aux_view = core_engine_module.MLAHostPagedKVWorkerView(aux_config)
+			aux_view = aux_view_cls(aux_config)
 		except RuntimeError as e:
 			raise RuntimeError(
 				"Cannot create auxiliary KV worker view for DSA model; "

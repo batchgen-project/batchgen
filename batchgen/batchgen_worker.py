@@ -1048,6 +1048,11 @@ class BatchGenWorker:
 			)
 			primary_config = self._with_cuda_graph_page_table_capacity(primary_config)
 			aux_config = GPUPagedKVConfig(
+				logical_to_physical_layer=(
+					list(aux_profile.logical_to_physical_layer)
+					if getattr(aux_profile, "logical_to_physical_layer", None) is not None
+					else None
+				),
 				num_layers=aux_profile.num_layers,
 				num_pages=num_pages,
 				page_size_tokens=aux_profile.page_size,
@@ -6818,7 +6823,8 @@ class BatchGenWorker:
 		if self.rank == 0:
 			logging.info(
 				f"[GPU-KV] Actual size after model loading: {self.gpu_kv_cache_size_gb:.2f} GB "
-				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB)"
+				f"(total: {total_mem_gb:.2f} GB × frac: {self.gpu_memory_frac} - used: {used_mem_gb:.2f} GB "
+				f"- graph_reserve: {graph_reserve_gb:.2f} GB)"
 			)
 
 		# Broadcast to ensure all ranks use same value
@@ -9618,7 +9624,10 @@ class BatchGenWorker:
 						shared_buffers=shared_reuse_buffers,
 					)
 				else:
-					aux_blocked_k = aux_k_cache[layer_idx]
+					# aux pool may hold only the indexer layers (M1c): resolve
+					# the physical slot instead of indexing by engine layer.
+					aux_phys = aux_manager.resolve_physical_layer(layer_idx)
+					aux_blocked_k = aux_k_cache[aux_phys]
 					dummy = torch.empty(
 						1,
 						1,

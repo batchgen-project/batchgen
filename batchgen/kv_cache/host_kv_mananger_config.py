@@ -56,6 +56,9 @@ class _HostKVModelProfile:
 	kv_dtype: str = "bfloat16"
 	sequence_table_capacity: int | None = None
 	alignment_bytes: int = 64
+	# Optional dense physical->slot map (len = engine layers; -1 = layer not in
+	# this pool). num_layers above is then the SLOT count, not the engine count.
+	logical_to_physical_layer: tuple | None = None
 
 	def bytes_per_page(self) -> int:
 		element_bytes = _dtype_size_bytes(self.kv_dtype)
@@ -145,6 +148,25 @@ _GLM5_INDEXER_PROFILE = _HostKVModelProfile(
 	kv_dtype="bfloat16",
 )
 
+# GLM-5.2 DSA: 21 full-indexer layers ([0,1,2] + every 4th from 6); the other
+# 57 layers reuse the previous full layer's top-k and never touch the aux
+# cache (consumer trace 2026-08-15). Slots are dense over the full layers.
+_GLM5_2_INDEXER_LAYERS = tuple([0, 1, 2] + list(range(6, 78, 4)))
+assert len(_GLM5_2_INDEXER_LAYERS) == 21
+_GLM5_2_AUX_LAYER_MAP = tuple(
+	_GLM5_2_INDEXER_LAYERS.index(l) if l in _GLM5_2_INDEXER_LAYERS else -1
+	for l in range(78)
+)
+_GLM5_2_INDEXER_PROFILE = _HostKVModelProfile(
+	num_layers=21,
+	num_k_heads=1,
+	k_head_dim=128,
+	num_v_heads=0,
+	v_head_dim=0,
+	kv_dtype="bfloat16",
+	logical_to_physical_layer=_GLM5_2_AUX_LAYER_MAP,
+)
+
 # Kimi-K3: MLA latent KV, SAME geometry as kimi-linear (compressed_kv_dim=576)
 # but 93 ENGINE layers, not 27. K3 has 24 MLA layers sitting at engine indices
 # 3,7,...,87,91,92 — and `wrappers.py::_offload_prepacked_kv` indexes the pool
@@ -181,6 +203,7 @@ _PROFILE_REGISTRY: Dict[str, _HostKVModelProfile] = {
 	"minimax_m25_gqa": _MINIMAX_M25_GQA_PROFILE,
 	"glm5_mla": _GLM5_MLA_PROFILE,
 	"glm5_indexer": _GLM5_INDEXER_PROFILE,
+	"glm5_2_indexer": _GLM5_2_INDEXER_PROFILE,
 	"kimi_linear_mla": _KIMI_LINEAR_MLA_PROFILE,
 	"kimi_k3_mla": _KIMI_K3_MLA_PROFILE,
 }
@@ -280,8 +303,9 @@ for canonical, aliases in {
 		"zai-org/glm-5.1",
 		"glm-5.1-fp8",
 		"glm-5.1",
-		# GLM-5.2: same indexer dims; shared layers reuse top-k, no aux cache
-		# needed but the profile is used for sizing so it's safe to over-allocate.
+	),
+	"glm5_2_indexer": (
+		# GLM-5.2: only the 21 full-indexer layers hold aux K (M1c).
 		"zai-org/glm-5.2-fp8",
 		"zai-org/glm-5.2",
 		"glm-5.2-fp8",
@@ -401,6 +425,10 @@ def build_gpu_kv_config(
 	profile = _resolve_profile(model_name)
 	num_pages = _compute_gpu_page_capacity(sequence_tokens, profile.page_size)
 	return GPUPagedKVConfig(
+		logical_to_physical_layer=(
+			list(profile.logical_to_physical_layer)
+			if profile.logical_to_physical_layer is not None else None
+		),
 		num_layers=profile.num_layers,
 		num_pages=num_pages,
 		page_size_tokens=profile.page_size,
