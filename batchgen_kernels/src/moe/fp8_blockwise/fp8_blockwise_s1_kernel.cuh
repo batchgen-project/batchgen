@@ -35,10 +35,11 @@ __global__ void __launch_bounds__(384, 1)
         const __grid_constant__ TmaBS tma_bs_gate,
         const __grid_constant__ TmaBS tma_bs_up,
         cute::TmaDescriptor *td_xy, int *seqlens_ptr,
+        const int *cu_seqlens_ptr,
         float *xscale_ptr,
         int *tiles_ptr, int *cu_tiles_ptr,
         int num_group, int m, int n, int k,
-        int m_pad, int mtp_tiles,
+        int m_pad,
         int num_block_n, int num_block_k, int num_block_k_pad4,
         cutlass::FastDivmod flat_divider) {
   using namespace cute;  // NOLINT
@@ -183,6 +184,9 @@ __global__ void __launch_bounds__(384, 1)
         if (itile_n >= num_tile_n) break;
       }
       iblock += gridDim.x;
+      // x_scale shares x's row space (see fp8_blockwise_gemm_kernel.cuh header):
+      // expert igroup's first scale tile is cu_seqlens[igroup] / kTileM.
+      int scale_tile_base = cu_seqlens_ptr[igroup] / kTileM;
 
       // ──── PHASE 1: Gate weight K-loop (leader only) ────
       if (is_leader_in_load) {
@@ -196,7 +200,7 @@ __global__ void __launch_bounds__(384, 1)
                      tBg_gate(_, itile_n, itile_k, igroup),
                      tBs_gate(_, 0, 0, ismem_write));
           cute::copy(tma_as.with(readable[ismem_write]),
-                     tASg(_, itile_k, igroup * mtp_tiles + itile_m),
+                     tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
           cute::copy(tma_bs_gate.with(readable[ismem_write]),
                      tBSg_gate(_, itile_n, itile_k / 4, igroup),
@@ -227,7 +231,7 @@ __global__ void __launch_bounds__(384, 1)
                      tBg_up(_, itile_n, itile_k, igroup),
                      tBs_up(_, 0, 0, ismem_write));
           cute::copy(tma_as.with(readable[ismem_write]),
-                     tASg(_, itile_k, igroup * mtp_tiles + itile_m),
+                     tASg(_, itile_k, scale_tile_base + itile_m),
                      tASs(_, ismem_write, 0));
           cute::copy(tma_bs_up.with(readable[ismem_write]),
                      tBSg_up(_, itile_n, itile_k / 4, igroup),

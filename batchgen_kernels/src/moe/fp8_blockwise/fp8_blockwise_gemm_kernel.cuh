@@ -1,7 +1,9 @@
 // BatchGen — FP8 Blockwise Grouped GEMM Kernel
 // Persistent 3-WG CuTe kernel: 2 math WGs (TiledMma N-split) + 1 TMA loader WG.
 // Adaptive TileM (16/32/64), TileN=128, TileK=128, 8-stage TMA pipeline.
-// Supports uniform mtp-stride buffer layout via mtp_tiles parameter.
+// x/y/x_scale all live in one row space described by cu_seqlens; the layout may
+// be uniform-stride padded ([E, mtp, dim]) or compact ragged, the only contract
+// being that every cu_seqlens[e] is a multiple of TileM.
 
 #ifndef BATCHGEN_FP8_BLOCKWISE_GEMM_KERNEL_CUH_
 #define BATCHGEN_FP8_BLOCKWISE_GEMM_KERNEL_CUH_
@@ -113,6 +115,19 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 
     int num_seq = seqlens_ptr[igroup];
     int cu_seqlen = cu_seqlens_ptr[igroup];
+    // x_scale is addressed in the SAME row space as x (tile index
+    // cu_seqlens[e] / kTileM), so every expert segment start must be a
+    // multiple of kTileM. Both supported layouts satisfy this: the padded
+    // layout has cu_seqlens[e] = e * mtp with mtp a multiple of 64, and the
+    // compact ragged layout aligns segment starts up to 64. Fail loudly
+    // rather than silently reading a neighbour expert's scales.
+    if (idx == 0 && (cu_seqlen % kTileM) != 0) {
+      printf("[fp8_blockwise] FATAL: cu_seqlens[%d]=%d is not a multiple of "
+             "TileM=%d; x_scale tile indexing requires aligned expert segment "
+             "starts\n",
+             igroup, cu_seqlen, kTileM);
+      __trap();
+    }
     auto *x_ibatch_ptr = x_ptr + cu_seqlen * k;
     auto *y_ibatch_ptr = y_ptr + cu_seqlen * n;
 
@@ -150,7 +165,7 @@ __global__ void update_expert_tma(const vec_t<cute::TmaDescriptor, 2> td_xy,
 // ============================================================================
 // Main persistent kernel: FP8 blockwise grouped GEMM
 // 384 threads: 2 math WGs (256 threads) + 1 loader WG (128 threads)
-// Supports uniform mtp-stride x_scale layout via mtp_tiles parameter.
+// x_scale is indexed in x's row space via cu_seqlens (see file header).
 // ============================================================================
 template <typename Config, typename TmaA, typename TmaB, typename TmaC, typename TmaAS,
           typename TmaBS, bool IsLoopH>
@@ -159,10 +174,11 @@ __global__ void __launch_bounds__(384, 1)
                                       const __grid_constant__ TmaAS tma_as,
                                       const __grid_constant__ TmaBS tma_bs,
                                       cute::TmaDescriptor *td_xy, int *seqlens_ptr,
+                                      const int *cu_seqlens_ptr,
                                       float *xscale_ptr, float *wscale_ptr,
                                       int *tiles_ptr, int *cu_tiles_ptr,
                                       int num_group, int m, int n, int k,
-                                      int m_pad, int mtp_tiles,
+                                      int m_pad,
                                       int num_block_n, int num_block_k,
                                       int num_block_k_pad4,
                                       cutlass::FastDivmod flat_divider) {
@@ -295,6 +311,11 @@ __global__ void __launch_bounds__(384, 1)
 
         iblock += gridDim.x;
         auto *td_x = td_xy + igroup * 2;
+        // x_scale shares x's row space: expert igroup's first M-tile of scales
+        // sits at row cu_seqlens[igroup], i.e. tile cu_seqlens[igroup]/kTileM.
+        // Works for both the padded (cu_seqlens[e] = e*mtp) and the compact
+        // ragged (64-aligned segment starts) layouts.
+        int scale_tile_base = cu_seqlens_ptr[igroup] / kTileM;
 
 #pragma unroll 1
         for (int itile_k = 0; itile_k < ntile_k; ++itile_k) {
@@ -305,9 +326,8 @@ __global__ void __launch_bounds__(384, 1)
           cute::copy(tma_b.with(readable[ismem_write]), tBg(_, itile_n, itile_k, igroup),
                      tBs(_, 0, 0, ismem_write));
 
-          // x_scale: use mtp_tiles for uniform-stride buffer layout
           cute::copy(tma_as.with(readable[ismem_write]),
-                     tASg(_, itile_k, igroup * mtp_tiles + itile_m), tASs(_, ismem_write, 0));
+                     tASg(_, itile_k, scale_tile_base + itile_m), tASs(_, ismem_write, 0));
           cute::copy(tma_bs.with(readable[ismem_write]), tBSg(_, itile_n, itile_k / 4, igroup),
                      tBSs(_, ismem_write, 0));
 

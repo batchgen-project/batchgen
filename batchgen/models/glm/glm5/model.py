@@ -37,15 +37,16 @@ from .config import GLM5Config as Glm5Config, dsa_layer_skips_topk
 
 
 # ============================================================================
-# K2.5 3D-buffer MoE kernels — port of minimax-m25's validated decode path.
+# Compact ragged MoE decode kernels (M1a-2). Started as a port of minimax-m25's
+# padded [E, mtp, dim] path; the buffer layout is now compact (moe_ragged.py).
 # ============================================================================
-# The MoE 3D path uses `dispatch_scatter_3d` + `grouped_fp8_blockwise_*` +
-# `reduce_weighted_scatter`. Falls back to `_triton_compute` if the 3D
-# kernels or FP8 blockwise ops aren't available.
+# The MoE decode path uses `dispatch_scatter_ragged` (moe_ragged.py) +
+# `grouped_fp8_blockwise_*` + `reduce_weighted_scatter`. Falls back to
+# `_triton_compute` only if the dispatch/reduce kernels aren't available at
+# all; there is no padded-layout fallback inside the ragged path.
 
 try:
     from batchgen.moe.grouped_fp8_blockwise_moe import (
-        grouped_fp8_blockwise_s1_silu,
         grouped_fp8_blockwise_fused_s1,
         grouped_fp8_blockwise_s3,
     )
@@ -54,23 +55,25 @@ except ImportError:
     _GLM5_HAS_FP8_BLOCKWISE = False
 
 try:
-    from batchgen_kernels.moe._C_fp8_blockwise_ops import (
-        act_quant_3d, fused_silu_quant_3d,
-    )
-    _GLM5_HAS_FP8_OPS = True
-except ImportError:
-    _GLM5_HAS_FP8_OPS = False
-
-try:
-    from batchgen.moe.dispatch_scatter_3d import (
-        dispatch_scatter_3d, reduce_weighted_scatter,
-    )
+    from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
     _GLM5_HAS_DISPATCH_3D = True
 except ImportError:
     _GLM5_HAS_DISPATCH_3D = False
 
+from .moe_ragged import (
+    GEMM_TILEM_AVG as _GLM5_MOE_GEMM_TILEM_AVG,
+    act_quant_ragged as _glm5_act_quant_ragged,
+    dispatch_scatter_ragged as _glm5_dispatch_scatter_ragged,
+    make_quant_buffers as _glm5_make_quant_buffers,
+    ragged_row_capacity as _glm5_ragged_row_capacity,
+)
+
+# DEAD as of M1a-2 (compact ragged MoE dispatch): the dispatch/result buffers are
+# no longer sized by a per-expert stride, so this knob controls nothing. It is
+# still defined only because `batchgen_worker.py` imports it and forwards it as
+# `Glm5MoEGraphBufferPool(base_mtp=...)`, which is likewise ignored. Delete both
+# together in the follow-up that is allowed to touch the worker.
 _GLM5_3D_MTP = int(os.environ.get("BATCHGEN_GLM5_3D_MTP", "4096"))
-_GLM5_MTP_BLOCK = 128  # align mtp to FP8 blockwise block size (and TMA-friendly)
 _GLM5_MOE_CUDA_GRAPH_ENV = "BATCHGEN_GLM5_MOE_CUDA_GRAPH"
 _GLM5_MOE_GRAPH_COMPARE_ENV = "BATCHGEN_GLM5_MOE_GRAPH_COMPARE"
 _GLM5_MOE_ROUTER_MODE_ENV = "BATCHGEN_GLM5_MOE_ROUTER_MODE"
@@ -1027,15 +1030,29 @@ def scatter_weight_reduce_optimized(res, global_indices, token_topk_pos,
 
 
 # ============================================================================
-# K2.5 3D MoE Buffer Manager — port of MiniMaxM25MoEBufferManager
+# Compact ragged MoE Buffer Manager (M1a-2)
 # ============================================================================
 
 class Glm5MoE3DBuffers:
-    """Pre-allocated buffers for GLM-5 MoE decode on the K2.5 3D strided layout.
+    """Pre-allocated buffers for GLM-5 MoE decode on the compact ragged layout.
 
-    One instance per model, shared across all 75 MoE layers. Mirrors
-    MiniMaxM25MoEBufferManager (batchgen/models/minimax/minimax_m25/model.py:609)
-    exactly in shape + lifetime; only the docstring / logging labels differ.
+    One instance per model, shared across all 75 MoE layers.
+
+    Was the K2.5 per-expert 3D slot table ``[E_local, mtp, H]`` (1.51 GiB at
+    mtp=2048 / E_local=32 for dispatch + result). M1a-2 replaces the per-expert
+    stride with one compact row space of ``capacity`` rows, where
+
+        capacity = round_up(max_global_bsz * topk + E_local * 63, 128)
+
+    is the *total* worst case: every routed (token, expert) pair is at most one
+    row, plus at most 63 rows per segment of start alignment. Because that bound
+    is static there is no per-expert capacity left to overflow — see
+    :meth:`resize_if_needed`, which asserts instead of regrowing.
+
+    Layout contract (see ``moe_ragged.py``): expert ``e`` owns rows
+    ``[cu_seqlens[e], cu_seqlens[e] + expert_counts[e])``; ``cu_seqlens`` is
+    written on device by ``dispatch_scatter_ragged`` with 64-row-aligned starts
+    so the grouped GEMM can index ``x_scale`` in the same row space.
     """
 
     def __init__(
@@ -1047,7 +1064,6 @@ class Glm5MoE3DBuffers:
         topk: int,
         num_tokens_per_rank: int,
         device: torch.device,
-        max_tokens_padded: int,
     ):
         self.E_local = E_local
         self.H = H
@@ -1056,42 +1072,64 @@ class Glm5MoE3DBuffers:
         self.max_global_bsz = max_global_bsz
         self.num_tokens_per_rank = num_tokens_per_rank
         self.device = device
-        self.max_tokens_padded = max_tokens_padded
 
         NK = max_global_bsz * topk
-        buf_rows = E_local * max_tokens_padded
+        self.capacity = _glm5_ragged_row_capacity(max_global_bsz, topk, E_local)
 
         self.all_tokens = torch.zeros(max_global_bsz, H, dtype=torch.bfloat16, device=device)
         self.padded = torch.zeros(num_tokens_per_rank, H, dtype=torch.bfloat16, device=device)
         self.expert_counts = torch.zeros(E_local, dtype=torch.int32, device=device)
         self.expert_counters = torch.zeros(E_local, dtype=torch.int32, device=device)
+        self.cu_seqlens = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
         self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
-        self.dispatched_x = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
-        self.expert_out = torch.zeros(buf_rows, H, dtype=torch.bfloat16, device=device)
         self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self._alloc_row_buffers()
 
         total_bytes = 0
         for t in (self.all_tokens, self.padded, self.expert_counts, self.expert_counters,
-                  self.topk_pos, self.dispatched_x, self.expert_out, self.result_buffer):
+                  self.cu_seqlens, self.topk_pos, self.dispatched_x, self.intermediate,
+                  self.expert_out, self.result_buffer, self.x_fp8, self.x_scale,
+                  self.inter_fp8, self.inter_scale):
             total_bytes += t.nelement() * t.element_size()
         logging.info(
-            f"[Glm5MoE3DBuffers] E_local={E_local}, mtp={max_tokens_padded}, "
-            f"buf_rows={buf_rows}, H={H}, N_inter={N_inter}, "
+            f"[Glm5MoE3DBuffers] ragged: E_local={E_local}, capacity={self.capacity} rows "
+            f"(NK={NK} + align pad), H={H}, N_inter={N_inter}, "
             f"total={total_bytes / (1024**3):.2f} GiB"
         )
 
-    def resize_if_needed(self, global_bsz: int, num_tokens_per_rank: int = None):
-        """Resize comm/routing buffers and — if per-expert worst case would exceed
-        the 3D stride — regrow the per-expert 3D buffers.
+    def _alloc_row_buffers(self):
+        """(Re)allocate everything indexed by the compact row space."""
+        cap, H, N_inter, device = self.capacity, self.H, self.N_inter, self.device
+        self.dispatched_x = torch.zeros(cap, H, dtype=torch.bfloat16, device=device)
+        self.intermediate = torch.empty(cap, N_inter, dtype=torch.bfloat16, device=device)
+        self.expert_out = torch.zeros(cap, H, dtype=torch.bfloat16, device=device)
+        # FP8 staging for S1/S3. Persistent rather than per-call `torch.empty`
+        # so nothing of this size is allocated inside a CUDA-graph capture, and
+        # so the zero-init of the scale buffers happens exactly once (the GEMM
+        # TMA-loads whole M-tiles, including alignment holes act_quant_ragged
+        # never writes; a stale finite scale there multiplies a hardware
+        # zero-filled activation row, an uninitialised NaN would not).
+        self.x_fp8, self.x_scale = _glm5_make_quant_buffers(cap, H, device)
+        self.inter_fp8, self.inter_scale = _glm5_make_quant_buffers(cap, N_inter, device)
 
-        Mirrors Kimi MoEBufferManager.resize_if_needed (moonshotai/kimi_k25/model.py:314).
-        The per-expert slot capacity is `max_tokens_padded`; worst case a single
-        expert can receive up to `global_bsz` tokens (every routed token), so
-        `max_tokens_padded` must be >= global_bsz to guarantee no OOB write in
-        dispatch_scatter_3d / grouped_fp8_blockwise_fused_s1.
+    def resize_if_needed(self, global_bsz: int, num_tokens_per_rank: int = None):
+        """Resize the comm/routing buffers, and the compact row space with them.
+
+        The 3D path's per-expert `grew_mtp` regrow is gone — the compact layout
+        has no per-expert capacity to overflow. What remains is a job-boundary
+        resize: the compact bound is a pure function of
+        ``(max_global_bsz, topk, E_local)``, so it can only change when the
+        planner raises the batch between jobs, which is the same event that
+        already reallocates the comm buffers. A *dispatch-time* overflow is
+        still a hard failure (TORCH_CHECK inside ``dispatch_scatter_ragged``).
+
+        NOTE vs m1a2_spec.md C5, which asked for a hard assert here on the
+        grounds that the total bound is static: it is static only within a job.
+        ``Glm5MoE.set_num_tokens_per_rank`` (called per batch job from
+        ``batchgen_worker.py``) raises ``global_bsz``, so an assert would turn
+        the documented n32 -> n128 -> n2048 job sequence into a crash.
         """
         grew_comm = global_bsz > self.max_global_bsz
-        grew_mtp = global_bsz > self.max_tokens_padded
         # `padded` (per-rank all-gather send buffer) is sized at creation-time
         # num_tokens_per_rank; the class-level buffer outlives the batch job, so
         # a later job with more per-rank tokens overruns it (bug_log 2026-08-13:
@@ -1101,7 +1139,7 @@ class Glm5MoE3DBuffers:
             and num_tokens_per_rank > self.padded.shape[0]
         )
 
-        if not grew_comm and not grew_mtp and not grew_padded:
+        if not grew_comm and not grew_padded:
             return
 
         if grew_padded:
@@ -1112,6 +1150,7 @@ class Glm5MoE3DBuffers:
                 num_tokens_per_rank, self.H, dtype=torch.bfloat16, device=self.device)
 
         if grew_comm:
+            needed = _glm5_ragged_row_capacity(global_bsz, self.topk, self.E_local)
             logging.info(
                 f"[Glm5MoE3DBuffers] Resizing comm buffers: {self.max_global_bsz} -> {global_bsz}")
             self.max_global_bsz = global_bsz
@@ -1119,15 +1158,13 @@ class Glm5MoE3DBuffers:
             self.all_tokens = torch.zeros(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
             self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=self.device)
             self.result_buffer = torch.empty(global_bsz, self.H, dtype=torch.bfloat16, device=self.device)
-
-        if grew_mtp:
-            new_mtp = ((global_bsz + _GLM5_MTP_BLOCK - 1) // _GLM5_MTP_BLOCK) * _GLM5_MTP_BLOCK
-            logging.info(
-                f"[Glm5MoE3DBuffers] Resizing 3D buffers: mtp {self.max_tokens_padded} -> {new_mtp}")
-            self.max_tokens_padded = new_mtp
-            buf_rows = self.E_local * new_mtp
-            self.dispatched_x = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=self.device)
-            self.expert_out = torch.zeros(buf_rows, self.H, dtype=torch.bfloat16, device=self.device)
+            if needed > self.capacity:
+                logging.warning(
+                    f"[Glm5MoE3DBuffers] Regrowing compact MoE rows: "
+                    f"{self.capacity} -> {needed} (global_bsz={global_bsz}). Sizing "
+                    f"the first job at the planner's max batch avoids this realloc.")
+                self.capacity = needed
+                self._alloc_row_buffers()
 
 
 # ============================================================================
@@ -1257,7 +1294,6 @@ class Glm5MoE(nn.Module):
                 topk=K,
                 num_tokens_per_rank=num_tokens_per_rank,
                 device=self.device,
-                max_tokens_padded=_GLM5_3D_MTP,
             )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank: int):
@@ -1512,7 +1548,7 @@ class Glm5MoE(nn.Module):
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """EP decode: AllGather → Gate → Expert Compute → AllReduce → Extract + Shared."""
         # K2.5 3D-MoE path (opt-in) — routes through validated minimax/kimi
-        # pattern: dispatch_scatter_3d + grouped_fp8_blockwise_* + reduce_weighted_scatter.
+        # pattern: dispatch_scatter_ragged + grouped_fp8_blockwise_* + reduce_weighted_scatter.
         if (self.use_3d_moe and self._fp8_blockwise_ready and
                 Glm5MoE._3d_buf is not None and _GLM5_HAS_DISPATCH_3D):
             debug_mode = _glm5_moe_debug_mode()
@@ -1806,7 +1842,8 @@ class Glm5MoE(nn.Module):
 
         if not getattr(Glm5MoE, '_warned_k25_path', False):
             logging.warning(
-                "[Glm5MoE] HOT PATH: dispatch_scatter_3d + reduce_weighted_scatter (K2.5 pattern)")
+                "[Glm5MoE] HOT PATH: dispatch_scatter_ragged + reduce_weighted_scatter "
+                "(compact ragged MoE)")
             Glm5MoE._warned_k25_path = True
 
         # 1) AllGather
@@ -1855,30 +1892,23 @@ class Glm5MoE(nn.Module):
                     topk_weight,
                 )
 
-        # 3) 3D dispatch
-        # No memset on the CUDA-ops path: the grouped GEMM rewrites per-expert
-        # TMA descriptors with extent = seqlens[e] (rows past the count are
-        # hardware-zero-filled on load and the Y store is extent-clipped), and
-        # act_quant_3d returns at token >= count. Only the Triton fallback
-        # quant reads the full [E*mtp] buffer and needs sane bf16 there.
-        if not _GLM5_HAS_FP8_OPS:
-            with (dt.timed("dispatch_memset", li) if dt else _nullctx()):
-                zero_rows = min(buf.max_tokens_padded, num_global + 128)
-                buf.dispatched_x.view(
-                    self.experts_per_rank, buf.max_tokens_padded, hidden_size
-                )[:, :zero_rows].zero_()
+        # 3) Compact ragged dispatch
+        # No memset: the grouped GEMM rewrites per-expert TMA descriptors with
+        # extent = seqlens[e] (rows past the count are hardware-zero-filled on
+        # load and the Y store is extent-clipped), and act_quant_ragged skips
+        # every row that is not a live token.
         with (dt.timed("dispatch", li) if dt else _nullctx()):
-            expert_counts, topk_pos = dispatch_scatter_3d(
+            expert_counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
                 all_tokens, topk_idx.to(torch.int32),
                 buf.dispatched_x,
                 self.routed_expert_start_idx, self.experts_per_rank,
-                buf.max_tokens_padded,
                 buf.expert_counts, buf.expert_counters,
+                buf.cu_seqlens,
                 buf.topk_pos[:num_global * topk],
             )
 
-        # 4) FP8 blockwise GEMM on 3D buffer
-        self._fp8_blockwise_gemm_3d(buf, expert_counts)
+        # 4) FP8 blockwise GEMM on the compact buffer
+        self._fp8_blockwise_gemm_3d(buf, expert_counts, cu_seqlens)
 
         # 5) Weighted scatter reduce
         result_buf = buf.result_buffer[:num_global]
@@ -1908,11 +1938,17 @@ class Glm5MoE(nn.Module):
             out = out + self.shared_expert_forward(identity)
         return out.view(*orig_shape)
 
-    def _fp8_blockwise_gemm_3d(self, buf, expert_counts):
-        """FP8 blockwise grouped GEMM on 3D strided buffer (in-place, no scatter/gather).
+    def _fp8_blockwise_gemm_3d(self, buf, expert_counts, cu_seqlens):
+        """FP8 blockwise grouped GEMM on the compact ragged buffer (in-place).
 
-        Mirrors MiniMaxM25MoE._fp8_blockwise_gemm_3d (model.py:1106-1177).
-        Reads buf.dispatched_x, writes buf.expert_out.
+        Reads buf.dispatched_x, writes buf.expert_out. Every staging tensor is a
+        persistent buffer, so this stage allocates nothing per call and the
+        scale tensors are already in the grouped GEMM's transposed layout (the
+        3D path needed a `[rows, K/128] -> [K/128, rows]` `.t().contiguous()`
+        after each quant).
+
+        There is no Triton fallback: `moe_ragged` hard-fails if the compiled
+        kernels predate the compact layout.
         """
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
@@ -1922,74 +1958,43 @@ class Glm5MoE(nn.Module):
 
         if not getattr(Glm5MoE, '_warned_gemm_3d', False):
             logging.warning(
-                f"[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d "
-                f"(act_quant_3d={_GLM5_HAS_FP8_OPS})")
+                "[Glm5MoE] HOT PATH: _fp8_blockwise_gemm_3d (compact ragged, "
+                f"capacity={buf.capacity} rows)")
             Glm5MoE._warned_gemm_3d = True
 
         E = self.experts_per_rank
-        K = self.hidden_size                  # 6144
-        N = self.config.moe_intermediate_size  # 2048
-        mtp = buf.max_tokens_padded
-        cu_seqlens = torch.arange(
-            0, (E + 1) * mtp, mtp, dtype=torch.int32, device=buf.dispatched_x.device)
         seqlens = expert_counts[:E]
-        avg = max(mtp // max(E, 1), 1)
+        avg = _GLM5_MOE_GEMM_TILEM_AVG
 
-        # Stage input quant (3D if CUDA ops available, else Triton fallback)
         with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
-            if _GLM5_HAS_FP8_OPS:
-                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-                x_3d = buf.dispatched_x[:E * mtp].view(E, mtp, K)
-                x_quant_3d, x_scale_3d = act_quant_3d(x_3d, seqlens)
-                x_quant = x_quant_3d.view(E * mtp, K)
-                x_scale_t = x_scale_3d.view(E * mtp, -1).t().contiguous()
-            else:
-                from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-                x_quant, x_scale = _act_quant(buf.dispatched_x[:E * mtp])
-                x_scale_t = x_scale.t().contiguous()
+            _glm5_act_quant_ragged(
+                buf.dispatched_x, seqlens, cu_seqlens, buf.x_fp8, buf.x_scale)
 
-        # S1: gate + up + SiLU (fused if possible) → BF16 intermediate
-        if _GLM5_HAS_FP8_OPS:
-            with (dt.timed("grouped_gemm_s1", li) if dt else _nullctx()):
-                s1_result = grouped_fp8_blockwise_fused_s1(
-                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                    seqlens, cu_seqlens, avg,
-                )
-            with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
-                inter_quant_3d, inter_scale_3d = act_quant_3d(
-                    s1_result.view(E, mtp, N), seqlens)
-                inter_quant = inter_quant_3d.view(E * mtp, N)
-                inter_scale_t = inter_scale_3d.view(E * mtp, -1).t().contiguous()
-        else:
-            with (dt.timed("grouped_gemm_s1", li) if dt else _nullctx()):
-                intermediate = grouped_fp8_blockwise_s1_silu(
-                    x_quant.view(torch.float8_e4m3fn), x_scale_t,
-                    self.fp8_gate_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_up_w3d.view(torch.float8_e4m3fn),
-                    self.fp8_gate_ws3d, self.fp8_up_ws3d,
-                    seqlens, cu_seqlens, avg,
-                )
-            from batchgen.attention.mla.fa3_backend import act_quant as _act_quant
-            with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
-                inter_quant, inter_scale = _act_quant(intermediate)
-                inter_scale_t = inter_scale.t().contiguous()
+        # S1: gate + up + SiLU → BF16 intermediate
+        with (dt.timed("grouped_gemm_s1", li) if dt else _nullctx()):
+            s1_result = grouped_fp8_blockwise_fused_s1(
+                buf.x_fp8.view(torch.float8_e4m3fn), buf.x_scale,
+                self.fp8_gate_w3d.view(torch.float8_e4m3fn),
+                self.fp8_up_w3d.view(torch.float8_e4m3fn),
+                self.fp8_gate_ws3d, self.fp8_up_ws3d,
+                seqlens, cu_seqlens, avg,
+                output=buf.intermediate,
+            )
+        with (dt.timed("moe_act_quant", li) if dt else _nullctx()):
+            _glm5_act_quant_ragged(
+                s1_result, seqlens, cu_seqlens, buf.inter_fp8, buf.inter_scale)
 
         # S3: down projection — write straight into the shared expert_out
-        # buffer (kernel supports output=). The former fresh-tensor + full
-        # [E*mtp, H] copy_ moved 2 x 1.61 GB x 75 layers = 242 GB/step
-        # (perf plan glm52-h200-perf-optimization, Phase 1 item #1). Stale rows
-        # beyond each expert's count are never read: reduce_weighted_scatter
-        # only visits this step's topk_pos slots.
+        # buffer (kernel supports output=). Stale rows beyond each expert's
+        # count are never read: reduce_weighted_scatter only visits this step's
+        # topk_pos slots.
         with (dt.timed("grouped_gemm_s3", li) if dt else _nullctx()):
             grouped_fp8_blockwise_s3(
-                inter_quant.view(torch.float8_e4m3fn), inter_scale_t,
+                buf.inter_fp8.view(torch.float8_e4m3fn), buf.inter_scale,
                 self.fp8_down_w3d.view(torch.float8_e4m3fn),
                 self.fp8_down_ws3d,
                 seqlens, cu_seqlens, avg,
-                output=buf.expert_out[:E * mtp],
+                output=buf.expert_out,
             )
 
     # ── Gate + Expert Compute ──

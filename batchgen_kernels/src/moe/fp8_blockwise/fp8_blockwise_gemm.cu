@@ -41,9 +41,6 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
   int num_block_k = k / kTileK;
   int num_block_n = n / kTileN;
 
-  // mtp_tiles: uniform stride for x_scale indexing in our reserved buffer layout
-  int mtp_tiles = m_pad / (kTileM * num_group);
-
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)), make_shape(m, k),
                        make_stride(k, Int<1>{}));
   auto W = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(w_ptr)),
@@ -99,9 +96,9 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          mtp_tiles, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr,
+          (float *)xscale_ptr, (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+          num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     } else {
       constexpr bool IsLoopH = false;
       auto kernel =
@@ -110,9 +107,9 @@ void launch_fp8_blockwise_gemm(void *y_ptr, const void *x_ptr, const void *w_ptr
                                                       decltype(tma_xs), decltype(tma_ws), IsLoopH>;
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
-          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
-          (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr, num_group, m, n, k, m_pad,
-          mtp_tiles, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
+          tma_w, tma_xs, tma_ws, tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr,
+          (float *)xscale_ptr, (float *)wscale_ptr, (int *)tiles_ptr, (int *)cu_tiles_ptr,
+          num_group, m, n, k, m_pad, num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     }
   }
 }
@@ -239,7 +236,6 @@ void launch_fp8_blockwise_fused_s1(
 
   int num_block_k = k / kTileK;
   int num_block_n = n / kTileN;
-  int mtp_tiles = m_pad / (kTileM * num_group);
 
   auto X = make_tensor(make_gmem_ptr(reinterpret_cast<const Tin *>(x_ptr)),
                        make_shape(m, k), make_stride(k, Int<1>{}));
@@ -299,9 +295,9 @@ void launch_fp8_blockwise_fused_s1(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
-          tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+          tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr, (float *)xscale_ptr,
           (int *)tiles_ptr, (int *)cu_tiles_ptr,
-          num_group, m, n, k, m_pad, mtp_tiles,
+          num_group, m, n, k, m_pad,
           num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     } else {
       constexpr bool IsLoopH = false;
@@ -311,9 +307,9 @@ void launch_fp8_blockwise_fused_s1(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
       kernel<<<grid, block, shm_size, stream>>>(
           tma_w_gate, tma_w_up, tma_xs, tma_ws_gate, tma_ws_up,
-          tma_xy, (int *)seqlens_ptr, (float *)xscale_ptr,
+          tma_xy, (int *)seqlens_ptr, (const int *)cu_seqlens_ptr, (float *)xscale_ptr,
           (int *)tiles_ptr, (int *)cu_tiles_ptr,
-          num_group, m, n, k, m_pad, mtp_tiles,
+          num_group, m, n, k, m_pad,
           num_block_n, num_block_k, num_block_k_pad4, flat_divider);
     }
   }

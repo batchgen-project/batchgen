@@ -1,11 +1,15 @@
 // BatchGen — FP8 Blockwise MoE Pipeline Operations
-// CUDA kernels for 3D-sparse FP8 quantization and fused SiLU activation.
-// All kernels operate on [E, mtp, dim] layout with tokens_per_expert masking.
+// CUDA kernels for sparse FP8 quantization and fused SiLU activation.
+// Kernels 1-3 operate on the padded [E, mtp, dim] layout with
+// tokens_per_expert masking; kernel 4 operates on the compact ragged layout
+// described by (seqlens, cu_seqlens).
 //
 // Kernels:
 // 1. act_quant_3d       — BF16→FP8 blockwise quantization (128-element blocks)
 // 2. silu_mul_3d        — SiLU(gate) × up (vectorized BF16)
 // 3. fused_silu_quant_3d — SiLU(gate) × up + FP8 quantization (fuses S1 epilogue + S3 input)
+// 4. act_quant_ragged   — kernel 1 on the compact ragged layout, writing the
+//                         scale already transposed into grouped-GEMM order
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -234,6 +238,103 @@ __global__ void fused_silu_quant_3d_kernel(
 }
 
 // ============================================================================
+// Kernel 4: act_quant_ragged — FP8 blockwise quantization, compact ragged layout
+//
+// Rows are compact: expert e owns rows [cu_seqlens[e], cu_seqlens[e]+seqlens[e])
+// and cu_seqlens[e+1] = cu_seqlens[e] + round_up(seqlens[e], 64). The 64-row
+// alignment is what lets the grouped GEMM address x_scale in the SAME row space
+// (scale tile index = cu_seqlens[e] / TileM + local_tile) for every supported
+// TileM (16/32/64).
+//
+// Grid: (max_rows,) — one CTA per buffer row. max_rows is a host constant, so
+// the launch geometry is static and CUDA-graph capturable while the segment
+// boundaries stay device-side.
+//
+// Rows that are not live tokens (alignment pad inside a segment, or past the
+// last segment) return without writing. Their x rows are never read by the GEMM
+// (the per-expert TMA extent is seqlens[e], so those rows are hardware
+// zero-filled), and their scale slots are only ever multiplied by that zero —
+// so a stale finite value there is harmless. The caller must therefore allocate
+// `scale` zero-initialised ONCE; it is never re-zeroed per call.
+//
+// `scale` is written TRANSPOSED, [num_k_blocks, max_rows], which is exactly the
+// layout the grouped GEMM's x_scale TMA descriptor wants. That removes the
+// per-call `[rows, nkb] -> [nkb, rows]` `.t().contiguous()` the 3D path needed.
+// ============================================================================
+__global__ void act_quant_ragged_kernel(
+    const __nv_bfloat16* __restrict__ x,      // [max_rows, K]
+    uint8_t* __restrict__ y,                   // [max_rows, K] FP8
+    float* __restrict__ scale,                 // [num_k_blocks, max_rows]
+    const int32_t* __restrict__ seqlens,       // [E]
+    const int32_t* __restrict__ cu_seqlens,    // [E+1]
+    int E, int max_rows, int K, int num_k_blocks
+) {
+    const int row = blockIdx.x;
+    if (row >= cu_seqlens[E]) return;
+
+    // Largest e with cu_seqlens[e] <= row. Uniform across the CTA.
+    int lo = 0, hi = E;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (cu_seqlens[mid] <= row) lo = mid; else hi = mid - 1;
+    }
+    const int expert = lo;
+    const int local = row - cu_seqlens[expert];
+    if (local >= seqlens[expert]) return;  // alignment pad row
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_warps = blockDim.x / 32;
+
+    const __nv_bfloat16* x_row = x + (int64_t)row * K;
+    uint8_t* y_row = y + (int64_t)row * K;
+
+    for (int kb = warp_id; kb < num_k_blocks; kb += num_warps) {
+        int col_base = kb * BLOCK_SIZE_QUANT;
+
+        float vals[4];
+        float local_max = 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                vals[i] = __bfloat162float(x_row[col]);
+            } else {
+                vals[i] = 0.0f;
+            }
+            local_max = fmaxf(local_max, fabsf(vals[i]));
+        }
+
+        #pragma unroll
+        for (int offset = 16; offset >= 1; offset >>= 1) {
+            float other = __shfl_xor_sync(0xffffffff, local_max, offset);
+            local_max = fmaxf(local_max, other);
+        }
+
+        // Byte-exact with act_quant_3d_kernel: same FP32 op sequence
+        // (`s = amax * (1/448)`, `scaled = x / s`).
+        constexpr float FP8_MAX_VAL_INV = 1.0f / FP8_MAX_VAL;
+        float s = fmaxf(local_max, QUANT_EPS) * FP8_MAX_VAL_INV;
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int col = col_base + lane_id * 4 + i;
+            if (col < K) {
+                float scaled = vals[i] / s;
+                scaled = fmaxf(fminf(scaled, FP8_MAX_VAL), -FP8_MAX_VAL);
+                y_row[col] = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+            }
+        }
+
+        if (lane_id == 0) {
+            scale[(int64_t)kb * max_rows + row] = s;
+        }
+    }
+}
+
+// ============================================================================
 // C++ Wrappers
 // ============================================================================
 
@@ -321,9 +422,49 @@ std::tuple<torch::Tensor, torch::Tensor> fused_silu_quant_3d(
     return std::make_tuple(y, scale);
 }
 
+void act_quant_ragged(
+    torch::Tensor x,           // [max_rows, K]   BF16, compact ragged
+    torch::Tensor seqlens,     // [E]             int32
+    torch::Tensor cu_seqlens,  // [E+1]           int32, 64-aligned segment starts
+    torch::Tensor y,           // [max_rows, K]   uint8  (caller-owned)
+    torch::Tensor scale        // [nkb, max_rows] float32 (caller-owned, zero-init once)
+) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D [max_rows, K]");
+    TORCH_CHECK(x.dtype() == torch::kBFloat16, "x must be BF16");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(y.dtype() == torch::kUInt8 && y.is_contiguous(), "y must be contiguous uint8");
+    TORCH_CHECK(scale.dtype() == torch::kFloat32 && scale.is_contiguous(),
+                "scale must be contiguous float32");
+    TORCH_CHECK(seqlens.dtype() == torch::kInt32 && cu_seqlens.dtype() == torch::kInt32,
+                "seqlens/cu_seqlens must be int32");
+
+    const int max_rows = x.size(0);
+    const int K = x.size(1);
+    const int E = seqlens.size(0);
+    const int num_k_blocks = (K + BLOCK_SIZE_QUANT - 1) / BLOCK_SIZE_QUANT;
+
+    TORCH_CHECK(cu_seqlens.size(0) == E + 1, "cu_seqlens must be [E+1], got ", cu_seqlens.size(0));
+    TORCH_CHECK(y.size(0) == max_rows && y.size(1) == K, "y must match x shape");
+    TORCH_CHECK(scale.size(0) == num_k_blocks && scale.size(1) == max_rows,
+                "scale must be [K/128, max_rows] = [", num_k_blocks, ", ", max_rows,
+                "], got [", scale.size(0), ", ", scale.size(1), "]");
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    act_quant_ragged_kernel<<<max_rows, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        y.data_ptr<uint8_t>(),
+        scale.data_ptr<float>(),
+        seqlens.data_ptr<int32_t>(),
+        cu_seqlens.data_ptr<int32_t>(),
+        E, max_rows, K, num_k_blocks);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("act_quant_3d", &act_quant_3d,
           "FP8 blockwise quantization on 3D [E, mtp, K] layout");
+    m.def("act_quant_ragged", &act_quant_ragged,
+          "FP8 blockwise quantization on the compact ragged layout "
+          "(scale written transposed in grouped-GEMM order)");
     m.def("silu_mul_3d", &silu_mul_3d,
           "SiLU(gate) * up on 3D [E, mtp, N] layout");
     m.def("fused_silu_quant_3d", &fused_silu_quant_3d,

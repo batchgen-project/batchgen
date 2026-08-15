@@ -3,36 +3,43 @@
 The GLM-5 MoE graph captures the full decode MoE module boundary:
 
     padded local tokens -> all_gather -> router -> rank padding mask
-      -> dispatch_scatter_3d -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
+      -> dispatch_scatter_ragged -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
       -> all_reduce -> local slice + shared expert
 
 The decoder-layer residual add remains eager in the caller because it is owned
 by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
+
+Buffers use the compact ragged layout (``moe_ragged.py``): one row space of
+``ragged_row_capacity(...)`` rows instead of a per-expert ``mtp`` slot table.
+The capture-time shapes stay static per bucket; the only per-step dynamic data
+is the contents of ``expert_counts`` / ``cu_seqlens``, which are device tensors.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from typing import Dict, List
 
 import torch
 
 from batchgen.cuda_graph.graph_manager import TensorSpec
-from batchgen.moe.dispatch_scatter_3d import dispatch_scatter_3d, reduce_weighted_scatter
+from batchgen.moe.dispatch_scatter_3d import reduce_weighted_scatter
 from batchgen.moe.grouped_fp8_blockwise_moe import (
     grouped_fp8_blockwise_fused_s1,
     grouped_fp8_blockwise_s3,
 )
 from batchgen.moe.routing import gate_sigmoid_topk_cuda, glm5_router_gemm_cuda
 
+from .moe_ragged import (
+    GEMM_TILEM_AVG as _GLM5_MOE_GEMM_TILEM_AVG,
+    act_quant_ragged,
+    dispatch_scatter_ragged,
+    make_quant_buffers,
+    ragged_row_capacity,
+)
+
 logger = logging.getLogger(__name__)
-
-
-def _act_quant_3d(x: torch.Tensor, seqlens: torch.Tensor):
-    from batchgen_kernels.moe._C_fp8_blockwise_ops import act_quant_3d
-
-    return act_quant_3d(x, seqlens)
 
 
 def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
@@ -58,16 +65,93 @@ class _Glm5MoEGraphBuffers:
     dispatched_x: torch.Tensor
     intermediate: torch.Tensor
     expert_out: torch.Tensor
+    x_fp8: torch.Tensor
+    x_scale: torch.Tensor
+    inter_fp8: torch.Tensor
+    inter_scale: torch.Tensor
     routed_global_output: torch.Tensor
     local_moe_output: torch.Tensor
     cu_seqlens: torch.Tensor
-    max_tokens_padded: int
+    capacity: int
+
+
+# ---------------------------------------------------------------------------
+# Per-bucket buffer VIEWS (allocate once at the largest bucket). Same contract
+# as the DSA statics (cuda_graph_segments.py): slices share storage with the
+# base tensor, capture happens AFTER setup, and buckets replay one at a time.
+#
+# Three disjoint sets, and every dataclass field must be in exactly one of them
+# (enforced by _assert_moe_buffer_field_coverage below).
+#
+#   * _BUCKET_DIM_FIELDS  — dim 0 scales with the bucket; take a leading slice.
+#     Every initializer used for them is slice-invariant (empty / zeros / full).
+#   * _SHARED_FIELDS      — bucket-independent (per-expert metadata); one tensor
+#     handed to every bucket.
+#   * _REBUILT_FIELDS     — must be built per bucket:
+#       rank_ids/local_pos   values depend on bucket_size, not just length;
+#       x_scale/inter_scale  are TRANSPOSED [K/128, capacity], so the bucket
+#                            dimension is dim 1 — a dim-1 slice is not
+#                            contiguous and the grouped GEMM requires a
+#                            contiguous [K/128, m_pad] scale tensor. They are
+#                            also zero-init-once buffers (see make_quant_buffers).
+#       capacity             a plain int.
+_MOE_BUCKET_DIM_FIELDS = (
+    "padded",
+    "all_tokens",
+    "router_logits",
+    "topk_indices",
+    "topk_weights",
+    "topk_masked_indices",
+    "topk_masked_weights",
+    "topk_negative_ones",
+    "topk_zero_weights",
+    "topk_pos",
+    "dispatched_x",
+    "intermediate",
+    "expert_out",
+    "x_fp8",
+    "inter_fp8",
+    "routed_global_output",
+    "local_moe_output",
+)
+
+_MOE_SHARED_FIELDS = (
+    "expert_counts",
+    "expert_counters",
+    "cu_seqlens",
+)
+
+_MOE_REBUILT_FIELDS = (
+    "rank_ids",
+    "local_pos",
+    "x_scale",
+    "inter_scale",
+    "capacity",
+)
+
+
+def _assert_moe_buffer_field_coverage(covered, where: str) -> None:
+    """Fail loudly if the buffer dataclass grew a field the view path ignores."""
+    expected = {f.name for f in dataclass_fields(_Glm5MoEGraphBuffers)}
+    covered = set(covered)
+    missing = sorted(expected - covered)
+    unknown = sorted(covered - expected)
+    if missing or unknown:
+        raise RuntimeError(
+            f"{where}: _Glm5MoEGraphBuffers field coverage is stale — "
+            f"missing={missing} unknown={unknown}. Add each new field to the "
+            "sliced, shared, or rebuilt set."
+        )
+
+
+_assert_moe_buffer_field_coverage(
+    _MOE_BUCKET_DIM_FIELDS + _MOE_SHARED_FIELDS + _MOE_REBUILT_FIELDS,
+    "moe_cuda_graph_segments",
+)
 
 
 class Glm5MoEGraphBufferPool:
     """Shared static buffers for all GLM-5 MoE graph segments on one rank."""
-
-    _MTP_BLOCK = 128
 
     def __init__(
         self,
@@ -79,8 +163,15 @@ class Glm5MoEGraphBufferPool:
         intermediate_size: int,
         device: torch.device,
         bucket_sizes: List[int],
-        base_mtp: int,
+        base_mtp: int = 0,
     ) -> None:
+        """``base_mtp`` is DEAD as of M1a-2 (compact ragged layout).
+
+        The dispatch/result buffers are no longer sized by a per-expert stride,
+        so the value is ignored. The parameter only survives because
+        ``batchgen_worker.py`` still forwards ``base_mtp=_GLM5_3D_MTP``; drop
+        both together in the follow-up that may touch the worker.
+        """
         if not bucket_sizes:
             raise ValueError("GLM-5 MoE graph requires at least one bucket size")
         self.world_size = int(world_size)
@@ -90,9 +181,15 @@ class Glm5MoEGraphBufferPool:
         self.intermediate_size = int(intermediate_size)
         self.device = device
         self.bucket_sizes = sorted({int(b) for b in bucket_sizes})
-        self.base_mtp = int(base_mtp)
         self._base: Dict[str, torch.Tensor] = {}
         self._views: Dict[int, _Glm5MoEGraphBuffers] = {}
+
+    def _capacity_for(self, bucket_size: int) -> int:
+        return ragged_row_capacity(
+            self.world_size * int(bucket_size),
+            self.num_experts_per_tok,
+            self.num_local_experts,
+        )
 
     def setup(self) -> None:
         if self._base:
@@ -100,8 +197,7 @@ class Glm5MoEGraphBufferPool:
 
         max_bucket = max(self.bucket_sizes)
         max_global = self.world_size * max_bucket
-        mtp = max(self.base_mtp, self._round_up(max_global, self._MTP_BLOCK))
-        rows = self.num_local_experts * mtp
+        capacity = self._capacity_for(max_bucket)
         nk = max_global * self.num_experts_per_tok
         d = self.device
         h = self.hidden_size
@@ -120,71 +216,95 @@ class Glm5MoEGraphBufferPool:
         b["topk_zero_weights"] = torch.zeros(max_global, k, dtype=torch.float32, device=d)
         b["expert_counts"] = torch.zeros(self.num_local_experts, dtype=torch.int32, device=d)
         b["expert_counters"] = torch.zeros(self.num_local_experts, dtype=torch.int32, device=d)
+        # Written on device by dispatch_scatter_ragged every step (64-aligned
+        # segment starts); no longer the constant arange of the mtp layout.
+        b["cu_seqlens"] = torch.zeros(self.num_local_experts + 1, dtype=torch.int32, device=d)
         b["topk_pos"] = torch.full((nk,), -1, dtype=torch.int32, device=d)
-        b["dispatched_x"] = torch.zeros(rows, h, dtype=torch.bfloat16, device=d)
-        b["intermediate"] = torch.empty(rows, n, dtype=torch.bfloat16, device=d)
-        b["expert_out"] = torch.empty(rows, h, dtype=torch.bfloat16, device=d)
+        b["dispatched_x"] = torch.zeros(capacity, h, dtype=torch.bfloat16, device=d)
+        b["intermediate"] = torch.empty(capacity, n, dtype=torch.bfloat16, device=d)
+        b["expert_out"] = torch.empty(capacity, h, dtype=torch.bfloat16, device=d)
+        b["x_fp8"] = torch.empty(capacity, h, dtype=torch.uint8, device=d)
+        b["inter_fp8"] = torch.empty(capacity, n, dtype=torch.uint8, device=d)
         b["routed_global_output"] = torch.empty(max_global, h, dtype=torch.bfloat16, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
-        b["cu_seqlens"] = torch.arange(
-            0,
-            (self.num_local_experts + 1) * mtp,
-            mtp,
-            dtype=torch.int32,
-            device=d,
-        )
-
-        total_bytes = sum(t.nelement() * t.element_size() for t in b.values())
-        logger.info(
-            "Glm5MoEGraphBufferPool: allocated %.2f GiB "
-            "(max_bucket=%d, world_size=%d, mtp=%d, rows=%d)",
-            total_bytes / (1024**3),
-            max_bucket,
-            self.world_size,
-            mtp,
-            rows,
-        )
 
         for bucket_size in self.bucket_sizes:
-            self._create_view(bucket_size, mtp)
+            self._create_view(bucket_size)
+
+        total_bytes = sum(t.nelement() * t.element_size() for t in b.values())
+        scale_bytes = sum(
+            v.x_scale.nelement() * v.x_scale.element_size()
+            + v.inter_scale.nelement() * v.inter_scale.element_size()
+            for v in self._views.values()
+        )
+        logger.info(
+            "Glm5MoEGraphBufferPool: allocated %.2f GiB base + %.2f GiB per-bucket "
+            "scales (max_bucket=%d, world_size=%d, capacity=%d rows)",
+            total_bytes / (1024**3),
+            scale_bytes / (1024**3),
+            max_bucket,
+            self.world_size,
+            capacity,
+        )
 
     def get(self, bucket_size: int) -> _Glm5MoEGraphBuffers:
         self.setup()
         return self._views[int(bucket_size)]
 
-    def _create_view(self, bucket_size: int, mtp: int) -> None:
+    def _create_view(self, bucket_size: int) -> None:
         global_rows = self.world_size * bucket_size
         nk = global_rows * self.num_experts_per_tok
-        rows = self.num_local_experts * mtp
+        capacity = self._capacity_for(bucket_size)
         b = self._base
+        base_capacity = b["dispatched_x"].shape[0]
+        if capacity > base_capacity:
+            raise RuntimeError(
+                f"GLM-5 MoE pool: bucket {bucket_size} needs {capacity} ragged rows "
+                f"but the base allocation has {base_capacity}; setup() must run on "
+                "the largest bucket first."
+            )
         positions = torch.arange(global_rows, dtype=torch.int64, device=self.device)
+        sliced = {
+            "padded": b["padded"][:bucket_size],
+            "all_tokens": b["all_tokens"][:global_rows],
+            "router_logits": b["router_logits"][:global_rows],
+            "topk_indices": b["topk_indices"][:global_rows],
+            "topk_weights": b["topk_weights"][:global_rows],
+            "topk_masked_indices": b["topk_masked_indices"][:global_rows],
+            "topk_masked_weights": b["topk_masked_weights"][:global_rows],
+            "topk_negative_ones": b["topk_negative_ones"][:global_rows],
+            "topk_zero_weights": b["topk_zero_weights"][:global_rows],
+            "topk_pos": b["topk_pos"][:nk],
+            "dispatched_x": b["dispatched_x"][:capacity],
+            "intermediate": b["intermediate"][:capacity],
+            "expert_out": b["expert_out"][:capacity],
+            "x_fp8": b["x_fp8"][:capacity],
+            "inter_fp8": b["inter_fp8"][:capacity],
+            "routed_global_output": b["routed_global_output"][:global_rows],
+            "local_moe_output": b["local_moe_output"][:bucket_size],
+        }
+        if set(sliced) != set(_MOE_BUCKET_DIM_FIELDS):
+            raise RuntimeError(
+                "GLM-5 MoE pool: sliced view set drifted from _MOE_BUCKET_DIM_FIELDS "
+                f"(extra={sorted(set(sliced) - set(_MOE_BUCKET_DIM_FIELDS))}, "
+                f"missing={sorted(set(_MOE_BUCKET_DIM_FIELDS) - set(sliced))})"
+            )
+        # x_fp8/inter_fp8 borrow the base storage; only the two transposed scale
+        # tensors are per-bucket (dim 1 is the bucket dim — a dim-1 slice is not
+        # contiguous, and the GEMM needs a contiguous [K/128, m_pad]).
+        _, x_scale = make_quant_buffers(capacity, self.hidden_size, self.device)
+        _, inter_scale = make_quant_buffers(capacity, self.intermediate_size, self.device)
         self._views[bucket_size] = _Glm5MoEGraphBuffers(
-            padded=b["padded"][:bucket_size],
-            all_tokens=b["all_tokens"][:global_rows],
-            router_logits=b["router_logits"][:global_rows],
-            topk_indices=b["topk_indices"][:global_rows],
-            topk_weights=b["topk_weights"][:global_rows],
-            topk_masked_indices=b["topk_masked_indices"][:global_rows],
-            topk_masked_weights=b["topk_masked_weights"][:global_rows],
-            topk_negative_ones=b["topk_negative_ones"][:global_rows],
-            topk_zero_weights=b["topk_zero_weights"][:global_rows],
+            **sliced,
             rank_ids=positions // bucket_size,
             local_pos=positions % bucket_size,
             expert_counts=b["expert_counts"],
             expert_counters=b["expert_counters"],
-            topk_pos=b["topk_pos"][:nk],
-            dispatched_x=b["dispatched_x"][:rows],
-            intermediate=b["intermediate"][:rows],
-            expert_out=b["expert_out"][:rows],
-            routed_global_output=b["routed_global_output"][:global_rows],
-            local_moe_output=b["local_moe_output"][:bucket_size],
             cu_seqlens=b["cu_seqlens"],
-            max_tokens_padded=mtp,
+            x_scale=x_scale,
+            inter_scale=inter_scale,
+            capacity=capacity,
         )
-
-    @staticmethod
-    def _round_up(value: int, block: int) -> int:
-        return ((value + block - 1) // block) * block
 
     def release(self) -> None:
         self._views.clear()
@@ -324,22 +444,21 @@ class Glm5MoEGraphSegment:
             out=bufs.topk_masked_weights,
         )
 
-        # No memset (see eager path): TMA extents clip to seqlens[e]; the graph
-        # MoE path requires CUDA fp8 ops, so the Triton-fallback consumer of
-        # zeroed rows does not exist here.
-        expert_counts, topk_pos = dispatch_scatter_3d(
+        # No memset (see eager path): TMA extents clip to seqlens[e] and
+        # act_quant_ragged skips every row that is not a live token.
+        expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
             bufs.all_tokens,
             bufs.topk_masked_indices,
             bufs.dispatched_x,
             self.expert_start,
             self.num_local_experts,
-            bufs.max_tokens_padded,
             bufs.expert_counts,
             bufs.expert_counters,
+            bufs.cu_seqlens,
             bufs.topk_pos,
         )
 
-        self._fp8_blockwise_gemm_3d(bufs, expert_counts)
+        self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
 
         routed_global_output = reduce_weighted_scatter(
             bufs.expert_out,
@@ -369,45 +488,40 @@ class Glm5MoEGraphSegment:
         self,
         bufs: _Glm5MoEGraphBuffers,
         expert_counts: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> None:
+        """Compact ragged S1/S3. Allocates nothing — every staging tensor is a
+        pool buffer, so no block of this size is minted inside graph capture,
+        and the scale tensors are already in the grouped GEMM's transposed
+        layout (the 3D path needed a `.t().contiguous()` after each quant).
+        """
         e = self.num_local_experts
-        h = self.hidden_size
-        n = self.intermediate_size
-        mtp = bufs.max_tokens_padded
         seqlens = expert_counts[:e]
-        avg = max(mtp // max(e, 1), 1)
+        avg = _GLM5_MOE_GEMM_TILEM_AVG
 
-        x_3d = bufs.dispatched_x.view(e, mtp, h)
-        x_quant_3d, x_scale_3d = _act_quant_3d(x_3d, seqlens)
-        x_quant = x_quant_3d.view(e * mtp, h)
-        x_scale_t = x_scale_3d.view(e * mtp, -1).t().contiguous()
+        act_quant_ragged(bufs.dispatched_x, seqlens, cu_seqlens, bufs.x_fp8, bufs.x_scale)
 
         s1_result = grouped_fp8_blockwise_fused_s1(
-            x_quant.view(torch.float8_e4m3fn),
-            x_scale_t,
+            bufs.x_fp8.view(torch.float8_e4m3fn),
+            bufs.x_scale,
             self.moe.fp8_gate_w3d.view(torch.float8_e4m3fn),
             self.moe.fp8_up_w3d.view(torch.float8_e4m3fn),
             self.moe.fp8_gate_ws3d,
             self.moe.fp8_up_ws3d,
             seqlens,
-            bufs.cu_seqlens,
+            cu_seqlens,
             avg,
             output=bufs.intermediate,
         )
-        inter_quant_3d, inter_scale_3d = _act_quant_3d(
-            s1_result.view(e, mtp, n),
-            seqlens,
-        )
-        inter_quant = inter_quant_3d.view(e * mtp, n)
-        inter_scale_t = inter_scale_3d.view(e * mtp, -1).t().contiguous()
+        act_quant_ragged(s1_result, seqlens, cu_seqlens, bufs.inter_fp8, bufs.inter_scale)
 
         grouped_fp8_blockwise_s3(
-            inter_quant.view(torch.float8_e4m3fn),
-            inter_scale_t,
+            bufs.inter_fp8.view(torch.float8_e4m3fn),
+            bufs.inter_scale,
             self.moe.fp8_down_w3d.view(torch.float8_e4m3fn),
             self.moe.fp8_down_ws3d,
             seqlens,
-            bufs.cu_seqlens,
+            cu_seqlens,
             avg,
             output=bufs.expert_out,
         )
