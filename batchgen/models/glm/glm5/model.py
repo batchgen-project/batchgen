@@ -1856,17 +1856,17 @@ class Glm5MoE(nn.Module):
                 )
 
         # 3) 3D dispatch
-        # Zero only the rows a GEMM tile can read this step, not the whole
-        # [E*mtp, H] buffer: mtp is pinned at 4096 for capacity, but one expert
-        # can receive at most num_global tokens, and the grouped GEMM / 3D
-        # act-quant read at most ceil(count/128)*128 rows per expert. Full
-        # zero_() was 1.61 GB x 75 MoE layers = 121 GB/step of B-independent
-        # memset (perf plan glm52-h200-perf-optimization, Phase 1 item #1).
-        with (dt.timed("dispatch_memset", li) if dt else _nullctx()):
-            zero_rows = min(buf.max_tokens_padded, num_global + 128)
-            buf.dispatched_x.view(
-                self.experts_per_rank, buf.max_tokens_padded, hidden_size
-            )[:, :zero_rows].zero_()
+        # No memset on the CUDA-ops path: the grouped GEMM rewrites per-expert
+        # TMA descriptors with extent = seqlens[e] (rows past the count are
+        # hardware-zero-filled on load and the Y store is extent-clipped), and
+        # act_quant_3d returns at token >= count. Only the Triton fallback
+        # quant reads the full [E*mtp] buffer and needs sane bf16 there.
+        if not _GLM5_HAS_FP8_OPS:
+            with (dt.timed("dispatch_memset", li) if dt else _nullctx()):
+                zero_rows = min(buf.max_tokens_padded, num_global + 128)
+                buf.dispatched_x.view(
+                    self.experts_per_rank, buf.max_tokens_padded, hidden_size
+                )[:, :zero_rows].zero_()
         with (dt.timed("dispatch", li) if dt else _nullctx()):
             expert_counts, topk_pos = dispatch_scatter_3d(
                 all_tokens, topk_idx.to(torch.int32),
@@ -1882,8 +1882,8 @@ class Glm5MoE(nn.Module):
 
         # 5) Weighted scatter reduce
         result_buf = buf.result_buffer[:num_global]
-        with (dt.timed("scatter_memset", li) if dt else _nullctx()):
-            result_buf.zero_()
+        # reduce_weighted_scatter writes every output element unconditionally
+        # (skips only pos<0 INPUT rows) — no pre-zero needed.
         with (dt.timed("scatter_reduce", li) if dt else _nullctx()):
             global_results = reduce_weighted_scatter(
                 buf.expert_out, topk_pos, topk_weight,

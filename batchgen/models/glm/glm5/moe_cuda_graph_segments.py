@@ -324,7 +324,9 @@ class Glm5MoEGraphSegment:
             out=bufs.topk_masked_weights,
         )
 
-        bufs.dispatched_x.zero_()
+        # No memset (see eager path): TMA extents clip to seqlens[e]; the graph
+        # MoE path requires CUDA fp8 ops, so the Triton-fallback consumer of
+        # zeroed rows does not exist here.
         expert_counts, topk_pos = dispatch_scatter_3d(
             bufs.all_tokens,
             bufs.topk_masked_indices,
@@ -339,7 +341,6 @@ class Glm5MoEGraphSegment:
 
         self._fp8_blockwise_gemm_3d(bufs, expert_counts)
 
-        bufs.routed_global_output.zero_()
         routed_global_output = reduce_weighted_scatter(
             bufs.expert_out,
             topk_pos,
