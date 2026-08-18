@@ -43,6 +43,15 @@ from .wrappers import KimiLinearExpertWrapper
 # ============================================================================
 
 
+def _reduce_mla_tp_output(module, output):
+    """Sum the row-parallel MLA output projection across the TP group."""
+    if getattr(module, "attn_tp_size", 1) > 1:
+        import torch.distributed as dist
+
+        dist.all_reduce(output, group=module.attn_tp_group)
+    return output
+
+
 def mla_prefill_nope(self, hidden_states, attention_mask, position_ids):
     """NoPE MLA prefill (sdpa fallback path; FA3 varlen upgrade is P1).
 
@@ -102,7 +111,7 @@ def mla_prefill_nope(self, hidden_states, attention_mask, position_ids):
     out = out.transpose(1, 2).reshape(bsz, seq_len, -1).contiguous()
     if self.use_output_gate:
         out = out * self.g_proj(hidden_states).sigmoid()
-    return self.o_proj(out), offload_kv
+    return _reduce_mla_tp_output(self, self.o_proj(out)), offload_kv
 
 
 def mla_prefill_nope_prepacked(
@@ -184,6 +193,7 @@ def mla_prefill_nope_prepacked(
     if self.use_output_gate:
         attn_output = attn_output * self.g_proj(hidden_states_2d).sigmoid()
     attn_output = self.o_proj(attn_output)
+    attn_output = _reduce_mla_tp_output(self, attn_output)
     return attn_output, offload_kv
 
 
@@ -304,6 +314,7 @@ def mla_decoding_nope_with_pagekv(
         gate = F.linear(hidden_states, self.g_proj.weight).sigmoid()
         attn_output = attn_output * gate
     attn_output = F.linear(attn_output, self.o_proj.weight)
+    attn_output = _reduce_mla_tp_output(self, attn_output)
     return attn_output.view(bsz, 1, -1), k_tensor
 
 

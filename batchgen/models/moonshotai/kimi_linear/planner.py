@@ -53,10 +53,21 @@ class KimiLinearPlanner(BasePlanner):
         """
         super().__init__()
         self.is_k3 = is_k3
-        self.stream_all_modules = (
-            is_k3 if stream_all_modules is None else bool(stream_all_modules)
-        )
         self.attention_group_size = int(attention_group_size)
+        # M2b: G>1 runs head-parallel KDA, whose RESIDENT load path (M2a)
+        # requires stream_all_modules OFF -- the streamed-KDA head-shard seam
+        # is unwired (PSM raises NotImplementedError). K3 streams only at G=1
+        # (where 90 GiB/rank attn+kda+shared cannot fit resident); G>1 shards
+        # the KDA (~7 GiB/rank) and goes fully resident. Explicit arg wins.
+        if stream_all_modules is None:
+            self.stream_all_modules = is_k3 and self.attention_group_size == 1
+            if is_k3 and self.attention_group_size > 1:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "[K3] attention_group_size=%d>1 -> stream_all_modules=False "
+                    "(resident head-parallel KDA)", self.attention_group_size)
+        else:
+            self.stream_all_modules = bool(stream_all_modules)
         if is_k3:
             # `_compute_batch_configs` runs before `_adjust_config_for_model`
             # and asserts NUM_EXPERTS // world_size > 0; K3 has 896, not 256.

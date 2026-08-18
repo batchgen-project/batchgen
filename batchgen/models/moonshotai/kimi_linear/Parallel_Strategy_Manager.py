@@ -72,6 +72,75 @@ def _replace_param(root_module, dotted_name, tensor):
     mod._parameters[leaf] = torch.nn.Parameter(tensor.detach(), requires_grad=False)
 
 
+def shard_shared_expert_tensor(tensor, name, tp_size, tp_rank):
+    """Return this TP rank's standard MLP weight shard.
+
+    gate/up are column-parallel (output rows); down is row-parallel (input
+    columns). Summing the per-rank down-projection outputs reconstructs the
+    original shared-expert output.
+    """
+    if tp_size == 1:
+        return tensor
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(
+            f"invalid shared-expert TP rank {tp_rank}/{tp_size}"
+        )
+
+    base = name.split(".", 1)[0]
+    if base in ("gate_proj", "up_proj"):
+        dim = 0
+    elif base == "down_proj":
+        dim = 1
+    else:
+        raise ValueError(f"unsupported shared-expert tensor for TP: {name}")
+
+    width = tensor.shape[dim]
+    if width % tp_size != 0:
+        raise ValueError(
+            f"shared-expert tensor {name} shape {tuple(tensor.shape)} cannot "
+            f"be split across TP={tp_size} on dim {dim}"
+        )
+    chunk = width // tp_size
+    return tensor.narrow(dim, tp_rank * chunk, chunk).contiguous()
+
+
+def shard_mla_tensor(tensor, name, tp_size, tp_rank):
+    """Return this TP rank's NoPE-MLA weight shard.
+
+    The low-rank q/kv-A projections and their norms are replicated. Projections
+    that produce per-head values are column-parallel (output rows), while
+    ``o_proj`` is row-parallel over the local value-head columns.
+    """
+    if tp_size == 1:
+        return tensor
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid MLA TP rank {tp_rank}/{tp_size}")
+
+    base = name.split(".", 1)[0]
+    if base in (
+        "q_a_proj",
+        "q_a_layernorm",
+        "kv_a_proj_with_mqa",
+        "kv_a_layernorm",
+    ):
+        return tensor
+    if base in ("q_b_proj", "q_proj", "kv_b_proj", "g_proj"):
+        dim = 0
+    elif base == "o_proj":
+        dim = 1
+    else:
+        raise ValueError(f"unsupported MLA tensor for TP: {name}")
+
+    width = tensor.shape[dim]
+    if width % tp_size != 0:
+        raise ValueError(
+            f"MLA tensor {name} shape {tuple(tensor.shape)} cannot be split "
+            f"across TP={tp_size} on dim {dim}"
+        )
+    chunk = width // tp_size
+    return tensor.narrow(dim, tp_rank * chunk, chunk).contiguous()
+
+
 class KimiLinearParallelStrategyManager:
     """Parallel Strategy Manager for Kimi-Linear (KDA + NoPE-MLA hybrid)."""
 
@@ -631,9 +700,38 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"attn_{layer_idx}")
             for name, p in list(attn.named_parameters()):
                 if name in tensors:
-                    _replace_param(attn, name, tensors[name].to(device=device))
+                    tensor = tensors[name]
+                    if self._attn_tp_size > 1:
+                        tensor = shard_mla_tensor(
+                            tensor,
+                            name,
+                            self._attn_tp_size,
+                            self._attn_tp_rank,
+                        )
+                    _replace_param(attn, name, tensor.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"attn_{layer_idx}: missing tensor {name}")
+            if self._attn_tp_size > 1:
+                local_heads = attn.num_heads // self._attn_tp_size
+                attn.num_heads = local_heads
+                attn.num_key_value_heads = local_heads
+                attn.num_key_value_groups = 1
+                if hasattr(attn, "q_b_proj"):
+                    attn.q_b_proj.out_features = (
+                        local_heads * attn.q_head_dim
+                    )
+                if hasattr(attn, "q_proj"):
+                    attn.q_proj.out_features = (
+                        local_heads * attn.q_head_dim
+                    )
+                attn.kv_b_proj.out_features = local_heads * (
+                    attn.qk_nope_head_dim + attn.v_head_dim
+                )
+                if hasattr(attn, "g_proj"):
+                    attn.g_proj.out_features = (
+                        local_heads * attn.v_head_dim
+                    )
+                attn.o_proj.in_features = local_heads * attn.v_head_dim
 
     def _build_attn_tp_group(self):
         """Build the head-parallel (KDA TP) NCCL sub-groups (M2a).
@@ -690,14 +788,23 @@ class KimiLinearParallelStrategyManager:
             # scalar per head). Its stored shape is (1, 1, H, 1) on the 48B
             # checkpoint, so slice the flattened head axis -- a dim-0 slice
             # (tensor[lo:hi]) hits the size-1 leading axis and returns 0 rows.
+            # A_log LAYOUT differs by model: 48B is per-HEAD (numel ==
+            # kda_num_heads, stored (1,1,H,1)) -> slice this rank's heads; K3
+            # is per-HEAD_DIM (numel == kda_head_dim, like o_norm, shared
+            # across all heads) -> the head shard keeps every head_dim so each
+            # rank needs the FULL vector -> REPLICATE. (K3 A_log=(128,); the
+            # fla kda kernel consumes it as-is.)
             a = tensor.reshape(-1)
             n = self._attn_tp_hl * self._attn_tp_size
-            if a.numel() != n:
-                raise ValueError(
-                    f"A_log has {a.numel()} elements (shape {tuple(tensor.shape)}); "
-                    f"expected kda_num_heads={n} for a per-head shard"
-                )
-            return a[lo:hi]
+            if a.numel() == n:
+                return a[lo:hi]
+            if a.numel() == self._attn_tp_head_dim:
+                return tensor
+            raise ValueError(
+                f"A_log has {a.numel()} elements (shape {tuple(tensor.shape)}); "
+                f"expected kda_num_heads={n} (per-head) or "
+                f"kda_head_dim={self._attn_tp_head_dim} (per-head-dim)"
+            )
         if base == "b_proj":
             return tensor[lo:hi]
         return tensor[rlo:rhi]
@@ -745,9 +852,23 @@ class KimiLinearParallelStrategyManager:
             tensors = self.core_engine.get_tensor(f"shared_expert_{layer_idx}")
             for name, p in list(shared.named_parameters()):
                 if name in tensors:
-                    _replace_param(shared, name, tensors[name].to(device=device))
+                    tensor = tensors[name]
+                    if self._attn_tp_size > 1:
+                        tensor = shard_shared_expert_tensor(
+                            tensor,
+                            name,
+                            self._attn_tp_size,
+                            self._attn_tp_rank,
+                        )
+                    _replace_param(shared, name, tensor.to(device=device))
                 elif self.rank == 0:
                     logging.warning(f"shared_expert_{layer_idx}: missing {name}")
+            if self._attn_tp_size > 1:
+                local_intermediate = shared.gate_proj.weight.shape[0]
+                shared.intermediate_size = local_intermediate
+                shared.gate_proj.out_features = local_intermediate
+                shared.up_proj.out_features = local_intermediate
+                shared.down_proj.in_features = local_intermediate
 
     # ------------------------------------------------------------------ #
     #  Serving method injection                                           #
@@ -766,6 +887,8 @@ class KimiLinearParallelStrategyManager:
             attn.mla_decoding_nope_with_pagekv = types.MethodType(
                 mla_decoding_nope_with_pagekv, attn
             )
+            attn.attn_tp_size = self._attn_tp_size
+            attn.attn_tp_group = self._attn_tp_group
             self.model.model.layers[layer_idx].self_attn = KimiLinearAttnWrapper(
                 attn, layer_idx, self.core_engine, self.engine_config,
                 self.model_config, persistent=not self._stream_all_modules,
@@ -842,6 +965,9 @@ class KimiLinearParallelStrategyManager:
                     self.engine_config, self.model_config,
                     persistent=False,
                 )
+            elif shared is not None and self._attn_tp_size > 1:
+                shared._tp_size = self._attn_tp_size
+                shared._tp_group = self._attn_tp_group
             # M2b: stamp the head-parallel (TP) context the resident-EP decode
             # forward reads for the intra-group token scatter/gather. G==1 leaves
             # attn_tp_size==1, so moe_forward_resident_ep_decode skips it and the

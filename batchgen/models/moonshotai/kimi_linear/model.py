@@ -162,6 +162,14 @@ class KimiMLP(nn.Module):
             return self.down_proj(self.act_fn(gate_up))
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+    def _reduce_tp_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Sum row-parallel shared-expert partials across its TP group."""
+        if getattr(self, "_tp_size", 1) > 1:
+            import torch.distributed as dist
+
+            dist.all_reduce(output, group=self._tp_group)
+        return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Token-tiled FFN — BIT-EXACT against the unchunked body.
 
@@ -181,7 +189,7 @@ class KimiMLP(nn.Module):
         num_tokens = x.numel() // x.shape[-1]
         if num_tokens <= _FFN_TOKEN_TILE:
             # Decode and short prefill: the pre-chunking call, unchanged.
-            return self._ffn(x)
+            return self._reduce_tp_output(self._ffn(x))
 
         flat = x.reshape(num_tokens, x.shape[-1])
         n_tiles = math.ceil(num_tokens / _FFN_TOKEN_TILE)
@@ -201,7 +209,9 @@ class KimiMLP(nn.Module):
             # peak — MEASURED at +T*H*2 bytes = +0.109 GiB at K3 scale, which is
             # small but is carried into the prefill budget and is free to drop.
             del y
-        return out.view(*x.shape[:-1], out.shape[-1])
+        return self._reduce_tp_output(
+            out.view(*x.shape[:-1], out.shape[-1])
+        )
 
 
 class KimiBlockSparseMLP(nn.Module):
