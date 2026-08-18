@@ -430,10 +430,21 @@ class Glm5MoEGraphSegment:
         shared_output = self.moe.shared_expert_forward(padded)
 
         with torch.cuda.stream(self.routed_stream):
-            self.router_context.router_forward(
-                bufs.all_tokens,
-                logits=bufs.router_logits,
-            )
+            if 192 <= global_rows <= 512:
+                from batchgen_kernels.triton.glm5_router_gemm import (
+                    glm5_router_gemm,
+                )
+
+                glm5_router_gemm(
+                    bufs.all_tokens,
+                    self.gate_weight_bf16,
+                    bufs.router_logits,
+                )
+            else:
+                self.router_context.router_forward(
+                    bufs.all_tokens,
+                    logits=bufs.router_logits,
+                )
             gate_sigmoid_topk_cuda(
                 bufs.router_logits,
                 self.gate_bias_fp32,

@@ -233,3 +233,32 @@ def test_glm5_tensorcore_router_matches_bf16_reference_and_graph_replay(m):
     graph.replay()
     ref_replay = _reference_router(replacement, weight)
     _assert_bf16_router_close(output, ref_replay)
+
+
+@pytest.mark.parametrize("m", [200, 240, 280, 320, 400])
+def test_glm5_triton_router_matches_bf16_reference_and_graph_replay(m):
+    from batchgen_kernels.triton.glm5_router_gemm import glm5_router_gemm
+
+    torch.manual_seed(20260819 + m)
+    device = torch.device("cuda")
+    hidden = (
+        torch.randn(m, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    weight = (
+        torch.randn(256, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    output = torch.empty(m, 256, device=device, dtype=torch.float32)
+
+    glm5_router_gemm(hidden, weight, output)
+    _assert_bf16_router_close(output, _reference_router(hidden, weight))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        glm5_router_gemm(hidden, weight, output)
+
+    replacement = (
+        torch.randn_like(hidden.float()) * 0.1
+    ).to(torch.bfloat16)
+    hidden.copy_(replacement)
+    graph.replay()
+    _assert_bf16_router_close(output, _reference_router(replacement, weight))
