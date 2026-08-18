@@ -5,17 +5,24 @@ Run with:
     tests/gpu/kimi_linear_tp_weight_parity.py
 """
 
-import os
+import importlib.util
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import (
-    shard_mla_tensor,
-    shard_shared_expert_tensor,
+_SHARDING_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "batchgen/models/moonshotai/kimi_linear/tp_weight_sharding.py"
 )
-from batchgen.models.moonshotai.kimi_linear.model import SituAndMul
+_SPEC = importlib.util.spec_from_file_location(
+    "kimi_linear_tp_weight_sharding", _SHARDING_PATH
+)
+_SHARDING = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_SHARDING)
+shard_mla_tensor = _SHARDING.shard_mla_tensor
+shard_shared_expert_tensor = _SHARDING.shard_shared_expert_tensor
 
 
 def _err_ratio(actual, expected):
@@ -27,6 +34,15 @@ def _err_ratio(actual, expected):
 def _broadcast(tensor, src=0):
     dist.broadcast(tensor, src=src)
     return tensor
+
+
+def _situ_and_mul(x, beta=4.0, linear_beta=25.0):
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    situ = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    up = linear_beta * torch.tanh(up / linear_beta)
+    return (situ * up).to(x.dtype)
 
 
 def main():
@@ -54,13 +70,14 @@ def main():
     down = _broadcast(
         torch.randn(hidden, shared_intermediate, device=device)
     )
-    activation = SituAndMul(beta=4.0, linear_beta=25.0)
     shared_full = F.linear(
-        activation(torch.cat([F.linear(x, gate), F.linear(x, up)], dim=-1)),
+        _situ_and_mul(
+            torch.cat([F.linear(x, gate), F.linear(x, up)], dim=-1)
+        ),
         down,
     )
     shared_local = F.linear(
-        activation(
+        _situ_and_mul(
             torch.cat(
                 [
                     F.linear(

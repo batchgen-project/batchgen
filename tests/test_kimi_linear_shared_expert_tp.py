@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import (
+from batchgen.models.moonshotai.kimi_linear.tp_weight_sharding import (
     shard_mla_tensor,
     shard_shared_expert_tensor,
 )
