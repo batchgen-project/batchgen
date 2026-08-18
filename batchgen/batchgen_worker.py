@@ -206,10 +206,12 @@ BATCHGEN_ENABLE_NAN_CHECK = os.environ.get('BATCHGEN_ENABLE_NAN_CHECK', '0') == 
 # Optional gate for expensive/critical diagnostics (default off in production)
 BATCHGEN_ENABLE_CRITICAL_DIAGS = os.environ.get('BATCHGEN_ENABLE_CRITICAL_DIAGS', '0') == '1'
 
-# Max per-rank in-decode batch. Bounds the K2.5 MoE padded buffer (mtp = round_up(world_size *
-# this)) so init does not OOM on a large candidate pool, and is the per-rank admission cap so
-# the pre-reserved buffer never overflows at runtime. Raise to fill more GPU KV (memory permitting).
-_MAX_DECODE_RANK_BSZ = int(os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ", "128"))
+# Default max per-rank in-decode batch. Bounds the MoE padded buffer
+# (mtp = round_up(world_size * this)) so init does not OOM on a large
+# candidate pool. GLM-5 whole-model graphs may safely raise this to the
+# configured largest graph bucket because capture already requires buffers
+# for that bucket; an explicit environment override remains authoritative.
+_DEFAULT_MAX_DECODE_RANK_BSZ = 128
 
 # Optional Nsight Systems capture window for decode-forward profiling.
 # Start nsys with: --capture-range=cudaProfilerApi --capture-range-end=stop.
@@ -6127,7 +6129,10 @@ class BatchGenWorker:
 				# this)) stays bounded — a large candidate pool must NOT inflate the padded
 				# buffers (that re-OOMs init). The page-boundary admission also caps in-decode
 				# at this value (decode.py max_rank_bsz), so the buffer never overflows.
-				max_num_seq_estimate = min(max_num_seq_estimate, _MAX_DECODE_RANK_BSZ)
+				max_num_seq_estimate = min(
+					max_num_seq_estimate,
+					self._decode_rank_batch_cap(),
+				)
 
 				self._load_decode_model(max_num_seq_estimate, self.comm)
 
@@ -8950,6 +8955,29 @@ class BatchGenWorker:
 				+ int(getattr(self, "max_decoding_length", 0) or 0),
 			)
 		return math.ceil(required / int(page_size)) * int(page_size)
+
+	def _decode_rank_batch_cap(self) -> int:
+		"""Per-rank decode admission and MoE-buffer capacity."""
+		explicit = os.environ.get("BATCHGEN_MAX_DECODE_RANK_BSZ")
+		legacy = os.environ.get("BATCHGEN_MAX_RANK_BSZ")
+		if explicit is not None and legacy is not None and explicit != legacy:
+			raise RuntimeError(
+				"BATCHGEN_MAX_DECODE_RANK_BSZ and BATCHGEN_MAX_RANK_BSZ "
+				"must match when both are set"
+			)
+		override = explicit if explicit is not None else legacy
+		if override is not None:
+			cap = int(override)
+		else:
+			cap = _DEFAULT_MAX_DECODE_RANK_BSZ
+			if self._glm5_whole_model_graph_requested_for_current_batch():
+				cap = max(
+					cap,
+					int(getattr(self.args, "cuda_graph_max_bucket_size", 0) or 0),
+				)
+		if cap <= 0:
+			raise RuntimeError("BATCHGEN_MAX_DECODE_RANK_BSZ must be positive")
+		return cap
 
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):

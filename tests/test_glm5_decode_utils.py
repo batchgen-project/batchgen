@@ -1177,6 +1177,79 @@ def test_worker_enable_cuda_graph_requests_glm5_whole_model_path(monkeypatch):
     assert not worker._glm5_moe_graph_output_required_for_current_batch()
 
 
+def test_glm5_whole_graph_decode_cap_matches_largest_bucket(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_MAX_DECODE_RANK_BSZ", raising=False)
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5.2-FP8"
+    worker.args = types.SimpleNamespace(
+        enable_cuda_graph=True,
+        disable_cuda_graphs=False,
+        cuda_graph_max_bucket_size=256,
+    )
+
+    assert worker._decode_rank_batch_cap() == 256
+
+
+def test_decode_cap_retains_default_without_glm5_whole_graph(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_MAX_DECODE_RANK_BSZ", raising=False)
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5.2-FP8"
+    worker.args = types.SimpleNamespace(
+        enable_cuda_graph=False,
+        disable_cuda_graphs=True,
+        cuda_graph_max_bucket_size=256,
+    )
+
+    assert worker._decode_rank_batch_cap() == 128
+
+
+def test_decode_cap_explicit_override_is_authoritative(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.setenv("BATCHGEN_MAX_DECODE_RANK_BSZ", "80")
+    monkeypatch.delenv("BATCHGEN_MAX_RANK_BSZ", raising=False)
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5.2-FP8"
+    worker.args = types.SimpleNamespace(
+        enable_cuda_graph=True,
+        disable_cuda_graphs=False,
+        cuda_graph_max_bucket_size=256,
+    )
+
+    assert worker._decode_rank_batch_cap() == 80
+
+
+def test_decode_cap_legacy_override_is_authoritative(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.delenv("BATCHGEN_MAX_DECODE_RANK_BSZ", raising=False)
+    monkeypatch.setenv("BATCHGEN_MAX_RANK_BSZ", "96")
+    worker = object.__new__(BatchGenWorker)
+    worker.model_name = "zai-org/GLM-5.2-FP8"
+    worker.args = types.SimpleNamespace(
+        enable_cuda_graph=True,
+        disable_cuda_graphs=False,
+        cuda_graph_max_bucket_size=256,
+    )
+
+    assert worker._decode_rank_batch_cap() == 96
+
+
+def test_decode_cap_rejects_conflicting_overrides(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    monkeypatch.setenv("BATCHGEN_MAX_DECODE_RANK_BSZ", "256")
+    monkeypatch.setenv("BATCHGEN_MAX_RANK_BSZ", "128")
+    worker = object.__new__(BatchGenWorker)
+
+    with pytest.raises(RuntimeError, match="must match"):
+        worker._decode_rank_batch_cap()
+
+
 def test_worker_glm5_debug_modes_override_segmented_graph(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 
