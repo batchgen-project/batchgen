@@ -2,9 +2,12 @@
 
 The GLM-5 MoE graph captures the full decode MoE module boundary:
 
-    padded local tokens -> all_gather -> router -> rank padding mask
-      -> dispatch_scatter_ragged -> FP8 blockwise S1/S3 -> reduce_weighted_scatter
-      -> all_reduce -> local slice + shared expert
+    padded local tokens -> all_gather
+      -> shared expert on the capture stream
+      -> router -> rank padding mask -> dispatch_scatter_ragged
+         -> FP8 blockwise S1/S3 -> reduce_weighted_scatter -> reduce_scatter
+         on a side stream
+      -> add shared expert
 
 The decoder-layer residual add remains eager in the caller because it is owned
 by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
@@ -352,6 +355,11 @@ class Glm5MoEGraphSegment:
             router_bias=None,
             topk=self.num_experts_per_tok,
         )
+        self.routed_stream = type(moe)._routed_moe_stream
+        if self.routed_stream is None:
+            raise RuntimeError(
+                f"Layer {moe.layer_idx}: GLM-5 MoE graph requires a CUDA side stream"
+            )
 
     def _validate_shared_expert_graph_safe(self) -> None:
         shared = getattr(self.moe, "shared_experts", None)
@@ -417,73 +425,75 @@ class Glm5MoEGraphSegment:
                 stream=torch.cuda.current_stream(self.device),
             )
 
-        self.router_context.router_forward(
-            bufs.all_tokens,
-            logits=bufs.router_logits,
-        )
-        gate_sigmoid_topk_cuda(
-            bufs.router_logits,
-            self.gate_bias_fp32,
-            k=self.num_experts_per_tok,
-            routed_scaling_factor=self.routed_scaling_factor,
-            topk_indices=bufs.topk_indices,
-            topk_weights=bufs.topk_weights,
-        )
+        current_stream = torch.cuda.current_stream(self.device)
+        self.routed_stream.wait_stream(current_stream)
+        shared_output = self.moe.shared_expert_forward(padded)
 
-        valid_per_row = rank_token_counts[bufs.rank_ids]
-        padding_mask = bufs.local_pos >= valid_per_row
-        padding_mask_2d = padding_mask.unsqueeze(1).expand_as(bufs.topk_indices)
-        torch.where(
-            padding_mask_2d,
-            bufs.topk_negative_ones,
-            bufs.topk_indices,
-            out=bufs.topk_masked_indices,
-        )
-        torch.where(
-            padding_mask_2d,
-            bufs.topk_zero_weights,
-            bufs.topk_weights,
-            out=bufs.topk_masked_weights,
-        )
-
-        # No memset (see eager path): TMA extents clip to seqlens[e] and
-        # act_quant_ragged skips every row that is not a live token.
-        expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
-            bufs.all_tokens,
-            bufs.topk_masked_indices,
-            bufs.dispatched_x,
-            self.expert_start,
-            self.num_local_experts,
-            bufs.expert_counts,
-            bufs.expert_counters,
-            bufs.cu_seqlens,
-            bufs.topk_pos,
-        )
-
-        self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
-
-        routed_global_output = reduce_weighted_scatter(
-            bufs.expert_out,
-            topk_pos,
-            bufs.topk_masked_weights,
-            global_rows,
-            self.hidden_size,
-            self.num_experts_per_tok,
-            output=bufs.routed_global_output,
-        )
-
-        import torch.distributed as dist
-
-        with self.comm.change_state(enable=True):
-            self.comm.all_reduce(
-                routed_global_output,
-                op=dist.ReduceOp.SUM,
-                stream=torch.cuda.current_stream(self.device),
+        with torch.cuda.stream(self.routed_stream):
+            self.router_context.router_forward(
+                bufs.all_tokens,
+                logits=bufs.router_logits,
+            )
+            gate_sigmoid_topk_cuda(
+                bufs.router_logits,
+                self.gate_bias_fp32,
+                k=self.num_experts_per_tok,
+                routed_scaling_factor=self.routed_scaling_factor,
+                topk_indices=bufs.topk_indices,
+                topk_weights=bufs.topk_weights,
             )
 
-        start = self.rank * bucket_size
-        bufs.local_moe_output.copy_(routed_global_output[start:start + bucket_size])
-        bufs.local_moe_output.add_(self.moe.shared_expert_forward(padded))
+            valid_per_row = rank_token_counts[bufs.rank_ids]
+            padding_mask = bufs.local_pos >= valid_per_row
+            padding_mask_2d = padding_mask.unsqueeze(1).expand_as(bufs.topk_indices)
+            torch.where(
+                padding_mask_2d,
+                bufs.topk_negative_ones,
+                bufs.topk_indices,
+                out=bufs.topk_masked_indices,
+            )
+            torch.where(
+                padding_mask_2d,
+                bufs.topk_zero_weights,
+                bufs.topk_weights,
+                out=bufs.topk_masked_weights,
+            )
+
+            # No memset (see eager path): TMA extents clip to seqlens[e] and
+            # act_quant_ragged skips every row that is not a live token.
+            expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
+                bufs.all_tokens,
+                bufs.topk_masked_indices,
+                bufs.dispatched_x,
+                self.expert_start,
+                self.num_local_experts,
+                bufs.expert_counts,
+                bufs.expert_counters,
+                bufs.cu_seqlens,
+                bufs.topk_pos,
+            )
+
+            self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
+
+            routed_global_output = reduce_weighted_scatter(
+                bufs.expert_out,
+                topk_pos,
+                bufs.topk_masked_weights,
+                global_rows,
+                self.hidden_size,
+                self.num_experts_per_tok,
+                output=bufs.routed_global_output,
+            )
+
+            with self.comm.change_state(enable=True):
+                self.comm.reduce_scatter(
+                    bufs.local_moe_output,
+                    routed_global_output,
+                    stream=torch.cuda.current_stream(self.device),
+                )
+
+        current_stream.wait_stream(self.routed_stream)
+        bufs.local_moe_output.add_(shared_output)
         return {"moe_output": bufs.local_moe_output}
 
     def _fp8_blockwise_gemm_3d(

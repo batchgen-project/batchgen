@@ -352,6 +352,7 @@ def test_eager_buffers_are_compact_and_regrow_only_at_job_boundaries():
     assert buf.inter_scale.shape == (N // QUANT_BLOCK, cap)
     assert float(buf.x_scale.abs().sum()) == 0.0
     assert buf.cu_seqlens.shape == (E + 1,)
+    assert buf.local_result_buffer.shape == (32, H)
 
     buf.resize_if_needed(max_global)          # no growth -> no-op
     assert buf.dispatched_x.shape == (cap, H)
@@ -388,3 +389,4 @@ def test_eager_buffers_regrow_only_the_send_buffer():
     )
     buf.resize_if_needed(64, num_tokens_per_rank=16)
     assert buf.padded.shape == (16, 256)
+    assert buf.local_result_buffer.shape == (16, 256)

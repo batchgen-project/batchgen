@@ -1083,12 +1083,16 @@ class Glm5MoE3DBuffers:
         self.cu_seqlens = torch.zeros(E_local + 1, dtype=torch.int32, device=device)
         self.topk_pos = torch.full((NK,), -1, dtype=torch.int32, device=device)
         self.result_buffer = torch.empty(max_global_bsz, H, dtype=torch.bfloat16, device=device)
+        self.local_result_buffer = torch.empty(
+            num_tokens_per_rank, H, dtype=torch.bfloat16, device=device
+        )
         self._alloc_row_buffers()
 
         total_bytes = 0
         for t in (self.all_tokens, self.padded, self.expert_counts, self.expert_counters,
                   self.cu_seqlens, self.topk_pos, self.dispatched_x, self.intermediate,
-                  self.expert_out, self.result_buffer, self.x_fp8, self.x_scale,
+                  self.expert_out, self.result_buffer, self.local_result_buffer,
+                  self.x_fp8, self.x_scale,
                   self.inter_fp8, self.inter_scale):
             total_bytes += t.nelement() * t.element_size()
         logging.info(
@@ -1138,16 +1142,32 @@ class Glm5MoE3DBuffers:
             num_tokens_per_rank is not None
             and num_tokens_per_rank > self.padded.shape[0]
         )
+        grew_local_result = (
+            num_tokens_per_rank is not None
+            and num_tokens_per_rank > self.local_result_buffer.shape[0]
+        )
 
-        if not grew_comm and not grew_padded:
+        if not grew_comm and not grew_padded and not grew_local_result:
             return
 
-        if grew_padded:
+        if grew_padded or grew_local_result:
             logging.info(
-                f"[Glm5MoE3DBuffers] Resizing padded send buffer: "
-                f"{self.padded.shape[0]} -> {num_tokens_per_rank}")
-            self.padded = torch.zeros(
-                num_tokens_per_rank, self.H, dtype=torch.bfloat16, device=self.device)
+                f"[Glm5MoE3DBuffers] Resizing local buffers: "
+                f"padded={self.padded.shape[0]}, result={self.local_result_buffer.shape[0]} "
+                f"-> {num_tokens_per_rank}")
+            if grew_padded:
+                self.padded = torch.zeros(
+                    num_tokens_per_rank,
+                    self.H,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            self.local_result_buffer = torch.empty(
+                num_tokens_per_rank,
+                self.H,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
 
         if grew_comm:
             needed = _glm5_ragged_row_capacity(global_bsz, self.topk, self.E_local)
@@ -1207,6 +1227,7 @@ class Glm5MoE(nn.Module):
     _warned_gemm_3d = False
     _warned_partial_3d_disabled = False
     _rank_token_counts: Optional[torch.Tensor] = None  # [world_size] real token count per rank — mask padding before dispatch
+    _routed_moe_stream: Optional[torch.cuda.Stream] = None
 
     def __init__(self, config: Glm5Config, layer_idx: int = -1, comm=None):
         super().__init__()
@@ -1231,6 +1252,8 @@ class Glm5MoE(nn.Module):
         self.device = torch.device("cuda", self.rank % torch.cuda.device_count())
         self.num_tokens_per_rank = None
         self._gate_w_fp32 = None
+        if Glm5MoE._routed_moe_stream is None and torch.cuda.is_available():
+            Glm5MoE._routed_moe_stream = torch.cuda.Stream(device=self.device)
         self.enable_ep_offloading = False
         self.num_persistent_local_experts = self.experts_per_rank
 
@@ -1327,6 +1350,12 @@ class Glm5MoE(nn.Module):
                 buf.padded = torch.zeros(
                     num_tokens_per_rank, buf.H,
                     dtype=torch.bfloat16, device=buf.device,
+                )
+                buf.local_result_buffer = torch.empty(
+                    num_tokens_per_rank,
+                    buf.H,
+                    dtype=torch.bfloat16,
+                    device=buf.device,
                 )
                 buf.num_tokens_per_rank = num_tokens_per_rank
 
@@ -1617,7 +1646,6 @@ class Glm5MoE(nn.Module):
             bsz=hidden_states.shape[0],
             reason="3d MoE graph path unavailable",
         )
-        import torch.distributed as dist
         from contextlib import nullcontext as _nullctx
         from batchgen.timing import get_decode_timer
 
@@ -1863,79 +1891,80 @@ class Glm5MoE(nn.Module):
                     stream=torch.cuda.current_stream(self.device),
                 )
 
-        # 2) Gate (reuse existing _gate_decode — returns int32 topk_idx, fp32 topk_weight)
-        with (dt.timed("routing", li) if dt else _nullctx()):
-            topk_idx, topk_weight = self._gate_decode(all_tokens)
+        current_stream = torch.cuda.current_stream(self.device)
+        routed_stream = type(self)._routed_moe_stream
+        if routed_stream is None:
+            raise RuntimeError("GLM-5 routed MoE side stream is not initialized")
+        routed_stream.wait_stream(current_stream)
+        with (dt.timed("shared_expert", li) if dt else _nullctx()):
+            shared_output = self.shared_expert_forward(identity)
 
-        # Mask padding tokens so they don't inflate expert_counts nor pollute
-        # grouped GEMM compute. Mirrors KimiK25MoE (kimi_k25/model.py:954-968):
-        # each rank contributes `num_tokens_per_rank` slots but only the first
-        # `_rank_token_counts[r]` are real — the rest are zero-padded. Dispatch
-        # treats topk_idx=-1 as "skip" via the existing local_expert<0 guard.
-        rank_counts = Glm5MoE._rank_token_counts
-        if rank_counts is not None:
-            with (dt.timed("routing_pad_mask", li) if dt else _nullctx()):
-                positions = torch.arange(num_global, device=self.device)
-                rank_ids = positions // ntp
-                local_pos = positions % ntp
-                max_valid = rank_counts[rank_ids]
-                padding_mask = local_pos >= max_valid
-                padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
-                topk_idx = torch.where(
-                    padding_mask_2d,
-                    torch.full_like(topk_idx, -1),
-                    topk_idx,
-                )
-                topk_weight = torch.where(
-                    padding_mask_2d,
-                    torch.zeros_like(topk_weight),
-                    topk_weight,
-                )
+        with torch.cuda.stream(routed_stream):
+            # 2) Gate (returns int32 topk_idx, fp32 topk_weight)
+            with (dt.timed("routing", li) if dt else _nullctx()):
+                topk_idx, topk_weight = self._gate_decode(all_tokens)
 
-        # 3) Compact ragged dispatch
-        # No memset: the grouped GEMM rewrites per-expert TMA descriptors with
-        # extent = seqlens[e] (rows past the count are hardware-zero-filled on
-        # load and the Y store is extent-clipped), and act_quant_ragged skips
-        # every row that is not a live token.
-        with (dt.timed("dispatch", li) if dt else _nullctx()):
-            expert_counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
-                all_tokens, topk_idx.to(torch.int32),
-                buf.dispatched_x,
-                self.routed_expert_start_idx, self.experts_per_rank,
-                buf.expert_counts, buf.expert_counters,
-                buf.cu_seqlens,
-                buf.topk_pos[:num_global * topk],
-            )
+            # Mask padding tokens so they don't inflate expert_counts nor pollute
+            # grouped GEMM compute.
+            rank_counts = Glm5MoE._rank_token_counts
+            if rank_counts is not None:
+                with (dt.timed("routing_pad_mask", li) if dt else _nullctx()):
+                    positions = torch.arange(num_global, device=self.device)
+                    rank_ids = positions // ntp
+                    local_pos = positions % ntp
+                    max_valid = rank_counts[rank_ids]
+                    padding_mask = local_pos >= max_valid
+                    padding_mask_2d = padding_mask.unsqueeze(1).expand_as(topk_idx)
+                    topk_idx = torch.where(
+                        padding_mask_2d,
+                        torch.full_like(topk_idx, -1),
+                        topk_idx,
+                    )
+                    topk_weight = torch.where(
+                        padding_mask_2d,
+                        torch.zeros_like(topk_weight),
+                        topk_weight,
+                    )
 
-        # 4) FP8 blockwise GEMM on the compact buffer
-        self._fp8_blockwise_gemm_3d(buf, expert_counts, cu_seqlens)
-
-        # 5) Weighted scatter reduce
-        result_buf = buf.result_buffer[:num_global]
-        # reduce_weighted_scatter writes every output element unconditionally
-        # (skips only pos<0 INPUT rows) — no pre-zero needed.
-        with (dt.timed("scatter_reduce", li) if dt else _nullctx()):
-            global_results = reduce_weighted_scatter(
-                buf.expert_out, topk_pos, topk_weight,
-                num_global, hidden_size, topk,
-                output=result_buf,
-            )
-
-        # 6) AllReduce across EP ranks
-        with (dt.timed("allreduce", li) if dt else _nullctx()):
-            with self.comm.change_state(enable=True):
-                self.comm.all_reduce(
-                    global_results, op=dist.ReduceOp.SUM,
-                    stream=torch.cuda.current_stream(self.device),
+            # 3) Compact ragged dispatch
+            with (dt.timed("dispatch", li) if dt else _nullctx()):
+                expert_counts, cu_seqlens, topk_pos = _glm5_dispatch_scatter_ragged(
+                    all_tokens, topk_idx.to(torch.int32),
+                    buf.dispatched_x,
+                    self.routed_expert_start_idx, self.experts_per_rank,
+                    buf.expert_counts, buf.expert_counters,
+                    buf.cu_seqlens,
+                    buf.topk_pos[:num_global * topk],
                 )
 
-        # 7) Slice local + add shared expert
+            # 4) FP8 blockwise GEMM on the compact buffer
+            self._fp8_blockwise_gemm_3d(buf, expert_counts, cu_seqlens)
+
+            # 5) Weighted scatter reduce
+            result_buf = buf.result_buffer[:num_global]
+            with (dt.timed("scatter_reduce", li) if dt else _nullctx()):
+                global_results = reduce_weighted_scatter(
+                    buf.expert_out, topk_pos, topk_weight,
+                    num_global, hidden_size, topk,
+                    output=result_buf,
+                )
+
+            # 6) Reduce directly into the rank-local rows.
+            with (dt.timed("reduce_scatter", li) if dt else _nullctx()):
+                with self.comm.change_state(enable=True):
+                    self.comm.reduce_scatter(
+                        buf.local_result_buffer[:ntp],
+                        global_results,
+                        stream=torch.cuda.current_stream(self.device),
+                    )
+
+        current_stream.wait_stream(routed_stream)
+
+        # 7) Slice real local rows + add shared expert
         if num_tokens == 0:
             return torch.empty(orig_shape, device=self.device, dtype=hidden_states.dtype)
-        start = self.rank * ntp
-        out = global_results[start:start + num_tokens].to(hidden_states.dtype)
-        with (dt.timed("shared_expert", li) if dt else _nullctx()):
-            out = out + self.shared_expert_forward(identity)
+        out = buf.local_result_buffer[:num_tokens].to(hidden_states.dtype)
+        out = out + shared_output
         return out.view(*orig_shape)
 
     def _fp8_blockwise_gemm_3d(self, buf, expert_counts, cu_seqlens):
