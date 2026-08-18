@@ -47,6 +47,7 @@ from batchgen.models.glm.glm5.wrappers import (
     _fail_if_glm5_dsa_cuda_graph_required_without_replay,
 )
 from batchgen.models.wrappers import AttnWrapperBase
+from batchgen.sequence import SequenceBatch, SequenceEntry
 
 
 def test_build_clamped_dense_token_indices_caps_each_row():
@@ -2049,6 +2050,37 @@ def test_glm5_dsa_graph_score_capacity_uses_page_table_capacity(monkeypatch):
         64,
         model_max_position_embeddings=16889,
     ) == 16889
+
+
+def test_glm5_dsa_graph_required_tokens_uses_active_sequence_budgets():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.global_batch = SequenceBatch()
+    for gid, budget in ((11, 551), (17, 4097), (23, 900)):
+        seq = SequenceEntry(
+            uuid=f"seq-{gid}",
+            global_idx=gid,
+            prompt_length=1,
+            max_decode_length=budget - 1,
+        )
+        worker.global_batch.add_sequence(seq)
+    worker.max_input_length = 8192
+    worker.max_decoding_length = 512
+
+    assert worker._glm5_dsa_graph_required_tokens([11, 23], page_size=64) == 4160
+    assert worker._glm5_dsa_graph_required_tokens([17], page_size=64) == 4160
+
+
+def test_glm5_dsa_graph_required_tokens_falls_back_to_worker_budget():
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker.global_batch = SequenceBatch()
+    worker.max_input_length = 39
+    worker.max_decoding_length = 512
+
+    assert worker._glm5_dsa_graph_required_tokens([], page_size=64) == 576
 
 
 def test_glm5_segmented_graph_bucket_changes_do_not_request_recapture(monkeypatch):

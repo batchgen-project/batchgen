@@ -22,6 +22,11 @@ from dataclasses import dataclass, fields as dataclass_fields
 from typing import Dict, Optional
 
 import torch
+try:
+    from flash_attn_interface import flash_attn_with_kvcache as _fa3_with_kvcache
+except ImportError:
+    _fa3_with_kvcache = None
+
 from batchgen.attention.mla.fa3_backend import act_quant
 from batchgen.attention.mla.fused_rmsnorm_rope import (
     fused_rmsnorm_rope_with_q_native as _fused_rmsnorm_rope,
@@ -684,6 +689,7 @@ class Glm5FullDsaAttnSegment:
         index_topk: int = 2048,
         page_size: int = 64,
         aux_page_size: int | None = None,
+        all_short: bool = False,
         shared_buffers: Optional[Dict[int, _Glm5FullDsaSegmentBuffers]] = None,
     ) -> None:
         self.wrapper = wrapper
@@ -702,6 +708,7 @@ class Glm5FullDsaAttnSegment:
         self.index_topk = int(index_topk)
         self.page_size = int(page_size)
         self.aux_page_size = int(aux_page_size if aux_page_size is not None else page_size)
+        self.all_short = bool(all_short)
         self._uses_shared_buffers = shared_buffers is not None
         self._buffers = shared_buffers if shared_buffers is not None else {}
         self._outputs: Dict[int, _Glm5FullDsaSegmentOutputs] = {}
@@ -727,9 +734,37 @@ class Glm5FullDsaAttnSegment:
             raise ValueError("primary_blocked_k last dimension does not match GLM-5 compressed KV")
         if self.aux_blocked_k.shape[3] != self.attn.indexer.index_head_dim:
             raise ValueError("aux_blocked_k last dimension does not match GLM-5 indexer K")
+        if self.all_short and _fa3_with_kvcache is None:
+            raise RuntimeError(
+                "all-short GLM-5 DSA graph requires flash_attn_interface "
+                "(FlashAttention-3)"
+            )
 
     def _padding_selected_length(self) -> int:
         return min(int(self.max_seqlen), int(self.index_topk))
+
+    def _run_all_short_fa3(
+        self,
+        buffers: _Glm5FullDsaSegmentBuffers,
+    ) -> torch.Tensor:
+        """Run dense MLA decode directly over the original page-size-64 KV."""
+        if _fa3_with_kvcache is None:
+            raise RuntimeError("FlashAttention-3 is unavailable")
+        q_rope = buffers.q_rope_4d.squeeze(2).unsqueeze(1)
+        q_nope = buffers.absorbed_q.unsqueeze(1)
+        return _fa3_with_kvcache(
+            q=q_rope,
+            k_cache=self.primary_blocked_k[..., self.attn.kv_lora_rank :],
+            v_cache=self.primary_blocked_k[..., : self.attn.kv_lora_rank],
+            qv=q_nope,
+            page_table=self.primary_page_table,
+            cache_batch_idx=buffers.safe_primary_slot_indices,
+            cache_seqlens=buffers.safe_cache_seqlens,
+            softmax_scale=float(self.attn.softmax_scale),
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=False,
+        )
 
     def _flashmla_tensor_metadata_specs(
         self,
@@ -1233,81 +1268,84 @@ class Glm5FullDsaAttnSegment:
             num_valid_tokens=num_valid_tokens,
         )
 
-        head_gates_out(
-            hidden_flat,
-            indexer.weights_proj.weight.data,
-            buffers.head_gates,
-            scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.positions_expanded.copy_(
-            position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
-        )
-        cuda_wq_b_proj_out(
-            q_a_normed,
-            self.wq_b_weights,
-            self.cuda_module,
-            buffers.q_x_fp8,
-            buffers.q_x_scale,
-            buffers.q_tma_desc,
-            buffers.q_flat_indexer,
-            num_valid_tokens=num_valid_tokens,
-        )
-        rope_hadamard_q_out(
-            buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),
-            self.cos_table,
-            self.sin_table,
-            buffers.positions_expanded.view(-1),
-            buffers.q_index,
-        )
-        fused_paged_score_and_topk_with_slots_out(
-            buffers.q_index,
-            self.aux_blocked_k,
-            self.aux_page_table,
-            buffers.safe_aux_slot_indices,
-            buffers.head_gates,
-            buffers.safe_cache_seqlens,
-            buffers.agg_scores,
-            buffers.top_k_indices,
-            topk=self.index_topk,
-            page_size=self.aux_page_size,
-            max_seqlen=self.max_seqlen,
-            num_valid_tokens=num_valid_tokens,
-        )
-        select_mla_kv_for_flashmla_bf16_out(
-            self.primary_blocked_k,
-            self.primary_page_table,
-            buffers.safe_cache_seqlens,
-            buffers.top_k_indices,
-            self.page_size,
-            buffers.selected_mla_kv,
-            buffers.selected_lengths,
-            None,
-            buffers.row_modes,
-            index_topk=self.index_topk,
-            return_indices=False,
-            primary_slot_indices=buffers.safe_primary_slot_indices,
-            num_valid_tokens=num_valid_tokens,
-        )
-
+        if not self.all_short:
+            head_gates_out(
+                hidden_flat,
+                indexer.weights_proj.weight.data,
+                buffers.head_gates,
+                scale=(indexer.index_n_heads ** -0.5) * (indexer.index_head_dim ** -0.5),
+                num_valid_tokens=num_valid_tokens,
+            )
+            buffers.positions_expanded.copy_(
+                position_ids.view(batch_size, 1).expand(batch_size, indexer.index_n_heads)
+            )
+            cuda_wq_b_proj_out(
+                q_a_normed,
+                self.wq_b_weights,
+                self.cuda_module,
+                buffers.q_x_fp8,
+                buffers.q_x_scale,
+                buffers.q_tma_desc,
+                buffers.q_flat_indexer,
+                num_valid_tokens=num_valid_tokens,
+            )
+            rope_hadamard_q_out(
+                buffers.q_flat_indexer.view(batch_size, indexer.index_n_heads, indexer.index_head_dim),
+                self.cos_table,
+                self.sin_table,
+                buffers.positions_expanded.view(-1),
+                buffers.q_index,
+            )
+            fused_paged_score_and_topk_with_slots_out(
+                buffers.q_index,
+                self.aux_blocked_k,
+                self.aux_page_table,
+                buffers.safe_aux_slot_indices,
+                buffers.head_gates,
+                buffers.safe_cache_seqlens,
+                buffers.agg_scores,
+                buffers.top_k_indices,
+                topk=self.index_topk,
+                page_size=self.aux_page_size,
+                max_seqlen=self.max_seqlen,
+                num_valid_tokens=num_valid_tokens,
+            )
         fp8_q_absorb_out(
             buffers.q_nope,
             self.absorb_weights,
             buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
-        pack_flashmla_query_out(
-            buffers.absorbed_q,
-            buffers.q_rope_4d.squeeze(2),
-            buffers.query_states,
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.query_states.mul_(valid_rows_bf16_4d)
-        attn_out = run_prepared_sparse_flash_mla_decode(
-            buffers.prepared_flashmla,
-            tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            num_splits=flashmla_num_splits,
-        )
+        if self.all_short:
+            attn_out = self._run_all_short_fa3(buffers)
+        else:
+            select_mla_kv_for_flashmla_bf16_out(
+                self.primary_blocked_k,
+                self.primary_page_table,
+                buffers.safe_cache_seqlens,
+                buffers.top_k_indices,
+                self.page_size,
+                buffers.selected_mla_kv,
+                buffers.selected_lengths,
+                None,
+                buffers.row_modes,
+                index_topk=self.index_topk,
+                return_indices=False,
+                primary_slot_indices=buffers.safe_primary_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            pack_flashmla_query_out(
+                buffers.absorbed_q,
+                buffers.q_rope_4d.squeeze(2),
+                buffers.query_states,
+                num_valid_tokens=num_valid_tokens,
+            )
+            buffers.query_states.mul_(valid_rows_bf16_4d)
+            attn_out = run_prepared_sparse_flash_mla_decode(
+                buffers.prepared_flashmla,
+                tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                num_splits=flashmla_num_splits,
+            )
         fp8_out_absorb_out(
             attn_out,
             self.absorb_weights,

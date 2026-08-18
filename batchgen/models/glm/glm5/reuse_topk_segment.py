@@ -147,6 +147,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         self.index_topk = int(index_topk)
         self.page_size = int(page_size)
         self.topk_source = topk_source
+        self.all_short = bool(getattr(topk_source, "all_short", False))
         # NOTE: full segments share ONE _buffers dict across all indexer
         # layers (that is what the worker's shared_dsa_buffers is). Skip
         # segments share their OWN dict — passing the full segments' dict
@@ -441,41 +442,42 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             num_valid_tokens=num_valid_tokens,
         )
 
-        # Reuse branch semantics (glm5_decode_selector.py:446-448): row_modes
-        # = (cache_seqlens > index_topk), int32.
-        torch.gt(buffers.safe_cache_seqlens, self.index_topk, out=buffers.valid_mask)
-        buffers.row_modes.copy_(buffers.valid_mask.to(torch.int32))
-
-        select_mla_kv_for_flashmla_bf16_out(
-            self.primary_blocked_k,
-            self.primary_page_table,
-            buffers.safe_cache_seqlens,
-            buffers.top_k_indices,           # borrowed from the producer
-            self.page_size,
-            buffers.selected_mla_kv,
-            buffers.selected_lengths,
-            None,
-            buffers.row_modes,
-            index_topk=self.index_topk,
-            return_indices=False,
-            primary_slot_indices=buffers.safe_primary_slot_indices,
-            num_valid_tokens=num_valid_tokens,
-        )
-
         fp8_q_absorb_out(
             buffers.q_nope, self.absorb_weights, buffers.absorbed_q,
             num_valid_tokens=num_valid_tokens,
         )
-        pack_flashmla_query_out(
-            buffers.absorbed_q, buffers.q_rope_4d.squeeze(2), buffers.query_states,
-            num_valid_tokens=num_valid_tokens,
-        )
-        buffers.query_states.mul_(valid_rows_bf16_4d)
-        attn_out = run_prepared_sparse_flash_mla_decode(
-            buffers.prepared_flashmla,
-            tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-            num_splits=flashmla_num_splits,
-        )
+        if self.all_short:
+            attn_out = self._run_all_short_fa3(buffers)
+        else:
+            # Reuse branch semantics (glm5_decode_selector.py:446-448):
+            # row_modes = (cache_seqlens > index_topk), int32.
+            torch.gt(buffers.safe_cache_seqlens, self.index_topk, out=buffers.valid_mask)
+            buffers.row_modes.copy_(buffers.valid_mask.to(torch.int32))
+            select_mla_kv_for_flashmla_bf16_out(
+                self.primary_blocked_k,
+                self.primary_page_table,
+                buffers.safe_cache_seqlens,
+                buffers.top_k_indices,           # borrowed from the producer
+                self.page_size,
+                buffers.selected_mla_kv,
+                buffers.selected_lengths,
+                None,
+                buffers.row_modes,
+                index_topk=self.index_topk,
+                return_indices=False,
+                primary_slot_indices=buffers.safe_primary_slot_indices,
+                num_valid_tokens=num_valid_tokens,
+            )
+            pack_flashmla_query_out(
+                buffers.absorbed_q, buffers.q_rope_4d.squeeze(2), buffers.query_states,
+                num_valid_tokens=num_valid_tokens,
+            )
+            buffers.query_states.mul_(valid_rows_bf16_4d)
+            attn_out = run_prepared_sparse_flash_mla_decode(
+                buffers.prepared_flashmla,
+                tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                num_splits=flashmla_num_splits,
+            )
         fp8_out_absorb_out(
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,

@@ -107,6 +107,15 @@ def _build_fake_wrapper(device):
 
 
 def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim, v_dim, device):
+    calls = {
+        "head_gates": 0,
+        "wq_b": 0,
+        "rope_hadamard_q": 0,
+        "score_topk": 0,
+        "select": 0,
+        "flashmla": 0,
+        "fa3": 0,
+    }
     topk_template = torch.arange(index_topk, device=device, dtype=torch.int32).view(1, index_topk)
     topk_template = topk_template.expand(bucket_size, index_topk).contiguous()
     selected_template = topk_template.to(torch.bfloat16).view(bucket_size, index_topk, 1, 1)
@@ -144,22 +153,32 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
 
     def fake_wq_b_proj(q_a_normed, weights, cuda_module, x_fp8, x_scale, tma_desc, out, num_valid_tokens=None):
         del weights, cuda_module, x_fp8, x_scale, tma_desc, num_valid_tokens
+        calls["wq_b"] += 1
         out.copy_(q_a_normed[:, :1].expand_as(out) + 0.25)
+        return out
+
+    def fake_head_gates(hidden, weight, out, *, scale, num_valid_tokens=None):
+        del hidden, weight, scale, num_valid_tokens
+        calls["head_gates"] += 1
+        out.fill_(1)
         return out
 
     def fake_rope_hadamard_q(q_flat, cos, sin, positions, out):
         del cos, sin, positions
+        calls["rope_hadamard_q"] += 1
         out.copy_(q_flat + 0.03125)
         return out
 
     def fake_score_topk(q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, top_k_indices, *, topk, page_size, max_seqlen, num_valid_tokens=None):
         del q_index, aux_blocked_k, aux_page_table, aux_slot_indices, head_gates, cache_seqlens, agg_scores, page_size, max_seqlen, num_valid_tokens
+        calls["score_topk"] += 1
         assert topk == index_topk
         top_k_indices.copy_(topk_template[: top_k_indices.shape[0]])
         return top_k_indices
 
     def fake_select(primary_blocked_k, primary_page_table, cache_seqlens, top_k_indices, page_size, selected_mla_kv, selected_lengths, selected_indices, row_modes, *, index_topk, return_indices, primary_slot_indices=None, num_valid_tokens=None):
         del primary_blocked_k, primary_page_table, top_k_indices, page_size, selected_indices, return_indices, num_valid_tokens
+        calls["select"] += 1
         selected_mla_kv.copy_(selected_template[: selected_mla_kv.shape[0]])
         if primary_slot_indices is not None:
             selected_mla_kv.mul_((cache_seqlens > 0).to(torch.bfloat16).view(-1, 1, 1, 1))
@@ -184,8 +203,14 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
 
     def fake_run_prepared(prepared, *, tile_scheduler_metadata, num_splits):
         del tile_scheduler_metadata, num_splits
+        calls["flashmla"] += 1
         selected = prepared.selected_mla_kv[:, :1, :, :v_dim]
         return prepared.query_states[..., :v_dim] + selected
+
+    def fake_fa3(*, q, k_cache, v_cache, qv, page_table, cache_batch_idx, cache_seqlens, **kwargs):
+        del q, k_cache, v_cache, page_table, cache_batch_idx, cache_seqlens, kwargs
+        calls["fa3"] += 1
+        return qv
 
     def fake_q_absorb(q_nope, weights, absorbed_q, num_valid_tokens=None):
         del weights, num_valid_tokens
@@ -209,6 +234,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
     monkeypatch.setattr(segments, "_fused_rmsnorm_rope", fake_rmsnorm_rope)
     monkeypatch.setattr(segments, "make_fp8_activation_scratch", fake_make_scratch)
     monkeypatch.setattr(segments, "cuda_wk_proj_gemm_only_out", fake_wk_proj)
+    monkeypatch.setattr(segments, "head_gates_out", fake_head_gates)
     monkeypatch.setattr(segments, "cuda_wq_b_proj_out", fake_wq_b_proj)
     monkeypatch.setattr(segments, "rope_hadamard_q_out", fake_rope_hadamard_q)
     monkeypatch.setattr(segments, "fused_paged_score_and_topk_with_slots_out", fake_score_topk)
@@ -216,9 +242,11 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
     monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_tensor_metadata", fake_metadata)
     monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_inputs", fake_prepare)
     monkeypatch.setattr(segments, "run_prepared_sparse_flash_mla_decode", fake_run_prepared)
+    monkeypatch.setattr(segments, "_fa3_with_kvcache", fake_fa3)
     monkeypatch.setattr(segments, "fp8_q_absorb_out", fake_q_absorb)
     monkeypatch.setattr(segments, "pack_flashmla_query_out", fake_pack_query)
     monkeypatch.setattr(segments, "fp8_out_absorb_out", fake_out_absorb)
+    return calls
 
 
 def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypatch):
@@ -360,3 +388,67 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     manager.drop_bucket(bucket_size)
     assert bucket_size not in shared_buffers
     assert bucket_size not in segment._outputs
+
+
+def test_glm5_full_dsa_all_short_skips_query_score_but_writes_indexer_k(monkeypatch):
+    device = torch.device("cuda")
+    bucket_size = 2
+    page_size = 4
+    wrapper = _build_fake_wrapper(device)
+    attn = wrapper.module
+    kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+    index_dim = attn.indexer.index_head_dim
+    calls = _patch_full_dsa_dependencies(
+        monkeypatch,
+        bucket_size=bucket_size,
+        index_topk=attn.indexer.index_topk,
+        kv_dim=kv_dim,
+        v_dim=attn.v_head_dim,
+        device=device,
+    )
+    primary_cache = torch.zeros(2, page_size, 1, kv_dim, dtype=torch.bfloat16, device=device)
+    aux_cache = torch.zeros(2, page_size, 1, index_dim, dtype=torch.bfloat16, device=device)
+    page_table = torch.tensor([[0], [1]], dtype=torch.int32, device=device)
+    cos = torch.ones(attn.indexer.index_topk, attn.qk_rope_head_dim, dtype=torch.bfloat16, device=device)
+    sin = torch.zeros_like(cos)
+    segment = Glm5FullDsaAttnSegment(
+        wrapper=wrapper,
+        primary_blocked_k=primary_cache,
+        aux_blocked_k=aux_cache,
+        primary_page_table=page_table,
+        aux_page_table=page_table,
+        wq_b_weights=object(),
+        absorb_weights=object(),
+        cuda_module=object(),
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=attn.indexer.index_topk,
+        index_topk=attn.indexer.index_topk,
+        page_size=page_size,
+        aux_page_size=page_size,
+        all_short=True,
+    )
+
+    outputs = segment.forward(
+        hidden_states=torch.randn(bucket_size, 1, attn.hidden_size, dtype=torch.bfloat16, device=device),
+        position_ids=torch.tensor([[1], [2]], dtype=torch.int64, device=device),
+        cache_seqlens=torch.tensor([2, 3], dtype=torch.int32, device=device),
+        primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        num_valid_tokens=torch.tensor([bucket_size], dtype=torch.int32, device=device),
+        flashmla_tile_scheduler_metadata=torch.arange(4, dtype=torch.int32, device=device).view(1, 4),
+        flashmla_num_splits=torch.ones(1, dtype=torch.int32, device=device),
+    )
+    torch.cuda.synchronize()
+
+    assert calls == {
+        "head_gates": 0,
+        "wq_b": 0,
+        "rope_hadamard_q": 0,
+        "score_topk": 0,
+        "select": 0,
+        "flashmla": 0,
+        "fa3": 1,
+    }
+    assert torch.count_nonzero(outputs["indexer_k_tensor"]).item() > 0
+    assert torch.count_nonzero(aux_cache).item() > 0

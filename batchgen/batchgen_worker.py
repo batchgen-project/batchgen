@@ -8918,6 +8918,39 @@ class BatchGenWorker:
 			)
 		return capacity
 
+	def _glm5_dsa_graph_required_tokens(
+		self,
+		active_sequence_ids: Sequence[int],
+		*,
+		page_size: int,
+	) -> int:
+		"""Smallest page-aligned decode length the current graph must cover."""
+		budgets = [
+			int(seq.kv_token_budget)
+			for seq in self.global_batch
+			if seq.status != SequenceStatus.COMPLETED
+		] if self.global_batch is not None else []
+		if not budgets and active_sequence_ids:
+			by_gid = {
+				int(seq.global_idx): seq
+				for seq in self.global_batch
+			} if self.global_batch is not None else {}
+			budgets = [
+				int(by_gid[seq_id].kv_token_budget)
+				for seq_id in active_sequence_ids
+				if int(seq_id) in by_gid
+			]
+		if budgets:
+			required = max(budgets)
+		else:
+			required = max(
+				1,
+				int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0),
+				int(getattr(self, "max_input_length", 0) or 0)
+				+ int(getattr(self, "max_decoding_length", 0) or 0),
+			)
+		return math.ceil(required / int(page_size)) * int(page_size)
+
 	def _debug_flag_enabled(self, value) -> bool:
 		if isinstance(value, bool):
 			return value
@@ -9519,20 +9552,47 @@ class BatchGenWorker:
 				aux_page_size,
 				model_max_position_embeddings=getattr(self.model_config, "max_position_embeddings", None),
 			)
+			required_seqlen = self._glm5_dsa_graph_required_tokens(
+				active_sequence_ids,
+				page_size=primary_page_size,
+			)
+			first_indexer = next(
+				(
+					getattr(layer.self_attn.module, "indexer", None)
+					for layer in self.model.model.layers
+					if getattr(layer.self_attn.module, "indexer", None) is not None
+				),
+				None,
+			)
+			index_topk = int(getattr(first_indexer, "index_topk", 2048))
 			env_graph_max_seqlen = os.environ.get("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN")
-			graph_max_seqlen = int(env_graph_max_seqlen) if env_graph_max_seqlen else int(capacity_seqlen)
+			graph_max_seqlen = (
+				int(env_graph_max_seqlen)
+				if env_graph_max_seqlen
+				else max(int(required_seqlen), index_topk)
+			)
 			if graph_max_seqlen <= 0:
 				raise RuntimeError("BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH_MAX_SEQLEN must be positive")
-			if int(getattr(AttnWrapperBase, "max_seqlen", 0) or 0) > graph_max_seqlen:
+			if required_seqlen > graph_max_seqlen:
 				raise RuntimeError(
-					f"GLM-5 whole-model CUDA graph max_seqlen={AttnWrapperBase.max_seqlen} "
-					f"exceeds cap {graph_max_seqlen}"
+					f"GLM-5 whole-model CUDA graph requires {required_seqlen} tokens "
+					f"but cap is {graph_max_seqlen}"
 				)
 			if graph_max_seqlen > int(capacity_seqlen):
 				raise RuntimeError(
 					f"GLM-5 whole-model CUDA graph max_seqlen={graph_max_seqlen} "
 					f"exceeds page-table capacity {capacity_seqlen}"
 				)
+			all_short = required_seqlen <= index_topk
+			logging.info(
+				"Rank %s: GLM-5 graph attention span required=%s cap=%s "
+				"index_topk=%s all_short=%s",
+				self.rank,
+				required_seqlen,
+				graph_max_seqlen,
+				index_topk,
+				all_short,
+			)
 
 			AttnWrapperBase.gpu_paged_kv_manager = primary_manager
 			AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
@@ -9678,6 +9738,7 @@ class BatchGenWorker:
 						index_topk=indexer.index_topk,
 						page_size=primary_page_size,
 						aux_page_size=aux_page_size,
+						all_short=all_short,
 						shared_buffers=shared_dsa_buffers,
 					)
 					last_full_segment = dsa_segment
