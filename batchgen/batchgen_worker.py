@@ -7400,10 +7400,6 @@ class BatchGenWorker:
 
 		cur_batch_start = 0
 		output_tokens = []
-		_k3_profile_enabled = self._debug_flag_enabled(
-			(self._batchgen_debug or {}).get("k3_prefill_profile")
-		)
-		_k3_profile_logits = []
 		
 		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
 			# Feed watchdog during long prefill operations
@@ -7596,6 +7592,10 @@ class BatchGenWorker:
 			)
 
 		output_tokens = []
+		_k3_profile_enabled = self._debug_flag_enabled(
+			(self._batchgen_debug or {}).get("k3_prefill_profile")
+		)
+		_k3_profile_logits = []
 
 		# Pure forward wall time: started here so configure_prefill (already
 		# reported separately as `Config completed`) is NEVER folded in.
