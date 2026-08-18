@@ -38,3 +38,33 @@ def test_k3_prefill_profile_locals_are_defined_in_prepacked_scope():
             f"{name} is first read at line {min(loads)} before its first "
             f"assignment at line {min(stores)}"
         )
+
+
+def test_k3_prefill_profile_uses_sequence_debug_in_both_prefill_stages():
+    worker_path = (
+        Path(__file__).resolve().parents[1] / "batchgen" / "batchgen_worker.py"
+    )
+    tree = ast.parse(worker_path.read_text())
+    worker = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "BatchGenWorker"
+    )
+    functions = {
+        node.name: node
+        for node in worker.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    for function_name in ("_config_prefill_for_batch", "prefill_prepacked"):
+        calls = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_active_batchgen_debug_for_sequences"
+        ]
+        assert calls, (
+            f"{function_name} must resolve batchgen_debug from the active "
+            "SequenceEntry objects used by persistent pool admissions"
+        )

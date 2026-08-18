@@ -6649,8 +6649,16 @@ class BatchGenWorker:
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_prefill_buffer()
+		prefill_sequences = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				prefill_sequences.append(seq)
+		prefill_debug = (
+			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		)
 		k3_prefill_profile = self._debug_flag_enabled(
-			(self._batchgen_debug or {}).get("k3_prefill_profile")
+			prefill_debug.get("k3_prefill_profile")
 		)
 		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
 		if k3_prefill_profile:
@@ -7592,8 +7600,15 @@ class BatchGenWorker:
 			)
 
 		output_tokens = []
+		prefill_sequences = [
+			self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
+			for local_idx in batch
+		]
+		prefill_debug = (
+			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		)
 		_k3_profile_enabled = self._debug_flag_enabled(
-			(self._batchgen_debug or {}).get("k3_prefill_profile")
+			prefill_debug.get("k3_prefill_profile")
 		)
 		_k3_profile_logits = []
 
