@@ -64,6 +64,29 @@ def _jit_compile(module_name: str):
 
     short_name = module_name.rsplit(".", 1)[-1]
 
+    # Fast path: a single-process pre-warm already built the .so. Import it
+    # directly via torch's post-baton step, skipping torch's FileBaton spin-wait
+    # (file_baton.py wait()) that deadlocks when 8 workers JIT the same module on
+    # the shared FS. Guarded on the .so being at least as new as every listed
+    # source so a stale binary still rebuilds through jit_load() below. Private
+    # torch symbols are import-guarded; any failure falls back to jit_load().
+    try:
+        from torch.utils.cpp_extension import (
+            _get_build_directory,
+            _import_module_from_library,
+        )
+        build_dir = _get_build_directory(short_name, verbose=False)
+        so_path = os.path.join(build_dir, short_name + ".so")
+        if os.path.exists(so_path) and os.path.getmtime(so_path) >= max(
+            os.path.getmtime(s) for s in sources
+        ):
+            logger.warning(
+                "[DEV] importing prebuilt %s, bypassing JIT baton", short_name
+            )
+            return _import_module_from_library(short_name, build_dir, is_python_module=True)
+    except (ImportError, AttributeError, OSError):
+        pass
+
     return jit_load(
         name=short_name,
         sources=sources,
