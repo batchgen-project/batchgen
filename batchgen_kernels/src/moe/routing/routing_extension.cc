@@ -69,6 +69,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ctx_ptr"),
           py::arg("hidden_states"));
 
+    m.def("fused_router_forward", &fused_router_forward,
+          "WGMMA router GEMM: BF16 hidden x BF16 weight^T -> FP32 logits (SM90a)",
+          py::arg("ctx_ptr"),
+          py::arg("hidden_states"),
+          py::arg("logits"),
+          py::arg("num_valid_tokens") = -1);
+
     m.def("fused_gate_forward", &fused_gate_forward,
           "Fused gate forward: WGMMA GEMM + bias + TopK + Softmax (SM90a)",
           py::arg("ctx_ptr"),

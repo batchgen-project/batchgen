@@ -200,3 +200,36 @@ def test_glm5_router_gemm_cuda_graph_replay_uses_device_rank_counts():
         world_size=world_size,
     )
     torch.testing.assert_close(graph_out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("m", [160, 320, 600])
+def test_glm5_tensorcore_router_matches_bf16_reference_and_graph_replay(m):
+    from batchgen.moe.routing import FusedGateContext
+
+    torch.manual_seed(20260818 + m)
+    device = torch.device("cuda")
+    hidden_base = (
+        torch.randn(600, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    weight = (
+        torch.randn(256, 6144, device=device, dtype=torch.float32) * 0.1
+    ).to(torch.bfloat16)
+    output = torch.empty(m, 256, device=device, dtype=torch.float32)
+    context = FusedGateContext(weight, router_bias=None, topk=8)
+    context.warmup(hidden_base)
+
+    actual = context.router_forward(hidden_base[:m], logits=output)
+    ref = _reference_router(hidden_base[:m], weight)
+    _assert_bf16_router_close(actual, ref)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        context.router_forward(hidden_base[:m], logits=output)
+
+    replacement = (
+        torch.randn_like(hidden_base[:m].float()) * 0.1
+    ).to(torch.bfloat16)
+    hidden_base[:m].copy_(replacement)
+    graph.replay()
+    ref_replay = _reference_router(replacement, weight)
+    _assert_bf16_router_close(output, ref_replay)

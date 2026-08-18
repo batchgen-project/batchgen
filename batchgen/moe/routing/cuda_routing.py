@@ -316,6 +316,16 @@ class FusedGateContext:
         )
         return result[0], result[1]
 
+    def router_forward(self, hidden_states, logits=None, num_valid_tokens=-1):
+        """Run only the BF16 tensor-core router GEMM and return FP32 logits."""
+        result = self._ext.fused_router_forward(
+            self._ctx,
+            hidden_states,
+            logits if logits is not None else torch.empty(0),
+            num_valid_tokens,
+        )
+        return result
+
     def __del__(self):
         if hasattr(self, '_ctx') and hasattr(self, '_ext'):
             self._ext.destroy_fused_gate_context(self._ctx)

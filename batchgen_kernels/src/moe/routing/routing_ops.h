@@ -84,6 +84,13 @@ void destroy_fused_gate_context(int64_t ctx_ptr);
 // Pre-create TMA descriptor for input buffer (call before CUDA graph capture)
 void fused_gate_warmup(int64_t ctx_ptr, torch::Tensor hidden_states);
 
+torch::Tensor fused_router_forward(
+    int64_t ctx_ptr,
+    torch::Tensor hidden_states,     // [N, K_dim] BF16
+    torch::Tensor logits,            // [N, E] FP32 pre-allocated (optional)
+    int64_t num_valid_tokens = -1
+);
+
 std::vector<torch::Tensor> fused_gate_forward(
     int64_t ctx_ptr,
     torch::Tensor hidden_states,     // [N, K_dim] BF16
