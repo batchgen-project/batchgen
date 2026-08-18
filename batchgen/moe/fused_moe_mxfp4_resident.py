@@ -119,6 +119,11 @@ def _repack_projection(packed, scale, device):
         MXFP4_PACK_FACTOR,
     )
 
+    if packed.dtype == torch.int32:
+        # Stored marlin (task #53 offline): packed IS marlin_qw int32; scale
+        # IS the marlin-order uint8 E8M0. Direct-copy qw, dequant scale once.
+        from batchgen.moe.marlin_weight_prep import mxfp4_scale_e8m0_to_bf16
+        return packed.to(device), mxfp4_scale_e8m0_to_bf16(scale.to(device))
     n_out = int(packed.shape[0])
     k_in = int(packed.shape[1]) * MXFP4_PACK_FACTOR
     return repack_mxfp4_to_marlin_device(
@@ -149,8 +154,16 @@ def build_layer_shard(expert_sources, device):
         MXFP4_PACK_FACTOR,
     )
     w1_packed0 = expert_sources[0]["w1"][0]
-    N = int(w1_packed0.shape[0])
-    K_latent = int(w1_packed0.shape[1]) * MXFP4_PACK_FACTOR
+    if w1_packed0.dtype == torch.int32:
+        # Stored marlin: w1 marlin_qw is [K_latent // _MARLIN_TILE, N * 2].
+        from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+            _MARLIN_TILE,
+        )
+        K_latent = int(w1_packed0.shape[0]) * _MARLIN_TILE
+        N = int(w1_packed0.shape[1]) // 2
+    else:
+        N = int(w1_packed0.shape[0])
+        K_latent = int(w1_packed0.shape[1]) * MXFP4_PACK_FACTOR
 
     shard = MXFP4LayerShard(num_local, N, K_latent, device)
     gate_B, gate_s, up_B, up_s, down_B, down_s = ([] for _ in range(6))

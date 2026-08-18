@@ -84,6 +84,7 @@ import torch.nn as nn
 
 from ..wrappers import KimiLinearExpertWrapper
 from .mxfp4_layout import (
+    K3_ROUTED_EXPERTS_MARLIN,
     MXFP4_DTYPE,
     MXFP4_GROUP_SIZE,
     MXFP4_PACK_FACTOR,
@@ -189,6 +190,7 @@ def repack_mxfp4_to_marlin_device(
     weight_scale: torch.Tensor,
     K: int,
     N: int,
+    scale_bf16: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Device-resident twin of ``repack_mxfp4_to_marlin_gs32(..., "bf16")``.
 
@@ -235,6 +237,11 @@ def repack_mxfp4_to_marlin_device(
     #    edge bytes rather than clamping them).
     s = weight_scale.t().contiguous()
     s = s.reshape(-1, scale_perm.numel())[:, scale_perm].reshape(-1, N).contiguous()
+    if not scale_bf16:
+        # V1 (task #53): return marlin-order uint8 E8M0; caller runs
+        # mxfp4_scale_e8m0_to_bf16 per-forward. Bit-identical to the bf16
+        # branch after that expansion, by construction (same s).
+        return marlin_qw, s
     return marlin_qw, mxfp4_scale_e8m0_to_bf16(s)
 
 
@@ -270,6 +277,24 @@ class K3MXFP4Projection(nn.Module):
         )
 
     def marlin(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        if K3_ROUTED_EXPERTS_MARLIN:
+            # Offline marlin (task #53): the streamed slot already holds
+            # marlin bytes, presented under the packed uint8 module_shape
+            # [n_out, k_in//2]. Reinterpret to marlin dims and dequant the
+            # E8M0 scale ONCE -- NO per-forward repack. The slot bytes are
+            # the exact linear bytes repack_mxfp4_to_marlin_device emits, so
+            # the same-linear-order reshape recovers its marlin_qw/scale
+            # bit-for-bit (validated: verify_k3_mxfp4_expert repack identity
+            # + the gate below). marlin_qw [k_in//16, n_out*2] int32; marlin
+            # scale [k_in//32, n_out] uint8 E8M0 -> bf16.
+            from batchgen.moe.marlin_weight_prep import (
+                mxfp4_scale_e8m0_to_bf16,
+            )
+            qw = self.weight_packed.data.contiguous().view(
+                torch.int32).reshape(self.k_in // _MARLIN_TILE, self.n_out * 2)
+            s = self.weight_scale.data.contiguous().reshape(
+                self.k_in // MXFP4_GROUP_SIZE, self.n_out)
+            return qw, mxfp4_scale_e8m0_to_bf16(s)
         return repack_mxfp4_to_marlin_device(
             self.weight_packed.data, self.weight_scale.data,
             self.k_in, self.n_out,

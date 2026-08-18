@@ -67,6 +67,16 @@ MXFP4_FORMAT_SUBSTR = "mxfp4"
 #: scale is BF16.
 MXFP4_DTYPE = torch.uint8
 
+#: task #53 (V1 offline marlin). When True, the converter emits routed-
+#: expert weights in marlin tile order (int32 qw + marlin-order uint8 E8M0
+#: scale, +0 host bytes) and the serving paths consume marlin directly:
+#: DECODE direct-copies (get_tensor exposes the true int32 dtype), PREFILL
+#: reinterprets the packed-shaped uint8 GPU slot bytes as marlin and SKIPS
+#: the per-forward repack. The converter flag (kimi_parameter_server) reads
+#: THIS constant, so a fresh conversion always matches. FLIPPING THIS
+#: REQUIRES RE-CONVERTING (a stale converted_ckpt is reused if present).
+K3_ROUTED_EXPERTS_MARLIN = True
+
 PACKED_SUFFIX = ".weight_packed"
 SCALE_SUFFIX = ".weight_scale"
 #: Checkpoint names: w1 = gate, w3 = up, w2 = down.

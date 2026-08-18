@@ -239,8 +239,17 @@ class KimiLinear_Parameter_Server:
         # (cached under <cache_dir>/converted_ckpt afterwards).
         if self.converted_ckpt_dir is None or not os.path.isdir(self.converted_ckpt_dir):
             converter = ckpt_converter()
+            # task #53: K3 emits offline marlin (K3_ROUTED_EXPERTS_MARLIN);
+            # 48B experts are BF16 (the repack matches nothing). The prefill
+            # and decode consume paths read the SAME constant, so the stored
+            # format always matches what they expect.
+            if self.family == "kimi_k3":
+                from .k3.mxfp4_layout import K3_ROUTED_EXPERTS_MARLIN
+                marlin = K3_ROUTED_EXPERTS_MARLIN
+            else:
+                marlin = False
             self.converted_ckpt_dir = converter.convert_model_directory(
-                self.cache_dir, marlin=False
+                self.cache_dir, marlin=marlin
             )
         else:
             logging.info(f"Using pre-converted checkpoint: {self.converted_ckpt_dir}")
