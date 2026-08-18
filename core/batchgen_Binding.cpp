@@ -519,6 +519,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("cuda_enable_peer_access", &BatchGen::cuda_enable_peer_access)
         .def("save_compressed_kv", &BatchGen::save_compressed_kv)
         .def("set_weight_copy_queue", &BatchGen::set_weight_copy_queue)
+        .def("reset_weight_stream_profile",
+             &BatchGen::reset_weight_stream_profile)
+        .def("get_weight_stream_profile",
+             &BatchGen::get_weight_stream_profile)
         .def("reset_decoding_buffer", &BatchGen::reset_decoding_buffer)
         .def("stop_h2d_worker", &BatchGen::stop_h2d_worker)
         .def("copy_kv_to_worker",

@@ -59,6 +59,7 @@ Storing BF16 scales would remove it but adds ~85.1 GB across 82,432 experts.
 """
 
 import logging
+import time
 from typing import Dict, Tuple
 
 import torch
@@ -364,6 +365,30 @@ class KimiK3MXFP4ExpertWrapper(KimiLinearExpertWrapper):
         ``else`` for K3 without touching the shared base class.
     """
 
+    _prefill_profile_enabled = False
+    _prefill_profile_calls = 0
+    _prefill_profile_active_calls = 0
+    _prefill_profile_token_rows = 0
+    _prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def reset_prefill_profile(cls, enabled: bool) -> None:
+        cls._prefill_profile_enabled = bool(enabled)
+        cls._prefill_profile_calls = 0
+        cls._prefill_profile_active_calls = 0
+        cls._prefill_profile_token_rows = 0
+        cls._prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def prefill_profile_snapshot(cls) -> dict:
+        return {
+            "enabled": cls._prefill_profile_enabled,
+            "calls": cls._prefill_profile_calls,
+            "active_calls": cls._prefill_profile_active_calls,
+            "token_rows": cls._prefill_profile_token_rows,
+            "wall_s": cls._prefill_profile_wall_s,
+        }
+
     def __init__(self, module, layer_idx, expert_idx, core_engine,
                  engine_config, model_config, persistent: bool = False):
         if persistent:
@@ -381,6 +406,20 @@ class KimiK3MXFP4ExpertWrapper(KimiLinearExpertWrapper):
             self.module_key, weights_dict, self.module.expected_slot_shapes()
         )
         return weights_dict
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not type(self)._prefill_profile_enabled:
+            return super().forward(hidden_states)
+        start = time.perf_counter()
+        result = super().forward(hidden_states)
+        cls = type(self)
+        cls._prefill_profile_calls += 1
+        rows = int(hidden_states.shape[0])
+        if rows:
+            cls._prefill_profile_active_calls += 1
+            cls._prefill_profile_token_rows += rows
+        cls._prefill_profile_wall_s += time.perf_counter() - start
+        return result
 
     def apply_weights(self, weights_dict):
         super().apply_weights(weights_dict)

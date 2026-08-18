@@ -18,6 +18,7 @@
  * ---------------------------------------------------------------------------- */
 // clang-format on
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,6 +92,29 @@ GPU_Weight_Buffer::GPU_Weight_Buffer(EngineConfig& engine_config,
             std::to_string(this->engine_config_.basic_config.device));
     this->logger_->info("GPU_Weight_Buffer Instantiated.");
 };
+
+void GPU_Weight_Buffer::reset_weight_stream_profile(bool enabled) {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    this->weight_profile_enabled_ = enabled;
+    this->weight_profile_requests_.clear();
+    this->weight_profile_wait_seconds_.clear();
+}
+
+pybind11::dict GPU_Weight_Buffer::get_weight_stream_profile() {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    pybind11::dict result;
+    result["enabled"] = this->weight_profile_enabled_;
+    pybind11::dict by_type;
+    for (const auto& [module_type, requests] :
+         this->weight_profile_requests_) {
+        pybind11::dict entry;
+        entry["requests"] = requests;
+        entry["wait_s"] = this->weight_profile_wait_seconds_[module_type];
+        by_type[module_type.c_str()] = entry;
+    }
+    result["by_type"] = by_type;
+    return result;
+}
 
 void GPU_Weight_Buffer::Init() {
     auto& buffer_shapes = this->engine_config_.gpu_buffer_config.module_shapes;
@@ -208,6 +232,18 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
                         })) {
                     auto [module_type, buffer_idx] =
                         this->module_in_buffers_[module_name];
+                    auto wait_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> profile_lock(
+                            this->weight_profile_mutex_);
+                        if (this->weight_profile_enabled_) {
+                            this->weight_profile_requests_[module_type] += 1;
+                            this->weight_profile_wait_seconds_[module_type] +=
+                                std::chrono::duration<double>(wait_end -
+                                                              start_time)
+                                    .count();
+                        }
+                    }
                     return this->buffers_[module_type][buffer_idx];
                 }
                 this->logger_->debug("Waiting for module: {}", module_name);

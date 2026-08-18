@@ -22,6 +22,7 @@
 #include "pybind11/pybind11.h"
 #include "pybind11/stl.h"
 #include "spdlog/spdlog.h"
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <string>
@@ -70,6 +71,8 @@ class HtoD_Engine {
     void set_weight_copy_queue(
         std::unordered_map<std::string, std::vector<std::string>>&
             weight_copy_tasks);
+    void reset_weight_stream_profile(bool enabled);
+    py::dict get_weight_stream_profile();
     void stop_h2d_worker();
     void batched_page_copy(const std::vector<void*>& gpu_ptrs,
                            const std::vector<void*>& host_ptrs,
@@ -108,6 +111,13 @@ class HtoD_Engine {
         weight_copy_tasks_;
     std::unordered_map<std::string, threadsafe_queue<std::string>>
         weights_copy_task_queue_;  // module type -> queue of module names.
+
+    std::mutex weight_profile_mutex_;
+    bool weight_profile_enabled_{false};
+    std::unordered_map<std::string, uint64_t> weight_profile_modules_;
+    std::unordered_map<std::string, uint64_t> weight_profile_tensors_;
+    std::unordered_map<std::string, uint64_t> weight_profile_bytes_;
+    std::unordered_map<std::string, double> weight_profile_copy_seconds_;
 
     std::thread HtoD_worker_;
     void HtoD_Worker();

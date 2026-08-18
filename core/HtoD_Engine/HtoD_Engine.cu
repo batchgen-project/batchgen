@@ -19,6 +19,7 @@
 // clang-format on
 
 #include "spdlog/spdlog.h"
+#include <chrono>
 #include <memory>
 #include <string>
 #include <torch/extension.h>
@@ -279,6 +280,32 @@ void HtoD_Engine::reset_weight_copy_queue() {
     this->weights_copy_task_queue_ = new_weights_copy_task_queue;
 };
 
+void HtoD_Engine::reset_weight_stream_profile(bool enabled) {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    this->weight_profile_enabled_ = enabled;
+    this->weight_profile_modules_.clear();
+    this->weight_profile_tensors_.clear();
+    this->weight_profile_bytes_.clear();
+    this->weight_profile_copy_seconds_.clear();
+}
+
+py::dict HtoD_Engine::get_weight_stream_profile() {
+    std::lock_guard<std::mutex> lock(this->weight_profile_mutex_);
+    py::dict result;
+    result["enabled"] = this->weight_profile_enabled_;
+    py::dict by_type;
+    for (const auto& [module_type, modules] : this->weight_profile_modules_) {
+        py::dict entry;
+        entry["modules"] = modules;
+        entry["tensors"] = this->weight_profile_tensors_[module_type];
+        entry["bytes"] = this->weight_profile_bytes_[module_type];
+        entry["copy_s"] = this->weight_profile_copy_seconds_[module_type];
+        by_type[module_type.c_str()] = entry;
+    }
+    result["by_type"] = by_type;
+    return result;
+}
+
 void HtoD_Engine::HtoD_Worker() {
     CUDA_CHECK(cudaSetDevice(this->engine_config_.basic_config.device));
     while (!terminate_flag_) {
@@ -473,8 +500,30 @@ void HtoD_Engine::HtoD_Worker() {
                             "HtoD: host/GPU byte size mismatch for " +
                             tensor_name);
                     }
+                    auto copy_start = std::chrono::steady_clock::now();
                     this->blocking_copy_(slot->second.data_ptr(), src_ptr,
                                          src_byte_size);
+                    auto copy_end = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            this->weight_profile_mutex_);
+                        if (this->weight_profile_enabled_) {
+                            this->weight_profile_tensors_[module_type] += 1;
+                            this->weight_profile_bytes_[module_type] +=
+                                static_cast<uint64_t>(src_byte_size);
+                            this->weight_profile_copy_seconds_[module_type] +=
+                                std::chrono::duration<double>(copy_end -
+                                                              copy_start)
+                                    .count();
+                        }
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lock(
+                        this->weight_profile_mutex_);
+                    if (this->weight_profile_enabled_) {
+                        this->weight_profile_modules_[module_type] += 1;
+                    }
                 }
                 this->logger_->debug("Copied module: {} to buffer: {}",
                                     module_name, buffer_idx);

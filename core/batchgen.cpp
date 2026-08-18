@@ -320,6 +320,19 @@ void BatchGen::reset_weight_copy_queue() {
     this->h2d_engine_.reset_weight_copy_queue();
 };
 
+void BatchGen::reset_weight_stream_profile(bool enabled) {
+    this->h2d_engine_.reset_weight_stream_profile(enabled);
+    this->gpu_weight_buffer_.reset_weight_stream_profile(enabled);
+}
+
+py::dict BatchGen::get_weight_stream_profile() {
+    py::dict result;
+    result["h2d"] = this->h2d_engine_.get_weight_stream_profile();
+    result["consumer_wait"] =
+        this->gpu_weight_buffer_.get_weight_stream_profile();
+    return result;
+}
+
 void BatchGen::reset_prefill_buffer() {
     this->gpu_weight_buffer_.reset_prefill_buffer();
 };

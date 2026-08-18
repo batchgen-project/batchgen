@@ -6649,6 +6649,15 @@ class BatchGenWorker:
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_prefill_buffer()
+		k3_prefill_profile = self._debug_flag_enabled(
+			(self._batchgen_debug or {}).get("k3_prefill_profile")
+		)
+		self.core_engine.reset_weight_stream_profile(k3_prefill_profile)
+		if k3_prefill_profile:
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(True)
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
 
@@ -7391,6 +7400,10 @@ class BatchGenWorker:
 
 		cur_batch_start = 0
 		output_tokens = []
+		_k3_profile_enabled = self._debug_flag_enabled(
+			(self._batchgen_debug or {}).get("k3_prefill_profile")
+		)
+		_k3_profile_logits = []
 		
 		for micro_batch_idx in tqdm(range(num_prefill_micro_batches), desc="Prefill Micro Batch"):
 			# Feed watchdog during long prefill operations
@@ -7787,6 +7800,8 @@ class BatchGenWorker:
 						self.model.lm_head.weight,
 						self.model.lm_head.bias if hasattr(self.model.lm_head, 'bias') and self.model.lm_head.bias is not None else None
 					).float()
+				if _k3_profile_enabled:
+					_k3_profile_logits.append(logits.detach())
 
 				batch_sequences = [
 					self.global_batch.get_sequence(self._local_to_uuid_map[local_idx])
@@ -7813,6 +7828,34 @@ class BatchGenWorker:
 						batch_new_tokens.reshape(-1).tolist()[:16])
 
 		_prefill_forward_s = time.perf_counter() - _prefill_forward_t0
+		if _k3_profile_enabled:
+			# Freeze the cyclic producer before any Python import or JSON work.
+			# Otherwise it can refill newly released slots after the final
+			# expert and make one completed prefill look like a partial second
+			# pass.
+			self.core_engine.stop_h2d_worker()
+			_k3_profile_topk = []
+			for profile_logits in _k3_profile_logits:
+				top_values, top_indices = torch.topk(
+					profile_logits,
+					k=min(8, profile_logits.shape[-1]),
+					dim=-1,
+				)
+				_k3_profile_topk.append({
+					"ids": top_indices.cpu().tolist(),
+					"values": top_values.cpu().tolist(),
+				})
+			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+				KimiK3MXFP4ExpertWrapper,
+			)
+			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
+				"rank": self.rank,
+				"weight_stream": self.core_engine.get_weight_stream_profile(),
+				"expert_consumer": (
+					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
+				),
+				"logit_topk": _k3_profile_topk,
+			}, separators=(",", ":")))
 
 		# Structured prefill record, one JSON line per rank that actually ran a
 		# prefill (batchgen-benchmark docs/prefill_metrics_proposal.md). The
