@@ -40,40 +40,22 @@ green 9/9 GPU parity ladder (``tests/moe/gpu_parity_mxfp4_marlin.py``).  This
 also matches the 2026-08-04 decision ledger recorded in
 ``marlin_grouped_moe.py:253-261``.
 
-THE ONE COST, WITH THE NUMBER ATTACHED
---------------------------------------
-The marlin kernels read weights in marlin TILE order; the engine streams them
-in CHECKPOINT order, because ``kimi_parameter_server.py:242-243`` converts with
-``marlin=False`` (and ``ckpt_converter._apply_marlin_repack`` explicitly
-REFUSES uint8/E8M0 scales — it is a uniform-INT4 path).  So this module repacks
-per forward, on device, and that is EXPENSIVE.  MEASURED on H20, one expert at
-the real K3 shapes:
+CURRENT OFFLINE-MARLIN CONTRACT
+-------------------------------
+The converter now emits routed experts in Marlin tile order:
 
-    repack total        1068.1 us   (packed branch 641.4 + scale branch 426.6)
-    forward, t=1        1350.0 us with repack vs  240.8 us pre-repacked (5.61x)
-    forward, t=512      1688.8 us with repack vs  635.1 us pre-repacked (2.66x)
+  * ``weight_packed`` metadata is int32 Marlin tiles;
+  * ``weight_scale`` remains byte-neutral uint8 E8M0 in Marlin order.
 
-The cost is FLAT in token count — it is per expert, not per token.  INFERRED
-from that: at prefill occupancy (>=4096 tokens x top-16 makes essentially all
-896 experts non-empty) it is ~0.96 s of pure repack per MoE layer, ~88 s per
-forward across the 92 MoE layers.  This is a blocker for a real 8K prefill, not
-a rounding error, and it is NOT fixable inside this file.
+Decode's host ``get_tensor`` exposes the true int32 shape. Prefill's fixed GPU
+ring presents the same linear bytes through its historical uint8
+``[N, K//2]`` slot shape; :meth:`K3MXFP4Projection.marlin` reinterprets that
+view back to Marlin without permuting the packed weights.
 
-The end state is the converter emitting marlin order.  Two variants, and they
-are not interchangeable — ``marlin_grouped_moe.py:358`` hard-fails a non-bf16
-scale:
-
-  * converter emits marlin-order **uint8** E8M0 scales: per-expert byte count
-    unchanged, but ``mxfp4_scale_e8m0_to_bf16`` still runs every forward
-    (MEASURED 227.3 us/expert).  Only the 641 us packed branch collapses to a
-    ``.view()``.
-  * converter emits **bf16** scales: both branches become ``.view()``s, but
-    per-expert bytes go 17,547,264 -> 18,579,456 (+5.88%), i.e. +85.1 GB across
-    82,432 experts against the 2.147 TB host ceiling in ``mxfp4_layout.py``
-    :26-30.
-
-Either way it is a ``batchgen/ckpt_converter/`` change plus a ~2.4 h
-re-conversion, outside a model PR's allowlist.  NAMED FOLLOW-UP, sized.
+There is no Marlin→WGMMA transform in K3 prefill. Both phases call the Marlin
+MXFP4 kernels with the SiTU epilogue. The remaining per-forward format work is
+the exact E8M0 uint8→BF16 scale expansion (a device tensor bit shift + view).
+Storing BF16 scales would remove it but adds ~85.1 GB across 82,432 experts.
 """
 
 import logging
