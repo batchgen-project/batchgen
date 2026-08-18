@@ -247,6 +247,44 @@ def build_wrapped_expert(dev, weights_cpu):
     return wrapper, engine, served
 
 
+def stored_marlin_slot_weights(raw, dev):
+    """Build the uint8 GPU-ring view of the offline-Marlin checkpoint bytes.
+
+    The converted checkpoint metadata exposes ``marlin_qw`` as int32 with its
+    true Marlin shape. The prefill GPU ring is allocated from the model's fixed
+    checkpoint-order module shape, so core_engine copies the same linear bytes
+    into a uint8 ``[N, K//2]`` view; the scale bytes are likewise presented as
+    ``[N, K//32]`` even though they are stored in Marlin order.
+    """
+    from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
+        repack_mxfp4_to_marlin_device,
+    )
+
+    weights = {}
+    for name, (packed, scale) in raw.items():
+        n_out = packed.shape[0]
+        k_in = packed.shape[1] * 2
+        marlin_qw, marlin_scale = repack_mxfp4_to_marlin_device(
+            packed.to(dev),
+            scale.to(dev),
+            k_in,
+            n_out,
+            scale_bf16=False,
+        )
+        weights[f"{name}.weight_packed"] = (
+            marlin_qw.contiguous()
+            .view(torch.uint8)
+            .reshape(n_out, k_in // 2)
+            .cpu()
+        )
+        weights[f"{name}.weight_scale"] = (
+            marlin_scale.contiguous()
+            .reshape(n_out, k_in // 32)
+            .cpu()
+        )
+    return weights
+
+
 def reference_expert(x, dequant_w, swap_gate_up=False, use_silu=False):
     """Reference expert forward at the KERNEL's precision.
 
@@ -282,10 +320,7 @@ def check_numerics(dev, num_tokens=64):
                          ("w2", (K3_FFN, K3_LATENT))):
         raw[name] = rand_expert_weight(K, N, seed=hash(name) % 2**31)
 
-    weights_cpu = {}
-    for name, (packed, scale) in raw.items():
-        weights_cpu[f"{name}.weight_packed"] = packed
-        weights_cpu[f"{name}.weight_scale"] = scale
+    weights_cpu = stored_marlin_slot_weights(raw, dev)
 
     wrapper, engine, _ = build_wrapped_expert(dev, weights_cpu)
     dequant_w = {n: mxfp4_dequantize_oracle(p, s).to(dev)
