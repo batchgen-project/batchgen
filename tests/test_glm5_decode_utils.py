@@ -2751,6 +2751,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         def get_kv_tensors(self):
             return self.k_cache, None
 
+        def resolve_physical_layer(self, _layer_idx):
+            return 0
+
     class FakeIndexer:
         rope_head_dim = 4
         index_topk = 8
@@ -2816,6 +2819,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker._current_decode_max_rank_batch_size = 2
     worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
     worker._cuda_graph_manager = None
+    worker._cuda_graph_adapter = None
     worker._whole_model_segment = None
     worker._whole_model_bucketing = None
     worker._whole_model_graph = False
@@ -2864,7 +2868,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
 
     worker._setup_cuda_graphs(gpu_manager)
 
-    expected_buckets = [1, 2, 4, 8]
+    expected_buckets = [8, 4, 2, 1]
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
