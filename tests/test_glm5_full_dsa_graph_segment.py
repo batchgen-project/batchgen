@@ -9,6 +9,7 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     make_glm5_full_dsa_graph_segment_name,
 )
+from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -101,8 +102,64 @@ def _build_fake_wrapper(device):
         module=attn,
         layer_idx=0,
         weight_dequant_scale=weight_dequant_scale,
+        _fp8_qkv_a_proj=torch.cat(
+            (attn.q_a_proj.weight, attn.kv_a_proj_with_mqa.weight),
+            dim=0,
+        ).contiguous(),
+        _fp8_qkv_a_scale=torch.ones(1, device=device, dtype=torch.float32),
         _indexer_cuda_weights=object(),
         _indexer_cuda_module=object(),
+    )
+
+
+def test_glm5_registers_fused_qkv_a_storage_views():
+    device = torch.device("cuda")
+    q_weight = torch.arange(
+        12,
+        device=device,
+        dtype=torch.float32,
+    ).view(3, 4).to(torch.bfloat16)
+    kv_weight = torch.arange(
+        8,
+        device=device,
+        dtype=torch.float32,
+    ).view(2, 4).add_(100).to(torch.bfloat16)
+    q_scale = torch.tensor([[1.0, 2.0]], device=device)
+    kv_scale = torch.tensor([[3.0, 4.0]], device=device)
+    wrapper = types.SimpleNamespace(
+        layer_idx=0,
+        module=types.SimpleNamespace(
+            q_a_proj=types.SimpleNamespace(weight=types.SimpleNamespace(data=q_weight)),
+            q_b_proj=types.SimpleNamespace(weight=types.SimpleNamespace(data=q_weight)),
+            kv_a_proj_with_mqa=types.SimpleNamespace(
+                weight=types.SimpleNamespace(data=kv_weight)
+            ),
+            kv_b_proj=types.SimpleNamespace(weight=types.SimpleNamespace(data=kv_weight)),
+            o_proj=types.SimpleNamespace(weight=types.SimpleNamespace(data=q_weight)),
+        ),
+        weight_dequant_scale={
+            "q_a_proj.weight_scale_inv": q_scale,
+            "kv_a_proj_with_mqa.weight_scale_inv": kv_scale,
+        },
+    )
+
+    GLM5AttnWrapper._register_fp8_weights(wrapper)
+
+    assert torch.equal(
+        wrapper._fp8_qkv_a_proj,
+        torch.cat((q_weight, kv_weight), dim=0),
+    )
+    assert torch.equal(
+        wrapper._fp8_qkv_a_scale,
+        torch.cat((q_scale, kv_scale), dim=0),
+    )
+    assert (
+        wrapper.module.q_a_proj.weight.data.untyped_storage().data_ptr()
+        == wrapper._fp8_qkv_a_proj.untyped_storage().data_ptr()
+    )
+    assert (
+        wrapper.module.kv_a_proj_with_mqa.weight.data.untyped_storage().data_ptr()
+        == wrapper._fp8_qkv_a_proj.untyped_storage().data_ptr()
     )
 
 

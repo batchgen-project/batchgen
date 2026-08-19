@@ -445,6 +445,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
         # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step).
         # These are BF16 WEIGHT copies, not workspaces. They are quantizer
         # INPUT only: once _fp8_absorb_weights is built they are freed by
@@ -478,6 +480,34 @@ class GLM5AttnWrapper(AttnWrapperBase):
 
     def _register_fp8_weights(self):
         """Cache FP8 attention weights. GLM-5 uses kv_a_proj_with_mqa."""
+        q_a_weight = self.module.q_a_proj.weight.data
+        kv_a_weight = self.module.kv_a_proj_with_mqa.weight.data
+        q_a_scale = self.weight_dequant_scale.get("q_a_proj.weight_scale_inv")
+        kv_a_scale = self.weight_dequant_scale.get(
+            "kv_a_proj_with_mqa.weight_scale_inv"
+        )
+        if q_a_scale is None or kv_a_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] fused Q-A/KV-A requires both FP8 scales"
+            )
+        self._fp8_qkv_a_proj = torch.cat(
+            (q_a_weight, kv_a_weight),
+            dim=0,
+        ).contiguous()
+        self._fp8_qkv_a_scale = torch.cat(
+            (q_a_scale, kv_a_scale),
+            dim=0,
+        ).contiguous()
+        q_rows = q_a_weight.shape[0]
+        q_scale_rows = q_a_scale.shape[0]
+        self.module.q_a_proj.weight.data = self._fp8_qkv_a_proj[:q_rows]
+        self.module.kv_a_proj_with_mqa.weight.data = self._fp8_qkv_a_proj[q_rows:]
+        self.weight_dequant_scale["q_a_proj.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[:q_scale_rows]
+        )
+        self.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"] = (
+            self._fp8_qkv_a_scale[q_scale_rows:]
+        )
         self.fp8_q_a_proj = self.module.q_a_proj.weight.data
         self.fp8_q_b_proj = self.module.q_b_proj.weight.data
         self.fp8_kv_a_proj = self.module.kv_a_proj_with_mqa.weight.data
@@ -490,6 +520,8 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_kv_a_proj = None
         self.fp8_kv_b_proj = None
         self.fp8_o_proj = None
+        self._fp8_qkv_a_proj = None
+        self._fp8_qkv_a_scale = None
 
     def initialize_decode_absorb(self):
         """Pre-compute absorbed projections from FP8 kv_b_proj weight.

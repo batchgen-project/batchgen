@@ -41,6 +41,7 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
+    fused_rmsnorm,
 )
 
 
@@ -66,7 +67,9 @@ _REUSE_BUCKET_DIM_FIELDS = (
     "safe_primary_slot_indices",
     "safe_aux_slot_indices",
     "safe_cache_seqlens",
+    "qkv_a",
     "q_a",
+    "q_a_normed",
     "q_flat",
     "q_nope",
     "q_rope_4d",
@@ -236,6 +239,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
 
         source_buffers = self._topk_source_buffers(bucket_size)
 
+        qkv_a = torch.empty(
+            bucket_size,
+            attn.q_lora_rank + kv_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
         selected_token_ids = torch.empty(
             bucket_size, self.index_topk,
             dtype=torch.int32, device=device,
@@ -259,7 +268,14 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             safe_primary_slot_indices=torch.empty(bucket_size, dtype=torch.int32, device=device),
             safe_aux_slot_indices=torch.zeros(bucket_size, dtype=torch.int32, device=device),
             safe_cache_seqlens=torch.empty(bucket_size, dtype=torch.int32, device=device),
-            q_a=torch.empty(bucket_size, attn.q_lora_rank, dtype=torch.bfloat16, device=device),
+            qkv_a=qkv_a,
+            q_a=qkv_a[:, : attn.q_lora_rank],
+            q_a_normed=torch.empty(
+                bucket_size,
+                attn.q_lora_rank,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
             q_flat=torch.empty(
                 bucket_size, attn.num_heads * attn.q_head_dim,
                 dtype=torch.bfloat16, device=device,
@@ -272,8 +288,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 bucket_size, attn.num_heads, 1, attn.qk_rope_head_dim,
                 dtype=torch.bfloat16, device=device,
             ),
-            new_compressed_kv=torch.empty(
-                bucket_size, 1, kv_dim, dtype=torch.bfloat16, device=device,
+            new_compressed_kv=qkv_a[:, attn.q_lora_rank :].view(
+                bucket_size, 1, kv_dim
             ),
             # Indexer-only fields: 1-element placeholders (never read on this
             # path; dataclass requires them).
@@ -356,13 +372,23 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             num_valid_tokens=num_valid_tokens,
             scale_tma_aligned=num_valid_tokens is not None,
         )
+        fused_qkv_a_weight = getattr(self.wrapper, "_fp8_qkv_a_proj", None)
+        fused_qkv_a_scale = getattr(self.wrapper, "_fp8_qkv_a_scale", None)
+        if fused_qkv_a_weight is None or fused_qkv_a_scale is None:
+            raise RuntimeError(
+                f"Layer {self.layer_idx}: GLM-5 graph requires fused Q-A/KV-A weights"
+            )
         w8a8_deepgemm(
-            hidden_fp8, hidden_scale, attn.q_a_proj.weight,
-            self.wrapper.weight_dequant_scale["q_a_proj.weight_scale_inv"],
-            out=buffers.q_a, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
+            hidden_fp8, hidden_scale, fused_qkv_a_weight, fused_qkv_a_scale,
+            out=buffers.qkv_a, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
-        buffers.q_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_a_normed = attn.q_a_layernorm(buffers.q_a).contiguous()
+        buffers.qkv_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+        q_a_normed = fused_rmsnorm(
+            buffers.q_a,
+            attn.q_a_layernorm.weight,
+            attn.q_a_layernorm.eps,
+            out=buffers.q_a_normed,
+        )
         q_a_fp8, q_a_scale = act_quant(
             q_a_normed,
             num_valid_tokens=num_valid_tokens,
@@ -378,13 +404,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
         buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
 
-        w8a8_deepgemm(
-            hidden_fp8, hidden_scale, attn.kv_a_proj_with_mqa.weight,
-            self.wrapper.weight_dequant_scale["kv_a_proj_with_mqa.weight_scale_inv"],
-            out=buffers.new_compressed_kv.view(batch_size, -1),
-            num_valid_tokens=num_valid_tokens, expected_m=batch_size,
-        )
-        buffers.new_compressed_kv.mul_(buffers.valid_rows_bf16.view(batch_size, 1, 1))
         offload_kv = _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
             buffers.q_rope_4d,

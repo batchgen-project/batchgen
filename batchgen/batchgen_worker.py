@@ -9653,6 +9653,14 @@ class BatchGenWorker:
 					wrapper.initialize_fused_kernels()
 				if getattr(wrapper, "_fp8_absorb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires FP8 absorb weights")
+				if (
+					getattr(wrapper, "_fp8_qkv_a_proj", None) is None
+					or getattr(wrapper, "_fp8_qkv_a_scale", None) is None
+				):
+					raise RuntimeError(
+						f"Layer {layer_idx}: GLM-5 whole-model graph requires "
+						"fused Q-A/KV-A weights"
+					)
 				if indexer is not None and getattr(wrapper, "_fused_wqb_weights", None) is None:
 					raise RuntimeError(f"Layer {layer_idx}: GLM-5 whole-model graph requires fused WQB weights")
 				if indexer is not None and getattr(wrapper, "_indexer_cuda_module", None) is None:

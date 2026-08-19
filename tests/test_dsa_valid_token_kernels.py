@@ -208,6 +208,105 @@ def test_score_topk_valid_tokens_skips_padding_rows():
     assert torch.all(torch.isneginf(agg[2:]))
 
 
+def test_score_topk_skips_dense_rows_and_keeps_long_row_result():
+    from batchgen_kernels.attention.dsa.fused_indexer_score import (
+        fused_paged_score_and_topk_with_slots_out,
+    )
+
+    torch.manual_seed(20260820)
+    batch_size = 3
+    num_heads = 1
+    head_dim = 4
+    page_size = 64
+    max_seqlen = 2112
+    topk_count = 2048
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    aux_k = torch.randn(
+        batch_size * (max_seqlen // page_size),
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(
+        batch_size * (max_seqlen // page_size),
+        device="cuda",
+        dtype=torch.int32,
+    ).view(batch_size, max_seqlen // page_size)
+    slots = torch.arange(batch_size, device="cuda", dtype=torch.int32)
+    gates = torch.randn(
+        batch_size,
+        num_heads,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    cache_seqlens = torch.tensor(
+        [17, topk_count, topk_count + 1],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    agg = torch.empty(
+        batch_size,
+        max_seqlen,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    topk = torch.empty(
+        batch_size,
+        topk_count,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    fused_paged_score_and_topk_with_slots_out(
+        q,
+        aux_k,
+        page_table,
+        slots,
+        gates,
+        cache_seqlens,
+        agg,
+        topk,
+        topk=topk_count,
+        page_size=page_size,
+        max_seqlen=max_seqlen,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        topk[0, :17],
+        torch.arange(17, device="cuda", dtype=torch.int32),
+    )
+    assert torch.all(topk[0, 17:] == -1)
+    assert torch.equal(
+        topk[1],
+        torch.arange(topk_count, device="cuda", dtype=torch.int32),
+    )
+    assert torch.all(torch.isneginf(agg[:2]))
+
+    long_k = aux_k[
+        2 * (max_seqlen // page_size) : 3 * (max_seqlen // page_size)
+    ].reshape(max_seqlen, head_dim)[: topk_count + 1].float()
+    reference_scores = (
+        q[2].float().unsqueeze(1) * long_k.unsqueeze(0)
+    ).sum(dim=-1)
+    reference_scores = (
+        reference_scores * gates[2].view(num_heads, 1)
+    ).sum(dim=0)
+    reference_topk = torch.topk(
+        reference_scores,
+        topk_count,
+    ).indices.sort().values
+    assert torch.equal(topk[2].sort().values, reference_topk.to(torch.int32))
+
+
 def test_selector_valid_tokens_skips_padding_rows():
     from batchgen_kernels.attention.dsa.fused_unified_selector import (
         fused_select_mla_kv_bf16_out,
@@ -303,6 +402,98 @@ def test_selected_page_table_handles_dense_long_slots_and_padding():
             dtype=torch.int32,
         ),
     )
+
+
+def test_fused_rmsnorm_rope_native_accepts_strided_kv_input():
+    from batchgen_kernels.triton.fused_rmsnorm_rope import (
+        fused_rmsnorm_rope_with_q_native,
+    )
+
+    torch.manual_seed(20260819)
+    batch_size = 3
+    num_heads = 2
+    kv_lora_rank = 8
+    rope_dim = 4
+    total_dim = kv_lora_rank + rope_dim
+    base = torch.randn(
+        batch_size,
+        total_dim + 5,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    strided_kv = base[:, :total_dim].view(batch_size, 1, total_dim)
+    assert not strided_kv.is_contiguous()
+    contiguous_kv = strided_kv.contiguous()
+    q = torch.randn(
+        batch_size,
+        num_heads,
+        1,
+        rope_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_strided = q.clone()
+    q_contiguous = q.clone()
+    cos = torch.randn(16, rope_dim, device="cuda", dtype=torch.float32)
+    sin = torch.randn_like(cos)
+    positions = torch.tensor([[1], [4], [7]], device="cuda", dtype=torch.int64)
+    weight = torch.randn(kv_lora_rank, device="cuda", dtype=torch.bfloat16)
+
+    strided_out = fused_rmsnorm_rope_with_q_native(
+        strided_kv,
+        q_strided,
+        cos,
+        sin,
+        positions,
+        weight,
+        kv_lora_rank,
+        rope_dim,
+    )
+    contiguous_out = fused_rmsnorm_rope_with_q_native(
+        contiguous_kv,
+        q_contiguous,
+        cos,
+        sin,
+        positions,
+        weight,
+        kv_lora_rank,
+        rope_dim,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(strided_out, contiguous_out)
+    assert torch.equal(q_strided, q_contiguous)
+
+
+def test_triton_rmsnorm_matches_cuda_on_strided_q_a_view():
+    from batchgen.attention.fused_kernels import cuda_rmsnorm
+    from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
+
+    torch.manual_seed(20260820)
+    batch_size = 7
+    q_rank = 2048
+    fused_width = q_rank + 576
+    fused = torch.randn(
+        batch_size,
+        fused_width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_a = fused[:, :q_rank]
+    assert not q_a.is_contiguous()
+    weight = torch.randn(q_rank, device="cuda", dtype=torch.bfloat16)
+    reference = cuda_rmsnorm(q_a, weight, 1e-5)
+    candidate = torch.empty_like(reference)
+    fused_rmsnorm(q_a, weight, 1e-5, out=candidate)
+    torch.cuda.synchronize()
+
+    diff = (reference.float() - candidate.float()).abs()
+    assert float(diff.max()) <= 0.03125
+    assert torch.nn.functional.cosine_similarity(
+        reference.float().reshape(-1),
+        candidate.float().reshape(-1),
+        dim=0,
+    ) >= 0.9999
 
 
 @pytest.mark.parametrize("batch_size,valid_m", [(64, 17), (128, 64)])
