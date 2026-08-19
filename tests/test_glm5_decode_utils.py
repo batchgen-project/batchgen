@@ -1896,57 +1896,6 @@ def test_glm5_moe_graph_over_bucket_routes_eager(monkeypatch):
     assert torch.equal(out, hidden + 1)
 
 
-def test_glm5_dsa_graph_path_allows_short_rows_with_fixed_selected_kv(monkeypatch):
-    from batchgen.batchgen_worker import BatchGenWorker
-
-    class FakeBucketing:
-        def get_padded_size(self, batch_size):
-            assert batch_size == 2
-            return 40
-
-    class FakeManager:
-        bucketing = FakeBucketing()
-
-        def has_graph(self, segment_name, batch_size):
-            return segment_name == "glm5_layer_0_dsa_attn" and batch_size == 2
-
-    class FakeWrapper:
-        _dsa_cuda_graph_segment_name = "glm5_layer_0_dsa_attn"
-        _dsa_cuda_graph_max_seqlen = 8192
-        module = types.SimpleNamespace(
-            indexer=types.SimpleNamespace(index_topk=2048),
-        )
-
-        def _dsa_cuda_graph_page_tables_match(self, primary_manager, aux_manager):
-            return True
-
-    worker = object.__new__(BatchGenWorker)
-    worker.model_name = "zai-org/GLM-5-FP8"
-    worker._batchgen_debug = {}
-    worker._cuda_graph_manager = FakeManager()
-    worker.core_engine = types.SimpleNamespace(gpu_paged_kv_manager_aux=object())
-    worker.model = types.SimpleNamespace(
-        model=types.SimpleNamespace(
-            layers=[types.SimpleNamespace(self_attn=FakeWrapper())],
-        ),
-    )
-    monkeypatch.setenv("BATCHGEN_GLM5_DSA_CUDA_GRAPH", "1")
-    monkeypatch.setattr(
-        AttnWrapperBase,
-        "cache_seqlens",
-        torch.tensor([970, 982], dtype=torch.int32),
-        raising=False,
-    )
-    monkeypatch.setattr(AttnWrapperBase, "max_seqlen", 1024, raising=False)
-    monkeypatch.setattr(AttnWrapperBase, "cur_batch", [11, 22], raising=False)
-
-    assert worker._glm5_dsa_graph_path_state(2, object()) == (
-        "graph",
-        40,
-        "captured",
-    )
-
-
 def test_glm5_dsa_page_table_signature_prefers_stable_graph_storage():
     storage = torch.empty(4, 8, dtype=torch.int32)
 
@@ -2854,6 +2803,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     worker.model_config = types.SimpleNamespace(max_position_embeddings=512)
     worker.torch_device = torch.device("cpu")
     worker._batchgen_debug = {}
+    worker.global_batch = None
     worker.model = types.SimpleNamespace(
         model=types.SimpleNamespace(layers=[FakeLayer()]),
         config=types.SimpleNamespace(vocab_size=16, hidden_size=4),

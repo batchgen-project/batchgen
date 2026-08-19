@@ -100,7 +100,9 @@ def triton_absorb_gemv(
 
     out = torch.empty(B, H, N, dtype=torch.bfloat16, device=x_bhk.device)
 
-    BLOCK_B = min(32, triton.next_power_of_2(B))
+    # Triton SM90 dot lowering requires M >= 16 even when only a smaller
+    # logical batch is valid. Keep a 16-row compute tile and mask rows >= B.
+    BLOCK_B = min(32, max(16, triton.next_power_of_2(B)))
     BLOCK_K = min(64, triton.next_power_of_2(K))
     BLOCK_N = 64
 
@@ -315,7 +317,9 @@ def triton_absorb_fp8(
 
     out = torch.empty(B, H, N, dtype=torch.bfloat16, device=x_bhk.device)
 
-    BLOCK_B = min(64, triton.next_power_of_2(B))
+    # Triton SM90 FP8 dot lowering requires M >= 16. CUDA-graph buckets
+    # include 1-8 rows, so pad the compute tile while masking logical rows.
+    BLOCK_B = min(64, max(16, triton.next_power_of_2(B)))
     BLOCK_K = 128  # match weight quantization block
     # Ensure BLOCK_K doesn't exceed K — pad up to power of 2
     if K < BLOCK_K:
@@ -363,7 +367,9 @@ def triton_absorb_fp8_out(
                 f"num_valid_tokens must contain one element, got {tuple(num_valid_tokens.shape)}"
             )
 
-    BLOCK_B = min(64, triton.next_power_of_2(B))
+    # Match triton_absorb_fp8(): small graph buckets still need a legal
+    # tensor-core M tile, with rows outside the logical batch masked.
+    BLOCK_B = min(64, max(16, triton.next_power_of_2(B)))
     BLOCK_K = 128
     if K < BLOCK_K:
         BLOCK_K = triton.next_power_of_2(K)
