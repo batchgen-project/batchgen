@@ -280,7 +280,7 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     attn = wrapper.module
     kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
     index_dim = attn.indexer.index_head_dim
-    _patch_full_dsa_dependencies(
+    calls = _patch_full_dsa_dependencies(
         monkeypatch,
         bucket_size=bucket_size,
         index_topk=attn.indexer.index_topk,
