@@ -16,6 +16,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 class _Identity(torch.nn.Module):
+    def __init__(self, size=None):
+        super().__init__()
+        if size is not None:
+            self.weight = torch.nn.Parameter(torch.ones(size))
+        self.eps = 1e-5
+
     def forward(self, x):
         return x
 
@@ -73,7 +79,7 @@ def _build_fake_wrapper(device):
         v_head_dim=kv_lora_rank,
         softmax_scale=0.25,
         indexer=indexer,
-        q_a_layernorm=_Identity().to(device),
+        q_a_layernorm=_Identity(q_lora_rank).to(device),
         kv_a_layernorm=types.SimpleNamespace(
             weight=torch.ones(kv_lora_rank, device=device, dtype=torch.bfloat16),
             eps=1e-5,
@@ -196,6 +202,13 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         q_rope.add_(0.0625)
         return new_compressed_kv + 0.25
 
+    def fake_rmsnorm(x, weight, eps, out=None):
+        del weight, eps
+        if out is None:
+            return x.clone()
+        out.copy_(x)
+        return out
+
     def fake_make_scratch(batch, cols, cuda_module, device):
         del cuda_module
         return (
@@ -307,6 +320,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
 
     monkeypatch.setattr(segments, "act_quant", fake_act_quant)
     monkeypatch.setattr(segments, "w8a8_deepgemm", fake_w8a8_deepgemm)
+    monkeypatch.setattr(segments, "fused_rmsnorm", fake_rmsnorm)
     monkeypatch.setattr(segments, "_fused_rmsnorm_rope", fake_rmsnorm_rope)
     monkeypatch.setattr(segments, "make_fp8_activation_scratch", fake_make_scratch)
     monkeypatch.setattr(segments, "cuda_wk_proj_gemm_only_out", fake_wk_proj)

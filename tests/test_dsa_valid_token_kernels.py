@@ -264,6 +264,7 @@ def test_score_topk_skips_dense_rows_and_keeps_long_row_result():
         device="cuda",
         dtype=torch.int32,
     )
+    num_valid = torch.tensor([batch_size], device="cuda", dtype=torch.int32)
 
     fused_paged_score_and_topk_with_slots_out(
         q,
@@ -277,6 +278,7 @@ def test_score_topk_skips_dense_rows_and_keeps_long_row_result():
         topk=topk_count,
         page_size=page_size,
         max_seqlen=max_seqlen,
+        num_valid_tokens=num_valid,
     )
     torch.cuda.synchronize()
 
