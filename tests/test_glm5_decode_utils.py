@@ -2765,6 +2765,8 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
                 num_heads=64,
             )
             self._fp8_absorb_weights = object()
+            self._fp8_qkv_a_proj = object()
+            self._fp8_qkv_a_scale = object()
             self._fused_wqb_weights = object()
             self._indexer_cuda_module = object()
 
