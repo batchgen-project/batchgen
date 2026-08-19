@@ -258,9 +258,6 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
                 "invalid distributed weight metadata row");
         }
         const std::string& module_key = fields[2];
-        if (module_key == "__skeleton__") {
-            continue;
-        }
         const std::string& tensor_key = fields[3];
         const int owner = std::stoi(fields[4]);
         const uint64_t compact_offset = std::stoull(fields[5]);

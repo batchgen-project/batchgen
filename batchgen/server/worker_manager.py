@@ -235,13 +235,6 @@ class WorkerManager:
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=5)
 
-        # The node-shared weight daemon owns sockets that every worker maps.
-        # Stop it before terminating workers so their socket closure is not
-        # misclassified as an unexpected serving failure.
-        if self.distributed_weight_daemon is not None:
-            self.distributed_weight_daemon.stop()
-            self.distributed_weight_daemon = None
-
         # Collect worker PIDs before sending shutdown signal
         worker_pids = self._get_worker_pids()
 
@@ -284,6 +277,10 @@ class WorkerManager:
                     logger.info(f"Force-killed worker process {pid}")
                 except Exception:
                     pass
+
+        if self.distributed_weight_daemon is not None:
+            self.distributed_weight_daemon.stop()
+            self.distributed_weight_daemon = None
 
         # Get shm_name for cleanup if available
         shm_name = self.model_info.get("shm_name")
@@ -795,28 +792,10 @@ class WorkerManager:
         )
 
     def _load_model_from_distributed_store(self) -> None:
-        from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
-            save_compact_skeleton_state_dict,
-        )
-
         config = self.distributed_weight_config
         if config is None:
             raise RuntimeError("distributed weight config is not loaded")
-        fd, file_path = tempfile.mkstemp(
-            suffix=".pt", prefix="batchgen_skel_"
-        )
-        os.close(fd)
-        count, actual_size = save_compact_skeleton_state_dict(
-            self.args.distributed_weight_config,
-            file_path,
-        )
-        logger.info(
-            "Compact skeleton state dict saved to %s (%d tensors, %.2f MB)",
-            file_path,
-            count,
-            actual_size / (1024**2),
-        )
-        self.skeleton_state_dict_file = file_path
+        self.skeleton_state_dict_file = None
         self.skeleton_state_dict = None
         self.parameter_server_instance = None
         self.model_info = {

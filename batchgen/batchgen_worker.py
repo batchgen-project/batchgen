@@ -758,6 +758,13 @@ class BatchGenWorker:
 			self.weights_storage.InitDistributed(
 				args.distributed_weight_config
 			)
+			self.skeleton_state_dict = self.weights_storage.get_tensor(
+				"__skeleton__"
+			)
+			logging.info(
+				f"Rank {self.rank}: Loaded compact skeleton state dict "
+				f"with {len(self.skeleton_state_dict)} keys"
+			)
 		else:
 			self.weights_storage.Init(
 				self.shm_name,

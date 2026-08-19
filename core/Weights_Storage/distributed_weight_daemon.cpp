@@ -422,6 +422,8 @@ struct DistributedWeightDaemon::Impl {
     std::uint64_t duplicate_fetches = 0;
     std::uint64_t wait_count = 0;
     double wait_seconds = 0.0;
+    std::array<std::uint64_t, kDefaultWorkers> worker_wait_count{};
+    std::array<double, kDefaultWorkers> worker_wait_seconds{};
     std::vector<double> ready_latency_ms;
 
     void RecordFailure(const std::string& message) {
@@ -904,7 +906,8 @@ struct DistributedWeightDaemon::Impl {
             static_cast<std::uint32_t>(1) << worker_id;
         const Clock::time_point begin = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex);
-        ring_cv.wait(lock, [&]() {
+        const bool available = ring_cv.wait_for(
+            lock, std::chrono::seconds(300), [&]() {
             if (failed.load() || stop.load()) {
                 return true;
             }
@@ -913,6 +916,9 @@ struct DistributedWeightDaemon::Impl {
                    slots[found->second].state ==
                        SlotState::kReady;
         });
+        if (!available) {
+            fail("timed out waiting for remote module: " + module_key);
+        }
         if (failed.load()) {
             fail(FailureMessage());
         }
@@ -945,6 +951,8 @@ struct DistributedWeightDaemon::Impl {
         if (waited) {
             ++wait_count;
             wait_seconds += wait_s;
+            worker_wait_count.at(worker_id) += 1;
+            worker_wait_seconds.at(worker_id) += wait_s;
         }
         (void)layer;
     }
@@ -1200,6 +1208,8 @@ struct DistributedWeightDaemon::Impl {
             summary["duplicate_fetches"] = duplicate_fetches;
             summary["wait_count"] = wait_count;
             summary["wait_seconds"] = wait_seconds;
+            summary["worker_wait_count"] = worker_wait_count;
+            summary["worker_wait_seconds"] = worker_wait_seconds;
             summary["staging_hwm_modules"] = staging_hwm;
             summary["ready_latency_ms"] = {
                 {"p50", percentile(ready_latency_ms, 50)},
