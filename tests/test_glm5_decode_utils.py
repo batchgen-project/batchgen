@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+import json
 
 import torch
 import pytest
@@ -48,6 +49,108 @@ from batchgen.models.glm.glm5.wrappers import (
 )
 from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.sequence import SequenceBatch, SequenceEntry
+
+
+def test_glm5_replay_profile_config_defaults_and_sanitizes_tag(tmp_path):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    worker = object.__new__(BatchGenWorker)
+    worker._batchgen_debug = {
+        "glm5_replay_profile": {
+            "output_dir": str(tmp_path),
+            "tag": "standard 600/trace",
+        },
+    }
+
+    assert worker._glm5_replay_profile_config() == {
+        "limit": 3,
+        "output_dir": str(tmp_path),
+        "tag": "standard_600_trace",
+    }
+
+
+def test_glm5_replay_profile_exports_after_limit(monkeypatch, tmp_path):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    class FakeEvent:
+        key = "fake_kernel"
+        count = 3
+        self_cpu_time_total = 12.5
+        self_device_time_total = 34.5
+
+    class FakeProfiler:
+        def __init__(self):
+            self.started = 0
+            self.stopped = 0
+
+        def start(self):
+            self.started += 1
+
+        def stop(self):
+            self.stopped += 1
+
+        def export_chrome_trace(self, path):
+            with open(path, "w") as handle:
+                handle.write("{}")
+
+        def key_averages(self):
+            return [FakeEvent()]
+
+    class FakeRecord:
+        labels = []
+
+        def __init__(self, label):
+            self.label = label
+
+        def __enter__(self):
+            self.labels.append(self.label)
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    profiler = FakeProfiler()
+    monkeypatch.setattr(torch.profiler, "profile", lambda **kwargs: profiler)
+    monkeypatch.setattr(torch.profiler, "record_function", FakeRecord)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.torch_device = torch.device("cuda")
+    worker._batchgen_debug = {
+        "glm5_replay_profile": {
+            "output_dir": str(tmp_path),
+            "tag": "unit",
+            "limit": 2,
+        },
+    }
+    worker._glm5_replay_profiler = None
+    worker._glm5_replay_profile_key = None
+    worker._glm5_replay_profile_count = 0
+    worker._glm5_replay_profile_completed = False
+    worker._glm5_replay_profile_config_active = None
+
+    for iteration in (1, 2):
+        token = worker._glm5_replay_profile_begin_forward(
+            local_iteration=iteration,
+            local_bsz=48,
+            max_rank_bsz=48,
+            bucket=56,
+        )
+        worker._glm5_replay_profile_end_forward(token)
+
+    assert profiler.started == 1
+    assert profiler.stopped == 1
+    assert worker._glm5_replay_profile_completed
+    assert FakeRecord.labels == [
+        "BatchGen_decode_forward_1_rank_0_local_bsz_48_max_rank_bsz_48_bucket_56_iter_1",
+        "BatchGen_decode_forward_2_rank_0_local_bsz_48_max_rank_bsz_48_bucket_56_iter_2",
+    ]
+    assert (tmp_path / "unit_rank0_trace.json").exists()
+    summary = json.loads((tmp_path / "unit_rank0_summary.json").read_text())
+    assert summary["reason"] == "limit_reached"
+    assert summary["count"] == 2
+    assert summary["events"][0]["key"] == "fake_kernel"
 
 
 def test_build_clamped_dense_token_indices_caps_each_row():

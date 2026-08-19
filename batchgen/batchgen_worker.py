@@ -708,6 +708,11 @@ class BatchGenWorker:
 		self._nsys_decode_profile_forward_count = 0
 		self._nsys_decode_profile_started = False
 		self._nsys_decode_profile_stopped = False
+		self._glm5_replay_profiler = None
+		self._glm5_replay_profile_key = None
+		self._glm5_replay_profile_count = 0
+		self._glm5_replay_profile_completed = False
+		self._glm5_replay_profile_config_active = None
 		self._decode_local_count_tensor = None
 		self._decode_all_rank_counts = None
 		self._decode_cache_seqlens_i32 = None
@@ -5732,6 +5737,154 @@ class BatchGenWorker:
 			sys.stdout.flush()
 			sys.stderr.flush()
 			os._exit(0)
+
+	def _glm5_replay_profile_config(self) -> Optional[dict]:
+		"""Resolve the batch-level post-capture replay profiler configuration."""
+		debug = self._batchgen_debug or getattr(AttnWrapperBase, "batchgen_debug", None) or {}
+		if not isinstance(debug, dict) or "glm5_replay_profile" not in debug:
+			return None
+		raw = debug.get("glm5_replay_profile")
+		if not isinstance(raw, dict) and not self._debug_flag_enabled(raw):
+			return None
+		options = raw if isinstance(raw, dict) else {}
+		limit = int(options.get("limit", 3))
+		if limit <= 0 or limit > 16:
+			raise ValueError("glm5_replay_profile.limit must be in [1, 16]")
+		output_dir = str(
+			options.get("output_dir")
+			or f"/tmp/batchgen_glm5_replay_profile_{os.getpid()}"
+		)
+		raw_tag = str(options.get("tag") or "glm5_replay")
+		tag = "".join(
+			char if char.isalnum() or char in "._-" else "_"
+			for char in raw_tag
+		).strip("._-") or "glm5_replay"
+		return {
+			"limit": limit,
+			"output_dir": output_dir,
+			"tag": tag,
+		}
+
+	def _finalize_glm5_replay_profile(self, reason: str) -> None:
+		"""Stop and export one rank's replay profile without affecting serving."""
+		profiler = getattr(self, "_glm5_replay_profiler", None)
+		if profiler is None:
+			return
+		self._glm5_replay_profiler = None
+		config = dict(getattr(self, "_glm5_replay_profile_config_active", None) or {})
+		try:
+			torch.cuda.synchronize(self.torch_device)
+			profiler.stop()
+			output_dir = config.get("output_dir")
+			tag = config.get("tag", "glm5_replay")
+			if not output_dir:
+				raise RuntimeError("GLM-5 replay profile output_dir is missing")
+			os.makedirs(output_dir, exist_ok=True)
+			trace_path = os.path.join(
+				output_dir,
+				f"{tag}_rank{self.rank}_trace.json",
+			)
+			summary_path = os.path.join(
+				output_dir,
+				f"{tag}_rank{self.rank}_summary.json",
+			)
+			profiler.export_chrome_trace(trace_path)
+			events = []
+			for event in profiler.key_averages():
+				events.append({
+					"key": event.key,
+					"count": event.count,
+					"self_cpu_time_us": event.self_cpu_time_total,
+					"self_device_time_us": getattr(
+						event,
+						"self_device_time_total",
+						0.0,
+					),
+				})
+			with open(summary_path, "w") as handle:
+				json.dump({
+					"reason": reason,
+					"count": self._glm5_replay_profile_count,
+					"limit": config.get("limit"),
+					"events": events,
+				}, handle, indent=2)
+			logging.warning(
+				"[GLM5_REPLAY_PROFILE] rank=%s complete reason=%s count=%s "
+				"trace=%s summary=%s",
+				self.rank,
+				reason,
+				self._glm5_replay_profile_count,
+				trace_path,
+				summary_path,
+			)
+		except Exception:
+			logging.exception(
+				"[GLM5_REPLAY_PROFILE] rank=%s export failed",
+				self.rank,
+			)
+		finally:
+			self._glm5_replay_profile_completed = True
+
+	def _glm5_replay_profile_begin_forward(
+		self,
+		*,
+		local_iteration: int,
+		local_bsz: int,
+		max_rank_bsz: int,
+		bucket: int,
+	):
+		"""Begin one labelled graph replay inside a post-capture Torch profile."""
+		config = self._glm5_replay_profile_config()
+		if config is None:
+			return None
+		key = (config["output_dir"], config["tag"], config["limit"])
+		if key != getattr(self, "_glm5_replay_profile_key", None):
+			self._finalize_glm5_replay_profile("config_switch")
+			self._glm5_replay_profile_key = key
+			self._glm5_replay_profile_count = 0
+			self._glm5_replay_profile_completed = False
+			self._glm5_replay_profile_config_active = config
+		if self._glm5_replay_profile_completed:
+			return None
+		if self._glm5_replay_profiler is None:
+			from torch.profiler import ProfilerActivity, profile
+			self._glm5_replay_profiler = profile(
+				activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+				record_shapes=False,
+				profile_memory=False,
+				with_stack=False,
+			)
+			self._glm5_replay_profiler.start()
+			logging.warning(
+				"[GLM5_REPLAY_PROFILE] rank=%s start limit=%s output_dir=%s tag=%s",
+				self.rank,
+				config["limit"],
+				config["output_dir"],
+				config["tag"],
+			)
+		self._glm5_replay_profile_count += 1
+		forward_idx = self._glm5_replay_profile_count
+		range_name = (
+			f"BatchGen_decode_forward_{forward_idx}"
+			f"_rank_{self.rank}_local_bsz_{local_bsz}_max_rank_bsz_{max_rank_bsz}"
+			f"_bucket_{bucket}_iter_{local_iteration}"
+		)
+		from torch.profiler import record_function
+		record = record_function(range_name)
+		record.__enter__()
+		return {
+			"record": record,
+			"forward_idx": forward_idx,
+			"limit": config["limit"],
+		}
+
+	def _glm5_replay_profile_end_forward(self, token) -> None:
+		"""End one labelled replay and export after the configured limit."""
+		if token is None:
+			return
+		token["record"].__exit__(*sys.exc_info())
+		if token["forward_idx"] >= token["limit"]:
+			self._finalize_glm5_replay_profile("limit_reached")
 
 	def generate(self):
 		"""
@@ -10971,9 +11124,18 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
-							_wm_seg_name, _max_bs, **replay_inputs,
+						_replay_profile = self._glm5_replay_profile_begin_forward(
+							local_iteration=local_iteration,
+							local_bsz=batch_size,
+							max_rank_bsz=_max_bs,
+							bucket=bucket,
 						)
+						try:
+							graph_out = self._cuda_graph_manager.replay(
+								_wm_seg_name, _max_bs, **replay_inputs,
+							)
+						finally:
+							self._glm5_replay_profile_end_forward(_replay_profile)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
@@ -11040,18 +11202,27 @@ class BatchGenWorker:
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_replay_start = time.perf_counter()
-						graph_out = self._cuda_graph_manager.replay(
-							"glm5_whole_model", _max_bs,
-							input_ids=new_tokens[:batch_size],
-							cache_seqlens=graph_inputs["cache_seqlens"],
-							position_ids=graph_inputs["position_ids"],
-							primary_slot_indices=graph_inputs["primary_slot_indices"],
-							aux_slot_indices=graph_inputs["aux_slot_indices"],
-							rank_token_counts=_all_rank_counts,
-							num_valid_tokens=graph_inputs["num_valid_tokens"],
-							flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
-							flashmla_num_splits=graph_inputs["flashmla_num_splits"],
+						_replay_profile = self._glm5_replay_profile_begin_forward(
+							local_iteration=local_iteration,
+							local_bsz=batch_size,
+							max_rank_bsz=_max_bs,
+							bucket=bucket,
 						)
+						try:
+							graph_out = self._cuda_graph_manager.replay(
+								"glm5_whole_model", _max_bs,
+								input_ids=new_tokens[:batch_size],
+								cache_seqlens=graph_inputs["cache_seqlens"],
+								position_ids=graph_inputs["position_ids"],
+								primary_slot_indices=graph_inputs["primary_slot_indices"],
+								aux_slot_indices=graph_inputs["aux_slot_indices"],
+								rank_token_counts=_all_rank_counts,
+								num_valid_tokens=graph_inputs["num_valid_tokens"],
+								flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
+								flashmla_num_splits=graph_inputs["flashmla_num_splits"],
+							)
+						finally:
+							self._glm5_replay_profile_end_forward(_replay_profile)
 						if _glm5_whole_timing:
 							torch.cuda.synchronize(self.torch_device)
 							_glm5_whole_timing_items["replay_ms"] = (
@@ -11077,13 +11248,22 @@ class BatchGenWorker:
 							)
 						elif pt_slice.shape[1] > wm_max_pages:
 							pt_slice = pt_slice[:, :wm_max_pages]
-						graph_out = self._cuda_graph_manager.replay(
-							"whole_model", bucket,
-							input_ids=new_tokens,
-							cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
-							page_table=pt_slice,
-							slot_indices=slot_indices_tensor[:batch_size],
+						_replay_profile = self._glm5_replay_profile_begin_forward(
+							local_iteration=local_iteration,
+							local_bsz=batch_size,
+							max_rank_bsz=_max_bs,
+							bucket=bucket,
 						)
+						try:
+							graph_out = self._cuda_graph_manager.replay(
+								"whole_model", bucket,
+								input_ids=new_tokens,
+								cache_seqlens=AttnWrapperBase.cache_seqlens[:batch_size],
+								page_table=pt_slice,
+								slot_indices=slot_indices_tensor[:batch_size],
+							)
+						finally:
+							self._glm5_replay_profile_end_forward(_replay_profile)
 
 					logits = graph_out["logits"][:batch_size]
 					graph_hidden_states = graph_out.get("hidden_states")
@@ -11391,6 +11571,7 @@ class BatchGenWorker:
 		AttnWrapperBase.position_ids = None
 		AttnWrapperBase.max_seqlen = None
 		AttnWrapperBase.cur_batch = None
+		self._finalize_glm5_replay_profile("decode_end")
 		self._flush_glm5_dispatch_trace_summary("decode_end")
 		AttnWrapperBase.batchgen_debug = None
 		GLM5AttnWrapper.glm5_dispatch_trace_enabled = False
