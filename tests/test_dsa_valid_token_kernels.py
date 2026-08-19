@@ -244,6 +244,67 @@ def test_selector_valid_tokens_skips_padding_rows():
     assert torch.count_nonzero(selected[2:].float()).item() == 0
 
 
+def test_selected_page_table_handles_dense_long_slots_and_padding():
+    from batchgen_kernels.attention.dsa.selected_page_table import (
+        transform_selected_positions_out,
+    )
+
+    page_table = torch.tensor(
+        [[2, 3], [4, 5]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cache_seqlens = torch.tensor(
+        [2, 6, 0, 0],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    topk = torch.tensor(
+        [
+            [3, 2, 1, 0],
+            [5, 0, 4, 1],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.tensor([0, 1, 999, 999], device="cuda", dtype=torch.int32)
+    physical = torch.empty(4, 4, device="cuda", dtype=torch.int32)
+    lengths = torch.empty(4, device="cuda", dtype=torch.int32)
+    num_valid = torch.tensor([2], device="cuda", dtype=torch.int32)
+
+    transform_selected_positions_out(
+        page_table,
+        cache_seqlens,
+        topk,
+        physical,
+        lengths,
+        page_size=4,
+        primary_slot_indices=slots,
+        num_valid_tokens=num_valid,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        lengths,
+        torch.tensor([2, 4, 0, 0], device="cuda", dtype=torch.int32),
+    )
+    assert torch.equal(
+        physical,
+        torch.tensor(
+            [
+                [8, 9, -1, -1],
+                [21, 16, 20, 17],
+                [-1, -1, -1, -1],
+                [-1, -1, -1, -1],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        ),
+    )
+
+
 @pytest.mark.parametrize("batch_size,valid_m", [(64, 17), (128, 64)])
 def test_indexer_wgmma_valid_m_variant_zeroes_padding_rows(batch_size: int, valid_m: int):
     from batchgen_kernels.attention.dsa.fused_indexer_kv_proj_cuda import (

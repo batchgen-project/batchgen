@@ -112,6 +112,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         "wq_b": 0,
         "rope_hadamard_q": 0,
         "score_topk": 0,
+        "transform": 0,
         "select": 0,
         "flashmla": 0,
         "fa3": 0,
@@ -186,6 +187,24 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         row_modes.zero_()
         return selected_mla_kv, selected_lengths, None, row_modes
 
+    def fake_transform(primary_page_table, cache_seqlens, top_k_indices, physical_token_ids, selected_lengths, *, page_size, primary_slot_indices=None, num_valid_tokens=None):
+        del primary_page_table, page_size, primary_slot_indices
+        calls["transform"] += 1
+        physical_token_ids.copy_(top_k_indices.to(torch.int32))
+        selected_lengths.copy_(torch.clamp(cache_seqlens, max=index_topk))
+        if num_valid_tokens is not None:
+            valid = (
+                torch.arange(
+                    physical_token_ids.shape[0],
+                    device=physical_token_ids.device,
+                    dtype=torch.int32,
+                )
+                < num_valid_tokens
+            )
+            physical_token_ids.masked_fill_(~valid.view(-1, 1), -1)
+            selected_lengths.masked_fill_(~valid, 0)
+        return physical_token_ids, selected_lengths
+
     def fake_metadata(selected_lengths, num_heads):
         del selected_lengths, num_heads
         return (
@@ -207,8 +226,8 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         selected = prepared.selected_mla_kv[:, :1, :, :v_dim]
         return prepared.query_states[..., :v_dim] + selected
 
-    def fake_fa3(*, q, k_cache, v_cache, qv, page_table, cache_batch_idx, cache_seqlens, **kwargs):
-        del q, k_cache, v_cache, page_table, cache_batch_idx, cache_seqlens, kwargs
+    def fake_fa3(*, q, k_cache, v_cache, qv, page_table, cache_seqlens, **kwargs):
+        del q, k_cache, v_cache, page_table, cache_seqlens, kwargs
         calls["fa3"] += 1
         return qv
 
@@ -239,6 +258,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
     monkeypatch.setattr(segments, "rope_hadamard_q_out", fake_rope_hadamard_q)
     monkeypatch.setattr(segments, "fused_paged_score_and_topk_with_slots_out", fake_score_topk)
     monkeypatch.setattr(segments, "select_mla_kv_for_flashmla_bf16_out", fake_select)
+    monkeypatch.setattr(segments, "transform_selected_positions_out", fake_transform)
     monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_tensor_metadata", fake_metadata)
     monkeypatch.setattr(segments, "prepare_sparse_flash_mla_decode_inputs", fake_prepare)
     monkeypatch.setattr(segments, "run_prepared_sparse_flash_mla_decode", fake_run_prepared)
@@ -324,6 +344,10 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
         )
 
     eager_outputs, eager_primary_cache, eager_aux_cache = run_eager()
+    assert calls["transform"] == 1
+    assert calls["select"] == 0
+    assert calls["flashmla"] == 0
+    assert calls["fa3"] == 1
 
     manager = CUDAGraphManager(BatchSizeBucketing([bucket_size]), device=device)
     manager.WARMUP_ITERATIONS = 1
@@ -380,8 +404,8 @@ def test_glm5_full_dsa_segment_graph_replay_matches_eager_and_writes_kv(monkeypa
     assert torch.equal(buffers.kv_aux_slot_indices, expected_kv_slots)
     assert torch.equal(buffers.safe_cache_seqlens, expected_safe_seqlens)
     assert torch.equal(captured.static_inputs["num_valid_tokens"], num_valid_tokens)
-    assert torch.count_nonzero(buffers.selected_mla_kv[actual_bsz:]).item() == 0
-    assert torch.count_nonzero(buffers.query_states[actual_bsz:]).item() == 0
+    assert torch.all(buffers.selected_token_ids[actual_bsz:] == -1)
+    assert torch.count_nonzero(buffers.selected_lengths[actual_bsz:]).item() == 0
     assert torch.count_nonzero(buffers.attn_heads[actual_bsz:]).item() == 0
     assert torch.count_nonzero(static_outputs.attn_output[actual_bsz:]).item() == 0
 
@@ -446,6 +470,7 @@ def test_glm5_full_dsa_all_short_skips_query_score_but_writes_indexer_k(monkeypa
         "wq_b": 0,
         "rope_hadamard_q": 0,
         "score_topk": 0,
+        "transform": 0,
         "select": 0,
         "flashmla": 0,
         "fa3": 1,

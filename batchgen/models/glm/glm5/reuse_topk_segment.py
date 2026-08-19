@@ -22,9 +22,8 @@ becomes a static-tensor read: this segment consumes the per-bucket
 Relative to the full segment this variant drops every indexer stage
 (wk proj / k-norm / rope-hadamard / aux-KV write / head gates / wq_b proj /
 score+topk) and keeps the MLA spine: q_a/q_b + kv_a projections, fused
-rmsnorm-rope, primary-KV update, select-KV(with reused top-k), FlashMLA,
-out-absorb, o_proj. ``row_modes`` is recomputed exactly as the eager reuse
-branch does: ``cache_seqlens > index_topk``.
+rmsnorm-rope, primary-KV update, selected-page-table transform, FA3,
+out-absorb, and o_proj.
 """
 
 from typing import Dict, Optional
@@ -36,13 +35,10 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     Glm5FullDsaAttnSegment,
     _Glm5FullDsaSegmentBuffers,
     _assert_dsa_buffer_field_coverage,
-    prepare_sparse_flash_mla_decode_inputs,
-    run_prepared_sparse_flash_mla_decode,
-    select_mla_kv_for_flashmla_bf16_out,
     fp8_q_absorb_out,
     fp8_out_absorb_out,
-    pack_flashmla_query_out,
     run_paged_kv_token_update_fused,
+    transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
 )
@@ -75,11 +71,9 @@ _REUSE_BUCKET_DIM_FIELDS = (
     "q_nope",
     "q_rope_4d",
     "new_compressed_kv",
-    "selected_mla_kv",
+    "selected_token_ids",
     "selected_lengths",
-    "row_modes",
     "absorbed_q",
-    "query_states",
     "attn_heads",
 )
 
@@ -102,11 +96,9 @@ _REUSE_PLACEHOLDER_FIELDS = (
 )
 
 # Rebuilt per bucket: top_k_indices is borrowed from the producing full
-# segment's buffer set FOR THIS BUCKET (never sliced from our own base), and
-# prepared_flashmla is batch-size dependent.
+# segment's buffer set FOR THIS BUCKET (never sliced from our own base).
 _REUSE_REBUILT_FIELDS = (
     "top_k_indices",
-    "prepared_flashmla",
 )
 
 _assert_dsa_buffer_field_coverage(
@@ -225,7 +217,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         base: _Glm5FullDsaSegmentBuffers,
         bucket_size: int,
     ) -> _Glm5FullDsaSegmentBuffers:
-        attn = self.attn
         buffers = {
             name: getattr(base, name)[:bucket_size]
             for name in _REUSE_BUCKET_DIM_FIELDS
@@ -236,15 +227,6 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         # THE handoff, per bucket: the producing full segment's static top-k
         # buffer for THIS bucket (itself a view of the producer's base).
         buffers["top_k_indices"] = self._topk_source_buffers(bucket_size).top_k_indices
-        buffers["prepared_flashmla"] = prepare_sparse_flash_mla_decode_inputs(
-            buffers["query_states"],
-            buffers["selected_mla_kv"],
-            buffers["selected_lengths"],
-            attn.num_heads,
-            float(attn.softmax_scale),
-            head_dim_v=attn.kv_lora_rank,
-            page_size=self.page_size,
-        )
         return _Glm5FullDsaSegmentBuffers(**buffers)
 
     def _allocate_static_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
@@ -254,25 +236,12 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
 
         source_buffers = self._topk_source_buffers(bucket_size)
 
-        selected_mla_kv = torch.empty(
-            bucket_size, self.index_topk, 1, kv_dim,
-            dtype=torch.bfloat16, device=device,
+        selected_token_ids = torch.empty(
+            bucket_size, self.index_topk,
+            dtype=torch.int32, device=device,
         )
         selected_lengths = torch.empty(bucket_size, dtype=torch.int32, device=device)
         selected_lengths.fill_(self._padding_selected_length())
-        query_states = torch.empty(
-            bucket_size, 1, attn.num_heads, kv_dim,
-            dtype=torch.bfloat16, device=device,
-        )
-        prepared_flashmla = prepare_sparse_flash_mla_decode_inputs(
-            query_states,
-            selected_mla_kv,
-            selected_lengths,
-            attn.num_heads,
-            float(attn.softmax_scale),
-            head_dim_v=attn.kv_lora_rank,
-            page_size=self.page_size,
-        )
         one_i32 = torch.ones(1, dtype=torch.int32, device=device)
         one_bf16 = torch.ones(1, dtype=torch.bfloat16, device=device)
         return _Glm5FullDsaSegmentBuffers(
@@ -322,19 +291,16 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             agg_scores=one_bf16,
             # THE handoff: the producing full segment's static top-k buffer.
             top_k_indices=source_buffers.top_k_indices,
-            selected_mla_kv=selected_mla_kv,
+            selected_token_ids=selected_token_ids,
             selected_lengths=selected_lengths,
-            row_modes=torch.empty(bucket_size, dtype=torch.int32, device=device),
             absorbed_q=torch.empty(
                 bucket_size, attn.num_heads, attn.kv_lora_rank,
                 dtype=torch.bfloat16, device=device,
             ),
-            query_states=query_states,
             attn_heads=torch.empty(
                 bucket_size, 1, attn.num_heads, attn.v_head_dim,
                 dtype=torch.bfloat16, device=device,
             ),
-            prepared_flashmla=prepared_flashmla,
         )
 
     def forward(
@@ -449,35 +415,17 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         if self.all_short:
             attn_out = self._run_all_short_fa3(buffers)
         else:
-            # Reuse branch semantics (glm5_decode_selector.py:446-448):
-            # row_modes = (cache_seqlens > index_topk), int32.
-            torch.gt(buffers.safe_cache_seqlens, self.index_topk, out=buffers.valid_mask)
-            buffers.row_modes.copy_(buffers.valid_mask.to(torch.int32))
-            select_mla_kv_for_flashmla_bf16_out(
-                self.primary_blocked_k,
+            transform_selected_positions_out(
                 self.primary_page_table,
                 buffers.safe_cache_seqlens,
                 buffers.top_k_indices,           # borrowed from the producer
-                self.page_size,
-                buffers.selected_mla_kv,
+                buffers.selected_token_ids,
                 buffers.selected_lengths,
-                None,
-                buffers.row_modes,
-                index_topk=self.index_topk,
-                return_indices=False,
+                page_size=self.page_size,
                 primary_slot_indices=buffers.safe_primary_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
-            pack_flashmla_query_out(
-                buffers.absorbed_q, buffers.q_rope_4d.squeeze(2), buffers.query_states,
-                num_valid_tokens=num_valid_tokens,
-            )
-            buffers.query_states.mul_(valid_rows_bf16_4d)
-            attn_out = run_prepared_sparse_flash_mla_decode(
-                buffers.prepared_flashmla,
-                tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                num_splits=flashmla_num_splits,
-            )
+            attn_out = self._run_selected_fa3(buffers)
         fp8_out_absorb_out(
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
