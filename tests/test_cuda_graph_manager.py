@@ -1,6 +1,7 @@
 import types
 
 import pytest
+import torch
 
 from batchgen.cuda_graph.graph_manager import BatchSizeBucketing, CapturedGraph, CUDAGraphManager
 
@@ -70,6 +71,45 @@ def test_warmup_and_capture_buckets_rejects_unknown_bucket():
 
     with pytest.raises(ValueError, match="unknown CUDA graph buckets"):
         manager.warmup_and_capture_buckets([4])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_capture_uses_manager_owned_explicit_stream(monkeypatch):
+    device = torch.device("cuda")
+    manager = CUDAGraphManager(BatchSizeBucketing([1]), device=device)
+    manager.WARMUP_ITERATIONS = 1
+
+    class Segment:
+        def __init__(self):
+            self.output = torch.empty(1, device=device)
+
+        def get_static_input_specs(self, _bucket_size):
+            from batchgen.cuda_graph.graph_manager import TensorSpec
+
+            return {"x": TensorSpec(("batch_size",), torch.float32)}
+
+        def get_static_output_specs(self, _bucket_size):
+            from batchgen.cuda_graph.graph_manager import TensorSpec
+
+            return {"output": TensorSpec(("batch_size",), torch.float32)}
+
+        def forward(self, x):
+            torch.add(x, 1, out=self.output)
+            return {"output": self.output}
+
+    observed_streams = []
+    real_graph = torch.cuda.graph
+
+    def recording_graph(graph, *args, **kwargs):
+        observed_streams.append(kwargs.get("stream"))
+        return real_graph(graph, *args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "graph", recording_graph)
+    manager.register_segment("seg", Segment())
+    manager.warmup_and_capture_all()
+
+    assert observed_streams == [manager._capture_stream]
+    assert manager._capture_stream != torch.cuda.current_stream(device)
 
 
 def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():

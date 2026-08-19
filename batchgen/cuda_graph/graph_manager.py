@@ -172,6 +172,17 @@ class CUDAGraphManager:
         # Shared memory pool across all graphs to minimize HBM usage.
         self._pool = torch.cuda.graph_pool_handle()
 
+        # Persistent capture-only stream for this manager/pool. Warmup stays on
+        # the caller stream and replay inherits the caller stream; only capture
+        # needs a stable explicit side stream. Reusing PyTorch's process-global
+        # default capture stream made a warmup-on-that-stream path poison later
+        # multi-stream NCCL/router capture on CUDA 12.9, while leaving capture
+        # implicit also shares one stream across otherwise independent managers.
+        #
+        # Keep one explicit stream per pool, as required by PyTorch's graph-pool
+        # contract. Do not use this stream for eager warmup or replay.
+        self._capture_stream = torch.cuda.Stream(device=self.device)
+
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
         self._segments: Dict[str, CapturableSegment] = {}
@@ -308,12 +319,19 @@ class CUDAGraphManager:
             memory_record, "warmup", phase_start
         )
 
-        # 3. Capture on current stream with shared pool
+        # 3. Capture on the manager's persistent capture-only stream.
+        caller_stream = torch.cuda.current_stream(self.device)
+        self._capture_stream.wait_stream(caller_stream)
         _capture_start = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
+        with torch.cuda.graph(
+            graph,
+            pool=self._pool,
+            stream=self._capture_stream,
+        ):
             with torch.inference_mode():
                 static_outputs = segment.forward(**static_inputs)
+        caller_stream.wait_stream(self._capture_stream)
         torch.cuda.synchronize(self.device)
         _capture_s = time.perf_counter() - _capture_start
         logger.info(
