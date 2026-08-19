@@ -22,7 +22,8 @@ def test_warmup_and_capture_buckets_captures_only_requested_buckets():
     manager = _make_uninitialized_manager([1, 2, 4])
     captured = []
 
-    def fake_capture_one(self, name, segment, bucket_size):
+    def fake_capture_one(self, name, segment, bucket_size, warmup_iters=None):
+        del segment, warmup_iters
         captured.append((name, bucket_size))
         self._graphs[name][bucket_size] = object()
 
@@ -40,7 +41,8 @@ def test_warmup_and_capture_all_captures_every_configured_bucket_once():
     manager = _make_uninitialized_manager([1, 2, 4, 8])
     captured = []
 
-    def fake_capture_one(self, name, segment, bucket_size):
+    def fake_capture_one(self, name, segment, bucket_size, warmup_iters=None):
+        del segment, warmup_iters
         captured.append((name, bucket_size))
         self._graphs[name][bucket_size] = object()
 
@@ -186,6 +188,7 @@ def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):
     manager = _make_uninitialized_manager([2])
     manager.device = torch.device("cpu")
     manager._pool = object()
+    manager._capture_stream = types.SimpleNamespace(wait_stream=lambda _stream: None)
     calls = []
 
     class Segment:
@@ -214,6 +217,8 @@ def test_capture_one_initializes_static_inputs_before_warmup(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
     monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: FakeGraph())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: manager._capture_stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device=None: None)
 
     manager._capture_one("seg", manager._segments["seg"], 2)
 
@@ -227,6 +232,7 @@ def test_capture_one_records_phase_memory_stats(monkeypatch):
     manager = _make_uninitialized_manager([2])
     manager.device = torch.device("cpu")
     manager._pool = object()
+    manager._capture_stream = types.SimpleNamespace(wait_stream=lambda _stream: None)
     manager._memory_diag_enabled = True
 
     snapshots = [
@@ -293,6 +299,8 @@ def test_capture_one_records_phase_memory_stats(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
     monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: FakeGraph())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: manager._capture_stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device=None: None)
 
     manager._segments = {"seg": Segment()}
     manager._graphs = {"seg": {}}
