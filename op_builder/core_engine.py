@@ -26,6 +26,7 @@ class CoreEngineBuilder(CUDAOpBuilder):
             f"{BATCHGEN_CORE_ROOT}/HtoD_Engine/HtoD_Engine_Kernels.cu",  # Your CUDA kernel
             f"{BATCHGEN_CORE_ROOT}/KV_Storage/KV_Storage.cpp",
             f"{BATCHGEN_CORE_ROOT}/Weights_Storage/Weights_Storage.cpp",
+            f"{BATCHGEN_CORE_ROOT}/Weights_Storage/distributed_weight_daemon.cpp",
             f"{BATCHGEN_CORE_ROOT}/Parameter_Server/Parameter_Server.cpp",
             f"{BATCHGEN_CORE_ROOT}/Parameter_Server/posix_shm.cpp",
             f"{BATCHGEN_CORE_ROOT}/GPU_Weight_Buffer/GPU_Weight_Buffer.cpp",
@@ -102,6 +103,10 @@ class CoreEngineBuilder(CUDAOpBuilder):
             '-lpthread',
             # '-ltcmalloc',
             '-lcufile',
+            '-lucp',
+            '-luct',
+            '-lucs',
+            '-lucm',
         ]
         return flags
 

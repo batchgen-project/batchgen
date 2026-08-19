@@ -581,6 +581,7 @@ class BatchGenWorkerArgs:
 	kv_aux_memfd_fd: int = -1  # Separate memfd fd for auxiliary (indexer) KV cache
 	weights_memfd_pid: int = -1
 	weights_memfd_fd: int = -1
+	distributed_weight_config: Optional[str] = None
 	# Request pool: max QueryBook capacity (pre-allocated, metadata only)
 	max_pool_size: int = 10240  # Default enables pool mode. 0 = legacy batch-FIFO.
 
@@ -753,15 +754,20 @@ class BatchGenWorker:
 		import time as _time
 		_t0 = _time.monotonic()
 		self.weights_storage = core_engine.Weights_Storage(self.local_rank)
-		self.weights_storage.Init(
-			self.shm_name,
-			self.weight_byte_size,
-			self.tensor_meta_shm_name,
-			self.enable_hugetlbfs,
-			args.fast_init,
-			args.weights_memfd_pid,
-			args.weights_memfd_fd,
-		)
+		if args.distributed_weight_config:
+			self.weights_storage.InitDistributed(
+				args.distributed_weight_config
+			)
+		else:
+			self.weights_storage.Init(
+				self.shm_name,
+				self.weight_byte_size,
+				self.tensor_meta_shm_name,
+				self.enable_hugetlbfs,
+				args.fast_init,
+				args.weights_memfd_pid,
+				args.weights_memfd_fd,
+			)
 		logging.info(f"Rank {self.rank}: [startup] Weights storage init: {_time.monotonic() - _t0:.2f}s")
 
 		# 5. Initialize Host KV Cache Manager View (cudaHostRegister for Host KV)

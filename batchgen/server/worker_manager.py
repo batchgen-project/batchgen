@@ -111,6 +111,8 @@ class WorkerManager:
         self.model_info: Dict[str, Any] = {}
         self.args_dict: Dict[str, Any] = {}
         self.parameter_server_instance = None
+        self.distributed_weight_daemon = None
+        self.distributed_weight_config = None
         self.skeleton_state_dict = None
         self.skeleton_state_dict_file = None
         self._lock = threading.Lock()
@@ -152,6 +154,9 @@ class WorkerManager:
         if self.args.fast_init:
             _validate_shmem_enabled()
             self._compact_memory()
+
+        if self.args.distributed_weight_config is not None:
+            self._start_distributed_weight_daemon()
 
         if self.args.enable_hugetlbfs:
             byte_size = get_model_byte_size(self.args.model)
@@ -196,6 +201,10 @@ class WorkerManager:
 
         spawn_start = _time.monotonic()
         _diag(">>> _spawn_workers")
+        if self.distributed_weight_daemon is not None:
+            _diag(">>> distributed_weight_daemon.wait_ready")
+            self.distributed_weight_daemon.wait_ready(600.0)
+            _diag("<<< distributed_weight_daemon.wait_ready")
         self._spawn_workers()
         _diag("<<< _spawn_workers")
         _diag(">>> _start_worker_monitor")
@@ -225,6 +234,13 @@ class WorkerManager:
         # Stop the monitor thread
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=5)
+
+        # The node-shared weight daemon owns sockets that every worker maps.
+        # Stop it before terminating workers so their socket closure is not
+        # misclassified as an unexpected serving failure.
+        if self.distributed_weight_daemon is not None:
+            self.distributed_weight_daemon.stop()
+            self.distributed_weight_daemon = None
 
         # Collect worker PIDs before sending shutdown signal
         worker_pids = self._get_worker_pids()
@@ -518,6 +534,10 @@ class WorkerManager:
                 endpoint, hf_cache_dir, converted_ckpt_dir
             )
             _diag("  <<< _load_model_from_remote_server")
+        elif self.args.distributed_weight_config is not None:
+            _diag("  >>> _load_model_from_distributed_store")
+            self._load_model_from_distributed_store()
+            _diag("  <<< _load_model_from_distributed_store")
         else:
             _diag("  >>> _load_model_locally")
             self._load_model_locally(hf_cache_dir, converted_ckpt_dir)
@@ -617,6 +637,11 @@ class WorkerManager:
             kv_aux_memfd_fd=self._get_kv_aux_memfd_fd(),
             weights_memfd_pid=self._get_weights_memfd_pid(),
             weights_memfd_fd=self._get_weights_memfd_fd(),
+            distributed_weight_config=(
+                str(self.args.distributed_weight_config)
+                if self.args.distributed_weight_config is not None
+                else None
+            ),
         )
         from batchgen.server_worker_main_loop import server_worker_main
         self.worker_process = mp.spawn(
@@ -742,6 +767,66 @@ class WorkerManager:
             logger.error("Failed to signal server shutdown", exc_info=True)
 
     # ---------------------- Model loading helpers ----------------------
+    def _start_distributed_weight_daemon(self) -> None:
+        if "kimi-k3" not in self.args.model.lower():
+            raise ValueError(
+                "--distributed-weight-config currently supports Kimi-K3 only"
+            )
+        from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+            load_distributed_weight_config,
+        )
+
+        config_path = Path(self.args.distributed_weight_config)
+        config = load_distributed_weight_config(config_path)
+        if int(config["node_rank"]) != int(self.args.node_rank):
+            raise ValueError(
+                "distributed weight config node_rank does not match "
+                f"--node-rank: {config['node_rank']} != {self.args.node_rank}"
+            )
+        self.distributed_weight_config = config
+        self.distributed_weight_daemon = bg_lib.DistributedWeightDaemon(
+            str(config_path)
+        )
+        self.distributed_weight_daemon.start()
+        logger.info(
+            "Distributed weight daemon started for node %d: store=%s",
+            self.args.node_rank,
+            config["store_path"],
+        )
+
+    def _load_model_from_distributed_store(self) -> None:
+        from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+            save_compact_skeleton_state_dict,
+        )
+
+        config = self.distributed_weight_config
+        if config is None:
+            raise RuntimeError("distributed weight config is not loaded")
+        fd, file_path = tempfile.mkstemp(
+            suffix=".pt", prefix="batchgen_skel_"
+        )
+        os.close(fd)
+        count, actual_size = save_compact_skeleton_state_dict(
+            self.args.distributed_weight_config,
+            file_path,
+        )
+        logger.info(
+            "Compact skeleton state dict saved to %s (%d tensors, %.2f MB)",
+            file_path,
+            count,
+            actual_size / (1024**2),
+        )
+        self.skeleton_state_dict_file = file_path
+        self.skeleton_state_dict = None
+        self.parameter_server_instance = None
+        self.model_info = {
+            "huggingface_ckpt_name": self.args.model,
+            "shm_name": f"distributed_k3_node{self.args.node_rank}",
+            "tensor_meta_shm_name": "",
+            "converted_ckpt_dir": self.args.converted_ckpt_dir,
+            "parameter_server_size": int(config["store_bytes"]),
+        }
+
     def _download_model_snapshot(self, hf_cache_dir: Path) -> Path:
         logger.info("Downloading model artifacts to %s", hf_cache_dir)
         from huggingface_hub import snapshot_download

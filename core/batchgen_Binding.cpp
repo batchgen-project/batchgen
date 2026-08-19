@@ -25,6 +25,7 @@
 #include "KV_Storage/swa_host_paged_kv_worker_view.h"
 #include "batchgen.h"
 #include "Weights_Storage/Weights_Storage.h" 
+#include "Weights_Storage/distributed_weight_daemon.h"
 #include "allocator.h"
 #include "data_structures.h"
 #include <ATen/cuda/CachingHostAllocator.h>
@@ -561,8 +562,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("enable_memfd") = false,
             py::arg("memfd_creator_pid") = -1,
             py::arg("memfd_fd") = -1)
+        .def("InitDistributed", &Weights_Storage::InitDistributed,
+            py::arg("config_path"))
         .def("get_tensor", &Weights_Storage::get_tensor,
             py::arg("module_key"));
+
+    py::class_<DistributedWeightDaemon>(m, "DistributedWeightDaemon")
+        .def(py::init<const std::string&>(), py::arg("config_path"))
+        .def("start", &DistributedWeightDaemon::Start)
+        .def("wait_ready", &DistributedWeightDaemon::WaitReady,
+             py::arg("timeout_seconds"))
+        .def("stop", &DistributedWeightDaemon::Stop);
     
     py::class_<kv::HostPagedKVConfig>(m, "HostPagedKVConfig")
         .def(py::init<>())
