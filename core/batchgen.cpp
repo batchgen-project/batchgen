@@ -21,6 +21,7 @@
 #include "spdlog/spdlog.h"
 #include <ATen/cuda/CachingHostAllocator.h>
 #include <filesystem>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <pybind11/pybind11.h>
@@ -418,15 +419,78 @@ py::object BatchGen::gpu_paged_kv_manager() const {
 
 
 #include <signal.h>
+#include <unistd.h>
 static BatchGen* engine_instance = nullptr;
-void signalHandler(int signum) {
+
+namespace {
+
+char* append_unsigned(char* cursor, unsigned long long value) {
+    char digits[32];
+    int count = 0;
+    do {
+        digits[count++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    while (count > 0) {
+        *cursor++ = digits[--count];
+    }
+    return cursor;
+}
+
+void write_signal_record(int signum, siginfo_t* info) {
+    char message[256];
+    char* cursor = message;
+    const char prefix[] = "[BATCHGEN_SIGNAL] signal=";
+    std::memcpy(cursor, prefix, sizeof(prefix) - 1);
+    cursor += sizeof(prefix) - 1;
+    cursor = append_unsigned(cursor, static_cast<unsigned>(signum));
+    const char sender[] = " sender_pid=";
+    std::memcpy(cursor, sender, sizeof(sender) - 1);
+    cursor += sizeof(sender) - 1;
+    cursor = append_unsigned(
+        cursor, info == nullptr ? 0 : static_cast<unsigned>(info->si_pid));
+    const char uid[] = " sender_uid=";
+    std::memcpy(cursor, uid, sizeof(uid) - 1);
+    cursor += sizeof(uid) - 1;
+    cursor = append_unsigned(
+        cursor, info == nullptr ? 0 : static_cast<unsigned>(info->si_uid));
+    const char code[] = " si_code=";
+    std::memcpy(cursor, code, sizeof(code) - 1);
+    cursor += sizeof(code) - 1;
+    const int si_code = info == nullptr ? 0 : info->si_code;
+    if (si_code < 0) {
+        *cursor++ = '-';
+        cursor = append_unsigned(
+            cursor, static_cast<unsigned long long>(-(long long)si_code));
+    } else {
+        cursor = append_unsigned(cursor, static_cast<unsigned>(si_code));
+    }
+    const char target[] = " target_pid=";
+    std::memcpy(cursor, target, sizeof(target) - 1);
+    cursor += sizeof(target) - 1;
+    cursor = append_unsigned(cursor, static_cast<unsigned>(getpid()));
+    *cursor++ = '\n';
+    const ssize_t ignored =
+        write(STDERR_FILENO, message, static_cast<size_t>(cursor - message));
+    (void)ignored;
+}
+
+void signalHandler(int signum, siginfo_t* info, void*) {
+    write_signal_record(signum, info);
     if (engine_instance) {
         engine_instance->Terminate();
     }
-    exit(signum);
+    _exit(128 + signum);
 }
+
+}  // namespace
+
 void BatchGen::register_signal_handler() {
     engine_instance = this;
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    struct sigaction action {};
+    action.sa_sigaction = signalHandler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
 }
