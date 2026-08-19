@@ -3,11 +3,16 @@
 The GLM-5 MoE graph captures the full decode MoE module boundary:
 
     padded local tokens -> all_gather
-      -> shared expert on the capture stream
+      -> shared expert
       -> router -> rank padding mask -> dispatch_scatter_ragged
          -> FP8 blockwise S1/S3 -> reduce_weighted_scatter -> reduce_scatter
-         on a side stream
+         on the graph capture stream
       -> add shared expert
+
+All MoE work stays on the graph capture stream. Reusing a side stream across
+MoE layers invalidates a whole-model graph when the second layer is added to
+the same capture on CUDA 12.9 / NCCL 2.27. Eager decode keeps its existing
+shared/routed overlap; only this whole-graph path is serialized.
 
 The decoder-layer residual add remains eager in the caller because it is owned
 by ``Glm5DecoderLayer.forward()``, not by ``Glm5MoE.forward()``.
@@ -426,10 +431,9 @@ class Glm5MoEGraphSegment:
             )
 
         current_stream = torch.cuda.current_stream(self.device)
-        self.routed_stream.wait_stream(current_stream)
         shared_output = self.moe.shared_expert_forward(padded)
 
-        with torch.cuda.stream(self.routed_stream):
+        with torch.cuda.stream(current_stream):
             if 192 <= global_rows <= 512:
                 from batchgen_kernels.triton.glm5_router_gemm import (
                     glm5_router_gemm,
@@ -503,7 +507,6 @@ class Glm5MoEGraphSegment:
                     stream=torch.cuda.current_stream(self.device),
                 )
 
-        current_stream.wait_stream(self.routed_stream)
         bufs.local_moe_output.add_(shared_output)
         return {"moe_output": bufs.local_moe_output}
 
