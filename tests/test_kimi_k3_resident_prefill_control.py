@@ -93,7 +93,14 @@ def test_worker_reads_batch_level_mode_before_configure_prefill():
         worker_path, "BatchGenWorker", "_config_prefill_for_batch"
     )
     calls = [
-        (node.lineno, getattr(node.func, "attr", None))
+        (
+            node.lineno,
+            (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else node.func.id if isinstance(node.func, ast.Name) else None
+            ),
+        )
         for node in ast.walk(function)
         if isinstance(node, ast.Call)
     ]
