@@ -953,12 +953,12 @@ class GLM5AttnWrapper(AttnWrapperBase):
         if getattr(self, "_dsa_cuda_graph_full", False):
             uses_aux_kv = getattr(self.module, "indexer", None) is not None
             primary_slot_indices = getattr(
-                AttnWrapperBase,
+                GLM5AttnWrapper,
                 "glm5_decode_primary_slot_indices",
                 None,
             )
             aux_slot_indices = getattr(
-                AttnWrapperBase,
+                GLM5AttnWrapper,
                 "glm5_decode_aux_slot_indices",
                 None,
             )

@@ -1707,13 +1707,19 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
         "_project_dsa_attn_heads",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not project")),
     )
-    AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = {
+    GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
         "bucket_size": 4,
         "tile_scheduler_metadata": torch.ones(3, dtype=torch.int32),
         "num_splits": torch.ones(1, dtype=torch.int32),
     }
-    AttnWrapperBase.glm5_decode_primary_slot_indices = torch.tensor([3, 4], dtype=torch.int32)
-    AttnWrapperBase.glm5_decode_aux_slot_indices = torch.tensor([7, 8], dtype=torch.int32)
+    GLM5AttnWrapper.glm5_decode_primary_slot_indices = torch.tensor(
+        [3, 4],
+        dtype=torch.int32,
+    )
+    GLM5AttnWrapper.glm5_decode_aux_slot_indices = torch.tensor(
+        [7, 8],
+        dtype=torch.int32,
+    )
     primary_appends = []
     aux_appends = []
     AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: primary_appends.append(
@@ -1733,9 +1739,9 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
             object(),
         )
     finally:
-        AttnWrapperBase.glm5_dsa_flashmla_graph_metadata = None
-        AttnWrapperBase.glm5_decode_primary_slot_indices = None
-        AttnWrapperBase.glm5_decode_aux_slot_indices = None
+        GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
+        GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+        GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
         AttnWrapperBase.kv_append_callback = None
         AttnWrapperBase.kv_append_callback_aux = None
 
@@ -1793,11 +1799,11 @@ def test_glm52_reuse_dsa_graph_replay_omits_aux_input_and_callback(monkeypatch):
             torch.ones(1, dtype=torch.int32),
         ),
     )
-    AttnWrapperBase.glm5_decode_primary_slot_indices = torch.tensor(
+    GLM5AttnWrapper.glm5_decode_primary_slot_indices = torch.tensor(
         [3, 4],
         dtype=torch.int32,
     )
-    AttnWrapperBase.glm5_decode_aux_slot_indices = None
+    GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
     primary_appends = []
     aux_appends = []
     AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: (
@@ -1817,8 +1823,8 @@ def test_glm52_reuse_dsa_graph_replay_omits_aux_input_and_callback(monkeypatch):
             object(),
         )
     finally:
-        AttnWrapperBase.glm5_decode_primary_slot_indices = None
-        AttnWrapperBase.glm5_decode_aux_slot_indices = None
+        GLM5AttnWrapper.glm5_decode_primary_slot_indices = None
+        GLM5AttnWrapper.glm5_decode_aux_slot_indices = None
         AttnWrapperBase.kv_append_callback = None
         AttnWrapperBase.kv_append_callback_aux = None
 
