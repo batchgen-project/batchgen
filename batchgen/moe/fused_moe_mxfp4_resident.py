@@ -240,10 +240,37 @@ class ResidentEPMXFP4MoELayer:
         the strided expert_out buffer, or -1 (non-local / padding).
         """
         pos = topk_pos.view(T, K).long()
+        weight = topk_weight.reshape(T, K).float()
+        if self.compact_dispatch:
+            # R5 prefill can have 65K+ global rows. Materializing
+            # [T, K, H] twice (gather + contribution) would require ~28 GiB
+            # at W2. Chunk only the independent token dimension; each chunk
+            # keeps the original [rows, K, H] FP32 reduction unchanged, so
+            # arithmetic order over top-k is identical to the decode path.
+            combined = torch.empty(
+                (T, H), dtype=torch.float32, device=expert_out.device
+            )
+            chunk_rows = 2048
+            for start in range(0, T, chunk_rows):
+                end = min(start + chunk_rows, T)
+                chunk_pos = pos[start:end]
+                valid = chunk_pos >= 0
+                rows = chunk_pos.clamp(min=0).reshape(-1)
+                gathered = expert_out.index_select(0, rows).float().view(
+                    end - start, K, H
+                )
+                w = weight[start:end].unsqueeze(-1)
+                contribution = (
+                    gathered
+                    * w
+                    * valid.unsqueeze(-1).to(torch.float32)
+                )
+                combined[start:end].copy_(contribution.sum(dim=1))
+            return combined
         valid = (pos >= 0)
         rows = pos.clamp(min=0).reshape(-1)
         gathered = expert_out.index_select(0, rows).float().view(T, K, H)
-        w = topk_weight.reshape(T, K).float().unsqueeze(-1)
+        w = weight.unsqueeze(-1)
         contrib = gathered * w * valid.unsqueeze(-1).to(torch.float32)
         return contrib.sum(dim=1)
 
