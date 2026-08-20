@@ -257,14 +257,18 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     manager = type("Manager", (), {})()
     dense = type("FFN", (), {"_resident_prefill_token_tile": None})()
     shared = type("FFN", (), {"_resident_prefill_token_tile": None})()
+    norm = type("KimiRMSNorm", (), {
+        "_resident_prefill_token_tile": None,
+    })()
     moe = type("MoE", (), {
         "_resident_ep_moe": None,
         "shared_experts": shared,
     })()
     layer = type("Layer", (), {"mlp": dense, "block_sparse_moe": moe})()
-    manager.model = type(
-        "Model", (), {"model": type("Inner", (), {"layers": [layer]})()}
-    )()
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": [layer]})(),
+        "modules": lambda self: [norm],
+    })()
     method = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
@@ -274,11 +278,13 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     method(True)
     assert dense._resident_prefill_token_tile == 512
     assert shared._resident_prefill_token_tile == 512
+    assert norm._resident_prefill_token_tile == 512
     assert moe._resident_ep_prefill_enabled is True
 
     method(False)
     assert dense._resident_prefill_token_tile is None
     assert shared._resident_prefill_token_tile is None
+    assert norm._resident_prefill_token_tile is None
     assert moe._resident_ep_prefill_enabled is False
 
 

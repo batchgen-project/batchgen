@@ -208,6 +208,10 @@ class KimiLinearParallelStrategyManager:
             ResidentEPMXFP4MoELayer.release_prefill_output()
         if self.model is None:
             return
+        tile = 512 if enabled else None
+        for module in self.model.modules():
+            if hasattr(module, "_resident_prefill_token_tile"):
+                module._resident_prefill_token_tile = tile
         for layer in self.model.model.layers:
             moe = getattr(layer, "block_sparse_moe", None)
             if moe is not None:
@@ -220,7 +224,6 @@ class KimiLinearParallelStrategyManager:
             # which cannot fit beside the resident expert shard. This smaller
             # tile is active only for resident prefill; W1 (4,096 rows),
             # streamed prefill and decode retain their original call shapes.
-            tile = 512 if enabled else None
             dense = getattr(layer, "mlp", None)
             if dense is not None:
                 dense._resident_prefill_token_tile = tile

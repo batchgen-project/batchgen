@@ -106,12 +106,30 @@ class KimiRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self._resident_prefill_token_tile = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         dtype = hidden_states.dtype
         x = hidden_states.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return self.weight * x.to(dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        token_tile = self._resident_prefill_token_tile
+        num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+        if token_tile is None or num_tokens <= int(token_tile):
+            return self._norm(hidden_states)
+
+        flat = hidden_states.reshape(num_tokens, hidden_states.shape[-1])
+        output = None
+        for start in range(0, num_tokens, int(token_tile)):
+            end = min(start + int(token_tile), num_tokens)
+            y = self._norm(flat[start:end])
+            if output is None:
+                output = y.new_empty((num_tokens, y.shape[-1]))
+            output[start:end].copy_(y)
+            del y
+        return output.view_as(hidden_states)
 
 
 # ============================================================================
