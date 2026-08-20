@@ -201,6 +201,11 @@ class KimiLinearParallelStrategyManager:
 
     def _set_resident_ep_prefill_enabled(self, enabled):
         """Route K3 MoE through resident EP in prefill and compact its scratch."""
+        if not enabled:
+            from batchgen.moe.fused_moe_mxfp4_resident import (
+                ResidentEPMXFP4MoELayer,
+            )
+            ResidentEPMXFP4MoELayer.release_prefill_output()
         if self.model is None:
             return
         for layer in self.model.model.layers:
@@ -222,6 +227,29 @@ class KimiLinearParallelStrategyManager:
             shared = getattr(moe, "shared_experts", None) if moe is not None else None
             if shared is not None:
                 shared._resident_prefill_token_tile = tile
+
+    def prepare_resident_ep_prefill_output(self, num_global):
+        """Reserve the reusable global FP32 combine output before expert HBM."""
+        if not self.prefill_uses_resident_ep():
+            return
+        hidden_size = self.loaded_model_config.routed_expert_hidden_size
+        if hidden_size is None:
+            raise RuntimeError(
+                "resident-EP prefill output requires LatentMoE hidden size"
+            )
+        from batchgen.moe.fused_moe_mxfp4_resident import (
+            ResidentEPMXFP4MoELayer,
+        )
+        output = ResidentEPMXFP4MoELayer.prepare_prefill_output(
+            num_global,
+            hidden_size,
+            self.engine_config.Basic_Config.device_torch,
+        )
+        logging.info(
+            "[K3_PREFILL_MOE] preallocated FP32 output shape=%s bytes=%s",
+            tuple(output.shape),
+            output.numel() * output.element_size(),
+        )
 
     def _build_weight_copy_task(self):
         """Modules the copy engine must stream (host-offloaded), in layer-major
@@ -489,8 +517,6 @@ class KimiLinearParallelStrategyManager:
         ceil(B_grp/G) (each rank owns 1/G of the group's rows after
         moe_forward_resident_ep_decode's scatter), so this scalar stays the
         per-rank distinct-row count the DP-32 resident layer expects."""
-        if not self._resident_ep_built:
-            return
         # Drive BOTH resident classes' per-rank layout scalar. Only one is
         # ever materialized per model (BF16 stacked hidden shard vs MXFP4
         # latent shard), but num_tokens_per_rank is a class attribute so

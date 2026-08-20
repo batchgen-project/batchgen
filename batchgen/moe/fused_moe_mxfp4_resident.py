@@ -217,6 +217,11 @@ class ResidentEPMXFP4MoELayer:
     # Per-step padded rows per rank; set by the worker for the M3.1b EP layout.
     # Unused at world=1 (all_gather / all_reduce are identity).
     num_tokens_per_rank = None
+    # Reused by every layer during resident prefill. W2 needs 896 MiB for this
+    # exact FP32 global output; reserving it before the resident expert shards
+    # prevents the late first-layer allocation from failing in a fragmented
+    # allocator arena.
+    _prefill_y = None
 
     def __init__(self, layer_idx, shard, down_proj, norm, up_proj,
                  comm=None, world_size=1, rank=0, expert_start=0):
@@ -238,6 +243,20 @@ class ResidentEPMXFP4MoELayer:
     @classmethod
     def set_num_tokens_per_rank(cls, num_tokens_per_rank):
         cls.num_tokens_per_rank = int(num_tokens_per_rank)
+
+    @classmethod
+    def prepare_prefill_output(cls, num_global, hidden_size, device):
+        cls._prefill_y = None
+        cls._prefill_y = torch.empty(
+            (int(num_global), int(hidden_size)),
+            dtype=torch.float32,
+            device=device,
+        )
+        return cls._prefill_y
+
+    @classmethod
+    def release_prefill_output(cls):
+        cls._prefill_y = None
 
     def _combine_fp32(self, expert_out, topk_pos, topk_weight, T, H, K):
         """Weighted top-k combine in FP32 — the streamed oracle's exact reduction
@@ -487,11 +506,18 @@ class ResidentEPMXFP4MoELayer:
             # Chunk only the independent token dimension. Each token still
             # sees the same expert kernels and FP32 top-k reduction, and the
             # completed global latent is all-reduced exactly once below.
-            y = torch.empty(
-                (num_global, K_latent),
-                dtype=torch.float32,
-                device=x.device,
-            )
+            prefill_y = ResidentEPMXFP4MoELayer._prefill_y
+            if (
+                prefill_y is None
+                or prefill_y.shape[0] < num_global
+                or prefill_y.shape[1] != K_latent
+                or prefill_y.device != x.device
+            ):
+                raise RuntimeError(
+                    "resident-EP prefill output was not preallocated for "
+                    f"{num_global}x{K_latent} FP32 rows on {x.device}"
+                )
+            y = prefill_y[:num_global]
             chunk_rows = compact_prefill_chunk_rows(
                 num_global, self.compact_chunk_rows
             )

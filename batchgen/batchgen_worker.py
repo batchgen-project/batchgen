@@ -6636,6 +6636,12 @@ class BatchGenWorker:
 		# NOTE: Rebalancing is now done BEFORE _prepare_prefill_batch() in the main loop
 		# to ensure batch selection uses accurate post-migration capacities.
 
+		# Resident TP groups must be known before sizing the reusable global
+		# FP32 MoE output. Fresh admissions are already grouped; this also
+		# restores groups for evicted re-entries before the normal idempotent
+		# assignment later in this method.
+		self._assign_decode_dp_groups(prefill_uuids)
+
 		# CRITICAL: Deep free decode model memory BEFORE configuring prefill (Bug Fix 7)
 		# This mirrors the cleanup done in _load_decode_model() for prefill→decode transitions
 		# Without this, decode model (~92 GB) stays in memory when prefill model loads → OOM
@@ -6646,6 +6652,40 @@ class BatchGenWorker:
 		# The GPU KV cache holds ~20-30GB that must be freed before loading prefill model
 		# Previously this was called AFTER configure_prefill() which caused OOM
 		self._destroy_gpu_paged_kv_cache()
+
+		if (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			local_lengths = [
+				int(seq.prompt_length)
+				for seq in prefill_sequences
+				if self._owns_local_sequence(seq)
+			]
+			token_cap = (
+				self.engine_config.Module_Batching_Config
+				.prefill_micro_batch_token_cap
+			)
+			use_l2 = os.environ.get("BATCHGEN_L2_BALANCE", "1") == "1"
+			predicted_batches, _ = build_prefill_micro_batches(
+				local_lengths,
+				token_cap,
+				l2_balance=use_l2,
+			)
+			local_max_tokens = max(
+				(
+					sum(local_lengths[start:end])
+					for start, end in predicted_batches
+				),
+				default=0,
+			)
+			moe_ntp = self._sync_prefill_moe_rank_counts(
+				local_max_tokens,
+				reason="prefill_output_preallocate",
+			)
+			self.parallel_manager.prepare_resident_ep_prefill_output(
+				self.world_size * moe_ntp
+			)
 
 		if torch.cuda.is_available():
 			free_mem, total_mem = torch.cuda.mem_get_info(self.local_rank)

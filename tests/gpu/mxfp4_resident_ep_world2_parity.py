@@ -154,8 +154,15 @@ def worker(rank, world, out_path, master_port):
                 # Force multiple expert-execution chunks on the existing small
                 # scenarios so compact-vs-original parity is non-vacuous.
                 layer.compact_chunk_rows = 32
-            with torch.no_grad():
-                ep_out = layer.forward(x_local, block.gate)
+                ResidentEPMXFP4MoELayer.prepare_prefill_output(
+                    world * ntp, layer.shard.K_latent, dev
+                )
+            try:
+                with torch.no_grad():
+                    ep_out = layer.forward(x_local, block.gate)
+            finally:
+                if compact:
+                    ResidentEPMXFP4MoELayer.release_prefill_output()
 
             assert list(ep_out.shape) == [T_local, hidden], ep_out.shape
             assert torch.isfinite(ep_out).all(), (

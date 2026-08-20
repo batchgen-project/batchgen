@@ -207,6 +207,34 @@ def test_compact_resident_prefill_chunks_before_one_all_reduce():
     assert len(bounded_calls) == 1
 
 
+def test_compact_resident_prefill_uses_preallocated_output():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    function = _function(path, "ResidentEPMXFP4MoELayer", "_forward_ep")
+    prefill_y_reads = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "_prefill_y"
+    ]
+    output_allocations = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "empty"
+        and any(
+            isinstance(arg, ast.Tuple)
+            and any(
+                isinstance(dim, ast.Name) and dim.id == "num_global"
+                for dim in arg.elts
+            )
+            for arg in node.args
+        )
+    ]
+    assert prefill_y_reads
+    assert not output_allocations
+
+
 def test_compact_resident_prefill_chunk_policy():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     choose = _isolated_function(path, "compact_prefill_chunk_rows")
@@ -252,3 +280,34 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     assert dense._resident_prefill_token_tile is None
     assert shared._resident_prefill_token_tile is None
     assert moe._resident_ep_prefill_enabled is False
+
+
+def test_worker_preallocates_resident_output_before_configure_prefill():
+    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
+    function = _function(
+        worker_path, "BatchGenWorker", "_config_prefill_for_batch"
+    )
+    calls = [
+        (
+            node.lineno,
+            node.func.attr,
+        )
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    ]
+    destroy = min(
+        line for line, name in calls if name == "_destroy_gpu_paged_kv_cache"
+    )
+    sync = min(
+        line for line, name in calls if name == "_sync_prefill_moe_rank_counts"
+    )
+    prepare = min(
+        line
+        for line, name in calls
+        if name == "prepare_resident_ep_prefill_output"
+    )
+    configure = min(
+        line for line, name in calls if name == "configure_prefill"
+    )
+    assert destroy < sync < prepare < configure
