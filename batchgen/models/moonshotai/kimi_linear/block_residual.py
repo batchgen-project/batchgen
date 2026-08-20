@@ -119,6 +119,9 @@ def apply_attn_res(prefix_sum: torch.Tensor,
     num_tokens, hidden = prefix_sum.shape
     eps = norm.variance_epsilon
     w = attn_res_score_weight(proj, norm)
+    resident_tile = getattr(norm, "_resident_prefill_token_tile", None)
+    if resident_tile is not None:
+        chunk_size = min(int(chunk_size), int(resident_tile))
     out = torch.empty_like(prefix_sum)
     for start in range(0, num_tokens, chunk_size):
         end = min(start + chunk_size, num_tokens)

@@ -589,6 +589,30 @@ def test_score_multiply_in_place_is_bit_exact():
     assert torch.equal(actual, expected)
 
 
+def test_resident_prefill_bounds_depth_mixer_chunk_exactly():
+    """Resident prefill reuses its 512-row memory tile in the depth mixer."""
+    tokens, num_blocks, hidden = 61, 5, 16
+    gen = torch.Generator().manual_seed(260821)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+        _resident_prefill_token_tile=16,
+    )
+
+    expected = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=16
+    )
+    actual = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=1024
+    )
+    assert torch.equal(actual, expected)
+
+
 def test_append_falls_back_to_cat_for_a_foreign_tensor():
     """A caller that never seeded keeps the exact previous behaviour."""
     BlockResidualBuffer.reset()
