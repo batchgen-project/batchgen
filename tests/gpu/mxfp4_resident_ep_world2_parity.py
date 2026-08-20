@@ -150,6 +150,10 @@ def worker(rank, world, out_path, master_port):
         original_ep_out = None
         for compact in (False, True):
             layer.compact_dispatch = compact
+            if compact:
+                # Force multiple expert-execution chunks on the existing small
+                # scenarios so compact-vs-original parity is non-vacuous.
+                layer.compact_chunk_rows = 32
             with torch.no_grad():
                 ep_out = layer.forward(x_local, block.gate)
 

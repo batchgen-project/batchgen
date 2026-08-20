@@ -220,6 +220,7 @@ class ResidentEPMXFP4MoELayer:
         # opts into exact route-count sizing because num_global can be 65K+
         # tokens and reserving that capacity for every local expert would OOM.
         self.compact_dispatch = False
+        self.compact_chunk_rows = 2048
 
     @classmethod
     def set_num_tokens_per_rank(cls, num_tokens_per_rank):
@@ -274,7 +275,13 @@ class ResidentEPMXFP4MoELayer:
         contrib = gathered * w * valid.unsqueeze(-1).to(torch.float32)
         return contrib.sum(dim=1)
 
-    def _expert_path(self, x_latent, topk_idx_i32, num_rows):
+    def _expert_path(
+        self,
+        x_latent,
+        topk_idx_i32,
+        num_rows,
+        dispatch_capacity=None,
+    ):
         """Dispatch ``num_rows`` latent rows into this rank's local expert shard
         and run grouped marlin S1(gate+up+SiTU) -> S3(down); returns
         (expert_out [E*mtp, K_latent] bf16, topk_pos [num_rows*K] int32).
@@ -291,7 +298,17 @@ class ResidentEPMXFP4MoELayer:
         K = topk_idx_i32.shape[-1]
 
         # --- dispatch latent rows into the strided [E*mtp, K_latent] buffer ---
-        if self.compact_dispatch:
+        if dispatch_capacity is not None:
+            if not self.compact_dispatch:
+                raise ValueError(
+                    "dispatch_capacity is only valid for compact dispatch"
+                )
+            if dispatch_capacity < num_rows:
+                raise ValueError(
+                    "dispatch_capacity cannot be smaller than num_rows"
+                )
+            mtp = max(((dispatch_capacity + 15) // 16) * 16, 16)
+        elif self.compact_dispatch:
             local = topk_idx_i32[
                 (topk_idx_i32 >= self.expert_start)
                 & (topk_idx_i32 < self.expert_start + E)
@@ -449,11 +466,55 @@ class ResidentEPMXFP4MoELayer:
             self.comm.all_gather(all_weight, topk_weight)
 
         # --- this rank's expert shard on the global tokens (non-owned -> -1) ---
-        expert_out, topk_pos = self._expert_path(all_latent, all_idx, num_global)
+        if self.compact_dispatch:
+            # Resident weights leave only a few GiB of HBM headroom. Even with
+            # exact route-count sizing, a skewed prefill can send every row to
+            # one local expert, making the three padded BF16 expert buffers
+            # scale with all global rows (8.75 GiB at W1, 35 GiB at W2).
+            # Chunk only the independent token dimension. Each token still
+            # sees the same expert kernels and FP32 top-k reduction, and the
+            # completed global latent is all-reduced exactly once below.
+            y = torch.empty(
+                (num_global, K_latent),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            chunk_rows = int(self.compact_chunk_rows)
+            if chunk_rows <= 0:
+                raise ValueError("compact_chunk_rows must be positive")
+            for chunk_start in range(0, num_global, chunk_rows):
+                chunk_end = min(chunk_start + chunk_rows, num_global)
+                chunk_count = chunk_end - chunk_start
+                expert_out, topk_pos = self._expert_path(
+                    all_latent[chunk_start:chunk_end],
+                    all_idx[chunk_start:chunk_end],
+                    chunk_count,
+                    dispatch_capacity=chunk_rows,
+                )
+                y[chunk_start:chunk_end].copy_(
+                    self._combine_fp32(
+                        expert_out,
+                        topk_pos,
+                        all_weight[chunk_start:chunk_end],
+                        chunk_count,
+                        K_latent,
+                        K,
+                    )
+                )
+        else:
+            expert_out, topk_pos = self._expert_path(
+                all_latent, all_idx, num_global
+            )
+            y = self._combine_fp32(
+                expert_out,
+                topk_pos,
+                all_weight,
+                num_global,
+                K_latent,
+                K,
+            )
 
-        # --- fp32 combine, then SUM the combined LATENT across ranks ---
-        y = self._combine_fp32(expert_out, topk_pos, all_weight,
-                               num_global, K_latent, K)            # fp32
+        # --- SUM the completed combined LATENT across ranks ---
         with self.comm.change_state(enable=True):
             self.comm.all_reduce(y, op=ReduceOp.SUM)
 

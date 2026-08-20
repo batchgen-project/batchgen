@@ -149,3 +149,65 @@ def test_prefill_schedule_checks_microbatch_count_before_sync_loop():
     ]
     assert gather_lines and sync_lines
     assert min(gather_lines) < min(sync_lines)
+
+
+def test_resident_build_releases_allocator_cache():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    function = _function(
+        path, "KimiLinearParallelStrategyManager", "_init_resident_ep_decode"
+    )
+    calls = [
+        (node.lineno, getattr(node.func, "attr", None))
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+    ]
+    build = min(
+        line
+        for line, name in calls
+        if name == "build_resident_ep_mxfp4_layers"
+    )
+    empty_cache = min(
+        line for line, name in calls if name == "empty_cache"
+    )
+    assert build < empty_cache
+
+
+def test_compact_resident_prefill_chunks_before_one_all_reduce():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    function = _function(path, "ResidentEPMXFP4MoELayer", "_forward_ep")
+    loops = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "chunk_start"
+    ]
+    assert len(loops) == 1
+    all_reduce_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "all_reduce"
+    ]
+    assert len(all_reduce_calls) == 1
+    assert loops[0].lineno < all_reduce_calls[0].lineno
+    bounded_calls = [
+        node
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_expert_path"
+        and any(
+            keyword.arg == "dispatch_capacity"
+            for keyword in node.keywords
+        )
+    ]
+    assert len(bounded_calls) == 1

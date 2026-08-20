@@ -450,6 +450,23 @@ class KimiLinearParallelStrategyManager:
                 self.experts_per_rank,
                 device,
             )
+            torch.cuda.synchronize(device)
+            free_before, _ = torch.cuda.mem_get_info(device)
+            reserved_before = torch.cuda.memory_reserved(device)
+            allocated = torch.cuda.memory_allocated(device)
+            torch.cuda.empty_cache()
+            free_after, _ = torch.cuda.mem_get_info(device)
+            logging.info(
+                "Rank %d: resident EP allocator cache released — "
+                "free %.2f→%.2f GiB, allocated %.2f GiB, "
+                "reserved %.2f→%.2f GiB",
+                self.global_rank,
+                free_before / (1024**3),
+                free_after / (1024**3),
+                allocated / (1024**3),
+                reserved_before / (1024**3),
+                torch.cuda.memory_reserved(device) / (1024**3),
+            )
         else:
             from batchgen.moe.fused_moe_bf16_resident import (
                 build_resident_ep_layers,
