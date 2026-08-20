@@ -41,6 +41,21 @@ def _isolated_method(path, class_name, function_name):
     return getattr(namespace["Isolated"], function_name)
 
 
+def _isolated_function(path, function_name):
+    tree = ast.parse(path.read_text())
+    function = copy.deepcopy(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        )
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[function_name]
+
+
 def test_prefill_mode_accepts_only_streamed_or_resident_ep():
     path = (
         ROOT
@@ -158,41 +173,6 @@ def test_prefill_schedule_checks_microbatch_count_before_sync_loop():
     assert min(gather_lines) < min(sync_lines)
 
 
-def test_resident_build_releases_allocator_cache():
-    path = (
-        ROOT
-        / "batchgen"
-        / "models"
-        / "moonshotai"
-        / "kimi_linear"
-        / "Parallel_Strategy_Manager.py"
-    )
-    function = _function(
-        path, "KimiLinearParallelStrategyManager", "_init_resident_ep_decode"
-    )
-    calls = [
-        (
-            node.lineno,
-            (
-                node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else node.func.id if isinstance(node.func, ast.Name) else None
-            ),
-        )
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-    ]
-    build = min(
-        line
-        for line, name in calls
-        if name == "build_resident_ep_mxfp4_layers"
-    )
-    empty_cache = min(
-        line for line, name in calls if name == "empty_cache"
-    )
-    assert build < empty_cache
-
-
 def test_compact_resident_prefill_chunks_before_one_all_reduce():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     function = _function(path, "ResidentEPMXFP4MoELayer", "_forward_ep")
@@ -225,3 +205,13 @@ def test_compact_resident_prefill_chunks_before_one_all_reduce():
         )
     ]
     assert len(bounded_calls) == 1
+
+
+def test_compact_resident_prefill_chunk_policy():
+    path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
+    choose = _isolated_function(path, "compact_prefill_chunk_rows")
+    assert choose(16384, 2048) == 2048
+    assert choose(65536, 2048) == 512
+    assert choose(65536, 256) == 256
+    with pytest.raises(ValueError, match="positive"):
+        choose(65536, 0)

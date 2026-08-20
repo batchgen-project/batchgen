@@ -75,6 +75,19 @@ from batchgen.moe.marlin_grouped_moe import (
 )
 
 
+def compact_prefill_chunk_rows(num_global, configured_rows):
+    """Choose the bounded resident-prefill expert chunk size."""
+    rows = int(configured_rows)
+    if int(num_global) > 16384:
+        # W2 carries ~0.98 GiB more unavoidable full-batch latent/y state than
+        # W1. A 512-row expert chunk keeps the modelled W2 peak below W1's
+        # validated 2,048-row peak.
+        rows = min(rows, 512)
+    if rows <= 0:
+        raise ValueError("compact_chunk_rows must be positive")
+    return rows
+
+
 class MXFP4LayerShard:
     """One MoE layer's local expert shard, repacked into marlin tile order once.
 
@@ -479,9 +492,9 @@ class ResidentEPMXFP4MoELayer:
                 dtype=torch.float32,
                 device=x.device,
             )
-            chunk_rows = int(self.compact_chunk_rows)
-            if chunk_rows <= 0:
-                raise ValueError("compact_chunk_rows must be positive")
+            chunk_rows = compact_prefill_chunk_rows(
+                num_global, self.compact_chunk_rows
+            )
             for chunk_start in range(0, num_global, chunk_rows):
                 chunk_end = min(chunk_start + chunk_rows, num_global)
                 chunk_count = chunk_end - chunk_start
