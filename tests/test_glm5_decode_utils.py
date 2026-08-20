@@ -2865,7 +2865,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             "position_ids": torch.empty((0, 1), dtype=torch.int64),
             "primary_slot_indices": torch.empty((0,), dtype=torch.int32),
             "aux_slot_indices": torch.empty((0,), dtype=torch.int32),
-            "rank_token_counts": torch.zeros((2,), dtype=torch.int64),
+            "rank_token_counts": torch.ones((2,), dtype=torch.int64),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32),
             "flashmla_tile_scheduler_metadata": torch.empty((1,), dtype=torch.int32),
             "flashmla_num_splits": torch.empty((1,), dtype=torch.int32),

@@ -297,7 +297,9 @@ class Glm5CudaGraphAdapter(ModelCudaGraphAdapter):
             "position_ids": torch.empty((0, 1), dtype=torch.int64, device=device),
             "primary_slot_indices": torch.empty((0,), dtype=torch.int32, device=device),
             "aux_slot_indices": torch.empty((0,), dtype=torch.int32, device=device),
-            "rank_token_counts": torch.zeros(
+            # DSA remains empty during capture, but MoE needs one synthetic
+            # row per rank to avoid its unsupported zero-row graph path.
+            "rank_token_counts": torch.ones(
                 (self.world_size,), dtype=torch.int64, device=device,
             ),
             "num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=device),

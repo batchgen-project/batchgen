@@ -9590,7 +9590,10 @@ class BatchGenWorker:
 			"position_ids": torch.empty((0, 1), dtype=torch.int64, device=self.torch_device),
 			"primary_slot_indices": torch.empty((0,), dtype=torch.int32, device=self.torch_device),
 			"aux_slot_indices": torch.empty((0,), dtype=torch.int32, device=self.torch_device),
-			"rank_token_counts": torch.zeros((self.world_size,), dtype=torch.int64, device=self.torch_device),
+			# Keep DSA at zero valid rows so capture cannot mutate a real KV
+			# slot, but give MoE one synthetic row per rank. The exact
+			# production MoE graph cannot capture the all-zero-row case.
+			"rank_token_counts": torch.ones((self.world_size,), dtype=torch.int64, device=self.torch_device),
 			"num_valid_tokens": torch.zeros((1,), dtype=torch.int32, device=self.torch_device),
 			"flashmla_tile_scheduler_metadata": tile_scheduler_metadata,
 			"flashmla_num_splits": num_splits,
