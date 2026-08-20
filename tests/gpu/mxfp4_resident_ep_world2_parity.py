@@ -9,14 +9,15 @@
 Proves ``ResidentEPMXFP4MoELayer.forward``'s world>=2 EP path
 (``_forward_ep``: all_gather the 3584-d LATENT, shard-experts on the global
 tokens, all_reduce(SUM) the combined latent, slice the local rows) reproduces
-the SINGLE-RANK oracle on rank 0's tokens. Two GPUs hold a 2-way split of the
-64 synthetic experts (32/rank); the global decode batch is DP-sharded across
-ranks. rank 0's local-token EP output is gated against three references on the
-SAME tokens/weights:
+the SINGLE-RANK oracle on rank 0's tokens. It also proves the R5 compact-scratch
+variant is numerically identical to the original resident implementation.
+Two GPUs hold a 2-way split of the 64 synthetic experts (32/rank); the global
+decode batch is DP-sharded across ranks. Rank 0's local-token EP output is
+gated against:
 
   * world=1 resident (SAME marlin kernels)  -> expect ~0 (EP correctness)
-  * streamed oracle expert path (block(x))  -> expect ~0 (kernel + repack id)
   * fp32 dequant oracle (M3.1a reference)   -> expect ~1.3e-3 (== M3.1a gate)
+  * compact vs original resident            -> expect exact equality
 
 Reuses the M3.1a fixture + oracle verbatim from
 ``tests/gpu/test_kimi_linear_mxfp4_latent_moe_serving.py`` so the parity is
@@ -24,6 +25,14 @@ against the identical weights, router, and dequant reference the world=1 gate
 uses. Deterministic name-keyed seeding builds a BIT-IDENTICAL block on every
 rank, so each rank's DP-replicated down_proj/router/norm/up + its expert slice
 are consistent without broadcasting weights.
+
+The old harness also subtracted ``shared_experts`` from ``block(x)`` and called
+that a streamed reference. That became invalid when production switched to
+offline-Marlin checkpoint bytes: this synthetic fixture still seeds raw packed
+E2M1 bytes, while ``K3MXFP4Projection.marlin`` now interprets its slot bytes as
+already-Marlin. The production streamed path is covered by the real R4
+output/token hashes; this isolated world-2 harness covers resident EP and the
+new compact scratch only.
 
 Run ON h20-instance-2 (2 free GPUs):
 
@@ -138,6 +147,7 @@ def worker(rank, world, out_path, master_port):
             T_local, block, cfg, dev, world, rank,
             ResidentEPMXFP4MoELayer, build_layer_shard)
 
+        original_ep_out = None
         for compact in (False, True):
             layer.compact_dispatch = compact
             with torch.no_grad():
@@ -155,40 +165,55 @@ def worker(rank, world, out_path, master_port):
                         T0, block, cfg, dev, 1, 0,
                         ResidentEPMXFP4MoELayer, build_layer_shard)
                     ref_res = w1_layer.forward(x_local, block.gate)
-                    # ref B: streamed oracle expert path (block == streamed path)
+                    # ref B: fp32 dequant oracle expert path
                     x3d = x_local.reshape(1, T0, hidden)
-                    streamed = block(x3d)
-                    streamed_ep = (
-                        streamed - block.shared_experts(x3d)
-                    ).reshape(T0, hidden)
-                    # ref C: fp32 dequant oracle expert path
                     _full, ref_expert_path, _idx, _w = \
                         TT._dequant_fp32_reference(block, x3d)
                     ref_oracle = ref_expert_path.reshape(T0, hidden)
 
                 er_res, _ = _err_ratio(ep_out, ref_res)
-                er_streamed, _ = _err_ratio(ep_out, streamed_ep)
                 er_oracle, rms = _err_ratio(ep_out, ref_oracle)
+                if compact:
+                    assert original_ep_out is not None
+                    compact_equal = bool(torch.equal(ep_out, original_ep_out))
+                    compact_max_abs = float(
+                        (ep_out.float() - original_ep_out.float()).abs().max()
+                    )
+                    if not compact_equal:
+                        raise AssertionError(
+                            f"{cfg_name}: compact resident output differs from "
+                            f"original, max_abs={compact_max_abs}"
+                        )
+                else:
+                    original_ep_out = ep_out.detach().clone()
+                    compact_equal = None
+                    compact_max_abs = None
                 rec = dict(
                     cfg=cfg_name, T0=T0, T1=T1, ntp=ntp,
                     compact_dispatch=compact,
                     experts_per_rank=e_per,
                     num_experts=len(block.experts),
                     err_vs_world1_resident=er_res,
-                    err_vs_streamed=er_streamed,
                     err_vs_fp32_oracle=er_oracle,
+                    compact_equals_original=compact_equal,
+                    compact_max_abs=compact_max_abs,
                     rms=rms,
                 )
                 results.append(rec)
                 print(
                     "[ep2] {:14s} T0={} T1={} ntp={} E/rank={} compact={} | "
-                    "vs_world1={:.3e} vs_streamed={:.3e} "
-                    "vs_oracle={:.3e}".format(
+                    "vs_world1={:.3e} vs_oracle={:.3e} "
+                    "compact_equal={}".format(
                         cfg_name, T0, T1, ntp, e_per, compact, er_res,
-                        er_streamed, er_oracle
+                        er_oracle, compact_equal
                     ),
                     flush=True,
                 )
+                if er_res >= 3e-3 or er_oracle >= 3e-3:
+                    raise AssertionError(
+                        f"{cfg_name}: resident EP parity gate failed: "
+                        f"world1={er_res}, fp32_oracle={er_oracle}"
+                    )
             dist.barrier()
 
     if rank == 0:
