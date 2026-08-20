@@ -171,7 +171,14 @@ def test_resident_build_releases_allocator_cache():
         path, "KimiLinearParallelStrategyManager", "_init_resident_ep_decode"
     )
     calls = [
-        (node.lineno, getattr(node.func, "attr", None))
+        (
+            node.lineno,
+            (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else node.func.id if isinstance(node.func, ast.Name) else None
+            ),
+        )
         for node in ast.walk(function)
         if isinstance(node, ast.Call)
     ]
