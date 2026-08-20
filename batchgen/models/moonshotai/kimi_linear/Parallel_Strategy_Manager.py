@@ -205,12 +205,23 @@ class KimiLinearParallelStrategyManager:
             return
         for layer in self.model.model.layers:
             moe = getattr(layer, "block_sparse_moe", None)
-            if moe is None:
-                continue
-            moe._resident_ep_prefill_enabled = bool(enabled)
-            resident = getattr(moe, "_resident_ep_moe", None)
-            if resident is not None:
-                resident.compact_dispatch = bool(enabled)
+            if moe is not None:
+                moe._resident_ep_prefill_enabled = bool(enabled)
+                resident = getattr(moe, "_resident_ep_moe", None)
+                if resident is not None:
+                    resident.compact_dispatch = bool(enabled)
+            # W2 gives each rank 16,384 rows. The normal 8,192-row KimiMLP
+            # tile needs 528 MiB per projection and a 1.03 GiB gate/up cat,
+            # which cannot fit beside the resident expert shard. This smaller
+            # tile is active only for resident prefill; W1 (4,096 rows),
+            # streamed prefill and decode retain their original call shapes.
+            tile = 256 if enabled else None
+            dense = getattr(layer, "mlp", None)
+            if dense is not None:
+                dense._resident_prefill_token_tile = tile
+            shared = getattr(moe, "shared_experts", None) if moe is not None else None
+            if shared is not None:
+                shared._resident_prefill_token_tile = tile
 
     def _build_weight_copy_task(self):
         """Modules the copy engine must stream (host-offloaded), in layer-major

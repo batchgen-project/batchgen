@@ -215,3 +215,40 @@ def test_compact_resident_prefill_chunk_policy():
     assert choose(65536, 256) == 256
     with pytest.raises(ValueError, match="positive"):
         choose(65536, 0)
+
+
+def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
+    dense = type("FFN", (), {"_resident_prefill_token_tile": None})()
+    shared = type("FFN", (), {"_resident_prefill_token_tile": None})()
+    moe = type("MoE", (), {
+        "_resident_ep_moe": None,
+        "shared_experts": shared,
+    })()
+    layer = type("Layer", (), {"mlp": dense, "block_sparse_moe": moe})()
+    manager.model = type(
+        "Model", (), {"model": type("Inner", (), {"layers": [layer]})()}
+    )()
+    method = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_set_resident_ep_prefill_enabled",
+    ).__get__(manager)
+
+    method(True)
+    assert dense._resident_prefill_token_tile == 256
+    assert shared._resident_prefill_token_tile == 256
+    assert moe._resident_ep_prefill_enabled is True
+
+    method(False)
+    assert dense._resident_prefill_token_tile is None
+    assert shared._resident_prefill_token_tile is None
+    assert moe._resident_ep_prefill_enabled is False

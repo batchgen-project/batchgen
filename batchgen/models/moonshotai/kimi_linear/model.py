@@ -153,6 +153,7 @@ class KimiMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = build_activation(config)
+        self._resident_prefill_token_tile = None
 
     def _ffn(self, x: torch.Tensor) -> torch.Tensor:
         """The FFN body, verbatim. Applied to the whole input or to one token
@@ -187,12 +188,18 @@ class KimiMLP(nn.Module):
         emitted. Pinned by tests/test_kimi_linear_ffn_chunk.py.
         """
         num_tokens = x.numel() // x.shape[-1]
-        if num_tokens <= _FFN_TOKEN_TILE:
+        token_tile = _FFN_TOKEN_TILE
+        resident_tile = self._resident_prefill_token_tile
+        if resident_tile is not None and num_tokens > token_tile:
+            token_tile = min(token_tile, int(resident_tile))
+        if token_tile <= 0:
+            raise ValueError("KimiMLP token tile must be positive")
+        if num_tokens <= token_tile:
             # Decode and short prefill: the pre-chunking call, unchanged.
             return self._reduce_tp_output(self._ffn(x))
 
         flat = x.reshape(num_tokens, x.shape[-1])
-        n_tiles = math.ceil(num_tokens / _FFN_TOKEN_TILE)
+        n_tiles = math.ceil(num_tokens / token_tile)
         out = None
         for i in range(n_tiles):
             start = (i * num_tokens) // n_tiles

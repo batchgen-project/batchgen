@@ -241,6 +241,26 @@ def test_short_input_takes_the_untiled_path(M):
     assert torch.equal(got, real_ffn(x))
 
 
+def test_resident_prefill_uses_smaller_tile_only_for_long_inputs(M, monkeypatch):
+    monkeypatch.setattr(M, "_FFN_TOKEN_TILE", TILE)
+    mlp = _mlp(M, "situ", torch.bfloat16)
+    mlp._resident_prefill_token_tile = 8
+    calls = []
+    real_ffn = mlp._ffn
+    mlp._ffn = lambda t: (calls.append(t.shape[0]), real_ffn(t))[1]
+
+    short = torch.randn(8, HIDDEN).bfloat16()
+    long = torch.randn(4 * TILE, HIDDEN).bfloat16()
+    with torch.inference_mode():
+        short_out = mlp(short)
+        long_out = mlp(long)
+
+    assert calls[0] == 8
+    assert max(calls[1:]) <= 8
+    assert torch.equal(short_out, real_ffn(short))
+    assert torch.equal(long_out, real_ffn(long))
+
+
 def test_bf16_exact_at_native_thread_count(M, monkeypatch):
     """The production dtype, at the machine's real thread count — i.e. without
     the single-thread pin the fp32 sweeps need. MEASURED exact for every token
@@ -374,8 +394,15 @@ def test_chunked_equals_unchunked_cuda(M, inter, num_tokens):
     with torch.inference_mode():
         ref = mlp._ffn(x)
         got = mlp(x)
+        mlp._resident_prefill_token_tile = 256
+        resident_got = mlp(x)
 
     assert torch.equal(got, ref), (
         "CUDA: chunked FFN differs from the unchunked body at inter={} "
         "num_tokens={} max|delta|={}".format(
             inter, num_tokens, (got.float() - ref.float()).abs().max()))
+    assert torch.equal(resident_got, ref), (
+        "CUDA: resident-prefill FFN tile differs from the unchunked body at "
+        "inter={} num_tokens={} max|delta|={}".format(
+            inter, num_tokens,
+            (resident_got.float() - ref.float()).abs().max()))
