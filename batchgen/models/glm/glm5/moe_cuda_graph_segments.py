@@ -3,7 +3,7 @@
 The GLM-5 MoE graph captures the full decode MoE module boundary:
 
     padded local tokens -> all_gather
-      -> shared expert
+      -> E=1 CuTe shared expert
       -> router -> rank padding mask -> dispatch_scatter_ragged
          -> FP8 blockwise S1/S3 -> reduce_weighted_scatter -> reduce_scatter
          on the graph capture stream
@@ -54,6 +54,25 @@ def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
     return f"glm5_layer_{layer_idx}_moe"
 
 
+def pack_glm5_shared_scale_for_grouped_gemm(scale: torch.Tensor) -> torch.Tensor:
+    """Pack one shared-expert block scale matrix as grouped-GEMM ``E=1``."""
+    if scale.dim() != 2:
+        raise ValueError(
+            f"GLM-5 shared scale must be 2D [N/128, K/128], got {tuple(scale.shape)}"
+        )
+    n_blocks, k_blocks = scale.shape
+    k_blocks_pad4 = (k_blocks + 3) // 4 * 4
+    packed = torch.zeros(
+        1,
+        n_blocks,
+        k_blocks_pad4,
+        dtype=torch.float32,
+        device=scale.device,
+    )
+    packed[0, :, :k_blocks].copy_(scale)
+    return packed
+
+
 @dataclass
 class _Glm5MoEGraphBuffers:
     padded: torch.Tensor
@@ -79,7 +98,12 @@ class _Glm5MoEGraphBuffers:
     inter_scale: torch.Tensor
     routed_global_output: torch.Tensor
     local_moe_output: torch.Tensor
+    shared_output: torch.Tensor
     cu_seqlens: torch.Tensor
+    shared_seqlens: torch.Tensor
+    shared_cu_seqlens: torch.Tensor
+    shared_x_scale: torch.Tensor
+    shared_inter_scale: torch.Tensor
     capacity: int
 
 
@@ -121,6 +145,7 @@ _MOE_BUCKET_DIM_FIELDS = (
     "inter_fp8",
     "routed_global_output",
     "local_moe_output",
+    "shared_output",
 )
 
 _MOE_SHARED_FIELDS = (
@@ -134,6 +159,10 @@ _MOE_REBUILT_FIELDS = (
     "local_pos",
     "x_scale",
     "inter_scale",
+    "shared_seqlens",
+    "shared_cu_seqlens",
+    "shared_x_scale",
+    "shared_inter_scale",
     "capacity",
 )
 
@@ -235,6 +264,7 @@ class Glm5MoEGraphBufferPool:
         b["inter_fp8"] = torch.empty(capacity, n, dtype=torch.uint8, device=d)
         b["routed_global_output"] = torch.empty(max_global, h, dtype=torch.bfloat16, device=d)
         b["local_moe_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
+        b["shared_output"] = torch.empty(max_bucket, h, dtype=torch.bfloat16, device=d)
 
         for bucket_size in self.bucket_sizes:
             self._create_view(bucket_size)
@@ -243,6 +273,8 @@ class Glm5MoEGraphBufferPool:
         scale_bytes = sum(
             v.x_scale.nelement() * v.x_scale.element_size()
             + v.inter_scale.nelement() * v.inter_scale.element_size()
+            + v.shared_x_scale.nelement() * v.shared_x_scale.element_size()
+            + v.shared_inter_scale.nelement() * v.shared_inter_scale.element_size()
             for v in self._views.values()
         )
         logger.info(
@@ -290,6 +322,7 @@ class Glm5MoEGraphBufferPool:
             "inter_fp8": b["inter_fp8"][:capacity],
             "routed_global_output": b["routed_global_output"][:global_rows],
             "local_moe_output": b["local_moe_output"][:bucket_size],
+            "shared_output": b["shared_output"][:bucket_size],
         }
         if set(sliced) != set(_MOE_BUCKET_DIM_FIELDS):
             raise RuntimeError(
@@ -302,6 +335,18 @@ class Glm5MoEGraphBufferPool:
         # contiguous, and the GEMM needs a contiguous [K/128, m_pad]).
         _, x_scale = make_quant_buffers(capacity, self.hidden_size, self.device)
         _, inter_scale = make_quant_buffers(capacity, self.intermediate_size, self.device)
+        shared_x_scale = torch.zeros(
+            self.hidden_size // 128,
+            bucket_size,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        shared_inter_scale = torch.zeros(
+            self.intermediate_size // 128,
+            bucket_size,
+            dtype=torch.float32,
+            device=self.device,
+        )
         self._views[bucket_size] = _Glm5MoEGraphBuffers(
             **sliced,
             rank_ids=positions // bucket_size,
@@ -311,6 +356,18 @@ class Glm5MoEGraphBufferPool:
             cu_seqlens=b["cu_seqlens"],
             x_scale=x_scale,
             inter_scale=inter_scale,
+            shared_seqlens=torch.tensor(
+                [bucket_size],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            shared_cu_seqlens=torch.tensor(
+                [0, bucket_size],
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            shared_x_scale=shared_x_scale,
+            shared_inter_scale=shared_inter_scale,
             capacity=capacity,
         )
 
@@ -359,6 +416,19 @@ class Glm5MoEGraphSegment:
             self.gate_weight_bf16,
             router_bias=None,
             topk=self.num_experts_per_tok,
+        )
+        shared = self.moe.shared_experts
+        self.shared_gate_weight = shared.cached_gate.unsqueeze(0).contiguous()
+        self.shared_up_weight = shared.cached_up.unsqueeze(0).contiguous()
+        self.shared_down_weight = shared.cached_down.unsqueeze(0).contiguous()
+        self.shared_gate_scale = pack_glm5_shared_scale_for_grouped_gemm(
+            shared.weight_dequant_scale["gate_proj.weight_scale_inv"]
+        )
+        self.shared_up_scale = pack_glm5_shared_scale_for_grouped_gemm(
+            shared.weight_dequant_scale["up_proj.weight_scale_inv"]
+        )
+        self.shared_down_scale = pack_glm5_shared_scale_for_grouped_gemm(
+            shared.weight_dequant_scale["down_proj.weight_scale_inv"]
         )
         self.routed_stream = type(moe)._routed_moe_stream
         if self.routed_stream is None:
@@ -431,7 +501,7 @@ class Glm5MoEGraphSegment:
             )
 
         current_stream = torch.cuda.current_stream(self.device)
-        shared_output = self.moe.shared_expert_forward(padded)
+        shared_output = self._shared_expert_forward(bufs, padded)
 
         with torch.cuda.stream(current_stream):
             if 192 <= global_rows <= 512:
@@ -509,6 +579,58 @@ class Glm5MoEGraphSegment:
 
         bufs.local_moe_output.add_(shared_output)
         return {"moe_output": bufs.local_moe_output}
+
+    def _shared_expert_forward(
+        self,
+        bufs: _Glm5MoEGraphBuffers,
+        padded: torch.Tensor,
+    ) -> torch.Tensor:
+        """Graph-only E=1 CuTe shared expert.
+
+        DeepGEMM is numerically valid but its SM90 FP8 runtime cannot follow
+        the routed post-S1 quantizer across repeated layers in one CUDA graph.
+        Reuse the graph-stable grouped CuTe path with one synthetic expert.
+        The routed FP8/intermediate scratch is safe to borrow here because the
+        routed path overwrites it only after ``shared_output`` is complete.
+        """
+        bucket_size = padded.shape[0]
+        act_quant_ragged(
+            padded,
+            bufs.shared_seqlens,
+            bufs.shared_cu_seqlens,
+            bufs.x_fp8[:bucket_size],
+            bufs.shared_x_scale,
+        )
+        grouped_fp8_blockwise_fused_s1(
+            bufs.x_fp8[:bucket_size].view(torch.float8_e4m3fn),
+            bufs.shared_x_scale,
+            self.shared_gate_weight.view(torch.float8_e4m3fn),
+            self.shared_up_weight.view(torch.float8_e4m3fn),
+            self.shared_gate_scale,
+            self.shared_up_scale,
+            bufs.shared_seqlens,
+            bufs.shared_cu_seqlens,
+            _GLM5_MOE_GEMM_TILEM_AVG,
+            output=bufs.intermediate[:bucket_size],
+        )
+        act_quant_ragged(
+            bufs.intermediate[:bucket_size],
+            bufs.shared_seqlens,
+            bufs.shared_cu_seqlens,
+            bufs.inter_fp8[:bucket_size],
+            bufs.shared_inter_scale,
+        )
+        grouped_fp8_blockwise_s3(
+            bufs.inter_fp8[:bucket_size].view(torch.float8_e4m3fn),
+            bufs.shared_inter_scale,
+            self.shared_down_weight.view(torch.float8_e4m3fn),
+            self.shared_down_scale,
+            bufs.shared_seqlens,
+            bufs.shared_cu_seqlens,
+            _GLM5_MOE_GEMM_TILEM_AVG,
+            output=bufs.shared_output,
+        )
+        return bufs.shared_output
 
     def _fp8_blockwise_gemm_3d(
         self,

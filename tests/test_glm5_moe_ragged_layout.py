@@ -290,13 +290,26 @@ def test_pool_scale_buffers_are_per_bucket_transposed_and_zeroed():
         assert v.dispatched_x.shape == (cap, 256)
         assert v.x_fp8.shape == (cap, 256)
         assert v.inter_fp8.shape == (cap, 128)
+        assert v.shared_output.shape == (bucket, 256)
         # Transposed, GEMM-ready: [dim/128, capacity]
         assert v.x_scale.shape == (256 // QUANT_BLOCK, cap)
         assert v.inter_scale.shape == (128 // QUANT_BLOCK, cap)
-        assert v.x_scale.is_contiguous() and v.inter_scale.is_contiguous()
+        assert v.shared_x_scale.shape == (256 // QUANT_BLOCK, bucket)
+        assert v.shared_inter_scale.shape == (128 // QUANT_BLOCK, bucket)
+        assert v.shared_seqlens.tolist() == [bucket]
+        assert v.shared_cu_seqlens.tolist() == [0, bucket]
+        assert (
+            v.x_scale.is_contiguous()
+            and v.inter_scale.is_contiguous()
+            and v.shared_x_scale.is_contiguous()
+            and v.shared_inter_scale.is_contiguous()
+        )
         assert float(v.x_scale.abs().sum()) == 0.0
         assert float(v.inter_scale.abs().sum()) == 0.0
+        assert float(v.shared_x_scale.abs().sum()) == 0.0
+        assert float(v.shared_inter_scale.abs().sum()) == 0.0
     assert pool.get(8).x_scale.data_ptr() != pool.get(32).x_scale.data_ptr()
+    assert pool.get(8).shared_x_scale.data_ptr() != pool.get(32).shared_x_scale.data_ptr()
 
 
 def test_pool_field_coverage_guard_catches_a_stale_set():
@@ -314,6 +327,29 @@ def test_pool_field_coverage_guard_catches_a_stale_set():
         _assert_moe_buffer_field_coverage(full[:-1], "dropped-a-field")
     with pytest.raises(RuntimeError, match="unknown="):
         _assert_moe_buffer_field_coverage(full + ("not_a_field",), "typo")
+
+
+def test_shared_scale_pack_adds_e1_axis_and_zero_pad():
+    from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+        pack_glm5_shared_scale_for_grouped_gemm,
+    )
+
+    scale = torch.arange(30, dtype=torch.float32).view(5, 6)
+    packed = pack_glm5_shared_scale_for_grouped_gemm(scale)
+
+    assert packed.shape == (1, 5, 8)
+    assert torch.equal(packed[0, :, :6], scale)
+    assert torch.equal(packed[0, :, 6:], torch.zeros(5, 2))
+    assert packed.is_contiguous()
+
+
+def test_shared_scale_pack_rejects_non_matrix():
+    from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+        pack_glm5_shared_scale_for_grouped_gemm,
+    )
+
+    with pytest.raises(ValueError, match="must be 2D"):
+        pack_glm5_shared_scale_for_grouped_gemm(torch.zeros(2, 3, 4))
 
 
 def test_pool_rejects_a_bucket_larger_than_the_base():
