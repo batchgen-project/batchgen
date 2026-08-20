@@ -138,43 +138,58 @@ def worker(rank, world, out_path, master_port):
             T_local, block, cfg, dev, world, rank,
             ResidentEPMXFP4MoELayer, build_layer_shard)
 
-        with torch.no_grad():
-            ep_out = layer.forward(x_local, block.gate)   # [T_local, hidden]
-
-        assert list(ep_out.shape) == [T_local, hidden], ep_out.shape
-        assert torch.isfinite(ep_out).all(), f"{cfg_name} EP output non-finite"
-
-        if rank == 0:
+        for compact in (False, True):
+            layer.compact_dispatch = compact
             with torch.no_grad():
-                # ref A: world=1 resident (all experts, SAME kernels) on rank0 tokens
-                w1_layer, _, _ = _build_layer(
-                    T0, block, cfg, dev, 1, 0,
-                    ResidentEPMXFP4MoELayer, build_layer_shard)
-                ref_res = w1_layer.forward(x_local, block.gate)
-                # ref B: streamed oracle expert path (block == streamed path)
-                x3d = x_local.reshape(1, T0, hidden)
-                streamed = block(x3d)
-                streamed_ep = (streamed - block.shared_experts(x3d)
-                               ).reshape(T0, hidden)
-                # ref C: fp32 dequant oracle expert path (the M3.1a reference)
-                _full, ref_expert_path, _idx, _w = \
-                    TT._dequant_fp32_reference(block, x3d)
-                ref_oracle = ref_expert_path.reshape(T0, hidden)
+                ep_out = layer.forward(x_local, block.gate)
 
-            er_res, _ = _err_ratio(ep_out, ref_res)
-            er_streamed, _ = _err_ratio(ep_out, streamed_ep)
-            er_oracle, rms = _err_ratio(ep_out, ref_oracle)
-            rec = dict(cfg=cfg_name, T0=T0, T1=T1, ntp=ntp,
-                       experts_per_rank=e_per, num_experts=len(block.experts),
-                       err_vs_world1_resident=er_res,
-                       err_vs_streamed=er_streamed,
-                       err_vs_fp32_oracle=er_oracle, rms=rms)
-            results.append(rec)
-            print("[ep2] {:14s} T0={} T1={} ntp={} E/rank={} | "
-                  "vs_world1={:.3e} vs_streamed={:.3e} vs_oracle={:.3e}".format(
-                      cfg_name, T0, T1, ntp, e_per, er_res, er_streamed,
-                      er_oracle), flush=True)
-        dist.barrier()
+            assert list(ep_out.shape) == [T_local, hidden], ep_out.shape
+            assert torch.isfinite(ep_out).all(), (
+                f"{cfg_name} compact={compact} EP output non-finite"
+            )
+
+            if rank == 0:
+                with torch.no_grad():
+                    # ref A: world=1 resident (all experts, SAME kernels)
+                    w1_layer, _, _ = _build_layer(
+                        T0, block, cfg, dev, 1, 0,
+                        ResidentEPMXFP4MoELayer, build_layer_shard)
+                    ref_res = w1_layer.forward(x_local, block.gate)
+                    # ref B: streamed oracle expert path (block == streamed path)
+                    x3d = x_local.reshape(1, T0, hidden)
+                    streamed = block(x3d)
+                    streamed_ep = (
+                        streamed - block.shared_experts(x3d)
+                    ).reshape(T0, hidden)
+                    # ref C: fp32 dequant oracle expert path
+                    _full, ref_expert_path, _idx, _w = \
+                        TT._dequant_fp32_reference(block, x3d)
+                    ref_oracle = ref_expert_path.reshape(T0, hidden)
+
+                er_res, _ = _err_ratio(ep_out, ref_res)
+                er_streamed, _ = _err_ratio(ep_out, streamed_ep)
+                er_oracle, rms = _err_ratio(ep_out, ref_oracle)
+                rec = dict(
+                    cfg=cfg_name, T0=T0, T1=T1, ntp=ntp,
+                    compact_dispatch=compact,
+                    experts_per_rank=e_per,
+                    num_experts=len(block.experts),
+                    err_vs_world1_resident=er_res,
+                    err_vs_streamed=er_streamed,
+                    err_vs_fp32_oracle=er_oracle,
+                    rms=rms,
+                )
+                results.append(rec)
+                print(
+                    "[ep2] {:14s} T0={} T1={} ntp={} E/rank={} compact={} | "
+                    "vs_world1={:.3e} vs_streamed={:.3e} "
+                    "vs_oracle={:.3e}".format(
+                        cfg_name, T0, T1, ntp, e_per, compact, er_res,
+                        er_streamed, er_oracle
+                    ),
+                    flush=True,
+                )
+            dist.barrier()
 
     if rank == 0:
         with open(out_path, "w") as f:

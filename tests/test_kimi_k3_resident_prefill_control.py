@@ -1,4 +1,5 @@
 import ast
+import copy
 from pathlib import Path
 
 import pytest
@@ -21,14 +22,43 @@ def _function(path, class_name, function_name):
     )
 
 
-def test_prefill_mode_accepts_only_streamed_or_resident_ep():
-    from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import (
-        KimiLinearParallelStrategyManager,
+def _isolated_method(path, class_name, function_name):
+    method = copy.deepcopy(_function(path, class_name, function_name))
+    module = ast.Module(
+        body=[
+            ast.ClassDef(
+                name="Isolated",
+                bases=[],
+                keywords=[],
+                body=[method],
+                decorator_list=[],
+            )
+        ],
+        type_ignores=[],
     )
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return getattr(namespace["Isolated"], function_name)
 
-    manager = object.__new__(KimiLinearParallelStrategyManager)
+
+def test_prefill_mode_accepts_only_streamed_or_resident_ep():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
     manager._is_k3 = True
     manager._prefill_moe_mode = "streamed"
+    manager.set_prefill_moe_mode = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
+    ).__get__(manager)
+    manager.prefill_uses_resident_ep = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "prefill_uses_resident_ep"
+    ).__get__(manager)
 
     manager.set_prefill_moe_mode("resident_ep")
     assert manager.prefill_uses_resident_ep()
@@ -39,13 +69,20 @@ def test_prefill_mode_accepts_only_streamed_or_resident_ep():
 
 
 def test_resident_prefill_is_refused_for_non_k3():
-    from batchgen.models.moonshotai.kimi_linear.Parallel_Strategy_Manager import (
-        KimiLinearParallelStrategyManager,
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
     )
-
-    manager = object.__new__(KimiLinearParallelStrategyManager)
+    manager = type("Manager", (), {})()
     manager._is_k3 = False
     manager._prefill_moe_mode = "streamed"
+    manager.set_prefill_moe_mode = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "set_prefill_moe_mode"
+    ).__get__(manager)
     with pytest.raises(ValueError, match="only for Kimi-K3"):
         manager.set_prefill_moe_mode("resident_ep")
 
