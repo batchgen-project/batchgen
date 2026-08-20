@@ -239,7 +239,7 @@ def test_compact_resident_prefill_chunk_policy():
     path = ROOT / "batchgen" / "moe" / "fused_moe_mxfp4_resident.py"
     choose = _isolated_function(path, "compact_prefill_chunk_rows")
     assert choose(16384, 2048) == 2048
-    assert choose(65536, 2048) == 512
+    assert choose(65536, 2048) == 256
     assert choose(65536, 256) == 256
     with pytest.raises(ValueError, match="positive"):
         choose(65536, 0)

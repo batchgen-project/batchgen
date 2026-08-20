@@ -80,9 +80,12 @@ def compact_prefill_chunk_rows(num_global, configured_rows):
     rows = int(configured_rows)
     if int(num_global) > 16384:
         # W2 carries ~0.98 GiB more unavoidable full-batch latent/y state than
-        # W1. A 512-row expert chunk keeps the modelled W2 peak below W1's
-        # validated 2,048-row peak.
-        rows = min(rows, 512)
+        # W1. Live telemetry after reserving y and tiling RMSNorm left only
+        # 88–96 MiB at the first expert chunk; the 512-row BF16 expert_out is
+        # 98 MiB by itself. A 256-row chunk halves dispatched/intermediate/
+        # expert_out and the FP32 combine temporaries without changing their
+        # per-token arithmetic or the single final all-reduce.
+        rows = min(rows, 256)
     if rows <= 0:
         raise ValueError("compact_chunk_rows must be positive")
     return rows
