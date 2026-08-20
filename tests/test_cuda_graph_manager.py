@@ -114,6 +114,32 @@ def test_capture_uses_manager_owned_explicit_stream(monkeypatch):
     assert manager._capture_stream != torch.cuda.current_stream(device)
 
 
+def test_segment_capture_streams_are_stable_and_distinct(monkeypatch):
+    manager = _make_uninitialized_manager([1], segment_names=("a", "b"))
+    manager.device = torch.device("cpu")
+    manager._capture_stream = object()
+    manager._separate_capture_streams = False
+    manager._segment_capture_streams = {}
+
+    streams = []
+
+    def fake_stream(*, device):
+        stream = types.SimpleNamespace(device=device, index=len(streams))
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", fake_stream)
+
+    assert manager._capture_stream_for("a") is manager._capture_stream
+    manager.enable_segment_capture_streams()
+    stream_a = manager._capture_stream_for("a")
+    stream_b = manager._capture_stream_for("b")
+
+    assert stream_a is manager._capture_stream_for("a")
+    assert stream_b is manager._capture_stream_for("b")
+    assert stream_a is not stream_b
+
+
 def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():
     manager = _make_uninitialized_manager([1, 2], segment_names=("a", "b"))
 

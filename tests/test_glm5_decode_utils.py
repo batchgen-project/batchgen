@@ -2712,7 +2712,11 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
             self.device = device
             self.captured = []
             self._segments = {}
+            self.segment_capture_streams_enabled = False
             FakeManager.instances.append(self)
+
+        def enable_segment_capture_streams(self):
+            self.segment_capture_streams_enabled = True
 
         def register_segment(self, name, segment):
             self._segments[name] = segment
@@ -2877,6 +2881,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
 
     expected_buckets = [8, 4, 2, 1]
     capture_manager = FakeManager.instances[-1]
+    assert capture_manager.segment_capture_streams_enabled
     assert capture_manager.captured == expected_buckets
     assert tuple(capture_manager._segments) == tuple(
         f"glm5_whole_model_chunk_{idx:02d}" for idx in range(4)

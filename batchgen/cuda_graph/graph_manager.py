@@ -179,9 +179,14 @@ class CUDAGraphManager:
         # multi-stream NCCL/router capture on CUDA 12.9, while leaving capture
         # implicit also shares one stream across otherwise independent managers.
         #
-        # Keep one explicit stream per pool, as required by PyTorch's graph-pool
-        # contract. Do not use this stream for eager warmup or replay.
+        # Keep an explicit default stream for the pool. Callers that capture
+        # multiple NCCL-bearing segments can opt into one persistent stream per
+        # segment; graphs sharing the pool are still captured and replayed in
+        # the same deterministic order. Do not use these streams for eager
+        # warmup or replay.
         self._capture_stream = torch.cuda.Stream(device=self.device)
+        self._separate_capture_streams = False
+        self._segment_capture_streams: Dict[str, torch.cuda.Stream] = {}
 
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
@@ -208,6 +213,25 @@ class CUDAGraphManager:
             raise ValueError(f"Segment '{name}' already registered")
         self._segments[name] = segment
         self._graphs[name] = {}
+
+    def enable_segment_capture_streams(self) -> None:
+        """Capture each registered segment on its own persistent CUDA stream."""
+        if self._is_captured:
+            raise RuntimeError("Cannot change capture streams after capture")
+        self._separate_capture_streams = True
+
+    def _capture_stream_for(self, name: str) -> torch.cuda.Stream:
+        if not getattr(self, "_separate_capture_streams", False):
+            return self._capture_stream
+        streams = getattr(self, "_segment_capture_streams", None)
+        if streams is None:
+            streams = {}
+            self._segment_capture_streams = streams
+        stream = streams.get(name)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            streams[name] = stream
+        return stream
 
     # -- Capture ------------------------------------------------------------
 
@@ -321,17 +345,18 @@ class CUDAGraphManager:
 
         # 3. Capture on the manager's persistent capture-only stream.
         caller_stream = torch.cuda.current_stream(self.device)
-        self._capture_stream.wait_stream(caller_stream)
+        capture_stream = self._capture_stream_for(name)
+        capture_stream.wait_stream(caller_stream)
         _capture_start = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(
             graph,
             pool=self._pool,
-            stream=self._capture_stream,
+            stream=capture_stream,
         ):
             with torch.inference_mode():
                 static_outputs = segment.forward(**static_inputs)
-        caller_stream.wait_stream(self._capture_stream)
+        caller_stream.wait_stream(capture_stream)
         torch.cuda.synchronize(self.device)
         _capture_s = time.perf_counter() - _capture_start
         logger.info(

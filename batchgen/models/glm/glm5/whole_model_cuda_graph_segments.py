@@ -28,8 +28,8 @@ from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 
 
 # The exact production GLM-5.2 MoE path captures four repeated layers on the
-# H200 CUDA 12.9 / NCCL 2.27.3 runtime, while five fail during capture. Keep
-# every graph chunk at or below the measured passing boundary.
+# H200 CUDA 12.9 / NCCL 2.27.3 runtime, while five fail during capture. Each
+# independent chunk also needs its own persistent capture stream.
 GLM5_WHOLE_GRAPH_MAX_LAYERS_PER_CHUNK = 4
 
 
