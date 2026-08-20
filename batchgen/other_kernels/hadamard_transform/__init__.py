@@ -18,7 +18,7 @@ _cuda_flags = [
 ]
 
 _hadamard_cuda = load(
-    name="fast_hadamard_transform_cuda",
+    name="batchgen_glm5_fast_hadamard_transform_cuda",
     sources=[
         os.path.join(_csrc_dir, "hadamard_binding.cpp"),
         os.path.join(_csrc_dir, "fast_hadamard_transform_cuda.cu"),
@@ -30,7 +30,7 @@ _hadamard_cuda = load(
 )
 
 _fused_rope_hadamard_cuda = load(
-    name="fused_rope_hadamard_cuda",
+    name="batchgen_glm5_fused_rope_hadamard_cuda",
     sources=[
         os.path.join(_csrc_dir, "fused_rope_hadamard_binding.cpp"),
         os.path.join(_csrc_dir, "fused_rope_hadamard.cu"),
