@@ -2807,6 +2807,44 @@ def test_glm5_whole_graph_missing_bucket_after_capture_uses_eager(monkeypatch):
     )
 
 
+def test_glm52_dsa_single_capture_bucket_covers_smaller_replay_batches(
+    monkeypatch,
+):
+    from batchgen.batchgen_worker import BatchGenWorker
+    import batchgen.cuda_graph as cuda_graph_module
+
+    class ReplayBucketingReady(Exception):
+        pass
+
+    bucket_policies = []
+
+    class FakeBucketing:
+        def __init__(self, bucket_sizes):
+            bucket_policies.append(list(bucket_sizes))
+            if len(bucket_policies) == 2:
+                assert bucket_sizes == [56]
+                raise ReplayBucketingReady
+
+        def get_padded_size(self, batch_size):
+            assert batch_size == 48
+            return 56
+
+    monkeypatch.setattr(cuda_graph_module, "BatchSizeBucketing", FakeBucketing)
+
+    worker = object.__new__(BatchGenWorker)
+    worker._current_decode_local_batch_size = 48
+    worker._glm5_dsa_graph_capture_attempted_for_batch = False
+    with pytest.raises(ReplayBucketingReady):
+        worker._setup_glm52_dsa_cuda_graphs(
+            object(),
+            [1, 2, 3, 5, 8, 12, 20, 32, 56, 96, 160, 256],
+        )
+    assert bucket_policies == [
+        [1, 2, 3, 5, 8, 12, 20, 32, 56, 96, 160, 256],
+        [56],
+    ]
+
+
 def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     monkeypatch,
 ):

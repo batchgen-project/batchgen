@@ -9073,9 +9073,9 @@ class BatchGenWorker:
 			Glm5ReuseTopkAttnSegment,
 		)
 
-		bucketing = BatchSizeBucketing(bucket_sizes)
+		configured_bucketing = BatchSizeBucketing(bucket_sizes)
 		try:
-			capture_bucket = int(bucketing.get_padded_size(local_bsz))
+			capture_bucket = int(configured_bucketing.get_padded_size(local_bsz))
 		except ValueError:
 			logging.info(
 				"Rank %s: GLM-5.2 local decode batch %s exceeds graph buckets; "
@@ -9085,6 +9085,10 @@ class BatchGenWorker:
 			)
 			self._glm5_dsa_graph_capture_attempted_for_batch = True
 			return
+		# This path intentionally captures one DSA bucket. Give the replay
+		# manager that exact policy so every smaller live batch pads to the
+		# captured graph instead of mapping to an uncaptured configured bucket.
+		bucketing = BatchSizeBucketing([capture_bucket])
 
 		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
 		aux_manager = getattr(
