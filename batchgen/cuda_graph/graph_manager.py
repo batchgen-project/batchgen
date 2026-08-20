@@ -214,8 +214,6 @@ class CUDAGraphManager:
             raise ValueError(f"Segment '{name}' already registered")
         self._segments[name] = segment
         self._graphs[name] = {}
-        if getattr(self, "_separate_capture_streams", False):
-            self._capture_stream_for(name)
 
     def enable_segment_capture_streams(self, *, barrier=None) -> None:
         """Capture each registered segment on its own persistent CUDA stream."""
@@ -223,8 +221,6 @@ class CUDAGraphManager:
             raise RuntimeError("Cannot change capture streams after capture")
         self._separate_capture_streams = True
         self._segment_capture_barrier = barrier
-        for name in self._segments:
-            self._capture_stream_for(name)
 
     def _capture_stream_for(self, name: str) -> torch.cuda.Stream:
         if not getattr(self, "_separate_capture_streams", False):
