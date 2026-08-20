@@ -187,6 +187,7 @@ class CUDAGraphManager:
         self._capture_stream = torch.cuda.Stream(device=self.device)
         self._separate_capture_streams = False
         self._segment_capture_streams: Dict[str, torch.cuda.Stream] = {}
+        self._segment_capture_barrier = None
 
         # segment_name → {bucket_size → CapturedGraph}
         self._graphs: Dict[str, Dict[int, CapturedGraph]] = {}
@@ -214,11 +215,12 @@ class CUDAGraphManager:
         self._segments[name] = segment
         self._graphs[name] = {}
 
-    def enable_segment_capture_streams(self) -> None:
+    def enable_segment_capture_streams(self, *, barrier=None) -> None:
         """Capture each registered segment on its own persistent CUDA stream."""
         if self._is_captured:
             raise RuntimeError("Cannot change capture streams after capture")
         self._separate_capture_streams = True
+        self._segment_capture_barrier = barrier
 
     def _capture_stream_for(self, name: str) -> torch.cuda.Stream:
         if not getattr(self, "_separate_capture_streams", False):
@@ -273,11 +275,13 @@ class CUDAGraphManager:
                 else self.WARMUP_ITERATIONS_SUBSEQUENT
             )
             for seg_name, segment in self._segments.items():
-                if bucket_size in self._graphs.get(seg_name, {}):
-                    continue
-                self._capture_one(
-                    seg_name, segment, bucket_size, warmup_iters=warmup_iters
-                )
+                if bucket_size not in self._graphs.get(seg_name, {}):
+                    self._capture_one(
+                        seg_name, segment, bucket_size, warmup_iters=warmup_iters
+                    )
+                barrier = getattr(self, "_segment_capture_barrier", None)
+                if barrier is not None:
+                    barrier()
             done = i + 1
             bar = "█" * done + "░" * (num_buckets - done)
             logger.info(

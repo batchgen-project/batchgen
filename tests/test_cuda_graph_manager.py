@@ -140,6 +140,28 @@ def test_segment_capture_streams_are_stable_and_distinct(monkeypatch):
     assert stream_a is not stream_b
 
 
+def test_segment_capture_barrier_runs_between_registered_segments():
+    manager = _make_uninitialized_manager([1], segment_names=("a", "b"))
+    captures = []
+    barriers = []
+
+    def fake_capture_one(self, name, segment, bucket_size, warmup_iters=None):
+        del segment, warmup_iters
+        captures.append((name, bucket_size))
+        self._graphs[name][bucket_size] = object()
+
+    manager._capture_one = types.MethodType(fake_capture_one, manager)
+    manager._is_captured = False
+    manager.enable_segment_capture_streams(
+        barrier=lambda: barriers.append(tuple(captures))
+    )
+
+    manager.warmup_and_capture_buckets([1])
+
+    assert captures == [("a", 1), ("b", 1)]
+    assert barriers == [(("a", 1),), (("a", 1), ("b", 1))]
+
+
 def test_has_bucket_for_all_segments_and_drop_bucket_release_buffers():
     manager = _make_uninitialized_manager([1, 2], segment_names=("a", "b"))
 

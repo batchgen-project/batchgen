@@ -9988,7 +9988,7 @@ class BatchGenWorker:
 				layer_segments=layer_segments,
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
-			manager.enable_segment_capture_streams()
+			manager.enable_segment_capture_streams(barrier=dist.barrier)
 			for chunk_seg in whole_seg.chunk_segments:
 				manager.register_segment(chunk_seg.name, chunk_seg)
 			first_wrapper = self.model.model.layers[0].self_attn.module
