@@ -394,7 +394,7 @@ def test_chunked_equals_unchunked_cuda(M, inter, num_tokens):
     with torch.inference_mode():
         ref = mlp._ffn(x)
         got = mlp(x)
-        mlp._resident_prefill_token_tile = 256
+        mlp._resident_prefill_token_tile = 512
         resident_got = mlp(x)
 
     assert torch.equal(got, ref), (

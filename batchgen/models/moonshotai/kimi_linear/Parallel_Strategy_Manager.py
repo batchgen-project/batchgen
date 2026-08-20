@@ -215,7 +215,7 @@ class KimiLinearParallelStrategyManager:
             # which cannot fit beside the resident expert shard. This smaller
             # tile is active only for resident prefill; W1 (4,096 rows),
             # streamed prefill and decode retain their original call shapes.
-            tile = 256 if enabled else None
+            tile = 512 if enabled else None
             dense = getattr(layer, "mlp", None)
             if dense is not None:
                 dense._resident_prefill_token_tile = tile

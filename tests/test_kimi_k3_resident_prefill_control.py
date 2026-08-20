@@ -244,8 +244,8 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     ).__get__(manager)
 
     method(True)
-    assert dense._resident_prefill_token_tile == 256
-    assert shared._resident_prefill_token_tile == 256
+    assert dense._resident_prefill_token_tile == 512
+    assert shared._resident_prefill_token_tile == 512
     assert moe._resident_ep_prefill_enabled is True
 
     method(False)
