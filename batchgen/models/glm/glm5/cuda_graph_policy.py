@@ -1,10 +1,11 @@
 """GLM-5 CUDA graph routing policy helpers.
 
-Phase C: layer / MoE / DSA / DSA-full / segmented graph modes are retired.
-The whole-model graph (driven by ``--enable-cuda-graph`` on GLM-5-FP8) is
-the only supported mode. Mode env vars (``BATCHGEN_GLM5_*_CUDA_GRAPH``,
-``BATCHGEN_SEGMENTED_GRAPH``) are no longer read here; the predicates for
-the retired modes return ``False`` unconditionally.
+GLM-5 / GLM-5.1 keep the whole-model graph selected by
+``--enable-cuda-graph``. GLM-5.2 uses per-layer full-DSA graphs instead:
+on the CUDA 12.9 / NCCL 2.27 H200 runtime, a second independent graph is
+invalidated when both graphs compose FlashMLA/DSA and graph-captured NCCL
+collectives. Keeping MoE eager avoids that unsupported composition while
+still removing the launch-heavy attention path.
 
 The compare-only debug env var ``BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE``
 remains in this file for the developer-facing compare facility (renaming
@@ -47,6 +48,20 @@ def _is_glm5_fp8_graph_default_model(model_name: str | None) -> bool:
     )
 
 
+def _is_glm52_fp8_model(model_name: str | None) -> bool:
+    normalized = (model_name or "").strip().lower()
+    return any(
+        pattern in normalized
+        for pattern in (
+            "zai-org/glm-5.2-fp8",
+            "glm-5.2-fp8",
+            "glm_5.2_fp8",
+            "glm52-fp8",
+            "glm52_fp8",
+        )
+    )
+
+
 def _env_flag_enabled(env: Mapping[str, str], name: str) -> bool:
     return env.get(name, "0") == "1"
 
@@ -61,8 +76,11 @@ def glm5_dsa_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    # Phase C: DSA-only graph mode retired. Always False.
-    return False
+    return (
+        bool(enable_cuda_graph)
+        and _is_glm_model(model_name)
+        and _is_glm52_fp8_model(model_name)
+    )
 
 
 def glm5_dsa_full_cuda_graph_requested(
@@ -79,7 +97,8 @@ def glm5_moe_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    # Phase C: MoE-only graph mode retired. Always False.
+    # Full-module per-layer MoE graphs are not selected on GLM-5.2: 75
+    # independent PyNCCL graphs exceed the runtime's graph-capture ceiling.
     return False
 
 
@@ -95,7 +114,11 @@ def glm5_whole_model_cuda_graph_requested_for_model(
     # mode env vars are retired.
     if not _is_glm_model(model_name):
         return False
-    return bool(enable_cuda_graph) and _is_glm5_fp8_graph_default_model(model_name)
+    return (
+        bool(enable_cuda_graph)
+        and _is_glm5_fp8_graph_default_model(model_name)
+        and not _is_glm52_fp8_model(model_name)
+    )
 
 
 def glm5_whole_model_cuda_graph_compare_requested_for_model(
@@ -113,8 +136,11 @@ def glm5_segmented_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    # Phase C: segmented (DSA-only + MoE-only) graph mode retired.
-    return False
+    return glm5_dsa_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=enable_cuda_graph,
+        environ=environ,
+    )
 
 
 def glm5_any_cuda_graph_requested_for_model(
@@ -123,9 +149,6 @@ def glm5_any_cuda_graph_requested_for_model(
     enable_cuda_graph: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> bool:
-    # Phase C: only the whole-model graph remains. Compare debug also
-    # activates the warmup path so users running compare without
-    # `--enable-cuda-graph` still get the captured graph to compare against.
     return (
         glm5_whole_model_cuda_graph_requested_for_model(
             model_name,
@@ -134,6 +157,11 @@ def glm5_any_cuda_graph_requested_for_model(
         )
         or glm5_whole_model_cuda_graph_compare_requested_for_model(
             model_name, environ=environ,
+        )
+        or glm5_segmented_cuda_graph_requested_for_model(
+            model_name,
+            enable_cuda_graph=enable_cuda_graph,
+            environ=environ,
         )
     )
 

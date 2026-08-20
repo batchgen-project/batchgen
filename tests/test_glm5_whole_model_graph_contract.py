@@ -1,3 +1,5 @@
+import types
+
 import torch
 import pytest
 
@@ -433,3 +435,47 @@ def test_glm5_layer_graph_segment_empty_rank_capture_context():
 
     assert static_inputs["num_valid_tokens"].item() == 0
     assert static_inputs["rank_token_counts"].tolist() == rank_counts.tolist()
+
+
+def test_glm52_reuse_segment_capture_inputs_do_not_require_aux_slots(
+    monkeypatch,
+):
+    from batchgen.models.glm.glm5.reuse_topk_segment import (
+        Glm5ReuseTopkAttnSegment,
+    )
+
+    segment = types.SimpleNamespace(
+        primary_blocked_k=torch.empty(1, 1, 1, 4),
+        attn=types.SimpleNamespace(num_heads=2),
+    )
+    static_inputs = {
+        "hidden_states": torch.ones(2, 1, 4),
+        "position_ids": torch.ones(2, 1, dtype=torch.int64),
+        "cache_seqlens": torch.ones(2, dtype=torch.int32),
+        "primary_slot_indices": torch.ones(2, dtype=torch.int32),
+        "num_valid_tokens": torch.zeros(1, dtype=torch.int32),
+        "flashmla_tile_scheduler_metadata": torch.empty(
+            1,
+            2,
+            dtype=torch.int32,
+        ),
+        "flashmla_num_splits": torch.empty(1, dtype=torch.int32),
+    }
+    monkeypatch.setattr(
+        "batchgen.attention.dsa.sparse_decode_mla."
+        "prepare_sparse_flash_mla_decode_tensor_metadata",
+        lambda lengths, num_heads: (
+            torch.ones(1, 2, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        ),
+    )
+
+    Glm5ReuseTopkAttnSegment.initialize_static_inputs(
+        segment,
+        static_inputs,
+        bucket_size=2,
+    )
+
+    assert "aux_slot_indices" not in static_inputs
+    assert static_inputs["num_valid_tokens"].item() == 1
+    assert static_inputs["primary_slot_indices"].tolist() == [0, -1]

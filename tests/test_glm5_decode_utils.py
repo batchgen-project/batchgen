@@ -1022,26 +1022,33 @@ def test_glm5_dsa_cuda_graph_replay_gate_allows_short_rows_with_fixed_selected_k
 
 
 def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
-    env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
+    model_name = "zai-org/GLM-5.2-FP8"
 
-    assert glm5_dsa_cuda_graph_requested_for_model("zai-org/GLM-5-FP8", environ=env)
+    assert glm5_dsa_cuda_graph_requested_for_model(
+        model_name,
+        enable_cuda_graph=True,
+        environ={},
+    )
     assert should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=False,
         global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        model_name=model_name,
+        enable_cuda_graph=True,
+        environ={},
     )
     assert not should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=True,
         global_batch_has_queueing=True,
-        model_name="zai-org/GLM-5-FP8",
-        environ=env,
+        model_name=model_name,
+        enable_cuda_graph=True,
+        environ={},
     )
     assert not should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=False,
         global_batch_has_queueing=True,
         model_name="gpt-oss-120b",
-        environ=env,
+        enable_cuda_graph=True,
+        environ={},
     )
     assert should_warmup_cuda_graphs_before_decode(
         graph_manager_is_initialized=False,
@@ -1051,10 +1058,10 @@ def test_glm5_dsa_warmup_policy_allows_capture_with_queued_prefill():
     )
 
 
-def test_glm5_whole_model_graph_policy_is_env_or_cli_default_and_glm_only():
+def test_glm5_whole_model_graph_policy_is_cli_only_and_glm_only():
     env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
 
-    assert glm5_whole_model_cuda_graph_requested_for_model(
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8", environ=env
     )
     assert glm5_whole_model_cuda_graph_requested_for_model(
@@ -1101,28 +1108,28 @@ def test_glm5_effective_decode_attn_mode_uses_continuous_path():
     assert glm5_effective_decode_attn_mode("deepseek_v3", 1) == 1
 
 
-def test_glm5_graph_policy_tracks_segmented_and_any_requests():
+def test_glm5_graph_policy_ignores_retired_mode_envs():
     dsa_env = {"BATCHGEN_GLM5_DSA_CUDA_GRAPH": "1"}
     moe_env = {"BATCHGEN_GLM5_MOE_CUDA_GRAPH": "1"}
     whole_env = {"BATCHGEN_GLM5_WHOLE_MODEL_CUDA_GRAPH": "1"}
     compare_env = {"BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE": "1"}
     model_name = "zai-org/GLM-5-FP8"
 
-    assert glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_moe_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_segmented_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert not glm5_dsa_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert not glm5_moe_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert not glm5_segmented_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert not glm5_segmented_cuda_graph_requested_for_model(model_name, environ=moe_env)
     assert not glm5_segmented_cuda_graph_requested_for_model(
         model_name, environ=whole_env
     )
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
-    assert glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
+    assert not glm5_any_cuda_graph_requested_for_model(model_name, environ=dsa_env)
+    assert not glm5_any_cuda_graph_requested_for_model(model_name, environ=moe_env)
+    assert not glm5_any_cuda_graph_requested_for_model(model_name, environ=whole_env)
     assert glm5_any_cuda_graph_requested_for_model(model_name, environ=compare_env)
     assert not glm5_any_cuda_graph_requested_for_model("gpt-oss-120b", environ=whole_env)
 
 
-def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
+def test_glm5_enable_cuda_graph_uses_segmented_dsa_for_glm52():
     env = {}
 
     assert glm5_whole_model_cuda_graph_requested_for_model(
@@ -1132,6 +1139,21 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
     assert glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5.1-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert not glm5_whole_model_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_dsa_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
+    assert glm5_segmented_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
@@ -1155,6 +1177,11 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
         enable_cuda_graph=True,
         environ=env,
     )
+    assert glm5_any_cuda_graph_requested_for_model(
+        "zai-org/GLM-5.2-FP8",
+        enable_cuda_graph=True,
+        environ=env,
+    )
     assert not glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=False,
@@ -1172,25 +1199,25 @@ def test_glm5_enable_cuda_graph_defaults_to_whole_model_graph():
     )
 
 
-def test_glm5_segmented_env_overrides_cli_whole_model_default():
+def test_glm5_segmented_env_is_inert():
     env = {"BATCHGEN_SEGMENTED_GRAPH": "1"}
 
-    assert glm5_segmented_cuda_graph_requested_for_model(
+    assert not glm5_segmented_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert glm5_dsa_cuda_graph_requested_for_model(
+    assert not glm5_dsa_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert glm5_moe_cuda_graph_requested_for_model(
+    assert not glm5_moe_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
     )
-    assert not glm5_whole_model_cuda_graph_requested_for_model(
+    assert glm5_whole_model_cuda_graph_requested_for_model(
         "zai-org/GLM-5-FP8",
         enable_cuda_graph=True,
         environ=env,
@@ -1721,6 +1748,85 @@ def test_glm5_full_dsa_graph_replay_returns_attn_output_without_eager_projection
     assert inputs["aux_slot_indices"].tolist() == [7, 8]
     assert primary_appends[0][0] == 0
     assert aux_appends[0][0] == 0
+
+
+def test_glm52_reuse_dsa_graph_replay_omits_aux_input_and_callback(monkeypatch):
+    class FakeManager:
+        def __init__(self):
+            self.inputs = None
+
+        def replay(self, segment_name, batch_size, **inputs):
+            self.inputs = (segment_name, batch_size, inputs)
+            return {
+                "attn_output": torch.full(
+                    (batch_size, 1, 8),
+                    3.0,
+                    dtype=torch.bfloat16,
+                ),
+                "primary_k_tensor": torch.ones(
+                    batch_size,
+                    1,
+                    1,
+                    4,
+                    dtype=torch.bfloat16,
+                ),
+            }
+
+    manager = FakeManager()
+    wrapper = object.__new__(GLM5AttnWrapper)
+    wrapper.layer_idx = 3
+    wrapper.module = types.SimpleNamespace(indexer=None)
+    wrapper._dsa_cuda_graph_max_seqlen = 4096
+    wrapper._dsa_cuda_graph_manager = manager
+    wrapper._dsa_cuda_graph_segment_name = "glm5_layer_3_full_dsa_attn"
+    wrapper._dsa_cuda_graph_full = True
+    monkeypatch.setattr(
+        wrapper,
+        "_dsa_cuda_graph_page_tables_match",
+        lambda primary_manager, aux_manager: True,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_dsa_cuda_graph_flashmla_metadata_inputs",
+        lambda batch_size: (
+            torch.ones(3, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        ),
+    )
+    AttnWrapperBase.glm5_decode_primary_slot_indices = torch.tensor(
+        [3, 4],
+        dtype=torch.int32,
+    )
+    AttnWrapperBase.glm5_decode_aux_slot_indices = None
+    primary_appends = []
+    aux_appends = []
+    AttnWrapperBase.kv_append_callback = lambda layer, tensor, _: (
+        primary_appends.append((layer, tensor.clone()))
+    )
+    AttnWrapperBase.kv_append_callback_aux = lambda layer, tensor, _: (
+        aux_appends.append((layer, tensor.clone()))
+    )
+
+    try:
+        out = wrapper._forward_decode_dsa_graph(
+            torch.zeros(2, 1, 8, dtype=torch.bfloat16),
+            torch.tensor([[2048], [2049]], dtype=torch.int64),
+            torch.tensor([2049, 2050], dtype=torch.int32),
+            4096,
+            object(),
+            object(),
+        )
+    finally:
+        AttnWrapperBase.glm5_decode_primary_slot_indices = None
+        AttnWrapperBase.glm5_decode_aux_slot_indices = None
+        AttnWrapperBase.kv_append_callback = None
+        AttnWrapperBase.kv_append_callback_aux = None
+
+    assert out.shape == (2, 1, 8)
+    _, _, inputs = manager.inputs
+    assert "aux_slot_indices" not in inputs
+    assert len(primary_appends) == 1
+    assert aux_appends == []
 
 
 def test_glm5_moe_graph_enable_records_cli_required_state():

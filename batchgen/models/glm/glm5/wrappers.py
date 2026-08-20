@@ -951,6 +951,7 @@ class GLM5AttnWrapper(AttnWrapperBase):
             self._dsa_cuda_graph_flashmla_metadata_inputs(bsz)
         )
         if getattr(self, "_dsa_cuda_graph_full", False):
+            uses_aux_kv = getattr(self.module, "indexer", None) is not None
             primary_slot_indices = getattr(
                 AttnWrapperBase,
                 "glm5_decode_primary_slot_indices",
@@ -961,27 +962,38 @@ class GLM5AttnWrapper(AttnWrapperBase):
                 "glm5_decode_aux_slot_indices",
                 None,
             )
-            if primary_slot_indices is None or aux_slot_indices is None:
+            if primary_slot_indices is None or (
+                uses_aux_kv and aux_slot_indices is None
+            ):
                 raise RuntimeError(
                     f"[layer {self.layer_idx}] GLM-5 full DSA CUDA graph requires "
                     "per-forward primary/aux slot tensors to be prepared"
                 )
+            replay_inputs = {
+                "hidden_states": hidden_states,
+                "position_ids": position_ids,
+                "cache_seqlens": cache_seqlens.to(
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                "primary_slot_indices": primary_slot_indices[:bsz].to(
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                ),
+                "flashmla_tile_scheduler_metadata": (
+                    flashmla_tile_scheduler_metadata
+                ),
+                "flashmla_num_splits": flashmla_num_splits,
+            }
+            if uses_aux_kv:
+                replay_inputs["aux_slot_indices"] = aux_slot_indices[:bsz].to(
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
             graph_outputs = self._dsa_cuda_graph_manager.replay(
                 self._dsa_cuda_graph_segment_name,
                 bsz,
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                cache_seqlens=cache_seqlens.to(dtype=torch.int32, device=hidden_states.device),
-                primary_slot_indices=primary_slot_indices[:bsz].to(
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                ),
-                aux_slot_indices=aux_slot_indices[:bsz].to(
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                ),
-                flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
-                flashmla_num_splits=flashmla_num_splits,
+                **replay_inputs,
             )
             if AttnWrapperBase.kv_append_callback is not None:
                 AttnWrapperBase.kv_append_callback(
@@ -989,10 +1001,14 @@ class GLM5AttnWrapper(AttnWrapperBase):
                     graph_outputs["primary_k_tensor"],
                     None,
                 )
-            if AttnWrapperBase.kv_append_callback_aux is not None:
+            indexer_k_tensor = graph_outputs.get("indexer_k_tensor")
+            if (
+                indexer_k_tensor is not None
+                and AttnWrapperBase.kv_append_callback_aux is not None
+            ):
                 AttnWrapperBase.kv_append_callback_aux(
                     self.layer_idx,
-                    graph_outputs["indexer_k_tensor"],
+                    indexer_k_tensor,
                     None,
                 )
             return graph_outputs["attn_output"]

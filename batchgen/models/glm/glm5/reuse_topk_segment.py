@@ -178,6 +178,42 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             ),
         }
 
+    def initialize_static_inputs(
+        self,
+        static_inputs: Dict[str, torch.Tensor],
+        bucket_size: int,
+    ) -> None:
+        static_inputs["hidden_states"].zero_()
+        static_inputs["position_ids"].zero_()
+        static_inputs["cache_seqlens"].zero_()
+        static_inputs["primary_slot_indices"].fill_(-1)
+        static_inputs["num_valid_tokens"].fill_(1)
+        static_inputs["cache_seqlens"][:1].fill_(1)
+        static_inputs["primary_slot_indices"][:1].fill_(0)
+        selected_lengths = torch.ones(
+            (bucket_size,),
+            dtype=torch.int32,
+            device=self.primary_blocked_k.device,
+        )
+        from batchgen.attention.dsa.sparse_decode_mla import (
+            prepare_sparse_flash_mla_decode_tensor_metadata,
+        )
+
+        tile_scheduler_metadata, num_splits = (
+            prepare_sparse_flash_mla_decode_tensor_metadata(
+                selected_lengths,
+                self.attn.num_heads,
+            )
+        )
+        static_inputs["flashmla_tile_scheduler_metadata"].copy_(
+            tile_scheduler_metadata,
+            non_blocking=True,
+        )
+        static_inputs["flashmla_num_splits"].copy_(
+            num_splits,
+            non_blocking=True,
+        )
+
     def _setup_static_output_buffers(self, bucket_size: int) -> None:
         if bucket_size in self._outputs:
             return

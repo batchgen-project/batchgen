@@ -9022,27 +9022,30 @@ class BatchGenWorker:
 		"""One-time CUDA graph warmup phase with model guard.
 
 		Called from generate() after model and GPU KV manager are ready.
-		Only captures graphs for supported models (currently GPT-OSS-120B).
+		Only captures graphs for supported models.
 		"""
-		# Model guard: only capture for supported models
-		# Phase C: layer / MoE / DSA / DSA-full segmented graph modes are retired
-		# (predicate functions return False); only the whole-model graph remains
-		# on GLM-5, plus K2.5's per-layer attn segment and GPT-OSS-120B's
-		# whole-model graph.
 		model_name = getattr(self, 'model_name', '') or ''
 		model_name_l = model_name.lower()
+		glm5_dsa_graph_enabled = (
+			glm5_dsa_cuda_graph_requested_for_model(
+				model_name,
+				enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+			)
+			and "glm" in model_name_l
+		)
 		glm5_whole_graph_enabled = (
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
 		if not self.engine_config.Basic_Config.enable_cuda_graphs:
-			if glm5_whole_graph_enabled:
+			if glm5_dsa_graph_enabled or glm5_whole_graph_enabled:
 				self.engine_config.Basic_Config.enable_cuda_graphs = True
 			else:
 				return
 		if (
 			"gpt-oss-120b" not in model_name_l
 			and not is_kimi_k25_backend_model(model_name)
+			and not glm5_dsa_graph_enabled
 			and not glm5_whole_graph_enabled
 		):
 			logging.info(f"Rank {self.rank}: CUDA graphs not supported for '{model_name}', skipping")
@@ -9054,6 +9057,255 @@ class BatchGenWorker:
 			return
 
 		self._setup_cuda_graphs(gpu_manager)
+
+	def _setup_glm52_dsa_cuda_graphs(self, gpu_manager, bucket_sizes) -> None:
+		local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
+		if local_bsz <= 0:
+			self._glm5_dsa_graph_capture_attempted_for_batch = True
+			return
+
+		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+		from batchgen.models.glm.glm5.cuda_graph_segments import (
+			Glm5FullDsaAttnSegment,
+			make_glm5_full_dsa_graph_segment_name,
+		)
+		from batchgen.models.glm.glm5.reuse_topk_segment import (
+			Glm5ReuseTopkAttnSegment,
+		)
+
+		bucketing = BatchSizeBucketing(bucket_sizes)
+		try:
+			capture_bucket = int(bucketing.get_padded_size(local_bsz))
+		except ValueError:
+			logging.info(
+				"Rank %s: GLM-5.2 local decode batch %s exceeds graph buckets; "
+				"using eager DSA",
+				self.rank,
+				local_bsz,
+			)
+			self._glm5_dsa_graph_capture_attempted_for_batch = True
+			return
+
+		primary_manager = getattr(gpu_manager, "primary", gpu_manager)
+		aux_manager = getattr(
+			gpu_manager,
+			"auxiliary",
+			getattr(self.core_engine, "gpu_paged_kv_manager_aux", None),
+		)
+		if aux_manager is None:
+			raise RuntimeError(
+				"GLM-5.2 DSA CUDA graph requires an auxiliary GPU KV manager"
+			)
+		active_sequence_ids = list(getattr(AttnWrapperBase, "cur_batch", None) or [])
+		primary_manager.ensure_cuda_graph_page_table(active_sequence_ids)
+		aux_manager.ensure_cuda_graph_page_table(active_sequence_ids)
+		primary_page_table = primary_manager.get_cuda_graph_page_table_storage()
+		aux_page_table = aux_manager.get_cuda_graph_page_table_storage()
+		if primary_page_table is None or aux_page_table is None:
+			raise RuntimeError(
+				"GLM-5.2 DSA CUDA graph page-table storage is not initialized"
+			)
+
+		primary_page_size = int(primary_manager.config.page_size_tokens)
+		aux_page_size = int(aux_manager.config.page_size_tokens)
+		capacity_seqlen = self._glm5_dsa_graph_score_capacity_tokens(
+			primary_page_table,
+			primary_page_size,
+			aux_page_table,
+			aux_page_size,
+			model_max_position_embeddings=getattr(
+				self.model_config,
+				"max_position_embeddings",
+				None,
+			),
+		)
+		required_seqlen = self._glm5_dsa_graph_required_tokens(
+			active_sequence_ids,
+			page_size=primary_page_size,
+		)
+		first_indexer = next(
+			(
+				getattr(layer.self_attn.module, "indexer", None)
+				for layer in self.model.model.layers
+				if getattr(layer.self_attn.module, "indexer", None) is not None
+			),
+			None,
+		)
+		index_topk = int(getattr(first_indexer, "index_topk", 2048))
+		graph_max_seqlen = max(int(required_seqlen), index_topk)
+		if graph_max_seqlen > capacity_seqlen:
+			raise RuntimeError(
+				f"GLM-5.2 DSA graph max_seqlen={graph_max_seqlen} exceeds "
+				f"page-table capacity {capacity_seqlen}"
+			)
+		all_short = required_seqlen <= index_topk
+
+		AttnWrapperBase.gpu_paged_kv_manager = primary_manager
+		AttnWrapperBase.gpu_paged_kv_manager_aux = aux_manager
+		primary_k_cache, _ = primary_manager.get_kv_tensors()
+		aux_k_cache, _ = aux_manager.get_kv_tensors()
+		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		shared_dsa_buffers = {}
+		shared_reuse_buffers = {}
+		last_full_segment = None
+		last_cos_table = None
+		last_sin_table = None
+		last_index_topk = None
+
+		for layer_idx, decoder_layer in enumerate(self.model.model.layers):
+			wrapper = decoder_layer.self_attn
+			indexer = getattr(wrapper.module, "indexer", None)
+			if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+				wrapper.initialize_decode_absorb()
+			if getattr(wrapper, "_fp8_absorb_weights", None) is None:
+				raise RuntimeError(
+					f"Layer {layer_idx}: GLM-5.2 DSA graph requires FP8 absorb weights"
+				)
+			primary_blocked_k = primary_k_cache[layer_idx]
+			if indexer is None:
+				if last_full_segment is None:
+					raise RuntimeError(
+						"GLM-5.2 DSA graph requires layer 0 to produce top-k"
+					)
+				segment = Glm5ReuseTopkAttnSegment(
+					wrapper=wrapper,
+					primary_blocked_k=primary_blocked_k,
+					primary_page_table=primary_page_table,
+					absorb_weights=wrapper._fp8_absorb_weights,
+					cos_table=last_cos_table,
+					sin_table=last_sin_table,
+					max_seqlen=graph_max_seqlen,
+					index_topk=last_index_topk,
+					page_size=primary_page_size,
+					topk_source=last_full_segment,
+					shared_buffers=shared_reuse_buffers,
+				)
+			else:
+				if (
+					getattr(wrapper, "_fused_wqb_weights", None) is None
+					or getattr(wrapper, "_indexer_cuda_module", None) is None
+				):
+					wrapper.initialize_fused_kernels()
+				aux_phys = aux_manager.resolve_physical_layer(layer_idx)
+				aux_blocked_k = aux_k_cache[aux_phys]
+				dummy = torch.empty(
+					1,
+					1,
+					indexer.rope_head_dim,
+					device=primary_blocked_k.device,
+					dtype=torch.bfloat16,
+				)
+				cos_table, sin_table = indexer.rotary_emb(
+					dummy,
+					seq_len=graph_max_seqlen,
+				)
+				segment = Glm5FullDsaAttnSegment(
+					wrapper=wrapper,
+					primary_blocked_k=primary_blocked_k,
+					aux_blocked_k=aux_blocked_k,
+					primary_page_table=primary_page_table,
+					aux_page_table=aux_page_table,
+					wq_b_weights=wrapper._fused_wqb_weights,
+					absorb_weights=wrapper._fp8_absorb_weights,
+					cuda_module=wrapper._indexer_cuda_module,
+					cos_table=cos_table,
+					sin_table=sin_table,
+					max_seqlen=graph_max_seqlen,
+					index_topk=indexer.index_topk,
+					page_size=primary_page_size,
+					aux_page_size=aux_page_size,
+					all_short=all_short,
+					shared_buffers=shared_dsa_buffers,
+				)
+				last_full_segment = segment
+				last_cos_table = cos_table
+				last_sin_table = sin_table
+				last_index_topk = int(indexer.index_topk)
+
+			segment_name = make_glm5_full_dsa_graph_segment_name(layer_idx)
+			manager.register_segment(segment_name, segment)
+			wrapper.enable_dsa_cuda_graph(
+				manager,
+				segment_name,
+				max_seqlen=graph_max_seqlen,
+				primary_page_table=primary_page_table,
+				aux_page_table=aux_page_table,
+				graph_output_required=True,
+				full_segment=True,
+			)
+
+		logging.info(
+			"Rank %s: capturing GLM-5.2 DSA-only CUDA graphs for %s layers "
+			"at bucket BS=%s max_seqlen=%s",
+			self.rank,
+			len(self.model.model.layers),
+			capture_bucket,
+			graph_max_seqlen,
+		)
+		self._cuda_graph_manager = manager
+		self._glm5_layer_graph_max_seqlen = graph_max_seqlen
+		self._glm5_dsa_graph_capture_attempted_for_batch = True
+		manager.warmup_and_capture_buckets([capture_bucket])
+		logging.info(
+			"Rank %s: GLM-5.2 DSA-only CUDA graphs ready in %.0fms",
+			self.rank,
+			manager.get_capture_stats()["total_capture_time_ms"],
+		)
+
+	def _prepare_glm52_dsa_graph_for_forward(
+		self,
+		local_bsz: int,
+		gpu_manager,
+	) -> None:
+		GLM5AttnWrapper.glm5_dsa_graph_forward_state = None
+		GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = None
+		if not glm5_dsa_cuda_graph_requested_for_model(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(
+				getattr(self, "args", None),
+				"enable_cuda_graph",
+				False,
+			),
+		):
+			return
+		manager = getattr(self, "_cuda_graph_manager", None)
+		if manager is None or local_bsz <= 0:
+			return
+		try:
+			bucket = int(manager.bucketing.get_padded_size(local_bsz))
+		except ValueError:
+			return
+		first_wrapper = self.model.model.layers[0].self_attn
+		if not manager.has_graph(
+			first_wrapper._dsa_cuda_graph_segment_name,
+			local_bsz,
+		):
+			return
+		graph_inputs = self._prepare_glm5_layer_graph_inputs(
+			local_bsz=local_bsz,
+			bucket=bucket,
+			gpu_manager=gpu_manager,
+		)
+		GLM5AttnWrapper.glm5_decode_primary_slot_indices = graph_inputs[
+			"primary_slot_indices"
+		]
+		GLM5AttnWrapper.glm5_decode_aux_slot_indices = graph_inputs[
+			"aux_slot_indices"
+		]
+		GLM5AttnWrapper.glm5_dsa_flashmla_graph_metadata = {
+			"bucket_size": bucket,
+			"tile_scheduler_metadata": graph_inputs[
+				"flashmla_tile_scheduler_metadata"
+			],
+			"num_splits": graph_inputs["flashmla_num_splits"],
+		}
+		GLM5AttnWrapper.glm5_dsa_graph_forward_state = {
+			"path": "graph",
+			"bucket": bucket,
+			"reason": "captured",
+			"local_bsz": int(local_bsz),
+			"metadata_prepared": True,
+		}
 
 	@staticmethod
 	def _glm5_dsa_graph_score_capacity_tokens(
@@ -9634,11 +9886,10 @@ class BatchGenWorker:
 		# RoPE cos/sin cache captured in the graph covers ALL possible positions.
 		max_rope_len = getattr(self.model_config, 'max_position_embeddings', 131072)
 		model_name_l = (getattr(self, 'model_name', '') or '').lower()
-		# Phase C: only whole-model graph remains for GLM-5 (other modes retired).
-		# The dsa/moe/dsa_full/layer enables are pinned False so the now-dead
-		# downstream branches stay typeable until a subsequent commit deletes
-		# them outright. The whole-model graph is the only live path here.
-		glm5_dsa_graph_enabled = False
+		glm5_dsa_graph_enabled = glm5_dsa_cuda_graph_requested_for_model(
+			getattr(self, "model_name", None),
+			enable_cuda_graph=getattr(self.args, "enable_cuda_graph", False),
+		)
 		glm5_dsa_full_graph_enabled = False
 		glm5_moe_graph_enabled = False
 		glm5_layer_graph_enabled = False
@@ -9646,6 +9897,9 @@ class BatchGenWorker:
 			self._glm5_whole_model_graph_requested_for_current_batch()
 			and "glm" in model_name_l
 		)
+		if glm5_dsa_graph_enabled:
+			self._setup_glm52_dsa_cuda_graphs(gpu_manager, bucket_sizes)
+			return
 		if glm5_whole_graph_enabled:
 			whole_graph_required = self._glm5_whole_model_graph_requested_for_current_batch()
 			local_bsz = int(getattr(self, "_current_decode_local_batch_size", 0) or 0)
@@ -10980,8 +11234,8 @@ class BatchGenWorker:
 				else:
 					AttnWrapperBase.kv_append_callback_aux = None
 
-				# Phase C: layer-graph mode retired; only the whole-model graph
-				# may need re-warmup here.
+				# Configure-time capture is authoritative. Do not recapture inside
+				# the decode loop if page-table storage changes later.
 				if self._glm5_whole_model_graph_current_bucket_missing():
 					logging.info(
 						f"Rank {self.rank}: GLM-5 whole-model CUDA graph was not captured "
@@ -10990,6 +11244,10 @@ class BatchGenWorker:
 					)
 					self._glm5_whole_model_graph_capture_attempted_for_batch = True
 
+				self._prepare_glm52_dsa_graph_for_forward(
+					len(batch),
+					gpu_manager,
+				)
 				self._log_glm5_graph_path_for_forward(
 					local_bsz=len(batch),
 					max_rank_bsz=int(getattr(self, "_current_decode_max_rank_batch_size", 0) or 0),
@@ -10997,10 +11255,6 @@ class BatchGenWorker:
 					gpu_manager=gpu_manager,
 					decode_iter=self._cumulative_decode_iterations,
 				)
-				# Phase C: DSA-only graph metadata prep retired (DSA graph mode
-				# is no longer reachable). The whole-model graph builds its
-				# FlashMLA metadata in-line during prepare_replay_inputs.
-
 				_nsys_forward_idx = self._nsys_decode_profile_begin_forward(
 					local_iteration=local_iteration,
 					local_bsz=len(batch),
