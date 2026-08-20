@@ -126,7 +126,12 @@ def apply_attn_res(prefix_sum: torch.Tensor,
             (block_residual[start:end], prefix_sum[start:end].unsqueeze(1)),
             dim=1).float()                                   # (c, nb+1, H) fp32
         k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
-        scores = (k * w).sum(-1)                             # (c, nb+1)
+        # k is dead after scoring. Multiplying it in place preserves the same
+        # elementwise FP32 product and hidden-axis reduction while avoiding a
+        # second (c, nb+1, H) temporary (140 MiB at W2, nb+1=5).
+        k.mul_(w)
+        scores = k.sum(-1)                                   # (c, nb+1)
+        del k
         probs = scores.softmax(-1).unsqueeze(1)              # (c, 1, nb+1)
         out[start:end] = torch.matmul(probs, v).squeeze(1).to(out.dtype)
     return out

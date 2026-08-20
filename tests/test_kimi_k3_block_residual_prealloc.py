@@ -147,6 +147,7 @@ num_block_residual_columns = KL.num_block_residual_columns
 # import dance above resolved to.
 BlockResidualCarrier = sys.modules[
     BlockResidualBuffer.__module__].BlockResidualCarrier
+apply_attn_res = sys.modules[BlockResidualBuffer.__module__].apply_attn_res
 
 
 # --------------------------------------------------------------------------- #
@@ -550,6 +551,42 @@ def test_consumer_cat_erases_the_stride_difference():
         assert from_contiguous.stride() == from_view.stride()
         assert from_contiguous.shape == from_view.shape
         assert from_view.is_contiguous()
+
+
+def test_score_multiply_in_place_is_bit_exact():
+    """The W2 scratch fix may reuse ``k`` only if scoring stays bit-exact."""
+    tokens, num_blocks, hidden = 61, 5, 16
+    gen = torch.Generator().manual_seed(260821)
+    prefix = torch.randn(tokens, hidden, generator=gen, dtype=torch.bfloat16)
+    block = torch.randn(
+        tokens, num_blocks, hidden, generator=gen, dtype=torch.bfloat16
+    )
+    proj = torch.nn.Linear(hidden, 1, bias=False).float()
+    norm = types.SimpleNamespace(
+        weight=torch.randn(hidden, generator=gen),
+        variance_epsilon=1e-6,
+    )
+
+    expected = torch.empty_like(prefix)
+    w = norm.weight.float() * proj.weight.squeeze(0).float()
+    for start in range(0, tokens, 32):
+        end = min(start + 32, tokens)
+        v = torch.cat(
+            (block[start:end], prefix[start:end].unsqueeze(1)), dim=1
+        ).float()
+        k = v * torch.rsqrt(
+            v.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon
+        )
+        scores = (k * w).sum(-1)
+        probs = scores.softmax(-1).unsqueeze(1)
+        expected[start:end] = torch.matmul(probs, v).squeeze(1).to(
+            expected.dtype
+        )
+
+    actual = apply_attn_res(
+        prefix, block, proj, norm, chunk_size=32
+    )
+    assert torch.equal(actual, expected)
 
 
 def test_append_falls_back_to_cat_for_a_foreign_tensor():
