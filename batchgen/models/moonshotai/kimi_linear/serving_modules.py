@@ -901,7 +901,12 @@ def moe_forward_serving(self, hidden_states):
     _require_k3_latent_moe(self)
 
     resident = getattr(self, "_resident_ep_moe", None)
-    if resident is not None and KimiLinearExpertWrapper.phase == "decode":
+    resident_prefill = bool(
+        getattr(self, "_resident_ep_prefill_enabled", False)
+    )
+    if resident is not None and (
+        KimiLinearExpertWrapper.phase == "decode" or resident_prefill
+    ):
         return moe_forward_resident_ep_decode(self, hidden_states, resident)
 
     identity = hidden_states

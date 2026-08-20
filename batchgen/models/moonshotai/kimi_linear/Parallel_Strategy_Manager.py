@@ -164,6 +164,7 @@ class KimiLinearParallelStrategyManager:
             )
         self._comm = None
         self._resident_ep_built = False
+        self._prefill_moe_mode = "streamed"
         self._decode_graph = None
 
     # ------------------------------------------------------------------ #
@@ -175,6 +176,41 @@ class KimiLinearParallelStrategyManager:
         the resident-EP decode MoE (all_gather + all_reduce per MoE layer);
         the streamed prefill path uses no collectives."""
         self._comm = comm
+
+    def set_prefill_moe_mode(self, mode):
+        """Select the K3 prefill MoE control for the next active batch.
+
+        ``streamed`` is the production/default path. ``resident_ep`` is the R5
+        experimental control: materialize this rank's resident expert shard and
+        run the existing EP collective path during prefill.
+        """
+        value = str(mode or "streamed").strip().lower()
+        if value not in {"streamed", "resident_ep"}:
+            raise ValueError(
+                "k3_prefill_moe_mode must be 'streamed' or 'resident_ep', "
+                f"got {mode!r}"
+            )
+        if value == "resident_ep" and not self._is_k3:
+            raise ValueError(
+                "resident-EP prefill control is implemented only for Kimi-K3"
+            )
+        self._prefill_moe_mode = value
+
+    def prefill_uses_resident_ep(self):
+        return self._prefill_moe_mode == "resident_ep"
+
+    def _set_resident_ep_prefill_enabled(self, enabled):
+        """Route K3 MoE through resident EP in prefill and compact its scratch."""
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None:
+                continue
+            moe._resident_ep_prefill_enabled = bool(enabled)
+            resident = getattr(moe, "_resident_ep_moe", None)
+            if resident is not None:
+                resident.compact_dispatch = bool(enabled)
 
     def _build_weight_copy_task(self):
         """Modules the copy engine must stream (host-offloaded), in layer-major
@@ -223,9 +259,11 @@ class KimiLinearParallelStrategyManager:
         return task
 
     def configure_prefill(self):
-        """Build the model (if needed) and switch to prefill phase (pure DP)."""
+        """Build the model and switch to streamed or resident-EP prefill."""
         self.loaded_model_config.phase = "prefill"
-        self.loaded_model_config.ep_size = 1  # pure DP; routed experts streamed
+        self.loaded_model_config.ep_size = (
+            self.world_size if self.prefill_uses_resident_ep() else 1
+        )
         if self.model is None:
             self._build_model()
         AttnWrapperBase.phase = "prefill"
@@ -235,6 +273,22 @@ class KimiLinearParallelStrategyManager:
         # this phase starts from the seeded-at-layer-0 state.
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
+        if self.prefill_uses_resident_ep():
+            if self._stream_all_modules or self._attn_tp_size <= 1:
+                raise RuntimeError(
+                    "resident-EP prefill requires K3's resident TP attention "
+                    "layout (attention_group_size>1, stream_all_modules=False)"
+                )
+            self._init_resident_ep_decode()
+            self._set_resident_ep_prefill_enabled(True)
+            self.weight_copy_task["routed_expert"] = []
+            if self.rank == 0:
+                logging.info(
+                    "[K3_PREFILL_MOE] resident_ep enabled: rank-owned Marlin "
+                    "experts, EP32 collectives, compact routed scratch"
+                )
+        else:
+            self._set_resident_ep_prefill_enabled(False)
         return self.model, self.weight_copy_task
 
     def configure_decoding(self, padding_bsz=None, comm=None):
@@ -263,6 +317,7 @@ class KimiLinearParallelStrategyManager:
                 "C4) or turn the flag off."
             )
         self.loaded_model_config.phase = "decode"
+        self._set_resident_ep_prefill_enabled(False)
         if comm is not None:
             self._comm = comm
         if self.model is None:

@@ -216,6 +216,10 @@ class ResidentEPMXFP4MoELayer:
         self.world_size = int(world_size)
         self.rank = int(rank)
         self.expert_start = int(expert_start)
+        # Decode keeps the original graph-stable worst-case stride. R5 prefill
+        # opts into exact route-count sizing because num_global can be 65K+
+        # tokens and reserving that capacity for every local expert would OOM.
+        self.compact_dispatch = False
 
     @classmethod
     def set_num_tokens_per_rank(cls, num_tokens_per_rank):
@@ -260,7 +264,22 @@ class ResidentEPMXFP4MoELayer:
         K = topk_idx_i32.shape[-1]
 
         # --- dispatch latent rows into the strided [E*mtp, K_latent] buffer ---
-        mtp = max(((num_rows + 15) // 16) * 16, 16)        # per-expert cnt <= num_rows
+        if self.compact_dispatch:
+            local = topk_idx_i32[
+                (topk_idx_i32 >= self.expert_start)
+                & (topk_idx_i32 < self.expert_start + E)
+            ] - self.expert_start
+            if local.numel():
+                local_counts = torch.bincount(
+                    local.reshape(-1).to(torch.int64),
+                    minlength=E,
+                )
+                max_local_count = int(local_counts.max().item())
+            else:
+                max_local_count = 0
+            mtp = max(((max_local_count + 15) // 16) * 16, 16)
+        else:
+            mtp = max(((num_rows + 15) // 16) * 16, 16)
         dispatched = torch.zeros(E * mtp, K_latent, dtype=torch.bfloat16,
                                  device=device)
         expert_counts = torch.zeros(E, dtype=torch.int32, device=device)

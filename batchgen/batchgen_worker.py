@@ -6584,6 +6584,20 @@ class BatchGenWorker:
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
+		prefill_sequences = []
+		for uuid in prefill_uuids:
+			seq = self.global_batch.get_sequence(uuid)
+			if seq is not None:
+				prefill_sequences.append(seq)
+		prefill_debug = (
+			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
+		)
+		AttnWrapperBase.batchgen_debug = prefill_debug or None
+		k3_prefill_moe_mode = prefill_debug.get(
+			"k3_prefill_moe_mode", "streamed"
+		)
+		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
+			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)
 		if self.rank == 0:
 			logging.info(
 				f"[PREFILL] Configuring prefill phase for {len(prefill_uuids)} sequences"
@@ -6662,14 +6676,6 @@ class BatchGenWorker:
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_weight_copy_queue()
 		self.core_engine.reset_prefill_buffer()
-		prefill_sequences = []
-		for uuid in prefill_uuids:
-			seq = self.global_batch.get_sequence(uuid)
-			if seq is not None:
-				prefill_sequences.append(seq)
-		prefill_debug = (
-			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
-		)
 		k3_prefill_profile = self._debug_flag_enabled(
 			prefill_debug.get("k3_prefill_profile")
 		)
@@ -7604,6 +7610,31 @@ class BatchGenWorker:
 			l2_balance=_USE_L2_MB,
 		)
 		total_tokens_all = sum(seq_lengths_list)
+		if (
+			hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+			and self.parallel_manager.prefill_uses_resident_ep()
+		):
+			local_micro_batches = torch.tensor(
+				[len(micro_batches)],
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			all_micro_batches = torch.empty(
+				(self.world_size,),
+				dtype=torch.int64,
+				device=self.torch_device,
+			)
+			dist.all_gather_into_tensor(
+				all_micro_batches, local_micro_batches
+			)
+			micro_batch_counts = [
+				int(value) for value in all_micro_batches.cpu().tolist()
+			]
+			if len(set(micro_batch_counts)) != 1:
+				raise RuntimeError(
+					"resident-EP prefill requires the same microbatch count "
+					f"on all ranks; got {micro_batch_counts}"
+				)
 
 		if self.rank == 0:
 			logging.info(
@@ -7658,6 +7689,14 @@ class BatchGenWorker:
 
 				batch_input_ids_flat = torch.cat(batch_input_ids, dim=0)
 				batch_position_ids_flat = torch.cat(batch_position_ids, dim=0)
+				if (
+					hasattr(self.parallel_manager, "prefill_uses_resident_ep")
+					and self.parallel_manager.prefill_uses_resident_ep()
+				):
+					self._sync_prefill_moe_rank_counts(
+						int(batch_input_ids_flat.numel()),
+						reason=f"prefill_microbatch_{batch_idx}",
+					)
 
 				batch_local_indices = batch[seq_start:seq_end]
 				local_to_global_seq_id_map = {}
@@ -9120,6 +9159,42 @@ class BatchGenWorker:
 				f"local={local_count} max={max_batch_size} counts={counts_list}"
 			)
 		return max_batch_size
+
+	def _sync_prefill_moe_rank_counts(
+		self, local_token_count: int, *, reason: str
+	) -> int:
+		"""Size resident-EP prefill collectives after TP-group row scattering."""
+		local = torch.tensor(
+			[int(local_token_count)],
+			dtype=torch.int64,
+			device=self.torch_device,
+		)
+		counts = torch.empty(
+			(self.world_size,), dtype=torch.int64, device=self.torch_device
+		)
+		dist.all_gather_into_tensor(counts, local)
+		G = self._decode_attn_tp_size()
+		counts_list = [int(value) for value in counts.cpu().tolist()]
+		for start in range(0, self.world_size, G):
+			group = counts_list[start:start + G]
+			if len(set(group)) != 1:
+				raise RuntimeError(
+					"resident-EP prefill requires identical token rows within "
+					f"each TP group; ranks {start}:{start + G} reported {group}"
+				)
+		max_group_tokens = max(counts_list)
+		from batchgen.decode_dp_group import moe_ntp_from_group_max
+		moe_ntp = moe_ntp_from_group_max(max_group_tokens, G)
+		self.parallel_manager.set_num_tokens_per_rank(moe_ntp)
+		if self.rank == 0:
+			logging.info(
+				"[K3_PREFILL_MOE] reason=%s group_token_counts=%s "
+				"post_scatter_ntp=%s",
+				reason,
+				[counts_list[start] for start in range(0, self.world_size, G)],
+				moe_ntp,
+			)
+		return moe_ntp
 
 	def _warmup_cuda_graphs(self):
 		"""One-time CUDA graph warmup phase with model guard.
