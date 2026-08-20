@@ -245,6 +245,29 @@ def test_compact_resident_prefill_chunk_policy():
         choose(65536, 0)
 
 
+def test_resident_prefill_shared_merge_is_exact_and_in_place():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "serving_modules.py"
+    )
+    merge = _isolated_function(path, "_merge_resident_prefill_shared")
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(260821)
+    routed = torch.randn((33, 17), dtype=torch.bfloat16)
+    shared = torch.randn_like(routed)
+    expected = routed + shared
+    storage = routed.data_ptr()
+
+    actual = merge(routed, shared)
+
+    assert actual.data_ptr() == storage
+    assert torch.equal(actual, expected)
+
+
 def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     path = (
         ROOT

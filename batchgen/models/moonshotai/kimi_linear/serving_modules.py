@@ -760,6 +760,12 @@ def _require_k3_latent_moe(self):
         )
 
 
+def _merge_resident_prefill_shared(routed, shared):
+    """Add the shared path without allocating a second full hidden output."""
+    routed.add_(shared)
+    return routed
+
+
 def moe_forward_resident_ep_decode(self, hidden_states, resident):
     """KimiSparseMoeBlock DECODE forward — resident EP-8 + fused BF16 MoE.
 
@@ -816,7 +822,11 @@ def moe_forward_resident_ep_decode(self, hidden_states, resident):
             routed = resident.forward(x, self.gate)
         out = routed.reshape(orig_shape)
         if getattr(self, "shared_experts", None) is not None:
-            out = out + self.shared_experts(identity)
+            shared = self.shared_experts(identity)
+            if getattr(self, "_resident_ep_prefill_enabled", False):
+                out = _merge_resident_prefill_shared(out, shared)
+            else:
+                out = out + shared
         return out
 
     identity = hidden_states
