@@ -27,7 +27,10 @@ from batchgen.models.wrappers import AttnWrapperBase
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
 
 
-GLM5_WHOLE_GRAPH_MAX_LAYERS_PER_CHUNK = 20
+# The exact production GLM-5.2 MoE path captures four repeated layers on the
+# H200 CUDA 12.9 / NCCL 2.27.3 runtime, while five fail during capture. Keep
+# every graph chunk at or below the measured passing boundary.
+GLM5_WHOLE_GRAPH_MAX_LAYERS_PER_CHUNK = 4
 
 
 def glm5_whole_model_layer_chunks(

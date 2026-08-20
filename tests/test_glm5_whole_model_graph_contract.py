@@ -81,15 +81,18 @@ def test_glm5_whole_model_segment_static_contract():
     assert outputs["logits"].resolve_shape(2) == (2, 151552)
 
 
-def test_glm5_whole_model_layer_chunks_stay_below_collective_limit():
-    assert glm5_whole_model_layer_chunks(78) == (
-        (0, 20),
-        (20, 40),
-        (40, 60),
-        (60, 78),
+def test_glm5_whole_model_layer_chunks_stay_below_production_moe_limit():
+    chunks = glm5_whole_model_layer_chunks(78)
+
+    assert len(chunks) == 20
+    assert chunks[:2] == ((0, 4), (4, 8))
+    assert chunks[-1] == (76, 78)
+    assert all(layer_end - layer_start <= 4 for layer_start, layer_end in chunks)
+    assert [layer_idx for start, end in chunks for layer_idx in range(start, end)] == list(
+        range(78)
     )
-    assert make_glm5_whole_model_graph_chunk_name(1, 20, 40) == (
-        "glm5_whole_model_chunk_01_layers_20_40"
+    assert make_glm5_whole_model_graph_chunk_name(1, 4, 8) == (
+        "glm5_whole_model_chunk_01_layers_04_08"
     )
 
 
@@ -105,7 +108,7 @@ def test_glm5_chunk_input_and_output_boundaries():
         model=_FakeModel21(),
         layer_segments=layer_segments,
     )
-    first, last = segment.chunk_segments
+    first, *_, last = segment.chunk_segments
 
     first_inputs = first.get_static_input_specs(bucket_size=2)
     last_inputs = last.get_static_input_specs(bucket_size=2)
