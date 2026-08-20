@@ -259,12 +259,12 @@ class ResidentEPMXFP4MoELayer:
                 gathered = expert_out.index_select(0, rows).float().view(
                     end - start, K, H
                 )
-                w = weight[start:end].unsqueeze(-1)
-                contribution = (
-                    gathered
-                    * w
-                    * valid.unsqueeze(-1).to(torch.float32)
+                gathered.masked_fill_(
+                    ~valid.unsqueeze(-1),
+                    0.0,
                 )
+                w = weight[start:end].unsqueeze(-1)
+                contribution = gathered * w
                 combined[start:end].copy_(contribution.sum(dim=1))
             return combined
         valid = (pos >= 0)
