@@ -1,11 +1,11 @@
 """GLM-5 CUDA graph routing policy helpers.
 
 GLM-5 / GLM-5.1 keep the whole-model graph selected by
-``--enable-cuda-graph``. GLM-5.2 uses per-layer full-DSA graphs instead:
-on the CUDA 12.9 / NCCL 2.27 H200 runtime, a second independent graph is
-invalidated when both graphs compose FlashMLA/DSA and graph-captured NCCL
-collectives. Keeping MoE eager avoids that unsupported composition while
-still removing the launch-heavy attention path.
+``--enable-cuda-graph``. GLM-5.2 uses per-layer full-DSA graphs plus local
+MoE-compute graphs. On the CUDA 12.9 / NCCL 2.27 H200 runtime, independent
+graphs that both contain NCCL collectives are invalidated; GLM-5.2 therefore
+keeps MoE all-gather/reduce-scatter eager and captures only the local MoE
+routing/dispatch/expert/shared-expert work.
 
 The compare-only debug env var ``BATCHGEN_GLM5_WHOLE_MODEL_GRAPH_COMPARE``
 remains in this file for the developer-facing compare facility (renaming

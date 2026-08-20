@@ -9255,6 +9255,95 @@ class BatchGenWorker:
 			self.rank,
 			manager.get_capture_stats()["total_capture_time_ms"],
 		)
+		self._setup_glm52_local_moe_cuda_graphs(bucket_sizes)
+
+	def _setup_glm52_local_moe_cuda_graphs(self, bucket_sizes) -> None:
+		max_rank_bsz = int(
+			getattr(self, "_current_decode_max_rank_batch_size", 0) or 0
+		)
+		if max_rank_bsz <= 0:
+			self._glm5_moe_graph_capture_attempted_for_batch = True
+			return
+
+		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
+		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
+		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+			Glm5MoEGraphBufferPool,
+			Glm5MoELocalGraphSegment,
+			make_glm5_moe_graph_segment_name,
+		)
+
+		configured_bucketing = BatchSizeBucketing(bucket_sizes)
+		capture_bucket = int(
+			configured_bucketing.get_padded_size(max_rank_bsz)
+		)
+		bucketing = BatchSizeBucketing([capture_bucket])
+		moe_layers = [
+			layer.mlp
+			for layer in self.model.model.layers
+			if isinstance(getattr(layer, "mlp", None), Glm5MoE)
+		]
+		if not moe_layers:
+			self._glm5_moe_graph_capture_attempted_for_batch = True
+			return
+
+		not_ready = [
+			moe.layer_idx
+			for moe in moe_layers
+			if not getattr(moe, "_fp8_blockwise_ready", False)
+		]
+		if not_ready:
+			raise RuntimeError(
+				"GLM-5.2 local MoE CUDA graph requires stacked FP8 weights; "
+				f"unavailable for layers {not_ready[:5]}"
+			)
+
+		first_moe = moe_layers[0]
+		pool = Glm5MoEGraphBufferPool(
+			world_size=self.world_size,
+			hidden_size=first_moe.hidden_size,
+			num_experts_per_tok=first_moe.num_experts_per_tok,
+			num_local_experts=first_moe.experts_per_rank,
+			intermediate_size=first_moe.config.moe_intermediate_size,
+			device=self.torch_device,
+			bucket_sizes=[capture_bucket],
+			base_mtp=_GLM5_3D_MTP,
+		)
+		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		for moe in moe_layers:
+			segment_name = make_glm5_moe_graph_segment_name(moe.layer_idx)
+			segment = Glm5MoELocalGraphSegment(
+				moe,
+				pool,
+				moe.comm,
+				world_size=self.world_size,
+				rank=self.rank,
+				device=self.torch_device,
+			)
+			manager.register_segment(segment_name, segment)
+			moe.enable_moe_cuda_graph(
+				manager,
+				segment_name,
+				segment,
+				bucketing,
+				graph_output_required=True,
+			)
+
+		logging.info(
+			"Rank %s: capturing %s GLM-5.2 local MoE CUDA graphs at "
+			"bucket BS=%s with eager collectives",
+			self.rank,
+			len(moe_layers),
+			capture_bucket,
+		)
+		self._glm5_moe_cuda_graph_manager = manager
+		self._glm5_moe_graph_capture_attempted_for_batch = True
+		manager.warmup_and_capture_buckets([capture_bucket])
+		logging.info(
+			"Rank %s: GLM-5.2 local MoE CUDA graphs ready in %.0fms",
+			self.rank,
+			manager.get_capture_stats()["total_capture_time_ms"],
+		)
 
 	def _prepare_glm52_dsa_graph_for_forward(
 		self,

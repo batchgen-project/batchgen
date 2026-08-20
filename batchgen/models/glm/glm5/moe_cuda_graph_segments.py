@@ -504,70 +504,10 @@ class Glm5MoEGraphSegment:
         shared_output = self._shared_expert_forward(bufs, padded)
 
         with torch.cuda.stream(current_stream):
-            if 192 <= global_rows <= 512:
-                from batchgen_kernels.triton.glm5_router_gemm import (
-                    glm5_router_gemm,
-                )
-
-                glm5_router_gemm(
-                    bufs.all_tokens,
-                    self.gate_weight_bf16,
-                    bufs.router_logits,
-                )
-            else:
-                self.router_context.router_forward(
-                    bufs.all_tokens,
-                    logits=bufs.router_logits,
-                )
-            gate_sigmoid_topk_cuda(
-                bufs.router_logits,
-                self.gate_bias_fp32,
-                k=self.num_experts_per_tok,
-                routed_scaling_factor=self.routed_scaling_factor,
-                topk_indices=bufs.topk_indices,
-                topk_weights=bufs.topk_weights,
-            )
-
-            valid_per_row = rank_token_counts[bufs.rank_ids]
-            padding_mask = bufs.local_pos >= valid_per_row
-            padding_mask_2d = padding_mask.unsqueeze(1).expand_as(bufs.topk_indices)
-            torch.where(
-                padding_mask_2d,
-                bufs.topk_negative_ones,
-                bufs.topk_indices,
-                out=bufs.topk_masked_indices,
-            )
-            torch.where(
-                padding_mask_2d,
-                bufs.topk_zero_weights,
-                bufs.topk_weights,
-                out=bufs.topk_masked_weights,
-            )
-
-            # No memset (see eager path): TMA extents clip to seqlens[e] and
-            # act_quant_ragged skips every row that is not a live token.
-            expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
+            routed_global_output = self._routed_local_forward(
+                bufs,
                 bufs.all_tokens,
-                bufs.topk_masked_indices,
-                bufs.dispatched_x,
-                self.expert_start,
-                self.num_local_experts,
-                bufs.expert_counts,
-                bufs.expert_counters,
-                bufs.cu_seqlens,
-                bufs.topk_pos,
-            )
-
-            self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
-
-            routed_global_output = reduce_weighted_scatter(
-                bufs.expert_out,
-                topk_pos,
-                bufs.topk_masked_weights,
-                global_rows,
-                self.hidden_size,
-                self.num_experts_per_tok,
-                output=bufs.routed_global_output,
+                rank_token_counts,
             )
 
             with self.comm.change_state(enable=True):
@@ -579,6 +519,79 @@ class Glm5MoEGraphSegment:
 
         bufs.local_moe_output.add_(shared_output)
         return {"moe_output": bufs.local_moe_output}
+
+    def _routed_local_forward(
+        self,
+        bufs: _Glm5MoEGraphBuffers,
+        all_tokens: torch.Tensor,
+        rank_token_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        global_rows = all_tokens.shape[0]
+        if 192 <= global_rows <= 512:
+            from batchgen_kernels.triton.glm5_router_gemm import (
+                glm5_router_gemm,
+            )
+
+            glm5_router_gemm(
+                all_tokens,
+                self.gate_weight_bf16,
+                bufs.router_logits,
+            )
+        else:
+            self.router_context.router_forward(
+                all_tokens,
+                logits=bufs.router_logits,
+            )
+        gate_sigmoid_topk_cuda(
+            bufs.router_logits,
+            self.gate_bias_fp32,
+            k=self.num_experts_per_tok,
+            routed_scaling_factor=self.routed_scaling_factor,
+            topk_indices=bufs.topk_indices,
+            topk_weights=bufs.topk_weights,
+        )
+
+        valid_per_row = rank_token_counts[bufs.rank_ids]
+        padding_mask = bufs.local_pos >= valid_per_row
+        padding_mask_2d = padding_mask.unsqueeze(1).expand_as(bufs.topk_indices)
+        torch.where(
+            padding_mask_2d,
+            bufs.topk_negative_ones,
+            bufs.topk_indices,
+            out=bufs.topk_masked_indices,
+        )
+        torch.where(
+            padding_mask_2d,
+            bufs.topk_zero_weights,
+            bufs.topk_weights,
+            out=bufs.topk_masked_weights,
+        )
+
+        # No memset (see eager path): TMA extents clip to seqlens[e] and
+        # act_quant_ragged skips every row that is not a live token.
+        expert_counts, cu_seqlens, topk_pos = dispatch_scatter_ragged(
+            all_tokens,
+            bufs.topk_masked_indices,
+            bufs.dispatched_x,
+            self.expert_start,
+            self.num_local_experts,
+            bufs.expert_counts,
+            bufs.expert_counters,
+            bufs.cu_seqlens,
+            bufs.topk_pos,
+        )
+
+        self._fp8_blockwise_gemm_3d(bufs, expert_counts, cu_seqlens)
+
+        return reduce_weighted_scatter(
+            bufs.expert_out,
+            topk_pos,
+            bufs.topk_masked_weights,
+            global_rows,
+            self.hidden_size,
+            self.num_experts_per_tok,
+            output=bufs.routed_global_output,
+        )
 
     def _shared_expert_forward(
         self,
@@ -673,3 +686,68 @@ class Glm5MoEGraphSegment:
             avg,
             output=bufs.expert_out,
         )
+
+
+class Glm5MoELocalGraphSegment(Glm5MoEGraphSegment):
+    """Graph only local MoE work; collectives remain eager.
+
+    This boundary avoids the H200 CUDA-graph/PyNCCL multi-graph failure while
+    retaining the launch savings from routing, dispatch, expert GEMMs,
+    weighted combine, and the shared expert.
+    """
+
+    eager_collectives = True
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "all_tokens": TensorSpec(
+                (self.world_size * bucket_size, self.hidden_size),
+                torch.bfloat16,
+            ),
+            "padded": TensorSpec(
+                ("batch_size", self.hidden_size),
+                torch.bfloat16,
+            ),
+            "rank_token_counts": TensorSpec((self.world_size,), torch.int64),
+        }
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {
+            "routed_global_output": TensorSpec(
+                (self.world_size * bucket_size, self.hidden_size),
+                torch.bfloat16,
+            ),
+            "shared_output": TensorSpec(
+                ("batch_size", self.hidden_size),
+                torch.bfloat16,
+            ),
+        }
+
+    def initialize_static_inputs(
+        self,
+        static_inputs: Dict[str, torch.Tensor],
+        bucket_size: int,
+    ) -> None:
+        static_inputs["all_tokens"].zero_()
+        static_inputs["padded"].zero_()
+        static_inputs["rank_token_counts"].fill_(bucket_size)
+
+    def forward(
+        self,
+        *,
+        all_tokens: torch.Tensor,
+        padded: torch.Tensor,
+        rank_token_counts: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        bucket_size = padded.shape[0]
+        bufs = self.pool.get(bucket_size)
+        shared_output = self._shared_expert_forward(bufs, padded)
+        routed_global_output = self._routed_local_forward(
+            bufs,
+            all_tokens,
+            rank_token_counts,
+        )
+        return {
+            "routed_global_output": routed_global_output,
+            "shared_output": shared_output,
+        }
