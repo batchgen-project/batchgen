@@ -9985,12 +9985,13 @@ class BatchGenWorker:
 				layer_segments=layer_segments,
 			)
 			segment_name = make_glm5_whole_model_graph_segment_name()
-			manager.register_segment(segment_name, whole_seg)
+			for chunk_seg in whole_seg.chunk_segments:
+				manager.register_segment(chunk_seg.name, chunk_seg)
 			first_wrapper = self.model.model.layers[0].self_attn.module
 			num_heads = int(getattr(first_wrapper, "num_heads", 64))
 			logging.info(
-				f"Rank {self.rank}: capturing GLM-5 whole-model CUDA graph "
-				f"segment={segment_name} buckets={capture_buckets}, "
+				f"Rank {self.rank}: capturing GLM-5 chunked whole-model CUDA graph "
+				f"segments={whole_seg.chunk_segment_names} buckets={capture_buckets}, "
 				f"max_seqlen_cap={graph_max_seqlen}"
 			)
 			torch.cuda.synchronize(self.torch_device)
@@ -11131,9 +11132,16 @@ class BatchGenWorker:
 							bucket=bucket,
 						)
 						try:
-							graph_out = self._cuda_graph_manager.replay(
-								_wm_seg_name, _max_bs, **replay_inputs,
-							)
+							if getattr(self._whole_model_segment, "chunk_segment_names", ()):
+								graph_out = self._whole_model_segment.replay_chunks(
+									self._cuda_graph_manager,
+									_max_bs,
+									**replay_inputs,
+								)
+							else:
+								graph_out = self._cuda_graph_manager.replay(
+									_wm_seg_name, _max_bs, **replay_inputs,
+								)
 						finally:
 							self._glm5_replay_profile_end_forward(_replay_profile)
 						if _glm5_whole_timing:
@@ -11209,18 +11217,29 @@ class BatchGenWorker:
 							bucket=bucket,
 						)
 						try:
-							graph_out = self._cuda_graph_manager.replay(
-								"glm5_whole_model", _max_bs,
-								input_ids=new_tokens[:batch_size],
-								cache_seqlens=graph_inputs["cache_seqlens"],
-								position_ids=graph_inputs["position_ids"],
-								primary_slot_indices=graph_inputs["primary_slot_indices"],
-								aux_slot_indices=graph_inputs["aux_slot_indices"],
-								rank_token_counts=_all_rank_counts,
-								num_valid_tokens=graph_inputs["num_valid_tokens"],
-								flashmla_tile_scheduler_metadata=graph_inputs["flashmla_tile_scheduler_metadata"],
-								flashmla_num_splits=graph_inputs["flashmla_num_splits"],
-							)
+							_glm5_replay_inputs = {
+								"input_ids": new_tokens[:batch_size],
+								"cache_seqlens": graph_inputs["cache_seqlens"],
+								"position_ids": graph_inputs["position_ids"],
+								"primary_slot_indices": graph_inputs["primary_slot_indices"],
+								"aux_slot_indices": graph_inputs["aux_slot_indices"],
+								"rank_token_counts": _all_rank_counts,
+								"num_valid_tokens": graph_inputs["num_valid_tokens"],
+								"flashmla_tile_scheduler_metadata": graph_inputs["flashmla_tile_scheduler_metadata"],
+								"flashmla_num_splits": graph_inputs["flashmla_num_splits"],
+							}
+							if getattr(self._whole_model_segment, "chunk_segment_names", ()):
+								graph_out = self._whole_model_segment.replay_chunks(
+									self._cuda_graph_manager,
+									_max_bs,
+									**_glm5_replay_inputs,
+								)
+							else:
+								graph_out = self._cuda_graph_manager.replay(
+									"glm5_whole_model",
+									_max_bs,
+									**_glm5_replay_inputs,
+								)
 						finally:
 							self._glm5_replay_profile_end_forward(_replay_profile)
 						if _glm5_whole_timing:

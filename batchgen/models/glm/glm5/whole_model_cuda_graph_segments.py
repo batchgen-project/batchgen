@@ -14,8 +14,9 @@ participate in NCCL graph capture/replay even when a rank has no local rows.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from collections.abc import Mapping
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Iterator
 
 import torch
 
@@ -24,6 +25,34 @@ from batchgen.models.wrappers import AttnWrapperBase
 # Phase C: GLM-5-specific ClassVars (_dsa_short_count, glm5_decode_*_slot_indices)
 # moved from AttnWrapperBase to GLM5AttnWrapper per audit §A finding #8.
 from batchgen.models.glm.glm5.wrappers import GLM5AttnWrapper
+
+
+GLM5_WHOLE_GRAPH_MAX_LAYERS_PER_CHUNK = 20
+
+
+def glm5_whole_model_layer_chunks(
+    num_layers: int,
+    max_layers_per_chunk: int = GLM5_WHOLE_GRAPH_MAX_LAYERS_PER_CHUNK,
+) -> tuple[tuple[int, int], ...]:
+    if num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    if max_layers_per_chunk <= 0:
+        raise ValueError("max_layers_per_chunk must be positive")
+    return tuple(
+        (start, min(start + max_layers_per_chunk, num_layers))
+        for start in range(0, num_layers, max_layers_per_chunk)
+    )
+
+
+def make_glm5_whole_model_graph_chunk_name(
+    chunk_idx: int,
+    layer_start: int,
+    layer_end: int,
+) -> str:
+    return (
+        f"glm5_whole_model_chunk_{int(chunk_idx):02d}_"
+        f"layers_{int(layer_start):02d}_{int(layer_end):02d}"
+    )
 
 
 class Glm5WholeModelSegment:
@@ -118,6 +147,23 @@ class Glm5WholeModelSegment:
         self._no_v_cache = True
         self._capture_inputs: dict[str, torch.Tensor] | None = None
         self._capture_dsa_short_count: int | None = None
+        self.chunk_ranges = (
+            glm5_whole_model_layer_chunks(self.num_layers)
+            if self.layer_segments
+            else ()
+        )
+        self.chunk_segments = [
+            Glm5WholeModelChunkSegment(
+                coordinator=self,
+                chunk_idx=chunk_idx,
+                layer_start=layer_start,
+                layer_end=layer_end,
+            )
+            for chunk_idx, (layer_start, layer_end) in enumerate(self.chunk_ranges)
+        ]
+        self.chunk_segment_names = tuple(
+            segment.name for segment in self.chunk_segments
+        )
 
     def set_capture_inputs(self, **inputs: torch.Tensor) -> None:
         required = set(self.get_static_input_specs(self.max_bucket_size))
@@ -134,6 +180,19 @@ class Glm5WholeModelSegment:
         static_inputs: Mapping[str, torch.Tensor],
         bucket_size: int,
     ) -> None:
+        self._initialize_static_inputs(
+            static_inputs,
+            bucket_size,
+            include_embedding=True,
+        )
+
+    def _initialize_static_inputs(
+        self,
+        static_inputs: Mapping[str, torch.Tensor],
+        bucket_size: int,
+        *,
+        include_embedding: bool,
+    ) -> None:
         if self._capture_inputs is None:
             raise RuntimeError(
                 "GLM-5 whole-model graph capture requires runtime inputs so warmup "
@@ -146,6 +205,8 @@ class Glm5WholeModelSegment:
                 target.fill_(spec.fill_value)
 
         for name, source in self._capture_inputs.items():
+            if name not in static_inputs:
+                continue
             target = static_inputs[name]
             if name == "rank_token_counts":
                 if tuple(source.shape) != tuple(target.shape):
@@ -171,6 +232,8 @@ class Glm5WholeModelSegment:
                     source.to(device=target.device, dtype=target.dtype),
                     non_blocking=True,
                 )
+        if not include_embedding:
+            static_inputs["hidden_states"].zero_()
         cache_seqlens = static_inputs.get("cache_seqlens")
         primary_slot_indices = static_inputs.get("primary_slot_indices")
         if cache_seqlens is not None and primary_slot_indices is not None:
@@ -311,6 +374,46 @@ class Glm5WholeModelSegment:
     def _probe_output_name(layer_idx: int) -> str:
         return f"probe_layer_{int(layer_idx):03d}_hidden"
 
+    @contextmanager
+    def _runtime_context(
+        self,
+        *,
+        bucket_size: int,
+        cache_seqlens: torch.Tensor,
+        position_ids: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        rank_token_counts: torch.Tensor,
+    ) -> Iterator[None]:
+        self._set_moe_bucket_state(bucket_size, rank_token_counts)
+        old_cache_seqlens = AttnWrapperBase.cache_seqlens
+        old_position_ids = AttnWrapperBase.position_ids
+        old_max_seqlen = AttnWrapperBase.max_seqlen
+        old_kv_cb = AttnWrapperBase.kv_append_callback
+        old_aux_cb = AttnWrapperBase.kv_append_callback_aux
+        old_dsa_short_count = GLM5AttnWrapper._dsa_short_count
+        old_primary_slots = GLM5AttnWrapper.glm5_decode_primary_slot_indices
+        old_aux_slots = GLM5AttnWrapper.glm5_decode_aux_slot_indices
+        try:
+            AttnWrapperBase.cache_seqlens = cache_seqlens
+            AttnWrapperBase.position_ids = position_ids
+            AttnWrapperBase.max_seqlen = self.max_seqlen
+            AttnWrapperBase.kv_append_callback = self._copy_primary_kv
+            AttnWrapperBase.kv_append_callback_aux = self._copy_aux_kv
+            GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
+            GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
+            GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
+            yield
+        finally:
+            AttnWrapperBase.cache_seqlens = old_cache_seqlens
+            AttnWrapperBase.position_ids = old_position_ids
+            AttnWrapperBase.max_seqlen = old_max_seqlen
+            AttnWrapperBase.kv_append_callback = old_kv_cb
+            AttnWrapperBase.kv_append_callback_aux = old_aux_cb
+            GLM5AttnWrapper._dsa_short_count = old_dsa_short_count
+            GLM5AttnWrapper.glm5_decode_primary_slot_indices = old_primary_slots
+            GLM5AttnWrapper.glm5_decode_aux_slot_indices = old_aux_slots
+
     def run_model_with_probes(
         self,
         *,
@@ -396,25 +499,14 @@ class Glm5WholeModelSegment:
         flashmla_num_splits: torch.Tensor | None = None,
     ) -> Mapping[str, torch.Tensor]:
         bucket_size = int(input_ids.shape[0])
-        self._set_moe_bucket_state(bucket_size, rank_token_counts)
-
-        old_cache_seqlens = AttnWrapperBase.cache_seqlens
-        old_position_ids = AttnWrapperBase.position_ids
-        old_max_seqlen = AttnWrapperBase.max_seqlen
-        old_kv_cb = AttnWrapperBase.kv_append_callback
-        old_aux_cb = AttnWrapperBase.kv_append_callback_aux
-        old_dsa_short_count = GLM5AttnWrapper._dsa_short_count
-        old_primary_slots = GLM5AttnWrapper.glm5_decode_primary_slot_indices
-        old_aux_slots = GLM5AttnWrapper.glm5_decode_aux_slot_indices
-        try:
-            AttnWrapperBase.cache_seqlens = cache_seqlens
-            AttnWrapperBase.position_ids = position_ids
-            AttnWrapperBase.max_seqlen = self.max_seqlen
-            AttnWrapperBase.kv_append_callback = self._copy_primary_kv
-            AttnWrapperBase.kv_append_callback_aux = self._copy_aux_kv
-            GLM5AttnWrapper._dsa_short_count = self._capture_dsa_short_count
-            GLM5AttnWrapper.glm5_decode_primary_slot_indices = primary_slot_indices
-            GLM5AttnWrapper.glm5_decode_aux_slot_indices = aux_slot_indices
+        with self._runtime_context(
+            bucket_size=bucket_size,
+            cache_seqlens=cache_seqlens,
+            position_ids=position_ids,
+            primary_slot_indices=primary_slot_indices,
+            aux_slot_indices=aux_slot_indices,
+            rank_token_counts=rank_token_counts,
+        ):
             outputs = self.run_model_with_probes(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -426,16 +518,197 @@ class Glm5WholeModelSegment:
                 flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
                 flashmla_num_splits=flashmla_num_splits,
             )
-        finally:
-            AttnWrapperBase.cache_seqlens = old_cache_seqlens
-            AttnWrapperBase.position_ids = old_position_ids
-            AttnWrapperBase.max_seqlen = old_max_seqlen
-            AttnWrapperBase.kv_append_callback = old_kv_cb
-            AttnWrapperBase.kv_append_callback_aux = old_aux_cb
-            GLM5AttnWrapper._dsa_short_count = old_dsa_short_count
-            GLM5AttnWrapper.glm5_decode_primary_slot_indices = old_primary_slots
-            GLM5AttnWrapper.glm5_decode_aux_slot_indices = old_aux_slots
 
+        return outputs
+
+    def replay_chunks(
+        self,
+        manager,
+        batch_size: int,
+        **inputs: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        hidden_states = None
+        merged: dict[str, torch.Tensor] = {}
+        for chunk_idx, chunk in enumerate(self.chunk_segments):
+            chunk_inputs = {
+                name: tensor
+                for name, tensor in inputs.items()
+                if name in chunk.get_static_input_specs(batch_size)
+            }
+            if chunk_idx == 0:
+                chunk_inputs["input_ids"] = inputs["input_ids"]
+            else:
+                if hidden_states is None:
+                    raise RuntimeError("GLM-5 graph chunk hidden-state boundary is missing")
+                chunk_inputs["hidden_states"] = hidden_states
+            chunk_out = manager.replay(
+                chunk.name,
+                batch_size,
+                **chunk_inputs,
+            )
+            hidden_states = chunk_out["hidden_states"]
+            for name, tensor in chunk_out.items():
+                if name.startswith("probe_layer_"):
+                    merged[name] = tensor
+            if chunk.is_last:
+                merged.update(chunk_out)
+        return merged
+
+
+class Glm5WholeModelChunkSegment:
+    """Contiguous GLM-5 layer chunk bounded by the NCCL graph-node limit."""
+
+    def __init__(
+        self,
+        *,
+        coordinator: Glm5WholeModelSegment,
+        chunk_idx: int,
+        layer_start: int,
+        layer_end: int,
+    ) -> None:
+        if not coordinator.layer_segments:
+            raise ValueError("GLM-5 whole-model chunks require layer segments")
+        if not 0 <= layer_start < layer_end <= coordinator.num_layers:
+            raise ValueError(
+                f"invalid GLM-5 chunk range [{layer_start}, {layer_end}) "
+                f"for {coordinator.num_layers} layers"
+            )
+        self.coordinator = coordinator
+        self.chunk_idx = int(chunk_idx)
+        self.layer_start = int(layer_start)
+        self.layer_end = int(layer_end)
+        self.name = make_glm5_whole_model_graph_chunk_name(
+            self.chunk_idx,
+            self.layer_start,
+            self.layer_end,
+        )
+        self.is_first = self.layer_start == 0
+        self.is_last = self.layer_end == coordinator.num_layers
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        self.coordinator.setup_static_buffers(bucket_size)
+
+    def release_static_buffers(self, bucket_size: int) -> None:
+        if self.is_first:
+            self.coordinator.release_static_buffers(bucket_size)
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        specs = self.coordinator.get_static_input_specs(bucket_size)
+        if self.is_first:
+            return specs
+        specs = dict(specs)
+        specs.pop("input_ids")
+        specs["hidden_states"] = TensorSpec(
+            ("batch_size", 1, self.coordinator.hidden_size),
+            torch.bfloat16,
+        )
+        return specs
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        if self.is_last:
+            specs = {
+                "hidden_states": TensorSpec(
+                    ("batch_size", self.coordinator.hidden_size),
+                    torch.bfloat16,
+                ),
+                "logits": TensorSpec(
+                    ("batch_size", self.coordinator.vocab_size),
+                    torch.bfloat16,
+                ),
+            }
+        else:
+            specs = {
+                "hidden_states": TensorSpec(
+                    ("batch_size", 1, self.coordinator.hidden_size),
+                    torch.bfloat16,
+                ),
+            }
+        for layer_idx in self.coordinator.compare_probe_layers:
+            if self.layer_start <= layer_idx < self.layer_end:
+                specs[self.coordinator._probe_output_name(layer_idx)] = TensorSpec(
+                    ("batch_size", self.coordinator.hidden_size),
+                    torch.bfloat16,
+                )
+        return specs
+
+    def initialize_static_inputs(
+        self,
+        static_inputs: Mapping[str, torch.Tensor],
+        bucket_size: int,
+    ) -> None:
+        self.coordinator._initialize_static_inputs(
+            static_inputs,
+            bucket_size,
+            include_embedding=self.is_first,
+        )
+
+    def forward(
+        self,
+        *,
+        cache_seqlens: torch.Tensor,
+        position_ids: torch.Tensor,
+        primary_slot_indices: torch.Tensor,
+        aux_slot_indices: torch.Tensor,
+        rank_token_counts: torch.Tensor,
+        num_valid_tokens: torch.Tensor,
+        flashmla_tile_scheduler_metadata: torch.Tensor,
+        flashmla_num_splits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None,
+    ) -> Mapping[str, torch.Tensor]:
+        if self.is_first:
+            if input_ids is None:
+                raise RuntimeError("first GLM-5 graph chunk requires input_ids")
+            bucket_size = int(input_ids.shape[0])
+            hidden_states = self.coordinator.model.model.embed_tokens(input_ids)
+        else:
+            if hidden_states is None:
+                raise RuntimeError("non-first GLM-5 graph chunk requires hidden_states")
+            bucket_size = int(hidden_states.shape[0])
+
+        outputs: dict[str, torch.Tensor] = {}
+        with self.coordinator._runtime_context(
+            bucket_size=bucket_size,
+            cache_seqlens=cache_seqlens,
+            position_ids=position_ids,
+            primary_slot_indices=primary_slot_indices,
+            aux_slot_indices=aux_slot_indices,
+            rank_token_counts=rank_token_counts,
+        ):
+            for layer_idx in range(self.layer_start, self.layer_end):
+                layer_segment = self.coordinator.layer_segments[layer_idx]
+                graph_out = layer_segment.forward(
+                    hidden_states=hidden_states,
+                    position_ids=position_ids,
+                    cache_seqlens=cache_seqlens,
+                    primary_slot_indices=primary_slot_indices,
+                    aux_slot_indices=aux_slot_indices,
+                    num_valid_tokens=num_valid_tokens,
+                    rank_token_counts=rank_token_counts,
+                    flashmla_tile_scheduler_metadata=flashmla_tile_scheduler_metadata,
+                    flashmla_num_splits=flashmla_num_splits,
+                )
+                hidden_states = graph_out["hidden_states"]
+                self.coordinator._copy_primary_kv(
+                    layer_idx,
+                    graph_out["primary_k_tensor"],
+                    None,
+                )
+                indexer_k = graph_out.get("indexer_k_tensor")
+                if indexer_k is not None:
+                    self.coordinator._copy_aux_kv(layer_idx, indexer_k, None)
+                if layer_idx in self.coordinator._compare_probe_layer_set:
+                    outputs[self.coordinator._probe_output_name(layer_idx)] = (
+                        hidden_states[:, -1, :]
+                    )
+
+            if self.is_last:
+                hidden_states = self.coordinator.model.model.norm(hidden_states)
+                logits = self.coordinator.model.lm_head(hidden_states)
+                outputs["hidden_states"] = hidden_states[:, -1, :]
+                outputs["logits"] = logits[:, -1, :]
+            else:
+                outputs["hidden_states"] = hidden_states
         return outputs
 
 

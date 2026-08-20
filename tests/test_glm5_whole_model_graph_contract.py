@@ -8,6 +8,8 @@ from batchgen.models.glm.glm5.layer_cuda_graph_segments import (
 from batchgen.models.glm.glm5.whole_model_cuda_graph_segments import (
     Glm5WholeModelSegment,
     compare_glm5_whole_model_graph_logits,
+    glm5_whole_model_layer_chunks,
+    make_glm5_whole_model_graph_chunk_name,
     make_glm5_whole_model_graph_segment_name,
 )
 
@@ -61,6 +63,7 @@ def test_glm5_whole_model_segment_static_contract():
     assert make_glm5_whole_model_graph_segment_name() == "glm5_whole_model"
     assert segment.primary_kv_dim == 576
     assert segment.aux_kv_dim == 128
+    assert segment.chunk_segments == []
 
     inputs = segment.get_static_input_specs(bucket_size=2)
     assert inputs["input_ids"].resolve_shape(2) == (2, 1)
@@ -76,6 +79,47 @@ def test_glm5_whole_model_segment_static_contract():
     outputs = segment.get_static_output_specs(bucket_size=2)
     assert outputs["hidden_states"].resolve_shape(2) == (2, 6144)
     assert outputs["logits"].resolve_shape(2) == (2, 151552)
+
+
+def test_glm5_whole_model_layer_chunks_stay_below_collective_limit():
+    assert glm5_whole_model_layer_chunks(78) == (
+        (0, 20),
+        (20, 40),
+        (40, 60),
+        (60, 78),
+    )
+    assert make_glm5_whole_model_graph_chunk_name(1, 20, 40) == (
+        "glm5_whole_model_chunk_01_layers_20_40"
+    )
+
+
+def test_glm5_chunk_input_and_output_boundaries():
+    class _FakeInnerModel21:
+        layers = [_FakeLayer() for _ in range(21)]
+
+    class _FakeModel21:
+        model = _FakeInnerModel21()
+
+    layer_segments = [_FakeDsaSegment() for _ in range(21)]
+    segment = _make_segment(
+        model=_FakeModel21(),
+        layer_segments=layer_segments,
+    )
+    first, last = segment.chunk_segments
+
+    first_inputs = first.get_static_input_specs(bucket_size=2)
+    last_inputs = last.get_static_input_specs(bucket_size=2)
+    assert "input_ids" in first_inputs
+    assert "hidden_states" not in first_inputs
+    assert "input_ids" not in last_inputs
+    assert last_inputs["hidden_states"].resolve_shape(2) == (2, 1, 6144)
+
+    first_outputs = first.get_static_output_specs(bucket_size=2)
+    last_outputs = last.get_static_output_specs(bucket_size=2)
+    assert first_outputs["hidden_states"].resolve_shape(2) == (2, 1, 6144)
+    assert "logits" not in first_outputs
+    assert last_outputs["hidden_states"].resolve_shape(2) == (2, 6144)
+    assert last_outputs["logits"].resolve_shape(2) == (2, 151552)
 
 
 def test_glm5_whole_model_segment_probe_output_contract():
