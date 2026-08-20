@@ -140,10 +140,43 @@ def test_segment_capture_streams_are_stable_and_distinct(monkeypatch):
     assert stream_a is not stream_b
 
 
-def test_segment_capture_barrier_runs_between_registered_segments():
+def test_segment_capture_streams_are_precreated_before_capture(monkeypatch):
+    manager = _make_uninitialized_manager([1], segment_names=())
+    manager.device = torch.device("cpu")
+    manager._capture_stream = object()
+    manager._separate_capture_streams = False
+    manager._segment_capture_streams = {}
+    streams = []
+
+    def fake_stream(*, device):
+        stream = types.SimpleNamespace(device=device, index=len(streams))
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", fake_stream)
+    manager.enable_segment_capture_streams()
+    manager.register_segment("a", object())
+    manager.register_segment("b", object())
+
+    assert tuple(manager._segment_capture_streams) == ("a", "b")
+    assert manager._segment_capture_streams["a"] is streams[0]
+    assert manager._segment_capture_streams["b"] is streams[1]
+
+
+def test_segment_capture_barrier_runs_between_registered_segments(monkeypatch):
     manager = _make_uninitialized_manager([1], segment_names=("a", "b"))
+    manager.device = torch.device("cpu")
+    manager._capture_stream = object()
+    manager._separate_capture_streams = False
+    manager._segment_capture_streams = {}
     captures = []
     barriers = []
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "Stream",
+        lambda *, device: types.SimpleNamespace(device=device),
+    )
 
     def fake_capture_one(self, name, segment, bucket_size, warmup_iters=None):
         del segment, warmup_iters
