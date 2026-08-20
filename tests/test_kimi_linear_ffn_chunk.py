@@ -260,6 +260,13 @@ def test_resident_prefill_uses_smaller_tile_only_for_long_inputs(M, monkeypatch)
     assert torch.equal(short_out, real_ffn(short))
     assert torch.equal(long_out, real_ffn(long))
 
+    calls.clear()
+    ragged = torch.randn(4 * TILE + 1, HIDDEN).bfloat16()
+    with torch.inference_mode():
+        ragged_out = mlp(ragged)
+    assert max(calls) > 8
+    assert torch.equal(ragged_out, real_ffn(ragged))
+
 
 def test_bf16_exact_at_native_thread_count(M, monkeypatch):
     """The production dtype, at the machine's real thread count — i.e. without
@@ -378,7 +385,7 @@ def test_backend_invariance_notes():
     # different cuBLAS regime (N = 2*33792 = 67,584). 6144 passing does not
     # imply 33792 passes; both must be run. Unchunked reference transient is
     # 24 * num_tokens * inter = 6.6 GiB and 13.8 GiB for these two cases.
-    (33792, 8192 + 1), (33792, 2 * 8192 + 517),
+    (33792, 8192 + 1), (33792, 16384), (33792, 2 * 8192 + 517),
 ])
 def test_chunked_equals_unchunked_cuda(M, inter, num_tokens):
     """Real K3 widths (hidden 7168), production dtype, production tile. This is

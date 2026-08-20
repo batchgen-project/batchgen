@@ -190,7 +190,15 @@ class KimiMLP(nn.Module):
         num_tokens = x.numel() // x.shape[-1]
         token_tile = _FFN_TOKEN_TILE
         resident_tile = self._resident_prefill_token_tile
-        if resident_tile is not None and num_tokens > token_tile:
+        if (
+            resident_tile is not None
+            and num_tokens > token_tile
+            and num_tokens % int(resident_tile) == 0
+        ):
+            # The registered W2 shape is 16,384 rows, exactly 32 x 512.
+            # Ragged 512-ish GEMMs can select a different cuBLAS reduction
+            # order, so non-divisible shapes keep the validated 8,192-row
+            # even tiler instead of forcing a 512-row remainder.
             token_tile = min(token_tile, int(resident_tile))
         if token_tile <= 0:
             raise ValueError("KimiMLP token tile must be positive")
