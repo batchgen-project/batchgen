@@ -2023,6 +2023,11 @@ def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
         "_rank_token_counts",
         torch.tensor([2, 2], dtype=torch.int64),
     )
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: None,
+    )
 
     hidden = torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]])
     out = moe._forward_decode_3d_graph(hidden)
