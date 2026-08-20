@@ -1749,7 +1749,11 @@ class Glm5MoE(nn.Module):
             raise RuntimeError(
                 f"Layer {self.layer_idx}: GLM-5 MoE CUDA graph requested but not captured"
             )
-        if getattr(self._moe_cuda_graph_segment, "eager_collectives", False):
+        if getattr(
+            self._moe_cuda_graph_segment,
+            "separate_collective_graphs",
+            False,
+        ):
             return self._forward_decode_3d_local_graph(hidden_states)
 
         orig_shape = hidden_states.shape
@@ -1822,26 +1826,16 @@ class Glm5MoE(nn.Module):
 
         bucket = self._moe_cuda_graph_bucketing.get_padded_size(ntp)
         bufs = self._moe_cuda_graph_segment.pool.get(bucket)
-        padded = self._moe_cuda_graph_manager.get_static_input(
-            self._moe_cuda_graph_segment_name,
-            ntp,
-            "padded",
-        )
-        all_tokens = self._moe_cuda_graph_manager.get_static_input(
-            self._moe_cuda_graph_segment_name,
-            ntp,
-            "all_tokens",
-        )
+        padded = bufs.padded
         padded.zero_()
         if num_tokens > 0:
             padded[:num_tokens].copy_(hidden_flat)
 
-        with self.comm.change_state(enable=True):
-            self.comm.all_gather(
-                all_tokens,
-                padded,
-                stream=torch.cuda.current_stream(self.device),
-            )
+        collective_manager = self._moe_cuda_graph_segment.collective_graph_manager
+        collective_manager.replay(
+            self._moe_cuda_graph_segment.all_gather_segment_name,
+            ntp,
+        )
 
         rank_counts = Glm5MoE._rank_token_counts
         if rank_counts is None:
@@ -1869,12 +1863,10 @@ class Glm5MoE(nn.Module):
                 "return routed_global_output and shared_output"
             )
 
-        with self.comm.change_state(enable=True):
-            self.comm.reduce_scatter(
-                bufs.local_moe_output,
-                routed_global_output,
-                stream=torch.cuda.current_stream(self.device),
-            )
+        collective_manager.replay(
+            self._moe_cuda_graph_segment.reduce_scatter_segment_name,
+            ntp,
+        )
 
         if num_tokens == 0:
             return torch.empty(

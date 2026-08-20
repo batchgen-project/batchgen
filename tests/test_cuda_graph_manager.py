@@ -75,21 +75,6 @@ def test_warmup_and_capture_buckets_rejects_unknown_bucket():
         manager.warmup_and_capture_buckets([4])
 
 
-def test_get_static_input_returns_captured_bucket_buffer():
-    manager = object.__new__(CUDAGraphManager)
-    manager.bucketing = BatchSizeBucketing([4])
-    static = torch.empty(4, 8)
-    manager._graphs = {
-        "segment": {
-            4: types.SimpleNamespace(
-                static_inputs={"all_tokens": static},
-            )
-        }
-    }
-
-    assert manager.get_static_input("segment", 3, "all_tokens") is static
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_capture_uses_manager_owned_explicit_stream(monkeypatch):
     device = torch.device("cuda")

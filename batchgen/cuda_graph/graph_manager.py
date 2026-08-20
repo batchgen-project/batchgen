@@ -571,28 +571,6 @@ class CUDAGraphManager:
             return False
         return bucket in self._graphs.get(name, {})
 
-    def get_static_input(
-        self,
-        name: str,
-        batch_size: int,
-        key: str,
-    ) -> torch.Tensor:
-        """Return one captured static input buffer for eager/graph handoff."""
-        bucket = self.bucketing.get_padded_size(batch_size)
-        captured = self._graphs.get(name, {}).get(bucket)
-        if captured is None:
-            raise RuntimeError(
-                f"No graph captured for segment '{name}' at bucket {bucket}. "
-                f"Available: {list(self._graphs.get(name, {}).keys())}"
-            )
-        static_input = captured.static_inputs.get(key)
-        if static_input is None:
-            raise KeyError(
-                f"Input '{key}' not found in captured graph '{name}'. "
-                f"Available: {list(captured.static_inputs.keys())}"
-            )
-        return static_input
-
     def has_bucket_for_all_segments(self, batch_size: int) -> bool:
         """Check whether every registered segment has the bucket for batch_size."""
         bucket = self.bucketing.get_padded_size(batch_size)

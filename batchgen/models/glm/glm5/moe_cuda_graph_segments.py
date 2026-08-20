@@ -54,6 +54,10 @@ def make_glm5_moe_graph_segment_name(layer_idx: int) -> str:
     return f"glm5_layer_{layer_idx}_moe"
 
 
+GLM5_MOE_ALL_GATHER_GRAPH_SEGMENT = "glm5_moe_all_gather"
+GLM5_MOE_REDUCE_SCATTER_GRAPH_SEGMENT = "glm5_moe_reduce_scatter"
+
+
 def pack_glm5_shared_scale_for_grouped_gemm(scale: torch.Tensor) -> torch.Tensor:
     """Pack one shared-expert block scale matrix as grouped-GEMM ``E=1``."""
     if scale.dim() != 2:
@@ -689,25 +693,17 @@ class Glm5MoEGraphSegment:
 
 
 class Glm5MoELocalGraphSegment(Glm5MoEGraphSegment):
-    """Graph only local MoE work; collectives remain eager.
+    """Graph local MoE work with separately captured reusable collectives.
 
-    This boundary avoids the H200 CUDA-graph/PyNCCL multi-graph failure while
-    retaining the launch savings from routing, dispatch, expert GEMMs,
-    weighted combine, and the shared expert.
+    The all-gather and reduce-scatter each have one graph shared by all 75
+    layers. This avoids the H200 ceiling hit by 75 independent NCCL-bearing
+    graphs while retaining graph replay for the complete MoE boundary.
     """
 
-    eager_collectives = True
+    separate_collective_graphs = True
 
     def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
         return {
-            "all_tokens": TensorSpec(
-                (self.world_size * bucket_size, self.hidden_size),
-                torch.bfloat16,
-            ),
-            "padded": TensorSpec(
-                ("batch_size", self.hidden_size),
-                torch.bfloat16,
-            ),
             "rank_token_counts": TensorSpec((self.world_size,), torch.int64),
         }
 
@@ -728,26 +724,100 @@ class Glm5MoELocalGraphSegment(Glm5MoEGraphSegment):
         static_inputs: Dict[str, torch.Tensor],
         bucket_size: int,
     ) -> None:
-        static_inputs["all_tokens"].zero_()
-        static_inputs["padded"].zero_()
+        bufs = self.pool.get(bucket_size)
+        bufs.all_tokens.zero_()
+        bufs.padded.zero_()
         static_inputs["rank_token_counts"].fill_(bucket_size)
 
     def forward(
         self,
         *,
-        all_tokens: torch.Tensor,
-        padded: torch.Tensor,
         rank_token_counts: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        bucket_size = padded.shape[0]
+        bucket_size = max(self.pool.bucket_sizes)
         bufs = self.pool.get(bucket_size)
-        shared_output = self._shared_expert_forward(bufs, padded)
+        shared_output = self._shared_expert_forward(bufs, bufs.padded)
         routed_global_output = self._routed_local_forward(
             bufs,
-            all_tokens,
+            bufs.all_tokens,
             rank_token_counts,
         )
         return {
             "routed_global_output": routed_global_output,
             "shared_output": shared_output,
         }
+
+
+class Glm5MoEAllGatherGraphSegment:
+    """One reusable all-gather graph shared by every GLM-5.2 MoE layer."""
+
+    def __init__(self, pool: Glm5MoEGraphBufferPool, comm, device: torch.device):
+        self.pool = pool
+        self.comm = comm
+        self.device = device
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        if hasattr(self.comm, "disabled"):
+            self.comm.disabled = False
+        bufs = self.pool.get(bucket_size)
+        bufs.padded.zero_()
+        bufs.all_tokens.zero_()
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {}
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        bufs = self.pool.get(bucket_size)
+        return {
+            "all_tokens": TensorSpec(tuple(bufs.all_tokens.shape), torch.bfloat16),
+        }
+
+    def forward(self) -> Dict[str, torch.Tensor]:
+        bucket_size = max(self.pool.bucket_sizes)
+        bufs = self.pool.get(bucket_size)
+        with self.comm.change_state(enable=True):
+            self.comm.all_gather(
+                bufs.all_tokens,
+                bufs.padded,
+                stream=torch.cuda.current_stream(self.device),
+            )
+        return {"all_tokens": bufs.all_tokens}
+
+
+class Glm5MoEReduceScatterGraphSegment:
+    """One reusable reduce-scatter graph shared by every GLM-5.2 MoE layer."""
+
+    def __init__(self, pool: Glm5MoEGraphBufferPool, comm, device: torch.device):
+        self.pool = pool
+        self.comm = comm
+        self.device = device
+
+    def setup_static_buffers(self, bucket_size: int) -> None:
+        if hasattr(self.comm, "disabled"):
+            self.comm.disabled = False
+        bufs = self.pool.get(bucket_size)
+        bufs.routed_global_output.zero_()
+        bufs.local_moe_output.zero_()
+
+    def get_static_input_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        return {}
+
+    def get_static_output_specs(self, bucket_size: int) -> Dict[str, TensorSpec]:
+        bufs = self.pool.get(bucket_size)
+        return {
+            "local_moe_output": TensorSpec(
+                tuple(bufs.local_moe_output.shape),
+                torch.bfloat16,
+            ),
+        }
+
+    def forward(self) -> Dict[str, torch.Tensor]:
+        bucket_size = max(self.pool.bucket_sizes)
+        bufs = self.pool.get(bucket_size)
+        with self.comm.change_state(enable=True):
+            self.comm.reduce_scatter(
+                bufs.local_moe_output,
+                bufs.routed_global_output,
+                stream=torch.cuda.current_stream(self.device),
+            )
+        return {"local_moe_output": bufs.local_moe_output}

@@ -9268,8 +9268,12 @@ class BatchGenWorker:
 		from batchgen.cuda_graph import BatchSizeBucketing, CUDAGraphManager
 		from batchgen.models.glm.glm5.model import Glm5MoE, _GLM5_3D_MTP
 		from batchgen.models.glm.glm5.moe_cuda_graph_segments import (
+			GLM5_MOE_ALL_GATHER_GRAPH_SEGMENT,
+			GLM5_MOE_REDUCE_SCATTER_GRAPH_SEGMENT,
+			Glm5MoEAllGatherGraphSegment,
 			Glm5MoEGraphBufferPool,
 			Glm5MoELocalGraphSegment,
+			Glm5MoEReduceScatterGraphSegment,
 			make_glm5_moe_graph_segment_name,
 		)
 
@@ -9310,6 +9314,27 @@ class BatchGenWorker:
 			base_mtp=_GLM5_3D_MTP,
 		)
 		manager = CUDAGraphManager(bucketing, device=self.torch_device)
+		collective_manager = CUDAGraphManager(
+			bucketing,
+			device=self.torch_device,
+		)
+		collective_manager.enable_segment_capture_streams(barrier=dist.barrier)
+		collective_manager.register_segment(
+			GLM5_MOE_ALL_GATHER_GRAPH_SEGMENT,
+			Glm5MoEAllGatherGraphSegment(
+				pool,
+				first_moe.comm,
+				self.torch_device,
+			),
+		)
+		collective_manager.register_segment(
+			GLM5_MOE_REDUCE_SCATTER_GRAPH_SEGMENT,
+			Glm5MoEReduceScatterGraphSegment(
+				pool,
+				first_moe.comm,
+				self.torch_device,
+			),
+		)
 		for moe in moe_layers:
 			segment_name = make_glm5_moe_graph_segment_name(moe.layer_idx)
 			segment = Glm5MoELocalGraphSegment(
@@ -9319,6 +9344,13 @@ class BatchGenWorker:
 				world_size=self.world_size,
 				rank=self.rank,
 				device=self.torch_device,
+			)
+			segment.collective_graph_manager = collective_manager
+			segment.all_gather_segment_name = (
+				GLM5_MOE_ALL_GATHER_GRAPH_SEGMENT
+			)
+			segment.reduce_scatter_segment_name = (
+				GLM5_MOE_REDUCE_SCATTER_GRAPH_SEGMENT
 			)
 			manager.register_segment(segment_name, segment)
 			moe.enable_moe_cuda_graph(
@@ -9331,13 +9363,24 @@ class BatchGenWorker:
 
 		logging.info(
 			"Rank %s: capturing %s GLM-5.2 local MoE CUDA graphs at "
-			"bucket BS=%s with eager collectives",
+			"bucket BS=%s with two reusable collective graphs",
 			self.rank,
 			len(moe_layers),
 			capture_bucket,
 		)
 		self._glm5_moe_cuda_graph_manager = manager
 		self._glm5_moe_graph_capture_attempted_for_batch = True
+		torch.cuda.synchronize(self.torch_device)
+		dist.barrier()
+		collective_manager.warmup_and_capture_buckets([capture_bucket])
+		torch.cuda.synchronize(self.torch_device)
+		dist.barrier()
+		logging.info(
+			"Rank %s: GLM-5.2 reusable MoE collective CUDA graphs ready in "
+			"%.0fms",
+			self.rank,
+			collective_manager.get_capture_stats()["total_capture_time_ms"],
+		)
 		manager.warmup_and_capture_buckets([capture_bucket])
 		logging.info(
 			"Rank %s: GLM-5.2 local MoE CUDA graphs ready in %.0fms",

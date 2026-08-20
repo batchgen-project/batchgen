@@ -1935,7 +1935,7 @@ def test_glm5_moe_graph_output_is_full_module_boundary(monkeypatch):
     assert manager.replay_inputs["rank_token_counts"].tolist() == [4, 4]
 
 
-def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
+def test_glm5_local_moe_graph_uses_reusable_collective_graphs(monkeypatch):
     class FakeBucketing:
         def get_padded_size(self, batch_size):
             assert batch_size == 4
@@ -1944,6 +1944,21 @@ def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
     static_padded = torch.empty(4, 2)
     static_all_tokens = torch.empty(8, 2)
 
+    class FakeCollectiveManager:
+        replay_calls = []
+
+        def replay(self, segment_name, batch_size, **inputs):
+            assert batch_size == 4
+            assert inputs == {}
+            self.replay_calls.append(segment_name)
+            if segment_name == "glm5_moe_all_gather":
+                static_all_tokens[:4].copy_(static_padded)
+                static_all_tokens[4:].copy_(static_padded + 10)
+                return {"all_tokens": static_all_tokens}
+            assert segment_name == "glm5_moe_reduce_scatter"
+            pool.local_moe_output.copy_(pool.routed_global_output[4:8])
+            return {"local_moe_output": pool.local_moe_output}
+
     class FakeManager:
         def has_graph(self, segment_name, batch_size):
             return (
@@ -1951,61 +1966,40 @@ def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
                 and batch_size == 4
             )
 
-        def get_static_input(self, segment_name, batch_size, key):
-            assert segment_name == "glm5_layer_3_moe"
-            assert batch_size == 4
-            return {
-                "padded": static_padded,
-                "all_tokens": static_all_tokens,
-            }[key]
-
         def replay(self, segment_name, batch_size, **inputs):
             assert segment_name == "glm5_layer_3_moe"
             assert batch_size == 4
             assert set(inputs) == {"rank_token_counts"}
-            return {
-                "routed_global_output": torch.arange(
-                    16,
-                    dtype=torch.float32,
-                ).view(8, 2),
-                "shared_output": torch.full((4, 2), 100.0),
-            }
-
-    class FakePool:
-        def get(self, bucket):
-            assert bucket == 4
-            return types.SimpleNamespace(
-                local_moe_output=torch.empty(4, 2),
+            pool.routed_global_output.copy_(
+                torch.arange(16, dtype=torch.float32).view(8, 2)
+            )
+            pool.shared_output.fill_(100.0)
+            return dict(
+                routed_global_output=pool.routed_global_output,
+                shared_output=pool.shared_output,
             )
 
-    class FakeComm:
-        all_gather_calls = 0
-        reduce_scatter_calls = 0
+    class FakePool:
+        def __init__(self):
+            self.padded = static_padded
+            self.all_tokens = static_all_tokens
+            self.routed_global_output = torch.empty(8, 2)
+            self.local_moe_output = torch.empty(4, 2)
+            self.shared_output = torch.empty(4, 2)
 
-        class _State:
-            def __enter__(self):
-                return None
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        def change_state(self, enable=True):
-            return self._State()
-
-        def all_gather(self, output, input, **kwargs):
-            self.all_gather_calls += 1
-            output[:4].copy_(input)
-            output[4:].copy_(input + 10)
-
-        def reduce_scatter(self, output, input, **kwargs):
-            self.reduce_scatter_calls += 1
-            output.copy_(input[4:8])
+        def get(self, bucket):
+            assert bucket == 4
+            return self
 
     manager = FakeManager()
-    comm = FakeComm()
+    pool = FakePool()
+    collective_manager = FakeCollectiveManager()
     segment = types.SimpleNamespace(
-        pool=FakePool(),
-        eager_collectives=True,
+        pool=pool,
+        separate_collective_graphs=True,
+        collective_graph_manager=collective_manager,
+        all_gather_segment_name="glm5_moe_all_gather",
+        reduce_scatter_segment_name="glm5_moe_reduce_scatter",
     )
     moe = object.__new__(Glm5MoE)
     moe.layer_idx = 3
@@ -2017,7 +2011,6 @@ def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
     moe._moe_cuda_graph_segment_name = "glm5_layer_3_moe"
     moe._moe_cuda_graph_segment = segment
     moe._moe_cuda_graph_bucketing = FakeBucketing()
-    moe.comm = comm
     monkeypatch.setattr(
         Glm5MoE,
         "_rank_token_counts",
@@ -2036,8 +2029,10 @@ def test_glm5_local_moe_graph_keeps_collectives_eager(monkeypatch):
         out,
         torch.tensor([[[108.0, 109.0]], [[110.0, 111.0]]]),
     )
-    assert comm.all_gather_calls == 1
-    assert comm.reduce_scatter_calls == 1
+    assert collective_manager.replay_calls == [
+        "glm5_moe_all_gather",
+        "glm5_moe_reduce_scatter",
+    ]
     assert torch.equal(static_padded[:2], hidden.view(2, 2))
     assert torch.equal(static_padded[2:], torch.zeros(2, 2))
 
