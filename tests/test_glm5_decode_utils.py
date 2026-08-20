@@ -2732,6 +2732,13 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         def __init__(self, **kwargs):
             self.capture_inputs = []
             self.max_seqlen = kwargs["max_seqlen"]
+            self.chunk_segments = [
+                types.SimpleNamespace(name=f"glm5_whole_model_chunk_{idx:02d}")
+                for idx in range(4)
+            ]
+            self.chunk_segment_names = tuple(
+                segment.name for segment in self.chunk_segments
+            )
 
         def set_capture_inputs(self, **inputs):
             self.capture_inputs.append(inputs)
@@ -2871,6 +2878,9 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
     expected_buckets = [8, 4, 2, 1]
     capture_manager = FakeManager.instances[-1]
     assert capture_manager.captured == expected_buckets
+    assert tuple(capture_manager._segments) == tuple(
+        f"glm5_whole_model_chunk_{idx:02d}" for idx in range(4)
+    )
     assert bucket_inputs == [(bucket, 64) for bucket in expected_buckets]
     assert worker._glm5_whole_model_graph_capture_attempted_for_batch
     assert worker._glm5_whole_model_graph_signature == ("sig",)
