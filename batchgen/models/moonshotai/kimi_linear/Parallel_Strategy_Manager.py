@@ -578,6 +578,15 @@ class KimiLinearParallelStrategyManager:
             StreamedSP8MXFP4MoELayer,
         )
 
+        expert_ring_depth = int(
+            self.engine_config.GPU_Buffer_Config
+            .num_prefill_module_buffer["routed_expert"]
+        )
+        if expert_ring_depth <= 0:
+            raise RuntimeError(
+                "streamed-SP8 prefill requires a positive routed-expert "
+                "prefill ring depth"
+            )
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
@@ -587,7 +596,7 @@ class KimiLinearParallelStrategyManager:
             num_experts=cfg.n_routed_experts,
             intermediate_size=cfg.moe_intermediate_size,
             latent_size=cfg.routed_expert_hidden_size,
-            acquire_batch_size=16,
+            acquire_batch_size=expert_ring_depth,
         )
         for layer_idx, layer in enumerate(self.model.model.layers):
             moe = getattr(layer, "block_sparse_moe", None)

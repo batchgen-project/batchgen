@@ -149,6 +149,27 @@ def test_streamed_sp8_builds_rank_local_112_expert_schedule():
     assert tasks[-1] == "routed_expert_0_447"
 
 
+def test_streamed_sp8_acquire_batch_tracks_expert_ring_depth():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    function = _function(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_init_streamed_sp8_prefill",
+    )
+    source = ast.unparse(function)
+
+    assert "num_prefill_module_buffer['routed_expert']" in source
+    assert "acquire_batch_size=expert_ring_depth" in source
+    assert "acquire_batch_size=16" not in source
+
+
 def test_streamed_sp8_forward_uses_only_local_row_collective():
     path = (
         ROOT
