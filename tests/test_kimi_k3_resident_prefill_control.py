@@ -187,6 +187,42 @@ def test_streamed_sp8_forward_uses_only_local_row_collective():
     assert "all_gather" not in calls
 
 
+def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    function = _function(
+        path, "StreamedSP8LayerBuffer", "_acquire_local_shard"
+    )
+    phases = [
+        node.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("prefill")
+    ]
+    assert "prefill_sp8" in phases
+    assert "prefill" not in phases
+
+
+def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
+    path = ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
+    source = path.read_text()
+    release = source[
+        source.index("void GPU_Weight_Buffer::releaseBuffer"):
+        source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights")
+    ]
+    get_weights = source[
+        source.index("module_weight_tensor_map GPU_Weight_Buffer::get_weights"):
+        source.index("void GPU_Weight_Buffer::weights_copy_complete")
+    ]
+
+    assert "module_in_buffers_.find(module_name)" in release
+    assert "module_in_buffers_[module_name]" not in release
+    assert "Cannot release missing weight-buffer lease" in release
+    assert 'phase == "prefill_sp8"' in get_weights
+    assert "std::chrono::seconds(300)" in get_weights
+    assert "!hold_layer_batch" in get_weights
+
+
 def test_worker_reads_batch_level_mode_before_configure_prefill():
     worker_path = ROOT / "batchgen" / "batchgen_worker.py"
     function = _function(

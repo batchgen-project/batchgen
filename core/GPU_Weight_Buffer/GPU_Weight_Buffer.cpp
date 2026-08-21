@@ -203,8 +203,22 @@ GPU_Weight_Buffer::acquireEmptyBuffer(const std::string& module_type) {
 
 void GPU_Weight_Buffer::releaseBuffer(const std::string& module_name) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    auto [module_type, buffer_idx] = this->module_in_buffers_[module_name];
-    this->module_in_buffers_.erase(module_name);
+    auto module_it = this->module_in_buffers_.find(module_name);
+    if (module_it == this->module_in_buffers_.end()) {
+        std::ostringstream oss;
+        oss << "Cannot release missing weight-buffer lease for "
+            << module_name << ". Current modules: ";
+        size_t count = 0;
+        for (const auto& [key, value] : this->module_in_buffers_) {
+            oss << key;
+            if (++count < this->module_in_buffers_.size()) {
+                oss << ", ";
+            }
+        }
+        throw std::runtime_error(oss.str());
+    }
+    auto [module_type, buffer_idx] = module_it->second;
+    this->module_in_buffers_.erase(module_it);
     this->buffer_status_[module_type][buffer_idx] = 0;
     this->logger_->debug("Released buffer: module={}, type={}, idx={}",
                          module_name, module_type, buffer_idx);
@@ -218,7 +232,10 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
     
     // Start timer for timeout tracking
     auto start_time = std::chrono::steady_clock::now();
-    constexpr auto timeout_duration = std::chrono::seconds(2);
+    const bool hold_layer_batch = phase == "prefill_sp8";
+    const auto timeout_duration = hold_layer_batch
+                                      ? std::chrono::seconds(300)
+                                      : std::chrono::seconds(2);
     
     try {
         while (true) {
@@ -272,7 +289,8 @@ module_weight_tensor_map GPU_Weight_Buffer::get_weights(
             
             // Check if module_name starts with "routed_expert" and has enough
             // length
-            if (module_name.substr(0, 13) == "routed_expert") {
+            if (!hold_layer_batch &&
+                module_name.substr(0, 13) == "routed_expert") {
                 // Find the last two underscores
                 size_t last_underscore = module_name.rfind('_');
                 size_t second_last_underscore =

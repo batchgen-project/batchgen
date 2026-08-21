@@ -97,7 +97,10 @@ class StreamedSP8LayerBuffer:
                 self.expert_start + self.experts_per_rank,
             )
         ]
-        phase = "prefill"
+        # Hold every slot in this bounded batch until its D2D copy completes.
+        # The ordinary prefill phase may evict earlier expert mappings while a
+        # later module is still being acquired.
+        phase = "prefill_sp8"
         for begin in range(0, len(names), self.acquire_batch_size):
             acquired = []
             batch = names[begin:begin + self.acquire_batch_size]
