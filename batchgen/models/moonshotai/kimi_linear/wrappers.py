@@ -139,6 +139,7 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         super().__init__(module, layer_idx, core_engine, engine_config,
                          model_config, persistent=persistent)
         self.module_key = f"kda_attn_{layer_idx}"
+        self._resident_prefill_segment_tokens = None
 
     @classmethod
     def init_state_pools(cls, kda_layer_indices, num_slots, num_heads, head_dim,
@@ -214,9 +215,20 @@ class KimiLinearKDAWrapper(AttnWrapperBase):
         hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         slot_ids = state.prepare_prefill(seq_ids)
-        out = self.module.kda_prefill_serving(
-            hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state
-        )
+        segment_tokens = self._resident_prefill_segment_tokens
+        if segment_tokens is None:
+            out = self.module.kda_prefill_serving(
+                hidden_2d, cu_seqlens, slot_ids, state.has_initial_state, state
+            )
+        else:
+            out = self.module.kda_prefill_serving(
+                hidden_2d,
+                cu_seqlens,
+                slot_ids,
+                state.has_initial_state,
+                state,
+                segment_tokens=segment_tokens,
+            )
         return out.unsqueeze(0)
 
     def _forward_decode(self, hidden_states, **kwargs):

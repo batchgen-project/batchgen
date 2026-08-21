@@ -283,6 +283,9 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     norm = type("KimiRMSNorm", (), {
         "_resident_prefill_token_tile": None,
     })()
+    kda = type("KDAWrapper", (), {
+        "_resident_prefill_segment_tokens": None,
+    })()
     moe = type("MoE", (), {
         "_resident_ep_moe": None,
         "shared_experts": shared,
@@ -290,7 +293,7 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     layer = type("Layer", (), {"mlp": dense, "block_sparse_moe": moe})()
     manager.model = type("Model", (), {
         "model": type("Inner", (), {"layers": [layer]})(),
-        "modules": lambda self: [norm],
+        "modules": lambda self: [norm, kda],
     })()
     method = _isolated_method(
         path,
@@ -302,12 +305,14 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
     assert dense._resident_prefill_token_tile == 512
     assert shared._resident_prefill_token_tile == 512
     assert norm._resident_prefill_token_tile == 512
+    assert kda._resident_prefill_segment_tokens == 8192
     assert moe._resident_ep_prefill_enabled is True
 
     method(False)
     assert dense._resident_prefill_token_tile is None
     assert shared._resident_prefill_token_tile is None
     assert norm._resident_prefill_token_tile is None
+    assert kda._resident_prefill_segment_tokens is None
     assert moe._resident_ep_prefill_enabled is False
 
 

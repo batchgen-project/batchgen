@@ -212,6 +212,14 @@ class KimiLinearParallelStrategyManager:
         for module in self.model.modules():
             if hasattr(module, "_resident_prefill_token_tile"):
                 module._resident_prefill_token_tile = tile
+            if hasattr(module, "_resident_prefill_segment_tokens"):
+                # W1 has 4,096 local rows and stays a single KDA call. W2 has
+                # 16,384 rows; two 8,192-row, chunk-aligned calls halve FLA's
+                # per-segment scratch while threading the same FP32 recurrent
+                # state through the already-validated segmented seam.
+                module._resident_prefill_segment_tokens = (
+                    8192 if enabled else None
+                )
         for layer in self.model.model.layers:
             moe = getattr(layer, "block_sparse_moe", None)
             if moe is not None:
