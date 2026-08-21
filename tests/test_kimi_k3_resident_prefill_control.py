@@ -22,7 +22,7 @@ def _function(path, class_name, function_name):
     )
 
 
-def _isolated_method(path, class_name, function_name):
+def _isolated_method(path, class_name, function_name, globals_=None):
     method = copy.deepcopy(_function(path, class_name, function_name))
     module = ast.Module(
         body=[
@@ -36,7 +36,7 @@ def _isolated_method(path, class_name, function_name):
         ],
         type_ignores=[],
     )
-    namespace = {}
+    namespace = dict(globals_ or {})
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return getattr(namespace["Isolated"], function_name)
 
@@ -231,6 +231,7 @@ def test_streamed_sp8_reinterprets_offline_marlin_as_int32():
         path,
         "StreamedSP8LayerBuffer",
         "_offline_marlin_packed_view",
+        {"torch": torch},
     )
     packed = torch.empty((3, 3072, 1792), dtype=torch.uint8)
     storage = packed.data_ptr()
