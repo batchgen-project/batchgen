@@ -142,6 +142,18 @@ class StreamedSP8LayerBuffer:
         stride_bytes = tensor[0].numel() * tensor.element_size()
         return self._expert_offsets.mul(stride_bytes).add(tensor.data_ptr())
 
+    @staticmethod
+    def _offline_marlin_packed_view(
+        packed_u8: torch.Tensor,
+        n_out: int,
+        k_in: int,
+    ) -> torch.Tensor:
+        # The ring slot preserves the checkpoint-shaped uint8 ABI, but its
+        # linear bytes are already offline-Marlin int32 words.
+        return packed_u8.view(torch.int32).reshape(
+            packed_u8.shape[0], k_in // 16, n_out * 2
+        )
+
     def load(self, layer_idx: int):
         self._acquire_local_shard(layer_idx)
         self._gather_full_layer()
@@ -156,8 +168,8 @@ class StreamedSP8LayerBuffer:
             else:
                 n_out, k_in = self.latent_size, self.intermediate_size
 
-            packed[projection] = self.full[packed_name].view(
-                self.num_experts, k_in // 16, n_out * 2
+            packed[projection] = self._offline_marlin_packed_view(
+                self.full[packed_name], n_out, k_in
             )
             scale_u8 = self.full[scale_name].view(
                 self.num_experts, k_in // MXFP4_GROUP_SIZE, n_out

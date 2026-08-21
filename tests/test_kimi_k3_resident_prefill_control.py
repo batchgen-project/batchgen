@@ -224,6 +224,25 @@ def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
     assert "prefill" not in phases
 
 
+def test_streamed_sp8_reinterprets_offline_marlin_as_int32():
+    torch = pytest.importorskip("torch")
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    method = _isolated_method(
+        path,
+        "StreamedSP8LayerBuffer",
+        "_offline_marlin_packed_view",
+    )
+    packed = torch.empty((3, 3072, 1792), dtype=torch.uint8)
+    storage = packed.data_ptr()
+
+    actual = method(packed, 3072, 3584)
+
+    assert actual.dtype is torch.int32
+    assert actual.shape == (3, 224, 6144)
+    assert actual.data_ptr() == storage
+    assert actual.numel() * actual.element_size() == packed.numel()
+
+
 def test_weight_buffer_release_is_fail_safe_for_missing_sp8_lease():
     path = ROOT / "core" / "GPU_Weight_Buffer" / "GPU_Weight_Buffer.cpp"
     source = path.read_text()
