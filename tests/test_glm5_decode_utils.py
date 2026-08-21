@@ -1198,6 +1198,7 @@ def test_glm52_qprep_initializes_every_layer(monkeypatch):
     calls = []
     worker = object.__new__(BatchGenWorker)
     worker.rank = 0
+    worker._batchgen_debug = {}
     worker.model_config = types.SimpleNamespace(model_type="glm_moe_dsa_5_2")
     worker.model = types.SimpleNamespace(
         model=types.SimpleNamespace(
@@ -1227,6 +1228,7 @@ def test_glm52_qprep_skips_without_whole_graph(monkeypatch):
 
     calls = []
     worker = object.__new__(BatchGenWorker)
+    worker._batchgen_debug = {}
     worker.model_config = types.SimpleNamespace(model_type="glm_moe_dsa_5_2")
     worker.model = types.SimpleNamespace(
         model=types.SimpleNamespace(

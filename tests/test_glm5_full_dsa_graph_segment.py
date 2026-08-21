@@ -201,16 +201,14 @@ def test_glm52_folded_q_b_initialization(monkeypatch):
             qk_nope_head_dim=q_nope_dim,
             kv_lora_rank=kv_lora_rank,
             q_b_proj=types.SimpleNamespace(
-                weight=types.SimpleNamespace(data=q_b_weight)
+                weight=q_b_weight
             ),
             kv_b_proj=types.SimpleNamespace(
-                weight=types.SimpleNamespace(
-                    data=torch.empty(
-                        heads * (q_nope_dim + 256),
-                        kv_lora_rank,
-                        device=device,
-                        dtype=torch.float8_e4m3fn,
-                    )
+                weight=torch.empty(
+                    heads * (q_nope_dim + 256),
+                    kv_lora_rank,
+                    device=device,
+                    dtype=torch.float8_e4m3fn,
                 )
             ),
         ),
