@@ -183,8 +183,8 @@ def test_glm52_folded_q_b_initialization(monkeypatch):
         heads * q_head_dim,
         q_lora_rank,
         device=device,
-        dtype=torch.bfloat16,
-    )
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
     q_absorb = torch.randn(
         heads,
         q_nope_dim,
