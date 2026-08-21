@@ -919,6 +919,37 @@ def moe_forward_serving(self, hidden_states):
     ):
         return moe_forward_resident_ep_decode(self, hidden_states, resident)
 
+    streamed_sp8 = getattr(self, "_streamed_sp8_moe", None)
+    if (
+        streamed_sp8 is not None
+        and getattr(self, "_streamed_sp8_prefill_enabled", False)
+        and KimiLinearExpertWrapper.phase == "prefill"
+    ):
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_dim)
+        G = int(getattr(self, "attn_tp_size", 1))
+        if G <= 1:
+            raise RuntimeError(
+                "streamed-SP8 prefill reached MoE without TP row sharding"
+            )
+        from .moe_tp_reshard import all_gather_rows, scatter_rows
+
+        num_rows = x.shape[0]
+        x_local = scatter_rows(x, G, self.attn_tp_rank)
+        routed_local = streamed_sp8.forward(x_local, self.gate)
+        routed = all_gather_rows(
+            routed_local,
+            num_rows,
+            G,
+            self.attn_tp_rank,
+            self.attn_tp_group,
+        )
+        out = routed.reshape(orig_shape)
+        if getattr(self, "shared_experts", None) is not None:
+            out.add_(self.shared_experts(identity))
+        return out
+
     identity = hidden_states
     orig_shape = hidden_states.shape
     x = hidden_states.reshape(-1, self.hidden_dim)

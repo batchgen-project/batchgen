@@ -338,6 +338,7 @@ struct DistributedWeightDaemon::Impl {
         superchunk = config.value("superchunk", 8);
         outstanding = config.value("outstanding", 8);
         workers = config.value("workers", kDefaultWorkers);
+        worker_sharded = config.value("worker_sharded", false);
 
         if (node_rank < 0 || node_rank >= kNodes ||
             node_ips.size() != kNodes) {
@@ -345,7 +346,10 @@ struct DistributedWeightDaemon::Impl {
         }
         if (depth <= 0 || depth % superchunk != 0 ||
             superchunk <= 0 || outstanding <= 0 ||
-            workers <= 0 || workers > 31) {
+            workers <= 0 || workers > 31 ||
+            (worker_sharded &&
+             (kExperts % workers != 0 ||
+              (kExperts / workers) % superchunk != 0))) {
             fail("invalid distributed weight ring configuration");
         }
         staging_bytes =
@@ -372,6 +376,7 @@ struct DistributedWeightDaemon::Impl {
     int superchunk = 8;
     int outstanding = 8;
     int workers = kDefaultWorkers;
+    bool worker_sharded = false;
     std::uint32_t all_workers_mask = 0;
 
     int store_fd = -1;
@@ -904,6 +909,12 @@ struct DistributedWeightDaemon::Impl {
         }
         const std::uint32_t worker_bit =
             static_cast<std::uint32_t>(1) << worker_id;
+        const std::uint32_t expected_workers =
+            ExpectedWorkers(module_key);
+        if ((expected_workers & worker_bit) == 0) {
+            fail("worker acquired a module outside its SP shard: " +
+                 module_key);
+        }
         const Clock::time_point begin = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex);
         const bool available = ring_cv.wait_for(
@@ -975,7 +986,7 @@ struct DistributedWeightDaemon::Impl {
         slot.released_mask |= worker_bit;
         response->slot = found->second;
         response->generation = generation;
-        if (slot.released_mask == all_workers_mask) {
+        if (slot.released_mask == ExpectedWorkers(module_key)) {
             module_to_slot.erase(found);
             slot = Slot{};
             ring_cv.notify_all();
@@ -985,10 +996,48 @@ struct DistributedWeightDaemon::Impl {
         ++release_count;
     }
 
+    std::uint32_t ExpectedWorkers(
+        const std::string& module_key) const {
+        if (!worker_sharded) {
+            return all_workers_mask;
+        }
+        const auto [layer, expert] = parse_module_key(module_key);
+        const int experts_per_worker = kExperts / workers;
+        const int worker = expert / experts_per_worker;
+        (void)layer;
+        return static_cast<std::uint32_t>(1) << worker;
+    }
+
     std::vector<std::string> BuildSchedule() const {
         std::vector<std::string> schedule;
         schedule.reserve(
             kLayers * (kExperts - kExpertsPerOwner));
+        if (worker_sharded) {
+            const int experts_per_worker = kExperts / workers;
+            // Round-robin complete superchunks across worker shards. Every
+            // worker's first requested module is then within the initial ring
+            // fill; a layer-major expert sweep would strand high TP ranks
+            // behind get_weights()' 2-second timeout.
+            for (int layer = 1; layer <= kLayers; ++layer) {
+                for (int chunk_offset = 0;
+                     chunk_offset < experts_per_worker;
+                     chunk_offset += superchunk) {
+                    for (int worker = 0; worker < workers; ++worker) {
+                        const int first_expert =
+                            worker * experts_per_worker + chunk_offset;
+                        if (first_expert / kExpertsPerOwner == node_rank) {
+                            continue;
+                        }
+                        for (int index = 0; index < superchunk; ++index) {
+                            schedule.push_back(
+                                "routed_expert_" + std::to_string(layer) +
+                                "_" + std::to_string(first_expert + index));
+                        }
+                    }
+                }
+            }
+            return schedule;
+        }
         for (int layer = 1; layer <= kLayers; ++layer) {
             for (int expert = 0; expert < kExperts; ++expert) {
                 if (expert / kExpertsPerOwner == node_rank) {
@@ -1198,6 +1247,7 @@ struct DistributedWeightDaemon::Impl {
             summary["depth"] = depth;
             summary["superchunk"] = superchunk;
             summary["outstanding"] = outstanding;
+            summary["worker_sharded"] = worker_sharded;
             summary["store_bytes"] = store_bytes;
             summary["staging_bytes"] = staging_bytes;
             summary["fetched_modules"] = fetched_modules;

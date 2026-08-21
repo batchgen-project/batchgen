@@ -164,6 +164,7 @@ class KimiLinearParallelStrategyManager:
             )
         self._comm = None
         self._resident_ep_built = False
+        self._streamed_sp8_buffer = None
         self._prefill_moe_mode = "streamed"
         self._decode_graph = None
 
@@ -180,24 +181,50 @@ class KimiLinearParallelStrategyManager:
     def set_prefill_moe_mode(self, mode):
         """Select the K3 prefill MoE control for the next active batch.
 
-        ``streamed`` is the production/default path. ``resident_ep`` is the R5
-        experimental control: materialize this rank's resident expert shard and
-        run the existing EP collective path during prefill.
+        ``streamed`` is the legacy replicated pure-DP path. ``resident_ep`` is
+        the R5 control. ``streamed_sp8`` keeps TP8 attention but scatters token
+        rows locally across the eight GPUs, runs one grouped all-expert MoE per
+        layer, and gathers rows only inside the node.
         """
         value = str(mode or "streamed").strip().lower()
-        if value not in {"streamed", "resident_ep"}:
+        if value not in {"streamed", "resident_ep", "streamed_sp8"}:
             raise ValueError(
-                "k3_prefill_moe_mode must be 'streamed' or 'resident_ep', "
+                "k3_prefill_moe_mode must be 'streamed', 'resident_ep' or "
+                "'streamed_sp8', "
                 f"got {mode!r}"
             )
-        if value == "resident_ep" and not self._is_k3:
+        if value in {"resident_ep", "streamed_sp8"} and not self._is_k3:
             raise ValueError(
-                "resident-EP prefill control is implemented only for Kimi-K3"
+                f"{value} prefill is implemented only for Kimi-K3"
             )
         self._prefill_moe_mode = value
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"
+
+    def prefill_uses_streamed_sp8(self):
+        return self._prefill_moe_mode == "streamed_sp8"
+
+    def _set_prefill_memory_tiling(self, enabled):
+        """Bound K3 prefill temporaries for resident-EP and streamed-SP8."""
+        if self.model is None:
+            return
+        tile = 512 if enabled else None
+        for module in self.model.modules():
+            if hasattr(module, "_resident_prefill_token_tile"):
+                module._resident_prefill_token_tile = tile
+            if hasattr(module, "_resident_prefill_segment_tokens"):
+                module._resident_prefill_segment_tokens = (
+                    8192 if enabled else None
+                )
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            dense = getattr(layer, "mlp", None)
+            if dense is not None:
+                dense._resident_prefill_token_tile = tile
+            shared = getattr(moe, "shared_experts", None) if moe is not None else None
+            if shared is not None:
+                shared._resident_prefill_token_tile = tile
 
     def _set_resident_ep_prefill_enabled(self, enabled):
         """Route K3 MoE through resident EP in prefill and compact its scratch."""
@@ -206,20 +233,9 @@ class KimiLinearParallelStrategyManager:
                 ResidentEPMXFP4MoELayer,
             )
             ResidentEPMXFP4MoELayer.release_prefill_output()
+        self._set_prefill_memory_tiling(enabled)
         if self.model is None:
             return
-        tile = 512 if enabled else None
-        for module in self.model.modules():
-            if hasattr(module, "_resident_prefill_token_tile"):
-                module._resident_prefill_token_tile = tile
-            if hasattr(module, "_resident_prefill_segment_tokens"):
-                # W1 has 4,096 local rows and stays a single KDA call. W2 has
-                # 16,384 rows; two 8,192-row, chunk-aligned calls halve FLA's
-                # per-segment scratch while threading the same FP32 recurrent
-                # state through the already-validated segmented seam.
-                module._resident_prefill_segment_tokens = (
-                    8192 if enabled else None
-                )
         for layer in self.model.model.layers:
             moe = getattr(layer, "block_sparse_moe", None)
             if moe is not None:
@@ -227,17 +243,26 @@ class KimiLinearParallelStrategyManager:
                 resident = getattr(moe, "_resident_ep_moe", None)
                 if resident is not None:
                     resident.compact_dispatch = bool(enabled)
-            # W2 gives each rank 16,384 rows. The normal 8,192-row KimiMLP
-            # tile needs 528 MiB per projection and a 1.03 GiB gate/up cat,
-            # which cannot fit beside the resident expert shard. This smaller
-            # tile is active only for resident prefill; W1 (4,096 rows),
-            # streamed prefill and decode retain their original call shapes.
-            dense = getattr(layer, "mlp", None)
-            if dense is not None:
-                dense._resident_prefill_token_tile = tile
-            shared = getattr(moe, "shared_experts", None) if moe is not None else None
-            if shared is not None:
-                shared._resident_prefill_token_tile = tile
+
+    def _set_streamed_sp8_prefill_enabled(self, enabled):
+        self._set_prefill_memory_tiling(enabled)
+        if self.model is None:
+            return
+        for layer in self.model.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is not None:
+                moe._streamed_sp8_prefill_enabled = bool(enabled)
+
+    def _release_streamed_sp8_prefill(self):
+        if self.model is not None:
+            for layer in self.model.model.layers:
+                moe = getattr(layer, "block_sparse_moe", None)
+                if moe is not None:
+                    moe._streamed_sp8_prefill_enabled = False
+                    moe._streamed_sp8_moe = None
+        self._streamed_sp8_buffer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def prepare_resident_ep_prefill_output(self, num_global):
         """Reserve the reusable global FP32 combine output before expert HBM."""
@@ -303,6 +328,13 @@ class KimiLinearParallelStrategyManager:
             ) is not None:
                 task["shared_expert"].append(f"shared_expert_{layer_idx}")
             for e_idx in range(len(moe.experts)):
+                if self.prefill_uses_streamed_sp8():
+                    start = self._attn_tp_rank * (
+                        len(moe.experts) // self._attn_tp_size
+                    )
+                    end = start + len(moe.experts) // self._attn_tp_size
+                    if not (start <= e_idx < end):
+                        continue
                 task["routed_expert"].append(
                     f"routed_expert_{layer_idx}_{e_idx}"
                 )
@@ -324,6 +356,7 @@ class KimiLinearParallelStrategyManager:
         BlockResidualCarrier.reset()
         self.weight_copy_task = self._build_weight_copy_task()
         if self.prefill_uses_resident_ep():
+            self._release_streamed_sp8_prefill()
             if self._stream_all_modules or self._attn_tp_size <= 1:
                 raise RuntimeError(
                     "resident-EP prefill requires K3's resident TP attention "
@@ -337,7 +370,23 @@ class KimiLinearParallelStrategyManager:
                     "[K3_PREFILL_MOE] resident_ep enabled: rank-owned Marlin "
                     "experts, EP32 collectives, compact routed scratch"
                 )
+        elif self.prefill_uses_streamed_sp8():
+            self._set_resident_ep_prefill_enabled(False)
+            if self._stream_all_modules or self._attn_tp_size != 8:
+                raise RuntimeError(
+                    "streamed-SP8 prefill requires K3's resident TP8 attention "
+                    "layout (attention_group_size=8, stream_all_modules=False)"
+                )
+            self._init_streamed_sp8_prefill()
+            self._set_streamed_sp8_prefill_enabled(True)
+            if self.rank == 0:
+                logging.info(
+                    "[K3_PREFILL_MOE] streamed_sp8 enabled: 112 experts/rank "
+                    "H2D, TP8 layer weight all-gather, local row scatter/gather, "
+                    "zero cross-node MoE activation collectives"
+                )
         else:
+            self._release_streamed_sp8_prefill()
             self._set_resident_ep_prefill_enabled(False)
         return self.model, self.weight_copy_task
 
@@ -367,6 +416,7 @@ class KimiLinearParallelStrategyManager:
                 "C4) or turn the flag off."
             )
         self.loaded_model_config.phase = "decode"
+        self._release_streamed_sp8_prefill()
         self._set_resident_ep_prefill_enabled(False)
         if comm is not None:
             self._comm = comm
@@ -517,6 +567,43 @@ class KimiLinearParallelStrategyManager:
                 device,
             )
         self._resident_ep_built = True
+
+    def _init_streamed_sp8_prefill(self):
+        """Attach one reusable layer-wise all-expert buffer to every K3 MoE."""
+        if self._streamed_sp8_buffer is not None:
+            return
+        cfg = self.loaded_model_config
+        from batchgen.moe.streamed_sp8_mxfp4 import (
+            StreamedSP8LayerBuffer,
+            StreamedSP8MXFP4MoELayer,
+        )
+
+        self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
+            core_engine=self.core_engine,
+            device=self.engine_config.Basic_Config.device_torch,
+            tp_group=self._attn_tp_group,
+            tp_rank=self._attn_tp_rank,
+            tp_size=self._attn_tp_size,
+            num_experts=cfg.n_routed_experts,
+            intermediate_size=cfg.moe_intermediate_size,
+            latent_size=cfg.routed_expert_hidden_size,
+            acquire_batch_size=16,
+        )
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is None or moe.experts is None:
+                continue
+            moe._streamed_sp8_moe = StreamedSP8MXFP4MoELayer(
+                layer_idx=layer_idx,
+                buffer=self._streamed_sp8_buffer,
+                down_proj=moe.routed_expert_down_proj,
+                norm=(
+                    moe.routed_expert_norm
+                    if getattr(moe, "latent_moe_use_norm", False)
+                    else None
+                ),
+                up_proj=moe.routed_expert_up_proj,
+            )
 
     def set_num_tokens_per_rank(self, num_tokens_per_rank):
         """Worker hook (duck-typed by _sync_decode_moe_rank_counts): per-step

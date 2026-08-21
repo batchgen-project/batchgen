@@ -203,18 +203,16 @@ class KimiLinearPlanner(BasePlanner):
         #   attn           442.88 MiB x 2 =   885.8 MiB
         #   kda_attn       846.67 MiB x 2 =  1653.3 MiB
         #   shared_expert  252.00 MiB x 2 =   504.0 MiB
-        #   routed_expert   16.73 MiB x 64 = 1071.0 MiB
-        #                                  = 4.02 GiB total
+        #   routed_expert   16.73 MiB x112 = 1873.9 MiB
+        #                                  = 4.80 GiB total
         # Depth 2 for the three big types is the MINIMUM that overlaps at all:
         # one slot being consumed while the producer fills the next. Each layer
         # requests exactly one attn OR one kda_attn and one shared_expert, so a
         # third slot buys prefetch cushion at 0.83 GiB per slot on the KDA ring
-        # — the worst HBM-per-benefit trade of the four. Depth 64 on the routed
-        # experts is the opposite trade: 896 experts are driven back to back
-        # with near-zero compute each, so the ring must absorb the producer's
-        # per-tensor cudaStreamSynchronize, and a slot costs only 16.73 MiB.
-        # The knee is an M3 measurement (PREFILL_PLAN §5), not a guess — do not
-        # raise these past what a measurement supports.
+        # — the worst HBM-per-benefit trade of the four. Depth 112 on the routed
+        # experts is one TP8 shard of a K3 layer (896/8): streamed-SP8 acquires
+        # the whole shard before the node-local weight all-gather. The legacy
+        # streamed path also tolerates the deeper producer lead.
         #
         # kda_attn has no entry in base_planner's default map
         # (base_planner.py:90-94), and GPU_Weight_Buffer::Init() iterates that
@@ -225,7 +223,7 @@ class KimiLinearPlanner(BasePlanner):
             "attn": 2,
             "kda_attn": 2,
             "shared_expert": 2,
-            "routed_expert": 64,
+            "routed_expert": 112,
         }
 
     def get_module_shapes(self) -> dict:

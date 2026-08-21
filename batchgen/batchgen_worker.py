@@ -13052,6 +13052,8 @@ class BatchGenWorker:
 		# (INT4 contiguous weight buffers, MoE class-level buffers)
 		if hasattr(self, 'parallel_manager') and self.parallel_manager is not None:
 			pm = self.parallel_manager
+			if hasattr(pm, "_release_streamed_sp8_prefill"):
+				pm._release_streamed_sp8_prefill()
 			for attr in ('_int4_packed_gpu_buf', '_int4_scale_gpu_buf'):
 				if hasattr(pm, attr):
 					delattr(pm, attr)

@@ -56,7 +56,7 @@ def _isolated_function(path, function_name):
     return namespace[function_name]
 
 
-def test_prefill_mode_accepts_only_streamed_or_resident_ep():
+def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     path = (
         ROOT
         / "batchgen"
@@ -74,12 +74,18 @@ def test_prefill_mode_accepts_only_streamed_or_resident_ep():
     manager.prefill_uses_resident_ep = _isolated_method(
         path, "KimiLinearParallelStrategyManager", "prefill_uses_resident_ep"
     ).__get__(manager)
+    manager.prefill_uses_streamed_sp8 = _isolated_method(
+        path, "KimiLinearParallelStrategyManager", "prefill_uses_streamed_sp8"
+    ).__get__(manager)
 
     manager.set_prefill_moe_mode("resident_ep")
     assert manager.prefill_uses_resident_ep()
+    manager.set_prefill_moe_mode("streamed_sp8")
+    assert manager.prefill_uses_streamed_sp8()
     manager.set_prefill_moe_mode(None)
     assert not manager.prefill_uses_resident_ep()
-    with pytest.raises(ValueError, match="streamed.*resident_ep"):
+    assert not manager.prefill_uses_streamed_sp8()
+    with pytest.raises(ValueError, match="streamed.*resident_ep.*streamed_sp8"):
         manager.set_prefill_moe_mode("unknown")
 
 
@@ -100,6 +106,85 @@ def test_resident_prefill_is_refused_for_non_k3():
     ).__get__(manager)
     with pytest.raises(ValueError, match="only for Kimi-K3"):
         manager.set_prefill_moe_mode("resident_ep")
+    with pytest.raises(ValueError, match="only for Kimi-K3"):
+        manager.set_prefill_moe_mode("streamed_sp8")
+
+
+def test_streamed_sp8_builds_rank_local_112_expert_schedule():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
+    manager._stream_all_modules = False
+    manager._attn_tp_size = 8
+    manager._attn_tp_rank = 3
+    manager.prefill_uses_streamed_sp8 = lambda: True
+    moe = type("MoE", (), {
+        "experts": [object()] * 896,
+        "shared_experts": None,
+    })()
+    layer = type("Layer", (), {"block_sparse_moe": moe})()
+    manager.model = type("Model", (), {
+        "model": type("Inner", (), {"layers": [layer]})(),
+    })()
+    manager.loaded_model_config = type("Config", (), {
+        "num_hidden_layers": 1,
+        "is_kda_layer": lambda self, _: False,
+    })()
+    build = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_build_weight_copy_task",
+    ).__get__(manager)
+
+    tasks = build()["routed_expert"]
+
+    assert len(tasks) == 112
+    assert tasks[0] == "routed_expert_0_336"
+    assert tasks[-1] == "routed_expert_0_447"
+
+
+def test_streamed_sp8_forward_uses_only_local_row_collective():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "serving_modules.py"
+    )
+    tree = ast.parse(path.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "moe_forward_serving"
+    )
+    sp8_if = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(name, ast.Name) and name.id == "streamed_sp8"
+            for name in ast.walk(node.test)
+        )
+    )
+    calls = set()
+    for node in ast.walk(sp8_if):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute):
+            calls.add(node.func.attr)
+        elif isinstance(node.func, ast.Name):
+            calls.add(node.func.id)
+    assert "all_gather_rows" in calls
+    assert "all_reduce" not in calls
+    assert "all_gather" not in calls
 
 
 def test_worker_reads_batch_level_mode_before_configure_prefill():
@@ -295,6 +380,11 @@ def test_resident_prefill_sets_dense_and_shared_ffn_tiles():
         "model": type("Inner", (), {"layers": [layer]})(),
         "modules": lambda self: [norm, kda],
     })()
+    manager._set_prefill_memory_tiling = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "_set_prefill_memory_tiling",
+    ).__get__(manager)
     method = _isolated_method(
         path,
         "KimiLinearParallelStrategyManager",
