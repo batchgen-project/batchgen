@@ -26,6 +26,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _err_ratio(actual, reference):
