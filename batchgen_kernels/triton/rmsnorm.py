@@ -274,8 +274,8 @@ def fused_rmsnorm_group_quant_out(
     group_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Write RMSNorm BF16 output and its blockwise FP8 quantization."""
-    if x.dim() != 2 or not x.is_contiguous():
-        raise ValueError("x must be a contiguous 2-D tensor")
+    if x.dim() != 2 or x.stride(1) != 1:
+        raise ValueError("x must be a 2-D tensor contiguous in its hidden dimension")
     if x.dtype != torch.bfloat16:
         raise TypeError(f"x must be bfloat16, got {x.dtype}")
     rows, hidden_size = x.shape

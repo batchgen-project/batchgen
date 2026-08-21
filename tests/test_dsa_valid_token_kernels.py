@@ -37,6 +37,139 @@ def test_act_quant_valid_tokens_zeroes_padding_rows(rows: int):
     assert torch.all(scale[valid_rows:] == 1e-12)
 
 
+@pytest.mark.parametrize("rows,valid_rows", [(4, 2), (56, 48)])
+def test_fused_rmsnorm_group_quant_matches_separate_path(
+    rows: int,
+    valid_rows: int,
+):
+    from batchgen.attention.mla.fa3_backend import act_quant
+    from batchgen_kernels.triton.rmsnorm import (
+        fused_rmsnorm,
+        fused_rmsnorm_group_quant_out,
+    )
+
+    torch.manual_seed(rows + valid_rows)
+    hidden_size = 2048
+    num_groups = hidden_size // 128
+    aligned_rows = ((rows + 3) // 4) * 4
+    x = (
+        torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+        * 0.1
+    ).contiguous()
+    weight = (
+        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+        * 0.1
+    ).contiguous()
+    num_valid = torch.tensor([valid_rows], device="cuda", dtype=torch.int32)
+
+    reference_norm = torch.empty_like(x)
+    fused_rmsnorm(x, weight, 1e-5, out=reference_norm)
+    reference_q, reference_scale = act_quant(
+        reference_norm,
+        num_valid_tokens=num_valid,
+        scale_tma_aligned=True,
+    )
+
+    actual_norm = torch.full_like(x, 7)
+    actual_q = torch.empty_like(reference_q)
+    actual_scale = torch.empty(
+        num_groups,
+        aligned_rows,
+        device="cuda",
+        dtype=torch.float32,
+    ).transpose(0, 1)[:rows]
+    fused_rmsnorm_group_quant_out(
+        x,
+        weight,
+        1e-5,
+        actual_norm,
+        actual_q,
+        actual_scale,
+        num_valid_tokens=num_valid,
+    )
+    torch.cuda.synchronize()
+
+    _assert_bf16_wgmma_close(
+        actual_norm[:valid_rows],
+        reference_norm[:valid_rows],
+    )
+    reference_dequant = (
+        reference_q[:valid_rows].float()
+        * reference_scale[:valid_rows].repeat_interleave(128, dim=1)
+    )
+    actual_dequant = (
+        actual_q[:valid_rows].float()
+        * actual_scale[:valid_rows].repeat_interleave(128, dim=1)
+    )
+    assert (
+        1
+        - torch.nn.functional.cosine_similarity(
+            reference_dequant.flatten().double(),
+            actual_dequant.flatten().double(),
+            dim=0,
+        )
+    ) < 1e-6
+    assert torch.count_nonzero(actual_norm[valid_rows:].float()).item() == 0
+    assert torch.count_nonzero(actual_q[valid_rows:].float()).item() == 0
+    assert torch.all(actual_scale[valid_rows:] == 1e-12)
+
+
+def test_fused_rmsnorm_group_quant_accepts_row_strided_q_a_view():
+    from batchgen.attention.mla.fa3_backend import act_quant
+    from batchgen_kernels.triton.rmsnorm import (
+        fused_rmsnorm,
+        fused_rmsnorm_group_quant_out,
+    )
+
+    rows = 5
+    hidden_size = 2048
+    num_groups = hidden_size // 128
+    aligned_rows = ((rows + 3) // 4) * 4
+    qkv_a = torch.randn(
+        rows,
+        hidden_size + 576,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    x = qkv_a[:, :hidden_size]
+    assert not x.is_contiguous()
+    assert x.stride(1) == 1
+    weight = torch.randn(
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    reference_norm = torch.empty_like(x, memory_format=torch.contiguous_format)
+    fused_rmsnorm(x.contiguous(), weight, 1e-5, out=reference_norm)
+    reference_q, reference_scale = act_quant(
+        reference_norm,
+        scale_tma_aligned=True,
+    )
+
+    actual_norm = torch.empty_like(reference_norm)
+    actual_q = torch.empty_like(reference_q)
+    actual_scale = torch.empty(
+        num_groups,
+        aligned_rows,
+        device="cuda",
+        dtype=torch.float32,
+    ).transpose(0, 1)[:rows]
+    fused_rmsnorm_group_quant_out(
+        x,
+        weight,
+        1e-5,
+        actual_norm,
+        actual_q,
+        actual_scale,
+    )
+    torch.cuda.synchronize()
+
+    _assert_bf16_wgmma_close(actual_norm, reference_norm)
+    assert torch.equal(actual_q, reference_q)
+    assert torch.equal(actual_scale, reference_scale)
+
+
 def test_head_gates_valid_tokens_zeroes_padding_rows():
     from batchgen_kernels.attention.dsa.head_gates import head_gates_out
 
