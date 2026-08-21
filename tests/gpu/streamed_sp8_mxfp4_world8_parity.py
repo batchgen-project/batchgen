@@ -1,0 +1,207 @@
+"""World-8 parity gate for Kimi-K3 TP8-attention + SP8-MoE prefill.
+
+Run on one 8-GPU H20 node. Each rank:
+
+1. owns one contiguous 1/8 expert shard;
+2. node-locally all-gathers the six MXFP4 tensors into one full layer;
+3. computes only its contiguous 1/8 token-row slice with grouped Marlin;
+4. node-locally gathers rows.
+
+The reconstructed output is compared with a world-1 all-expert resident
+forward on the same synthetic K3 block. No cross-node process group exists in
+this harness, so the only communication is the intended TP8-local weight and
+row gathering.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _err_ratio(actual, reference):
+    actual = actual.float()
+    reference = reference.float()
+    rms = reference.pow(2).mean().sqrt()
+    return float(
+        (actual - reference).pow(2).mean().sqrt() / (rms + 1e-8)
+    )
+
+
+def _sources(experts):
+    return [
+        {
+            "w1": (expert.w1.weight_packed.data, expert.w1.weight_scale.data),
+            "w3": (expert.w3.weight_packed.data, expert.w3.weight_scale.data),
+            "w2": (expert.w2.weight_packed.data, expert.w2.weight_scale.data),
+        }
+        for expert in experts
+    ]
+
+
+def _gather_sources(block, rank, world, device):
+    experts = list(block.experts)
+    assert len(experts) % world == 0
+    per_rank = len(experts) // world
+    start = rank * per_rank
+    local = experts[start:start + per_rank]
+    gathered = {}
+    for name in (
+        "w1.weight_packed",
+        "w1.weight_scale",
+        "w3.weight_packed",
+        "w3.weight_scale",
+        "w2.weight_packed",
+        "w2.weight_scale",
+    ):
+        projection, tensor_name = name.split(".", 1)
+        local_tensor = torch.stack(
+            [getattr(getattr(expert, projection), tensor_name).data
+             for expert in local],
+            dim=0,
+        ).contiguous()
+        full = torch.empty(
+            (len(experts), *local_tensor.shape[1:]),
+            dtype=local_tensor.dtype,
+            device=device,
+        )
+        dist.all_gather_into_tensor(full, local_tensor)
+        gathered[name] = full
+
+    sources = []
+    for expert_idx in range(len(experts)):
+        sources.append({
+            "w1": (
+                gathered["w1.weight_packed"][expert_idx],
+                gathered["w1.weight_scale"][expert_idx],
+            ),
+            "w3": (
+                gathered["w3.weight_packed"][expert_idx],
+                gathered["w3.weight_scale"][expert_idx],
+            ),
+            "w2": (
+                gathered["w2.weight_packed"][expert_idx],
+                gathered["w2.weight_scale"][expert_idx],
+            ),
+        })
+    return sources, per_rank
+
+
+def _layer(block, shard, ResidentEPMXFP4MoELayer):
+    return ResidentEPMXFP4MoELayer(
+        layer_idx=0,
+        shard=shard,
+        down_proj=block.routed_expert_down_proj,
+        norm=block.routed_expert_norm if block.latent_moe_use_norm else None,
+        up_proj=block.routed_expert_up_proj,
+        world_size=1,
+        expert_start=0,
+    )
+
+
+def worker(rank, world, out_path, master_port):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    device = torch.device("cuda", rank)
+
+    import kimi_k3_harness as H
+    import test_kimi_linear_mxfp4_latent_moe_serving as TT
+    from batchgen.moe.fused_moe_mxfp4_resident import (
+        ResidentEPMXFP4MoELayer,
+        build_layer_shard,
+    )
+    from batchgen.models.moonshotai.kimi_linear.moe_tp_reshard import (
+        all_gather_rows,
+        scatter_rows,
+    )
+
+    block, cfg, _ = TT._build_mxfp4_serving_block("syn25_mxfp4")
+    block = block.to(device)
+    num_rows = 64
+    hidden = cfg.hidden_size
+    x = H.seeded_input(
+        "streamed-sp8-world8", 1, num_rows, hidden, dtype=torch.bfloat16
+    ).to(device).reshape(num_rows, hidden)
+
+    gathered_sources, experts_per_rank = _gather_sources(
+        block, rank, world, device
+    )
+    gathered_shard = build_layer_shard(gathered_sources, device)
+    sp8_layer = _layer(block, gathered_shard, ResidentEPMXFP4MoELayer)
+    x_local = scatter_rows(x, world, rank)
+    with torch.no_grad():
+        routed_local = sp8_layer.forward(x_local, block.gate)
+        routed = all_gather_rows(
+            routed_local, num_rows, world, rank, dist.group.WORLD
+        )
+
+        reference_shard = build_layer_shard(_sources(block.experts), device)
+        reference = _layer(
+            block, reference_shard, ResidentEPMXFP4MoELayer
+        ).forward(x, block.gate)
+
+    error = _err_ratio(routed, reference)
+    max_abs = float((routed.float() - reference.float()).abs().max())
+    gate_out = block.gate(x_local.view(x_local.shape[0], 1, hidden))
+    local_assignments = torch.tensor(
+        [gate_out[0].numel()], dtype=torch.int64, device=device
+    )
+    dist.all_reduce(local_assignments)
+    expected_assignments = num_rows * gate_out[0].shape[-1]
+
+    if error >= 3e-3:
+        raise AssertionError(
+            f"SP8 row parity failed: err_ratio={error} max_abs={max_abs}"
+        )
+    if int(local_assignments.item()) != expected_assignments:
+        raise AssertionError(
+            f"duplicated assignments: got {int(local_assignments.item())}, "
+            f"expected {expected_assignments}"
+        )
+
+    if rank == 0:
+        result = {
+            "world_size": world,
+            "num_rows": num_rows,
+            "rows_per_rank": num_rows // world,
+            "num_experts": len(block.experts),
+            "experts_per_ingress_rank": experts_per_rank,
+            "top_k": gate_out[0].shape[-1],
+            "routed_assignments": int(local_assignments.item()),
+            "expected_assignments": expected_assignments,
+            "err_ratio_vs_world1": error,
+            "max_abs_vs_world1": max_abs,
+            "verdict": "PASS",
+        }
+        Path(out_path).write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result, indent=2), flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--port", type=int, default=29617)
+    args = parser.parse_args()
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+        raise RuntimeError(
+            f"world-8 SP8 parity needs 8 GPUs; saw {torch.cuda.device_count()}"
+        )
+    mp.spawn(worker, args=(8, args.out, args.port), nprocs=8, join=True)
+
+
+if __name__ == "__main__":
+    main()
