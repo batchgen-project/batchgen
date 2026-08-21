@@ -16,6 +16,7 @@ row gathering.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -36,6 +37,26 @@ def _err_ratio(actual, reference):
     return float(
         (actual - reference).pow(2).mean().sqrt() / (rms + 1e-8)
     )
+
+
+def _install_core_engine_from_cache():
+    """Prevent synthetic model imports from rebuilding the unrelated core."""
+    if "batchgen.core_engine" in sys.modules:
+        return
+    cache = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if not cache:
+        raise RuntimeError(
+            "TORCH_EXTENSIONS_DIR is required for the world-8 parity gate"
+        )
+    so_path = Path(cache) / "core_engine" / "core_engine.so"
+    if not so_path.is_file():
+        raise FileNotFoundError(so_path)
+    spec = importlib.util.spec_from_file_location(
+        "batchgen.core_engine", so_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["batchgen.core_engine"] = module
+    spec.loader.exec_module(module)
 
 
 def _sources(experts):
@@ -116,6 +137,7 @@ def worker(rank, world, out_path, master_port):
     dist.init_process_group("nccl", rank=rank, world_size=world)
     device = torch.device("cuda", rank)
 
+    _install_core_engine_from_cache()
     import kimi_k3_harness as H
     import test_kimi_linear_mxfp4_latent_moe_serving as TT
     from batchgen.moe.fused_moe_mxfp4_resident import (
