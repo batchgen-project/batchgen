@@ -447,6 +447,9 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_o_proj = None
         self._fp8_qkv_a_proj = None
         self._fp8_qkv_a_scale = None
+        self._fp8_folded_q_b_proj = None
+        self._fp8_folded_q_b_scale = None
+        self._folded_q_b_retained_rows = None
         # Cached absorbed projections (Fix 1: avoid 78× FP8 dequant per step).
         # These are BF16 WEIGHT copies, not workspaces. They are quantizer
         # INPUT only: once _fp8_absorb_weights is built they are freed by
@@ -522,6 +525,116 @@ class GLM5AttnWrapper(AttnWrapperBase):
         self.fp8_o_proj = None
         self._fp8_qkv_a_proj = None
         self._fp8_qkv_a_scale = None
+        self._fp8_folded_q_b_proj = None
+        self._fp8_folded_q_b_scale = None
+        self._folded_q_b_retained_rows = None
+
+    def _initialize_folded_q_b(self) -> None:
+        """Fold the static q-nope absorb into Q-B for graph decode."""
+        if self._fp8_folded_q_b_proj is not None:
+            return
+        q_b_scale = self.weight_dequant_scale.get("q_b_proj.weight_scale_inv")
+        kv_b_scale = self.weight_dequant_scale.get("kv_b_proj.weight_scale_inv")
+        if q_b_scale is None or kv_b_scale is None:
+            raise RuntimeError(
+                f"[layer {self.layer_idx}] folded Q-B requires Q-B and KV-B FP8 scales"
+            )
+
+        import deep_gemm
+
+        attn = self.module
+        block_size = 128
+        q_b_weight = attn.q_b_proj.weight.data
+        q_absorb = self._cached_q_absorb
+        if q_absorb is None:
+            kv_b_proj = glm5_fp8_dequantization(
+                attn.kv_b_proj.weight.data,
+                kv_b_scale,
+            ).view(attn.num_heads, -1, attn.kv_lora_rank)
+            q_absorb = kv_b_proj[:, :attn.qk_nope_head_dim].contiguous()
+        q_b_bf16 = glm5_fp8_dequantization(q_b_weight, q_b_scale)
+        q_b_heads_bf16 = q_b_bf16.view(
+            attn.num_heads,
+            attn.q_head_dim,
+            attn.q_lora_rank,
+        )
+        q_b_heads_fp8 = q_b_weight.view(
+            attn.num_heads,
+            attn.q_head_dim,
+            attn.q_lora_rank,
+        )
+        q_b_scale_heads = q_b_scale.view(
+            attn.num_heads,
+            attn.q_head_dim // block_size,
+            attn.q_lora_rank // block_size,
+        )
+        folded_q_nope = torch.bmm(
+            q_absorb.transpose(1, 2).float(),
+            q_b_heads_bf16[:, : attn.qk_nope_head_dim].float(),
+        )
+        folded_q_nope_fp8 = []
+        folded_q_nope_scale = []
+        for head in range(attn.num_heads):
+            weight, scale = deep_gemm.per_block_cast_to_fp8(
+                folded_q_nope[head],
+                use_ue8m0=False,
+            )
+            folded_q_nope_fp8.append(weight)
+            folded_q_nope_scale.append(scale)
+
+        retained_rows = block_size
+        self._folded_q_b_retained_rows = retained_rows
+        retained_weight = q_b_heads_fp8[:, -retained_rows:].flatten(0, 1)
+        retained_scale = q_b_scale_heads[:, -1:].flatten(0, 1)
+        self._fp8_folded_q_b_proj = torch.cat(
+            (torch.cat(folded_q_nope_fp8, dim=0), retained_weight),
+            dim=0,
+        ).contiguous()
+        self._fp8_folded_q_b_scale = torch.cat(
+            (torch.cat(folded_q_nope_scale, dim=0), retained_scale),
+            dim=0,
+        ).contiguous()
+
+        # The GLM-5.2 graph path is fail-closed, so the original Q-B/KV-B
+        # tensors and q-absorb FP8 copy have no remaining decode consumer.
+        # Releasing them offsets most of the wider folded projection.
+        attn.q_b_proj.weight.data = torch.empty(
+            0,
+            dtype=q_b_weight.dtype,
+            device=q_b_weight.device,
+        )
+        attn.kv_b_proj.weight.data = torch.empty(
+            0,
+            dtype=attn.kv_b_proj.weight.dtype,
+            device=attn.kv_b_proj.weight.device,
+        )
+        self.weight_dequant_scale["q_b_proj.weight_scale_inv"] = torch.empty(
+            0,
+            dtype=q_b_scale.dtype,
+            device=q_b_scale.device,
+        )
+        self.weight_dequant_scale["kv_b_proj.weight_scale_inv"] = torch.empty(
+            0,
+            dtype=kv_b_scale.dtype,
+            device=kv_b_scale.device,
+        )
+        self.fp8_q_b_proj = None
+        self.fp8_kv_b_proj = None
+        self._fp8_absorb_weights.q_absorb_fp8 = torch.empty(
+            0,
+            dtype=self._fp8_absorb_weights.q_absorb_fp8.dtype,
+            device=self._fp8_absorb_weights.q_absorb_fp8.device,
+        )
+        self._fp8_absorb_weights.q_absorb_scale = torch.empty(
+            0,
+            dtype=self._fp8_absorb_weights.q_absorb_scale.dtype,
+            device=self._fp8_absorb_weights.q_absorb_scale.device,
+        )
+        logging.info(
+            "[layer %s] initialized folded GLM-5.2 Q-B weight %s",
+            self.layer_idx,
+            tuple(self._fp8_folded_q_b_proj.shape),
+        )
 
     def initialize_decode_absorb(self):
         """Pre-compute absorbed projections from FP8 kv_b_proj weight.

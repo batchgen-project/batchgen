@@ -1192,6 +1192,64 @@ def test_glm5_whole_graph_decode_cap_matches_largest_bucket(monkeypatch):
     assert worker._decode_rank_batch_cap() == 256
 
 
+def test_glm52_qprep_initializes_every_layer(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    calls = []
+    worker = object.__new__(BatchGenWorker)
+    worker.rank = 0
+    worker.model_config = types.SimpleNamespace(model_type="glm_moe_dsa_5_2")
+    worker.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=[
+                types.SimpleNamespace(
+                    self_attn=types.SimpleNamespace(
+                        _initialize_folded_q_b=lambda layer=i: calls.append(layer)
+                    )
+                )
+                for i in range(3)
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_requested_for_current_batch",
+        lambda: True,
+    )
+
+    worker._initialize_glm52_folded_q_b_for_decode()
+
+    assert calls == [0, 1, 2]
+
+
+def test_glm52_qprep_skips_without_whole_graph(monkeypatch):
+    from batchgen.batchgen_worker import BatchGenWorker
+
+    calls = []
+    worker = object.__new__(BatchGenWorker)
+    worker.model_config = types.SimpleNamespace(model_type="glm_moe_dsa_5_2")
+    worker.model = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            layers=[
+                types.SimpleNamespace(
+                    self_attn=types.SimpleNamespace(
+                        _initialize_folded_q_b=lambda: calls.append(True)
+                    )
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        worker,
+        "_glm5_whole_model_graph_requested_for_current_batch",
+        lambda: False,
+    )
+
+    worker._initialize_glm52_folded_q_b_for_decode()
+
+    assert calls == []
+
+
 def test_decode_cap_retains_default_without_glm5_whole_graph(monkeypatch):
     from batchgen.batchgen_worker import BatchGenWorker
 

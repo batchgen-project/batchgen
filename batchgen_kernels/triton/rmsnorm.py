@@ -187,6 +187,166 @@ def fused_rmsnorm(
     return out.reshape(orig_shape)
 
 
+@triton.jit
+def _rmsnorm_group_quant_kernel(
+    x_ptr,
+    weight_ptr,
+    normalized_ptr,
+    quantized_ptr,
+    scale_ptr,
+    num_valid_tokens_ptr,
+    stride_xm,
+    stride_normalized_m,
+    stride_quantized_m,
+    stride_scale_m,
+    stride_scale_group,
+    hidden_size: tl.constexpr,
+    group_size: tl.constexpr,
+    num_groups: tl.constexpr,
+    eps: tl.constexpr,
+    has_valid_tokens: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Fuse RMSNorm with block-128 FP8 activation quantization."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    mask = offsets < hidden_size
+    row_valid = (
+        row < tl.load(num_valid_tokens_ptr)
+        if has_valid_tokens
+        else True
+    )
+
+    x = tl.load(
+        x_ptr + row * stride_xm + offsets,
+        mask=mask & row_valid,
+        other=0.0,
+    ).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_groups = tl.reshape(x, (num_groups, group_size))
+    variance = tl.sum(tl.sum(x_groups * x_groups, axis=1), axis=0) / hidden_size
+    normalized = (x * tl.rsqrt(variance + eps) * weight).to(tl.bfloat16)
+    tl.store(
+        normalized_ptr + row * stride_normalized_m + offsets,
+        tl.where(row_valid, normalized, 0.0),
+        mask=mask,
+    )
+
+    normalized_groups = tl.reshape(
+        normalized.to(tl.float32),
+        (num_groups, group_size),
+    )
+    amax = tl.max(tl.abs(normalized_groups), axis=1)
+    amax = tl.maximum(amax, 1.52587890625e-05)
+    scale = tl.maximum(amax * (1.0 / 448.0), 1e-12)
+    quantized = tl.maximum(
+        tl.minimum(
+            normalized_groups / tl.expand_dims(scale, 1),
+            448.0,
+        ),
+        -448.0,
+    ).to(tl.float8e4nv)
+    tl.store(
+        quantized_ptr + row * stride_quantized_m + offsets,
+        tl.reshape(quantized, (block_size,)),
+        mask=mask,
+    )
+    groups = tl.arange(0, num_groups)
+    tl.store(
+        scale_ptr + row * stride_scale_m + groups * stride_scale_group,
+        tl.where(row_valid, scale, 1e-12),
+    )
+
+
+def fused_rmsnorm_group_quant_out(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    normalized_out: torch.Tensor,
+    quantized_out: torch.Tensor,
+    scale_out: torch.Tensor,
+    *,
+    num_valid_tokens: torch.Tensor | None = None,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Write RMSNorm BF16 output and its blockwise FP8 quantization."""
+    if x.dim() != 2 or not x.is_contiguous():
+        raise ValueError("x must be a contiguous 2-D tensor")
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"x must be bfloat16, got {x.dtype}")
+    rows, hidden_size = x.shape
+    if hidden_size % group_size != 0:
+        raise ValueError(
+            f"hidden size {hidden_size} must be divisible by group size {group_size}"
+        )
+    if weight.shape != (hidden_size,) or weight.device != x.device:
+        raise ValueError(
+            f"weight must have shape {(hidden_size,)} on {x.device}, "
+            f"got {tuple(weight.shape)} on {weight.device}"
+        )
+    if normalized_out.shape != x.shape or normalized_out.dtype != x.dtype:
+        raise ValueError(
+            f"normalized_out must match x shape/dtype, got "
+            f"{tuple(normalized_out.shape)} {normalized_out.dtype}"
+        )
+    if not normalized_out.is_contiguous():
+        raise ValueError("normalized_out must be contiguous")
+    if quantized_out.shape != x.shape or quantized_out.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"quantized_out must be FP8 with shape {tuple(x.shape)}, got "
+            f"{tuple(quantized_out.shape)} {quantized_out.dtype}"
+        )
+    if not quantized_out.is_contiguous():
+        raise ValueError("quantized_out must be contiguous")
+    num_groups = hidden_size // group_size
+    if scale_out.shape != (rows, num_groups) or scale_out.dtype != torch.float32:
+        raise ValueError(
+            f"scale_out must be FP32 with shape {(rows, num_groups)}, got "
+            f"{tuple(scale_out.shape)} {scale_out.dtype}"
+        )
+    if scale_out.device != x.device:
+        raise ValueError("scale_out must be on the same device as x")
+    if num_valid_tokens is not None:
+        if num_valid_tokens.device != x.device:
+            raise ValueError("num_valid_tokens must be on the same device as x")
+        if num_valid_tokens.dtype != torch.int32:
+            raise TypeError(
+                f"num_valid_tokens must be int32, got {num_valid_tokens.dtype}"
+            )
+        if num_valid_tokens.numel() != 1:
+            raise ValueError(
+                "num_valid_tokens must contain one element, got "
+                f"{tuple(num_valid_tokens.shape)}"
+            )
+
+    block_size = triton.next_power_of_2(hidden_size)
+    _rmsnorm_group_quant_kernel[(rows,)](
+        x,
+        weight,
+        normalized_out,
+        quantized_out,
+        scale_out,
+        num_valid_tokens if num_valid_tokens is not None else scale_out,
+        x.stride(0),
+        normalized_out.stride(0),
+        quantized_out.stride(0),
+        scale_out.stride(0),
+        scale_out.stride(1),
+        hidden_size=hidden_size,
+        group_size=group_size,
+        num_groups=num_groups,
+        eps=eps,
+        has_valid_tokens=num_valid_tokens is not None,
+        block_size=block_size,
+        num_warps=8,
+    )
+    return normalized_out, quantized_out, scale_out
+
+
 class FusedRMSNorm(torch.nn.Module):
     """
     Drop-in replacement for PyTorch RMSNorm.

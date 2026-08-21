@@ -113,6 +113,9 @@ def _build_fake_wrapper(device):
             dim=0,
         ).contiguous(),
         _fp8_qkv_a_scale=torch.ones(1, device=device, dtype=torch.float32),
+        _fp8_folded_q_b_proj=None,
+        _fp8_folded_q_b_scale=None,
+        _folded_q_b_retained_rows=None,
         _indexer_cuda_weights=object(),
         _indexer_cuda_module=object(),
     )
@@ -169,6 +172,119 @@ def test_glm5_registers_fused_qkv_a_storage_views():
     )
 
 
+def test_glm52_folded_q_b_initialization(monkeypatch):
+    device = torch.device("cuda")
+    heads = 2
+    q_head_dim = 256
+    q_nope_dim = 192
+    q_lora_rank = 256
+    kv_lora_rank = 128
+    q_b_weight = torch.randn(
+        heads * q_head_dim,
+        q_lora_rank,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    q_absorb = torch.randn(
+        heads,
+        q_nope_dim,
+        kv_lora_rank,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    wrapper = types.SimpleNamespace(
+        layer_idx=0,
+        module=types.SimpleNamespace(
+            num_heads=heads,
+            q_head_dim=q_head_dim,
+            q_lora_rank=q_lora_rank,
+            qk_nope_head_dim=q_nope_dim,
+            kv_lora_rank=kv_lora_rank,
+            q_b_proj=types.SimpleNamespace(
+                weight=types.SimpleNamespace(data=q_b_weight)
+            ),
+            kv_b_proj=types.SimpleNamespace(
+                weight=types.SimpleNamespace(
+                    data=torch.empty(
+                        heads * (q_nope_dim + 256),
+                        kv_lora_rank,
+                        device=device,
+                        dtype=torch.float8_e4m3fn,
+                    )
+                )
+            ),
+        ),
+        weight_dequant_scale={
+            "q_b_proj.weight_scale_inv": torch.ones(
+                heads * q_head_dim // 128,
+                q_lora_rank // 128,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "kv_b_proj.weight_scale_inv": torch.ones(
+                heads * (q_nope_dim + 256) // 128,
+                kv_lora_rank // 128,
+                device=device,
+                dtype=torch.float32,
+            ),
+        },
+        _cached_q_absorb=q_absorb,
+        _fp8_absorb_weights=types.SimpleNamespace(
+            q_absorb_fp8=torch.ones(
+                heads,
+                kv_lora_rank,
+                q_nope_dim,
+                device=device,
+                dtype=torch.float8_e4m3fn,
+            ),
+            q_absorb_scale=torch.ones(
+                heads,
+                kv_lora_rank,
+                2,
+                device=device,
+                dtype=torch.float32,
+            ),
+        ),
+        _fp8_folded_q_b_proj=None,
+        _fp8_folded_q_b_scale=None,
+        _folded_q_b_retained_rows=None,
+        fp8_q_b_proj=q_b_weight,
+        fp8_kv_b_proj=torch.empty(1, device=device),
+    )
+    monkeypatch.setattr(
+        "batchgen.models.glm.glm5.wrappers.glm5_fp8_dequantization",
+        lambda weight, scale: weight.to(torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        "deep_gemm.per_block_cast_to_fp8",
+        lambda weight, use_ue8m0=False: (
+            weight.to(torch.float8_e4m3fn),
+            torch.ones(
+                weight.shape[0] // 128,
+                weight.shape[1] // 128,
+                device=weight.device,
+                dtype=torch.float32,
+            ),
+        ),
+    )
+
+    GLM5AttnWrapper._initialize_folded_q_b(wrapper)
+
+    assert wrapper._fp8_folded_q_b_proj.shape == (
+        heads * (kv_lora_rank + 128),
+        q_lora_rank,
+    )
+    assert wrapper._fp8_folded_q_b_scale.shape == (
+        heads * (kv_lora_rank + 128) // 128,
+        q_lora_rank // 128,
+    )
+    assert wrapper._folded_q_b_retained_rows == 128
+    assert wrapper.module.q_b_proj.weight.data.numel() == 0
+    assert wrapper.module.kv_b_proj.weight.data.numel() == 0
+    assert wrapper._fp8_absorb_weights.q_absorb_fp8.numel() == 0
+    assert wrapper._fp8_absorb_weights.q_absorb_scale.numel() == 0
+
+
 def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim, v_dim, device):
     calls = {
         "head_gates": 0,
@@ -179,6 +295,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
         "select": 0,
         "flashmla": 0,
         "fa3": 0,
+        "q_absorb": 0,
     }
     topk_template = torch.arange(index_topk, device=device, dtype=torch.int32).view(1, index_topk)
     topk_template = topk_template.expand(bucket_size, index_topk).contiguous()
@@ -303,6 +420,7 @@ def _patch_full_dsa_dependencies(monkeypatch, *, bucket_size, index_topk, kv_dim
 
     def fake_q_absorb(q_nope, weights, absorbed_q, num_valid_tokens=None):
         del weights, num_valid_tokens
+        calls["q_absorb"] += 1
         absorbed_q.copy_(q_nope[..., : absorbed_q.shape[-1]])
         return absorbed_q
 
@@ -545,6 +663,113 @@ def test_glm5_full_dsa_all_short_skips_query_score_but_writes_indexer_k(monkeypa
         "select": 0,
         "flashmla": 0,
         "fa3": 1,
+        "q_absorb": 1,
     }
     assert torch.count_nonzero(outputs["indexer_k_tensor"]).item() > 0
     assert torch.count_nonzero(aux_cache).item() > 0
+
+
+def test_glm52_full_dsa_folded_q_b_skips_q_absorb(monkeypatch):
+    device = torch.device("cuda")
+    bucket_size = 2
+    page_size = 4
+    wrapper = _build_fake_wrapper(device)
+    attn = wrapper.module
+    wrapper._fp8_folded_q_b_proj = attn.q_b_proj.weight
+    wrapper._fp8_folded_q_b_scale = torch.ones(
+        1,
+        device=device,
+        dtype=torch.float32,
+    )
+    wrapper._folded_q_b_retained_rows = 2
+    kv_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+    calls = _patch_full_dsa_dependencies(
+        monkeypatch,
+        bucket_size=bucket_size,
+        index_topk=attn.indexer.index_topk,
+        kv_dim=kv_dim,
+        v_dim=attn.v_head_dim,
+        device=device,
+    )
+
+    def fake_fused_norm_quant(
+        x,
+        weight,
+        eps,
+        normalized_out,
+        quantized_out,
+        scale_out,
+        *,
+        num_valid_tokens=None,
+        group_size=128,
+    ):
+        del weight, eps, num_valid_tokens, group_size
+        normalized_out.copy_(x)
+        quantized_out.copy_(x)
+        scale_out.fill_(1)
+        return normalized_out, quantized_out, scale_out
+
+    monkeypatch.setattr(
+        segments,
+        "fused_rmsnorm_group_quant_out",
+        fake_fused_norm_quant,
+    )
+    primary_cache = torch.zeros(
+        2, page_size, 1, kv_dim, dtype=torch.bfloat16, device=device,
+    )
+    aux_cache = torch.zeros(
+        2, page_size, 1, attn.indexer.index_head_dim,
+        dtype=torch.bfloat16, device=device,
+    )
+    page_table = torch.tensor([[0], [1]], dtype=torch.int32, device=device)
+    cos = torch.ones(
+        attn.indexer.index_topk,
+        attn.qk_rope_head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    sin = torch.zeros_like(cos)
+    segment = Glm5FullDsaAttnSegment(
+        wrapper=wrapper,
+        primary_blocked_k=primary_cache,
+        aux_blocked_k=aux_cache,
+        primary_page_table=page_table,
+        aux_page_table=page_table,
+        wq_b_weights=object(),
+        absorb_weights=object(),
+        cuda_module=object(),
+        cos_table=cos,
+        sin_table=sin,
+        max_seqlen=attn.indexer.index_topk,
+        index_topk=attn.indexer.index_topk,
+        page_size=page_size,
+        aux_page_size=page_size,
+        all_short=True,
+    )
+
+    outputs = segment.forward(
+        hidden_states=torch.randn(
+            bucket_size, 1, attn.hidden_size,
+            dtype=torch.bfloat16, device=device,
+        ),
+        position_ids=torch.tensor([[1], [2]], dtype=torch.int64, device=device),
+        cache_seqlens=torch.tensor([2, 3], dtype=torch.int32, device=device),
+        primary_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        aux_slot_indices=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        num_valid_tokens=torch.tensor(
+            [bucket_size], dtype=torch.int32, device=device,
+        ),
+        flashmla_tile_scheduler_metadata=torch.arange(
+            4, dtype=torch.int32, device=device,
+        ).view(1, 4),
+        flashmla_num_splits=torch.ones(1, dtype=torch.int32, device=device),
+    )
+    torch.cuda.synchronize()
+
+    assert calls["q_absorb"] == 0
+    assert calls["fa3"] == 1
+    assert outputs["attn_output"].shape == (
+        bucket_size,
+        1,
+        attn.hidden_size,
+    )

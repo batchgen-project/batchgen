@@ -62,7 +62,10 @@ from batchgen_kernels.attention.dsa.selected_page_table import (
     transform_selected_positions_out,
 )
 from batchgen_kernels.triton.kv_cache import run_paged_kv_token_update_fused
-from batchgen_kernels.triton.rmsnorm import fused_rmsnorm
+from batchgen_kernels.triton.rmsnorm import (
+    fused_rmsnorm,
+    fused_rmsnorm_group_quant_out,
+)
 
 
 @dataclass
@@ -113,6 +116,8 @@ class _Glm5FullDsaSegmentBuffers:
     q_x_fp8: torch.Tensor
     q_x_scale: torch.Tensor
     q_tma_desc: torch.Tensor
+    q_b_x_fp8: torch.Tensor
+    q_b_x_scale: torch.Tensor
     q_flat_indexer: torch.Tensor
     q_index: torch.Tensor
     head_gates: torch.Tensor
@@ -185,9 +190,12 @@ _FULL_DSA_BUCKET_DIM_FIELDS = (
 )
 
 # Fields that must be rebuilt per bucket rather than sliced:
-#   * the two FP8 activation scratch triples — dim 0 is max(bucket, _BLOCK_M),
+#   * the two indexer FP8 activation scratch triples — dim 0 is
+#     max(bucket, _BLOCK_M),
 #     and the TMA descriptor bakes BOTH the base pointer and the global row
 #     count, so the descriptor is re-encoded over the sliced view;
+#   * the folded-Q-B FP8 activation/scale pair — its column-major scale
+#     storage has a bucket-dependent leading dimension.
 _FULL_DSA_REBUILT_FIELDS = (
     "indexer_k_x_fp8",
     "indexer_k_x_scale",
@@ -195,6 +203,8 @@ _FULL_DSA_REBUILT_FIELDS = (
     "q_x_fp8",
     "q_x_scale",
     "q_tma_desc",
+    "q_b_x_fp8",
+    "q_b_x_scale",
 )
 
 
@@ -250,6 +260,30 @@ def _slice_fp8_activation_scratch(
         _FP8_SCRATCH_BLOCK_K,
     )
     return x_fp8, x_scale, a_tma_desc
+
+
+def _make_group_quant_scratch(
+    batch_size: int,
+    hidden_size: int,
+    *,
+    device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate FP8 data plus TMA-aligned block scales for DeepGEMM."""
+    num_groups = hidden_size // 128
+    aligned_batch = ((batch_size + 3) // 4) * 4
+    x_fp8 = torch.empty(
+        batch_size,
+        hidden_size,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    scale = torch.empty(
+        num_groups,
+        aligned_batch,
+        dtype=torch.float32,
+        device=device,
+    ).transpose(0, 1)[:batch_size]
+    return x_fp8, scale
 
 
 class Glm5DsaAttnSegment:
@@ -746,12 +780,16 @@ class Glm5FullDsaAttnSegment:
     def _run_all_short_fa3(
         self,
         buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        absorbed_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run dense MLA decode directly over the original page-size-64 KV."""
         if _fa3_with_kvcache is None:
             raise RuntimeError("FlashAttention-3 is unavailable")
         q_rope = buffers.q_rope_4d.squeeze(2).unsqueeze(1)
-        q_nope = buffers.absorbed_q.unsqueeze(1)
+        q_nope = (
+            buffers.absorbed_q if absorbed_q is None else absorbed_q
+        ).unsqueeze(1)
         return _fa3_with_kvcache(
             q=q_rope,
             k_cache=self.primary_blocked_k[..., self.attn.kv_lora_rank :],
@@ -769,6 +807,8 @@ class Glm5FullDsaAttnSegment:
     def _run_selected_fa3(
         self,
         buffers: _Glm5FullDsaSegmentBuffers,
+        *,
+        absorbed_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run sparse MLA decode over selected physical token IDs."""
         if _fa3_with_kvcache is None:
@@ -783,7 +823,9 @@ class Glm5FullDsaAttnSegment:
             q=buffers.q_rope_4d.squeeze(2).unsqueeze(1),
             k_cache=flat_kv[..., self.attn.kv_lora_rank :],
             v_cache=flat_kv[..., : self.attn.kv_lora_rank],
-            qv=buffers.absorbed_q.unsqueeze(1),
+            qv=(
+                buffers.absorbed_q if absorbed_q is None else absorbed_q
+            ).unsqueeze(1),
             page_table=buffers.selected_token_ids,
             cache_seqlens=buffers.selected_lengths,
             softmax_scale=float(self.attn.softmax_scale),
@@ -928,6 +970,14 @@ class Glm5FullDsaAttnSegment:
             bucket_size,
             self.cuda_module,
         )
+        (
+            buffers["q_b_x_fp8"],
+            buffers["q_b_x_scale"],
+        ) = _make_group_quant_scratch(
+            bucket_size,
+            attn.q_lora_rank,
+            device=base.q_b_x_fp8.device,
+        )
         return _Glm5FullDsaSegmentBuffers(**buffers)
 
     def _allocate_static_buffers(self, bucket_size: int) -> _Glm5FullDsaSegmentBuffers:
@@ -949,12 +999,23 @@ class Glm5FullDsaAttnSegment:
             self.cuda_module,
             device=device,
         )
+        q_b_x_fp8, q_b_x_scale = _make_group_quant_scratch(
+            bucket_size,
+            attn.q_lora_rank,
+            device=device,
+        )
 
         qkv_a = torch.empty(
             bucket_size,
             attn.q_lora_rank + kv_dim,
             dtype=torch.bfloat16,
             device=device,
+        )
+        folded_q_b_weight = getattr(self.wrapper, "_fp8_folded_q_b_proj", None)
+        q_output_dim = (
+            int(folded_q_b_weight.shape[0])
+            if folded_q_b_weight is not None
+            else attn.num_heads * attn.q_head_dim
         )
         selected_token_ids = torch.empty(
             bucket_size,
@@ -989,7 +1050,7 @@ class Glm5FullDsaAttnSegment:
             ),
             q_flat=torch.empty(
                 bucket_size,
-                attn.num_heads * attn.q_head_dim,
+                q_output_dim,
                 dtype=torch.bfloat16,
                 device=device,
             ),
@@ -1018,6 +1079,8 @@ class Glm5FullDsaAttnSegment:
             q_x_fp8=q_x_fp8,
             q_x_scale=q_x_scale,
             q_tma_desc=q_tma_desc,
+            q_b_x_fp8=q_b_x_fp8,
+            q_b_x_scale=q_b_x_scale,
             q_flat_indexer=torch.empty(
                 bucket_size,
                 indexer.index_n_heads * index_dim,
@@ -1201,30 +1264,84 @@ class Glm5FullDsaAttnSegment:
             expected_m=batch_size,
         )
         buffers.qkv_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_a_normed = fused_rmsnorm(
-            buffers.q_a,
-            attn.q_a_layernorm.weight,
-            attn.q_a_layernorm.eps,
-            out=buffers.q_a_normed,
-        )
-        q_a_fp8, q_a_scale = act_quant(
-            q_a_normed,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
-        w8a8_deepgemm(
-            q_a_fp8,
-            q_a_scale,
-            attn.q_b_proj.weight,
-            self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
-            out=buffers.q_flat,
-            num_valid_tokens=num_valid_tokens,
-            expected_m=batch_size,
-        )
-        buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-        buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
-        buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
+        folded_q_b_weight = getattr(self.wrapper, "_fp8_folded_q_b_proj", None)
+        folded_q_b_scale = getattr(self.wrapper, "_fp8_folded_q_b_scale", None)
+        if folded_q_b_weight is not None and folded_q_b_scale is not None:
+            q_a_normed, q_a_fp8, q_a_scale = fused_rmsnorm_group_quant_out(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                buffers.q_a_normed,
+                buffers.q_b_x_fp8,
+                buffers.q_b_x_scale,
+                num_valid_tokens=num_valid_tokens,
+            )
+            w8a8_deepgemm(
+                q_a_fp8,
+                q_a_scale,
+                folded_q_b_weight,
+                folded_q_b_scale,
+                out=buffers.q_flat,
+                num_valid_tokens=num_valid_tokens,
+                expected_m=batch_size,
+            )
+            buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+            folded_q_nope_size = attn.num_heads * attn.kv_lora_rank
+            retained_rows = int(self.wrapper._folded_q_b_retained_rows)
+            absorbed_q = buffers.q_flat[:, :folded_q_nope_size].view(
+                batch_size,
+                attn.num_heads,
+                attn.kv_lora_rank,
+            )
+            retained = buffers.q_flat[:, folded_q_nope_size:].view(
+                batch_size,
+                attn.num_heads,
+                retained_rows,
+            )
+            buffers.q_rope_4d.copy_(
+                retained[..., -attn.qk_rope_head_dim:].unsqueeze(2)
+            )
+        else:
+            q_a_normed = fused_rmsnorm(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+            )
+            q_a_fp8, q_a_scale = act_quant(
+                q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
+            w8a8_deepgemm(
+                q_a_fp8,
+                q_a_scale,
+                attn.q_b_proj.weight,
+                self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
+                out=buffers.q_flat,
+                num_valid_tokens=num_valid_tokens,
+                expected_m=batch_size,
+            )
+            buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+            q_view = buffers.q_flat.view(
+                batch_size,
+                1,
+                attn.num_heads,
+                attn.q_head_dim,
+            ).transpose(1, 2)
+            buffers.q_nope.copy_(
+                q_view[..., :attn.qk_nope_head_dim].squeeze(2).contiguous()
+            )
+            buffers.q_rope_4d.copy_(
+                q_view[..., attn.qk_nope_head_dim:].contiguous()
+            )
+            fp8_q_absorb_out(
+                buffers.q_nope,
+                self.absorb_weights,
+                buffers.absorbed_q,
+                num_valid_tokens=num_valid_tokens,
+            )
+            absorbed_q = buffers.absorbed_q
 
         offload_kv = _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
@@ -1318,14 +1435,11 @@ class Glm5FullDsaAttnSegment:
                 max_seqlen=self.max_seqlen,
                 num_valid_tokens=num_valid_tokens,
             )
-        fp8_q_absorb_out(
-            buffers.q_nope,
-            self.absorb_weights,
-            buffers.absorbed_q,
-            num_valid_tokens=num_valid_tokens,
-        )
         if self.all_short:
-            attn_out = self._run_all_short_fa3(buffers)
+            attn_out = self._run_all_short_fa3(
+                buffers,
+                absorbed_q=absorbed_q,
+            )
         else:
             transform_selected_positions_out(
                 self.primary_page_table,
@@ -1337,7 +1451,10 @@ class Glm5FullDsaAttnSegment:
                 primary_slot_indices=buffers.safe_primary_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
-            attn_out = self._run_selected_fa3(buffers)
+            attn_out = self._run_selected_fa3(
+                buffers,
+                absorbed_q=absorbed_q,
+            )
         fp8_out_absorb_out(
             attn_out,
             self.absorb_weights,

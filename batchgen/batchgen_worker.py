@@ -6794,6 +6794,7 @@ class BatchGenWorker:
 		self.model, self.weight_copy_task = self.parallel_manager.configure_decoding(
 			padding_bsz=max_num_seq, comm=comm
 		)
+		self._initialize_glm52_folded_q_b_for_decode()
 		# Remember the per-rank batch the MoE buffer was sized for; the decode admission caps
 		# in-decode at this value so the padded buffer (mtp = round_up(world_size*max_num_seq))
 		# never overflows.
@@ -8995,6 +8996,21 @@ class BatchGenWorker:
 		if not isinstance(debug, dict):
 			return False
 		return self._debug_flag_enabled(debug.get("glm5_graph_path_log"))
+
+	def _initialize_glm52_folded_q_b_for_decode(self) -> None:
+		if (
+			getattr(getattr(self, "model_config", None), "model_type", "")
+			!= "glm_moe_dsa_5_2"
+			or not self._glm5_whole_model_graph_requested_for_current_batch()
+			or self._glm5_whole_model_graph_compare_requested_for_current_batch()
+		):
+			return
+		for layer in self.model.model.layers:
+			layer.self_attn._initialize_folded_q_b()
+		if self.rank == 0:
+			logging.info(
+				"GLM-5.2 whole-model graph uses folded Q-B/q-absorb weights"
+			)
 
 	def _glm5_whole_model_graph_requested_for_current_batch(self) -> bool:
 		# Phase C: whole-model graph is the only supported GLM-5 graph mode.

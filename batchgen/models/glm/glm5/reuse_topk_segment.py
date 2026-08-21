@@ -41,7 +41,9 @@ from batchgen.models.glm.glm5.cuda_graph_segments import (
     transform_selected_positions_out,
     w8a8_deepgemm,
     _fused_rmsnorm_rope,
+    _make_group_quant_scratch,
     fused_rmsnorm,
+    fused_rmsnorm_group_quant_out,
 )
 
 
@@ -101,6 +103,8 @@ _REUSE_PLACEHOLDER_FIELDS = (
 # Rebuilt per bucket: top_k_indices is borrowed from the producing full
 # segment's buffer set FOR THIS BUCKET (never sliced from our own base).
 _REUSE_REBUILT_FIELDS = (
+    "q_b_x_fp8",
+    "q_b_x_scale",
     "top_k_indices",
 )
 
@@ -227,6 +231,14 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
         buffers.update(
             {name: getattr(base, name) for name in _REUSE_PLACEHOLDER_FIELDS}
         )
+        (
+            buffers["q_b_x_fp8"],
+            buffers["q_b_x_scale"],
+        ) = _make_group_quant_scratch(
+            bucket_size,
+            self.attn.q_lora_rank,
+            device=base.q_b_x_fp8.device,
+        )
         # THE handoff, per bucket: the producing full segment's static top-k
         # buffer for THIS bucket (itself a view of the producer's base).
         buffers["top_k_indices"] = self._topk_source_buffers(bucket_size).top_k_indices
@@ -239,11 +251,22 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
 
         source_buffers = self._topk_source_buffers(bucket_size)
 
+        q_b_x_fp8, q_b_x_scale = _make_group_quant_scratch(
+            bucket_size,
+            attn.q_lora_rank,
+            device=device,
+        )
         qkv_a = torch.empty(
             bucket_size,
             attn.q_lora_rank + kv_dim,
             dtype=torch.bfloat16,
             device=device,
+        )
+        folded_q_b_weight = getattr(self.wrapper, "_fp8_folded_q_b_proj", None)
+        q_output_dim = (
+            int(folded_q_b_weight.shape[0])
+            if folded_q_b_weight is not None
+            else attn.num_heads * attn.q_head_dim
         )
         selected_token_ids = torch.empty(
             bucket_size, self.index_topk,
@@ -277,7 +300,7 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 device=device,
             ),
             q_flat=torch.empty(
-                bucket_size, attn.num_heads * attn.q_head_dim,
+                bucket_size, q_output_dim,
                 dtype=torch.bfloat16, device=device,
             ),
             q_nope=torch.empty(
@@ -300,6 +323,8 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             q_x_fp8=one_bf16,
             q_x_scale=one_bf16,
             q_tma_desc=one_i32,
+            q_b_x_fp8=q_b_x_fp8,
+            q_b_x_scale=q_b_x_scale,
             q_flat_indexer=one_bf16,
             q_index=one_bf16,
             head_gates=one_bf16,
@@ -383,26 +408,73 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             out=buffers.qkv_a, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
         )
         buffers.qkv_a.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_a_normed = fused_rmsnorm(
-            buffers.q_a,
-            attn.q_a_layernorm.weight,
-            attn.q_a_layernorm.eps,
-            out=buffers.q_a_normed,
-        )
-        q_a_fp8, q_a_scale = act_quant(
-            q_a_normed,
-            num_valid_tokens=num_valid_tokens,
-            scale_tma_aligned=num_valid_tokens is not None,
-        )
-        w8a8_deepgemm(
-            q_a_fp8, q_a_scale, attn.q_b_proj.weight,
-            self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
-            out=buffers.q_flat, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
-        )
-        buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
-        q_view = buffers.q_flat.view(batch_size, 1, attn.num_heads, attn.q_head_dim).transpose(1, 2)
-        buffers.q_nope.copy_(q_view[..., : attn.qk_nope_head_dim].squeeze(2).contiguous())
-        buffers.q_rope_4d.copy_(q_view[..., attn.qk_nope_head_dim :].contiguous())
+        folded_q_b_weight = getattr(self.wrapper, "_fp8_folded_q_b_proj", None)
+        folded_q_b_scale = getattr(self.wrapper, "_fp8_folded_q_b_scale", None)
+        if folded_q_b_weight is not None and folded_q_b_scale is not None:
+            q_a_normed, q_a_fp8, q_a_scale = fused_rmsnorm_group_quant_out(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                buffers.q_a_normed,
+                buffers.q_b_x_fp8,
+                buffers.q_b_x_scale,
+                num_valid_tokens=num_valid_tokens,
+            )
+            w8a8_deepgemm(
+                q_a_fp8, q_a_scale, folded_q_b_weight, folded_q_b_scale,
+                out=buffers.q_flat, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
+            )
+            buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+            folded_q_nope_size = attn.num_heads * attn.kv_lora_rank
+            retained_rows = int(self.wrapper._folded_q_b_retained_rows)
+            absorbed_q = buffers.q_flat[:, :folded_q_nope_size].view(
+                batch_size,
+                attn.num_heads,
+                attn.kv_lora_rank,
+            )
+            retained = buffers.q_flat[:, folded_q_nope_size:].view(
+                batch_size,
+                attn.num_heads,
+                retained_rows,
+            )
+            buffers.q_rope_4d.copy_(
+                retained[..., -attn.qk_rope_head_dim:].unsqueeze(2)
+            )
+        else:
+            q_a_normed = fused_rmsnorm(
+                buffers.q_a,
+                attn.q_a_layernorm.weight,
+                attn.q_a_layernorm.eps,
+                out=buffers.q_a_normed,
+            )
+            q_a_fp8, q_a_scale = act_quant(
+                q_a_normed,
+                num_valid_tokens=num_valid_tokens,
+                scale_tma_aligned=num_valid_tokens is not None,
+            )
+            w8a8_deepgemm(
+                q_a_fp8, q_a_scale, attn.q_b_proj.weight,
+                self.wrapper.weight_dequant_scale["q_b_proj.weight_scale_inv"],
+                out=buffers.q_flat, num_valid_tokens=num_valid_tokens, expected_m=batch_size,
+            )
+            buffers.q_flat.mul_(buffers.valid_rows_bf16.view(batch_size, 1))
+            q_view = buffers.q_flat.view(
+                batch_size,
+                1,
+                attn.num_heads,
+                attn.q_head_dim,
+            ).transpose(1, 2)
+            buffers.q_nope.copy_(
+                q_view[..., :attn.qk_nope_head_dim].squeeze(2).contiguous()
+            )
+            buffers.q_rope_4d.copy_(
+                q_view[..., attn.qk_nope_head_dim:].contiguous()
+            )
+            fp8_q_absorb_out(
+                buffers.q_nope, self.absorb_weights, buffers.absorbed_q,
+                num_valid_tokens=num_valid_tokens,
+            )
+            absorbed_q = buffers.absorbed_q
 
         offload_kv = _fused_rmsnorm_rope(
             buffers.new_compressed_kv,
@@ -427,12 +499,11 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
             num_valid_tokens=num_valid_tokens,
         )
 
-        fp8_q_absorb_out(
-            buffers.q_nope, self.absorb_weights, buffers.absorbed_q,
-            num_valid_tokens=num_valid_tokens,
-        )
         if self.all_short:
-            attn_out = self._run_all_short_fa3(buffers)
+            attn_out = self._run_all_short_fa3(
+                buffers,
+                absorbed_q=absorbed_q,
+            )
         else:
             transform_selected_positions_out(
                 self.primary_page_table,
@@ -444,7 +515,10 @@ class Glm5ReuseTopkAttnSegment(Glm5FullDsaAttnSegment):
                 primary_slot_indices=buffers.safe_primary_slot_indices,
                 num_valid_tokens=num_valid_tokens,
             )
-            attn_out = self._run_selected_fa3(buffers)
+            attn_out = self._run_selected_fa3(
+                buffers,
+                absorbed_q=absorbed_q,
+            )
         fp8_out_absorb_out(
             attn_out, self.absorb_weights, buffers.attn_heads,
             num_valid_tokens=num_valid_tokens,
