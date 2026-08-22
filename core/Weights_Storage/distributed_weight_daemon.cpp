@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <netinet/in.h>
-#include <numa.h>
+#include "../numa_compat.h"
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
