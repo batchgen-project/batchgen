@@ -13,6 +13,7 @@ layers; only one layer is resident at a time.
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import torch
@@ -299,6 +300,36 @@ class StreamedSP8LayerBuffer:
 class StreamedSP8MXFP4MoELayer:
     """SP8 routed path for one K3 MoE layer."""
 
+    _prefill_profile_enabled = False
+    _prefill_profile_forward_calls = 0
+    _prefill_profile_input_rows = 0
+    _prefill_profile_routed_assignments = 0
+    _prefill_profile_grouped_chunks = 0
+    _prefill_profile_active_experts = 0
+    _prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def reset_prefill_profile(cls, enabled: bool) -> None:
+        cls._prefill_profile_enabled = bool(enabled)
+        cls._prefill_profile_forward_calls = 0
+        cls._prefill_profile_input_rows = 0
+        cls._prefill_profile_routed_assignments = 0
+        cls._prefill_profile_grouped_chunks = 0
+        cls._prefill_profile_active_experts = 0
+        cls._prefill_profile_wall_s = 0.0
+
+    @classmethod
+    def prefill_profile_snapshot(cls) -> dict:
+        return {
+            "enabled": cls._prefill_profile_enabled,
+            "forward_calls": cls._prefill_profile_forward_calls,
+            "input_rows": cls._prefill_profile_input_rows,
+            "routed_assignments": cls._prefill_profile_routed_assignments,
+            "grouped_chunks": cls._prefill_profile_grouped_chunks,
+            "active_experts": cls._prefill_profile_active_experts,
+            "wall_s": cls._prefill_profile_wall_s,
+        }
+
     def __init__(
         self,
         *,
@@ -320,6 +351,11 @@ class StreamedSP8MXFP4MoELayer:
 
     def forward(self, x: torch.Tensor, gate) -> torch.Tensor:
         T, H = x.shape
+        cls = type(self)
+        profile = cls._prefill_profile_enabled
+        if profile:
+            cls._prefill_profile_forward_calls += 1
+            cls._prefill_profile_input_rows += T
         # Every TP rank must load the layer and enter all six weight
         # all-gathers, including a rank that owns zero rows after the
         # deterministic row split. Returning before ``buffer.load`` lets the
@@ -329,6 +365,7 @@ class StreamedSP8MXFP4MoELayer:
         if T == 0:
             return x.new_zeros((0, H))
 
+        profile_start = time.perf_counter() if profile else None
         helper = ResidentEPMXFP4MoELayer(
             self.layer_idx,
             shard,
@@ -343,10 +380,19 @@ class StreamedSP8MXFP4MoELayer:
         topk_idx = gate_out[0].reshape(T, -1).to(torch.int32)
         topk_weight = gate_out[1].reshape(T, -1)
         top_k = topk_idx.shape[-1]
+        if profile:
+            cls._prefill_profile_routed_assignments += int(topk_idx.numel())
+            cls._prefill_profile_active_experts += int(
+                torch.unique(topk_idx).numel()
+            )
         x_latent = self.down_proj(x).contiguous()
         latent_size = shard.K_latent
         combined = x_latent.new_empty((T, latent_size))
 
+        if profile:
+            cls._prefill_profile_grouped_chunks += (
+                T + self.chunk_rows - 1
+            ) // self.chunk_rows
         for start in range(0, T, self.chunk_rows):
             end = min(start + self.chunk_rows, T)
             count = end - start
@@ -376,4 +422,8 @@ class StreamedSP8MXFP4MoELayer:
         # At this point ``buffer.full`` is no longer read by this MoE.  Reuse
         # it for the next layer while the decoder runs that layer's attention.
         self.buffer.prefetch_next(self.layer_idx)
+        if profile:
+            cls._prefill_profile_wall_s += (
+                time.perf_counter() - profile_start
+            )
         return output

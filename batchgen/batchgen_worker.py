@@ -6732,6 +6732,10 @@ class BatchGenWorker:
 				KimiK3MXFP4ExpertWrapper,
 			)
 			KimiK3MXFP4ExpertWrapper.reset_prefill_profile(True)
+			from batchgen.moe.streamed_sp8_mxfp4 import (
+				StreamedSP8MXFP4MoELayer,
+			)
+			StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)
 		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
 
@@ -7962,11 +7966,17 @@ class BatchGenWorker:
 			from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_expert import (
 				KimiK3MXFP4ExpertWrapper,
 			)
+			from batchgen.moe.streamed_sp8_mxfp4 import (
+				StreamedSP8MXFP4MoELayer,
+			)
 			logging.info("[K3_PREFILL_PROFILE] %s", json.dumps({
 				"rank": self.rank,
 				"weight_stream": self.core_engine.get_weight_stream_profile(),
 				"expert_consumer": (
 					KimiK3MXFP4ExpertWrapper.prefill_profile_snapshot()
+				),
+				"streamed_sp8": (
+					StreamedSP8MXFP4MoELayer.prefill_profile_snapshot()
 				),
 				"logit_topk": _k3_profile_topk,
 			}, separators=(",", ":")))

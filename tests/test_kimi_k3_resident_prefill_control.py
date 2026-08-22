@@ -307,6 +307,38 @@ def test_streamed_sp8_empty_rank_loads_before_returning():
     )
 
 
+def test_streamed_sp8_profile_counts_grouped_assignments():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    forward = _function(path, "StreamedSP8MXFP4MoELayer", "forward")
+    source = ast.unparse(forward)
+
+    assert "_prefill_profile_input_rows += T" in source
+    assert "_prefill_profile_routed_assignments += int(topk_idx.numel())" in source
+    assert "_prefill_profile_grouped_chunks +=" in source
+    assert source.count("helper._expert_path") == 1
+
+
+def test_streamed_sp8_profile_is_emitted_separately_from_legacy_expert_profile():
+    path = ROOT / "batchgen" / "batchgen_worker.py"
+    function = _function(path, "BatchGenWorker", "_config_prefill_for_batch")
+    assert function is not None
+    source = path.read_text()
+
+    assert "StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)" in source
+    assert '"streamed_sp8": (' in source
+    assert '"expert_consumer": (' in source
+
+
+def test_distributed_daemon_joins_bootstrap_threads_on_failure():
+    path = ROOT / "core" / "Weights_Storage" / "distributed_weight_daemon.cpp"
+    source = path.read_text()
+
+    assert "auto join_accept_threads" in source
+    assert "close_tcp_listeners" in source
+    assert source.count("join_accept_threads();") >= 3
+    assert "if (listener >= 0)" in source
+
+
 def test_streamed_sp8_reinterprets_offline_marlin_as_int32():
     torch = pytest.importorskip("torch")
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
