@@ -12,6 +12,7 @@ layers; only one layer is resident at a time.
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import torch
@@ -27,7 +28,14 @@ from batchgen.models.moonshotai.kimi_linear.k3.mxfp4_layout import (
 
 
 class StreamedSP8LayerBuffer:
-    """One reusable full-layer MXFP4 buffer per GPU."""
+    """One reusable full-layer MXFP4 buffer per GPU.
+
+    The buffer is deliberately single-buffered in HBM.  Once layer ``L``'s
+    grouped MoE has consumed ``full``, the local ingress storage and the same
+    full-layer storage can be filled with layer ``L+1`` while the model runs
+    layer ``L+1`` attention.  A second full 896-expert allocation would cost
+    another ~12 GiB/rank and defeat the memory objective.
+    """
 
     def __init__(
         self,
@@ -41,6 +49,7 @@ class StreamedSP8LayerBuffer:
         intermediate_size: int,
         latent_size: int,
         acquire_batch_size: int,
+        layer_indices=None,
     ):
         if tp_size <= 1 or num_experts % tp_size:
             raise ValueError(
@@ -58,6 +67,13 @@ class StreamedSP8LayerBuffer:
         self.intermediate_size = int(intermediate_size)
         self.latent_size = int(latent_size)
         self.acquire_batch_size = max(1, int(acquire_batch_size))
+        self.layer_indices = tuple(int(i) for i in (layer_indices or ()))
+        self._next_layer = {
+            current: following
+            for current, following in zip(
+                self.layer_indices, self.layer_indices[1:]
+            )
+        }
         self.shapes = routed_expert_module_shapes(
             self.intermediate_size, self.latent_size
         )
@@ -67,6 +83,8 @@ class StreamedSP8LayerBuffer:
         self._expert_offsets = torch.arange(
             self.num_experts, dtype=torch.int64, device=self.device
         )
+        self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        self._pending = None
 
     def _allocate(self):
         if self.local is not None:
@@ -88,7 +106,7 @@ class StreamedSP8LayerBuffer:
             for name, shape in self.shapes.items()
         }
 
-    def _acquire_local_shard(self, layer_idx: int):
+    def _acquire_local_shard(self, layer_idx: int, stream=None):
         self._allocate()
         names = [
             f"routed_expert_{layer_idx}_{expert_idx}"
@@ -101,32 +119,137 @@ class StreamedSP8LayerBuffer:
         # The ordinary prefill phase may evict earlier expert mappings while a
         # later module is still being acquired.
         phase = "prefill_sp8"
+        copy_stream = stream or torch.cuda.current_stream(self.device)
         for begin in range(0, len(names), self.acquire_batch_size):
             acquired = []
             batch = names[begin:begin + self.acquire_batch_size]
-            for local_offset, module_name in enumerate(batch, start=begin):
-                weights = self.core_engine.get_weights(module_name, phase)
-                validate_routed_expert_slot(module_name, weights, self.shapes)
-                for tensor_name in self.shapes:
-                    self.local[tensor_name][local_offset].copy_(
-                        weights[tensor_name]
-                    )
-                acquired.append(module_name)
+            with torch.cuda.stream(copy_stream):
+                for local_offset, module_name in enumerate(batch, start=begin):
+                    weights = self.core_engine.get_weights(module_name, phase)
+                    validate_routed_expert_slot(module_name, weights, self.shapes)
+                    for tensor_name in self.shapes:
+                        self.local[tensor_name][local_offset].copy_(
+                            weights[tensor_name]
+                        )
+                    acquired.append(module_name)
 
             # The ring slot may be overwritten immediately after release.
             # Drain all D2D slot->local copies once per bounded batch, not once
-            # per expert.
-            torch.cuda.current_stream(self.device).synchronize()
+            # per expert.  For a prefetch this blocks only the prefetch thread;
+            # the main thread is running attention/MoE in parallel.
+            copy_stream.synchronize()
             for module_name in acquired:
                 self.core_engine.free_weights_buffer(module_name)
 
-    def _gather_full_layer(self):
-        for tensor_name in self.shapes:
-            dist.all_gather_into_tensor(
-                self.full[tensor_name],
-                self.local[tensor_name],
-                group=self.tp_group,
+    def _gather_full_layer(self, stream=None):
+        gather_stream = stream or torch.cuda.current_stream(self.device)
+        with torch.cuda.stream(gather_stream):
+            for tensor_name in self.shapes:
+                dist.all_gather_into_tensor(
+                    self.full[tensor_name],
+                    self.local[tensor_name],
+                    group=self.tp_group,
+                )
+
+    def _make_shard(self):
+        packed = {}
+        scales = {}
+        for projection in ROUTED_EXPERT_PROJECTIONS:
+            packed_name = projection + ".weight_packed"
+            scale_name = projection + ".weight_scale"
+            if projection in ("w1", "w3"):
+                n_out, k_in = self.intermediate_size, self.latent_size
+            else:
+                n_out, k_in = self.latent_size, self.intermediate_size
+
+            packed[projection] = self._offline_marlin_packed_view(
+                self.full[packed_name], n_out, k_in
             )
+            scale_u8 = self.full[scale_name].view(
+                self.num_experts, k_in // MXFP4_GROUP_SIZE, n_out
+            )
+            scale = self.scale_bf16.get(projection)
+            if scale is None or tuple(scale.shape) != tuple(scale_u8.shape):
+                scale = torch.empty_like(scale_u8, dtype=torch.bfloat16)
+                self.scale_bf16[projection] = scale
+            scales[projection] = self._expand_e8m0_into(scale_u8, scale)
+
+        self.scale_bf16 = scales
+        return SimpleNamespace(
+            num_local=self.num_experts,
+            N=self.intermediate_size,
+            K_latent=self.latent_size,
+            gate_B_ptrs=self._ptrs(packed["w1"]),
+            gate_scales_ptrs=self._ptrs(scales["w1"]),
+            up_B_ptrs=self._ptrs(packed["w3"]),
+            up_scales_ptrs=self._ptrs(scales["w3"]),
+            down_B_ptrs=self._ptrs(packed["w2"]),
+            down_scales_ptrs=self._ptrs(scales["w2"]),
+            # Keep all storage alive for the grouped kernel pointer arrays.
+            _tensors=(self.full, self.scale_bf16),
+        )
+
+    def _wait_pending(self):
+        pending = self._pending
+        if pending is None:
+            return
+        pending.thread.join()
+        if pending.error is not None:
+            raise RuntimeError(
+                f"streamed-SP8 prefetch of layer {pending.layer_idx} failed"
+            ) from pending.error
+        # The prefetch stream owns the full-layer writes.  Make the caller's
+        # compute stream wait without a device-wide synchronize.
+        torch.cuda.current_stream(self.device).wait_event(pending.ready)
+        self._pending = None
+
+    def prefetch_next(self, layer_idx: int):
+        """Start host->HBM + node-local assembly for the next MoE layer.
+
+        The call is intentionally non-blocking for the model thread.  The
+        C++ ``get_weights`` binding releases the GIL while waiting for the
+        daemon, and the dedicated weight process group keeps these gathers
+        independent of TP attention collectives.
+        """
+        next_layer = self._next_layer.get(int(layer_idx))
+        if next_layer is None:
+            return
+        if self._pending is not None:
+            raise RuntimeError(
+                f"streamed-SP8 prefetch already pending for "
+                f"layer {self._pending.layer_idx}"
+            )
+
+        pending = SimpleNamespace(
+            layer_idx=next_layer,
+            error=None,
+            ready=torch.cuda.Event(),
+            thread=None,
+        )
+
+        def run():
+            try:
+                torch.cuda.set_device(self.device)
+                self._acquire_local_shard(
+                    next_layer, stream=self._prefetch_stream
+                )
+                self._gather_full_layer(stream=self._prefetch_stream)
+                pending.ready.record(self._prefetch_stream)
+            except BaseException as exc:  # re-raise on the model thread
+                pending.error = exc
+
+        pending.thread = threading.Thread(
+            target=run,
+            name=f"k3-sp8-prefetch-{next_layer}",
+            daemon=True,
+        )
+        self._pending = pending
+        pending.thread.start()
+
+    def close(self):
+        """Drain a pending prefetch before phase teardown."""
+        self._wait_pending()
+        self._prefetch_stream.synchronize()
 
     @staticmethod
     def _expand_e8m0_into(
@@ -155,46 +278,17 @@ class StreamedSP8LayerBuffer:
         )
 
     def load(self, layer_idx: int):
-        self._acquire_local_shard(layer_idx)
-        self._gather_full_layer()
-
-        packed = {}
-        scales = {}
-        for projection in ROUTED_EXPERT_PROJECTIONS:
-            packed_name = projection + ".weight_packed"
-            scale_name = projection + ".weight_scale"
-            if projection in ("w1", "w3"):
-                n_out, k_in = self.intermediate_size, self.latent_size
-            else:
-                n_out, k_in = self.latent_size, self.intermediate_size
-
-            packed[projection] = self._offline_marlin_packed_view(
-                self.full[packed_name], n_out, k_in
-            )
-            scale_u8 = self.full[scale_name].view(
-                self.num_experts, k_in // MXFP4_GROUP_SIZE, n_out
-            )
-            scale = self.scale_bf16.get(projection)
-            if scale is None or tuple(scale.shape) != tuple(scale_u8.shape):
-                scale = torch.empty_like(scale_u8, dtype=torch.bfloat16)
-                self.scale_bf16[projection] = scale
-            scales[projection] = self._expand_e8m0_into(scale_u8, scale)
-
-        self.scale_bf16 = scales
-        shard = SimpleNamespace(
-            num_local=self.num_experts,
-            N=self.intermediate_size,
-            K_latent=self.latent_size,
-            gate_B_ptrs=self._ptrs(packed["w1"]),
-            gate_scales_ptrs=self._ptrs(scales["w1"]),
-            up_B_ptrs=self._ptrs(packed["w3"]),
-            up_scales_ptrs=self._ptrs(scales["w3"]),
-            down_B_ptrs=self._ptrs(packed["w2"]),
-            down_scales_ptrs=self._ptrs(scales["w2"]),
-            # Keep all storage alive for the grouped kernel pointer arrays.
-            _tensors=(self.full, self.scale_bf16),
-        )
-        return shard
+        if self._pending is not None:
+            if self._pending.layer_idx != int(layer_idx):
+                raise RuntimeError(
+                    f"streamed-SP8 expected prefetched layer "
+                    f"{self._pending.layer_idx}, requested {layer_idx}"
+                )
+            self._wait_pending()
+        else:
+            self._acquire_local_shard(layer_idx)
+            self._gather_full_layer()
+        return self._make_shard()
 
 class StreamedSP8MXFP4MoELayer:
     """SP8 routed path for one K3 MoE layer."""
@@ -273,4 +367,7 @@ class StreamedSP8MXFP4MoELayer:
             if self.norm is not None:
                 y = self.norm(y)
             output[start:end].copy_(self.up_proj(y))
+        # At this point ``buffer.full`` is no longer read by this MoE.  Reuse
+        # it for the next layer while the decoder runs that layer's attention.
+        self.buffer.prefetch_next(self.layer_idx)
         return output

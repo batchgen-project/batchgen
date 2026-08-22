@@ -163,6 +163,13 @@ class KimiLinearParallelStrategyManager:
         self._attn_tp_hl = kda_num_heads // G
         self._attn_tp_head_dim = int(loaded_model_config.kda_head_dim)
         self._attn_tp_group = None  # torch NCCL sub-group, built at configure
+        # Weight assembly has its own communicator.  The streamed-SP8
+        # prefetcher launches the next layer's six all-gathers from a host
+        # thread while the main thread runs the next layer's attention.  A
+        # separate process group prevents those collectives from being
+        # ordered against attention's all-reduces when ranks reach the
+        # prefetch point at slightly different times.
+        self._weight_tp_group = None
         if self._stream_all_modules and self._attn_tp_size > 1:
             # Streamed KDA feeds full-96-head tensors from the copy-engine
             # ring, which _load_kda_modules never sees, so the head slice
@@ -212,7 +219,10 @@ class KimiLinearParallelStrategyManager:
             raise ValueError(
                 f"{value} prefill is implemented only for Kimi-K3"
             )
-        if self._distributed_weight_sharded and value != "streamed_sp8":
+        if (
+            getattr(self, "_distributed_weight_sharded", False)
+            and value != "streamed_sp8"
+        ):
             raise ValueError(
                 "distributed K3 host weights require k3_prefill_moe_mode="
                 "'streamed_sp8' (the legacy replicated path would request "
@@ -279,6 +289,8 @@ class KimiLinearParallelStrategyManager:
                 moe._streamed_sp8_prefill_enabled = bool(enabled)
 
     def _release_streamed_sp8_prefill(self):
+        if self._streamed_sp8_buffer is not None:
+            self._streamed_sp8_buffer.close()
         if self.model is not None:
             for layer in self.model.model.layers:
                 moe = getattr(layer, "block_sparse_moe", None)
@@ -615,13 +627,19 @@ class KimiLinearParallelStrategyManager:
         self._streamed_sp8_buffer = StreamedSP8LayerBuffer(
             core_engine=self.core_engine,
             device=self.engine_config.Basic_Config.device_torch,
-            tp_group=self._attn_tp_group,
+            tp_group=self._weight_tp_group,
             tp_rank=self._attn_tp_rank,
             tp_size=self._attn_tp_size,
             num_experts=cfg.n_routed_experts,
             intermediate_size=cfg.moe_intermediate_size,
             latent_size=cfg.routed_expert_hidden_size,
             acquire_batch_size=expert_ring_depth,
+            layer_indices=[
+                layer_idx
+                for layer_idx, layer in enumerate(self.model.model.layers)
+                if getattr(layer, "block_sparse_moe", None) is not None
+                and getattr(layer.block_sparse_moe, "experts", None) is not None
+            ],
         )
         for layer_idx, layer in enumerate(self.model.model.layers):
             moe = getattr(layer, "block_sparse_moe", None)
@@ -915,6 +933,14 @@ class KimiLinearParallelStrategyManager:
             grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
             if g == self._attn_tp_group_id:
                 self._attn_tp_group = grp
+        # Do not reuse the attention group for streamed weight assembly.  The
+        # prefetch thread can otherwise enqueue a weight all-gather after one
+        # rank has already entered the next attention all-reduce, which is an
+        # invalid NCCL ordering even though both collectives are node-local.
+        for g in range(self.world_size // G):
+            grp = dist.new_group(ranks=list(range(g * G, (g + 1) * G)))
+            if g == self._attn_tp_group_id:
+                self._weight_tp_group = grp
 
     def _head_shard_kda_tensor(self, name, tensor):
         """Slice a KDA weight/param to this rank's head shard (M2a, G>1).

@@ -497,7 +497,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // .def("set_batching_plan", &BatchGen::set_batching_plan)
         .def("kv_offload", &BatchGen::kv_offload)
         // .def("add_weight_storage", &BatchGen::add_weight_storage)
-        .def("get_weights", &BatchGen::get_weights)
+        // Streamed-SP8 starts the next layer's blocking host-weight acquire
+        // from a Python prefetch thread.  Release the interpreter lock while
+        // get_weights waits for the daemon/ring so the main thread can run
+        // attention and MoE compute concurrently.
+        .def("get_weights", &BatchGen::get_weights,
+             py::call_guard<py::gil_scoped_release>())
         .def("free_weights_buffer", &BatchGen::free_weights_buffer)
         .def("attn", &BatchGen::attn)
         .def("submit_to_KV_queue", &BatchGen::submit_to_KV_queue)
