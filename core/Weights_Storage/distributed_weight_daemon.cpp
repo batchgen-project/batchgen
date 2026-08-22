@@ -387,7 +387,11 @@ struct DistributedWeightDaemon::Impl {
     int unix_listener = -1;
     void* store = nullptr;
     void* staging = nullptr;
-    std::array<int, kRails> tcp_listeners{};
+    std::array<int, kRails> tcp_listeners = [] {
+        std::array<int, kRails> listeners{};
+        listeners.fill(-1);
+        return listeners;
+    }();
     std::array<UcpRail, kRails> rails;
     std::array<std::array<RemoteEndpoint, kNodes>, kRails> remotes;
     std::array<std::vector<ucp_ep_h>, kRails> incoming_endpoints;
@@ -654,112 +658,144 @@ struct DistributedWeightDaemon::Impl {
         }
 
         std::array<std::thread, kRails> accept_threads;
-        for (int rail = 0; rail < kRails; ++rail) {
-            accept_threads[rail] = std::thread([this, rail]() {
-                try {
-                    const int fd = accept(tcp_listeners[rail],
-                                          nullptr, nullptr);
-                    if (fd < 0) {
-                        if (stop.load()) {
-                            return;
+        auto join_accept_threads = [&]() {
+            for (std::thread& thread : accept_threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        };
+        auto close_tcp_listeners = [&]() {
+            for (int& listener : tcp_listeners) {
+                if (listener >= 0) {
+                    shutdown(listener, SHUT_RDWR);
+                    close(listener);
+                    listener = -1;
+                }
+            }
+        };
+        try {
+            for (int rail = 0; rail < kRails; ++rail) {
+                accept_threads[rail] = std::thread([this, rail]() {
+                    try {
+                        const int fd = accept(tcp_listeners[rail],
+                                              nullptr, nullptr);
+                        if (fd < 0) {
+                            if (stop.load()) {
+                                return;
+                            }
+                            fail("owner accept failed: " +
+                                 std::string(strerror(errno)));
                         }
-                        fail("owner accept failed: " +
-                             std::string(strerror(errno)));
-                    }
-                    std::uint64_t client_address_bytes = 0;
-                    recv_exact(fd, &client_address_bytes,
-                               sizeof(client_address_bytes));
-                    std::vector<unsigned char> client_address(
-                        client_address_bytes);
-                    recv_exact(fd, client_address.data(),
-                               client_address.size());
-                    ucp_ep_h endpoint = create_endpoint(
-                        rails[rail].worker, client_address.data());
-                    incoming_endpoints[rail].push_back(endpoint);
-                    incoming_controls[rail].push_back(fd);
+                        std::uint64_t client_address_bytes = 0;
+                        recv_exact(fd, &client_address_bytes,
+                                   sizeof(client_address_bytes));
+                        std::vector<unsigned char> client_address(
+                            client_address_bytes);
+                        recv_exact(fd, client_address.data(),
+                                   client_address.size());
+                        ucp_ep_h endpoint = create_endpoint(
+                            rails[rail].worker, client_address.data());
+                        incoming_endpoints[rail].push_back(endpoint);
+                        incoming_controls[rail].push_back(fd);
 
-                    void* packed_rkey = nullptr;
-                    size_t packed_rkey_bytes = 0;
+                        void* packed_rkey = nullptr;
+                        size_t packed_rkey_bytes = 0;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-                    check_ucs(
-                        ucp_rkey_pack(
-                            rails[rail].context,
-                            rails[rail].source_memh,
-                            &packed_rkey, &packed_rkey_bytes),
-                        "ucp_rkey_pack");
+                        check_ucs(
+                            ucp_rkey_pack(
+                                rails[rail].context,
+                                rails[rail].source_memh,
+                                &packed_rkey, &packed_rkey_bytes),
+                            "ucp_rkey_pack");
 #pragma GCC diagnostic pop
-                    BootstrapHeader header;
-                    header.worker_address_bytes =
+                        BootstrapHeader header;
+                        header.worker_address_bytes =
+                            rails[rail].address_bytes;
+                        header.rkey_bytes = packed_rkey_bytes;
+                        header.source_address =
+                            reinterpret_cast<std::uint64_t>(store);
+                        header.source_bytes = store_bytes;
+                        send_exact(fd, &header, sizeof(header));
+                        send_exact(fd, rails[rail].address,
+                                   rails[rail].address_bytes);
+                        send_exact(fd, packed_rkey, packed_rkey_bytes);
+                        ucp_rkey_buffer_release(packed_rkey);
+                    } catch (const std::exception& error) {
+                        if (!stop.load()) {
+                            RecordFailure(
+                                "owner bootstrap failed: " +
+                                std::string(error.what()));
+                        }
+                    }
+                });
+            }
+
+            for (int rail = 0; rail < kRails; ++rail) {
+                for (int owner = 0; owner < kNodes; ++owner) {
+                    if (owner == node_rank ||
+                        destination_for_owner_rail(owner, rail + 1) !=
+                            node_rank) {
+                        continue;
+                    }
+                    const int fd = connect_retry(
+                        node_ips[owner],
+                        base_port + owner * kRails + rail, stop);
+                    const std::uint64_t address_bytes =
                         rails[rail].address_bytes;
-                    header.rkey_bytes = packed_rkey_bytes;
-                    header.source_address =
-                        reinterpret_cast<std::uint64_t>(store);
-                    header.source_bytes = store_bytes;
-                    send_exact(fd, &header, sizeof(header));
+                    send_exact(fd, &address_bytes,
+                               sizeof(address_bytes));
                     send_exact(fd, rails[rail].address,
                                rails[rail].address_bytes);
-                    send_exact(fd, packed_rkey, packed_rkey_bytes);
-                    ucp_rkey_buffer_release(packed_rkey);
-                } catch (const std::exception& error) {
-                    if (!stop.load()) {
-                        RecordFailure(
-                            "owner bootstrap failed: " +
-                            std::string(error.what()));
+
+                    BootstrapHeader header{};
+                    recv_exact(fd, &header, sizeof(header));
+                    if (header.magic != kBootstrapMagic ||
+                        header.source_bytes != store_bytes) {
+                        fail("invalid distributed weight bootstrap");
                     }
+                    std::vector<unsigned char> owner_address(
+                        header.worker_address_bytes);
+                    std::vector<unsigned char> packed_rkey(
+                        header.rkey_bytes);
+                    recv_exact(fd, owner_address.data(),
+                               owner_address.size());
+                    recv_exact(fd, packed_rkey.data(),
+                               packed_rkey.size());
+                    RemoteEndpoint remote;
+                    remote.endpoint = create_endpoint(
+                        rails[rail].worker, owner_address.data());
+                    check_ucs(
+                        ucp_ep_rkey_unpack(
+                            remote.endpoint, packed_rkey.data(),
+                            &remote.rkey),
+                        "ucp_ep_rkey_unpack");
+                    remote.control_fd = fd;
+                    remote.source_address = header.source_address;
+                    remote.source_bytes = header.source_bytes;
+                    remotes[rail][owner] = remote;
+                    owner_rails[owner].push_back(rail);
                 }
-            });
-        }
-
-        for (int rail = 0; rail < kRails; ++rail) {
-            for (int owner = 0; owner < kNodes; ++owner) {
-                if (owner == node_rank ||
-                    destination_for_owner_rail(owner, rail + 1) !=
-                        node_rank) {
-                    continue;
-                }
-                const int fd = connect_retry(
-                    node_ips[owner],
-                    base_port + owner * kRails + rail, stop);
-                const std::uint64_t address_bytes =
-                    rails[rail].address_bytes;
-                send_exact(fd, &address_bytes,
-                           sizeof(address_bytes));
-                send_exact(fd, rails[rail].address,
-                           rails[rail].address_bytes);
-
-                BootstrapHeader header{};
-                recv_exact(fd, &header, sizeof(header));
-                if (header.magic != kBootstrapMagic ||
-                    header.source_bytes != store_bytes) {
-                    fail("invalid distributed weight bootstrap");
-                }
-                std::vector<unsigned char> owner_address(
-                    header.worker_address_bytes);
-                std::vector<unsigned char> packed_rkey(
-                    header.rkey_bytes);
-                recv_exact(fd, owner_address.data(),
-                           owner_address.size());
-                recv_exact(fd, packed_rkey.data(),
-                           packed_rkey.size());
-                RemoteEndpoint remote;
-                remote.endpoint = create_endpoint(
-                    rails[rail].worker, owner_address.data());
-                check_ucs(
-                    ucp_ep_rkey_unpack(
-                        remote.endpoint, packed_rkey.data(),
-                        &remote.rkey),
-                    "ucp_ep_rkey_unpack");
-                remote.control_fd = fd;
-                remote.source_address = header.source_address;
-                remote.source_bytes = header.source_bytes;
-                remotes[rail][owner] = remote;
-                owner_rails[owner].push_back(rail);
             }
-        }
 
-        for (std::thread& thread : accept_threads) {
-            thread.join();
+            join_accept_threads();
+        } catch (const std::exception& error) {
+            if (!stop.load()) {
+                RecordFailure("distributed weight bootstrap failed: " +
+                              std::string(error.what()));
+            }
+            close_tcp_listeners();
+            join_accept_threads();
+            throw;
+        } catch (...) {
+            if (!stop.load()) {
+                RecordFailure("distributed weight bootstrap failed: "
+                              "unknown exception");
+            }
+            close_tcp_listeners();
+            join_accept_threads();
+            throw;
         }
         if (failed.load()) {
             fail(FailureMessage());
@@ -1291,7 +1327,7 @@ struct DistributedWeightDaemon::Impl {
             unix_listener = -1;
         }
         for (int& listener : tcp_listeners) {
-            if (listener > 0) {
+            if (listener >= 0) {
                 shutdown(listener, SHUT_RDWR);
                 close(listener);
                 listener = -1;
