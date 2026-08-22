@@ -1,5 +1,6 @@
 import ast
 import copy
+import json
 from pathlib import Path
 
 import pytest
@@ -87,6 +88,69 @@ def test_prefill_mode_accepts_streamed_resident_ep_or_streamed_sp8():
     assert not manager.prefill_uses_streamed_sp8()
     with pytest.raises(ValueError, match="streamed.*resident_ep.*streamed_sp8"):
         manager.set_prefill_moe_mode("unknown")
+
+
+def test_distributed_store_defaults_to_sp8_and_rejects_replicated_prefill():
+    path = (
+        ROOT
+        / "batchgen"
+        / "models"
+        / "moonshotai"
+        / "kimi_linear"
+        / "Parallel_Strategy_Manager.py"
+    )
+    manager = type("Manager", (), {})()
+    manager._distributed_weight_sharded = True
+    manager._is_k3 = True
+    manager._prefill_moe_mode = "streamed_sp8"
+    default_mode = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "default_prefill_moe_mode",
+    ).__get__(manager)
+    set_mode = _isolated_method(
+        path,
+        "KimiLinearParallelStrategyManager",
+        "set_prefill_moe_mode",
+    ).__get__(manager)
+
+    assert default_mode() == "streamed_sp8"
+    set_mode("streamed_sp8")
+    with pytest.raises(ValueError, match="require.*streamed_sp8"):
+        set_mode("streamed")
+    with pytest.raises(ValueError, match="require.*streamed_sp8"):
+        set_mode("resident_ep")
+
+
+def test_distributed_store_requires_boolean_worker_sharding(tmp_path):
+    from batchgen.models.moonshotai.kimi_linear.distributed_weight_store import (
+        load_distributed_weight_config,
+    )
+
+    store = tmp_path / "store.bin"
+    store.write_bytes(b"store")
+    metadata = tmp_path / "metadata.tsv"
+    metadata.write_text("H\n")
+    base = {
+        "node_rank": 0,
+        "node_ips": ["n0", "n1", "n2", "n3"],
+        "workers": 8,
+        "store_path": str(store),
+        "metadata_path": str(metadata),
+        "daemon_socket": str(tmp_path / "daemon.sock"),
+        "summary_path": str(tmp_path / "summary.json"),
+        "store_bytes": store.stat().st_size,
+        "replicated_bytes": 0,
+        "module_bytes": 1,
+    }
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text(json.dumps({**base, "worker_sharded": "true"}))
+    with pytest.raises(ValueError, match="worker_sharded=true"):
+        load_distributed_weight_config(invalid)
+
+    valid = tmp_path / "valid.json"
+    valid.write_text(json.dumps({**base, "worker_sharded": True}))
+    assert load_distributed_weight_config(valid)["workers"] == 8
 
 
 def test_resident_prefill_is_refused_for_non_k3():
@@ -222,6 +286,17 @@ def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
     ]
     assert "prefill_sp8" in phases
     assert "prefill" not in phases
+
+
+def test_streamed_sp8_empty_rank_loads_before_returning():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    function = _function(
+        path, "StreamedSP8MXFP4MoELayer", "forward"
+    )
+    source = ast.unparse(function)
+    assert source.index("shard = self.buffer.load") < source.index(
+        "if T == 0"
+    )
 
 
 def test_streamed_sp8_reinterprets_offline_marlin_as_int32():

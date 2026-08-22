@@ -6593,8 +6593,13 @@ class BatchGenWorker:
 			self._active_batchgen_debug_for_sequences(prefill_sequences) or {}
 		)
 		AttnWrapperBase.batchgen_debug = prefill_debug or None
+		_default_k3_prefill_mode = "streamed"
+		if hasattr(self.parallel_manager, "default_prefill_moe_mode"):
+			_default_k3_prefill_mode = (
+				self.parallel_manager.default_prefill_moe_mode()
+			)
 		k3_prefill_moe_mode = prefill_debug.get(
-			"k3_prefill_moe_mode", "streamed"
+			"k3_prefill_moe_mode", _default_k3_prefill_mode
 		)
 		if hasattr(self.parallel_manager, "set_prefill_moe_mode"):
 			self.parallel_manager.set_prefill_moe_mode(k3_prefill_moe_mode)

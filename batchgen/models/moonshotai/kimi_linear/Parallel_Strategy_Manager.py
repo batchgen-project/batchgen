@@ -108,6 +108,19 @@ class KimiLinearParallelStrategyManager:
         # rest of the family uses (kimi_initializer.is_k3,
         # kimi_parameter_server._detect_kimi_family).
         self._is_k3 = getattr(loaded_model_config, "model_type", None) == "kimi_k3"
+        self._distributed_weight_sharded = bool(
+            getattr(
+                engine_config.Basic_Config,
+                "distributed_weight_sharded",
+                False,
+            )
+        )
+        if self._distributed_weight_sharded and (
+            not self._is_k3 or world_size != 32
+        ):
+            raise ValueError(
+                "distributed host weights require K3 with world_size=32"
+            )
 
         # `model_config` is a ModelConfig, which has NO `n_routed_experts`
         # field at all — the old `getattr(..., 256) or 256` here therefore
@@ -165,7 +178,9 @@ class KimiLinearParallelStrategyManager:
         self._comm = None
         self._resident_ep_built = False
         self._streamed_sp8_buffer = None
-        self._prefill_moe_mode = "streamed"
+        self._prefill_moe_mode = (
+            "streamed_sp8" if self._distributed_weight_sharded else "streamed"
+        )
         self._decode_graph = None
 
     # ------------------------------------------------------------------ #
@@ -197,7 +212,17 @@ class KimiLinearParallelStrategyManager:
             raise ValueError(
                 f"{value} prefill is implemented only for Kimi-K3"
             )
+        if self._distributed_weight_sharded and value != "streamed_sp8":
+            raise ValueError(
+                "distributed K3 host weights require k3_prefill_moe_mode="
+                "'streamed_sp8' (the legacy replicated path would request "
+                "experts outside this worker's ingress shard)"
+            )
         self._prefill_moe_mode = value
+
+    def default_prefill_moe_mode(self):
+        """Return the safe batch default for this weight-source topology."""
+        return "streamed_sp8" if self._distributed_weight_sharded else "streamed"
 
     def prefill_uses_resident_ep(self):
         return self._prefill_moe_mode == "resident_ep"

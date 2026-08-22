@@ -81,6 +81,17 @@ class KimiLinearInitializer:
         self.local_rank = input_arguments.local_rank
         self.global_rank = input_arguments.global_rank
         self.world_size = input_arguments.world_size
+        self.distributed_weight_config = getattr(
+            input_arguments, "distributed_weight_config", None
+        )
+        self.distributed_weight_sharded = bool(self.distributed_weight_config)
+        if self.distributed_weight_sharded and (
+            not self.is_k3 or self.world_size != 32
+        ):
+            raise ValueError(
+                "K3 distributed host weights require model_type='kimi_k3' "
+                "and world_size=32"
+            )
         self.enable_hugetlbfs = os.environ.get("BATCHGEN_ENABLE_HUGETLBFS", "0") == "1"
         logging.info(f"Enable hugetlbfs: {self.enable_hugetlbfs}")
 
@@ -89,19 +100,32 @@ class KimiLinearInitializer:
         self.engine_config = EngineConfig()
         self.engine_config = self._set_basic_config(self.engine_config, input_arguments)
         self._default_engine_config()
-        # M2b: decode head-parallel TP degree G (attention_group_size). The
-        # planner threads it into Basic_Config, which the PSM reads to build the
-        # attn_tp sub-group. There is no server CLI/config seam for it yet, so
-        # it is a launch-time env knob (model-scoped); default 1 keeps the
-        # validated pure-DP-32 path byte-identical. world_size must be a
-        # multiple of G (asserted downstream in the PSM).
-        G = int(os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1"))
+        # M2b: decode head-parallel TP degree G (attention_group_size). A
+        # distributed K3 store is only valid with TP8: each node's eight
+        # workers own disjoint 112-expert ingress shards and the node-local
+        # group reconstructs the current layer.
+        requested_G = int(
+            os.environ.get("BATCHGEN_KIMI_ATTENTION_GROUP_SIZE", "1")
+        )
+        if self.distributed_weight_sharded:
+            if requested_G != 8 and self.global_rank == 0:
+                logging.warning(
+                    "[K3] distributed host weights require attention_group_size=8; "
+                    "overriding requested G=%d",
+                    requested_G,
+                )
+            G = 8
+        else:
+            G = requested_G
         self.planner = KimiLinearPlanner(
             is_k3=self.is_k3, attention_group_size=G
         )
         if self.global_rank == 0:
             logging.info(f"KimiLinearPlanner attention_group_size (G) = {G}")
         self.engine_config = self.planner.generate_config(self.engine_config)
+        self.engine_config.Basic_Config.distributed_weight_sharded = (
+            self.distributed_weight_sharded
+        )
         if self.global_rank == 0:
             logging.info(f"Engine config after planning: {self.engine_config}")
 

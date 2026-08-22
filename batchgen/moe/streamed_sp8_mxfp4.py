@@ -220,10 +220,15 @@ class StreamedSP8MXFP4MoELayer:
 
     def forward(self, x: torch.Tensor, gate) -> torch.Tensor:
         T, H = x.shape
+        # Every TP rank must load the layer and enter all six weight
+        # all-gathers, including a rank that owns zero rows after the
+        # deterministic row split. Returning before ``buffer.load`` lets the
+        # non-empty ranks enter the collective alone and deadlocks the group
+        # on short or imbalanced microbatches.
+        shard = self.buffer.load(self.layer_idx)
         if T == 0:
             return x.new_zeros((0, H))
 
-        shard = self.buffer.load(self.layer_idx)
         helper = ResidentEPMXFP4MoELayer(
             self.layer_idx,
             shard,

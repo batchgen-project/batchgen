@@ -347,6 +347,9 @@ struct DistributedWeightDaemon::Impl {
         if (depth <= 0 || depth % superchunk != 0 ||
             superchunk <= 0 || outstanding <= 0 ||
             workers <= 0 || workers > 31 ||
+            !config.contains("worker_sharded") ||
+            !config.at("worker_sharded").is_boolean() ||
+            !worker_sharded ||
             (worker_sharded &&
              (kExperts % workers != 0 ||
               (kExperts / workers) % superchunk != 0))) {

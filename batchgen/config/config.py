@@ -46,6 +46,7 @@ class BasicConfig:
     rank: Optional[int] = None
     world_size: Optional[int] = None
     gpu_arch: Optional[str] = None
+    distributed_weight_sharded: bool = False
     enable_cuda_graphs: bool = False  # Default off (128K+ NCCL corruption when graph warmup runs MoE AllGather)
     cuda_graph_bucket_sizes: Optional[List[int]] = None
 
@@ -84,7 +85,8 @@ class BasicConfig:
             f"  num_queries: {self.num_queries}\n"
             f"  rank: {self.rank}\n"
             f"  world_size: {self.world_size}\n"
-            f"  gpu_arch: {self.gpu_arch}"
+            f"  gpu_arch: {self.gpu_arch}\n"
+            f"  distributed_weight_sharded: {self.distributed_weight_sharded}"
         )
 
 

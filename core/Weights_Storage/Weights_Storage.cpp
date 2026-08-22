@@ -214,6 +214,12 @@ void Weights_Storage::InitDistributed(const std::string& config_path) {
         config.at("store_bytes").get<int64_t>();
     this->distributed_module_bytes_ =
         config.at("module_bytes").get<int64_t>();
+    if (!config.contains("worker_sharded") ||
+        !config.at("worker_sharded").is_boolean() ||
+        !config.at("worker_sharded").get<bool>()) {
+        throw std::runtime_error(
+            "distributed K3 weights require worker_sharded=true");
+    }
 
     this->compact_fd_ = open(store_path.c_str(), O_RDWR);
     if (this->compact_fd_ < 0) {
