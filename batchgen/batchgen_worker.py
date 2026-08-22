@@ -458,6 +458,7 @@ class InputArguments:
 	enable_ep_with_offloading: bool = False
 	ep_offloading_ratio: float = 0.0
 	pre_dequantize_weights: bool = False
+	distributed_weight_config: Optional[str] = None
 
 	def __post_init__(self):
 		if self.max_prompt_length is None and self.padding_length is not None:
@@ -2781,6 +2782,7 @@ class BatchGenWorker:
 			"enable_ep_with_offloading": self.args.enable_ep_with_offloading,
 			"ep_offloading_ratio": self.args.ep_offloading_ratio,
 			"pre_dequantize_weights": self.args.pre_dequantize_weights,
+			"distributed_weight_config": self.args.distributed_weight_config,
 		}
 		logging.info(f"kv_dtype: {input_arguments['kv_dtype']}")
 			
