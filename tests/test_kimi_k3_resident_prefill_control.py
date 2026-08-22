@@ -288,6 +288,14 @@ def test_streamed_sp8_weight_batch_uses_non_evicting_phase():
     assert "prefill" not in phases
 
 
+def test_streamed_sp8_reusable_buffers_are_not_inference_tensors():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    function = _function(path, "StreamedSP8LayerBuffer", "_allocate")
+    source = ast.unparse(function)
+
+    assert "with torch.inference_mode(False)" in source
+
+
 def test_streamed_sp8_empty_rank_loads_before_returning():
     path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
     function = _function(

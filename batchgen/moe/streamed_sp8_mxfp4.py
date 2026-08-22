@@ -89,22 +89,28 @@ class StreamedSP8LayerBuffer:
     def _allocate(self):
         if self.local is not None:
             return
-        self.local = {
-            name: torch.empty(
-                (self.experts_per_rank, *shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            for name, shape in self.shapes.items()
-        }
-        self.full = {
-            name: torch.empty(
-                (self.num_experts, *shape),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            for name, shape in self.shapes.items()
-        }
+        # The first load is normally reached from the worker's inference-mode
+        # generate loop, but the same buffers are written by the background
+        # prefetch thread after that loop starts.  Allocate them as ordinary
+        # tensors so the asynchronous stream can update them outside
+        # inference_mode on subsequent layers.
+        with torch.inference_mode(False):
+            self.local = {
+                name: torch.empty(
+                    (self.experts_per_rank, *shape),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                for name, shape in self.shapes.items()
+            }
+            self.full = {
+                name: torch.empty(
+                    (self.num_experts, *shape),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                for name, shape in self.shapes.items()
+            }
 
     def _acquire_local_shard(self, layer_idx: int, stream=None):
         self._allocate()
