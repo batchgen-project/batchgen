@@ -712,6 +712,13 @@ class BatchGenWorker:
 		self._decode_cache_seqlens_cpu_staging = None
 		self._decode_metadata_batch_key = None
 		self._decode_metadata_cpu_seqlens = None
+		# Kimi-K3 streamed-SP8 prefill: the distributed weight daemon serves one
+		# free-running circular schedule and erases every key it releases, so the
+		# H2D weight pipeline is installed exactly ONCE. These two fields record
+		# that installation; while set, the worker must not rewind the weight
+		# queue cursor or drop the routed-expert GPU slots it has prefetched.
+		self._streamed_sp8_h2d_installed = False
+		self._streamed_sp8_weight_copy_fingerprint = None
 
 		# 2. Set Device immediately
 		torch.cuda.set_device(self.local_rank)
@@ -6610,6 +6617,19 @@ class BatchGenWorker:
 
 	# ============ Phase Configuration ============
 
+	@staticmethod
+	def _weight_copy_task_fingerprint(weight_copy_task) -> tuple:
+		"""Immutable identity of an H2D weight-copy schedule.
+
+		Both the module types and the per-type ORDER matter: the copy engine
+		drains each type's list front to front and the consumer blocks on the
+		head, so two tasks are interchangeable only if their lists are equal.
+		"""
+		return tuple(
+			(str(module_type), tuple(str(name) for name in names))
+			for module_type, names in sorted((weight_copy_task or {}).items())
+		)
+
 	def _config_prefill_for_batch(self, prefill_uuids: List[str]) -> None:
 		"""Configure prefill phase for a batch of sequences."""
 		start_time = time.perf_counter()
@@ -6747,9 +6767,21 @@ class BatchGenWorker:
 				f"free={free_mem/1e9:.2f}GB alloc={allocated:.2f}GB"
 			)
 
+		# The distributed weight daemon drives ONE free-running circular schedule
+		# and erases each key as it releases it. Re-seeding the weight queue
+		# rewinds our cursor onto keys the daemon has already erased, and
+		# resetting the prefill buffer throws away routed-expert GPU slots the
+		# daemon has already delivered. So the streamed-SP8 H2D pipeline is
+		# installed exactly once; every later prefill resumes it in place.
+		streamed_sp8 = (
+			hasattr(self.parallel_manager, "prefill_uses_streamed_sp8")
+			and self.parallel_manager.prefill_uses_streamed_sp8()
+		)
+		sp8_reentry = streamed_sp8 and self._streamed_sp8_h2d_installed
 		self.core_engine.stop_h2d_worker()
-		self.core_engine.clear_weight_copy_queue()
-		self.core_engine.reset_prefill_buffer()
+		if not sp8_reentry:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_prefill_buffer()
 		k3_prefill_profile = self._debug_flag_enabled(
 			prefill_debug.get("k3_prefill_profile")
 		)
@@ -6763,8 +6795,25 @@ class BatchGenWorker:
 				StreamedSP8MXFP4MoELayer,
 			)
 			StreamedSP8MXFP4MoELayer.reset_prefill_profile(True)
-		self.core_engine.set_weight_copy_queue(self.weight_copy_task)
+		fingerprint = self._weight_copy_task_fingerprint(self.weight_copy_task)
+		if sp8_reentry:
+			# configure_prefill rebuilt the task from scratch. The preserved
+			# cursor only means anything if that rebuild is byte-identical to
+			# the schedule the daemon is still walking.
+			if fingerprint != self._streamed_sp8_weight_copy_fingerprint:
+				raise RuntimeError(
+					f"Rank {self.rank}: streamed-SP8 weight-copy schedule "
+					"changed after the H2D pipeline was installed; the "
+					"preserved daemon cursor no longer matches the rebuilt "
+					"task and would stream the wrong experts"
+				)
+		else:
+			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 		self.core_engine.start_h2d_worker()
+		self._streamed_sp8_h2d_installed = streamed_sp8
+		self._streamed_sp8_weight_copy_fingerprint = (
+			fingerprint if streamed_sp8 else None
+		)
 
 		# NOTE: _destroy_gpu_paged_kv_cache() moved before configure_prefill() (Bug Fix 7.2)
 
@@ -7025,11 +7074,24 @@ class BatchGenWorker:
 		self.set_phase("decode")
 		self.core_engine.stop_h2d_worker()
 		self.core_engine.clear_kv_copy_queue()
-		self.core_engine.clear_weight_copy_queue()
-		self.core_engine.reset_decoding_buffer()
+		# Resident decode does not stream routed experts, but the streamed-SP8
+		# prefill pipeline shares the daemon's single free-running circular
+		# schedule across the phase boundary. clear_weight_copy_queue() rewinds
+		# our cursor onto keys the daemon has already erased and
+		# reset_decoding_buffer() destroys the routed-expert GPU slots it has
+		# already prefetched — either one breaks the next prefill.
+		if not self._streamed_sp8_h2d_installed:
+			self.core_engine.clear_weight_copy_queue()
+			self.core_engine.reset_decoding_buffer()
 
 		# Only start H2D worker if there are experts to offload
 		if self.weight_copy_task.get("routed_expert"):
+			if self._streamed_sp8_h2d_installed:
+				raise RuntimeError(
+					f"Rank {self.rank}: streamed decode cannot replace an "
+					"installed streamed-SP8 prefill pipeline; use resident-EP "
+					"decode so the distributed weight schedule stays aligned"
+				)
 			self.core_engine.set_weight_copy_queue(self.weight_copy_task)
 			self.core_engine.start_h2d_worker()
 

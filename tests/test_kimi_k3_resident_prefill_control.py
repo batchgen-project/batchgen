@@ -44,6 +44,32 @@ def _isolated_method(path, class_name, function_name, globals_=None):
     return getattr(namespace["Isolated"], function_name)
 
 
+def _call_guards(function):
+    """Map each ``obj.name()`` call to the ``if`` tests enclosing it.
+
+    Returns ``{attribute_name: [tuple_of_enclosing_tests, ...]}``; an empty
+    tuple means the call runs unconditionally in the function body.
+    """
+    found = {}
+
+    def visit(node, stack):
+        if isinstance(node, ast.If):
+            visit(node.test, stack)
+            for child in node.body:
+                visit(child, stack + (ast.unparse(node.test),))
+            for child in node.orelse:
+                visit(child, stack + ("else: " + ast.unparse(node.test),))
+            return
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            found.setdefault(node.func.attr, []).append(stack)
+        for child in ast.iter_child_nodes(node):
+            visit(child, stack)
+
+    for statement in function.body:
+        visit(statement, ())
+    return found
+
+
 def _isolated_function(path, function_name):
     tree = ast.parse(path.read_text())
     function = copy.deepcopy(
@@ -382,6 +408,7 @@ def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
     buffer._pending = None
     buffer._next_layer = {3: 4}
     buffer._prefetch_stream = prefetch_stream
+    buffer._local_free = FakeEvent()
     buffer._acquire_local_shard = record_call("acquire")
     buffer._gather_full_layer = record_call("gather")
     buffer.prefetch_next = _isolated_method(
@@ -402,6 +429,7 @@ def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
     assert pending.error is None
     assert [(entry.op, entry.stream) for entry in trace] == [
         ("record", "compute"),
+        ("wait", "prefetch"),
         ("acquire", "prefetch"),
         ("wait", "prefetch"),
         ("gather", "prefetch"),
@@ -411,13 +439,30 @@ def test_streamed_sp8_prefetch_waits_for_compute_before_overwriting_full():
     # compute-stream event, and that event is recorded on the model thread
     # before the prefetch thread starts, so it covers the in-flight MoE work.
     compute_done = trace[0].event
-    assert trace[2].event is compute_done
+    assert trace[3].event is compute_done
     assert trace[0].thread == model_thread
     assert trace[1].thread != model_thread
-    # Overlap: the local-shard acquisition is not held behind that wait, and
-    # ``pending.ready`` still orders the prefetch before the next compute.
-    assert trace[4].event is pending.ready
+    # Safety: the ingress that overwrites ``self.local`` is ordered after the
+    # PREVIOUS all-gather, which on the first boundary ran on the compute
+    # stream and is therefore not covered by prefetch-stream ordering.
+    assert trace[1].event is buffer._local_free
+    assert buffer._local_free is not compute_done
+    # Overlap: the local-shard acquisition is not held behind the compute wait,
+    # and ``pending.ready`` still orders the prefetch before the next compute.
+    assert trace[5].event is pending.ready
     assert pending.ready is not compute_done
+
+
+def test_streamed_sp8_gather_marks_local_shard_free():
+    path = ROOT / "batchgen" / "moe" / "streamed_sp8_mxfp4.py"
+    source = ast.unparse(
+        _function(path, "StreamedSP8LayerBuffer", "_gather_full_layer")
+    )
+    assert source.index("all_gather_into_tensor") < source.index(
+        "self._local_free.record(gather_stream)"
+    )
+    init = ast.unparse(_function(path, "StreamedSP8LayerBuffer", "__init__"))
+    assert "self._local_free = torch.cuda.Event()" in init
 
 
 def test_streamed_sp8_empty_rank_loads_before_returning():
@@ -751,3 +796,113 @@ def test_worker_preallocates_resident_output_before_configure_prefill():
         line for line, name in calls if name == "configure_prefill"
     )
     assert destroy < sync < prepare < configure
+
+
+def test_worker_initializes_streamed_sp8_install_state():
+    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
+    source = ast.unparse(_function(worker_path, "BatchGenWorker", "__init__"))
+    assert "self._streamed_sp8_h2d_installed = False" in source
+    assert "self._streamed_sp8_weight_copy_fingerprint = None" in source
+
+
+def test_streamed_sp8_prefill_installs_the_h2d_pipeline_exactly_once():
+    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
+    function = _function(
+        worker_path, "BatchGenWorker", "_config_prefill_for_batch"
+    )
+    guards = _call_guards(function)
+
+    # Every prefill still stops/starts the copy engine and resets the profile.
+    for name in (
+        "stop_h2d_worker",
+        "start_h2d_worker",
+        "reset_weight_stream_profile",
+    ):
+        assert () in guards[name], name
+
+    # Seeding the queue and dropping the prefill buffer would rewind the
+    # daemon's free-running circular schedule, so they are first-install only.
+    for name in (
+        "clear_weight_copy_queue",
+        "reset_prefill_buffer",
+        "set_weight_copy_queue",
+    ):
+        assert guards[name], name
+        assert all(
+            any("sp8_reentry" in test for test in stack)
+            for stack in guards[name]
+        ), name
+
+    # A re-entry that finds a different schedule must fail loudly rather than
+    # stream the wrong experts against the preserved cursor.
+    mismatch = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "_streamed_sp8_weight_copy_fingerprint" in ast.unparse(node.test)
+    )
+    assert any(isinstance(node, ast.Raise) for node in ast.walk(mismatch))
+
+
+def test_resident_decode_preserves_streamed_sp8_weight_pipeline():
+    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
+    function = _function(worker_path, "BatchGenWorker", "_load_decode_model")
+    guards = _call_guards(function)
+
+    assert () in guards["stop_h2d_worker"]
+    assert () in guards["clear_kv_copy_queue"]
+    # Both of these destroy streamed-SP8 state: one rewinds the queue cursor,
+    # the other frees the already-prefetched routed-expert GPU slots.
+    for name in ("clear_weight_copy_queue", "reset_decoding_buffer"):
+        assert guards[name], name
+        assert all(
+            any("_streamed_sp8_h2d_installed" in test for test in stack)
+            for stack in guards[name]
+        ), name
+
+    # A streamed decode task would reseed the same queue with a different
+    # phase schedule.  Distributed streamed-SP8 therefore requires the
+    # resident-EP decode path and fails before set_weight_copy_queue.
+    routed_task = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "weight_copy_task.get('routed_expert')" in ast.unparse(node.test)
+    )
+    installed_guard = next(
+        node
+        for node in routed_task.body
+        if isinstance(node, ast.If)
+        and "_streamed_sp8_h2d_installed" in ast.unparse(node.test)
+    )
+    assert any(isinstance(node, ast.Raise) for node in installed_guard.body)
+    assert routed_task.body.index(installed_guard) < next(
+        index
+        for index, node in enumerate(routed_task.body)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "set_weight_copy_queue"
+    )
+
+
+def test_weight_copy_task_fingerprint_pins_type_and_order():
+    worker_path = ROOT / "batchgen" / "batchgen_worker.py"
+    fingerprint = _isolated_method(
+        worker_path, "BatchGenWorker", "_weight_copy_task_fingerprint"
+    )
+    base = {
+        "attn": [],
+        "routed_expert": ["routed_expert_0_336", "routed_expert_0_337"],
+    }
+
+    # Dict insertion order is not part of the schedule; list order is.
+    assert fingerprint(base) == fingerprint(
+        dict(reversed(list(base.items())))
+    )
+    assert fingerprint(base) != fingerprint(
+        {**base, "routed_expert": list(reversed(base["routed_expert"]))}
+    )
+    assert fingerprint(base) != fingerprint(
+        {**base, "routed_expert": base["routed_expert"][:1]}
+    )

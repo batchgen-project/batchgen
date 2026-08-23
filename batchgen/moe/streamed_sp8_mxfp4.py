@@ -85,6 +85,12 @@ class StreamedSP8LayerBuffer:
             self.num_experts, dtype=torch.int64, device=self.device
         )
         self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        # ``self.local`` is the all-gather source and is single-buffered too.
+        # The next layer's ingress may only overwrite it once the previous
+        # gather has read it.  On the first boundary that gather ran on the
+        # caller's compute stream — not the prefetch stream — so ordering
+        # within the prefetch stream alone does not cover the hazard.
+        self._local_free = torch.cuda.Event()
         self._pending = None
 
     def _allocate(self):
@@ -157,6 +163,9 @@ class StreamedSP8LayerBuffer:
                     self.local[tensor_name],
                     group=self.tp_group,
                 )
+        # Record on whichever stream ran the gathers: ``self.local`` is only
+        # free for the next layer's ingress once they have consumed it.
+        self._local_free.record(gather_stream)
 
     def _make_shard(self):
         packed = {}
@@ -243,6 +252,10 @@ class StreamedSP8LayerBuffer:
         def run():
             try:
                 torch.cuda.set_device(self.device)
+                # WAR on ``self.local``: the previous layer's all-gather reads
+                # it, and on the first boundary that gather was enqueued on the
+                # compute stream.  Order this layer's ingress after it.
+                self._prefetch_stream.wait_event(self._local_free)
                 # Local-shard acquisition writes ``self.local`` only, which no
                 # compute kernel reads, so it overlaps the current layer.
                 self._acquire_local_shard(
