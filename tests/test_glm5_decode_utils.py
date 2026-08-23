@@ -2817,6 +2817,7 @@ def test_glm5_setup_cuda_graphs_captures_all_configured_whole_model_buckets(
         vocab_size=16,
     )
     worker.core_engine = types.SimpleNamespace()
+    worker.global_batch = None
     worker._current_decode_local_batch_size = 2
     worker._current_decode_max_rank_batch_size = 2
     worker._current_decode_rank_token_counts = torch.tensor([2, 2], dtype=torch.int64)
